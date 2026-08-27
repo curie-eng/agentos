@@ -228,6 +228,24 @@ Toggles (all default `true`): `langfuse.deploy`, `postgres.deploy`,
 Flipping any to `false` removes its resources from the render; consumers
 (Langfuse env, the collector config) repoint at the BYO host automatically.
 
+### Langfuse Postgres startup readiness
+
+`langfuse.web.postgresReadiness` is enabled by default. Before Langfuse web
+starts, its `wait-for-postgres` init container makes a credential-free
+`pg_isready` protocol-readiness check only; it does not validate authentication
+or run migrations. Its `image` is empty by default and falls back to
+`postgres.image`; override it for a BYO Postgres/private registry when the
+default image is unavailable there.
+
+Defaults are `attempts: 60`, `intervalSeconds: 2`, and
+`probeTimeoutSeconds: 2`: the wait is bounded to approximately 2--4 minutes,
+depending on how quickly each probe fails. While the Pod remains in `Init`, use
+`kubectl logs <langfuse-web-pod> -c wait-for-postgres` and check the Postgres
+endpoint, DNS, and network path. Exhaustion fails the init container so
+Kubernetes restarts it. After a successful protocol check, Langfuse web owns
+authentication and migrations: bad credentials and permanent migration failures
+are terminal there and are not retried by this gate.
+
 Secrets: all credentials are written to one `<release>-secrets` Secret. A sealed
 `helm install` (the default) generates strong random values for all eleven
 chart owned credentials: the backing store passwords, Langfuse

@@ -174,6 +174,16 @@ langfuse:
     # cap (~512Mi) OOM-crashes under a tight container limit; raise it in step
     # with the memory limit. Empty = leave the image default.
     nodeOptions: "--max-old-space-size=1024"
+    # Credential-free protocol readiness gate before Langfuse web starts its
+    # own migrations. Authentication and migration failures remain owned by
+    # the unmodified Langfuse entrypoint after this bounded wait succeeds.
+    postgresReadiness:
+      enabled: true
+      # Empty reuses postgres.image; override for BYO Postgres when needed.
+      image: ""
+      attempts: 60
+      intervalSeconds: 2
+      probeTimeoutSeconds: 2
     resources:
       requests: { cpu: 150m, memory: 384Mi }
       limits: { cpu: "1", memory: 1536Mi }

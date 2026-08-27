@@ -178,6 +178,14 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/langfuse-runasuser-assertions.sh
 
+      # Prove the web-only Postgres readiness gate is ordered before Langfuse,
+      # credential-free, bounded/tunable, hardened like the web container, and
+      # removable through its explicit values switch. Includes a red mutation.
+      - name: helm render assertions (langfuse postgres readiness)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/langfuse-postgres-readiness-assertions.sh
+
       # Prove the controller NetworkPolicy RBAC split (issue #350): exactly one
       # read-only cluster grant (get/list/watch) so the informer syncs, no
       # cluster-wide mutate anywhere (#66 guarded), namespaced mutate intact, and
