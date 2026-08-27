@@ -4,6 +4,7 @@
 - **Candidate:** `0f20d32cf523293ad72d4cb8b3486709251af860` (`origin/next`)
 - **Experiment:** 2026-08-27 09:42:18–09:54:18 UTC, 720.023 seconds
 - **Lane:** D, long-turn reliability
+- **Implementation:** [#1971](https://github.com/curie-eng/curie/issues/1971)
 
 ## Decision summary
 
