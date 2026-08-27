@@ -403,6 +403,90 @@ service:
       exporters: [nop/metrics{{- if $debugEnabled }}, debug{{- end }}{{- range .Values.otelCollector.extraMetricPipelineExporters }}, {{ . }}{{- end }}]
 {{- end }}
 
+{{/* Chart-owned OTLP destination (#1819). In-cluster Service while deploy is
+     true; otelCollector.endpoint when the operator brings their own collector.
+     Empty when telemetry is explicitly disabled or when no-endpoint mode is
+     valid (gate off, deploy false, endpoint empty). */}}
+{{- define "curie.otel.endpoint" -}}
+{{- if .Values.otelCollector.deploy -}}
+http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.service.httpPort }}
+{{- else if not .Values.otelCollector.telemetryDisabled -}}
+{{- .Values.otelCollector.endpoint | default "" -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Fail closed on contradictory OTEL values always. Fail closed on accidental
+     missing only when security.checkDefaultCredentials is on: local/offline
+     no-endpoint remains valid outside that gate. extraEnv-only does not satisfy
+     the production gate because the four workloads can drift. */}}
+{{- define "curie.otel.validate" -}}
+{{- $otel := .Values.otelCollector -}}
+{{- if and $otel.telemetryDisabled $otel.deploy -}}
+{{- fail "otelCollector.telemetryDisabled cannot be true while otelCollector.deploy is true. Deploy the chart-managed collector, or set deploy to false and keep telemetryDisabled true." -}}
+{{- end -}}
+{{- if and $otel.telemetryDisabled (not (empty $otel.endpoint)) -}}
+{{- fail "otelCollector.telemetryDisabled cannot be true while otelCollector.endpoint is set. Set one destination or acknowledge that telemetry is disabled." -}}
+{{- end -}}
+{{- if and $otel.telemetryDisabled (not (empty $otel.headers)) -}}
+{{- fail "otelCollector.telemetryDisabled cannot be true while otelCollector.headers is set." -}}
+{{- end -}}
+{{- if and $otel.telemetryDisabled (not (empty $otel.headersExistingSecret)) -}}
+{{- fail "otelCollector.telemetryDisabled cannot be true while otelCollector.headersExistingSecret is set." -}}
+{{- end -}}
+{{- if and (not (empty $otel.headers)) (not (empty $otel.headersExistingSecret)) -}}
+{{- fail "otelCollector.headers and otelCollector.headersExistingSecret cannot both be set. Use headersExistingSecret for credentials." -}}
+{{- end -}}
+{{- $sensitiveHeaderPattern := "(?i)(^|[,;\\s])(authorization|token|api[-_]?key|secret|password|credential)=" -}}
+{{- if and (not (empty $otel.headers)) (regexMatch $sensitiveHeaderPattern (toString $otel.headers)) -}}
+{{- fail "otelCollector.headers is sensitive and must use headersExistingSecret so the value never enters Helm values or the rendered workload env as a literal." -}}
+{{- end -}}
+{{- $protocol := $otel.protocol | default "http/protobuf" -}}
+{{- if and (not (empty $protocol)) (not (or (eq $protocol "http/protobuf") (eq $protocol "grpc") (eq $protocol "http/json"))) -}}
+{{- fail "otelCollector.protocol must be grpc, http/protobuf, or http/json." -}}
+{{- end -}}
+{{- if and .Values.security.checkDefaultCredentials (not $otel.deploy) (not $otel.telemetryDisabled) (empty $otel.endpoint) -}}
+{{- fail "security.checkDefaultCredentials is on but neither a chart-managed collector nor otelCollector.endpoint is configured. Set otelCollector.endpoint to the external collector, keep otelCollector.deploy true, or set otelCollector.telemetryDisabled=true to acknowledge that telemetry is disabled." -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Standard OTEL_EXPORTER_OTLP_* env for every instrumented workload. extraEnv
+     still wins per variable. Include with nindent 12. Call with
+     dict "root" $ "extraEnv" .Values.<workload>.extraEnv */}}
+{{- define "curie.env.otel" -}}
+{{- include "curie.otel.validate" .root -}}
+{{- $extra := .extraEnv | default list -}}
+{{- $hasEndpoint := false -}}
+{{- $hasProtocol := false -}}
+{{- $hasHeaders := false -}}
+{{- range $extra -}}
+{{- if eq .name "OTEL_EXPORTER_OTLP_ENDPOINT" -}}{{- $hasEndpoint = true -}}{{- end -}}
+{{- if eq .name "OTEL_EXPORTER_OTLP_PROTOCOL" -}}{{- $hasProtocol = true -}}{{- end -}}
+{{- if eq .name "OTEL_EXPORTER_OTLP_HEADERS" -}}{{- $hasHeaders = true -}}{{- end -}}
+{{- end -}}
+{{- $endpoint := include "curie.otel.endpoint" .root | trim -}}
+{{- $protocol := .root.Values.otelCollector.protocol | default "http/protobuf" -}}
+{{- if and (not $hasEndpoint) (ne $endpoint "") }}
+- name: OTEL_EXPORTER_OTLP_ENDPOINT
+  value: {{ $endpoint | quote }}
+{{- end }}
+{{- if and (not $hasProtocol) (ne $endpoint "") }}
+- name: OTEL_EXPORTER_OTLP_PROTOCOL
+  value: {{ $protocol | quote }}
+{{- end }}
+{{- if and (not $hasHeaders) (not .root.Values.otelCollector.deploy) (not .root.Values.otelCollector.telemetryDisabled) (ne $endpoint "") }}
+{{- if not (empty .root.Values.otelCollector.headersExistingSecret) }}
+- name: OTEL_EXPORTER_OTLP_HEADERS
+  valueFrom:
+    secretKeyRef:
+      name: {{ .root.Values.otelCollector.headersExistingSecret | quote }}
+      key: {{ .root.Values.otelCollector.headersSecretKey | default "headers" | quote }}
+{{- else if not (empty .root.Values.otelCollector.headers) }}
+- name: OTEL_EXPORTER_OTLP_HEADERS
+  value: {{ .root.Values.otelCollector.headers | quote }}
+{{- end }}
+{{- end }}
+{{- end -}}
+
 {{/* ---- Default-credential gate (issue #198) ----
      When security.checkDefaultCredentials is on, refuse to render if a Langfuse
      chart input for a bootstrap identity still carries the published dev default
@@ -502,6 +586,7 @@ service:
 {{- fail "security.checkDefaultCredentials is on but the chart would ship the published dev header \"Basic cGstbGYtY3VyaWUtZGV2OnNrLWxmLWN1cmllLWRldg==\" as the OTel Collector auth credential in its Secret (auth scheme spelling, whitespace and base64 padding aside), which the collector authenticates with when deployed. That is the dev project key pk-lf-curie-dev:sk-lf-curie-dev, which anyone reading this repository holds. That header arrives either from otelCollector.otlpAuthHeader set to it directly, or from the chart composing it out of langfuse.init.projectPublicKey and langfuse.init.projectSecretKey when the chart-managed Secret is the one the collector reads. Set otelCollector.otlpAuthHeader from your own project keys, override those two langfuse.init values, or point langfuse.existingSecret at your own Secret and supply otlpAuthHeader there." -}}
 {{- end -}}
 {{- end -}}
+{{- include "curie.otel.validate" . -}}
 {{- end -}}
 
 {{/* ---- Auto-generated per-release chart credential (issue #195) ----

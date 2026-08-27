@@ -151,7 +151,10 @@ that directory on a PVC by default, so queued trace batches survive a Collector 
 restart. Any operator-supplied network exporter is rejected at render time unless it
 also enables finite retry and a finite file-backed queue. Logs and metrics deliberately
 use explicit no-op exporters until an operator configures their backends, avoiding scope
-overlap with #1765.
+overlap with #1765. Instrumented workloads take a single chart-owned OTLP destination:
+the in-cluster collector while `otelCollector.deploy` is true, `otelCollector.endpoint`
+when the operator brings an external collector, or no endpoint when telemetry is
+explicitly disabled. The production credential gate refuses a missing destination.
 
 Collector self-metrics remain enabled on the chart's internal metrics port, including
 queue size/capacity and exporter accepted, sent, failed, and enqueue-failed counters used
@@ -170,9 +173,11 @@ create a recursive failure loop.
 
 One trace backend: Langfuse, reached through the OTel Collector (which authenticates and
 forwards over HTTP because Langfuse OTLP ingest is HTTP-only). Every producer knows only
-OTLP. The chart injects the Collector endpoint into the API, dispatcher, worker, eval
-worker, and sandbox runner; the local Compose profiles do the same for the services they
-start. The read side (trace list and tree reconstruction) remains a separate API concern.
+OTLP. The chart injects one destination into the API, dispatcher, worker, eval worker,
+and sandbox runner: the in-cluster collector, a chart-owned external endpoint, or nothing
+when telemetry is explicitly disabled. The local Compose profiles do the same for the
+services they start. The read side (trace list and tree reconstruction) remains a
+separate API concern.
 
 The default chart intentionally has no log or metric storage implementation: those
 pipelines terminate in named no-op exporters unless the operator adds durable backends.
