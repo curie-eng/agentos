@@ -180,6 +180,8 @@ langfuse:
     postgresReadiness:
       enabled: true
       # Empty reuses postgres.image; override for BYO Postgres when needed.
+      # This probe always runs as non-root, independently of a web image's
+      # containerSecurityContext override, because it uses the Postgres image.
       image: ""
       attempts: 60
       intervalSeconds: 2

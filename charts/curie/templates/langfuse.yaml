@@ -50,6 +50,8 @@ spec:
       {{- $_ := set $readinessSecurityContext "runAsNonRoot" true }}
       {{- if not (hasKey $readinessSecurityContext "runAsUser") }}
       {{- $_ := set $readinessSecurityContext "runAsUser" 1001 }}
+      {{- else if eq (int64 (get $readinessSecurityContext "runAsUser")) 0 }}
+      {{- $_ := set $readinessSecurityContext "runAsUser" 1001 }}
       {{- end }}
       {{- range $field := list "attempts" "intervalSeconds" "probeTimeoutSeconds" }}
       {{- $value := index $postgresReadiness $field }}

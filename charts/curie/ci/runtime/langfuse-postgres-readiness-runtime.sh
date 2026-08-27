@@ -9,7 +9,7 @@ NAMESPACE="${LANGFUSE_POSTGRES_NAMESPACE:-}"
 RELEASE="${LANGFUSE_POSTGRES_RELEASE:-}"
 POSTGRES_IMAGE="${LANGFUSE_POSTGRES_IMAGE:-}"
 CHART=""
-OBSERVE_SECONDS="${LANGFUSE_POSTGRES_OBSERVE_SECONDS:-10}"
+OBSERVE_SECONDS="${LANGFUSE_POSTGRES_OBSERVE_SECONDS:-20}"
 POLL_SECONDS=2
 NAMESPACE_CREATED=0
 CLEANUP_STARTED=0
@@ -373,11 +373,13 @@ done
 MIN_PRE_READY_SAMPLES=3
 PRE_READY_SAMPLES=0
 OBSERVE_STARTED=$SECONDS
-while (( SECONDS - OBSERVE_STARTED < OBSERVE_SECONDS )); do
+while (( PRE_READY_SAMPLES < MIN_PRE_READY_SAMPLES )); do
+  (( SECONDS - OBSERVE_STARTED < OBSERVE_SECONDS )) || \
+    fail "pre-ready sampling exceeded ${OBSERVE_SECONDS}s after $PRE_READY_SAMPLES samples"
   current_ref="$(component_pod langfuse-web)"
   [[ "${current_ref#*|}" == "$WEB_UID" ]] || fail "Langfuse web pod was replaced before Postgres readiness"
   if [[ "$(pod_ready "$POSTGRES_POD")" == "True" ]]; then
-    break
+    fail "delayed fixture became ready after only $PRE_READY_SAMPLES pre-ready samples"
   fi
   read_snapshot "$WEB_POD"
   [[ "$INIT_PRESENT" == "yes" && "$INIT_STATE" == "running" ]] || fail "readiness init stopped waiting before Postgres was ready"
@@ -386,10 +388,10 @@ while (( SECONDS - OBSERVE_STARTED < OBSERVE_SECONDS )); do
   [[ "$WEB_STATE" == "waiting" || "$WEB_STATE" == "missing" ]] || fail "Langfuse web started before its readiness init completed"
   PRE_READY_SAMPLES=$((PRE_READY_SAMPLES + 1))
   echo "pre-ready sample $PRE_READY_SAMPLES: init=running initRestarts=0 web=${WEB_STATE} webRestarts=0"
-  sleep "$POLL_SECONDS"
+  if (( PRE_READY_SAMPLES < MIN_PRE_READY_SAMPLES )); then
+    sleep "$POLL_SECONDS"
+  fi
 done
-(( PRE_READY_SAMPLES >= MIN_PRE_READY_SAMPLES )) || \
-  fail "collected only $PRE_READY_SAMPLES pre-ready samples; need at least $MIN_PRE_READY_SAMPLES"
 assert_no_backoff "$WEB_POD"
 echo "pre-ready observation: samples=$PRE_READY_SAMPLES BackOff=0"
 

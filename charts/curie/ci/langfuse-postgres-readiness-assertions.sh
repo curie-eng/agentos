@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Fast render contract for the Langfuse web Postgres readiness gate (#1853).
-# The live delayed-start regression is the non-executable sibling in this
-# directory; this executable script is the chart-check/helm-ci fast pin.
+# The executable live delayed-start regression is nested under ci/runtime so
+# chart-check keeps discovering only the fast top-level assertion scripts.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -22,6 +22,9 @@ render() {
 render default
 render disabled --set langfuse.web.postgresReadiness.enabled=false
 render blank-security --set-json 'langfuse.web.containerSecurityContext=null'
+render root-web-security \
+  --set langfuse.web.containerSecurityContext.runAsNonRoot=false \
+  --set langfuse.web.containerSecurityContext.runAsUser=0
 render tuned \
   --set-string langfuse.web.postgresReadiness.image=registry.example.com/postgres-readiness:test \
   --set langfuse.web.postgresReadiness.attempts=7 \
@@ -74,7 +77,7 @@ if wait.get("image") != expected_image:
 web_main = next(item for item in web_spec["containers"] if item.get("name") == "langfuse-web")
 wait_sc = wait.get("securityContext") or {}
 web_sc = web_main.get("securityContext") or {}
-if mode != "blank-security" and wait_sc != web_sc:
+if mode not in ("blank-security", "root-web-security") and wait_sc != web_sc:
     raise SystemExit(f"wait-for-postgres securityContext differs from langfuse-web: {wait_sc!r} != {web_sc!r}")
 uid = wait_sc.get("runAsUser")
 if type(uid) is not int or uid < 1:
@@ -83,6 +86,9 @@ if wait_sc.get("runAsNonRoot") is not True:
     raise SystemExit("wait-for-postgres must retain runAsNonRoot=true")
 if mode == "blank-security" and (uid != 1001 or web_sc):
     raise SystemExit(f"blank web securityContext must leave the init at its 1001 non-root floor, got wait={wait_sc!r} web={web_sc!r}")
+if mode == "root-web-security":
+    if uid != 1001 or web_sc.get("runAsUser") != 0 or web_sc.get("runAsNonRoot") is not False:
+        raise SystemExit(f"root web override must leave the readiness init at its 1001 non-root floor, got wait={wait_sc!r} web={web_sc!r}")
 
 env_items = wait.get("env", [])
 env = {item.get("name"): item for item in env_items}
@@ -125,6 +131,7 @@ PY
 python3 "$TMP/assert.py" "$TMP/default.yaml" default postgres:16-alpine 60 2 2
 python3 "$TMP/assert.py" "$TMP/tuned.yaml" tuned registry.example.com/postgres-readiness:test 7 3 4
 python3 "$TMP/assert.py" "$TMP/blank-security.yaml" blank-security postgres:16-alpine 60 2 2
+python3 "$TMP/assert.py" "$TMP/root-web-security.yaml" root-web-security postgres:16-alpine 60 2 2
 python3 "$TMP/assert.py" "$TMP/disabled.yaml" disabled ignored 0 0 0
 
 assert_refused() {
