@@ -92,7 +92,8 @@ def _get(url: str, token: str | None, accept: str) -> bytes:
     request = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(request, timeout=60) as response:
-            return response.read()
+            body: bytes = response.read()
+        return body
     except urllib.error.HTTPError as exc:
         # 404 on a private repository with no token is really 401, and reads as
         # "no such repo" to anyone who has not hit it before. Say the likely
@@ -120,8 +121,39 @@ def latest_commit(repo: str, branch: str, token: str | None) -> str:
     return sha
 
 
-def deployed_commit(api_url: str, api_key: str, agent: str) -> tuple[str, str | None]:
-    """``(agent_id, commit_sha)`` for the agent's newest version.
+def _api(
+    api_url: str,
+    api_key: str,
+    path: str,
+    *,
+    method: str = "GET",
+    body: bytes | None = None,
+    content_type: str = "application/json",
+) -> bytes:
+    """One call to the platform API, with the platform key.
+
+    The key lives here, in a job outside the sandbox, and never inside it: an
+    agent that could deploy its own version could also deploy one without its own
+    approval gates.
+    """
+
+    headers = {"X-API-Key": api_key}
+    if body is not None:
+        headers["Content-Type"] = content_type
+    request = urllib.request.Request(
+        f"{api_url.rstrip('/')}{path}", data=body, method=method, headers=headers
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            payload: bytes = response.read()
+        return payload
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="replace")[:400]
+        raise SelfUpgradeError(f"{method} {path} returned HTTP {exc.code}: {detail}") from exc
+
+
+def deployed_commit(api_url: str, api_key: str, agent: str) -> tuple[str, str | None, str | None]:
+    """``(agent_id, commit_sha, version_id)`` for the agent's newest version.
 
     ``None`` for the sha when the newest version records none -- a version
     deployed by hand from a working copy has no commit, and that must read as
@@ -147,9 +179,9 @@ def deployed_commit(api_url: str, api_key: str, agent: str) -> tuple[str, str | 
     with urllib.request.urlopen(request, timeout=60) as response:
         versions = json.load(response)
     if not versions:
-        return agent_id, None
+        return agent_id, None, None
     newest = sorted(versions, key=lambda v: v["created_at"])[-1]
-    return agent_id, newest.get("commit_sha")
+    return agent_id, newest.get("commit_sha"), newest.get("id")
 
 
 def _wanted(name: str) -> bool:
@@ -203,6 +235,123 @@ def bundle_from_repo_tarball(archive: bytes, prefix: str = BUNDLE_PREFIX) -> byt
     return out.getvalue()
 
 
+def paths_changed(repo: str, base: str, head: str, token: str | None) -> set[str]:
+    """Repository paths that differ between two commits.
+
+    One API call, and it replaces the thing this job cannot do: parse
+    `connectors.yaml`. The runtime image is `python:3.13-alpine` with the standard
+    library and no YAML parser, and adding one to install a dependency at job time
+    would buy a parser in exchange for a network dependency in the deploy path.
+    """
+
+    body = _get(
+        f"https://api.github.com/repos/{repo}/compare/{base}...{head}",
+        token,
+        "application/vnd.github+json",
+    )
+    files = json.loads(body).get("files") or []
+    return {entry.get("filename", "") for entry in files}
+
+
+def deployed_bundle_file(
+    api_url: str, api_key: str, agent_id: str, version_id: str, path: str
+) -> bytes:
+    """One file out of the version that is currently deployed."""
+
+    body = _api(api_url, api_key, f"/agents/{agent_id}/versions/{version_id}/files")
+    for entry in json.loads(body).get("files") or []:
+        if entry.get("path") == path:
+            return str(entry.get("content", "")).encode()
+    raise SelfUpgradeError(
+        f"the deployed version carries no {path}; this job reuses it rather than "
+        f"resolving connector images itself, so it cannot proceed without it"
+    )
+
+
+def with_connectors_from(bundle: bytes, connectors: bytes) -> bytes:
+    """The new bundle, but keeping the deployed `connectors.yaml`.
+
+    The repository's copy declares `build:`, which records a LOCAL image id that
+    the cluster tier refuses -- a cluster cannot pull an image that exists only in
+    one machine's Docker daemon. Resolving those to published digests is the
+    installer's job and it needs a registry conversation this job has no business
+    having. The deployed copy already carries resolved digests, so the safe move
+    is to carry it forward unchanged.
+
+    Only sound while the declaration itself has not changed, which the caller
+    checks first and refuses on.
+    """
+
+    out = io.BytesIO()
+    source = tarfile.open(fileobj=io.BytesIO(bundle), mode="r:gz")
+    with source, tarfile.open(fileobj=out, mode="w:gz") as target:
+        for member in source.getmembers():
+            if member.name == "connectors.yaml":
+                replacement = tarfile.TarInfo("connectors.yaml")
+                replacement.size = len(connectors)
+                replacement.mode = member.mode
+                target.addfile(replacement, io.BytesIO(connectors))
+                continue
+            extracted = source.extractfile(member)
+            target.addfile(member, extracted)
+    return out.getvalue()
+
+
+def deploy(
+    api_url: str,
+    api_key: str,
+    agent_id: str,
+    bundle: bytes,
+    commit: str,
+) -> str:
+    """Create a version from ``bundle``, upload it, and make it active.
+
+    Three calls because the platform models them as three facts: a version
+    exists, its bytes are stored, and it is the one being served. Ordered so a
+    failure never leaves a version marked active with no bundle behind it.
+    """
+
+    created = json.loads(
+        _api(
+            api_url,
+            api_key,
+            f"/agents/{agent_id}/versions",
+            method="POST",
+            body=json.dumps(
+                {
+                    "version_label": f"self-upgrade-{commit[:12]}",
+                    "commit_sha": commit,
+                    "created_by": "sre-bot-self-upgrade",
+                }
+            ).encode(),
+        )
+    )
+    version_id = str(created["id"])
+    _api(
+        api_url,
+        api_key,
+        f"/agents/{agent_id}/versions/{version_id}/bundle",
+        method="PUT",
+        body=bundle,
+        content_type="application/gzip",
+    )
+    _api(
+        api_url,
+        api_key,
+        "/deployments",
+        method="POST",
+        body=json.dumps(
+            {
+                "agent_id": agent_id,
+                "version_id": version_id,
+                "environment": "prod",
+                "commit_sha": commit,
+            }
+        ).encode(),
+    )
+    return version_id
+
+
 def main() -> int:
     repo = os.environ.get("CURIE_SELF_UPGRADE_REPO", "curie-eng/curie")
     branch = os.environ.get("CURIE_SELF_UPGRADE_BRANCH", "main")
@@ -218,7 +367,7 @@ def main() -> int:
 
     try:
         tip = latest_commit(repo, branch, token)
-        agent_id, current = deployed_commit(api_url, api_key, agent)
+        agent_id, current, version_id = deployed_commit(api_url, api_key, agent)
     except SelfUpgradeError as exc:
         # Exit non-zero: a job that cannot tell whether it is behind must not
         # report success. A silent "nothing to do" is the failure this whole file
@@ -234,14 +383,43 @@ def main() -> int:
         print("dry run: would deploy the bundle at the tip", flush=True)
         return 0
 
-    print(
-        "a newer bundle exists. This job does not deploy it yet: the bundle in the "
-        "repository declares `build:` for three connectors, and a cluster deploy is "
-        "refused for an image that exists only in a local daemon. Deploying from "
-        "here needs the published digests first (curie#1945), the way the installer "
-        "already resolves tempo's.",
-        flush=True,
-    )
+    if not current or not version_id:
+        print(
+            "the deployed version records no commit, so there is nothing to compare "
+            "against and no connector declaration to carry forward. Deploy once "
+            "through the installer first.",
+            flush=True,
+        )
+        return 1
+
+    try:
+        # The one thing this job will not do. Resolving `build:` connectors to
+        # published digests is the installer's work; carrying the deployed
+        # declaration forward is only sound while that declaration has not moved.
+        if f"{BUNDLE_PREFIX}/connectors.yaml" in paths_changed(repo, current, tip, token):
+            print(
+                "connectors.yaml changed between the deployed commit and the tip. "
+                "This job carries the deployed connector declaration forward rather "
+                "than resolving images itself, so it refuses instead of deploying a "
+                "bundle whose connectors it cannot vouch for. Run the installer.",
+                flush=True,
+            )
+            return 1
+
+        archive = _get(
+            f"https://api.github.com/repos/{repo}/tarball/{tip}",
+            token,
+            "application/vnd.github+json",
+        )
+        bundle = bundle_from_repo_tarball(archive)
+        connectors = deployed_bundle_file(api_url, api_key, agent_id, version_id, "connectors.yaml")
+        bundle = with_connectors_from(bundle, connectors)
+        new_version = deploy(api_url, api_key, agent_id, bundle, tip)
+    except SelfUpgradeError as exc:
+        print(f"deploy failed: {exc}", flush=True)
+        return 1
+
+    print(f"deployed {agent} version {new_version} at {tip[:12]}", flush=True)
     return 0
 
 
