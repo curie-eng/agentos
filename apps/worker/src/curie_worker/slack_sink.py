@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from collections.abc import Awaitable, Callable, Sequence
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 from urllib.parse import urlsplit
@@ -68,6 +69,35 @@ _DEFAULT_PORTS = {"http": 80, "https": 443}
 # ``None``, which matches ANY port on that scheme+host (the dev/CLI stub's
 # ephemeral port, see ``_configured_origins``).
 _TrustedOrigin = tuple[str, str, int | None]
+
+
+# Slack names a thread by its parent message's timestamp: `<seconds>.<micros>`.
+_SLACK_TS = re.compile(r"^\d+\.\d+$")
+
+
+def _thread_ts(conversation_id: str | None) -> str | None:
+    """The Slack thread this conversation id names, or None when it names none.
+
+    ``ReplyTarget.conversation_id`` is "in the channel's own terms"
+    (``channel_protocol.reply``), and for a Slack-ingress turn those terms are the
+    parent message's ts -- which is why it used to be passed straight through as
+    ``thread_ts``.
+
+    A TRIGGERED turn's conversation id is not a ts. ``POST /hooks/{agent}/{name}``
+    mints ``hook:<agent>:<name>``, deliberately disjoint from Slack thread ids so a
+    hook can never land inside a human conversation. Sent as ``thread_ts`` that
+    string makes Slack refuse the entire delivery with ``invalid_thread_ts``, and it
+    does so AFTER the turn has run: the work is done, the money is spent, and the
+    answer is dropped on the floor.
+
+    So anything that is not a timestamp names no thread. The reply then posts at
+    channel level and the ts it mints becomes the ``reply_ref`` the rest of the turn
+    edits, which is the placeholder-less path ADR-0079 already describes.
+    """
+
+    if conversation_id is None or not _SLACK_TS.match(conversation_id):
+        return None
+    return conversation_id
 
 
 class UntrustedSlackEndpointError(RuntimeError):
@@ -235,7 +265,7 @@ class SlackReplyAdapter:
         if isinstance(event, TurnStatus):
             await self._set_status(
                 channel=target.address,
-                thread_ts=target.conversation_id or "",
+                thread_ts=_thread_ts(target.conversation_id) or "",
                 status=event.status,
                 endpoint=endpoint,
             )
@@ -274,7 +304,7 @@ class SlackReplyAdapter:
                 # placeholder-less turn into a silent delivery failure.
                 ref = await self._post_text(
                     channel=target.address,
-                    thread_ts=target.conversation_id,
+                    thread_ts=_thread_ts(target.conversation_id),
                     text=event.text or "",
                     nav=event.nav,
                     endpoint=endpoint,
@@ -295,7 +325,7 @@ class SlackReplyAdapter:
                 channel=target.address,
                 message=event.message,
                 requested_by=event.requested_by,
-                thread_ts=target.conversation_id,
+                thread_ts=_thread_ts(target.conversation_id),
                 endpoint=endpoint,
             )
             return ReplyAck(ref=ref)
@@ -611,9 +641,7 @@ class SlackReplyAdapter:
         # expiry notice still beats leaving live-looking buttons.
         async def op(client: AsyncWebClient) -> None:
             try:
-                await client.chat_update(
-                    channel=channel, ts=ts, text=text, blocks=blocks
-                )
+                await client.chat_update(channel=channel, ts=ts, text=text, blocks=blocks)
             except SlackApiError:
                 logger.warning(
                     "card chat_update with blocks rejected for %s; retrying text-only",
@@ -621,9 +649,7 @@ class SlackReplyAdapter:
                 )
                 await client.chat_update(channel=channel, ts=ts, text=text)
 
-        await self._with_transport_fallback(
-            endpoint, op, describe="chat_update(card)"
-        )
+        await self._with_transport_fallback(endpoint, op, describe="chat_update(card)")
 
     async def _set_status(
         self, *, channel: str, thread_ts: str, status: str, endpoint: str | None = None
