@@ -94,31 +94,33 @@ because `resourceQuota.sandboxPriorityClassName` binds a release's quota
 ## Decision
 
 **A cluster has exactly one owner release for its shared singletons. Every other
-release is a consumer: it renders nothing cluster scoped, and it declares the
-contract revision it needs from the owner, which is preflighted and fails closed
-on skew.**
+release is a consumer: it renders no owner-scoped cluster templates, installs no
+CRDs, and declares the contract it needs from the owner. Compatibility is
+preflighted and fails closed on skew.**
 
-### 1. One value declares ownership, and it gates the whole owner set
+### 1. One value declares ownership and gates the templated owner set
 
 Ownership today is inferred from three unrelated flags
 (`agentSandbox.controller.deploy`, `priorityClasses.platform.create`,
 `priorityClasses.sandbox.create`) that an operator can set in any combination,
 including combinations that render an incoherent cluster. It becomes one
 declaration, `clusterSingletons.owner` (default `true`, so the single release
-case is unchanged), and the owner set is defined as exactly:
+case is unchanged), and the templated owner set is defined as exactly:
 
 - the vendored agent-sandbox controller, its `agent-sandbox-system` namespace,
   its webhook Service, and every ClusterRole and ClusterRoleBinding it needs,
   including `agent-sandbox-controller-networkpolicies-read`;
-- the `curie-platform` and `curie-sandbox` PriorityClasses;
-- the four agent-sandbox CRDs, with the caveat in decision 4.
+- the `curie-platform` and `curie-sandbox` PriorityClasses.
 
 A PriorityClass is a cluster wide ranking, so two releases holding different
 opinions about it is not a coherent state to support; the singleton form is
 correct and only the ownership needed naming. The existing per flag values stay
 readable for an operator who wants finer control, but the owner flag is the
 supported surface, and a consumer release setting it to `false` gets a coherent
-render rather than a combination.
+template render rather than a combination. The four agent-sandbox CRDs are also
+owner-only, but Helm processes `crds/` before values and cannot gate them with
+this flag. Decision 4 therefore makes `--skip-crds` part of the supported
+consumer install contract instead of pretending the value controls them.
 
 ### 2. Grants follow the consumer, not the owner
 
@@ -135,26 +137,36 @@ actually contain Curie sandboxes, and each such namespace grants them for itself
 rather than inheriting them from whichever release happened to install the
 controller.
 
-### 3. A contract revision, a declared floor, and a fixed upgrade order
+### 3. A versioned contract range and a fixed upgrade order
 
-The skew contract between chart templates and the shared controller is a single
-monotonically increasing integer, `clusterContract`, carried by the chart.
+The skew contract between chart templates and the shared controller is an epoch
+plus monotonically increasing revision, `clusterContract`, carried by the chart.
+Compatible additions increment the revision; a change that cannot serve older
+consumers increments the epoch. Within one epoch, a newer owner is required to
+remain backward compatible down to the floor it stamps.
 
 - The owner release **stamps** what it installed: labels on the
   `agent-sandbox-system` namespace and the controller Deployment recording the
-  contract revision, the upstream controller version, and the owning release and
-  namespace.
-- Every chart version **declares** the minimum revision its templates require.
-  The declaration is bumped whenever templates begin to depend on something the
-  shared install must provide: a new grant, a newer upstream controller, a CRD
-  field, or a changed controller side default.
+  contract epoch, current revision, oldest compatible consumer revision, the
+  upstream controller version, and the owning release and namespace.
+- Every chart version **declares** its contract epoch and required revision. The
+  revision is bumped whenever templates begin to depend on something the shared
+  install must provide: a new grant, a newer upstream controller, a CRD field,
+  or a changed controller-side default.
 - Every install and upgrade **preflights** the stamp by `lookup` and fails
-  closed when the installed revision is below what it requires, naming the owner
-  release and the required order. An absent stamp means an externally managed
-  controller, which is a supported configuration and requires an explicit
-  acknowledgement value; the operator owns compatibility from there.
-- The **order is owner first**. The owner's chart version is at least every
-  consumer's, and a consumer is never permitted to run ahead of the contract.
+  closed unless the epochs match and the consumer's required revision falls
+  between the owner's compatibility floor and current revision. The error names
+  both ranges, the owner release, and the required order.
+- An absent stamp has two explicit branches. `owner=true` may bootstrap only
+  when no foreign fixed-name singleton exists and the installed CRDs equal the
+  packaged schemas; an existing singleton without a stamp is a loud adoption
+  conflict. `owner=false` never turns absence into an acknowledgement bypass:
+  an external manager must publish the same verifiable contract stamp and pass
+  live controller capability, RBAC, and CRD-schema probes before the consumer
+  installs.
+- The **order is owner first**. The owner's contract revision is at or above
+  every consumer's required revision within the same epoch, and a consumer is
+  never permitted to run ahead of that range.
 
 The revision is deliberately not the chart version. Most chart versions change
 nothing a shared controller must provide, and tying the two would make every
@@ -169,6 +181,13 @@ operator action on the owner release, surfaced through `curie` rather than a
 copied `kubectl apply`, and the contract revision covers CRD schema so a
 consumer needing a newer field fails its preflight instead of writing a field the
 apiserver prunes.
+
+A supported consumer install always passes `--skip-crds`; `curie` adds it when
+`clusterSingletons.owner=false`, and the documented direct-Helm command includes
+it. CI executes both owner and consumer commands and fails if the consumer path
+submits any CRD. Helm cannot infer this flag from chart values, so omitting it is
+an unsupported invocation that `curie doctor` reports rather than a protection
+the chart claims to enforce.
 
 ### 5. An image tag entering a shared runtime carries release identity
 
@@ -190,6 +209,14 @@ status and doctor output (installed revision, required revision, owner release),
 and the claim timeout diagnostic, which names the missing grant or the contract
 gap instead of reporting a generic timeout.
 
+Every consumer also writes a namespaced registration naming its release,
+namespace, owner, epoch, and required revision. An owner pre-delete hook lists
+those registrations through read-only cluster RBAC and refuses uninstall while
+another consumer remains. `curie cluster owner handoff` transfers the stamp and
+registrations to a compatible replacement first. A separate explicit force path
+may remove an owner during disaster recovery, but it names the affected
+consumers and is never the default `helm uninstall` behavior.
+
 ## Alternatives rejected
 
 **Split the chart into a `curie-platform` cluster chart and a `curie` release
@@ -201,10 +228,10 @@ narrative. It is a breaking packaging change for every existing install, it
 splits the one command install that the evaluation path depends on, and it cuts
 against ADR-0097's one file declares an installation. The consequence of
 rejecting it is accepted and real: under this ADR, `helm uninstall` on the owner
-release is a cluster level operation that removes the controller, the RBAC, and
-the PriorityClasses out from under every consumer, and only documentation and the
-owner stamp stand between an operator and that outcome. If multi release clusters
-become a supported product configuration rather than an operational reality, this
+release is a cluster-level operation, so decision 6 must refuse it while
+consumers remain and provide an explicit handoff. The value and hook are still
+more moving parts than a separate package. If multi-release clusters become a
+supported product configuration rather than an operational reality, this
 alternative is the natural successor ADR.
 
 **Keep the current flags and document the multi release procedure.** The cheapest
@@ -230,8 +257,9 @@ wrong direction for the failure class this ADR exists to close.
 ## Consequences
 
 - The single release install, which is every documented install today, renders
-  identically. `clusterSingletons.owner` defaults to `true`, and the contract
-  preflight passes trivially against a stamp the same release just wrote.
+  identically. `clusterSingletons.owner` defaults to `true`; an absent-stamp
+  first-owner preflight verifies no foreign singleton and matching CRDs, then
+  permits the owner to stamp what it installs.
 - A consumer release gains the namespaced RBAC it never had, so the
   reported "claims silently never bind" state is not reachable through the
   missing grant path, at matched or skewed versions.
@@ -239,10 +267,11 @@ wrong direction for the failure class this ADR exists to close.
   runtime silence. The cost is that a consumer install can now be refused for a
   reason outside its own namespace, which is a new class of install failure an
   operator has to understand.
-- The owner release becomes load bearing for the cluster. Uninstalling it breaks
-  every consumer, and nothing enforces that beyond the stamp and the
-  documentation. This is the accepted cost of not splitting the chart, and it is
-  the trigger to revisit that alternative.
+- The owner release becomes load bearing for the cluster. Its pre-delete hook
+  refuses removal while consumers remain; planned replacement uses the handoff
+  path, and only an explicit disaster-recovery force can bypass it. This is still
+  more operational coupling than a split platform chart and remains the trigger
+  to revisit that alternative.
 - The offline dev path changes shape: imported tags become version derived, so
   existing local scripts and any operator muscle memory around `curie-*:local`
   break once, deliberately.
@@ -250,5 +279,8 @@ wrong direction for the failure class this ADR exists to close.
   template change that needs a new grant and does not bump it reintroduces the
   exact class this ADR closes, which argues for tying the bump to a gate rather
   than to reviewer memory.
+- Consumer installs have a non-value requirement because Helm cannot condition
+  `crds/`: they use `--skip-crds`, preferably through `curie`, and the direct
+  Helm path is documented and tested with that flag.
 - Nothing here makes Curie multi tenant. It makes multi release clusters fail
   honestly. Real tenancy remains issue #158.
