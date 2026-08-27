@@ -591,6 +591,55 @@ fn assert_inference_once(shown: &str, applied_override: &str) {
     );
 }
 
+fn failed_install_line(shown: &str) -> bool {
+    shown
+        .lines()
+        .any(|line| line.contains(&format!("installing release {TARGET_RELEASE}: failed")))
+}
+
+fn retrying_install_line(shown: &str) -> bool {
+    shown
+        .lines()
+        .any(|line| line.contains(&format!("installing release {TARGET_RELEASE}: retrying")))
+}
+
+fn ok_install_line(shown: &str) -> bool {
+    shown
+        .lines()
+        .any(|line| line.contains(&format!("installing release {TARGET_RELEASE}: ok")))
+}
+
+/// Issue #1906: automatic gVisor recovery must narrate the first attempt as
+/// retrying, not as a terminal red failure, and must leave one successful
+/// install result after the retry.
+fn assert_automatic_gvisor_recovery_narration(shown: &str) {
+    assert!(
+        !failed_install_line(shown),
+        "automatic gVisor recovery must not freeze the first install attempt as a terminal failure:\n{shown}"
+    );
+    assert!(
+        retrying_install_line(shown),
+        "the first install attempt must render as retrying after admission rejects gVisor:\n{shown}"
+    );
+    assert_eq!(
+        shown
+            .lines()
+            .filter(|line| line.contains(&format!("installing release {TARGET_RELEASE}: retrying")))
+            .count(),
+        1,
+        "exactly one retrying install attempt:\n{shown}"
+    );
+    assert!(
+        ok_install_line(shown),
+        "the retry must leave one unambiguous installed result:\n{shown}"
+    );
+    assert!(
+        shown.contains("inferred that the cluster has no `gvisor` RuntimeClass from admission")
+            && shown.contains("--set security.gvisor.mode=off"),
+        "recovery must announce the gVisor admission retry with the inferred override:\n{shown}"
+    );
+}
+
 #[test]
 fn bare_cluster_up_infers_all_detected_facts_and_retries_once() {
     let fixture = Fixture::new("matching", "foreign", OPENROUTER_CREDENTIAL);
@@ -619,6 +668,7 @@ fn bare_cluster_up_infers_all_detected_facts_and_retries_once() {
     ] {
         assert_inference_once(&shown, applied);
     }
+    assert_automatic_gvisor_recovery_narration(&shown);
     assert!(
         !shown.contains("DeadlineExceeded"),
         "the later Helm timeout must not become the diagnosis:\n{shown}"
@@ -686,6 +736,7 @@ fn fresh_namespace_rejection_is_observed_after_helm_creates_the_namespace() {
         "the post Helm namespace retry must still beat the fake deadline, elapsed {elapsed:?}\nstderr:\n{shown}"
     );
     assert_inference_once(&shown, "--set security.gvisor.mode=off");
+    assert_automatic_gvisor_recovery_narration(&shown);
     assert!(
         !shown.contains("DeadlineExceeded"),
         "the Helm deadline must not replace the fresh namespace diagnosis:\n{shown}"
@@ -771,6 +822,7 @@ fn bare_cluster_up_json_keeps_inferences_on_stderr_and_one_success_on_stdout() {
     ] {
         assert_inference_once(&shown, applied);
     }
+    assert_automatic_gvisor_recovery_narration(&shown);
     assert_eq!(fixture.upgrade_count(), 2);
     fixture.assert_event_was_observed_for_rendered_job();
     fixture.assert_graceful_helm_interruption();
@@ -805,6 +857,14 @@ fn explicit_gvisor_mode_contradicting_admission_is_rejected_before_retry() {
             !shown.contains("--set security.gvisor.mode=off"),
             "the explicit value must not be silently overridden: {shown}"
         );
+        assert!(
+            failed_install_line(&shown),
+            "an explicit contradiction is a terminal failure, not recovery:\n{shown}"
+        );
+        assert!(
+            !retrying_install_line(&shown),
+            "an explicit contradiction must not narrate a retry:\n{shown}"
+        );
         fixture.assert_graceful_helm_interruption();
         fixture.assert_children_stopped();
     }
@@ -831,6 +891,14 @@ fn prepared_apply_keeps_the_exact_gvisor_rejection_fail_closed() {
     assert!(
         !shown.contains("inferred that the cluster has no"),
         "prepared apply must not infer a posture: {shown}"
+    );
+    assert!(
+        failed_install_line(&shown),
+        "prepared apply must keep the first attempt as a terminal failure:\n{shown}"
+    );
+    assert!(
+        !retrying_install_line(&shown),
+        "prepared apply must not narrate automatic recovery:\n{shown}"
     );
     assert_eq!(fixture.upgrade_count(), 1, "prepared apply must not retry");
     fixture.assert_graceful_helm_interruption();
