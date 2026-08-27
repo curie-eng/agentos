@@ -145,8 +145,12 @@ fn skill_message_warns_when_the_editable_bundle_differs_from_the_running_snapsho
         "the source edit must be named before it is mistaken for a running change: {stderr}"
     );
     assert!(
-        stderr.contains("curie skill up --replace"),
+        stderr.contains("curie skill up"),
         "the warning must name the command that loads the edited bundle: {stderr}"
+    );
+    assert!(
+        !stderr.contains("curie skill up --replace"),
+        "a verified same-bundle edit reloads with plain skill up; do not send the user to --replace: {stderr}"
     );
 }
 

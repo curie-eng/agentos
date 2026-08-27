@@ -115,8 +115,8 @@ curie skill message "hello, are you there?"
 ```
 
 A real reply streams back: no Slack, no platform yet. `skill up` runs an immutable snapshot of the
-bundle, so after you edit `skills/my-agent/SKILL.md` the change only reaches a running runner once you
-restart it with `curie skill up --replace`. When done run the following command
+bundle, so after you edit `skills/my-agent/SKILL.md` run `curie skill up` again to load the new
+snapshot. When done run the following command
 
 ```bash
 curie skill down

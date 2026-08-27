@@ -37,7 +37,7 @@ curie skill up && curie skill message "hello, what can you do?"
 ```
 
 You now have a working agent. Edit `skills/my-agent/SKILL.md` to change what it <!-- doclint:ignore-line -->
-does, then `curie skill up --replace` to reload it.
+does, then `curie skill up` again to reload it.
 
 No credential handy? `curie skill up --fake-model` runs the whole loop offline
 with scripted replies — enough to prove the plumbing, not to judge the agent.
