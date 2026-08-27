@@ -15,6 +15,8 @@
 //! nobody notices because nothing breaks.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -199,6 +201,36 @@ pub fn get_secret_args(namespace: &str, name: &str) -> Vec<String> {
         "-o".into(),
         "json".into(),
     ]
+}
+
+/// A captured kubeconfig target. Connector reads and writes always name this
+/// snapshot explicitly, never a subsequently changed ambient context.
+#[derive(Clone, Debug)]
+pub struct ClusterTarget {
+    pub scope: SecretScope,
+    kubeconfig: Arc<tempfile::NamedTempFile>,
+}
+
+impl ClusterTarget {
+    fn args(&self, argv: &[String]) -> Vec<String> {
+        let mut result = vec![
+            "kubectl".into(),
+            "--kubeconfig".into(),
+            self.kubeconfig.path().display().to_string(),
+        ];
+        result.extend(argv.iter().skip(1).cloned());
+        result
+    }
+
+    async fn revalidate_ambient_binding(&self) -> Result<()> {
+        if discover_cluster_identity().await? != self.scope.cluster_identity {
+            anyhow::bail!(
+                "current kubectl context no longer matches the connector target {}; refusing to mutate the captured target",
+                self.scope.describe()
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Fingerprint of the kube-apiserver this kubeconfig currently points at.
@@ -563,15 +595,25 @@ pub struct ConnectorSync {
 }
 
 /// Discover the release's rendered app name (the chart's nameOverride).
-pub async fn discover_app_name(namespace: &str, release: &str) -> Result<String> {
-    let (ok, out, err) = run(&app_name_args(namespace, release), None).await?;
+pub async fn discover_app_name(target: &ClusterTarget) -> Result<String> {
+    let (ok, out, err) = run(
+        &target.args(&app_name_args(
+            &target.scope.namespace,
+            &target.scope.release,
+        )),
+        None,
+    )
+    .await?;
     let name = out.trim();
     if !ok || name.is_empty() {
         anyhow::bail!(
-            "could not read the app name for release {release} in namespace {namespace}: no \
-             Deployment carries app.kubernetes.io/instance={release}. Connectors need it to \
+            "could not read the app name for release {} in namespace {}: no \
+             Deployment carries app.kubernetes.io/instance={}. Connectors need it to \
              target the sandbox pods Rail 1 denies by default. Confirm the release is installed \
              with `curie cluster status`.{}",
+            target.scope.release,
+            target.scope.namespace,
+            target.scope.release,
             if err.trim().is_empty() {
                 String::new()
             } else {
@@ -631,9 +673,18 @@ pub struct PreparedConnectorSync {
     secret_keys: Vec<String>,
     secret_sources: BTreeMap<String, String>,
     target: SecretScope,
+    bound_target: Option<ClusterTarget>,
 }
 
 impl PreparedConnectorSync {
+    pub fn bind_target(mut self, target: ClusterTarget) -> Result<Self> {
+        if self.target != target.scope {
+            anyhow::bail!("prepared connector scope does not match captured Kubernetes target");
+        }
+        self.bound_target = Some(target);
+        Ok(self)
+    }
+
     pub fn write_intent(&self) -> Option<String> {
         let secret_name = self.secret_name.as_deref()?;
         Some(write_intent_line(
@@ -663,6 +714,30 @@ pub async fn discover_cluster_identity() -> Result<String> {
     let view: Value = serde_json::from_str(&out)
         .context("parsing `kubectl config view --minify --raw -o json`")?;
     cluster_identity_from_kubeconfig_view(&view)
+}
+
+/// Snapshot the selected kubeconfig at prepare time. The private temporary file
+/// lives exactly as long as the connector plan that consumes it.
+pub async fn bind_current_cluster(namespace: &str, release: &str) -> Result<ClusterTarget> {
+    let (ok, out, err) = run(&kubeconfig_view_args(), None).await?;
+    if !ok {
+        anyhow::bail!("could not capture the current kubeconfig: {}", err.trim());
+    }
+    let view: Value = serde_json::from_str(&out)
+        .context("parsing `kubectl config view --minify --raw -o json`")?;
+    let cluster_identity = cluster_identity_from_kubeconfig_view(&view)?;
+    let mut kubeconfig = tempfile::NamedTempFile::new()
+        .context("creating private kubeconfig snapshot for connector deploy")?;
+    kubeconfig.write_all(out.as_bytes())?;
+    kubeconfig.flush()?;
+    Ok(ClusterTarget {
+        scope: SecretScope {
+            cluster_identity,
+            release: release.into(),
+            namespace: namespace.into(),
+        },
+        kubeconfig: Arc::new(kubeconfig),
+    })
 }
 
 /// Resolve and render an agent's connector objects without writing to kubectl.
@@ -716,6 +791,7 @@ pub fn prepare(
         secret_keys,
         secret_sources,
         target: target.clone(),
+        bound_target: None,
     })
 }
 
@@ -735,14 +811,16 @@ pub async fn sync(prepared: PreparedConnectorSync) -> Result<ConnectorSync> {
         secret_keys,
         secret_sources,
         target,
+        bound_target,
     } = prepared;
+    let bound_target = bound_target.context("connector sync has no captured Kubernetes target")?;
 
     if let Some(name) = secret_name.as_deref() {
         ui.note(&write_intent_line(name, &secret_keys, &target));
         for (key, source) in &secret_sources {
             ui.note(&format!("{key}: {source}"));
         }
-        let existing = inspect_secret_keys(&namespace, name).await;
+        let existing = inspect_secret_keys(&bound_target, &namespace, name).await?;
         let replaced = keys_being_replaced(&existing, &secret_keys);
         if !replaced.is_empty() {
             ui.warn(&replacement_warning_line(name, &replaced));
@@ -751,7 +829,8 @@ pub async fn sync(prepared: PreparedConnectorSync) -> Result<ConnectorSync> {
     }
 
     if let Some(doc) = apply_document {
-        let (ok, _out, err) = run(&apply_args(&namespace), Some(&doc)).await?;
+        bound_target.revalidate_ambient_binding().await?;
+        let (ok, _out, err) = run(&bound_target.args(&apply_args(&namespace)), Some(&doc)).await?;
         if !ok {
             anyhow::bail!("applying connectors failed: {}", err.trim());
         }
@@ -764,7 +843,12 @@ pub async fn sync(prepared: PreparedConnectorSync) -> Result<ConnectorSync> {
 
     // Runs even with nothing declared -- that is the case where a connector was
     // REMOVED, and the whole reason this is not a bare `kubectl apply`.
-    let (ok, _out, err) = run(&prune_args(&namespace, &agent_name, &keep), None).await?;
+    bound_target.revalidate_ambient_binding().await?;
+    let (ok, _out, err) = run(
+        &bound_target.args(&prune_args(&namespace, &agent_name, &keep)),
+        None,
+    )
+    .await?;
     if !ok {
         ui.warn(&format!(
             "connectors: pruning stale objects for {agent_name} failed: {}",
@@ -774,16 +858,22 @@ pub async fn sync(prepared: PreparedConnectorSync) -> Result<ConnectorSync> {
     Ok(result)
 }
 
-async fn inspect_secret_keys(namespace: &str, name: &str) -> BTreeSet<String> {
-    let (ok, out, _err) = match run(&get_secret_args(namespace, name), None).await {
-        Ok(result) => result,
-        Err(_) => return BTreeSet::new(),
-    };
+async fn inspect_secret_keys(
+    target: &ClusterTarget,
+    namespace: &str,
+    name: &str,
+) -> Result<BTreeSet<String>> {
+    let (ok, out, err) = run(&target.args(&get_secret_args(namespace, name)), None).await?;
     if !ok {
-        return BTreeSet::new();
+        if err.contains("NotFound") || err.contains("not found") {
+            return Ok(BTreeSet::new());
+        }
+        anyhow::bail!(
+            "could not inspect existing connector Secret {name}: {}; refusing to overwrite it",
+            err.trim()
+        );
     }
-    match serde_json::from_str::<Value>(&out) {
-        Ok(obj) => secret_key_names(&obj),
-        Err(_) => BTreeSet::new(),
-    }
+    let obj = serde_json::from_str::<Value>(&out)
+        .context("parsing existing connector Secret JSON; refusing to overwrite it")?;
+    Ok(secret_key_names(&obj))
 }

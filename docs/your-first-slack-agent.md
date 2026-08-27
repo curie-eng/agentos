@@ -123,7 +123,9 @@ connectors:
 `secrets` are **names only** — the value never enters your repository:
 
 ```bash
-curie secrets set GRAFANA_SERVICE_ACCOUNT_TOKEN --from-env GRAFANA_SERVICE_ACCOUNT_TOKEN
+CURIE_CLUSTER_ID="ca:$(kubectl config view --minify --raw -o json | jq -r '.clusters[0].cluster | ((.server // "") + "\\n" + (."certificate-authority-data" // ."certificate-authority" // ""))' | sha256sum | awk '{print $1}')"
+curie secrets set GRAFANA_SERVICE_ACCOUNT_TOKEN --from-env GRAFANA_SERVICE_ACCOUNT_TOKEN \
+  --cluster-identity "$CURIE_CLUSTER_ID" --release curie --namespace curie
 ```
 
 At cluster deploy time, Curie delivers both connector `secrets` and

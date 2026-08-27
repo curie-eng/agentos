@@ -145,7 +145,9 @@ current-context: prod
 YAML
 
 export K8S_READONLY_KUBECONFIG="$(cat /tmp/sre-bot.kubeconfig)"
-curie secrets set K8S_READONLY_KUBECONFIG --from-env K8S_READONLY_KUBECONFIG
+CURIE_CLUSTER_ID="ca:$(kubectl config view --minify --raw -o json | jq -r '.clusters[0].cluster | ((.server // "") + "\\n" + (."certificate-authority-data" // ."certificate-authority" // ""))' | sha256sum | awk '{print $1}')"
+curie secrets set K8S_READONLY_KUBECONFIG --from-env K8S_READONLY_KUBECONFIG \
+  --cluster-identity "$CURIE_CLUSTER_ID" --release curie --namespace curie
 shred -u /tmp/sre-bot.kubeconfig /tmp/sre-token 2>/dev/null || rm -f /tmp/sre-bot.kubeconfig /tmp/sre-token
 ```
 
@@ -278,7 +280,9 @@ contexts: [{name: prod, context: {cluster: prod, user: sre-bot-writer}}]
 current-context: prod
 YAML
 )"
-curie secrets set K8S_WRITE_KUBECONFIG --from-env K8S_WRITE_KUBECONFIG
+CURIE_CLUSTER_ID="ca:$(kubectl config view --minify --raw -o json | jq -r '.clusters[0].cluster | ((.server // "") + "\\n" + (."certificate-authority-data" // ."certificate-authority" // ""))' | sha256sum | awk '{print $1}')"
+curie secrets set K8S_WRITE_KUBECONFIG --from-env K8S_WRITE_KUBECONFIG \
+  --cluster-identity "$CURIE_CLUSTER_ID" --release curie --namespace curie
 ```
 
 Prove the ceiling before wiring it up. The second and third must fail:

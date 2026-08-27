@@ -582,8 +582,9 @@ saved for one cluster is refused on another instead of being silently reused.
 scoped value requires `--expected-version` from that listing.
 
 ```bash
+CURIE_CLUSTER_ID="ca:$(kubectl config view --minify --raw -o json | jq -r '.clusters[0].cluster | ((.server // "") + "\\n" + (."certificate-authority-data" // ."certificate-authority" // ""))' | sha256sum | awk '{print $1}')"
 curie secrets set K8S_WRITE_KUBECONFIG --from-env K8S_WRITE_KUBECONFIG \
-  --cluster-identity ca:0123abcd --release curie --namespace curie-test
+  --cluster-identity "$CURIE_CLUSTER_ID" --release curie --namespace curie-test
 curie secrets set K8S_WRITE_KUBECONFIG --from-env K8S_WRITE_KUBECONFIG \
   --cluster-identity ca:0123abcd --release curie --namespace curie-test \
   --expected-version 1

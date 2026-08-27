@@ -443,6 +443,11 @@ fn conflict(message: String, fix: &str) -> anyhow::Error {
 }
 
 impl SecretVault {
+    fn remove_all(&mut self, name: &str) {
+        self.values.remove(name);
+        self.scoped.remove(name);
+    }
+
     fn has_name(&self, name: &str) -> bool {
         self.values.contains_key(name)
             || self
@@ -648,6 +653,16 @@ pub fn delete_value(name: &str) -> Result<()> {
 pub fn remove_value(name: &str) -> Result<()> {
     validate_name(name)?;
     delete_value(name)?;
+    remove_from_index(name)
+}
+
+/// Remove every scope for a name. The interactive TUI has no scope picker, so
+/// it must remove all matching entries rather than claim a partial success.
+pub fn remove_all_values(name: &str) -> Result<()> {
+    validate_name(name)?;
+    let mut credentials = read_credentials()?;
+    credentials.remove_all(name);
+    write_credentials(&credentials)?;
     remove_from_index(name)
 }
 
@@ -1114,6 +1129,22 @@ mod tests {
             serde_json::from_str(r#"{"values":{"ANTHROPIC_API_KEY":"x"}}"#).unwrap();
         assert_eq!(decoded.values.get("ANTHROPIC_API_KEY").unwrap(), "x");
         assert!(decoded.scoped.is_empty());
+    }
+
+    #[test]
+    fn tui_all_scope_removal_cannot_leave_a_scoped_entry() {
+        let mut vault = SecretVault::default();
+        let scope = SecretScope {
+            cluster_identity: "ca:a".into(),
+            release: "curie".into(),
+            namespace: "curie-test".into(),
+        };
+        vault
+            .save_scoped("K8S_WRITE_KUBECONFIG", &scope, "token-a", None)
+            .unwrap();
+        vault.remove_all("K8S_WRITE_KUBECONFIG");
+        assert!(!vault.has_name("K8S_WRITE_KUBECONFIG"));
+        assert!(vault.scoped_entries("K8S_WRITE_KUBECONFIG").is_empty());
     }
 
     #[cfg(unix)]

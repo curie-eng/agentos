@@ -123,6 +123,39 @@ async fn two_disposable_clusters_refuse_mismatch_and_warn_on_replace() {
     assert!(!intent.contains("token-cluster-a"));
 
     std::env::set_var("KUBECONFIG", &kube_a);
+    let captured_a = connectors::bind_current_cluster(ns_a, "acme")
+        .await
+        .unwrap();
+    let prepared_a = prepared_a.bind_target(captured_a).unwrap();
+    // A switch after prepare must refuse before it can apply A's credential.
+    std::env::set_var("KUBECONFIG", &kube_b);
+    let switched = sync(prepared_a).await.unwrap_err().to_string();
+    assert!(switched.contains("no longer matches"));
+    let (ok, _, _) = kubectl(
+        &kube_b,
+        &["-n", ns_b, "get", "secret", "acme-bot-connector-secrets"],
+    );
+    assert!(
+        !ok,
+        "context switch must not write the captured credential to B"
+    );
+
+    std::env::set_var("KUBECONFIG", &kube_a);
+    let prepared_a = prepare(
+        &[],
+        &BTreeMap::new(),
+        "acme-bot-connector-secrets",
+        &["K8S_WRITE_KUBECONFIG".to_string()],
+        &scope_a,
+        "acme-bot",
+    )
+    .unwrap()
+    .bind_target(
+        connectors::bind_current_cluster(ns_a, "acme")
+            .await
+            .unwrap(),
+    )
+    .unwrap();
     let first = sync(prepared_a).await.unwrap();
     assert!(
         first.replaced_keys.is_empty(),
@@ -139,7 +172,17 @@ async fn two_disposable_clusters_refuse_mismatch_and_warn_on_replace() {
         "acme-bot",
     )
     .unwrap();
-    let replaced = sync(prepared_again).await.unwrap();
+    let replaced = sync(
+        prepared_again
+            .bind_target(
+                connectors::bind_current_cluster(ns_a, "acme")
+                    .await
+                    .unwrap(),
+            )
+            .unwrap(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         replaced.replaced_keys,
         vec!["K8S_WRITE_KUBECONFIG".to_string()]
