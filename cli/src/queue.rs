@@ -29,6 +29,9 @@ pub const DEFAULT_VALKEY_URL: &str = "redis://:valkeypass@localhost:26379";
 /// The worker's consumer group (CURIE_CONSUMER_GROUP default); used to detect
 /// completion (the worker acks an entry only after the turn finalizes).
 pub const WORKER_GROUP: &str = WORKER_GROUP_DEFAULT;
+/// Valkey SET the API, worker, and CLI share for thread-reset requests.
+/// Frozen in `tests/vectors/thread-reset-set.json` (#1534).
+pub const THREAD_RESET_SET: &str = "curie:thread-reset-requests";
 
 /// Prefix on the synthetic event id so dedupe can never collide with a real
 /// Slack event id (which are `Ev...`, not `EvSIM-...`).
@@ -135,6 +138,22 @@ pub async fn xadd(
         .await
         .with_context(|| format!("XADD onto {stream}"))?;
     Ok(stream_id)
+}
+
+/// Queue `thread_key` for a forced sandbox release on the worker's next drain
+/// (`THREAD_RESET_SET`, the same SET `reset-thread` uses). Idempotent.
+///
+/// `curie local eval` / `curie cluster eval` call this after every case so
+/// eval-owned `curie-thread-*` sandboxes do not pin quota until
+/// `routeTtlSeconds` (#1534).
+pub async fn queue_thread_reset(conn: &mut MultiplexedConnection, thread_key: &str) -> Result<()> {
+    let _: i32 = redis::cmd("SADD")
+        .arg(THREAD_RESET_SET)
+        .arg(thread_key)
+        .query_async(conn)
+        .await
+        .with_context(|| format!("SADD {THREAD_RESET_SET} {thread_key}"))?;
+    Ok(())
 }
 
 /// The Valkey stream id of the first entry whose decoded `QueuedTurn` carries
@@ -561,5 +580,32 @@ mod tests {
         assert!(!id_ge("4-9", "5-0"));
         // Unparseable compares false (not-yet-delivered).
         assert!(!id_ge("0-0", "not-an-id"));
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ThreadResetVector {
+        #[serde(rename = "comment")]
+        _comment: String,
+        thread_reset_set: String,
+        thread_reset_inflight_set: String,
+    }
+
+    #[test]
+    fn thread_reset_set_matches_the_frozen_vector() {
+        let raw = include_str!("../../tests/vectors/thread-reset-set.json");
+        let parsed: ThreadResetVector = serde_json::from_str(raw).unwrap_or_else(|err| {
+            panic!(
+                "parse tests/vectors/thread-reset-set.json: {err}\n\
+                 An unknown field is rejected on purpose: a key this lane cannot see \
+                 would pass vacuously. Teach the new key to ThreadResetVector here \
+                 and to _EXPECTED_KEYS in the API and worker vector tests."
+            )
+        });
+        assert_eq!(parsed.thread_reset_set, THREAD_RESET_SET);
+        assert_eq!(
+            parsed.thread_reset_inflight_set,
+            "curie:thread-reset-inflight"
+        );
     }
 }

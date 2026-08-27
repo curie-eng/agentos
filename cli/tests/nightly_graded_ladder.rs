@@ -405,6 +405,28 @@ fn live_cluster_rung_emits_the_graded_reply_for_passing_cases() {
     );
 }
 
+#[test]
+fn cluster_rung_repeats_eval_then_messages_inside_claim_timeout() {
+    let text = ladder();
+    assert!(
+        text.contains("#1534 repeated cluster eval then message still claims"),
+        "the cluster rung must run repeated eval suites then a message so \
+         retained eval sandboxes cannot exhaust the default ResourceQuota; \
+         ladder contents:\n{text}"
+    );
+    assert!(
+        text.contains(r#"timeout 45 "$BIN" "${retention_args[@]}""#),
+        "the post-eval message must be bounded well inside the 90s claim \
+         timeout; a hang until ClaimTimeoutError is the #1534 failure; \
+         ladder contents:\n{text}"
+    );
+    assert!(
+        text.contains(r#"assert_finalized_reply "cluster" "$retention_out""#),
+        "the post-eval message must still finalize a reply, proving a normal \
+         turn can claim after repeated evals; ladder contents:\n{text}"
+    );
+}
+
 // --- Assertion group 6: the EXECUTING parity controls -----------------------
 //
 // Everything below runs the real `cli/scripts/e2e-ladder.sh` against a stub
@@ -938,7 +960,7 @@ fn ladder_selects_platform_trajectory_eval_without_overriding_deployed_cases() {
         .lines()
         .filter(|line| line.contains("local eval") || line.contains("cluster eval"))
         .collect::<Vec<_>>();
-    assert_eq!(trajectory_evals.len(), 4, "{trajectory_invocations}");
+    assert_eq!(trajectory_evals.len(), 6, "{trajectory_invocations}");
     assert!(
         trajectory_evals
             .iter()
@@ -979,7 +1001,7 @@ fn ladder_selects_platform_trajectory_eval_without_overriding_deployed_cases() {
         .lines()
         .filter(|line| line.contains("local eval") || line.contains("cluster eval"))
         .collect::<Vec<_>>();
-    assert_eq!(ordinary_evals.len(), 4, "{ordinary_invocations}");
+    assert_eq!(ordinary_evals.len(), 6, "{ordinary_invocations}");
     assert!(
         ordinary_evals.iter().all(|line| line.contains("--cases")),
         "ordinary eval must retain its explicit cases path: {ordinary_invocations}"
