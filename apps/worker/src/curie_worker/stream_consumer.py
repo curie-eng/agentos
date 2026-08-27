@@ -362,10 +362,10 @@ class StreamConsumer:
         """
 
         self._reset_generation()
-        await self._publish_liveness()  # ordered publication precedes every read
         reserved = factories.keys() & {"bootstrap", "liveness"}
         if reserved:
             raise ValueError(f"consumer generation factories use reserved names: {reserved}")
+        await self._publish_liveness()  # ordered publication precedes every read
 
         # A prior generation in this same pod can have been canceled after its
         # alive lease became unverifiable. Recover rows still owned by this
@@ -696,6 +696,16 @@ class StreamConsumer:
                 )
                 if token is None:
                     continue
+                # The alive lease can be republished between the observation
+                # above and winning arbitration. Re-check inside the lease so a
+                # stale absence never transfers work from a restarted owner.
+                if await self._liveness_store.is_alive(
+                    stream=self._spec.stream,
+                    group=self._spec.group,
+                    consumer=name,
+                ):
+                    self._peer_absent_since.pop(name, None)
+                    continue
                 selected.extend(
                     await self._claim_consumer_pending_locked(name, over_cap)
                 )
@@ -727,11 +737,48 @@ class StreamConsumer:
     async def _recover_local_pending_once(self) -> None:
         """Recover rows canceled by an earlier generation with this same name."""
 
-        async with self._reclaim_lock:
-            entries = await self._claim_consumer_pending_locked(
-                self._spec.consumer, set()
-            )
-        await self._dispatch_reclaimed(entries)
+        if self._liveness_store is None:
+            raise RuntimeError("consumer liveness store is required")
+        retry_s = min(max(0.001, self._spec.heartbeat_ttl_ms / 3000), 1.0)
+        while not self._should_stop():
+            token: str | None = None
+            entries: list[StreamEntry] = []
+            async with self._reclaim_lock:
+                try:
+                    # A peer can begin transferring this stable consumer name
+                    # while the local supervisor is between generations.
+                    # Bootstrap must contend on the same distributed lease or
+                    # both XCLAIM calls can dispatch the row and spend two
+                    # delivery attempts.
+                    token = await self._liveness_store.try_acquire_reclaim(
+                        stream=self._spec.stream,
+                        group=self._spec.group,
+                        consumer=self._spec.consumer,
+                        ttl_ms=max(self._spec.heartbeat_ttl_ms * 2, 60_000),
+                    )
+                    if token is not None:
+                        entries = await self._claim_consumer_pending_locked(
+                            self._spec.consumer, set()
+                        )
+                finally:
+                    if token is not None:
+                        try:
+                            await self._liveness_store.release_reclaim(
+                                stream=self._spec.stream,
+                                group=self._spec.group,
+                                consumer=self._spec.consumer,
+                                token=token,
+                            )
+                        except Exception:
+                            self._spec.logger.warning(
+                                "local pending recovery lease release failed for %s",
+                                self._spec.consumer,
+                                exc_info=True,
+                            )
+            if token is not None:
+                await self._dispatch_reclaimed(entries)
+                return
+            await self._sleep_generation(retry_s)
 
     async def _claim_consumer_pending_locked(
         self, name: str, over_cap: set[str]

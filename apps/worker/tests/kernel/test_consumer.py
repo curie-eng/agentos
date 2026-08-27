@@ -464,6 +464,86 @@ def test_prompt_reclaim_arbitrates_across_replicas_without_burning_delivery_budg
     asyncio.run(go())
 
 
+def test_local_generation_bootstrap_contends_with_peer_transfer_lease(
+    make_harness,
+) -> None:
+    async def go() -> None:
+        async with make_harness(
+            reclaim_min_idle_ms=5000,
+            dead_consumer_idle_ms=0,
+            consumer_heartbeat_ttl_ms=30,
+            consumer_capability_ttl_ms=6000,
+        ) as h:
+            h.runner.default_script = [Final(text="done", status=DONE)]
+            owner_config = h.config.model_copy(update={"consumer_name": "restart-owner"})
+            peer_config = h.config.model_copy(update={"consumer_name": "replacement-peer"})
+            owner = Consumer(redis=h.async_redis, kernel=h.kernel, config=owner_config)
+            peer = Consumer(redis=h.async_redis, kernel=h.kernel, config=peer_config)
+            owner._liveness_store = ConsumerLivenessStore(h.async_redis)
+            peer._liveness_store = ConsumerLivenessStore(h.async_redis)
+            await owner.ensure_group()
+
+            entry_id = await h.async_redis.xadd(
+                h.config.stream,
+                to_stream_fields(
+                    _qevent("bootstrap-race", thread="tr-bootstrap", event_id="r-bootstrap")
+                ),
+            )
+            assert await h.async_redis.xreadgroup(
+                h.config.consumer_group,
+                owner_config.consumer_name,
+                {h.config.stream: ">"},
+                count=1,
+            )
+
+            # Model a peer that has already won the transfer lease while the
+            # stable-name consumer starts its replacement generation.
+            token = await peer._liveness_store.try_acquire_reclaim(
+                stream=h.config.stream,
+                group=h.config.consumer_group,
+                consumer=owner_config.consumer_name,
+                ttl_ms=60_000,
+            )
+            assert token is not None
+            bootstrap = asyncio.create_task(owner._recover_local_pending_once())
+            try:
+                await asyncio.sleep(0.03)
+                assert not bootstrap.done()
+                rows = await h.async_redis.xpending_range(
+                    h.config.stream,
+                    h.config.consumer_group,
+                    min=entry_id,
+                    max=entry_id,
+                    count=1,
+                )
+                assert len(rows) == 1
+                assert rows[0]["consumer"] == owner_config.consumer_name
+                assert int(rows[0]["times_delivered"]) == 1
+                assert h.runner.opened == []
+
+                async with peer._reclaim_lock:
+                    entries = await peer._claim_consumer_pending_locked(
+                        owner_config.consumer_name, set()
+                    )
+                assert await peer._dispatch_reclaimed(entries) == 1
+            finally:
+                await peer._liveness_store.release_reclaim(
+                    stream=h.config.stream,
+                    group=h.config.consumer_group,
+                    consumer=owner_config.consumer_name,
+                    token=token,
+                )
+
+            await asyncio.wait_for(bootstrap, timeout=1)
+            await _wait_until(lambda: h.runner.opened == ["bootstrap-race"])
+            await asyncio.gather(*list(peer._inflight))
+            assert (await h.async_redis.xpending(h.config.stream, h.config.consumer_group))[
+                "pending"
+            ] == 0
+
+    asyncio.run(go())
+
+
 def test_reclaim_does_not_promptly_steal_from_unknown_peer_without_heartbeat_capability(
     make_harness,
 ) -> None:
