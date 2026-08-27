@@ -39,9 +39,25 @@ vendored file stays a static .Files.Get (not tpl-ed) and this value-dependent
 patch lives in the template layer alongside the #66 RBAC patch below.
 */}}
 {{- $controllerManifest := .Files.Get "files/agent-sandbox/controller.yaml" }}
-{{- with .Values.priorityClasses.platform.name }}
-{{- $controllerManifest = $controllerManifest | replace "      serviceAccountName: agent-sandbox-controller" (printf "      serviceAccountName: agent-sandbox-controller\n      priorityClassName: %s" .) }}
+{{- $controllerMetadataAnchor := "    metadata:\n      labels:\n        app: agent-sandbox-controller" }}
+{{- $controllerMetadata := "    metadata:\n      labels:" }}
+{{- with (include "curie.placement.labels" .Values.placement.controller) }}
+{{- $controllerMetadata = printf "%s\n%s" $controllerMetadata (indent 8 .) }}
 {{- end }}
+{{- $controllerMetadata = printf "%s\n        app: agent-sandbox-controller" $controllerMetadata }}
+{{- with (include "curie.placement.annotations" .Values.placement.controller) }}
+{{- $controllerMetadata = printf "%s\n      annotations:\n%s" $controllerMetadata (indent 8 .) }}
+{{- end }}
+{{- $controllerManifest = $controllerManifest | replace $controllerMetadataAnchor $controllerMetadata }}
+{{- $controllerServiceAccount := "      serviceAccountName: agent-sandbox-controller" }}
+{{- $controllerPodFields := $controllerServiceAccount }}
+{{- with .Values.priorityClasses.platform.name }}
+{{- $controllerPodFields = printf "%s\n      priorityClassName: %s" $controllerPodFields . }}
+{{- end }}
+{{- with (include "curie.placement.spec" .Values.placement.controller) }}
+{{- $controllerPodFields = printf "%s\n%s" $controllerPodFields (indent 6 .) }}
+{{- end }}
+{{- $controllerManifest = $controllerManifest | replace $controllerServiceAccount $controllerPodFields }}
 {{ $controllerManifest }}
 ---
 {{/*
@@ -173,11 +189,21 @@ spec:
   podTemplate:
     metadata:
       labels:
+        {{- with (include "curie.placement.labels" .Values.placement.sandbox) }}
+        {{- . | nindent 8 }}
+        {{- end }}
         {{- include "curie.selectorLabels" (dict "root" . "component" "runner-sandbox") | nindent 8 }}
         {{- if $agent }}
         curietech.ai/agent: {{ $agent | quote }}
         {{- end }}
+      {{- with (include "curie.placement.annotations" .Values.placement.sandbox) }}
+      annotations:
+        {{- . | nindent 8 }}
+      {{- end }}
     spec:
+      {{- with (include "curie.placement.spec" .Values.placement.sandbox) }}
+      {{- . | nindent 6 }}
+      {{- end }}
       {{- if $runner.serviceAccount.create }}
       serviceAccountName: {{ include "curie.fullname" . }}-runner
       automountServiceAccountToken: {{ $runner.serviceAccount.automountToken }}
@@ -589,14 +615,15 @@ spec:
             - name: ANTHROPIC_BASE_URL
               value: http://localhost:{{ $runner.liteLLM.port }}
             {{- end }}
-            {{- if $runner.credentials }}
+            {{- if or $runner.credentials $runner.credentialsExistingSecret }}
             # Warm-pod fallback credential; the worker's per-claim Overrides
             # injection carries the (per-agent) credential on a bound run.
+            # Same shared secret reference worker.yaml resolves (issue #1759,
+            # curie.secretRef), so the two cannot drift apart.
             - name: CURIE_CREDENTIALS
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "curie.secretName" . }}
-                  key: agentCredentials
+                  {{- include "curie.secretRef" (dict "root" . "existingSecret" $runner.credentialsExistingSecret "existingSecretKey" $runner.credentialsExistingSecretKey "defaultKey" "agentCredentials") | nindent 18 }}
             {{- end }}
             - name: CURIE_PLUGIN_DIR
               value: {{ $runner.pluginDir | quote }}
@@ -624,12 +651,7 @@ spec:
             - name: GIT_CONFIG_VALUE_0
               value: {{ $wf.mountPath | quote }}
             {{- end }}
-            {{- if .Values.otelCollector.deploy }}
-            - name: OTEL_EXPORTER_OTLP_ENDPOINT
-              value: http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.service.httpPort }}
-            - name: OTEL_EXPORTER_OTLP_PROTOCOL
-              value: http/protobuf
-            {{- end }}
+            {{- include "curie.env.otel" (dict "root" . "extraEnv" $runner.extraEnv) | nindent 12 }}
             {{- with $runner.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

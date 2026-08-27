@@ -158,6 +158,7 @@ class ApprovalClient:
         api_base_url: str,
         api_key: str,
         client: httpx.AsyncClient,
+        read_timeout_s: float,
         worker_token: str = "",
     ) -> None:
         self._url = f"{api_base_url.rstrip('/')}/approvals"
@@ -165,6 +166,7 @@ class ApprovalClient:
         self._headers = {"X-API-Key": api_key} if api_key else {}
         self._worker_headers = {"X-Curie-Worker-Token": worker_token} if worker_token else {}
         self._client = client
+        self._read_timeout_s = read_timeout_s
 
     async def create(self, request: ApprovalRequest) -> CreatedApproval:
         try:
@@ -193,7 +195,11 @@ class ApprovalClient:
         """
 
         try:
-            response = await self._client.get(f"{self._url}/{approval_id}", headers=self._headers)
+            response = await self._client.get(
+                f"{self._url}/{approval_id}",
+                headers=self._headers,
+                timeout=self._read_timeout_s,
+            )
         except httpx.HTTPError as exc:
             logger.warning("approval read failed for %s: %s", approval_id, exc)
             return None

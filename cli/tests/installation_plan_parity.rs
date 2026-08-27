@@ -144,6 +144,10 @@ if [ "$1" = get ] && [ "$2" = values ]; then
 fi
 if [ "$1" = template ]; then
     case " $* " in
+        *" --show-only templates/preflight-gvisor.yaml "*)
+            printf '%s\n' 'Error: could not find template templates/preflight-gvisor.yaml in chart' >&2
+            exit 1
+            ;;
         *" --show-only templates/priorityclass.yaml "*)
             case " $* " in
                 *" --set priorityClasses.sandbox.create=false "*)
@@ -360,6 +364,12 @@ persist_source() {{
     cat "$migration_source"
 }}
 case "$verb $object" in
+'get deployment')
+    case "$all" in
+        'get deployment agent-sandbox-controller -n agent-sandbox-system --ignore-not-found -o json') : ;;
+        *) unexpected ;;
+    esac
+    ;;
 'get priorityclass')
     # Empty stdout with exit 0 is kubectl --ignore-not-found for an absent class.
     :
@@ -1467,7 +1477,7 @@ fn cluster_up_rerun_preserves_existing_runner_model_and_egress_configuration() {
 }
 
 #[test]
-fn cluster_up_detected_credential_without_provider_installs_sealed() {
+fn cluster_up_detected_credential_without_provider_infers_bounded_egress() {
     let fixture = HelmFixture::new(
         installation_for_the_stateful_guard(),
         HelmValuesResponse::Absent,
@@ -1479,24 +1489,24 @@ fn cluster_up_detected_credential_without_provider_installs_sealed() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    json_output(output, "cluster up with a sealed OpenRouter credential");
+    json_output(output, "cluster up with an inferred OpenRouter provider");
     assert!(
-        visible.contains("the sandbox is sealed -- no egress opened"),
-        "the bare credential must remain sealed: {visible}"
+        visible.contains("applying `--allow-egress-host openrouter`"),
+        "the recognized credential must infer its provider route: {visible}"
     );
     assert!(
         !visible.contains(OPENROUTER_CREDENTIAL),
-        "the sealed credential leaked into command output: {visible}"
+        "the credential leaked into command output: {visible}"
     );
 
     let calls = fixture.calls();
     assert!(
         calls.contains("HELM_CALL: upgrade "),
-        "the sealed credential must not block installation: {calls}"
+        "the inferred provider must not block installation: {calls}"
     );
     assert!(
-        !calls.contains("security.networkPolicy.allowedEgress"),
-        "the bare credential must not open provider egress: {calls}"
+        calls.contains("security.networkPolicy.allowedEgress"),
+        "the inferred provider must open only its resolved egress route: {calls}"
     );
     assert!(
         !calls.contains(OPENROUTER_CREDENTIAL),

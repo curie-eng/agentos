@@ -145,7 +145,13 @@ assert_env() {
   local -a sets=()
   while [ "$1" != "--" ]; do sets+=("$1"); shift; done
   shift
-  if ! helm template curie "$CHART" -s templates/worker.yaml "${sets[@]}" >"$out" 2>&1; then
+  # `${sets[@]+"${sets[@]}"}` rather than a bare `"${sets[@]}"`: expanding an
+  # EMPTY array under `set -u` is an "unbound variable" error until bash 4.4, and
+  # macOS ships 3.2 as /bin/bash. Assertion (a) passes no --set at all, so `sets`
+  # is empty on the very first call -- and because the EXIT trap's own status
+  # replaces the script's in 3.2, the abort surfaced as exit 0 and chart-check
+  # reported PASS for a run that asserted NOTHING.
+  if ! helm template curie "$CHART" -s templates/worker.yaml ${sets[@]+"${sets[@]}"} >"$out" 2>&1; then
     fail "$letter" "the render FAILED; it must succeed
   $(head -5 "$out")"
   fi

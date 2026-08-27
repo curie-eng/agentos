@@ -73,7 +73,9 @@ banned in this contract, so all three tiers are written out in full:
 
 At the skill tier the bundle is the session, so there is no separate deploy
 <!-- doclint:ignore-line -->
-step. `eval` runs the bundle's OWN `evals/cases.json` at every tier. When the
+step. `eval` runs the bundle's OWN `evals/cases.json` at every tier. Default
+`skill`, `local`, and `cluster` eval execute that suite without ambient durable
+agent memory, so a deployed preference cannot change a committed case. When the
 <!-- doclint:ignore-line -->
 bundle also carries `evals/trajectory.json`, every case is scored from the
 observed tool sequence. Skill reads runner tool frames directly. Local and
@@ -117,7 +119,12 @@ earlier failure and not the named grader.
 
 **Success on an eval is `failed` equal to 0 AND `plumbing_ok` equal to 0.**
 `plumbing_ok` counts cases that completed on the fake model and were therefore
-never graded (ADR-0055), and `passed + failed + plumbing_ok == total`. A run
+never graded (ADR-0055), and `passed + failed + plumbing_ok == total`. Each
+case also reports `samples`, `passes`, and `policy` so a one-sample miss is
+labeled as one draw, not unexplained tier drift. Default is one sample with
+majority aggregation; `curie skill eval --samples 3 --json`,
+`curie local eval --samples 3 --json`, and
+`curie cluster eval --samples 3 --json` raise N on the in-CLI path. A run
 that is all `plumbing_ok` is not a pass, it is an ungraded run.
 
 **When a command is uncertain, `curie schema` is the authority.** Do not invoke

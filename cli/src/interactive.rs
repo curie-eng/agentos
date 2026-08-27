@@ -34,6 +34,16 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::channel::{parse_terminal_message, TerminalAction, REPLY_FENCE};
 use crate::recipes::{build_argv, recipes, ArgPart, Recipe, RecipeKind, Tier, TuiAction, Workflow};
 
+/// The model credentials Curie accepts, in the order every lookup tries them.
+///
+/// One list so the workflow, the status readout, and the availability checks
+/// cannot drift apart.
+const MODEL_CREDENTIAL_NAMES: &[&str] = &[
+    "CURIE_CREDENTIALS",
+    "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+];
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum SecretNameChoice {
     Name(String),
@@ -977,11 +987,7 @@ fn env_credential_present(name: &str) -> bool {
 /// credential here (it lives on the chart Secret) but forwarding it is harmless.
 fn slack_secret_env() -> Result<Vec<(String, String)>> {
     let mut env = Vec::new();
-    for name in [
-        "CURIE_CREDENTIALS",
-        "ANTHROPIC_API_KEY",
-        "CLAUDE_CODE_OAUTH_TOKEN",
-    ] {
+    for name in MODEL_CREDENTIAL_NAMES.iter().copied() {
         if env_credential_present(name) {
             break;
         }
@@ -1111,19 +1117,11 @@ fn prompt_bundle_dir(
 
 fn example_secret_env(extra_secrets: &[&str]) -> Result<Vec<(String, String)>> {
     let mut env = Vec::new();
-    if ![
-        "CURIE_CREDENTIALS",
-        "ANTHROPIC_API_KEY",
-        "CLAUDE_CODE_OAUTH_TOKEN",
-    ]
-    .iter()
-    .any(|name| env_credential_present(name))
+    if !MODEL_CREDENTIAL_NAMES
+        .iter()
+        .any(|name| env_credential_present(name))
     {
-        for name in [
-            "CURIE_CREDENTIALS",
-            "ANTHROPIC_API_KEY",
-            "CLAUDE_CODE_OAUTH_TOKEN",
-        ] {
+        for name in MODEL_CREDENTIAL_NAMES.iter().copied() {
             if let Some(value) = crate::secrets::get_value(name)? {
                 env.push((name.to_string(), value));
                 break;
@@ -1178,12 +1176,7 @@ fn secret_available(name: &str) -> bool {
 
 /// Any accepted model credential, by the same rule `ensure_model_credential_available` uses.
 fn model_credential_available() -> bool {
-    const NAMES: &[&str] = &[
-        "CURIE_CREDENTIALS",
-        "ANTHROPIC_API_KEY",
-        "CLAUDE_CODE_OAUTH_TOKEN",
-    ];
-    NAMES.iter().any(|n| secret_available(n))
+    MODEL_CREDENTIAL_NAMES.iter().any(|n| secret_available(n))
 }
 
 /// What the workflow will actually ask for, given what is already in place.
@@ -1327,22 +1320,17 @@ fn ensure_model_credential_available(
     const RECOVERY: &str =
         "A model credential is required. `CURIE_MODEL_BASE_URL` selects the endpoint. Use \
         `curie secrets set <NAME>` or `export <NAME>=...`, then retry";
-    const NAMES: &[&str] = &[
-        "CURIE_CREDENTIALS",
-        "ANTHROPIC_API_KEY",
-        "CLAUDE_CODE_OAUTH_TOKEN",
-    ];
-    for name in NAMES {
+    for name in MODEL_CREDENTIAL_NAMES {
         if env_credential_present(name) {
             return Ok(());
         }
     }
-    for name in NAMES {
+    for name in MODEL_CREDENTIAL_NAMES {
         if crate::secrets::is_saved(name)? {
             return Ok(());
         }
     }
-    let legacy_names = NAMES
+    let legacy_names = MODEL_CREDENTIAL_NAMES
         .iter()
         .filter_map(|name| {
             crate::secrets::needs_vault_upgrade(name)
@@ -1357,7 +1345,7 @@ fn ensure_model_credential_available(
         }
     }
 
-    let choices = NAMES
+    let choices = MODEL_CREDENTIAL_NAMES
         .iter()
         .map(|name| SelectChoice {
             label: (*name).to_string(),
@@ -1391,11 +1379,7 @@ fn model_credential_status(
     saved_names: &BTreeSet<String>,
     legacy_names: &BTreeSet<String>,
 ) -> &'static str {
-    for name in [
-        "CURIE_CREDENTIALS",
-        "ANTHROPIC_API_KEY",
-        "CLAUDE_CODE_OAUTH_TOKEN",
-    ] {
+    for name in MODEL_CREDENTIAL_NAMES.iter().copied() {
         if env_credential_present(name) || saved_names.contains(name) {
             return "available";
         }

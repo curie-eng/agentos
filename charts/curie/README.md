@@ -135,41 +135,159 @@ kubectl get pods -n curie-dev -w
 Reach the Langfuse UI after a stock install:
 
 ```bash
-kubectl port-forward -n curie svc/curie-langfuse-web 3000:3000
-# http://localhost:3000
-kubectl get secret curie-secrets -n curie -o jsonpath='{.data.langfuseInitProjectSecretKey}' | base64 -d; echo
-kubectl get secret curie-secrets -n curie -o jsonpath='{.data.langfuseInitUserPassword}' | base64 -d; echo
+curie cluster observability
 ```
 
-Log in as `dev@curie.local` with the retrieved admin password. The first
-command retrieves the project secret key for API and OTel authentication.
-The development overlay retains the published development keys
-`pk-lf-curie-dev` and `sk-lf-curie-dev`.
+The command reports the Langfuse UI URL and a connection hint when the Service
+is not externally reachable. Pass `--open` to open a reachable Langfuse URL in
+your browser. It reports access surfaces only and does not read or rotate
+Langfuse credentials.
 
-App services emit OTLP (OpenTelemetry Protocol) to the **collector**, never
-straight to Langfuse (Langfuse OTLP ingest is HTTP-only): `curie-otel-collector:4317` (gRPC) /
-`:4318` (HTTP). The collector forwards to Langfuse over HTTP.
+For a sealed install, Helm's post install notes show how to retrieve the
+generated Langfuse admin password. Sign in as `dev@curie.local` unless
+`langfuse.init.userEmail` was overridden.
+
+## Collector operation and backends
+
+API, dispatcher, worker, and runner emit OTLP traces, correlated logs, and
+low-cardinality metrics to the **collector**, never directly to Langfuse or a
+log/metrics backend. The in-chart collector receives gRPC on
+`curie-otel-collector:4317` and HTTP on `:4318`. Applications use standard
+`OTEL_EXPORTER_OTLP_*` settings. The chart owns one destination for every
+instrumented workload:
+
+- `otelCollector.deploy: true` (default) wires the in-cluster collector.
+- `otelCollector.deploy: false` plus `otelCollector.endpoint` wires an
+  external collector, with optional `protocol`, `headers`, or
+  `headersExistingSecret`.
+- `otelCollector.telemetryDisabled: true` is the explicit no-OTLP
+  acknowledgement. `security.checkDefaultCredentials` refuses a production
+  render that has neither a chart collector nor an external endpoint unless
+  this flag is set.
+- Outside that production gate, `deploy: false` with an empty endpoint remains
+  the supported local/offline no-endpoint mode: SDK export stays inert while
+  stderr diagnostics remain available.
+
+`api.extraEnv`, `dispatcher.extraEnv`, `worker.extraEnv`, and
+`agentSandbox.runner.extraEnv` remain per-workload overrides, including
+`valueFrom`. They do not satisfy the production availability gate, because the
+four services can drift.
+
+```yaml
+otelCollector:
+  deploy: false
+  endpoint: https://otel.example.com:4318
+  protocol: http/protobuf
+  headersExistingSecret: acme-otel-auth
+  headersSecretKey: headers
+```
+
+Langfuse ingest is HTTP-only, so the collector forwards traces to Langfuse over
+HTTP. Logs and metrics retain explicit collector pipelines. Their destinations
+are operator-configured collector exporters; installing Grafana, Loki, Tempo,
+Prometheus, or another retained backend is deliberately separate from this
+chart's OTLP write path.
+
+The chart-managed collector is a bounded gateway, not a lossless store. Every
+network exporter uses retry plus a bounded sending queue. `memory_limiter` runs
+before `batch`, and the default persistent `file_storage` queue uses a 1Gi PVC
+at `/var/lib/otelcol/storage`; that volume and the queue limit bound outage
+storage. Queue overflow and retry expiry are explicit loss, exposed through
+collector self-metrics rather than hidden by an unbounded backlog. The default
+60-second termination grace period gives the collector a finite drain window;
+it does not promise a drain that cannot complete.
+
+Collector internal metrics are exposed on port 8888 and include receiver
+accepted/refused, exporter sent/send-failed/enqueue-failed, queue
+size/capacity, process resource use, and uptime. They let an operator
+distinguish no application traffic from a telemetry delivery problem. Process
+health remains the health endpoint; data-flow health is these self-metrics and
+stderr exporter diagnostics.
+
+The Collector self-metrics port is ingress-isolated by the default-on
+`security.otelCollectorNetworkPolicy`. The policy selects only this release's
+Collector pods, leaves OTLP gRPC/HTTP ingestion unrestricted on 4317/4318,
+admits the kubelet health probe on 13133, and does not admit port 8888 until
+`metricsIngress` names an explicit standard
+Kubernetes `NetworkPolicyPeer`. Empty peers, empty selectors, and catch-all
+`0.0.0.0/0` or `::/0` IP blocks are rejected at render time. For example:
+
+```yaml
+security:
+  otelCollectorNetworkPolicy:
+    metricsIngress:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: observability
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/name: prometheus
+```
+
+`otelCollector.service.metricsPort` changes the Service, container, and policy
+port together. Set `security.otelCollectorNetworkPolicy.enabled: false` only
+when an external control plane supplies equivalent isolation; setting
+`otelCollector.deploy: false` omits the policy along with the chart-owned
+Collector.
+
+The production chart omits the `debug` exporter to avoid copying telemetry to
+collector stdout. `values-dev.yaml` explicitly enables it and selects an
+ephemeral queue for disposable development. Use the same explicit persistence
+override for any short-lived test installation; production installs retain the
+PVC by default.
 
 Additional trace destinations are configured through
 `otelCollector.extraExporters`, a map of exporter names to collector exporter
 configuration, and `otelCollector.extraPipelineExporters`, an ordered list of
 those names. The map is rendered under `exporters` and the list is appended to
-the traces pipeline; built-in `otlphttp/langfuse` and `debug` exporters may
-also be named. Helm fails with the missing exporter name if a pipeline entry is
-undefined. For example, this adds a Tempo exporter:
+the traces pipeline. `extraLogPipelineExporters` and
+`extraMetricPipelineExporters` do the equivalent for the respective signal
+pipelines. Helm rejects a missing exporter or a network exporter without its
+bounded retry and persistent queue protections. The development-only `debug`
+exporter is available only when enabled.
+
+Built-in exporter names (`otlphttp/langfuse`, `nop/logs`, `nop/metrics`, and
+`debug`) are reserved and cannot be overridden through `extraExporters`.
+Sensitive header names such as `Authorization`, tokens, API keys, secrets,
+passwords, and credentials must use exact Collector environment expansion
+(`${env:NAME}`), with that variable supplied through `otelCollector.extraEnv`
+and a Kubernetes Secret reference. This prevents a literal backend credential
+from being rendered into the Collector ConfigMap.
+
+Exporter credentials belong in a Kubernetes Secret, not in
+`extraExporters`: that map becomes `collector-config.yaml` in a ConfigMap.
+`otelCollector.extraEnv` accepts complete `EnvVar` entries so the exporter can
+use Collector environment expansion while the credential itself is resolved
+only on the Pod. This example adds an authenticated OTLP/HTTP destination with
+the required bounded retry and persistent queue:
 
 ```yaml
 otelCollector:
+  extraEnv:
+    - name: BACKEND_AUTH
+      valueFrom:
+        secretKeyRef:
+          name: acme-otel-backend
+          key: authorization
   extraExporters:
-    otlp/tempo:
-      endpoint: tempo:4317
-      tls:
-        insecure: true
-  extraPipelineExporters: [otlp/tempo]
+    otlphttp/acme-secure-sink:
+      endpoint: https://otel-backend.example.com:4318
+      headers:
+        Authorization: ${env:BACKEND_AUTH}
+      retry_on_failure:
+        enabled: true
+        max_interval: 5s
+        max_elapsed_time: 5m
+      sending_queue:
+        enabled: true
+        storage: file_storage
+        queue_size: 1000
+  extraPipelineExporters: [otlphttp/acme-secure-sink]
 ```
 
-Changes to either value roll the collector Deployment through its config
-checksum, so the configured pipeline is applied on `helm upgrade`.
+The referenced Secret is not copied into a ConfigMap or tracked values file.
+Changes to either value roll the collector Deployment, so the configured
+pipeline and environment are applied on `helm upgrade`.
 
 ## Components
 
@@ -180,22 +298,40 @@ checksum, so the configured pipeline is applied on `helm upgrade`.
 | Valkey | `valkey/valkey:8-alpine` | Langfuse cache/queue + dispatcher Streams queue. |
 | ClickHouse | `clickhouse/clickhouse-server:24.8` | Langfuse OLAP store. Tag pinned SSE4.2-safe (see preflight). |
 | RustFS | `rustfs/rustfs:1.0.0-beta.12` plus `amazon/aws-cli:2.32.6` init | Langfuse object storage; BYO real S3 in prod. |
-| OTel Collector | `otel/opentelemetry-collector-contrib:0.119.0` | OTLP (gRPC+HTTP) -> Langfuse over HTTP. |
+| OTel Collector | `otel/opentelemetry-collector-contrib:0.119.0` | Bounded OTLP gateway (gRPC+HTTP), durable queue by default; traces -> Langfuse over HTTP, logs/metrics -> configured exporters. |
+| Mail adapter | `ghcr.io/curie-eng/curie-mail-adapter` | Off by default. One `Recreate` replica with durable SQLite on single-writer storage; no platform key/database credential or ServiceAccount token. |
+
+The mail adapter's `mailAdapter.persistence` block renders a 1 GiB RWO PVC by
+default or mounts a named same-namespace single-writer Filesystem `existingClaim`
+with exactly one `ReadWriteOnce` or `ReadWriteOncePod` access mode. Its
+root filesystem remains read-only; only the state mount and an `emptyDir` at
+`/tmp` are writable. Enabling it also requires an explicit
+`mailAdapter.agentmail.httpsCidrs` list. One egress-only NetworkPolicy then
+allows DNS, this release's API pods, and those provider/proxy CIDRs on TCP 443.
+When `api.deploy=false`, the in-chart API selector is replaced by the required
+`mailAdapter.apiEgress.httpsCidrs` peers on `mailAdapter.apiEgress.port`; the
+chart does not infer IPs from `apiBaseUrl`. The policy has no Kubernetes API
+carve-out and never selects runner sandboxes. See
+[`docs/operations.md`](../../docs/operations.md#connecting-email) for the
+mode-0600 credential workflow, retention, erase, and recovery procedure.
 
 ## Publishing and pulling images
 
 First-party service images are published to GHCR by the `Release images`
 workflow (`.github/workflows/release.yaml`) on every push to `main`, as
 `ghcr.io/curie-eng/curie-<service>` tagged with the commit SHA and `latest`.
-All five first-party services build in the matrix: `curie-api`,
-`curie-dispatcher`, `curie-worker`, `curie-ui`, and `curie-runner`. The
-chart defaults every first-party image at its `ghcr.io/curie-eng/curie-*`
-`:latest`, so the bare install (above) pulls from GHCR with no image overrides.
+All six first-party services build in the matrix: `curie-api`,
+`curie-dispatcher`, `curie-mail-adapter`, `curie-worker`, `curie-ui`, and
+`curie-runner`. The chart defaults every first-party image at its
+`ghcr.io/curie-eng/curie-*` `:latest`, so the bare install (above) pulls from
+GHCR with no image overrides -- except `curie-mail-adapter`, whose Deployment is
+off by default (`mailAdapter.deploy`), so its image is published and defaulted
+but not pulled until an operator enables the email channel.
 
-- **Pull policy for the four Deployment-managed services** (api, dispatcher,
-  worker, ui): `imagePullPolicy: Always` -- they pull once per rollout, so
-  `Always` just keeps a fresh install from serving a stale `latest` a node
-  cached earlier.
+- **Pull policy for the five Deployment-managed services** (api, dispatcher,
+  mail-adapter, worker, ui): `imagePullPolicy: Always` -- they pull once per
+  rollout, so `Always` just keeps a fresh install from serving a stale `latest`
+  a node cached earlier.
 - **The runner image is the exception:** it uses `imagePullPolicy: IfNotPresent`
   because a sandbox pod is cold-created per Slack thread, and an `Always`
   (re-)pull inside that boot window blew past the worker's claim timeout and
@@ -222,19 +358,22 @@ is not anonymously pullable and the node needs credentials. Two supported paths:
 - **Public package.** In the GHCR package settings make the package public; then
   no pull Secret is needed and `imagePullSecrets` stays empty.
 
-For offline dev/e2e, `-f values-dev.yaml` overrides all five first-party images
+For offline dev/e2e, `-f values-dev.yaml` overrides all six first-party images
 back to locally-built, cluster-imported tags with `imagePullPolicy: Never`, so a
-disconnected cluster never attempts a GHCR pull. That path requires building and
-importing each image first:
+disconnected cluster never attempts a GHCR pull. `curie-mail-adapter` is
+overridden the same way even though `mailAdapter.deploy` is false in that
+profile, so `--set mailAdapter.deploy=true` on a disconnected cluster starts
+rather than hanging on a GHCR pull. That path requires building and importing
+each image first:
 
 ```bash
-for svc in api dispatcher worker ui; do
+for svc in api dispatcher mail-adapter worker ui; do
   docker build -f apps/$svc/Dockerfile -t curie-$svc:local .
 done
 docker build -f runner/Dockerfile -t curie-runner:latest .
 # import each into the cluster runtime, e.g. for k3s:
-for img in curie-api:local curie-dispatcher:local curie-worker:local \
-           curie-ui:local curie-runner:latest; do
+for img in curie-api:local curie-dispatcher:local curie-mail-adapter:local \
+           curie-worker:local curie-ui:local curie-runner:latest; do
   docker save "$img" | ssh <node> 'sudo k3s ctr images import -'
 done
 ```
@@ -263,7 +402,9 @@ postgres:
 Toggles (all default `true`): `langfuse.deploy`, `postgres.deploy`,
 `valkey.deploy`, `clickhouse.deploy`, `rustfs.deploy`, `otelCollector.deploy`.
 Flipping any to `false` removes its resources from the render; consumers
-(Langfuse env, the collector config) repoint at the BYO host automatically.
+(Langfuse env, the collector config, application OTEL env) repoint at the BYO
+fields on the same block (`host`/`port` for stores, `otelCollector.endpoint`
+for an external collector).
 
 Secrets: all credentials are written to one `<release>-secrets` Secret. A sealed
 `helm install` (the default) generates strong random values for all eleven
@@ -319,8 +460,11 @@ is the published dev header `Basic cGstbGYtY3VyaWUtZGV2OnNrLWxmLWN1cmllLWRldg==`
 whether `otelCollector.otlpAuthHeader` is set to it directly or the chart
 composed it from the `langfuse.init` keys; `langfuse.existingSecret` does not
 clear it, because that header is what the collector sends regardless of where the
-Langfuse credential comes from. It is off by default so the zero-secret bare
-install stays green.
+Langfuse credential comes from. The same flag also refuses a render that disables
+the chart collector without setting `otelCollector.endpoint` or
+`otelCollector.telemetryDisabled=true`, so a production install cannot silently
+drop every workload's OTLP destination. It is off by default so the zero-secret
+bare install stays green.
 
 ### Key-free object store auth
 
@@ -719,8 +863,10 @@ to install only the control plane + backing stores without the runner substrate.
   the substrate's resume path can inject `CURIE_HISTORY_REF` /
   `CURIE_SESSION_ID` per claim. Claims carrying env bind a fresh sandbox
   rather than a pre-warmed one; the fast path (no env) binds warm.
-- Traces flow to `<release>-otel-collector:4318` (HTTP), per the collector
-  rule above; the env block is omitted when `otelCollector.deploy: false`.
+- Traces flow to `<release>-otel-collector:4318` (HTTP) when the chart collector
+  is deployed, or to `otelCollector.endpoint` when that BYO field is set. The
+  env block is omitted only for explicit `telemetryDisabled` or local/offline
+  no-endpoint mode.
 
 ## Deploying without inbound access
 
@@ -952,3 +1098,52 @@ and needs no coordination with any repository:
 Installations, permissions, and the App ID are untouched. This is a real
 advantage over a personal access token, where rotation means re-issuing the
 credential *and* re-authorizing what it could reach.
+
+### The other direct-passthrough credentials
+
+The GitHub App key was the first of nine credential keys read straight from
+`.Values` with no in-chart generation (`charts/curie/templates/secrets.yaml`
+calls these direct passthrough, as opposed to the eleven keys
+`curie.managedSecret` generates and persists). Issue #1759 gave the other
+eight the same `existingSecret` / `existingSecretKey` escape, one pair per
+key, all winning over their plain value when set:
+
+| Credential | Plain value | BYO fields |
+|---|---|---|
+| Model credential | `agentSandbox.runner.credentials` | `agentSandbox.runner.credentialsExistingSecret` / `credentialsExistingSecretKey` (default key `agentCredentials`) |
+| Per-adapter egress secrets | `worker.adapterCredentials` | `worker.adapterCredentialsExistingSecret` / `adapterCredentialsExistingSecretKey` (default key `adapterCredentials`) -- the referenced key must hold the already-JSON-encoded map |
+| Outbound GitHub token | `api.githubToken` | `api.githubTokenExistingSecret` / `githubTokenExistingSecretKey` (default key `githubToken`) |
+| Sealing private key | `sealing.privateKey` | `sealing.privateKeyExistingSecret` / `privateKeyExistingSecretKey` (default key `sealingPrivateKey`) |
+| Sealing previous private key | `sealing.previousPrivateKey` | `sealing.previousPrivateKeyExistingSecret` / `previousPrivateKeyExistingSecretKey` (default key `sealingPreviousPrivateKey`) |
+| Slack app token | `dispatcher.slack.appToken` | `dispatcher.slack.appTokenExistingSecret` / `appTokenExistingSecretKey` (default key `slackAppToken`) |
+| Slack bot token | `dispatcher.slack.botToken` | `dispatcher.slack.botTokenExistingSecret` / `botTokenExistingSecretKey` (default key `slackBotToken`) |
+| Slack signing secret | `dispatcher.slack.signingSecret` | `dispatcher.slack.signingSecretExistingSecret` / `signingSecretExistingSecretKey` (default key `slackSigningSecret`) |
+
+For example, to keep the model credential and both Slack tokens entirely out
+of helm values and release history:
+
+```yaml
+agentSandbox:
+  runner:
+    credentialsExistingSecret: my-model-credential
+    credentialsExistingSecretKey: agentCredentials   # the default
+dispatcher:
+  slack:
+    appTokenExistingSecret: my-slack-tokens
+    appTokenExistingSecretKey: slackAppToken          # the default
+    botTokenExistingSecret: my-slack-tokens
+    botTokenExistingSecretKey: slackBotToken          # the default
+```
+
+As with `githubAppExistingSecret`, a Secret missing the referenced key fails
+that one pod at `CreateContainerConfigError` rather than the chart silently
+falling back to an empty credential.
+
+**Known gap, tracked in #1801.** None of these 16 new fields are yet covered
+by the CLI's preserved-values mechanism (the same one `COMMS_MANAGED_KEYS` and
+`GITHUB_APP_MANAGED_KEYS` give the Slack tokens and the GitHub App identity in
+`cli/src/ops.rs`). A plain `curie cluster up` runs a full `helm upgrade
+--install` with no `--reuse-values`, so it resets any values key it does not
+explicitly re-supply -- set one of these fields today and keep it declared in
+the values file you pass to every `cluster up`/`helm upgrade`, the same way you
+would for any other values key the CLI does not manage yet.

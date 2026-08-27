@@ -25,11 +25,13 @@
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use curie_aci_protocol::QueuedTurn;
 use redis::aio::MultiplexedConnection;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::api::{Agent, ApiClient};
 use crate::chat::{
@@ -38,7 +40,9 @@ use crate::chat::{
 };
 use crate::evals::{EvalCase, EvalSuite, ExpectedStatus, LoadedEval};
 use crate::ops::{plain, require_on_path, run_capture, OpsCommand};
-use crate::queue::{self, connect, diagnostics, synthetic_turn, xadd};
+use crate::queue::{
+    self, connect, diagnostics, eval_case_turn, queue_thread_reset, synthetic_turn, xadd,
+};
 use crate::state::{save_turn, TurnContext, TurnVerb};
 
 pub const DEFAULT_STREAM: &str = queue::DEFAULT_STREAM;
@@ -401,6 +405,674 @@ pub fn port_forward_command(
 /// The `/api/` base URL the worker posts its placeholder edits to.
 fn advertised_url(host: &str, port: u16) -> String {
     format!("http://{host}:{port}/api/")
+}
+
+/// Temporary worker widening for the no-Slack cluster-message stub (#1812).
+///
+/// The worker intentionally refuses per-turn Slack endpoints whose origin was
+/// not operator-trusted (ADR-0096). A default chart install has no extra trusted
+/// origins, so the CLI must trust the host it advertises before enqueueing. The
+/// guard restores the exact prior environment state on every unwinding return;
+/// callers that use the module's non-unwinding exit helper restore it
+/// asynchronously first and then move the guard into that helper as a fallback.
+const TRUST_ENV: &str = "CURIE_SLACK_TRUSTED_ORIGINS";
+const TRUST_HOLDER_ANNOTATION: &str = "curie.dev/cluster-message-trust-holder";
+const TRUST_HOLDER_JSON_PATH: &str =
+    "/metadata/annotations/curie.dev~1cluster-message-trust-holder";
+
+#[derive(Clone)]
+enum TrustMutationMode {
+    /// Real Kubernetes objects always expose a resourceVersion. The holder
+    /// annotation and env mutation are one JSON Patch guarded by that version.
+    Cas { holder: String, temporary: String },
+    /// Test doubles that are not Kubernetes objects may omit resourceVersion.
+    /// Keep the legacy command shape for those fixtures only.
+    Legacy,
+}
+
+#[derive(Clone)]
+struct TrustCleanupSpec {
+    namespace: String,
+    deployment: String,
+    origin: String,
+    original: Option<String>,
+    mode: TrustMutationMode,
+}
+
+struct ClusterStubTrust {
+    cleanup: TrustCleanupSpec,
+    armed: bool,
+}
+
+#[derive(Clone)]
+struct WorkerTrustView {
+    resource_version: Option<String>,
+    annotations_present: bool,
+    holder: Option<String>,
+    worker_index: usize,
+    env_present: bool,
+    env: Vec<serde_json::Value>,
+    trust: Option<String>,
+}
+
+#[cfg(unix)]
+static CLUSTER_TRUST_SIGNAL_STATE: std::sync::LazyLock<std::sync::Mutex<Option<TrustCleanupSpec>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+#[cfg(unix)]
+static CLUSTER_TRUST_SIGNAL_HANDLER: std::sync::OnceLock<std::result::Result<(), String>> =
+    std::sync::OnceLock::new();
+
+/// Probe the connected transport without collapsing a kubectl/RBAC failure into
+/// "dispatcher absent". Trust may only be widened after absence is positively
+/// observed; an indeterminate probe therefore refuses before any mutation.
+async fn dispatcher_connected_strict(namespace: &str, release: &str) -> Result<bool> {
+    let command = OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("-n"),
+            plain(namespace),
+            plain("get"),
+            plain("deployment"),
+            plain(format!("{release}-dispatcher")),
+            plain("--ignore-not-found"),
+            plain("-o"),
+            plain("name"),
+        ],
+    );
+    let (ok, out, err) = run_capture(&command).await?;
+    if !ok {
+        bail!(
+            "could not prove that Slack is disconnected for release {release} in namespace \
+             {namespace}; refusing to widen worker Slack trust: {}",
+            err.trim().lines().next().unwrap_or("kubectl probe failed")
+        );
+    }
+    Ok(!out.trim().is_empty())
+}
+
+impl ClusterStubTrust {
+    async fn install(namespace: &str, release: &str, advertise_host: &str) -> Result<Self> {
+        let deployment = format!("{release}-worker");
+        let view = read_worker_trust(namespace, &deployment).await?;
+        let host = if advertise_host.contains(':') && !advertise_host.starts_with('[') {
+            format!("[{advertise_host}]")
+        } else {
+            advertise_host.to_string()
+        };
+        let origin = format!("http://{host}");
+        if let Some(holder) = view.holder.as_deref() {
+            bail!(
+                "another cluster message command ({holder}) is temporarily managing worker Slack \
+                 trust for release {release}; retry after it exits"
+            );
+        }
+        if view
+            .trust
+            .as_deref()
+            .is_some_and(|value| value.split(',').any(|entry| entry.trim() == origin))
+        {
+            return Ok(Self {
+                cleanup: TrustCleanupSpec {
+                    namespace: namespace.to_string(),
+                    deployment,
+                    origin,
+                    original: view.trust,
+                    mode: TrustMutationMode::Legacy,
+                },
+                armed: false,
+            });
+        }
+        let original = view.trust.clone();
+        let temporary = match original.as_deref().filter(|value| !value.is_empty()) {
+            Some(value) => format!("{value},{origin}"),
+            None => origin.clone(),
+        };
+        let (mode, apply) = match view.resource_version.as_deref() {
+            Some(_) => {
+                let holder = uuid::Uuid::new_v4().to_string();
+                let patch = trust_patch(&view, Some(&temporary), Some(&holder), false)?;
+                (
+                    TrustMutationMode::Cas {
+                        holder,
+                        temporary: temporary.clone(),
+                    },
+                    worker_patch_command(namespace, &deployment, patch),
+                )
+            }
+            None => (
+                TrustMutationMode::Legacy,
+                worker_set_env_command(namespace, &deployment, Some(&temporary)),
+            ),
+        };
+        let cleanup = TrustCleanupSpec {
+            namespace: namespace.to_string(),
+            deployment,
+            origin: origin.clone(),
+            original,
+            mode,
+        };
+        register_cluster_trust_signal_cleanup(cleanup.clone())?;
+        // Arm before invoking kubectl: even an unusual nonzero result after the
+        // API accepted the mutation must run restoration.
+        let guard = Self {
+            cleanup,
+            armed: true,
+        };
+        let (ok, _, err) = run_capture(&apply).await?;
+        if !ok {
+            bail!(
+                "temporarily trusting cluster-message stub origin {origin}: {}",
+                err.trim()
+            );
+        }
+
+        let rollout = guard.rollout_command();
+        let (ok, _, err) = run_capture(&rollout).await?;
+        if !ok {
+            bail!(
+                "waiting for the worker to trust cluster-message stub origin {origin}: {}",
+                err.trim()
+            );
+        }
+        // rollout status returns once the new replica is Ready. The outgoing
+        // pod can still be Terminating and still blocked in XREADGROUP, which
+        // is how the first cluster message strands its own turn (#1532).
+        wait_for_worker_pods_to_release_claimers(namespace, release).await?;
+        Ok(guard)
+    }
+
+    async fn restore(&mut self) -> Result<()> {
+        if !self.armed {
+            return Ok(());
+        }
+        restore_cluster_trust(&self.cleanup).await?;
+        let (ok, _, err) = run_capture(&self.rollout_command()).await?;
+        if !ok {
+            bail!(
+                "waiting for the worker to restore its prior Slack trust: {}",
+                err.trim()
+            );
+        }
+        self.armed = false;
+        clear_cluster_trust_signal_cleanup(&self.cleanup);
+        Ok(())
+    }
+
+    fn rollout_command(&self) -> OpsCommand {
+        OpsCommand::new(
+            "kubectl",
+            vec![
+                plain("-n"),
+                plain(&self.cleanup.namespace),
+                plain("rollout"),
+                plain("status"),
+                plain(format!("deployment/{}", self.cleanup.deployment)),
+                plain("--timeout=120s"),
+            ],
+        )
+    }
+}
+
+const WORKER_POD_SETTLE_TIMEOUT: Duration = Duration::from_secs(120);
+const WORKER_POD_SETTLE_POLL: Duration = Duration::from_millis(500);
+
+fn worker_pods_command(namespace: &str, release: &str) -> OpsCommand {
+    OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("-n"),
+            plain(namespace),
+            plain("get"),
+            plain("pods"),
+            plain("-l"),
+            plain(format!(
+                "app.kubernetes.io/instance={release},app.kubernetes.io/component=worker"
+            )),
+            plain("-o"),
+            plain("json"),
+        ],
+    )
+}
+
+fn pod_is_ready(pod: &serde_json::Value) -> bool {
+    if pod
+        .pointer("/status/phase")
+        .and_then(serde_json::Value::as_str)
+        != Some("Running")
+    {
+        return false;
+    }
+    pod.pointer("/status/conditions")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|condition| {
+            condition.get("type").and_then(serde_json::Value::as_str) == Some("Ready")
+                && condition.get("status").and_then(serde_json::Value::as_str) == Some("True")
+        })
+}
+
+fn worker_pods_allow_enqueue(pods_json: &str) -> Result<bool> {
+    let value: serde_json::Value = serde_json::from_str(pods_json)
+        .context("parsing worker pods while waiting out a callback-trust rollout")?;
+    let items = value
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .context("worker pod list has no items array")?;
+    if items.is_empty() {
+        return Ok(false);
+    }
+    for pod in items {
+        if pod
+            .pointer("/metadata/deletionTimestamp")
+            .is_some_and(|stamp| !stamp.is_null())
+        {
+            return Ok(false);
+        }
+        if !pod_is_ready(pod) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+async fn wait_for_worker_pods_to_release_claimers(namespace: &str, release: &str) -> Result<()> {
+    let deadline = Instant::now() + WORKER_POD_SETTLE_TIMEOUT;
+    loop {
+        let (ok, out, err) = run_capture(&worker_pods_command(namespace, release)).await?;
+        if !ok {
+            bail!(
+                "listing worker pods for release {release} in namespace {namespace}: {}",
+                err.trim()
+            );
+        }
+        if worker_pods_allow_enqueue(&out)? {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "the previous worker pod for release {release} was still terminating after \
+                 {WORKER_POD_SETTLE_TIMEOUT:?}; retry cluster message once that pod is gone so \
+                 it cannot claim the turn"
+            );
+        }
+        tokio::time::sleep(WORKER_POD_SETTLE_POLL).await;
+    }
+}
+
+impl Drop for ClusterStubTrust {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if restore_cluster_trust_sync(&self.cleanup).is_err() {
+            crate::ui::ui().warn("could not restore the worker's prior Slack trust");
+            return;
+        }
+        let rollout = self.rollout_command();
+        let rollout = std::process::Command::new(&rollout.program)
+            .args(rollout.argv())
+            .output();
+        if !matches!(rollout, Ok(output) if output.status.success()) {
+            crate::ui::ui().warn("worker did not finish restoring its prior Slack trust posture");
+        }
+        clear_cluster_trust_signal_cleanup(&self.cleanup);
+    }
+}
+
+fn worker_trust_view(deployment_json: &str) -> Result<WorkerTrustView> {
+    let deployment: serde_json::Value = serde_json::from_str(deployment_json)
+        .context("parsing the worker Deployment while snapshotting Slack trust")?;
+    let containers = deployment
+        .pointer("/spec/template/spec/containers")
+        .and_then(serde_json::Value::as_array)
+        .context("worker Deployment has no pod containers")?;
+    let (worker_index, worker) = containers
+        .iter()
+        .enumerate()
+        .find(|(_, container)| {
+            container.get("name").and_then(serde_json::Value::as_str) == Some("worker")
+        })
+        .context("worker Deployment has no container named worker")?;
+    let env_present = worker.get("env").is_some();
+    let env = worker
+        .get("env")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let trust_entry = env
+        .iter()
+        .find(|entry| entry.get("name").and_then(serde_json::Value::as_str) == Some(TRUST_ENV));
+    let trust = match trust_entry {
+        Some(entry) => Some(
+            entry
+                .get("value")
+                .and_then(serde_json::Value::as_str)
+                .context("CURIE_SLACK_TRUSTED_ORIGINS is not a literal environment value")?
+                .to_string(),
+        ),
+        None => None,
+    };
+    let annotations = deployment.pointer("/metadata/annotations");
+    Ok(WorkerTrustView {
+        resource_version: deployment
+            .pointer("/metadata/resourceVersion")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        annotations_present: annotations.is_some_and(serde_json::Value::is_object),
+        holder: annotations
+            .and_then(|value| value.get(TRUST_HOLDER_ANNOTATION))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        worker_index,
+        env_present,
+        env,
+        trust,
+    })
+}
+
+fn worker_get_command(namespace: &str, deployment: &str) -> OpsCommand {
+    OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("-n"),
+            plain(namespace),
+            plain("get"),
+            plain("deployment"),
+            plain(deployment),
+            plain("-o"),
+            plain("json"),
+        ],
+    )
+}
+
+async fn read_worker_trust(namespace: &str, deployment: &str) -> Result<WorkerTrustView> {
+    let (ok, out, err) = run_capture(&worker_get_command(namespace, deployment)).await?;
+    if !ok {
+        bail!("reading worker Deployment {deployment}: {}", err.trim());
+    }
+    worker_trust_view(&out)
+}
+
+fn env_with_trust(view: &WorkerTrustView, target: Option<&str>) -> Vec<serde_json::Value> {
+    let mut env = view.env.clone();
+    let position = env
+        .iter()
+        .position(|entry| entry.get("name").and_then(serde_json::Value::as_str) == Some(TRUST_ENV));
+    match (position, target) {
+        (Some(index), Some(value)) => {
+            env[index] = serde_json::json!({"name": TRUST_ENV, "value": value});
+        }
+        (Some(index), None) => {
+            env.remove(index);
+        }
+        (None, Some(value)) => {
+            env.push(serde_json::json!({"name": TRUST_ENV, "value": value}));
+        }
+        (None, None) => {}
+    }
+    env
+}
+
+fn trust_patch(
+    view: &WorkerTrustView,
+    target: Option<&str>,
+    acquire_holder: Option<&str>,
+    release_holder: bool,
+) -> Result<String> {
+    let resource_version = view
+        .resource_version
+        .as_deref()
+        .context("worker Deployment omitted metadata.resourceVersion")?;
+    let mut operations = vec![serde_json::json!({
+        "op": "test",
+        "path": "/metadata/resourceVersion",
+        "value": resource_version,
+    })];
+    if let Some(holder) = acquire_holder {
+        if !view.annotations_present {
+            operations.push(serde_json::json!({
+                "op": "add",
+                "path": "/metadata/annotations",
+                "value": {},
+            }));
+        }
+        operations.push(serde_json::json!({
+            "op": "add",
+            "path": TRUST_HOLDER_JSON_PATH,
+            "value": holder,
+        }));
+    }
+    let env_path = format!("/spec/template/spec/containers/{}/env", view.worker_index);
+    operations.push(serde_json::json!({
+        "op": if view.env_present { "replace" } else { "add" },
+        "path": env_path,
+        "value": env_with_trust(view, target),
+    }));
+    if release_holder {
+        operations.push(serde_json::json!({
+            "op": "remove",
+            "path": TRUST_HOLDER_JSON_PATH,
+        }));
+    }
+    serde_json::to_string(&operations).context("serializing worker trust JSON Patch")
+}
+
+fn worker_patch_command(namespace: &str, deployment: &str, patch: String) -> OpsCommand {
+    OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("-n"),
+            plain(namespace),
+            plain("patch"),
+            plain("deployment"),
+            plain(deployment),
+            plain("--type=json"),
+            plain("-p"),
+            plain(patch),
+        ],
+    )
+}
+
+fn worker_set_env_command(namespace: &str, deployment: &str, target: Option<&str>) -> OpsCommand {
+    let assignment = target
+        .map(|value| format!("{TRUST_ENV}={value}"))
+        .unwrap_or_else(|| format!("{TRUST_ENV}-"));
+    OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("-n"),
+            plain(namespace),
+            plain("set"),
+            plain("env"),
+            plain(format!("deployment/{deployment}")),
+            plain(assignment),
+        ],
+    )
+}
+
+fn cleanup_target(current: Option<&str>, cleanup: &TrustCleanupSpec) -> Option<String> {
+    let TrustMutationMode::Cas { temporary, .. } = &cleanup.mode else {
+        return cleanup.original.clone();
+    };
+    if current == Some(temporary.as_str()) {
+        return cleanup.original.clone();
+    }
+    current.map(|value| {
+        value
+            .split(',')
+            .filter(|entry| entry.trim() != cleanup.origin)
+            .collect::<Vec<_>>()
+            .join(",")
+    })
+}
+
+async fn restore_cluster_trust(cleanup: &TrustCleanupSpec) -> Result<()> {
+    if matches!(&cleanup.mode, TrustMutationMode::Legacy) {
+        let (ok, _, err) = run_capture(&worker_set_env_command(
+            &cleanup.namespace,
+            &cleanup.deployment,
+            cleanup.original.as_deref(),
+        ))
+        .await?;
+        if !ok {
+            bail!("restoring worker Slack trust: {}", err.trim());
+        }
+        return Ok(());
+    }
+    let TrustMutationMode::Cas { holder, .. } = &cleanup.mode else {
+        unreachable!()
+    };
+    for _ in 0..5 {
+        let view = read_worker_trust(&cleanup.namespace, &cleanup.deployment).await?;
+        if view.holder.as_deref() != Some(holder) {
+            if view.holder.is_none()
+                && !view.trust.as_deref().is_some_and(|value| {
+                    value
+                        .split(',')
+                        .any(|entry| entry.trim() == cleanup.origin.as_str())
+                })
+            {
+                return Ok(());
+            }
+            bail!("temporary worker trust ownership changed; refusing a stale restoration");
+        }
+        let target = cleanup_target(view.trust.as_deref(), cleanup);
+        let patch = trust_patch(&view, target.as_deref(), None, true)?;
+        let (ok, _, err) = run_capture(&worker_patch_command(
+            &cleanup.namespace,
+            &cleanup.deployment,
+            patch,
+        ))
+        .await?;
+        if ok {
+            return Ok(());
+        }
+        let lower = err.to_lowercase();
+        if !(lower.contains("conflict")
+            || lower.contains("test failed")
+            || lower.contains("object has been modified"))
+        {
+            bail!("restoring worker Slack trust: {}", err.trim());
+        }
+    }
+    bail!("worker Deployment kept changing while restoring temporary Slack trust")
+}
+
+fn run_sync_capture(command: &OpsCommand) -> Result<(bool, String, String)> {
+    let output = std::process::Command::new(&command.program)
+        .args(command.argv())
+        .output()
+        .with_context(|| format!("invoking {} during signal cleanup", command.program))?;
+    Ok((
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    ))
+}
+
+fn restore_cluster_trust_sync(cleanup: &TrustCleanupSpec) -> Result<()> {
+    if matches!(&cleanup.mode, TrustMutationMode::Legacy) {
+        let (ok, _, err) = run_sync_capture(&worker_set_env_command(
+            &cleanup.namespace,
+            &cleanup.deployment,
+            cleanup.original.as_deref(),
+        ))?;
+        if !ok {
+            bail!("restoring worker Slack trust: {}", err.trim());
+        }
+        return Ok(());
+    }
+    let TrustMutationMode::Cas { holder, .. } = &cleanup.mode else {
+        unreachable!()
+    };
+    for _ in 0..5 {
+        let (ok, out, err) =
+            run_sync_capture(&worker_get_command(&cleanup.namespace, &cleanup.deployment))?;
+        if !ok {
+            bail!("reading worker during signal cleanup: {}", err.trim());
+        }
+        let view = worker_trust_view(&out)?;
+        if view.holder.as_deref() != Some(holder) {
+            return Ok(());
+        }
+        let target = cleanup_target(view.trust.as_deref(), cleanup);
+        let patch = trust_patch(&view, target.as_deref(), None, true)?;
+        let (ok, _, err) = run_sync_capture(&worker_patch_command(
+            &cleanup.namespace,
+            &cleanup.deployment,
+            patch,
+        ))?;
+        if ok {
+            return Ok(());
+        }
+        let lower = err.to_lowercase();
+        if !(lower.contains("conflict")
+            || lower.contains("test failed")
+            || lower.contains("object has been modified"))
+        {
+            bail!("restoring worker Slack trust: {}", err.trim());
+        }
+    }
+    bail!("worker Deployment kept changing during signal cleanup")
+}
+
+#[cfg(unix)]
+fn register_cluster_trust_signal_cleanup(cleanup: TrustCleanupSpec) -> Result<()> {
+    match CLUSTER_TRUST_SIGNAL_HANDLER.get_or_init(|| {
+        let mut signals = signal_hook::iterator::Signals::new([
+            signal_hook::consts::signal::SIGINT,
+            signal_hook::consts::signal::SIGTERM,
+        ])
+        .map_err(|error| error.to_string())?;
+        std::thread::Builder::new()
+            .name("curie-cluster-trust-cleanup".to_string())
+            .spawn(move || {
+                if let Some(signal) = signals.forever().next() {
+                    let cleanup = CLUSTER_TRUST_SIGNAL_STATE
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone();
+                    if let Some(cleanup) = cleanup {
+                        let _ = restore_cluster_trust_sync(&cleanup);
+                    }
+                    let _ = signal_hook::low_level::emulate_default_handler(signal);
+                    signal_hook::low_level::exit(128 + signal);
+                }
+            })
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }) {
+        Ok(()) => {
+            *CLUSTER_TRUST_SIGNAL_STATE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(cleanup);
+            Ok(())
+        }
+        Err(error) => bail!("installing cluster trust signal cleanup: {error}"),
+    }
+}
+
+#[cfg(not(unix))]
+fn register_cluster_trust_signal_cleanup(_cleanup: TrustCleanupSpec) -> Result<()> {
+    Ok(())
+}
+
+fn clear_cluster_trust_signal_cleanup(cleanup: &TrustCleanupSpec) {
+    #[cfg(unix)]
+    {
+        let mut current = CLUSTER_TRUST_SIGNAL_STATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if current.as_ref().is_some_and(|registered| {
+            registered.deployment == cleanup.deployment && registered.namespace == cleanup.namespace
+        }) {
+            *current = None;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = cleanup;
 }
 
 /// Local mode: the Valkey URL the CLI enqueues onto -- the compose Valkey on its
@@ -836,37 +1508,111 @@ fn detect_local_ip(host: &str, port: u16) -> Option<std::net::IpAddr> {
 }
 
 /// Spawn a `kubectl port-forward` child (killed on drop via `kill_on_drop`) and
-/// block until its local port accepts TCP, so callers can use it immediately.
+/// block until its effective local port accepts TCP, so callers can use it
+/// immediately. The returned port is the requested value unless kubectl assigns
+/// one for a zero request.
 pub async fn start_port_forward(
     cmd: &OpsCommand,
     local_port: u16,
     label: &str,
-) -> Result<tokio::process::Child> {
+) -> Result<(tokio::process::Child, u16)> {
     crate::ui::ui().plumbing(&format!("+ {}", cmd.display()));
     let mut child = tokio::process::Command::new(&cmd.program)
         .args(cmd.argv())
         .kill_on_drop(true)
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .with_context(|| format!("spawning `{}` (is kubectl on PATH?)", cmd.program))?;
-    wait_for_tcp(local_port, Duration::from_secs(15))
+    let stdout = child
+        .stdout
+        .take()
+        .context("kubectl port forward stdout was not captured")?;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let effective_port =
+        wait_for_port_forward_readiness(stdout, local_port, deadline, label).await?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    wait_for_tcp(effective_port, remaining)
         .await
-        .with_context(|| format!("the {label} port-forward never opened localhost:{local_port}"))?;
-    // The port accepting TCP is not proof WE bound it. If another process was
-    // already listening on localhost:{local_port}, kubectl could not bind, so it
-    // exited, and the socket that just answered is the squatter's -- a caller
-    // that then posts a discovered key would leak it to that process. If the
-    // child has already exited by the time TCP connects, it never held the port;
-    // refuse and name the conflict. A child still alive is the happy path (this
-    // stays race-tolerant: only a definitely-exited child trips the guard).
+        .with_context(|| {
+            format!("the {label} port-forward never opened localhost:{effective_port}")
+        })?;
+    // For a fixed request, the exact IPv4 readiness line proves that this child
+    // owned the socket before the TCP check. The TCP check then proves that the
+    // effective IPv4 address is reachable. A child can still exit after printing
+    // readiness, so the try_wait guard catches that exit before returning it.
     if child.try_wait()?.is_some() {
         bail!(
-            "the {label} port-forward exited immediately; localhost:{local_port} is already in \
+            "the {label} port-forward exited immediately; localhost:{effective_port} is already in \
              use by another process. Free that port or stop the conflicting process, then retry."
         );
     }
-    Ok(child)
+    Ok((child, effective_port))
+}
+
+fn parse_forwarded_port(line: &str) -> Result<Option<u16>> {
+    let Some(readiness) = line.strip_prefix("Forwarding from ") else {
+        return Ok(None);
+    };
+    let (source, _) = readiness
+        .split_once(" -> ")
+        .context("kubectl reported malformed forwarding readiness")?;
+    let port = source
+        .parse::<std::net::SocketAddr>()
+        .context("kubectl reported an invalid assigned local address")?
+        .port();
+    if port == 0 {
+        bail!("kubectl reported zero as its assigned local port");
+    }
+    Ok(Some(port))
+}
+
+async fn wait_for_port_forward_readiness(
+    stdout: tokio::process::ChildStdout,
+    local_port: u16,
+    deadline: Instant,
+    label: &str,
+) -> Result<u16> {
+    // Kubernetes documents `Forwarding from 127.0.0.1:<port> -> <remote>` at:
+    // https://kubernetes.io/docs/tasks/access-application-cluster/port-forward-access-application-cluster/
+    let readiness = if local_port == 0 {
+        "a kubectl forwarding readiness line".to_string()
+    } else {
+        format!("Forwarding from 127.0.0.1:{local_port} ->")
+    };
+    let mut lines = BufReader::new(stdout).lines();
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let effective_port = match tokio::time::timeout(remaining, async {
+        loop {
+            let line = lines
+                .next_line()
+                .await
+                .context("reading kubectl forwarding readiness")?
+                .with_context(|| {
+                    format!(
+                        "the {label} port forward did not open 127.0.0.1:{local_port}; \
+                         kubectl closed stdout before reporting {readiness}. The port may already be in use."
+                    )
+                })?;
+            if let Some(port) = parse_forwarded_port(&line)? {
+                if local_port == 0 || (port == local_port && line.starts_with(&readiness)) {
+                    return Ok::<u16, anyhow::Error>(port);
+                }
+            }
+        }
+    })
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => bail!(
+            "the {label} port forward did not open 127.0.0.1:{local_port} within 15 seconds; \
+             kubectl never reported {readiness}."
+        ),
+    };
+    std::mem::drop(tokio::spawn(async move {
+        while let Ok(Some(_)) = lines.next_line().await {}
+    }));
+    Ok(effective_port)
 }
 
 /// Poll-connect to `localhost:port` until it accepts or the timeout elapses.
@@ -918,13 +1664,493 @@ async fn bounded_diagnostics(
         })
 }
 
+const COMPOSE_CONFIG_FILES_LABEL: &str = "com.docker.compose.project.config_files";
+const COMPOSE_DISPATCHER_SERVICE: &str = "curie-dispatcher";
+const DISPATCHER_ENQUEUE_MODULE: &str = "curie_dispatcher.enqueue_once";
+const DISPATCHER_ENQUEUE_TIMEOUT: Duration = Duration::from_secs(30);
+const OTEL_EXPORTER_ENV_KEYS: [&str; 38] = [
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_PROTOCOL",
+    "OTEL_EXPORTER_OTLP_HEADERS",
+    "OTEL_EXPORTER_OTLP_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_CLIENT_KEY",
+    "OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_INSECURE",
+    "OTEL_EXPORTER_OTLP_COMPRESSION",
+    "OTEL_EXPORTER_OTLP_TIMEOUT",
+    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
+    "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+    "OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_TRACES_CLIENT_KEY",
+    "OTEL_EXPORTER_OTLP_TRACES_CLIENT_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_TRACES_INSECURE",
+    "OTEL_EXPORTER_OTLP_TRACES_COMPRESSION",
+    "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT",
+    "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL",
+    "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
+    "OTEL_EXPORTER_OTLP_LOGS_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_LOGS_CLIENT_KEY",
+    "OTEL_EXPORTER_OTLP_LOGS_CLIENT_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_LOGS_INSECURE",
+    "OTEL_EXPORTER_OTLP_LOGS_COMPRESSION",
+    "OTEL_EXPORTER_OTLP_LOGS_TIMEOUT",
+    "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL",
+    "OTEL_EXPORTER_OTLP_METRICS_HEADERS",
+    "OTEL_EXPORTER_OTLP_METRICS_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_METRICS_CLIENT_KEY",
+    "OTEL_EXPORTER_OTLP_METRICS_CLIENT_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_METRICS_INSECURE",
+    "OTEL_EXPORTER_OTLP_METRICS_COMPRESSION",
+    "OTEL_EXPORTER_OTLP_METRICS_TIMEOUT",
+    "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE",
+    "OTEL_EXPORTER_OTLP_METRICS_DEFAULT_HISTOGRAM_AGGREGATION",
+];
+static DISPATCHER_ENQUEUE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Parse Compose's canonical config-file label. Compose stores multiple `-f`
+/// inputs as a comma-separated list; an ordinary Curie stack carries one.
+fn compose_config_files(label: &str) -> Result<Vec<String>> {
+    let files: Vec<String> = label
+        .trim()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != "<no value>" && *value != "<nil>")
+        .map(str::to_string)
+        .collect();
+    if files.is_empty() {
+        bail!(
+            "the running local worker has no `{COMPOSE_CONFIG_FILES_LABEL}` label; restart it with `curie local up`"
+        );
+    }
+    Ok(files)
+}
+
+/// The tag in an image reference, or None when it carries none.
+///
+/// Not a naive rsplit on ':'. A digest pin (`repo@sha256:...`) and a registry
+/// host with a port (`localhost:5000/repo`) both contain a colon that is not a
+/// tag separator, and reading either as one would pin the one-shot producer to
+/// a tag that does not exist.
+fn image_tag(image: &str) -> Option<&str> {
+    let last_segment = image.rsplit('/').next().unwrap_or(image);
+    if last_segment.contains('@') {
+        return None;
+    }
+    last_segment.split_once(':').map(|(_, tag)| tag)
+}
+
+/// `docker ps` for the running API container, by compose service label.
+///
+/// The API, deliberately, not the worker. The worker is `build:` in
+/// `compose.dev.yaml` (an overlay over the published base), so its
+/// `.Config.Image` is the compose-built `curie-curie-worker` with no tag at all
+/// -- reading a tag there yields nothing useful, and reading `latest` off it
+/// would pin the producer to the very image the override exists to avoid. The
+/// API container's image IS `ghcr.io/curie-eng/curie-api:${CURIE_BASE_TAG}`, so
+/// it carries the answer directly.
+fn api_ps_command() -> OpsCommand {
+    OpsCommand::new(
+        "docker",
+        vec![
+            plain("ps"),
+            plain("--filter"),
+            plain("label=com.docker.compose.service=curie-api"),
+            plain("--format"),
+            plain("{{.Names}}"),
+        ],
+    )
+}
+
+/// `docker inspect --format {{.Config.Image}} <container>`: the image reference
+/// the running container was created from.
+fn container_image_command(container: &str) -> OpsCommand {
+    OpsCommand::new(
+        "docker",
+        vec![
+            plain("inspect"),
+            plain("--format"),
+            plain("{{ .Config.Image }}"),
+            plain(container),
+        ],
+    )
+}
+
+/// `docker image inspect <ref>` -- succeeds only if the image is present.
+fn image_present_command(image: &str) -> OpsCommand {
+    OpsCommand::new(
+        "docker",
+        vec![
+            plain("image"),
+            plain("inspect"),
+            plain("--format"),
+            plain("{{ .Id }}"),
+            plain(image),
+        ],
+    )
+}
+
+/// The dispatcher image the one-shot producer should run, or None to leave
+/// compose's default alone.
+///
+/// Derived from the RUNNING api container's tag, then checked for existence, and
+/// both halves are load-bearing:
+///
+/// - Derived, because the tag is a property of the stack rather than of this
+///   invocation. Compose substitutes its variables from each caller's own
+///   environment, so after `local up --build` the stack ran `:dev` while this
+///   verb resolved `:latest` and died on `No module named
+///   curie_dispatcher.enqueue_once`.
+/// - Checked, because a tag that exists for the platform images need not exist
+///   for the dispatcher. CI runs the ladder with `CURIE_BASE_TAG=ci-local` and
+///   builds its dispatcher as `:latest`, so pointing this at `:ci-local` asked
+///   for an image nothing had built and failed the stack.
+///
+/// Best-effort throughout: any unreadable step leaves compose's default in
+/// force, which is the behaviour that existed before #1915.
+async fn one_shot_dispatcher_image() -> Option<String> {
+    let (ok, stdout, _) = run_capture(&api_ps_command()).await.ok()?;
+    if !ok {
+        return None;
+    }
+    let container = stdout.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let (ok, image, _) = run_capture(&container_image_command(container))
+        .await
+        .ok()?;
+    if !ok {
+        return None;
+    }
+    let tag = image_tag(image.trim())?;
+    let candidate = format!("ghcr.io/curie-eng/curie-dispatcher:{tag}");
+    let (present, _, _) = run_capture(&image_present_command(&candidate)).await.ok()?;
+    present.then_some(candidate)
+}
+
+fn worker_compose_config_command(container: &str) -> OpsCommand {
+    OpsCommand::new(
+        "docker",
+        vec![
+            plain("inspect"),
+            plain("--format"),
+            plain(format!(
+                "{{{{ index .Config.Labels \"{COMPOSE_CONFIG_FILES_LABEL}\" }}}}"
+            )),
+            plain(container),
+        ],
+    )
+}
+
+fn worker_otel_exporter_env_command(container: &str) -> OpsCommand {
+    // Filter before captured stdout crosses the worker process boundary. Each
+    // selected entry is encoded as one JSON string so the first `=` and
+    // everything after it survive intact.
+    let mut template = concat!(
+        "{{range .Config.Env}}",
+        "{{$entry := .}}",
+        "{{$name := index (split $entry \"=\") 0}}",
+        "{{if or "
+    )
+    .to_string();
+    for name in OTEL_EXPORTER_ENV_KEYS {
+        template.push_str(&format!("(eq $name \"{name}\") "));
+    }
+    template.push_str("}}{{json $entry}}{{println}}{{end}}{{end}}");
+    OpsCommand::new(
+        "docker",
+        vec![
+            plain("inspect"),
+            plain("--format"),
+            plain(template),
+            plain(container),
+        ],
+    )
+}
+
+fn parse_worker_otel_env(stdout: &str) -> Result<Vec<(String, String)>> {
+    let mut selected = Vec::new();
+    for (index, line) in stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .enumerate()
+    {
+        let line = line.trim();
+        let entry = if line.starts_with('"') {
+            serde_json::from_str::<String>(line).with_context(|| {
+                format!(
+                    "parsing the local worker's telemetry environment entry {}",
+                    index + 1
+                )
+            })?
+        } else {
+            // Some already-filtered callers and test doubles return one plain
+            // Docker environment entry per line. Production inspection emits
+            // JSON strings, but retaining this narrow seam is harmless because
+            // the exact allowlist below still gates every accepted name.
+            line.to_string()
+        };
+        let Some((name, value)) = entry.split_once('=') else {
+            continue;
+        };
+        // Keep the same allowlist here as defense in depth if the Docker
+        // formatting boundary ever changes independently.
+        if OTEL_EXPORTER_ENV_KEYS.contains(&name) {
+            selected.push((name.to_string(), value.to_string()));
+        }
+    }
+    Ok(selected)
+}
+
+struct LocalDispatcherContext {
+    compose_files: Vec<String>,
+    /// The dispatcher image the running stack would use, when it can be
+    /// determined and is actually present.
+    dispatcher_image: Option<String>,
+    otel_env: Vec<(String, String)>,
+}
+
+async fn local_dispatcher_context() -> Result<LocalDispatcherContext> {
+    let container = local_worker_container().await?;
+    let cmd = worker_compose_config_command(&container);
+    let (ok, stdout, stderr) = run_capture(&cmd).await?;
+    if !ok {
+        bail!(
+            "reading the local stack's Compose configuration: {}",
+            stderr.trim()
+        );
+    }
+    let compose_files = compose_config_files(&stdout)?;
+
+    let telemetry_cmd = worker_otel_exporter_env_command(&container);
+    let (ok, telemetry_stdout, telemetry_stderr) = run_capture(&telemetry_cmd).await?;
+    if !ok {
+        bail!(
+            "reading the local worker's telemetry configuration: {}",
+            telemetry_stderr.trim()
+        );
+    }
+    let otel_env = parse_worker_otel_env(&telemetry_stdout)?;
+
+    // #1915: the stack's own image tag, so the one-shot producer below runs what
+    // the stack runs. Best-effort: an unreadable image is not worth failing an
+    // enqueue over, and compose's default then applies exactly as before.
+    let dispatcher_image = one_shot_dispatcher_image().await;
+
+    Ok(LocalDispatcherContext {
+        compose_files,
+        otel_env,
+        dispatcher_image,
+    })
+}
+
+/// Build the bounded one-shot dispatcher producer. Secrets ride named process
+/// environment entries, never argv; Slack variables are explicitly cleared so
+/// this process cannot acquire or use a workspace credential.
+fn dispatcher_enqueue_command(
+    compose_files: &[String],
+    container_name: &str,
+    stream: &str,
+    valkey_password: &str,
+    otel_env: &[(String, String)],
+    dispatcher_image: Option<&str>,
+) -> OpsCommand {
+    // The dispatcher service lives in the slack profile but depends on core
+    // services (notably the API and Valkey). Compose resolves that dependency
+    // graph before the one-shot Python producer starts.
+    let mut args = vec![
+        plain("compose"),
+        plain("--profile"),
+        plain("core"),
+        plain("--profile"),
+        plain("slack"),
+    ];
+    for file in compose_files {
+        args.extend([plain("-f"), plain(file)]);
+    }
+    args.extend([
+        plain("run"),
+        plain("--rm"),
+        plain("--name"),
+        plain(container_name),
+        plain("--no-deps"),
+        plain("-T"),
+        plain("-e"),
+        plain("VALKEY_PASSWORD"),
+        plain("-e"),
+        plain("CURIE_STREAM"),
+        plain("-e"),
+        plain("SLACK_APP_TOKEN="),
+        plain("-e"),
+        plain("SLACK_BOT_TOKEN="),
+        plain("-e"),
+        plain("SLACK_SIGNING_SECRET="),
+    ]);
+    for (name, _) in otel_env {
+        if OTEL_EXPORTER_ENV_KEYS.contains(&name.as_str()) {
+            args.extend([plain("-e"), plain(name)]);
+        }
+    }
+    args.extend([
+        plain(COMPOSE_DISPATCHER_SERVICE),
+        plain("python"),
+        plain("-m"),
+        plain(DISPATCHER_ENQUEUE_MODULE),
+    ]);
+    let mut secret_env = vec![("VALKEY_PASSWORD".to_string(), valkey_password.to_string())];
+    secret_env.extend(
+        otel_env
+            .iter()
+            .filter(|(name, _)| OTEL_EXPORTER_ENV_KEYS.contains(&name.as_str()))
+            .cloned(),
+    );
+    let mut env = vec![
+        (
+            "COMPOSE_PROJECT_NAME".to_string(),
+            crate::local::COMPOSE_PROJECT.to_string(),
+        ),
+        ("CURIE_STREAM".to_string(), stream.to_string()),
+    ];
+    // Only when the running stack has one. Passing nothing leaves compose's
+    // `${CURIE_BASE_TAG:-latest}` default in force, so a published stack behaves
+    // exactly as it did.
+    if let Some(image) = dispatcher_image {
+        env.push(("CURIE_DISPATCHER_IMAGE".to_string(), image.to_string()));
+    }
+    OpsCommand::new("docker", args)
+        .with_env(env)
+        .with_secret_env(secret_env)
+}
+
+fn redact_dispatcher_diagnostic(stderr: &str, sensitive_values: &[&str]) -> String {
+    let clean = sensitive_values
+        .iter()
+        .filter(|value| !value.is_empty())
+        .fold(stderr.to_string(), |text, value| {
+            text.replace(value, "[REDACTED]")
+        });
+    let clean = clean.trim();
+    if clean.is_empty() {
+        "one-shot dispatcher exited without a diagnostic".to_string()
+    } else {
+        clean.chars().take(4096).collect()
+    }
+}
+
+fn parse_dispatcher_stream_id(stdout: &str) -> Result<String> {
+    let mut lines = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let stream_id = lines
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("one-shot dispatcher returned no Stream id"))?;
+    let valid = stream_id.split_once('-').is_some_and(|(ms, sequence)| {
+        !ms.is_empty()
+            && !sequence.is_empty()
+            && ms.bytes().all(|byte| byte.is_ascii_digit())
+            && sequence.bytes().all(|byte| byte.is_ascii_digit())
+    });
+    if !valid || lines.next().is_some() {
+        bail!("one-shot dispatcher returned malformed stdout instead of one Stream id");
+    }
+    Ok(stream_id.to_string())
+}
+
+/// Enqueue a local synthetic turn through code running in the dispatcher image.
+/// The CLI retains its open Valkey connection only for completion observation;
+/// the producer write itself happens inside this bounded child process.
+async fn dispatcher_enqueue_local(opts: &MessageOpts, turn: &QueuedTurn) -> Result<String> {
+    let context = local_dispatcher_context().await?;
+    let sequence = DISPATCHER_ENQUEUE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let container_name = format!("curie-dispatcher-enqueue-{}-{sequence}", std::process::id());
+    let cmd = dispatcher_enqueue_command(
+        &context.compose_files,
+        &container_name,
+        &opts.stream,
+        &opts.valkey_password,
+        &context.otel_env,
+        context.dispatcher_image.as_deref(),
+    );
+    crate::ui::ui().plumbing(&format!("+ {}", cmd.display()));
+    let payload = queue::payload_json(turn)?;
+
+    let mut child = tokio::process::Command::new(&cmd.program)
+        .args(cmd.argv())
+        .envs(cmd.env.iter().chain(cmd.secret_env.iter()).cloned())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .context("starting the one-shot local dispatcher producer")?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("one-shot dispatcher stdin was unavailable"))?;
+    let child_run = async move {
+        stdin
+            .write_all(payload.as_bytes())
+            .await
+            .context("sending the queued turn to the one-shot dispatcher")?;
+        drop(stdin);
+        child
+            .wait_with_output()
+            .await
+            .context("waiting for the one-shot dispatcher producer")
+    };
+    let output = match tokio::time::timeout(DISPATCHER_ENQUEUE_TIMEOUT, child_run).await {
+        Ok(result) => result?,
+        Err(_) => {
+            // Dropping child_run kills the Docker CLI. Remove the explicitly
+            // named Compose container too: otherwise a blocked Valkey connect
+            // can outlive the CLI with its secret environment still attached.
+            let _ = crate::docker::remove_container(&container_name).await;
+            bail!(
+                "one-shot dispatcher did not finish within {}s",
+                DISPATCHER_ENQUEUE_TIMEOUT.as_secs()
+            );
+        }
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut sensitive_values = vec![opts.valkey_password.as_str()];
+    sensitive_values.extend(context.otel_env.iter().map(|(_, value)| value.as_str()));
+    if !stderr.trim().is_empty() {
+        let sanitized = redact_dispatcher_diagnostic(&stderr, &sensitive_values);
+        for line in sanitized.lines() {
+            crate::ui::ui().plumbing(line);
+        }
+    }
+    if !output.status.success() {
+        let diagnostic = redact_dispatcher_diagnostic(&stderr, &sensitive_values);
+        bail!("one-shot dispatcher failed: {diagnostic}");
+    }
+    parse_dispatcher_stream_id(&stdout)
+}
+
+async fn enqueue_for_turn_verb(
+    opts: &MessageOpts,
+    conn: &mut MultiplexedConnection,
+    verb: TurnVerb,
+    turn: &QueuedTurn,
+) -> Result<String> {
+    match verb {
+        TurnVerb::Local => dispatcher_enqueue_local(opts, turn).await,
+        // Deliberately retain the direct lane as the missing-carrier
+        // compatibility control required by #1817.
+        TurnVerb::Cluster => xadd(conn, &opts.stream, turn).await,
+    }
+}
+
 /// The `curie local message` handler: drive the compose stack directly.
 ///
 /// The cluster path's self-plumbing (kubectl port-forwards) is cluster-specific,
-/// so local mode keeps only the shared engine: bind the Slack stub, enqueue the
-/// `QueuedTurn` carrying this stub as its reply endpoint (issue #19), and wait on
-/// the XACK signal. The compose worker reaches the stub on the fixed loopback
-/// port `http://localhost:{DEFAULT_LOCAL_STUB_PORT}/api/`.
+/// so local mode keeps only the shared engine: bind the Slack stub, send the
+/// `QueuedTurn` through the compose dispatcher's bounded producer, and wait on
+/// the XACK signal. The turn still carries this stub as its reply endpoint
+/// (issue #19). The compose worker reaches the stub on the fixed loopback port
+/// `http://localhost:{DEFAULT_LOCAL_STUB_PORT}/api/`.
 async fn message_local(opts: MessageOpts) -> Result<()> {
     let ui = crate::ui::ui();
     let valkey_url = local_valkey_url(&opts.valkey_password);
@@ -964,7 +2190,7 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
     // sentinel), post a real placeholder and enqueue against its ts with no
     // per-turn endpoint so the reply and any approval card ride that transport.
     // Resolving the channel first keeps the behavior identical to the stub path.
-    if let Some(bot_token) = local_connected_bot_token().await {
+    if let Some(transport) = local_connected_transport().await {
         let channel = match opts.channel.as_deref() {
             Some(channel) => channel.to_string(),
             None => {
@@ -983,7 +2209,7 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
             &mut conn,
             TurnVerb::Local,
             &channel,
-            &bot_token,
+            &transport,
         )
         .await;
     }
@@ -1040,7 +2266,7 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
         &placeholder_ts,
         Some(reply_endpoint),
     );
-    let stream_id = xadd(&mut conn, &opts.stream, &event).await?;
+    let stream_id = enqueue_for_turn_verb(&opts, &mut conn, TurnVerb::Local, &event).await?;
     ui.plumbing(&format!(
         "enqueued {} on {} as {stream_id}",
         event.event_id, opts.stream
@@ -1130,7 +2356,7 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
                         // listener is torn down before exit rather than leaked
                         // (#751).
                         ResumeExit::Transient => {
-                            exit_after_drop(crate::exit::ExitClass::Transient, stub);
+                            crate::exit::exit_after_drop(crate::exit::ExitClass::Transient, stub);
                         }
                     }
                 }
@@ -1150,7 +2376,7 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
                     persist_and_hint(&opts, TurnVerb::Local, &channel, &thread_ts);
                     // Drop the Slack stub first so its listener is not leaked past
                     // this non-unwinding exit (#751).
-                    exit_after_drop(crate::exit::ExitClass::Transient, stub);
+                    crate::exit::exit_after_drop(crate::exit::ExitClass::Transient, stub);
                 }
             }
         }
@@ -1255,28 +2481,6 @@ enum ResumeExit {
     /// is retryable: the caller drops its port-forward guards and exits with the
     /// transient class.
     Transient,
-}
-
-/// Exit the process with `class`, after dropping `guards` first.
-///
-/// `std::process::exit` does not unwind the stack, so any `Drop` impl still in
-/// scope at the call site -- the Slack stub's listener/server task
-/// ([`SlackStub`](crate::chat::SlackStub)), a `kubectl port-forward` child --
-/// would otherwise never run, leaking whatever it holds (#751: a timed-out
-/// `local message`/`cluster message` used to leak the stub's bound port this
-/// way, wedging every subsequent turn with "Address already in use").
-///
-/// Every exit site in this module that needs to tear down a guard before
-/// exiting routes through here instead of calling `std::process::exit`
-/// directly: `guards` is taken BY VALUE, so the compiler forces the caller to
-/// move ownership in (a `SlackStub`, a `tokio::process::Child`, or a tuple of
-/// several) rather than merely borrowing it, and this function drops it before
-/// the process actually exits. That makes the guard-then-exit ordering
-/// structural rather than something a future call site has to remember to do
-/// by hand.
-fn exit_after_drop<T>(class: crate::exit::ExitClass, guards: T) -> ! {
-    drop(guards);
-    std::process::exit(class.code());
 }
 
 /// Keep the reply stub alive after a turn parked awaiting approval and wait for
@@ -1497,8 +2701,15 @@ type WorkerTransport = (Option<String>, Option<String>);
 /// authoring bot `chat.update` a message, so two different tokens would leave the
 /// placeholder stuck at "..." with `cant_update_message` (#957 mode B).
 ///
+/// Returning the base ALONGSIDE the token is what closes #1030 at this tier. Both
+/// values were already read out of the same container here; only the token was
+/// kept, and the base was then re-read from the CLI's own process environment at
+/// post time. Carrying the pair means the placeholder goes exactly where the
+/// worker that will edit it is pointed, and a stale `SLACK_API_BASE_URL` in the
+/// operator's shell has nothing left to decide.
+///
 /// Pure, so both conditions are unit-testable without Docker.
-fn connected_worker_bot_token(transport: WorkerTransport) -> Option<String> {
+fn connected_worker_transport(transport: WorkerTransport) -> Option<crate::slack::SlackTransport> {
     let (api_base, token) = transport;
     let api_base = api_base.unwrap_or_default();
     // Wired to the stub (or to nothing resolvable) means not connected.
@@ -1506,7 +2717,8 @@ fn connected_worker_bot_token(transport: WorkerTransport) -> Option<String> {
         return None;
     }
     let token = token?.trim().to_string();
-    (!token.is_empty() && token != LOCAL_STUB_BOT_TOKEN).then_some(token)
+    (!token.is_empty() && token != LOCAL_STUB_BOT_TOKEN)
+        .then(|| crate::slack::SlackTransport::new(Some(api_base), token))
 }
 
 /// Read the running compose worker's Slack transport out of the container.
@@ -1534,9 +2746,9 @@ async fn running_worker_transport() -> WorkerTransport {
     (find("SLACK_API_BASE_URL="), find("SLACK_BOT_TOKEN="))
 }
 
-/// Process-level wrapper: the token to post with, or `None` for the stub path.
-async fn local_connected_bot_token() -> Option<String> {
-    connected_worker_bot_token(running_worker_transport().await)
+/// Process-level wrapper: the transport to post over, or `None` for the stub path.
+async fn local_connected_transport() -> Option<crate::slack::SlackTransport> {
+    connected_worker_transport(running_worker_transport().await)
 }
 
 /// The human dry-run line noting that a connected workspace changes the plan
@@ -1570,7 +2782,7 @@ pub async fn enqueue_over_connected_transport(
     conn: &mut MultiplexedConnection,
     verb: TurnVerb,
     channel: &str,
-    bot_token: &str,
+    transport: &crate::slack::SlackTransport,
 ) -> Result<()> {
     let ui = crate::ui::ui();
     // An empty `--thread` is normalized away at the [`message`] entry point, and
@@ -1581,7 +2793,7 @@ pub async fn enqueue_over_connected_transport(
     let explicit_thread = opts.thread.as_deref().filter(|ts| !ts.is_empty());
 
     let placeholder_ts =
-        crate::slack::post_placeholder(bot_token, channel, "\u{2026}", explicit_thread)
+        crate::slack::post_placeholder(transport, channel, "\u{2026}", explicit_thread)
             .await
             .with_context(|| {
                 let mut context =
@@ -1603,7 +2815,7 @@ pub async fn enqueue_over_connected_transport(
             })?;
 
     let event = connected_turn(channel, opts, explicit_thread, &placeholder_ts);
-    let stream_id = xadd(conn, &opts.stream, &event).await?;
+    let stream_id = enqueue_for_turn_verb(opts, conn, verb, &event).await?;
     ui.plumbing(&format!(
         "enqueued {} on {} as {stream_id}",
         event.event_id, opts.stream
@@ -1659,7 +2871,7 @@ async fn resolve_cluster_channel(opts: &MessageOpts) -> Result<(String, Option<S
     match opts.channel.as_deref() {
         Some(channel) => Ok((channel.to_string(), None)),
         None => {
-            let _api_pf = start_port_forward(
+            let (_api_pf, api_local_port) = start_port_forward(
                 &port_forward_command(
                     &opts.namespace,
                     &opts.release,
@@ -1671,10 +2883,7 @@ async fn resolve_cluster_channel(opts: &MessageOpts) -> Result<(String, Option<S
                 "api",
             )
             .await?;
-            let api = ApiClient::new(
-                &format!("http://localhost:{}", opts.api_local_port),
-                &opts.api_key,
-            )?;
+            let api = ApiClient::new(&format!("http://127.0.0.1:{api_local_port}"), &opts.api_key)?;
             let agents = api
                 .list_agents()
                 .await
@@ -1697,7 +2906,7 @@ async fn message_connected(opts: MessageOpts) -> Result<()> {
     let ui = crate::ui::ui();
 
     // Valkey port-forward for the enqueue (killed on drop at fn end).
-    let _valkey_pf = start_port_forward(
+    let (_valkey_pf, valkey_local_port) = start_port_forward(
         &port_forward_command(
             &opts.namespace,
             &opts.release,
@@ -1740,13 +2949,46 @@ async fn message_connected(opts: MessageOpts) -> Result<()> {
         }
         None => crate::ops::discover_slack_bot_token(&opts.namespace, &opts.release).await?,
     };
+    // The base comes from the same release as the token (#1030), never from the
+    // CLI's own environment. A `CURIE_SLACK_BOT_TOKEN` override changes only the
+    // identity, not the destination: an operator working around a stale Secret is
+    // still posting into this release's workspace, and letting the override drag
+    // the URL along would restore exactly the split this issue is about.
+    let transport = match crate::ops::discover_slack_api_base_url(&opts.namespace, &opts.release)
+        .await
+    {
+        crate::ops::SlackApiBase::Configured(base) => {
+            ui.note(&format!(
+                "posting over the release's configured Slack base {base}"
+            ));
+            crate::slack::SlackTransport::new(Some(base), bot_token)
+        }
+        crate::ops::SlackApiBase::RealSlack => crate::slack::SlackTransport::new(None, bot_token),
+        // Refusing here rather than defaulting is the whole point of the tri-state.
+        // "Could not look" is not evidence that the worker talks to real Slack, and
+        // acting as if it were would post a real placeholder somewhere the worker
+        // can never edit -- an orphaned ellipsis in a real channel, which is the
+        // #957 mode A failure arriving by a different road.
+        crate::ops::SlackApiBase::Unknown => {
+            anyhow::bail!(
+                "could not read the Slack API base from the worker Deployment for release \
+                 {} in namespace {}; refusing to guess where a real workspace token should be \
+                 sent. Check `kubectl -n {} get deployment -l \
+                 app.kubernetes.io/instance={},app.kubernetes.io/component=worker`.",
+                opts.release,
+                opts.namespace,
+                opts.namespace,
+                opts.release
+            );
+        }
+    };
 
     let valkey_url = format!(
-        "redis://:{}@localhost:{}",
-        opts.valkey_password, opts.valkey_local_port
+        "redis://:{}@127.0.0.1:{valkey_local_port}",
+        opts.valkey_password
     );
     let mut conn = connect(&valkey_url).await?;
-    enqueue_over_connected_transport(&opts, &mut conn, TurnVerb::Cluster, &channel, &bot_token)
+    enqueue_over_connected_transport(&opts, &mut conn, TurnVerb::Cluster, &channel, &transport)
         .await
 }
 
@@ -1786,7 +3028,7 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
     // against its ts with no per-turn endpoint, so the approval card and any
     // resumed reply ride the connected transport -- no throwaway stub. A kubectl
     // failure reads as NOT connected, so this falls through to the stub path.
-    if crate::ops::dispatcher_connected(&opts.namespace, &opts.release).await {
+    if dispatcher_connected_strict(&opts.namespace, &opts.release).await? {
         return message_connected(opts).await;
     }
 
@@ -1800,8 +3042,15 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
         "slack stub listening; the worker will post to {url}"
     ));
 
+    // Install the portless exact host origin before any enqueue plumbing. The
+    // connected-dispatcher branch returned above, so this never widens a
+    // Slack-connected release. The guard restores the default closed posture on
+    // every normal/error return and is moved into non-unwinding exits below.
+    let mut stub_trust =
+        ClusterStubTrust::install(&opts.namespace, &opts.release, &advertise_host).await?;
+
     // Valkey port-forward for the enqueue (killed on drop at fn end).
-    let _valkey_pf = start_port_forward(
+    let (_valkey_pf, valkey_local_port) = start_port_forward(
         &port_forward_command(
             &opts.namespace,
             &opts.release,
@@ -1825,8 +3074,8 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
     // to the stub without a worker-global `helm upgrade`; a real workspace on the
     // same worker keeps replying to real Slack.
     let valkey_url = format!(
-        "redis://:{}@localhost:{}",
-        opts.valkey_password, opts.valkey_local_port
+        "redis://:{}@127.0.0.1:{valkey_local_port}",
+        opts.valkey_password
     );
     let mut conn = connect(&valkey_url).await?;
     let (channel, thread_ts, placeholder_ts) =
@@ -1879,6 +3128,7 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
                 reply,
             });
             persist_and_hint(&opts, TurnVerb::Cluster, &channel, &thread_ts);
+            stub_trust.restore().await?;
             Ok(())
         }
         Outcome::CompletedNoEdit => {
@@ -1887,6 +3137,7 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
                 thread: thread_ts.clone(),
             });
             persist_and_hint(&opts, TurnVerb::Cluster, &channel, &thread_ts);
+            stub_trust.restore().await?;
             Ok(())
         }
         Outcome::AwaitingApproval(reply) => {
@@ -1924,7 +3175,10 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
                     )
                     .await
                     {
-                        ResumeExit::Done => Ok(()),
+                        ResumeExit::Done => {
+                            stub_trust.restore().await?;
+                            Ok(())
+                        }
                         ResumeExit::Transient => {
                             // Drop the Slack stub AND the Valkey port-forward first:
                             // `process::exit` does not unwind, so without dropping
@@ -1933,7 +3187,11 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
                             // run, leaking the stub's bound port (#751) and
                             // orphaning the `kubectl port-forward` child to init
                             // (#766).
-                            exit_after_drop(crate::exit::ExitClass::Transient, (stub, _valkey_pf));
+                            stub_trust.restore().await?;
+                            crate::exit::exit_after_drop(
+                                crate::exit::ExitClass::Transient,
+                                (stub, _valkey_pf, stub_trust),
+                            );
                         }
                     }
                 }
@@ -1952,7 +3210,11 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
                         channel: channel.clone(),
                     });
                     persist_and_hint(&opts, TurnVerb::Cluster, &channel, &thread_ts);
-                    exit_after_drop(crate::exit::ExitClass::Transient, (stub, _valkey_pf));
+                    stub_trust.restore().await?;
+                    crate::exit::exit_after_drop(
+                        crate::exit::ExitClass::Transient,
+                        (stub, _valkey_pf, stub_trust),
+                    );
                 }
             }
         }
@@ -1978,7 +3240,11 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
             // transient stall), so it maps to the transient exit code, not
             // failure. Drop the Valkey port-forward now, for the same
             // non-unwinding reason as the stub above (#766).
-            exit_after_drop(crate::exit::ExitClass::Transient, _valkey_pf);
+            stub_trust.restore().await?;
+            crate::exit::exit_after_drop(
+                crate::exit::ExitClass::Transient,
+                (_valkey_pf, stub_trust),
+            );
         }
     }
 }
@@ -2020,6 +3286,8 @@ pub struct EvalOpts {
     /// real parallel dispatch is worker-side and tracked in #709, so any value
     /// above 1 is refused up front rather than silently run sequentially.
     pub concurrency: usize,
+    /// Independent samples per case and the aggregation policy (#1907).
+    pub sampling: crate::eval_sampling::SampleConfig,
 }
 
 /// Resolve the requested eval concurrency to the only value the CLI eval loop
@@ -2201,9 +3469,16 @@ pub fn eval_dry_run_lines(opts: &EvalOpts, suite_name: &str, case_count: usize) 
     }
     lines.push(format!("concurrency: sequential ({})", opts.concurrency));
     lines.push(format!(
+        "sampling: {} sample(s), {}",
+        opts.sampling.n, opts.sampling.policy
+    ));
+    lines.push(format!(
         "enqueue one synthetic QueuedTurn per case on stream {}",
         opts.stream
     ));
+    lines.push(
+        "without ambient durable agent memory (eval: conversation prefix per case)".to_string(),
+    );
     lines
 }
 
@@ -2211,8 +3486,12 @@ pub fn eval_dry_run_lines(opts: &EvalOpts, suite_name: &str, case_count: usize) 
 /// wins, else `evals/cases.json` in the cwd, then the recorded bundle dir.
 fn resolve_eval(explicit: Option<PathBuf>) -> Result<LoadedEval> {
     let state_plugin_dir = crate::state::load(Path::new("."))?.map(|s| PathBuf::from(s.plugin_dir));
-    let path =
-        crate::commands::resolve_cases_path(explicit, Path::new("."), state_plugin_dir.as_deref())?;
+    let path = crate::commands::resolve_cases_path(
+        explicit,
+        Path::new("."),
+        None,
+        state_plugin_dir.as_deref(),
+    )?;
     crate::evals::load_eval(&path)
 }
 
@@ -2229,61 +3508,106 @@ async fn run_eval_turns(
     stub: &mut SlackStub,
 ) -> Result<crate::commands::EvalReport> {
     let ui = crate::ui::ui();
+    let sampling = opts.sampling;
     let total = suite.cases.len();
-    let bar = ui.progress_bar(total as u64, "running evals");
+    let bar = ui.progress_bar(
+        (total as u64).saturating_mul(u64::from(sampling.n)),
+        "running evals",
+    );
     let mut results: Vec<crate::commands::EvalRow> = Vec::with_capacity(total);
-    for case in &suite.cases {
-        // Each case is its own thread so turns never cross-talk on the stub.
-        let (channel_id, thread_ts, placeholder_ts) = resolve_targets(Some(channel), None);
-        let reply_endpoint = stub.base_api_url().to_string();
-        let event = synthetic_turn(
-            "slack",
-            &channel_id,
-            &opts.user,
-            &case.input,
-            &thread_ts,
-            &placeholder_ts,
-            Some(reply_endpoint),
-        );
-        let started = Instant::now();
-        let stream_id = xadd(conn, &opts.stream, &event).await?;
-        let mut observe_update = |_: &str| {};
-        let outcome = await_reply(
-            stub,
-            conn,
-            &opts.stream,
-            &stream_id,
-            &placeholder_ts,
-            Duration::from_secs(opts.timeout_secs),
-            &mut observe_update,
-        )
-        .await;
-        let elapsed = started.elapsed().as_secs_f64();
-        // Carry the reply text (#548) so a red case is diagnosable from --json /
-        // the human summary; a non-Replied outcome has no gradeable text.
-        let output = match &outcome {
-            Outcome::Replied(reply) => reply.clone(),
-            Outcome::AwaitingApproval(reply) => reply.clone().unwrap_or_default(),
-            Outcome::CompletedNoEdit => String::new(),
-            // A timed-out case surfaces the stream/consumer diagnostics the same
-            // way the non-eval message path does (#706), so the failure is not a
-            // silent empty string but the stream state that explains it.
-            Outcome::TimedOut => diagnostics(conn, &opts.stream, &stream_id).await,
-        };
-        results.push((
-            case.id.clone(),
-            if reply_passes(case, &outcome) {
-                crate::evals::CaseOutcome::Pass
-            } else {
-                crate::evals::CaseOutcome::Fail
-            },
-            elapsed,
-            output,
-        ));
-        bar.inc(1);
+    let mut sample_passes = std::collections::BTreeMap::new();
+    let mut details = std::collections::BTreeMap::new();
+    let mut eval_threads: Vec<String> = Vec::with_capacity(total * sampling.n as usize);
+    let run = async {
+        for case in &suite.cases {
+            let mut samples = Vec::with_capacity(sampling.n as usize);
+            for _ in 0..sampling.n {
+                // Each sample is its own thread so draws never inherit prior
+                // turns (#550). Prefix the conversation_id so the worker omits
+                // ambient agent memory from that sandbox (#1909): durable memory
+                // is per-agent and would otherwise load on a fresh thread.
+                // Thread reset (#1534) must use the same prefixed key the
+                // worker claimed.
+                let (channel_id, thread_ts, placeholder_ts) = resolve_targets(Some(channel), None);
+                let reply_endpoint = stub.base_api_url().to_string();
+                let event = eval_case_turn(
+                    "slack",
+                    &channel_id,
+                    &opts.user,
+                    &case.input,
+                    &thread_ts,
+                    &placeholder_ts,
+                    Some(reply_endpoint),
+                );
+                let conversation_id = event.conversation_id.clone();
+                eval_threads.push(conversation_id.clone());
+                let started = Instant::now();
+                let stream_id = xadd(conn, &opts.stream, &event).await?;
+                let mut observe_update = |_: &str| {};
+                let outcome = await_reply(
+                    stub,
+                    conn,
+                    &opts.stream,
+                    &stream_id,
+                    &placeholder_ts,
+                    Duration::from_secs(opts.timeout_secs),
+                    &mut observe_update,
+                )
+                .await;
+                // Release this sample's sandbox on every completed/red/timed-out
+                // path so a three-case suite run twice cannot pin eight
+                // curie-thread-* claims against the default ResourceQuota (#1534).
+                queue_thread_reset(conn, &conversation_id).await?;
+                let elapsed = started.elapsed().as_secs_f64();
+                let output = match &outcome {
+                    Outcome::Replied(reply) => reply.clone(),
+                    Outcome::AwaitingApproval(reply) => reply.clone().unwrap_or_default(),
+                    Outcome::CompletedNoEdit => String::new(),
+                    Outcome::TimedOut => diagnostics(conn, &opts.stream, &stream_id).await,
+                };
+                let passed = reply_passes(case, &outcome);
+                let completed = matches!(
+                    outcome,
+                    Outcome::Replied(_) | Outcome::AwaitingApproval(_) | Outcome::CompletedNoEdit
+                );
+                samples.push(crate::eval_sampling::SampleRecord {
+                    outcome: if passed {
+                        crate::evals::CaseOutcome::Pass
+                    } else {
+                        crate::evals::CaseOutcome::Fail
+                    },
+                    output,
+                    seconds: elapsed,
+                    error: if completed {
+                        None
+                    } else {
+                        Some("turn did not complete".into())
+                    },
+                });
+                bar.inc(1);
+            }
+            let agg = crate::eval_sampling::aggregate_samples(&samples, sampling);
+            sample_passes.insert(case.id.clone(), agg.passes);
+            if let Some(variance) = &agg.variance {
+                details.insert(case.id.clone(), variance.clone());
+            }
+            results.push((case.id.clone(), agg.outcome, agg.seconds, agg.output));
+        }
+        anyhow::Ok(crate::commands::EvalReport {
+            rows: results,
+            details,
+            sampling,
+            sample_passes,
+        })
+    };
+    let result = run.await;
+    // Suite error/cancel: still queue every case we enqueued, including the
+    // in-flight one, so an abandoned retry cannot bind a late sandbox.
+    for conversation_id in &eval_threads {
+        let _ = queue_thread_reset(conn, conversation_id).await;
     }
     bar.finish();
-    Ok(crate::commands::EvalReport::from_rows(results))
+    result
 }
 
 /// The shared `eval` handler: run the bundle's `evals/cases.json` through the
@@ -2320,6 +3644,20 @@ pub async fn eval(opts: EvalOpts) -> Result<()> {
                 ),
             ));
         }
+        if opts.sampling.n > 1 {
+            return Err(anyhow::Error::from(
+                crate::exit::CliError::unsupported(
+                    "--samples has no effect on a --model sweep: the sweep enqueues a frozen \
+                     EvalJob that cannot carry a sample count, so in-CLI N never reaches the \
+                     worker",
+                )
+                .with_fix(
+                    "drop --samples to sweep at the worker default, set CURIE_EVAL_SAMPLES on \
+                     the worker to raise N on the production eval path, or omit --model to \
+                     grade in-CLI with `curie <local|cluster> eval --samples N`",
+                ),
+            ));
+        }
         let loaded = resolve_eval(opts.cases.clone())?;
         return eval_sweep(opts, loaded.suite).await;
     }
@@ -2332,6 +3670,18 @@ pub async fn eval(opts: EvalOpts) -> Result<()> {
                 )
                 .with_fix(
                     "drop --cases to grade the deployed trajectory suite, or use skill eval to grade the local file",
+                ),
+            ));
+        }
+        if opts.sampling.n > 1 {
+            return Err(anyhow::Error::from(
+                crate::exit::CliError::unsupported(
+                    "--samples has no effect on a local/cluster trajectory eval: scoring \
+                     runs on the worker eval plane, and the frozen EvalJob cannot carry N",
+                )
+                .with_fix(
+                    "drop --samples, set CURIE_EVAL_SAMPLES on the worker, or use \
+                     `curie skill eval --samples N` to sample in-CLI",
                 ),
             ));
         }
@@ -2585,7 +3935,7 @@ async fn eval_sweep(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
         (ApiClient::new(&base, &opts.api_key)?, None)
     } else {
         require_on_path("kubectl")?;
-        let pf = start_port_forward(
+        let (pf, api_local_port) = start_port_forward(
             &port_forward_command(
                 &opts.namespace,
                 &opts.release,
@@ -2597,7 +3947,7 @@ async fn eval_sweep(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
             "api",
         )
         .await?;
-        let base = format!("http://localhost:{}", opts.api_local_port);
+        let base = format!("http://127.0.0.1:{api_local_port}");
         (ApiClient::new(&base, &opts.api_key)?, Some(pf))
     };
 
@@ -2703,7 +4053,7 @@ async fn eval_trajectory_platform(opts: EvalOpts, suite: EvalSuite) -> Result<()
     let api_base = if opts.local {
         local_api_base(opts.api_url.as_deref())
     } else {
-        format!("http://localhost:{}", opts.api_local_port)
+        format!("http://127.0.0.1:{}", opts.api_local_port)
     };
     if opts.dry_run {
         let tier = if opts.local { "local" } else { "cluster" };
@@ -2731,7 +4081,7 @@ async fn eval_trajectory_platform(opts: EvalOpts, suite: EvalSuite) -> Result<()
         (ApiClient::new(&api_base, &opts.api_key)?, None)
     } else {
         require_on_path("kubectl")?;
-        let pf = start_port_forward(
+        let (pf, api_local_port) = start_port_forward(
             &port_forward_command(
                 &opts.namespace,
                 &opts.release,
@@ -2743,7 +4093,11 @@ async fn eval_trajectory_platform(opts: EvalOpts, suite: EvalSuite) -> Result<()
             "api",
         )
         .await?;
-        (ApiClient::new(&api_base, &opts.api_key)?, Some(pf))
+        let effective_api_base = format!("http://127.0.0.1:{api_local_port}");
+        (
+            ApiClient::new(&effective_api_base, &opts.api_key)?,
+            Some(pf),
+        )
     };
 
     let agents = api
@@ -2772,7 +4126,7 @@ async fn eval_trajectory_platform(opts: EvalOpts, suite: EvalSuite) -> Result<()
         if let Some(report) =
             trajectory_matrix_report(&matrix, &triggered.sha, &triggered.stream_id)?
         {
-            return crate::commands::report_eval(&report, None);
+            return crate::commands::report_eval(&report, None, _api_pf);
         }
         if Instant::now() >= deadline {
             bail!(
@@ -2826,17 +4180,6 @@ fn trajectory_matrix_report(
                 matrix_row.case_id
             );
         }
-        if cell
-            .model
-            .as_deref()
-            .map(str::trim)
-            .is_none_or(str::is_empty)
-        {
-            bail!(
-                "stream filtered trajectory result for case {:?} has no resolved model",
-                matrix_row.case_id
-            );
-        }
         let case_count = cell.case_count.context(format!(
             "stream filtered trajectory result for case {:?} has no case count",
             matrix_row.case_id
@@ -2883,7 +4226,9 @@ fn trajectory_matrix_report(
             rows.len()
         );
     }
-    Ok(Some(crate::commands::EvalReport { rows, details }))
+    Ok(Some(crate::commands::EvalReport::with_details(
+        rows, details,
+    )))
 }
 
 /// The wanted models' rows in the matrix for the TRIGGERED sha, scoped to the
@@ -3002,7 +4347,7 @@ async fn eval_local(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
     ui.note(&format!("routing to channel {channel}"));
 
     let results = run_eval_turns(&opts, &channel, &suite, &mut conn, &mut stub).await?;
-    crate::commands::report_eval(&results, None)
+    crate::commands::report_eval(&results, None, stub)
 }
 
 /// Whether a surfaced enqueue/await error looks like a timeout or a stalled
@@ -3065,7 +4410,7 @@ async fn eval_cluster(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
     ));
 
     // Valkey port-forward for the enqueue, kept alive for the whole eval loop.
-    let _valkey_pf = start_port_forward(
+    let (_valkey_pf, valkey_local_port) = start_port_forward(
         &port_forward_command(
             &opts.namespace,
             &opts.release,
@@ -3081,7 +4426,7 @@ async fn eval_cluster(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
     let channel = match opts.channel.as_deref() {
         Some(channel) => channel.to_string(),
         None => {
-            let _api_pf = start_port_forward(
+            let (_api_pf, api_local_port) = start_port_forward(
                 &port_forward_command(
                     &opts.namespace,
                     &opts.release,
@@ -3093,10 +4438,7 @@ async fn eval_cluster(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
                 "api",
             )
             .await?;
-            let api = ApiClient::new(
-                &format!("http://localhost:{}", opts.api_local_port),
-                &opts.api_key,
-            )?;
+            let api = ApiClient::new(&format!("http://127.0.0.1:{api_local_port}"), &opts.api_key)?;
             let agents = api
                 .list_agents()
                 .await
@@ -3107,8 +4449,8 @@ async fn eval_cluster(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
     ui.note(&format!("routing to channel {channel}"));
 
     let valkey_url = format!(
-        "redis://:{}@localhost:{}",
-        opts.valkey_password, opts.valkey_local_port
+        "redis://:{}@127.0.0.1:{valkey_local_port}",
+        opts.valkey_password
     );
     let mut conn = connect(&valkey_url).await?;
 
@@ -3116,12 +4458,274 @@ async fn eval_cluster(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
         Ok(results) => results,
         Err(err) => return Err(enrich_cluster_enqueue_timeout(err).await),
     };
-    crate::commands::report_eval(&results, None)
+    // report_eval process::exits on a red suite without unwinding, so the
+    // Valkey forward and stub must move in as guards (#1908).
+    crate::commands::report_eval(&results, None, (_valkey_pf, stub))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const EXPECTED_OTEL_EXPORTER_ENV_KEYS: [&str; 38] = [
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_PROTOCOL",
+        "OTEL_EXPORTER_OTLP_HEADERS",
+        "OTEL_EXPORTER_OTLP_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_CLIENT_KEY",
+        "OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_INSECURE",
+        "OTEL_EXPORTER_OTLP_COMPRESSION",
+        "OTEL_EXPORTER_OTLP_TIMEOUT",
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
+        "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+        "OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_TRACES_CLIENT_KEY",
+        "OTEL_EXPORTER_OTLP_TRACES_CLIENT_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_TRACES_INSECURE",
+        "OTEL_EXPORTER_OTLP_TRACES_COMPRESSION",
+        "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT",
+        "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL",
+        "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
+        "OTEL_EXPORTER_OTLP_LOGS_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_LOGS_CLIENT_KEY",
+        "OTEL_EXPORTER_OTLP_LOGS_CLIENT_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_LOGS_INSECURE",
+        "OTEL_EXPORTER_OTLP_LOGS_COMPRESSION",
+        "OTEL_EXPORTER_OTLP_LOGS_TIMEOUT",
+        "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL",
+        "OTEL_EXPORTER_OTLP_METRICS_HEADERS",
+        "OTEL_EXPORTER_OTLP_METRICS_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_METRICS_CLIENT_KEY",
+        "OTEL_EXPORTER_OTLP_METRICS_CLIENT_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_METRICS_INSECURE",
+        "OTEL_EXPORTER_OTLP_METRICS_COMPRESSION",
+        "OTEL_EXPORTER_OTLP_METRICS_TIMEOUT",
+        "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE",
+        "OTEL_EXPORTER_OTLP_METRICS_DEFAULT_HISTOGRAM_AGGREGATION",
+    ];
+
+    fn otel_exporter_test_value(name: &str) -> String {
+        if name.ends_with("_PROTOCOL") {
+            "grpc".to_string()
+        } else if name.ends_with("_HEADERS") {
+            "authorization=Bearer example==,tenant=acme".to_string()
+        } else if name.ends_with("_ENDPOINT") {
+            "https://collector.example.com/v1/data?signature=example==".to_string()
+        } else if name.ends_with("_CLIENT_KEY") {
+            "/tls/client=key.pem".to_string()
+        } else if name.ends_with("_CLIENT_CERTIFICATE") {
+            "/tls/client=certificate.pem".to_string()
+        } else if name.ends_with("_CERTIFICATE") {
+            "/tls/ca=certificate.pem".to_string()
+        } else if name.ends_with("_INSECURE") {
+            "false".to_string()
+        } else if name.ends_with("_COMPRESSION") {
+            "gzip".to_string()
+        } else if name.ends_with("_TIMEOUT") {
+            "12.5".to_string()
+        } else if name.ends_with("_TEMPORALITY_PREFERENCE") {
+            "delta".to_string()
+        } else {
+            "base2_exponential_bucket_histogram".to_string()
+        }
+    }
+
+    fn sensitive_otel_exporter_value(name: &str) -> bool {
+        name.ends_with("_ENDPOINT")
+            || name.ends_with("_HEADERS")
+            || name.ends_with("_CERTIFICATE")
+            || name.ends_with("_CLIENT_KEY")
+            || name.ends_with("_CLIENT_CERTIFICATE")
+    }
+
+    #[test]
+    fn local_dispatcher_command_is_slack_free_and_keeps_secrets_off_argv() {
+        let secret = "private-valkey-password";
+        let otel_env: Vec<(String, String)> = EXPECTED_OTEL_EXPORTER_ENV_KEYS
+            .iter()
+            .map(|name| (name.to_string(), otel_exporter_test_value(name)))
+            .collect();
+        let command = dispatcher_enqueue_command(
+            &["/tmp/curie compose.yaml".to_string()],
+            "curie-dispatcher-enqueue-test",
+            "test:curie:runs",
+            secret,
+            &otel_env,
+            None,
+        );
+        let argv = command.argv();
+
+        // `curie-dispatcher` is declared in the slack profile but depends on
+        // `curie-api` from the core profile. Selecting slack alone makes the
+        // one-shot producer fail before Python runs because Compose cannot
+        // resolve that dependency.
+        assert!(
+            argv.windows(2).any(|pair| pair == ["--profile", "core"]),
+            "one-shot dispatcher must activate core dependencies: {argv:?}"
+        );
+        assert!(argv
+            .windows(2)
+            .any(|pair| { pair[0] == COMPOSE_DISPATCHER_SERVICE && pair[1] == "python" }));
+        assert!(argv
+            .windows(2)
+            .any(|pair| pair[0] == "-m" && pair[1] == DISPATCHER_ENQUEUE_MODULE));
+        assert!(argv.contains(&"--no-deps".to_string()));
+        assert!(argv
+            .windows(2)
+            .any(|pair| pair == ["--name", "curie-dispatcher-enqueue-test"]));
+        assert!(argv.contains(&"-T".to_string()));
+        assert!(argv.contains(&"SLACK_APP_TOKEN=".to_string()));
+        assert!(argv.contains(&"SLACK_BOT_TOKEN=".to_string()));
+        assert!(!argv.iter().any(|arg| arg.contains(secret)));
+        assert!(!command.display().contains(secret));
+        for (name, value) in &otel_env {
+            assert!(
+                argv.windows(2)
+                    .any(|pair| pair[0] == "-e" && pair[1] == *name),
+                "one-shot dispatcher did not forward {name}: {argv:?}"
+            );
+            assert!(
+                !argv.iter().any(|arg| arg.contains(value)),
+                "telemetry value for {name} leaked onto argv"
+            );
+            if sensitive_otel_exporter_value(name) {
+                assert!(
+                    !command.display().contains(value),
+                    "sensitive telemetry value for {name} leaked into command display"
+                );
+            }
+            assert!(
+                command.secret_env.contains(&(name.clone(), value.clone())),
+                "telemetry value for {name} was not preserved exactly"
+            );
+        }
+        assert!(command
+            .secret_env
+            .contains(&("VALKEY_PASSWORD".to_string(), secret.to_string())));
+    }
+
+    #[test]
+    fn compose_config_label_preserves_each_declared_file() {
+        assert_eq!(
+            compose_config_files(" /tmp/base.yaml,/tmp/override.yaml\n").unwrap(),
+            vec!["/tmp/base.yaml", "/tmp/override.yaml"]
+        );
+        assert!(compose_config_files("  \n").is_err());
+        assert!(compose_config_files("<no value>\n").is_err());
+    }
+
+    #[test]
+    fn worker_telemetry_probe_outputs_only_standard_exporter_configuration() {
+        let command = worker_otel_exporter_env_command("curie-worker-example");
+        let template = &command.argv()[2];
+
+        assert_eq!(
+            OTEL_EXPORTER_ENV_KEYS.as_slice(),
+            EXPECTED_OTEL_EXPORTER_ENV_KEYS.as_slice()
+        );
+        for name in EXPECTED_OTEL_EXPORTER_ENV_KEYS {
+            assert!(template.contains(name), "inspect template omitted {name}");
+        }
+        assert!(!template.contains("{{json .Config.Env}}"));
+        assert!(!template.contains("UNRELATED_SECRET"));
+        assert!(!template.contains("println ."));
+        assert!(!template.contains("range .Config.Env}}{{println"));
+    }
+
+    #[test]
+    fn worker_telemetry_probe_preserves_equals_in_exporter_values() {
+        let inspected = concat!(
+            "\"OTEL_EXPORTER_OTLP_PROTOCOL=grpc\"\n",
+            "\"OTEL_EXPORTER_OTLP_HEADERS=authorization=Bearer example==,tenant=acme\"\n",
+            "\"OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=https://logs.example.com/v1/logs?signature=example==\"\n",
+            "\"OTEL_EXPORTER_OTLP_LOGS_CLIENT_KEY=/tls/client=key.pem\"\n",
+            "\"OTEL_EXPORTER_OTLP_LOGS_CLIENT_CERTIFICATE=/tls/client=certificate.pem\"\n",
+            "\"OTEL_EXPORTER_OTLP_METRICS_ENDPOINT=\"\n",
+            "\"UNRELATED_SECRET=must-not-forward\"\n",
+        );
+
+        assert_eq!(
+            parse_worker_otel_env(inspected).unwrap(),
+            vec![
+                (
+                    "OTEL_EXPORTER_OTLP_PROTOCOL".to_string(),
+                    "grpc".to_string(),
+                ),
+                (
+                    "OTEL_EXPORTER_OTLP_HEADERS".to_string(),
+                    "authorization=Bearer example==,tenant=acme".to_string(),
+                ),
+                (
+                    "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT".to_string(),
+                    "https://logs.example.com/v1/logs?signature=example==".to_string(),
+                ),
+                (
+                    "OTEL_EXPORTER_OTLP_LOGS_CLIENT_KEY".to_string(),
+                    "/tls/client=key.pem".to_string(),
+                ),
+                (
+                    "OTEL_EXPORTER_OTLP_LOGS_CLIENT_CERTIFICATE".to_string(),
+                    "/tls/client=certificate.pem".to_string(),
+                ),
+                (
+                    "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT".to_string(),
+                    "".to_string(),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn worker_telemetry_probe_accepts_already_filtered_plain_lines() {
+        let inspected = concat!(
+            "OTEL_EXPORTER_OTLP_ENDPOINT=https://collector.example.com?signature=example==\n",
+            "UNRELATED_SECRET=must-not-forward\n",
+            "/tmp/non-telemetry-inspect-output\n",
+        );
+
+        assert_eq!(
+            parse_worker_otel_env(inspected).unwrap(),
+            vec![(
+                "OTEL_EXPORTER_OTLP_ENDPOINT".to_string(),
+                "https://collector.example.com?signature=example==".to_string(),
+            )]
+        );
+    }
+
+    #[test]
+    fn dispatcher_failure_diagnostic_is_present_bounded_and_redacted() {
+        let secret = "private-valkey-password";
+        let endpoint = "https://token@collector.example.com";
+        let stderr = format!(
+            "connection failed for password {secret} at {endpoint} {}",
+            "x".repeat(5000)
+        );
+        let diagnostic = redact_dispatcher_diagnostic(&stderr, &[secret, endpoint]);
+        assert!(diagnostic.contains("connection failed"));
+        assert!(diagnostic.contains("[REDACTED]"));
+        assert!(!diagnostic.contains(secret));
+        assert!(!diagnostic.contains(endpoint));
+        assert!(diagnostic.chars().count() <= 4096);
+        assert_eq!(
+            redact_dispatcher_diagnostic("", &[secret]),
+            "one-shot dispatcher exited without a diagnostic"
+        );
+    }
+
+    #[test]
+    fn dispatcher_stdout_must_be_exactly_one_stream_id() {
+        assert_eq!(
+            parse_dispatcher_stream_id("1700000000000-0\n").unwrap(),
+            "1700000000000-0"
+        );
+        assert!(parse_dispatcher_stream_id("").is_err());
+        assert!(parse_dispatcher_stream_id("telemetry\n1700000000000-0\n").is_err());
+        assert!(parse_dispatcher_stream_id("not-an-id\n").is_err());
+    }
 
     /// An empty `--thread` must not survive as a thread: carried through, it
     /// enqueues `conversation_id: ""` and puts a literal `"thread_ts": ""` in an
@@ -3131,6 +4735,25 @@ mod tests {
     #[test]
     fn an_empty_thread_normalizes_to_no_thread() {
         assert_eq!(normalize_thread(Some(String::new())), None);
+    }
+
+    #[test]
+    fn eval_turns_queue_thread_reset_on_case_and_suite_paths() {
+        // AC1 is the SADD sites in run_eval_turns, not queue_thread_reset
+        // itself. Deleting either call keeps the helper test green.
+        let src = include_str!("message.rs");
+        assert!(
+            src.contains("eval_case_turn("),
+            "each eval case must mint through eval_case_turn so the enqueued conversation_id is isolated"
+        );
+        assert!(
+            src.contains("queue_thread_reset(conn, &conversation_id)"),
+            "each eval case must queue its isolated conversation_id for sandbox release"
+        );
+        assert!(
+            src.contains("for conversation_id in &eval_threads"),
+            "suite error/cancel must still queue every enqueued eval thread"
+        );
     }
 
     /// The filter must not eat a real thread ts, and an already-absent thread
@@ -3423,6 +5046,71 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn port_forward_rejects_an_occupied_port_without_owned_readiness() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let cmd = OpsCommand::new("sh", vec![plain("-c"), plain("sleep 0.05; exit 1")]);
+
+        let err = start_port_forward(&cmd, port, "valkey")
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("valkey"), "{err}");
+        assert!(err.contains(&port.to_string()), "{err}");
+        assert!(err.contains("closed stdout before reporting"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn port_forward_accepts_the_kubectl_readiness_line() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let cmd = OpsCommand::new(
+            "sh",
+            vec![
+                plain("-c"),
+                plain(format!(
+                    "printf 'Forwarding from 127.0.0.1:{port} -> 6379\\n'; sleep 1"
+                )),
+            ],
+        );
+
+        let (mut child, effective_port) = start_port_forward(&cmd, port, "valkey").await.unwrap();
+
+        assert_eq!(effective_port, port);
+        assert!(child.try_wait().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn port_forward_rejects_ipv6_readiness_for_a_fixed_ipv4_port() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let cmd = OpsCommand::new(
+            "sh",
+            vec![
+                plain("-c"),
+                plain(format!(
+                    "printf 'Forwarding from [::1]:{port} -> 6379\\n'; sleep 0.5"
+                )),
+            ],
+        );
+
+        let err = start_port_forward(&cmd, port, "valkey")
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains(&port.to_string()), "{err}");
+        assert!(err.contains("closed stdout before reporting"), "{err}");
+    }
+
     #[test]
     fn select_channel_prefers_explicit() {
         let agents = [test_agent("a", "C1"), test_agent("b", "C2")];
@@ -3637,18 +5325,22 @@ mod tests {
     #[test]
     fn connected_only_when_the_worker_itself_talks_to_real_slack() {
         let t = |s: &str| Some(s.to_string());
+        let token = |r: Option<crate::slack::SlackTransport>| r.map(|t| t.bot_token);
 
         // Connected: the worker's transport is real Slack and its token is real.
         assert_eq!(
-            connected_worker_bot_token((t("https://slack.com/api/"), t("xoxb-real"))).as_deref(),
-            Some("xoxb-real")
+            token(connected_worker_transport((
+                t("https://slack.com/api/"),
+                t("xoxb-real")
+            ))),
+            Some("xoxb-real".to_string())
         );
 
         // #957 mode A, the failure this replaced: a REAL token is present but the
         // worker is wired to the stub, so posting would orphan a "..." in a real
         // channel that the worker can never edit. Not connected.
         assert_eq!(
-            connected_worker_bot_token((
+            connected_worker_transport((
                 t("http://localhost:8155/api/"),
                 t("xoxb-real-from-the-vault")
             )),
@@ -3657,20 +5349,47 @@ mod tests {
 
         // The stub sentinel is not a workspace token even if the base URL is odd.
         assert_eq!(
-            connected_worker_bot_token((t("https://slack.com/api/"), t(LOCAL_STUB_BOT_TOKEN))),
+            connected_worker_transport((t("https://slack.com/api/"), t(LOCAL_STUB_BOT_TOKEN))),
             None
         );
         // No stack running / nothing resolvable -> stub path, never a real post.
-        assert_eq!(connected_worker_bot_token((None, None)), None);
-        assert_eq!(connected_worker_bot_token((t(""), t("xoxb-real"))), None);
+        assert_eq!(connected_worker_transport((None, None)), None);
+        assert_eq!(connected_worker_transport((t(""), t("xoxb-real"))), None);
         assert_eq!(
-            connected_worker_bot_token((t("https://slack.com/api/"), None)),
+            connected_worker_transport((t("https://slack.com/api/"), None)),
             None
         );
         assert_eq!(
-            connected_worker_bot_token((t("https://slack.com/api/"), t("  "))),
+            connected_worker_transport((t("https://slack.com/api/"), t("  "))),
             None
         );
+    }
+
+    #[test]
+    fn the_local_transport_carries_the_workers_own_base_not_the_shells() {
+        // The #1030 regression at local tier. The base and the token are read from
+        // the same `docker inspect`, so the placeholder goes where the worker that
+        // will edit it is pointed. Before this, only the token survived and the base
+        // came from whatever the operator happened to have exported.
+        let resolved = connected_worker_transport((
+            Some("https://proxy.example/api".to_string()),
+            Some("xoxb-worker-actual".to_string()),
+        ))
+        .expect("a real base and a real token are a connected transport");
+        assert_eq!(resolved.api_base, "https://proxy.example/api");
+        assert_eq!(resolved.bot_token, "xoxb-worker-actual");
+
+        std::env::set_var("SLACK_API_BASE_URL", "http://127.0.0.1:18081/api");
+        let again = connected_worker_transport((
+            Some("https://proxy.example/api".to_string()),
+            Some("xoxb-worker-actual".to_string()),
+        ))
+        .expect("still connected");
+        assert_eq!(
+            again.api_base, "https://proxy.example/api",
+            "an ambient SLACK_API_BASE_URL must not redirect a resolved token"
+        );
+        std::env::remove_var("SLACK_API_BASE_URL");
     }
 
     #[test]
@@ -3912,6 +5631,62 @@ mod tests {
         assert!(v.get("thread").is_none(), "timeout carries no thread: {v}");
     }
 
+    fn ready_pod(name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "metadata": {"name": name},
+            "status": {
+                "phase": "Running",
+                "conditions": [{"type": "Ready", "status": "True"}]
+            }
+        })
+    }
+
+    fn terminating_pod(name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "metadata": {
+                "name": name,
+                "deletionTimestamp": "2026-08-23T00:00:00Z"
+            },
+            "status": {
+                "phase": "Running",
+                "conditions": [{"type": "Ready", "status": "True"}]
+            }
+        })
+    }
+
+    fn pods_list(items: Vec<serde_json::Value>) -> String {
+        serde_json::json!({"items": items}).to_string()
+    }
+
+    #[test]
+    fn worker_pods_allow_enqueue_when_the_replacement_is_ready_and_nobody_is_terminating() {
+        assert!(
+            worker_pods_allow_enqueue(&pods_list(vec![ready_pod("curie-worker-new")])).unwrap()
+        );
+    }
+
+    #[test]
+    fn worker_pods_refuse_enqueue_while_a_terminating_worker_can_still_claim() {
+        // #1532: kubectl rollout status can return while the outgoing pod is
+        // still Terminating and still blocked in XREADGROUP.
+        assert!(!worker_pods_allow_enqueue(&pods_list(vec![
+            ready_pod("curie-worker-new"),
+            terminating_pod("curie-worker-old"),
+        ]))
+        .unwrap());
+        assert!(!worker_pods_allow_enqueue(&pods_list(vec![])).unwrap());
+        assert!(
+            !worker_pods_allow_enqueue(&pods_list(vec![serde_json::json!({
+                "metadata": {"name": "curie-worker-booting"},
+                "status": {
+                    "phase": "Running",
+                    "conditions": [{"type": "Ready", "status": "False"}]
+                }
+            })]))
+            .unwrap()
+        );
+    }
+
     #[test]
     fn message_dry_run_json_carries_the_planned_action() {
         // Explicit channel passes through verbatim.
@@ -3959,6 +5734,7 @@ mod tests {
             api_url: None,
             models: Vec::new(),
             concurrency: 1,
+            sampling: crate::eval_sampling::SampleConfig::default(),
         }
     }
 
@@ -4056,6 +5832,23 @@ mod tests {
                     && l.contains(DEFAULT_STREAM)
             ),
             "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("without ambient durable agent memory")),
+            "default local eval must declare memory isolation: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn eval_dry_run_plan_names_sampling_policy() {
+        let lines = eval_dry_run_lines(&eval_opts(true, None), "smoke", 1);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("sampling: 1 sample(s), majority")),
+            "dry-run must document the default one-sample majority policy: {lines:?}"
         );
     }
 
@@ -4433,5 +6226,63 @@ mod tests {
             fix.contains("--cases") && fix.contains("--model"),
             "the fix points at both the drop-flag and the in-CLI path: {fix}"
         );
+    }
+
+    /// #1915: the one-shot producer must run the dispatcher image the STACK
+    /// runs, not whatever this shell resolves.
+    ///
+    /// Compose substitutes its variables from each invocation's own environment,
+    /// so after `local up --build` the stack ran `:dev` while `local message`
+    /// resolved `:latest` and died on `No module named
+    /// curie_dispatcher.enqueue_once` -- the module the published image predates.
+    #[test]
+    fn the_one_shot_producer_runs_the_stacks_dispatcher_image() {
+        let cmd = dispatcher_enqueue_command(
+            &["compose.dev.yaml".to_string()],
+            "enqueue-1",
+            "curie:runs",
+            "pw",
+            &[],
+            Some("ghcr.io/curie-eng/curie-dispatcher:dev"),
+        );
+
+        assert!(
+            cmd.env.iter().any(|(k, v)| k == "CURIE_DISPATCHER_IMAGE"
+                && v == "ghcr.io/curie-eng/curie-dispatcher:dev"),
+            "expected the stack's dispatcher image in the child env, got {:?}",
+            cmd.env
+        );
+    }
+
+    /// A stack on the published images passes nothing, so compose's own default
+    /// still applies. This is also what keeps CI working: the ladder builds its
+    /// dispatcher as `:latest` while setting CURIE_BASE_TAG=ci-local, so a
+    /// derived-but-unchecked tag would ask for an image nothing built.
+    #[test]
+    fn a_published_stack_leaves_the_image_to_compose() {
+        let cmd = dispatcher_enqueue_command(
+            &["compose.dev.yaml".to_string()],
+            "enqueue-1",
+            "curie:runs",
+            "pw",
+            &[],
+            None,
+        );
+
+        assert!(!cmd.env.iter().any(|(k, _)| k == "CURIE_DISPATCHER_IMAGE"));
+    }
+
+    #[test]
+    fn an_image_reference_yields_its_tag() {
+        assert_eq!(image_tag("ghcr.io/curie-eng/curie-worker:dev"), Some("dev"));
+        assert_eq!(
+            image_tag("ghcr.io/curie-eng/curie-worker:latest"),
+            Some("latest")
+        );
+        // A digest pin has no tag, and the colon inside it must not be read as
+        // one -- the registry host's port must not either.
+        assert_eq!(image_tag("ghcr.io/curie-eng/curie-worker@sha256:abc"), None);
+        assert_eq!(image_tag("localhost:5000/curie-worker"), None);
+        assert_eq!(image_tag("localhost:5000/curie-worker:dev"), Some("dev"));
     }
 }

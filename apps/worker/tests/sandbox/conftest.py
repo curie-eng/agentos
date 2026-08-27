@@ -98,6 +98,7 @@ class FakeClaim:
     env: dict[str, str]
     labels: dict[str, str]
     sandbox_name: str
+    pool: str = ""
     ready: bool = True
     # The claim's creation instant, tz-aware UTC, as the cluster would stamp it.
     # A test ages a claim by assigning a past instant here, which is how the
@@ -151,6 +152,7 @@ class FakeSandboxClient:
             env=dict(env or {}),
             labels={"curietech.ai/managed-by": "curie-sandbox-substrate", **(labels or {})},
             sandbox_name=sandbox_name,
+            pool=pool,
             ready=self.bind_ready and self.quota_rejection is None,
             created_at=datetime.now(UTC),
             quota_rejection=self.quota_rejection,

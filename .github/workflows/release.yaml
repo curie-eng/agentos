@@ -106,7 +106,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        name: [runner, api, dispatcher, worker, ui, sre-bot-tempo]
+        name: [runner, api, dispatcher, mail-adapter, worker, ui, sre-bot-tempo, sre-bot-k8s-write, sre-bot-k8s-scale]
         platform: [linux/amd64, linux/arm64]
         include:
           - name: runner
@@ -118,6 +118,9 @@ jobs:
           - name: dispatcher
             context: .
             dockerfile: apps/dispatcher/Dockerfile
+          - name: mail-adapter
+            context: .
+            dockerfile: apps/mail-adapter/Dockerfile
           - name: worker
             context: .
             dockerfile: apps/worker/Dockerfile
@@ -127,6 +130,18 @@ jobs:
           - name: sre-bot-tempo
             context: examples/sre-bot/connectors/tempo
             dockerfile: examples/sre-bot/connectors/tempo/Dockerfile
+          # The bundle's two write connectors. Without a published image a
+          # `build:`-declaring connector is refused at the cluster tier (a
+          # cluster cannot pull an image that exists only in one machine's
+          # Docker daemon), so an unpublished write connector is a write verb
+          # the live bot cannot have -- which is how `k8s-scale` came to be
+          # merged, reviewed, and undeployable.
+          - name: sre-bot-k8s-write
+            context: examples/sre-bot/connectors/k8s-write
+            dockerfile: examples/sre-bot/connectors/k8s-write/Dockerfile
+          - name: sre-bot-k8s-scale
+            context: examples/sre-bot/connectors/k8s-scale
+            dockerfile: examples/sre-bot/connectors/k8s-scale/Dockerfile
           - platform: linux/amd64
             runner: ubuntu-latest
             arch: amd64
@@ -147,7 +162,7 @@ jobs:
       - name: Set up Buildx
         id: setup_buildx
         continue-on-error: true
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
       - name: Back off before retrying Set up Buildx
         if: steps.setup_buildx.outcome == 'failure'
         run: |
@@ -155,7 +170,7 @@ jobs:
           sleep 15
       - name: Set up Buildx (retry)
         if: steps.setup_buildx.outcome == 'failure'
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
       - name: Log in to GHCR
         id: ghcr_login
         continue-on-error: true
@@ -223,7 +238,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        name: [runner, api, dispatcher, worker, ui, sre-bot-tempo]
+        name: [runner, api, dispatcher, mail-adapter, worker, ui, sre-bot-tempo, sre-bot-k8s-write, sre-bot-k8s-scale]
     steps:
       - name: Download digests
         id: download_digests
@@ -248,7 +263,7 @@ jobs:
       - name: Set up Buildx
         id: setup_buildx
         continue-on-error: true
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
       - name: Back off before retrying Set up Buildx
         if: steps.setup_buildx.outcome == 'failure'
         run: |
@@ -256,7 +271,7 @@ jobs:
           sleep 15
       - name: Set up Buildx (retry)
         if: steps.setup_buildx.outcome == 'failure'
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
       - name: Log in to GHCR
         id: ghcr_login
         continue-on-error: true
@@ -330,7 +345,7 @@ jobs:
       - name: Set up Buildx
         id: setup_buildx
         continue-on-error: true
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
       - name: Back off before retrying Set up Buildx
         if: steps.setup_buildx.outcome == 'failure'
         run: |
@@ -338,7 +353,7 @@ jobs:
           sleep 15
       - name: Set up Buildx (retry)
         if: steps.setup_buildx.outcome == 'failure'
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
       - name: Log in to GHCR
         id: ghcr_login
         continue-on-error: true
@@ -422,7 +437,7 @@ jobs:
       - name: Set up Buildx
         id: setup_buildx
         continue-on-error: true
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
       - name: Back off before retrying Set up Buildx
         if: steps.setup_buildx.outcome == 'failure'
         run: |
@@ -430,7 +445,7 @@ jobs:
           sleep 15
       - name: Set up Buildx (retry)
         if: steps.setup_buildx.outcome == 'failure'
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
       - name: Log in to GHCR
         id: ghcr_login
         continue-on-error: true

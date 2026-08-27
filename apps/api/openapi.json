@@ -564,6 +564,9 @@
           "repo_full_name": {
             "anyOf": [
               {
+                "maxLength": 140,
+                "minLength": 3,
+                "pattern": "^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*/[A-Za-z0-9._-]+$",
                 "type": "string"
               },
               {
@@ -624,7 +627,9 @@
           "approval_routes": {
             "anyOf": [
               {
-                "additionalProperties": true,
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/ApprovalRouteBindingOut"
+                },
                 "type": "object"
               },
               {
@@ -647,7 +652,7 @@
           },
           "channels": {
             "items": {
-              "$ref": "#/components/schemas/ChannelBinding"
+              "$ref": "#/components/schemas/ChannelBindingOut"
             },
             "title": "Channels",
             "type": "array"
@@ -791,6 +796,9 @@
           "repo_full_name": {
             "anyOf": [
               {
+                "maxLength": 140,
+                "minLength": 3,
+                "pattern": "^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*/[A-Za-z0-9._-]+$",
                 "type": "string"
               },
               {
@@ -844,7 +852,7 @@
       },
       "ApprovalApprovers": {
         "additionalProperties": false,
-        "description": "WHO may resolve a route's approvals (#420), as opposed to the binding's\n``channel``, which is only WHERE the card posts.\n\nDeclaring an approvers block is what lets a request sit in a broad channel\nwhere everyone can see it while only a narrow set may act on it. Omitting it\nkeeps the zero-setup default: the card channel's members are the approvers.",
+        "description": "WHO may resolve a route's approvals (#420), as opposed to the binding's\n``resolution``, which is only WHERE the interactive card posts.\n\nDeclaring an approvers block is what lets a request sit in a broad channel\nwhere everyone can see it while only a narrow set may act on it. Omitting it\nkeeps the zero-setup default: the resolution-card channel's members are the\napprovers. Notification recipients never enter this policy.",
         "properties": {
           "group": {
             "anyOf": [
@@ -873,6 +881,38 @@
           }
         },
         "title": "ApprovalApprovers",
+        "type": "object"
+      },
+      "ApprovalApproversOut": {
+        "description": "Repair-oriented read projection of the stored approver declaration.",
+        "properties": {
+          "group": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Group"
+          },
+          "users": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Users"
+          }
+        },
+        "title": "ApprovalApproversOut",
         "type": "object"
       },
       "ApprovalAuditOut": {
@@ -962,6 +1002,48 @@
           "created_at"
         ],
         "title": "ApprovalAuditOut",
+        "type": "object"
+      },
+      "ApprovalNotificationTarget": {
+        "additionalProperties": false,
+        "description": "A visibility-only approval ping target and its server-side transport.\n\nSlack may use the worker's configured default transport. Every other kind\nneeds the full endpoint/adapter pair at write time, so a declared\nnotification cannot persist as a permanently undeliverable best-effort\nbranch.",
+        "properties": {
+          "adapter": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Adapter"
+          },
+          "address": {
+            "title": "Address",
+            "type": "string"
+          },
+          "endpoint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Endpoint"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "address"
+        ],
+        "title": "ApprovalNotificationTarget",
         "type": "object"
       },
       "ApprovalOut": {
@@ -1296,6 +1378,27 @@
         "title": "ApprovalRequest",
         "type": "object"
       },
+      "ApprovalResolutionTarget": {
+        "additionalProperties": false,
+        "description": "The one target permitted to carry an approval-resolving affordance.\n\n``kind`` is an explicit extension point, but it is intentionally Slack-only\nuntil a second adapter can present the scoped verified identity ADR-0096\nrequires. Merely teaching an adapter to render buttons cannot widen this\nauthority boundary.",
+        "properties": {
+          "address": {
+            "title": "Address",
+            "type": "string"
+          },
+          "kind": {
+            "const": "slack",
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "address"
+        ],
+        "title": "ApprovalResolutionTarget",
+        "type": "object"
+      },
       "ApprovalResolve": {
         "description": "One resolution attempt. Exactly one attempt wins (compare-and-set), and\nthe server-side authorizer (#246) decides first whether this actor may\nresolve at all: ordinary self-approval is blocked, while a server-linked\npublication requester must still prove membership. ``actor_channel`` is the\nchannel the resolution attempt was made from (the card click's channel,\nrelayed by the dispatcher; asserted explicitly by API-key operators).",
         "properties": {
@@ -1344,7 +1447,7 @@
       },
       "ApprovalRouteBinding": {
         "additionalProperties": false,
-        "description": "One workspace binding for a manifest-declared approval route (#247):\nthe Slack channel whose members are that route's approvers (under the\nchannel-membership authorizer), and optionally the ``approvers`` block that\nnarrows WHO may act (#420), leaving ``channel`` to mean only WHERE the card\nposts.",
+        "description": "One strict workspace binding for a declared approval route (#1460).\n\n``resolution`` is the single verified-identity action surface.\n``notification`` may make the pending request visible elsewhere, but its\nmessage carries no interaction. ``approvers`` continues to narrow WHO may\nact through the resolution card path and is never inferred from notification\nrecipients.",
         "properties": {
           "approvers": {
             "anyOf": [
@@ -1356,15 +1459,76 @@
               }
             ]
           },
-          "channel": {
-            "title": "Channel",
+          "notification": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ApprovalNotificationTarget"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "resolution": {
+            "$ref": "#/components/schemas/ApprovalResolutionTarget"
+          }
+        },
+        "required": [
+          "resolution"
+        ],
+        "title": "ApprovalRouteBinding",
+        "type": "object"
+      },
+      "ApprovalRouteBindingOut": {
+        "description": "The required resolution plus optional, redacted visibility policy.",
+        "properties": {
+          "approvers": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ApprovalApproversOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "notification": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ApprovalTargetOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "resolution": {
+            "$ref": "#/components/schemas/ApprovalTargetOut"
+          }
+        },
+        "required": [
+          "resolution"
+        ],
+        "title": "ApprovalRouteBindingOut",
+        "type": "object"
+      },
+      "ApprovalTargetOut": {
+        "description": "Display-safe target identity; stored transport is write-only.\n\nThis is deliberately a tolerant read projection. Write models validate the\nchannel kind/address pair before persistence, while reads must still expose\na malformed historical address so an operator can repair it.",
+        "properties": {
+          "address": {
+            "title": "Address",
+            "type": "string"
+          },
+          "kind": {
+            "title": "Kind",
             "type": "string"
           }
         },
         "required": [
-          "channel"
+          "kind",
+          "address"
         ],
-        "title": "ApprovalRouteBinding",
+        "title": "ApprovalTargetOut",
         "type": "object"
       },
       "BehaviorPacksConfig": {
@@ -1530,9 +1694,9 @@
         "title": "BundleOut",
         "type": "object"
       },
-      "ChannelBinding": {
+      "ChannelBindingOut": {
         "additionalProperties": false,
-        "description": "Where one agent listens: a channel KIND and an ADDRESS (ADR-0096, #1459).\n\nAn agent holds ONE OR MORE of these (ADR-0118, #1525, amending ADR-0089's\nsingular clause). `AgentCreate` still carries one `channel` OBJECT -- the\nfirst binding, required, since an agent with none cannot receive a turn --\n`AgentOut` carries the `channels` LIST, and every write after the create\ngoes through the `/agents/{id}/channels` subresource. `AgentUpdate` carries\nno binding key at all.\n\n`kind` names the adapter that owns the binding, selects the address-shape\ncheck, AND routes: since ADR-0096 phase 2 the worker resolves on the\n`(kind, address)` PAIR, so the two together are the routing key the worker\nmatches on equality (a Slack channel id for `kind=\"slack\"`). One address can\ntherefore be bound twice under two different kinds.",
+        "description": "The READ side of a binding: the stored pair, serialized as it is stored.\n\nDeliberately NOT a subclass of `ChannelBinding`, and that is the whole point.\n`ChannelBinding` carries the address-shape rule three write paths inherit\n(`ChannelBindingWrite`, `ChannelTokenRequest`, `TurnIn`), and it used to be\nthe element type of `AgentOut.channels` as well -- so the rule that guards a\nBIND also ran when an existing row was READ, and one row it rejected failed\nthe whole response for every agent in it (#1914).\n\nAn install reaches that state by upgrading: migration 0021 backfills\n`agent_channels.address` from `agents.slack_channel` verbatim, and that column\nis exactly where a literal `#name` from before the validator lived. So an\ninstall that was merely mis-routed became one whose agent list was\nunavailable, reporting a Pydantic error instead of the bad value.\n\nSerializing a stored row must not re-litigate whether it should have been\nstored. Showing the bad address is also the more useful outcome: an operator\ncannot fix a value the API refuses to tell them.\n\nThe shape stays `{kind, address}`, identical to what `ChannelBinding`\nserialized, so this is not a wire change -- `ChannelBindingWrite`'s docstring\nalready describes that as the read contract.",
         "properties": {
           "address": {
             "title": "Address",
@@ -1547,7 +1711,7 @@
           "kind",
           "address"
         ],
-        "title": "ChannelBinding",
+        "title": "ChannelBindingOut",
         "type": "object"
       },
       "ChannelBindingPatch": {
@@ -2578,6 +2742,20 @@
         "title": "LoadPackConfig",
         "type": "object"
       },
+      "MemoryEntryCreate": {
+        "description": "Append one operator-authored memory record (#1904).\n\nProvenance is stamped by the server. Extra body fields, including a\ncaller-supplied provenance object, are ignored rather than trusted.",
+        "properties": {
+          "content": {
+            "title": "Content",
+            "type": "string"
+          }
+        },
+        "required": [
+          "content"
+        ],
+        "title": "MemoryEntryCreate",
+        "type": "object"
+      },
       "MemoryEntryEdit": {
         "description": "Edit one memory entry using its parent log version.\n\nThe required version prevents a stale positional index from changing an\nentry after the log has changed. Provenance is preserved.",
         "properties": {
@@ -2626,7 +2804,7 @@
         "type": "object"
       },
       "MemoryProvenanceOut": {
-        "description": "Where a memory entry was learned from (#264 ``Provenance`` shape).",
+        "description": "Where a memory entry was learned from (#264 ``Provenance`` shape).\n\n``source`` distinguishes an operator-seeded record (``operator``) from a\nsession-learned one. Absent or null means learned/unspecified, matching\nrecords written before the operator seed path existed.",
         "properties": {
           "learned_from_session_id": {
             "anyOf": [
@@ -2643,6 +2821,17 @@
             "default": "",
             "title": "Recorded At",
             "type": "string"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source"
           },
           "source_trace_ids": {
             "items": {
@@ -5439,6 +5628,74 @@
           }
         },
         "summary": "List Memory",
+        "tags": [
+          "memory"
+        ]
+      },
+      "post": {
+        "description": "Append an operator-authored memory record (#1904).\n\nCreates the ``memory/log`` key when absent, otherwise appends under the same\nrow lock the state-append path uses. Provenance is stamped here so a caller\ncannot claim a session or traces they did not produce. The runner rehydrates\nthe log at the next session boot; a live thread keeps the memory it booted\nwith.",
+        "operationId": "create_memory_agents__agent_id__memory_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemoryEntryCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryEntryOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Memory",
         "tags": [
           "memory"
         ]

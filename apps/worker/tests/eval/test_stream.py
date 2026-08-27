@@ -19,8 +19,9 @@ import logging
 import tarfile
 import time
 import uuid
-from collections.abc import Callable
-from dataclasses import dataclass, field
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -29,6 +30,11 @@ import httpx
 import pytest
 import redis
 from aci_protocol import STREAM_PAYLOAD_FIELD
+from curie_telemetry import (
+    TRACEPARENT_STREAM_FIELD,
+    operation_span,
+    record_metric,
+)
 from curie_test_support.valkey import (
     VALKEY_HOST as _VH,
 )
@@ -38,6 +44,7 @@ from curie_test_support.valkey import (
 from curie_test_support.valkey import (
     VALKEY_PW as _VPW,
 )
+from curie_worker import stream_consumer as stream_consumer_module
 from curie_worker.binding import BUDGET_ENV, BUNDLE_REF_ENV, MODEL_ENV, THINKING_ENV
 from curie_worker.bundle_store import BundleStore
 from curie_worker.config import WorkerConfig
@@ -52,9 +59,11 @@ from curie_worker.eval import (
     LangfuseEvalRecorder,
     load_suite_from_bundle,
 )
+from curie_worker.eval import stream as eval_stream_module
 from curie_worker.eval.models import EvalCaseResult, EvalOutcome, EvalRunResult
 from curie_worker.sandbox import AffinityStore, SandboxSubstrate, SubstrateConfig
 from curie_worker.sandbox.types import ClaimView, SandboxView
+from opentelemetry import trace
 from redis.asyncio import Redis as AsyncRedis
 
 CONTAINS = GraderKind.CONTAINS
@@ -84,6 +93,9 @@ class _StubRepo:
         # the agent's secrets so an authed-MCP bundle authenticates during eval.
         return None
 
+    async def name_for(self, _agent_id: uuid.UUID) -> str | None:
+        return None
+
     async def thinking_for(self, agent_id: uuid.UUID) -> str | None:
         self.thinking_agent_id = agent_id
         return self._thinking
@@ -111,6 +123,7 @@ class _FakeClaim:
     sandbox_name: str
     labels: dict[str, str]
     env: dict[str, str]
+    pool: str = ""
 
 
 @dataclass
@@ -118,6 +131,8 @@ class _FakeK8s:
     namespace: str = "test-ns"
     claims: dict[str, _FakeClaim] = field(default_factory=dict)
     claim_envs: list[dict[str, str]] = field(default_factory=list)
+    created_pools: list[str] = field(default_factory=list)
+    created_labels: list[dict[str, str]] = field(default_factory=list)
     deleted: list[str] = field(default_factory=list)
 
     def create_claim(
@@ -129,11 +144,16 @@ class _FakeK8s:
         labels: dict[str, str] | None = None,
     ) -> None:
         self.claim_envs.append(dict(env or {}))
+        self.created_pools.append(pool)
+        self.created_labels.append(
+            {"curietech.ai/managed-by": "curie-sandbox-substrate", **(labels or {})}
+        )
         self.claims[name] = _FakeClaim(
             name=name,
             sandbox_name=f"sbx-{name}",
             labels={"curietech.ai/managed-by": "curie-sandbox-substrate", **(labels or {})},
             env=dict(env or {}),
+            pool=pool,
         )
 
     def get_claim(self, name: str) -> ClaimView | None:
@@ -843,6 +863,72 @@ def test_pending_entry_from_a_dead_consumer_is_reclaimed(make_eval_harness, bund
     asyncio.run(go())
 
 
+def test_pending_entry_from_a_dead_consumer_is_reclaimed_without_waiting_min_idle(
+    make_eval_harness, bundles
+) -> None:
+    """Eval sibling of the #1532 dead-consumer prompt reclaim: the 15-minute
+    XAUTOCLAIM idle must not be what recovers the entry."""
+    store, upload = bundles
+
+    async def go() -> None:
+        async with make_eval_harness() as (base_url, fake, _client):
+            fake.responses = {"q": "ok"}
+            bundle_ref = upload(
+                EvalSuite(
+                    name="recl-fast",
+                    cases=[
+                        EvalCase(id="1", input="q", grader=Grader(kind=CONTAINS, expected="ok"))
+                    ],
+                )
+            )
+            token = uuid.uuid4().hex[:8]
+            cfg = _cfg(
+                f"test:evals:{token}",
+                f"g-{token}",
+                reclaim_min_idle_ms=900000,
+                reclaim_interval_s=0.05,
+            )
+            client = AsyncRedis(host=_VH, port=_VP, password=_VPW, decode_responses=True)
+            reports: list[dict[str, Any]] = []
+            async with httpx.AsyncClient(timeout=30.0) as lf_client:
+                consumer = _build_consumer(
+                    redis_client=client,
+                    cfg=cfg,
+                    bundle_store=store,
+                    substrate=_UnusedSubstrate(),
+                    reports=reports,
+                    lf_client=lf_client,
+                )
+                # Production eval pins this to reclaim_min_idle_ms because its
+                # read loop is inline. Pin 0 here so this sibling proves the
+                # shared helper, not XAUTOCLAIM.
+                consumer._delivery = replace(consumer._delivery, dead_consumer_idle_ms=0)
+                await consumer.ensure_group()
+                sha = f"sha-{token}"
+                item = _item(suite="recl-fast", sha=sha, bundle_ref=bundle_ref, target_url=base_url)
+                await client.xadd(cfg.eval_stream, {"payload": item.model_dump_json()})
+                await client.xreadgroup(
+                    cfg.eval_consumer_group,
+                    "dead-consumer",
+                    {cfg.eval_stream: ">"},
+                    count=10,
+                )
+                pending = await client.xpending(cfg.eval_stream, cfg.eval_consumer_group)
+                assert pending["pending"] == 1
+
+                await _drain_one(consumer, reports)
+
+                assert reports[0]["sha"] == sha
+                assert reports[0]["passed_count"] == 1
+                summary = await client.xpending(cfg.eval_stream, cfg.eval_consumer_group)
+                assert summary["pending"] == 0
+
+            await client.delete(cfg.eval_stream)
+            await client.aclose()
+
+    asyncio.run(go())
+
+
 # --- Per-sandbox runner token threading (issue #63) ---------------------------
 # The env-var name is the cross-package contract with the runner; asserted by its
 # literal string so the module never depends on a constant that only exists after
@@ -900,7 +986,9 @@ class _TokenSubstrate:
         self._token = token
         self.released: list[str] = []
 
-    def claim(self, _key: str, *, env: dict[str, str] | None = None) -> _FakeHandle:
+    def claim(
+        self, _key: str, *, env: dict[str, str] | None = None, **_: object
+    ) -> _FakeHandle:
         return _FakeHandle(base_url="http://sandbox.local:8080", token=self._token)
 
     def release(self, key: str) -> None:
@@ -929,6 +1017,29 @@ def test_eval_boot_env_mints_runner_token() -> None:
     item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.zip", target_url=None)
     env = consumer._boot_env(item)
     assert env.get(RUNNER_TOKEN_ENV), "_boot_env must mint a non-empty runner token"
+
+
+def test_eval_lane_boot_env_omits_memory_ref() -> None:
+    """#1909 sibling: the platform eval lane already boots without ambient memory.
+
+    The message-path local/cluster eval must match this: no CURIE_MEMORY_REF,
+    so a deployed agent's durable log cannot change a static suite result.
+    """
+
+    consumer = EvalStreamConsumer(
+        redis=None,  # type: ignore[arg-type]
+        config=WorkerConfig(),
+        bundle_store=None,  # type: ignore[arg-type]
+        substrate=None,  # type: ignore[arg-type]
+        reporter=None,  # type: ignore[arg-type]
+        recorder=None,  # type: ignore[arg-type]
+        repo_lookup=None,
+    )
+    item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.zip", target_url=None)
+    env = consumer._boot_env(item)
+    assert "CURIE_MEMORY_REF" not in env
+    assert "CURIE_MEMORY_TOKEN" not in env
+    assert "CURIE_HISTORY_REF" not in env
 
 
 def test_eval_requested_model_boots_and_tags_that_model() -> None:
@@ -1042,7 +1153,9 @@ class _ConcurrencyProbeSubstrate:
         self.peak = 0
         self.claims = 0
 
-    def claim(self, _key: str, *, env: dict[str, str] | None = None) -> _FakeHandle:
+    def claim(
+        self, _key: str, *, env: dict[str, str] | None = None, **_: object
+    ) -> _FakeHandle:
         with self._lock:
             self._live += 1
             self.claims += 1
@@ -1154,6 +1267,106 @@ def _fake_job_consumer(reporter: Any) -> EvalStreamConsumer:
         substrate=_TokenSubstrate("tok"),
         reporter=reporter,
         repo_lookup=_StubRepo(),
+    )
+
+
+@dataclass(frozen=True)
+class _EvalMetric:
+    name: str
+    value: float
+    attributes: dict[str, str]
+
+
+class _EvalSpan:
+    def add_event(
+        self, _name: str, _attributes: Mapping[str, str] | None = None
+    ) -> None:
+        pass
+
+
+class _EvalTelemetryProbe:
+    def __init__(self) -> None:
+        self.spans: list[tuple[str, bool]] = []
+        self.metrics: list[_EvalMetric] = []
+
+    @contextmanager
+    def operation_span(
+        self,
+        name: str,
+        *,
+        kind: Any,
+        parent: Any = None,
+        attributes: Mapping[str, str] | None = None,
+    ) -> Iterator[_EvalSpan]:
+        del kind, attributes
+        span = trace.get_current_span(parent) if parent is not None else trace.get_current_span()
+        self.spans.append((name, span.get_span_context().is_valid))
+        yield _EvalSpan()
+
+    def record_metric(
+        self,
+        name: str,
+        value: float = 1,
+        *,
+        attributes: Mapping[str, str] | None = None,
+    ) -> None:
+        self.metrics.append(_EvalMetric(name, float(value), dict(attributes or {})))
+
+
+@pytest.mark.parametrize(
+    "carrier",
+    [None, "not-a-valid-traceparent"],
+    ids=["missing", "malformed"],
+)
+def test_eval_consumer_uses_a_safe_root_and_records_bounded_completion(
+    monkeypatch: pytest.MonkeyPatch,
+    carrier: str | None,
+) -> None:
+    """The eval sibling must tolerate the same carrier failures as runs."""
+
+    assert callable(operation_span)
+    assert callable(record_metric)
+    probe = _EvalTelemetryProbe()
+    import curie_telemetry
+
+    monkeypatch.setattr(curie_telemetry, "operation_span", probe.operation_span)
+    monkeypatch.setattr(curie_telemetry, "record_metric", probe.record_metric)
+    for module in (eval_stream_module, stream_consumer_module):
+        if hasattr(module, "operation_span"):
+            monkeypatch.setattr(module, "operation_span", probe.operation_span)
+        if hasattr(module, "record_metric"):
+            monkeypatch.setattr(module, "record_metric", probe.record_metric)
+
+    _canned_run(monkeypatch, [EvalOutcome.PASS])
+    reporter = _FakeReporter()
+    consumer = _fake_job_consumer(reporter)
+    acked: list[str] = []
+
+    async def _record_ack(entry_id: str) -> None:
+        acked.append(entry_id)
+
+    monkeypatch.setattr(consumer, "_ack", _record_ack)
+    item = _item(
+        suite="s",
+        sha="deadbeef",
+        bundle_ref="bundles/x.tgz",
+        target_url=None,
+    )
+    fields = {STREAM_PAYLOAD_FIELD: item.model_dump_json()}
+    if carrier is not None:
+        fields[TRACEPARENT_STREAM_FIELD] = carrier
+
+    asyncio.run(consumer._handle("1-0", fields))
+
+    assert acked == ["1-0"]
+    assert ("curie.eval.process", False) in probe.spans
+    completed = [point for point in probe.metrics if point.name == "curie.eval.process"]
+    assert completed
+    assert {point.attributes["outcome"] for point in completed} == {"success"}
+    assert all(
+        set(point.attributes)
+        <= {"service.name", "operation", "role", "source", "outcome"}
+        for point in completed
     )
 
 
@@ -1269,6 +1482,64 @@ def test_eval_boot_env_drops_reserved_connector_secret() -> None:
     assert env.get("CURIE_CONNECTOR_SECRET_KEYS") == "GITHUB_PERSONAL_ACCESS_TOKEN"
 
 
+def test_eval_claim_with_connector_secrets_targets_the_per_agent_pool(monkeypatch) -> None:
+    """Eval is the sibling of the runs claim path (#1488): secrets + agent name
+    must route the claim to the per-agent pool, not the generic one."""
+    from curie_worker.eval import stream as stream_module
+    from curie_worker.sandbox.types import AGENT_LABEL
+
+    class _NamedSecrets(_StubRepo):
+        async def secrets_for(self, _agent_id: uuid.UUID) -> dict[str, str] | None:
+            return {"GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_ok"}
+
+        async def name_for(self, _agent_id: uuid.UUID) -> str | None:
+            return "acme-a"
+
+    async def _skip_suite(*_args: object, **_kwargs: object) -> EvalRunResult:
+        return EvalRunResult(version="deadbeef", suite="s", results=[])
+
+    monkeypatch.setattr(stream_module, "run_eval_suite", _skip_suite)
+    fake_k8s = _FakeK8s()
+    sandbox_prefix = f"test:curie:sandbox:{uuid.uuid4().hex}"
+    affinity = AffinityStore(
+        redis.Redis(host=_VH, port=_VP, password=_VPW or None, decode_responses=False),
+        key_prefix=sandbox_prefix,
+    )
+    substrate = SandboxSubstrate(
+        fake_k8s,  # type: ignore[arg-type]
+        affinity,
+        SubstrateConfig(
+            namespace="test-ns",
+            warm_pool="curie-runner-pool",
+            claim_timeout_seconds=3.0,
+            poll_interval_seconds=0.005,
+            key_prefix=sandbox_prefix,
+        ),
+    )
+    consumer = _consumer(
+        WorkerConfig(fake_model=True),
+        bundle_store=_FakeBundleStore(
+            _suite_bundle(
+                EvalSuite(
+                    name="s",
+                    cases=[EvalCase(id="1", input="q", grader=Grader(kind=CONTAINS, expected="a"))],
+                )
+            )
+        ),
+        substrate=substrate,
+        reporter=_FakeReporter(),
+        repo_lookup=_NamedSecrets(),
+    )
+    item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.tgz", target_url=None)
+
+    async def go() -> None:
+        await consumer._run_and_report(item, "test-stream-id")
+
+    asyncio.run(go())
+    assert fake_k8s.created_pools == ["curie-agent-acme-a-runner-pool"]
+    assert fake_k8s.created_labels[-1][AGENT_LABEL] == "acme-a"
+
+
 def test_eval_threads_claim_token_into_run_eval_suite(monkeypatch) -> None:
     # The token surfaced from the provisioned handle must be threaded into the
     # eval turn driver so a token-enforcing sandbox does not 401 the eval. The
@@ -1289,6 +1560,7 @@ def test_eval_threads_claim_token_into_run_eval_suite(monkeypatch) -> None:
         fake: Any = None,
         stream_id: str | None,
         scorer: Any = None,
+        samples: Any = None,
     ) -> EvalRunResult:
         captured["base_url"] = base_url
         captured["token"] = token
@@ -1324,6 +1596,51 @@ def test_eval_threads_claim_token_into_run_eval_suite(monkeypatch) -> None:
     assert captured["token"] == "tok-eval-xyz"
     assert captured["stream_id"] == "test-stream-id"
     assert captured["scorer"] is None
+
+
+def test_eval_threads_sample_config_from_env_into_run_eval_suite(
+    monkeypatch,
+) -> None:
+    """#1907: the production eval consumer must honor CURIE_EVAL_SAMPLES rather
+    than silently running n=1. The capture is the run_eval_suite seam."""
+    from curie_worker.eval import stream as stream_module
+    from curie_worker.eval.sampling import AggregationPolicy, SampleConfig
+
+    monkeypatch.setenv("CURIE_EVAL_SAMPLES", "3")
+    monkeypatch.setenv("CURIE_EVAL_AGGREGATION", "majority")
+    captured: dict[str, Any] = {}
+
+    async def _capture_run(
+        suite: EvalSuite, *, version: str, samples: Any = None, **_kw: Any
+    ) -> EvalRunResult:
+        captured["samples"] = samples
+        return EvalRunResult(version=version, suite=suite.name, results=[])
+
+    monkeypatch.setattr(stream_module, "run_eval_suite", _capture_run)
+
+    suite = EvalSuite(
+        name="s",
+        cases=[EvalCase(id="1", input="q", grader=Grader(kind=CONTAINS, expected="a"))],
+    )
+    consumer = EvalStreamConsumer(
+        redis=None,  # type: ignore[arg-type]
+        config=WorkerConfig(),
+        bundle_store=_FakeBundleStore(_suite_bundle(suite)),  # type: ignore[arg-type]
+        substrate=_TokenSubstrate("tok-eval-xyz"),  # type: ignore[arg-type]
+        reporter=_FakeReporter(),  # type: ignore[arg-type]
+        recorder=None,  # type: ignore[arg-type]
+        repo_lookup=_StubRepo(),
+    )
+    item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.tgz", target_url=None)
+
+    async def go() -> None:
+        await consumer._run_and_report(item, "test-stream-id")
+
+    asyncio.run(go())
+
+    assert captured["samples"] == SampleConfig(
+        n=3, policy=AggregationPolicy.MAJORITY, k=1
+    )
 
 
 @pytest.mark.parametrize("fake_model", [True, False])

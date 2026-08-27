@@ -25,13 +25,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 import uuid
 from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import aiohttp
 from aci_protocol import (
@@ -64,6 +67,8 @@ from channel_protocol.reply import (
     TurnCompleted,
     TurnStatus,
 )
+from curie_telemetry import operation_span, record_metric
+from opentelemetry.trace import SpanKind, StatusCode
 from pydantic import ValidationError
 
 from .actions import ActionBackendError, ActionRecorder
@@ -91,7 +96,7 @@ from .killswitch import KillSwitch
 from .markers import CompletionRecord, MalformedCompletionError, Markers
 from .publication_validation import validate_snapshot_against_base
 from .receipt import render_receipt
-from .reply_sink import ReplySink, TargetRoute
+from .reply_sink import ObservedReplySink, ReplySink, TargetRoute
 from .runner_client import (
     RunnerClient,
     RunnerError,
@@ -148,6 +153,39 @@ def _publication_approval_summary(snapshot: RunnerWorkspaceSnapshot) -> str:
         f"{len(snapshot.changed_paths)} changed path(s): {path_list}."
         f"{workflow_note} Requester-provided title: {requester_title}. "
         f"Requester-provided description: {requester_body}"
+    )
+
+_LIFECYCLE_SPAN: ContextVar[Any | None] = ContextVar(
+    "curie_worker_lifecycle_span", default=None
+)
+_LIFECYCLE_OUTCOME: ContextVar[str | None] = ContextVar(
+    "curie_worker_lifecycle_outcome", default=None
+)
+_ERROR_LIFECYCLE_OUTCOMES = frozenset(
+    {
+        "awaiting_approval",
+        "budget_halted",
+        "classified_failure",
+        "side_effect_halted",
+        "interrupted",
+    }
+)
+
+
+def _lifecycle_event(name: str, outcome: str) -> None:
+    span = _LIFECYCLE_SPAN.get()
+    if span is not None:
+        span.add_event(name, {"outcome": outcome})
+
+
+def _record_route(outcome: str) -> None:
+    record_metric(
+        "curie.thread.route",
+        attributes={
+            "service.name": "curie-worker",
+            "source": "worker",
+            "outcome": outcome,
+        },
     )
 
 
@@ -241,15 +279,102 @@ RETRYABLE_CLASSIFICATIONS = frozenset({"rate-limit", "runner-error"})
 # platform contract on a platform-authored turn -- not user-intent guessing.
 _EXPIRY_RESUME_MARKER = "[approval expired]"
 
-# The channel kind a POLICY-ROUTED approval card posts to (#247). The one place
-# the kernel names a kind, and it is a fact about the route binding rather than a
-# branch on the turn: ``ApprovalRouteBinding.channel`` is validated as a Slack
-# channel id (``apps/api/src/curie_api/schemas.py``), the channel-membership
-# authorizer proves approver membership through Slack, and widening that binding
-# to other kinds is explicitly out of scope for ADR-0096 phase 2. Its route is
-# empty on both halves, which means the worker's DEFAULT Slack transport (#451):
-# the card is policy, so its transport is policy too, never the trigger's.
+# The only channel kind a POLICY-ROUTED approval RESOLUTION target may name
+# (#1460). The explicit kind is the future extension point, but accepting another
+# resolver now would bypass the verified Slack identity on which the API's
+# authorizer relies. Its route is empty on both halves, which means the worker's
+# DEFAULT Slack transport (#451): the card is policy, so its transport is policy
+# too, never the trigger's or the notification target's.
 POLICY_CARD_KIND = "slack"
+_POLICY_CARD_ADDRESS = re.compile(r"^[CDG][A-Z0-9]{7,}$")
+_NOTIFICATION_ADDRESS_SHAPES = {POLICY_CARD_KIND: _POLICY_CARD_ADDRESS}
+_CHANNEL_SLUG = re.compile(r"^[a-z0-9]+(?:[-_][a-z0-9]+)*$")
+_ROUTE_WHITESPACE = re.compile(r"\s")
+
+
+def _valid_notification_endpoint(endpoint: Any) -> bool:
+    """Mirror the API's absolute HTTP(S), host, and no-userinfo endpoint gate."""
+
+    if not isinstance(endpoint, str):
+        return False
+    try:
+        parsed = urlsplit(endpoint)
+    except ValueError:
+        return False
+    return (
+        parsed.scheme in {"http", "https"}
+        and bool(parsed.hostname)
+        and parsed.username is None
+        and parsed.password is None
+    )
+
+
+def _parse_approval_targets(
+    binding: Any,
+) -> tuple[tuple[str, str], tuple[str, str, TargetRoute] | None] | None:
+    """Parse one stored approval binding, or fail closed with ``None``.
+
+    The API owns complete config validation. This worker boundary independently
+    reasserts the authority-bearing envelope and Slack resolution-ID shape
+    because JSONB may be written out of band: the retired ``channel`` key, a
+    non-Slack resolver, an unknown target field, a half-configured transport,
+    or duplicate targets must not produce a durable approval with ambiguous
+    authority.
+    """
+
+    if not isinstance(binding, dict) or set(binding) - {
+        "resolution",
+        "notification",
+        "approvers",
+    }:
+        return None
+
+    resolution = binding.get("resolution")
+    if (
+        not isinstance(resolution, dict)
+        or set(resolution) != {"kind", "address"}
+        or resolution.get("kind") != POLICY_CARD_KIND
+        or not isinstance(resolution.get("address"), str)
+        or _POLICY_CARD_ADDRESS.fullmatch(resolution["address"]) is None
+    ):
+        return None
+    resolution_pair = (POLICY_CARD_KIND, resolution["address"])
+
+    notification = binding.get("notification")
+    if notification is None:
+        return resolution_pair, None
+    if not isinstance(notification, dict) or set(notification) - {
+        "kind",
+        "address",
+        "endpoint",
+        "adapter",
+    }:
+        return None
+
+    kind = notification.get("kind")
+    address = notification.get("address")
+    endpoint = notification.get("endpoint")
+    adapter = notification.get("adapter")
+    address_shape = (
+        _NOTIFICATION_ADDRESS_SHAPES.get(kind) if isinstance(kind, str) else None
+    )
+    if (
+        not isinstance(kind, str)
+        or _CHANNEL_SLUG.fullmatch(kind) is None
+        or not isinstance(address, str)
+        or not address
+        or _ROUTE_WHITESPACE.search(address) is not None
+        or (address_shape is not None and address_shape.fullmatch(address) is None)
+        or (adapter is not None and (
+            not isinstance(adapter, str) or _CHANNEL_SLUG.fullmatch(adapter) is None
+        ))
+        or (endpoint is None) != (adapter is None)
+        or (endpoint is not None and not _valid_notification_endpoint(endpoint))
+        or (kind != POLICY_CARD_KIND and endpoint is None)
+        or (kind, address) == resolution_pair
+    ):
+        return None
+    return resolution_pair, (kind, address, TargetRoute(endpoint=endpoint, adapter=adapter))
 
 
 def _approval_id_from_resume_event(event_id: str) -> str | None:
@@ -439,7 +564,7 @@ class _ThrottledReply:
         best_effort: bool = False,
         on_ref: Callable[[str], None] | None = None,
     ) -> None:
-        self._sink = sink
+        self._sink = ObservedReplySink(sink)
         self._target = target
         # Told when this turn mints a reply ref (ADR-0079), so the kernel's other
         # delivery paths edit the same message this streamer created. Only fires
@@ -564,7 +689,11 @@ class Kernel:
     ) -> None:
         self._substrate = substrate
         self._runner = runner
-        self._sink = sink
+        # Every outbound reply, including platform-authored drops, completion
+        # events, escalations, and approval cards, crosses this one observed
+        # seam. ``_ThrottledReply`` retains its decorator for direct callers;
+        # the reply-sink ContextVar suppresses that nested observation.
+        self._sink = ObservedReplySink(sink)
         self._lock = lock
         self._markers = markers
         self._config = config
@@ -683,6 +812,53 @@ class Kernel:
         return ack
 
     async def process_event(self, qevent: QueuedTurn) -> None:
+        """Observe one kernel lifecycle while preserving its ``None`` result."""
+
+        error: BaseException | None = None
+        with operation_span(
+            "curie.turn.process",
+            kind=SpanKind.INTERNAL,
+            attributes={"service.name": "curie-worker", "source": "worker"},
+        ) as span:
+            token = _LIFECYCLE_SPAN.set(span)
+            outcome_token = _LIFECYCLE_OUTCOME.set(None)
+            try:
+                await self._process_event(qevent)
+            except asyncio.CancelledError as exc:
+                error = exc
+                _LIFECYCLE_OUTCOME.set("interrupted")
+                span.add_event(
+                    "turn.processing.interrupted",
+                    {"outcome": "interrupted"},
+                )
+            except Exception as exc:
+                error = exc
+                span.add_event(
+                    "turn.processing.failed",
+                    {"outcome": "classified_failure", "error.class": type(exc).__name__},
+                )
+            finally:
+                outcome = _LIFECYCLE_OUTCOME.get()
+                if outcome is None:
+                    # A normal early return is the already-terminal skip. An
+                    # exception is classified here rather than exported as the
+                    # operation_span default OK.
+                    outcome = "classified_failure" if error is not None else "done"
+                if hasattr(span, "set_attribute"):
+                    span.set_attribute("outcome", outcome)
+                if hasattr(span, "set_status"):
+                    span.set_status(
+                        StatusCode.ERROR
+                        if outcome in _ERROR_LIFECYCLE_OUTCOMES
+                        else StatusCode.OK
+                    )
+                span.add_event("turn.processing.completed", {"outcome": outcome})
+                _LIFECYCLE_OUTCOME.reset(outcome_token)
+                _LIFECYCLE_SPAN.reset(token)
+        if error is not None:
+            raise error
+
+    async def _process_event(self, qevent: QueuedTurn) -> None:
         """Handle one queued turn to a terminal state (success or escalate).
 
         Returns normally once the event is terminally handled; the consumer then
@@ -741,7 +917,27 @@ class Kernel:
             # If this is an approval resume, settle its live card before running
             # the continuation: expired (#419) or resolved (#1084). Best-effort,
             # and gated on the resume event id so an ordinary turn pays nothing.
-            await self._finalize_settled_card(qevent, route)
+            if self._is_approval_resume(qevent.event_id):
+                with operation_span(
+                    "curie.approval.resume",
+                    kind=SpanKind.INTERNAL,
+                    attributes={
+                        "service.name": "curie-worker",
+                        "operation": "resume",
+                    },
+                ) as approval_span:
+                    await self._finalize_settled_card(qevent, route)
+                    approval_span.add_event("approval.resumed", {"outcome": "resumed"})
+                record_metric(
+                    "curie.approval.lifecycle",
+                    attributes={
+                        "service.name": "curie-worker",
+                        "operation": "resume",
+                        "outcome": "resumed",
+                    },
+                )
+            else:
+                await self._finalize_settled_card(qevent, route)
 
             # Crash-safety: a prior attempt executed a side effect but never
             # reached done (worker died mid-run). Do not auto-retry the action.
@@ -769,7 +965,12 @@ class Kernel:
                     "A prior attempt started an action before the worker restarted; "
                     "not retrying automatically. Flagging for a human.",
                 )
-                await self._complete(qevent, route, "escalated")
+                await self._complete(
+                    qevent,
+                    route,
+                    "escalated",
+                    telemetry_outcome="classified_failure",
+                )
                 return
 
             # Deployment-to-runtime binding: resolve which agent/version this
@@ -777,6 +978,7 @@ class Kernel:
             # polite drop, not a crash.
             boot_env: dict[str, str] | None = None
             agent_id: uuid.UUID | None = None
+            agent_name: str | None = None
             workspace_deployment_id: uuid.UUID | None = None
             nav: NavAffordance | None = None
             packs: BehaviorPacks | None = None
@@ -821,14 +1023,24 @@ class Kernel:
                     )
                     return
                 agent_id = resolved.agent_id
+                agent_name = getattr(resolved, "agent_name", None)
                 # The scoped key, not the bare conversation id: this mints the
                 # sandbox's history ref and session id, so two channels sharing
                 # a conversation id must not rehydrate one another's transcript.
+                boot_env_kwargs: dict[str, Any] = {
+                    "kind": qevent.reply_handle.kind,
+                    "address": qevent.reply_handle.channel,
+                }
+                # The internal thread key is channel-scoped, so it no longer
+                # starts with the eval marker carried by conversation_id.
+                # Preserve that isolation intent explicitly without changing
+                # the stable sandbox/history identity (#1909 + ADR-0096).
+                if qevent.conversation_id.startswith("eval:"):
+                    boot_env_kwargs["isolate_memory"] = True
                 boot_env = self._binding.boot_env(
                     resolved,
                     thread_key,
-                    kind=qevent.reply_handle.kind,
-                    address=qevent.reply_handle.channel,
+                    **boot_env_kwargs,
                 )
                 if getattr(resolved, "workspace_enabled", False):
                     workspace_deployment_id = getattr(resolved, "deployment_id", None)
@@ -916,6 +1128,7 @@ class Kernel:
                     nav,
                     packs,
                     workspace_deployment_id,
+                    agent_name,
                 )
 
                 if outcome.status is SessionStatus.AWAITING_APPROVAL:
@@ -930,11 +1143,25 @@ class Kernel:
                         approval_routes,
                         deployment_id=workspace_deployment_id,
                     )
-                    await self._complete(qevent, route, "awaiting-approval")
+                    await self._complete(
+                        qevent,
+                        route,
+                        "awaiting-approval",
+                        telemetry_outcome="awaiting_approval",
+                    )
                     return
 
                 if outcome.terminal_ok:
-                    await self._complete(qevent, route, "delivered")
+                    await self._complete(
+                        qevent,
+                        route,
+                        "delivered",
+                        telemetry_outcome=(
+                            "idle"
+                            if outcome.status is SessionStatus.IDLE_AWAITING_INPUT
+                            else "done"
+                        ),
+                    )
                     return
 
                 if outcome.saw_side_effect:
@@ -944,7 +1171,12 @@ class Kernel:
                         f"The run hit an error ({outcome.classification or 'unknown'}) after "
                         "starting an action; not retrying automatically. Flagging for a human.",
                     )
-                    await self._complete(qevent, route, "escalated")
+                    await self._complete(
+                        qevent,
+                        route,
+                        "escalated",
+                        telemetry_outcome="side_effect_halted",
+                    )
                     return
 
                 retryable = outcome.classification in RETRYABLE_CLASSIFICATIONS
@@ -955,9 +1187,26 @@ class Kernel:
                         f"The run failed ({outcome.classification or 'unknown'}) after "
                         f"{attempt} attempt(s). Flagging for a human.",
                     )
-                    await self._complete(qevent, route, "escalated")
+                    await self._complete(
+                        qevent,
+                        route,
+                        "escalated",
+                        telemetry_outcome=(
+                            "budget_halted"
+                            if outcome.classification == "budget-exceeded"
+                            else "classified_failure"
+                        ),
+                    )
                     return
 
+                record_metric(
+                    "curie.queue.retry",
+                    attributes={
+                        "service.name": "curie-worker",
+                        "source": "worker",
+                        "retry_class": cast("str", outcome.classification),
+                    },
+                )
                 await asyncio.sleep(self._backoff(attempt))
         finally:
             release_order()
@@ -1219,7 +1468,7 @@ class Kernel:
         """Edit the placeholder with a reason and complete the turn (a polite
         drop for an unmapped channel or a paused agent, never a crash)."""
         await self._reply_for(qevent, route, message)
-        await self._complete(qevent, route, "dropped")
+        await self._complete(qevent, route, "dropped", telemetry_outcome="interrupted")
 
     async def _reply(
         self,
@@ -1246,6 +1495,8 @@ class Kernel:
         qevent: QueuedTurn,
         route: TargetRoute,
         outcome: str,
+        *,
+        telemetry_outcome: str,
     ) -> None:
         """The terminal ordering, at every durable ``mark_done`` call site.
 
@@ -1267,6 +1518,7 @@ class Kernel:
         would be a completion nothing could ever recover.
         """
         event_id = qevent.event_id
+        _LIFECYCLE_OUTCOME.set(telemetry_outcome)
         record = CompletionRecord(
             event_id=event_id,
             event=TurnCompleted(
@@ -1283,6 +1535,23 @@ class Kernel:
         generation = await self._markers.mark_completion_pending(event_id, record)
         await self._markers.mark_done(event_id)
         await self._deliver_completion(record, generation=generation)
+        attributes = {
+            "service.name": "curie-worker",
+            "source": "worker",
+            "outcome": telemetry_outcome,
+        }
+        record_metric("curie.turn.completed", attributes=attributes)
+        try:
+            received = datetime.fromisoformat(qevent.received_at)
+            if received.tzinfo is None:
+                received = received.replace(tzinfo=UTC)
+            duration = max(
+                0.0,
+                (datetime.now(UTC) - received.astimezone(UTC)).total_seconds(),
+            )
+        except ValueError:
+            duration = 0.0
+        record_metric("curie.turn.duration", duration, attributes=attributes)
 
     async def _deliver_completion(self, record: CompletionRecord, *, generation: str) -> bool:
         """Emit a stored completion and clear it, or leave it owed. True on send.
@@ -1504,6 +1773,7 @@ class Kernel:
         nav: NavAffordance | None = None,
         packs: BehaviorPacks | None = None,
         workspace_deployment_id: uuid.UUID | None = None,
+        agent_name: str | None = None,
     ) -> TurnOutcome:
         thread_key = _thread_key_for(qevent)
 
@@ -1531,16 +1801,31 @@ class Kernel:
         # turns per thread across workers). Then release the order lock so the
         # next same-thread event can route, and release the Valkey lock before
         # streaming so a follow-up can steer.
+        routed: _RouteResult | None = None
+
+        def close_routed_turn() -> None:
+            if routed is not None and routed.turn is not None:
+                routed.turn.close()
+
         try:
-            async with self._lock.hold(self._config.lock_key(thread_key)):
-                routed = await self._route_and_start(
-                    thread_key,
-                    event,
-                    boot_env,
-                    packs,
-                    workspace_deployment_id=workspace_deployment_id,
-                    source=qevent.source,
-                )
+            try:
+                async with self._lock.hold(self._config.lock_key(thread_key)):
+                    routed = await self._route_and_start(
+                        thread_key,
+                        event,
+                        boot_env,
+                        packs,
+                        workspace_deployment_id=workspace_deployment_id,
+                        agent_name=agent_name,
+                        source=qevent.source,
+                    )
+            except BaseException:
+                # start_turn owns a live response as soon as it returns, which
+                # is before the route lock's async exit has finished. Preserve
+                # cancellation and every existing error policy, but release the
+                # response first if lock cleanup itself fails or is cancelled.
+                close_routed_turn()
+                raise
         except CapacityExhaustedError as exc:
             release_order()
             rejection = exc.rejection
@@ -1588,13 +1873,21 @@ class Kernel:
             release_order()
             logger.warning("turn start failed for %s: %r", qevent.event_id, exc)
             return TurnOutcome(terminal_ok=False, classification="runner-error")
-        release_order()
+        assert routed is not None
+        try:
+            release_order()
+        except BaseException:
+            close_routed_turn()
+            raise
 
         if not self._config.slack_no_edit_streaming and defer_job_booting:
             try:
                 # Routing succeeded, so this delivery owns a real turn. Adopt the
                 # minted ref before streaming so every later update edits it.
                 await self._reply_for(qevent, route, self._config.booting_text)
+            except asyncio.CancelledError:
+                close_routed_turn()
+                raise
             except Exception:
                 logger.warning("booting-state update failed for %s", qevent.event_id)
 
@@ -1621,6 +1914,7 @@ class Kernel:
             return TurnOutcome(terminal_ok=True, steered=True)
 
         assert routed.handle is not None and routed.turn is not None
+        turn = routed.turn
         # Register this owner turn so a kill for its agent interrupts it, then
         # stream; unregister when the turn ends.
         self._register_run(agent_id, thread_key)
@@ -1634,7 +1928,7 @@ class Kernel:
                 and await self._killswitch.is_killed(agent_id)
             ):
                 await self.interrupt_thread(thread_key, f"agent {agent_id} killed by operator")
-            outcome = await self._consume(qevent, route, routed.turn, nav, agent_id)
+            outcome = await self._consume(qevent, route, turn, nav, agent_id)
             if (
                 outcome.status is SessionStatus.AWAITING_APPROVAL
                 and _is_publish_provenance(
@@ -1676,6 +1970,11 @@ class Kernel:
             return outcome
         finally:
             self._unregister_run(agent_id, thread_key)
+            # _consume owns bounded post-Final drain and normally releases the
+            # response itself. This idempotent backstop covers cancellation or
+            # an unexpected failure after start_turn but before _consume enters
+            # its response context.
+            turn.close()
 
     async def _route_and_start(
         self,
@@ -1685,6 +1984,7 @@ class Kernel:
         packs: BehaviorPacks | None = None,
         *,
         workspace_deployment_id: uuid.UUID | None = None,
+        agent_name: str | None = None,
         source: TurnSource = TurnSource.SLACK,
     ) -> _RouteResult:
         # A workspace-enabled thread must establish (or confirm) its repository
@@ -1712,12 +2012,17 @@ class Kernel:
         # both run under this same lock), so answer canned without claiming a
         # sandbox or starting a model turn. Any existing route falls through to the
         # normal claim -> steer/start_turn path below.
+        # Snapshot the route under the same distributed lock that guards the
+        # claim and turn-open decision. ``claim`` can evict a stale route or
+        # ``_claim_or_resume`` can replace a suspended one, so the handle after
+        # claiming is compared with this full snapshot rather than treating the
+        # mere presence of an affinity record as proof that a live route was
+        # retained.
+        existing_handle = await asyncio.to_thread(self._substrate.lookup, thread_key)
         if packs is not None:
             reply = match_greeting(packs, event.text) or match_help(packs, event.text)
-            if reply is not None:
-                existing = await asyncio.to_thread(self._substrate.lookup, thread_key)
-                if existing is None:
-                    return _RouteResult(steered=False, canned_reply=reply)
+            if reply is not None and existing_handle is None:
+                return _RouteResult(steered=False, canned_reply=reply)
         # claim() adopts the thread's live sandbox and refreshes its route TTL
         # (so a busy thread past route_ttl is not reaped), or claims a warm one /
         # resumes a suspended one. On a fresh claim the boot env binds the agent's
@@ -1737,7 +2042,9 @@ class Kernel:
             thread_key,
             boot_env,
             workspace_deployment_id=workspace_deployment_id,
+            agent_name=agent_name,
         )
+        retained_live_route = existing_handle is not None and handle == existing_handle
         claim_ms = round((time.monotonic() - claim_started) * 1000)
         logger.info("claim latency for %s: %d ms", thread_key, claim_ms)
         if source.is_job:
@@ -1761,9 +2068,42 @@ class Kernel:
                 raise ThreadBusyError(
                     f"thread {thread_key} has a live session; deferring the {source} turn"
                 )
-        elif await self._runner.steer(handle.base_url, event, token=handle.token or None):
-            return _RouteResult(steered=True)
+        else:
+            active_before_steer = False
+            if retained_live_route:
+                try:
+                    status = await self._runner.status(handle.base_url)
+                except Exception as exc:  # noqa: BLE001 -- steering still decides the route
+                    logger.warning(
+                        "could not read pre-steer turn liveness at %s: %r",
+                        handle.base_url,
+                        exc,
+                    )
+                else:
+                    active = status.get("turn_active")
+                    if isinstance(active, bool):
+                        active_before_steer = active
+                    else:
+                        logger.warning(
+                            "runner pre-steer status carried no usable turn_active: %r",
+                            status,
+                        )
+            steered = await self._runner.steer(handle.base_url, event, token=handle.token or None)
+            if steered:
+                _record_route("steer")
+                _lifecycle_event("runner.turn.steered", "steer")
+                return _RouteResult(steered=True)
+            # A 409 is a finish race only when the route-lock snapshot and the
+            # claim resolve to the same retained live sandbox. A fresh or
+            # replacement runner is expected to refuse its first steer probe;
+            # counting that bootstrap condition as a race would make every new
+            # turn inflate the operator signal.
+            if retained_live_route and active_before_steer:
+                _record_route("finish-race")
+                _lifecycle_event("runner.finish_race", "finish-race")
         turn = await self._runner.start_turn(handle.base_url, event, token=handle.token or None)
+        _record_route("start")
+        _lifecycle_event("runner.turn.started", "start")
         return _RouteResult(steered=False, handle=handle, turn=turn)
 
     async def _turn_active(self, handle: SandboxHandle) -> bool:
@@ -1804,6 +2144,7 @@ class Kernel:
         boot_env: dict[str, str] | None,
         *,
         workspace_deployment_id: uuid.UUID | None = None,
+        agent_name: str | None = None,
     ) -> SandboxHandle:
         # A live route is an adopt/steer, not a session start. Preparing before
         # this check would clone on every threaded steer and could even replace
@@ -1833,6 +2174,7 @@ class Kernel:
                 thread_key=thread_key,
                 deployment_id=workspace_deployment_id,
                 env=boot_env,
+                agent_name=agent_name,
             )
             if not isinstance(workspace_claim.handle, SandboxHandle):
                 raise WorkspacePreparationError(
@@ -1840,13 +2182,17 @@ class Kernel:
                 )
             return workspace_claim.handle
         try:
-            return await asyncio.to_thread(self._substrate.claim, thread_key, env=boot_env)
+            return await asyncio.to_thread(
+                self._substrate.claim, thread_key, env=boot_env, agent_name=agent_name
+            )
         except SuspendedThreadError:
             # Resume with the same bound boot env a fresh claim gets (bundle
             # ref, budget, refs): a suspended pod was deleted (ADR-0003), so
             # the replacement boots from env alone; without this it would come
             # up generic, without the agent's bundle.
-            return await asyncio.to_thread(self._substrate.resume, thread_key, env=boot_env)
+            return await asyncio.to_thread(
+                self._substrate.resume, thread_key, env=boot_env, agent_name=agent_name
+            )
 
     @staticmethod
     def _is_approval_resume(event_id: str) -> bool:
@@ -1859,69 +2205,30 @@ class Kernel:
     async def _finalize_settled_card(self, qevent: QueuedTurn, route: TargetRoute) -> None:
         """Settle the approval card when its approval resumes (#419, #1084).
 
-        Every terminal transition ends here, because the card outlives the
-        decision and nothing else in the system owns it. An EXPIRY (#419) has no
-        click at all: the #412 sweeper or a past-SLA resolve flips the record and
-        enqueues a ``[approval expired]`` turn, and the buttons would otherwise
-        keep looking live. A RESOLVE (#1084) has a click only sometimes -- a
-        resolution that arrived through ``POST /approvals/{id}/resolve`` or
-        ``curie <tier> approvals --resolve`` never touched Slack, so the card
-        stayed live there too, and every later click earned a 409.
+        Approval id is the only identity used for the remembered ref. A resolved
+        resume reads its durable verdict first, so an unavailable record defers
+        settlement without touching the ref. Expiry needs no verdict read.
 
-        Both forms render through the SAME function the dispatcher's click path
-        is pinned against, so a CLI resolve and a button click leave the same
-        card behind. That convergence is the point of #1084; two renderers on one
-        surface is what it was filed to stop.
+        The card ref is read without mutation and the Slack edit happens while
+        the original value remains stored. Only confirmed delivery is followed
+        by an atomic comparison and deletion of that exact value. A failed edit
+        leaves the ref available to a reclaimed pass only when that delivery
+        also fails before mark_done. Otherwise it remains until TTL.
 
-        Idempotence, and why an unconditional re-stamp is safe: ``pop`` is a
-        GETDEL of the ref, the only pointer the platform still holds to the
-        posted card, so at most one turn holds it at a time; of the turns that
-        hold it, only the one whose approval the ref belongs to keeps it and
-        stamps, and every other holder puts it back. A redelivery after a stamp
-        finds nothing. Within the pass that does claim the ref, the stamp may
-        land on a card the dispatcher already stamped from a click, which is a
-        rewrite to an equivalent card rather than a second verdict -- the shared
-        renderer is what makes "equivalent" true, and a test pins it. A card
-        stamped here and then clicked late gets the existing already-resolved
-        refusal from the API, unchanged.
+        Two worker replicas may read the same ref and emit equivalent edits
+        because both use the shared renderer. Only one can consume the matching
+        value. Sequential redelivery finds no ref after successful cleanup. If a
+        newer ref replaces the value during delivery, comparison preserves it.
 
-        Fully best-effort: nothing here may fail the resume, the cheap event-id
-        check gates all of it so ordinary turns pay nothing, and a record that
-        cannot be read leaves BOTH the card and its ref alone rather than
-        stamping a verdict the kernel had to guess. That makes an unreadable
-        record a deferral instead of a permanent loss (#1199): ``ApprovalReader``
-        never raises, so before #1199 one transient blip stranded the card with
-        live-looking buttons forever. That closes a one-way door, but it is not
-        an unconditional later settle: this runs once per ``process_event``,
-        outside the retry loop, and an otherwise-healthy turn goes on to write
-        the done marker, after which every redelivery is skipped. The surviving
-        ref is therefore revisited only when that same delivery ALSO failed to
-        reach ``mark_done`` and the entry is reclaimed (ADR-0039, #505).
-
-        Two honest consequences. An approval-resume turn whose ref is already
-        gone now pays one record read before finding that out, a cost that lands
-        only on approval-resume turns. And a PERMANENT reason for no outcome (no
-        reader configured, an id that does not parse, a record somehow not
-        resolved) leaves the ref in Valkey until its TTL lapses or a later
-        approval on the same thread overwrites it, rather than being cleaned up
-        eagerly -- telling transient from permanent here would mean guessing.
-        That lingering ref is NOT harmless on its own: a later approval's resume
-        on the same thread would pop it and stamp on it. What makes it safe is
-        the pairing check below, not the entry being per-thread and TTL-bounded.
-
-        The pairing check, and why it puts the ref back: the entry is keyed by
-        thread, so ``remember`` carries the approval id (#1199) and a popped ref
-        whose id is not the one this resume is settling is not stamped -- that
-        card belongs to another, still-pending approval, and stamping it would
-        state this approval's verdict about that one. It is written back
-        conditionally (``ApprovalCardStore.restore``, a ``SET NX``), because
-        destroying it would strand that other approval's card with live buttons
-        nothing can ever settle: the same harm #1199 is about, arriving through
-        the refusal instead of through the record read, and terminal on the
-        expiry path where no click exists to heal it.
+        This remains fully best effort and never fails the resume. There is no
+        dual read for refs keyed by thread before the approval id layout. Those
+        refs are not automatically settled and remain until their TTL expires.
         """
 
         if self._card_store is None or not self._is_approval_resume(qevent.event_id):
+            return
+        approval_id = _approval_id_from_resume_event(qevent.event_id)
+        if approval_id is None:
             return
         # Computed once, and the only thing the two forms disagree about. It is
         # an explicit flag rather than "no outcome to stamp" because those two
@@ -1934,54 +2241,23 @@ class Kernel:
         # the failure log below names it.
         thread_key = _thread_key_for(qevent)
         try:
-            # Expiry states only that nobody decided, so it needs no record read;
-            # a resolve states what was decided, and that comes from the record.
-            # The read is the only step that differs, so it is the only step
-            # inside the branch: the pop, the pairing check and its put-back
-            # below are written once and apply to both, because a check present
-            # on one path only is a wrong-card stamp on the other.
+            # Expiry states only that nobody decided, so it needs no record read.
+            # A resolve states what was decided, and that comes from the durable
+            # record before the card ref is touched.
             outcome: SettledOutcome | None = None
             if not is_expiry:
-                # Read first, pop second (#1199). The read is the step that can
-                # come back empty for a reason that later passes could recover
-                # from, and the pop is irreversible; doing them in this order is
-                # what keeps a blip a deferral. The pop is still the GETDEL that
-                # makes the stamp exactly-once, just claimed one step later.
-                outcome = await self._settled_from_record(qevent)
+                outcome = await self._settled_from_record(approval_id)
                 if outcome is None:
-                    # Logged because a deliberate non-stamp otherwise looks
-                    # identical to there having been no card at all: nothing was
-                    # popped, so the ref is still there for a later pass.
                     logger.info(
                         "no readable approval outcome for thread %s -- "
                         "leaving its card ref in place, not stamped",
                         thread_key,
                     )
                     return
-            ref = await self._card_store.pop(thread_key)
-            if ref is None:
+            entry = await self._card_store.read(approval_id)
+            if entry is None:
                 return
-            # The ref is keyed by thread, so this is what tells "my card" from a
-            # card another approval on this thread posted -- either by
-            # overwriting the ref inside the record-read window above, or by
-            # leaving a stale one behind that this resume just popped. An EMPTY
-            # id is an entry remembered before #1199 (they outlive a deploy);
-            # it stamps exactly as it did then, because refusing there would
-            # strand every pre-upgrade card instead of protecting anything.
-            resume_approval_id = _approval_id_from_resume_event(qevent.event_id)
-            if ref.approval_id and ref.approval_id != resume_approval_id:
-                # Put back conditionally so the approval it really belongs to can
-                # still settle its own card; a newer entry, if one arrived, wins.
-                await self._card_store.restore(thread_key, ref)
-                # Logged because a deliberate non-stamp otherwise looks
-                # identical to there having been no card at all.
-                logger.info(
-                    "approval card for thread %s belongs to approval %s, not %s -- not stamped",
-                    thread_key,
-                    ref.approval_id,
-                    resume_approval_id,
-                )
-                return
+            ref, raw_ref = entry
             if is_expiry:
                 # The branch above left the outcome unread, on purpose: an expiry
                 # says only that nobody decided.
@@ -2025,7 +2301,14 @@ class Kernel:
                     adapter=ref.adapter if ref.kind else route.adapter,
                 ),
             )
-            logger.info("settled approval card for thread %s", thread_key)
+            consumed = await self._card_store.consume(approval_id, raw_ref)
+            if consumed:
+                logger.info("settled approval card for thread %s", qevent.conversation_id)
+            else:
+                logger.info(
+                    "approval card ref changed or vanished before cleanup for approval %s",
+                    approval_id,
+                )
         except Exception as exc:  # noqa: BLE001 - card teardown is best-effort
             logger.warning(
                 "approval card teardown failed for thread %s: %s",
@@ -2033,26 +2316,20 @@ class Kernel:
                 exc,
             )
 
-    async def _settled_from_record(self, qevent: QueuedTurn) -> SettledOutcome | None:
+    async def _settled_from_record(self, approval_id: str) -> SettledOutcome | None:
         """The resolved outcome to stamp, read from the durable record.
 
         Read, not parsed. The resume turn does state the decision, the resolver
         and the note, but it states them in a sentence written for a language
-        model; reconstructing them by regex would make the card's correctness
-        depend on that wording. The approval id comes out of the resume turn's
-        deterministic ``event_id`` instead, which is a frozen key shared with
-        ``resumequeue.resume_event_id``.
+        model. Reconstructing them by regex would make the card's correctness
+        depend on that wording.
 
-        None means "do not stamp": no reader configured, an id that does not
-        parse, a record that could not be read, or a record that is somehow not
-        resolved. Leaving a live-looking card is a smaller wrong than stamping a
-        verdict nobody confirmed.
+        None means "do not stamp": no reader configured, a record that could not
+        be read, or a record that is somehow not resolved. Leaving a live looking
+        card is a smaller wrong than stamping a verdict nobody confirmed.
         """
 
         if self._approval_reader is None:
-            return None
-        approval_id = _approval_id_from_resume_event(qevent.event_id)
-        if approval_id is None:
             return None
         record = await self._approval_reader.get(approval_id)
         if record is None or record.status not in ("approved", "rejected"):
@@ -2083,13 +2360,13 @@ class Kernel:
         resume path cold-claims a fresh sandbox regardless (ADR-0003).
 
         ``approval_routes`` is the agent's per-deployment route-binding map
-        (#247): when the request named a route bound to a channel, the card is
-        routed there and that channel's members become the approvers. A named
-        but UNBOUND route (declared in the manifest, not bound in this agent's
-        deployment config) is ESCALATED loudly rather than routed to the
-        requesting channel (#544, Decision B, reversing #247): silently widening
-        authority to whoever happens to be in the requesting channel is exactly
-        the failure AC2 closes. No approval is created in that case.
+        (#247/#1460): ``resolution`` owns the sole interactive card and verified
+        identity path; ``notification`` may receive a separate text-only ping.
+        A named but UNBOUND or malformed route is ESCALATED loudly rather than
+        routed to the requesting channel (#544, Decision B, reversing #247):
+        silently widening authority to whoever happens to be in the requesting
+        channel is exactly the failure AC2 closes. No approval is created in
+        that case.
         """
 
         # Both identities are live in this function and they are not
@@ -2125,18 +2402,13 @@ class Kernel:
         # happens to equal a Slack policy channel as "the requesting channel".
         card_kind = qevent.reply_handle.kind
         card_channel = qevent.reply_handle.channel
+        notification_target: tuple[str, str, TargetRoute] | None = None
         if route_name:
             binding = (approval_routes or {}).get(route_name)
-            bound = binding.get("channel") if isinstance(binding, dict) else None
-            if bound:
-                # A policy channel is a Slack channel id by construction
-                # (POLICY_CARD_KIND), so the routed card's pair is that kind
-                # with that address -- whatever kind the requesting turn had.
-                card_kind = POLICY_CARD_KIND
-                card_channel = str(bound)
-            else:
+            targets = _parse_approval_targets(binding)
+            if targets is None:
                 logger.warning(
-                    "approval route %r is not bound for agent %s; escalating "
+                    "approval route %r is not bound or is malformed for agent %s; escalating "
                     "rather than routing the card to the requesting channel",
                     route_name,
                     agent_id,
@@ -2145,10 +2417,12 @@ class Kernel:
                     qevent,
                     route,
                     f"The run requested approval via route {route_name!r}, but that "
-                    "route is not bound to a channel for this agent; flagging for "
-                    "a human instead of widening the request to this channel.",
+                    "route is not bound to a valid resolution target for this "
+                    "agent; flagging for a human instead of widening the request "
+                    "to this channel.",
                 )
                 return
+            (card_kind, card_channel), notification_target = targets
 
         if not is_publication and self._approvals is None:
             await self._escalate(
@@ -2293,13 +2567,55 @@ class Kernel:
                         thread,
                         ttl_seconds=self._suspended_route_ttl_seconds,
                     )
-        try:
-            await asyncio.to_thread(self._substrate.suspend, thread_key, history_ref=None)
-        except SandboxError as exc:
+        record_metric(
+            "curie.approval.lifecycle",
+            attributes={
+                "service.name": "curie-worker",
+                "operation": "request",
+                "outcome": "requested",
+            },
+        )
+
+        suspend_error: SandboxError | None = None
+        with operation_span(
+            "curie.approval.suspend",
+            kind=SpanKind.INTERNAL,
+            attributes={
+                "service.name": "curie-worker",
+                "operation": "suspend",
+            },
+        ) as approval_span:
+            try:
+                await asyncio.to_thread(
+                    self._substrate.suspend, thread_key, history_ref=None
+                )
+            except SandboxError as exc:
+                suspend_error = exc
+                if hasattr(approval_span, "set_status"):
+                    approval_span.set_status(StatusCode.ERROR)
+                approval_span.add_event(
+                    "approval.suspend.failed",
+                    {"outcome": "failure", "error.class": type(exc).__name__},
+                )
+            else:
+                approval_span.add_event("approval.suspended", {"outcome": "suspended"})
+        record_metric(
+            "curie.approval.lifecycle",
+            attributes={
+                "service.name": "curie-worker",
+                "operation": "suspend",
+                "outcome": "failure" if suspend_error is not None else "suspended",
+            },
+        )
+        if suspend_error is not None:
             # Non-fatal: the record is durable and the resume path cold-claims a
             # fresh sandbox either way; a still-live sandbox is just reaped when
             # its route expires.
-            logger.warning("suspend failed for thread %s: %s", thread_key, exc)
+            logger.warning(
+                "suspend failed for thread %s (%s)",
+                thread_key,
+                type(suspend_error).__name__,
+            )
 
         # The notice is a control string the CLI parses by splitting on blank
         # lines and requiring the marker-leading block (cli/src/chat.rs
@@ -2322,7 +2638,9 @@ class Kernel:
                 "The session is paused and will resume once an authorized member "
                 "resolves this request."
             )
-        await self._reply_for(qevent, route, f"{base}\n\n{notice}" if base else notice)
+        await self._reply_for(
+            qevent, route, f"{base}\n\n{notice}" if base else notice
+        )
 
         if is_publication:
             # The atomic Approval+Publication insert is also the durable initial
@@ -2341,10 +2659,11 @@ class Kernel:
         # requesting channel the card joins the thread and rides the trigger's
         # own transport. A route-bound channel has no such thread and is policy,
         # not a per-turn reply: it posts top-level over the worker's default
-        # Slack transport, because an ``ApprovalRouteBinding`` is a Slack channel
-        # id by construction (``schemas.py`` validates it as one, and #247's
-        # binding shape is explicitly out of scope for ADR-0096 phase 2), and the
-        # authorizer proves membership of that channel through Slack.
+        # Slack transport, because ``ApprovalRouteBinding.resolution`` is
+        # Slack-only by construction (``schemas.py`` validates the explicit
+        # pair), and the authorizer proves membership of that channel through a
+        # verified Slack card click. Notification transport never feeds this
+        # comparison or these route fields.
         #
         # Keeping the requesting turn's kind and adapter here was a fail-closed
         # bug: an email-originated approval routed to a Slack policy channel kept
@@ -2444,7 +2763,7 @@ class Kernel:
             if card_ts and self._card_store is not None:
                 try:
                     await self._card_store.remember(
-                        thread_key,
+                        str(created.id),
                         channel=card_channel,
                         ts=card_ts,
                         summary=summary,
@@ -2456,15 +2775,6 @@ class Kernel:
                         # a policy-routed card, is a different channel entirely).
                         kind=card_kind,
                         adapter=card_adapter,
-                        # Pair the ref to the approval it belongs to (#1199).
-                        # The entry is keyed by thread, so this is the only
-                        # thing that lets the resume turn tell "my card" from a
-                        # card another approval on this thread left behind.
-                        # ``resumequeue.resume_event_id`` builds that turn's
-                        # event id as ``approval-<id>-resolved`` from this same
-                        # id, so this is exactly the string
-                        # ``_approval_id_from_resume_event`` recovers there.
-                        approval_id=str(created.id),
                         # The settled rebuild shows the same "Requested by" line
                         # the live card did, and once the sandbox is gone this
                         # is the worker's only copy of it (#1084).
@@ -2472,6 +2782,38 @@ class Kernel:
                     )
                 except Exception as exc:  # noqa: BLE001 - best-effort memory
                     logger.warning("remembering approval card for %s failed: %s", created.id, exc)
+        # Visibility is independent of card delivery. This is a second post, not
+        # a second card: there is deliberately no ConfirmIntent, action value, or
+        # remembered card ref. A failed notification cannot invalidate or move
+        # the durable approval, and a failed resolution-card transport must not
+        # suppress the notification attempt.
+        if notification_target is not None:
+            notification_kind, notification_address, notification_route = notification_target
+            try:
+                await self._sink.emit(
+                    ReplyPost(
+                        version=REPLY_WIRE_VERSION,
+                        event="reply.post",
+                        target=ReplyTarget(
+                            kind=notification_kind,
+                            address=notification_address,
+                            conversation_id=None,
+                            reply_ref=None,
+                        ),
+                        message=OutboundMessage(
+                            version=MESSAGE_VERSION,
+                            text=(
+                                f"Approval {created.id} requires review: {notice_summary}. "
+                                "Resolve in the configured approval channel."
+                            ),
+                            interaction=None,
+                        ),
+                        requested_by=qevent.author,
+                    ),
+                    route=notification_route,
+                )
+            except Exception as exc:  # noqa: BLE001 - the durable pause stands
+                logger.warning("approval notification post failed for %s: %s", created.id, exc)
         logger.info("thread %s suspended awaiting approval %s", thread_key, created.id)
 
     async def _consume(
@@ -2511,6 +2853,12 @@ class Kernel:
             async with turn:
                 async for frame in turn:
                     await self._apply_frame(frame, acc, reply, qevent, agent_id)
+                    # ``Final`` is the protocol's terminal response event. Stop
+                    # at that boundary so a late frame from a finishing runner
+                    # cannot overwrite the outcome and suppress the kernel's
+                    # bounded retry/escalation decision.
+                    if isinstance(frame, Final):
+                        break
         except (aiohttp.ClientError, TimeoutError) as exc:
             # Stream dropped mid-run (sandbox killed, network fault). No final.
             logger.warning("turn stream dropped for %s: %s", qevent.event_id, exc)

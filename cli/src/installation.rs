@@ -1675,6 +1675,36 @@ mod diff_tests {
         }
     }
 
+    #[test]
+    fn shipped_curie_yaml_example_plans_for_apply() {
+        let _lock = CREDENTIAL_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let names = ["ANTHROPIC_API_KEY", "SLACK_APP_TOKEN", "SLACK_BOT_TOKEN"];
+        let env = CredentialEnvRestore::clear(&names);
+        for name in names {
+            env.set(name, "example credential");
+        }
+
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/curie.yaml");
+        let cfg = Installation::load(&path).expect("the shipped curie.yaml example must parse");
+
+        assert_eq!(cfg.install.namespace, "acme-bot");
+        assert_eq!(cfg.install.release, "acme-bot");
+        assert_eq!(
+            cfg.helm_sets(),
+            vec!["ui.deploy=false", "inference.deploy=false"]
+        );
+        assert_eq!(
+            cfg.egress_hosts().first().map(String::as_str),
+            Some("anthropic")
+        );
+        assert_eq!(cfg.credential_names(), names.map(str::to_string));
+
+        plan_installation(cfg, true)
+            .expect("the shipped curie.yaml example must plan through curie apply");
+    }
+
     fn live(json: serde_json::Value) -> serde_json::Value {
         json
     }

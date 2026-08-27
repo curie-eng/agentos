@@ -106,9 +106,14 @@ def test_claim_timeout_cleans_up_claim(
     assert affinity.get("T1") is None
 
 
-def test_quota_rejection_waits_for_deadline_and_cleans_up_claim(
+def test_quota_rejection_fails_promptly_and_cleans_up_claim(
     fake_k8s: FakeSandboxClient, affinity: AffinityStore, config: SubstrateConfig
 ) -> None:
+    """#1534: a persisting ResourceQuota rejection is terminal at the next
+    poll, not after claim_timeout_seconds. One extra poll is the debounce so a
+    single-blip rejection can still bind (see
+    test_transient_quota_rejection_can_clear_before_claim_binds)."""
+
     rejection = QuotaRejection(
         quota_name="curie-sandbox-quota",
         resource="limits.cpu",
@@ -134,15 +139,14 @@ def test_quota_rejection_waits_for_deadline_and_cleans_up_claim(
         return view
 
     fake_k8s.get_claim = get_claim_with_updated_rejection  # type: ignore[method-assign]
-    short_config = replace(config, claim_timeout_seconds=0.05)
-    substrate = SandboxSubstrate(fake_k8s, affinity, short_config)
+    substrate = SandboxSubstrate(fake_k8s, affinity, config)
 
     started = time.monotonic()
     with pytest.raises(CapacityExhaustedError) as excinfo:
         substrate.claim("T1")
     elapsed = time.monotonic() - started
 
-    assert elapsed >= short_config.claim_timeout_seconds
+    assert elapsed < 20 * config.poll_interval_seconds
     assert excinfo.value.rejection == rejection
     assert excinfo.value.rejection.quota_name == "curie-sandbox-quota"
     assert excinfo.value.rejection.resource == "limits.cpu"

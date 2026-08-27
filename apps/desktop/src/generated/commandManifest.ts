@@ -383,15 +383,15 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Bind an approval route to a channel. Accepted so it can be DECLINED with a reason rather than error like a typo: a route binding is per-agent platform config, and the skill tier has no platform",
-              "id": "route",
-              "long": "route",
+              "help": "Bind a route's verified Slack resolution card. Accepted so it can be DECLINED with a reason: the skill tier has no platform agent record",
+              "id": "route_resolution",
+              "long": "route-resolution",
               "positional": false,
               "required": false
             },
             {
               "global": false,
-              "help": "Narrow a route's approvers. Declined at this tier for the same reason as --route",
+              "help": "Narrow a route's approvers. Declined at this tier for the same reason as --route-resolution",
               "id": "route_approvers",
               "long": "route-approvers",
               "positional": false,
@@ -399,7 +399,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Read the route map from a JSON file. Declined at this tier for the same reason as --route",
+              "help": "Read the complete route map, including optional notifications, from JSON. Declined at this tier for the same reason as --route-resolution",
               "id": "routes_from",
               "long": "routes-from",
               "positional": false,
@@ -407,7 +407,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Show the agent's route bindings. Declined at this tier for the same reason as --route",
+              "help": "Show the agent's route bindings. Declined at this tier for the same reason as --route-resolution",
               "id": "list_routes",
               "long": "list-routes",
               "positional": false,
@@ -419,7 +419,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Remove every route binding. Declined at this tier for the same reason as --route",
+              "help": "Remove every route binding. Declined at this tier for the same reason as --route-resolution",
               "id": "clear_routes",
               "long": "clear-routes",
               "positional": false,
@@ -442,6 +442,120 @@ export const commandManifest = {
           "about": "Not available at this tier: this tier configures no memory namespace: `skill up` never sets a memory ref, and there is no platform here to own or address one; use `curie local memory <agent>` or `curie cluster memory <agent>` for a deployed agent",
           "hidden": false,
           "name": "memory"
+        },
+        {
+          "about": "Not available at this tier: the skill tier runs only a bundle runner and has no platform API or observability read service; `--otel-endpoint` can export telemetry but does not create a query API; use `curie local observability runs|run|metrics` or `curie cluster observability runs|run|metrics`; to export this skill runner's telemetry, restart it with `curie skill up --otel-endpoint <OTLP_URL>` and query through a platform API",
+          "hidden": false,
+          "name": "observability",
+          "subcommands": [
+            {
+              "about": "Explain why recent runs cannot be queried at the skill tier",
+              "args": [
+                {
+                  "default_values": [
+                    "20"
+                  ],
+                  "global": false,
+                  "help": "Maximum newest-first trace rows to return (1-100)",
+                  "id": "limit",
+                  "long": "limit",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Restrict traces to one agent id",
+                  "id": "agent_id",
+                  "long": "agent-id",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "runs"
+            },
+            {
+              "about": "Explain why a run cannot be queried by trace id at the skill tier",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Trace id previously returned by `observability runs` or a completed turn",
+                  "id": "trace_id",
+                  "positional": true,
+                  "required": true
+                }
+              ],
+              "hidden": false,
+              "name": "run"
+            },
+            {
+              "about": "Explain why metrics cannot be queried at the skill tier",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Return a time series for this metric; omit for the scalar summary",
+                  "id": "metric",
+                  "long": "metric",
+                  "positional": false,
+                  "possible_values": [
+                    "runs",
+                    "latency_p95_ms",
+                    "tokens",
+                    "cost_usd",
+                    "error_rate"
+                  ],
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Series bucket size. Defaults to day when --metric is present",
+                  "id": "granularity",
+                  "long": "granularity",
+                  "positional": false,
+                  "possible_values": [
+                    "hour",
+                    "day",
+                    "week"
+                  ],
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Optional metrics-window start accepted by the platform API",
+                  "id": "start",
+                  "long": "start",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Optional metrics-window end accepted by the platform API",
+                  "id": "end",
+                  "long": "end",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Restrict metrics to one deployment environment",
+                  "id": "environment",
+                  "long": "environment",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Restrict metrics to one agent name",
+                  "id": "agent",
+                  "long": "agent",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "metrics"
+            }
+          ]
         },
         {
           "about": "Stop and remove the local runner container",
@@ -576,6 +690,46 @@ export const commandManifest = {
               "long": "image",
               "positional": false,
               "required": false
+            },
+            {
+              "default_values": [
+                "1"
+              ],
+              "env": "CURIE_EVAL_SAMPLES",
+              "global": false,
+              "help": "Independent samples per case for live-model grading. Default: 1. A single sample is not proof of tier drift; raise this to distinguish variance from a real miss. Same policy on skill, local, and cluster",
+              "id": "samples",
+              "long": "samples",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "majority"
+              ],
+              "env": "CURIE_EVAL_AGGREGATION",
+              "global": false,
+              "help": "How to reduce N sample verdicts. Default: majority",
+              "id": "aggregation",
+              "long": "aggregation",
+              "positional": false,
+              "possible_values": [
+                "majority",
+                "pass_at_k"
+              ],
+              "required": false
+            },
+            {
+              "default_values": [
+                "1"
+              ],
+              "env": "CURIE_EVAL_PASS_AT_K",
+              "global": false,
+              "help": "Pass@k threshold when --aggregation pass_at_k. Default: 1",
+              "id": "pass_at_k",
+              "long": "pass-at-k",
+              "positional": false,
+              "required": false
             }
           ],
           "hidden": false,
@@ -704,6 +858,18 @@ export const commandManifest = {
               "id": "env_file",
               "long": "env-file",
               "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Build the stack's images from THIS checkout instead of pulling the published ones, and run them (#1915)",
+              "id": "build",
+              "long": "build",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
               "required": false
             }
           ],
@@ -1198,6 +1364,46 @@ export const commandManifest = {
               "required": false
             },
             {
+              "default_values": [
+                "1"
+              ],
+              "env": "CURIE_EVAL_SAMPLES",
+              "global": false,
+              "help": "Independent samples per case for live-model grading. Default: 1. A single sample is not proof of tier drift; raise this to distinguish variance from a real miss. Same policy on skill, local, and cluster",
+              "id": "samples",
+              "long": "samples",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "majority"
+              ],
+              "env": "CURIE_EVAL_AGGREGATION",
+              "global": false,
+              "help": "How to reduce N sample verdicts. Default: majority",
+              "id": "aggregation",
+              "long": "aggregation",
+              "positional": false,
+              "possible_values": [
+                "majority",
+                "pass_at_k"
+              ],
+              "required": false
+            },
+            {
+              "default_values": [
+                "1"
+              ],
+              "env": "CURIE_EVAL_PASS_AT_K",
+              "global": false,
+              "help": "Pass@k threshold when --aggregation pass_at_k. Default: 1",
+              "id": "pass_at_k",
+              "long": "pass-at-k",
+              "positional": false,
+              "required": false
+            },
+            {
               "global": false,
               "help": "Print the plan that a real run would produce, and exit",
               "id": "dry_run",
@@ -1387,7 +1593,7 @@ export const commandManifest = {
           "name": "versions"
         },
         {
-          "about": "Show what an agent has learned (its memory log; `GET /agents/{id}/memory`)",
+          "about": "Show what an agent has learned (its memory log; `GET /agents/{id}/memory`). `--add <content>` seeds an operator-authored record; a fresh session is required before it is injected at boot",
           "args": [
             {
               "global": false,
@@ -1427,6 +1633,14 @@ export const commandManifest = {
                 "true",
                 "false"
               ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Append this content as an operator-authored memory record",
+              "id": "add",
+              "long": "add",
+              "positional": false,
               "required": false
             }
           ],
@@ -1554,15 +1768,15 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Bind a manifest approval route to the channel its card posts in, as NAME=CHANNEL (e.g. deal_desk=C0123ABCD). Repeatable. A write REPLACES the whole route map, like --gate does for tool gates",
-              "id": "route",
-              "long": "route",
+              "help": "Bind a manifest route's verified Slack resolution card, as NAME=CHANNEL (e.g. deal_desk=C0123ABCD). Repeatable. A write REPLACES the whole route map, like --gate does for tool gates",
+              "id": "route_resolution",
+              "long": "route-resolution",
               "positional": false,
               "required": false
             },
             {
               "global": false,
-              "help": "Narrow WHO may resolve a route, independently of where its card posts, as NAME=users:U1,U2 or NAME=group:S1. Repeatable. Omit to leave the card channel's members as the approvers",
+              "help": "Narrow WHO may resolve a route, independently of its resolution target, as NAME=users:U1,U2 or NAME=group:S1. Repeatable. Omit to leave the resolution card's channel members as the approvers",
               "id": "route_approvers",
               "long": "route-approvers",
               "positional": false,
@@ -1570,7 +1784,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Read the whole route map from a JSON file, e.g. {\"deal_desk\": {\"channel\": \"C0123ABCD\"}}. The repeatable flags apply on top of it",
+              "help": "Read the whole route map from a JSON file, e.g. {\"deal_desk\":{\"resolution\":{\"kind\":\"slack\",\"address\":\"C0123ABCD\"}}}. Notifications, including endpoint+adapter transport, are declared in this strict map. The repeatable override flags apply on top of it",
               "id": "routes_from",
               "long": "routes-from",
               "positional": false,
@@ -1621,7 +1835,188 @@ export const commandManifest = {
             }
           ],
           "hidden": false,
-          "name": "observability"
+          "name": "observability",
+          "subcommands": [
+            {
+              "about": "List recent runs, newest first",
+              "args": [
+                {
+                  "default_values": [
+                    "20"
+                  ],
+                  "global": false,
+                  "help": "Maximum newest-first trace rows to return (1-100)",
+                  "id": "limit",
+                  "long": "limit",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Restrict traces to one agent id",
+                  "id": "agent_id",
+                  "long": "agent-id",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "http://localhost:28000"
+                  ],
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie-dev-key"
+                  ],
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "runs"
+            },
+            {
+              "about": "Read one complete run by trace id",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Trace id previously returned by `observability runs` or a completed turn",
+                  "id": "trace_id",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "default_values": [
+                    "http://localhost:28000"
+                  ],
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie-dev-key"
+                  ],
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "run"
+            },
+            {
+              "about": "Read the metrics summary or one bounded metric series",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Return a time series for this metric; omit for the scalar summary",
+                  "id": "metric",
+                  "long": "metric",
+                  "positional": false,
+                  "possible_values": [
+                    "runs",
+                    "latency_p95_ms",
+                    "tokens",
+                    "cost_usd",
+                    "error_rate"
+                  ],
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Series bucket size. Defaults to day when --metric is present",
+                  "id": "granularity",
+                  "long": "granularity",
+                  "positional": false,
+                  "possible_values": [
+                    "hour",
+                    "day",
+                    "week"
+                  ],
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Optional metrics-window start accepted by the platform API",
+                  "id": "start",
+                  "long": "start",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Optional metrics-window end accepted by the platform API",
+                  "id": "end",
+                  "long": "end",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Restrict metrics to one deployment environment",
+                  "id": "environment",
+                  "long": "environment",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Restrict metrics to one agent name",
+                  "id": "agent",
+                  "long": "agent",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "http://localhost:28000"
+                  ],
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie-dev-key"
+                  ],
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "metrics"
+            }
+          ]
         },
         {
           "about": "Read or change an agent's model and thinking overrides (`PATCH /agents/{id}`)",
@@ -2087,7 +2482,7 @@ export const commandManifest = {
       "name": "cluster",
       "subcommands": [
         {
-          "about": "Install or upgrade the Curie release via Helm (helm upgrade --install). By default it puts the UI and Langfuse on node ports for tailnet/LAN access; pass --no-expose to keep them ClusterIP-only. Set CURIE_CREDENTIALS to a supported model provider credential (CURIE_MODEL_CREDENTIALS is a deprecated alias) to install with the real model. A fresh install without it uses fake mode. A rerun preserves the recorded model configuration. Use --fake-model to explicitly downgrade to fake mode. A real model is still unreachable behind the fail-closed sandbox until you open its egress with --allow-egress-host <provider> (or --allow-web-egress <CIDR> for a raw range). Zhipu, Moonshot, and DeepSeek also require their matching base URL in worker runtime configuration, in addition to a credential and named egress",
+          "about": "Install or upgrade the Curie release via Helm (helm upgrade --install). By default it puts the UI and Langfuse on node ports for tailnet/LAN access; pass --no-expose to keep them ClusterIP-only. Set CURIE_CREDENTIALS to a supported model provider credential (CURIE_MODEL_CREDENTIALS is a deprecated alias) to install with the real model. A fresh install without it uses fake mode. A rerun preserves the recorded model configuration. Use --fake-model to explicitly downgrade to fake mode. An sk-ant- or sk-or- credential infers its provider egress when --allow-egress-host is absent. Other credential shapes remain sealed until their provider or a raw range is explicit. Existing singleton resources are reused only from complete Helm ownership metadata. An exact admission result that the gvisor RuntimeClass is absent applies security.gvisor.mode=off and retries once. Every inferred value is printed",
           "args": [
             {
               "default_values": [
@@ -2166,7 +2561,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Open runner egress to a named model provider's API host(s), resolved to narrow host routes at install time (repeatable). One of: anthropic, openrouter, zhipu, moonshot, deepseek. Provider native Zhipu, Moonshot, and DeepSeek also need their matching worker runtime base URL; a credential plus egress alone does not reach them. For a raw CIDR, use --allow-web-egress",
+              "help": "Explicitly open runner egress to a named model provider's API host(s), resolved to narrow host routes at install time (repeatable). An sk-ant- or sk-or- credential infers anthropic or openrouter when this flag is absent. An explicit list that omits the detected provider is an error. One of: anthropic, openrouter, zhipu, moonshot, deepseek. Provider native Zhipu, Moonshot, and DeepSeek also need their matching worker runtime base URL; a credential plus egress alone does not reach them. For a raw CIDR, use --allow-web-egress",
               "id": "allow_egress_host",
               "long": "allow-egress-host",
               "positional": false,
@@ -2174,7 +2569,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Open runner egress to a declared destination for skill web access, repeatable CIDR, TCP 443. Additive to the provider egress; omit to stay fully sealed",
+              "help": "Open runner egress to a declared destination for skill web access, repeatable CIDR, TCP 443. Additive to provider egress. Omit to keep general web egress sealed",
               "id": "allow_web_egress",
               "long": "allow-web-egress",
               "positional": false,
@@ -2238,7 +2633,7 @@ export const commandManifest = {
           "name": "up"
         },
         {
-          "about": "Uninstall the release and sweep its runtime namespaces (helm uninstall + kubectl delete namespace). The agents.x-k8s.io CRDs are left in place",
+          "about": "Uninstall the release and sweep its runtime namespaces, running helm uninstall followed by kubectl delete namespace. The namespace delete is scoped to namespaces this release created, matched by both its release name and install namespace, so another release's namespaces on the same cluster are never touched. Pre-existing namespaces and the agents.x-k8s.io CRDs are left in place",
           "args": [
             {
               "default_values": [
@@ -2427,7 +2822,7 @@ export const commandManifest = {
                 "curie"
               ],
               "env": "CURIE_NAMESPACE",
-              "global": false,
+              "global": true,
               "help": "Kubernetes namespace",
               "id": "namespace",
               "long": "namespace",
@@ -2438,7 +2833,7 @@ export const commandManifest = {
               "default_values": [
                 "curie"
               ],
-              "global": false,
+              "global": true,
               "help": "Helm release name",
               "id": "release",
               "long": "release",
@@ -2471,7 +2866,170 @@ export const commandManifest = {
             }
           ],
           "hidden": false,
-          "name": "observability"
+          "name": "observability",
+          "subcommands": [
+            {
+              "about": "List recent runs, newest first",
+              "args": [
+                {
+                  "default_values": [
+                    "20"
+                  ],
+                  "global": false,
+                  "help": "Maximum newest-first trace rows to return (1-100)",
+                  "id": "limit",
+                  "long": "limit",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Restrict traces to one agent id",
+                  "id": "agent_id",
+                  "long": "agent-id",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL. Omit to self-plumb the release API over loopback",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key. Required with --api-url; omit both for release discovery",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "runs"
+            },
+            {
+              "about": "Read one complete run by trace id",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Trace id previously returned by `observability runs` or a completed turn",
+                  "id": "trace_id",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL. Omit to self-plumb the release API over loopback",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key. Required with --api-url; omit both for release discovery",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "run"
+            },
+            {
+              "about": "Read the metrics summary or one bounded metric series",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Return a time series for this metric; omit for the scalar summary",
+                  "id": "metric",
+                  "long": "metric",
+                  "positional": false,
+                  "possible_values": [
+                    "runs",
+                    "latency_p95_ms",
+                    "tokens",
+                    "cost_usd",
+                    "error_rate"
+                  ],
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Series bucket size. Defaults to day when --metric is present",
+                  "id": "granularity",
+                  "long": "granularity",
+                  "positional": false,
+                  "possible_values": [
+                    "hour",
+                    "day",
+                    "week"
+                  ],
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Optional metrics-window start accepted by the platform API",
+                  "id": "start",
+                  "long": "start",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Optional metrics-window end accepted by the platform API",
+                  "id": "end",
+                  "long": "end",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Restrict metrics to one deployment environment",
+                  "id": "environment",
+                  "long": "environment",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Restrict metrics to one agent name",
+                  "id": "agent",
+                  "long": "agent",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL. Omit to self-plumb the release API over loopback",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key. Required with --api-url; omit both for release discovery",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "metrics"
+            }
+          ]
         },
         {
           "about": "Connect or disconnect the cluster release from a real Slack workspace",
@@ -2739,7 +3297,7 @@ export const commandManifest = {
             },
             {
               "default_values": [
-                "8155"
+                "0"
               ],
               "global": false,
               "help": "Port the stub binds (0.0.0.0); the worker posts here",
@@ -2750,7 +3308,7 @@ export const commandManifest = {
             },
             {
               "default_values": [
-                "56381"
+                "0"
               ],
               "global": false,
               "help": "Local port the Valkey port-forward binds",
@@ -2770,7 +3328,7 @@ export const commandManifest = {
             },
             {
               "default_values": [
-                "8123"
+                "0"
               ],
               "global": false,
               "help": "Local port the API port-forward binds (default-channel lookup)",
@@ -2887,10 +3445,10 @@ export const commandManifest = {
             },
             {
               "default_values": [
-                "8155"
+                "0"
               ],
               "global": false,
-              "help": "Port the stub binds (0.0.0.0); the worker posts here",
+              "help": "Port the stub binds (0.0.0.0); the worker posts here. Default 0 lets the kernel assign an ephemeral port",
               "id": "listen_port",
               "long": "listen-port",
               "positional": false,
@@ -2898,10 +3456,10 @@ export const commandManifest = {
             },
             {
               "default_values": [
-                "56381"
+                "0"
               ],
               "global": false,
-              "help": "Local port the Valkey port-forward binds",
+              "help": "Local port the Valkey port-forward binds. Default 0 lets kubectl assign an ephemeral local port",
               "id": "valkey_local_port",
               "long": "valkey-local-port",
               "positional": false,
@@ -2918,10 +3476,10 @@ export const commandManifest = {
             },
             {
               "default_values": [
-                "8123"
+                "0"
               ],
               "global": false,
-              "help": "Local port the API port-forward binds (default-channel lookup)",
+              "help": "Local port the API port-forward binds (default-channel lookup). Default 0 is kernel-assigned, matching `cluster message`",
               "id": "api_local_port",
               "long": "api-local-port",
               "positional": false,
@@ -2986,6 +3544,46 @@ export const commandManifest = {
               "help": "Number of eval cases to run concurrently. Sequential (1) is the only supported value today; parallel dispatch is tracked in #709, so any value above 1 is refused rather than silently run sequentially",
               "id": "concurrency",
               "long": "concurrency",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "1"
+              ],
+              "env": "CURIE_EVAL_SAMPLES",
+              "global": false,
+              "help": "Independent samples per case for live-model grading. Default: 1. A single sample is not proof of tier drift; raise this to distinguish variance from a real miss. Same policy on skill, local, and cluster",
+              "id": "samples",
+              "long": "samples",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "majority"
+              ],
+              "env": "CURIE_EVAL_AGGREGATION",
+              "global": false,
+              "help": "How to reduce N sample verdicts. Default: majority",
+              "id": "aggregation",
+              "long": "aggregation",
+              "positional": false,
+              "possible_values": [
+                "majority",
+                "pass_at_k"
+              ],
+              "required": false
+            },
+            {
+              "default_values": [
+                "1"
+              ],
+              "env": "CURIE_EVAL_PASS_AT_K",
+              "global": false,
+              "help": "Pass@k threshold when --aggregation pass_at_k. Default: 1",
+              "id": "pass_at_k",
+              "long": "pass-at-k",
               "positional": false,
               "required": false
             },
@@ -3080,6 +3678,14 @@ export const commandManifest = {
               "required": false
             },
             {
+              "global": false,
+              "help": "Helm chart used to write per-agent connector Secrets. Default: the version-pinned chart release asset on release builds; local `charts/curie` on dev builds",
+              "id": "chart",
+              "long": "chart",
+              "positional": false,
+              "required": false
+            },
+            {
               "env": "CURIE_API_KEY",
               "global": false,
               "help": "Platform API key. Omit to auto-discover the release Secret key (`<release>-secrets`); the discovered key travels only in the X-API-Key header over the loopback tunnel, never over the cleartext NodePort proxy (ADR-0057). An explicit value wins",
@@ -3150,7 +3756,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Per-agent connector secrets are NOT yet delivered at the cluster tier (#440): this flag is accepted only so it can be DECLINED with a reason instead of erroring like a typo. Until per-agent K8s Secret + secretKeyRef delivery lands, a value-only SandboxClaim CR would persist the token in plaintext in etcd. Use `curie local deploy --secret` today. See ADR-0009",
+              "help": "Per-agent connector secrets: values are written to the agent's Helm Secret through a private values file (never argv). The SandboxClaim stays names-only. See ADR-0009 / #1488",
               "id": "secret",
               "long": "secret",
               "positional": false,
@@ -3173,7 +3779,7 @@ export const commandManifest = {
             {
               "env": "CURIE_API_URL",
               "global": false,
-              "help": "Platform API base URL. Omit to discover the release's UI `/api` proxy",
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
               "id": "api_url",
               "long": "api-url",
               "positional": false,
@@ -3252,7 +3858,7 @@ export const commandManifest = {
             {
               "env": "CURIE_API_URL",
               "global": false,
-              "help": "Platform API base URL. Omit to discover the release's UI `/api` proxy",
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
               "id": "api_url",
               "long": "api-url",
               "positional": false,
@@ -3359,7 +3965,7 @@ export const commandManifest = {
             {
               "env": "CURIE_API_URL",
               "global": false,
-              "help": "Platform API base URL. Omit to discover the release's UI `/api` proxy",
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
               "id": "api_url",
               "long": "api-url",
               "positional": false,
@@ -3459,7 +4065,7 @@ export const commandManifest = {
             {
               "env": "CURIE_API_URL",
               "global": false,
-              "help": "Platform API base URL. Omit to discover the release's UI `/api` proxy",
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
               "id": "api_url",
               "long": "api-url",
               "positional": false,
@@ -3535,7 +4141,7 @@ export const commandManifest = {
             {
               "env": "CURIE_API_URL",
               "global": false,
-              "help": "Platform API base URL. Omit to discover the release's UI `/api` proxy",
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
               "id": "api_url",
               "long": "api-url",
               "positional": false,
@@ -3610,7 +4216,7 @@ export const commandManifest = {
             {
               "env": "CURIE_API_URL",
               "global": false,
-              "help": "Platform API base URL. Omit to discover the release's UI `/api` proxy",
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
               "id": "api_url",
               "long": "api-url",
               "positional": false,
@@ -3689,7 +4295,7 @@ export const commandManifest = {
             {
               "env": "CURIE_API_URL",
               "global": false,
-              "help": "Platform API base URL. Omit to discover the release's UI `/api` proxy",
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
               "id": "api_url",
               "long": "api-url",
               "positional": false,
@@ -3768,7 +4374,7 @@ export const commandManifest = {
             {
               "env": "CURIE_API_URL",
               "global": false,
-              "help": "Platform API base URL. Omit to discover the release's UI `/api` proxy",
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
               "id": "api_url",
               "long": "api-url",
               "positional": false,
@@ -3822,7 +4428,7 @@ export const commandManifest = {
           "name": "versions"
         },
         {
-          "about": "Show what an agent has learned (its memory log; `GET /agents/{id}/memory`)",
+          "about": "Show what an agent has learned (its memory log; `GET /agents/{id}/memory`). `--add <content>` seeds an operator-authored record; a fresh session is required before it is injected at boot",
           "args": [
             {
               "global": false,
@@ -3834,7 +4440,7 @@ export const commandManifest = {
             {
               "env": "CURIE_API_URL",
               "global": false,
-              "help": "Platform API base URL. Omit to discover the release's UI `/api` proxy",
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
               "id": "api_url",
               "long": "api-url",
               "positional": false,
@@ -3882,6 +4488,14 @@ export const commandManifest = {
                 "false"
               ],
               "required": false
+            },
+            {
+              "global": false,
+              "help": "Append this content as an operator-authored memory record",
+              "id": "add",
+              "long": "add",
+              "positional": false,
+              "required": false
             }
           ],
           "hidden": false,
@@ -3900,7 +4514,7 @@ export const commandManifest = {
             {
               "env": "CURIE_API_URL",
               "global": false,
-              "help": "Platform API base URL. Omit to discover the release's UI `/api` proxy",
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
               "id": "api_url",
               "long": "api-url",
               "positional": false,
@@ -4027,15 +4641,15 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Bind a manifest approval route to the channel its card posts in, as NAME=CHANNEL (e.g. deal_desk=C0123ABCD). Repeatable. A write REPLACES the whole route map, like --gate does for tool gates",
-              "id": "route",
-              "long": "route",
+              "help": "Bind a manifest route's verified Slack resolution card, as NAME=CHANNEL (e.g. deal_desk=C0123ABCD). Repeatable. A write REPLACES the whole route map, like --gate does for tool gates",
+              "id": "route_resolution",
+              "long": "route-resolution",
               "positional": false,
               "required": false
             },
             {
               "global": false,
-              "help": "Narrow WHO may resolve a route, independently of where its card posts, as NAME=users:U1,U2 or NAME=group:S1. Repeatable. Omit to leave the card channel's members as the approvers",
+              "help": "Narrow WHO may resolve a route, independently of its resolution target, as NAME=users:U1,U2 or NAME=group:S1. Repeatable. Omit to leave the resolution card's channel members as the approvers",
               "id": "route_approvers",
               "long": "route-approvers",
               "positional": false,
@@ -4043,7 +4657,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Read the whole route map from a JSON file, e.g. {\"deal_desk\": {\"channel\": \"C0123ABCD\"}}. The repeatable flags apply on top of it",
+              "help": "Read the whole route map from a JSON file, e.g. {\"deal_desk\":{\"resolution\":{\"kind\":\"slack\",\"address\":\"C0123ABCD\"}}}. Notifications, including endpoint+adapter transport, are declared in this strict map. The repeatable override flags apply on top of it",
               "id": "routes_from",
               "long": "routes-from",
               "positional": false,
@@ -4121,6 +4735,48 @@ export const commandManifest = {
                   "help": "Bind the installed bot to this Slack channel",
                   "id": "slack_channel",
                   "long": "slack-channel",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Keep the approval-gated restart tool, scoped to these Deployments (`namespace/name`, comma separated). One list renders BOTH ceilings: the Role's resourceNames and the connector's K8S_WRITE_ALLOWLIST. Omit to install read only",
+                  "id": "write_allowlist",
+                  "long": "write-allowlist",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "env": "CURIE_NAMESPACE",
+                  "global": false,
+                  "help": "Kubernetes namespace of the Curie release. Default: curie",
+                  "id": "namespace",
+                  "long": "namespace",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "global": false,
+                  "help": "Helm release name of the Curie install. Default: curie",
+                  "id": "release",
+                  "long": "release",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "observability"
+                  ],
+                  "global": false,
+                  "help": "Kubernetes namespace of the retained observability stack. Default: observability",
+                  "id": "observability_namespace",
+                  "long": "observability-namespace",
                   "positional": false,
                   "required": false
                 }
@@ -4408,7 +5064,64 @@ export const commandManifest = {
           "name": "e2e-ladder"
         },
         {
+          "about": "Select the end to end tiers CI would run for paths or revisions",
+          "args": [
+            {
+              "global": false,
+              "help": "Changed path. Repeat for every path in the candidate change",
+              "id": "path",
+              "long": "path",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Base revision for a local branch comparison",
+              "id": "base",
+              "long": "base",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Head revision for a local branch comparison",
+              "id": "head",
+              "long": "head",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Select every tier, matching a push event",
+              "id": "push",
+              "long": "push",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "e2e-ci-selection"
+        },
+        {
           "about": "Runtime E2E the Helm chart on a local cluster: install a trimmed slice, seed a bundle into RustFS, run the sandbox bundle-fetch init pair, and exec-assert the runner's view -- the one-command way to satisfy a chart/sandbox runtime acceptance criterion static checks cannot (#199, `bash scripts/chart-runtime-e2e.sh`)",
+          "args": [
+            {
+              "global": false,
+              "help": "Allow running against a kube context other than `k8scratch`",
+              "id": "force",
+              "long": "force",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
           "hidden": false,
           "name": "chart-runtime-e2e"
         },
@@ -4578,7 +5291,7 @@ export const commandManifest = {
         }
       ],
       "hidden": false,
-      "long_about": "Converge a cluster to a `curie.yaml` installation file (ADR-0097).\n\nThe file states the whole intent, so `apply` never has to be told what it was told last time -- the gap behind the dropped-settings failures the `--set`/`--reuse-values` shape kept producing.",
+      "long_about": "Converge a cluster to a `curie.yaml` installation file (ADR-0097).\n\nThe file states the whole intent, so `apply` never has to be told what it was told last time -- the gap behind the dropped-settings failures the `--set`/`--reuse-values` shape kept producing.\n\nA worked common installation is available at `examples/curie.yaml` in the Curie repository.",
       "name": "apply"
     },
     {

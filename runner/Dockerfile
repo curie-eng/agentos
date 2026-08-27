@@ -2,7 +2,8 @@
 # full ACI v0.1 runner.
 #
 # BUILD FROM THE REPO ROOT, not from runner/, because the runner compiles against
-# the frozen workspace packages (packages/aci-protocol, packages/plugin-format):
+# the frozen workspace packages (packages/aci-protocol, packages/plugin-format)
+# and shared telemetry packages (packages/telemetry and telemetry-schema):
 #
 #   docker build -f runner/Dockerfile -t curie-runner .
 #
@@ -44,22 +45,29 @@ RUN npm install -g @modelcontextprotocol/server-github@2025.4.8
 
 WORKDIR /app
 
-# The three source trees the runner needs: the two frozen workspace packages and
-# the runner itself. Copied by path so the image is reproducible from the lockfile
-# above them (root pyproject/uv.lock are the workspace source of truth).
+# The five source trees the runner needs: the two frozen workspace packages, the
+# shared telemetry implementation and schema, and the runner itself. Copied by path so the image is
+# reproducible from the lockfile above them (root pyproject/uv.lock are the
+# workspace source of truth).
 COPY uv.lock ./uv.lock
 COPY packages/aci-protocol ./packages/aci-protocol
 COPY packages/plugin-format ./packages/plugin-format
+COPY packages/telemetry ./packages/telemetry
+COPY packages/telemetry-schema ./packages/telemetry-schema
 COPY runner ./runner
 
 # One venv. Install every local project without dependencies, then install the
 # full registry dependency closure exported from the tested workspace uv.lock.
 # The local packages are installed by path first so the
-# "aci-protocol"/"plugin-format" requirements resolve to the copied trees, not
-# a same-named PyPI distribution.
+# workspace requirements resolve to the copied trees, not same-named PyPI
+# distributions.
 RUN python3 -m venv /app/.venv \
     && /app/.venv/bin/pip install --no-cache-dir --upgrade pip \
-    && /app/.venv/bin/pip install --no-cache-dir --no-deps ./packages/aci-protocol ./packages/plugin-format \
+    && /app/.venv/bin/pip install --no-cache-dir --no-deps \
+        ./packages/aci-protocol \
+        ./packages/plugin-format \
+        ./packages/telemetry \
+        ./packages/telemetry-schema \
     && /app/.venv/bin/pip install --no-cache-dir --no-deps ./runner \
     && python3 runner/export_dependency_pins.py < uv.lock > /tmp/runner-dependency-pins.txt \
     && /app/.venv/bin/pip install --no-cache-dir --no-deps -r /tmp/runner-dependency-pins.txt

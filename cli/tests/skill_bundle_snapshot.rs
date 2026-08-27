@@ -12,9 +12,11 @@
 mod support;
 
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output};
 
+use curie::bundle;
 use curie::state::{self, RunnerState};
+use curie_aci_protocol::PROTOCOL_VERSION;
 use support::{serve, Response};
 
 fn bin() -> &'static str {
@@ -63,6 +65,187 @@ fn recorded_runner(base_url: &str, dir: &Path) -> RunnerState {
         connector_containers: Vec::new(),
         connector_network: None,
     }
+}
+
+fn frame(value: serde_json::Value) -> String {
+    serde_json::to_string(&value).expect("serialize ACI frame")
+}
+
+fn done_turn(text: &str) -> Response {
+    Response::ndjson(&[
+        frame(serde_json::json!({
+            "type": "text_delta",
+            "version": PROTOCOL_VERSION,
+            "text": text,
+        })),
+        frame(serde_json::json!({
+            "type": "final",
+            "version": PROTOCOL_VERSION,
+            "text": text,
+            "status": "done",
+        })),
+    ])
+}
+
+fn skill_message(dir: &Path, url: &str) -> Output {
+    Command::new(bin())
+        .current_dir(dir)
+        .args(["skill", "message", "hello", "--url", url])
+        .output()
+        .expect("run curie skill message")
+}
+
+fn eval_cases(input: &str) -> String {
+    serde_json::json!({
+        "name": "snapshot suite",
+        "cases": [{
+            "id": "snapshot case",
+            "input": input,
+            "grader": {"kind": "contains", "expected": "answer"},
+        }],
+    })
+    .to_string()
+}
+
+#[test]
+fn skill_message_warns_when_the_editable_bundle_differs_from_the_running_snapshot() {
+    let server = serve(
+        |request| match (request.method.as_str(), request.path.as_str()) {
+            ("POST", "/v1/reset") => Response::json(200, "{}"),
+            ("POST", "/v1/event") => done_turn("snapshot reply"),
+            _ => Response::json(404, r#"{"error":"unexpected request"}"#),
+        },
+    );
+    let dir = tempfile::tempdir().expect("tempdir");
+    let skill = dir.path().join("SKILL.md");
+    std::fs::write(&skill, "before the runner started").expect("write initial bundle");
+    let snapshot = bundle::snapshot(dir.path()).expect("snapshot initial bundle");
+    std::fs::write(&skill, "edited after the runner started").expect("edit bundle");
+    state::save(
+        dir.path(),
+        &RunnerState {
+            bundle_digest: Some(snapshot.digest),
+            bundle_snapshot_dir: Some(snapshot.dir.display().to_string()),
+            ..recorded_runner(&server.base_url, dir.path())
+        },
+    )
+    .expect("record the runner");
+
+    let output = skill_message(dir.path(), &server.base_url);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "skill message must still answer from the running snapshot; stderr: {stderr}"
+    );
+    assert_eq!(
+        stdout, "snapshot reply\n",
+        "the reply must remain unchanged"
+    );
+    assert!(
+        stderr.contains("editable bundle differs from the running snapshot"),
+        "the source edit must be named before it is mistaken for a running change: {stderr}"
+    );
+    assert!(
+        stderr.contains("curie skill up"),
+        "the warning must name the command that loads the edited bundle: {stderr}"
+    );
+    assert!(
+        !stderr.contains("curie skill up --replace"),
+        "a verified same-bundle edit reloads with plain skill up; do not send the user to --replace: {stderr}"
+    );
+}
+
+#[test]
+fn skill_message_does_not_warn_when_the_editable_bundle_matches_the_running_snapshot() {
+    let server = serve(
+        |request| match (request.method.as_str(), request.path.as_str()) {
+            ("POST", "/v1/reset") => Response::json(200, "{}"),
+            ("POST", "/v1/event") => done_turn("snapshot reply"),
+            _ => Response::json(404, r#"{"error":"unexpected request"}"#),
+        },
+    );
+    let dir = tempfile::tempdir().expect("tempdir");
+    let skill = dir.path().join("SKILL.md");
+    std::fs::write(&skill, "bundle used by the runner").expect("write bundle");
+    let snapshot = bundle::snapshot(dir.path()).expect("snapshot bundle");
+    state::save(
+        dir.path(),
+        &RunnerState {
+            bundle_digest: Some(snapshot.digest),
+            bundle_snapshot_dir: Some(snapshot.dir.display().to_string()),
+            ..recorded_runner(&server.base_url, dir.path())
+        },
+    )
+    .expect("record the runner");
+
+    let output = skill_message(dir.path(), &server.base_url);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "skill message must answer from the matching snapshot; stderr: {stderr}"
+    );
+    assert_eq!(stdout, "snapshot reply\n");
+    assert!(
+        !stderr.contains("editable bundle differs from the running snapshot"),
+        "a matching source must not produce a mismatch warning: {stderr}"
+    );
+}
+
+#[test]
+fn skill_eval_uses_cases_from_the_running_snapshot_by_default() {
+    let server = serve(
+        |request| match (request.method.as_str(), request.path.as_str()) {
+            ("POST", "/v1/reset") => Response::json(200, "{}"),
+            ("POST", "/v1/event") => done_turn("answer"),
+            _ => Response::json(404, r#"{"error":"unexpected request"}"#),
+        },
+    );
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cases_path = dir.path().join("evals/cases.json");
+    std::fs::create_dir_all(cases_path.parent().expect("evals parent")).expect("create evals");
+    std::fs::write(&cases_path, eval_cases("snapshot input")).expect("write initial cases");
+    let snapshot = bundle::snapshot(dir.path()).expect("snapshot initial bundle");
+    std::fs::write(&cases_path, eval_cases("edited source input")).expect("edit cases");
+    state::save(
+        dir.path(),
+        &RunnerState {
+            bundle_digest: Some(snapshot.digest),
+            bundle_snapshot_dir: Some(snapshot.dir.display().to_string()),
+            ..recorded_runner(&server.base_url, dir.path())
+        },
+    )
+    .expect("record the runner");
+
+    let output = Command::new(bin())
+        .current_dir(dir.path())
+        .args(["skill", "eval", "--json"])
+        .output()
+        .expect("run curie skill eval");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "skill eval must run the recorded snapshot suite; stderr: {stderr}"
+    );
+    let body: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("skill eval must emit JSON");
+    assert_eq!(body["cases"][0]["id"], "snapshot case", "{body}");
+
+    let events = server
+        .recorded()
+        .into_iter()
+        .filter(|request| request.path == "/v1/event")
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 1, "the suite must send one case");
+    let event: serde_json::Value =
+        serde_json::from_slice(&events[0].body).expect("parse eval event");
+    assert_eq!(
+        event["text"], "snapshot input",
+        "default eval must use the case the running snapshot contains"
+    );
 }
 
 #[test]

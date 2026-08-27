@@ -89,7 +89,22 @@ curie example sre-bot install --observability
 ```
 
 This installs the bot and its self referential observability stack with no
-values files. The installer makes a read only runtime copy of the checked in
+values files. With no targeting flags, Curie lands as release `curie` in
+namespace `curie`, and the retained Grafana/Loki/Alloy/Tempo/Prometheus stack
+lands in namespace `observability`. To install beside an existing release, pass
+the same identity the rest of the cluster CLI uses:
+
+```bash
+curie example sre-bot install --observability \
+  --namespace soak \
+  --release soak \
+  --observability-namespace soak-obs
+```
+
+`--namespace` also reads `CURIE_NAMESPACE`. The installer threads those three
+values through every Helm, kubectl, manifest, secret-discovery, connector, and
+deploy step, including the embedded `read-access.yaml` and observability
+service DNS. The installer makes a read only runtime copy of the checked in
 bundle by removing the write connector and its matching approval gate together.
 The declared write path remains in the source bundle for the explicit Level up
 build and deploy flow below.
@@ -236,7 +251,7 @@ The deploy renders only the digest from `connectors.lock.yaml`.
 **5. Bind the route, or the card has nowhere to post.**
 
 ```bash
-curie cluster approvals sre-bot --route sre-approvals=C0EXAMPLE1
+curie cluster approvals sre-bot --route-resolution sre-approvals=C0EXAMPLE1
 curie cluster approvals sre-bot --list-routes
 ```
 
@@ -244,8 +259,10 @@ An unbound route fails SAFE -- it escalates to a human rather than executing --
 but you will see `approval route 'sre-approvals' is not bound for agent ...;
 escalating rather than routing the card` and no card will appear.
 
-**`--route` and `--gate` are FULL REPLACEMENTS, not additive.** A write replaces
-the whole map, so name every route you want on every invocation. Passing one
+**Route-binding writes and `--gate` are FULL REPLACEMENTS, not additive.** A
+write using `--route-resolution`, `--route-approvers`, or `--routes-from`
+replaces the whole route map, so name every route you want on every invocation.
+Notifications are declared only in the complete `--routes-from` map. Passing one
 route to add it silently drops the others.
 
 **6. Request one restart, approve it as a second actor, and verify the rollout.**
@@ -481,8 +498,9 @@ stream surgery is needed.
 
 **The bot says it escalated and no approval card appeared.** The route named in
 `approvalPolicy` is not bound for that agent. Bind it with
-`curie cluster approvals <agent> --route <name>=<channel>` and confirm with
-`--list-routes`. This fails safe -- an unbound route escalates, it never executes.
+`curie cluster approvals <agent> --route-resolution <name>=<channel>` and
+confirm with `--list-routes`. This fails safe -- an unbound route escalates, it
+never executes.
 
 **The write fails AFTER a human approved it.** The worst shape: the approval is
 spent, nothing rolled, and the operator's attention is gone. Both instances of

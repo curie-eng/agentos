@@ -2,7 +2,7 @@
 
 Mirrors ADR-0074's committed-artifact-plus-CI-gate discipline for the CLI's
 ``--json`` schemas, adapted for this Python-only surface: ``SpanAttributeKey``
-(``otel.py``) is the single source of truth in code, this file's committed
+(``curie_telemetry_schema``) is the single source of truth in code, this file's committed
 mirror (``runner/schema/otel-attributes.schema.json``) is the reviewed
 artifact, and the tests below fail loudly if the two diverge -- catching a
 new attribute key, a bumped ``SCHEMA_VERSION``, or a value-TYPE change to an
@@ -22,20 +22,136 @@ key=lambda m: m.value)}}`` as indented JSON to
 stable diff).
 """
 
+import ast
 import json
 from pathlib import Path
 
 import anyio
 from aci_protocol import Event, OtelConfig
-from curie_runner import RunTracer, SideEffectClassifier, build_tracer_provider
+from curie_runner import (
+    RunTracer,
+    SideEffectClassifier,
+    build_tracer_provider,
+)
+from curie_runner import (
+    SpanAttributeKey as RunnerSpanAttributeKey,
+)
 from curie_runner.fake import FakeModelSession
-from curie_runner.otel import SCHEMA_VERSION, SPAN_ATTRIBUTE_VALUE_TYPES, SpanAttributeKey
+from curie_runner.otel import SCHEMA_VERSION, SPAN_ATTRIBUTE_VALUE_TYPES
 from curie_runner.session import SessionRunner
+from curie_telemetry_schema import SpanAttributeKey
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 _SCHEMA_PATH = Path(__file__).parent.parent / "schema" / "otel-attributes.schema.json"
+_REPO_ROOT = Path(__file__).parents[2]
+_ENUM_SOURCE = (
+    _REPO_ROOT
+    / "packages"
+    / "telemetry-schema"
+    / "src"
+    / "curie_telemetry_schema"
+    / "__init__.py"
+)
+
+
+def _production_python_modules() -> list[Path]:
+    source_dirs = (
+        _REPO_ROOT / "runner" / "src",
+        *sorted(_REPO_ROOT.glob("apps/*/src")),
+        *sorted(_REPO_ROOT.glob("packages/*/src")),
+    )
+    return sorted(
+        module
+        for source_dir in source_dirs
+        for module in source_dir.rglob("*.py")
+        if module != _ENUM_SOURCE
+    )
+
+
+def _display_module_path(module: Path) -> Path:
+    try:
+        return module.relative_to(_REPO_ROOT)
+    except ValueError:
+        return module
+
+
+def _open_coded_span_attribute_values(
+    modules: list[Path] | None = None,
+) -> list[tuple[Path, int, str, str]]:
+    # The bare "model" value is a common domain field, while "service.name" is
+    # the standard resource/metric dimension owned by the shared telemetry
+    # package. Neither literal can identify a runner span-schema consumer drift.
+    members_by_value = {
+        member.value: member
+        for member in SpanAttributeKey
+        if member not in {SpanAttributeKey.MODEL, SpanAttributeKey.SERVICE_NAME}
+    }
+    violations: list[tuple[Path, int, str, str]] = []
+    modules_to_scan = _production_python_modules() if modules is None else modules
+
+    assert modules_to_scan, "The OTel literal scan must inspect at least one production module."
+
+    for module in modules_to_scan:
+        tree = ast.parse(module.read_text(), filename=str(module))
+        docstring_nodes = {
+            id(owner.body[0].value)
+            for owner in ast.walk(tree)
+            if isinstance(
+                owner,
+                (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef),
+            )
+            and owner.body
+            and isinstance(owner.body[0], ast.Expr)
+            and isinstance(owner.body[0].value, ast.Constant)
+            and isinstance(owner.body[0].value.value, str)
+        }
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+                continue
+            if id(node) in docstring_nodes:
+                continue
+            member = members_by_value.get(node.value)
+            if member is not None:
+                violations.append(
+                    (
+                        _display_module_path(module),
+                        node.lineno,
+                        node.value,
+                        member.name,
+                    )
+                )
+
+    return sorted(violations)
+
+
+def test_literal_scan_reports_the_exact_enum_key_in_an_injected_module(tmp_path: Path) -> None:
+    module = tmp_path / "consumer.py"
+    module.write_text('attribute = "curie.sandbox_id"\n')
+
+    assert _open_coded_span_attribute_values([module]) == [
+        (module, 1, "curie.sandbox_id", "CURIE_SANDBOX_ID")
+    ]
+
+_ADR_0076_V1_KEYS = {
+    "curie.sandbox_id": "str",
+    "curie.session_id": "str",
+    "gen_ai.approval.decision": "str",
+    "gen_ai.operation.name": "str",
+    "gen_ai.request.model": "str",
+    "gen_ai.tool.name": "str",
+    "gen_ai.usage.cache_creation_input_tokens": "int",
+    "gen_ai.usage.cache_read_input_tokens": "int",
+    "gen_ai.usage.input_tokens": "int",
+    "gen_ai.usage.output_tokens": "int",
+    "langfuse.session.id": "str",
+    "langfuse.trace.name": "str",
+    "langfuse.user.id": "str",
+    "model": "str",
+    "schema.version": "str",
+    "service.name": "str",
+}
 
 
 def _committed_schema() -> dict:
@@ -63,12 +179,30 @@ def test_committed_schema_matches_the_enum() -> None:
     committed_keys = _committed_schema()["keys"]
     code_keys = {member.value: SPAN_ATTRIBUTE_VALUE_TYPES[member] for member in SpanAttributeKey}
     assert code_keys == committed_keys, (
-        "SpanAttributeKey (otel.py) and the committed schema "
+        "SpanAttributeKey (curie_telemetry_schema) and the committed schema "
         f"({_SCHEMA_PATH}) have diverged -- a key was added, removed, or "
         "RETYPED on one side but not the other (a retyped value, e.g. an "
         "attribute switching from str to int, trips this gate too). "
         "Regenerate the committed file (see this module's docstring) and "
         "commit it alongside the code change."
+    )
+
+
+def test_runner_reexports_the_shared_span_attribute_key_enum() -> None:
+    assert RunnerSpanAttributeKey is SpanAttributeKey
+
+
+def test_production_consumers_resolve_span_attribute_keys_through_the_enum() -> None:
+    violations = _open_coded_span_attribute_values()
+
+    assert not violations, (
+        "Production consumers must resolve OTel span attribute keys through "
+        "SpanAttributeKey instead of restating its values:\n"
+        + "\n".join(
+            f"{path}:{line}: {literal!r} must use "
+            f"SpanAttributeKey.{member}.value"
+            for path, line, literal, member in violations
+        )
     )
 
 
@@ -145,8 +279,8 @@ def test_every_declared_key_emits_its_committed_value_type() -> None:
     # an approval decision, or the prompt-cache usage fields through). This test
     # closes that gap by driving every declared key through its real setter --
     # the 12 span-level keys via RunTracer.run_span/record_usage/tool_span, and
-    # the 4 resource-level keys via build_tracer_provider -- so a call-site
-    # retype of any of the seven previously-unexercised keys (that also forgot
+    # the stable resource keys via build_tracer_provider -- so a call-site
+    # retype of any previously-unexercised key (that also forgot
     # to update SPAN_ATTRIBUTE_VALUE_TYPES) fails here instead of slipping past.
     committed = _committed_schema()["keys"]
     emitted: dict[str, object] = {}
@@ -154,6 +288,7 @@ def test_every_declared_key_emits_its_committed_value_type() -> None:
     exporter = InMemorySpanExporter()
     provider = TracerProvider()
     provider.add_span_processor(SimpleSpanProcessor(exporter))
+    provider._curie_sandbox_id = "sandbox-abc"  # type: ignore[attr-defined]
     tracer = RunTracer(provider)
 
     with tracer.run_span(
@@ -180,9 +315,8 @@ def test_every_declared_key_emits_its_committed_value_type() -> None:
     otel = OtelConfig(endpoint="http://localhost:24318")
     resource_provider = build_tracer_provider(otel, "s1", "sandbox-abc")
     assert resource_provider is not None
-    # The OTel SDK's own Resource.create() merges in ambient default attributes
-    # (telemetry.sdk.language/name/version) alongside the ones this module
-    # stamps; only the declared keys are this schema's concern.
+    # The shared stable resource carries only service identity and the schema;
+    # session/sandbox correlation was exercised on the root span above.
     resource_attrs = resource_provider.resource.attributes
     emitted.update({key: value for key, value in resource_attrs.items() if key in committed})
     resource_provider.shutdown()

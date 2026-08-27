@@ -239,6 +239,95 @@ pub struct LocalOpts {
     /// Without it, `up` refuses rather than fetching ~11.4 GB implicitly. Only
     /// `up` consumes it; the other verbs set `false`.
     pub pull_model: bool,
+    /// Build the stack's images from THIS checkout instead of pulling the
+    /// published ones (#1915). Only `up` consumes it.
+    ///
+    /// Without it a contributor gets a source-built CLI talking to whatever the
+    /// registry last published, and the gap shows up as a serde error about a
+    /// field name or a missing Python module inside a container.
+    pub build: bool,
+}
+
+/// The tag `--build` writes and runs. Fixed rather than content-derived: the
+/// flag means "build now", so a stale `dev` is an explicit choice rather than a
+/// silent one, and a fixed name keeps `docker images` readable.
+pub const SOURCE_IMAGE_TAG: &str = "dev";
+
+/// The ghcr ref `--build` writes and the stack runs, for one published image.
+///
+/// Named once so `build_source_images` and `compose_model_env` cannot drift:
+/// the tag a `--build` stack runs is the tag it just built (#1931).
+pub fn source_image_ref(image: &str) -> String {
+    format!("ghcr.io/curie-eng/{image}:{SOURCE_IMAGE_TAG}")
+}
+
+/// One published image the dev stack can run, and where its source lives.
+pub struct SourceImage {
+    /// The ghcr repository name, matching `compose.dev.yaml`.
+    pub image: &'static str,
+    /// Dockerfile path, relative to the repo root.
+    pub dockerfile: &'static str,
+    /// The compose variable that points at this image, when it has its own.
+    ///
+    /// `None` means the image rides `CURIE_BASE_TAG` (the api, and the worker
+    /// overlay's base). Everything else gets a variable of its own, because
+    /// `CURIE_BASE_TAG` means "the platform images THIS caller built" and CI sets
+    /// it while building only those two -- widening its reach made compose pull
+    /// tags nothing had built and fail the stack with `manifest unknown`.
+    pub env: Option<&'static str>,
+}
+
+/// The images `--build` builds for this invocation, in dependency-ish order.
+///
+/// Skips only what nothing can reach: a `--minimal` run starts no UI, and
+/// building one is minutes of pnpm for a container that never starts.
+///
+/// The dispatcher is built ALWAYS, including without `--slack`, and that is not
+/// symmetry for its own sake. The compose profile governs the long-running
+/// dispatcher service, but `curie local message` runs a ONE-SHOT container from
+/// the same image on every invocation (`message.rs`'s
+/// `curie_dispatcher.enqueue_once`), outside any profile. Keying the build set on
+/// profiles alone left the main dev-loop verb still failing with
+/// `No module named curie_dispatcher.enqueue_once` -- observed, not theorised.
+///
+/// `curie-api` covers `curie-migrate` too: same image, and it is what applies
+/// the migrations, which is how a stale one leaves the database behind the tree.
+pub fn source_images(o: &LocalOpts) -> Vec<SourceImage> {
+    let mut images = vec![
+        SourceImage {
+            image: "curie-api",
+            dockerfile: "apps/api/Dockerfile",
+            env: None,
+        },
+        SourceImage {
+            image: "curie-worker",
+            dockerfile: "apps/worker/Dockerfile",
+            env: None,
+        },
+        SourceImage {
+            image: "curie-dispatcher",
+            dockerfile: "apps/dispatcher/Dockerfile",
+            env: Some("CURIE_DISPATCHER_IMAGE"),
+        },
+        // The one that decides whether the AGENT runs this checkout. The worker
+        // spawns it per turn from CURIE_RUNNER_IMAGE, so leaving it out rebuilt
+        // the platform and left the sandbox on the registry's runner -- which is
+        // how a turn kept producing the OLD fake model's frames while every
+        // other service was current.
+        SourceImage {
+            image: "curie-runner",
+            dockerfile: "runner/Dockerfile",
+            env: Some("CURIE_RUNNER_IMAGE"),
+        },
+    ];
+    if !o.minimal {
+        images.push(SourceImage {
+            image: "curie-ui",
+            dockerfile: "apps/ui/Dockerfile",
+            env: Some("CURIE_UI_IMAGE"),
+        });
+    }
+    images
 }
 
 pub struct LocalDownOpts {
@@ -330,6 +419,23 @@ fn compose_model_env(o: &LocalOpts, model: Option<&str>) -> Vec<(String, String)
     // above, not inside it, because the `--local-model` arm does not fall
     // through to the else: `--minimal --local-model` needs suppressing too.
     env.extend(otel_endpoint_env_override(o.minimal));
+    // #1915: point every published image at what `--build` just built. Set here
+    // rather than in `up` so `--dry-run` shows it, and so the one variable drives
+    // api, migrate, worker, ui and dispatcher uniformly -- which is why the two
+    // that were pinned to `latest` were changed to read it.
+    if o.build {
+        // The two that ride the base tag (the api, and the worker overlay's
+        // base), then one explicit reference per image that has its own variable.
+        // Named outright rather than derived: CURIE_BASE_TAG means "the platform
+        // images this caller built", and CI sets it while building only those
+        // two, so anything else reading it goes looking for a tag nothing built.
+        env.push(("CURIE_BASE_TAG".into(), SOURCE_IMAGE_TAG.into()));
+        for image in source_images(o) {
+            if let Some(name) = image.env {
+                env.push((name.into(), source_image_ref(image.image)));
+            }
+        }
+    }
     env
 }
 
@@ -342,6 +448,14 @@ fn up_command_with_model(o: &LocalOpts, model: Option<&str>) -> OpsCommand {
         plain("-d"),
         plain("--wait"),
     ]);
+    // #1915: `curie-worker` is a compose-built OVERLAY over the published base.
+    // Rebuilding the base is not enough -- without this, compose reuses the
+    // overlay it baked over the PREVIOUS base, so the stack runs yesterday's
+    // worker on today's base and nothing says so until a turn behaves like old
+    // code. Only under `--build`: a plain `up` must stay a fast restart.
+    if o.build {
+        args.push(plain("--build"));
+    }
     let mut cmd = OpsCommand::new("docker", args);
     let env = compose_model_env(o, model);
     if !env.is_empty() {
@@ -413,6 +527,84 @@ pub fn down_command(o: &LocalDownOpts) -> OpsCommand {
 /// `docker compose -f <file> ps`.
 pub fn status_command(o: &LocalOpts) -> OpsCommand {
     compose(&o.file, &["ps"])
+}
+
+/// Whether the URL points at the default local deploy API.
+fn uses_default_local_api(api_url: &str) -> bool {
+    api_url.trim_end_matches('/') == crate::message::DEFAULT_LOCAL_API_URL
+}
+
+/// Format recovery for a local deploy that could not reach its API. The
+/// compose output is deliberately an input so its state classification is
+/// testable without Docker.
+pub fn deploy_unreachable_hint(api_url: &str, compose_ps: Option<&str>) -> String {
+    if !uses_default_local_api(api_url) {
+        return format!(
+            "the platform API at {api_url} is unreachable. Check that --api-url points to a reachable API, then re-run. If you meant to use the local stack, inspect it with `curie local status`."
+        );
+    }
+
+    let lines: Vec<_> = compose_ps
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let rows = if lines
+        .first()
+        .is_some_and(|line| line.starts_with("NAME") && line.contains("STATUS"))
+    {
+        &lines[1..]
+    } else {
+        &lines[..]
+    };
+
+    if rows.iter().any(|line| {
+        let status = line.to_ascii_lowercase();
+        status.contains("(starting)") || status.contains("(health: starting)")
+    }) {
+        format!(
+            "the platform API at {api_url} is unreachable because the local stack is still starting. Run `curie local status`, wait for the API to become healthy, then re-run."
+        )
+    } else if rows.is_empty() {
+        format!(
+            "the platform API at {api_url} is unreachable because no local services are running. Start them with `curie local up`, confirm with `curie local status`, then re-run."
+        )
+    } else {
+        format!(
+            "the platform API at {api_url} is unreachable although local services are present. Inspect them with `curie local status`, then re-run."
+        )
+    }
+}
+
+/// Attach a compose state aware recovery only after a local deploy's API
+/// request has already failed as transient. The diagnostic itself is best
+/// effort: a missing Docker binary must not hide the original API failure.
+pub async fn with_deploy_unreachable_hint<T>(result: Result<T>, api_url: &str) -> Result<T> {
+    match result {
+        Err(err) if crate::exit::is_transient_reqwest(&err) => {
+            if !uses_default_local_api(api_url) {
+                return Err(crate::exit::operator_context(
+                    err,
+                    deploy_unreachable_hint(api_url, None),
+                    None,
+                ));
+            }
+
+            let cmd = OpsCommand::new(
+                "docker",
+                vec![plain("compose"), plain("-p"), plain("curie"), plain("ps")],
+            );
+            let hint = match run_capture(&cmd).await {
+                Ok((true, out, _)) => deploy_unreachable_hint(api_url, Some(&out)),
+                Ok((false, _, _)) | Err(_) => format!(
+                    "the platform API at {api_url} is unreachable, and Curie could not read local compose state. Run `curie local status`, then re-run."
+                ),
+            };
+            Err(crate::exit::operator_context(err, hint, None))
+        }
+        result => result,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -533,6 +725,39 @@ pub fn apply_credential_plan(
     Ok(resolved)
 }
 
+/// Build every image this run needs from THIS checkout, tagged [`SOURCE_IMAGE_TAG`].
+///
+/// The gap this closes: `curie update` refreshes the CLI and the runner image,
+/// and nothing refreshed api, worker, ui or dispatcher -- so a contributor on a
+/// feature branch ran a source-built CLI against whatever the registry last
+/// published. The failures do not look like version skew: a serde error about a
+/// missing field, or `No module named` from inside a container.
+async fn build_source_images(o: &LocalOpts) -> Result<()> {
+    let ui = crate::ui::ui();
+    // Same checkout sentinel `curie build` uses: a release binary has nothing
+    // to build. Keep the `--build`-specific error here rather than inside the
+    // shared builder, which both verbs call.
+    let root = crate::commands::find_repo_root().context(
+        "not inside a curie source checkout. `--build` builds the stack's images from \
+         source; a release binary runs the published images and has nothing to build.",
+    )?;
+    let images = source_images(o);
+    ui.note(&format!(
+        "building {} image(s) from {} as :{SOURCE_IMAGE_TAG}",
+        images.len(),
+        root.display()
+    ));
+    for image in &images {
+        let tag = source_image_ref(image.image);
+        crate::commands::build_image(image.dockerfile, &tag).await?;
+    }
+    ui.success(&format!(
+        "built {} image(s) as :{SOURCE_IMAGE_TAG}; the stack below runs them",
+        images.len()
+    ));
+    Ok(())
+}
+
 pub async fn up(mut o: LocalOpts, model: Option<String>) -> Result<LocalUpOutput> {
     let ui = crate::ui::ui();
     // #749/ADR-0070: an opt-in bundle `.env` is the LOWEST-priority model
@@ -548,6 +773,11 @@ pub async fn up(mut o: LocalOpts, model: Option<String>) -> Result<LocalUpOutput
         }));
     }
     require_on_path("docker")?;
+    // #1915: build before compose starts anything, so a failed build never
+    // leaves a half-source stack running. Streams its log like `curie build`.
+    if o.build {
+        build_source_images(&o).await?;
+    }
     // ADR 0093: `--local-model` never downloads its ~11.4 GB of assets
     // implicitly. Refuse before anything is brought up, unless the operator
     // asked for the fetch on this invocation.
@@ -574,7 +804,7 @@ pub async fn up(mut o: LocalOpts, model: Option<String>) -> Result<LocalUpOutput
             ModelMode::FakePinnedDespiteCredential => ui.warn(
                 "Running the FAKE model despite an available credential: CURIE_FAKE_MODEL is pinned on. Unset it or set CURIE_FAKE_MODEL=0 to go live.",
             ),
-            ModelMode::DefaultFake => ui.note(
+            ModelMode::DefaultFake => ui.warn(
                 "Running the fake model (no credential set). Provide a credential (ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN / CURIE_CREDENTIALS) or --local-model to go live.",
             ),
         }
@@ -885,6 +1115,68 @@ pub async fn down(o: LocalDownOpts) -> Result<LocalDownOutput> {
 mod tests {
     use super::*;
 
+    struct DeployDiagnosisEnvRestore {
+        path: Option<std::ffi::OsString>,
+        log: Option<std::ffi::OsString>,
+        output: Option<std::ffi::OsString>,
+        fail: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for DeployDiagnosisEnvRestore {
+        fn drop(&mut self) {
+            for (name, previous) in [
+                ("PATH", &self.path),
+                ("CURIE_TEST_DOCKER_LOG", &self.log),
+                ("CURIE_TEST_DOCKER_OUTPUT", &self.output),
+                ("CURIE_TEST_DOCKER_FAIL", &self.fail),
+            ] {
+                match previous {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    fn install_recording_docker(
+        tools: &std::path::Path,
+        log: &std::path::Path,
+    ) -> DeployDiagnosisEnvRestore {
+        let docker = tools.join("docker");
+        std::fs::write(
+            &docker,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CURIE_TEST_DOCKER_LOG\"\n\
+             if [ \"$*\" = 'compose -p curie ps' ]; then\n\
+               if [ \"$CURIE_TEST_DOCKER_FAIL\" = '1' ]; then exit 91; fi\n\
+               printf '%s\\n' \"$CURIE_TEST_DOCKER_OUTPUT\"\n\
+               exit 0\n\
+             fi\n\
+             exit 91\n",
+        )
+        .expect("write fake docker executable");
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&docker)
+            .expect("read fake docker metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&docker, permissions)
+            .expect("make fake docker executable runnable");
+
+        let restore = DeployDiagnosisEnvRestore {
+            path: std::env::var_os("PATH"),
+            log: std::env::var_os("CURIE_TEST_DOCKER_LOG"),
+            output: std::env::var_os("CURIE_TEST_DOCKER_OUTPUT"),
+            fail: std::env::var_os("CURIE_TEST_DOCKER_FAIL"),
+        };
+        let mut path = vec![tools.to_path_buf()];
+        path.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        std::env::set_var("PATH", std::env::join_paths(path).expect("join test PATH"));
+        std::env::set_var("CURIE_TEST_DOCKER_LOG", log);
+        restore
+    }
+
     fn opts(file: &str) -> LocalOpts {
         LocalOpts {
             file: file.into(),
@@ -895,6 +1187,7 @@ mod tests {
             slack: false,
             model_mode: ModelMode::DefaultFake,
             env_file: None,
+            build: false,
         }
     }
 
@@ -908,6 +1201,7 @@ mod tests {
             slack: false,
             model_mode: ModelMode::DefaultFake,
             env_file: None,
+            build: false,
         }
     }
 
@@ -1453,6 +1747,219 @@ mod tests {
     }
 
     #[test]
+    fn deploy_unreachable_hint_reports_a_starting_local_stack_without_restarting_it() {
+        let hint = deploy_unreachable_hint(
+            "http://localhost:28000",
+            Some(
+                "NAME              IMAGE             SERVICE     STATUS\n\
+                 curie-api-1       curie-api:dev     curie-api   Up 8 seconds (health: starting)",
+            ),
+        );
+
+        assert!(
+            hint.contains("local stack is still starting"),
+            "starting compose state must be named in the deploy recovery: {hint}"
+        );
+        assert!(
+            hint.contains("curie local status"),
+            "the deploy recovery must direct the operator to inspect the stack: {hint}"
+        );
+        assert!(
+            !hint.contains("curie local up"),
+            "a stack already starting must not be told to start again: {hint}"
+        );
+    }
+
+    #[test]
+    fn deploy_unreachable_hint_reports_an_absent_local_stack_and_status_recovery() {
+        for compose_ps in [
+            None,
+            Some(""),
+            Some("NAME   IMAGE   COMMAND   SERVICE   CREATED   STATUS   PORTS"),
+        ] {
+            let hint = deploy_unreachable_hint("http://localhost:28000", compose_ps);
+
+            assert!(
+                hint.contains("no local services are running"),
+                "an empty compose state must be named in the deploy recovery: {hint}"
+            );
+            assert!(
+                hint.contains("curie local up"),
+                "an absent stack must be told how to start: {hint}"
+            );
+            assert!(
+                hint.contains("curie local status"),
+                "the recovery must include state inspection: {hint}"
+            );
+        }
+    }
+
+    #[test]
+    fn deploy_unreachable_hint_treats_restarting_as_services_present() {
+        let hint = deploy_unreachable_hint(
+            crate::message::DEFAULT_LOCAL_API_URL,
+            Some(
+                "NAME          IMAGE           SERVICE     STATUS\n\
+                 curie-api-1   curie-api:dev   curie-api   Restarting (1) 2 seconds ago",
+            ),
+        );
+
+        assert!(
+            hint.contains("local services are present"),
+            "a restarting service is present, not starting: {hint}"
+        );
+        assert!(
+            !hint.contains("local stack is still starting"),
+            "restarting must not be reported as initial startup: {hint}"
+        );
+        assert!(
+            !hint.contains("curie local up"),
+            "a present service must not be told to start again: {hint}"
+        );
+    }
+
+    #[test]
+    fn deploy_unreachable_hint_reports_nonstarting_services_as_present() {
+        let hint = deploy_unreachable_hint(
+            crate::message::DEFAULT_LOCAL_API_URL,
+            Some(
+                "NAME          IMAGE           SERVICE     STATUS\n\
+                 curie-api-1   curie-api:dev   curie-api   Up 30 seconds (healthy)",
+            ),
+        );
+
+        assert!(
+            hint.contains("local services are present"),
+            "a running service must be reported as present: {hint}"
+        );
+        assert!(
+            hint.contains("curie local status"),
+            "present service guidance must retain status inspection: {hint}"
+        );
+        assert!(
+            !hint.contains("curie local up"),
+            "a running service must not be told to start again: {hint}"
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_api_deploy_failure_does_not_read_local_compose_state() {
+        let _lock = crate::PROCESS_ENV_LOCK.lock().await;
+        let tools = tempfile::tempdir().expect("create fake docker directory");
+        let log = tools.path().join("docker.log");
+        let _restore = install_recording_docker(tools.path(), &log);
+        let transient = reqwest::Client::new()
+            .get("http://127.0.0.1:1")
+            .send()
+            .await
+            .expect_err("port 1 must refuse the test connection");
+
+        let result: anyhow::Result<()> = Err(transient.into());
+        let error = with_deploy_unreachable_hint(result, "https://api.example.com")
+            .await
+            .expect_err("the original deploy failure must remain an error");
+        let rendered = format!("{error:#}");
+
+        assert!(
+            rendered.contains("Check that --api-url points to a reachable API"),
+            "custom API guidance was replaced: {rendered}"
+        );
+        assert!(
+            !log.exists(),
+            "custom API failure must not invoke docker; calls: {}",
+            std::fs::read_to_string(&log).unwrap_or_default()
+        );
+    }
+
+    #[tokio::test]
+    async fn default_api_deploy_failure_reads_the_running_curie_project() {
+        let _lock = crate::PROCESS_ENV_LOCK.lock().await;
+        let tools = tempfile::tempdir().expect("create fake docker directory");
+        let log = tools.path().join("docker.log");
+        let _restore = install_recording_docker(tools.path(), &log);
+        std::env::set_var(
+            "CURIE_TEST_DOCKER_OUTPUT",
+            "curie-api-1   curie-api:dev   curie-api   Up 8 seconds (health: starting)",
+        );
+        let transient = reqwest::Client::new()
+            .get("http://127.0.0.1:1")
+            .send()
+            .await
+            .expect_err("port 1 must refuse the test connection");
+
+        let result: anyhow::Result<()> = Err(crate::exit::operator_context(
+            transient.into(),
+            "the API request failed",
+            None,
+        ));
+        let error = with_deploy_unreachable_hint(result, crate::message::DEFAULT_LOCAL_API_URL)
+            .await
+            .expect_err("the original deploy failure must remain an error");
+        let (normal_message, _) = crate::exit::present_error(&error);
+        let rendered = format!("{error:#}");
+        let invocations = std::fs::read_to_string(&log).expect("read docker invocation log");
+
+        assert_eq!(
+            invocations.trim(),
+            "compose -p curie ps",
+            "diagnosis must inspect the running Curie project by name"
+        );
+        assert!(
+            normal_message.contains("local stack is still starting"),
+            "normal output must select the state aware compose diagnosis: {normal_message}"
+        );
+        assert!(
+            !normal_message.contains("the API request failed"),
+            "normal output must not select the inner generic context: {normal_message}"
+        );
+        assert!(
+            rendered.contains("local stack is still starting"),
+            "starting state was not reported: {rendered}"
+        );
+        assert!(
+            rendered.contains("curie local status"),
+            "state inspection guidance was omitted: {rendered}"
+        );
+        assert!(
+            !rendered.contains("curie local up"),
+            "a starting stack must not be told to start again: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_api_deploy_failure_keeps_status_guidance_when_compose_is_unreadable() {
+        let _lock = crate::PROCESS_ENV_LOCK.lock().await;
+        let tools = tempfile::tempdir().expect("create fake docker directory");
+        let log = tools.path().join("docker.log");
+        let _restore = install_recording_docker(tools.path(), &log);
+        std::env::set_var("CURIE_TEST_DOCKER_FAIL", "1");
+        let transient = reqwest::Client::new()
+            .get("http://127.0.0.1:1")
+            .send()
+            .await
+            .expect_err("port 1 must refuse the test connection");
+
+        let result: anyhow::Result<()> = Err(transient.into());
+        let error = with_deploy_unreachable_hint(result, crate::message::DEFAULT_LOCAL_API_URL)
+            .await
+            .expect_err("the original deploy failure must remain an error");
+        let rendered = format!("{error:#}");
+
+        assert!(
+            rendered.contains("could not read local compose state"),
+            "compose failure must remain explicit: {rendered}"
+        );
+        assert!(
+            rendered.contains("curie local status"),
+            "unreadable compose state must retain status guidance: {rendered}"
+        );
+        assert!(
+            !rendered.contains("curie local up"),
+            "unreadable state must not claim services are absent: {rendered}"
+        );
+    }
+
+    #[test]
     fn down_keeps_volumes_by_default() {
         let cmd = down_command(&LocalDownOpts {
             common: opts(DEFAULT_COMPOSE_FILE),
@@ -1621,11 +2128,12 @@ mod tests {
         "curie-worker",
     ];
 
-    /// The 5 services that must carry `profiles: *full_profiles`.
+    /// The 6 services that must carry `profiles: *full_profiles`.
     const FULL_SERVICES: &[&str] = &[
         "clickhouse",
         "langfuse-worker",
         "langfuse-web",
+        "otel-collector-perms",
         "otel-collector",
         "curie-ui",
     ];
@@ -1651,7 +2159,7 @@ mod tests {
         &rest[..end]
     }
 
-    /// Assert the shared core(8)/full(5) profile binding in a compose file:
+    /// Assert the shared core(8)/full(6) profile binding in a compose file:
     /// the anchors are declared, the counts hold, AND each service block carries
     /// the anchor it should (so swapping a service's profile fails the test).
     fn assert_core_full_bindings(compose: &str, file: &str) {
@@ -1670,7 +2178,7 @@ mod tests {
         );
         assert_eq!(
             compose.matches("profiles: *full_profiles").count(),
-            5,
+            6,
             "{file} full-profile count"
         );
         for service in CORE_SERVICES {
@@ -1771,5 +2279,198 @@ mod tests {
         assert!(!dispatcher.contains("profiles: *full_profiles"));
         assert!(dispatcher.contains("      VALKEY_HOST: valkey"));
         assert!(dispatcher.contains("      SLACK_APP_TOKEN: ${SLACK_APP_TOKEN:-}"));
+    }
+
+    /// Regression: rebuilding the BASE images is not enough. `curie-worker` is a
+    /// compose-built overlay over the published base, and without `--build` on
+    /// the compose child, compose reuses the overlay it baked over the PREVIOUS
+    /// base -- so a stack reported as source-built ran yesterday's worker on
+    /// today's base, and a real turn recorded no `post_state` because the code
+    /// that extracts it was in the layer that never got rebuilt.
+    #[test]
+    fn build_rebuilds_the_compose_overlays_too() {
+        let mut o = opts(DEFAULT_COMPOSE_FILE);
+        o.build = true;
+
+        let display = up_command(&o).display();
+
+        assert!(
+            display.contains(" up -d --build") || display.contains(" --build"),
+            "expected compose to rebuild its overlays, got: {display}"
+        );
+    }
+
+    /// #1915: `--build` has to reach the compose child as the tag override, or
+    /// the images it just built are not the images the stack runs.
+    #[test]
+    fn build_pins_every_published_image_to_the_locally_built_tag() {
+        let mut o = opts(DEFAULT_COMPOSE_FILE);
+        o.build = true;
+
+        let display = up_command(&o).display();
+
+        assert!(
+            display.contains(&format!("CURIE_BASE_TAG={SOURCE_IMAGE_TAG}")),
+            "expected the source tag in the compose env, got: {display}"
+        );
+    }
+
+    /// Without the flag nothing is pinned: a plain `local up` keeps pulling the
+    /// published images, which is what a non-contributor wants.
+    #[test]
+    fn without_build_the_tag_is_left_to_compose() {
+        let display = up_command(&opts(DEFAULT_COMPOSE_FILE)).display();
+
+        assert!(!display.contains("CURIE_BASE_TAG"), "got: {display}");
+    }
+
+    /// `--minimal` starts no UI, so building one is minutes of pnpm for a
+    /// container that never starts.
+    #[test]
+    fn minimal_skips_the_ui_it_never_starts() {
+        let mut minimal = opts(DEFAULT_COMPOSE_FILE);
+        minimal.minimal = true;
+        minimal.build = true;
+
+        let names: Vec<&str> = source_images(&minimal).iter().map(|i| i.image).collect();
+
+        assert_eq!(
+            names,
+            vec![
+                "curie-api",
+                "curie-worker",
+                "curie-dispatcher",
+                "curie-runner"
+            ]
+        );
+        let mut full = opts(DEFAULT_COMPOSE_FILE);
+        full.build = true;
+        let full_names: Vec<&str> = source_images(&full).iter().map(|i| i.image).collect();
+        assert!(full_names.contains(&"curie-ui"));
+    }
+
+    /// Regression: the runner was the image left out, and it is the one that
+    /// decides whether the AGENT runs this checkout. Without it `--build`
+    /// rebuilt every platform service and the sandbox still ran the registry's
+    /// runner, so a turn kept producing the OLD fake model's frames.
+    #[test]
+    fn the_runner_is_in_the_build_set() {
+        let mut o = opts(DEFAULT_COMPOSE_FILE);
+        o.build = true;
+        o.minimal = true;
+
+        let names: Vec<&str> = source_images(&o).iter().map(|i| i.image).collect();
+
+        assert!(names.contains(&"curie-runner"), "got {names:?}");
+    }
+
+    /// Regression: keying the build set on the `slack` PROFILE left
+    /// `curie local message` failing with `No module named
+    /// curie_dispatcher.enqueue_once`, because that verb runs a one-shot
+    /// container from the dispatcher image on every invocation, profile or not.
+    #[test]
+    fn the_dispatcher_is_built_even_without_the_slack_profile() {
+        let mut o = opts(DEFAULT_COMPOSE_FILE);
+        o.build = true;
+        o.slack = false;
+
+        let names: Vec<&str> = source_images(&o).iter().map(|i| i.image).collect();
+
+        assert!(
+            names.contains(&"curie-dispatcher"),
+            "local message needs this image with no slack profile: {names:?}"
+        );
+    }
+
+    /// Every image compose can pull under the override must be buildable here,
+    /// or `--build` produces a stack that is partly source and partly registry
+    /// -- the exact split #1915 is about.
+    #[test]
+    fn every_overridable_compose_image_is_in_the_build_set() {
+        let compose = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .join(DEFAULT_COMPOSE_FILE),
+        )
+        .expect("compose file");
+
+        // Three forms carry an override, and missing one is how this test went
+        // wrong twice: an `image:` line interpolating CURIE_BASE_TAG, the worker
+        // overlay taking it as a build ARG for its own `FROM`, and the runner,
+        // which is not a compose service at all -- the worker spawns it from
+        // CURIE_RUNNER_IMAGE, on its own axis. All three are scanned, so an
+        // image the stack can be pointed at cannot escape the build set.
+        let overlay = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .join("compose/worker-local.Dockerfile"),
+        )
+        .expect("worker overlay");
+
+        let mut overridable = std::collections::BTreeSet::new();
+        for line in compose.lines().chain(overlay.lines()) {
+            let line = line.trim();
+            let interpolates = line.contains("${CURIE_BASE_TAG")
+                || line.contains("${BASE_TAG")
+                || line.contains("${CURIE_RUNNER_IMAGE")
+                || line.contains("${CURIE_UI_IMAGE")
+                || line.contains("${CURIE_DISPATCHER_IMAGE");
+            if !interpolates {
+                continue;
+            }
+            if let Some(idx) = line.find("ghcr.io/curie-eng/") {
+                let rest = &line[idx + "ghcr.io/curie-eng/".len()..];
+                let name = rest.split(':').next().unwrap_or_default();
+                overridable.insert(name.to_string());
+            }
+        }
+
+        let mut o = opts(DEFAULT_COMPOSE_FILE);
+        o.build = true;
+        let buildable: std::collections::BTreeSet<String> = source_images(&o)
+            .iter()
+            .map(|i| i.image.to_string())
+            .collect();
+
+        assert_eq!(
+            overridable, buildable,
+            "compose can override these images but --build does not build them all"
+        );
+    }
+
+    /// Regression, caught by CI rather than by reasoning: the runner is a
+    /// SEPARATE axis from the published platform images, and coupling it to
+    /// CURIE_BASE_TAG broke the e2e ladder.
+    ///
+    /// CI sets `CURIE_BASE_TAG=ci-local` for the platform images and builds its
+    /// runner as a plain `curie-runner`, so making CURIE_RUNNER_IMAGE read that
+    /// variable sent the worker looking for `curie-runner:ci-local`, which
+    /// nothing had built. `--build` names the runner image outright instead.
+    #[test]
+    fn build_names_the_runner_image_without_borrowing_the_base_tag() {
+        let mut o = opts(DEFAULT_COMPOSE_FILE);
+        o.build = true;
+
+        let display = up_command(&o).display();
+
+        assert!(
+            display.contains(&format!(
+                "CURIE_RUNNER_IMAGE={}",
+                source_image_ref("curie-runner")
+            )),
+            "got: {display}"
+        );
+    }
+
+    /// The other half: without `--build`, the runner variable is untouched, so a
+    /// caller that sets CURIE_BASE_TAG for the platform images (CI does) keeps
+    /// whatever runner it built.
+    #[test]
+    fn without_build_the_runner_image_is_left_alone() {
+        let display = up_command(&opts(DEFAULT_COMPOSE_FILE)).display();
+
+        assert!(!display.contains("CURIE_RUNNER_IMAGE"), "got: {display}");
     }
 }

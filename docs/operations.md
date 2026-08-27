@@ -18,7 +18,7 @@ Targets, see the target comparison table in the
 |---|---|
 | `kubectl` and `helm` on PATH | Every `cluster` verb wraps one or both of them. |
 | A reachable cluster | Every verb talks to the cluster's Kubernetes API server directly -- there's nothing to install onto or inspect without one. The chart's own preflights additionally need the `agents.x-k8s.io` Agent Sandbox CRDs (Custom Resource Definitions) installable and a NetworkPolicy-enforcing CNI (Container Network Interface) already present; see `charts/curie/README.md`. |
-| `runsc` (gVisor) on every node -- **real models only** | Real-model installs refuse to start without it, as a safety measure against running a live model in a less-isolated sandbox. Skip the check with `--set security.gvisor.mode=off` if your cluster doesn't have it. Fake-model installs don't need it. |
+| `runsc` (gVisor) on every node for full kernel isolation | A real model first installs with gVisor enabled. If admission reports exactly that the `gvisor` RuntimeClass is absent, plain `cluster up` shows that attempt as retrying, applies `security.gvisor.mode=off`, and retries once. Other preflight failures remain closed. Fake model installs do not need it. |
 
 **For testing**, pick between **k3s**, **kind**, and **minikube** based on
 your host and how disposable the cluster needs to be. A single-node **k3s**
@@ -72,6 +72,24 @@ Two things to know:
   will not start on an older distro. The ones named for a full Rust target
   triple (`curie-<target>-<sha>`) are the portable pair.
 
+### `curie apply`
+
+Copy [`examples/curie.yaml`](../examples/curie.yaml) into your repository as
+`curie.yaml` and customize it. Credential fields contain credential names, not
+secret values.
+Before either command, provide values for `ANTHROPIC_API_KEY`,
+`SLACK_APP_TOKEN`, and `SLACK_BOT_TOKEN` in the environment or store them with
+`curie secrets set <NAME>`.
+
+Preview the installation, then apply it:
+
+```bash
+curie apply --dry-run
+curie apply
+```
+
+Use `curie cluster up` below for flag driven installs.
+
 ### `curie cluster up`
 
 Installs (or upgrades) Curie's Helm chart onto the cluster you're pointed at:
@@ -86,11 +104,11 @@ curie cluster up
 | `-f <compose>` | Override a resolved local-dev artifact path. |
 | `--image <ref>` | Override a resolved image reference. |
 | `--no-expose` | Keep the UI and Langfuse ClusterIP-only instead of exposing them on node ports. |
-| `CURIE_CREDENTIALS` (alias `CURIE_MODEL_CREDENTIALS`) | A real model credential. The interactive check accepts Anthropic `sk-ant-`, OpenRouter `sk-or-`, Zhipu `id.secret`, and bare `sk-` shapes for Moonshot or DeepSeek. It checks only shape and does not prove liveness. During `cluster up`, Anthropic and OpenRouter shapes are recognized only to check consistency with explicit named egress. Present credentials install live through masked `--set` machinery, so `--dry-run` never prints them. An absent credential uses fake mode on a fresh install and preserves the recorded model configuration on a rerun. |
+| `CURIE_CREDENTIALS` (alias `CURIE_MODEL_CREDENTIALS`) | A real model credential. The interactive check accepts Anthropic `sk-ant-`, OpenRouter `sk-or-`, Zhipu `id.secret`, and bare `sk-` shapes for Moonshot or DeepSeek. The first two prefixes select one provider and infer its egress when no provider flag is present. Other shapes do not identify a provider. Present credentials install live through masked `--set` machinery, so `--dry-run` never prints them. An absent credential uses fake mode on a fresh install and preserves the recorded model configuration on a rerun. |
 | `--fake-model` | Explicitly downgrade to fake mode, even when a credential is present or a rerun has recorded live model configuration. |
 | `--github-token <token>` (or `CURIE_GITHUB_TOKEN`) | The Curie API's own GitHub credential, for cloning a PRIVATE repo during a git-flow bundle deploy and for posting the eval commit status. Goes to helm through a private mode-0600 values file, never a command-line argument, so it never appears in the helm command, the printed plan, or that plan's JSON. Prefer the environment variable: a token typed after the flag still sits in `curie`'s own argv, so it still reaches your shell history and `ps`. Omitting both on a later `cluster up` preserves whatever the release already has. Errors if combined with `--set api.githubToken=`. |
 | `--clear-github-token` | Remove the stored GitHub credential. Not a revocation: the running API keeps the old token until its pod restarts (`cluster up` prints the restart command), and the token itself stays valid at GitHub until you revoke it there. |
-| `--allow-egress-host <provider>` (repeatable) | Open runner egress on TCP 443 to one named model provider: `anthropic`, `openrouter`, `zhipu`, `moonshot`, or `deepseek`. Names are lowercase exact; any other provider name is rejected. |
+| `--allow-egress-host <provider>` (repeatable) | Explicitly open runner egress on TCP 443 to one named model provider: `anthropic`, `openrouter`, `zhipu`, `moonshot`, or `deepseek`. Names are lowercase exact. An explicit list must include the provider detected from an `sk-ant-` or `sk-or-` credential. |
 | `--allow-web-egress <CIDR>` (repeatable) | Open runner egress on TCP 443 to an arbitrary CIDR (Classless Inter-Domain Routing block) -- for skill/tool web access, or a provider not covered above. |
 
 A downloaded release binary needs no repo checkout; the chart resolves from
@@ -101,14 +119,16 @@ their matching documented `CURIE_MODEL_BASE_URL` in worker runtime configuration
 as well as a credential and their named egress entry. Their credential shapes do
 not identify the provider: the base URL selects it.
 
-**Egress is sealed by default.** A model credential alone opens no egress:
-the sandbox stays fail-closed until you open its provider egress with one of
-the two flags above. Neither flag bakes provider IPs into the binary --
-only hostnames are resolved (to narrow `/32`+`/128` host routes) at install
-time, because provider/CDN IPs rotate; re-run `up` to re-resolve if calls
-start failing. Credential shape validation does not select a provider or open a
-route. The named provider allowlist admits only the five documented lowercase
-names above; unknown names stay denied. `--allow-web-egress` is for agents whose
+**Ambiguous egress stays sealed.** An effective credential beginning `sk-ant-`
+or `sk-or-` selects Anthropic or OpenRouter and plain `cluster up` infers the
+matching named egress. Other credential shapes do not identify one provider,
+so the sandbox stays fail closed until the operator opens its provider or web
+egress. An explicit provider list that omits a detected provider is a usage
+error. Neither flag bakes provider IPs into the binary. Only hostnames are
+resolved to narrow `/32` and `/128` host routes at install time because
+provider and CDN IPs rotate. Re-run `up` to resolve them again if calls start
+failing. The named provider allowlist admits only the five documented lowercase
+names above. Unknown names stay denied. `--allow-web-egress` is for agents whose
 skills need open web access, such as search or weather lookup, beyond the named
 model providers. `curie cluster up --allow-web-egress 0.0.0.0/0` opens the
 internet except `169.254.169.254`; narrow the CIDR to a specific destination for
@@ -128,6 +148,24 @@ You don't need to worry about ordering when using the CLI flags together --
 `cluster up` composes `--allow-egress-host` and `--allow-web-egress` into
 one list automatically, with named-provider entries first and web-egress
 CIDRs after.
+
+**Cluster facts are inferred only when they are complete.** Direct
+`curie cluster up` inspects the two PriorityClasses and the
+`agent-sandbox-controller` Deployment. When complete Helm ownership metadata
+names another release, Curie applies the matching creation or deployment value
+as false. Missing, malformed, unreadable, or incomplete ownership does not
+authorize reuse and blocks the install. An explicit true value that contradicts
+the detected owner is a usage error.
+
+The first gVisor preflight keeps the chart default. Only the exact admission
+result `RuntimeClass "gvisor" not found` authorizes
+`security.gvisor.mode=off` and one retry. That first attempt renders as
+retrying, not as a failed install; the retry is the one installed or failed
+result. An explicit `auto` or `require` mode contradicts that result and
+errors. Other admission failures and an unavailable event watch remain closed.
+Curie prints one standard error line for every inference, including the
+equivalent override. Prepared `apply` and `diff` paths do not infer live
+cluster facts.
 
 ### `curie cluster status`
 
@@ -154,6 +192,11 @@ curie cluster down
 `curie cluster down` safely removes everything this release created, and
 only what it created -- other things on the cluster are untouched,
 including pre-existing namespaces and the Agent Sandbox CRDs.
+
+A release is identified by its name AND the namespace it was installed
+into, so if you run a second install of Curie on the same cluster (which
+normally means two releases sharing the default name `curie` in different
+namespaces), tearing one down never touches the other's namespaces.
 
 It's also safe to re-run if something goes wrong. If the underlying
 uninstall fails (say, a brief Kubernetes API-server hiccup), teardown doesn't just
@@ -322,6 +365,151 @@ agent's bound Slack channel; disconnected releases use the terminal stub.
 For the `local`-target equivalent (`curie local comms --slack`), see
 [`cli/README.md`](../cli/README.md).
 
+### Connecting email
+
+There is no `curie cluster comms --email` yet, so email is wired with a private
+Helm values file. The mail adapter ships off by default
+([`apps/mail-adapter`](../apps/mail-adapter)).
+
+Two platform-side steps come first, in this order:
+
+1. **Bind the agent** to `{"kind": "email", "address": "<the inbox address>"}` with a
+   reply route: `endpoint` is the in-cluster Service the chart renders,
+   `http://<fullname>-mail-adapter:<mailAdapter.service.port>/`, and `adapter` is
+   `mail-adapter`. Neither half of that is a literal. `<fullname>` is the chart's
+   `curie.fullname` ([`charts/curie/templates/_helpers.tpl`](../charts/curie/templates/_helpers.tpl)):
+   it is the release name alone when the release name already contains `curie`, and
+   `<release>-curie` otherwise, so release `curie` renders `curie-mail-adapter` while
+   release `acme-bot` renders `acme-bot-curie-mail-adapter`. The port is
+   `mailAdapter.service.port` (default `8080`), not a fixed `8080`. Getting either
+   wrong points the reply route at nothing, and every completion retries and then
+   dead-letters. Read both off your own release instead of deriving them:
+
+   ```bash
+   kubectl get svc -n <ns> \
+     -l app.kubernetes.io/instance=<release>,app.kubernetes.io/component=mail-adapter \
+     -o jsonpath='http://{.items[0].metadata.name}:{.items[0].spec.ports[0].port}/'
+   ```
+
+   The `adapter` value must equal `mailAdapter.adapterSlug`, because the worker looks
+   its egress credential up under that key.
+2. **Mint the channel token.** `POST /channels/token` with the platform key returns a
+   scoped `chn` token for that one binding. It refuses with 409 for a non-`slack`
+   binding that has no reply route, which is why the binding comes first.
+
+Then turn the adapter on. Do not put any of its three credentials in `--set`:
+command arguments reach shell history and the process table. Keep the ordinary
+configuration in the installation's checked-in values and render the secret
+values from a secret manager into a gitignored mode-0600 file:
+
+```bash
+# One-time local guard for the private file. .git/info/exclude is local to this
+# checkout; it cannot accidentally publish the filename as a repo rule.
+printf '%s\n' '.curie-mail-secrets.yaml' >> .git/info/exclude
+install -m 0600 /dev/null .curie-mail-secrets.yaml
+
+# Have the secret manager/template step write this shape without echoing values:
+# mailAdapter:
+#   agentmail:
+#     apiKey: <secret>
+#   channelToken: <secret>
+#   egressSecret: <secret>
+${EDITOR:?set EDITOR} .curie-mail-secrets.yaml
+chmod 0600 .curie-mail-secrets.yaml
+
+helm upgrade <release> <chart> -n <ns> \
+  -f values.yaml -f .curie-mail-secrets.yaml
+```
+
+The non-secret `values.yaml` contains the switch, inbox, allowed senders, and
+network destination. Kubernetes NetworkPolicy cannot authorize an FQDN, so use
+the provider's current HTTPS CIDRs or point `agentmail.baseUrl` at a controlled
+egress proxy with a stable CIDR:
+
+```yaml
+mailAdapter:
+  deploy: true
+  inbox: agent@yourdomain.example
+  allowedSenders: [alice@example.com, example.com]
+  agentmail:
+    baseUrl: https://api.agentmail.to/v0
+    httpsCidrs: [203.0.113.0/24] # placeholder; replace from your provider/proxy
+```
+
+An empty `mailAdapter.agentmail.httpsCidrs` refuses to render when the adapter is
+enabled. Prefix-0 and prefix-1 routes refuse to render, including IPv4 or IPv6
+split default routes; surrounding whitespace and expanded IPv6 spelling do not
+bypass that gate. Use narrow current provider or controlled-proxy ranges.
+
+For a bring-your-own platform API, declare the URL and its NetworkPolicy peer
+independently; the chart cannot safely infer IP ranges from a hostname:
+
+```yaml
+api:
+  deploy: false
+mailAdapter:
+  apiBaseUrl: https://api.example.com:8443
+  apiEgress:
+    httpsCidrs: [198.51.100.0/24] # placeholder; use the real narrow API range
+    port: 8443
+```
+
+| Value | What it does |
+|---|---|
+| `mailAdapter.deploy` | Renders the Deployment and Service. Default `false`; nothing about email exists in a default install. |
+| `mailAdapter.inbox` | The AgentMail inbox this adapter polls and replies from. |
+| `mailAdapter.pollIntervalSeconds` | Seconds between polls of that inbox (default `5`). Zero or negative fails the boot gate rather than tight-looping a third-party API. |
+| `mailAdapter.maxPendingDeliveries` | Maximum unresolved inbound rows (default `1000`). At capacity new mail stays unclaimed at AgentMail rather than evicting accepted work. |
+| `mailAdapter.maxBodyBytes` / `maxReplyBytes` / `maxStateBytes` | Allocation and SQLite page bounds. Size the PVC above `maxStateBytes` for the WAL and filesystem overhead. |
+| `mailAdapter.allowedSenders` | Who may start a turn. Empty denies everyone, and with ingress on the pod refuses to boot rather than run an inbox that answers nobody; `*` is the explicit allow-all. |
+| `mailAdapter.ingressEnabled` | `false` serves egress while sending nothing inbound. That is the staged-cutover position while the platform side of a new binding is being wired. |
+| `mailAdapter.egressSecret` | The shared secret the worker presents on `X-Curie-Adapter-Secret` and the adapter checks before any side effect. |
+| `mailAdapter.agentmail.httpsCidrs` | Required provider/proxy destination CIDRs on TCP 443. The mail pod's egress policy otherwise allows only DNS and this release's API pods. |
+| `mailAdapter.apiEgress.httpsCidrs` / `port` | Required narrow destination peers when `api.deploy=false`; default port `8000`. Ignored for the in-chart API, whose pod selector and service port are used instead. |
+| `mailAdapter.persistence.size` / `storageClass` | Chart-managed RWO SQLite PVC. The default size is `1Gi`; empty storage class inherits `global.storageClass` and then the cluster default. |
+| `mailAdapter.persistence.existingClaim` | Mount an existing same-namespace RWO Filesystem PVC instead of rendering one. An install/upgrade hook checks the exact claim before replacing the pod. |
+
+**Do not write `worker.adapterCredentials.mail-adapter` by hand.** The chart derives it
+from `mailAdapter.egressSecret`, so the pair cannot drift. An equal value is accepted; a
+conflicting one fails the render by design. Rotating `mailAdapter.channelToken`,
+`mailAdapter.egressSecret` or `mailAdapter.agentmail.apiKey` and running `helm upgrade`
+restarts the adapter pod on its own, with no `kubectl rollout restart`. The one
+`Recreate` replica reopens the same SQLite file and resumes pending work. The
+adapter cannot mint a replacement `chn` token because it deliberately holds no
+platform key.
+
+The chart Secret still contains the three values because the pods need them.
+Using secret references keeps them out of rendered Deployment manifests; it does
+not hide them from a release administrator who can read Helm's release Secret or
+the chart Secret. Restrict those permissions with cluster RBAC, and rotate at the
+provider/platform when an administrator loses that trust.
+
+Only a new SQLite file primes the current inbox as history. A restart performs
+one provider confirmation without marking messages seen, then resumes durable
+pending and downtime mail before `/readyz` becomes healthy. Steady readiness is
+local-only; an AgentMail outage leaves the pod ready while retries remain visible
+in logs and state.
+
+The PVC is PII-bearing application data: it can hold email addresses, message and
+thread identifiers, recovery text, and delivery receipts, though never the three
+credentials or a platform database credential. Back up with a storage snapshot
+that is consistent for SQLite, or stop the Deployment before copying the file.
+Restore the claim before starting the writer. An older image refuses a newer
+schema; restore the pre-upgrade snapshot or roll forward rather than
+deleting state to force a rollback. A chart-managed PVC is deleted by Helm
+uninstall, subject to the StorageClass reclaim policy; an `existingClaim` is not
+owned or deleted by the chart. Erasure means stopping the adapter and deleting
+the PVC plus every retained PV, snapshot, and backup. Starting on a fresh claim
+performs first-boot priming and intentionally does not backfill the inbox.
+
+The remaining operator-relevant sender boundary is documented once in the
+adapter's README rather than here: Curie authenticates no sender, so
+`mailAdapter.allowedSenders` filters an attacker-controlled `From` header and
+buys nothing unless every domain on it enforces DMARC. That section, the
+AgentMail-specific parameter names, the full config surface and the boot gates all live in
+[`apps/mail-adapter/README.md`](../apps/mail-adapter/README.md); to build an adapter for a
+different channel, see [Building a channel adapter](guides/building-a-channel-adapter.md).
+
 ## Upgrading the chart
 
 A chart upgrade is a **full** upgrade: anything the new chart does not render is
@@ -456,12 +644,13 @@ and the rollback re-attaches it with the data intact. Keep the export anyway.
 Notes from the first installs of the chart on fresh clusters, kept for the
 next operator.
 
-- **The agent-sandbox controller is opt-in.** The chart ships the
-  agent-sandbox CRDs, but the vendored controller is gated behind
-  `agentSandbox.controller.deploy`. A cluster that has the CRDs but no
-  controller silently never binds claims, so a first install must set
-  `agentSandbox.controller.deploy=true` unless the cluster already runs the
-  controller.
+- **The agent-sandbox controller is enabled by default.** The chart ships the
+  agent-sandbox CRDs and deploys the vendored controller when
+  `agentSandbox.controller.deploy=true`, which is the default. A cluster that
+  has the CRDs but no controller silently never binds claims. Plain `cluster
+  up` keeps the default when the controller is absent and infers
+  `agentSandbox.controller.deploy=false` only when an existing Deployment has
+  complete Helm ownership metadata for another release.
 - **gVisor stays off without runsc on the node.** Use the
   `values-e2e-nogvisor` overlay on nodes without `runsc`. All other
   security rails were verified ON in the first fresh-cluster install:

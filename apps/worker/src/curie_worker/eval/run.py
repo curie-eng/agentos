@@ -10,6 +10,8 @@ Env:
     CURIE_EVAL_SUITE        path to the suite JSON (EvalSuite shape)
     CURIE_EVAL_TARGET_URL   runner base_url to evaluate against
     CURIE_EVAL_VERSION      version/sha tag to key results by (default "local")
+    CURIE_EVAL_SAMPLES / CURIE_EVAL_AGGREGATION / CURIE_EVAL_PASS_AT_K
+                              multi-sample policy (default n=1 majority)
     LANGFUSE_HOST / LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY
                               if all set, per-case scores are recorded to Langfuse
 """
@@ -17,13 +19,16 @@ Env:
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import sys
 from collections.abc import Mapping
 from pathlib import Path
 
 import httpx
+from curie_telemetry import bootstrap_service_telemetry
 
+from .. import __version__
 from ..runner_client import RunnerClient
 from .models import EvalRunResult, EvalScorer, EvalSuite
 from .recorder import LangfuseEvalRecorder
@@ -76,7 +81,7 @@ async def run_eval_suite(
     return result
 
 
-def _sample_config_from_env(env: Mapping[str, str]) -> SampleConfig:
+def sample_config_from_env(env: Mapping[str, str]) -> SampleConfig:
     """Build the multi-sample policy from the eval Job's env (#332).
 
     ``CURIE_EVAL_SAMPLES`` (default 1) sets N; ``CURIE_EVAL_AGGREGATION``
@@ -98,7 +103,7 @@ async def _main_async(env: Mapping[str, str]) -> int:
     # (the same CURIE_MODEL the runner authenticates from). Empty/unset means
     # "model unknown", recorded as no model tag.
     model = env.get("CURIE_MODEL") or None
-    samples = _sample_config_from_env(env)
+    samples = sample_config_from_env(env)
 
     lf_keys = ("LANGFUSE_HOST", "LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY")
     if all(k in env for k in lf_keys):
@@ -137,7 +142,18 @@ async def _main_async(env: Mapping[str, str]) -> int:
 
 
 def main(env: Mapping[str, str] | None = None) -> None:
-    sys.exit(asyncio.run(_main_async(env if env is not None else os.environ)))
+    resolved = env if env is not None else os.environ
+    telemetry = bootstrap_service_telemetry(
+        "curie-worker",
+        service_version=__version__,
+        logger=logging.getLogger("curie_worker"),
+        environ=resolved,
+    )
+    try:
+        exit_code = asyncio.run(_main_async(resolved))
+    finally:
+        telemetry.shutdown()
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

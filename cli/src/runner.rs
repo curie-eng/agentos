@@ -61,7 +61,7 @@ impl RunnerClient {
             .get(format!("{}/status", self.base_url))
             .send()
             .await
-            .with_context(|| format!("GET {}/status", self.base_url))?;
+            .map_err(|error| self.request_error(error, format!("GET {}/status", self.base_url)))?;
         if !resp.status().is_success() {
             bail!("GET /status returned {}", resp.status());
         }
@@ -82,7 +82,9 @@ impl RunnerClient {
             .post(format!("{}/v1/reset", self.base_url))
             .send()
             .await
-            .with_context(|| format!("POST {}/v1/reset", self.base_url))?;
+            .map_err(|error| {
+                self.request_error(error, format!("POST {}/v1/reset", self.base_url))
+            })?;
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
@@ -115,7 +117,9 @@ impl RunnerClient {
             .json(&frame)
             .send()
             .await
-            .with_context(|| format!("POST {}/v1/event", self.base_url))?;
+            .map_err(|error| {
+                self.request_error(error, format!("POST {}/v1/event", self.base_url))
+            })?;
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
@@ -151,6 +155,32 @@ impl RunnerClient {
             );
         }
         Ok(events)
+    }
+
+    fn request_error(&self, error: reqwest::Error, operation: String) -> anyhow::Error {
+        let unreachable = error.is_connect() || error.is_timeout();
+        let source = anyhow::Error::from(error).context(operation);
+        if unreachable {
+            crate::exit::operator_context(
+                source,
+                format!(
+                    "The local runner at {} could not be reached.",
+                    self.base_url
+                ),
+                Some("Run `curie skill status` to check the local runner.".to_string()),
+            )
+        } else {
+            let remedy = if self.base_url.contains("://") {
+                "Pass an absolute runner URL beginning with `http://` or `https://`.".to_string()
+            } else {
+                format!("Pass the absolute runner URL `http://{}`.", self.base_url)
+            };
+            crate::exit::operator_context(
+                source,
+                format!("The configured runner URL `{}` is invalid.", self.base_url),
+                Some(remedy),
+            )
+        }
     }
 }
 

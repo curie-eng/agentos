@@ -358,7 +358,7 @@ def test_connector_secrets_are_never_written_to_the_claim() -> None:
     # Per-agent connector secrets (#429) ride the substrate-agnostic boot env by
     # value, but the value-only claim CR would persist them in plaintext in etcd.
     # The binding marks their keys in CURIE_CONNECTOR_SECRET_KEYS; the substrate
-    # strips both the marker and every key it names (cluster delivery is #440).
+    # strips both the marker and every key it names (cluster delivery is #1488).
     api = _FakeApi()
     _client(api).create_claim(
         "claim-1",
@@ -380,3 +380,23 @@ def test_connector_secrets_are_never_written_to_the_claim() -> None:
     assert "CURIE_CONNECTOR_SECRET_KEYS" not in names
     # Non-secret boot env is still written.
     assert {"name": "CURIE_BUDGET", "value": "{}"} in entries
+    body = api.created[0]
+    assert "additionalPodMetadata" not in body["spec"]
+    assert body["spec"]["warmPoolRef"]["name"] == "pool"
+
+
+def test_claim_metadata_agent_label_is_not_additional_pod_metadata() -> None:
+    # The adopted controller rejects spec.additionalPodMetadata.labels under
+    # curietech.ai (Ready=False reason=InvalidMetadata). Claim object labels
+    # are ordinary Kubernetes metadata and are the rotation selector.
+    api = _FakeApi()
+    _client(api).create_claim(
+        "claim-1",
+        pool="curie-agent-acme-a-runner-pool",
+        labels={"curietech.ai/agent": "acme-a"},
+        env={"CURIE_BUDGET": "{}"},
+    )
+    body = api.created[0]
+    assert body["metadata"]["labels"]["curietech.ai/agent"] == "acme-a"
+    assert "additionalPodMetadata" not in body["spec"]
+    assert body["spec"]["warmPoolRef"]["name"] == "curie-agent-acme-a-runner-pool"

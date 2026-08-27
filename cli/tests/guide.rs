@@ -142,7 +142,7 @@ fn guide_prints_primer_to_stdout() {
     // "Roughly 100 lines": a real primer, neither a stub nor a sprawling manual.
     let lines = text.lines().count();
     assert!(
-        (60..=160).contains(&lines),
+        (60..=170).contains(&lines),
         "primer is {lines} lines, expected roughly 100"
     );
 }
@@ -207,24 +207,35 @@ fn guide_json_emits_pure_structured_data_on_stdout() {
 }
 
 #[test]
-fn guide_documents_gvisor_fail_closed_opt_out() {
-    // AC (#363): a real-model `cluster up` on a no-runsc cluster fails closed under
-    // the default gVisor mode; the opt-out and its preflight symptom must both be
-    // discoverable in the primer -- in the Markdown default and the --json variant.
+fn guide_documents_cluster_up_gvisor_inference_and_fail_closed_contradictions() {
+    // AC (#1662, ADR 0114): a real-model `cluster up` may infer gVisor off only
+    // from the exact admission symptom, retry once, and keep every other failure
+    // closed. Explicit auto or require modes contradict that detected result.
     let md = out_str(&run(&["guide"]));
     let json = out_str(&run(&["guide", "--json"]));
     for (label, text) in [("markdown", &md), ("json", &json)] {
         assert!(
             text.contains("security.gvisor.mode=off"),
-            "{label} primer missing the gVisor opt-out `security.gvisor.mode=off`\n{text}"
+            "{label} primer missing the inferred override `security.gvisor.mode=off`\n{text}"
         );
         assert!(
-            text.contains("curie-preflight-gvisor"),
-            "{label} primer missing the preflight symptom `curie-preflight-gvisor`\n{text}"
+            text.contains("curie-preflight-gvisor")
+                && text.contains("RuntimeClass gvisor is not found"),
+            "{label} primer missing the exact admission symptom\n{text}"
         );
         assert!(
-            text.contains("running runner pods on the host kernel"),
-            "{label} primer missing the Landmine detail `running runner pods on the host kernel`\n{text}"
+            text.contains("retries once"),
+            "{label} primer missing the one retry limit\n{text}"
+        );
+        assert!(
+            text.contains("Other failures remain closed"),
+            "{label} primer missing the fail closed behavior for other failures\n{text}"
+        );
+        assert!(
+            text.contains(
+                "Explicit auto or require modes contradict the detected result and are errors"
+            ),
+            "{label} primer missing the explicit mode contradiction error\n{text}"
         );
     }
 }
@@ -243,7 +254,17 @@ fn guide_documents_the_approval_plane() {
         for needle in [
             "mcp__curie__request_approval",
             "approval_routes",
+            "--route-resolution",
+            "--routes-from",
             "approvers.group",
+            "text-only",
+            "interaction=None",
+            "configured approval channel",
+            "without disclosing its identifier",
+            "endpoint",
+            "adapter",
+            "verified Slack",
+            "scoped credential",
             "self-approval",
             "[approval resolved]",
             // #1086. Each is a fact an agent cannot derive from the command

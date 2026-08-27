@@ -60,7 +60,10 @@ endpoint (#248), inheriting durability and the per-value/per-namespace size caps
 The worker (`binding.boot_env`) delivers the ref as
 `http(s)://api/agents/<id>/state/memory` and forwards a scoped, agent-bound
 `state` token (ADR-0033, #410) as the memory token rather than the raw platform
-key. `NullMemoryStore` is the no-ref sink.
+key, except on a default local/cluster eval turn whose `conversation_id`
+starts with `eval:` (#1909): that path omits the ref so the runner boots
+`NullMemoryStore` and a deployed memory log cannot change a static suite.
+`NullMemoryStore` is also the no-ref sink.
 
 ## Known leakage
 
@@ -84,9 +87,10 @@ key. `NullMemoryStore` is the no-ref sink.
   and any read-only backing make consolidation a reporting-only no-op. Automatic
   learned-record *extraction* remains later work.
 - **An operator read/write plane sits below the port, not on it.** The
-  inspect, trace-back, edit, and delete surface (#266, #267) is
+  inspect, seed, trace-back, edit, and delete surface (#266, #267, #1904) is
   `apps/api/src/curie_api/routers/memory.py`
   (`apps/api/src/curie_api/routers/memory.py::list_memory`,
+  `apps/api/src/curie_api/routers/memory.py::create_memory`,
   `apps/api/src/curie_api/routers/memory.py::memory_trace_back`,
   `apps/api/src/curie_api/routers/memory.py::edit_memory`,
   `apps/api/src/curie_api/routers/memory.py::delete_memory`), and it never goes
@@ -100,8 +104,9 @@ key. `NullMemoryStore` is the no-ref sink.
   `{content, provenance}` item shape in
   `apps/api/src/curie_api/routers/memory.py::_records_of`, and borrows the state
   router's size caps (`apps/api/src/curie_api/routers/state.py::_enforce_caps`).
-  Its consumers are the CLI (`cli/src/api.rs`, behind `curie local memory` and
-  `curie cluster memory`) and the console (`apps/ui/src/api/client.ts`). Unlike
+  Its consumers are the CLI (`cli/src/api.rs`, behind `curie local memory` /
+  `curie local memory --add` and `curie cluster memory` /
+  `curie cluster memory --add`) and the console (`apps/ui/src/api/client.ts`). Unlike
   the sandbox path it is platform-key-only (`require_api_key`), so the scoped
   memory token cannot reach it. This is coherent today (one loader, one backing
   store, and the router says so in its own docstring), but it is the precise leak

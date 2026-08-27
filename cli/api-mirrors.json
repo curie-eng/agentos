@@ -28,17 +28,42 @@
     },
     {
       "struct": "ChannelBinding",
-      "schema": "ChannelBinding",
+      "schema": "ChannelBindingOut",
       "omissions": []
     },
     {
-      "struct": "ApprovalRouteBinding",
-      "schema": "ApprovalRouteBinding",
+      "struct": "ApprovalRouteBindingResponse",
+      "schema": "ApprovalRouteBindingOut",
+      "omissions": []
+    },
+    {
+      "struct": "ApprovalResolutionTargetResponse",
+      "schema": "ApprovalTargetOut",
+      "omissions": []
+    },
+    {
+      "struct": "ApprovalNotificationTargetResponse",
+      "schema": "ApprovalTargetOut",
       "omissions": []
     },
     {
       "struct": "ApprovalApprovers",
-      "schema": "ApprovalApprovers",
+      "schema": "ApprovalApproversOut",
+      "omissions": []
+    },
+    {
+      "struct": "ApprovalRouteBindingWrite",
+      "schema": "ApprovalRouteBinding",
+      "omissions": []
+    },
+    {
+      "struct": "ApprovalResolutionTargetWrite",
+      "schema": "ApprovalResolutionTarget",
+      "omissions": []
+    },
+    {
+      "struct": "NotificationTargetWrite",
+      "schema": "ApprovalNotificationTarget",
       "omissions": []
     },
     {
@@ -92,12 +117,12 @@
     {
       "struct": "MemoryEntry",
       "schema": "MemoryEntryOut",
-      "omissions": [
-        {
-          "field": "provenance",
-          "why": "The memory list verb renders index/content/version; provenance is a nested MemoryProvenanceOut $ref with no CLI mirror, and carrying it would require a second struct out of this gate's scope."
-        }
-      ]
+      "omissions": []
+    },
+    {
+      "struct": "MemoryProvenance",
+      "schema": "MemoryProvenanceOut",
+      "omissions": []
     },
     {
       "struct": "Bundle",
@@ -218,9 +243,39 @@
       "struct": "ListedTargets",
       "schema": "ListedTargets",
       "omissions": []
+    },
+    {
+      "struct": "ObservationNode",
+      "schema": "ObservationNode",
+      "omissions": []
+    },
+    {
+      "struct": "TraceTree",
+      "schema": "TraceTree",
+      "omissions": []
+    },
+    {
+      "struct": "MetricsSummary",
+      "schema": "MetricsSummary",
+      "omissions": []
+    },
+    {
+      "struct": "MetricPoint",
+      "schema": "MetricPoint",
+      "omissions": []
+    },
+    {
+      "struct": "MetricSeries",
+      "schema": "MetricSeries",
+      "omissions": []
     }
   ],
-  "non_mirrors": [],
+  "non_mirrors": [
+    {
+      "struct": "TraceListRow",
+      "reason": "GET /langfuse/traces returns list[dict[str, object]] with no named OpenAPI component schema. The CLI requires id and timestamp, preserves the API's nullable name, and flattens every other anonymous field so the response is retained wholesale."
+    }
+  ],
   "_emits_comment": "The second, emit-hop gate (#699): a CliOutput::to_json can hand-project one of the mirror structs above into a serde_json::json! literal and drop a field the struct-level gate already proved it carries (the named drift was VersionsOutput dropping Version.id, fixed in #691). Each entry below declares that a specific `output` type's to_json projects a specific mirror `struct`, and every allowlisted omission needs a consumer-derived justification just like the mirrors list above. Check with: curie dev emit-parity. This is a narrower gate than the struct-level one: it verifies every DECLARED (output, struct) pair stays honest, but (unlike mirrors' UndeclaredStruct check) it cannot discover a NEW projection on its own -- see cli/tests/support/emit_parity.rs's module doc for why that reach is out of scope for a syntax-only check.",
   "emits": [
     {
@@ -239,7 +294,11 @@
       "omissions": [
         {
           "field": "version",
-          "why": "The memory listing is read-only in the CLI today -- no verb performs a versioned mutation against a memory entry, so the log's optimistic-concurrency version (MemoryEntryOut.version) is not surfaced yet. Pinned by json_emit_contract.rs's memory_output_json_shape_is_pinned, which notes surfacing it later is a contract decision, not an oversight."
+          "why": "The list verb still emits index/content only; version is the parent-log CAS token used by edit/delete, not by add or list. Pinned by json_emit_contract.rs's memory_output_json_shape_is_pinned."
+        },
+        {
+          "field": "provenance",
+          "why": "The list verb keeps its existing index/content shape. The add verb lifts provenance.source to a top-level `source` key on MemoryOutput::Added rather than nesting the full MemoryProvenanceOut object. Pinned by json_emit_contract.rs."
         }
       ]
     },

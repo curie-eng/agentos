@@ -233,6 +233,7 @@ def test_defaults_parity_with_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     # Crash recovery
     assert config.reclaim_min_idle_ms == 900000
     assert config.reclaim_interval_s == 30.0
+    assert config.dead_consumer_idle_ms == 15000
     # Slack edit throttle
     assert config.slack_edit_min_interval_s == 0.7
     # Runner HTTP timeouts

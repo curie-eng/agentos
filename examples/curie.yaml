@@ -1,0 +1,19 @@
+version: 1
+
+install:
+  namespace: acme-bot
+  release: acme-bot
+
+platform:
+  ui: false
+  inference: false
+  egress:
+    - host: anthropic
+
+credentials:
+  model: ANTHROPIC_API_KEY
+
+comms:
+  slack:
+    app_token: SLACK_APP_TOKEN
+    bot_token: SLACK_BOT_TOKEN

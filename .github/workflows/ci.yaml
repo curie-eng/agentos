@@ -21,6 +21,8 @@ jobs:
   python:
     name: Python (ruff + mypy + pytest)
     runs-on: ubuntu-latest
+    env:
+      CI_REQUIRE_VALKEY_TESTS: "1"
     steps:
       - uses: actions/checkout@v7
         with:
@@ -102,8 +104,8 @@ jobs:
             langfuse-web langfuse-worker otel-collector
       # Langfuse web has no compose healthcheck, so --wait returns once its
       # container is merely running. Poll its public health endpoint until it is
-      # actually serving; the Langfuse-backed tests skip themselves when the
-      # stack is unreachable, so this gate is what keeps them running for real.
+      # actually serving, so the full-stack readiness gate fails fast with an
+      # actionable error before integration tests begin.
       - name: Wait for Langfuse to serve
         run: |
           for i in $(seq 1 60); do
@@ -113,6 +115,10 @@ jobs:
             sleep 3
           done
           echo "Langfuse did not become ready within 180s"; exit 1
+      - name: Released database upgrade gate
+        run: |
+          uv run python scripts/check-released-upgrade.py --self-test
+          uv run python scripts/check-released-upgrade.py
       # The apps/api suite provisions a throwaway migrated DB per run, but the
       # worker binding integration tests dial the shared default database and
       # assume the curie schema already exists (as it does on a dev box).
@@ -124,9 +130,9 @@ jobs:
       # The committed-lock test only proves the lock matches the current wire; it
       # passes even if the lock was regenerated without a version bump. Compare
       # against the BASE branch's lock so an unbumped wire change actually fails
-      # CI. Fetch the base ref at depth 1 to keep this comparison focused; a
-      # missing or empty base lock (base predates the lock) skips cleanly (exit 0), and
-      # only a genuine unbumped wire change vs an existing base lock exits 1.
+      # CI. Refresh that remote ref before reading it; a missing or empty base
+      # lock (base predates the lock) skips cleanly (exit 0), and only a genuine
+      # unbumped wire change vs an existing base lock exits 1.
       - name: ACI wire-lock base gate
         run: |
           git fetch --no-tags --depth=1 origin "${{ github.base_ref || 'main' }}" || true
@@ -158,6 +164,19 @@ jobs:
   rust:
     name: Rust (fmt + clippy + test)
     runs-on: ubuntu-latest
+    env:
+      CI_REQUIRE_VALKEY_TESTS: "1"
+      TEST_VALKEY_URL: redis://localhost:26379
+    services:
+      valkey:
+        image: valkey/valkey:8-alpine
+        ports:
+          - 26379:6379
+        options: >-
+          --health-cmd "valkey-cli ping | grep -q PONG"
+          --health-interval 3s
+          --health-timeout 5s
+          --health-retries 10
     defaults:
       run:
         working-directory: cli
@@ -332,6 +351,8 @@ jobs:
           git diff --exit-code -- packages/aci-protocol/generated/ts/aci-protocol.ts
       - name: tsc --noEmit on generated ACI types
         run: npx --yes -p typescript@5.9.3 tsc --noEmit -p packages/aci-protocol/generated/ts/tsconfig.json
+      - name: Architecture atlas preview route test
+        run: node --test docs/architecture-atlas/test-update-hash.mjs
 
   ui:
     name: UI (lint + vitest + build + Playwright)
@@ -477,10 +498,10 @@ jobs:
         run: |
           count=$(docker compose -f compose.release.yaml --profile core config --services | wc -l)
           [ "$count" -eq 8 ] || { echo "core profile must render 8 services, got $count" >&2; exit 1; }
-      - name: Full profile renders 13 services
+      - name: Full profile renders 14 services
         run: |
           count=$(docker compose -f compose.release.yaml --profile full config --services | wc -l)
-          [ "$count" -eq 13 ] || { echo "full profile must render 13 services, got $count" >&2; exit 1; }
+          [ "$count" -eq 14 ] || { echo "full profile must render 14 services, got $count" >&2; exit 1; }
 
   # Build the first-party images on every PR/push -- build only, never push --
   # so a Dockerfile break is caught here instead of only at release time. This
@@ -504,6 +525,8 @@ jobs:
           - name: dispatcher
             context: .
             dockerfile: apps/dispatcher/Dockerfile
+          - name: mail-adapter
+            dockerfile: apps/mail-adapter/Dockerfile
           - name: worker
             context: .
             dockerfile: apps/worker/Dockerfile
@@ -513,12 +536,18 @@ jobs:
           - name: sre-bot-tempo
             context: examples/sre-bot/connectors/tempo
             dockerfile: examples/sre-bot/connectors/tempo/Dockerfile
+          - name: sre-bot-k8s-write
+            context: examples/sre-bot/connectors/k8s-write
+            dockerfile: examples/sre-bot/connectors/k8s-write/Dockerfile
+          - name: sre-bot-k8s-scale
+            context: examples/sre-bot/connectors/k8s-scale
+            dockerfile: examples/sre-bot/connectors/k8s-scale/Dockerfile
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
       - name: Build (no push)
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
@@ -567,6 +596,24 @@ jobs:
         run: docker build -t curie-dispatcher:ci-smoke -f apps/dispatcher/Dockerfile .
       - name: Entrypoint imports resolve in the built image
         run: docker run --rm --entrypoint python curie-dispatcher:ci-smoke -c "import curie_dispatcher; import aci_protocol"
+
+  # Same gap, same shape (issue #428). The mail adapter image also builds with
+  # `uv sync --no-editable`, so it installs only the package's DECLARED
+  # dependencies: aci-protocol (a uv workspace member) and pydantic-settings
+  # stay importable from a source checkout while being absent from the isolated
+  # image venv, and the process crash-loops on startup. The build-only `images`
+  # job above never runs the image, so this is the one place that is observable.
+  mail-adapter-image-smoke:
+    name: Mail adapter image imports resolve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Build the mail adapter image locally
+        run: docker build -t curie-mail-adapter:ci-smoke -f apps/mail-adapter/Dockerfile .
+      - name: Entrypoint imports resolve in the built image
+        run: docker run --rm --entrypoint python curie-mail-adapter:ci-smoke -c "import curie_mail_adapter; import aci_protocol; import pydantic_settings"
 
   # FALSIFIABILITY gate for the committed eval suites (issue #619). This is NOT
   # an E2E test: it never runs a real agent or makes a model call. It boots the
@@ -772,7 +819,7 @@ jobs:
       # layers from cache alone (58s -> 15s) after wiping the builder.
       - name: Set up a cache-only buildx builder (named, NOT the default -- preserves compose FROM, #803)
         id: laddercache
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
         with:
           use: false
       - name: Build the runner image locally (gha layer cache)
@@ -816,6 +863,17 @@ jobs:
           load: true
           cache-from: type=gha,scope=ladder-worker
           cache-to: type=gha,mode=max,scope=ladder-worker
+      - name: Build the dispatcher image locally (one-shot local message producer, no registry auth)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: apps/dispatcher/Dockerfile
+          builder: ${{ steps.laddercache.outputs.name }}
+          tags: ghcr.io/curie-eng/curie-dispatcher:latest
+          push: false
+          load: true
+          cache-from: type=gha,scope=ladder-dispatcher
+          cache-to: type=gha,mode=max,scope=ladder-dispatcher
       - name: Parity ladder (skill + local rungs, fake model, credential-free)
         env:
           CURIE_BIN: cli/target/release/curie
@@ -853,7 +911,7 @@ jobs:
       # documents in full.
       - name: Set up a cache-only buildx builder (named, NOT the default -- #803)
         id: releasecache
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
         with:
           use: false
       - name: Build the runner image locally (gha layer cache)
@@ -891,6 +949,17 @@ jobs:
           load: true
           cache-from: type=gha,scope=ladder-worker
           cache-to: type=gha,mode=max,scope=ladder-worker
+      - name: Build the dispatcher image locally (one-shot local message producer, no registry auth)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: apps/dispatcher/Dockerfile
+          builder: ${{ steps.releasecache.outputs.name }}
+          tags: ghcr.io/curie-eng/curie-dispatcher:latest
+          push: false
+          load: true
+          cache-from: type=gha,scope=ladder-dispatcher
+          cache-to: type=gha,mode=max,scope=ladder-dispatcher
       - name: Build the ui image locally (satisfies the generated release compose, no registry auth)
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
@@ -929,7 +998,8 @@ jobs:
   # deploy`/`cluster message` self-plumb kubectl port-forwards and read the
   # release's UI `/api` NodePort. The hard leg is POD->HOST: the in-cluster
   # worker must POST its reply back to the host-bound Slack stub that `cluster
-  # message` binds on 0.0.0.0:8155 on THIS runner. `cluster message`
+  # message` binds on 0.0.0.0 with a kernel assigned ephemeral port on THIS
+  # runner. `cluster message`
   # auto-detects the host to advertise from the kubeconfig API-server address,
   # but a kind cluster's API server is bound on loopback (127.0.0.1:<port>), so
   # auto-detection yields 127.0.0.1 -- which an in-cluster pod cannot route to.
@@ -981,14 +1051,14 @@ jobs:
           set -euo pipefail
           if [ "${{ github.event_name }}" = "push" ]; then
             uv run --no-project --with pyyaml==6.0.3 python \
-              tools/e2e-ci-selection/select.py \
+              tools/e2e-ci-selection/select_tiers.py \
               --registry .github/e2e-selection.yaml \
               --push
           else
             base="${{ github.base_ref }}"
             git fetch --quiet origin "$base"
             uv run --no-project --with pyyaml==6.0.3 python \
-              tools/e2e-ci-selection/select.py \
+              tools/e2e-ci-selection/select_tiers.py \
               --registry .github/e2e-selection.yaml \
               --base "origin/$base" \
               --head HEAD
@@ -1021,7 +1091,7 @@ jobs:
       # cluster round trip actually needs; the dispatcher is not deployed.
       - name: Set up a cache-only buildx builder (named, NOT the default)
         id: clustercache
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
         with:
           use: false
       - name: Build the api image locally
@@ -1187,9 +1257,10 @@ jobs:
       # with pullPolicy Never (the runner AND its prewarm DaemonSet), force gVisor
       # off (no runsc on kind nodes), and drop the dispatcher (no Slack; its
       # presence would trip the `cluster message` reply-hijack guard).
-      # worker.slackTrustedOrigins is a CI-only widening that lets the worker
-      # answer the host-side reply stub (port = STUB_PORT in
-      # cli/scripts/e2e-ladder.sh); the chart default stays empty and fail-closed.
+      # worker.slackTrustedOrigins is a CI only widening that lets the worker
+      # answer the host side reply stub on any kernel assigned port on this
+      # host. The portless origin is intentional because `cluster message`
+      # requests an ephemeral port; the chart default stays empty and fail closed.
       - name: Install the platform (curie cluster up)
         env:
           CURIE_BIN: cli/target/release/curie
@@ -1201,7 +1272,7 @@ jobs:
             --fake-model \
             --set security.gvisor.mode=off \
             --set dispatcher.deploy=false \
-            --set worker.slackTrustedOrigins="http://${CURIE_E2E_LISTEN_HOST}:8155" \
+            --set worker.slackTrustedOrigins="http://${CURIE_E2E_LISTEN_HOST}" \
             --set api.image.repository=curie-api --set api.image.tag=local --set api.image.pullPolicy=Never \
             --set worker.image.repository=curie-worker --set worker.image.tag=local --set worker.image.pullPolicy=Never \
             --set ui.image.repository=curie-ui --set ui.image.tag=local --set ui.image.pullPolicy=Never \

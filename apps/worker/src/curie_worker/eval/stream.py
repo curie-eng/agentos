@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import secrets
 import tempfile
 import uuid
@@ -45,6 +46,8 @@ from aci_protocol import (
     EvalReport,
     parse_eval_job,
 )
+from curie_telemetry import extract_trace_context, operation_span, record_metric
+from opentelemetry.trace import SpanKind
 from plugin_format import (
     DEFAULT_MAX_COMPRESSION_RATIO,
     DEFAULT_MAX_MEMBERS,
@@ -69,7 +72,7 @@ from ..sandbox.types import SandboxError
 from ..stream_consumer import DeliverySpec, ReadLoopSpec, StreamConsumer
 from .models import EvalCaseResult, EvalOutcome, EvalRunResult, EvalScorer, EvalSuite
 from .recorder import LangfuseEvalRecorder
-from .run import run_eval_suite
+from .run import run_eval_suite, sample_config_from_env
 from .scorer import TrajectoryScorer
 from .trajectory import TrajectorySidecar
 
@@ -284,8 +287,15 @@ class EvalStreamConsumer(StreamConsumer):
             max_delivery=config.max_delivery,
             dead_letter_maxlen=config.dead_letter_maxlen,
             reclaim_min_idle_ms=config.reclaim_min_idle_ms,
+            # The eval read loop awaits ``_handle`` inline, so XINFO CONSUMERS
+            # idle tracks in-flight suite runtime rather than process liveness.
+            # Prompt reclaim here would steal a live eval after 15s. Use the
+            # entry-idle window instead; the shared helper still runs, and tests
+            # that need the fast path replace this field.
+            dead_consumer_idle_ms=config.reclaim_min_idle_ms,
             read_count=config.read_count,
             cap_scan_page=_EVAL_CAP_SCAN_PAGE,
+            telemetry_source="eval",
             handler=self._handle,
             logger=logger,
             dead_letter_log="dead-lettered eval entry %s after %d deliveries (reason=%s) -> %s",
@@ -354,6 +364,18 @@ class EvalStreamConsumer(StreamConsumer):
             await self._sleep_or_stop(self._config.reclaim_interval_s)
 
     async def _handle(self, entry_id: str, fields: dict[str, str]) -> None:
+        # Eval jobs are their own lifecycle. Ignore any adjacent turn carrier so
+        # a reused transport field cannot fabricate causality across the sibling
+        # stream; missing and malformed values therefore share this safe root.
+        with operation_span(
+            "curie.eval.process",
+            kind=SpanKind.CONSUMER,
+            parent=extract_trace_context({}),
+            attributes={"service.name": "curie-worker", "source": "eval"},
+        ):
+            await self._handle_entry(entry_id, fields)
+
+    async def _handle_entry(self, entry_id: str, fields: dict[str, str]) -> None:
         self._inflight_ids.add(entry_id)
         try:
             try:
@@ -366,6 +388,14 @@ class EvalStreamConsumer(StreamConsumer):
                 # (not a bare ack) so the malformed entry is observable in the
                 # eval graveyard, matching the runs lane's unparseable path (#535).
                 logger.exception("malformed eval work item %s; dead-lettering as poison", entry_id)
+                record_metric(
+                    "curie.eval.process",
+                    attributes={
+                        "service.name": "curie-worker",
+                        "source": "eval",
+                        "outcome": "failure",
+                    },
+                )
                 await self._dead_letter(entry_id, fields, reason="unparseable", delivery_count=1)
                 return
             try:
@@ -375,7 +405,33 @@ class EvalStreamConsumer(StreamConsumer):
                 # An unexpected error before the report attempt: leave pending so
                 # the reclaim loop re-runs it (an eval must not be lost to a crash).
                 logger.exception("eval processing failed for %s; left pending", entry_id)
+                record_metric(
+                    "curie.eval.process",
+                    attributes={
+                        "service.name": "curie-worker",
+                        "source": "eval",
+                        "outcome": "failure",
+                    },
+                )
                 return
+            metric_outcome = (
+                "plumbing"
+                if result.results
+                and all(row.outcome is EvalOutcome.PLUMBING_OK for row in result.results)
+                else (
+                    "failure"
+                    if any(row.outcome is EvalOutcome.FAIL for row in result.results)
+                    else "success"
+                )
+            )
+            record_metric(
+                "curie.eval.process",
+                attributes={
+                    "service.name": "curie-worker",
+                    "source": "eval",
+                    "outcome": metric_outcome,
+                },
+            )
             await self._ack(entry_id)
         finally:
             self._inflight_ids.discard(entry_id)
@@ -414,6 +470,7 @@ class EvalStreamConsumer(StreamConsumer):
         base_url, release_key, token = await self._acquire_target(item)
         if base_url is None:
             return await self._report_failed(item, repo, "runner provisioning failed")
+        samples = sample_config_from_env(os.environ)
         try:
             if loaded.scorer is None:
                 result = await run_eval_suite(
@@ -424,6 +481,7 @@ class EvalStreamConsumer(StreamConsumer):
                     token=token,
                     model=model,
                     fake=self._config.fake_model,
+                    samples=samples,
                     stream_id=stream_id,
                 )
             else:
@@ -436,6 +494,7 @@ class EvalStreamConsumer(StreamConsumer):
                     model=model,
                     fake=self._config.fake_model,
                     scorer=loaded.scorer,
+                    samples=samples,
                     stream_id=stream_id,
                 )
         finally:
@@ -471,6 +530,8 @@ class EvalStreamConsumer(StreamConsumer):
         try:
             connector_secrets = await self._repo_lookup.secrets_for(item.agent_id)
             thinking = await self._repo_lookup.thinking_for(item.agent_id)
+            name_for = getattr(self._repo_lookup, "name_for", None)
+            agent_name = await name_for(item.agent_id) if name_for is not None else None
             env = self._boot_env(item, connector_secrets, thinking)
             # Hold a claim slot only across creation/binding (the flood source),
             # not the whole suite run: the semaphore is released the moment the
@@ -478,7 +539,12 @@ class EvalStreamConsumer(StreamConsumer):
             # claim may begin. The secrets/env prep above is cheap and does not
             # touch the cluster, so it stays outside the slot.
             async with self._claim_slots:
-                handle = await asyncio.to_thread(self._substrate.claim, release_key, env=env)
+                handle = await asyncio.to_thread(
+                    self._substrate.claim,
+                    release_key,
+                    env=env,
+                    agent_name=agent_name,
+                )
         except SandboxError:
             logger.exception("could not provision a runner for eval %s", item.sha)
             return None, None, None

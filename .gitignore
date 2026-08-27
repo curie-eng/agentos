@@ -24,6 +24,9 @@ oauth.env
 # assertion script (ADR-0009, #429): Helm syntax / a test, not secret material.
 !charts/curie/templates/agent-connector-secrets.yaml
 !charts/curie/ci/connector-secrets-assertions.sh
+# Same exception for the cluster-tier Helm bind path (#1488): command
+# construction, never secret material.
+!cli/src/cluster_secrets.rs
 # Same exception for the collector Langfuse Secret wiring assertions (#1563): a
 # render-assertion script, not secret material. Without this the `*secret*` rule
 # drops it and the CI step that runs it goes red on a missing file.
@@ -35,6 +38,11 @@ oauth.env
 # add` skips it without a word, and the desktop build fails in CI on a missing
 # import.
 !apps/desktop/electron/ipc/secrets.ts
+
+# Same exception for the direct-passthrough existingSecret assertions (#1759):
+# a render-assertion script, not secret material. Without this the `*secret*`
+# rule drops it and the CI step that runs it goes red on a missing file.
+!charts/curie/ci/direct-passthrough-existing-secret-assertions.sh
 
 # Python
 __pycache__/

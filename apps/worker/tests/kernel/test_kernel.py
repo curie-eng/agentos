@@ -11,8 +11,10 @@ import logging
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from aci_protocol import (
@@ -31,7 +33,7 @@ from curie_worker import kernel as kernel_module
 from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.kernel import ThreadBusyError
 from curie_worker.reply_sink import TargetRoute
-from curie_worker.runner_client import RunnerError
+from curie_worker.runner_client import RunnerError, TurnStream
 from curie_worker.sandbox import QuotaRejection
 from curie_worker.workspace import WorkspaceSelectionRefused
 
@@ -75,6 +77,25 @@ async def _wait_until(pred: Callable[[], bool], timeout: float = 5.0) -> None:
     raise AssertionError("condition not met within timeout")
 
 
+def _spy_next_turn_release(kernel: Any) -> dict[str, int]:
+    calls = {"n": 0}
+    real_start_turn = kernel._runner.start_turn
+
+    async def start_turn(*args: Any, **kwargs: Any) -> TurnStream:
+        turn = await real_start_turn(*args, **kwargs)
+        real_release = turn._response.release
+
+        def release() -> Any:
+            calls["n"] += 1
+            return real_release()
+
+        turn._response.release = release
+        return turn
+
+    kernel._runner.start_turn = start_turn
+    return calls
+
+
 def test_new_turn_streams_to_slack_and_acks(make_harness) -> None:
     async def go() -> None:
         async with make_harness() as h:
@@ -89,6 +110,152 @@ def test_new_turn_streams_to_slack_and_acks(make_harness) -> None:
             assert h.runner.opened == ["hi"]
             assert h.sink.last_text == "Hello world"
             assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+
+    asyncio.run(go())
+
+
+def test_post_final_stall_does_not_reclassify_or_retry_success(make_harness) -> None:
+    async def go() -> None:
+        async with make_harness(max_attempts=3) as h:
+            hold = asyncio.Event()
+            h.runner.default_script = [Final(text="answer", status=DONE)]
+            h.runner.hold = hold
+            event = _qevent("hi")
+            try:
+                await asyncio.wait_for(h.kernel.process_event(event), timeout=2.0)
+                assert h.runner.opened == ["hi"]
+                assert h.sink.last_text == "answer"
+                assert await h.async_redis.exists(h.config.done_key(event.event_id))
+            finally:
+                hold.set()
+
+    asyncio.run(go())
+
+
+def test_cancellation_while_route_lock_exits_releases_open_runner_response(
+    make_harness,
+) -> None:
+    class BlockingExitLock:
+        def __init__(self, inner: object) -> None:
+            self._inner = inner
+            self.exit_started = asyncio.Event()
+            self.unblock = asyncio.Event()
+
+        @asynccontextmanager
+        async def hold(self, key: str) -> AsyncIterator[object]:
+            async with self._inner.hold(key) as lease:  # type: ignore[attr-defined]
+                yield lease
+                self.exit_started.set()
+                await self.unblock.wait()
+
+    async def go() -> None:
+        async with make_harness() as h:
+            runner_hold = asyncio.Event()
+            h.runner.hold = runner_hold
+            h.runner.default_script = [Final(text="answer", status=DONE)]
+            lock = BlockingExitLock(h.kernel._lock)
+            h.kernel._lock = lock  # type: ignore[assignment]
+            release_calls = _spy_next_turn_release(h.kernel)
+            task = asyncio.create_task(h.kernel.process_event(_qevent("hi", thread="tCancel")))
+            try:
+                await asyncio.wait_for(lock.exit_started.wait(), timeout=1.0)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                assert release_calls["n"] >= 1
+            finally:
+                lock.unblock.set()
+                runner_hold.set()
+                if not task.done():
+                    task.cancel()
+                await _wait_until(lambda: not h.runner.turn_active)
+
+    asyncio.run(go())
+
+
+def test_cancellation_during_registered_kill_recheck_releases_runner_response(
+    make_harness,
+) -> None:
+    class BlockingSecondKillCheck:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.entered = asyncio.Event()
+            self.unblock = asyncio.Event()
+
+        async def is_killed(self, _agent_id: uuid.UUID) -> bool:
+            self.calls += 1
+            if self.calls == 1:
+                return False
+            self.entered.set()
+            await self.unblock.wait()
+            return False
+
+    async def go() -> None:
+        agent_id = uuid.uuid4()
+        binding = _TokenBinding("", agent_id)
+        async with make_harness(binding=binding) as h:
+            runner_hold = asyncio.Event()
+            h.runner.hold = runner_hold
+            h.runner.default_script = [Final(text="answer", status=DONE)]
+            killswitch = BlockingSecondKillCheck()
+            h.kernel.attach_killswitch(killswitch)  # type: ignore[arg-type]
+            release_calls = _spy_next_turn_release(h.kernel)
+            task = asyncio.create_task(h.kernel.process_event(_qevent("hi", thread="tRegistered")))
+            try:
+                await asyncio.wait_for(killswitch.entered.wait(), timeout=1.0)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                assert release_calls["n"] >= 1
+            finally:
+                killswitch.unblock.set()
+                runner_hold.set()
+                if not task.done():
+                    task.cancel()
+                await _wait_until(lambda: not h.runner.turn_active)
+
+    asyncio.run(go())
+
+
+def test_cancellation_during_deferred_job_boot_reply_releases_runner_response(
+    make_harness,
+) -> None:
+    async def go() -> None:
+        async with make_harness() as h:
+            runner_hold = asyncio.Event()
+            h.runner.hold = runner_hold
+            h.runner.default_script = [Final(text="answer", status=DONE)]
+            reply_started = asyncio.Event()
+            reply_unblock = asyncio.Event()
+
+            async def blocking_reply(*_args: Any, **_kwargs: Any) -> None:
+                reply_started.set()
+                await reply_unblock.wait()
+
+            h.kernel._reply_for = blocking_reply  # type: ignore[method-assign]
+            release_calls = _spy_next_turn_release(h.kernel)
+            task = asyncio.create_task(
+                h.kernel.process_event(
+                    _qevent(
+                        "digest",
+                        thread="tDeferred",
+                        placeholder=None,
+                        source=TurnSource.CRON,
+                    )
+                )
+            )
+            try:
+                await asyncio.wait_for(reply_started.wait(), timeout=1.0)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                assert release_calls["n"] >= 1
+            finally:
+                reply_unblock.set()
+                runner_hold.set()
+                if not task.done():
+                    task.cancel()
+                await _wait_until(lambda: not h.runner.turn_active)
 
     asyncio.run(go())
 
@@ -1081,6 +1248,7 @@ class _FakeResolved:
 
     def __init__(self, agent_id: uuid.UUID) -> None:
         self.agent_id = agent_id
+        self.agent_name = "test-agent"
         # Unset on this binding, so the turn keeps the route the server minted
         # onto its reply handle (ADR-0096 EB-B2).
         self.endpoint: str | None = None

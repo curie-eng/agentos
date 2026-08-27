@@ -14,6 +14,9 @@ spec:
     - name: http
       port: {{ .Values.api.service.port }}
       targetPort: 8000
+      {{- if and (eq .Values.api.service.type "NodePort") .Values.api.service.nodePort }}
+      nodePort: {{ .Values.api.service.nodePort }}
+      {{- end }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -30,9 +33,19 @@ spec:
   template:
     metadata:
       labels:
+        {{- with (include "curie.placement.labels" .Values.placement.platform) }}
+        {{- . | nindent 8 }}
+        {{- end }}
         {{- include "curie.labels" . | nindent 8 }}
         {{- include "curie.selectorLabels" (dict "root" . "component" "api") | nindent 8 }}
+      {{- with (include "curie.placement.annotations" .Values.placement.platform) }}
+      annotations:
+        {{- . | nindent 8 }}
+      {{- end }}
     spec:
+      {{- with (include "curie.placement.spec" .Values.placement.platform) }}
+      {{- . | nindent 6 }}
+      {{- end }}
       # The runner-logs proxy lists pods and reads pod logs via the K8s API, so
       # the API pod runs as its own ServiceAccount (see api-rbac.yaml).
       serviceAccountName: {{ include "curie.fullname" . }}-api
@@ -45,8 +58,8 @@ spec:
       {{- end }}
       {{- if .Values.api.migrate.enabled }}
       # Bring the schema to head before the server boots. The init container
-      # re-runs until it succeeds, so it also serves as a wait-for-Postgres gate
-      # on a fresh install (migration 0001 creates the `curie` schema).
+      # waits quietly for Postgres before migrating. Kubernetes restarts remain
+      # the backstop after bounded readiness attempts or migration failure.
       initContainers:
         - name: migrate
           image: {{ include "curie.image" (dict "repository" .Values.api.image.repository "tag" .Values.api.image.tag "digest" .Values.api.image.digest "defaultTag" .Chart.AppVersion) | quote }}
@@ -54,7 +67,44 @@ spec:
           {{- with .Values.api.containerSecurityContext }}
           {{- include "curie.containerSecurityContext" . | nindent 10 }}
           {{- end }}
-          command: ["alembic", "-c", "alembic.ini", "upgrade", "head"]
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              attempt=1
+              max_attempts=60
+              probe_error_class=""
+              while [ "$attempt" -le "$max_attempts" ]; do
+                if probe_error_class=$(python -c '
+              import asyncio
+              import os
+
+              try:
+                  import asyncpg
+
+                  async def probe():
+                      database_url = os.environ["DATABASE_URL"].replace(
+                          "postgresql+asyncpg://", "postgresql://", 1
+                      )
+                      connection = await asyncpg.connect(database_url, timeout=2)
+                      await connection.close()
+
+                  asyncio.run(probe())
+              except Exception as error:
+                  print(type(error).__name__)
+                  raise SystemExit(1)
+              ' 2>/dev/null); then
+                  exec alembic -c alembic.ini upgrade head
+                fi
+                if [ "$attempt" -eq 1 ]; then
+                  echo "Waiting for Postgres readiness"
+                fi
+                if [ "$attempt" -lt "$max_attempts" ]; then
+                  sleep 2
+                fi
+                attempt=$((attempt + 1))
+              done
+              echo "Postgres unavailable after $max_attempts readiness attempts; final probe error class: $probe_error_class; exiting for init container restart" >&2
+              exit 1
           env:
             {{- include "curie.env.postgres" . | nindent 12 }}
       {{- end }}
@@ -95,10 +145,13 @@ spec:
             - name: GITHUB_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "curie.secretName" . }}
-                  key: githubToken
+                  {{- /* BYO (issue #1759, same idiom as GITHUB_APP_PRIVATE_KEY
+                         below): the token never passes through helm values on
+                         this path. */}}
+                  {{- include "curie.secretRef" (dict "root" . "existingSecret" .Values.api.githubTokenExistingSecret "existingSecretKey" .Values.api.githubTokenExistingSecretKey "defaultKey" "githubToken") | nindent 18 }}
             - name: GITHUB_REPO_ALLOWLIST
               value: {{ .Values.api.githubRepoAllowlist | toJson | quote }}
+            {{- include "curie.env.otel" (dict "root" . "extraEnv" .Values.api.extraEnv) | nindent 12 }}
             # GitHub App identity (ADR-0092). When both are set the platform
             # mints a one-hour token scoped to the single repository it is
             # cloning, instead of using GITHUB_TOKEN above. Both empty is fine:
@@ -171,16 +224,15 @@ spec:
               value: {{ .Values.api.resumeReconciler.batchLimit | quote }}
             # Slack bot token for the approval user-group authorizer (#420): the
             # API resolves usergroups.users.list itself rather than trusting a
-            # caller-asserted membership claim (ADR-0034). Same shared secret key
-            # the dispatcher and worker read, so no new secret material. Rendered
-            # unconditionally, mirroring worker.yaml's ref to the same key; a
-            # declared approver group with no token then fails closed at resolve
-            # time, which is the intended posture.
+            # caller-asserted membership claim (ADR-0034). Same shared secret
+            # reference dispatcher.yaml and worker.yaml resolve (issue #1759,
+            # curie.secretRef), so the three cannot drift apart.
+            # Rendered unconditionally; a declared approver group with no token
+            # then fails closed at resolve time, which is the intended posture.
             - name: SLACK_BOT_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "curie.secretName" . }}
-                  key: slackBotToken
+                  {{- include "curie.secretRef" (dict "root" . "existingSecret" .Values.dispatcher.slack.botTokenExistingSecret "existingSecretKey" .Values.dispatcher.slack.botTokenExistingSecretKey "defaultKey" "slackBotToken") | nindent 18 }}
             # Expiry sweeper cadence (#412). Rendered unconditionally, not behind
             # an optional-value guard, because the disable value 0 is falsy in Go
             # templates and would be silently dropped, leaving the app default
@@ -194,6 +246,9 @@ spec:
             # the setting an operator is trying to make.
             - name: SLACK_USERGROUP_CACHE_TTL_S
               value: {{ .Values.api.slackUsergroupCacheTtlSeconds | quote }}
+            {{- with .Values.api.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           ports:
             - name: http
               containerPort: 8000

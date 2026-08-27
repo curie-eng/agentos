@@ -101,6 +101,13 @@ fn incomplete_matrix_body() -> String {
     body.to_string()
 }
 
+fn unlabelled_model_matrix_body() -> String {
+    let mut body: serde_json::Value =
+        serde_json::from_str(&matrix_body()).expect("valid matrix fixture");
+    body["rows"][0]["cells"][0]["model"] = serde_json::Value::Null;
+    body.to_string()
+}
+
 fn platform_server_with_matrix(
     matrix: impl Fn() -> String + Send + Sync + 'static,
 ) -> support::MockServer {
@@ -213,13 +220,15 @@ if "port-forward" not in args:
     sys.exit(64)
 
 mapping = next(arg for arg in reversed(args) if ":" in arg and arg.split(":", 1)[0].isdigit())
-local_port = int(mapping.split(":", 1)[0])
+local_port, remote_port = mapping.split(":", 1)
+local_port = int(local_port)
 backend_host, backend_port = os.environ["CURIE_TEST_API_BACKEND"].rsplit(":", 1)
 
 listener = socket.socket()
 listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 listener.bind(("127.0.0.1", local_port))
 listener.listen()
+print(f"Forwarding from 127.0.0.1:{local_port} -> {remote_port}", flush=True)
 
 while True:
     client, _ = listener.accept()
@@ -448,6 +457,25 @@ fn local_and_cluster_use_the_same_structured_trajectory_verdicts() {
             .is_some_and(|detail| detail.contains("no trajectory spec")),
         "the missing spec verdict must remain explanatory: {local}"
     );
+    assert_platform_flow(&local_requests);
+    assert_platform_flow(&cluster_requests);
+}
+
+#[test]
+fn local_and_cluster_report_trajectory_results_without_a_resolved_model() {
+    let (local_output, local_requests) = run_platform_eval_against(
+        "local",
+        platform_server_with_matrix(unlabelled_model_matrix_body),
+    );
+    let (cluster_output, cluster_requests) = run_platform_eval_against(
+        "cluster",
+        platform_server_with_matrix(unlabelled_model_matrix_body),
+    );
+
+    let local = parsed_output(&local_output);
+    let cluster = parsed_output(&cluster_output);
+    assert_eq!(verdict_projection(&local), verdict_projection(&cluster));
+    assert_eq!(case_result(&local, "ordered")["passed"], true, "{local}");
     assert_platform_flow(&local_requests);
     assert_platform_flow(&cluster_requests);
 }

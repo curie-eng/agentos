@@ -473,6 +473,14 @@ class WorkerConfig(BaseSettings):
     # crash recovery.
     reclaim_min_idle_ms: int = 900000
     reclaim_interval_s: float = 30.0
+    # Prompt reclaim for a consumer that has stopped interacting with the
+    # group (#1532). Entry idle is the wrong signal: a live replica's
+    # in-flight turn is pending for the whole runner timeout, so a short
+    # XAUTOCLAIM threshold would steal it. Consumer idle is the right one:
+    # the read loop keeps issuing XREADGROUP every ``read_block_ms`` even
+    # while a turn is in flight, so a peer idle longer than a few block
+    # intervals is dead, not mid-turn. Default is 3x ``read_block_ms``.
+    dead_consumer_idle_ms: int = Field(default=15000, ge=0)
 
     # Slack placeholder edits are throttled to avoid rate limits while streaming.
     slack_edit_min_interval_s: float = 0.7
@@ -799,11 +807,10 @@ class WorkerConfig(BaseSettings):
     def lock_key(self, thread_key: str) -> str:
         return f"{self.key_prefix}:lock:{thread_key}"
 
-    def approval_card_key(self, thread_key: str) -> str:
-        # Where a suspended thread's posted approval card lives, so an expiry can
-        # disable it (#419). Keyed by thread: one pending approval per suspended
-        # thread at a time.
-        return f"{self.key_prefix}:approval-card:{thread_key}"
+    def approval_card_key(self, approval_id: str) -> str:
+        # Where a posted approval card lives so its own resolution or expiry can
+        # settle it without sharing identity with another approval on the thread.
+        return f"{self.key_prefix}:approval-card:{approval_id}"
 
     def dead_letter_stream_name(self) -> str:
         """The graveyard stream: the explicit override, else derived ``<stream>:dead``.

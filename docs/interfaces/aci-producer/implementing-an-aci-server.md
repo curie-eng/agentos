@@ -26,6 +26,7 @@ routes and streams NDJSON back:
 | `POST /v1/steer` | Inject a follow-up `event` into the live turn; return `409` when no turn is active (the caller then falls back to a fresh `/v1/event`). |
 | `POST /v1/interrupt` | Hard-stop the live turn. Body is an `interrupt` frame; the open turn's `final` is reclassified to idle. |
 | `POST /v1/reset` | Discard the conversation and start a fresh model session, so the next turn cannot answer from earlier history; return `409` while a turn is active. No body, no wire frame (#550). |
+| `POST /v1/snapshot` | Capture a bounded, credential-free snapshot of the managed repository workspace for the authenticated worker; return `409` when the session has no managed workspace. |
 
 Plus two unauthenticated GETs the platform relies on: `GET /healthz` (liveness)
 and `GET /status` (session status + readiness). The chart's readiness probe hits
@@ -178,6 +179,8 @@ Route contract to honor:
 - **`/v1/reset`**: no body. Tear down the conversation and start a fresh session,
   keeping the process (and any per-process setup) alive. Return **409** while a
   turn is active, rather than resetting under an open `/v1/event` stream.
+- **`/v1/snapshot`**: no body. Return the bounded managed-workspace snapshot to
+  the authenticated worker, or **409** when no managed workspace is mounted.
 - **`/healthz`**, **`/status`**: always-open GETs; `/status` returns
   `{status, ready, turn_active}`.
 - **Auth (optional):** when a bearer token is configured, require
@@ -235,6 +238,8 @@ You have a conformant ACI server when:
       no live turn; `/v1/interrupt` reclassifies to idle.
 - [ ] `POST /v1/reset` discards the conversation between turns and returns 409
       while a turn is active, so eval cases stay isolated.
+- [ ] `POST /v1/snapshot` returns the bounded managed-workspace snapshot, or 409
+      when the session has no managed workspace.
 - [ ] `GET /healthz` and `GET /status` are open and unauthenticated.
 - [ ] `SessionConfig.from_env()` is honored and the `CURIE_PLUGIN_DIR` bundle is
       loaded.

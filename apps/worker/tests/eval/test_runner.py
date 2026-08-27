@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
+from typing import Any
 
 import pytest
 from curie_worker.eval import (
@@ -21,6 +22,56 @@ from curie_worker.eval import (
 )
 
 CONTAINS = GraderKind.CONTAINS
+
+
+def test_eval_stops_at_final_and_bounds_a_stalled_http_tail(make_eval_harness) -> None:
+    async def go() -> None:
+        async with make_eval_harness() as (base_url, fake, client):
+            fake.responses = {"q": "answer"}
+            fake.post_final_stall_inputs = {"q"}
+            suite = EvalSuite(
+                name="post-final-stall",
+                cases=[
+                    EvalCase(
+                        id="c",
+                        input="q",
+                        grader=Grader(kind=CONTAINS, expected="answer"),
+                    )
+                ],
+            )
+            release_calls: list[dict[str, int]] = []
+            real_start_turn = client.start_turn
+
+            async def start_turn(*args: Any, **kwargs: Any) -> Any:
+                turn = await real_start_turn(*args, **kwargs)
+                calls = {"n": 0}
+                real_release = turn._response.release
+
+                def release() -> Any:
+                    calls["n"] += 1
+                    return real_release()
+
+                turn._response.release = release
+                release_calls.append(calls)
+                return turn
+
+            client.start_turn = start_turn  # type: ignore[method-assign]
+            task = asyncio.create_task(
+                EvalRunner(client).run(suite, base_url=base_url, version="v1")
+            )
+            try:
+                await asyncio.wait_for(fake.post_final_started.wait(), timeout=1.0)
+                result = await asyncio.wait_for(task, timeout=2.0)
+                assert result.summary() == "1/1 passed"
+                assert result.results[0].output == "answer"
+                assert release_calls == [{"n": 1}]
+            finally:
+                fake.post_final_unblock.set()
+                if not task.done():
+                    task.cancel()
+                await asyncio.wait_for(fake.post_final_handler_done.wait(), timeout=1.0)
+
+    asyncio.run(go())
 
 
 def test_runs_and_grades_a_mixed_suite(make_eval_harness) -> None:
@@ -557,7 +608,10 @@ def test_flaky_case_that_passes_one_of_three_is_red_with_variance(make_eval_harn
 
             case = result.results[0]
             assert case.passed is False
-            assert case.error is not None and "1/3 samples passed" in case.error
+            assert case.error is None
+            assert case.variance is not None and "1/3 samples passed" in case.variance
+            assert case.samples == 3
+            assert case.passes == 1
 
     asyncio.run(go())
 

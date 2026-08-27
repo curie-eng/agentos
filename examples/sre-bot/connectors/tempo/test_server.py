@@ -293,6 +293,11 @@ def test_every_tool_is_annotated_read_only():
     assert srv.READ_ONLY.destructiveHint is False
 
 
+def test_streamable_http_is_mounted_at_curie_connector_path():
+    srv = _load()
+    assert [route.path for route in srv.mcp.streamable_http_app().routes] == ["/mcp"]
+
+
 def test_missing_config_refuses_rather_than_answering_nonsense(monkeypatch):
     # A connector that answers "not configured" to every call looks healthy to
     # Kubernetes and is useless to the agent, so main() exits non-zero.

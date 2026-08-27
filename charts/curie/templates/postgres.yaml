@@ -29,9 +29,19 @@ spec:
   template:
     metadata:
       labels:
+        {{- with (include "curie.placement.labels" .Values.placement.data) }}
+        {{- . | nindent 8 }}
+        {{- end }}
         {{- include "curie.labels" . | nindent 8 }}
         {{- include "curie.selectorLabels" (dict "root" . "component" "postgres") | nindent 8 }}
+      {{- with (include "curie.placement.annotations" .Values.placement.data) }}
+      annotations:
+        {{- . | nindent 8 }}
+      {{- end }}
     spec:
+      {{- with (include "curie.placement.spec" .Values.placement.data) }}
+      {{- . | nindent 6 }}
+      {{- end }}
       {{- with .Values.priorityClasses.platform.name }}
       priorityClassName: {{ . }}
       {{- end }}

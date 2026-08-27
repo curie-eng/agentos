@@ -239,11 +239,18 @@ pub fn primer() -> Primer {
                     detail: "A bundle declares routes in .claude-plugin/plugin.json under \
                              approvalPolicy.gates[], each entry {gate: <tool name>, route: \
                              <route name>}. An operator then binds each route per agent with \
-                             `approvals <AGENT> --route <name>=<channel>` (and optionally \
-                             `--route-approvers <name>=users:U1,U2` or `<name>=group:S1`). \
-                             `channel` is WHERE the card posts; `approvers` is WHO may act \
-                             on it. A write REPLACES the whole route map, so name every \
-                             route it should keep.",
+                             `approvals <AGENT> --route-resolution <name>=<channel>` (and optionally \
+                             `--route-approvers <name>=users:U1,U2` or `<name>=group:S1`). Declare \
+                             a notification in the strict `--routes-from` JSON map. \
+                             `resolution` is the single verified Slack card where an identity \
+                             acts; `notification` is a text-only ping with interaction=None, \
+                             and `approvers` is WHO may act. A notification directs humans to \
+                             the configured approval channel without disclosing its identifier \
+                             and carries no resolving affordance. Slack uses \
+                             its configured transport; a non-Slack notification needs both \
+                             endpoint and adapter in --routes-from. Resolution on another \
+                             channel remains a future extension requiring a scoped credential. \
+                             A write REPLACES the whole route map, so name every route it should keep.",
                 },
                 ApprovalFact {
                     title: "Who may resolve is independent of where the card is",
@@ -295,19 +302,19 @@ pub fn primer() -> Primer {
             },
             Landmine {
                 title: "Silence after a request usually means an unbound route",
-                detail: "A route the bundle names but the agent's approval_routes never bound is escalated to a human rather than widened to the requesting channel, so no card appears anywhere and the turn still reports the request as pending. Bind the route with `--route <name>=<channel>` and re-run the turn; check that before suspecting the gate.",
+                detail: "A route the bundle names but the agent's approval_routes never bound is escalated to a human rather than widened to the requesting channel, so no card appears anywhere and the turn still reports the request as pending. Bind its verified Slack resolution with `--route-resolution <name>=<channel>` and re-run the turn; check that before suspecting the gate.",
             },
             Landmine {
                 title: "Fake vs live model is symmetric across skill and local",
                 detail: "`curie skill up` and `curie local up` both run the real model when a credential is present and the fake model otherwise; `curie skill up --fake-model` or CURIE_FAKE_MODEL=1 forces the offline fake at either tier.",
             },
             Landmine {
-                title: "A real model in-cluster needs its provider's egress opened",
-                detail: "The runner sandbox is default-deny egress, so `curie cluster up` with a credential is still sealed and the model unreachable until you pass --allow-egress-host <provider> (anthropic/openrouter/zhipu/moonshot/deepseek). Zhipu, Moonshot, and DeepSeek also need their matching base URL in worker runtime configuration; a web-fetching skill additionally needs --allow-web-egress <CIDR> for its hosts.",
+                title: "Ambiguous provider credentials need explicit cluster egress",
+                detail: "Direct `curie cluster up` infers anthropic from sk-ant- and openrouter from sk-or- when --allow-egress-host is absent. Other credential shapes stay sealed until you pass --allow-egress-host <provider> (zhipu/moonshot/deepseek) or a raw range. An explicit provider list that omits the detected provider is an error. Zhipu, Moonshot, and DeepSeek also need their matching base URL in worker runtime configuration; a web fetching skill additionally needs --allow-web-egress <CIDR> for its hosts.",
             },
             Landmine {
                 title: "The skill runner executes an immutable snapshot taken at `skill up`",
-                detail: "A `SKILL.md` or `.mcp.json` edit does not reach a running runner: re-run `curie skill up --replace` and confirm the new `bundle_digest` in `curie skill status --json`. `evals/cases.json` IS read live from source, so the contract can update while the behavior stays frozen at the boot snapshot.",
+                detail: "A `SKILL.md` or `.mcp.json` edit does not reach a running runner: re-run `curie skill up` and confirm the new `bundle_digest` in `curie skill status --json`. A verified same-directory runner is replaced automatically; `--replace` still forces a restart. `evals/cases.json` IS read live from source, so the contract can update while the behavior stays frozen at the boot snapshot.",
             },
             Landmine {
                 title: "secretKeyRef env vars resolve once, at pod start",
@@ -318,22 +325,26 @@ pub fn primer() -> Primer {
                 detail: "When you are asked to get a bundle running, do the plumbing yourself -- source the bundle's dotenv, run `curie local up`, `curie local deploy`, and `curie local comms --slack`, then tear down -- rather than handing the human a shell checklist to copy-paste. Two parts are irreducibly manual and stay with the human: supplying the actual secret VALUES (never type a credential or API key yourself) and creating an external app in a browser to mint its tokens (e.g. the Slack app). Automate everything between. If a credential already lives in the environment or the bundle's own `.env`, use it instead of asking for it to be exported.",
             },
             Landmine {
-                title: "A real-model `cluster up` fails closed without a gVisor runtime",
-                detail: "On a cluster with no `runsc` RuntimeClass, the default `security.gvisor.mode=auto` renders a blocking enforcement preflight for a real (non-fake) model, so `curie cluster up` fails closed instead of running runner pods on the host kernel. Install anyway with `curie cluster up --set security.gvisor.mode=off` (no kernel isolation, knowingly), use `--fake-model` (the sealed path skips the preflight), or install runsc on the nodes. This is the security posture, not a bug.",
+                title: "Missing gVisor is inferred only from admission",
+                detail: "A real model install first keeps the gVisor chart default. When admission reports exactly that RuntimeClass gvisor is not found, direct `curie cluster up` shows that attempt as retrying, applies security.gvisor.mode=off, prints the override, and retries once. Other failures remain closed. Explicit auto or require modes contradict the detected result and are errors.",
             },
         ],
         recovery: vec![
             Recovery {
                 symptom: "\"platform API ... unreachable\" on a local deploy or message",
-                fix: "The stack is down. Run `curie local up`, then retry.",
+                fix: "Check the API URL and follow the local status guidance. Run `curie local up` only if local services are absent, then retry.",
+            },
+            Recovery {
+                symptom: "`curie cluster up` fails immediately when `curie-preflight-gvisor` reports `FailedCreate`: `RuntimeClass \"gvisor\" not found`",
+                fix: "Plain `curie cluster up` now infers security.gvisor.mode=off from this exact admission result and retries once. If you explicitly set auto or require, remove that setting to accept the detected posture, or install runsc on the nodes.",
             },
             Recovery {
                 symptom: "`curie cluster up` hangs ~2 min then dies with `job curie-preflight-gvisor failed: DeadlineExceeded`",
-                fix: "A real-model install on a cluster with no `runsc` RuntimeClass fails closed under `security.gvisor.mode=auto`. Opt out with `curie cluster up --set security.gvisor.mode=off`, or use `--fake-model`, or install runsc on the nodes.",
+                fix: "The Kubernetes Event watch was unavailable, so Helm reported the later deadline. A real-model install on a cluster with no `runsc` RuntimeClass still fails closed. Opt out with `curie cluster up --set security.gvisor.mode=off`, or use `--fake-model`, or install runsc on the nodes.",
             },
             Recovery {
                 symptom: "\"(no response)\" or an empty reply",
-                fix: "You are on the fake model (--fake-model, or a sealed install). Provide a credential to go live; on cluster, also open the provider egress with --allow-egress-host <provider>. Zhipu, Moonshot, and DeepSeek also need their matching base URL in worker runtime configuration or the model stays unreachable.",
+                fix: "You are on the fake model (--fake-model, or a sealed install). Provide a credential to go live. On cluster, sk-ant- and sk-or- infer their provider egress; other providers need --allow-egress-host <provider>. Zhipu, Moonshot, and DeepSeek also need their matching base URL in worker runtime configuration or the model stays unreachable.",
             },
             Recovery {
                 symptom: "the agent answers but never calls your MCP tools",

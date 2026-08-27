@@ -45,9 +45,12 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 import httpx
+from curie_telemetry import operation_span, record_metric
+from opentelemetry.trace import SpanKind, StatusCode
 
 from .config import Settings
 from .models import GIT_FLOW_CREATED_BY
+from .repo_full_name import InvalidRepoFullName, repo_url_path
 
 logger = logging.getLogger(__name__)
 
@@ -196,6 +199,7 @@ class GitHubBranchTip:
         return 60.0
 
     def sha_for(self, repo_full_name: str, branch: str) -> str | None:
+        repository_path = repo_url_path(repo_full_name)
         now = time.time()
         wait_until = self._retry_at.get(repo_full_name, 0.0)
         if now < wait_until:
@@ -210,7 +214,10 @@ class GitHubBranchTip:
         }
         if token:
             headers["Authorization"] = f"Bearer {token}"
-        url = f"{self._settings.github_api_url.rstrip('/')}/repos/{repo_full_name}/commits/{branch}"
+        url = (
+            f"{self._settings.github_api_url.rstrip('/')}"
+            f"/repos/{repository_path}/commits/{branch}"
+        )
         with httpx.Client(timeout=self._timeout) as client:
             response = client.get(url, headers=headers)
         if response.status_code in (403, 429):
@@ -328,6 +335,7 @@ class CommitPoller:
         # Archive failure gets one retry on the next pass, then settles. This
         # bounds network failure clones without making a single blip terminal.
         self._archive_retry: dict[tuple[str, str], str] = {}
+        self._last_success_monotonic: float | None = None
 
     async def run_forever(self) -> None:
         logger.info("commit poller started interval=%ss", self._interval)
@@ -349,6 +357,51 @@ class CommitPoller:
             await asyncio.sleep(self._interval)
 
     async def poll_once(self) -> list[Move]:
+        """Run one measured poll pass without changing its returned moves."""
+
+        moves: list[Move] = []
+        error: Exception | None = None
+        attributes = {
+            "service.name": "curie-api",
+            "operation": "commit-poller",
+            "role": "background",
+        }
+        with operation_span(
+            "curie.background.commit-poller",
+            kind=SpanKind.INTERNAL,
+            attributes=attributes,
+        ) as span:
+            try:
+                moves = await self._poll_once()
+            except Exception as exc:
+                error = exc
+                if hasattr(span, "set_status"):
+                    span.set_status(StatusCode.ERROR)
+                span.add_event(
+                    "background.pass.failed",
+                    {"outcome": "failure", "error.class": type(exc).__name__},
+                )
+            else:
+                span.add_event("background.pass.completed", {"outcome": "success"})
+        outcome = "failure" if error is not None else "success"
+        record_metric(
+            "curie.background.loop",
+            attributes={**attributes, "outcome": outcome},
+        )
+        now = time.monotonic()
+        if error is None:
+            self._last_success_monotonic = now
+        if self._last_success_monotonic is not None:
+            record_metric(
+                "curie.background.last_success.age",
+                max(0.0, now - self._last_success_monotonic),
+                attributes=attributes,
+            )
+        if error is not None:
+            raise error
+        return moves
+
+    async def _poll_once(self) -> list[Move]:
         from sqlalchemy import text
 
         from . import gitflow
@@ -376,14 +429,24 @@ class CommitPoller:
 
         binding_snapshots = {repo: tuple(names) for repo, names in bindings.items()}
 
-        targets = [
-            PollTarget(
-                repo_full_name=repo,
-                clone_url=gitflow.trusted_clone_url(repo, self._settings),
-                branches=tuple(branch_for_env.values()),
+        targets: list[PollTarget] = []
+        for repo in bindings:
+            try:
+                clone_url = gitflow.trusted_clone_url(repo, self._settings)
+            except InvalidRepoFullName as exc:
+                logger.warning(
+                    "commit poll skipping invalid repository binding repo=%r: %s",
+                    repo,
+                    exc,
+                )
+                continue
+            targets.append(
+                PollTarget(
+                    repo_full_name=repo,
+                    clone_url=clone_url,
+                    branches=tuple(branch_for_env.values()),
+                )
             )
-            for repo in bindings
-        ]
         # to_thread because the tip reader is sync httpx: a blocking call in
         # the event loop would stall every request the API is serving.
         moves: list[Move] = await asyncio.to_thread(moves_to_deploy, targets, self._tips, deployed)
@@ -424,9 +487,7 @@ class CommitPoller:
             elif result.status == "rejected":
                 codes = {(error.get("code") or "") for error in (result.errors or [])}
                 if codes & _TOPOLOGY_REJECTIONS:
-                    self._settled[key] = Settled(
-                        move.sha, binding_snapshots[move.repo_full_name]
-                    )
+                    self._settled[key] = Settled(move.sha, binding_snapshots[move.repo_full_name])
                     self._archive_retry.pop(key, None)
                 elif _ARCHIVE_FAILURE in codes and self._archive_retry.get(key) != move.sha:
                     self._archive_retry[key] = move.sha

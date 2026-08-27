@@ -442,11 +442,11 @@ impl Ui {
     }
 
     /// The frozen, styled line a finished interactive step commits.
-    fn step_line(&self, ok: bool, label: &str, detail: &str, elapsed: &str) -> String {
-        let (glyph, style) = if ok {
-            (self.ok_glyph(), self.green())
-        } else {
-            (self.fail_glyph(), self.red())
+    fn step_line(&self, status: StepStatus, label: &str, detail: &str, elapsed: &str) -> String {
+        let (glyph, style) = match status {
+            StepStatus::Ok => (self.ok_glyph(), self.green()),
+            StepStatus::Fail => (self.fail_glyph(), self.red()),
+            StepStatus::Warn => (self.warn_glyph(), self.amber()),
         };
         let mut left = format!("{} {label}", self.paint_err(style, glyph));
         if !detail.is_empty() {
@@ -584,6 +584,12 @@ pub struct Step {
     label: String,
 }
 
+enum StepStatus {
+    Ok,
+    Fail,
+    Warn,
+}
+
 impl Step {
     /// Update the live spinner's "why still waiting" suffix.
     pub fn tick_detail(&self, detail: &str) {
@@ -599,12 +605,18 @@ impl Step {
 
     /// Freeze the step to a success line with an optional detail.
     pub fn done(self, detail: &str) {
-        self.finish(true, detail);
+        self.finish(StepStatus::Ok, detail);
     }
 
     /// Freeze the step to a failure line (also used for timeouts).
     pub fn fail(self, detail: &str) {
-        self.finish(false, detail);
+        self.finish(StepStatus::Fail, detail);
+    }
+
+    /// Freeze the step to an amber recovery line. Used when the first attempt
+    /// is a planned retry rather than a terminal failure.
+    pub fn warn(self, detail: &str) {
+        self.finish(StepStatus::Warn, detail);
     }
 
     /// Clear the step's spinner without committing any line. Used when a spinner
@@ -615,7 +627,7 @@ impl Step {
         }
     }
 
-    fn finish(self, ok: bool, detail: &str) {
+    fn finish(self, status: StepStatus, detail: &str) {
         let elapsed = fmt_elapsed(self.start.elapsed());
         if self.ui.quiet {
             if let Some(pb) = self.pb {
@@ -625,17 +637,19 @@ impl Step {
         }
         match self.pb {
             Some(pb) => {
-                let line = self.ui.step_line(ok, &self.label, detail, &elapsed);
+                let line = self.ui.step_line(status, &self.label, detail, &elapsed);
                 if let Ok(style) = ProgressStyle::with_template("{msg}") {
                     pb.set_style(style);
                 }
                 pb.finish_with_message(line);
             }
             None => {
-                let line = if ok {
-                    format!("{}: ok ({elapsed})", self.label)
-                } else {
-                    format!("{}: failed ({detail}) ({elapsed})", self.label)
+                let line = match status {
+                    StepStatus::Ok => format!("{}: ok ({elapsed})", self.label),
+                    StepStatus::Fail => {
+                        format!("{}: failed ({detail}) ({elapsed})", self.label)
+                    }
+                    StepStatus::Warn => format!("{}: retrying ({elapsed})", self.label),
                 };
                 let _ = writeln!(anstream::stderr(), "{line}");
             }

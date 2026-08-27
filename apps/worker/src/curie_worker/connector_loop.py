@@ -9,10 +9,12 @@ Three things make this safe to run unattended, and each is a deliberate choice
 rather than a default:
 
 **One agent's failure ends with that agent.** A pass reconciles every agent with
-an active deployment. An exception in one is caught, logged and counted; the
-rest of the pass continues. A reconciler that aborts the sweep on the first bad
-agent leaves every later agent unreconciled indefinitely, and the ordering is
-arbitrary, so which agents those are changes between passes.
+an active deployment. An exception in one is caught and logged. Recognized
+platform 5xx responses have a bounded quiet retry window before failed
+accounting and traceback escalation; other exceptions are counted immediately.
+The rest of the pass continues. A reconciler that aborts the sweep on the first
+bad agent leaves every later agent unreconciled indefinitely, and the ordering
+is arbitrary, so which agents those are changes between passes.
 
 **A pass never kills the worker.** The loop's body is wrapped whole. This shares
 a process with the kernel, whose four correctness rules are not negotiable, so
@@ -33,11 +35,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
+from curie_telemetry import record_metric
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -50,6 +54,9 @@ from .connector_agent import (
 from .connector_apply import ConnectorClient
 
 logger = logging.getLogger(__name__)
+_monotonic = time.monotonic
+
+_PLATFORM_5XX_GRACE_PASSES = 3
 
 
 # Every agent with an in-force deployment, and the version that deployment
@@ -154,6 +161,7 @@ class ConnectorReconcileLoop:
         self._client = client
         self._namespace = namespace
         self._interval = interval_seconds
+        self._platform_5xx_streaks: dict[uuid.UUID, int] = {}
         # Table identifiers are not user input; the schema comes from config.
         self._sql = text(_TARGETS_SQL.format(schema=db_schema))
 
@@ -183,11 +191,34 @@ class ConnectorReconcileLoop:
         """Reconcile every deployed agent once."""
 
         summary = PassSummary()
-        for target in await self.targets():
+        targets = await self.targets()
+        for target in targets:
             summary.reconciled += 1
             try:
                 outcome = await asyncio.to_thread(self._reconcile_one, target)
-            except Exception:
+            except Exception as exc:
+                if (
+                    isinstance(exc, httpx.HTTPStatusError)
+                    and 500 <= exc.response.status_code <= 599
+                ):
+                    streak = min(
+                        self._platform_5xx_streaks.get(target.agent_id, 0) + 1,
+                        _PLATFORM_5XX_GRACE_PASSES + 1,
+                    )
+                    self._platform_5xx_streaks[target.agent_id] = streak
+                    if streak <= _PLATFORM_5XX_GRACE_PASSES:
+                        logger.warning(
+                            "connector reconcile platform API returned %d for agent=%s; "
+                            "retrying next pass (%d/%d)",
+                            exc.response.status_code,
+                            target.agent_name,
+                            streak,
+                            _PLATFORM_5XX_GRACE_PASSES,
+                        )
+                        continue
+                else:
+                    self._platform_5xx_streaks.pop(target.agent_id, None)
+
                 # Ends with this agent. Aborting the sweep would leave every
                 # later agent unreconciled, and the order is arbitrary.
                 summary.failed += 1
@@ -197,6 +228,7 @@ class ConnectorReconcileLoop:
                 )
                 continue
 
+            self._platform_5xx_streaks.pop(target.agent_id, None)
             if outcome.skipped:
                 summary.skipped += 1
                 # A skip means "no operator-supplied Secret", not "nothing
@@ -218,7 +250,30 @@ class ConnectorReconcileLoop:
             summary.skipped,
             summary.failed,
         )
+        self._record_pass_metrics(
+            outcome="failure" if summary.failed else "success",
+        )
         return summary
+
+    def _record_pass_metrics(self, *, outcome: str) -> None:
+        now = _monotonic()
+        last_success = getattr(self, "_last_success_monotonic", None)
+        if outcome == "success":
+            self._last_success_monotonic = now
+            last_success = now
+        attributes = {
+            "service.name": "curie-worker",
+            "operation": "connector-reconciler",
+            "role": "background",
+            "outcome": outcome,
+        }
+        record_metric("curie.background.loop", attributes=attributes)
+        if last_success is not None:
+            record_metric(
+                "curie.background.last_success.age",
+                max(0.0, now - last_success),
+                attributes={key: value for key, value in attributes.items() if key != "outcome"},
+            )
 
     async def run_forever(self, stop: asyncio.Event | None = None) -> None:
         """Reconcile on an interval until told to stop.

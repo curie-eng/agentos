@@ -9,9 +9,10 @@ multi-step setup, add or extend a `curie` subcommand instead — a single,
 discoverable surface beats a scatter of scripts. The script or tool call can
 stay the *implementation*; it just isn't the interface.
 
-- Building the runner image → `curie build` (not a copy-pasted `docker build -f runner/Dockerfile ...`).
+- Building the runner image → `curie build` (not a copy-pasted `docker build -f runner/Dockerfile ...`). That tags both `curie-runner` (what `curie skill up` runs) and `ghcr.io/curie-eng/curie-runner:dev` (what `curie local up --build` runs), so `curie update --image` refreshes a `--build` stack's runner.
 - First-run dev bootstrap → `curie install` (or `./get-curie.sh` from a source checkout, which also puts `curie` on PATH the first time by building it).
 - Refresh the on-PATH CLI after a code change → `curie update` (rebuilds and `cargo install`s the CLI to `~/.cargo/bin`; `--image` also rebuilds the runner). The per-change loop, so you never re-run the bootstrap script.
+- Run the local stack on YOUR checkout → `curie local up --build`. `curie update` covers the CLI and the runner image; the stack's api, worker, dispatcher and ui otherwise come from the registry, so a source-built CLI ends up talking to whatever was last published. That skew does not announce itself — it surfaces as a serde error about a field name, or a missing Python module from inside a container (#1915).
 - Contributor/CI scripts (contract codegen, chart render-asserts, the e2e round-trip) → `curie dev <...>`. The `dev` namespace fences off commands that need a **source checkout + dev toolchains**; they error clearly when run from a released binary.
 - Operator/product commands stay top-level: `init`, `build`, `skill`, `local`, `cluster`.
 
@@ -21,11 +22,12 @@ New tooling ships as a `curie` subcommand (add the clap surface in
 
 ## Release train selection
 
-`main` is the stable v0.6.x line and `next` is the v0.7.0 integration branch.
-Before starting work, choose the release train from the branch table in
-[`AGENTS.md`](AGENTS.md#release-train-branch-and-commit-conventions), then create
-the worktree and PR against that base. Do not assume `main` is the target for
-every feature.
+`main` is the stable line and `next` is the integration branch for the next
+feature release. Those are roles, not versions, so the branch table does not name
+a release number. Before starting work, choose the release train from that table
+in [`AGENTS.md`](AGENTS.md#release-train-branch-and-commit-conventions), then
+create the worktree and PR against that base. Do not assume `main` is the target
+for every feature.
 
 ## Architecture Decision Records (ADRs)
 

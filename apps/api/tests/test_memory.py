@@ -14,6 +14,7 @@ from typing import Any
 
 import asyncpg
 from curie_api.config import get_settings
+from curie_api.sandbox_token import mint
 from sqlalchemy import make_url
 
 
@@ -601,4 +602,198 @@ def test_overlapping_append_then_delete_rejects_stale_delete(
     assert [record["content"] for record in stored["value"]] == [
         "keep this lesson",
         "runner follow up",
+    ]
+
+
+def _create(
+    client: Any, headers: dict[str, str], aid: str, content: str
+) -> Any:
+    """POST one operator-authored memory record through the memory surface."""
+    return client.post(
+        f"/agents/{aid}/memory",
+        json={"content": content},
+        headers=headers,
+    )
+
+
+def test_create_memory_seeds_an_empty_log_with_operator_provenance(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    aid = _agent(client, auth_headers)
+    lesson = (
+        "Before translating into any target language other than Spanish, "
+        "ask the user for explicit confirmation"
+    )
+    created = _create(client, auth_headers, aid, lesson)
+    assert created.status_code == 201, created.text
+    body = created.json()
+    assert body["index"] == 0
+    assert body["content"] == lesson
+    assert body["provenance"]["source"] == "operator"
+    assert body["provenance"]["learned_from_session_id"] is None
+    assert body["provenance"]["source_trace_ids"] == []
+    assert body["provenance"]["recorded_at"]
+    assert body["version"] == 1
+
+    entries = _memory(client, auth_headers, aid)
+    assert len(entries) == 1
+    assert entries[0]["content"] == body["content"]
+    assert entries[0]["provenance"]["source"] == "operator"
+    assert entries[0]["version"] == body["version"]
+
+
+def test_create_memory_appends_to_an_existing_log(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    aid = _agent(client, auth_headers)
+    seeded = _remember(
+        client,
+        auth_headers,
+        aid,
+        {"content": "deploy is a git push", "provenance": _prov("sess-1", "t-a")},
+    )
+    created = _create(client, auth_headers, aid, "always confirm before French")
+    assert created.status_code == 201, created.text
+    assert created.json()["index"] == 1
+    assert created.json()["version"] == seeded["version"] + 1
+    assert created.json()["provenance"]["source"] == "operator"
+
+    entries = _memory(client, auth_headers, aid)
+    assert [e["content"] for e in entries] == [
+        "deploy is a git push",
+        "always confirm before French",
+    ]
+    assert entries[0]["provenance"]["source_trace_ids"] == ["t-a"]
+    assert entries[1]["provenance"]["source"] == "operator"
+
+
+def test_create_memory_rejects_empty_and_whitespace_content(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    aid = _agent(client, auth_headers)
+    empty = _create(client, auth_headers, aid, "")
+    assert empty.status_code == 422, empty.text
+    blank = _create(client, auth_headers, aid, "   \n")
+    assert blank.status_code == 422, blank.text
+    assert _memory(client, auth_headers, aid) == []
+
+
+def test_create_memory_unknown_agent_is_404(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    missing = "00000000-0000-0000-0000-000000000000"
+    response = _create(client, auth_headers, missing, "a lesson")
+    assert response.status_code == 404, response.text
+
+
+def test_create_memory_requires_the_platform_key(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    aid = _agent(client, auth_headers)
+    assert (
+        client.post(
+            f"/agents/{aid}/memory", json={"content": "no key"}
+        ).status_code
+        == 401
+    )
+    token = mint(
+        get_settings().api_key,
+        agent=aid,
+        scope="state",
+        exp=4102444800,
+    )
+    denied = client.post(
+        f"/agents/{aid}/memory",
+        json={"content": "scoped token"},
+        headers={"X-API-Key": token},
+    )
+    assert denied.status_code == 401, denied.text
+    assert _memory(client, auth_headers, aid) == []
+
+
+def test_create_memory_rejects_caller_supplied_provenance(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    aid = _agent(client, auth_headers)
+    response = client.post(
+        f"/agents/{aid}/memory",
+        json={
+            "content": "operator lesson",
+            "provenance": {
+                "learned_from_session_id": "sess-forged",
+                "source_trace_ids": ["trace-forged"],
+                "source": "learned",
+            },
+        },
+        headers=auth_headers,
+    )
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["provenance"]["source"] == "operator"
+    assert body["provenance"]["learned_from_session_id"] is None
+    assert body["provenance"]["source_trace_ids"] == []
+
+
+def test_create_memory_oversized_content_is_rejected_without_writing(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    aid = _agent(client, auth_headers)
+    get_settings().state_max_value_bytes = 100
+    try:
+        response = _create(client, auth_headers, aid, "x" * 200)
+        assert response.status_code == 413, response.text
+        assert _memory(client, auth_headers, aid) == []
+        stored = client.get(
+            f"/agents/{aid}/state/memory/log", headers=auth_headers
+        )
+        assert stored.status_code == 404, stored.text
+    finally:
+        get_settings.cache_clear()
+
+
+def test_create_then_list_is_the_shape_the_runner_loader_accepts(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """The operator POST writes the same {content, provenance} item the runner loads."""
+    aid = _agent(client, auth_headers)
+    created = _create(client, auth_headers, aid, "prefer celsius")
+    assert created.status_code == 201, created.text
+    stored = client.get(
+        f"/agents/{aid}/state/memory/log", headers=auth_headers
+    )
+    assert stored.status_code == 200, stored.text
+    items = stored.json()["value"]
+    assert items == [
+        {
+            "content": "prefer celsius",
+            "provenance": items[0]["provenance"],
+        }
+    ]
+    provenance = items[0]["provenance"]
+    assert provenance["source"] == "operator"
+    assert provenance["learned_from_session_id"] is None
+    assert provenance["source_trace_ids"] == []
+    assert provenance["recorded_at"]
+
+
+def test_overlapping_operator_creates_both_persist(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    aid = _agent(client, auth_headers)
+    _remember(client, auth_headers, aid, {"content": "seeded lesson"})
+    first, second = _run_ordered_memory_requests(
+        lambda: _create(client, auth_headers, aid, "first operator lesson"),
+        lambda: _create(client, auth_headers, aid, "second operator lesson"),
+    )
+    assert first.status_code == 201, first.text
+    assert second.status_code == 201, second.text
+    entries = _memory(client, auth_headers, aid)
+    assert [entry["content"] for entry in entries] == [
+        "seeded lesson",
+        "first operator lesson",
+        "second operator lesson",
+    ]
+    assert [entry["provenance"].get("source") for entry in entries[1:]] == [
+        "operator",
+        "operator",
     ]

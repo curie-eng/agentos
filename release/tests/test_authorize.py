@@ -892,6 +892,27 @@ def helm_ci_job_check_run_names() -> set[str]:
     return workflow_job_check_run_names(HELM_CI_YAML)
 
 
+class TestRustValkeyWorkflowContract:
+    def test_rust_job_requires_and_connects_to_valkey_guarded_tests(self):
+        workflow = yaml.safe_load(CI_YAML.read_text())
+        rust = workflow["jobs"]["rust"]
+
+        assert rust["env"]["CI_REQUIRE_VALKEY_TESTS"] == "1"
+        assert rust["env"]["TEST_VALKEY_URL"] == "redis://localhost:26379"
+
+        valkey = rust["services"]["valkey"]
+        assert str(valkey["image"]).startswith("valkey/")
+        assert "26379:6379" in valkey["ports"]
+
+
+class TestPythonValkeyWorkflowContract:
+    def test_python_job_requires_valkey_guarded_tests(self):
+        workflow = yaml.safe_load(CI_YAML.read_text())
+        python = workflow["jobs"]["python"]
+
+        assert python["env"]["CI_REQUIRE_VALKEY_TESTS"] == "1"
+
+
 class TestHelmCiCheckRunNames:
     def test_expands_matrix_include_rows(self, tmp_path, monkeypatch):
         workflow = tmp_path / "helm-ci.yaml"
@@ -1352,10 +1373,10 @@ class TestLegitimateSkips:
         )
         script_path = tmp_path / "filter.sh"
         script_path.write_text(script)
-        selector_path = tmp_path / "tools" / "e2e-ci-selection" / "select.py"
+        selector_path = tmp_path / "tools" / "e2e-ci-selection" / "select_tiers.py"
         selector_path.parent.mkdir(parents=True)
         shutil.copy2(
-            REPO_ROOT / "tools" / "e2e-ci-selection" / "select.py", selector_path
+            REPO_ROOT / "tools" / "e2e-ci-selection" / "select_tiers.py", selector_path
         )
         registry_path = tmp_path / ".github" / "e2e-selection.yaml"
         registry_path.parent.mkdir()

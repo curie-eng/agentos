@@ -12,6 +12,7 @@ use serde::Deserialize;
 struct ProviderRow {
     name: String,
     base_url: Option<String>,
+    inferred_provider: Option<String>,
     egress_hosts: Vec<String>,
     credential_examples: Vec<String>,
 }
@@ -84,6 +85,14 @@ fn every_supported_provider_passes_credential_and_egress_checks() {
                     provider.name
                 )
             });
+        }
+
+        if let Some(inferred) = &provider.inferred_provider {
+            assert_eq!(
+                inferred, &provider.name,
+                "{} must infer its own provider name",
+                provider.name,
+            );
         }
 
         assert_eq!(

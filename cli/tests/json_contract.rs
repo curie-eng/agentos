@@ -92,6 +92,42 @@ fn eval_json_validates_against_eval_schema() {
     );
 }
 
+/// #1907: a single sample must still report N, passes, and policy so a
+/// stochastic miss is labeled as one draw, not unexplained tier drift.
+#[test]
+fn eval_json_exposes_sampling_on_every_row() {
+    let schema = load_schema("eval.schema.json");
+    let results = vec![
+        (
+            "identity".to_string(),
+            CaseOutcome::Fail,
+            10.6_f64,
+            "¿Quién eres?".to_string(),
+        ),
+        (
+            "translate".to_string(),
+            CaseOutcome::Pass,
+            1.0_f64,
+            "hola".to_string(),
+        ),
+    ];
+    let value = eval_json(&results, None);
+    assert!(
+        validator(&schema).is_valid(&value),
+        "sampling fields must validate: {value}"
+    );
+    assert_eq!(value["samples"], 1, "{value}");
+    assert_eq!(value["policy"], "majority", "{value}");
+    let identity = &value["cases"][0];
+    assert_eq!(identity["id"], "identity", "{value}");
+    assert_eq!(identity["samples"], 1, "{value}");
+    assert_eq!(identity["passes"], 0, "{value}");
+    assert_eq!(identity["policy"], "majority", "{value}");
+    let translate = &value["cases"][1];
+    assert_eq!(translate["samples"], 1, "{value}");
+    assert_eq!(translate["passes"], 1, "{value}");
+}
+
 /// #1087 AC2 is a "confirm" criterion, so the digest has to be readable from the
 /// MACHINE surface: `docs/agents.md` bans stderr as agent-facing evidence, and a
 /// human note is all the sweep used to emit. Both states are pinned -- a real
@@ -807,6 +843,180 @@ fn observability_schema_gate_has_teeth() {
 }
 
 #[test]
+fn observability_runs_query_schema_is_closed_and_bounded() {
+    let schema = load_schema("observability-runs.schema.json");
+    let v = validator(&schema);
+    let valid = serde_json::json!({
+        "limit": 1,
+        "count": 1,
+        "runs": [{
+            "id": "trace-1",
+            "name": "curie-run:agent-example-thread-1",
+            "timestamp": "2026-08-22T00:00:00Z",
+            "sessionId": "session-1",
+            "metadata": {"terminal_outcome": "completed"}
+        }]
+    });
+    assert!(
+        v.is_valid(&valid),
+        "bounded runs payload must validate: {valid}"
+    );
+    let mut unnamed = valid.clone();
+    unnamed["runs"][0]["name"] = serde_json::Value::Null;
+    assert!(
+        v.is_valid(&unnamed),
+        "the console/API contract permits unnamed traces: {unnamed}"
+    );
+
+    let mut missing_count = valid.clone();
+    missing_count.as_object_mut().unwrap().remove("count");
+    assert!(
+        !v.is_valid(&missing_count),
+        "runs schema must require an explicit returned count"
+    );
+
+    let too_many: Vec<_> = (0..101)
+        .map(|index| {
+            serde_json::json!({
+                "id": format!("trace-{index}"),
+                "name": "curie-run:agent-example-thread-1",
+                "timestamp": "2026-08-22T00:00:00Z"
+            })
+        })
+        .collect();
+    let over_bound = serde_json::json!({"limit": 100, "count": 101, "runs": too_many});
+    assert!(
+        !v.is_valid(&over_bound),
+        "runs schema must reject a result larger than the public maximum"
+    );
+    assert!(
+        !v.is_valid(&serde_json::json!({"limit": 0, "count": 0, "runs": []})),
+        "the documented lower bound is one"
+    );
+    assert!(
+        !v.is_valid(&serde_json::json!({"limit": 1, "count": 1, "runs": [{}]})),
+        "every typed list row must carry the identity needed by `run <trace-id>`"
+    );
+}
+
+#[test]
+fn observability_run_query_schema_requires_the_complete_trace_tree() {
+    let schema = load_schema("observability-run.schema.json");
+    let v = validator(&schema);
+    let valid = serde_json::json!({
+        "trace": {
+            "id": "trace-1",
+            "sessionId": "session-1",
+            "metadata": {"terminal_outcome": "completed"}
+        },
+        "tree": [{
+            "id": "span-1",
+            "type": "SPAN",
+            "name": null,
+            "startTime": null,
+            "model": null,
+            "usageDetails": null,
+            "children": []
+        }],
+        "sandbox_id": null,
+        "approval_decision": null
+    });
+    assert!(
+        v.is_valid(&valid),
+        "complete TraceTree must validate: {valid}"
+    );
+
+    let mut missing_correlation = valid.clone();
+    missing_correlation
+        .as_object_mut()
+        .unwrap()
+        .remove("sandbox_id");
+    assert!(
+        !v.is_valid(&missing_correlation),
+        "stable nullable correlation fields are emitted, not omitted"
+    );
+
+    let mut incomplete_node = valid.clone();
+    incomplete_node["tree"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("children");
+    assert!(
+        !v.is_valid(&incomplete_node),
+        "every typed observation node carries its children"
+    );
+
+    let mut extra = valid;
+    extra["backend_credentials"] = serde_json::json!("must-never-exist");
+    assert!(
+        !v.is_valid(&extra),
+        "the top-level CLI result is closed to accidental backend fields"
+    );
+}
+
+#[test]
+fn observability_metrics_query_schema_covers_complete_summary_and_series() {
+    let schema = load_schema("observability-metrics.schema.json");
+    let v = validator(&schema);
+    let summary = serde_json::json!({
+        "start": "2026-08-22T00:00:00Z",
+        "end": "2026-08-23T00:00:00Z",
+        "runs": 3,
+        "latency_p95_ms": 25.0,
+        "tokens": 42,
+        "cost_usd": 0.0,
+        "cost_known": false,
+        "error_rate": 0.0
+    });
+    let series = serde_json::json!({
+        "metric": "runs",
+        "granularity": "day",
+        "start": "2026-08-22T00:00:00Z",
+        "end": "2026-08-23T00:00:00Z",
+        "points": [{"ts": "2026-08-22T00:00:00Z", "value": 3.0}]
+    });
+    assert!(
+        v.is_valid(&summary),
+        "complete summary DTO must validate: {summary}"
+    );
+    assert!(
+        v.is_valid(&series),
+        "complete series DTO must validate: {series}"
+    );
+
+    let mut missing_cost_state = summary;
+    missing_cost_state
+        .as_object_mut()
+        .unwrap()
+        .remove("cost_known");
+    assert!(
+        !v.is_valid(&missing_cost_state),
+        "cost_known cannot be projected away from the existing API DTO"
+    );
+
+    let mut invalid_granularity = series;
+    invalid_granularity["granularity"] = serde_json::json!("minute");
+    assert!(
+        !v.is_valid(&invalid_granularity),
+        "series granularity is the bounded hour/day/week CLI enum"
+    );
+
+    let too_many_points = serde_json::json!({
+        "metric": "runs",
+        "granularity": "hour",
+        "start": "2026-01-01T00:00:00Z",
+        "end": "2026-12-31T00:00:00Z",
+        "points": (0..1001)
+            .map(|index| serde_json::json!({"ts": format!("point-{index}"), "value": 0.0}))
+            .collect::<Vec<_>>()
+    });
+    assert!(
+        !v.is_valid(&too_many_points),
+        "metric-series results must have a finite public point bound"
+    );
+}
+
+#[test]
 fn eval_schema_gate_has_teeth() {
     // negative control: proves the schema gate discriminates
     let schema = load_schema("eval.schema.json");
@@ -1347,6 +1557,10 @@ fn doctor_output_validates() {
     let facts = curie::doctor::Facts {
         model_credential: Some("CURIE_CREDENTIALS".to_string()),
         model_credential_source: Some("environment".to_string()),
+        // A dated snapshot, so the schema is validated against the pinned
+        // branch of the model-pin check rather than its advisory branch.
+        model_pin: Some("claude-haiku-4-5-20251001".to_string()),
+        model_credential_provider: None,
         docker_ok: true,
         bundle_name: Some("my-agent".to_string()),
         kube_context: Some("minikube".to_string()),
@@ -1587,6 +1801,7 @@ fn memory_output_validates_all_variants() {
         index: 0,
         content: "prefer terse".to_string(),
         version: 1,
+        provenance: Default::default(),
     }];
     let list = MemoryOutput::List {
         agent: "d".to_string(),
@@ -1601,6 +1816,14 @@ fn memory_output_validates_all_variants() {
         lines: vec!["GET /memory".to_string()],
     });
     assert_valid("memory.schema.json", &dry.to_json());
+    let added = MemoryOutput::Added {
+        agent: "d".to_string(),
+        index: 0,
+        content: "prefer terse".to_string(),
+        source: "operator".to_string(),
+        fresh_session_required: true,
+    };
+    assert_valid("memory.schema.json", &added.to_json());
 }
 
 fn approval_record() -> ApprovalRecord {
@@ -1638,6 +1861,21 @@ fn approvals_output_validates_all_variants() {
         record: approval_record(),
     };
     assert_valid("approvals.schema.json", &resolved.to_json());
+    let routes = ApprovalsOutput::Routes {
+        agent: "d".to_string(),
+        routes: serde_json::from_value(serde_json::json!({
+            "finance": {
+                "resolution": {"kind": "slack", "address": "C0EXAMPLE1"}
+            }
+        }))
+        .expect("the route response carries its required resolution"),
+    };
+    let routes_json = routes.to_json();
+    assert_eq!(
+        routes_json["routes"]["finance"]["resolution"]["address"],
+        "C0EXAMPLE1"
+    );
+    assert_valid("approvals.schema.json", &routes_json);
     let dry = ApprovalsOutput::DryRun(DryRunPlan {
         lines: vec!["GET /approvals".to_string()],
     });

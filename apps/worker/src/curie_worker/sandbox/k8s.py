@@ -65,9 +65,8 @@ CREDENTIALS_ENV = BootEnv.env_key("credentials_ref")
 # plaintext in etcd -- the same leak the model-credential stripping above avoids.
 # The binding marks which keys are connector secrets in this env var
 # (comma-separated names); strip both the marker and every key it names off the
-# claim. Their secretKeyRef delivery via a per-agent Secret is #440; until then
-# an authed-MCP bundle simply is not delivered its secret on the cluster tier
-# rather than leaking it. Named from the BootEnv declaration like the two above:
+# claim. Their secretKeyRef delivery is the per-agent SandboxTemplate (#1488).
+# Named from the BootEnv declaration like the two above:
 # a local literal that drifted on a rename would stop matching the marker the
 # binding writes, and every connector secret would be persisted as plaintext.
 CONNECTOR_SECRET_KEYS_ENV = BootEnv.env_key("connector_secret_keys")
@@ -256,8 +255,9 @@ class KubernetesSandboxClient:
             # model credential and per-agent connector secrets are deliberately
             # excluded so no secret value is ever persisted in plain text on the
             # claim: the credential reaches the runner via the template's
-            # secretKeyRef, and connector-secret delivery is #440. The marker var
-            # naming the connector-secret keys is stripped too.
+            # secretKeyRef, and connector secrets are delivered the same way via
+            # the per-agent template (#1488). The marker var naming the
+            # connector-secret keys is stripped too.
             marker = env.get(CONNECTOR_SECRET_KEYS_ENV, "")
             stripped = {
                 CREDENTIALS_ENV,

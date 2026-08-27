@@ -11,13 +11,49 @@
 
 use anyhow::{Context, Result};
 
-/// The Slack Web API base. `SLACK_API_BASE_URL` overrides it (a test/stub base,
-/// the same env the worker's own sink honours), else real Slack.
-fn api_base() -> String {
-    std::env::var("SLACK_API_BASE_URL")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "https://slack.com/api".to_string())
+/// Real Slack, used when the resolved transport names no base of its own.
+pub const DEFAULT_API_BASE: &str = "https://slack.com/api";
+
+/// The Slack transport to post a placeholder over: a bot token and the base URL
+/// it belongs to, resolved TOGETHER from one source (#1030).
+///
+/// The two used to come from unrelated places. The token was read from the
+/// release Secret (cluster) or from `docker inspect` of the worker (local), while
+/// the base URL was read from `SLACK_API_BASE_URL` in the CLI's OWN process
+/// environment. A developer with `export SLACK_API_BASE_URL=http://localhost:8155/api/`
+/// left over from stub testing therefore sent a production workspace bot token to
+/// their local stub, whose entire purpose is to log what it receives. No attacker
+/// and no misconfiguration of the cluster was required.
+///
+/// Pairing them in one value is what removes that: a caller cannot construct a
+/// transport without saying where both halves came from, and there is no ambient
+/// read left for a stale shell variable to win.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlackTransport {
+    /// The API base the resolved token belongs to.
+    pub api_base: String,
+    /// The workspace bot token. Sent only in the Authorization header.
+    pub bot_token: String,
+}
+
+impl SlackTransport {
+    /// Build a transport, falling back to real Slack when the source named no base.
+    ///
+    /// An absent or empty base means the source did not configure one, which for
+    /// both tiers means real Slack: the chart renders `SLACK_API_BASE_URL` only
+    /// when `worker.slackApiBaseUrl` is non-empty, and a compose worker without it
+    /// set talks to Slack directly. Falling back here rather than at each call site
+    /// keeps one answer to "what did no value mean".
+    pub fn new(api_base: Option<String>, bot_token: String) -> Self {
+        let api_base = api_base
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| DEFAULT_API_BASE.to_string());
+        Self {
+            api_base,
+            bot_token,
+        }
+    }
 }
 
 /// Post `text` to `channel` as the bot, returning the created message `ts` (the
@@ -26,15 +62,14 @@ fn api_base() -> String {
 /// own `ts` is the thread root. The token is sent only in the Authorization
 /// header; it is never logged.
 pub async fn post_placeholder(
-    bot_token: &str,
+    transport: &SlackTransport,
     channel: &str,
     text: &str,
     thread_ts: Option<&str>,
 ) -> Result<String> {
-    let base = api_base();
     let resp = reqwest::Client::new()
-        .post(format!("{base}/chat.postMessage"))
-        .bearer_auth(bot_token)
+        .post(method_url(transport, "chat.postMessage"))
+        .bearer_auth(&transport.bot_token)
         .json(&post_body(channel, text, thread_ts))
         .send()
         .await
@@ -43,6 +78,17 @@ pub async fn post_placeholder(
         .await
         .context("decoding the Slack chat.postMessage response")?;
     parse_ts(&resp)
+}
+
+/// The absolute URL for a Slack Web API method on this transport.
+///
+/// Pure and separated from the request so the destination can be asserted without
+/// a network round trip. That matters more than it looks: the defect in #1030 was
+/// entirely about which base a request went to, and a guard that needs an HTTP
+/// stub to run is a guard that does not run in the fast suite.
+fn method_url(transport: &SlackTransport, method: &str) -> String {
+    let base = transport.api_base.trim_end_matches('/');
+    format!("{base}/{method}")
 }
 
 /// The `chat.postMessage` request body. `thread_ts` is an OPTIONAL Slack
@@ -126,13 +172,59 @@ mod tests {
     }
 
     #[test]
-    fn api_base_defaults_to_real_slack_and_honours_the_override() {
-        // No override -> real Slack. (Set/removed in-process; keep the assertions
-        // tolerant of a pre-set env by asserting the shape, not a fixed value.)
+    fn a_transport_without_a_base_falls_back_to_real_slack() {
+        assert_eq!(
+            SlackTransport::new(None, "xoxb-x".into()).api_base,
+            DEFAULT_API_BASE
+        );
+        // Empty and whitespace-only mean "the source configured nothing", which is
+        // real Slack for both tiers: the chart renders SLACK_API_BASE_URL only when
+        // worker.slackApiBaseUrl is non-empty.
+        assert_eq!(
+            SlackTransport::new(Some(String::new()), "xoxb-x".into()).api_base,
+            DEFAULT_API_BASE
+        );
+        assert_eq!(
+            SlackTransport::new(Some("   ".into()), "xoxb-x".into()).api_base,
+            DEFAULT_API_BASE
+        );
+    }
+
+    #[test]
+    fn the_request_url_comes_from_the_transport_and_never_from_the_environment() {
+        // The #1030 regression, asserted on the destination itself rather than on
+        // the value that feeds it. An earlier revision of this fix had no test at
+        // this layer: restoring the ambient read inside the request builder left
+        // the whole suite green, because every other test asserted on the
+        // constructor. Mutating the rule is what found that.
+        let transport =
+            SlackTransport::new(Some("https://proxy.example/api/".into()), "xoxb-x".into());
+        std::env::set_var("SLACK_API_BASE_URL", "http://127.0.0.1:18081/api");
+        assert_eq!(
+            method_url(&transport, "chat.postMessage"),
+            "https://proxy.example/api/chat.postMessage"
+        );
         std::env::remove_var("SLACK_API_BASE_URL");
-        assert_eq!(api_base(), "https://slack.com/api");
-        std::env::set_var("SLACK_API_BASE_URL", "http://stub:9/api");
-        assert_eq!(api_base(), "http://stub:9/api");
+        // A trailing slash on the resolved base must not produce a double slash:
+        // some Slack-compatible stubs route on the exact path.
+        assert_eq!(
+            method_url(
+                &SlackTransport::new(Some("https://x/api///".into()), "t".into()),
+                "chat.postMessage"
+            ),
+            "https://x/api/chat.postMessage"
+        );
+    }
+
+    #[test]
+    fn a_resolved_base_is_used_verbatim_and_the_ambient_env_cannot_win() {
+        // The regression this pins (#1030): a stale SLACK_API_BASE_URL in the
+        // operator's own shell used to decide where a real workspace token was
+        // sent. There is no ambient read left, so setting it changes nothing.
+        std::env::set_var("SLACK_API_BASE_URL", "http://127.0.0.1:18081/api");
+        let transport =
+            SlackTransport::new(Some("https://proxy.example/api".into()), "xoxb-x".into());
+        assert_eq!(transport.api_base, "https://proxy.example/api");
         std::env::remove_var("SLACK_API_BASE_URL");
     }
 }

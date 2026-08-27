@@ -369,6 +369,7 @@ fn eval_dry_run_plan_names_sequential_concurrency() {
         api_url: None,
         models: Vec::new(),
         concurrency: 1,
+        sampling: curie::eval_sampling::SampleConfig::default(),
     };
     let lines = eval_dry_run_lines(&opts, "weather", 3);
     assert!(
@@ -676,11 +677,13 @@ fn memory_output_json_shape_is_pinned() {
                     index: 0,
                     content: "user prefers celsius".to_string(),
                     version: 3,
+                    provenance: Default::default(),
                 },
                 MemoryEntry {
                     index: 1,
                     content: "home airport is BOS".to_string(),
                     version: 3,
+                    provenance: Default::default(),
                 },
             ],
         }
@@ -691,6 +694,23 @@ fn memory_output_json_shape_is_pinned() {
                 {"index": 0, "content": "user prefers celsius"},
                 {"index": 1, "content": "home airport is BOS"},
             ],
+        })
+    );
+    assert_eq!(
+        MemoryOutput::Added {
+            agent: "weather".to_string(),
+            index: 0,
+            content: "ask first".to_string(),
+            source: "operator".to_string(),
+            fresh_session_required: true,
+        }
+        .to_json(),
+        json!({
+            "agent": "weather",
+            "index": 0,
+            "content": "ask first",
+            "source": "operator",
+            "fresh_session_required": true,
         })
     );
 }
@@ -1114,7 +1134,7 @@ fn cluster_down_failforward_error_is_transient_with_resume_fix() {
     // The resume command an incomplete teardown surfaces: only the outstanding
     // steps, label-scoped per #707 (the ownership-scope invariant).
     let resume =
-        "kubectl delete namespace -l curietech.ai/created-by=prod-release --ignore-not-found";
+        "kubectl delete namespace -l curietech.ai/created-by=prod-release,curietech.ai/created-in=agent-ns --ignore-not-found";
     let err: anyhow::Error =
         CliError::transient("cluster teardown could not complete; the API server was unreachable")
             .with_fix(resume)
@@ -1345,6 +1365,48 @@ enum DeployFixtureFailure {
     Deploy(&'static str),
 }
 
+#[derive(Clone, Copy)]
+enum ConnectorFixture {
+    Empty,
+    CredentialKeys,
+    Manifest,
+}
+
+#[derive(Clone, Copy)]
+enum KubectlFixtureFailure {
+    None,
+    Discovery,
+    Apply,
+}
+
+#[derive(Clone, Copy)]
+enum CredentialEnvironment {
+    Host,
+    BothWithoutHome,
+    DevOnlyWithEmptyVault,
+}
+
+#[derive(Clone, Copy)]
+struct ClusterDeployFixture {
+    all_targets: bool,
+    deploy_failure: DeployFixtureFailure,
+    connectors: ConnectorFixture,
+    kubectl_failure: KubectlFixtureFailure,
+    credentials: CredentialEnvironment,
+}
+
+impl Default for ClusterDeployFixture {
+    fn default() -> Self {
+        Self {
+            all_targets: true,
+            deploy_failure: DeployFixtureFailure::None,
+            connectors: ConnectorFixture::Empty,
+            kubectl_failure: KubectlFixtureFailure::None,
+            credentials: CredentialEnvironment::Host,
+        }
+    }
+}
+
 fn target_from_agent(agent: &str) -> &'static str {
     if agent.contains("prod") {
         "prod"
@@ -1365,7 +1427,11 @@ fn response_json(status: u16, value: serde_json::Value) -> Response {
     Response::json(status, &value.to_string())
 }
 
-fn deploy_api_response(req: &support::Request, failure: DeployFixtureFailure) -> Response {
+fn deploy_api_response(
+    req: &support::Request,
+    failure: DeployFixtureFailure,
+    connectors: ConnectorFixture,
+) -> Response {
     match (req.method.as_str(), req.path.as_str()) {
         ("POST", "/deploy-targets/list") => response_json(
             200,
@@ -1450,12 +1516,34 @@ fn deploy_api_response(req: &support::Request, failure: DeployFixtureFailure) ->
             )
         }
         ("GET", path) if path.contains("/versions/") && path.contains("/connectors?") => {
+            let target = target_from_agent(path);
+            let (manifests, owned_secret_name, owned_secret_keys) = match connectors {
+                ConnectorFixture::Empty => (Vec::new(), String::new(), Vec::new()),
+                ConnectorFixture::CredentialKeys => (
+                    Vec::new(),
+                    format!("acme-{target}-connector-credentials"),
+                    vec![format!("{}_TOKEN", target.to_ascii_uppercase())],
+                ),
+                ConnectorFixture::Manifest => (
+                    vec![json!({
+                        "apiVersion": "v1",
+                        "kind": "ConfigMap",
+                        "metadata": {
+                            "name": format!("acme-{target}-connector"),
+                            "namespace": "curie"
+                        },
+                        "data": {"target": target}
+                    })],
+                    String::new(),
+                    Vec::new(),
+                ),
+            };
             response_json(
                 200,
                 json!({
-                    "manifests": [],
-                    "owned_secret_name": "",
-                    "owned_secret_keys": [],
+                    "manifests": manifests,
+                    "owned_secret_name": owned_secret_name,
+                    "owned_secret_keys": owned_secret_keys,
                     "mcp_entries": {}
                 }),
             )
@@ -1474,11 +1562,19 @@ fn write_kubectl_stub(dir: &Path) -> PathBuf {
         r#"#!/bin/sh
 case "$*" in
   *"get deployment"*)
-    if [ "${CURIE_TEST_CONNECTOR_FAILURE:-}" = 1 ]; then
-      printf '%s\n' 'connector sync exploded' >&2
+    if [ "${CURIE_TEST_KUBECTL_FAILURE:-}" = discovery ]; then
+      printf '%s\n' 'app discovery exploded' >&2
       exit 1
     fi
     printf '%s' 'curie'
+    ;;
+  *"apply -f -"*)
+    cat >/dev/null
+    if [ "${CURIE_TEST_KUBECTL_FAILURE:-}" = apply ]; then
+      printf '%s\n' 'connector apply exploded' >&2
+      exit 1
+    fi
+    exit 0
     ;;
   *"delete deployment,service,networkpolicy,secret"*)
     exit 0
@@ -1507,11 +1603,7 @@ fn stub_path(bin_dir: &Path) -> std::ffi::OsString {
     std::env::join_paths(paths).expect("join stub PATH")
 }
 
-fn run_cluster_deploy_json(
-    all_targets: bool,
-    failure: DeployFixtureFailure,
-    connector_failure: bool,
-) -> Output {
+fn run_cluster_deploy_json(fixture: ClusterDeployFixture) -> (Output, Vec<support::Request>) {
     let plugin = tempfile::tempdir().expect("plugin tempdir");
     curie::scaffold::scaffold(plugin.path(), "acme-bundle").expect("scaffold test bundle");
     fs::write(
@@ -1522,7 +1614,10 @@ fn run_cluster_deploy_json(
 
     let tools = tempfile::tempdir().expect("tool tempdir");
     write_kubectl_stub(tools.path());
-    let server = serve(move |req| deploy_api_response(req, failure));
+    let deploy_failure = fixture.deploy_failure;
+    let connectors = fixture.connectors;
+    let server = serve(move |req| deploy_api_response(req, deploy_failure, connectors));
+    let empty_config_dir = tempfile::tempdir().expect("empty config tempdir");
 
     let mut command = Command::new(bin());
     command.args([
@@ -1541,7 +1636,7 @@ fn run_cluster_deploy_json(
         "--label",
         DEPLOY_LABEL,
     ]);
-    if all_targets {
+    if fixture.all_targets {
         command.arg("--all-targets");
     } else {
         command.args(["--target", "dev"]);
@@ -1550,13 +1645,44 @@ fn run_cluster_deploy_json(
         .arg("--json")
         .env("PATH", stub_path(tools.path()))
         .env_remove("CURIE_API_URL")
-        .env_remove("CURIE_API_KEY");
-    if connector_failure {
-        command.env("CURIE_TEST_CONNECTOR_FAILURE", "1");
-    } else {
-        command.env_remove("CURIE_TEST_CONNECTOR_FAILURE");
+        .env_remove("CURIE_API_KEY")
+        .env_remove("DEV_TOKEN")
+        .env_remove("PROD_TOKEN")
+        .env_remove("CURIE_TEST_KUBECTL_FAILURE");
+    match fixture.kubectl_failure {
+        KubectlFixtureFailure::None => {}
+        KubectlFixtureFailure::Discovery => {
+            command.env("CURIE_TEST_KUBECTL_FAILURE", "discovery");
+        }
+        KubectlFixtureFailure::Apply => {
+            command.env("CURIE_TEST_KUBECTL_FAILURE", "apply");
+        }
     }
-    command.output().expect("run cluster deploy JSON contract")
+    match fixture.credentials {
+        CredentialEnvironment::Host => {}
+        CredentialEnvironment::BothWithoutHome => {
+            command
+                .env("DEV_TOKEN", "dev-token-value")
+                .env("PROD_TOKEN", "prod-token-value")
+                .env_remove("HOME")
+                .env_remove("CURIE_CONFIG_DIR");
+        }
+        CredentialEnvironment::DevOnlyWithEmptyVault => {
+            command
+                .env("DEV_TOKEN", "dev-token-value")
+                .env_remove("PROD_TOKEN")
+                .env("CURIE_CONFIG_DIR", empty_config_dir.path());
+        }
+    }
+    let output = command.output().expect("run cluster deploy JSON contract");
+    (output, server.recorded())
+}
+
+fn deployment_request_count(requests: &[support::Request]) -> usize {
+    requests
+        .iter()
+        .filter(|request| request.method == "POST" && request.path == "/deployments")
+        .count()
 }
 
 fn one_stdout_object(output: &Output) -> serde_json::Value {
@@ -1628,7 +1754,7 @@ fn assert_failure_keys(value: &serde_json::Value, includes_failed_result: bool) 
 
 #[test]
 fn cluster_deploy_json_all_targets_emits_one_ordered_complete_object() {
-    let output = run_cluster_deploy_json(true, DeployFixtureFailure::None, false);
+    let (output, _) = run_cluster_deploy_json(ClusterDeployFixture::default());
     assert_eq!(
         output.status.code(),
         Some(0),
@@ -1648,7 +1774,10 @@ fn cluster_deploy_json_all_targets_emits_one_ordered_complete_object() {
 
 #[test]
 fn cluster_deploy_json_later_failure_names_target_and_completed_results() {
-    let output = run_cluster_deploy_json(true, DeployFixtureFailure::Deploy("prod"), false);
+    let (output, _) = run_cluster_deploy_json(ClusterDeployFixture {
+        deploy_failure: DeployFixtureFailure::Deploy("prod"),
+        ..ClusterDeployFixture::default()
+    });
     assert_eq!(output.status.code(), Some(1));
     let value = one_stdout_object(&output);
     assert_failure_keys(&value, false);
@@ -1668,7 +1797,10 @@ fn cluster_deploy_json_later_failure_names_target_and_completed_results() {
 
 #[test]
 fn cluster_deploy_json_first_failure_has_empty_completed_results() {
-    let output = run_cluster_deploy_json(true, DeployFixtureFailure::Deploy("dev"), false);
+    let (output, _) = run_cluster_deploy_json(ClusterDeployFixture {
+        deploy_failure: DeployFixtureFailure::Deploy("dev"),
+        ..ClusterDeployFixture::default()
+    });
     assert_eq!(output.status.code(), Some(1));
     let value = one_stdout_object(&output);
     assert_failure_keys(&value, false);
@@ -1684,8 +1816,100 @@ fn cluster_deploy_json_first_failure_has_empty_completed_results() {
 }
 
 #[test]
-fn cluster_deploy_json_connector_sync_failure_carries_failed_result() {
-    let output = run_cluster_deploy_json(true, DeployFixtureFailure::None, true);
+fn cluster_deploy_json_all_targets_env_credentials_ignore_unset_home() {
+    let (output, requests) = run_cluster_deploy_json(ClusterDeployFixture {
+        connectors: ConnectorFixture::CredentialKeys,
+        credentials: CredentialEnvironment::BothWithoutHome,
+        ..ClusterDeployFixture::default()
+    });
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "environment supplied connector credentials must not read the host vault: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        one_stdout_object(&output),
+        json!({
+            "results": [
+                {"target": "dev", "result": expected_deploy("dev")},
+                {"target": "prod", "result": expected_deploy("prod")}
+            ]
+        })
+    );
+    assert_eq!(
+        deployment_request_count(&requests),
+        2,
+        "both targets must activate after credential preparation succeeds"
+    );
+}
+
+#[test]
+fn cluster_deploy_json_later_connector_credential_failure_deploys_zero_targets() {
+    let (output, requests) = run_cluster_deploy_json(ClusterDeployFixture {
+        connectors: ConnectorFixture::CredentialKeys,
+        credentials: CredentialEnvironment::DevOnlyWithEmptyVault,
+        ..ClusterDeployFixture::default()
+    });
+    assert_eq!(output.status.code(), Some(2));
+    let value = one_stdout_object(&output);
+    assert_failure_keys(&value, false);
+    assert_eq!(value["failed_target"], json!("prod"));
+    assert_eq!(value["stage"], json!("deploy"));
+    assert_eq!(value["completed"], json!([]));
+    assert!(
+        value["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("PROD_TOKEN")),
+        "failure must name the missing prod connector credential: {value}"
+    );
+    assert_eq!(
+        deployment_request_count(&requests),
+        0,
+        "all connector credentials must resolve before the first deployment"
+    );
+}
+
+#[test]
+fn cluster_deploy_json_app_discovery_failure_is_precondition_with_zero_deployments() {
+    let (output, requests) = run_cluster_deploy_json(ClusterDeployFixture {
+        kubectl_failure: KubectlFixtureFailure::Discovery,
+        ..ClusterDeployFixture::default()
+    });
+    assert_eq!(output.status.code(), Some(1));
+    let value = one_stdout_object(&output);
+    assert_failure_keys(&value, false);
+    assert_eq!(value["failed_target"], json!("dev"));
+    assert_eq!(value["stage"], json!("deploy"));
+    assert_eq!(value["completed"], json!([]));
+    assert!(
+        value["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("app discovery exploded")),
+        "failure must retain the app discovery error: {value}"
+    );
+    assert_eq!(
+        deployment_request_count(&requests),
+        0,
+        "app discovery must complete before the first deployment"
+    );
+    let schema: serde_json::Value =
+        serde_json::from_str(include_str!("../schema/deploy.schema.json"))
+            .expect("deploy schema is valid JSON");
+    let validator = jsonschema::validator_for(&schema).expect("deploy schema compiles");
+    assert!(
+        validator.is_valid(&value),
+        "app discovery precondition failure must retain the deploy schema: {value}"
+    );
+}
+
+#[test]
+fn cluster_deploy_json_connector_apply_failure_carries_failed_result_after_activation() {
+    let (output, requests) = run_cluster_deploy_json(ClusterDeployFixture {
+        connectors: ConnectorFixture::Manifest,
+        kubectl_failure: KubectlFixtureFailure::Apply,
+        ..ClusterDeployFixture::default()
+    });
     assert_eq!(output.status.code(), Some(1));
     let value = one_stdout_object(&output);
     assert_failure_keys(&value, true);
@@ -1696,14 +1920,22 @@ fn cluster_deploy_json_connector_sync_failure_carries_failed_result() {
     assert!(
         value["error"]
             .as_str()
-            .is_some_and(|error| error.contains("connector sync exploded")),
-        "failure must retain the connector error: {value}"
+            .is_some_and(|error| error.contains("connector apply exploded")),
+        "failure must retain the connector apply error: {value}"
+    );
+    assert_eq!(
+        deployment_request_count(&requests),
+        1,
+        "connector apply must fail after the dev target activates"
     );
 }
 
 #[test]
 fn cluster_deploy_json_single_target_shape_is_unchanged() {
-    let output = run_cluster_deploy_json(false, DeployFixtureFailure::None, false);
+    let (output, _) = run_cluster_deploy_json(ClusterDeployFixture {
+        all_targets: false,
+        ..ClusterDeployFixture::default()
+    });
     assert_eq!(
         output.status.code(),
         Some(0),

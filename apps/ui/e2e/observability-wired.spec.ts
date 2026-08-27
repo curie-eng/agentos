@@ -1,4 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
+import { cliCommand } from "../src/primitives/cliCommand";
 
 // Wired Observability (OB1) in the stackless suite: the app runs in ?api=1 mode
 // but the observability API is stubbed with real-shaped responses via route
@@ -69,6 +70,36 @@ test("Metrics tab renders the summary cards and the series chart from real-shape
   await expect(page.getByTestId("metric-chart-latest")).toHaveText("122");
   await page.getByRole("button", { name: "Error rate" }).click();
   await expect(page.getByTestId("metric-chart-latest")).toHaveText("6.0%");
+
+  // The hint follows the same live filters as the console request. Resolve the
+  // expected command through the generated manifest so this does not duplicate
+  // the CLI grammar in the browser test.
+  await page.getByTestId("metric-agent-filter").fill("billing-bot");
+  await page.getByTestId("metric-agent-filter").press("Enter");
+  await expect(
+    page.getByRole("button", {
+      name: `Copy command: ${cliCommand("cluster.observability.metrics", {
+        metric: "error_rate",
+        granularity: "day",
+        environment: "prod",
+        agent: "billing-bot",
+      })}`,
+    }),
+  ).toBeVisible();
+
+  // Prod/dev changes only the tier and environment filter; the selected metric,
+  // granularity, and agent filter survive the switch.
+  await page.getByRole("button", { name: "DEV", exact: true }).click();
+  await expect(
+    page.getByRole("button", {
+      name: `Copy command: ${cliCommand("local.observability.metrics", {
+        metric: "error_rate",
+        granularity: "day",
+        environment: "dev",
+        agent: "billing-bot",
+      })}`,
+    }),
+  ).toBeVisible();
 });
 
 test("a single-point series renders the value without NaN", async ({ page }) => {
@@ -192,10 +223,86 @@ test("an agent's View traces opens the Traces list pre-filtered to that agent", 
   // the filter chip is shown with a clear affordance.
   await expect(page.getByTestId("trace-filter-clear")).toBeVisible();
   await expect.poll(() => traceUrls.some((u) => u.includes(`agent_id=${agent.id}`))).toBe(true);
+  await expect(
+    page.getByRole("button", {
+      name: `Copy command: ${cliCommand("cluster.observability.runs", {
+        limit: "20",
+        "agent-id": agent.id,
+      })}`,
+    }),
+  ).toBeVisible();
+
+  // The console's dev twin must carry the same bounded list and agent filter.
+  await page.getByRole("button", { name: "DEV", exact: true }).click();
+  await expect(
+    page.getByRole("button", {
+      name: `Copy command: ${cliCommand("local.observability.runs", {
+        limit: "20",
+        "agent-id": agent.id,
+      })}`,
+    }),
+  ).toBeVisible();
 
   // Clearing the filter re-requests without the agent_id.
   await page.getByTestId("trace-filter-clear").click();
   await expect.poll(() => traceUrls.some((u) => u.includes("/langfuse/traces") && !u.includes("agent_id"))).toBe(true);
+});
+
+test("Runs list and detail expose manifest-derived local and cluster query hints", async ({ page }) => {
+  const traceId = "trace-866";
+  await page.route(
+    (url) => url.pathname.endsWith("/api/langfuse/traces"),
+    (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify([
+          { id: traceId, name: "curie-run:agent-ag-866-thread-1", timestamp: "2026-08-22T19:18:45Z" },
+        ]),
+      }),
+  );
+  await page.route(`**/api/langfuse/traces/${traceId}`, (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        trace: { id: traceId, name: "curie-run:agent-ag-866-thread-1" },
+        tree: [],
+        sandbox_id: "sandbox-866",
+        approval_decision: null,
+      }),
+    }),
+  );
+
+  await page.goto("/?state=3&api=1");
+  await page.getByRole("navigation").getByText("Observability", { exact: true }).click();
+
+  await expect(
+    page.getByRole("button", {
+      name: `Copy command: ${cliCommand("cluster.observability.runs", { limit: "20" })}`,
+    }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "DEV", exact: true }).click();
+  await expect(
+    page.getByRole("button", {
+      name: `Copy command: ${cliCommand("local.observability.runs", { limit: "20" })}`,
+    }),
+  ).toBeVisible();
+
+  await page.getByTestId("trace-row").click();
+  // trace_id is deliberately positional: cliCommand reads that fact from the
+  // manifest and would render a flag if the command surface drifted.
+  await expect(
+    page.getByRole("button", {
+      name: `Copy command: ${cliCommand("local.observability.run", { trace_id: traceId })}`,
+    }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "PROD", exact: true }).click();
+  await expect(
+    page.getByRole("button", {
+      name: `Copy command: ${cliCommand("cluster.observability.run", { trace_id: traceId })}`,
+    }),
+  ).toBeVisible();
 });
 
 // Wired Memory tab (#869): the GET/PUT/DELETE /agents/{id}/memory endpoint is

@@ -14,9 +14,10 @@ from typing import Any
 
 from sqlalchemy import Enum, ForeignKey, Index, LargeBinary, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from .db import SCHEMA, Base
+from .repo_full_name import normalize_repo_full_name
 
 GIT_FLOW_CREATED_BY = "git-flow"
 
@@ -68,6 +69,13 @@ class Agent(Base):
     # sharing a repository is intended, two sharing a channel is silent
     # shadowing.
     repo_full_name: Mapped[str | None] = mapped_column(default=None, index=True)
+
+    @validates("repo_full_name")
+    def _validate_repo_full_name(self, _key: str, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return normalize_repo_full_name(value)
+
     # Per-agent budget (L1). Field names match the frozen ACI SessionConfig
     # CURIE_BUDGET so the worker passes them straight through at sandbox boot;
     # NULL means platform defaults apply.
@@ -102,11 +110,12 @@ class Agent(Base):
     # Per-agent approval route bindings (#247, ADR-0010): the workspace half of
     # the split policy. The bundle manifest declares gate points and route
     # NAMES (versioned with the agent); this maps each declared name to
-    # workspace specifics, today a Slack channel: {"managers": {"channel":
-    # "C0123..."}}. The worker resolves a raised route through this map to
-    # decide where the approval card goes (and therefore who the
-    # channel-membership authorizer counts as approvers). NULL means no
-    # bindings; an unbound route falls back to the requesting channel.
+    # workspace specifics: one Slack-only resolution target and an optional
+    # channel-neutral notification target. The worker posts the sole resolving
+    # card at ``resolution`` (whose address is persisted on the Approval row for
+    # authorization) and may send a text-only ping at ``notification``. NULL
+    # means no bindings; a named unbound route escalates rather than widening to
+    # the requesting channel.
     approval_routes: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
     # Per-agent connector secrets (ADR-0009, #429): the named secret VALUES the
     # bundle's authed MCP servers need (e.g. GITHUB_PERSONAL_ACCESS_TOKEN). The

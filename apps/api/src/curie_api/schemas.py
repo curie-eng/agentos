@@ -31,6 +31,7 @@ from pydantic import (
 
 from .config import get_settings
 from .models import GIT_FLOW_CREATED_BY, Environment
+from .repo_full_name import RepoFullName
 from .workspace_policy import REPOSITORY_FULL_NAME_PATTERN, valid_repository_name
 
 # Slack channel IDs start with C (public/private channel), D (DM), or G (legacy
@@ -178,25 +179,6 @@ def _slack_shape_error(value: str) -> str:
 _CHANNEL_ADDRESS_SHAPES: dict[str, tuple[re.Pattern[str], Callable[[str], str]]] = {
     "slack": (_SLACK_CHANNEL_ID, _slack_shape_error),
 }
-
-
-def _validate_slack_channel_id(value: str | None) -> str | None:
-    """Enforce a Slack channel-ID shape on an APPROVAL ROUTE's destination.
-
-    Scoped to `ApprovalRouteBinding` since ADR-0096 (#1459). The agent's channel
-    binding is validated by `_validate_channel_binding` below instead: an
-    approval route's channel is a different concept that merely shared this
-    validator (bf717203d), so it keeps a Slack-specific rule of its own rather
-    than being dragged through a kind dispatch it has no kind for. Making it
-    neutral is #1460's work, not this one's.
-
-    None (an omitted PATCH field) passes through as a no-op.
-    """
-    if value is None:
-        return value
-    if not _SLACK_CHANNEL_ID.match(value):
-        raise ValueError(_slack_shape_error(value))
-    return value
 
 
 def _validate_channel_binding(kind: str, address: str) -> str:
@@ -467,11 +449,12 @@ class _StoredWithoutNulls(BaseModel):
 
 class ApprovalApprovers(_StoredWithoutNulls):
     """WHO may resolve a route's approvals (#420), as opposed to the binding's
-    ``channel``, which is only WHERE the card posts.
+    ``resolution``, which is only WHERE the interactive card posts.
 
     Declaring an approvers block is what lets a request sit in a broad channel
     where everyone can see it while only a narrow set may act on it. Omitting it
-    keeps the zero-setup default: the card channel's members are the approvers.
+    keeps the zero-setup default: the resolution-card channel's members are the
+    approvers. Notification recipients never enter this policy.
     """
 
     # A typo in an optional key must not be ignored: silently dropping it would
@@ -531,28 +514,9 @@ class ApprovalApprovers(_StoredWithoutNulls):
         return self
 
 
-class ApprovalRouteBinding(_StoredWithoutNulls):
-    """One workspace binding for a manifest-declared approval route (#247):
-    the Slack channel whose members are that route's approvers (under the
-    channel-membership authorizer), and optionally the ``approvers`` block that
-    narrows WHO may act (#420), leaving ``channel`` to mean only WHERE the card
-    posts.
-    """
-
-    # Rejects a typo'd ``approver`` rather than storing a channel-only binding
-    # the operator believes narrows authority. Pre-#420 bindings are
-    # ``{"channel": ...}`` only, so forbidding extras does not reject them.
-    model_config = ConfigDict(extra="forbid")
-
-    channel: str
-    approvers: ApprovalApprovers | None = None
-
-    _check_channel = field_validator("channel")(_validate_slack_channel_id)
-
-
 def _validate_route_names(
-    value: dict[str, ApprovalRouteBinding] | None,
-) -> dict[str, ApprovalRouteBinding] | None:
+    value: "dict[str, ApprovalRouteBinding] | None",
+) -> "dict[str, ApprovalRouteBinding] | None":
     """Route names must be non-empty; they are matched verbatim against the
     manifest's declared route names."""
     if value is None:
@@ -597,7 +561,7 @@ def _reject_retired_binding_keys(data: Any) -> Any:
             raise ValueError(
                 "slack_channel is no longer an agent field: it was replaced by "
                 "the channel-neutral binding (ADR-0096), so sending it would "
-                'leave the agent bound where it already was. Send channel: '
+                "leave the agent bound where it already was. Send channel: "
                 '{"kind": "slack", "address": "C0123ABCD"} instead.'
             )
         if "channels" in data:
@@ -674,6 +638,37 @@ class ChannelBinding(BaseModel):
         # the kind, so neither field can be judged alone.
         _validate_channel_binding(self.kind, self.address)
         return self
+
+
+class ChannelBindingOut(BaseModel):
+    """The READ side of a binding: the stored pair, serialized as it is stored.
+
+    Deliberately NOT a subclass of `ChannelBinding`, and that is the whole point.
+    `ChannelBinding` carries the address-shape rule three write paths inherit
+    (`ChannelBindingWrite`, `ChannelTokenRequest`, `TurnIn`), and it used to be
+    the element type of `AgentOut.channels` as well -- so the rule that guards a
+    BIND also ran when an existing row was READ, and one row it rejected failed
+    the whole response for every agent in it (#1914).
+
+    An install reaches that state by upgrading: migration 0021 backfills
+    `agent_channels.address` from `agents.slack_channel` verbatim, and that column
+    is exactly where a literal `#name` from before the validator lived. So an
+    install that was merely mis-routed became one whose agent list was
+    unavailable, reporting a Pydantic error instead of the bad value.
+
+    Serializing a stored row must not re-litigate whether it should have been
+    stored. Showing the bad address is also the more useful outcome: an operator
+    cannot fix a value the API refuses to tell them.
+
+    The shape stays `{kind, address}`, identical to what `ChannelBinding`
+    serialized, so this is not a wire change -- `ChannelBindingWrite`'s docstring
+    already describes that as the read contract.
+    """
+
+    model_config = ConfigDict(extra="forbid", from_attributes=True)
+
+    kind: str
+    address: str
 
 
 class ChannelBindingWrite(ChannelBinding):
@@ -770,6 +765,99 @@ class ChannelBindingPatch(ChannelBindingWrite):
         return self
 
 
+class ApprovalResolutionTarget(ChannelBinding):
+    """The one target permitted to carry an approval-resolving affordance.
+
+    ``kind`` is an explicit extension point, but it is intentionally Slack-only
+    until a second adapter can present the scoped verified identity ADR-0096
+    requires. Merely teaching an adapter to render buttons cannot widen this
+    authority boundary.
+    """
+
+    kind: Literal["slack"]
+
+
+class ApprovalNotificationTarget(ChannelBindingWrite, _StoredWithoutNulls):
+    """A visibility-only approval ping target and its server-side transport.
+
+    Slack may use the worker's configured default transport. Every other kind
+    needs the full endpoint/adapter pair at write time, so a declared
+    notification cannot persist as a permanently undeliverable best-effort
+    branch.
+    """
+
+    @model_validator(mode="after")
+    def _require_non_slack_transport(self) -> "ApprovalNotificationTarget":
+        if self.kind != "slack" and self.endpoint is None:
+            raise ValueError(
+                "a non-slack approval notification target requires both endpoint "
+                "and adapter; only slack can use the worker's configured default "
+                "transport"
+            )
+        return self
+
+
+class ApprovalRouteBinding(_StoredWithoutNulls):
+    """One strict workspace binding for a declared approval route (#1460).
+
+    ``resolution`` is the single verified-identity action surface.
+    ``notification`` may make the pending request visible elsewhere, but its
+    message carries no interaction. ``approvers`` continues to narrow WHO may
+    act through the resolution card path and is never inferred from notification
+    recipients.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    resolution: ApprovalResolutionTarget
+    notification: ApprovalNotificationTarget | None = None
+    approvers: ApprovalApprovers | None = None
+
+    @model_validator(mode="after")
+    def _targets_must_differ(self) -> "ApprovalRouteBinding":
+        if self.notification is not None and (
+            self.resolution.kind,
+            self.resolution.address,
+        ) == (self.notification.kind, self.notification.address):
+            raise ValueError(
+                "approval notification must differ from the resolution target; "
+                "a duplicate target adds no notification surface"
+            )
+        return self
+
+
+class ApprovalTargetOut(ChannelBindingOut):
+    """Display-safe target identity; stored transport is write-only.
+
+    This is deliberately a tolerant read projection. Write models validate the
+    channel kind/address pair before persistence, while reads must still expose
+    a malformed historical address so an operator can repair it.
+    """
+
+    # Stored bindings contain endpoint/adapter. Accept and discard those
+    # server-controlled fields so AgentOut never discloses them.
+    model_config = ConfigDict(extra="ignore")
+
+
+class ApprovalApproversOut(BaseModel):
+    """Repair-oriented read projection of the stored approver declaration."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    group: str | None = None
+    users: list[str] | None = None
+
+
+class ApprovalRouteBindingOut(BaseModel):
+    """The required resolution plus optional, redacted visibility policy."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    resolution: ApprovalTargetOut
+    notification: ApprovalTargetOut | None = None
+    approvers: ApprovalApproversOut | None = None
+
+
 class AgentCreate(BaseModel):
     name: str
     # Required, and singular. Every create path supplies exactly one binding
@@ -781,7 +869,7 @@ class AgentCreate(BaseModel):
     # phase 2). `AgentOut.channels` stays a list of read-only `{kind, address}`
     # pairs. Additional bindings are added through the subresource, never here.
     channel: ChannelBindingWrite
-    repo_full_name: str | None = None
+    repo_full_name: RepoFullName | None = None
     behavior_packs: BehaviorPacksConfig | None = None
     # Per-agent model id, forwarded as CURIE_MODEL at boot (#254). None uses the
     # platform default model.
@@ -792,9 +880,9 @@ class AgentCreate(BaseModel):
     # Per-agent permission gates (#245): tool names requiring human approval.
     # None means no gates (the bypass posture).
     approval_required_tools: list[str] | None = None
-    # Per-agent approval route bindings (#247): manifest route name -> workspace
-    # channel. None means no bindings (unbound routes fall back to the
-    # requesting channel).
+    # Per-agent approval route bindings (#247/#1460): manifest route name -> one
+    # verified Slack resolution target and optional visibility-only notification
+    # target. None means no bindings; a named unbound route escalates.
     approval_routes: dict[str, ApprovalRouteBinding] | None = None
     # Per-agent connector secret VALUES (ADR-0009, #429): env-var-style name ->
     # secret. Stored on the agent row for the local tier and forwarded into the
@@ -853,13 +941,8 @@ class AgentUpdate(BaseModel):
     # SECOND agent of a repo, which the unique index forbade from carrying it --
     # has no other way to be bound. Without this, git-flow cannot find that
     # agent and a target naming it is rejected as unknown.
-    repo_full_name: str | None = None
-    # New value for whether this agent's bindings share one workflow-state
-    # namespace (#1525 follow-up). Omitted (None) leaves it unchanged; unlike
-    # `model`/`thinking` there is no separate "platform default" a null would
-    # clear back to, so the router checks `is not None` rather than
-    # `model_fields_set` -- an explicit `"memory": null` is refused by the
-    # type rather than accepted as a third state.
+    repo_full_name: RepoFullName | None = None
+    # Whether this agent's bindings share one workflow-state namespace.
     memory: bool | None = None
 
     _check_model = field_validator("model")(_validate_model_override)
@@ -886,13 +969,13 @@ class AgentOut(BaseModel):
     # has no `created_at` and an unordered list makes two identical GETs differ
     # -- which re-renders the console's rows on every poll. The LOADING strategy
     # lives on the relationship too (`models.Agent.channels`, lazy="selectin").
-    channels: list[ChannelBinding]
+    channels: list[ChannelBindingOut]
     repo_full_name: str | None
     behavior_packs: dict[str, Any] | None
     model: str | None
     thinking: str | None
     approval_required_tools: list[str] | None
-    approval_routes: dict[str, Any] | None
+    approval_routes: dict[str, ApprovalRouteBindingOut] | None
     # Connector secret NAMES only (#429) -- values are never returned. The stored
     # column is a name->value map; expose just the sorted names so an operator can
     # see which secrets an agent has bound without the material leaving the API.
@@ -1732,11 +1815,17 @@ class StateNamespaceOut(BaseModel):
 
 
 class MemoryProvenanceOut(BaseModel):
-    """Where a memory entry was learned from (#264 ``Provenance`` shape)."""
+    """Where a memory entry was learned from (#264 ``Provenance`` shape).
+
+    ``source`` distinguishes an operator-seeded record (``operator``) from a
+    session-learned one. Absent or null means learned/unspecified, matching
+    records written before the operator seed path existed.
+    """
 
     learned_from_session_id: str | None = None
     source_trace_ids: list[str] = Field(default_factory=list)
     recorded_at: str = ""
+    source: str | None = None
 
 
 class SourceTraceOut(BaseModel):
@@ -1783,6 +1872,24 @@ class MemoryEntryEdit(BaseModel):
 
     content: str
     expected_version: int
+
+
+class MemoryEntryCreate(BaseModel):
+    """Append one operator-authored memory record (#1904).
+
+    Provenance is stamped by the server. Extra body fields, including a
+    caller-supplied provenance object, are ignored rather than trusted.
+    """
+
+    content: str
+
+    @field_validator("content")
+    @classmethod
+    def _content_not_blank(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("content must not be empty")
+        return stripped
 
 
 # --- console sessions (ADR-0083, #1044) -------------------------------------

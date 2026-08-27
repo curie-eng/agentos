@@ -19,7 +19,9 @@ def test_eval_state_maps_rollup_to_status() -> None:
     assert eval_state(0, 0) == ("failure", "0/0 passed")
 
 
-def _run_report(passed: int, total: int) -> tuple[httpx.Request, str]:
+def _run_report(
+    passed: int, total: int, repo_full_name: str = "octo/demo"
+) -> tuple[httpx.Request, str]:
     captured: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -36,7 +38,7 @@ def _run_report(passed: int, total: int) -> tuple[httpx.Request, str]:
                 context="curie/evals",
             )
             state = await reporter.report_eval(
-                "octo/demo", "abc123def", passed, total, target_url="https://x/run"
+                repo_full_name, "abc123def", passed, total, target_url="https://x/run"
             )
         return captured[0], state
 
@@ -64,6 +66,37 @@ def test_report_eval_posts_the_exact_commit_status() -> None:
 def test_report_eval_success_state() -> None:
     _, state = _run_report(36, 36)
     assert state == "success"
+
+
+def test_report_eval_preserves_a_valid_repository_in_the_status_url() -> None:
+    request, _ = _run_report(36, 36, "Octo-Corp/repo.name_with-parts")
+
+    assert str(request.url) == (
+        "https://api.github.com/repos/Octo-Corp/repo.name_with-parts/statuses/abc123def"
+    )
+
+
+def test_invalid_repo_full_name_is_rejected_before_status_http() -> None:
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(201, json={})
+
+    async def go() -> None:
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            reporter = GitHubStatusReporter(
+                client,
+                api_url="https://api.github.com",
+                token="tok-123",
+                context="curie/evals",
+            )
+            with pytest.raises(ValueError):
+                await reporter.report_eval("octo/../escape?token=x", "abc123", 1, 1)
+
+    asyncio.run(go())
+    assert captured == []
 
 
 def test_report_eval_skips_post_when_no_token() -> None:

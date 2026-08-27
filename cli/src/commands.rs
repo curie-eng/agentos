@@ -587,11 +587,32 @@ pub async fn try_first_run(keep: bool, image: String) -> Result<()> {
     Ok(())
 }
 
-/// `curie build`: build the runner image locally from the repo's Dockerfile.
-/// The one-command equivalent of `docker build -f runner/Dockerfile -t <tag> .`
-/// run from the repo root. Errors clearly when Docker is missing or when run
-/// outside a source checkout (a release binary pulls the image from GHCR).
-pub async fn build(tag: &str) -> Result<()> {
+/// Tags `docker build` applies for one platform image.
+///
+/// The runner has two identities: the short name [`crate::docker::RUNNER_IMAGE`]
+/// (`curie skill up`, `curie update --image`) and the ghcr `:dev` ref a
+/// `--build` stack runs. Building either also tags the other, so the two
+/// paths share one image (#1931). A custom `curie build --tag` is left alone.
+pub(crate) fn platform_image_tags(dockerfile: &str, tag: &str) -> Vec<String> {
+    let mut tags = vec![tag.to_string()];
+    if dockerfile == "runner/Dockerfile" {
+        let short = crate::docker::RUNNER_IMAGE;
+        let qualified = crate::local::source_image_ref(short);
+        if tag == short || tag == qualified {
+            if tag != short {
+                tags.push(short.to_string());
+            }
+            if tag != qualified {
+                tags.push(qualified);
+            }
+        }
+    }
+    tags
+}
+
+/// Build one platform image. The single `docker build` invocation for Curie
+/// images: `curie build` and `curie local up --build` both route here (#1931).
+pub(crate) async fn build_image(dockerfile: &str, tag: &str) -> Result<()> {
     let ui = crate::ui::ui();
     if !on_path("docker") {
         bail!(
@@ -600,26 +621,90 @@ pub async fn build(tag: &str) -> Result<()> {
         );
     }
     let root = find_repo_root().context(
-        "runner/Dockerfile not found here or in any parent directory. Run `curie build` \
-         from a curie repo checkout -- a release binary pulls the runner image from GHCR \
-         automatically and never needs to build.",
+        "runner/Dockerfile not found here or in any parent directory. Run this from a \
+         curie repo checkout -- a release binary pulls published images and never needs to build.",
     )?;
+    let tags = platform_image_tags(dockerfile, tag);
+    let mut args = vec![
+        "build".to_string(),
+        "-f".to_string(),
+        dockerfile.to_string(),
+    ];
+    for image_tag in &tags {
+        args.push("-t".to_string());
+        args.push(image_tag.clone());
+    }
+    args.push(".".to_string());
+    let rendered = tags
+        .iter()
+        .map(|image_tag| format!("-t {image_tag}"))
+        .collect::<Vec<_>>()
+        .join(" ");
     ui.note(&format!(
-        "=== docker build -f runner/Dockerfile -t {tag} . (in {}) ===",
+        "=== docker build -f {dockerfile} {rendered} . (in {}) ===",
         root.display()
     ));
     // Inherit stdio so the build log streams to the terminal like a hand-run build.
     let status = tokio::process::Command::new("docker")
-        .args(["build", "-f", "runner/Dockerfile", "-t", tag, "."])
+        .args(&args)
         .current_dir(&root)
         .status()
         .await
         .context("failed to invoke docker")?;
     if !status.success() {
-        bail!("docker build failed ({status})");
+        bail!("docker build failed for {dockerfile} ({status})");
     }
+    Ok(())
+}
+
+/// `curie build`: build the runner image locally from the repo's Dockerfile.
+/// The one-command equivalent of `docker build -f runner/Dockerfile -t <tag> .`
+/// run from the repo root. Errors clearly when Docker is missing or when run
+/// outside a source checkout (a release binary pulls the image from GHCR).
+///
+/// When `tag` is the default short name, the same image is also tagged
+/// [`crate::local::source_image_ref`] so a `--build` stack sees it.
+pub async fn build(tag: &str) -> Result<()> {
+    let ui = crate::ui::ui();
+    build_image("runner/Dockerfile", tag).await?;
     ui.success(&format!("built runner image '{tag}'"));
     Ok(())
+}
+
+#[cfg(test)]
+mod platform_image_tags_tests {
+    use super::platform_image_tags;
+    use crate::docker::RUNNER_IMAGE;
+    use crate::local::source_image_ref;
+
+    #[test]
+    fn runner_short_name_also_tags_the_build_stack_ref() {
+        let tags = platform_image_tags("runner/Dockerfile", RUNNER_IMAGE);
+        assert_eq!(
+            tags,
+            vec![RUNNER_IMAGE.to_string(), source_image_ref(RUNNER_IMAGE),]
+        );
+    }
+
+    #[test]
+    fn runner_build_stack_ref_also_tags_the_short_name() {
+        let qualified = source_image_ref(RUNNER_IMAGE);
+        let tags = platform_image_tags("runner/Dockerfile", &qualified);
+        assert_eq!(tags, vec![qualified, RUNNER_IMAGE.to_string()]);
+    }
+
+    #[test]
+    fn custom_runner_tag_is_left_alone() {
+        let tags = platform_image_tags("runner/Dockerfile", "my-runner");
+        assert_eq!(tags, vec!["my-runner".to_string()]);
+    }
+
+    #[test]
+    fn non_runner_image_keeps_its_single_tag() {
+        let tag = source_image_ref("curie-api");
+        let tags = platform_image_tags("apps/api/Dockerfile", &tag);
+        assert_eq!(tags, vec![tag]);
+    }
 }
 
 /// `curie install`: from-a-checkout dev bootstrap/update -- install deps and
@@ -770,6 +855,87 @@ pub async fn dev_script(rel_path: &str, args: &[&str]) -> Result<()> {
     if !status.success() {
         bail!("{rel_path} failed ({status})");
     }
+    Ok(())
+}
+
+pub async fn dev_e2e_ci_selection(
+    paths: &[PathBuf],
+    base: Option<&str>,
+    head: Option<&str>,
+    push: bool,
+) -> Result<()> {
+    let root = find_repo_root().context(
+        "runner/Dockerfile not found here or in any parent directory. Run `curie dev` \
+         from a curie source checkout.",
+    )?;
+    let selector = root.join("tools/e2e-ci-selection/select_tiers.py");
+    let registry = root.join(".github/e2e-selection.yaml");
+    if !selector.is_file() {
+        bail!("selector not found: {}", selector.display());
+    }
+    if !registry.is_file() {
+        bail!("selection registry not found: {}", registry.display());
+    }
+
+    let output_path = (0..100)
+        .find_map(|attempt| {
+            let path = std::env::temp_dir().join(format!(
+                "curie-e2e-ci-selection-{}-{attempt}",
+                std::process::id()
+            ));
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .ok()
+                .map(|_| path)
+        })
+        .context("failed to create temporary selector output")?;
+
+    let selection = async {
+        let mut command = tokio::process::Command::new("uv");
+        command
+            .args([
+                "run",
+                "--no-project",
+                "--with",
+                "pyyaml==6.0.3",
+                "python",
+                "tools/e2e-ci-selection/select_tiers.py",
+                "--registry",
+                ".github/e2e-selection.yaml",
+            ])
+            .env("GITHUB_OUTPUT", &output_path)
+            .current_dir(&root);
+        for path in paths {
+            command.arg("--path").arg(path);
+        }
+        if let Some(base) = base {
+            command.arg("--base").arg(base);
+        }
+        if let Some(head) = head {
+            command.arg("--head").arg(head);
+        }
+        if push {
+            command.arg("--push");
+        }
+
+        let status = command
+            .status()
+            .await
+            .context("failed to invoke the end to end CI selector")?;
+        if !status.success() {
+            bail!("end to end CI selector failed ({status})");
+        }
+        std::fs::read_to_string(&output_path).context("failed to read selector output")
+    }
+    .await;
+
+    let cleanup = std::fs::remove_file(&output_path)
+        .with_context(|| format!("failed to remove {}", output_path.display()));
+    let selection = selection?;
+    cleanup?;
+    print!("{selection}");
     Ok(())
 }
 
@@ -1043,33 +1209,27 @@ fn resolve_agent_folder(folder: &str) -> Result<std::path::PathBuf> {
 /// for that tier.
 pub async fn deploy_named(folder: &str, opts: DeployNamedOpts) -> Result<DeployOutput> {
     let plugin_dir = resolve_agent_folder(folder)?;
-    let connect_hint = format!(
-        "the platform API at {} is unreachable. Start the local stack first with `curie local \
-         up`, then re-run (or pass --api-url if your API is elsewhere).",
-        opts.api_url
-    );
-    deploy(DeployOpts {
+    let api_url = opts.api_url.clone();
+    let result = deploy(DeployOpts {
         plugin_dir,
         // deploy_named is the multi-agent-folder path: the folder IS the agent
         // identity there, so there is nothing to override.
         agent: None,
         target: None,
-        api_url: opts.api_url,
+        api_url,
         api_key: opts.api_key,
         slack_channel: opts.slack_channel,
         repo: opts.repo,
         workspace: WorkspaceIntent::Preserve,
+        tier: DeployTier::Local,
         env: Some(opts.env),
         label: opts.label,
         secret: opts.secret,
         secret_binding_supported: true,
-        connect_hint,
-        // The third local-deploy caller (block B1-11): it must reach the same
-        // preflight `local deploy` does, or a source-built bundle uploads with
-        // no lock check.
-        tier: DeployTier::Local,
+        connect_hint: "the platform API is unreachable.".to_string(),
     })
-    .await
+    .await;
+    crate::local::with_deploy_unreachable_hint(result, &opts.api_url).await
 }
 
 /// The `curie deploy-local <folder>` flags, mirroring `local deploy`'s minus
@@ -1266,7 +1426,12 @@ fn on_path(bin: &str) -> bool {
 
 /// Walk up from the current directory to the repo root: the nearest ancestor
 /// that contains `runner/Dockerfile`.
-fn find_repo_root() -> Option<PathBuf> {
+///
+/// `pub(crate)` for `build_image` and `local::build_source_images` (#1915),
+/// which build the dev stack's images from the same root and want the same
+/// "are we in a checkout" answer rather than a second walk with its own
+/// anchor file.
+pub(crate) fn find_repo_root() -> Option<PathBuf> {
     let mut dir = std::env::current_dir().ok()?;
     loop {
         if dir.join("runner/Dockerfile").is_file() {
@@ -1533,32 +1698,82 @@ fn load_model_credentials_from_env_file(
     Ok(resolved)
 }
 
-/// What a recorded runner means for a fresh `skill up` (#747).
+/// What a recorded runner means for a fresh `skill up` (#747, #1905).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordedStatePlan {
     /// Nothing recorded; boot.
     Proceed,
-    /// `--replace` names the very container the record describes, so the record
-    /// is about to become stale anyway: clear it and boot.
+    /// Tear the recorded runner down and boot. Either `--replace` names that
+    /// exact container, or a verified same-bundle identity is serving a stale
+    /// snapshot of this source.
     ClearAndProceed,
-    /// A runner is recorded that `--replace` does not cover; refuse, so a second
-    /// bundle's live runner cannot be silently forgotten.
+    /// The recorded runner is this bundle and already serves the current
+    /// source; do not restart.
+    AlreadyRunning,
+    /// A runner is recorded that this `up` must not remove: a different name,
+    /// a foreign or unverifiable identity, or a snapshot that cannot be
+    /// compared. Refuse so a second bundle's live runner cannot be silently
+    /// forgotten.
     Refuse,
 }
 
-/// Resolve the recorded-state gate. Pure so both branches are testable without a
-/// bundle on disk. `--replace` only clears the record when it is replacing that
-/// exact container: a record naming a DIFFERENT runner still blocks, since
-/// removing one container is no reason to forget another.
-pub fn plan_recorded_state(
-    recorded: Option<&str>,
-    target: &str,
-    replace: bool,
-) -> RecordedStatePlan {
-    match recorded {
-        None => RecordedStatePlan::Proceed,
-        Some(container) if replace && container == target => RecordedStatePlan::ClearAndProceed,
-        Some(_) => RecordedStatePlan::Refuse,
+/// Inputs to [`plan_recorded_state`]. Identity fields are optional so the
+/// `--replace` name gate stays testable without Docker; auto-reload requires
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordedStateQuery<'a> {
+    pub recorded_name: Option<&'a str>,
+    pub target_name: &'a str,
+    pub replace: bool,
+    pub recorded_id: Option<&'a str>,
+    pub live_id: Option<&'a str>,
+    pub same_bundle_dir: bool,
+    pub recorded_digest: Option<&'a str>,
+    pub current_digest: Option<&'a str>,
+}
+
+/// Whether a recorded container id and a `docker ps` id name the same
+/// container. `docker ps` reports a 12-char short id while `docker run`
+/// returns the full 64-char one, so identity is a prefix match, not equality.
+/// An empty recorded id cannot be compared and is not a match: auto-reload
+/// must not treat an unverified identity as owned (#1905 / #747).
+pub fn recorded_ids_match(recorded_id: &str, live_id: &str) -> bool {
+    !recorded_id.is_empty()
+        && (recorded_id.starts_with(live_id) || live_id.starts_with(recorded_id))
+}
+
+/// Resolve the recorded-state gate. Pure so every branch is testable without a
+/// bundle on disk or a Docker daemon.
+///
+/// `--replace` still clears only the record for the exact target name: a record
+/// naming a DIFFERENT runner still blocks, since removing one container is no
+/// reason to forget another (#747). Without `--replace`, a verified
+/// same-directory runner whose snapshot no longer matches this source is
+/// replaced automatically (#1905); an unverified identity never is.
+pub fn plan_recorded_state(q: RecordedStateQuery<'_>) -> RecordedStatePlan {
+    let Some(recorded) = q.recorded_name else {
+        return RecordedStatePlan::Proceed;
+    };
+    if q.replace && recorded == q.target_name {
+        return RecordedStatePlan::ClearAndProceed;
+    }
+    if recorded != q.target_name {
+        return RecordedStatePlan::Refuse;
+    }
+    let identity_verified = q.same_bundle_dir
+        && match (q.recorded_id, q.live_id) {
+            (Some(recorded_id), Some(live_id)) => recorded_ids_match(recorded_id, live_id),
+            _ => false,
+        };
+    if !identity_verified {
+        return RecordedStatePlan::Refuse;
+    }
+    match (q.recorded_digest, q.current_digest) {
+        (Some(recorded_digest), Some(current_digest)) if recorded_digest == current_digest => {
+            RecordedStatePlan::AlreadyRunning
+        }
+        (Some(_), Some(_)) => RecordedStatePlan::ClearAndProceed,
+        _ => RecordedStatePlan::Refuse,
     }
 }
 
@@ -1632,16 +1847,66 @@ pub async fn start(opts: StartOpts) -> Result<()> {
     // Decided here, ACTED ON below: refusing is free, but replacing tears down a
     // live runner and must not happen until nothing cheap can still abort (#747).
     let recorded_runner = state::load(&plugin_dir)?;
-    let recorded_plan = plan_recorded_state(
-        recorded_runner.as_ref().map(|s| s.container_name.as_str()),
-        &opts.name,
-        opts.replace,
-    );
+    // `--replace` decides from the name alone and must stay a cheap abort
+    // until budget / model preflights pass (#747). Auto-reload needs the live
+    // container id, so only probe Docker when that path could fire.
+    let live_for_plan = match recorded_runner.as_ref() {
+        Some(saved) if !opts.replace => docker::container_facts(&saved.container_name).await?,
+        _ => None,
+    };
+    let same_bundle_dir = recorded_runner.as_ref().is_some_and(|saved| {
+        Path::new(&saved.plugin_dir)
+            .canonicalize()
+            .ok()
+            .is_some_and(|recorded| recorded == plugin_dir)
+    });
+    let identity_verified = recorded_runner.as_ref().is_some_and(|saved| {
+        same_bundle_dir
+            && live_for_plan
+                .as_ref()
+                .is_some_and(|facts| recorded_ids_match(&saved.container_id, &facts.id))
+    });
+    // Packing is cheap relative to teardown and is how we know the snapshot is
+    // stale. Skip it unless auto-reload could actually fire: `--replace` does
+    // not need a digest, and an unverified identity must still refuse.
+    let current_digest = if identity_verified && !opts.replace {
+        crate::bundle::digest_source(&plugin_dir).ok()
+    } else {
+        None
+    };
+    let recorded_plan = plan_recorded_state(RecordedStateQuery {
+        recorded_name: recorded_runner.as_ref().map(|s| s.container_name.as_str()),
+        target_name: &opts.name,
+        replace: opts.replace,
+        recorded_id: recorded_runner.as_ref().map(|s| s.container_id.as_str()),
+        live_id: live_for_plan.as_ref().map(|f| f.id.as_str()),
+        same_bundle_dir,
+        recorded_digest: recorded_runner
+            .as_ref()
+            .and_then(|s| s.bundle_digest.as_deref()),
+        current_digest: current_digest.as_deref(),
+    });
     if recorded_plan == RecordedStatePlan::Refuse {
+        let recorded_name = &recorded_runner
+            .as_ref()
+            .expect("a refusal requires a recorded runner")
+            .container_name;
         return Err(crate::exit::usage(format!(
-            "a local runner is already recorded in {}/.curie/runner.json; run 'curie skill down' there first",
-            plugin_dir.display()
+            "a local runner is already recorded in {}/.curie/runner.json; run 'curie skill down' there first, or rerun 'curie skill up --replace --name {recorded_name}' to replace it",
+            plugin_dir.display(),
         )));
+    }
+    if recorded_plan == RecordedStatePlan::AlreadyRunning {
+        let saved = recorded_runner.expect("already-running requires a recorded runner");
+        let ui = crate::ui::ui();
+        ui.success(&format!(
+            "runner '{}' is already running this bundle snapshot",
+            saved.container_name
+        ));
+        if let Some(digest) = saved.bundle_digest.as_deref() {
+            ui.note(&format!("bundle {}", short_digest(digest)));
+        }
+        return Ok(());
     }
 
     // Parse (not just forward) the budget so a typo fails here, not in-container.
@@ -1685,10 +1950,12 @@ pub async fn start(opts: StartOpts) -> Result<()> {
     // network, then the file -- because clearing the record while its runner is
     // still live strands exactly the untracked orphan this ticket removes (#747).
     if let (RecordedStatePlan::ClearAndProceed, Some(saved)) = (recorded_plan, recorded_runner) {
-        crate::ui::ui().note(&format!(
-            "--replace: tearing down the recorded runner '{}' first",
-            saved.container_name
-        ));
+        let reason = if opts.replace {
+            "--replace: tearing down the recorded runner"
+        } else {
+            "bundle changed: replacing the recorded runner"
+        };
+        crate::ui::ui().note(&format!("{reason} '{}' first", saved.container_name));
         let live = docker::container_facts(&saved.container_name).await?;
         stop_recorded(&plugin_dir, crate::ui::ui(), saved, live.as_ref()).await?;
     }
@@ -2185,9 +2452,10 @@ pub fn plan_recorded_teardown(
     };
     // `docker ps` reports a 12-char short id while `docker run` returns the full
     // 64-char one, so identity is a prefix match, not equality. A record with no
-    // id at all cannot be compared, so it keeps the old name-based behavior
-    // rather than refusing to tear down.
-    if recorded_id.is_empty() || recorded_id.starts_with(live) || live.starts_with(recorded_id) {
+    // id at all cannot be compared, so teardown keeps the old name-based
+    // behavior rather than refusing to tear down. Auto-reload does NOT use this
+    // empty-id fallback: [`recorded_ids_match`] rejects it (#1905).
+    if recorded_id.is_empty() || recorded_ids_match(recorded_id, live) {
         return RecordedTeardown::Remove {
             id: live.to_string(),
         };
@@ -2465,15 +2733,32 @@ pub type EvalRow = (String, CaseOutcome, f64, String);
 pub struct EvalReport {
     pub rows: Vec<EvalRow>,
     pub details: BTreeMap<String, String>,
+    /// Sampling policy this run used (#1907). Default n=1 majority.
+    pub sampling: crate::eval_sampling::SampleConfig,
+    /// Per-case count of samples that passed, keyed by case id.
+    pub sample_passes: BTreeMap<String, u32>,
 }
 
 impl EvalReport {
     pub fn from_rows(rows: Vec<EvalRow>) -> Self {
+        Self::with_details(rows, BTreeMap::new())
+    }
+
+    pub fn with_details(rows: Vec<EvalRow>, details: BTreeMap<String, String>) -> Self {
+        let sample_passes = n1_sample_passes(&rows);
         Self {
             rows,
-            details: BTreeMap::new(),
+            details,
+            sampling: crate::eval_sampling::SampleConfig::default(),
+            sample_passes,
         }
     }
+}
+
+fn n1_sample_passes(rows: &[EvalRow]) -> BTreeMap<String, u32> {
+    rows.iter()
+        .map(|(id, outcome, _, _)| (id.clone(), u32::from(*outcome == CaseOutcome::Pass)))
+        .collect()
 }
 
 /// The three counts every eval surface reports. Split out so the `--json`
@@ -2502,21 +2787,21 @@ fn eval_counts(results: &[EvalRow]) -> (usize, usize, usize) {
 /// snapshotted bundle, and on a skill run against a runner this checkout never
 /// recorded.
 pub fn eval_json(results: &[EvalRow], bundle_digest: Option<&str>) -> serde_json::Value {
-    eval_json_with_details(results, &BTreeMap::new(), bundle_digest)
+    eval_json_with_details(&EvalReport::from_rows(results.to_vec()), bundle_digest)
 }
 
-fn eval_json_with_details(
-    results: &[EvalRow],
-    details: &BTreeMap<String, String>,
-    bundle_digest: Option<&str>,
-) -> serde_json::Value {
+fn eval_json_with_details(report: &EvalReport, bundle_digest: Option<&str>) -> serde_json::Value {
     // Derive every count from `results` in one pass so the rollup can never
     // disagree with the per-case rows (no caller-supplied passed/total to drift).
+    let results = &report.rows;
     let total = results.len();
     let (passed, failed, plumbing_ok) = eval_counts(results);
+    let n = report.sampling.n;
+    let policy = report.sampling.policy.as_str();
     let cases: Vec<serde_json::Value> = results
         .iter()
         .map(|(id, outcome, seconds, output)| {
+            let sample_passes = report.sample_passes.get(id).copied().unwrap_or(0);
             let mut row = serde_json::json!({
                 "id": id,
                 "outcome": outcome,
@@ -2527,9 +2812,22 @@ fn eval_json_with_details(
                 "passed": outcome.passed(),
                 "seconds": seconds,
                 "output": output,
+                "samples": n,
+                "passes": sample_passes,
+                "policy": policy,
             });
-            if let Some(detail) = details.get(id) {
+            if let Some(detail) = report.details.get(id) {
                 row["detail"] = serde_json::json!(detail);
+            }
+            if n > 1 {
+                let bar = match report.sampling.policy {
+                    crate::eval_sampling::AggregationPolicy::PassAtK => {
+                        format!("pass@{}", report.sampling.effective_k())
+                    }
+                    crate::eval_sampling::AggregationPolicy::Majority => "majority".to_string(),
+                };
+                row["variance"] =
+                    serde_json::json!(format!("{sample_passes}/{n} samples passed ({bar})"));
             }
             row
         })
@@ -2540,6 +2838,8 @@ fn eval_json_with_details(
         "failed": failed,
         "plumbing_ok": plumbing_ok,
         "bundle_digest": bundle_digest,
+        "samples": n,
+        "policy": policy,
         "cases": cases,
     })
 }
@@ -2944,8 +3244,13 @@ pub async fn send(
     r#continue: bool,
 ) -> Result<bool> {
     let url = resolve_url(url)?;
+    let saved = state::load(Path::new(".")).unwrap_or(None);
+    let bundle_warning = editable_bundle_warning(saved.as_ref(), &url);
     let client = RunnerClient::new(&url)?;
     let ui = crate::ui::ui();
+    if let Some(warning) = bundle_warning {
+        ui.warn(&warning);
+    }
     let mut printer = TurnPrinter::default();
 
     if !r#continue {
@@ -3066,6 +3371,27 @@ pub struct SkillMessageOutput {
     pub finalized: bool,
 }
 
+fn editable_bundle_warning(saved: Option<&state::RunnerState>, url: &str) -> Option<String> {
+    let saved = saved.filter(|saved| saved.base_url == url)?;
+    let recorded_digest = saved.bundle_digest.as_deref()?;
+    let editable_digest = match crate::bundle::digest_source(Path::new(&saved.plugin_dir)) {
+        Ok(digest) => digest,
+        Err(_) => {
+            return Some(
+                "could not compare the editable bundle with the running snapshot. Run `curie skill up` after fixing the bundle."
+                    .to_string(),
+            );
+        }
+    };
+    if editable_digest == recorded_digest {
+        return None;
+    }
+    Some(
+        "editable bundle differs from the running snapshot. Run `curie skill up` to load the changes."
+            .to_string(),
+    )
+}
+
 impl crate::ui::CliOutput for SkillMessageOutput {
     fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
@@ -3089,11 +3415,10 @@ pub async fn eval(
     models: Vec<String>,
     secrets: Vec<String>,
     image: String,
+    sampling: crate::eval_sampling::SampleConfig,
 ) -> Result<()> {
     let saved = state::load(Path::new("."))?;
     let state_plugin_dir = saved.as_ref().map(|s| PathBuf::from(s.plugin_dir.clone()));
-    let cases_path = resolve_cases_path(cases_path, Path::new("."), state_plugin_dir.as_deref())?;
-    let loaded = load_eval(&cases_path)?;
 
     // Model selection (#526): with `--model`, boot a transient runner per model,
     // run the suite against each, and report pass-rate per model -- the one
@@ -3101,6 +3426,14 @@ pub async fn eval(
     // manual `skill up --model X` + `skill eval` loop per model. Without it, the
     // default path drives the already-running runner (whatever model it booted).
     if !models.is_empty() {
+        let recorded_snapshot_dir = sweep_snapshot(saved.as_ref()).map(|(dir, _)| dir);
+        let cases_path = resolve_cases_path(
+            cases_path,
+            Path::new("."),
+            recorded_snapshot_dir.as_deref(),
+            state_plugin_dir.as_deref(),
+        )?;
+        let loaded = load_eval(&cases_path)?;
         return eval_sweep(
             &loaded.suite,
             loaded.trajectory.as_ref(),
@@ -3109,12 +3442,25 @@ pub async fn eval(
             &image,
             sweep_snapshot(saved.as_ref()),
             state_plugin_dir.as_deref(),
+            sampling,
         )
         .await;
     }
 
     let fake = drives_a_fake_runner(saved.as_ref(), url.as_deref());
     let url = resolve_url(url)?;
+    let recorded_snapshot_dir = saved
+        .as_ref()
+        .filter(|saved| saved.base_url == url)
+        .and_then(|saved| saved.bundle_snapshot_dir.as_ref())
+        .map(PathBuf::from);
+    let cases_path = resolve_cases_path(
+        cases_path,
+        Path::new("."),
+        recorded_snapshot_dir.as_deref(),
+        state_plugin_dir.as_deref(),
+    )?;
+    let loaded = load_eval(&cases_path)?;
     // #1087 AC2: the bundle this eval graded, on the machine surface, so an
     // agent can confirm it is the SAME digest `skill status`/`skill message`
     // report without reading a human note off stderr (docs/agents.md bans
@@ -3123,21 +3469,25 @@ pub async fn eval(
     let bundle_digest = recorded_bundle_digest(saved.as_ref(), &url);
     let client = RunnerClient::new(&url)?;
     let ui = crate::ui::ui();
-    let bar = ui.progress_bar(loaded.suite.cases.len() as u64, "running evals");
     // `run_suite_cases` also tallies completion for the `--model` sweep path;
     // the single-runner report doesn't need the count (it already reports the
     // per-case `Fail` either way and exits on any of them), so it is discarded.
+    let bar = ui.progress_bar(
+        (loaded.suite.cases.len() as u64).saturating_mul(u64::from(sampling.n)),
+        "running evals",
+    );
     let (results, _completed) = run_suite_cases(
         &client,
         &loaded.suite,
         fake,
         loaded.trajectory.as_ref(),
+        sampling,
         |_| bar.inc(1),
     )
     .await?;
     bar.finish();
 
-    report_eval(&results, bundle_digest.as_deref())
+    report_eval(&results, bundle_digest.as_deref(), ())
 }
 
 /// Whether the runner `skill eval` is about to drive is the fake. Learned from
@@ -3169,51 +3519,71 @@ async fn run_suite_cases(
     suite: &EvalSuite,
     fake: bool,
     trajectory_scorer: Option<&TrajectoryScorer>,
-    mut on_case: impl FnMut(usize),
+    sampling: crate::eval_sampling::SampleConfig,
+    mut on_sample: impl FnMut(usize),
 ) -> Result<(EvalReport, usize)> {
     let mut results = Vec::with_capacity(suite.cases.len());
     let mut details = BTreeMap::new();
+    let mut sample_passes = BTreeMap::new();
     let mut completed = 0usize;
-    for (i, case) in suite.cases.iter().enumerate() {
-        // Fresh conversation by default (#550): reset the runner before a case so
-        // it cannot answer from an earlier case's history instead of actually
-        // invoking its tools. A shared_history case skips the reset and inherits
-        // the prior case's conversation on purpose (a multi-turn scenario).
-        if !case.shared_history {
-            client.reset().await.with_context(|| {
-                format!(
-                    "resetting the runner conversation before case {:?}",
-                    case.id
-                )
-            })?;
+    for case in &suite.cases {
+        let mut samples = Vec::with_capacity(sampling.n as usize);
+        let mut case_completed = false;
+        for _ in 0..sampling.n {
+            // Fresh conversation before every sample (#550 / #1907): two samples
+            // of the same case must each start clean, or the second inherits the
+            // first's turn. A shared_history case still skips the reset.
+            if !case.shared_history {
+                client.reset().await.with_context(|| {
+                    format!(
+                        "resetting the runner conversation before case {:?}",
+                        case.id
+                    )
+                })?;
+            }
+            let started = Instant::now();
+            let events = client
+                .send_event(EventType::EvalCase, &case.input, "U-eval", |_| {})
+                .await?;
+            let elapsed = started.elapsed().as_secs_f64();
+            let sample_completed = turn_completed(case, &events);
+            if sample_completed {
+                case_completed = true;
+            }
+            let scored = score_turn(case, &events, fake, trajectory_scorer);
+            if let Some(detail) = scored.detail.clone() {
+                details.insert(case.id.clone(), detail);
+            }
+            samples.push(crate::eval_sampling::SampleRecord {
+                outcome: scored.outcome,
+                output: graded_answer(&events),
+                seconds: elapsed,
+                error: if sample_completed {
+                    None
+                } else {
+                    Some("turn did not complete".into())
+                },
+            });
+            on_sample(0);
         }
-        let started = Instant::now();
-        let events = client
-            .send_event(EventType::EvalCase, &case.input, "U-eval", |_| {})
-            .await?;
-        let elapsed = started.elapsed().as_secs_f64();
-        if turn_completed(case, &events) {
+        if case_completed {
             completed += 1;
         }
-        // Capture the graded answer -- the exact text `turn_outcome` judged -- so
-        // a red case can be diagnosed from `--json` without a manual re-run
-        // (#548). A fake row carries its canned reply for the same reason.
-        let scored = score_turn(case, &events, fake, trajectory_scorer);
-        if let Some(detail) = scored.detail {
-            details.insert(case.id.clone(), detail);
+        let agg = crate::eval_sampling::aggregate_samples(&samples, sampling);
+        sample_passes.insert(case.id.clone(), agg.passes);
+        if let Some(variance) = &agg.variance {
+            details
+                .entry(case.id.clone())
+                .or_insert_with(|| variance.clone());
         }
-        results.push((
-            case.id.clone(),
-            scored.outcome,
-            elapsed,
-            graded_answer(&events),
-        ));
-        on_case(i);
+        results.push((case.id.clone(), agg.outcome, agg.seconds, agg.output));
     }
     Ok((
         EvalReport {
             rows: results,
             details,
+            sampling,
+            sample_passes,
         },
         completed,
     ))
@@ -3515,6 +3885,7 @@ mod eval_bundle {
 }
 
 /// Run the suite once per model in a fresh runner and report pass-rate per model.
+#[allow(clippy::too_many_arguments)]
 async fn eval_sweep(
     suite: &EvalSuite,
     trajectory_scorer: Option<&TrajectoryScorer>,
@@ -3523,6 +3894,7 @@ async fn eval_sweep(
     image: &str,
     recorded: Option<(PathBuf, String)>,
     state_plugin_dir: Option<&Path>,
+    sampling: crate::eval_sampling::SampleConfig,
 ) -> Result<()> {
     let ui = crate::ui::ui();
     // The mount is decided once, purely, by `resolve_sweep_mount`, then
@@ -3561,7 +3933,8 @@ async fn eval_sweep(
             // `boot_eval_runner` pins `fake_model: false`, so every sweep runner is a
             // REAL model whatever the standing dev runner is -- the sweep grades,
             // so this in-CLI path never produces a plumbing-only row.
-            let run = run_suite_cases(&client, suite, false, trajectory_scorer, |_| {}).await;
+            let run =
+                run_suite_cases(&client, suite, false, trajectory_scorer, sampling, |_| {}).await;
             let _ = docker::remove_container(&name).await;
             let (results, completed) = run?;
             let passed = results
@@ -3755,7 +4128,12 @@ pub fn report_sweep(rows: &[SweepRow], bundle_digest: Option<&str>) -> Result<()
 /// graded is confirmable from the machine surface. Callers pass `None` when no
 /// locally snapshotted bundle applies (the local/cluster tiers grade a deployed
 /// version), never a digest they did not observe.
-pub fn report_eval(report: &EvalReport, bundle_digest: Option<&str>) -> Result<()> {
+///
+/// `guards` are dropped before a red eval's non-unwinding `process::exit`
+/// (#1908). `std::process::exit` does not run Drop, so a `kubectl port-forward`
+/// child or Slack stub still in the caller's scope would otherwise be orphaned
+/// onto PID 1. Callers with no such resource pass `()`.
+pub fn report_eval<G>(report: &EvalReport, bundle_digest: Option<&str>, guards: G) -> Result<()> {
     let (_passed, failed, _plumbing_ok) = eval_counts(&report.rows);
     // Emit through the one success point (#474), then apply the exit-code side
     // effect for BOTH paths -- the json path had it inline, the human path after.
@@ -3766,7 +4144,7 @@ pub fn report_eval(report: &EvalReport, bundle_digest: Option<&str>) -> Result<(
         bundle_digest,
     });
     if failed > 0 {
-        std::process::exit(crate::exit::ExitClass::Failure.code());
+        crate::exit::exit_after_drop(crate::exit::ExitClass::Failure, guards);
     }
     Ok(())
 }
@@ -3784,23 +4162,39 @@ struct EvalOutput<'a> {
 
 impl crate::ui::CliOutput for EvalOutput<'_> {
     fn to_json(&self) -> serde_json::Value {
-        eval_json_with_details(&self.report.rows, &self.report.details, self.bundle_digest)
+        eval_json_with_details(self.report, self.bundle_digest)
     }
 
     fn render(&self, ui: &crate::ui::Ui) {
         let results = &self.report.rows;
         let (passed, failed, plumbing_ok) = eval_counts(results);
+        let n = self.report.sampling.n;
         let rows: Vec<Vec<String>> = results
             .iter()
             .map(|(name, outcome, seconds, _)| {
-                vec![
+                let passes = self.report.sample_passes.get(name).copied().unwrap_or(0);
+                let mut cols = vec![
                     name.clone(),
                     outcome_label(*outcome),
                     format!("{seconds:.1}s"),
-                ]
+                ];
+                if n > 1 {
+                    cols.insert(2, format!("{passes}/{n}"));
+                }
+                cols
             })
             .collect();
-        ui.payload_plain(&crate::ui::table(&["case", "result", "time"], &rows, &[2]));
+        let headers: &[&str] = if n > 1 {
+            &["case", "result", "samples", "time"]
+        } else {
+            &["case", "result", "time"]
+        };
+        let right_align: &[usize] = if n > 1 { &[3] } else { &[2] };
+        ui.payload_plain(&crate::ui::table(headers, &rows, right_align));
+        ui.note(&format!(
+            "sampling: {} sample(s), {}",
+            n, self.report.sampling.policy
+        ));
         if failed == 0 {
             ui.success(&rollup_line(passed, failed, plumbing_ok));
             if plumbing_ok > 0 {
@@ -3838,16 +4232,30 @@ impl crate::ui::CliOutput for EvalOutput<'_> {
 }
 
 /// Where the eval cases live: an explicit `--cases` wins; otherwise
-/// `evals/cases.json` in the current directory, falling back to the started
-/// runner's recorded bundle directory (so `curie skill eval` works from
-/// wherever `curie skill up` was run).
+/// `evals/cases.json` in the recorded running snapshot wins, then the current
+/// directory and, only when no snapshot is recorded, the started runner's
+/// recorded bundle directory (so `curie skill eval` works from wherever `curie
+/// skill up` was run).
 pub fn resolve_cases_path(
     explicit: Option<PathBuf>,
     cwd: &Path,
+    recorded_snapshot_dir: Option<&Path>,
     state_plugin_dir: Option<&Path>,
 ) -> Result<PathBuf> {
     if let Some(path) = explicit {
         return Ok(path);
+    }
+    if let Some(snapshot_dir) = recorded_snapshot_dir {
+        let in_snapshot = snapshot_dir.join("evals/cases.json");
+        if in_snapshot.is_file() {
+            return Ok(in_snapshot);
+        }
+        return Err(crate::exit::CliError::usage(format!(
+            "no eval cases found in the running snapshot: {}. Run `curie skill up` or pass --cases",
+            in_snapshot.display()
+        ))
+        .with_fix("run `curie skill up` or pass --cases")
+        .into());
     }
     let local = cwd.join("evals/cases.json");
     if local.is_file() {
@@ -3904,11 +4312,9 @@ pub struct DeployOpts {
     /// forward into the sandbox. From `deploy --secret <NAME>`.
     pub secret: Vec<String>,
     /// Whether this tier offers `--secret` binding, gating the declared-secrets
-    /// policy check (#464): true for tiers that can bind a declared secret
-    /// (local), false where secret delivery is not yet wired (cluster, until
-    /// #440 flips it). When false the gate is skipped -- otherwise every
-    /// secrets-declaring bundle would hard-fail with a `--secret <NAME>`
-    /// remediation that does not exist on that tier.
+    /// policy check (#464): true when the tier can bind a declared secret
+    /// (local by value, cluster via the per-agent Helm Secret). When false the
+    /// gate is skipped.
     pub secret_binding_supported: bool,
     /// Actionable remediation line printed when the platform API connection
     /// fails (e.g. the kubectl port-forward command for cluster, or
@@ -3998,7 +4404,34 @@ pub fn normalize_deploy_api_key(api_key: Option<String>) -> Option<String> {
     api_key.filter(|k| !k.trim().is_empty())
 }
 
-pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
+pub struct PreparedDeploy {
+    client: ApiClient,
+    outcome: crate::api::PreparedDeployOutcome,
+    plugin_name: String,
+    label: String,
+    env: String,
+    requested_repo: Option<String>,
+    connect_hint: String,
+    step: crate::ui::Step,
+    tier: DeployTier,
+    plugin_dir: PathBuf,
+}
+
+impl PreparedDeploy {
+    pub fn agent_id(&self) -> &str {
+        &self.outcome.agent.id
+    }
+
+    pub fn agent_name(&self) -> &str {
+        &self.outcome.agent.name
+    }
+
+    pub fn version_id(&self) -> &str {
+        &self.outcome.version.id
+    }
+}
+
+pub async fn prepare_deploy(opts: DeployOpts) -> Result<PreparedDeploy> {
     let plugin_dir = opts
         .plugin_dir
         .canonicalize()
@@ -4041,9 +4474,8 @@ pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
     // the ticket -- a missing binding otherwise surfaces later as a runtime auth
     // failure (#429). This runs in the shared deploy() path, pre-network, so it
     // covers BOTH `local deploy` and `cluster deploy`. It is gated on
-    // `secret_binding_supported` (AC2): cluster deploy cannot bind a `--secret`
-    // until #440 wires delivery, so enforcing there would hard-fail every
-    // secrets-declaring bundle with a remediation the tier cannot satisfy. It
+    // `secret_binding_supported` (AC2): skip only on a tier that still cannot
+    // bind. Cluster binding is #1488. It
     // runs first, before the archive is even packed: the check is a pure
     // name-set diff on `opts.secret` (the bound NAME set) and needs no packed
     // bundle or resolved values, so a declared-but-unbound policy fails fast
@@ -4152,10 +4584,7 @@ pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
     // the sandbox (ADR-0009, #429). The value never appears in argv.
     let mut secrets: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     for name in &opts.secret {
-        let value = std::env::var(name)
-            .ok()
-            .filter(|v| !v.is_empty())
-            .or(crate::secrets::get_value(name)?);
+        let value = crate::secrets::resolve_env_or_saved(name)?;
         match value {
             Some(v) => {
                 secrets.insert(name.clone(), v);
@@ -4188,30 +4617,71 @@ pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
     let cl = ui.checklist();
     let step = cl.step(&format!("deploying {plugin_name} as {agent_name}"));
     let outcome = match client
-        .deploy(
+        .prepare_deploy(
             &agent_name,
             opts.slack_channel
                 .as_deref()
                 .or_else(|| resolved.as_ref().and_then(|r| r.slack_channel.as_deref())),
             &label,
             &created_by,
-            env,
             archive,
-            &secrets,
+            &match opts.tier {
+                DeployTier::Local => secrets.clone(),
+                DeployTier::Cluster => crate::cluster_secrets::agent_record_secrets(&secrets),
+            },
             opts.repo.as_deref(),
             commit_sha.as_deref(),
             opts.workspace,
         )
         .await
     {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            step.fail("failed");
+            if crate::exit::is_transient_reqwest(&err) {
+                return Err(crate::exit::operator_context(err, opts.connect_hint, None));
+            }
+            return Err(err);
+        }
+    };
+
+    Ok(PreparedDeploy {
+        client,
+        outcome,
+        plugin_name,
+        label,
+        env: env.to_string(),
+        requested_repo: opts.repo,
+        connect_hint: opts.connect_hint,
+        step,
+        tier: opts.tier,
+        plugin_dir,
+    })
+}
+
+pub async fn deploy_prepared(prepared: PreparedDeploy) -> Result<DeployOutput> {
+    let ui = crate::ui::ui();
+    let PreparedDeploy {
+        client,
+        outcome,
+        plugin_name,
+        label,
+        env,
+        requested_repo,
+        connect_hint,
+        step,
+        tier,
+        plugin_dir,
+    } = prepared;
+    let outcome = match client.activate_deploy(outcome, &env).await {
         Ok(outcome) => {
-            step.done(env);
+            step.done(&env);
             outcome
         }
         Err(err) => {
             step.fail("failed");
             if crate::exit::is_transient_reqwest(&err) {
-                return Err(err.context(opts.connect_hint));
+                return Err(crate::exit::operator_context(err, connect_hint, None));
             }
             return Err(err);
         }
@@ -4227,8 +4697,7 @@ pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
     // which repository's pushes deploy this agent produced no output at all.
     // The value read here is the one the API stored, not the one asked for, so
     // a bind the platform dropped falls to the warning above instead (#1212).
-    let bound_repo = opts
-        .repo
+    let bound_repo = requested_repo
         .as_deref()
         .filter(|want| outcome.agent.repo_full_name.as_deref() == Some(*want));
     if let Some(repo) = bound_repo {
@@ -4255,7 +4724,7 @@ pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
     // start no connector. The identity is the one the deploy RESOLVED, never
     // re-read from plugin.json: `--agent`/`--target` can override it, and an
     // alias built from the manifest name is one the runner never dials.
-    if opts.tier == DeployTier::Local {
+    if tier == DeployTier::Local {
         let lock = crate::connector_build::load_lock(&plugin_dir)?.unwrap_or_else(|| {
             crate::connector_build::ConnectorLockFileDecl {
                 version: crate::connector_build::LOCK_VERSION,
@@ -4273,7 +4742,7 @@ pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
     Ok(DeployOutput {
         plugin_name,
         label,
-        env: env.to_string(),
+        env,
         agent_name: outcome.agent.name,
         agent_id: outcome.agent.id,
         version_label: outcome.version.version_label,
@@ -4286,6 +4755,10 @@ pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
         deployment_environment: outcome.deployment.environment,
         deployment_status: outcome.deployment.status,
     })
+}
+
+pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
+    deploy_prepared(prepare_deploy(opts).await?).await
 }
 
 /// Output of `<tier> deploy`: the deployed agent/version/channel/bundle/deployment
@@ -4980,8 +5453,10 @@ pub async fn versions(opts: AgentActionOpts) -> Result<VersionsOutput> {
     })
 }
 
-/// Output of `<tier> memory <agent>`: the dry-run plan, the empty case, or the
-/// learned-memory list. Owns its data so it outlives the `ApiClient`.
+/// Output of `<tier> memory <agent>`: the dry-run plan, the empty case, the
+/// learned-memory list, or an operator-seeded add (#1904). Owns its data so it
+/// outlives the `ApiClient`.
+#[derive(Debug)]
 pub enum MemoryOutput {
     DryRun(crate::ui::DryRunPlan),
     Empty {
@@ -4990,6 +5465,13 @@ pub enum MemoryOutput {
     List {
         agent: String,
         entries: Vec<crate::api::MemoryEntry>,
+    },
+    Added {
+        agent: String,
+        index: u64,
+        content: String,
+        source: String,
+        fresh_session_required: bool,
     },
 }
 
@@ -5007,6 +5489,19 @@ impl crate::ui::CliOutput for MemoryOutput {
                     .collect();
                 serde_json::json!({"agent": agent, "entries": entries})
             }
+            MemoryOutput::Added {
+                agent,
+                index,
+                content,
+                source,
+                fresh_session_required,
+            } => serde_json::json!({
+                "agent": agent,
+                "index": index,
+                "content": content,
+                "source": source,
+                "fresh_session_required": fresh_session_required,
+            }),
         }
     }
 
@@ -5020,6 +5515,21 @@ impl crate::ui::CliOutput for MemoryOutput {
                 ui.payload(&format!("{agent} — {} memory entr(ies):", entries.len()));
                 for e in entries {
                     ui.kv(&format!("#{}", e.index), &e.content);
+                }
+            }
+            MemoryOutput::Added {
+                agent,
+                index,
+                content,
+                source,
+                fresh_session_required,
+            } => {
+                ui.payload(&format!("{agent} — added memory #{index} ({source})"));
+                ui.kv("content", content);
+                if *fresh_session_required {
+                    ui.payload(
+                        "A fresh session is required before this entry is injected at boot.",
+                    );
                 }
             }
         }
@@ -5048,6 +5558,37 @@ pub async fn memory(opts: AgentActionOpts) -> Result<MemoryOutput> {
     })
 }
 
+/// `<tier> memory <agent> --add <content>`: append an operator-authored record.
+pub async fn memory_add(opts: AgentActionOpts, content: String) -> Result<MemoryOutput> {
+    let content = content.trim().to_string();
+    if content.is_empty() {
+        return Err(crate::exit::usage(
+            "memory content must not be empty. Pass the durable lesson with --add.",
+        ));
+    }
+    if opts.dry_run {
+        return Ok(MemoryOutput::DryRun(crate::ui::DryRunPlan {
+            lines: vec![format!(
+                "POST {}/agents/<id>/memory  (would resolve agent {:?} first)",
+                opts.api_url, opts.agent
+            )],
+        }));
+    }
+    let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
+    let agent = client.find_agent(&opts.agent).await?;
+    let entry = client.create_memory(&agent.id, &content).await?;
+    Ok(MemoryOutput::Added {
+        agent: agent.name,
+        index: entry.index,
+        content: entry.content,
+        source: entry
+            .provenance
+            .source
+            .unwrap_or_else(|| "operator".to_string()),
+        fresh_session_required: true,
+    })
+}
+
 /// The pending-list / resolve flags for `local approvals` (#506). Defaulted so
 /// the skill/cluster tiers, which keep only the gate view/set surface, pass an
 /// empty value.
@@ -5059,8 +5600,8 @@ pub struct ApprovalCmd {
     pub reject: bool,
     pub note: Option<String>,
     pub actor_channel: Option<String>,
-    /// `--route NAME=CHANNEL`, repeatable.
-    pub route: Vec<String>,
+    /// `--route-resolution NAME=CHANNEL`, repeatable.
+    pub route_resolution: Vec<String>,
     /// `--route-approvers NAME=users:U1,U2` or `NAME=group:S1`, repeatable.
     pub route_approvers: Vec<String>,
     /// `--routes-from FILE`: the whole binding map as JSON.
@@ -5071,16 +5612,17 @@ pub struct ApprovalCmd {
 
 // --- Approval route bindings (#1052) -----------------------------------------
 //
-// Which channel an approval card posts to, and who may resolve it, live in the
-// agent's `approval_routes` map. Until this verb existed the only way to write
-// one was a hand-rolled `PATCH /agents/{id}`, against the repo's own "one entry
-// point: curie <command>" rule.
+// The verified resolution card, optional text-only notification, and who may
+// resolve live as separate fields in the agent's `approval_routes` map. Until
+// this verb existed the only way to write one was a hand-rolled
+// `PATCH /agents/{id}`, against the repo's own "one entry point: curie
+// <command>" rule.
 //
 // Two properties shape the code below.
 //
 // The write is a FULL REPLACEMENT, exactly as `--gate` already is for
 // `approval_required_tools`. That is the field's semantics on `AgentUpdate`, and
-// a merge would make `--route` unable to express removal.
+// a merge would make the route inputs unable to express removal.
 //
 // Every parse and shape error is collected BEFORE any HTTP call. A partial write
 // of a binding map is a silently widened (or silently narrowed) approver set,
@@ -5096,6 +5638,9 @@ static SLACK_USERGROUP_ID: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"^S[A-Z0-9]{7,}$").expect("usergroup id re"));
 static SLACK_USER_ID: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"^[UW][A-Z0-9]{7,}$").expect("user id re"));
+static CHANNEL_KIND: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"^[a-z0-9]+(?:[-_][a-z0-9]+)*$").expect("channel kind re")
+});
 
 /// Split `NAME=VALUE` once, rejecting an empty half.
 ///
@@ -5105,7 +5650,7 @@ static SLACK_USER_ID: std::sync::LazyLock<regex::Regex> =
 fn split_route_arg<'a>(flag: &str, raw: &'a str) -> Result<(&'a str, &'a str)> {
     let (name, value) = raw.split_once('=').ok_or_else(|| {
         crate::exit::usage(format!(
-            "{flag} {raw:?} is not NAME=VALUE; pass e.g. {flag} deal_desk=C0123ABCD"
+            "{flag} {raw:?} is not NAME=VALUE; pass e.g. {flag} deal_desk=C0EXAMPLE1"
         ))
     })?;
     let (name, value) = (name.trim(), value.trim());
@@ -5190,23 +5735,24 @@ fn parse_route_approvers(value: &str) -> Result<crate::api::ApprovalApprovers> {
     }
 }
 
-/// Build the binding map a write should send, from the three input forms.
+/// Build the binding map a write should send from a strict file plus overrides.
 ///
 /// `--routes-from` seeds the map and the repeatable flags apply on top, so a
 /// committed file can be spot-overridden on the command line. Every error is a
 /// usage error raised before the caller opens a connection.
 fn build_route_bindings(
-    route: &[String],
+    route_resolution: &[String],
     route_approvers: &[String],
     routes_from: Option<&PathBuf>,
-) -> Result<BTreeMap<String, crate::api::ApprovalRouteBinding>> {
-    let mut bindings: BTreeMap<String, crate::api::ApprovalRouteBinding> = BTreeMap::new();
+) -> Result<BTreeMap<String, crate::api::ApprovalRouteBindingWrite>> {
+    let mut bindings: BTreeMap<String, crate::api::ApprovalRouteBindingWrite> = BTreeMap::new();
 
     if let Some(path) = routes_from {
         let text = std::fs::read_to_string(path).map_err(|e| {
             crate::exit::usage(format!(
                 "--routes-from {}: {e}; the file must be JSON shaped \
-                 {{\"<route>\": {{\"channel\": \"C0123ABCD\"}}}}",
+                 {{\"<route>\": {{\"resolution\": \
+                 {{\"kind\": \"slack\", \"address\": \"C0EXAMPLE1\"}}}}}}",
                 path.display()
             ))
         })?;
@@ -5219,7 +5765,8 @@ fn build_route_bindings(
             serde_json::from_str(&text).map_err(|e| {
                 crate::exit::usage(format!(
                     "--routes-from {}: {e}; expected JSON shaped \
-                     {{\"<route>\": {{\"channel\": \"C0123ABCD\", \
+                     {{\"<route>\": {{\"resolution\": \
+                     {{\"kind\": \"slack\", \"address\": \"C0EXAMPLE1\"}}, \
                      \"approvers\": {{\"group\": \"S0123ABCD\"}}}}}}",
                     path.display()
                 ))
@@ -5227,8 +5774,8 @@ fn build_route_bindings(
         for (name, value) in raw {
             // RouteBindingInput is the strict, operator-file twin of the
             // response-side type: it refuses an unknown key instead of dropping
-            // it (#1072). A dropped `approver` would leave a channel-only
-            // binding, which widens the approver set to the whole card channel.
+            // it (#1072). A dropped `approver` would leave authority falling
+            // back to the whole resolution-card channel.
             let input: crate::api::RouteBindingInput =
                 serde_json::from_value(value).map_err(|e| {
                     anyhow::Error::from(
@@ -5237,15 +5784,14 @@ fn build_route_bindings(
                             path.display()
                         ))
                         .with_fix(
-                            "a route binding takes `channel` and an optional `approvers` \
-                             block of `group` or `users`, and nothing else. A dropped \
-                             sibling key would leave a channel-only binding, which makes \
-                             every member of that channel an approver",
+                            "a route binding requires `resolution: {kind: \"slack\", \
+                             address: \"C...\"}` and accepts optional `notification` and \
+                             `approvers` blocks, and nothing else. The retired `channel` key \
+                             is not accepted",
                         ),
                     )
                 })?;
-            let binding: crate::api::ApprovalRouteBinding = input.into();
-            validate_route_channel(&name, &binding.channel)?;
+            let binding: crate::api::ApprovalRouteBindingWrite = input.into();
             if let Some(approvers) = &binding.approvers {
                 validate_parsed_approvers(&name, approvers)?;
             }
@@ -5253,14 +5799,22 @@ fn build_route_bindings(
         }
     }
 
-    for raw in route {
-        let (name, channel) = split_route_arg("--route", raw)?;
-        validate_route_channel(name, channel)?;
+    for raw in route_resolution {
+        let (name, channel) = split_route_arg("--route-resolution", raw)?;
         bindings
             .entry(name.to_string())
-            .and_modify(|b| b.channel = channel.to_string())
-            .or_insert_with(|| crate::api::ApprovalRouteBinding {
-                channel: channel.to_string(),
+            .and_modify(|b| {
+                b.resolution = crate::api::ApprovalResolutionTargetWrite {
+                    kind: "slack".to_string(),
+                    address: channel.to_string(),
+                }
+            })
+            .or_insert_with(|| crate::api::ApprovalRouteBindingWrite {
+                resolution: crate::api::ApprovalResolutionTargetWrite {
+                    kind: "slack".to_string(),
+                    address: channel.to_string(),
+                },
+                notification: None,
                 approvers: None,
             });
     }
@@ -5268,17 +5822,15 @@ fn build_route_bindings(
     for raw in route_approvers {
         let (name, value) = split_route_arg("--route-approvers", raw)?;
         let approvers = parse_route_approvers(value)?;
-        // Approvers narrow an EXISTING binding; without a channel there is
-        // nowhere for the card to post, and the API's model requires one. Refuse
-        // rather than invent a channel.
+        // Approvers narrow an EXISTING binding; without a resolution there is
+        // no verified card surface. Refuse rather than invent one.
         let binding = bindings.get_mut(name).ok_or_else(|| {
             anyhow::Error::from(
                 crate::exit::CliError::usage(format!(
-                    "--route-approvers {name:?} names a route with no channel to post its \
-                     card in"
+                    "--route-approvers {name:?} names a route with no resolution"
                 ))
                 .with_fix(format!(
-                    "add --route {name}=<CHANNEL> to the same invocation (or name the \
+                    "add --route-resolution {name}=<CHANNEL> to the same invocation (or name the \
                      route in --routes-from): a write replaces the whole route map, so \
                      every route it should keep must be present"
                 )),
@@ -5287,7 +5839,136 @@ fn build_route_bindings(
         binding.approvers = Some(approvers);
     }
 
+    // Overrides can invalidate a previously valid file binding (for example,
+    // by moving resolution onto its notification target), so validate only the
+    // complete final map. Nothing reaches HTTP unless every binding survives.
+    for (name, binding) in &bindings {
+        validate_resolution_target(name, &binding.resolution)?;
+        if let Some(notification) = &binding.notification {
+            validate_notification_target(name, notification)?;
+            reject_identical_targets(name, &binding.resolution, notification)?;
+        }
+        if let Some(approvers) = &binding.approvers {
+            validate_parsed_approvers(name, approvers)?;
+        }
+    }
+
     Ok(bindings)
+}
+
+/// The interactive extension point is explicit but remains Slack-only until a
+/// second channel can mint a scoped, verified resolver credential.
+fn validate_resolution_target(
+    route: &str,
+    target: &crate::api::ApprovalResolutionTargetWrite,
+) -> Result<()> {
+    if target.kind != "slack" {
+        return Err(crate::exit::usage(format!(
+            "route {route:?}: resolution kind {:?} is unsupported; only slack can carry \
+             a verified resolver identity",
+            target.kind
+        )));
+    }
+    validate_route_channel(route, &target.address)
+}
+
+/// Validate the notification identity and its independent transport route.
+fn validate_notification_target(
+    route: &str,
+    target: &crate::api::NotificationTargetWrite,
+) -> Result<()> {
+    if !CHANNEL_KIND.is_match(&target.kind) {
+        return Err(crate::exit::usage(format!(
+            "route {route:?}: notification kind {:?} is not a lowercase channel-kind slug",
+            target.kind
+        )));
+    }
+    if target.kind == "slack" {
+        validate_route_channel(route, &target.address)?;
+    } else if target.address.is_empty() || target.address.chars().any(char::is_whitespace) {
+        return Err(crate::exit::usage(format!(
+            "route {route:?}: notification address must be non-empty and contain no whitespace"
+        )));
+    }
+    let complete_transport = target.endpoint.is_some() && target.adapter.is_some();
+    let empty_transport = target.endpoint.is_none() && target.adapter.is_none();
+    if !complete_transport && !empty_transport {
+        return Err(crate::exit::usage(format!(
+            "route {route:?}: notification endpoint and adapter must be supplied together"
+        )));
+    }
+    if target.kind != "slack" && !complete_transport {
+        return Err(crate::exit::CliError::usage(format!(
+            "route {route:?}: non-Slack notification kind {:?} requires both endpoint and adapter",
+            target.kind
+        ))
+        .with_fix(
+            "put the complete notification object in --routes-from, including an absolute \
+             endpoint URL and adapter name",
+        )
+        .into());
+    }
+    if let Some(adapter) = &target.adapter {
+        if !CHANNEL_KIND.is_match(adapter) {
+            return Err(crate::exit::usage(format!(
+                "route {route:?}: notification adapter is not a lowercase slug"
+            )));
+        }
+    }
+    if let Some(endpoint) = &target.endpoint {
+        let parsed = reqwest::Url::parse(endpoint).map_err(|_| {
+            crate::exit::usage(format!(
+                "route {route:?}: notification endpoint must be an absolute http(s) URL with a host"
+            ))
+        })?;
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+            return Err(crate::exit::usage(format!(
+                "route {route:?}: notification endpoint must be an absolute http(s) URL with a host"
+            )));
+        }
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(crate::exit::usage(format!(
+                "route {route:?}: notification endpoint must not contain userinfo; use adapter credentials"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn reject_identical_targets(
+    route: &str,
+    resolution: &crate::api::ApprovalResolutionTargetWrite,
+    notification: &crate::api::NotificationTargetWrite,
+) -> Result<()> {
+    if resolution.kind == notification.kind && resolution.address == notification.address {
+        return Err(crate::exit::usage(format!(
+            "route {route:?}: notification must differ from resolution; a duplicate target \
+             is not a second notification surface"
+        )));
+    }
+    Ok(())
+}
+
+/// Render route bindings for a dry-run without exposing credential-bearing
+/// adapter URL paths, queries, or fragments. The origin is enough to identify
+/// the transport destination; the real PATCH retains the complete endpoint.
+fn route_bindings_plan_json(
+    bindings: &BTreeMap<String, crate::api::ApprovalRouteBindingWrite>,
+) -> String {
+    let mut display = bindings.clone();
+    for binding in display.values_mut() {
+        let Some(endpoint) = binding
+            .notification
+            .as_mut()
+            .and_then(|target| target.endpoint.as_mut())
+        else {
+            continue;
+        };
+        *endpoint = reqwest::Url::parse(endpoint)
+            .map(|url| url.origin().ascii_serialization())
+            .unwrap_or_else(|_| "<redacted>".to_string());
+    }
+    serde_json::to_string(&display).unwrap_or_else(|_| "<unserializable>".to_string())
 }
 
 /// Channel-shape check for one route binding, with the route named in the error.
@@ -5299,8 +5980,8 @@ fn validate_route_channel(route: &str, channel: &str) -> Result<()> {
              receives messages"
         ))
         .with_fix(
-            "pass the channel ID (e.g. C0123ABCD): find it in the channel's About tab, \
-             or at the end of the channel URL (.../archives/C0123ABCD)",
+            "pass the channel ID (e.g. C0EXAMPLE1): find it in the channel's About tab, \
+             or at the end of the channel URL (.../archives/C0EXAMPLE1)",
         )
         .into());
     }
@@ -5377,7 +6058,7 @@ pub enum ApprovalsOutput {
     /// bundle names escalates to a human rather than posting a card.
     Routes {
         agent: String,
-        routes: BTreeMap<String, crate::api::ApprovalRouteBinding>,
+        routes: BTreeMap<String, crate::api::ApprovalRouteBindingResponse>,
     },
 }
 
@@ -5504,10 +6185,18 @@ impl crate::ui::CliOutput for ApprovalsOutput {
                         routes.len()
                     ));
                     for (name, binding) in routes {
-                        // Print WHERE and WHO as separate labelled facts: ADR-0034
-                        // unfused these two axes, and a single collapsed line would
-                        // re-fuse them in the operator's head.
-                        ui.kv(name, &format!("channel {}", binding.channel));
+                        let resolution =
+                            format!("{}:{}", binding.resolution.kind, binding.resolution.address);
+                        ui.kv(
+                            name,
+                            &format!("resolution {resolution} (verified interactive card)"),
+                        );
+                        let notification = binding
+                            .notification
+                            .as_ref()
+                            .map(|target| format!("{}:{} (text-only)", target.kind, target.address))
+                            .unwrap_or_else(|| "(none)".to_string());
+                        ui.kv("", &format!("  notification: {notification}"));
                         ui.kv("", &format!("  approvers: {}", describe_approvers(binding)));
                     }
                 }
@@ -5517,11 +6206,11 @@ impl crate::ui::CliOutput for ApprovalsOutput {
 }
 
 /// One line naming who may resolve a route's approvals, including the default.
-fn describe_approvers(binding: &crate::api::ApprovalRouteBinding) -> String {
+fn describe_approvers(binding: &crate::api::ApprovalRouteBindingResponse) -> String {
     match &binding.approvers {
         None => format!(
-            "members of {} (the default: no approvers block declared)",
-            binding.channel
+            "members of {}:{} (the default: no approvers block declared)",
+            binding.resolution.kind, binding.resolution.address
         ),
         Some(a) => match (&a.users, &a.group) {
             // Mirror the API's precedence in the wording rather than hiding it:
@@ -5583,20 +6272,19 @@ pub async fn approvals(
 ) -> Result<ApprovalsOutput> {
     let gate_mode = clear || !gate.is_empty();
 
-    // --route/--route-approvers/--routes-from/--list-routes/--clear-routes (#1052):
-    // the agent's route bindings, which decide WHERE a card posts and WHO may
-    // resolve it. Handled ahead of every other branch because it is a distinct
+    // The split target/approver flags address the agent's approval route map.
+    // Handled ahead of every other branch because it is a distinct
     // object from both the tool gates and the pending records, and mixing it with
     // either in one invocation would make the write's replace-the-whole-map
     // semantics ambiguous.
-    let route_write = !cmd.route.is_empty()
+    let route_write = !cmd.route_resolution.is_empty()
         || !cmd.route_approvers.is_empty()
         || cmd.routes_from.is_some()
         || cmd.clear_routes;
     if route_write || cmd.list_routes {
         if gate_mode || cmd.list || cmd.resolve.is_some() {
             return Err(crate::exit::usage(
-                "the route-binding flags (--route/--route-approvers/--routes-from/\
+                "the route-binding flags (--route-resolution/--route-approvers/--routes-from/\
                  --list-routes/--clear-routes) address the agent's approval ROUTES; they \
                  cannot be combined with --gate/--clear (tool gates) or --list/--resolve \
                  (pending records). Run them as separate invocations",
@@ -5608,13 +6296,14 @@ pub async fn approvals(
             ));
         }
         if cmd.clear_routes
-            && (!cmd.route.is_empty()
+            && (!cmd.route_resolution.is_empty()
                 || !cmd.route_approvers.is_empty()
                 || cmd.routes_from.is_some())
         {
             return Err(crate::exit::usage(
-                "--clear-routes cannot be combined with --route/--route-approvers/\
-                 --routes-from (clear removes every binding)",
+                "--clear-routes cannot be combined with --route-resolution/\
+                 --route-approvers/--routes-from \
+                 (clear removes every binding)",
             ));
         }
 
@@ -5623,7 +6312,11 @@ pub async fn approvals(
         let bindings = if cmd.clear_routes {
             BTreeMap::new()
         } else {
-            build_route_bindings(&cmd.route, &cmd.route_approvers, cmd.routes_from.as_ref())?
+            build_route_bindings(
+                &cmd.route_resolution,
+                &cmd.route_approvers,
+                cmd.routes_from.as_ref(),
+            )?
         };
 
         if opts.dry_run {
@@ -5631,9 +6324,10 @@ pub async fn approvals(
                 format!(
                     "PATCH {}/agents/<id> approval_routes={} (a FULL REPLACEMENT of the map)",
                     opts.api_url,
-                    // Deliberately not valid JSON. "{}" is the real clear payload, so a
-                    // fallback that looked like "{}" would misreport a full revocation.
-                    serde_json::to_string(&bindings).unwrap_or_else(|_| "<unserializable>".into())
+                    // Deliberately not valid JSON on serialization failure. "{}" is the
+                    // real clear payload, so a fallback that looked like "{}" would
+                    // misreport a full revocation.
+                    route_bindings_plan_json(&bindings)
                 )
             } else {
                 format!(
@@ -5834,7 +6528,7 @@ pub async fn observability(open: bool) -> Result<crate::observability::Observabi
 /// answered authoritatively by the API.
 ///
 /// The `slack` arm rejects a `#name` rather than a channel ID: real Slack
-/// events carry the channel **ID** (e.g. `C0123ABCD`), and the worker's
+/// events carry the channel **ID** (e.g. `C0EXAMPLE1`), and the worker's
 /// binding resolver matches on that ID, so a `#name` value is stored verbatim
 /// and never routes -- a silently dead binding. Fail the deploy up front
 /// instead.
@@ -5842,9 +6536,9 @@ fn validate_channel_binding(kind: &str, address: &str) -> Result<()> {
     if kind == "slack" && address.trim_start().starts_with('#') {
         return Err(crate::exit::usage(format!(
             "slack channel {address:?} is a name, not an ID: real Slack events carry the \
-             channel ID (e.g. C0123ABCD) and the worker routes on it, so a #name binding \
+             channel ID (e.g. C0EXAMPLE1) and the worker routes on it, so a #name binding \
              never receives messages. Pass the channel ID instead -- find it in the \
-             channel's About tab, or the channel URL (.../archives/C0123ABCD)."
+             channel's About tab, or the channel URL (.../archives/C0EXAMPLE1)."
         )));
     }
     Ok(())
@@ -6414,6 +7108,12 @@ pub const MEMORY_REASON: &str =
 /// Where to run `memory` instead.
 pub const MEMORY_ALT: &str =
     "use `curie local memory <agent>` or `curie cluster memory <agent>` for a deployed agent";
+/// Why observability query verbs cannot be answered at this tier.
+pub const OBSERVABILITY_REASON: &str =
+    "the skill tier runs only a bundle runner and has no platform API or observability read service; `--otel-endpoint` can export telemetry but does not create a query API";
+/// Where to query observability, or how to export telemetry from a skill runner.
+pub const OBSERVABILITY_ALT: &str =
+    "use `curie local observability runs|run|metrics` or `curie cluster observability runs|run|metrics`; to export this skill runner's telemetry, restart it with `curie skill up --otel-endpoint <OTLP_URL>` and query through a platform API";
 
 /// `skill versions`: answered, but unavailable at this tier by construction.
 ///
@@ -6443,6 +7143,19 @@ pub fn skill_versions_unavailable() -> anyhow::Error {
 /// (issue #459, ADR-0041).
 pub fn skill_memory_unavailable() -> anyhow::Error {
     crate::exit::unsupported("memory", MEMORY_REASON, MEMORY_ALT)
+}
+
+/// `skill observability runs|run|metrics`: understood, but unavailable here.
+///
+/// A skill runner can emit OTLP when explicitly wired, but it does not host the
+/// API read models these query verbs intentionally use. Decline with ADR-0041's
+/// capability exit (4) rather than bypassing the API to query a backend.
+pub fn skill_observability_unavailable() -> anyhow::Error {
+    crate::exit::unsupported(
+        "observability runs|run|metrics",
+        OBSERVABILITY_REASON,
+        OBSERVABILITY_ALT,
+    )
 }
 
 /// Why `skill approvals --list`/`--resolve` cannot be answered at this tier.
@@ -6478,15 +7191,14 @@ pub const APPROVALS_ROUTES_REASON: &str =
     "an approval route binding is per-agent platform config (agents.approval_routes), and the skill tier runs a bare runner with no platform, no agent record, and therefore nothing to bind a route on";
 /// Where to bind approval routes instead.
 pub const APPROVALS_ROUTES_ALT: &str =
-    "use `curie local approvals <agent> --route <name>=<channel>` or `curie cluster approvals <agent> --route <name>=<channel>` for a deployed agent; the bundle-side half (which routes exist) is the manifest's approvalPolicy, which `curie skill approvals` does show";
+    "use `curie local approvals <agent> --route-resolution <name>=<channel>` or `curie cluster approvals <agent> --route-resolution <name>=<channel>` for a deployed agent; use `--routes-from <file>` to declare a complete route with a text-only notification; the bundle-side half (which routes exist) is the manifest's approvalPolicy, which `curie skill approvals` does show";
 
-/// `skill approvals --route`/`--route-approvers`/`--routes-from`/`--list-routes`/
-/// `--clear-routes`: answered, but unavailable at this tier by construction
-/// (ADR-0041). Accepted so the tier reports WHY (exit 4) rather than erroring
-/// like an unknown-flag typo, matching `--list`/`--resolve` above.
+/// The route-binding inputs are answered but unavailable at this tier by
+/// construction (ADR-0041). Accepted so the tier reports WHY (exit 4) rather
+/// than erroring like an unknown-flag typo, matching `--list`/`--resolve` above.
 pub fn skill_approval_routes_unavailable() -> anyhow::Error {
     crate::exit::unsupported(
-        "approvals --route/--route-approvers/--routes-from/--list-routes/--clear-routes",
+        "approvals --route-resolution/--route-approvers/--routes-from/--list-routes/--clear-routes",
         APPROVALS_ROUTES_REASON,
         APPROVALS_ROUTES_ALT,
     )
@@ -6497,11 +7209,11 @@ mod tests {
     use super::{
         absent_container_note, merge_secret_env, model_credential_summary,
         parse_credential_env_file, parse_manifest_gates, plan_recorded_state,
-        plan_recorded_teardown, plan_skill_down, replace_first_line, report_sweep,
-        resolve_cases_path, resolve_env_file_credentials, seed_env_if_missing,
+        plan_recorded_teardown, plan_skill_down, recorded_ids_match, replace_first_line,
+        report_sweep, resolve_cases_path, resolve_env_file_credentials, seed_env_if_missing,
         select_in_force_deployment, select_passthrough_env, sweep_json_row, sweep_table_row,
         validate_channel_binding, ApprovalGateDecl, DownPlan, EnvSeed, RecordedStatePlan,
-        RecordedTeardown, SweepRow,
+        RecordedStateQuery, RecordedTeardown, SweepRow,
     };
     use serde::Deserialize;
     use std::path::{Path, PathBuf};
@@ -6651,17 +7363,38 @@ mod tests {
         assert!(msg.contains("model-beta"), "{msg}");
     }
 
+    fn recorded_query<'a>(
+        recorded: Option<&'a str>,
+        target: &'a str,
+        replace: bool,
+    ) -> RecordedStateQuery<'a> {
+        RecordedStateQuery {
+            recorded_name: recorded,
+            target_name: target,
+            replace,
+            recorded_id: None,
+            live_id: None,
+            same_bundle_dir: true,
+            recorded_digest: None,
+            current_digest: None,
+        }
+    }
+
     #[test]
     fn replace_clears_a_stale_record_for_the_very_container_it_replaces() {
         // A bundle holding both a stale runner.json and a live container of that
         // name was unrecoverable with --replace: the record refused the boot
         // before the preflight could remove anything (#747).
         assert_eq!(
-            plan_recorded_state(Some("curie-runner-local"), "curie-runner-local", true),
+            plan_recorded_state(recorded_query(
+                Some("curie-runner-local"),
+                "curie-runner-local",
+                true
+            )),
             RecordedStatePlan::ClearAndProceed
         );
         assert_eq!(
-            plan_recorded_state(None, "curie-runner-local", false),
+            plan_recorded_state(recorded_query(None, "curie-runner-local", false)),
             RecordedStatePlan::Proceed
         );
     }
@@ -6671,13 +7404,99 @@ mod tests {
         // Removing one container is no reason to forget another: a record for a
         // different, still-live runner keeps refusing, with or without --replace.
         assert_eq!(
-            plan_recorded_state(Some("curie-runner-local"), "curie-example-42", true),
+            plan_recorded_state(recorded_query(
+                Some("curie-runner-local"),
+                "curie-example-42",
+                true
+            )),
             RecordedStatePlan::Refuse
         );
         assert_eq!(
-            plan_recorded_state(Some("curie-runner-local"), "curie-runner-local", false),
+            plan_recorded_state(recorded_query(
+                Some("curie-runner-local"),
+                "curie-runner-local",
+                false
+            )),
             RecordedStatePlan::Refuse
         );
+    }
+
+    fn verified_query<'a>(
+        replace: bool,
+        recorded_digest: Option<&'a str>,
+        current_digest: Option<&'a str>,
+    ) -> RecordedStateQuery<'a> {
+        RecordedStateQuery {
+            recorded_name: Some("curie-runner-local"),
+            target_name: "curie-runner-local",
+            replace,
+            recorded_id: Some("deadbeef00001111"),
+            live_id: Some("deadbeef0000"),
+            same_bundle_dir: true,
+            recorded_digest,
+            current_digest,
+        }
+    }
+
+    #[test]
+    fn plain_up_replaces_a_verified_same_bundle_when_the_snapshot_differs() {
+        assert_eq!(
+            plan_recorded_state(verified_query(false, Some("aaa"), Some("bbb"))),
+            RecordedStatePlan::ClearAndProceed
+        );
+    }
+
+    #[test]
+    fn plain_up_reports_already_running_when_the_verified_snapshot_matches() {
+        assert_eq!(
+            plan_recorded_state(verified_query(false, Some("aaa"), Some("aaa"))),
+            RecordedStatePlan::AlreadyRunning
+        );
+    }
+
+    #[test]
+    fn replace_still_restarts_a_verified_unchanged_bundle() {
+        assert_eq!(
+            plan_recorded_state(verified_query(true, Some("aaa"), Some("aaa"))),
+            RecordedStatePlan::ClearAndProceed
+        );
+    }
+
+    #[test]
+    fn plain_up_refuses_when_the_snapshot_cannot_be_compared() {
+        assert_eq!(
+            plan_recorded_state(verified_query(false, None, Some("aaa"))),
+            RecordedStatePlan::Refuse
+        );
+        assert_eq!(
+            plan_recorded_state(verified_query(false, Some("aaa"), None)),
+            RecordedStatePlan::Refuse
+        );
+    }
+
+    #[test]
+    fn plain_up_refuses_a_verified_name_whose_container_id_does_not_match() {
+        let mut q = verified_query(false, Some("aaa"), Some("bbb"));
+        q.live_id = Some("cccccccccccc");
+        assert_eq!(plan_recorded_state(q), RecordedStatePlan::Refuse);
+    }
+
+    #[test]
+    fn plain_up_refuses_when_the_record_is_not_this_bundle_directory() {
+        let mut q = verified_query(false, Some("aaa"), Some("bbb"));
+        q.same_bundle_dir = false;
+        assert_eq!(plan_recorded_state(q), RecordedStatePlan::Refuse);
+    }
+
+    #[test]
+    fn recorded_ids_match_across_short_and_long_docker_ids() {
+        assert!(recorded_ids_match(
+            "9f2c1d3e4b5a6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f",
+            "9f2c1d3e4b5a"
+        ));
+        assert!(recorded_ids_match("9f2c1d3e4b5a", "9f2c1d3e4b5a6c7d"));
+        assert!(!recorded_ids_match("", "9f2c1d3e4b5a"));
+        assert!(!recorded_ids_match("aaaa", "bbbb"));
     }
 
     #[test]
@@ -6949,13 +7768,33 @@ mod tests {
 
     #[test]
     fn explicit_cases_path_wins() {
+        let snapshot = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(snapshot.path().join("evals")).unwrap();
+        std::fs::write(snapshot.path().join("evals/cases.json"), "[]").unwrap();
         let path = resolve_cases_path(
             Some(PathBuf::from("/x/cases.json")),
             std::path::Path::new("/nowhere"),
+            Some(snapshot.path()),
             None,
         )
         .unwrap();
         assert_eq!(path, PathBuf::from("/x/cases.json"));
+    }
+
+    #[test]
+    fn missing_recorded_snapshot_cases_do_not_fall_back_to_cwd() {
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cwd.path().join("evals")).unwrap();
+        std::fs::write(cwd.path().join("evals/cases.json"), "[]").unwrap();
+        let snapshot = tempfile::tempdir().unwrap();
+
+        let err = resolve_cases_path(None, cwd.path(), Some(snapshot.path()), None).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("no eval cases found in the running snapshot"),
+            "{message}"
+        );
+        assert!(message.contains("--cases"), "{message}");
     }
 
     #[test]
@@ -6966,20 +7805,20 @@ mod tests {
         std::fs::write(bundle.path().join("evals/cases.json"), "[]").unwrap();
 
         // cwd has no cases: resolve into the bundle dir from the state file.
-        let resolved = resolve_cases_path(None, cwd.path(), Some(bundle.path())).unwrap();
+        let resolved = resolve_cases_path(None, cwd.path(), None, Some(bundle.path())).unwrap();
         assert_eq!(resolved, bundle.path().join("evals/cases.json"));
 
         // cwd cases take precedence once present.
         std::fs::create_dir_all(cwd.path().join("evals")).unwrap();
         std::fs::write(cwd.path().join("evals/cases.json"), "[]").unwrap();
-        let resolved = resolve_cases_path(None, cwd.path(), Some(bundle.path())).unwrap();
+        let resolved = resolve_cases_path(None, cwd.path(), None, Some(bundle.path())).unwrap();
         assert_eq!(resolved, cwd.path().join("evals/cases.json"));
     }
 
     #[test]
     fn errors_when_nothing_is_found() {
         let cwd = tempfile::tempdir().unwrap();
-        let err = resolve_cases_path(None, cwd.path(), None).unwrap_err();
+        let err = resolve_cases_path(None, cwd.path(), None, None).unwrap_err();
         assert!(err.to_string().contains("--cases"), "{err}");
     }
 
@@ -7289,7 +8128,12 @@ mod tests {
     async fn deploy_names_the_remediation_when_api_is_unreachable() {
         let dir = tempfile::tempdir().unwrap();
         crate::scaffold::scaffold(dir.path(), "test-agent").unwrap();
-        let hint = "kubectl -n curie port-forward svc/curie-api 8000:8000";
+        // Exercise local state guidance with its default URL while port 1 below
+        // remains the deterministic connection refusal target.
+        let hint = crate::local::deploy_unreachable_hint(
+            crate::message::DEFAULT_LOCAL_API_URL,
+            Some("curie-api-1   curie-api:dev   curie-api   Up 8 seconds (health: starting)"),
+        );
         let opts = super::DeployOpts {
             agent: None,
             target: None,
@@ -7300,18 +8144,26 @@ mod tests {
             slack_channel: None,
             repo: None,
             workspace: super::WorkspaceIntent::Preserve,
+            tier: super::DeployTier::Local,
             env: Some(super::DeployEnv::Dev),
             label: Some("v0".to_string()),
             secret: vec![],
             secret_binding_supported: true,
-            connect_hint: hint.to_string(),
-            tier: super::DeployTier::Local,
+            connect_hint: hint.clone(),
         };
         let err = super::deploy(opts).await.unwrap_err();
         let rendered = format!("{err:#}");
         assert!(
-            rendered.contains(hint),
-            "hint missing from error: {rendered}"
+            rendered.contains("local stack is still starting"),
+            "the connection error must retain the state aware recovery: {rendered}"
+        );
+        assert!(
+            rendered.contains("curie local status"),
+            "the connection error must direct the operator to inspect local state: {rendered}"
+        );
+        assert!(
+            !rendered.contains("curie local up"),
+            "a starting stack must not be told to start again: {rendered}"
         );
     }
 
@@ -7395,10 +8247,10 @@ mod tests {
 
     #[tokio::test]
     async fn deploy_skips_secrets_gate_when_binding_unsupported() {
-        // AC2: the cluster tier cannot bind a `--secret` until #440, so the
-        // declared-secrets gate is SKIPPED there. A secrets-declaring bundle must
-        // NOT be preempted by the gate; deploy proceeds to the network and fails
-        // on the connect path instead (naming the connect hint, never the secret).
+        // AC2: a tier that cannot bind `--secret` skips the declared-secrets
+        // gate so a secrets-declaring bundle is not preempted with a
+        // remediation that does not exist. Cluster now binds (#1488); this
+        // pin is the skip itself.
         let dir = tempfile::tempdir().unwrap();
         scaffold_with_secrets(dir.path(), "test-agent", &["GITHUB_PERSONAL_ACCESS_TOKEN"]);
 
@@ -8153,8 +9005,8 @@ mod tests {
     }
 
     /// AC2: an unavailable verb must name the concept's absence AND point at the
-    /// tier that answers it. `main`'s human path renders `{err:#}` and discards
-    /// the fix, so both halves have to survive on the Display surface alone.
+    /// tier that answers it. The normal human path renders only the outer message
+    /// and does not emit this error's fix, so both halves must remain in Display.
     #[test]
     fn skill_versions_unavailable_message_names_reason_and_alternative() {
         let shown = format!("{:#}", super::skill_versions_unavailable());

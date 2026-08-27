@@ -186,6 +186,34 @@ fn real_tree_has_no_field_parity_violations() {
 }
 
 #[test]
+fn approval_routes_declare_separate_response_and_write_mirrors() {
+    let manifest = repo_json("cli/api-mirrors.json");
+    let mirrors = manifest["mirrors"].as_array().expect("mirrors array");
+    let schema_for = |name: &str| {
+        mirrors
+            .iter()
+            .find(|entry| entry["struct"] == name)
+            .and_then(|entry| entry["schema"].as_str())
+    };
+
+    assert_eq!(
+        schema_for("ApprovalRouteBindingResponse"),
+        Some("ApprovalRouteBindingOut"),
+        "the tolerant/redacted GET model needs its own API mirror"
+    );
+    assert_eq!(
+        schema_for("ApprovalRouteBindingWrite"),
+        Some("ApprovalRouteBinding"),
+        "the strict PATCH model must mirror the full stored binding"
+    );
+    assert_eq!(
+        schema_for("NotificationTargetWrite"),
+        Some("ApprovalNotificationTarget"),
+        "notification endpoint and adapter belong only to the write mirror"
+    );
+}
+
+#[test]
 fn version_struct_carries_the_full_version_out() {
     // The issue's named drift: `Version` must cover `agent_id` and `bundle_ref`.
     // Checked independently of the generic sweep so a manifest mistake cannot

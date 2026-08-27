@@ -1,21 +1,22 @@
 ---
-seam: Channel / ingress (Slack)
+seam: Channel / ingress
 kind: SOFT
 impls: 1
-grade: C
+grade: B-
 vision_row: Communication
 epics:
   - "#7"
   - "#19"
   - "#27"
   - "#38"
+  - "#1515"
 order: 4
 ---
-# INTERFACE: Channel / ingress (Slack)
+# INTERFACE: Channel / ingress
 
 > Part of the Curie swappable-seam catalog — see the [seam index](../../interfaces.md).
 <!-- BEGIN GENERATED: header (curie dev docs-lint) -->
-> **Kind:** SOFT &nbsp;·&nbsp; **Implementations today:** 1 &nbsp;·&nbsp; **Swap-readiness grade:** C
+> **Kind:** SOFT &nbsp;·&nbsp; **Implementations today:** 1 &nbsp;·&nbsp; **Swap-readiness grade:** B-
 <!-- END GENERATED: header -->
 
 **Kind legend:** CLEAN = a real `Protocol`/typed port class · SOFT = swap via env/URL/prefix/wire, no code interface · NONE = not built yet.
@@ -28,21 +29,33 @@ the egress port the kernel writes replies through (`ReplySink`). Everything betw
 routing, concurrency, sandboxing — is opinionated core and channel-agnostic. Since #7 and
 #19 the ingress payload and the per-turn reply routing are channel-neutral, so this is no
 longer the least-clean seam by its wire contract, and #1459 took the Slack shape off the
-binding surface too; the remaining vendor shape is on the egress semantics (edit-in-place
-streaming, plus posting and settling platform-owned cards). One implementation
-today; the port is the wire + Protocol contract, extracted further only when a second
-channel demands it ("the second implementation teaches the interface").
+binding surface too; the remaining vendor shape is on the egress semantics
+(edit-in-place streaming, plus posting and settling platform-owned cards). Three
+implementations today, Slack, Discord, and email, confirm that the seam boundary is the
+HTTP wire rather than only the in-process port: `adapters/discord` and
+`apps/mail-adapter` are services outside the core that neither construct a `QueuedTurn`
+nor implement `ReplySink`.
 
 ## Current contract
 
-A second channel must produce the ingress payload and satisfy the egress Protocol:
+A channel joins at one of two boundaries: in process, producing the ingress payload and
+satisfying the egress Protocol, or out of process over the HTTP wire.
 
+- **Wire** — the out-of-process boundary, and the one a channel the core has never heard
+  of uses. Ingress is `POST /channels/turns` under a binding-scoped `chn` token; egress is
+  the same four reply events POSTed to the binding's `endpoint` with an
+  `X-Curie-Adapter-Secret` header, addressed by `target.reply_ref`, an opaque
+  adapter-minted handle the platform stores and hands back untouched.
+  [`docs/guides/building-a-channel-adapter.md`](../../guides/building-a-channel-adapter.md)
+  is normative for this boundary, down to the conformance floor an adapter must meet;
+  `apps/mail-adapter` is the worked example.
 - **Ingress** — `QueuedTurn` (`packages/aci-protocol/src/aci_protocol/turn.py::QueuedTurn`),
   a Pydantic model in the frozen ACI package with channel-neutral fields: `event_id`
   (idempotency key), `conversation_id` (the conversation/thread key routing keeps one live
   session per), `author`, `text`, `received_at`, and `reply_handle` — a `ReplyHandle`
-  (`packages/aci-protocol/src/aci_protocol/turn.py::ReplyHandle`) carrying `channel`,
-  required nullable `placeholder`, and an optional per-turn `endpoint`. The Slack adapter
+  (`packages/aci-protocol/src/aci_protocol/turn.py::ReplyHandle`) carrying the required
+  `kind` and `channel` routing pair, required nullable `placeholder`, and an optional
+  per-turn `endpoint`. The Slack adapter
   currently supplies the pre-posted reply ts that the worker edits in place. The
   dispatcher serializes the turn to a single Stream field via `to_stream_fields`
   (`apps/dispatcher/src/curie_dispatcher/queue.py::to_stream_fields`), keyed by
@@ -54,8 +67,8 @@ A second channel must produce the ingress payload and satisfy the egress Protoco
   `cli/src/queue.rs`), so a second ingress adopts the package constant rather than copying
   the literal.
   For the Slack adapter, `event_id` is the Slack event id, `conversation_id` is the thread
-  ts, `author` is the Slack user id, and `reply_handle` carries the Slack channel plus the
-  placeholder ts.
+  ts, `author` is the Slack user id, and `reply_handle` carries the `slack` kind, Slack
+  channel, and placeholder ts.
 - **Egress** — the `ReplySink` Protocol (`apps/worker/src/curie_worker/reply_sink.py::ReplySink`),
   whose one method is `async def emit(self, event, *, route, best_effort_unreachable=False)`
   (`apps/worker/src/curie_worker/reply_sink.py::ReplySink.emit`) — four versioned neutral
@@ -86,24 +99,32 @@ A second channel must produce the ingress payload and satisfy the egress Protoco
   (`apps/worker/src/curie_worker/mrkdwn.py::to_mrkdwn`) and the Block Kit rendering in
   `render` (`apps/worker/src/curie_worker/blocks.py::render`) and `approval_card`
   (`apps/worker/src/curie_worker/blocks.py::approval_card`).
-- **Binding** — a channel resolves to a deployment by `agent_channels.address`
-  equality in `BindingResolver.resolve` (`apps/worker/src/curie_worker/binding.py::BindingResolver.resolve`).
-  The binding is written as a neutral `{kind, address}` pair (ADR-0096, #1459), so a second
-  channel binds its agent without a schema change. An agent may hold several bindings
-  (ADR-0118); ingress still resolves one inbound `{kind, address}` pair to exactly one row.
+- **Binding** — a channel resolves to a deployment by exact `(kind, address)` equality in
+  `BindingResolver.resolve` (`apps/worker/src/curie_worker/binding.py::BindingResolver.resolve`).
+  Both halves are required, with no address-only fallback, and uniqueness is on the same
+  pair. The binding is written as a neutral `{kind, address}` pair (ADR-0096, #1459), so a
+  second channel binds its agent without a schema change and the same address may belong to
+  different adapter kinds.
 
 ## Implementations today
 
-One: Slack. Ingress is `apps/dispatcher` (Bolt / Socket Mode); egress is
-`SlackReplyAdapter` (`apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter`) on the Slack Web API. The swap proof that the
-protocol (not just the service) is the seam: the Rust CLI mints the exact
+One proven first-party production channel: Slack. Ingress is `apps/dispatcher`
+(Bolt / Socket Mode); egress is `SlackReplyAdapter`
+(`apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter`) on the Slack
+Web API. `HttpReplyAdapter`
+(`apps/worker/src/curie_worker/reply_sink.py::HttpReplyAdapter`) is also
+shipped for configured non-Slack endpoints and consumes the same versioned
+neutral events, but it is not evidence of a complete second production-channel
+lifecycle. The swap proof that the protocol (not just the service) is the seam:
+the Rust CLI mints the exact
 `QueuedTurn` wire payload with the same channel-neutral fields
 (`cli/src/queue.rs`) and drives the whole deployed system with zero Slack contact
 via `curie local message` / `cluster message` (`cli/src/chat.rs`, `cli/src/message.rs`).
 
 ## Known leakage
 
-Two ends and the binding surface were cleaned; what remains is egress semantics.
+Two ends and the binding surface were cleaned; what remains is egress semantics and
+incomplete adapter coverage and conformance.
 
 - **Fixed (#7).** The ingress field names were Slack's (`slack_event_id`, `thread_ts`,
   `placeholder_ts`); the payload was promoted into `packages/aci-protocol` as `QueuedTurn`
@@ -117,12 +138,11 @@ Two ends and the binding surface were cleaned; what remains is egress semantics.
   refused rather than handed the platform bot token.
 - **Still leaks — egress semantics.** The streamed reply is edit-a-placeholder: it runs on
   Slack's `chat.update` against the message the ingress already posted, so a channel with no
-  in-place edit must emulate it. That is no longer the whole egress model, though: the
-  adapter also really posts, via `chat.postMessage`, for platform-owned messages such as the
-  approval card, and settles that card in place afterwards (expired in #419, resolved in
-  #1084). A second channel therefore has to support three shapes, not one: repeatedly
-  editing one streamed message, posting an interactive card and returning its id, and
-  editing that card into a settled, non-interactive form.
+  in-place edit must emulate it. That is no longer the whole egress model: the adapter also
+  posts platform-owned messages such as approval cards and settles them in place afterwards.
+  Email is another datapoint: it accumulates reply events per
+  `(conversation_id, reply_ref)` and sends one threaded mail on `turn.completed`
+  (`apps/mail-adapter/src/curie_mail_adapter/adapter.py::MailAdapter.send_reply`).
 - **Fixed (#1459, ADR-0096).** The binding surface was Slack-typed in the control plane, not
   just at the channel edges: the agents table carried a `slack_channel` column, and agent
   create/update validated it as a Slack channel id, so binding any other channel kind took a
@@ -133,11 +153,14 @@ Two ends and the binding surface were cleaned; what remains is egress semantics.
   validates on its own address shape, an unregistered one on a generic non-empty rule, so a
   new kind binds with no schema change. Still no multi-channel adapter framework (#27) — the
   restraint stands; only the Slack-shaped assumption is gone.
-- **Still leaks — `kind` is stored, not routed.** The queue wire carries no channel kind, so
-  the resolver matches on `address` alone and the uniqueness constraint is on `address`
-  alone. Until `ReplyHandle` carries a kind, two adapters cannot own the same address, and
-  `kind` selects the address validator and names the owning adapter without deciding
-  anything at routing time.
+- **Fixed (#1459, ADR-0096 phase 2).** `ReplyHandle.kind` is required, and the worker
+  resolves the required `(kind, address)` pair with uniqueness on that same pair. There is
+  no address-only overload or default kind: two adapters can own the same address without
+  silently selecting one another's binding.
+- **Still leaks — adapter coverage and conformance.** Slack is the only registered kind, and
+  there is no multi-channel adapter framework or a second adapter proving conformance yet
+  (#27). The routing pair removes the binding ambiguity; it does not by itself implement or
+  verify another adapter's ingress and egress behavior.
 
 ## Cross-links
 
@@ -146,7 +169,7 @@ Two ends and the binding surface were cleaned; what remains is egress semantics.
 - **Epic(s):** #19 — per-turn reply routing (landed)
 - **Epic(s):** #27 — deliberately defers a pluggable multi-channel framework
 - **Epic(s):** #38 — channel-seam hardening / follow-up
-- **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — Job 6 (Communication channel), grade C
+- **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — Job 6 (Communication channel), grade B-
 - **ADR(s):** none directly on this seam
 - **Interaction contract:** [Channel interaction](../channel-interaction/INTERFACE.md)
   defines the semantic reply before this Slack adapter renders it.

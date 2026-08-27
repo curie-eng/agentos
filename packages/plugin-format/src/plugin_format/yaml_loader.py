@@ -1,7 +1,7 @@
 """Load Curie owned YAML without silently replacing repeated keys."""
 
 from collections.abc import Hashable
-from typing import Any
+from typing import Any, cast
 
 import yaml
 from yaml.constructor import ConstructorError
@@ -80,4 +80,4 @@ def safe_load_unique(text: str) -> Any:
     try:
         return loader.get_single_data()
     finally:
-        loader.dispose()  # type: ignore[no-untyped-call]
+        cast(Any, loader).dispose()

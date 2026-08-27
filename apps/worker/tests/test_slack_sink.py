@@ -36,6 +36,7 @@ from channel_protocol.reply import (
     SettledOutcome,
     TurnStatus,
 )
+from curie_worker import slack_sink as slack_sink_module
 from curie_worker.config import WorkerConfig
 from curie_worker.reply_sink import TargetRoute
 from curie_worker.slack_sink import SlackReplyAdapter, UntrustedSlackEndpointError
@@ -56,9 +57,7 @@ _ELSEWHERE = "https://slack.com/elsewhere/"
 def _target(
     *, channel: str = "C1", ts: str | None = "1.1", thread: str | None = None
 ) -> ReplyTarget:
-    return ReplyTarget(
-        kind="slack", address=channel, conversation_id=thread, reply_ref=ts
-    )
+    return ReplyTarget(kind="slack", address=channel, conversation_id=thread, reply_ref=ts)
 
 
 def _update(
@@ -274,9 +273,9 @@ def test_update_renders_status_and_link_blocks_for_a_reply() -> None:
     sink._client_for(None).chat_update = _fake_chat_update  # type: ignore[method-assign]
 
     text = (
-        '```curie-reply\n'
+        "```curie-reply\n"
         '{"status": "Working", "text": "body", "links": [["Docs", "https://x/y"]]}\n'
-        '```'
+        "```"
     )
     asyncio.run(_update(sink, text=text))
 
@@ -284,9 +283,7 @@ def test_update_renders_status_and_link_blocks_for_a_reply() -> None:
     assert isinstance(blocks, list)
     assert blocks[0]["type"] == "context"  # status context leads  # type: ignore[index]
     link_actions = [
-        b
-        for b in blocks
-        if b["type"] == "actions" and any("url" in e for e in b["elements"])
+        b for b in blocks if b["type"] == "actions" and any("url" in e for e in b["elements"])
     ]
     assert link_actions, "expected an actions block of URL link buttons"
     assert link_actions[0]["elements"][0]["url"] == "https://x/y"
@@ -298,16 +295,23 @@ def test_update_renders_status_and_link_blocks_for_a_reply() -> None:
 # once and never re-enqueues.
 
 
-def test_update_falls_back_to_text_only_on_slack_api_error() -> None:
+def test_update_falls_back_to_text_only_on_slack_api_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     sink = SlackReplyAdapter("xoxb-test")
     calls: list[dict[str, object]] = []
+    metrics: list[tuple[str, dict[str, str]]] = []
+
+    monkeypatch.setattr(
+        slack_sink_module,
+        "record_metric",
+        lambda name, *, attributes: metrics.append((name, attributes)),
+    )
 
     async def _fake_chat_update(**kwargs: object) -> None:
         calls.append(kwargs)
         if "blocks" in kwargs:  # the first (with-blocks) call is rejected
-            raise SlackApiError(
-                "invalid_blocks", {"ok": False, "error": "invalid_blocks"}
-            )
+            raise SlackApiError("invalid_blocks", {"ok": False, "error": "invalid_blocks"})
 
     sink._client_for(None).chat_update = _fake_chat_update  # type: ignore[method-assign]
 
@@ -319,6 +323,54 @@ def test_update_falls_back_to_text_only_on_slack_api_error() -> None:
     second = calls[1]
     assert "blocks" not in second  # the retry is text-only
     assert second["text"] == "body"  # same accessibility fallback text
+    assert metrics == [
+        (
+            "curie.reply.retry",
+            {
+                "service.name": "curie-worker",
+                "operation": "update",
+                "role": "client",
+                "retry_class": "block-fallback",
+            },
+        )
+    ]
+
+
+def test_update_labels_a_429_retry_as_rate_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = SlackReplyAdapter("xoxb-test")
+    metrics: list[dict[str, str]] = []
+    monkeypatch.setattr(
+        slack_sink_module,
+        "record_metric",
+        lambda _name, *, attributes: metrics.append(attributes),
+    )
+    calls = 0
+
+    async def _fake_chat_update(**kwargs: object) -> None:
+        nonlocal calls
+        calls += 1
+        if "blocks" in kwargs:
+            raise SlackApiError(
+                "ratelimited",
+                {"ok": False, "error": "ratelimited", "status_code": 429},
+            )
+
+    sink._client_for(None).chat_update = _fake_chat_update  # type: ignore[method-assign]
+    text = '```curie-reply\n{"header": "Hi", "text": "body"}\n```'
+
+    asyncio.run(_update(sink, text=text))
+
+    assert calls == 2
+    assert metrics == [
+        {
+            "service.name": "curie-worker",
+            "operation": "update",
+            "role": "client",
+            "retry_class": "rate-limit",
+        }
+    ]
 
 
 def test_update_fallback_text_stays_within_slack_text_cap() -> None:
@@ -349,9 +401,17 @@ def test_update_fallback_text_stays_within_slack_text_cap() -> None:
     assert len(final["text"]) <= 40000
 
 
-def test_update_does_not_retry_when_blocks_update_succeeds() -> None:
+def test_update_does_not_retry_when_blocks_update_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     sink = SlackReplyAdapter("xoxb-test")
     calls: list[dict[str, object]] = []
+    metrics: list[str] = []
+    monkeypatch.setattr(
+        slack_sink_module,
+        "record_metric",
+        lambda name, *, attributes: metrics.append(name),
+    )
 
     async def _fake_chat_update(**kwargs: object) -> None:
         calls.append(kwargs)
@@ -363,6 +423,7 @@ def test_update_does_not_retry_when_blocks_update_succeeds() -> None:
 
     assert len(calls) == 1  # a spurious retry would make this 2
     assert isinstance(calls[0].get("blocks"), list)
+    assert metrics == []
 
 
 # --- #530: fall back to the default transport when a resumed reply endpoint is
@@ -384,9 +445,17 @@ def _record_call(sink_calls, label):
     return _fake
 
 
-def test_update_falls_back_to_default_when_endpoint_unreachable() -> None:
+def test_update_falls_back_to_default_when_endpoint_unreachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     sink = SlackReplyAdapter("xoxb-test", base_url=_DEFAULT)
     landed: list[str] = []
+    metrics: list[dict[str, str]] = []
+    monkeypatch.setattr(
+        slack_sink_module,
+        "record_metric",
+        lambda _name, *, attributes: metrics.append(attributes),
+    )
     # The per-turn client's PATH is dead (a stub whose route moved) -> connection
     # error on a trusted origin, which is the surviving #530 shape under D4.4.
     sink._client_for(_STUB).chat_update = _raise_connection_error()  # type: ignore[method-assign]
@@ -395,6 +464,14 @@ def test_update_falls_back_to_default_when_endpoint_unreachable() -> None:
     asyncio.run(_update(sink, text="hi", endpoint=_STUB))
 
     assert landed == ["default"], "the resumed reply must land on the default transport"
+    assert metrics == [
+        {
+            "service.name": "curie-worker",
+            "operation": "update",
+            "role": "client",
+            "retry_class": "transport-fallback",
+        }
+    ]
 
 
 def test_slack_api_error_is_not_treated_as_unreachable() -> None:
@@ -508,9 +585,7 @@ def test_slack_api_error_not_swallowed_even_with_best_effort() -> None:
     sink._client_for(None).chat_update = _record_call(default_hits, "default")  # type: ignore[method-assign]
 
     with pytest.raises(SlackApiError):
-        asyncio.run(
-            _update(sink, text="hi", endpoint=_STUB, best_effort_unreachable=True)
-        )
+        asyncio.run(_update(sink, text="hi", endpoint=_STUB, best_effort_unreachable=True))
     assert default_hits == [], (
         "a SlackApiError must not fall back to the default, best-effort or not"
     )
@@ -592,13 +667,16 @@ def test_post_renders_the_approval_card_from_a_confirm_intent() -> None:
             channel="C1",
             message=_approval_message("appr-1", "Give ACME a 20% discount"),
             requested_by="U_AE",
-            thread="th-card",
+            # A ts Slack could actually mint. It used to read "th-card", which no
+            # real thread is named; the adapter now refuses a conversation id that
+            # is not a timestamp, because a hook mints one that is not.
+            thread="1787792627.881000",
         )
     )
 
     assert ack.ref == "9.9"
     assert captured["channel"] == "C1"
-    assert captured["thread_ts"] == "th-card"
+    assert captured["thread_ts"] == "1787792627.881000"
     assert "Give ACME a 20% discount" in captured["text"]  # accessibility fallback
     blocks = captured["blocks"]
     assert isinstance(blocks, list)
@@ -694,9 +772,7 @@ def test_update_message_renders_the_expired_card() -> None:
                 version=REPLY_WIRE_VERSION,
                 event="reply.update",
                 target=_target(ts="9.9"),
-                message=OutboundMessage(
-                    version=MESSAGE_VERSION, text="Give ACME a 20% discount"
-                ),
+                message=OutboundMessage(version=MESSAGE_VERSION, text="Give ACME a 20% discount"),
             ),
             route=TargetRoute(),
         )
@@ -756,3 +832,86 @@ def test_best_effort_still_falls_back_to_default_when_present() -> None:
 
     asyncio.run(_update(sink, text="hi", endpoint=_STUB, best_effort_unreachable=True))
     assert landed == ["default"], "the flag must not bypass the #530 default-transport fallback"
+
+
+# --- A triggered turn's conversation id is not a Slack thread (hook delivery) ---
+#
+# `POST /hooks/{agent}/{name}` mints `hook:<agent>:<name>` as the conversation id,
+# deliberately disjoint from Slack thread ids so a hook can never land inside a
+# human conversation. Passing it through as `thread_ts` made Slack refuse the
+# delivery with `invalid_thread_ts` AFTER the turn had already run: the whole
+# investigation happened, cost real money, and the answer was dropped.
+
+
+def _hook_update(sink: SlackReplyAdapter, *, conversation: str | None) -> object:
+    """A placeholder-less reply.update, the shape a triggered turn produces."""
+    return sink.emit(
+        ReplyUpdate(
+            version=REPLY_WIRE_VERSION,
+            event="reply.update",
+            target=ReplyTarget(
+                kind="slack", address="C1", conversation_id=conversation, reply_ref=None
+            ),
+            text="what I found",
+        ),
+        route=TargetRoute(endpoint=None),
+    )
+
+
+def _record_post(sink: SlackReplyAdapter, seen: dict[str, object]) -> None:
+    async def _fake_post(**kwargs: object) -> dict[str, object]:
+        seen.update(kwargs)
+        return {"ts": "9.9"}
+
+    sink._client_for(None).chat_postMessage = _fake_post  # type: ignore[method-assign]
+
+
+@pytest.mark.anyio
+async def test_a_hook_conversation_id_posts_at_channel_level() -> None:
+    sink = SlackReplyAdapter("xoxb-test", base_url=_DEFAULT)
+    seen: dict[str, object] = {}
+    _record_post(sink, seen)
+
+    ack = await _hook_update(sink, conversation="hook:ede69396-9917-4a30-b0af-6a65ccc7b297:alert")
+
+    assert seen["thread_ts"] is None, seen
+    # The minted ts still comes back, so the rest of the turn edits one message.
+    assert ack.ref == "9.9"
+
+
+@pytest.mark.anyio
+async def test_a_slack_thread_ts_still_threads() -> None:
+    sink = SlackReplyAdapter("xoxb-test", base_url=_DEFAULT)
+    seen: dict[str, object] = {}
+    _record_post(sink, seen)
+
+    await _hook_update(sink, conversation="1787792627.881000")
+
+    assert seen["thread_ts"] == "1787792627.881000", seen
+
+
+@pytest.mark.anyio
+async def test_a_hook_conversation_id_does_not_thread_an_approval_card() -> None:
+    # The same coercion sits on the ReplyPost path, which is how an approval card
+    # posts. A hook-triggered gated call would fail to raise its card at all.
+    sink = SlackReplyAdapter("xoxb-test", base_url=_DEFAULT)
+    seen: dict[str, object] = {}
+    _record_post(sink, seen)
+
+    await sink.emit(
+        ReplyPost(
+            version=REPLY_WIRE_VERSION,
+            event="reply.post",
+            target=ReplyTarget(
+                kind="slack",
+                address="C1",
+                conversation_id="hook:ede69396-9917-4a30-b0af-6a65ccc7b297:alert",
+                reply_ref=None,
+            ),
+            message=OutboundMessage(version=MESSAGE_VERSION, text="approve?"),
+            requested_by="U_AE",
+        ),
+        route=TargetRoute(endpoint=None),
+    )
+
+    assert seen["thread_ts"] is None, seen
