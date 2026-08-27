@@ -32,9 +32,11 @@ fenced delivery lease**:
    deduplication on `event_id`; it does not mean an impossible exactly-once
    network send.
 
-This does not implement the fix, alter a frozen contract, or duplicate the two
-active #1532 recovery tasks. Their Slack-delivery and rollout-race findings are
-inputs to the eventual implementation.
+This does not implement the fix, alter a frozen contract, or duplicate the
+narrower #1532 recovery work. The rollout fix later merged and its
+terminating-worker avoidance and dead-consumer discovery are inputs to the
+eventual implementation. The reply-lifecycle task's recorded ownership-policy
+blocker is resolved by ADR-0130.
 
 ## Precondition and scope
 
@@ -191,10 +193,12 @@ other provider's thirty-minute behavior.
 
 ### Semantics to pin
 
-- **Budget:** one monotonic deadline for a delivery, including claim, runner
-  calls, retry backoff, and terminal cleanup. Default remains 600 seconds for
-  compatibility; the supported configured value is 1,800 seconds. Attempts use
-  `remaining = deadline - monotonic_now`; they do not multiply the budget.
+- **Budget:** one deadline for a delivery, including claim, runner calls, retry
+  backoff, reclaim, and terminal cleanup. Default remains 600 seconds for
+  compatibility; the supported configured value is 1,800 seconds. The initial
+  owner persists the deadline from Valkey server time; each process enforces its
+  remaining slice with a locally anchored monotonic clock. Attempts and reclaim
+  do not multiply or reset the budget.
 - **Lease:** authority to process and settle one stream entry. It is distinct
   from the logical thread lock, sandbox route TTL, runner liveness, and
   user-facing progress.
@@ -226,6 +230,8 @@ For each `(stream, group, entry_id)`:
 - Lease value: a random owner token plus a monotonically increasing fencing
   generation.
 - Lease TTL: `deliveryLeaseSeconds`.
+- Delivery state: the Valkey-time deadline and fencing generation, retained
+  through the budget plus shutdown reserve.
 - Existing event keys: done marker, side-effect marker, and completion outbox.
 
 The fencing generation is not a public or ACI field. It is internal worker
@@ -260,8 +266,9 @@ On each maintenance pass:
 1. Scan PEL entries whose idle time is at least the lease duration.
 2. Skip entries with a matching unexpired lease before delivery-cap evaluation.
 3. Dead-letter an over-cap entry only when no live lease protects it.
-4. `XAUTOCLAIM` an expired/unleased entry, then atomically acquire a new fencing
-   generation. If acquisition loses a race, do not dispatch.
+4. Use one Valkey-scripted operation to transfer an expired/unleased PEL entry,
+   increment its fencing generation, and publish the new lease. If transfer
+   loses a race, do not dispatch.
 5. Check the side-effect marker before any retry. If present, settle to human
    escalation; never execute the runner again.
 6. Probe the retained runner. If it still reports an active turn, interrupt and
@@ -287,11 +294,11 @@ Replace the separate ownership-blind terminal writes with one
 4. Return `won`; only that caller may attempt terminal delivery.
 
 A lease loser returns without ACK or terminal output. The current outbox then
-retries `turn.completed` by stable `event_id`. Every adapter must deduplicate
-that event id before applying a terminal effect; Slack's edit of the same
-placeholder is naturally idempotent, while non-Slack adapters need an explicit
-receipt store. ACK and lease deletion happen only after the kernel returns a
-settled result.
+retries `turn.completed` by stable `event_id`. An adapter may claim exactly-once
+terminal effect only when its receiving boundary applies that identifier
+idempotently or it mutates one stable target. A sender-side receipt flag cannot
+close the apply-success/ack-loss window. ACK and lease deletion happen only
+after the kernel returns a settled result.
 
 ### Shutdown and rollout
 
