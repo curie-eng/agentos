@@ -1,4 +1,4 @@
-# 126. A write connector declares permitted field paths, and the agent composes within them
+# 133. A write connector declares permitted field paths, and the agent composes within them
 
 Date: 2026-08-26
 
