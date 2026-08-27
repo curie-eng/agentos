@@ -4593,6 +4593,14 @@ export const commandManifest = {
                   "long": "slack-channel",
                   "positional": false,
                   "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Keep the approval-gated restart tool, scoped to these Deployments (`namespace/name`, comma separated). One list renders BOTH ceilings: the Role's resourceNames and the connector's K8S_WRITE_ALLOWLIST. Omit to install read only",
+                  "id": "write_allowlist",
+                  "long": "write-allowlist",
+                  "positional": false,
+                  "required": false
                 }
               ],
               "hidden": false,
