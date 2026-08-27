@@ -14,8 +14,17 @@
 //! with a credential mounted and nothing referencing it -- the kind of leak
 //! nobody notices because nothing breaks.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+
+use crate::secrets::{
+    keys_being_replaced, replacement_warning_line, write_intent_line, SecretScope,
+};
 
 /// Marks every object this command owns, so pruning can find them again.
 pub const OWNER_LABEL: &str = "curie.dev/connector-owner";
@@ -165,6 +174,114 @@ pub fn app_name_args(namespace: &str, release: &str) -> Vec<String> {
         "-o".into(),
         r"jsonpath={.items[0].metadata.labels.app\.kubernetes\.io/name}".into(),
     ]
+}
+
+/// `kubectl` argv for the current kubeconfig's cluster identity material.
+pub fn kubeconfig_view_args() -> Vec<String> {
+    vec![
+        "kubectl".into(),
+        "config".into(),
+        "view".into(),
+        "--minify".into(),
+        "--raw".into(),
+        "-o".into(),
+        "json".into(),
+    ]
+}
+
+/// `kubectl` argv that lists a Secret without decoding its values on this side.
+pub fn get_secret_args(namespace: &str, name: &str) -> Vec<String> {
+    vec![
+        "kubectl".into(),
+        "-n".into(),
+        namespace.into(),
+        "get".into(),
+        "secret".into(),
+        name.into(),
+        "-o".into(),
+        "json".into(),
+    ]
+}
+
+/// A captured kubeconfig target. Connector reads and writes always name this
+/// snapshot explicitly, never a subsequently changed ambient context.
+#[derive(Clone, Debug)]
+pub struct ClusterTarget {
+    pub scope: SecretScope,
+    kubeconfig: Arc<tempfile::NamedTempFile>,
+}
+
+impl ClusterTarget {
+    fn args(&self, argv: &[String]) -> Vec<String> {
+        let mut result = vec![
+            "kubectl".into(),
+            "--kubeconfig".into(),
+            self.kubeconfig.path().display().to_string(),
+        ];
+        result.extend(argv.iter().skip(1).cloned());
+        result
+    }
+
+    async fn revalidate_ambient_binding(&self) -> Result<()> {
+        if discover_cluster_identity().await? != self.scope.cluster_identity {
+            anyhow::bail!(
+                "current kubectl context no longer matches the connector target {}; refusing to mutate the captured target",
+                self.scope.describe()
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Fingerprint of the kube-apiserver this kubeconfig currently points at.
+///
+/// SHA-256 of `server` plus CA material so two clusters with the same release
+/// name still differ. The digest is the stored identity; the raw CA PEM is never
+/// retained as the key.
+pub fn cluster_identity_from_kubeconfig_view(view: &Value) -> Result<String> {
+    let cluster = view
+        .get("clusters")
+        .and_then(|clusters| clusters.as_array())
+        .and_then(|clusters| clusters.first())
+        .and_then(|entry| entry.get("cluster"))
+        .ok_or_else(|| {
+            crate::exit::usage(
+                "kubectl config view returned no cluster; cannot scope connector secrets",
+            )
+        })?;
+    let server = cluster.get("server").and_then(Value::as_str).unwrap_or("");
+    let ca = cluster
+        .get("certificate-authority-data")
+        .and_then(Value::as_str)
+        .or_else(|| cluster.get("certificate-authority").and_then(Value::as_str))
+        .unwrap_or("");
+    if server.is_empty() && ca.is_empty() {
+        return Err(crate::exit::usage(
+            "kubectl config view has no server or certificate authority; cannot scope connector secrets",
+        ));
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(server.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(ca.as_bytes());
+    let digest = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    Ok(format!("ca:{digest}"))
+}
+
+/// Key names present on a live Secret object. Values (base64 or plaintext) are
+/// discarded so replacement detection cannot leak them into logs.
+pub fn secret_key_names(obj: &Value) -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+    for field in ["data", "stringData"] {
+        if let Some(map) = obj.get(field).and_then(Value::as_object) {
+            keys.extend(map.keys().cloned());
+        }
+    }
+    keys
 }
 
 /// Serialize a manifest list as a single JSON `List` for one apply invocation.
@@ -326,6 +443,107 @@ mod tests {
         let args = apply_args("ns");
         assert_eq!(args.last().unwrap(), "-");
     }
+
+    #[test]
+    fn cluster_identity_changes_when_the_ca_changes() {
+        let a = json!({
+            "clusters": [{"cluster": {
+                "server": "https://cluster-a.example.com",
+                "certificate-authority-data": "Y2EtYQ=="
+            }}]
+        });
+        let b = json!({
+            "clusters": [{"cluster": {
+                "server": "https://cluster-b.example.com",
+                "certificate-authority-data": "Y2EtYg=="
+            }}]
+        });
+        let id_a = cluster_identity_from_kubeconfig_view(&a).unwrap();
+        let id_b = cluster_identity_from_kubeconfig_view(&b).unwrap();
+        assert!(id_a.starts_with("ca:"));
+        assert_ne!(id_a, id_b);
+        assert!(!id_a.contains("example.com"));
+        assert!(!id_a.contains("Y2Et"));
+    }
+
+    #[test]
+    fn secret_key_names_ignore_values() {
+        let obj = json!({
+            "data": {"K8S_WRITE_KUBECONFIG": "dG9rZW4tYQ=="},
+            "stringData": {"OTHER": "should-not-appear-as-a-logged-value"}
+        });
+        let keys = secret_key_names(&obj);
+        assert!(keys.contains("K8S_WRITE_KUBECONFIG"));
+        assert!(keys.contains("OTHER"));
+        let rendered = format!("{keys:?}");
+        assert!(!rendered.contains("dG9rZW4"));
+        assert!(!rendered.contains("should-not-appear"));
+    }
+
+    #[test]
+    fn get_secret_args_do_not_decode_values() {
+        let args = get_secret_args("curie", "acme-bot-connector-secrets");
+        assert!(args.contains(&"json".to_string()));
+        assert!(!args.iter().any(|a| a.contains("go-template")));
+    }
+
+    fn with_isolated_store<T>(body: impl FnOnce() -> T) -> T {
+        let _lock = crate::PROCESS_ENV_LOCK.lock().expect("env lock");
+        let dir = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("CURIE_CONFIG_DIR");
+        std::env::set_var("CURIE_CONFIG_DIR", dir.path());
+        let result = body();
+        match previous {
+            Some(value) => std::env::set_var("CURIE_CONFIG_DIR", value),
+            None => std::env::remove_var("CURIE_CONFIG_DIR"),
+        }
+        result
+    }
+
+    #[test]
+    fn prepare_writes_the_matching_cluster_secret_and_refuses_the_other() {
+        with_isolated_store(|| {
+            let a = SecretScope {
+                cluster_identity: "ca:a".into(),
+                release: "curie".into(),
+                namespace: "curie-test".into(),
+            };
+            let b = SecretScope {
+                cluster_identity: "ca:b".into(),
+                release: "curie".into(),
+                namespace: "curie".into(),
+            };
+            crate::secrets::save_scoped_value("K8S_WRITE_KUBECONFIG", &a, "token-a", None).unwrap();
+            let prepared = prepare(
+                &[],
+                &BTreeMap::new(),
+                "acme-bot-connector-secrets",
+                &["K8S_WRITE_KUBECONFIG".to_string()],
+                &a,
+                "acme-bot",
+            )
+            .unwrap();
+            let intent = prepared.write_intent().unwrap();
+            assert!(intent.contains("K8S_WRITE_KUBECONFIG"));
+            assert!(!intent.contains("token-a"));
+            assert_eq!(
+                prepared.source_lines(),
+                vec!["K8S_WRITE_KUBECONFIG: scoped stored secret (version 1)".to_string()]
+            );
+            let err = prepare(
+                &[],
+                &BTreeMap::new(),
+                "acme-bot-connector-secrets",
+                &["K8S_WRITE_KUBECONFIG".to_string()],
+                &b,
+                "acme-bot",
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("refusing to inject"));
+            assert!(!err.contains("token-a"));
+        });
+    }
 }
 
 // --------------------------------------------------------------------------- #
@@ -369,19 +587,33 @@ async fn run(argv: &[String], stdin: Option<&str>) -> Result<(bool, String, Stri
 #[derive(Debug, Default)]
 pub struct ConnectorSync {
     pub applied: Vec<String>,
-    pub urls: std::collections::BTreeMap<String, String>,
+    pub urls: BTreeMap<String, String>,
+    /// Connector secret keys this deploy wrote. Names only, never values.
+    pub written_keys: Vec<String>,
+    /// Live Secret keys this deploy is replacing. Names only, never values.
+    pub replaced_keys: Vec<String>,
 }
 
 /// Discover the release's rendered app name (the chart's nameOverride).
-pub async fn discover_app_name(namespace: &str, release: &str) -> Result<String> {
-    let (ok, out, err) = run(&app_name_args(namespace, release), None).await?;
+pub async fn discover_app_name(target: &ClusterTarget) -> Result<String> {
+    let (ok, out, err) = run(
+        &target.args(&app_name_args(
+            &target.scope.namespace,
+            &target.scope.release,
+        )),
+        None,
+    )
+    .await?;
     let name = out.trim();
     if !ok || name.is_empty() {
         anyhow::bail!(
-            "could not read the app name for release {release} in namespace {namespace}: no \
-             Deployment carries app.kubernetes.io/instance={release}. Connectors need it to \
+            "could not read the app name for release {} in namespace {}: no \
+             Deployment carries app.kubernetes.io/instance={}. Connectors need it to \
              target the sandbox pods Rail 1 denies by default. Confirm the release is installed \
              with `curie cluster status`.{}",
+            target.scope.release,
+            target.scope.namespace,
+            target.scope.release,
             if err.trim().is_empty() {
                 String::new()
             } else {
@@ -392,62 +624,149 @@ pub async fn discover_app_name(namespace: &str, release: &str) -> Result<String>
     Ok(name.to_string())
 }
 
-/// Resolve each declared credential: environment first, then the host vault.
+/// Resolve each declared credential against the cluster target.
 ///
-/// Fails naming every gap at once rather than one per run. A connector that
-/// starts without its credential does not fail at apply -- it comes up and
-/// returns 401s to the agent, which reads as "the tool is broken".
-fn resolve_secret_values(keys: &[String]) -> Result<std::collections::BTreeMap<String, String>> {
-    let mut values = std::collections::BTreeMap::new();
+/// A matching scoped store entry is required once anything is stored under that
+/// name. Process environment is a first-run fallback only when the store has no
+/// entry at all, and the source is returned so deploy can say so without printing
+/// the value. Fails naming every gap at once rather than one per run.
+fn resolve_secret_values(
+    keys: &[String],
+    target: &SecretScope,
+) -> Result<(BTreeMap<String, String>, BTreeMap<String, String>)> {
+    let mut values = BTreeMap::new();
+    let mut sources = BTreeMap::new();
     let mut missing = Vec::new();
     for k in keys {
-        match crate::secrets::resolve_env_or_saved(k)? {
-            Some(v) => {
-                values.insert(k.clone(), v);
+        match crate::secrets::resolve_cluster_secret(k, target)? {
+            Some(resolved) => {
+                sources.insert(k.clone(), resolved.source_label());
+                values.insert(k.clone(), resolved.value);
             }
             None => missing.push(k.clone()),
         }
     }
     if !missing.is_empty() {
         return Err(crate::exit::usage(format!(
-            "connectors.yaml declares secret(s) with no value available: {}. Export each in the \
-             environment, or store it once with `curie secrets set <NAME>`.",
-            missing.join(", ")
+            "connectors.yaml declares secret(s) with no value available for {}: {}. Export each in \
+             the environment, or store it for this target with `curie secrets set <NAME> \
+             --from-env <NAME> --cluster-identity {} --release {} --namespace {}`.",
+            target.describe(),
+            missing.join(", "),
+            target.cluster_identity,
+            target.release,
+            target.namespace
         )));
     }
-    Ok(values)
+    Ok((values, sources))
 }
 
 /// An agent's fully resolved connector synchronization plan.
+#[derive(Debug)]
 pub struct PreparedConnectorSync {
     namespace: String,
     agent_name: String,
     keep: Vec<String>,
     apply_document: Option<String>,
     result: ConnectorSync,
+    secret_name: Option<String>,
+    secret_keys: Vec<String>,
+    secret_sources: BTreeMap<String, String>,
+    target: SecretScope,
+    bound_target: Option<ClusterTarget>,
+}
+
+impl PreparedConnectorSync {
+    pub fn bind_target(mut self, target: ClusterTarget) -> Result<Self> {
+        if self.target != target.scope {
+            anyhow::bail!("prepared connector scope does not match captured Kubernetes target");
+        }
+        self.bound_target = Some(target);
+        Ok(self)
+    }
+
+    pub fn write_intent(&self) -> Option<String> {
+        let secret_name = self.secret_name.as_deref()?;
+        Some(write_intent_line(
+            secret_name,
+            &self.secret_keys,
+            &self.target,
+        ))
+    }
+
+    pub fn source_lines(&self) -> Vec<String> {
+        self.secret_sources
+            .iter()
+            .map(|(key, source)| format!("{key}: {source}"))
+            .collect()
+    }
+}
+
+/// Discover the current kubeconfig's cluster identity.
+pub async fn discover_cluster_identity() -> Result<String> {
+    let (ok, out, err) = run(&kubeconfig_view_args(), None).await?;
+    if !ok {
+        anyhow::bail!(
+            "could not read the current kubeconfig cluster identity: {}",
+            err.trim()
+        );
+    }
+    let view: Value = serde_json::from_str(&out)
+        .context("parsing `kubectl config view --minify --raw -o json`")?;
+    cluster_identity_from_kubeconfig_view(&view)
+}
+
+/// Snapshot the selected kubeconfig at prepare time. The private temporary file
+/// lives exactly as long as the connector plan that consumes it.
+pub async fn bind_current_cluster(namespace: &str, release: &str) -> Result<ClusterTarget> {
+    let (ok, out, err) = run(&kubeconfig_view_args(), None).await?;
+    if !ok {
+        anyhow::bail!("could not capture the current kubeconfig: {}", err.trim());
+    }
+    let view: Value = serde_json::from_str(&out)
+        .context("parsing `kubectl config view --minify --raw -o json`")?;
+    let cluster_identity = cluster_identity_from_kubeconfig_view(&view)?;
+    let mut kubeconfig = tempfile::NamedTempFile::new()
+        .context("creating private kubeconfig snapshot for connector deploy")?;
+    kubeconfig.write_all(out.as_bytes())?;
+    kubeconfig.flush()?;
+    Ok(ClusterTarget {
+        scope: SecretScope {
+            cluster_identity,
+            release: release.into(),
+            namespace: namespace.into(),
+        },
+        kubeconfig: Arc::new(kubeconfig),
+    })
 }
 
 /// Resolve and render an agent's connector objects without writing to kubectl.
 pub fn prepare(
     manifests: &[Value],
-    mcp_entries: &std::collections::BTreeMap<String, Value>,
+    mcp_entries: &BTreeMap<String, Value>,
     owned_secret_name: &str,
     owned_secret_keys: &[String],
-    namespace: &str,
+    target: &SecretScope,
     agent_name: &str,
 ) -> Result<PreparedConnectorSync> {
     let mut objects = Vec::new();
+    let mut secret_name = None;
+    let mut secret_keys = Vec::new();
+    let mut secret_sources = BTreeMap::new();
 
-    if let Some((secret_name, keys)) = owned_secret(owned_secret_name, owned_secret_keys) {
-        objects.push(render_secret(
-            &secret_name,
-            namespace,
-            &resolve_secret_values(&keys)?,
-        ));
+    if let Some((name, keys)) = owned_secret(owned_secret_name, owned_secret_keys) {
+        let (values, sources) = resolve_secret_values(&keys, target)?;
+        objects.push(render_secret(&name, &target.namespace, &values));
+        secret_name = Some(name);
+        secret_keys = keys;
+        secret_sources = sources;
     }
     objects.extend_from_slice(manifests);
 
-    let mut result = ConnectorSync::default();
+    let mut result = ConnectorSync {
+        written_keys: secret_keys.clone(),
+        ..Default::default()
+    };
     for (name, entry) in mcp_entries {
         if let Some(url) = entry.get("url").and_then(|u| u.as_str()) {
             result.urls.insert(name.clone(), url.to_string());
@@ -463,11 +782,16 @@ pub fn prepare(
     };
 
     Ok(PreparedConnectorSync {
-        namespace: namespace.to_string(),
+        namespace: target.namespace.clone(),
         agent_name: agent_name.to_string(),
         keep,
         apply_document,
         result,
+        secret_name,
+        secret_keys,
+        secret_sources,
+        target: target.clone(),
+        bound_target: None,
     })
 }
 
@@ -483,10 +807,30 @@ pub async fn sync(prepared: PreparedConnectorSync) -> Result<ConnectorSync> {
         keep,
         apply_document,
         mut result,
+        secret_name,
+        secret_keys,
+        secret_sources,
+        target,
+        bound_target,
     } = prepared;
+    let bound_target = bound_target.context("connector sync has no captured Kubernetes target")?;
+
+    if let Some(name) = secret_name.as_deref() {
+        ui.note(&write_intent_line(name, &secret_keys, &target));
+        for (key, source) in &secret_sources {
+            ui.note(&format!("{key}: {source}"));
+        }
+        let existing = inspect_secret_keys(&bound_target, &namespace, name).await?;
+        let replaced = keys_being_replaced(&existing, &secret_keys);
+        if !replaced.is_empty() {
+            ui.warn(&replacement_warning_line(name, &replaced));
+        }
+        result.replaced_keys = replaced;
+    }
 
     if let Some(doc) = apply_document {
-        let (ok, _out, err) = run(&apply_args(&namespace), Some(&doc)).await?;
+        bound_target.revalidate_ambient_binding().await?;
+        let (ok, _out, err) = run(&bound_target.args(&apply_args(&namespace)), Some(&doc)).await?;
         if !ok {
             anyhow::bail!("applying connectors failed: {}", err.trim());
         }
@@ -499,7 +843,12 @@ pub async fn sync(prepared: PreparedConnectorSync) -> Result<ConnectorSync> {
 
     // Runs even with nothing declared -- that is the case where a connector was
     // REMOVED, and the whole reason this is not a bare `kubectl apply`.
-    let (ok, _out, err) = run(&prune_args(&namespace, &agent_name, &keep), None).await?;
+    bound_target.revalidate_ambient_binding().await?;
+    let (ok, _out, err) = run(
+        &bound_target.args(&prune_args(&namespace, &agent_name, &keep)),
+        None,
+    )
+    .await?;
     if !ok {
         ui.warn(&format!(
             "connectors: pruning stale objects for {agent_name} failed: {}",
@@ -507,4 +856,24 @@ pub async fn sync(prepared: PreparedConnectorSync) -> Result<ConnectorSync> {
         ));
     }
     Ok(result)
+}
+
+async fn inspect_secret_keys(
+    target: &ClusterTarget,
+    namespace: &str,
+    name: &str,
+) -> Result<BTreeSet<String>> {
+    let (ok, out, err) = run(&target.args(&get_secret_args(namespace, name)), None).await?;
+    if !ok {
+        if err.contains("NotFound") || err.contains("not found") {
+            return Ok(BTreeSet::new());
+        }
+        anyhow::bail!(
+            "could not inspect existing connector Secret {name}: {}; refusing to overwrite it",
+            err.trim()
+        );
+    }
+    let obj = serde_json::from_str::<Value>(&out)
+        .context("parsing existing connector Secret JSON; refusing to overwrite it")?;
+    Ok(secret_key_names(&obj))
 }

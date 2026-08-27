@@ -217,7 +217,7 @@
       "result": "SecretsListOutput",
       "kind": "CliOutput",
       "schema": "secrets.schema.json",
-      "version": "1.0"
+      "version": "1.1"
     },
     {
       "result": "SkillApprovalsOutput",
