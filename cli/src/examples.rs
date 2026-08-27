@@ -50,6 +50,13 @@ const WRITE_RULE_RESOURCES: [&str; 1] = ["deployments"];
 const WRITE_RULE_VERBS: [&str; 2] = ["get", "patch"];
 const READER_TOKEN_TIMEOUT: &str = "2m";
 const KUBECONFIG_SECRET_KEY: &str = "K8S_READONLY_KUBECONFIG";
+// The gated write connector's published image. A `sha-<commit>` tag rather than a
+// semver one because no tagged release has carried this connector yet: it is
+// published by `release.yaml` on every push to a release branch, and a commit tag
+// is immutable in the way `latest` is not. Move this to a semver tag once a
+// release publishes one.
+const K8S_WRITE_IMAGE_REPOSITORY: &str = "ghcr.io/curie-eng/curie-sre-bot-k8s-write";
+const K8S_WRITE_IMAGE_TAG: &str = "sha-0fb841432db69f67591648eedf96f278aa87bd2c";
 const TEMPO_IMAGE_REPOSITORY: &str = "ghcr.io/curie-eng/curie-sre-bot-tempo";
 const TEMPO_IMAGE_TAG: &str = "0.8.0";
 const TEMPO_TAGGED_IMAGE: &str = "ghcr.io/curie-eng/curie-sre-bot-tempo:0.8.0";
@@ -120,8 +127,12 @@ pub struct SreBotInstallOpts {
     pub observability: bool,
     pub dry_run: bool,
     pub slack_channel: Option<String>,
-    /// `ns/name[,ns/name]`. Absent keeps the install read only.
+    /// `ns/name[,ns/name]`. Absent still INSTALLS the gated write connector,
+    /// with an empty ceiling: the tool is published and gated, and every call is
+    /// refused until an operator names targets. See `write_targets` below.
     pub write_allowlist: Option<String>,
+    /// Leave the write connector out entirely, as absence used to.
+    pub no_write: bool,
     pub namespace: String,
     pub release: String,
     pub observability_namespace: String,
@@ -401,9 +412,36 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
         ));
     }
 
-    let write_targets = match opts.write_allowlist.as_deref() {
-        Some(raw) => Some(parse_write_allowlist(raw)?),
-        None => None,
+    // Three states, not two. The write connector is now installed by default,
+    // because a capability nobody can see is indistinguishable from one that was
+    // never built -- which is exactly how this bundle's second write verb came to
+    // read as a design choice.
+    //
+    // `None` here means the connector is absent. `Some(&[])` means it is present
+    // with an EMPTY ceiling, and both halves of that ceiling are closed:
+    //
+    //   * the connector starts, publishes its tool, and refuses every call. Its
+    //     own source says so: "a missing config fails closed rather than granting
+    //     everything."
+    //   * no Role is rendered at all. This is the load-bearing half. An RBAC rule
+    //     whose `resourceNames` is empty or absent is NOT a rule that grants
+    //     nothing -- it grants the verb on EVERY resource of that type. So the
+    //     empty case must omit the Role rather than render one with no names, and
+    //     `render_write_role` does: with no targets it emits the ServiceAccount
+    //     and its token Secret and stops.
+    //
+    // The identity is still minted either way, because bring-up refuses without
+    // `K8S_WRITE_KUBECONFIG` -- an identity that can do nothing is what makes
+    // "enabled, ceiling empty" a state the platform can actually boot.
+    let write_targets = match (opts.no_write, opts.write_allowlist.as_deref()) {
+        (true, Some(_)) => {
+            return Err(crate::exit::usage(
+                "--no-write and --write-allowlist contradict each other; pass one",
+            ));
+        }
+        (true, None) => None,
+        (false, Some(raw)) => Some(parse_write_allowlist(raw)?),
+        (false, None) => Some(Vec::new()),
     };
     let write_targets = write_targets.as_deref();
     let identity = InstallIdentity::from_opts(&opts);
@@ -444,11 +482,19 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
                 .to_string(),
         );
         if let Some(targets) = write_targets {
-            lines.push(format!(
-                "render manifests/write-role.yaml and connectors.k8s-write env {} from one allowlist: {}",
-                WRITE_ALLOWLIST_ENV,
-                write_allowlist_value(targets)
-            ));
+            if targets.is_empty() {
+                lines.push(format!(
+                    "install connectors.k8s-write with an EMPTY {WRITE_ALLOWLIST_ENV}: the tool is \
+                     published and gated, every call is refused, and NO Role is rendered (an empty \
+                     resourceNames would grant every Deployment). Name targets with --write-allowlist"
+                ));
+            } else {
+                lines.push(format!(
+                    "render manifests/write-role.yaml and connectors.k8s-write env {} from one allowlist: {}",
+                    WRITE_ALLOWLIST_ENV,
+                    write_allowlist_value(targets)
+                ));
+            }
             lines.push(write_role_command.display(&chart));
             lines.push(format!(
                 "kubectl wait --namespace {} --for=jsonpath={{.data.token}} secret/{WRITER_TOKEN_SECRET} --timeout={READER_TOKEN_TIMEOUT}",
@@ -477,7 +523,20 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
     let tempo_digest = resolve_tempo_index_digest().await?;
     let chart = crate::artifacts::ensure_cached(&resolved_chart).await?;
     crate::ops::require_on_path("helm")?;
-    let workspace = EmbeddedWorkspace::create(&tempo_digest, write_targets, &identity)?;
+    // Resolved only when the connector is kept, so a --no-write install makes no
+    // registry call for an image it will never run.
+    let write_digest = match write_targets {
+        Some(_) => {
+            Some(resolve_index_digest(K8S_WRITE_IMAGE_REPOSITORY, K8S_WRITE_IMAGE_TAG).await?)
+        }
+        None => None,
+    };
+    let workspace = EmbeddedWorkspace::create(
+        &tempo_digest,
+        write_digest.as_deref(),
+        write_targets,
+        &identity,
+    )?;
     ensure_grafana_admin_secret(&identity.observability_namespace).await?;
     for command in &stack_commands {
         run_install_command(command, &workspace, &chart).await?;
@@ -551,6 +610,22 @@ struct RegistryToken {
 }
 
 async fn resolve_tempo_index_digest() -> Result<String> {
+    resolve_index_digest(TEMPO_IMAGE_REPOSITORY, TEMPO_IMAGE_TAG).await
+}
+
+/// The immutable index digest behind one `ghcr.io/<org>/<name>:<tag>`.
+///
+/// Generalised from the tempo-only resolver because the gated write connector
+/// needs exactly the same treatment. The bundle declares it `build:`, which
+/// records a LOCAL image id, and a cluster cannot pull an image that exists only
+/// in one machine's Docker daemon -- so keeping the connector without resolving a
+/// published digest produces a bundle whose write path can never come up.
+async fn resolve_index_digest(repository: &str, tag: &str) -> Result<String> {
+    let path = repository
+        .strip_prefix("ghcr.io/")
+        .with_context(|| format!("{repository} is not a ghcr.io repository"))?
+        .to_string();
+    let tagged = format!("{repository}:{tag}");
     let registry = std::env::var("CURIE_TEST_SRE_BOT_REGISTRY_ENDPOINT")
         .unwrap_or_else(|_| "https://ghcr.io".to_string());
     let registry = registry.trim_end_matches('/');
@@ -562,29 +637,27 @@ async fn resolve_tempo_index_digest() -> Result<String> {
         .get(format!("{registry}/token"))
         .query(&[
             ("service", "ghcr.io"),
-            ("scope", "repository:curie-eng/curie-sre-bot-tempo:pull"),
+            ("scope", format!("repository:{path}:pull").as_str()),
         ])
         .send()
         .await
-        .with_context(|| format!("resolving {TEMPO_TAGGED_IMAGE} before cluster mutation"))?;
+        .with_context(|| format!("resolving {tagged} before cluster mutation"))?;
     if !token_response.status().is_success() {
         bail!(
-            "could not resolve {TEMPO_TAGGED_IMAGE} before cluster mutation: anonymous GHCR token request returned HTTP {}",
+            "could not resolve {tagged} before cluster mutation: anonymous GHCR token request returned HTTP {}",
             token_response.status()
         );
     }
     let token: RegistryToken = token_response
         .json()
         .await
-        .with_context(|| format!("reading the anonymous token for {TEMPO_TAGGED_IMAGE}"))?;
+        .with_context(|| format!("reading the anonymous token for {tagged}"))?;
     if token.token.is_empty() {
-        bail!("could not resolve {TEMPO_TAGGED_IMAGE}: GHCR returned an empty token");
+        bail!("could not resolve {tagged}: GHCR returned an empty token");
     }
 
     let manifest_response = client
-        .get(format!(
-            "{registry}/v2/curie-eng/curie-sre-bot-tempo/manifests/{TEMPO_IMAGE_TAG}"
-        ))
+        .get(format!("{registry}/v2/{path}/manifests/{tag}"))
         .bearer_auth(&token.token)
         .header(
             reqwest::header::ACCEPT,
@@ -592,19 +665,19 @@ async fn resolve_tempo_index_digest() -> Result<String> {
         )
         .send()
         .await
-        .with_context(|| format!("fetching the OCI image index for {TEMPO_TAGGED_IMAGE}"))?;
+        .with_context(|| format!("fetching the OCI image index for {tagged}"))?;
     if !manifest_response.status().is_success() {
         bail!(
-            "could not resolve {TEMPO_TAGGED_IMAGE}: OCI index request returned HTTP {}",
+            "could not resolve {tagged}: OCI index request returned HTTP {}",
             manifest_response.status()
         );
     }
     let body = manifest_response
         .bytes()
         .await
-        .with_context(|| format!("reading the OCI image index for {TEMPO_TAGGED_IMAGE}"))?;
+        .with_context(|| format!("reading the OCI image index for {tagged}"))?;
     let manifest: serde_json::Value = serde_json::from_slice(&body)
-        .with_context(|| format!("{TEMPO_TAGGED_IMAGE} returned a malformed OCI index"))?;
+        .with_context(|| format!("{tagged} returned a malformed OCI index"))?;
     let media_type = manifest
         .get("mediaType")
         .and_then(serde_json::Value::as_str);
@@ -622,7 +695,7 @@ async fn resolve_tempo_index_digest() -> Result<String> {
             .is_some_and(serde_json::Value::is_array);
     if !is_index {
         bail!(
-            "could not resolve {TEMPO_TAGGED_IMAGE}: expected an OCI image index, got {}",
+            "could not resolve {tagged}: expected an OCI image index, got {}",
             media_type.unwrap_or("no mediaType")
         );
     }
@@ -1190,6 +1263,7 @@ struct EmbeddedWorkspace {
 impl EmbeddedWorkspace {
     fn create(
         tempo_digest: &str,
+        write_digest: Option<&str>,
         write_targets: Option<&[WriteTarget]>,
         identity: &InstallIdentity,
     ) -> Result<Self> {
@@ -1211,6 +1285,7 @@ impl EmbeddedWorkspace {
                 let runtime = runtime_connector_declaration(
                     contents,
                     tempo_digest,
+                    write_digest,
                     write_targets,
                     &identity.observability_namespace,
                 )?;
@@ -1516,6 +1591,7 @@ fn render_write_role(
 fn runtime_connector_declaration(
     source: &[u8],
     tempo_digest: &str,
+    write_digest: Option<&str>,
     write_targets: Option<&[WriteTarget]>,
     observability_namespace: &str,
 ) -> Result<Vec<u8>> {
@@ -1587,6 +1663,31 @@ fn runtime_connector_declaration(
         "image".to_string(),
         serde_json::Value::String(format!("{TEMPO_IMAGE_REPOSITORY}@{tempo_digest}")),
     );
+    // The kept write connector gets the same treatment, and for the same reason:
+    // `build:` records a LOCAL image id, which the cluster tier refuses because a
+    // cluster cannot pull an image that exists only in one machine's Docker
+    // daemon. Without this the opt-in produced a bundle whose write path could
+    // never come up. Deliberately after the known-connector check above, so an
+    // unrecognised connector is still reported as one rather than as a missing
+    // image.
+    if write_targets.is_some() {
+        let digest =
+            write_digest.context("keeping connectors.k8s-write needs its resolved image digest")?;
+        let write = connectors
+            .get_mut("k8s-write")
+            .and_then(serde_json::Value::as_object_mut)
+            .context("embedded SRE bot must declare connectors.k8s-write")?;
+        if write.remove("build").is_none() || write.contains_key("image") {
+            bail!(
+                "embedded SRE bot k8s-write connector must declare one build source and no \
+                 image before immutable resolution"
+            );
+        }
+        write.insert(
+            "image".to_string(),
+            serde_json::Value::String(format!("{K8S_WRITE_IMAGE_REPOSITORY}@{digest}")),
+        );
+    }
     let serialized = serde_norway::to_string(&declaration)
         .context("serializing the immutable SRE bot connector declaration")?;
     Ok(rewrite_observability_namespace(
@@ -2019,6 +2120,7 @@ mod tests {
         let connectors = runtime_connector_declaration(
             bundle_file("connectors.yaml"),
             "sha256:fixture",
+            Some("sha256:writefixture"),
             Some(&parsed),
             OBSERVABILITY_NAMESPACE,
         )
@@ -2036,6 +2138,85 @@ mod tests {
             "the two ceilings must name the same targets"
         );
         assert_eq!(granted, vec!["curie/curie-api", "other/web"]);
+    }
+
+    /// The write connector is installed by default now, so the empty ceiling has
+    /// to be a state that is safe rather than merely representable.
+    ///
+    /// The RBAC trap this guards: a rule whose `resourceNames` is empty or absent
+    /// grants the verb on EVERY resource of that type. So "no targets" must omit
+    /// the Role, not render one with no names -- otherwise the default install
+    /// would hand the bot patch on every Deployment in the namespace, which is the
+    /// exact opposite of what an empty allowlist reads like.
+    #[test]
+    fn no_targets_renders_an_identity_with_no_role_at_all() {
+        let rendered = render_write_role(
+            bundle_file("manifests/write-role.yaml"),
+            &[],
+            CURIE_NAMESPACE,
+        )
+        .expect("write role renders with no targets");
+        let text = String::from_utf8(rendered).expect("rendered role is UTF-8");
+        let mut kinds: Vec<String> = Vec::new();
+        for document in serde_norway::Deserializer::from_str(&text) {
+            let value: serde_json::Value =
+                serde::Deserialize::deserialize(document).expect("rendered document parses");
+            if let Some(kind) = value.get("kind").and_then(serde_json::Value::as_str) {
+                kinds.push(kind.to_string());
+            }
+        }
+        kinds.sort();
+        assert_eq!(
+            kinds,
+            vec!["Secret".to_string(), "ServiceAccount".to_string()],
+            "an empty ceiling must mint the identity and grant it nothing; rendered: {text}"
+        );
+    }
+
+    /// The other half of the empty ceiling: the connector is present, so the tool
+    /// is published and gated, and its own allowlist is empty rather than the
+    /// shipped placeholder.
+    #[test]
+    fn no_targets_keeps_the_connector_with_an_empty_allowlist() {
+        let rendered = runtime_connector_declaration(
+            bundle_file("connectors.yaml"),
+            "sha256:fixture",
+            Some("sha256:writefixture"),
+            Some(&[]),
+            OBSERVABILITY_NAMESPACE,
+        )
+        .expect("connector declaration renders with no targets");
+        let declaration: serde_json::Value =
+            serde_norway::from_slice(&rendered).expect("rendered declaration parses");
+        let write = &declaration["connectors"]["k8s-write"];
+        assert!(
+            !write.is_null(),
+            "the write connector must be installed by default"
+        );
+        assert_eq!(
+            write["env"][WRITE_ALLOWLIST_ENV].as_str(),
+            Some(""),
+            "an empty ceiling is an empty allowlist, never the shipped placeholder"
+        );
+    }
+
+    /// And the opt-out still produces exactly what absence used to.
+    #[test]
+    fn opting_out_leaves_the_write_connector_absent() {
+        let rendered = runtime_connector_declaration(
+            bundle_file("connectors.yaml"),
+            "sha256:fixture",
+            None,
+            None,
+            OBSERVABILITY_NAMESPACE,
+        )
+        .expect("connector declaration renders with the write path out");
+        let declaration: serde_json::Value =
+            serde_norway::from_slice(&rendered).expect("rendered declaration parses");
+        assert!(
+            declaration["connectors"]["k8s-write"].is_null(),
+            "--no-write must leave the connector out entirely"
+        );
     }
 
     #[test]
@@ -2108,6 +2289,7 @@ mod tests {
         let connectors = runtime_connector_declaration(
             bundle_file("connectors.yaml"),
             "sha256:fixture",
+            Some("sha256:writefixture"),
             Some(&parsed),
             OBSERVABILITY_NAMESPACE,
         )
@@ -2139,6 +2321,7 @@ mod tests {
             bundle_file("connectors.yaml"),
             "sha256:fixture",
             None,
+            None,
             OBSERVABILITY_NAMESPACE,
         )
         .expect("read only declaration renders");
@@ -2159,6 +2342,7 @@ mod tests {
         let error = runtime_connector_declaration(
             source,
             "sha256:fixture",
+            Some("sha256:writefixture"),
             Some(&targets("curie/api")),
             OBSERVABILITY_NAMESPACE,
         )
@@ -2169,9 +2353,14 @@ mod tests {
     #[test]
     fn runtime_connector_transform_requires_the_declared_write_connector() {
         let source = b"connectors:\n  tempo:\n    build:\n      context: connectors/tempo\n      platforms: [linux/amd64]\n";
-        let error =
-            runtime_connector_declaration(source, "sha256:fixture", None, OBSERVABILITY_NAMESPACE)
-                .expect_err("missing k8s-write must be refused");
+        let error = runtime_connector_declaration(
+            source,
+            "sha256:fixture",
+            None,
+            None,
+            OBSERVABILITY_NAMESPACE,
+        )
+        .expect_err("missing k8s-write must be refused");
         assert!(
             error
                 .to_string()
