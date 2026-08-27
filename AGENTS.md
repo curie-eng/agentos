@@ -341,6 +341,11 @@ Known seam pairs:
   (`cli/src/queue.rs`) can't share code across Python/Rust. Operator
   `reset-thread` and `local`/`cluster` eval (#1534) both SADD the same set.
   Frozen in `tests/vectors/thread-reset-set.json`.
+- worker vs CLI eval-isolate prefix -- `EVAL_ISOLATE_THREAD_PREFIX`
+  (`apps/worker/src/curie_worker/binding.py`) and the CLI copy
+  (`cli/src/queue.rs`, stamped in `cli/src/message.rs::run_eval_turns`)
+  cannot share code across Python/Rust, so they are frozen together in
+  `tests/vectors/eval-memory-isolation.json`.
 - real SDK vs fake model session in the runner (`FakeModelSession`, `runner/src/curie_runner/fake.py`).
 - runs lane vs eval lane stream consumers (`apps/worker/src/curie_worker/consumer.py` vs `eval/stream.py`, both on the shared `stream_consumer.py`).
 - CLI-side vs API-side input validation (validate at the API/persistence boundary, mirror in the CLI).

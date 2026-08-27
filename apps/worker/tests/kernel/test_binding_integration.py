@@ -16,8 +16,10 @@ from curie_worker.binding import (
     BUDGET_ENV,
     BUNDLE_REF_ENV,
     PLUGIN_DIR_ENV,
+    BindingResolver,
     ResolvedDeployment,
 )
+from curie_worker.config import WorkerConfig
 from curie_worker.killswitch import kill_key
 
 DONE = SessionStatus.DONE
@@ -50,6 +52,21 @@ class StubBinding:
 
     def packs_for(self, resolved: ResolvedDeployment) -> BehaviorPacks:
         return BehaviorPacks.from_config(resolved.behavior_packs)
+
+
+class RealBootEnvBinding(StubBinding):
+    """Canned resolve, real ``BindingResolver.boot_env`` (#1909).
+
+    Kernel tests stub resolution so they need no Postgres. Isolation lives in
+    ``boot_env(thread_key)``, which the kernel already forwards as
+    ``QueuedTurn.conversation_id``. Using the real renderer here is the
+    enqueue -> claim path without touching sacred ``kernel.py``.
+    """
+
+    def boot_env(self, resolved: ResolvedDeployment, thread_key: str) -> dict[str, str]:
+        resolver = BindingResolver.__new__(BindingResolver)
+        resolver._config = WorkerConfig()
+        return resolver.boot_env(resolved, thread_key)
 
 
 def _resolved(agent_id: uuid.UUID, *, bundle: str | None = "bundles/x.zip") -> ResolvedDeployment:
@@ -162,6 +179,45 @@ def test_bound_channel_claims_sandbox_with_boot_env(make_harness) -> None:
             assert env[BUNDLE_REF_ENV] == "bundles/x.zip"
             assert env[PLUGIN_DIR_ENV] == "/bundles/current"
             assert "max_usd_per_day" in env[BUDGET_ENV]
+
+    asyncio.run(go())
+
+
+def test_eval_isolate_turn_claims_without_ambient_memory(make_harness) -> None:
+    """#1909: an eval-prefixed conversation_id through process_event omits memory.
+
+    Positive: ``eval:`` claim has no CURIE_MEMORY_REF. Negative: the same
+    agent on a plain thread still loads it. Fake-model replies ignore the
+    prompt, so the claim env is the observable consumer path.
+    """
+
+    async def go() -> None:
+        agent_id = uuid.uuid4()
+        resolved = _resolved(agent_id, bundle="bundles/x.zip")
+        binding = RealBootEnvBinding({("slack", "C-bound"): resolved})
+        async with make_harness(binding=binding) as h:
+            h.runner.default_script = [Final(text="answer", status=DONE)]
+            await h.kernel.process_event(
+                _qevent(
+                    "hi",
+                    channel="C-bound",
+                    thread="eval:1720000000.000100",
+                )
+            )
+            eval_env = h.fake_k8s.claim_envs[-1]
+            assert eval_env is not None
+            assert "CURIE_MEMORY_REF" not in eval_env
+            assert "CURIE_MEMORY_TOKEN" not in eval_env
+            assert "CURIE_HISTORY_REF" in eval_env
+            assert "CURIE_HISTORY_TOKEN" in eval_env
+
+            await h.kernel.process_event(
+                _qevent("hi again", channel="C-bound", thread="thread-1")
+            )
+            plain_env = h.fake_k8s.claim_envs[-1]
+            assert plain_env is not None
+            assert "CURIE_MEMORY_REF" in plain_env
+            assert "CURIE_MEMORY_TOKEN" in plain_env
 
     asyncio.run(go())
 

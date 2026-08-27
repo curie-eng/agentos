@@ -37,6 +37,47 @@ pub const THREAD_RESET_SET: &str = "curie:thread-reset-requests";
 /// Slack event id (which are `Ev...`, not `EvSIM-...`).
 const EVENT_ID_PREFIX: &str = "EvSIM-";
 
+/// Prefix on a local/cluster eval `conversation_id` so the worker omits
+/// ambient agent memory from that sandbox (#1909). Frozen in
+/// `tests/vectors/eval-memory-isolation.json`. Disjoint from Slack thread
+/// timestamps the same way `hook:` ids are.
+pub const EVAL_ISOLATE_THREAD_PREFIX: &str = "eval:";
+
+/// Stamp the eval-isolate prefix onto a fresh synthetic thread ts.
+pub fn eval_isolate_conversation_id(thread_ts: &str) -> String {
+    format!("{EVAL_ISOLATE_THREAD_PREFIX}{thread_ts}")
+}
+
+/// True when `thread_key` is a hermetic local/cluster eval conversation.
+pub fn is_eval_isolate_thread(thread_key: &str) -> bool {
+    thread_key.starts_with(EVAL_ISOLATE_THREAD_PREFIX)
+}
+
+/// Mint the QueuedTurn `run_eval_turns` enqueues: a synthetic turn whose
+/// `conversation_id` carries the isolate prefix so the worker omits ambient
+/// agent memory (#1909). The only production mint for local/cluster eval
+/// cases; tests assert the stamped id rather than scanning source.
+pub fn eval_case_turn(
+    kind: impl Into<String>,
+    channel: impl Into<String>,
+    author: impl Into<String>,
+    text: impl Into<String>,
+    thread_ts: impl Into<String>,
+    placeholder: impl Into<String>,
+    endpoint: Option<String>,
+) -> QueuedTurn {
+    let thread_ts = thread_ts.into();
+    synthetic_turn(
+        kind,
+        channel,
+        author,
+        text,
+        eval_isolate_conversation_id(&thread_ts),
+        placeholder,
+        endpoint,
+    )
+}
+
 /// Build a synthetic turn: a fresh `EvSIM-` id and the current UTC time, with the
 /// given conversation/reply coordinates. Maps the Slack-facing drivers' inputs
 /// onto the channel-neutral `QueuedTurn` (channel + placeholder live in the
@@ -386,6 +427,63 @@ mod tests {
         assert!(a.starts_with("EvSIM-"), "unexpected id: {a}");
         assert_ne!(a, b, "event ids must be unique");
         Uuid::parse_str(a.trim_start_matches("EvSIM-")).expect("suffix is a uuid");
+    }
+
+    #[test]
+    fn eval_isolate_prefix_matches_the_frozen_vector() {
+        // Rust half of the CLI/worker eval-isolate prefix gate (#1909).
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct EvalIsolateVector {
+            #[serde(rename = "comment")]
+            _comment: String,
+            conversation_id_prefix: String,
+        }
+        let raw = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/vectors/eval-memory-isolation.json"
+        ))
+        .expect("read tests/vectors/eval-memory-isolation.json");
+        let parsed: EvalIsolateVector = serde_json::from_str(&raw).unwrap_or_else(|err| {
+            panic!(
+                "parse tests/vectors/eval-memory-isolation.json: {err}\n\
+                 An unknown field is rejected on purpose: a key this lane cannot see \
+                 would pass vacuously. Teach the new key to EvalIsolateVector here, to \
+                 _EXPECTED_VECTOR_KEYS in \
+                 apps/worker/tests/binding/test_eval_memory_isolation.py, and to both \
+                 lanes' assertions."
+            )
+        });
+        assert_eq!(EVAL_ISOLATE_THREAD_PREFIX, parsed.conversation_id_prefix);
+        assert_eq!(
+            eval_isolate_conversation_id("1720000000.000100"),
+            format!("{}1720000000.000100", parsed.conversation_id_prefix)
+        );
+        assert!(is_eval_isolate_thread("eval:1720000000.000100"));
+        assert!(!is_eval_isolate_thread("thread-1"));
+        assert!(!is_eval_isolate_thread("eval-thread-1"));
+    }
+
+    #[test]
+    fn eval_case_turn_stamps_the_isolate_prefix_on_conversation_id() {
+        // The object run_eval_turns XADDs, not a source scan: the worker
+        // boots from QueuedTurn.conversation_id (#1909).
+        let turn = eval_case_turn(
+            "slack",
+            "C1",
+            "U1",
+            "ping",
+            "1720000000.000100",
+            "1720000000.000200",
+            Some("http://127.0.0.1:8155/api/".into()),
+        );
+        assert_eq!(
+            turn.conversation_id,
+            eval_isolate_conversation_id("1720000000.000100")
+        );
+        assert!(turn.conversation_id.starts_with(EVAL_ISOLATE_THREAD_PREFIX));
+        assert_eq!(turn.text, "ping");
+        assert_eq!(turn.reply_handle.channel, "C1");
     }
 
     #[test]
