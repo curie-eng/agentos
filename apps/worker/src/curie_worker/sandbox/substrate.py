@@ -346,10 +346,21 @@ class SandboxSubstrate:
     def _await_bound(self, claim_name: str, deadline: float) -> str:
         last_quota_rejection = None
         last_ready_condition: tuple[str | None, str | None] | None = None
+        consecutive_quota = 0
         while time.monotonic() < deadline:
             claim = self._k8s.get_claim(claim_name)
             if claim is not None:
                 last_quota_rejection = claim.quota_rejection
+                if claim.quota_rejection is not None:
+                    consecutive_quota += 1
+                    # Two observations is the debounce: a single-poll blip can
+                    # still bind (#1572 transient-clear), but a persisting
+                    # ResourceQuota rejection is terminal now rather than after
+                    # claim_timeout_seconds (#1534).
+                    if consecutive_quota >= 2:
+                        raise CapacityExhaustedError(claim.quota_rejection)
+                else:
+                    consecutive_quota = 0
                 if claim.ready_reason is not None or claim.ready_message is not None:
                     last_ready_condition = (claim.ready_reason, claim.ready_message)
                 if claim.ready and claim.sandbox_name:

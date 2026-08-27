@@ -39,7 +39,7 @@ use crate::chat::{
 };
 use crate::evals::{EvalCase, EvalSuite, ExpectedStatus, LoadedEval};
 use crate::ops::{plain, require_on_path, run_capture, OpsCommand};
-use crate::queue::{self, connect, diagnostics, synthetic_turn, xadd};
+use crate::queue::{self, connect, diagnostics, queue_thread_reset, synthetic_turn, xadd};
 use crate::state::{save_turn, TurnContext, TurnVerb};
 
 pub const DEFAULT_STREAM: &str = queue::DEFAULT_STREAM;
@@ -2907,56 +2907,71 @@ async fn run_eval_turns(
     let total = suite.cases.len();
     let bar = ui.progress_bar(total as u64, "running evals");
     let mut results: Vec<crate::commands::EvalRow> = Vec::with_capacity(total);
-    for case in &suite.cases {
-        // Each case is its own thread so turns never cross-talk on the stub.
-        let (channel_id, thread_ts, placeholder_ts) = resolve_targets(Some(channel), None);
-        let reply_endpoint = stub.base_api_url().to_string();
-        let event = synthetic_turn(
-            "slack",
-            &channel_id,
-            &opts.user,
-            &case.input,
-            &thread_ts,
-            &placeholder_ts,
-            Some(reply_endpoint),
-        );
-        let started = Instant::now();
-        let stream_id = xadd(conn, &opts.stream, &event).await?;
-        let outcome = await_reply(
-            stub,
-            conn,
-            &opts.stream,
-            &stream_id,
-            &placeholder_ts,
-            Duration::from_secs(opts.timeout_secs),
-        )
-        .await;
-        let elapsed = started.elapsed().as_secs_f64();
-        // Carry the reply text (#548) so a red case is diagnosable from --json /
-        // the human summary; a non-Replied outcome has no gradeable text.
-        let output = match &outcome {
-            Outcome::Replied(reply) => reply.clone(),
-            Outcome::AwaitingApproval(reply) => reply.clone().unwrap_or_default(),
-            Outcome::CompletedNoEdit => String::new(),
-            // A timed-out case surfaces the stream/consumer diagnostics the same
-            // way the non-eval message path does (#706), so the failure is not a
-            // silent empty string but the stream state that explains it.
-            Outcome::TimedOut => diagnostics(conn, &opts.stream, &stream_id).await,
-        };
-        results.push((
-            case.id.clone(),
-            if reply_passes(case, &outcome) {
-                crate::evals::CaseOutcome::Pass
-            } else {
-                crate::evals::CaseOutcome::Fail
-            },
-            elapsed,
-            output,
-        ));
-        bar.inc(1);
+    let mut eval_threads: Vec<String> = Vec::with_capacity(total);
+    let run = async {
+        for case in &suite.cases {
+            // Each case is its own thread so turns never cross-talk on the stub.
+            let (channel_id, thread_ts, placeholder_ts) = resolve_targets(Some(channel), None);
+            eval_threads.push(thread_ts.clone());
+            let reply_endpoint = stub.base_api_url().to_string();
+            let event = synthetic_turn(
+                "slack",
+                &channel_id,
+                &opts.user,
+                &case.input,
+                &thread_ts,
+                &placeholder_ts,
+                Some(reply_endpoint),
+            );
+            let started = Instant::now();
+            let stream_id = xadd(conn, &opts.stream, &event).await?;
+            let outcome = await_reply(
+                stub,
+                conn,
+                &opts.stream,
+                &stream_id,
+                &placeholder_ts,
+                Duration::from_secs(opts.timeout_secs),
+            )
+            .await;
+            // Release this case's sandbox on every completed/red/timed-out
+            // path so a three-case suite run twice cannot pin eight
+            // curie-thread-* claims against the default ResourceQuota (#1534).
+            queue_thread_reset(conn, &thread_ts).await?;
+            let elapsed = started.elapsed().as_secs_f64();
+            // Carry the reply text (#548) so a red case is diagnosable from --json /
+            // the human summary; a non-Replied outcome has no gradeable text.
+            let output = match &outcome {
+                Outcome::Replied(reply) => reply.clone(),
+                Outcome::AwaitingApproval(reply) => reply.clone().unwrap_or_default(),
+                Outcome::CompletedNoEdit => String::new(),
+                // A timed-out case surfaces the stream/consumer diagnostics the same
+                // way the non-eval message path does (#706), so the failure is not a
+                // silent empty string but the stream state that explains it.
+                Outcome::TimedOut => diagnostics(conn, &opts.stream, &stream_id).await,
+            };
+            results.push((
+                case.id.clone(),
+                if reply_passes(case, &outcome) {
+                    crate::evals::CaseOutcome::Pass
+                } else {
+                    crate::evals::CaseOutcome::Fail
+                },
+                elapsed,
+                output,
+            ));
+            bar.inc(1);
+        }
+        anyhow::Ok(crate::commands::EvalReport::from_rows(results))
+    };
+    let result = run.await;
+    // Suite error/cancel: still queue every case we enqueued, including the
+    // in-flight one, so an abandoned retry cannot bind a late sandbox.
+    for thread_ts in &eval_threads {
+        let _ = queue_thread_reset(conn, thread_ts).await;
     }
     bar.finish();
-    Ok(crate::commands::EvalReport::from_rows(results))
+    result
 }
 
 /// The shared `eval` handler: run the bundle's `evals/cases.json` through the
@@ -3790,6 +3805,21 @@ mod tests {
     #[test]
     fn an_empty_thread_normalizes_to_no_thread() {
         assert_eq!(normalize_thread(Some(String::new())), None);
+    }
+
+    #[test]
+    fn eval_turns_queue_thread_reset_on_case_and_suite_paths() {
+        // AC1 is the SADD sites in run_eval_turns, not queue_thread_reset
+        // itself. Deleting either call keeps the helper test green.
+        let src = include_str!("message.rs");
+        assert!(
+            src.contains("queue_thread_reset(conn, &thread_ts)"),
+            "each eval case must queue its conversation_id for sandbox release"
+        );
+        assert!(
+            src.contains("for thread_ts in &eval_threads"),
+            "suite error/cancel must still queue every enqueued eval thread"
+        );
     }
 
     /// The filter must not eat a real thread ts, and an already-absent thread

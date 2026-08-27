@@ -20,6 +20,7 @@ from curie_worker.consumer import (
     THREAD_RESET_SET,
     Consumer,
 )
+from curie_worker.sandbox import QuotaRejection
 
 DONE = SessionStatus.DONE
 
@@ -228,6 +229,76 @@ def test_reclaims_and_reprocesses_a_dead_consumers_pending_entry(make_harness) -
             assert h.runner.opened == ["orphan"]
             summary = await h.async_redis.xpending(h.config.stream, h.config.consumer_group)
             assert summary["pending"] == 0  # reclaimed entry acked after reprocessing
+
+    asyncio.run(go())
+
+
+def test_next_turn_drains_queued_eval_reset_before_claiming(make_harness) -> None:
+    """#1534: eval-owned sandboxes are SADDed onto THREAD_RESET_SET after each
+    case. The next runs-lane turn must release them before it claims, so a
+    following eval case or cluster message does not wait for the 30s
+    maintenance tick (or the 90s claim timeout) with the quota already full.
+    """
+
+    async def go() -> None:
+        async with make_harness() as h:
+            h.runner.default_script = [Final(text="hi", status=DONE)]
+            await h.kernel.process_event(_qevent("eval-case-1", thread="tEval1"))
+            assert h.substrate.lookup("tEval1") is not None
+
+            await h.async_redis.sadd(THREAD_RESET_SET, "tEval1")
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            await consumer.ensure_group()
+            nxt = _qevent("eval-case-2", thread="tEval2", event_id="eval-2")
+            entry_id = await h.async_redis.xadd(h.config.stream, to_stream_fields(nxt))
+            await consumer._sem.acquire()
+            await consumer._handle(entry_id, to_stream_fields(nxt))
+
+            assert h.substrate.lookup("tEval1") is None
+            assert h.substrate.lookup("tEval2") is not None
+            assert await h.async_redis.scard(THREAD_RESET_SET) == 0
+            assert not await h.async_redis.sismember(THREAD_RESET_INFLIGHT_SET, "tEval1")
+
+    asyncio.run(go())
+
+
+def test_next_turn_drains_reset_before_claiming_when_quota_is_full(make_harness) -> None:
+    """#1534: drain must run BEFORE the follow-up claim. If it ran after
+    process_event, tEval2 would see ResourceQuota still full (tEval1 still
+    holding the slot), raise CapacityExhaustedError, and never bind.
+    """
+
+    async def go() -> None:
+        async with make_harness(claim_timeout_seconds=0.2) as h:
+            h.runner.default_script = [Final(text="hi", status=DONE)]
+            await h.kernel.process_event(_qevent("eval-case-1", thread="tEval1"))
+            assert h.substrate.lookup("tEval1") is not None
+
+            h.fake_k8s.quota_rejection = QuotaRejection(
+                quota_name="curie-sandbox-quota",
+                resource="limits.cpu",
+                requested="1",
+                used="8",
+                hard="8",
+            )
+            original_delete = h.fake_k8s.delete_claim
+
+            def delete_and_free(name: str) -> None:
+                original_delete(name)
+                h.fake_k8s.quota_rejection = None
+
+            h.fake_k8s.delete_claim = delete_and_free  # type: ignore[method-assign]
+
+            await h.async_redis.sadd(THREAD_RESET_SET, "tEval1")
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            await consumer.ensure_group()
+            nxt = _qevent("eval-case-2", thread="tEval2", event_id="eval-2-quota")
+            entry_id = await h.async_redis.xadd(h.config.stream, to_stream_fields(nxt))
+            await consumer._sem.acquire()
+            await consumer._handle(entry_id, to_stream_fields(nxt))
+
+            assert h.substrate.lookup("tEval1") is None
+            assert h.substrate.lookup("tEval2") is not None
 
     asyncio.run(go())
 
