@@ -157,6 +157,10 @@ remain backward compatible down to the floor it stamps.
   closed unless the epochs match and the consumer's required revision falls
   between the owner's compatibility floor and current revision. The error names
   both ranges, the owner release, and the required order.
+- An owner upgrade also reads every consumer registration from decision 6 and
+  refuses any proposed epoch or compatibility floor that would exclude one of
+  them. Raising the floor is therefore safe only after every registered
+  consumer has upgraded into the retained range.
 - An absent stamp has two explicit branches. `owner=true` may bootstrap only
   when no foreign fixed-name singleton exists and the installed CRDs equal the
   packaged schemas; an existing singleton without a stamp is a loud adoption
@@ -164,9 +168,15 @@ remain backward compatible down to the floor it stamps.
   an external manager must publish the same verifiable contract stamp and pass
   live controller capability, RBAC, and CRD-schema probes before the consumer
   installs.
-- The **order is owner first**. The owner's contract revision is at or above
-  every consumer's required revision within the same epoch, and a consumer is
-  never permitted to run ahead of that range.
+- For a compatible revision, the **order is owner first**. The owner's contract
+  revision is at or above every consumer's required revision within the same
+  epoch, and a consumer is never permitted to run ahead of that range. An epoch
+  transition is not an ordinary owner-first Helm upgrade: `curie cluster
+  contract migrate` drains every registered consumer, proves no active claim or
+  sandbox remains, upgrades the owner and CRDs, upgrades and re-registers every
+  consumer in the new epoch, then reopens admission. No old- and new-epoch
+  consumers run concurrently; a failed migration leaves admission closed and
+  reports the exact incomplete step.
 
 The revision is deliberately not the chart version. Most chart versions change
 nothing a shared controller must provide, and tying the two would make every
@@ -256,10 +266,11 @@ wrong direction for the failure class this ADR exists to close.
 
 ## Consequences
 
-- The single release install, which is every documented install today, renders
-  identically. `clusterSingletons.owner` defaults to `true`; an absent-stamp
-  first-owner preflight verifies no foreign singleton and matching CRDs, then
-  permits the owner to stamp what it installs.
+- The single-release topology and default remain unchanged: the one release is
+  the owner because `clusterSingletons.owner` defaults to `true`. Its rendered
+  product resources gain ownership metadata and lifecycle hooks; the
+  absent-stamp first-owner preflight verifies no foreign singleton and matching
+  CRDs before permitting the owner to stamp what it installs.
 - A consumer release gains the namespaced RBAC it never had, so the
   reported "claims silently never bind" state is not reachable through the
   missing grant path, at matched or skewed versions.
