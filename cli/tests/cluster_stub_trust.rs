@@ -60,6 +60,25 @@ if "patch deployment curie-worker" in args:
     save()
     sys.exit(0)
 
+if "rollout status" in args:
+    sys.exit(0)
+
+if "get pods" in args and "-o json" in args:
+    polls = int(state.get("pod_polls") or 0) + 1
+    state["pod_polls"] = polls
+    save()
+    new_pod = {
+        "metadata": {"name": "curie-worker-new"},
+        "status": {"phase": "Running", "conditions": [{"type": "Ready", "status": "True"}]},
+    }
+    old_pod = {
+        "metadata": {"name": "curie-worker-old", "deletionTimestamp": "2026-08-23T00:00:00Z"},
+        "status": {"phase": "Running", "conditions": [{"type": "Ready", "status": "True"}]},
+    }
+    items = [new_pod, old_pod] if os.environ.get("CURIE_TEST_TERMINATING_WORKER") == "1" and polls == 1 else [new_pod]
+    print(json.dumps({"items": items}))
+    sys.exit(0)
+
 # The Valkey forward fails after temporary trust should have been installed.
 if "port-forward" in args and "valkey" in args:
     print("intentional Valkey tunnel failure", file=sys.stderr)
@@ -78,6 +97,15 @@ fn run_cluster_message(
     connected: bool,
     existing_trust: Option<&str>,
     dispatcher_probe_fails: bool,
+) -> (Output, Vec<String>, serde_json::Value) {
+    run_cluster_message_with(connected, existing_trust, dispatcher_probe_fails, false)
+}
+
+fn run_cluster_message_with(
+    connected: bool,
+    existing_trust: Option<&str>,
+    dispatcher_probe_fails: bool,
+    terminating_worker: bool,
 ) -> (Output, Vec<String>, serde_json::Value) {
     let tools = tempfile::tempdir().expect("create fake tool directory");
     write_tool(tools.path(), "kubectl");
@@ -131,6 +159,9 @@ fn run_cluster_message(
     }
     if dispatcher_probe_fails {
         command.env("CURIE_TEST_DISPATCHER_PROBE_FAIL", "1");
+    }
+    if terminating_worker {
+        command.env("CURIE_TEST_TERMINATING_WORKER", "1");
     }
     let output = command.output().expect("run cluster message");
     let lines = fs::read_to_string(log_path)
@@ -244,4 +275,47 @@ fn connected_or_unprobeable_dispatcher_never_mutates_worker_stub_trust() {
         "a failed dispatcher probe is not proof it is safe to mutate worker trust: {lines:#?}"
     );
     assert!(state["trust"].is_null());
+}
+
+#[test]
+fn disconnected_cluster_message_waits_out_a_terminating_worker_before_enqueue() {
+    // #1532: the first cluster message rolls the worker to install stub trust.
+    // Enqueue must wait until the outgoing pod is gone, otherwise that
+    // consumer can claim the turn during SIGTERM and strand it for 15 minutes.
+    let (output, lines, state) = run_cluster_message_with(false, None, false, true);
+    assert!(
+        !output.status.success(),
+        "fixture must reach its forced tunnel error"
+    );
+
+    let rollout_index = lines
+        .iter()
+        .position(|line| line.contains("rollout status"))
+        .expect("trust install waits for rollout status");
+    let pod_indices: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.contains("get pods"))
+        .map(|(index, _)| index)
+        .collect();
+    assert!(
+        pod_indices.len() >= 2,
+        "a terminating worker must be polled until it disappears: {lines:#?}"
+    );
+    let forward_index = lines
+        .iter()
+        .position(|line| line.contains("port-forward") && line.contains("valkey"))
+        .expect("message must attempt its Valkey tunnel");
+    assert!(
+        rollout_index < pod_indices[0],
+        "pod wait follows rollout status: {lines:#?}"
+    );
+    assert!(
+        *pod_indices.last().expect("pod wait") < forward_index,
+        "enqueue plumbing must not start while a terminating worker remains: {lines:#?}"
+    );
+    assert!(
+        state["pod_polls"].as_u64().unwrap_or(0) >= 2,
+        "the terminating snapshot must have been replaced before enqueue: {state}"
+    );
 }

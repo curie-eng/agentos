@@ -20,7 +20,7 @@ import tarfile
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -832,6 +832,72 @@ def test_pending_entry_from_a_dead_consumer_is_reclaimed(make_eval_harness, bund
                 await _drain_one(consumer, reports)
 
                 # Reclaimed, re-run against the bundle, reported, and acked.
+                assert reports[0]["sha"] == sha
+                assert reports[0]["passed_count"] == 1
+                summary = await client.xpending(cfg.eval_stream, cfg.eval_consumer_group)
+                assert summary["pending"] == 0
+
+            await client.delete(cfg.eval_stream)
+            await client.aclose()
+
+    asyncio.run(go())
+
+
+def test_pending_entry_from_a_dead_consumer_is_reclaimed_without_waiting_min_idle(
+    make_eval_harness, bundles
+) -> None:
+    """Eval sibling of the #1532 dead-consumer prompt reclaim: the 15-minute
+    XAUTOCLAIM idle must not be what recovers the entry."""
+    store, upload = bundles
+
+    async def go() -> None:
+        async with make_eval_harness() as (base_url, fake, _client):
+            fake.responses = {"q": "ok"}
+            bundle_ref = upload(
+                EvalSuite(
+                    name="recl-fast",
+                    cases=[
+                        EvalCase(id="1", input="q", grader=Grader(kind=CONTAINS, expected="ok"))
+                    ],
+                )
+            )
+            token = uuid.uuid4().hex[:8]
+            cfg = _cfg(
+                f"test:evals:{token}",
+                f"g-{token}",
+                reclaim_min_idle_ms=900000,
+                reclaim_interval_s=0.05,
+            )
+            client = AsyncRedis(host=_VH, port=_VP, password=_VPW, decode_responses=True)
+            reports: list[dict[str, Any]] = []
+            async with httpx.AsyncClient(timeout=30.0) as lf_client:
+                consumer = _build_consumer(
+                    redis_client=client,
+                    cfg=cfg,
+                    bundle_store=store,
+                    substrate=_UnusedSubstrate(),
+                    reports=reports,
+                    lf_client=lf_client,
+                )
+                # Production eval pins this to reclaim_min_idle_ms because its
+                # read loop is inline. Pin 0 here so this sibling proves the
+                # shared helper, not XAUTOCLAIM.
+                consumer._delivery = replace(consumer._delivery, dead_consumer_idle_ms=0)
+                await consumer.ensure_group()
+                sha = f"sha-{token}"
+                item = _item(suite="recl-fast", sha=sha, bundle_ref=bundle_ref, target_url=base_url)
+                await client.xadd(cfg.eval_stream, {"payload": item.model_dump_json()})
+                await client.xreadgroup(
+                    cfg.eval_consumer_group,
+                    "dead-consumer",
+                    {cfg.eval_stream: ">"},
+                    count=10,
+                )
+                pending = await client.xpending(cfg.eval_stream, cfg.eval_consumer_group)
+                assert pending["pending"] == 1
+
+                await _drain_one(consumer, reports)
+
                 assert reports[0]["sha"] == sha
                 assert reports[0]["passed_count"] == 1
                 summary = await client.xpending(cfg.eval_stream, cfg.eval_consumer_group)

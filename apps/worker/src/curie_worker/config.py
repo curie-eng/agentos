@@ -474,6 +474,14 @@ class WorkerConfig(BaseSettings):
     # crash recovery.
     reclaim_min_idle_ms: int = 900000
     reclaim_interval_s: float = 30.0
+    # Prompt reclaim for a consumer that has stopped interacting with the
+    # group (#1532). Entry idle is the wrong signal: a live replica's
+    # in-flight turn is pending for the whole runner timeout, so a short
+    # XAUTOCLAIM threshold would steal it. Consumer idle is the right one:
+    # the read loop keeps issuing XREADGROUP every ``read_block_ms`` even
+    # while a turn is in flight, so a peer idle longer than a few block
+    # intervals is dead, not mid-turn. Default is 3x ``read_block_ms``.
+    dead_consumer_idle_ms: int = Field(default=15000, ge=0)
 
     # Slack placeholder edits are throttled to avoid rate limits while streaming.
     slack_edit_min_interval_s: float = 0.7

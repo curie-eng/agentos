@@ -132,6 +132,7 @@ class Consumer(StreamConsumer):
             max_delivery=config.max_delivery,
             dead_letter_maxlen=config.dead_letter_maxlen,
             reclaim_min_idle_ms=config.reclaim_min_idle_ms,
+            dead_consumer_idle_ms=config.dead_consumer_idle_ms,
             read_count=config.read_count,
             cap_scan_page=_CAP_SCAN_PAGE,
             handler=self._dispatch,
