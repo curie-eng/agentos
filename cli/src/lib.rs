@@ -53,4 +53,4 @@ pub mod ui;
 pub use retired::retired_hint;
 
 #[cfg(test)]
-pub(crate) static PROCESS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static PROCESS_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());

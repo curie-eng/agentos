@@ -1844,9 +1844,7 @@ mod tests {
 
     #[tokio::test]
     async fn custom_api_deploy_failure_does_not_read_local_compose_state() {
-        let _lock = crate::PROCESS_ENV_LOCK
-            .lock()
-            .expect("lock deploy diagnosis environment");
+        let _lock = crate::PROCESS_ENV_LOCK.lock().await;
         let tools = tempfile::tempdir().expect("create fake docker directory");
         let log = tools.path().join("docker.log");
         let _restore = install_recording_docker(tools.path(), &log);
@@ -1875,9 +1873,7 @@ mod tests {
 
     #[tokio::test]
     async fn default_api_deploy_failure_reads_the_running_curie_project() {
-        let _lock = crate::PROCESS_ENV_LOCK
-            .lock()
-            .expect("lock deploy diagnosis environment");
+        let _lock = crate::PROCESS_ENV_LOCK.lock().await;
         let tools = tempfile::tempdir().expect("create fake docker directory");
         let log = tools.path().join("docker.log");
         let _restore = install_recording_docker(tools.path(), &log);
@@ -1932,9 +1928,7 @@ mod tests {
 
     #[tokio::test]
     async fn default_api_deploy_failure_keeps_status_guidance_when_compose_is_unreadable() {
-        let _lock = crate::PROCESS_ENV_LOCK
-            .lock()
-            .expect("lock deploy diagnosis environment");
+        let _lock = crate::PROCESS_ENV_LOCK.lock().await;
         let tools = tempfile::tempdir().expect("create fake docker directory");
         let log = tools.path().join("docker.log");
         let _restore = install_recording_docker(tools.path(), &log);

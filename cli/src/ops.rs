@@ -2383,9 +2383,7 @@ esac
 
     #[tokio::test]
     async fn api_key_failure_names_a_deployed_same_name_release_in_another_namespace() {
-        let _lock = crate::PROCESS_ENV_LOCK
-            .lock()
-            .expect("lock test environment");
+        let _lock = crate::PROCESS_ENV_LOCK.lock().await;
         let tools = tempfile::tempdir().expect("create fake cluster tools");
         let _restore = install_cluster_diagnosis_tools(tools.path());
         let log = tools.path().join("helm.log");
@@ -2426,9 +2424,7 @@ esac
 
     #[tokio::test]
     async fn api_key_failure_without_a_deployed_alternate_does_not_offer_a_key_remedy() {
-        let _lock = crate::PROCESS_ENV_LOCK
-            .lock()
-            .expect("lock test environment");
+        let _lock = crate::PROCESS_ENV_LOCK.lock().await;
         let tools = tempfile::tempdir().expect("create fake cluster tools");
         let _restore = install_cluster_diagnosis_tools(tools.path());
         let log = tools.path().join("helm.log");
@@ -2460,9 +2456,7 @@ esac
 
     #[tokio::test]
     async fn deployed_release_key_failure_does_not_require_all_namespace_access() {
-        let _lock = crate::PROCESS_ENV_LOCK
-            .lock()
-            .expect("lock test environment");
+        let _lock = crate::PROCESS_ENV_LOCK.lock().await;
         let tools = tempfile::tempdir().expect("create fake cluster tools");
         let _restore = install_cluster_diagnosis_tools(tools.path());
         let log = tools.path().join("helm.log");
@@ -2509,9 +2503,7 @@ esac
 
     #[tokio::test]
     async fn pending_upgrade_is_read_instead_of_reported_as_a_missing_release() {
-        let _lock = crate::PROCESS_ENV_LOCK
-            .lock()
-            .expect("lock test environment");
+        let _lock = crate::PROCESS_ENV_LOCK.lock().await;
         let tools = tempfile::tempdir().expect("create fake cluster tools");
         let _restore = install_cluster_diagnosis_tools(tools.path());
         let log = tools.path().join("helm.log");
@@ -2550,9 +2542,7 @@ esac
 
     #[tokio::test]
     async fn failed_release_state_survives_a_forbidden_all_namespace_scan() {
-        let _lock = crate::PROCESS_ENV_LOCK
-            .lock()
-            .expect("lock test environment");
+        let _lock = crate::PROCESS_ENV_LOCK.lock().await;
         let tools = tempfile::tempdir().expect("create fake cluster tools");
         let _restore = install_cluster_diagnosis_tools(tools.path());
         let log = tools.path().join("helm.log");
