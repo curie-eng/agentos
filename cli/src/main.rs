@@ -803,6 +803,21 @@ enum SreBotAction {
         /// Bind the installed bot to this Slack channel.
         #[arg(long, value_name = "CHANNEL")]
         slack_channel: Option<String>,
+        /// Keep the approval-gated restart tool, scoped to these Deployments
+        /// (`namespace/name`, comma separated). One list renders BOTH ceilings:
+        /// the Role's resourceNames and the connector's K8S_WRITE_ALLOWLIST.
+        /// Omit to install read only.
+        #[arg(long, value_name = "NS/NAME[,NS/NAME]")]
+        write_allowlist: Option<String>,
+        /// Kubernetes namespace of the Curie release. Default: curie.
+        #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
+        namespace: String,
+        /// Helm release name of the Curie install. Default: curie.
+        #[arg(long, default_value = "curie")]
+        release: String,
+        /// Kubernetes namespace of the retained observability stack. Default: observability.
+        #[arg(long, default_value = "observability")]
+        observability_namespace: String,
     },
 }
 
@@ -2120,6 +2135,11 @@ enum ClusterAction {
         /// Helm release name (for the port-forward + key discovery). Default: curie.
         #[arg(long, default_value = "curie")]
         release: String,
+        /// Helm chart used to write per-agent connector Secrets. Default: the
+        /// version-pinned chart release asset on release builds; local
+        /// `charts/curie` on dev builds.
+        #[arg(long)]
+        chart: Option<String>,
         /// Platform API key. Omit to auto-discover the release Secret key
         /// (`<release>-secrets`); the discovered key travels only in the
         /// X-API-Key header over the loopback tunnel, never over the cleartext
@@ -2157,12 +2177,9 @@ enum ClusterAction {
         /// Version label; defaults to <manifest version>-<unix time>.
         #[arg(long)]
         label: Option<String>,
-        /// Per-agent connector secrets are NOT yet delivered at the cluster tier
-        /// (#440): this flag is accepted only so it can be DECLINED with a reason
-        /// instead of erroring like a typo. Until per-agent K8s Secret +
-        /// secretKeyRef delivery lands, a value-only SandboxClaim CR would persist
-        /// the token in plaintext in etcd. Use `curie local deploy --secret`
-        /// today. See ADR-0009.
+        /// Per-agent connector secrets: values are written to the agent's Helm
+        /// Secret through a private values file (never argv). The SandboxClaim
+        /// stays names-only. See ADR-0009 / #1488.
         #[arg(long = "secret")]
         secret: Vec<String>,
     },
@@ -2377,6 +2394,38 @@ async fn resolve_compose_file(file: Option<String>, dry_run: bool) -> Result<Str
     materialize_artifact(resolved, dry_run, "compose").await
 }
 
+async fn bind_cluster_connector_secrets(
+    namespace: &str,
+    release: &str,
+    chart: Option<&str>,
+    agent_name: &str,
+    secret_names: &[String],
+) -> Result<()> {
+    let secrets = curie::cluster_secrets::resolve_named_secrets(secret_names)?;
+    if secrets.is_empty() {
+        return Ok(());
+    }
+    let resolved = artifacts::resolve_chart(
+        chart,
+        artifacts::Channel::current(),
+        artifacts::version(),
+        artifacts::cache_root,
+        std::path::Path::new("charts/curie").is_dir(),
+    )?;
+    let chart = materialize_artifact(resolved, false, "chart").await?;
+    curie::cluster_secrets::bind(curie::cluster_secrets::BindOpts {
+        common: CommonOpts {
+            namespace: namespace.to_string(),
+            release: release.to_string(),
+            dry_run: false,
+        },
+        chart,
+        agent: agent_name.to_string(),
+        secrets,
+    })
+    .await
+}
+
 async fn materialize_artifact(
     resolved: artifacts::Resolved,
     dry_run: bool,
@@ -2464,12 +2513,20 @@ async fn run(command: Option<Command>) -> Result<()> {
                             observability,
                             dry_run,
                             slack_channel,
+                            write_allowlist,
+                            namespace,
+                            release,
+                            observability_namespace,
                         },
                 },
         }) => match curie::examples::install_sre_bot(curie::examples::SreBotInstallOpts {
             observability,
             dry_run,
             slack_channel,
+            write_allowlist,
+            namespace,
+            release,
+            observability_namespace,
         })
         .await?
         {
@@ -3540,6 +3597,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 api_url,
                 namespace,
                 release,
+                chart,
                 api_key,
                 slack_channel,
                 repo,
@@ -3549,19 +3607,6 @@ async fn run(command: Option<Command>) -> Result<()> {
                 label,
                 secret,
             } => {
-                // Decline `--secret` at the cluster tier with a REASON, not a
-                // clap "unexpected argument" that reads like a typo (#551): the
-                // parity rule is every verb is either implemented or explicitly
-                // declined. Per-agent secret delivery to worker-spawned sandboxes
-                // is tracked in #440 (ADR-0009); `local deploy --secret` works today.
-                if !secret.is_empty() {
-                    bail!(
-                        "`cluster deploy --secret` is not supported at the cluster tier yet: \
-                         per-agent connector-secret delivery to worker-spawned sandboxes needs the \
-                         K8s Secret + secretKeyRef path tracked in #440 (ADR-0009). Deploy without \
-                         --secret, or use `curie local deploy --secret` for a local end-to-end run."
-                    );
-                }
                 let api_key = commands::normalize_deploy_api_key(api_key);
                 // ADR-0057 (supersedes ADR-0024's deploy transport): with no
                 // explicit --api-key, discover the release's strong Secret key;
@@ -3685,14 +3730,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                         workspace: commands::WorkspaceIntent::from_flags(workspace, no_workspace),
                         env,
                         label: label.clone(),
-                        // Cluster connector-secret delivery is deferred to #440; no
-                        // `--secret` flag on `cluster deploy` (see the note above).
-                        secret: Vec::new(),
-                        // Secret binding is not wired on cluster until #440, so the
-                        // declared-secrets policy gate (#464) is skipped here: it
-                        // would otherwise hard-fail every secrets-declaring bundle
-                        // with a `--secret <NAME>` remediation this tier lacks.
-                        secret_binding_supported: false,
+                        secret: secret.clone(),
+                        secret_binding_supported: true,
                         connect_hint: connect_hint.clone(),
                         tier: commands::DeployTier::Cluster,
                     })
@@ -3719,7 +3758,32 @@ async fn run(command: Option<Command>) -> Result<()> {
                     // before the next turn reaches for them; the credentials here
                     // are the CONNECTOR's, resolved locally and written straight to
                     // a K8s Secret, which is a different path from the sandbox
-                    // secret delivery #440 tracks.
+                    // secret delivery #1488 tracks.
+                    if !secret.is_empty() {
+                        if let Err(err) = bind_cluster_connector_secrets(
+                            &namespace,
+                            &release,
+                            chart.as_deref(),
+                            &deployed.agent_name,
+                            &secret,
+                        )
+                        .await
+                        {
+                            if all_targets {
+                                let failed_target = target_name
+                                    .as_deref()
+                                    .expect("all target entries always have a target name");
+                                let payload = commands::all_targets_deploy_failure_json(
+                                    failed_target,
+                                    &completed,
+                                    Some(&deployed),
+                                    &err,
+                                );
+                                return Err(curie::exit::with_json_payload(err, payload));
+                            }
+                            return Err(err);
+                        }
+                    }
                     if let Err(err) = curie::connectors::sync_deployed_version(
                         &api_url,
                         &api_key,
@@ -5342,10 +5406,9 @@ mod tests {
     }
 
     #[test]
-    fn cluster_deploy_accepts_secret_so_it_can_decline_with_a_reason() {
-        // `--secret` must PARSE (not error like a typo) so the handler can decline
-        // it with an explicit #440 message (#551). The decline itself is a runtime
-        // bail; here we lock that the surface accepts the flag.
+    fn cluster_deploy_accepts_secret_flag() {
+        // `--secret` must PARSE (not error like a typo). Cluster delivery is
+        // implemented (#1488); this lock is the clap surface, not the helm path.
         match Cli::try_parse_from([
             "curie",
             "cluster",
@@ -5353,7 +5416,7 @@ mod tests {
             "--secret",
             "GITHUB_PERSONAL_ACCESS_TOKEN",
         ])
-        .expect("cluster deploy --secret should parse (then be declined at runtime)")
+        .expect("cluster deploy --secret should parse")
         .command
         {
             Some(Command::Cluster {

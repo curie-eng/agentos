@@ -27,6 +27,39 @@ from plugin_format import is_reserved_boot_env_name
 MANAGED_BY_LABEL = "curietech.ai/managed-by"
 MANAGED_BY_VALUE = "curie-sandbox-substrate"
 THREAD_HASH_LABEL = "curietech.ai/thread-hash"
+# Claim-object label (not spec.additionalPodMetadata). The adopted controller
+# rejects curietech.ai under additionalPodMetadata; template pod labels and
+# claim metadata labels are the supported paths (#1488).
+AGENT_LABEL = "curietech.ai/agent"
+
+_GENERIC_POOL_SUFFIX = "-runner-pool"
+
+
+def agent_warm_pool_name(base_pool: str, agent_name: str | None) -> str:
+    """Derive the per-agent pool name matching charts/curie/templates/agent-sandbox.yaml.
+
+    Generic pool: ``{fullname}-runner-pool``.
+    Per-agent pool: ``{fullname}-agent-{agent}-runner-pool``.
+    An operator override that does not use the chart suffix is left alone.
+    """
+
+    if not agent_name:
+        return base_pool
+    if not base_pool.endswith(_GENERIC_POOL_SUFFIX):
+        return base_pool
+    prefix = base_pool[: -len(_GENERIC_POOL_SUFFIX)]
+    return f"{prefix}-agent-{agent_name}{_GENERIC_POOL_SUFFIX}"
+
+
+def claim_warm_pool(
+    base_pool: str, env: Mapping[str, str] | None, agent_name: str | None
+) -> str:
+    """Route connector-secret claims to the per-agent pool, otherwise the generic pool."""
+
+    marker = (env or {}).get(BootEnv.env_key("connector_secret_keys"), "").strip()
+    if marker and agent_name:
+        return agent_warm_pool_name(base_pool, agent_name)
+    return base_pool
 
 HOST_APPLICATION_CREDENTIAL_ENV_NAMES: frozenset[str] = frozenset(
     {

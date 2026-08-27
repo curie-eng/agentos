@@ -13,6 +13,7 @@ from .docker import DockerError, DockerSandboxClient, RunnerHardening
 from .k8s import KubernetesSandboxClient
 from .substrate import HISTORY_ENV, SESSION_ENV, SandboxSubstrate
 from .types import (
+    AGENT_LABEL,
     MANAGED_BY_LABEL,
     MANAGED_BY_VALUE,
     THREAD_HASH_LABEL,
@@ -29,14 +30,19 @@ from .types import (
     SandboxView,
     SubstrateConfig,
     SuspendedThreadError,
+    agent_warm_pool_name,
+    claim_warm_pool,
 )
 
 __all__ = [
+    "AGENT_LABEL",
     "HISTORY_ENV",
     "MANAGED_BY_LABEL",
     "MANAGED_BY_VALUE",
     "SESSION_ENV",
     "THREAD_HASH_LABEL",
+    "agent_warm_pool_name",
+    "claim_warm_pool",
     "AffinityStore",
     "CapacityExhaustedError",
     "ClaimTimeoutError",

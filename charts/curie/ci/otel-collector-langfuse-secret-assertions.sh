@@ -341,7 +341,9 @@ grep -qF 'otelCollector.otlpAuthHeader' "$TMP/dev-header-interior-space.stderr" 
 # message claiming a header "the OTel Collector would send" describes something
 # the operator cannot find. Asserting on the wording is what stops a future edit
 # from silently reintroducing that false claim.
-rc="$(gate_rc dev-header-no-collector --set security.checkDefaultCredentials=true --set otelCollector.deploy=false --set langfuse.existingSecret='my-langfuse' --set-string 'otelCollector.otlpAuthHeader=Basic cGstbGYtY3VyaWUtZGV2OnNrLWxmLWN1cmllLWRldg==')"
+# telemetryDisabled isolates this header check from #1819's availability gate,
+# which otherwise refuses deploy=false with no chart-owned endpoint.
+rc="$(gate_rc dev-header-no-collector --set security.checkDefaultCredentials=true --set otelCollector.deploy=false --set otelCollector.telemetryDisabled=true --set langfuse.existingSecret='my-langfuse' --set-string 'otelCollector.otlpAuthHeader=Basic cGstbGYtY3VyaWUtZGV2OnNrLWxmLWN1cmllLWRldg==')"
 [[ "$rc" != "0" ]] || fail "T14: security.checkDefaultCredentials=true rendered successfully with otelCollector.deploy=false and the published dev header. The chart still writes that credential into its Secret whether or not this release runs a collector, so the gate must still refuse"
 grep -qF 'as the OTel Collector auth credential in its Secret' "$TMP/dev-header-no-collector.stderr" || fail "T14: the render failed but its message does not say the credential is what the chart ships in its Secret, which is the part that is true whether or not a collector is deployed. stderr was: $(cat "$TMP/dev-header-no-collector.stderr")"
 if grep -qF 'header the OTel Collector would send to Langfuse' "$TMP/dev-header-no-collector.stderr"; then

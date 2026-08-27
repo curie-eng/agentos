@@ -706,7 +706,7 @@ teardown failures. Inline tests in product files are not inferred.
 
 | Command | What it does |
 |---|---|
-| `curie build` | Build the runner image locally: `docker build -f runner/Dockerfile -t curie-runner .` from the repo root (found by walking up to `runner/Dockerfile`). `--tag` overrides the tag. Prints a clear error if Docker is not installed or if run outside a source checkout -- a release binary pulls the pinned runner image from GHCR automatically and never needs to build. |
+| `curie build` | Build the runner image locally from `runner/Dockerfile` at the repo root. Default tag is `curie-runner`; the same image is also tagged `ghcr.io/curie-eng/curie-runner:dev` so a `curie local up --build` stack sees it. `--tag` overrides the primary tag (a custom tag is not also applied as `:dev`). Prints a clear error if Docker is not installed or if run outside a source checkout -- a release binary pulls the pinned runner image from GHCR automatically and never needs to build. |
 
 ### Prototyping agents in a source checkout
 

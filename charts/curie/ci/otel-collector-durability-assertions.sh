@@ -158,6 +158,94 @@ agentSandbox:
         value: grpc
 YAML
 
+cat > "$TMP/chart-owned-external.yaml" <<'YAML'
+otelCollector:
+  deploy: false
+  endpoint: https://otel.example.com:4318
+  protocol: http/protobuf
+  headersExistingSecret: acme-otel-auth
+  headersSecretKey: headers
+dispatcher:
+  deploy: true
+  slack:
+    appToken: placeholder-app-token
+    botToken: placeholder-bot-token
+YAML
+
+cat > "$TMP/chart-owned-external-literal-headers.yaml" <<'YAML'
+otelCollector:
+  deploy: false
+  endpoint: https://otel.example.com:4318
+  headers: "x-scope-orgid=acme"
+dispatcher:
+  deploy: true
+  slack:
+    appToken: placeholder-app-token
+    botToken: placeholder-bot-token
+YAML
+
+cat > "$TMP/explicit-disable.yaml" <<'YAML'
+security:
+  checkDefaultCredentials: true
+otelCollector:
+  deploy: false
+  telemetryDisabled: true
+langfuse:
+  existingSecret: my-langfuse
+dispatcher:
+  deploy: true
+  slack:
+    appToken: placeholder-app-token
+    botToken: placeholder-bot-token
+YAML
+
+cat > "$TMP/chart-owned-external-plus-extraenv-override.yaml" <<'YAML'
+otelCollector:
+  deploy: false
+  endpoint: https://otel.example.com:4318
+  protocol: http/protobuf
+dispatcher:
+  deploy: true
+  slack:
+    appToken: placeholder-app-token
+    botToken: placeholder-bot-token
+agentSandbox:
+  runner:
+    extraEnv:
+      - name: OTEL_EXPORTER_OTLP_ENDPOINT
+        value: https://otel-override.example.com:4318
+      - name: OTEL_EXPORTER_OTLP_PROTOCOL
+        value: grpc
+YAML
+
+cat > "$TMP/both-header-sources.yaml" <<'YAML'
+otelCollector:
+  deploy: false
+  endpoint: https://otel.example.com:4318
+  headers: "x-scope-orgid=acme"
+  headersExistingSecret: acme-otel-auth
+YAML
+
+cat > "$TMP/disabled-with-endpoint.yaml" <<'YAML'
+otelCollector:
+  deploy: false
+  telemetryDisabled: true
+  endpoint: https://otel.example.com:4318
+YAML
+
+cat > "$TMP/disabled-with-deploy.yaml" <<'YAML'
+otelCollector:
+  deploy: true
+  telemetryDisabled: true
+YAML
+
+cat > "$TMP/literal-sensitive-workload-headers.yaml" <<'YAML'
+otelCollector:
+  deploy: false
+  endpoint: https://otel.example.com:4318
+  headers: "Authorization=Basic placeholder-not-a-credential"
+YAML
+
 render "$TMP/default.yaml"
 render "$TMP/workload-wiring.yaml" \
   --set dispatcher.deploy=true \
@@ -184,6 +272,15 @@ render "$TMP/external-otel-workload-env.yaml.out" \
   -f "$TMP/external-otel-workload-env.yaml"
 render "$TMP/internal-runner-otel-override.yaml.out" \
   -f "$TMP/internal-runner-otel-override.yaml"
+render "$TMP/chart-owned-external.yaml.out" \
+  -f "$TMP/chart-owned-external.yaml"
+render "$TMP/chart-owned-external-literal-headers.yaml.out" \
+  -f "$TMP/chart-owned-external-literal-headers.yaml"
+render "$TMP/explicit-disable.yaml.out" \
+  -f "$TMP/explicit-disable.yaml" \
+  --set-string otelCollector.otlpAuthHeader='Basic cGstbGYtb3duZWQ6c2stbGYtb3duZWQ='
+render "$TMP/chart-owned-external-plus-extraenv-override.yaml.out" \
+  -f "$TMP/chart-owned-external-plus-extraenv-override.yaml"
 
 expect_render_failure() {
   local label="$1" expected="$2"
@@ -300,6 +397,22 @@ expect_render_failure wildcard-pod-metrics-peer metricsIngress \
 expect_render_failure wildcard-namespace-metrics-peer metricsIngress \
   -f "$TMP/wildcard-namespace-metrics-peer.yaml"
 
+# Production-hardening gate: deploy=false without a chart-owned endpoint or an
+# explicit disable is accidental missing, not an implied external collector.
+expect_render_failure accidental-missing-external-endpoint telemetryDisabled \
+  --set security.checkDefaultCredentials=true \
+  --set otelCollector.deploy=false \
+  --set langfuse.existingSecret=my-langfuse \
+  --set-string otelCollector.otlpAuthHeader='Basic cGstbGYtb3duZWQ6c2stbGYtb3duZWQ='
+expect_render_failure both-header-sources headersExistingSecret \
+  -f "$TMP/both-header-sources.yaml"
+expect_render_failure disabled-with-endpoint telemetryDisabled \
+  -f "$TMP/disabled-with-endpoint.yaml"
+expect_render_failure disabled-with-deploy telemetryDisabled \
+  -f "$TMP/disabled-with-deploy.yaml"
+expect_render_failure literal-sensitive-workload-headers headersExistingSecret \
+  -f "$TMP/literal-sensitive-workload-headers.yaml"
+
 python3 - \
   "$TMP/default.yaml" "$TMP/dev.yaml" "$TMP/ephemeral.yaml" \
   "$TMP/storage-class.yaml" "$TMP/external.yaml" "$TMP/extra.yaml" \
@@ -308,7 +421,11 @@ python3 - \
   "$TMP/network-policy-disabled.yaml" \
   "$TMP/external-otel-workload-env.yaml.out" \
   "$TMP/secret-backed-extra-exporter.yaml.out" \
-  "$TMP/internal-runner-otel-override.yaml.out" <<'PY'
+  "$TMP/internal-runner-otel-override.yaml.out" \
+  "$TMP/chart-owned-external.yaml.out" \
+  "$TMP/chart-owned-external-literal-headers.yaml.out" \
+  "$TMP/explicit-disable.yaml.out" \
+  "$TMP/chart-owned-external-plus-extraenv-override.yaml.out" <<'PY'
 import re
 import sys
 
@@ -441,6 +558,10 @@ def quantity_is_finite(value):
     external_otel_workload_env_path,
     secret_backed_extra_exporter_path,
     internal_runner_otel_override_path,
+    chart_owned_external_path,
+    chart_owned_external_literal_headers_path,
+    explicit_disable_path,
+    chart_owned_external_plus_extraenv_override_path,
 ) = sys.argv[1:]
 
 
@@ -552,6 +673,85 @@ for role, container in workload_containers(external_otel_workload_env_path).item
     assert not any(
         "curie-otel-collector" in str(entry.get("value", "")) for entry in entries
     ), f"{role}: otelCollector.deploy=false synthesized the absent internal endpoint"
+
+chart_owned_endpoint = "https://otel.example.com:4318"
+chart_owned_headers_ref = {
+    "secretKeyRef": {"name": "acme-otel-auth", "key": "headers"}
+}
+for role, container in workload_containers(chart_owned_external_path).items():
+    entries = container.get("env", [])
+    otel_entries = {
+        name: [entry for entry in entries if entry.get("name") == name]
+        for name in (
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_PROTOCOL",
+            "OTEL_EXPORTER_OTLP_HEADERS",
+        )
+    }
+    for name, matches in otel_entries.items():
+        assert len(matches) == 1, (
+            f"{role}: chart-owned external Collector must render {name} exactly once, "
+            f"got {matches!r}"
+        )
+    assert otel_entries["OTEL_EXPORTER_OTLP_ENDPOINT"][0].get("value") == chart_owned_endpoint, (
+        f"{role}: chart-owned external endpoint was {otel_entries['OTEL_EXPORTER_OTLP_ENDPOINT'][0].get('value')!r}"
+    )
+    assert otel_entries["OTEL_EXPORTER_OTLP_PROTOCOL"][0].get("value") == "http/protobuf", (
+        f"{role}: chart-owned external protocol was {otel_entries['OTEL_EXPORTER_OTLP_PROTOCOL'][0].get('value')!r}"
+    )
+    assert otel_entries["OTEL_EXPORTER_OTLP_HEADERS"][0].get("valueFrom") == chart_owned_headers_ref, (
+        f"{role}: chart-owned headersExistingSecret was dropped or rewritten: "
+        f"{otel_entries['OTEL_EXPORTER_OTLP_HEADERS'][0]!r}"
+    )
+    assert not any(
+        "curie-otel-collector" in str(entry.get("value", "")) for entry in entries
+    ), f"{role}: chart-owned external mode synthesized the absent internal endpoint"
+assert not collector_documents(chart_owned_external_path), (
+    "chart-owned external: otelCollector.deploy=false rendered chart-owned Collector resources"
+)
+
+for role, container in workload_containers(chart_owned_external_literal_headers_path).items():
+    entries = container.get("env", [])
+    header_matches = [entry for entry in entries if entry.get("name") == "OTEL_EXPORTER_OTLP_HEADERS"]
+    assert header_matches == [
+        {"name": "OTEL_EXPORTER_OTLP_HEADERS", "value": "x-scope-orgid=acme"}
+    ], f"{role}: chart-owned literal headers were {header_matches!r}"
+
+for role, container in workload_containers(explicit_disable_path).items():
+    env = environment(container)
+    for name in (
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_PROTOCOL",
+        "OTEL_EXPORTER_OTLP_HEADERS",
+    ):
+        assert name not in env, (
+            f"{role}: explicit telemetryDisabled still injected {name}={env[name]!r}"
+        )
+assert not collector_documents(explicit_disable_path), (
+    "explicit disable: otelCollector.deploy=false rendered chart-owned Collector resources"
+)
+
+override_workloads = workload_containers(chart_owned_external_plus_extraenv_override_path)
+for role, container in override_workloads.items():
+    env = environment(container)
+    if role == "runner":
+        assert env.get("OTEL_EXPORTER_OTLP_ENDPOINT") == "https://otel-override.example.com:4318", (
+            f"runner: extraEnv override lost to chart-owned endpoint {env.get('OTEL_EXPORTER_OTLP_ENDPOINT')!r}"
+        )
+        assert env.get("OTEL_EXPORTER_OTLP_PROTOCOL") == "grpc", (
+            f"runner: extraEnv protocol override lost: {env.get('OTEL_EXPORTER_OTLP_PROTOCOL')!r}"
+        )
+        assert sum(
+            entry.get("name") == "OTEL_EXPORTER_OTLP_ENDPOINT"
+            for entry in container.get("env", [])
+        ) == 1, "runner: chart-owned endpoint must not duplicate an extraEnv override"
+    else:
+        assert env.get("OTEL_EXPORTER_OTLP_ENDPOINT") == chart_owned_endpoint, (
+            f"{role}: chart-owned external endpoint was {env.get('OTEL_EXPORTER_OTLP_ENDPOINT')!r}"
+        )
+        assert env.get("OTEL_EXPORTER_OTLP_PROTOCOL") == "http/protobuf", (
+            f"{role}: chart-owned external protocol was {env.get('OTEL_EXPORTER_OTLP_PROTOCOL')!r}"
+        )
 
 default_docs = collector_documents(default_path)
 default_config = collector_config(default_path, "default")

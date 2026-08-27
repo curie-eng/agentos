@@ -520,6 +520,8 @@ class EvalStreamConsumer(StreamConsumer):
         try:
             connector_secrets = await self._repo_lookup.secrets_for(item.agent_id)
             thinking = await self._repo_lookup.thinking_for(item.agent_id)
+            name_for = getattr(self._repo_lookup, "name_for", None)
+            agent_name = await name_for(item.agent_id) if name_for is not None else None
             env = self._boot_env(item, connector_secrets, thinking)
             # Hold a claim slot only across creation/binding (the flood source),
             # not the whole suite run: the semaphore is released the moment the
@@ -527,7 +529,12 @@ class EvalStreamConsumer(StreamConsumer):
             # claim may begin. The secrets/env prep above is cheap and does not
             # touch the cluster, so it stays outside the slot.
             async with self._claim_slots:
-                handle = await asyncio.to_thread(self._substrate.claim, release_key, env=env)
+                handle = await asyncio.to_thread(
+                    self._substrate.claim,
+                    release_key,
+                    env=env,
+                    agent_name=agent_name,
+                )
         except SandboxError:
             logger.exception("could not provision a runner for eval %s", item.sha)
             return None, None, None

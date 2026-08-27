@@ -152,39 +152,34 @@ API, dispatcher, worker, and runner emit OTLP traces, correlated logs, and
 low-cardinality metrics to the **collector**, never directly to Langfuse or a
 log/metrics backend. The in-chart collector receives gRPC on
 `curie-otel-collector:4317` and HTTP on `:4318`. Applications use standard
-`OTEL_EXPORTER_OTLP_*` settings; with `otelCollector.deploy: false`, the chart
-omits its in-cluster endpoint and the operator supplies an external collector
-endpoint through the application's normal OTEL environment configuration.
-The four workload override paths are `api.extraEnv`, `dispatcher.extraEnv`,
-`worker.extraEnv`, and `agentSandbox.runner.extraEnv`. They accept complete
-Kubernetes `EnvVar` entries, including `valueFrom`, so an external endpoint can
-use standard OTEL configuration without copying authentication headers into
-Helm values:
+`OTEL_EXPORTER_OTLP_*` settings. The chart owns one destination for every
+instrumented workload:
+
+- `otelCollector.deploy: true` (default) wires the in-cluster collector.
+- `otelCollector.deploy: false` plus `otelCollector.endpoint` wires an
+  external collector, with optional `protocol`, `headers`, or
+  `headersExistingSecret`.
+- `otelCollector.telemetryDisabled: true` is the explicit no-OTLP
+  acknowledgement. `security.checkDefaultCredentials` refuses a production
+  render that has neither a chart collector nor an external endpoint unless
+  this flag is set.
+- Outside that production gate, `deploy: false` with an empty endpoint remains
+  the supported local/offline no-endpoint mode: SDK export stays inert while
+  stderr diagnostics remain available.
+
+`api.extraEnv`, `dispatcher.extraEnv`, `worker.extraEnv`, and
+`agentSandbox.runner.extraEnv` remain per-workload overrides, including
+`valueFrom`. They do not satisfy the production availability gate, because the
+four services can drift.
 
 ```yaml
 otelCollector:
   deploy: false
-
-api:
-  extraEnv: &externalOtel
-    - {name: OTEL_EXPORTER_OTLP_ENDPOINT, value: https://otel.example.com:4318}
-    - {name: OTEL_EXPORTER_OTLP_PROTOCOL, value: http/protobuf}
-    - name: OTEL_EXPORTER_OTLP_HEADERS
-      valueFrom:
-        secretKeyRef: {name: acme-otel-auth, key: headers}
-dispatcher:
-  extraEnv: *externalOtel
-worker:
-  extraEnv: *externalOtel
-agentSandbox:
-  runner:
-    extraEnv: *externalOtel
+  endpoint: https://otel.example.com:4318
+  protocol: http/protobuf
+  headersExistingSecret: acme-otel-auth
+  headersSecretKey: headers
 ```
-
-When the in-chart collector is disabled, no workload receives a synthesized
-`<release>-otel-collector` endpoint. Leaving these override paths empty is the
-supported no-endpoint mode: SDK export stays inert while stderr diagnostics
-remain available.
 
 Langfuse ingest is HTTP-only, so the collector forwards traces to Langfuse over
 HTTP. Logs and metrics retain explicit collector pipelines. Their destinations
@@ -406,7 +401,9 @@ postgres:
 Toggles (all default `true`): `langfuse.deploy`, `postgres.deploy`,
 `valkey.deploy`, `clickhouse.deploy`, `rustfs.deploy`, `otelCollector.deploy`.
 Flipping any to `false` removes its resources from the render; consumers
-(Langfuse env, the collector config) repoint at the BYO host automatically.
+(Langfuse env, the collector config, application OTEL env) repoint at the BYO
+fields on the same block (`host`/`port` for stores, `otelCollector.endpoint`
+for an external collector).
 
 Secrets: all credentials are written to one `<release>-secrets` Secret. A sealed
 `helm install` (the default) generates strong random values for all eleven
@@ -462,8 +459,11 @@ is the published dev header `Basic cGstbGYtY3VyaWUtZGV2OnNrLWxmLWN1cmllLWRldg==`
 whether `otelCollector.otlpAuthHeader` is set to it directly or the chart
 composed it from the `langfuse.init` keys; `langfuse.existingSecret` does not
 clear it, because that header is what the collector sends regardless of where the
-Langfuse credential comes from. It is off by default so the zero-secret bare
-install stays green.
+Langfuse credential comes from. The same flag also refuses a render that disables
+the chart collector without setting `otelCollector.endpoint` or
+`otelCollector.telemetryDisabled=true`, so a production install cannot silently
+drop every workload's OTLP destination. It is off by default so the zero-secret
+bare install stays green.
 
 ### Key-free object store auth
 
@@ -862,8 +862,10 @@ to install only the control plane + backing stores without the runner substrate.
   the substrate's resume path can inject `CURIE_HISTORY_REF` /
   `CURIE_SESSION_ID` per claim. Claims carrying env bind a fresh sandbox
   rather than a pre-warmed one; the fast path (no env) binds warm.
-- Traces flow to `<release>-otel-collector:4318` (HTTP), per the collector
-  rule above; the env block is omitted when `otelCollector.deploy: false`.
+- Traces flow to `<release>-otel-collector:4318` (HTTP) when the chart collector
+  is deployed, or to `otelCollector.endpoint` when that BYO field is set. The
+  env block is omitted only for explicit `telemetryDisabled` or local/offline
+  no-endpoint mode.
 
 ## Deploying without inbound access
 

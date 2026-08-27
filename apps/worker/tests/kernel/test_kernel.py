@@ -1081,6 +1081,7 @@ class _FakeResolved:
 
     def __init__(self, agent_id: uuid.UUID) -> None:
         self.agent_id = agent_id
+        self.agent_name = "test-agent"
         # Unset on this binding, so the turn keeps the route the server minted
         # onto its reply handle (ADR-0096 EB-B2).
         self.endpoint: str | None = None

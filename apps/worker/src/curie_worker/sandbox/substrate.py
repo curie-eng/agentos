@@ -35,6 +35,7 @@ from opentelemetry.trace import SpanKind, StatusCode
 from ..binding import RUNNER_TOKEN_ENV
 from .affinity import AffinityStore
 from .types import (
+    AGENT_LABEL,
     MANAGED_BY_LABEL,
     MANAGED_BY_VALUE,
     THREAD_HASH_LABEL,
@@ -48,6 +49,7 @@ from .types import (
     SandboxView,
     SubstrateConfig,
     SuspendedThreadError,
+    claim_warm_pool,
 )
 
 # The resume overlay writes these into the replacement claim's per-claim env, and
@@ -124,12 +126,19 @@ class SandboxSubstrate:
         self._config = config
     # -- claim / lookup -------------------------------------------------------
 
-    def claim(self, thread_key: str, *, env: dict[str, str] | None = None) -> SandboxHandle:
+    def claim(
+        self,
+        thread_key: str,
+        *,
+        env: dict[str, str] | None = None,
+        agent_name: str | None = None,
+    ) -> SandboxHandle:
         """Return the thread's live sandbox, claiming a warm one if needed.
 
         ``env`` is per-claim env injection (the resume path uses it for the
         history ref); the fast path passes none so the claim binds a pre-warmed
-        generic sandbox.
+        generic sandbox. ``agent_name`` selects the per-agent warm pool when
+        connector secrets are marked on ``env`` (#1488).
         """
 
         started = time.monotonic()
@@ -155,7 +164,9 @@ class SandboxSubstrate:
                         # Never hand back a stale route or let it win the fresh claim.
                         self._evict_stale(thread_key, record)
                 if handle is None:
-                    handle = self._claim_fresh(thread_key, env=env, state=RouteState.LIVE)
+                    handle = self._claim_fresh(
+                        thread_key, env=env, state=RouteState.LIVE, agent_name=agent_name
+                    )
                     outcome = "claimed"
             except Exception as exc:
                 error = exc
@@ -273,7 +284,13 @@ class SandboxSubstrate:
             raise error
         assert record is not None
 
-    def resume(self, thread_key: str, *, env: dict[str, str] | None = None) -> SandboxHandle:
+    def resume(
+        self,
+        thread_key: str,
+        *,
+        env: dict[str, str] | None = None,
+        agent_name: str | None = None,
+    ) -> SandboxHandle:
         """Rehydrate a suspended thread into a fresh claim.
 
         The suspended claim is retired (its process and cache are gone either
@@ -318,6 +335,7 @@ class SandboxSubstrate:
                     state=RouteState.LIVE,
                     session_id=old.session_id,
                     history_ref=old.history_ref,
+                    agent_name=agent_name,
                 )
             except Exception as exc:
                 error = exc
@@ -519,17 +537,21 @@ class SandboxSubstrate:
         state: RouteState,
         session_id: str | None = None,
         history_ref: str | None = None,
+        agent_name: str | None = None,
     ) -> SandboxHandle:
         config = self._config
         nonce = uuid.uuid4().hex[:6]
         name = config.claim_name_for(thread_key, nonce)
         thread_hash = name.rsplit("-", 1)[0].rsplit("-", 1)[-1]
+        labels = {THREAD_HASH_LABEL: thread_hash}
+        if agent_name:
+            labels[AGENT_LABEL] = agent_name
 
         self._k8s.create_claim(
             name,
-            pool=config.warm_pool,
+            pool=claim_warm_pool(config.warm_pool, env, agent_name),
             env=env,
-            labels={THREAD_HASH_LABEL: thread_hash},
+            labels=labels,
         )
         deadline = time.monotonic() + config.claim_timeout_seconds
         try:

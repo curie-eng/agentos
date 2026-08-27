@@ -154,4 +154,9 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0122 | [A warm pool's runner token is per version, not per pod](0122-a-warm-pools-runner-token-is-per-version-not-per-pod.md) | Draft |
 | 0124 | [A snapshot is sealed to the connector that wrote it](0124-a-snapshot-is-sealed-to-the-connector-that-wrote-it.md) | Draft |
 | 0126 | [A write connector declares permitted field paths, and the agent composes within them](0126-a-write-connector-declares-permitted-field-paths-and-the-agent-composes-within-them.md) | Draft |
+| 0127 | [An inbound ACP client admits any ACP harness behind the harness port](0127-an-inbound-acp-client-admits-any-acp-harness.md) | Draft |
+| 0128 | [An installation owns the model gateway and operator bindings select its aliases](0128-install-owned-model-gateway-and-agent-aliases.md) | Draft |
+| 0129 | [One release owns a cluster's shared singletons; every other release declares what it needs from them](0129-one-release-owns-a-clusters-shared-singletons.md) | Draft |
+| 0130 | [Deliberate progress is bounded durable channel state, not answer streaming](0130-deliberate-progress-is-bounded-durable-channel-state.md) | Accepted |
+| 0131 | [A delivery has one deadline and one renewable fenced owner](0131-a-delivery-has-one-deadline-and-one-renewable-fenced-owner.md) | Accepted |
 <!-- END GENERATED: adr-index -->
