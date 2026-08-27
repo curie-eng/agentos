@@ -46,6 +46,7 @@ def test_stream_consumer_accepts_any_broker() -> None:
             return "0-1"
 
         async def xinfo_consumers(self, name, groupname):  # noqa: ANN001, ANN201
+            """#1532: dead-consumer prompt reclaim."""
             return []
 
         async def xclaim(  # noqa: ANN201
