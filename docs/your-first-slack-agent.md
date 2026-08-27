@@ -127,9 +127,10 @@ curie secrets set GRAFANA_SERVICE_ACCOUNT_TOKEN --from-env GRAFANA_SERVICE_ACCOU
 ```
 
 At cluster deploy time, Curie delivers both connector `secrets` and
-`secret_files` values into the agent's Kubernetes Secret. The host secret store
-is install global, so agents that use the same secret name share one stored
-value and can collide. Issue #440 tracks the future per agent delivery path.
+`secret_files` values into the agent's Kubernetes Secret. Those stored values
+must be scoped to the target cluster identity, release, and namespace; a
+mismatch is refused rather than silently reused. Unscoped names remain for
+skill/local credentials. Issue #440 tracks the future per agent delivery path.
 
 ---
 

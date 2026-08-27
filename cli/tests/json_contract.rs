@@ -1462,12 +1462,39 @@ fn guide_output_validates() {
 fn secrets_list_output_validates() {
     let out = SecretsListOutput {
         names: vec!["ANTHROPIC_API_KEY".to_string()],
+        entries: vec![curie::secrets::SecretListEntry {
+            name: "ANTHROPIC_API_KEY".to_string(),
+            scope: None,
+            version: None,
+        }],
     };
     assert_valid("secrets.schema.json", &out.to_json());
     assert_valid(
         "secrets.schema.json",
-        &SecretsListOutput { names: vec![] }.to_json(),
+        &SecretsListOutput {
+            names: vec![],
+            entries: vec![],
+        }
+        .to_json(),
     );
+    let scoped = SecretsListOutput {
+        names: vec!["K8S_WRITE_KUBECONFIG".to_string()],
+        entries: vec![curie::secrets::SecretListEntry {
+            name: "K8S_WRITE_KUBECONFIG".to_string(),
+            scope: Some(curie::secrets::SecretScope {
+                cluster_identity:
+                    "ca:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .to_string(),
+                release: "curie".to_string(),
+                namespace: "curie-test".to_string(),
+            }),
+            version: Some(1),
+        }],
+    };
+    assert_valid("secrets.schema.json", &scoped.to_json());
+    let rendered = scoped.to_json().to_string();
+    assert!(!rendered.contains("token"));
+    assert!(!rendered.contains("kubeconfig"));
 }
 
 #[test]

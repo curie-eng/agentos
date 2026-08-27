@@ -575,11 +575,25 @@ variable instead of prompting:
 curie secrets set GITHUB_PERSONAL_ACCESS_TOKEN --from-env GITHUB_PAT
 ```
 
-During cluster deploy, Curie resolves every connector secret name from the
-environment first and then the host secret store, and delivers the owned keys
-to the agent Kubernetes Secret. This includes connector `secrets` and
-`secret_files`. The host store is install global, so agents using the same
-secret name share one stored value and can collide. Issue #440 tracks the future
+Connector secrets that `curie cluster deploy` writes into a target namespace
+must be scoped to that cluster identity, Helm release, and namespace. A name
+saved for one cluster is refused on another instead of being silently reused.
+`curie secrets list` prints the scope and version, never the value. Replacing a
+scoped value requires `--expected-version` from that listing.
+
+```bash
+curie secrets set K8S_WRITE_KUBECONFIG --from-env K8S_WRITE_KUBECONFIG \
+  --cluster-identity ca:0123abcd --release curie --namespace curie-test
+curie secrets set K8S_WRITE_KUBECONFIG --from-env K8S_WRITE_KUBECONFIG \
+  --cluster-identity ca:0123abcd --release curie --namespace curie-test \
+  --expected-version 1
+```
+
+Unscoped names remain for skill/local credentials (model keys, Slack tokens).
+During cluster deploy, Curie resolves owned connector keys against the target
+scope, prints the names it is about to write, and warns when it is replacing a
+non-empty key in the live Secret. Process environment is a first-run fallback
+only when the store has no entry for that name. Issue #440 tracks the future
 per agent delivery path.
 
 `curie skill up --secret <NAME>` first uses a real environment variable when

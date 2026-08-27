@@ -137,6 +137,18 @@ async fn sync_connectors(
     apply_connectors(prepared).await
 }
 
+fn cluster_secret_scope(
+    namespace: &str,
+    release: &str,
+    cluster_identity: String,
+) -> secrets::SecretScope {
+    secrets::SecretScope {
+        cluster_identity,
+        release: release.to_string(),
+        namespace: namespace.to_string(),
+    }
+}
+
 struct ConnectorVersion<'a> {
     agent_id: &'a str,
     agent_name: &'a str,
@@ -151,6 +163,8 @@ async fn prepare_connectors(
     app_name: &str,
     connector_version: ConnectorVersion<'_>,
 ) -> anyhow::Result<curie::connectors::PreparedConnectorSync> {
+    let cluster_identity = curie::connectors::discover_cluster_identity().await?;
+    let target = cluster_secret_scope(namespace, release, cluster_identity);
     let client = curie::api::ApiClient::new(api_url, api_key)?;
     let rendered = client
         .version_connectors(
@@ -166,7 +180,7 @@ async fn prepare_connectors(
         &rendered.mcp_entries,
         &rendered.owned_secret_name,
         &rendered.owned_secret_keys,
-        namespace,
+        &target,
         connector_version.agent_name,
     )
 }
@@ -678,6 +692,20 @@ enum SecretsAction {
         /// Read the value from another environment variable instead of prompting.
         #[arg(long)]
         from_env: Option<String>,
+        /// Cluster identity fingerprint from `kubectl config view`. Required with
+        /// --release and --namespace to scope a connector secret to one cluster.
+        #[arg(long)]
+        cluster_identity: Option<String>,
+        /// Helm release the secret may be injected into.
+        #[arg(long)]
+        release: Option<String>,
+        /// Kubernetes namespace the secret may be injected into.
+        #[arg(long)]
+        namespace: Option<String>,
+        /// Compare-and-set version from `curie secrets list --json`. Required to
+        /// replace an existing cluster-scoped secret.
+        #[arg(long)]
+        expected_version: Option<u64>,
     },
     /// List saved Curie secret names. Values are never printed.
     List,
@@ -685,6 +713,16 @@ enum SecretsAction {
     Unset {
         /// Environment-variable-style secret name.
         name: String,
+        /// Cluster identity fingerprint. Required with --release and --namespace
+        /// to remove one scoped entry without deleting the unscoped value.
+        #[arg(long)]
+        cluster_identity: Option<String>,
+        /// Helm release of the scoped entry to remove.
+        #[arg(long)]
+        release: Option<String>,
+        /// Kubernetes namespace of the scoped entry to remove.
+        #[arg(long)]
+        namespace: Option<String>,
     },
 }
 
@@ -2149,11 +2187,33 @@ async fn run(command: Option<Command>) -> Result<()> {
         Some(Command::Update { image }) => commands::update(image).await,
         Some(Command::Interactive) => curie::interactive::run().await,
         Some(Command::Secrets { action }) => match action {
-            SecretsAction::Set { name, from_env } => {
-                secrets::set(secrets::SetSecretOpts { name, from_env })
-            }
+            SecretsAction::Set {
+                name,
+                from_env,
+                cluster_identity,
+                release,
+                namespace,
+                expected_version,
+            } => secrets::set(secrets::SetSecretOpts {
+                name,
+                from_env,
+                cluster_identity,
+                namespace,
+                release,
+                expected_version,
+            }),
             SecretsAction::List => secrets::list(),
-            SecretsAction::Unset { name } => secrets::unset(secrets::UnsetSecretOpts { name }),
+            SecretsAction::Unset {
+                name,
+                cluster_identity,
+                release,
+                namespace,
+            } => secrets::unset(secrets::UnsetSecretOpts {
+                name,
+                cluster_identity,
+                namespace,
+                release,
+            }),
         },
         Some(Command::Dev { action }) => match action {
             DevAction::Contracts => commands::dev_script("scripts/check-contracts.sh", &[]).await,
@@ -4124,6 +4184,33 @@ mod tests {
             cli.command,
             Some(Command::Secrets {
                 action: SecretsAction::Unset { .. }
+            })
+        ));
+        let cli = Cli::try_parse_from([
+            "curie",
+            "secrets",
+            "set",
+            "K8S_WRITE_KUBECONFIG",
+            "--from-env",
+            "K8S_WRITE_KUBECONFIG",
+            "--cluster-identity",
+            "ca:a",
+            "--release",
+            "curie",
+            "--namespace",
+            "curie-test",
+            "--expected-version",
+            "1",
+        ])
+        .expect("scoped secrets set should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Secrets {
+                action: SecretsAction::Set {
+                    cluster_identity: Some(_),
+                    expected_version: Some(1),
+                    ..
+                }
             })
         ));
     }

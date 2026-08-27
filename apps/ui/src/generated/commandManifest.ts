@@ -4018,6 +4018,38 @@ export const commandManifest = {
               "long": "from-env",
               "positional": false,
               "required": false
+            },
+            {
+              "global": false,
+              "help": "Cluster identity fingerprint from `kubectl config view`. Required with --release and --namespace to scope a connector secret to one cluster",
+              "id": "cluster_identity",
+              "long": "cluster-identity",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Helm release the secret may be injected into",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Kubernetes namespace the secret may be injected into",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Compare-and-set version from `curie secrets list --json`. Required to replace an existing cluster-scoped secret",
+              "id": "expected_version",
+              "long": "expected-version",
+              "positional": false,
+              "required": false
             }
           ],
           "hidden": false,
@@ -4037,6 +4069,30 @@ export const commandManifest = {
               "id": "name",
               "positional": true,
               "required": true
+            },
+            {
+              "global": false,
+              "help": "Cluster identity fingerprint. Required with --release and --namespace to remove one scoped entry without deleting the unscoped value",
+              "id": "cluster_identity",
+              "long": "cluster-identity",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Helm release of the scoped entry to remove",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Kubernetes namespace of the scoped entry to remove",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
             }
           ],
           "hidden": false,
