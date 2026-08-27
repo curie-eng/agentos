@@ -1211,9 +1211,14 @@ enum LocalAction {
         target: AgentTarget<LocalTier>,
     },
     /// Show what an agent has learned (its memory log; `GET /agents/{id}/memory`).
+    /// `--add <content>` seeds an operator-authored record; a fresh session is
+    /// required before it is injected at boot.
     Memory {
         #[command(flatten)]
         target: AgentTarget<LocalTier>,
+        /// Append this content as an operator-authored memory record.
+        #[arg(long, value_name = "CONTENT")]
+        add: Option<String>,
     },
     /// The human-in-the-loop plane: list and resolve pending approval records,
     /// and view or set the tools whose calls require approval. Which channel an
@@ -1957,9 +1962,14 @@ enum ClusterAction {
         target: ClusterAgentTarget,
     },
     /// Show what an agent has learned (its memory log; `GET /agents/{id}/memory`).
+    /// `--add <content>` seeds an operator-authored record; a fresh session is
+    /// required before it is injected at boot.
     Memory {
         #[command(flatten)]
         target: ClusterAgentTarget,
+        /// Append this content as an operator-authored memory record.
+        #[arg(long, value_name = "CONTENT")]
+        add: Option<String>,
     },
     /// The human-in-the-loop plane: list and resolve pending approval records,
     /// and view or set the tools whose calls require approval. Which channel an
@@ -2541,7 +2551,10 @@ async fn run(command: Option<Command>) -> Result<()> {
                 emit(local::with_deploy_unreachable_hint(result, &local_api_url).await?)
             }
             LocalAction::Versions { target } => emit(commands::versions(target.into()).await?),
-            LocalAction::Memory { target } => emit(commands::memory(target.into()).await?),
+            LocalAction::Memory { target, add } => match add {
+                None => emit(commands::memory(target.into()).await?),
+                Some(content) => emit(commands::memory_add(target.into(), content).await?),
+            },
             LocalAction::Approvals {
                 target,
                 gate,
@@ -3495,7 +3508,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                     .await?,
                 )
             }
-            ClusterAction::Memory { target } => {
+            ClusterAction::Memory { target, add } => {
                 let ClusterAgentTarget {
                     agent,
                     conn,
@@ -3503,15 +3516,16 @@ async fn run(command: Option<Command>) -> Result<()> {
                 } = target;
                 let (api_url, api_key, _cluster_api_pf) =
                     resolve_cluster_conn(conn, dry_run).await?;
-                emit(
-                    commands::memory(AgentActionOpts {
-                        api_url,
-                        api_key,
-                        agent,
-                        dry_run,
-                    })
-                    .await?,
-                )
+                let opts = AgentActionOpts {
+                    api_url,
+                    api_key,
+                    agent,
+                    dry_run,
+                };
+                match add {
+                    None => emit(commands::memory(opts).await?),
+                    Some(content) => emit(commands::memory_add(opts, content).await?),
+                }
             }
             ClusterAction::Approvals {
                 target,
@@ -4647,6 +4661,62 @@ mod tests {
         // local budget/kill/resume are the mirrored lifecycle verbs.
         assert!(Cli::try_parse_from(["curie", "local", "budget", "gh", "--limit", "1"]).is_ok());
         assert!(Cli::try_parse_from(["curie", "local", "kill", "gh", "--yes"]).is_ok());
+    }
+
+    #[test]
+    fn local_memory_add_parses_agent_and_content() {
+        let cli = Cli::try_parse_from([
+            "curie",
+            "local",
+            "memory",
+            "translation-bot",
+            "--add",
+            "ask before translating to French",
+        ])
+        .expect("local memory --add should parse");
+        match cli.command {
+            Some(Command::Local {
+                action: LocalAction::Memory { target, add },
+            }) => {
+                assert_eq!(target.agent, "translation-bot");
+                assert_eq!(add.as_deref(), Some("ask before translating to French"));
+            }
+            _ => panic!("expected local memory"),
+        }
+    }
+
+    #[test]
+    fn cluster_memory_add_parses_agent_and_content() {
+        let cli = Cli::try_parse_from([
+            "curie",
+            "cluster",
+            "memory",
+            "translation-bot",
+            "--add",
+            "ask before translating to French",
+        ])
+        .expect("cluster memory --add should parse");
+        match cli.command {
+            Some(Command::Cluster {
+                action: ClusterAction::Memory { target, add },
+            }) => {
+                assert_eq!(target.agent, "translation-bot");
+                assert_eq!(add.as_deref(), Some("ask before translating to French"));
+            }
+            _ => panic!("expected cluster memory"),
+        }
+    }
+
+    #[test]
+    fn local_memory_list_still_parses_without_add() {
+        assert!(matches!(
+            Cli::try_parse_from(["curie", "local", "memory", "translation-bot"])
+                .expect("local memory list")
+                .command,
+            Some(Command::Local {
+                action: LocalAction::Memory { add: None, .. }
+            })
+        ));
     }
 
     #[test]

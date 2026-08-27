@@ -401,6 +401,16 @@ fn all_discovered_cluster_api_verbs_avoid_the_nodeport() {
             ],
         ),
         ("memory", &["cluster", "memory", AGENT]),
+        (
+            "memory add",
+            &[
+                "cluster",
+                "memory",
+                AGENT,
+                "--add",
+                "ask before translating to French",
+            ],
+        ),
         ("approvals", &["cluster", "approvals", AGENT, "--list"]),
         ("delete", &["cluster", "delete", AGENT, "--yes"]),
     ];

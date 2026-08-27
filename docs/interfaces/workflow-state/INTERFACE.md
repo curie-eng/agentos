@@ -107,8 +107,10 @@ reclaim abandoned state, because it cannot inherit Valkey's expiry-as-GC for fre
 The store's own seam already leaks in-process on the API side. The HTTP state API is
 not the only reader and writer of `apps/api/src/curie_api/models.py::WorkflowStateEntry`:
 the memory router queries and mutates that table directly through the ORM in the same
-process, rather than calling its own state routes. `list_memory` and `edit_memory`
+process, rather than calling its own state routes. `list_memory`, `create_memory`,
+and `edit_memory`
 (`apps/api/src/curie_api/routers/memory.py::list_memory`,
+`apps/api/src/curie_api/routers/memory.py::create_memory`,
 `apps/api/src/curie_api/routers/memory.py::edit_memory`) and
 `apps/api/src/curie_api/routers/memory.py::delete_memory` all `select(WorkflowStateEntry)`
 against the `memory` namespace, and the router imports the state module's private
