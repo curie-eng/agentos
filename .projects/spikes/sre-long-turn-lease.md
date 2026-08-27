@@ -345,7 +345,9 @@ frozen-contract boundary.
 records the maintainer-approved boundary:
 
 1. The first implementation uses an operator-wide worker budget. Per-agent or
-   per-turn persistence is separate API/database/UI work.
+   per-turn persistence is separate API/database/UI work. Earlier task language
+   requesting per-agent or per-turn configuration is superseded by this
+   accepted decision and [#1971](https://github.com/curie-eng/curie/issues/1971).
 2. The 10/45/10 heartbeat, lease, and reclaim defaults are accepted, with a
    60-second shutdown reserve and fail-closed behavior during Valkey outages.
 3. Exactly-once means one user-visible terminal effect at an idempotent receiving
