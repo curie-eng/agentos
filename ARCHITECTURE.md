@@ -236,7 +236,14 @@ Each has an integration test under `apps/worker/tests/`:
 1. **One live session per thread.** A Valkey thread lock (`SET NX PX`) is the routing CAS (compare-and-swap) ([`apps/worker/src/curie_worker/threadlock.py::ThreadLock`](apps/worker/src/curie_worker/threadlock.py)).
 2. **The finish race.** A follow-up during a live turn is a steer; if the turn finished first, the runner returns 409 and the kernel opens a fresh turn on the same idle sandbox ([`apps/worker/src/curie_worker/kernel.py::Kernel._route_and_start`](apps/worker/src/curie_worker/kernel.py)).
 3. **No auto-retry after a side-effectful failure.** If a prior attempt flagged a side effect, the kernel escalates to a human instead of retrying ([`apps/worker/src/curie_worker/kernel.py::Kernel.process_event`](apps/worker/src/curie_worker/kernel.py)).
-4. **Crash recovery.** Pending stream entries are reclaimed with `XAUTOCLAIM` ([`apps/worker/src/curie_worker/stream_consumer.py::StreamConsumer._reclaim_once`](apps/worker/src/curie_worker/stream_consumer.py)). The runs consumer group is created at `$`, so a cold worker never replays ancient backlog ([`apps/worker/src/curie_worker/consumer.py::Consumer.ensure_group`](apps/worker/src/curie_worker/consumer.py)).
+4. **Crash recovery.** A capable dead consumer's pending entries are transferred
+   after sustained renewable-lease absence, with one Valkey arbitration lease
+   preventing replacement replicas from racing through the delivery budget;
+   unknown older consumers retain `XAUTOCLAIM` as the compatibility backstop
+   ([`apps/worker/src/curie_worker/stream_consumer.py::StreamConsumer._reclaim_once`](apps/worker/src/curie_worker/stream_consumer.py)).
+   A restarted generation first recovers rows under its own stable consumer name.
+   The runs consumer group is created at `$`, so a cold worker never replays ancient
+   backlog ([`apps/worker/src/curie_worker/consumer.py::Consumer.ensure_group`](apps/worker/src/curie_worker/consumer.py)).
 
 Beyond these four invariants, a **kill switch** — a Valkey pub/sub channel
 `curie:kill-events` plus per-agent kill keys — gates and interrupts live runs

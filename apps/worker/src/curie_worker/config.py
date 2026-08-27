@@ -474,14 +474,42 @@ class WorkerConfig(BaseSettings):
     # crash recovery.
     reclaim_min_idle_ms: int = 900000
     reclaim_interval_s: float = 30.0
-    # Prompt reclaim for a consumer that has stopped interacting with the
-    # group (#1532). Entry idle is the wrong signal: a live replica's
-    # in-flight turn is pending for the whole runner timeout, so a short
-    # XAUTOCLAIM threshold would steal it. Consumer idle is the right one:
-    # the read loop keeps issuing XREADGROUP every ``read_block_ms`` even
-    # while a turn is in flight, so a peer idle longer than a few block
-    # intervals is dead, not mid-turn. Default is 3x ``read_block_ms``.
+    # A cheap observation threshold for prompt peer recovery (#1532), not a
+    # liveness proof. XINFO consumer idle also rises while a live worker drains
+    # an in-flight turn or waits at its concurrency limit, so prompt reclaim is
+    # gated by the independent renewable lease below. Default is 3x
+    # ``read_block_ms`` to avoid probing peers during ordinary read blocking.
     dead_consumer_idle_ms: int = Field(default=15000, ge=0)
+    # Independent stream-consumer liveness. A capable worker publishes the
+    # short alive lease before it reads and refreshes it throughout graceful
+    # in-flight drain. A replacement requires two absent observations separated
+    # by a full heartbeat TTL before prompt claim, so neither consumer idle nor
+    # one transient Redis read can manufacture process death.
+    consumer_heartbeat_ttl_ms: int = Field(
+        default=15000,
+        gt=0,
+        validation_alias="CURIE_CONSUMER_HEARTBEAT_TTL_MS",
+    )
+    # The capability marker outlives the 15-minute compatibility backstop. It
+    # proves the departed consumer knew how to publish alive leases; an old
+    # unmarked worker stays exclusively on XAUTOCLAIM rather than being guessed
+    # dead. This TTL is renewed beside alive for the process lifetime.
+    consumer_capability_ttl_ms: int = Field(
+        default=1800000,
+        gt=0,
+        validation_alias="CURIE_CONSUMER_CAPABILITY_TTL_MS",
+    )
+
+    @model_validator(mode="after")
+    def _capability_outlives_reclaim_backstop(self) -> WorkerConfig:
+        if self.consumer_capability_ttl_ms <= self.reclaim_min_idle_ms:
+            raise ValueError(
+                "CURIE_CONSUMER_CAPABILITY_TTL_MS must be greater than "
+                "reclaim_min_idle_ms so a hard-killed capable consumer remains "
+                "distinguishable from a pre-marker worker through the long "
+                "XAUTOCLAIM compatibility window"
+            )
+        return self
 
     # Slack placeholder edits are throttled to avoid rate limits while streaming.
     slack_edit_min_interval_s: float = 0.7

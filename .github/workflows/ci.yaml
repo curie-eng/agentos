@@ -1123,11 +1123,10 @@ jobs:
       # overrides repoint every first-party image at the just-loaded local tags
       # with pullPolicy Never (the runner AND its prewarm DaemonSet), force gVisor
       # off (no runsc on kind nodes), and drop the dispatcher (no Slack; its
-      # presence would trip the `cluster message` reply-hijack guard).
-      # worker.slackTrustedOrigins is a CI only widening that lets the worker
-      # answer the host side reply stub on any kernel assigned port on this
-      # host. The portless origin is intentional because `cluster message`
-      # requests an ephemeral port; the chart default stays empty and fail closed.
+      # presence would trip the `cluster message` reply-hijack guard). The worker
+      # is deliberately installed with the chart's empty/default trusted-origin
+      # posture: the rollout-recovery regression below must exercise the first
+      # `cluster message` command's temporary trust rollout from that cold state.
       - name: Install the platform (curie cluster up)
         env:
           CURIE_BIN: cli/target/release/curie
@@ -1139,7 +1138,6 @@ jobs:
             --fake-model \
             --set security.gvisor.mode=off \
             --set dispatcher.deploy=false \
-            --set worker.slackTrustedOrigins="http://${CURIE_E2E_LISTEN_HOST}" \
             --set api.image.repository=curie-api --set api.image.tag=local --set api.image.pullPolicy=Never \
             --set worker.image.repository=curie-worker --set worker.image.tag=local --set worker.image.pullPolicy=Never \
             --set ui.image.repository=curie-ui --set ui.image.tag=local --set ui.image.pullPolicy=Never \
@@ -1158,6 +1156,18 @@ jobs:
           kubectl rollout status deploy/curie-worker -n curie --timeout=300s
           kubectl rollout status deploy/curie-ui -n curie --timeout=300s
           kubectl rollout status daemonset/curie-runner-prewarm -n curie --timeout=300s
+      # QA4-02: drive the first no-Slack invocation from the default/untrusted
+      # install through its real Deployment rollout and prove the outgoing
+      # worker never claims it. Then kill a real PEL owner while its sandbox
+      # is held Pending by a namespaced, sandbox-only node selector and require
+      # the same CLI process to transfer the PEL entry and recover its reply in
+      # under three minutes. The shared agent-sandbox controller stays Ready and
+      # untouched throughout. Red-on-revert binaries/images are opt-in harness
+      # knobs; CI deliberately exercises only the current branch.
+      - name: First invocation rollout and dead-consumer recovery
+        env:
+          CURIE_BIN: cli/target/release/curie
+        run: bash cli/scripts/e2e-cluster-rollout-recovery.sh
       # The cluster rung only: `cluster status` gate -> `cluster deploy` ->
       # `cluster message` (reply asserted). Fake model, credential-free.
       - name: Parity ladder (cluster rung, fake model, credential-free)
@@ -1184,6 +1194,14 @@ jobs:
           kubectl get events -n curie --sort-by=.lastTimestamp | tail -50 || true
           kubectl describe pods -n curie -l app.kubernetes.io/component=runner-sandbox || true
           kubectl logs -n curie -l app.kubernetes.io/component=worker --tail=100 || true
+      # Delete only this job's namespaced release resources. Do not uninstall or
+      # delete the shared controller namespace: the pinned kind action owns final
+      # disposal of the whole single-use cluster. This still runs after failure.
+      - name: Tear down the disposable cluster release
+        if: always()
+        run: |
+          kubectl delete namespace curie \
+            --ignore-not-found --wait=false 2>/dev/null || true
 
   e2e-required:
     name: E2E required

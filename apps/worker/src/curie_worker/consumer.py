@@ -44,6 +44,7 @@ from curie_dispatcher.queue import from_stream_fields
 from redis.asyncio import Redis
 
 from .config import WorkerConfig
+from .consumer_liveness import ConsumerLivenessStore
 from .kernel import Kernel
 from .stream_consumer import DeliverySpec, ReadLoopSpec, StreamConsumer
 
@@ -109,7 +110,7 @@ class Consumer(StreamConsumer):
         config: WorkerConfig,
         max_concurrency: int = 16,
     ) -> None:
-        super().__init__(redis)
+        super().__init__(redis, liveness_store=ConsumerLivenessStore(redis))
         # The base class narrows self._redis to the StreamBroker port (stream
         # verbs only, by design -- a second broker implementation need not
         # support anything else). The thread-reset drain (#713) needs a plain
@@ -119,6 +120,7 @@ class Consumer(StreamConsumer):
         self._valkey: Redis = redis
         self._kernel = kernel
         self._config = config
+        self._max_concurrency = max_concurrency
         self._sem = asyncio.Semaphore(max_concurrency)
         self._inflight: set[asyncio.Task[None]] = set()
         # The reclaim/dead-letter knobs the shared base machinery reads. Built
@@ -137,6 +139,8 @@ class Consumer(StreamConsumer):
             dead_letter_maxlen=config.dead_letter_maxlen,
             reclaim_min_idle_ms=config.reclaim_min_idle_ms,
             dead_consumer_idle_ms=config.dead_consumer_idle_ms,
+            heartbeat_ttl_ms=config.consumer_heartbeat_ttl_ms,
+            capability_ttl_ms=config.consumer_capability_ttl_ms,
             read_count=config.read_count,
             cap_scan_page=_CAP_SCAN_PAGE,
             handler=self._dispatch,
@@ -174,13 +178,22 @@ class Consumer(StreamConsumer):
         # it here made a healthy worker's ability to read turns at all wait on
         # the recovery of the thing that broke. Owed completions are recovered on
         # their own timeline; live traffic does not queue behind them.
-        await asyncio.gather(
-            self._startup_completion_sweep(),
-            self._read_loop(),
-            self._maintenance_loop(),
+        await self._run_consumer_generation(
+            {
+                "startup-completion-sweep": self._startup_completion_sweep,
+                "read": self._read_loop,
+                "maintenance": self._maintenance_loop,
+                "prompt-reclaim": self._prompt_reclaim_loop,
+            },
+            may_complete=frozenset({"startup-completion-sweep"}),
         )
-        if self._inflight:
-            await asyncio.gather(*self._inflight, return_exceptions=True)
+
+    def _generation_inflight_tasks(self) -> set[asyncio.Task[None]]:
+        return set(self._inflight)
+
+    def _reset_generation_resources(self) -> None:
+        self._inflight.clear()
+        self._sem = asyncio.Semaphore(self._max_concurrency)
 
     async def _startup_completion_sweep(self) -> None:
         try:
@@ -214,6 +227,9 @@ class Consumer(StreamConsumer):
         # claiming the whole backlog into this consumer's local queue (which would
         # starve other replicas and make a crash wait out the reclaim window).
         await self._sem.acquire()
+        if self._should_stop():
+            self._sem.release()
+            return
         self._inflight_ids.add(entry_id)
         task = asyncio.create_task(self._handle(entry_id, fields))
         self._inflight.add(task)
@@ -283,7 +299,7 @@ class Consumer(StreamConsumer):
     # -- maintenance loop -----------------------------------------------------
 
     async def _maintenance_loop(self) -> None:
-        while not self._stop.is_set():
+        while not self._should_stop():
             try:
                 await self._reclaim_once()
                 await self._kernel.reap_orphans()
