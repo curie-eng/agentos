@@ -1,10 +1,10 @@
-# 105. One release owns a cluster's shared singletons; every other release declares what it needs from them
+# 129. One release owns a cluster's shared singletons; every other release declares what it needs from them
 
 Date: 2026-08-14
 
 Status: Draft
 
-Implements [#1535](https://github.com/curie-eng/curie/issues/1535).
+Tracked by [#1535](https://github.com/curie-eng/curie/issues/1535).
 
 Builds on [ADR-0023](0023-controller-networkpolicy-rbac-cluster-read-namespace-mutate.md)
 (the controller's NetworkPolicy RBAC split), [ADR-0059](0059-sandbox-is-a-bounded-resource-envelope.md)
@@ -40,15 +40,17 @@ about, and it has two independent instances.
 
 **Instance one: the grants a shared controller needs follow the wrong release.**
 `templates/agent-sandbox.yaml` renders the controller and all four of its
-NetworkPolicy RBAC objects inside one `{{- if .Values.agentSandbox.controller.deploy }}`
-guard (lines 29 and 130), while the runner `SandboxTemplate` renders under the
-separate `agentSandbox.deploy` guard (line 131). Rendering the chart at
-`main` (`0.7.0-rc.4`) as a consumer proves the split:
+NetworkPolicy RBAC objects inside one
+`{{- if .Values.agentSandbox.controller.deploy }}` guard, while the runner
+`SandboxTemplate` renders under the separate `agentSandbox.deploy` guard.
+The same render was re-run after rebasing this Draft onto `next`; the consumer
+still receives one `SandboxTemplate` and neither controller NetworkPolicy role:
 
 ```
 helm template c2 charts/curie -n curie-b --set agentSandbox.controller.deploy=false
   kind: SandboxTemplate            1 occurrence
-  agent-sandbox-controller-networkpolicies*   0 occurrences
+  ClusterRole/agent-sandbox-controller-networkpolicies-read   0 occurrences
+  Role/agent-sandbox-controller-networkpolicies               0 occurrences
 ```
 
 The consumer therefore asks a cluster shared controller to reconcile objects in
@@ -75,8 +77,8 @@ silently dropped.
 GHCR path is already versioned; the chart renders
 `ghcr.io/curie-eng/curie-runner:0.7.0-rc.4` from `Chart.AppVersion`. The offline
 path is not. `values-dev.yaml` and the chart README both hardcode `curie-api:local`,
-`curie-dispatcher:local`, `curie-worker:local`, `curie-ui:local`, and
-`curie-runner:latest`, imported into the node runtime with
+`curie-dispatcher:local`, `curie-mail-adapter:local`, `curie-worker:local`,
+`curie-ui:local`, and `curie-runner:latest`, imported into the node runtime with
 `docker save "$img" | ssh <node> 'sudo k3s ctr images import -'`. The node image
 store is one namespace shared by every release on the cluster, so the second
 install's import silently rebinds the first install's tags. In #1535 that
