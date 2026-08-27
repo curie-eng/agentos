@@ -15,6 +15,7 @@ follow-up can only steer the live turn and never fork a second one.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import json
@@ -25,7 +26,7 @@ from types import TracebackType
 from typing import TypeVar
 
 import aiohttp
-from aci_protocol import Event, Interrupt, OutboundEvent, parse_ndjson_line
+from aci_protocol import Event, Final, Interrupt, OutboundEvent, parse_ndjson_line
 from curie_telemetry import inject_trace_context, operation_span, record_metric
 from opentelemetry.trace import SpanKind, StatusCode
 
@@ -42,6 +43,8 @@ from opentelemetry.trace import SpanKind, StatusCode
 # going) instead of re-deriving the bound -- or a coupling to this client's
 # other timeouts -- at each call site.
 _DEFAULT_INTERRUPT_TIMEOUT_S = 5.0
+_POST_FINAL_CLEANUP_TIMEOUT_S = 1.0
+_POST_FINAL_DISCARD_CHUNK_BYTES = 64 * 1024
 _T = TypeVar("_T")
 
 
@@ -79,13 +82,49 @@ class TurnStream:
 
     def __init__(self, response: aiohttp.ClientResponse) -> None:
         self._response = response
+        self._saw_final = False
 
     async def __aiter__(self) -> AsyncIterator[OutboundEvent]:
         async for raw in self._response.content:
             line = raw.decode("utf-8").strip()
             if not line:
                 continue
-            yield parse_ndjson_line(line)
+            frame = parse_ndjson_line(line)
+            if isinstance(frame, Final):
+                self._saw_final = True
+            yield frame
+            if isinstance(frame, Final):
+                # Final is terminal for every consumer, including evals that
+                # naturally iterate to stream end. Bytes after it belong only
+                # to the bounded transport cleanup in __aexit__; they must not
+                # be parsed, applied, or allowed to occupy the 600s turn budget.
+                return
+
+    async def _discard_post_final(self) -> None:
+        """Briefly keep the transport open while discarding bytes through EOF.
+
+        ``Kernel._consume`` stops applying frames at ``Final`` so a late line
+        cannot overwrite the outcome. Releasing at that moment closes the
+        socket while the runner is still recording the turn and calling
+        ``write_eof`` (issue #1958). The runner-controlled tail is read in
+        fixed-size chunks and given its own short bound rather than the normal
+        600-second stream timeout. Once a valid Final was observed, cleanup is
+        best-effort and cannot turn that successful result into a retry.
+        """
+        if not self._saw_final or self._response.content.at_eof():
+            return
+        try:
+            async with asyncio.timeout(_POST_FINAL_CLEANUP_TIMEOUT_S):
+                while not self._response.content.at_eof():
+                    chunk = await self._response.content.read(
+                        _POST_FINAL_DISCARD_CHUNK_BYTES
+                    )
+                    if not chunk:
+                        break
+        except TimeoutError:
+            return
+        except Exception:  # noqa: BLE001 - post-Final cleanup is best-effort
+            return
 
     def close(self) -> None:
         self._response.release()
@@ -99,7 +138,11 @@ class TurnStream:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        self.close()
+        try:
+            if exc_type is None:
+                await self._discard_post_final()
+        finally:
+            self.close()
 
 
 class RunnerClient:

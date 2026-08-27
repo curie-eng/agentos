@@ -1801,17 +1801,31 @@ class Kernel:
         # turns per thread across workers). Then release the order lock so the
         # next same-thread event can route, and release the Valkey lock before
         # streaming so a follow-up can steer.
+        routed: _RouteResult | None = None
+
+        def close_routed_turn() -> None:
+            if routed is not None and routed.turn is not None:
+                routed.turn.close()
+
         try:
-            async with self._lock.hold(self._config.lock_key(thread_key)):
-                routed = await self._route_and_start(
-                    thread_key,
-                    event,
-                    boot_env,
-                    packs,
-                    workspace_deployment_id=workspace_deployment_id,
-                    agent_name=agent_name,
-                    source=qevent.source,
-                )
+            try:
+                async with self._lock.hold(self._config.lock_key(thread_key)):
+                    routed = await self._route_and_start(
+                        thread_key,
+                        event,
+                        boot_env,
+                        packs,
+                        workspace_deployment_id=workspace_deployment_id,
+                        agent_name=agent_name,
+                        source=qevent.source,
+                    )
+            except BaseException:
+                # start_turn owns a live response as soon as it returns, which
+                # is before the route lock's async exit has finished. Preserve
+                # cancellation and every existing error policy, but release the
+                # response first if lock cleanup itself fails or is cancelled.
+                close_routed_turn()
+                raise
         except CapacityExhaustedError as exc:
             release_order()
             rejection = exc.rejection
@@ -1859,13 +1873,21 @@ class Kernel:
             release_order()
             logger.warning("turn start failed for %s: %r", qevent.event_id, exc)
             return TurnOutcome(terminal_ok=False, classification="runner-error")
-        release_order()
+        assert routed is not None
+        try:
+            release_order()
+        except BaseException:
+            close_routed_turn()
+            raise
 
         if not self._config.slack_no_edit_streaming and defer_job_booting:
             try:
                 # Routing succeeded, so this delivery owns a real turn. Adopt the
                 # minted ref before streaming so every later update edits it.
                 await self._reply_for(qevent, route, self._config.booting_text)
+            except asyncio.CancelledError:
+                close_routed_turn()
+                raise
             except Exception:
                 logger.warning("booting-state update failed for %s", qevent.event_id)
 
@@ -1892,6 +1914,7 @@ class Kernel:
             return TurnOutcome(terminal_ok=True, steered=True)
 
         assert routed.handle is not None and routed.turn is not None
+        turn = routed.turn
         # Register this owner turn so a kill for its agent interrupts it, then
         # stream; unregister when the turn ends.
         self._register_run(agent_id, thread_key)
@@ -1905,7 +1928,7 @@ class Kernel:
                 and await self._killswitch.is_killed(agent_id)
             ):
                 await self.interrupt_thread(thread_key, f"agent {agent_id} killed by operator")
-            outcome = await self._consume(qevent, route, routed.turn, nav, agent_id)
+            outcome = await self._consume(qevent, route, turn, nav, agent_id)
             if (
                 outcome.status is SessionStatus.AWAITING_APPROVAL
                 and _is_publish_provenance(
@@ -1947,6 +1970,11 @@ class Kernel:
             return outcome
         finally:
             self._unregister_run(agent_id, thread_key)
+            # _consume owns bounded post-Final drain and normally releases the
+            # response itself. This idempotent backstop covers cancellation or
+            # an unexpected failure after start_turn but before _consume enters
+            # its response context.
+            turn.close()
 
     async def _route_and_start(
         self,
