@@ -253,6 +253,14 @@ pub struct LocalOpts {
 /// silent one, and a fixed name keeps `docker images` readable.
 pub const SOURCE_IMAGE_TAG: &str = "dev";
 
+/// The ghcr ref `--build` writes and the stack runs, for one published image.
+///
+/// Named once so `build_source_images` and `compose_model_env` cannot drift:
+/// the tag a `--build` stack runs is the tag it just built (#1931).
+pub fn source_image_ref(image: &str) -> String {
+    format!("ghcr.io/curie-eng/{image}:{SOURCE_IMAGE_TAG}")
+}
+
 /// One published image the dev stack can run, and where its source lives.
 pub struct SourceImage {
     /// The ghcr repository name, matching `compose.dev.yaml`.
@@ -424,10 +432,7 @@ fn compose_model_env(o: &LocalOpts, model: Option<&str>) -> Vec<(String, String)
         env.push(("CURIE_BASE_TAG".into(), SOURCE_IMAGE_TAG.into()));
         for image in source_images(o) {
             if let Some(name) = image.env {
-                env.push((
-                    name.into(),
-                    format!("ghcr.io/curie-eng/{}:{SOURCE_IMAGE_TAG}", image.image),
-                ));
+                env.push((name.into(), source_image_ref(image.image)));
             }
         }
     }
@@ -651,6 +656,9 @@ pub fn apply_credential_plan(
 /// missing field, or `No module named` from inside a container.
 async fn build_source_images(o: &LocalOpts) -> Result<()> {
     let ui = crate::ui::ui();
+    // Same checkout sentinel `curie build` uses: a release binary has nothing
+    // to build. Keep the `--build`-specific error here rather than inside the
+    // shared builder, which both verbs call.
     let root = crate::commands::find_repo_root().context(
         "not inside a curie source checkout. `--build` builds the stack's images from \
          source; a release binary runs the published images and has nothing to build.",
@@ -662,21 +670,8 @@ async fn build_source_images(o: &LocalOpts) -> Result<()> {
         root.display()
     ));
     for image in &images {
-        let tag = format!("ghcr.io/curie-eng/{}:{SOURCE_IMAGE_TAG}", image.image);
-        ui.note(&format!(
-            "=== docker build -f {} -t {tag} . ===",
-            image.dockerfile
-        ));
-        // Inherit stdio so the build log streams, matching `curie build`.
-        let status = tokio::process::Command::new("docker")
-            .args(["build", "-f", image.dockerfile, "-t", &tag, "."])
-            .current_dir(&root)
-            .status()
-            .await
-            .context("failed to invoke docker")?;
-        if !status.success() {
-            bail!("docker build failed for {} ({status})", image.image);
-        }
+        let tag = source_image_ref(image.image);
+        crate::commands::build_image(image.dockerfile, &tag).await?;
     }
     ui.success(&format!(
         "built {} image(s) as :{SOURCE_IMAGE_TAG}; the stack below runs them",
@@ -2109,7 +2104,8 @@ mod tests {
 
         assert!(
             display.contains(&format!(
-                "CURIE_RUNNER_IMAGE=ghcr.io/curie-eng/curie-runner:{SOURCE_IMAGE_TAG}"
+                "CURIE_RUNNER_IMAGE={}",
+                source_image_ref("curie-runner")
             )),
             "got: {display}"
         );

@@ -9,7 +9,7 @@ multi-step setup, add or extend a `curie` subcommand instead — a single,
 discoverable surface beats a scatter of scripts. The script or tool call can
 stay the *implementation*; it just isn't the interface.
 
-- Building the runner image → `curie build` (not a copy-pasted `docker build -f runner/Dockerfile ...`).
+- Building the runner image → `curie build` (not a copy-pasted `docker build -f runner/Dockerfile ...`). That tags both `curie-runner` (what `curie skill up` runs) and `ghcr.io/curie-eng/curie-runner:dev` (what `curie local up --build` runs), so `curie update --image` refreshes a `--build` stack's runner.
 - First-run dev bootstrap → `curie install` (or `./get-curie.sh` from a source checkout, which also puts `curie` on PATH the first time by building it).
 - Refresh the on-PATH CLI after a code change → `curie update` (rebuilds and `cargo install`s the CLI to `~/.cargo/bin`; `--image` also rebuilds the runner). The per-change loop, so you never re-run the bootstrap script.
 - Run the local stack on YOUR checkout → `curie local up --build`. `curie update` covers the CLI and the runner image; the stack's api, worker, dispatcher and ui otherwise come from the registry, so a source-built CLI ends up talking to whatever was last published. That skew does not announce itself — it surfaces as a serde error about a field name, or a missing Python module from inside a container (#1915).
