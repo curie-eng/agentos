@@ -1,4 +1,4 @@
-# 112. An installation owns the model gateway and agents select its aliases
+# 128. An installation owns the model gateway and agents select its aliases
 
 Date: 2026-08-23
 
