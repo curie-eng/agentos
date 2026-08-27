@@ -456,6 +456,12 @@ jobs:
           - name: sre-bot-tempo
             context: examples/sre-bot/connectors/tempo
             dockerfile: examples/sre-bot/connectors/tempo/Dockerfile
+          - name: sre-bot-k8s-write
+            context: examples/sre-bot/connectors/k8s-write
+            dockerfile: examples/sre-bot/connectors/k8s-write/Dockerfile
+          - name: sre-bot-k8s-scale
+            context: examples/sre-bot/connectors/k8s-scale
+            dockerfile: examples/sre-bot/connectors/k8s-scale/Dockerfile
     steps:
       - uses: actions/checkout@v7
         with:
