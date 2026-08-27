@@ -2,7 +2,7 @@
 
 from typing import Any
 
-from curie_api.evals import build_matrix
+from curie_api.evals import _completed, build_matrix
 
 
 def _trace(tid: str, version: str, case: str, ts: str, passed: bool) -> dict[str, Any]:
@@ -285,6 +285,50 @@ def test_a_plumbing_row_does_not_dilute_its_own_model_pass_rate() -> None:
     assert opus.total == 1  # the plumbing row is not a denominator
     assert opus.pass_rate == 1.0
     assert opus.plumbing == 1
+
+
+def test_a_completed_variance_fail_is_completed_not_an_error() -> None:
+    """#857 / #1907: a majority-red aggregate whose samples all completed must
+    leave `error` unset. `_completed` is the consumer that would otherwise
+    misread a 0% pass rate as 'the model never resolved' (ADR-0068)."""
+    trace = _otrace(
+        "v1",
+        "shaA",
+        "identity",
+        "2026-07-01T00:00:00Z",
+        "fail",
+        "opus",
+    )
+    trace["metadata"]["samples"] = 3
+    trace["metadata"]["passes"] = 1
+    trace["metadata"]["policy"] = "majority"
+    trace["metadata"]["variance"] = "1/3 samples passed (majority)"
+    assert trace["metadata"]["error"] is None
+    assert _completed(trace) is True
+
+    matrix = build_matrix([trace], "s", 5)
+    opus = next(m for m in matrix.model_summaries if m.model == "opus")
+    assert opus.total == 1
+    assert opus.completed == 1
+    assert opus.passed == 0
+
+
+def test_an_incomplete_variance_fail_is_not_completed() -> None:
+    """The falsifiable negative: when no sample completed, `error` is set and
+    `_completed` is False, same as a one-sample transport failure."""
+    trace = _otrace(
+        "v1",
+        "shaA",
+        "identity",
+        "2026-07-01T00:00:00Z",
+        "fail",
+        "opus",
+        error="variance-aware grading failed: 0/3 samples passed (majority)",
+    )
+    assert _completed(trace) is False
+    matrix = build_matrix([trace], "s", 5)
+    opus = next(m for m in matrix.model_summaries if m.model == "opus")
+    assert opus.completed == 0
 
 
 def test_a_real_zero_percent_model_is_completed_but_not_passed() -> None:

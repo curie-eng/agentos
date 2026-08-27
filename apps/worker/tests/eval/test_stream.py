@@ -1378,6 +1378,7 @@ def test_eval_threads_claim_token_into_run_eval_suite(monkeypatch) -> None:
         fake: Any = None,
         stream_id: str | None,
         scorer: Any = None,
+        samples: Any = None,
     ) -> EvalRunResult:
         captured["base_url"] = base_url
         captured["token"] = token
@@ -1413,6 +1414,51 @@ def test_eval_threads_claim_token_into_run_eval_suite(monkeypatch) -> None:
     assert captured["token"] == "tok-eval-xyz"
     assert captured["stream_id"] == "test-stream-id"
     assert captured["scorer"] is None
+
+
+def test_eval_threads_sample_config_from_env_into_run_eval_suite(
+    monkeypatch,
+) -> None:
+    """#1907: the production eval consumer must honor CURIE_EVAL_SAMPLES rather
+    than silently running n=1. The capture is the run_eval_suite seam."""
+    from curie_worker.eval import stream as stream_module
+    from curie_worker.eval.sampling import AggregationPolicy, SampleConfig
+
+    monkeypatch.setenv("CURIE_EVAL_SAMPLES", "3")
+    monkeypatch.setenv("CURIE_EVAL_AGGREGATION", "majority")
+    captured: dict[str, Any] = {}
+
+    async def _capture_run(
+        suite: EvalSuite, *, version: str, samples: Any = None, **_kw: Any
+    ) -> EvalRunResult:
+        captured["samples"] = samples
+        return EvalRunResult(version=version, suite=suite.name, results=[])
+
+    monkeypatch.setattr(stream_module, "run_eval_suite", _capture_run)
+
+    suite = EvalSuite(
+        name="s",
+        cases=[EvalCase(id="1", input="q", grader=Grader(kind=CONTAINS, expected="a"))],
+    )
+    consumer = EvalStreamConsumer(
+        redis=None,  # type: ignore[arg-type]
+        config=WorkerConfig(),
+        bundle_store=_FakeBundleStore(_suite_bundle(suite)),  # type: ignore[arg-type]
+        substrate=_TokenSubstrate("tok-eval-xyz"),  # type: ignore[arg-type]
+        reporter=_FakeReporter(),  # type: ignore[arg-type]
+        recorder=None,  # type: ignore[arg-type]
+        repo_lookup=_StubRepo(),
+    )
+    item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.tgz", target_url=None)
+
+    async def go() -> None:
+        await consumer._run_and_report(item, "test-stream-id")
+
+    asyncio.run(go())
+
+    assert captured["samples"] == SampleConfig(
+        n=3, policy=AggregationPolicy.MAJORITY, k=1
+    )
 
 
 @pytest.mark.parametrize("fake_model", [True, False])

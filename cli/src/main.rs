@@ -688,6 +688,29 @@ enum SecretsAction {
     },
 }
 
+/// Shared `--samples` / `--aggregation` / `--pass-at-k` flags for every eval
+/// tier (#1907). Default n=1 majority is documented rather than silent.
+#[derive(Args, Debug, Clone)]
+struct EvalSamplingArgs {
+    /// Independent samples per case for live-model grading. Default: 1. A
+    /// single sample is not proof of tier drift; raise this to distinguish
+    /// variance from a real miss. Same policy on skill, local, and cluster.
+    #[arg(long, default_value_t = 1, env = "CURIE_EVAL_SAMPLES", value_parser = clap::value_parser!(u32).range(1..))]
+    samples: u32,
+    /// How to reduce N sample verdicts. Default: majority.
+    #[arg(long, default_value_t = curie::eval_sampling::AggregationPolicy::Majority, env = "CURIE_EVAL_AGGREGATION")]
+    aggregation: curie::eval_sampling::AggregationPolicy,
+    /// Pass@k threshold when --aggregation pass_at_k. Default: 1.
+    #[arg(long = "pass-at-k", default_value_t = 1, env = "CURIE_EVAL_PASS_AT_K", value_parser = clap::value_parser!(u32).range(1..))]
+    pass_at_k: u32,
+}
+
+impl EvalSamplingArgs {
+    fn config(self) -> anyhow::Result<curie::eval_sampling::SampleConfig> {
+        curie::eval_sampling::SampleConfig::new(self.samples, self.aggregation, self.pass_at_k)
+    }
+}
+
 #[derive(Subcommand)]
 enum SkillAction {
     /// Boot a local runner container for the bundle and print the env summary.
@@ -885,6 +908,8 @@ enum SkillAction {
         /// resolution as `skill up`.
         #[arg(long)]
         image: Option<String>,
+        #[command(flatten)]
+        sampling: EvalSamplingArgs,
     },
     /// Interview to generate a starter `evals/cases.json` (guided eval generation).
     EvalInit {
@@ -1139,6 +1164,8 @@ enum LocalAction {
         /// value above 1 is refused rather than silently run sequentially.
         #[arg(long, default_value_t = 1)]
         concurrency: usize,
+        #[command(flatten)]
+        sampling: EvalSamplingArgs,
         /// Print the plan that a real run would produce, and exit.
         #[arg(long)]
         dry_run: bool,
@@ -1774,6 +1801,8 @@ enum ClusterAction {
         /// value above 1 is refused rather than silently run sequentially.
         #[arg(long, default_value_t = 1)]
         concurrency: usize,
+        #[command(flatten)]
+        sampling: EvalSamplingArgs,
         /// Print the kubectl commands, stub URL, and enqueue description that a
         /// real run would produce, and exit without executing anything.
         #[arg(long)]
@@ -2284,13 +2313,14 @@ async fn run(command: Option<Command>) -> Result<()> {
                 model,
                 secret,
                 image,
+                sampling,
             } => {
                 let image = artifacts::resolve_image(
                     image.as_deref(),
                     artifacts::Channel::current(),
                     artifacts::version(),
                 );
-                commands::eval(cases, url, model, secret, image).await
+                commands::eval(cases, url, model, secret, image, sampling.config()?).await
             }
             SkillAction::EvalInit { out, force } => {
                 curie::eval_init::run(curie::eval_init::EvalInitOpts { out, force })
@@ -2497,6 +2527,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 timeout_secs,
                 model,
                 concurrency,
+                sampling,
                 dry_run,
             } => {
                 message::eval(message::EvalOpts {
@@ -2518,6 +2549,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                     api_url,
                     models: model,
                     concurrency,
+                    sampling: sampling.config()?,
                 })
                 .await
             }
@@ -3025,6 +3057,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 timeout_secs,
                 model,
                 concurrency,
+                sampling,
                 dry_run,
             } => {
                 // `cluster up` randomizes both credentials per release, so an
@@ -3065,6 +3098,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                     api_url: None,
                     models: model,
                     concurrency,
+                    sampling: sampling.config()?,
                 })
                 .await
             }

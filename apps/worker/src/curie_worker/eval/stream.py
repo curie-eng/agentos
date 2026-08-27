@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import secrets
 import tempfile
 import uuid
@@ -69,7 +70,7 @@ from ..sandbox.types import SandboxError
 from ..stream_consumer import DeliverySpec, ReadLoopSpec, StreamConsumer
 from .models import EvalCaseResult, EvalOutcome, EvalRunResult, EvalScorer, EvalSuite
 from .recorder import LangfuseEvalRecorder
-from .run import run_eval_suite
+from .run import run_eval_suite, sample_config_from_env
 from .scorer import TrajectoryScorer
 from .trajectory import TrajectorySidecar
 
@@ -420,6 +421,7 @@ class EvalStreamConsumer(StreamConsumer):
         base_url, release_key, token = await self._acquire_target(item)
         if base_url is None:
             return await self._report_failed(item, repo, "runner provisioning failed")
+        samples = sample_config_from_env(os.environ)
         try:
             if loaded.scorer is None:
                 result = await run_eval_suite(
@@ -430,6 +432,7 @@ class EvalStreamConsumer(StreamConsumer):
                     token=token,
                     model=model,
                     fake=self._config.fake_model,
+                    samples=samples,
                     stream_id=stream_id,
                 )
             else:
@@ -442,6 +445,7 @@ class EvalStreamConsumer(StreamConsumer):
                     model=model,
                     fake=self._config.fake_model,
                     scorer=loaded.scorer,
+                    samples=samples,
                     stream_id=stream_id,
                 )
         finally:

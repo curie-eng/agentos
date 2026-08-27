@@ -1,0 +1,153 @@
+{
+  "comment": "Python aggregate() owns these verdicts. The Rust CLI parity path replays the same vectors so skill/local/cluster eval cannot drift from the worker (issue #1907). n=1 is a pass-through. A completed FAIL must leave error unset (#857); variance rides its own field.",
+  "vectors": [
+    {
+      "name": "identity one-sample pass is unchanged",
+      "n": 1,
+      "policy": "majority",
+      "k": 1,
+      "samples": [
+        {"outcome": "pass", "output": "I am translation-bot", "error": null}
+      ],
+      "aggregate_outcome": "pass",
+      "passes": 1,
+      "error": null,
+      "variance": null,
+      "identity": true,
+      "representative_output": "I am translation-bot"
+    },
+    {
+      "name": "identity one-sample graded fail is unchanged and completed",
+      "n": 1,
+      "policy": "majority",
+      "k": 1,
+      "samples": [
+        {"outcome": "fail", "output": "¿Quién eres?", "error": null}
+      ],
+      "aggregate_outcome": "fail",
+      "passes": 0,
+      "error": null,
+      "variance": null,
+      "identity": true,
+      "representative_output": "¿Quién eres?"
+    },
+    {
+      "name": "majority two of three identity samples is green",
+      "n": 3,
+      "policy": "majority",
+      "k": 1,
+      "samples": [
+        {"outcome": "pass", "output": "I am translation-bot", "error": null},
+        {"outcome": "fail", "output": "¿Quién eres?", "error": null},
+        {"outcome": "pass", "output": "translation-bot here", "error": null}
+      ],
+      "aggregate_outcome": "pass",
+      "passes": 2,
+      "error": null,
+      "variance": "2/3 samples passed (majority)",
+      "identity": false,
+      "representative_output": "I am translation-bot"
+    },
+    {
+      "name": "majority one of three identity samples is red but completed",
+      "n": 3,
+      "policy": "majority",
+      "k": 1,
+      "samples": [
+        {"outcome": "pass", "output": "I am translation-bot", "error": null},
+        {"outcome": "fail", "output": "¿Quién eres?", "error": null},
+        {"outcome": "fail", "output": "Who are you?", "error": null}
+      ],
+      "aggregate_outcome": "fail",
+      "passes": 1,
+      "error": null,
+      "variance": "1/3 samples passed (majority)",
+      "identity": false,
+      "representative_output": "¿Quién eres?"
+    },
+    {
+      "name": "majority tie fails deny by default",
+      "n": 2,
+      "policy": "majority",
+      "k": 1,
+      "samples": [
+        {"outcome": "pass", "output": "ok", "error": null},
+        {"outcome": "fail", "output": "no", "error": null}
+      ],
+      "aggregate_outcome": "fail",
+      "passes": 1,
+      "error": null,
+      "variance": "1/2 samples passed (majority)",
+      "identity": false,
+      "representative_output": "no"
+    },
+    {
+      "name": "pass at k one of three is green",
+      "n": 3,
+      "policy": "pass_at_k",
+      "k": 1,
+      "samples": [
+        {"outcome": "pass", "output": "I am translation-bot", "error": null},
+        {"outcome": "fail", "output": "¿Quién eres?", "error": null},
+        {"outcome": "fail", "output": "Who are you?", "error": null}
+      ],
+      "aggregate_outcome": "pass",
+      "passes": 1,
+      "error": null,
+      "variance": "1/3 samples passed (pass@1)",
+      "identity": false,
+      "representative_output": "I am translation-bot"
+    },
+    {
+      "name": "pass at k threshold not met is red but completed",
+      "n": 3,
+      "policy": "pass_at_k",
+      "k": 2,
+      "samples": [
+        {"outcome": "pass", "output": "I am translation-bot", "error": null},
+        {"outcome": "fail", "output": "¿Quién eres?", "error": null},
+        {"outcome": "fail", "output": "Who are you?", "error": null}
+      ],
+      "aggregate_outcome": "fail",
+      "passes": 1,
+      "error": null,
+      "variance": "1/3 samples passed (pass@2)",
+      "identity": false,
+      "representative_output": "¿Quién eres?"
+    },
+    {
+      "name": "all plumbing samples stay non-graded",
+      "n": 3,
+      "policy": "majority",
+      "k": 1,
+      "samples": [
+        {"outcome": "plumbing_ok", "output": "all done", "error": null},
+        {"outcome": "plumbing_ok", "output": "all done", "error": null},
+        {"outcome": "plumbing_ok", "output": "all done", "error": null}
+      ],
+      "aggregate_outcome": "plumbing_ok",
+      "passes": 0,
+      "error": null,
+      "variance": null,
+      "identity": false,
+      "representative_output": "all done"
+    },
+    {
+      "name": "all incomplete samples keep error because none completed",
+      "n": 3,
+      "policy": "majority",
+      "k": 1,
+      "samples": [
+        {"outcome": "fail", "output": "", "error": "runner reported a classified failure"},
+        {"outcome": "fail", "output": "", "error": "timed out"},
+        {"outcome": "fail", "output": "", "error": "transport error"}
+      ],
+      "aggregate_outcome": "fail",
+      "passes": 0,
+      "error": "variance-aware grading failed: 0/3 samples passed (majority)",
+      "variance": "0/3 samples passed (majority)",
+      "identity": false,
+      "representative_output": ""
+    }
+  ]
+}

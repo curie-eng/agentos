@@ -92,7 +92,12 @@ explanatory `detail`; it never passes by omission.
 
 **Success on an eval is `failed` equal to 0 AND `plumbing_ok` equal to 0.**
 `plumbing_ok` counts cases that completed on the fake model and were therefore
-never graded (ADR-0055), and `passed + failed + plumbing_ok == total`. A run
+never graded (ADR-0055), and `passed + failed + plumbing_ok == total`. Each
+case also reports `samples`, `passes`, and `policy` so a one-sample miss is
+labeled as one draw, not unexplained tier drift. Default is one sample with
+majority aggregation; `curie skill eval --samples 3 --json`,
+`curie local eval --samples 3 --json`, and
+`curie cluster eval --samples 3 --json` raise N on the in-CLI path. A run
 that is all `plumbing_ok` is not a pass, it is an ungraded run.
 
 **When a command is uncertain, `curie schema` is the authority.** Do not invoke

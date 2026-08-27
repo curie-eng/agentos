@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/eval/v1.2.json",
+  "$id": "https://schemas.curietech.ai/cli/eval/v1.3.json",
   "title": "curie skill eval --json",
   "description": "The agent-facing payload of `curie skill eval --json`: the outcome roll-up plus one row per eval case.",
   "type": "object",
@@ -34,6 +34,16 @@
     "bundle_digest": {
       "type": ["string", "null"],
       "description": "sha256 of the tar.gz snapshot the evaluated runner mounted (#1087). Always present; null at the local/cluster tiers, which grade a deployed version rather than a locally snapshotted bundle, and on a skill run against a runner this checkout never recorded. Read it against `skill status --json`'s bundle_digest to confirm messaging and eval executed the same bundle."
+    },
+    "samples": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Independent samples run per case (#1907). Default 1. Always emitted so a one-sample miss is labeled as one draw, not unexplained tier drift."
+    },
+    "policy": {
+      "type": "string",
+      "enum": ["majority", "pass_at_k"],
+      "description": "How N sample verdicts reduce to one case outcome. Default majority."
     },
     "cases": {
       "type": "array",
@@ -79,6 +89,25 @@
               "null"
             ],
             "description": "Optional scorer explanation for this verdict. Present for a trajectory failure and omitted when the selected scorer has no additional evidence."
+          },
+          "samples": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Independent samples run for this case (#1907). Always emitted."
+          },
+          "passes": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "How many of this case's samples passed the grader."
+          },
+          "policy": {
+            "type": "string",
+            "enum": ["majority", "pass_at_k"],
+            "description": "Aggregation policy used to reduce the samples."
+          },
+          "variance": {
+            "type": "string",
+            "description": "Pass count over N when n>1, e.g. '2/3 samples passed (majority)'. Omitted at n=1."
           }
         }
       }
