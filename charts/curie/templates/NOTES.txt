@@ -25,7 +25,13 @@ Components deployed:
   - S3: BYO at {{ .Values.rustfs.host }}:{{ .Values.rustfs.port }}
 {{- end }}
 {{- if .Values.otelCollector.deploy }}
-  - OTel Collector ({{ .Values.otelCollector.image }})
+  - OTel Collector ({{ .Values.otelCollector.image }}) at http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.service.httpPort }}
+{{- else if .Values.otelCollector.telemetryDisabled }}
+  - OTel: telemetry explicitly disabled (no OTLP endpoint on instrumented workloads)
+{{- else if .Values.otelCollector.endpoint }}
+  - OTel: external collector at {{ .Values.otelCollector.endpoint }} ({{ .Values.otelCollector.protocol }})
+{{- else }}
+  - OTel: no endpoint (SDK export inert; stderr diagnostics remain)
 {{- end }}
 
 App services:

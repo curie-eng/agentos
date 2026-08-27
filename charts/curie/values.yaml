@@ -478,12 +478,29 @@ inference:
 # ---------------------------------------------------------------------------
 # OTel Collector. Receives traces, logs, and metrics over OTLP (gRPC 4317 / HTTP
 # 4318). Traces go to Langfuse over HTTP; logs and metrics retain explicit nop
-# defaults until #1765 supplies their backends. Deploy false to send application
-# telemetry to an external collector.
+# defaults until #1765 supplies their backends. Deploy false and set endpoint to
+# send application telemetry to an external collector. Deploy false with an
+# empty endpoint is no-endpoint mode (SDK export stays inert) unless
+# security.checkDefaultCredentials is on, in which case set telemetryDisabled
+# to acknowledge that this install emits no OTLP.
 # ---------------------------------------------------------------------------
 otelCollector:
   deploy: true
   image: otel/opentelemetry-collector-contrib:0.119.0
+  # Chart-owned external OTLP endpoint used when deploy is false. Wired to API,
+  # dispatcher, worker, and runner. Ignored while deploy is true (in-cluster
+  # collector wins). extraEnv remains a per-workload override.
+  endpoint: ""
+  protocol: http/protobuf
+  # Optional OTEL_EXPORTER_OTLP_HEADERS. Prefer headersExistingSecret for
+  # credentials so they never enter Helm values. The two sources are mutually
+  # exclusive; a literal is only for non-sensitive values such as a tenant id.
+  headers: ""
+  headersExistingSecret: ""
+  headersSecretKey: headers
+  # Explicit acknowledgement that this install emits no OTLP. Required by
+  # security.checkDefaultCredentials when deploy is false and endpoint is empty.
+  telemetryDisabled: false
   # Full `Authorization` header, `Basic <base64(publicKey:secretKey)>`, in three
   # branches. Set here, it always wins and is stored in the chart-managed Secret.
   # Left empty with chart managed init credentials, it is derived from the
@@ -751,9 +768,8 @@ api:
   # which were silently dropped before. WARNING to quieten it.
   logLevel: INFO
   # Extra env for the API container. Full Kubernetes EnvVar entries are
-  # accepted, including valueFrom. When supplying an external Collector with
-  # otelCollector.deploy=false, set the standard OTEL_EXPORTER_OTLP_* variables
-  # here; the chart will not invent an in-cluster endpoint in that mode.
+  # accepted, including valueFrom. Per-workload OTEL_EXPORTER_OTLP_* overrides
+  # still win over the chart-owned collector endpoint.
   extraEnv: []
   service:
     type: ClusterIP
@@ -862,8 +878,8 @@ dispatcher:
     requests: { cpu: 50m, memory: 128Mi }
     limits: { cpu: 500m, memory: 256Mi }
   # Extra env for the dispatcher container. Full Kubernetes EnvVar entries are
-  # accepted, including valueFrom. This is also the external-Collector override
-  # surface when otelCollector.deploy=false.
+  # accepted, including valueFrom. Per-workload OTEL_EXPORTER_OTLP_* overrides
+  # still win over the chart-owned collector endpoint.
   extraEnv: []
   # Container securityContext (issue #67). Image runs as non-root uid 1000 (see
   # apps/dispatcher/Dockerfile). readOnlyRootFilesystem stays false -- the
@@ -1243,7 +1259,9 @@ worker:
   adapterCredentials: {}
   # Extra env for the worker container, list of {name, value}. For SLACK_API_BASE_URL
   # prefer the first-class slackApiBaseUrl above; use extraEnv for any other
-  # worker override the fixed env block does not cover.
+  # worker override the fixed env block does not cover. Per-workload
+  # OTEL_EXPORTER_OTLP_* overrides still win over the chart-owned collector
+  # endpoint.
   extraEnv: []
   resources:
     requests: { cpu: 500m, memory: 512Mi, ephemeral-storage: 2Gi }
@@ -1494,6 +1512,8 @@ agentSandbox:
       fetchTimeoutSeconds: 45
       extractTimeoutSeconds: 45
     # Extra env for the runner container, list of {name, value}.
+    # Per-workload OTEL_EXPORTER_OTLP_* overrides still win over the
+    # chart-owned collector endpoint.
     extraEnv: []
     # --- BYO model: LiteLLM Anthropic-format sidecar (part of #24) ---
     # Off by default. Enable ONLY for genuine multi-model routing/fallback: a
