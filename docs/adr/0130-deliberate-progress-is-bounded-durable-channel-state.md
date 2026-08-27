@@ -24,12 +24,12 @@ generic stable delivery identity. Ordinary tool notes describe model activity;
 they are not permission to expose raw tool chatter, hidden reasoning, or an
 unbounded event log to a user.
 
-The executable mechanism spike in
-[the SRE progress report](../../.projects/spikes/sre-progress-contract.md) drove
-the real worker kernel, runner HTTP client, sandbox substrate, thread routing,
-steering, completion outbox, and a real disposable Valkey while mocking only the
-model, Slack, GitHub, and Kubernetes. It proved all of the following without a
-change to `packages/aci-protocol` or `packages/plugin-format`:
+The throwaway mechanism spike retained outside the published tree on local
+branch `task/sre-progress-contract-spike` drove the real worker kernel, runner
+HTTP client, sandbox substrate, thread routing, steering, completion outbox, and
+a real disposable Valkey while mocking only the model, Slack, GitHub, and
+Kubernetes. It proved all of the following without a change to
+`packages/aci-protocol` or `packages/plugin-format`:
 
 - a stable progress identity can own idempotent mutable state;
 - a durable reservation can bound milestone posts;
