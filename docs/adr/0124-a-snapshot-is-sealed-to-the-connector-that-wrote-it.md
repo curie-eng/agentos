@@ -2,7 +2,7 @@
 
 Date: 2026-08-25
 
-Status: Draft
+Status: Accepted
 
 Answers the exposure question [ADR-0117](0117-a-tool-that-changes-the-world-reports-what-it-changed.md)
 left to the connector author and
