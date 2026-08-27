@@ -39,7 +39,9 @@ use crate::chat::{
 };
 use crate::evals::{EvalCase, EvalSuite, ExpectedStatus, LoadedEval};
 use crate::ops::{plain, require_on_path, run_capture, OpsCommand};
-use crate::queue::{self, connect, diagnostics, queue_thread_reset, synthetic_turn, xadd};
+use crate::queue::{
+    self, connect, diagnostics, eval_case_turn, queue_thread_reset, synthetic_turn, xadd,
+};
 use crate::state::{save_turn, TurnContext, TurnVerb};
 
 pub const DEFAULT_STREAM: &str = queue::DEFAULT_STREAM;
@@ -2875,6 +2877,9 @@ pub fn eval_dry_run_lines(opts: &EvalOpts, suite_name: &str, case_count: usize) 
         "enqueue one synthetic QueuedTurn per case on stream {}",
         opts.stream
     ));
+    lines.push(
+        "without ambient durable agent memory (eval: conversation prefix per case)".to_string(),
+    );
     lines
 }
 
@@ -2910,11 +2915,14 @@ async fn run_eval_turns(
     let mut eval_threads: Vec<String> = Vec::with_capacity(total);
     let run = async {
         for case in &suite.cases {
-            // Each case is its own thread so turns never cross-talk on the stub.
+            // Each case is its own thread so turns never cross-talk on the stub
+            // (#550). Prefix the conversation_id so the worker omits ambient
+            // agent memory from that sandbox (#1909): durable memory is
+            // per-agent and would otherwise load on a fresh thread. Thread
+            // reset (#1534) must use the same prefixed key the worker claimed.
             let (channel_id, thread_ts, placeholder_ts) = resolve_targets(Some(channel), None);
-            eval_threads.push(thread_ts.clone());
             let reply_endpoint = stub.base_api_url().to_string();
-            let event = synthetic_turn(
+            let event = eval_case_turn(
                 "slack",
                 &channel_id,
                 &opts.user,
@@ -2923,6 +2931,8 @@ async fn run_eval_turns(
                 &placeholder_ts,
                 Some(reply_endpoint),
             );
+            let conversation_id = event.conversation_id.clone();
+            eval_threads.push(conversation_id.clone());
             let started = Instant::now();
             let stream_id = xadd(conn, &opts.stream, &event).await?;
             let outcome = await_reply(
@@ -2937,7 +2947,7 @@ async fn run_eval_turns(
             // Release this case's sandbox on every completed/red/timed-out
             // path so a three-case suite run twice cannot pin eight
             // curie-thread-* claims against the default ResourceQuota (#1534).
-            queue_thread_reset(conn, &thread_ts).await?;
+            queue_thread_reset(conn, &conversation_id).await?;
             let elapsed = started.elapsed().as_secs_f64();
             // Carry the reply text (#548) so a red case is diagnosable from --json /
             // the human summary; a non-Replied outcome has no gradeable text.
@@ -2967,8 +2977,8 @@ async fn run_eval_turns(
     let result = run.await;
     // Suite error/cancel: still queue every case we enqueued, including the
     // in-flight one, so an abandoned retry cannot bind a late sandbox.
-    for thread_ts in &eval_threads {
-        let _ = queue_thread_reset(conn, thread_ts).await;
+    for conversation_id in &eval_threads {
+        let _ = queue_thread_reset(conn, conversation_id).await;
     }
     bar.finish();
     result
@@ -3813,11 +3823,15 @@ mod tests {
         // itself. Deleting either call keeps the helper test green.
         let src = include_str!("message.rs");
         assert!(
-            src.contains("queue_thread_reset(conn, &thread_ts)"),
-            "each eval case must queue its conversation_id for sandbox release"
+            src.contains("eval_case_turn("),
+            "each eval case must mint through eval_case_turn so the enqueued conversation_id is isolated"
         );
         assert!(
-            src.contains("for thread_ts in &eval_threads"),
+            src.contains("queue_thread_reset(conn, &conversation_id)"),
+            "each eval case must queue its isolated conversation_id for sandbox release"
+        );
+        assert!(
+            src.contains("for conversation_id in &eval_threads"),
             "suite error/cancel must still queue every enqueued eval thread"
         );
     }
@@ -4692,6 +4706,12 @@ mod tests {
                     && l.contains(DEFAULT_STREAM)
             ),
             "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("without ambient durable agent memory")),
+            "default local eval must declare memory isolation: {lines:?}"
         );
     }
 

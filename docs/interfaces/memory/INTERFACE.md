@@ -60,7 +60,10 @@ endpoint (#248), inheriting durability and the per-value/per-namespace size caps
 The worker (`binding.boot_env`) delivers the ref as
 `http(s)://api/agents/<id>/state/memory` and forwards a scoped, agent-bound
 `state` token (ADR-0033, #410) as the memory token rather than the raw platform
-key. `NullMemoryStore` is the no-ref sink.
+key, except on a default local/cluster eval turn whose `conversation_id`
+starts with `eval:` (#1909): that path omits the ref so the runner boots
+`NullMemoryStore` and a deployed memory log cannot change a static suite.
+`NullMemoryStore` is also the no-ref sink.
 
 ## Known leakage
 

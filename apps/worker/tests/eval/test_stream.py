@@ -931,6 +931,29 @@ def test_eval_boot_env_mints_runner_token() -> None:
     assert env.get(RUNNER_TOKEN_ENV), "_boot_env must mint a non-empty runner token"
 
 
+def test_eval_lane_boot_env_omits_memory_ref() -> None:
+    """#1909 sibling: the platform eval lane already boots without ambient memory.
+
+    The message-path local/cluster eval must match this: no CURIE_MEMORY_REF,
+    so a deployed agent's durable log cannot change a static suite result.
+    """
+
+    consumer = EvalStreamConsumer(
+        redis=None,  # type: ignore[arg-type]
+        config=WorkerConfig(),
+        bundle_store=None,  # type: ignore[arg-type]
+        substrate=None,  # type: ignore[arg-type]
+        reporter=None,  # type: ignore[arg-type]
+        recorder=None,  # type: ignore[arg-type]
+        repo_lookup=None,
+    )
+    item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.zip", target_url=None)
+    env = consumer._boot_env(item)
+    assert "CURIE_MEMORY_REF" not in env
+    assert "CURIE_MEMORY_TOKEN" not in env
+    assert "CURIE_HISTORY_REF" not in env
+
+
 def test_eval_requested_model_boots_and_tags_that_model() -> None:
     """#526: a work item's ``model`` is booted into the provisioned sandbox
     (CURIE_MODEL wins over the worker default) AND becomes the run's model

@@ -92,6 +92,7 @@ CREDENTIALS_ENV = BootEnv.env_key("credentials_ref")
 # ``state`` token (ADR-0033), and a runner-local knob rather than part of the
 # frozen ACI env, like CURIE_RUNNER_TOKEN. The namespace URL itself rides in
 # the frozen SessionConfig's memory_ref, which render_worker emits.
+MEMORY_REF_ENV = BootEnv.env_key("memory_ref")
 MEMORY_TOKEN_ENV = BootEnv.env_key("memory_token")
 # The conversation-history port (#20, ADR-0029): the URL of THIS thread's
 # transcript key on the same durable state store, dereferenced by the runner at
@@ -145,6 +146,25 @@ DECISION_ENV = BootEnv.env_key("approval_decision")
 FALSE_COMPLETION_CHECK_ENV = "CURIE_FALSE_COMPLETION_CHECK"
 # the worker re-mints every turn; this only bounds a leaked-token window (ADR-0033)
 SANDBOX_TOKEN_TTL_SECONDS = 24 * 60 * 60
+
+# #1909: local/cluster message-path eval stamps this prefix on conversation_id
+# so boot_env omits ambient agent memory. Frozen in
+# tests/vectors/eval-memory-isolation.json with the CLI copy. Kernel.py is
+# not in the loop: it already forwards conversation_id as thread_key.
+EVAL_ISOLATE_THREAD_PREFIX = "eval:"
+
+
+def is_eval_isolate_thread(thread_key: str) -> bool:
+    """True when ``thread_key`` is a hermetic local/cluster eval conversation.
+
+    The CLI stamps ``EVAL_ISOLATE_THREAD_PREFIX`` onto each eval case's
+    ``QueuedTurn.conversation_id`` (#1909). That value is this method's
+    ``thread_key``. Prefix match only: a thread that merely starts with
+    ``eval-`` is a normal mention and still loads durable memory.
+    """
+
+    return thread_key.startswith(EVAL_ISOLATE_THREAD_PREFIX)
+
 
 # The permission-gate summary prefix. Duplicated (not imported) from
 # runner/src/curie_runner/approval.py::summarize_tool_call /
@@ -565,6 +585,10 @@ class BindingResolver:
         dropped feature. ``render_worker`` emits only the worker-authoritative
         keys: it never writes CURIE_SANDBOX_ID or CURIE_RUNNER_PORT, which
         the substrate derives from the pod itself.
+
+        A ``thread_key`` starting with ``EVAL_ISOLATE_THREAD_PREFIX`` (#1909)
+        omits ``CURIE_MEMORY_REF`` / ``CURIE_MEMORY_TOKEN`` so default
+        local/cluster eval does not load ambient durable agent memory.
         """
         # The memory ref (#264): the agent's scoped namespace on the durable
         # state store (#23/#248). The runner dereferences it at boot to load
@@ -692,6 +716,16 @@ class BindingResolver:
         inject_connector_secrets(
             env, resolved.secrets, agent_label=resolved.agent_id
         )
+        # #1909: default local/cluster eval is a static bundle-plus-cases gate.
+        # Ambient durable memory is per-agent, so a fresh thread still loaded
+        # it and could change a committed case. The CLI marks those turns with
+        # EVAL_ISOLATE_THREAD_PREFIX; drop the memory ref/token so the runner
+        # boots NullMemoryStore. History stays: each case already has a unique
+        # empty thread (#550 / ADR-0051). Kernel.py is not edited (sacred).
+        if is_eval_isolate_thread(thread_key):
+            env.pop(MEMORY_REF_ENV, None)
+            env.pop(MEMORY_TOKEN_ENV, None)
+            logger.info("eval isolate: omitted memory_ref for thread %s", thread_key)
         return env
 
 

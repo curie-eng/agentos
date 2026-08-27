@@ -71,7 +71,9 @@ banned in this contract, so all three tiers are written out in full:
 
 At the skill tier the bundle is the session, so there is no separate deploy
 <!-- doclint:ignore-line -->
-step. `eval` runs the bundle's OWN `evals/cases.json` at every tier. When the
+step. `eval` runs the bundle's OWN `evals/cases.json` at every tier. Default
+`skill`, `local`, and `cluster` eval execute that suite without ambient durable
+agent memory, so a deployed preference cannot change a committed case. When the
 <!-- doclint:ignore-line -->
 bundle also carries `evals/trajectory.json`, every case is scored from the
 observed tool sequence. Skill reads runner tool frames directly. Local and
