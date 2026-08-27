@@ -4,6 +4,11 @@ Date: 2026-08-20
 
 Status: Accepted
 
+**Superseded in part by
+[ADR-0122](0122-a-warm-pools-runner-token-is-per-version-not-per-pod.md)**:
+decision 2's per-pod runner token becomes one token per immutable agent version.
+The session-identity half of that decision and every other decision stand.
+
 Extends [ADR-0059](0059-sandbox-is-a-bounded-resource-envelope.md) into the
 dimension it deliberately left out of scope -- **throughput and the wall-clock
 deadline on the claim path** -- and revisits the resume framing of

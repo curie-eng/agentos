@@ -2,13 +2,12 @@
 
 Date: 2026-08-25
 
-Status: Draft
+Status: Accepted
 
-**Supersedes in part, when accepted,
+**Supersedes in part
 [ADR-0116](0116-session-identity-arrives-over-the-aci-so-a-sandbox-can-be-pre-bound.md)**,
 whose decision 2 says the pool "mints one per pod at creation". It cannot. While
-this record is Draft it replaces nothing; ADR-0116's clause stands until this one
-is Accepted. Everything else in ADR-0116 is unaffected either way, including the
+Everything else in ADR-0116 is unaffected, including the
 half of decision 2 that moves session identity onto the ACI `Event` frame, and
 including the ordering that puts the token before decision 3's warm pool.
 

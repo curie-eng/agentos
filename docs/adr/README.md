@@ -151,7 +151,7 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0119 | [A resumed thread rebuilds its prefix so the prompt cache still hits](0119-a-resumed-thread-rebuilds-its-prefix-so-the-prompt-cache-still-hits.md) | Draft |
 | 0120 | [First-party email delivery state is local durable single-writer state](0120-durable-first-party-email-state.md) | Accepted |
 | 0121 | [A restore is the connector's own verb, run under the same pinned connector](0121-a-restore-is-the-connectors-own-verb-run-under-the-same-pinned-connector.md) | Draft |
-| 0122 | [A warm pool's runner token is per version, not per pod](0122-a-warm-pools-runner-token-is-per-version-not-per-pod.md) | Draft |
+| 0122 | [A warm pool's runner token is per version, not per pod](0122-a-warm-pools-runner-token-is-per-version-not-per-pod.md) | Accepted |
 | 0124 | [A snapshot is sealed to the connector that wrote it](0124-a-snapshot-is-sealed-to-the-connector-that-wrote-it.md) | Draft |
 | 0127 | [An inbound ACP client admits any ACP harness behind the harness port](0127-an-inbound-acp-client-admits-any-acp-harness.md) | Draft |
 | 0128 | [An installation owns the model gateway and operator bindings select its aliases](0128-install-owned-model-gateway-and-agent-aliases.md) | Draft |
