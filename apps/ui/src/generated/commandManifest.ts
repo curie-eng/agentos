@@ -4065,7 +4065,7 @@ export const commandManifest = {
             {
               "env": "CURIE_API_URL",
               "global": false,
-              "help": "Platform API base URL. Omit to discover the release's UI `/api` proxy",
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
               "id": "api_url",
               "long": "api-url",
               "positional": false,
