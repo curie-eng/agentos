@@ -121,6 +121,14 @@ never copies ACP display data into `approval_granted_tool` or the digest. The
 writable path cannot ship until #1956 carries that digest through its own
 reviewed, backward-compatible ACI change.
 
+The approval card and durable human-readable summary are rendered from that
+same trusted canonical tool identity and input, or from an immutable rendering
+bound to their digest. ACP `title`, `kind`, and `rawInput` may be retained only
+as explicitly untrusted diagnostics; they never supply or override the text a
+human approves. The operation that later matches the digest is therefore the
+operation the approval surface described, not merely an operation hidden behind
+benign peer-authored display fields.
+
 The adapter invokes that existing callback; the worker and API persist the
 durable `Approval`. The adapter itself writes no durable state. Once the block
 is recorded, it responds to the pending reverse-request with
@@ -174,9 +182,11 @@ process, ADR-0119 rehydration, zero execution before approval, and exactly one
 matching execution during the resumed prompt cycle. Independent controls must
 prove that changed arguments, an absent identity contribution, rejection,
 absolute expiry while the prompt remains open, and reissue on a later prompt all
-execute zero times. Passing makes an ACP agent *wireable*, not *shippable*: per
-ADR-0062 decision 4, parity evals under ADR-0022 remain the bar before any
-ACP-driven harness is elevated past spike status.
+execute zero times. A conflicting peer title/raw input must not change the
+approval card or durable summary rendered from the trusted canonical operation.
+Passing makes an ACP agent *wireable*, not *shippable*: per ADR-0062 decision 4,
+parity evals under ADR-0022 remain the bar before any ACP-driven harness is
+elevated past spike status.
 
 **7. Explicit non-goals.** This ADR does not replace the ACP server path of
 ADR-0040 decision 2, which continues to serve editor embedding. It does not
