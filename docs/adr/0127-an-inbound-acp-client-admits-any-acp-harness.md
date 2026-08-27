@@ -92,48 +92,62 @@ per vendor.** The ACP client registers a single `HarnessContribution` under
 ADR-0060. An individual ACP agent (Claude Code, Codex, OpenCode, any of the
 registry) is **configuration of that contribution** — the command to launch, its
 auth shape, its declared read-only tool set — not a separate registry key. This
-is the whole economic claim of the decision: admitting the N+1st ACP agent is a
-configuration entry, not a new ACI server, a new installer, and a new bundle
-compiler. It also keeps ADR-0060's fail-closed guard rules meaningful, because
-one contribution claiming one key cannot silently shadow a built-in by fanning
-out into fifty.
+is the economic claim for the normalized turn wire and read-only tool surface:
+admitting the N+1st ACP agent there is a configuration entry, not a new ACI
+server. Writable tools have the additional trusted-identity requirement in
+decision 4 and remain unavailable for a peer that does not supply it. The
+single contribution also keeps ADR-0060's fail-closed guard rules meaningful,
+because one contribution claiming one key cannot silently shadow a built-in by
+fanning out into fifty.
 
 **4. The approval reverse-request enters Curie's durable suspend/replay
 lifecycle, never an adapter-local policy.** An ACP agent driven as an engine
-will issue `session/request_permission` back at Curie. The operation identity in
-that message is peer-supplied input, not grant authority. The adapter must
-resolve it against the validated tool registry produced from the bundle and the
-configured harness contribution; an unknown, ambiguous, or undeclared identity
-fails loud. Only that resolved registry entry enters the runner permission
-callback. The runner authors the durable permission-gate provenance and exact
-tool name from the resolved entry, under ADR-0046, rather than copying a raw ACP
-string into `approval_granted_tool`.
+will issue `session/request_permission` back at Curie. Stable ACP v1 does not
+make that request an authorization identity: its `ToolCallUpdate` requires only
+`toolCallId`; the title, kind, and raw input are optional display fields and may
+default on decode error
+([ACP v1 schema](https://github.com/agentclientprotocol/agent-client-protocol/blob/main/schema/v1/schema.json)).
+The generic adapter therefore never derives grant authority from those fields.
+
+Writable permission support requires a peer-specific **permission identity
+contribution** at a Curie-controlled execution boundary, such as the wrapper or
+MCP proxy that actually gates the call. It maps the peer call to one exact entry
+in the validated bundle tool registry and canonicalizes the arguments before
+execution. An absent, unknown, ambiguous, or undeclared mapping fails loud and
+the peer remains read-only. The runner authors the durable permission-gate
+provenance, tool name, and canonical input digest from that trusted contribution,
+under ADR-0046 and [#1956](https://github.com/curie-eng/curie/issues/1956); it
+never copies ACP display data into `approval_granted_tool` or the digest. The
+writable path cannot ship until #1956 carries that digest through its own
+reviewed, backward-compatible ACI change.
 
 The adapter invokes that existing callback; the worker and API persist the
 durable `Approval`. The adapter itself writes no durable state. Once the block
-is recorded, it cancels and terminates the current ACP invocation without
-sending an allow outcome that could execute the requested operation, then
-releases the process and sandbox. It never holds an ACP JSON-RPC request open
-for human-shaped time.
+is recorded, it responds to the pending reverse-request with
+`RequestPermissionOutcome::Cancelled`, issues `session/cancel`, waits a bounded
+interval for the prompt to stop, then terminates the process and releases the
+sandbox. No allow outcome reaches the original invocation. This ordering is the
+ACP cancellation contract, and it prevents the denied attempt from executing
+while avoiding an ACP JSON-RPC request held open for human-shaped time.
 
-After approval, Curie starts a fresh turn with the ADR-0035 one-shot grant. For
-this adapter, one ACP `session/prompt` cycle is one Curie turn for grant
-lifetime: the grant remains armed throughout that cycle, may survive preceding
-read-only work in the same cycle, is consumed by the first call to the exact
-resolved tool, and expires when the cycle returns. If the engine waits until a
-later prompt cycle to reissue the tool, the grant is gone and the ordinary gate
-requests approval again. This preserves ADR-0035's boot-turn-only boundary
-without assuming the write is the first thing a rehydrated ACP process does.
+After approval, Curie starts a fresh turn with an ADR-0035 one-shot grant bound
+to the trusted tool identity, canonical input digest, approval id, and absolute
+approval expiry. For this adapter, one ACP `session/prompt` cycle is one Curie
+turn for grant lifetime: the grant may survive preceding read-only work in that
+cycle, but the trusted execution boundary atomically rechecks the digest and
+expiry before consuming it. A mismatch or expiry denies without consuming the
+grant. The grant also expires when the prompt cycle returns, so a peer cannot
+carry it into a later prompt; the absolute expiry prevents a peer from retaining
+authority by holding one prompt open indefinitely.
 
-The grant remains tool-name-scoped, not argument-scoped, exactly as ADR-0035
-records. Therefore "exactly once" in this ADR means the denied pre-approval
-attempt executes zero times and at most one post-approval call to the resolved
-tool passes the gate; it does not claim that Curie can prove the reissued
-arguments are byte-identical to the summary the human saw. The ACP client holds
-no local policy, allowlist authority, or default answer. ADR-0040's decision 4
-is unchanged and is restated here in the inbound direction: **an ACP peer's
-opinion is input, never authority**, in whichever direction the request
-travels.
+This inbound path is deliberately stronger than ADR-0035's accepted
+tool-name-only baseline because the reissuing principal is a different external
+process. Here "exactly once" means the denied pre-approval attempt executes zero
+times and exactly one post-approval call with the approved canonical operation
+may pass. The ACP client holds no local policy, allowlist authority, or default
+answer. ADR-0040's decision 4 is unchanged and is restated here in the inbound
+direction: **an ACP peer's opinion is input, never authority**, in whichever
+direction the request travels.
 
 **5. Session persistence uses ADR-0119 structured replay; ACP-native resume is
 optional.** ADR-0040's decision 5 stands: no file-per-session JSONL, and the
@@ -154,17 +168,15 @@ is conformant only when it passes ADR-0062's extended suite — the ACI checks
 (`packages/aci-protocol/src/aci_protocol/conformance.py::run_conformance`,
 exercised by `runner/tests/test_conformance.py`) plus the read-only tool set,
 credential resolution, bundle compile, and telemetry seams. Its permission
-conformance case must prove, with a real ACP agent: permission request, resolved
-tool identity, process end, approval, fresh process, ADR-0119 rehydration, zero
-execution before approval, and exactly one admitted call to the resolved tool
-during the resumed prompt cycle. A control that reissues on a later prompt must
-show the expired grant refuses it; rejection and expiry must prove zero
-execution. The evidence records the arguments shown to the human and the
-arguments the ACP agent reissues, while reporting honestly that the current
-grant enforces tool identity rather than argument identity. Passing makes an
-ACP agent *wireable*, not *shippable*: per ADR-0062 decision 4, parity evals
-under ADR-0022 remain the bar before any ACP-driven harness is elevated past
-spike status.
+conformance case must prove, with a real ACP agent: permission request, trusted
+tool and input resolution, `Cancelled` response, process end, approval, fresh
+process, ADR-0119 rehydration, zero execution before approval, and exactly one
+matching execution during the resumed prompt cycle. Independent controls must
+prove that changed arguments, an absent identity contribution, rejection,
+absolute expiry while the prompt remains open, and reissue on a later prompt all
+execute zero times. Passing makes an ACP agent *wireable*, not *shippable*: per
+ADR-0062 decision 4, parity evals under ADR-0022 remain the bar before any
+ACP-driven harness is elevated past spike status.
 
 **7. Explicit non-goals.** This ADR does not replace the ACP server path of
 ADR-0040 decision 2, which continues to serve editor embedding. It does not
@@ -213,8 +225,10 @@ not fork or vendor any third-party adapter.
 
 ## Consequences
 
-- A second and third harness become a configuration entry plus a conformance run,
-  instead of a per-vendor server. That is the entire return on this decision.
+- A second and third harness become a configuration entry plus a conformance run
+  for the turn wire and read-only surface, instead of a per-vendor server. A
+  writable peer still needs the trusted permission identity contribution in
+  decision 4; ACP v1 alone cannot supply it.
 - The runner gains an ACP client dependency at the harness edge, next to the ACP
   server dependency ADR-0040 already accepted. Version skew is handled by
   decision 5; containment to the edge is what decision 2 buys.
@@ -232,12 +246,13 @@ not fork or vendor any third-party adapter.
   rather than designed away.
 - The adapter remains durably stateless and does not reserve a sandbox during an
   approval wait. Its writable permission path is consequently unavailable until
-  #1902 implements ADR-0119's structured replay; no ACP client implementation
-  begins from this Draft.
+  #1902 implements ADR-0119's structured replay and #1956 lands the separately
+  reviewed argument-bound grant contract. A read-only spike may precede those
+  prerequisites; no writable ACP client implementation begins from this Draft.
 - ACP normalizes the turn and permission wire. It does **not** normalize the
   installer, the credential shapes, or the bundle format. Anyone reading this ADR
   as "a second harness is now free" is reading it wrong; the claim is that the
   most expensive third of that bill is removed, and decision 7 names what remains.
-- Nothing in the worker, the API, or the approval plane moves. This is an adapter
-  behind an existing port, and the plane of decision 4 is the one already in the
-  tree.
+- The ordinary approval lifecycle stays in the worker and API, but #1956 must
+  extend its durable provenance with a canonical input digest before the
+  writable path can ship. This ADR does not modify the frozen contract itself.
