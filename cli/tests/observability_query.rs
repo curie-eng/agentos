@@ -770,7 +770,8 @@ fn unknown_trace_and_unavailable_api_are_distinct_semantic_failures() {
         );
         let error = value["error"].as_str().unwrap();
         assert!(
-            error.starts_with("the Curie API is unavailable for this query: GET /langfuse/traces:"),
+            error.starts_with("the Curie API is unavailable for this query:")
+                && error.contains("GET observability:"),
             "the error keeps the shared API-operation context: {value}"
         );
         assert!(
@@ -935,7 +936,7 @@ fn cluster_query_parent_namespace_and_release_drive_discovery_for_every_leaf() {
     let proxy = tools.path().join("proxy.py");
     fs::write(
         &proxy,
-        r#"import http.server, os, urllib.error, urllib.request
+        r#"import http.server, os, sys, urllib.error, urllib.request
 
 target = "http://127.0.0.1:" + os.environ["CURIE_TEST_OBSERVABILITY_TARGET_PORT"]
 
@@ -958,7 +959,10 @@ class Proxy(http.server.BaseHTTPRequestHandler):
     def log_message(self, *_args):
         pass
 
-http.server.ThreadingHTTPServer(("127.0.0.1", 8123), Proxy).serve_forever()
+server = http.server.ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), Proxy)
+assigned = server.server_address[1]
+print(f"Forwarding from 127.0.0.1:{assigned} -> 8000", flush=True)
+server.serve_forever()
 "#,
     )
     .expect("write API port-forward proxy");
@@ -980,8 +984,8 @@ case "$*" in
   *"-n observability-parent-ns get secret observability-parent-release-secrets"*"apiKey"*)
     printf '%s' "$CURIE_TEST_OBSERVABILITY_API_KEY"
     ;;
-  *"-n observability-parent-ns port-forward svc/observability-parent-release-api 8123:8000"*)
-    exec python3 "$CURIE_TEST_OBSERVABILITY_PROXY_SCRIPT"
+  *"-n observability-parent-ns port-forward svc/observability-parent-release-api 0:8000"*)
+    exec python3 "$CURIE_TEST_OBSERVABILITY_PROXY_SCRIPT" 0
     ;;
   *)
     printf 'unexpected kubectl invocation: %s\n' "$*" >&2
@@ -1070,7 +1074,7 @@ esac
         discovery
             .lines()
             .filter(|line| line.contains(&format!(
-                "-n {NAMESPACE} port-forward svc/{RELEASE}-api 8123:8000"
+                "-n {NAMESPACE} port-forward svc/{RELEASE}-api 0:8000"
             )))
             .count(),
         3,

@@ -214,6 +214,15 @@ class EvalCaseResult(BaseModel):
     turn failed. Runtime and transport failures remain in ``error``. This keeps
     a deterministic trajectory mismatch distinct from a broken execution.
 
+    ``error`` means the turn never produced a verdict: a classified failure, a
+    terminal status that did not match what the case expected, or a
+    transport/runner exception. A graded FAIL (the turn completed and the grader
+    said no) MUST leave ``error`` unset. The matrix's ``_completed`` predicate
+    keys on this: stuffing variance into ``error`` on a completed FAIL makes a
+    0% pass rate look like "the model never resolved" (issue #857, ADR-0068).
+    Multi-sample variance rides ``variance`` / ``samples`` / ``passes`` /
+    ``policy`` instead.
+
     ``cost_usd`` is the dollar cost the runner attributed to this case's turn
     when the harness reported usage/pricing; it is ``None`` when cost is not
     available (e.g. the fake-model path, or a provider that reports no usage), so
@@ -229,6 +238,10 @@ class EvalCaseResult(BaseModel):
     error: str | None = None
     detail: str | None = None
     cost_usd: float | None = None
+    samples: int | None = None
+    passes: int | None = None
+    policy: str | None = None
+    variance: str | None = None
 
     @computed_field  # type: ignore[prop-decorator]
     @property

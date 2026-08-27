@@ -51,19 +51,22 @@ be a subset of `M`.
 1. **Strict** matches when `G` is empty and `E` is empty. Additional operator
    gates do not weaken this result because they only add an approval requirement.
 
-2. **Standard** matches when every effective armed gate is manifest declared:
-   `A` is a subset of `M`. Manifest grantability and configured egress may take
-   the values ADR 0056 and the deployment allowlist permit.
+2. **Standard** matches when `A` is nonempty, meaning that at least one
+   effective approval gate from the ADR 0050 union is armed. Manifest
+   grantability and configured egress may take the values ADR 0056 and the
+   deployment allowlist permit.
 
-3. **Permissive** matches every remaining valid installation. In particular,
-   an installation with an operator gate outside `M` is Permissive, because it
-   has an armed gate whose approval provenance the bundle does not declare.
+3. **Permissive** matches every remaining valid installation. After the prior
+   matches, `A` is empty and `E` is nonempty.
 
-The order makes overlap intentional. A normal installation with no grantable
-gate and no egress matches both Strict and Standard, and resolves to Strict.
-A normal installation with manifest only gates, configured egress, and manifest
-grantability resolves to Standard. An installation with an additional operator
-gate resolves to Permissive unless Strict matched first.
+Arming a gate, including an operator gate, adds an approval requirement and
+must never lower a posture. The order makes overlap intentional. An
+installation with `G` and `E` empty resolves to Strict exactly once, even when
+it has an effective armed gate. A normal installation with manifest only gates,
+configured egress, and manifest grantability resolves to Standard exactly once.
+The same installation with an additional operator gate remains Standard exactly
+once because `A` remains nonempty. An installation with no effective gate and
+configured egress resolves to Permissive exactly once.
 
 An installation that fails ADR 0050 validation or cannot load its policy has no
 posture result because it does not have an effective policy to classify. A
@@ -75,9 +78,8 @@ Assume at least one manifest gate and a nonempty configured allowlist. Every
 manifest declared gate is armed, the manifest opts those gates into grantability,
 egress uses its configured allowlist, and no operator only gate is present. The
 ordered resolver returns **Standard** exactly once. Strict fails because
-grantability is nonempty and egress is nonempty. Standard matches because every
-effective armed gate is manifest declared, so evaluation stops before
-Permissive.
+grantability is nonempty and egress is nonempty. Standard matches because the
+effective armed gate set `A` is nonempty, so evaluation stops before Permissive.
 
 ## Consequences
 

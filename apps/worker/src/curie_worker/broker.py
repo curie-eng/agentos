@@ -40,7 +40,8 @@ class StreamBroker(Protocol):
 
     A second broker must honor: an ordered stream, consumer groups
     (``xgroup_create`` / ``xreadgroup``), per-entry ack (``xack``), pending-entry
-    reclaim for crash recovery (``xautoclaim``), and — since the delivery cap
+    reclaim for crash recovery (``xautoclaim``), dead-consumer prompt reclaim
+    (``xinfo_consumers`` / ``xclaim``, #1532), and — since the delivery cap
     (#505) — inspection of the pending list's delivery counts
     (``xpending_range``), entry lookup (``xrange``), and append (``xadd``) to move
     an over-cap entry to the dead-letter stream. Dedupe lives on the producer side
@@ -83,6 +84,26 @@ class StreamBroker(Protocol):
         justid: bool = ...,
     ) -> Awaitable[Any]:
         """Reclaim entries pending past ``min_idle_time`` from a dead consumer."""
+        ...
+
+    def xinfo_consumers(self, name: Any, groupname: Any) -> Awaitable[Any]:
+        """Per-consumer idle and pending counts — dead-consumer prompt reclaim."""
+        ...
+
+    def xclaim(
+        self,
+        name: Any,
+        groupname: Any,
+        consumername: Any,
+        min_idle_time: Any,
+        message_ids: Any,
+        idle: Any = ...,
+        time: Any = ...,
+        retrycount: Any = ...,
+        force: bool = ...,
+        justid: bool = ...,
+    ) -> Awaitable[Any]:
+        """Claim specific pending ids onto ``consumername``."""
         ...
 
     def xpending_range(

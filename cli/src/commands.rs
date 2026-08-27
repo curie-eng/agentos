@@ -858,6 +858,87 @@ pub async fn dev_script(rel_path: &str, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+pub async fn dev_e2e_ci_selection(
+    paths: &[PathBuf],
+    base: Option<&str>,
+    head: Option<&str>,
+    push: bool,
+) -> Result<()> {
+    let root = find_repo_root().context(
+        "runner/Dockerfile not found here or in any parent directory. Run `curie dev` \
+         from a curie source checkout.",
+    )?;
+    let selector = root.join("tools/e2e-ci-selection/select_tiers.py");
+    let registry = root.join(".github/e2e-selection.yaml");
+    if !selector.is_file() {
+        bail!("selector not found: {}", selector.display());
+    }
+    if !registry.is_file() {
+        bail!("selection registry not found: {}", registry.display());
+    }
+
+    let output_path = (0..100)
+        .find_map(|attempt| {
+            let path = std::env::temp_dir().join(format!(
+                "curie-e2e-ci-selection-{}-{attempt}",
+                std::process::id()
+            ));
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .ok()
+                .map(|_| path)
+        })
+        .context("failed to create temporary selector output")?;
+
+    let selection = async {
+        let mut command = tokio::process::Command::new("uv");
+        command
+            .args([
+                "run",
+                "--no-project",
+                "--with",
+                "pyyaml==6.0.3",
+                "python",
+                "tools/e2e-ci-selection/select_tiers.py",
+                "--registry",
+                ".github/e2e-selection.yaml",
+            ])
+            .env("GITHUB_OUTPUT", &output_path)
+            .current_dir(&root);
+        for path in paths {
+            command.arg("--path").arg(path);
+        }
+        if let Some(base) = base {
+            command.arg("--base").arg(base);
+        }
+        if let Some(head) = head {
+            command.arg("--head").arg(head);
+        }
+        if push {
+            command.arg("--push");
+        }
+
+        let status = command
+            .status()
+            .await
+            .context("failed to invoke the end to end CI selector")?;
+        if !status.success() {
+            bail!("end to end CI selector failed ({status})");
+        }
+        std::fs::read_to_string(&output_path).context("failed to read selector output")
+    }
+    .await;
+
+    let cleanup = std::fs::remove_file(&output_path)
+        .with_context(|| format!("failed to remove {}", output_path.display()));
+    let selection = selection?;
+    cleanup?;
+    print!("{selection}");
+    Ok(())
+}
+
 /// The chart assertion scripts live here, and helm-ci runs every one of them on
 /// any `charts/curie/**` change.
 pub const CHART_CI_DIR: &str = "charts/curie/ci";
@@ -1128,33 +1209,27 @@ fn resolve_agent_folder(folder: &str) -> Result<std::path::PathBuf> {
 /// for that tier.
 pub async fn deploy_named(folder: &str, opts: DeployNamedOpts) -> Result<DeployOutput> {
     let plugin_dir = resolve_agent_folder(folder)?;
-    let connect_hint = format!(
-        "the platform API at {} is unreachable. Start the local stack first with `curie local \
-         up`, then re-run (or pass --api-url if your API is elsewhere).",
-        opts.api_url
-    );
-    deploy(DeployOpts {
+    let api_url = opts.api_url.clone();
+    let result = deploy(DeployOpts {
         plugin_dir,
         // deploy_named is the multi-agent-folder path: the folder IS the agent
         // identity there, so there is nothing to override.
         agent: None,
         target: None,
-        api_url: opts.api_url,
+        api_url,
         api_key: opts.api_key,
         slack_channel: opts.slack_channel,
         repo: opts.repo,
         workspace: WorkspaceIntent::Preserve,
+        tier: DeployTier::Local,
         env: Some(opts.env),
         label: opts.label,
         secret: opts.secret,
         secret_binding_supported: true,
-        connect_hint,
-        // The third local-deploy caller (block B1-11): it must reach the same
-        // preflight `local deploy` does, or a source-built bundle uploads with
-        // no lock check.
-        tier: DeployTier::Local,
+        connect_hint: "the platform API is unreachable.".to_string(),
     })
-    .await
+    .await;
+    crate::local::with_deploy_unreachable_hint(result, &opts.api_url).await
 }
 
 /// The `curie deploy-local <folder>` flags, mirroring `local deploy`'s minus
@@ -1623,32 +1698,82 @@ fn load_model_credentials_from_env_file(
     Ok(resolved)
 }
 
-/// What a recorded runner means for a fresh `skill up` (#747).
+/// What a recorded runner means for a fresh `skill up` (#747, #1905).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordedStatePlan {
     /// Nothing recorded; boot.
     Proceed,
-    /// `--replace` names the very container the record describes, so the record
-    /// is about to become stale anyway: clear it and boot.
+    /// Tear the recorded runner down and boot. Either `--replace` names that
+    /// exact container, or a verified same-bundle identity is serving a stale
+    /// snapshot of this source.
     ClearAndProceed,
-    /// A runner is recorded that `--replace` does not cover; refuse, so a second
-    /// bundle's live runner cannot be silently forgotten.
+    /// The recorded runner is this bundle and already serves the current
+    /// source; do not restart.
+    AlreadyRunning,
+    /// A runner is recorded that this `up` must not remove: a different name,
+    /// a foreign or unverifiable identity, or a snapshot that cannot be
+    /// compared. Refuse so a second bundle's live runner cannot be silently
+    /// forgotten.
     Refuse,
 }
 
-/// Resolve the recorded-state gate. Pure so both branches are testable without a
-/// bundle on disk. `--replace` only clears the record when it is replacing that
-/// exact container: a record naming a DIFFERENT runner still blocks, since
-/// removing one container is no reason to forget another.
-pub fn plan_recorded_state(
-    recorded: Option<&str>,
-    target: &str,
-    replace: bool,
-) -> RecordedStatePlan {
-    match recorded {
-        None => RecordedStatePlan::Proceed,
-        Some(container) if replace && container == target => RecordedStatePlan::ClearAndProceed,
-        Some(_) => RecordedStatePlan::Refuse,
+/// Inputs to [`plan_recorded_state`]. Identity fields are optional so the
+/// `--replace` name gate stays testable without Docker; auto-reload requires
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordedStateQuery<'a> {
+    pub recorded_name: Option<&'a str>,
+    pub target_name: &'a str,
+    pub replace: bool,
+    pub recorded_id: Option<&'a str>,
+    pub live_id: Option<&'a str>,
+    pub same_bundle_dir: bool,
+    pub recorded_digest: Option<&'a str>,
+    pub current_digest: Option<&'a str>,
+}
+
+/// Whether a recorded container id and a `docker ps` id name the same
+/// container. `docker ps` reports a 12-char short id while `docker run`
+/// returns the full 64-char one, so identity is a prefix match, not equality.
+/// An empty recorded id cannot be compared and is not a match: auto-reload
+/// must not treat an unverified identity as owned (#1905 / #747).
+pub fn recorded_ids_match(recorded_id: &str, live_id: &str) -> bool {
+    !recorded_id.is_empty()
+        && (recorded_id.starts_with(live_id) || live_id.starts_with(recorded_id))
+}
+
+/// Resolve the recorded-state gate. Pure so every branch is testable without a
+/// bundle on disk or a Docker daemon.
+///
+/// `--replace` still clears only the record for the exact target name: a record
+/// naming a DIFFERENT runner still blocks, since removing one container is no
+/// reason to forget another (#747). Without `--replace`, a verified
+/// same-directory runner whose snapshot no longer matches this source is
+/// replaced automatically (#1905); an unverified identity never is.
+pub fn plan_recorded_state(q: RecordedStateQuery<'_>) -> RecordedStatePlan {
+    let Some(recorded) = q.recorded_name else {
+        return RecordedStatePlan::Proceed;
+    };
+    if q.replace && recorded == q.target_name {
+        return RecordedStatePlan::ClearAndProceed;
+    }
+    if recorded != q.target_name {
+        return RecordedStatePlan::Refuse;
+    }
+    let identity_verified = q.same_bundle_dir
+        && match (q.recorded_id, q.live_id) {
+            (Some(recorded_id), Some(live_id)) => recorded_ids_match(recorded_id, live_id),
+            _ => false,
+        };
+    if !identity_verified {
+        return RecordedStatePlan::Refuse;
+    }
+    match (q.recorded_digest, q.current_digest) {
+        (Some(recorded_digest), Some(current_digest)) if recorded_digest == current_digest => {
+            RecordedStatePlan::AlreadyRunning
+        }
+        (Some(_), Some(_)) => RecordedStatePlan::ClearAndProceed,
+        _ => RecordedStatePlan::Refuse,
     }
 }
 
@@ -1722,16 +1847,66 @@ pub async fn start(opts: StartOpts) -> Result<()> {
     // Decided here, ACTED ON below: refusing is free, but replacing tears down a
     // live runner and must not happen until nothing cheap can still abort (#747).
     let recorded_runner = state::load(&plugin_dir)?;
-    let recorded_plan = plan_recorded_state(
-        recorded_runner.as_ref().map(|s| s.container_name.as_str()),
-        &opts.name,
-        opts.replace,
-    );
+    // `--replace` decides from the name alone and must stay a cheap abort
+    // until budget / model preflights pass (#747). Auto-reload needs the live
+    // container id, so only probe Docker when that path could fire.
+    let live_for_plan = match recorded_runner.as_ref() {
+        Some(saved) if !opts.replace => docker::container_facts(&saved.container_name).await?,
+        _ => None,
+    };
+    let same_bundle_dir = recorded_runner.as_ref().is_some_and(|saved| {
+        Path::new(&saved.plugin_dir)
+            .canonicalize()
+            .ok()
+            .is_some_and(|recorded| recorded == plugin_dir)
+    });
+    let identity_verified = recorded_runner.as_ref().is_some_and(|saved| {
+        same_bundle_dir
+            && live_for_plan
+                .as_ref()
+                .is_some_and(|facts| recorded_ids_match(&saved.container_id, &facts.id))
+    });
+    // Packing is cheap relative to teardown and is how we know the snapshot is
+    // stale. Skip it unless auto-reload could actually fire: `--replace` does
+    // not need a digest, and an unverified identity must still refuse.
+    let current_digest = if identity_verified && !opts.replace {
+        crate::bundle::digest_source(&plugin_dir).ok()
+    } else {
+        None
+    };
+    let recorded_plan = plan_recorded_state(RecordedStateQuery {
+        recorded_name: recorded_runner.as_ref().map(|s| s.container_name.as_str()),
+        target_name: &opts.name,
+        replace: opts.replace,
+        recorded_id: recorded_runner.as_ref().map(|s| s.container_id.as_str()),
+        live_id: live_for_plan.as_ref().map(|f| f.id.as_str()),
+        same_bundle_dir,
+        recorded_digest: recorded_runner
+            .as_ref()
+            .and_then(|s| s.bundle_digest.as_deref()),
+        current_digest: current_digest.as_deref(),
+    });
     if recorded_plan == RecordedStatePlan::Refuse {
+        let recorded_name = &recorded_runner
+            .as_ref()
+            .expect("a refusal requires a recorded runner")
+            .container_name;
         return Err(crate::exit::usage(format!(
-            "a local runner is already recorded in {}/.curie/runner.json; run 'curie skill down' there first",
-            plugin_dir.display()
+            "a local runner is already recorded in {}/.curie/runner.json; run 'curie skill down' there first, or rerun 'curie skill up --replace --name {recorded_name}' to replace it",
+            plugin_dir.display(),
         )));
+    }
+    if recorded_plan == RecordedStatePlan::AlreadyRunning {
+        let saved = recorded_runner.expect("already-running requires a recorded runner");
+        let ui = crate::ui::ui();
+        ui.success(&format!(
+            "runner '{}' is already running this bundle snapshot",
+            saved.container_name
+        ));
+        if let Some(digest) = saved.bundle_digest.as_deref() {
+            ui.note(&format!("bundle {}", short_digest(digest)));
+        }
+        return Ok(());
     }
 
     // Parse (not just forward) the budget so a typo fails here, not in-container.
@@ -1775,10 +1950,12 @@ pub async fn start(opts: StartOpts) -> Result<()> {
     // network, then the file -- because clearing the record while its runner is
     // still live strands exactly the untracked orphan this ticket removes (#747).
     if let (RecordedStatePlan::ClearAndProceed, Some(saved)) = (recorded_plan, recorded_runner) {
-        crate::ui::ui().note(&format!(
-            "--replace: tearing down the recorded runner '{}' first",
-            saved.container_name
-        ));
+        let reason = if opts.replace {
+            "--replace: tearing down the recorded runner"
+        } else {
+            "bundle changed: replacing the recorded runner"
+        };
+        crate::ui::ui().note(&format!("{reason} '{}' first", saved.container_name));
         let live = docker::container_facts(&saved.container_name).await?;
         stop_recorded(&plugin_dir, crate::ui::ui(), saved, live.as_ref()).await?;
     }
@@ -2275,9 +2452,10 @@ pub fn plan_recorded_teardown(
     };
     // `docker ps` reports a 12-char short id while `docker run` returns the full
     // 64-char one, so identity is a prefix match, not equality. A record with no
-    // id at all cannot be compared, so it keeps the old name-based behavior
-    // rather than refusing to tear down.
-    if recorded_id.is_empty() || recorded_id.starts_with(live) || live.starts_with(recorded_id) {
+    // id at all cannot be compared, so teardown keeps the old name-based
+    // behavior rather than refusing to tear down. Auto-reload does NOT use this
+    // empty-id fallback: [`recorded_ids_match`] rejects it (#1905).
+    if recorded_id.is_empty() || recorded_ids_match(recorded_id, live) {
         return RecordedTeardown::Remove {
             id: live.to_string(),
         };
@@ -2555,15 +2733,32 @@ pub type EvalRow = (String, CaseOutcome, f64, String);
 pub struct EvalReport {
     pub rows: Vec<EvalRow>,
     pub details: BTreeMap<String, String>,
+    /// Sampling policy this run used (#1907). Default n=1 majority.
+    pub sampling: crate::eval_sampling::SampleConfig,
+    /// Per-case count of samples that passed, keyed by case id.
+    pub sample_passes: BTreeMap<String, u32>,
 }
 
 impl EvalReport {
     pub fn from_rows(rows: Vec<EvalRow>) -> Self {
+        Self::with_details(rows, BTreeMap::new())
+    }
+
+    pub fn with_details(rows: Vec<EvalRow>, details: BTreeMap<String, String>) -> Self {
+        let sample_passes = n1_sample_passes(&rows);
         Self {
             rows,
-            details: BTreeMap::new(),
+            details,
+            sampling: crate::eval_sampling::SampleConfig::default(),
+            sample_passes,
         }
     }
+}
+
+fn n1_sample_passes(rows: &[EvalRow]) -> BTreeMap<String, u32> {
+    rows.iter()
+        .map(|(id, outcome, _, _)| (id.clone(), u32::from(*outcome == CaseOutcome::Pass)))
+        .collect()
 }
 
 /// The three counts every eval surface reports. Split out so the `--json`
@@ -2592,21 +2787,21 @@ fn eval_counts(results: &[EvalRow]) -> (usize, usize, usize) {
 /// snapshotted bundle, and on a skill run against a runner this checkout never
 /// recorded.
 pub fn eval_json(results: &[EvalRow], bundle_digest: Option<&str>) -> serde_json::Value {
-    eval_json_with_details(results, &BTreeMap::new(), bundle_digest)
+    eval_json_with_details(&EvalReport::from_rows(results.to_vec()), bundle_digest)
 }
 
-fn eval_json_with_details(
-    results: &[EvalRow],
-    details: &BTreeMap<String, String>,
-    bundle_digest: Option<&str>,
-) -> serde_json::Value {
+fn eval_json_with_details(report: &EvalReport, bundle_digest: Option<&str>) -> serde_json::Value {
     // Derive every count from `results` in one pass so the rollup can never
     // disagree with the per-case rows (no caller-supplied passed/total to drift).
+    let results = &report.rows;
     let total = results.len();
     let (passed, failed, plumbing_ok) = eval_counts(results);
+    let n = report.sampling.n;
+    let policy = report.sampling.policy.as_str();
     let cases: Vec<serde_json::Value> = results
         .iter()
         .map(|(id, outcome, seconds, output)| {
+            let sample_passes = report.sample_passes.get(id).copied().unwrap_or(0);
             let mut row = serde_json::json!({
                 "id": id,
                 "outcome": outcome,
@@ -2617,9 +2812,22 @@ fn eval_json_with_details(
                 "passed": outcome.passed(),
                 "seconds": seconds,
                 "output": output,
+                "samples": n,
+                "passes": sample_passes,
+                "policy": policy,
             });
-            if let Some(detail) = details.get(id) {
+            if let Some(detail) = report.details.get(id) {
                 row["detail"] = serde_json::json!(detail);
+            }
+            if n > 1 {
+                let bar = match report.sampling.policy {
+                    crate::eval_sampling::AggregationPolicy::PassAtK => {
+                        format!("pass@{}", report.sampling.effective_k())
+                    }
+                    crate::eval_sampling::AggregationPolicy::Majority => "majority".to_string(),
+                };
+                row["variance"] =
+                    serde_json::json!(format!("{sample_passes}/{n} samples passed ({bar})"));
             }
             row
         })
@@ -2630,6 +2838,8 @@ fn eval_json_with_details(
         "failed": failed,
         "plumbing_ok": plumbing_ok,
         "bundle_digest": bundle_digest,
+        "samples": n,
+        "policy": policy,
         "cases": cases,
     })
 }
@@ -3034,8 +3244,13 @@ pub async fn send(
     r#continue: bool,
 ) -> Result<bool> {
     let url = resolve_url(url)?;
+    let saved = state::load(Path::new(".")).unwrap_or(None);
+    let bundle_warning = editable_bundle_warning(saved.as_ref(), &url);
     let client = RunnerClient::new(&url)?;
     let ui = crate::ui::ui();
+    if let Some(warning) = bundle_warning {
+        ui.warn(&warning);
+    }
     let mut printer = TurnPrinter::default();
 
     if !r#continue {
@@ -3156,6 +3371,27 @@ pub struct SkillMessageOutput {
     pub finalized: bool,
 }
 
+fn editable_bundle_warning(saved: Option<&state::RunnerState>, url: &str) -> Option<String> {
+    let saved = saved.filter(|saved| saved.base_url == url)?;
+    let recorded_digest = saved.bundle_digest.as_deref()?;
+    let editable_digest = match crate::bundle::digest_source(Path::new(&saved.plugin_dir)) {
+        Ok(digest) => digest,
+        Err(_) => {
+            return Some(
+                "could not compare the editable bundle with the running snapshot. Run `curie skill up` after fixing the bundle."
+                    .to_string(),
+            );
+        }
+    };
+    if editable_digest == recorded_digest {
+        return None;
+    }
+    Some(
+        "editable bundle differs from the running snapshot. Run `curie skill up` to load the changes."
+            .to_string(),
+    )
+}
+
 impl crate::ui::CliOutput for SkillMessageOutput {
     fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
@@ -3179,11 +3415,10 @@ pub async fn eval(
     models: Vec<String>,
     secrets: Vec<String>,
     image: String,
+    sampling: crate::eval_sampling::SampleConfig,
 ) -> Result<()> {
     let saved = state::load(Path::new("."))?;
     let state_plugin_dir = saved.as_ref().map(|s| PathBuf::from(s.plugin_dir.clone()));
-    let cases_path = resolve_cases_path(cases_path, Path::new("."), state_plugin_dir.as_deref())?;
-    let loaded = load_eval(&cases_path)?;
 
     // Model selection (#526): with `--model`, boot a transient runner per model,
     // run the suite against each, and report pass-rate per model -- the one
@@ -3191,6 +3426,14 @@ pub async fn eval(
     // manual `skill up --model X` + `skill eval` loop per model. Without it, the
     // default path drives the already-running runner (whatever model it booted).
     if !models.is_empty() {
+        let recorded_snapshot_dir = sweep_snapshot(saved.as_ref()).map(|(dir, _)| dir);
+        let cases_path = resolve_cases_path(
+            cases_path,
+            Path::new("."),
+            recorded_snapshot_dir.as_deref(),
+            state_plugin_dir.as_deref(),
+        )?;
+        let loaded = load_eval(&cases_path)?;
         return eval_sweep(
             &loaded.suite,
             loaded.trajectory.as_ref(),
@@ -3199,12 +3442,25 @@ pub async fn eval(
             &image,
             sweep_snapshot(saved.as_ref()),
             state_plugin_dir.as_deref(),
+            sampling,
         )
         .await;
     }
 
     let fake = drives_a_fake_runner(saved.as_ref(), url.as_deref());
     let url = resolve_url(url)?;
+    let recorded_snapshot_dir = saved
+        .as_ref()
+        .filter(|saved| saved.base_url == url)
+        .and_then(|saved| saved.bundle_snapshot_dir.as_ref())
+        .map(PathBuf::from);
+    let cases_path = resolve_cases_path(
+        cases_path,
+        Path::new("."),
+        recorded_snapshot_dir.as_deref(),
+        state_plugin_dir.as_deref(),
+    )?;
+    let loaded = load_eval(&cases_path)?;
     // #1087 AC2: the bundle this eval graded, on the machine surface, so an
     // agent can confirm it is the SAME digest `skill status`/`skill message`
     // report without reading a human note off stderr (docs/agents.md bans
@@ -3213,21 +3469,25 @@ pub async fn eval(
     let bundle_digest = recorded_bundle_digest(saved.as_ref(), &url);
     let client = RunnerClient::new(&url)?;
     let ui = crate::ui::ui();
-    let bar = ui.progress_bar(loaded.suite.cases.len() as u64, "running evals");
     // `run_suite_cases` also tallies completion for the `--model` sweep path;
     // the single-runner report doesn't need the count (it already reports the
     // per-case `Fail` either way and exits on any of them), so it is discarded.
+    let bar = ui.progress_bar(
+        (loaded.suite.cases.len() as u64).saturating_mul(u64::from(sampling.n)),
+        "running evals",
+    );
     let (results, _completed) = run_suite_cases(
         &client,
         &loaded.suite,
         fake,
         loaded.trajectory.as_ref(),
+        sampling,
         |_| bar.inc(1),
     )
     .await?;
     bar.finish();
 
-    report_eval(&results, bundle_digest.as_deref())
+    report_eval(&results, bundle_digest.as_deref(), ())
 }
 
 /// Whether the runner `skill eval` is about to drive is the fake. Learned from
@@ -3259,51 +3519,71 @@ async fn run_suite_cases(
     suite: &EvalSuite,
     fake: bool,
     trajectory_scorer: Option<&TrajectoryScorer>,
-    mut on_case: impl FnMut(usize),
+    sampling: crate::eval_sampling::SampleConfig,
+    mut on_sample: impl FnMut(usize),
 ) -> Result<(EvalReport, usize)> {
     let mut results = Vec::with_capacity(suite.cases.len());
     let mut details = BTreeMap::new();
+    let mut sample_passes = BTreeMap::new();
     let mut completed = 0usize;
-    for (i, case) in suite.cases.iter().enumerate() {
-        // Fresh conversation by default (#550): reset the runner before a case so
-        // it cannot answer from an earlier case's history instead of actually
-        // invoking its tools. A shared_history case skips the reset and inherits
-        // the prior case's conversation on purpose (a multi-turn scenario).
-        if !case.shared_history {
-            client.reset().await.with_context(|| {
-                format!(
-                    "resetting the runner conversation before case {:?}",
-                    case.id
-                )
-            })?;
+    for case in &suite.cases {
+        let mut samples = Vec::with_capacity(sampling.n as usize);
+        let mut case_completed = false;
+        for _ in 0..sampling.n {
+            // Fresh conversation before every sample (#550 / #1907): two samples
+            // of the same case must each start clean, or the second inherits the
+            // first's turn. A shared_history case still skips the reset.
+            if !case.shared_history {
+                client.reset().await.with_context(|| {
+                    format!(
+                        "resetting the runner conversation before case {:?}",
+                        case.id
+                    )
+                })?;
+            }
+            let started = Instant::now();
+            let events = client
+                .send_event(EventType::EvalCase, &case.input, "U-eval", |_| {})
+                .await?;
+            let elapsed = started.elapsed().as_secs_f64();
+            let sample_completed = turn_completed(case, &events);
+            if sample_completed {
+                case_completed = true;
+            }
+            let scored = score_turn(case, &events, fake, trajectory_scorer);
+            if let Some(detail) = scored.detail.clone() {
+                details.insert(case.id.clone(), detail);
+            }
+            samples.push(crate::eval_sampling::SampleRecord {
+                outcome: scored.outcome,
+                output: graded_answer(&events),
+                seconds: elapsed,
+                error: if sample_completed {
+                    None
+                } else {
+                    Some("turn did not complete".into())
+                },
+            });
+            on_sample(0);
         }
-        let started = Instant::now();
-        let events = client
-            .send_event(EventType::EvalCase, &case.input, "U-eval", |_| {})
-            .await?;
-        let elapsed = started.elapsed().as_secs_f64();
-        if turn_completed(case, &events) {
+        if case_completed {
             completed += 1;
         }
-        // Capture the graded answer -- the exact text `turn_outcome` judged -- so
-        // a red case can be diagnosed from `--json` without a manual re-run
-        // (#548). A fake row carries its canned reply for the same reason.
-        let scored = score_turn(case, &events, fake, trajectory_scorer);
-        if let Some(detail) = scored.detail {
-            details.insert(case.id.clone(), detail);
+        let agg = crate::eval_sampling::aggregate_samples(&samples, sampling);
+        sample_passes.insert(case.id.clone(), agg.passes);
+        if let Some(variance) = &agg.variance {
+            details
+                .entry(case.id.clone())
+                .or_insert_with(|| variance.clone());
         }
-        results.push((
-            case.id.clone(),
-            scored.outcome,
-            elapsed,
-            graded_answer(&events),
-        ));
-        on_case(i);
+        results.push((case.id.clone(), agg.outcome, agg.seconds, agg.output));
     }
     Ok((
         EvalReport {
             rows: results,
             details,
+            sampling,
+            sample_passes,
         },
         completed,
     ))
@@ -3605,6 +3885,7 @@ mod eval_bundle {
 }
 
 /// Run the suite once per model in a fresh runner and report pass-rate per model.
+#[allow(clippy::too_many_arguments)]
 async fn eval_sweep(
     suite: &EvalSuite,
     trajectory_scorer: Option<&TrajectoryScorer>,
@@ -3613,6 +3894,7 @@ async fn eval_sweep(
     image: &str,
     recorded: Option<(PathBuf, String)>,
     state_plugin_dir: Option<&Path>,
+    sampling: crate::eval_sampling::SampleConfig,
 ) -> Result<()> {
     let ui = crate::ui::ui();
     // The mount is decided once, purely, by `resolve_sweep_mount`, then
@@ -3651,7 +3933,8 @@ async fn eval_sweep(
             // `boot_eval_runner` pins `fake_model: false`, so every sweep runner is a
             // REAL model whatever the standing dev runner is -- the sweep grades,
             // so this in-CLI path never produces a plumbing-only row.
-            let run = run_suite_cases(&client, suite, false, trajectory_scorer, |_| {}).await;
+            let run =
+                run_suite_cases(&client, suite, false, trajectory_scorer, sampling, |_| {}).await;
             let _ = docker::remove_container(&name).await;
             let (results, completed) = run?;
             let passed = results
@@ -3845,7 +4128,12 @@ pub fn report_sweep(rows: &[SweepRow], bundle_digest: Option<&str>) -> Result<()
 /// graded is confirmable from the machine surface. Callers pass `None` when no
 /// locally snapshotted bundle applies (the local/cluster tiers grade a deployed
 /// version), never a digest they did not observe.
-pub fn report_eval(report: &EvalReport, bundle_digest: Option<&str>) -> Result<()> {
+///
+/// `guards` are dropped before a red eval's non-unwinding `process::exit`
+/// (#1908). `std::process::exit` does not run Drop, so a `kubectl port-forward`
+/// child or Slack stub still in the caller's scope would otherwise be orphaned
+/// onto PID 1. Callers with no such resource pass `()`.
+pub fn report_eval<G>(report: &EvalReport, bundle_digest: Option<&str>, guards: G) -> Result<()> {
     let (_passed, failed, _plumbing_ok) = eval_counts(&report.rows);
     // Emit through the one success point (#474), then apply the exit-code side
     // effect for BOTH paths -- the json path had it inline, the human path after.
@@ -3856,7 +4144,7 @@ pub fn report_eval(report: &EvalReport, bundle_digest: Option<&str>) -> Result<(
         bundle_digest,
     });
     if failed > 0 {
-        std::process::exit(crate::exit::ExitClass::Failure.code());
+        crate::exit::exit_after_drop(crate::exit::ExitClass::Failure, guards);
     }
     Ok(())
 }
@@ -3874,23 +4162,39 @@ struct EvalOutput<'a> {
 
 impl crate::ui::CliOutput for EvalOutput<'_> {
     fn to_json(&self) -> serde_json::Value {
-        eval_json_with_details(&self.report.rows, &self.report.details, self.bundle_digest)
+        eval_json_with_details(self.report, self.bundle_digest)
     }
 
     fn render(&self, ui: &crate::ui::Ui) {
         let results = &self.report.rows;
         let (passed, failed, plumbing_ok) = eval_counts(results);
+        let n = self.report.sampling.n;
         let rows: Vec<Vec<String>> = results
             .iter()
             .map(|(name, outcome, seconds, _)| {
-                vec![
+                let passes = self.report.sample_passes.get(name).copied().unwrap_or(0);
+                let mut cols = vec![
                     name.clone(),
                     outcome_label(*outcome),
                     format!("{seconds:.1}s"),
-                ]
+                ];
+                if n > 1 {
+                    cols.insert(2, format!("{passes}/{n}"));
+                }
+                cols
             })
             .collect();
-        ui.payload_plain(&crate::ui::table(&["case", "result", "time"], &rows, &[2]));
+        let headers: &[&str] = if n > 1 {
+            &["case", "result", "samples", "time"]
+        } else {
+            &["case", "result", "time"]
+        };
+        let right_align: &[usize] = if n > 1 { &[3] } else { &[2] };
+        ui.payload_plain(&crate::ui::table(headers, &rows, right_align));
+        ui.note(&format!(
+            "sampling: {} sample(s), {}",
+            n, self.report.sampling.policy
+        ));
         if failed == 0 {
             ui.success(&rollup_line(passed, failed, plumbing_ok));
             if plumbing_ok > 0 {
@@ -3928,16 +4232,30 @@ impl crate::ui::CliOutput for EvalOutput<'_> {
 }
 
 /// Where the eval cases live: an explicit `--cases` wins; otherwise
-/// `evals/cases.json` in the current directory, falling back to the started
-/// runner's recorded bundle directory (so `curie skill eval` works from
-/// wherever `curie skill up` was run).
+/// `evals/cases.json` in the recorded running snapshot wins, then the current
+/// directory and, only when no snapshot is recorded, the started runner's
+/// recorded bundle directory (so `curie skill eval` works from wherever `curie
+/// skill up` was run).
 pub fn resolve_cases_path(
     explicit: Option<PathBuf>,
     cwd: &Path,
+    recorded_snapshot_dir: Option<&Path>,
     state_plugin_dir: Option<&Path>,
 ) -> Result<PathBuf> {
     if let Some(path) = explicit {
         return Ok(path);
+    }
+    if let Some(snapshot_dir) = recorded_snapshot_dir {
+        let in_snapshot = snapshot_dir.join("evals/cases.json");
+        if in_snapshot.is_file() {
+            return Ok(in_snapshot);
+        }
+        return Err(crate::exit::CliError::usage(format!(
+            "no eval cases found in the running snapshot: {}. Run `curie skill up` or pass --cases",
+            in_snapshot.display()
+        ))
+        .with_fix("run `curie skill up` or pass --cases")
+        .into());
     }
     let local = cwd.join("evals/cases.json");
     if local.is_file() {
@@ -4086,7 +4404,34 @@ pub fn normalize_deploy_api_key(api_key: Option<String>) -> Option<String> {
     api_key.filter(|k| !k.trim().is_empty())
 }
 
-pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
+pub struct PreparedDeploy {
+    client: ApiClient,
+    outcome: crate::api::PreparedDeployOutcome,
+    plugin_name: String,
+    label: String,
+    env: String,
+    requested_repo: Option<String>,
+    connect_hint: String,
+    step: crate::ui::Step,
+    tier: DeployTier,
+    plugin_dir: PathBuf,
+}
+
+impl PreparedDeploy {
+    pub fn agent_id(&self) -> &str {
+        &self.outcome.agent.id
+    }
+
+    pub fn agent_name(&self) -> &str {
+        &self.outcome.agent.name
+    }
+
+    pub fn version_id(&self) -> &str {
+        &self.outcome.version.id
+    }
+}
+
+pub async fn prepare_deploy(opts: DeployOpts) -> Result<PreparedDeploy> {
     let plugin_dir = opts
         .plugin_dir
         .canonicalize()
@@ -4239,10 +4584,7 @@ pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
     // the sandbox (ADR-0009, #429). The value never appears in argv.
     let mut secrets: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     for name in &opts.secret {
-        let value = std::env::var(name)
-            .ok()
-            .filter(|v| !v.is_empty())
-            .or(crate::secrets::get_value(name)?);
+        let value = crate::secrets::resolve_env_or_saved(name)?;
         match value {
             Some(v) => {
                 secrets.insert(name.clone(), v);
@@ -4275,14 +4617,13 @@ pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
     let cl = ui.checklist();
     let step = cl.step(&format!("deploying {plugin_name} as {agent_name}"));
     let outcome = match client
-        .deploy(
+        .prepare_deploy(
             &agent_name,
             opts.slack_channel
                 .as_deref()
                 .or_else(|| resolved.as_ref().and_then(|r| r.slack_channel.as_deref())),
             &label,
             &created_by,
-            env,
             archive,
             &match opts.tier {
                 DeployTier::Local => secrets.clone(),
@@ -4294,14 +4635,53 @@ pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
         )
         .await
     {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            step.fail("failed");
+            if crate::exit::is_transient_reqwest(&err) {
+                return Err(crate::exit::operator_context(err, opts.connect_hint, None));
+            }
+            return Err(err);
+        }
+    };
+
+    Ok(PreparedDeploy {
+        client,
+        outcome,
+        plugin_name,
+        label,
+        env: env.to_string(),
+        requested_repo: opts.repo,
+        connect_hint: opts.connect_hint,
+        step,
+        tier: opts.tier,
+        plugin_dir,
+    })
+}
+
+pub async fn deploy_prepared(prepared: PreparedDeploy) -> Result<DeployOutput> {
+    let ui = crate::ui::ui();
+    let PreparedDeploy {
+        client,
+        outcome,
+        plugin_name,
+        label,
+        env,
+        requested_repo,
+        connect_hint,
+        step,
+        tier,
+        plugin_dir,
+    } = prepared;
+    let outcome = match client.activate_deploy(outcome, &env).await {
         Ok(outcome) => {
-            step.done(env);
+            step.done(&env);
             outcome
         }
         Err(err) => {
             step.fail("failed");
             if crate::exit::is_transient_reqwest(&err) {
-                return Err(err.context(opts.connect_hint));
+                return Err(crate::exit::operator_context(err, connect_hint, None));
             }
             return Err(err);
         }
@@ -4317,8 +4697,7 @@ pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
     // which repository's pushes deploy this agent produced no output at all.
     // The value read here is the one the API stored, not the one asked for, so
     // a bind the platform dropped falls to the warning above instead (#1212).
-    let bound_repo = opts
-        .repo
+    let bound_repo = requested_repo
         .as_deref()
         .filter(|want| outcome.agent.repo_full_name.as_deref() == Some(*want));
     if let Some(repo) = bound_repo {
@@ -4345,7 +4724,7 @@ pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
     // start no connector. The identity is the one the deploy RESOLVED, never
     // re-read from plugin.json: `--agent`/`--target` can override it, and an
     // alias built from the manifest name is one the runner never dials.
-    if opts.tier == DeployTier::Local {
+    if tier == DeployTier::Local {
         let lock = crate::connector_build::load_lock(&plugin_dir)?.unwrap_or_else(|| {
             crate::connector_build::ConnectorLockFileDecl {
                 version: crate::connector_build::LOCK_VERSION,
@@ -4363,7 +4742,7 @@ pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
     Ok(DeployOutput {
         plugin_name,
         label,
-        env: env.to_string(),
+        env,
         agent_name: outcome.agent.name,
         agent_id: outcome.agent.id,
         version_label: outcome.version.version_label,
@@ -4376,6 +4755,10 @@ pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
         deployment_environment: outcome.deployment.environment,
         deployment_status: outcome.deployment.status,
     })
+}
+
+pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
+    deploy_prepared(prepare_deploy(opts).await?).await
 }
 
 /// Output of `<tier> deploy`: the deployed agent/version/channel/bundle/deployment
@@ -5070,8 +5453,10 @@ pub async fn versions(opts: AgentActionOpts) -> Result<VersionsOutput> {
     })
 }
 
-/// Output of `<tier> memory <agent>`: the dry-run plan, the empty case, or the
-/// learned-memory list. Owns its data so it outlives the `ApiClient`.
+/// Output of `<tier> memory <agent>`: the dry-run plan, the empty case, the
+/// learned-memory list, or an operator-seeded add (#1904). Owns its data so it
+/// outlives the `ApiClient`.
+#[derive(Debug)]
 pub enum MemoryOutput {
     DryRun(crate::ui::DryRunPlan),
     Empty {
@@ -5080,6 +5465,13 @@ pub enum MemoryOutput {
     List {
         agent: String,
         entries: Vec<crate::api::MemoryEntry>,
+    },
+    Added {
+        agent: String,
+        index: u64,
+        content: String,
+        source: String,
+        fresh_session_required: bool,
     },
 }
 
@@ -5097,6 +5489,19 @@ impl crate::ui::CliOutput for MemoryOutput {
                     .collect();
                 serde_json::json!({"agent": agent, "entries": entries})
             }
+            MemoryOutput::Added {
+                agent,
+                index,
+                content,
+                source,
+                fresh_session_required,
+            } => serde_json::json!({
+                "agent": agent,
+                "index": index,
+                "content": content,
+                "source": source,
+                "fresh_session_required": fresh_session_required,
+            }),
         }
     }
 
@@ -5110,6 +5515,21 @@ impl crate::ui::CliOutput for MemoryOutput {
                 ui.payload(&format!("{agent} — {} memory entr(ies):", entries.len()));
                 for e in entries {
                     ui.kv(&format!("#{}", e.index), &e.content);
+                }
+            }
+            MemoryOutput::Added {
+                agent,
+                index,
+                content,
+                source,
+                fresh_session_required,
+            } => {
+                ui.payload(&format!("{agent} — added memory #{index} ({source})"));
+                ui.kv("content", content);
+                if *fresh_session_required {
+                    ui.payload(
+                        "A fresh session is required before this entry is injected at boot.",
+                    );
                 }
             }
         }
@@ -5135,6 +5555,37 @@ pub async fn memory(opts: AgentActionOpts) -> Result<MemoryOutput> {
     Ok(MemoryOutput::List {
         agent: agent.name,
         entries,
+    })
+}
+
+/// `<tier> memory <agent> --add <content>`: append an operator-authored record.
+pub async fn memory_add(opts: AgentActionOpts, content: String) -> Result<MemoryOutput> {
+    let content = content.trim().to_string();
+    if content.is_empty() {
+        return Err(crate::exit::usage(
+            "memory content must not be empty. Pass the durable lesson with --add.",
+        ));
+    }
+    if opts.dry_run {
+        return Ok(MemoryOutput::DryRun(crate::ui::DryRunPlan {
+            lines: vec![format!(
+                "POST {}/agents/<id>/memory  (would resolve agent {:?} first)",
+                opts.api_url, opts.agent
+            )],
+        }));
+    }
+    let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
+    let agent = client.find_agent(&opts.agent).await?;
+    let entry = client.create_memory(&agent.id, &content).await?;
+    Ok(MemoryOutput::Added {
+        agent: agent.name,
+        index: entry.index,
+        content: entry.content,
+        source: entry
+            .provenance
+            .source
+            .unwrap_or_else(|| "operator".to_string()),
+        fresh_session_required: true,
     })
 }
 
@@ -5341,6 +5792,9 @@ fn build_route_bindings(
                     )
                 })?;
             let binding: crate::api::ApprovalRouteBindingWrite = input.into();
+            if let Some(approvers) = &binding.approvers {
+                validate_parsed_approvers(&name, approvers)?;
+            }
             bindings.insert(name, binding);
         }
     }
@@ -5731,9 +6185,6 @@ impl crate::ui::CliOutput for ApprovalsOutput {
                         routes.len()
                     ));
                     for (name, binding) in routes {
-                        // Keep resolution, notification, and authority as three
-                        // labelled facts. The notification is never presented as
-                        // a place where an operator can act.
                         let resolution =
                             format!("{}:{}", binding.resolution.kind, binding.resolution.address);
                         ui.kv(
@@ -6758,11 +7209,11 @@ mod tests {
     use super::{
         absent_container_note, merge_secret_env, model_credential_summary,
         parse_credential_env_file, parse_manifest_gates, plan_recorded_state,
-        plan_recorded_teardown, plan_skill_down, replace_first_line, report_sweep,
-        resolve_cases_path, resolve_env_file_credentials, seed_env_if_missing,
+        plan_recorded_teardown, plan_skill_down, recorded_ids_match, replace_first_line,
+        report_sweep, resolve_cases_path, resolve_env_file_credentials, seed_env_if_missing,
         select_in_force_deployment, select_passthrough_env, sweep_json_row, sweep_table_row,
         validate_channel_binding, ApprovalGateDecl, DownPlan, EnvSeed, RecordedStatePlan,
-        RecordedTeardown, SweepRow,
+        RecordedStateQuery, RecordedTeardown, SweepRow,
     };
     use serde::Deserialize;
     use std::path::{Path, PathBuf};
@@ -6912,17 +7363,38 @@ mod tests {
         assert!(msg.contains("model-beta"), "{msg}");
     }
 
+    fn recorded_query<'a>(
+        recorded: Option<&'a str>,
+        target: &'a str,
+        replace: bool,
+    ) -> RecordedStateQuery<'a> {
+        RecordedStateQuery {
+            recorded_name: recorded,
+            target_name: target,
+            replace,
+            recorded_id: None,
+            live_id: None,
+            same_bundle_dir: true,
+            recorded_digest: None,
+            current_digest: None,
+        }
+    }
+
     #[test]
     fn replace_clears_a_stale_record_for_the_very_container_it_replaces() {
         // A bundle holding both a stale runner.json and a live container of that
         // name was unrecoverable with --replace: the record refused the boot
         // before the preflight could remove anything (#747).
         assert_eq!(
-            plan_recorded_state(Some("curie-runner-local"), "curie-runner-local", true),
+            plan_recorded_state(recorded_query(
+                Some("curie-runner-local"),
+                "curie-runner-local",
+                true
+            )),
             RecordedStatePlan::ClearAndProceed
         );
         assert_eq!(
-            plan_recorded_state(None, "curie-runner-local", false),
+            plan_recorded_state(recorded_query(None, "curie-runner-local", false)),
             RecordedStatePlan::Proceed
         );
     }
@@ -6932,13 +7404,99 @@ mod tests {
         // Removing one container is no reason to forget another: a record for a
         // different, still-live runner keeps refusing, with or without --replace.
         assert_eq!(
-            plan_recorded_state(Some("curie-runner-local"), "curie-example-42", true),
+            plan_recorded_state(recorded_query(
+                Some("curie-runner-local"),
+                "curie-example-42",
+                true
+            )),
             RecordedStatePlan::Refuse
         );
         assert_eq!(
-            plan_recorded_state(Some("curie-runner-local"), "curie-runner-local", false),
+            plan_recorded_state(recorded_query(
+                Some("curie-runner-local"),
+                "curie-runner-local",
+                false
+            )),
             RecordedStatePlan::Refuse
         );
+    }
+
+    fn verified_query<'a>(
+        replace: bool,
+        recorded_digest: Option<&'a str>,
+        current_digest: Option<&'a str>,
+    ) -> RecordedStateQuery<'a> {
+        RecordedStateQuery {
+            recorded_name: Some("curie-runner-local"),
+            target_name: "curie-runner-local",
+            replace,
+            recorded_id: Some("deadbeef00001111"),
+            live_id: Some("deadbeef0000"),
+            same_bundle_dir: true,
+            recorded_digest,
+            current_digest,
+        }
+    }
+
+    #[test]
+    fn plain_up_replaces_a_verified_same_bundle_when_the_snapshot_differs() {
+        assert_eq!(
+            plan_recorded_state(verified_query(false, Some("aaa"), Some("bbb"))),
+            RecordedStatePlan::ClearAndProceed
+        );
+    }
+
+    #[test]
+    fn plain_up_reports_already_running_when_the_verified_snapshot_matches() {
+        assert_eq!(
+            plan_recorded_state(verified_query(false, Some("aaa"), Some("aaa"))),
+            RecordedStatePlan::AlreadyRunning
+        );
+    }
+
+    #[test]
+    fn replace_still_restarts_a_verified_unchanged_bundle() {
+        assert_eq!(
+            plan_recorded_state(verified_query(true, Some("aaa"), Some("aaa"))),
+            RecordedStatePlan::ClearAndProceed
+        );
+    }
+
+    #[test]
+    fn plain_up_refuses_when_the_snapshot_cannot_be_compared() {
+        assert_eq!(
+            plan_recorded_state(verified_query(false, None, Some("aaa"))),
+            RecordedStatePlan::Refuse
+        );
+        assert_eq!(
+            plan_recorded_state(verified_query(false, Some("aaa"), None)),
+            RecordedStatePlan::Refuse
+        );
+    }
+
+    #[test]
+    fn plain_up_refuses_a_verified_name_whose_container_id_does_not_match() {
+        let mut q = verified_query(false, Some("aaa"), Some("bbb"));
+        q.live_id = Some("cccccccccccc");
+        assert_eq!(plan_recorded_state(q), RecordedStatePlan::Refuse);
+    }
+
+    #[test]
+    fn plain_up_refuses_when_the_record_is_not_this_bundle_directory() {
+        let mut q = verified_query(false, Some("aaa"), Some("bbb"));
+        q.same_bundle_dir = false;
+        assert_eq!(plan_recorded_state(q), RecordedStatePlan::Refuse);
+    }
+
+    #[test]
+    fn recorded_ids_match_across_short_and_long_docker_ids() {
+        assert!(recorded_ids_match(
+            "9f2c1d3e4b5a6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f",
+            "9f2c1d3e4b5a"
+        ));
+        assert!(recorded_ids_match("9f2c1d3e4b5a", "9f2c1d3e4b5a6c7d"));
+        assert!(!recorded_ids_match("", "9f2c1d3e4b5a"));
+        assert!(!recorded_ids_match("aaaa", "bbbb"));
     }
 
     #[test]
@@ -7210,13 +7768,33 @@ mod tests {
 
     #[test]
     fn explicit_cases_path_wins() {
+        let snapshot = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(snapshot.path().join("evals")).unwrap();
+        std::fs::write(snapshot.path().join("evals/cases.json"), "[]").unwrap();
         let path = resolve_cases_path(
             Some(PathBuf::from("/x/cases.json")),
             std::path::Path::new("/nowhere"),
+            Some(snapshot.path()),
             None,
         )
         .unwrap();
         assert_eq!(path, PathBuf::from("/x/cases.json"));
+    }
+
+    #[test]
+    fn missing_recorded_snapshot_cases_do_not_fall_back_to_cwd() {
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cwd.path().join("evals")).unwrap();
+        std::fs::write(cwd.path().join("evals/cases.json"), "[]").unwrap();
+        let snapshot = tempfile::tempdir().unwrap();
+
+        let err = resolve_cases_path(None, cwd.path(), Some(snapshot.path()), None).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("no eval cases found in the running snapshot"),
+            "{message}"
+        );
+        assert!(message.contains("--cases"), "{message}");
     }
 
     #[test]
@@ -7227,20 +7805,20 @@ mod tests {
         std::fs::write(bundle.path().join("evals/cases.json"), "[]").unwrap();
 
         // cwd has no cases: resolve into the bundle dir from the state file.
-        let resolved = resolve_cases_path(None, cwd.path(), Some(bundle.path())).unwrap();
+        let resolved = resolve_cases_path(None, cwd.path(), None, Some(bundle.path())).unwrap();
         assert_eq!(resolved, bundle.path().join("evals/cases.json"));
 
         // cwd cases take precedence once present.
         std::fs::create_dir_all(cwd.path().join("evals")).unwrap();
         std::fs::write(cwd.path().join("evals/cases.json"), "[]").unwrap();
-        let resolved = resolve_cases_path(None, cwd.path(), Some(bundle.path())).unwrap();
+        let resolved = resolve_cases_path(None, cwd.path(), None, Some(bundle.path())).unwrap();
         assert_eq!(resolved, cwd.path().join("evals/cases.json"));
     }
 
     #[test]
     fn errors_when_nothing_is_found() {
         let cwd = tempfile::tempdir().unwrap();
-        let err = resolve_cases_path(None, cwd.path(), None).unwrap_err();
+        let err = resolve_cases_path(None, cwd.path(), None, None).unwrap_err();
         assert!(err.to_string().contains("--cases"), "{err}");
     }
 
@@ -7550,7 +8128,12 @@ mod tests {
     async fn deploy_names_the_remediation_when_api_is_unreachable() {
         let dir = tempfile::tempdir().unwrap();
         crate::scaffold::scaffold(dir.path(), "test-agent").unwrap();
-        let hint = "kubectl -n curie port-forward svc/curie-api 8000:8000";
+        // Exercise local state guidance with its default URL while port 1 below
+        // remains the deterministic connection refusal target.
+        let hint = crate::local::deploy_unreachable_hint(
+            crate::message::DEFAULT_LOCAL_API_URL,
+            Some("curie-api-1   curie-api:dev   curie-api   Up 8 seconds (health: starting)"),
+        );
         let opts = super::DeployOpts {
             agent: None,
             target: None,
@@ -7561,18 +8144,26 @@ mod tests {
             slack_channel: None,
             repo: None,
             workspace: super::WorkspaceIntent::Preserve,
+            tier: super::DeployTier::Local,
             env: Some(super::DeployEnv::Dev),
             label: Some("v0".to_string()),
             secret: vec![],
             secret_binding_supported: true,
-            connect_hint: hint.to_string(),
-            tier: super::DeployTier::Local,
+            connect_hint: hint.clone(),
         };
         let err = super::deploy(opts).await.unwrap_err();
         let rendered = format!("{err:#}");
         assert!(
-            rendered.contains(hint),
-            "hint missing from error: {rendered}"
+            rendered.contains("local stack is still starting"),
+            "the connection error must retain the state aware recovery: {rendered}"
+        );
+        assert!(
+            rendered.contains("curie local status"),
+            "the connection error must direct the operator to inspect local state: {rendered}"
+        );
+        assert!(
+            !rendered.contains("curie local up"),
+            "a starting stack must not be told to start again: {rendered}"
         );
     }
 
@@ -8414,8 +9005,8 @@ mod tests {
     }
 
     /// AC2: an unavailable verb must name the concept's absence AND point at the
-    /// tier that answers it. `main`'s human path renders `{err:#}` and discards
-    /// the fix, so both halves have to survive on the Display surface alone.
+    /// tier that answers it. The normal human path renders only the outer message
+    /// and does not emit this error's fix, so both halves must remain in Display.
     #[test]
     fn skill_versions_unavailable_message_names_reason_and_alternative() {
         let shown = format!("{:#}", super::skill_versions_unavailable());

@@ -116,6 +116,30 @@ def _relational_db_prose(count: str) -> str:
     return f"`JSONB` is imported from the dialect and used on **{count}** columns.\n"
 
 
+def _aci_names_prose() -> str:
+    """The ACI seam's route enumeration, in the house phrasing."""
+    return (
+        "A second implementation is an **ACI server**, an HTTP process serving\n"
+        "the four POST endpoints (`runner/src/curie_runner/server.py`): "
+        "`POST /v1/event` opens a\n"
+        "turn, `POST /v1/steer` injects into the live turn,\n"
+        "`POST /v1/interrupt` hard stops it, and `POST /v1/reset` discards "
+        "the conversation.\n"
+        "Two GETs sit alongside them.\n"
+    )
+
+
+def _relational_db_names_prose() -> str:
+    """The relational DB seam's JSONB enumeration, in the house phrasing."""
+    return (
+        "`JSONB` is imported from the dialect and used on **six** columns:\n"
+        "`behavior_packs`, `approval_required_tools`, `approval_routes` and "
+        "`secrets` on\n"
+        "`Agent`, `evidence` on `ApprovalAuditEntry`, and `value` on\n"
+        "`WorkflowStateEntry`.\n"
+    )
+
+
 # --- the count disagrees with the tree: the named drift class --------------
 
 
@@ -526,6 +550,54 @@ def test_renamed_module_is_reported_by_name(tmp_path: Path) -> None:
     assert len(findings) == 1, findings
     detail = findings[0].reason
     assert "runtime.py" in detail and "session.py" in detail, detail
+
+
+def test_renamed_aci_route_is_reported_when_the_count_is_unchanged(
+    tmp_path: Path,
+) -> None:
+    write(
+        tmp_path,
+        _ACI_SERVER,
+        'web.post("/v1/event", _event),\n'
+        'web.post("/v1/followup", _steer),\n'
+        'web.post("/v1/interrupt", _interrupt),\n'
+        'web.post("/v1/reset", _reset),\n',
+    )
+    write(tmp_path, _ACI_DOC, _aci_names_prose())
+
+    assert check_counts(tmp_path) == []
+
+    findings = check_name_sets(tmp_path)
+    assert len(findings) == 1, findings
+    detail = findings[0].reason
+    assert "/v1/followup" in detail and "/v1/steer" in detail, detail
+
+
+def test_renamed_jsonb_column_is_reported_when_the_count_is_unchanged(
+    tmp_path: Path,
+) -> None:
+    write(
+        tmp_path,
+        "apps/api/src/curie_api/models.py",
+        "behavior_settings = mapped_column(JSONB)\n"
+        "approval_required_tools = mapped_column(JSONB)\n"
+        "approval_routes = mapped_column(JSONB)\n"
+        "secrets = mapped_column(JSONB)\n"
+        "evidence = mapped_column(JSONB)\n"
+        "value = mapped_column(JSONB)\n",
+    )
+    write(tmp_path, _RELATIONAL_DB_DOC, _relational_db_names_prose())
+
+    assert check_counts(tmp_path) == []
+
+    findings = check_name_sets(tmp_path)
+    assert len(findings) == 1, findings
+    detail = findings[0].reason
+    assert "behavior_settings" in detail and "behavior_packs" in detail, detail
+
+
+def test_every_name_set_claim_matches_the_real_repository() -> None:
+    assert check_name_sets(REPO_ROOT) == []
 
 
 def test_swapped_import_is_caught_though_the_count_is_unchanged(tmp_path: Path) -> None:

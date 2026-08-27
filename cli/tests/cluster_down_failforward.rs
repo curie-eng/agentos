@@ -25,7 +25,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use curie::exit::{classify, ExitClass};
-use curie::ops::{down, CommonOpts, DownOpts};
+use curie::ops::{down, down_commands, CommonOpts, DownOpts};
 
 /// Write `body` to `dir/name` and mark it executable (0o755).
 fn write_exec(dir: &Path, name: &str, body: &str) {
@@ -301,4 +301,25 @@ async fn cluster_down_fails_forward_through_real_down() {
 
     // Restore PATH so nothing else in this process observes the fakes.
     restore_path(&original_path);
+}
+
+/// #1654 public-surface regression: the sweep `cluster down` emits must be
+/// scoped by BOTH ownership labels, the release name AND the release's install
+/// namespace. Two independent installs on one cluster normally share the
+/// default release name and differ only in namespace, so a `created-by`-only
+/// selector matched the OTHER install's namespaces and deleted them. This test
+/// rides the PUBLIC `down_commands` builder (the same argv `down()` executes
+/// and the same one the resume command is rendered from), so a revert that
+/// drops `created-in` from the selector fails here even if the internal unit
+/// tests were rewritten. This test builds argv only and never touches PATH, so
+/// it does not race the PATH-mutating test above.
+#[test]
+fn down_sweep_selector_is_scoped_by_release_and_namespace() {
+    let cmds = down_commands(&down_opts().common);
+    assert_eq!(cmds.len(), 2);
+    let sweep = cmds[1].display();
+    assert_eq!(
+        sweep,
+        "kubectl delete namespace -l curietech.ai/created-by=prod-release,curietech.ai/created-in=agent-ns --ignore-not-found"
+    );
 }

@@ -292,33 +292,36 @@ class _Replies:
 class _Cards:
     def __init__(self) -> None:
         self.ref: ApprovalCardRef | None = None
+        self.key = str(APPROVAL_ID)
         self.popped: list[str] = []
         self.restored: list[tuple[str, ApprovalCardRef]] = []
         self.remember_fail_once = False
         self.restore_failures_remaining = 0
 
-    async def pop(self, thread: str) -> ApprovalCardRef | None:
-        self.popped.append(thread)
+    async def pop(self, approval_id: str) -> ApprovalCardRef | None:
+        self.popped.append(approval_id)
+        if approval_id != self.key:
+            return None
         ref, self.ref = self.ref, None
         return ref
 
-    async def restore(self, thread: str, ref: ApprovalCardRef) -> None:
-        self.restored.append((thread, ref))
+    async def restore(self, approval_id: str, ref: ApprovalCardRef) -> None:
+        self.restored.append((approval_id, ref))
         if self.restore_failures_remaining:
             self.restore_failures_remaining -= 1
             raise RuntimeError("card ref restore unavailable")
         if self.ref is None:
             self.ref = ref
+            self.key = approval_id
 
     async def remember(
         self,
-        thread: str,
+        approval_id: str,
         *,
         channel: str,
         ts: str,
         summary: str,
         endpoint: str | None,
-        approval_id: str,
         requested_by: str = "",
         kind: str = "",
         adapter: str | None = None,
@@ -332,10 +335,10 @@ class _Cards:
             summary=summary,
             endpoint=endpoint,
             requested_by=requested_by,
-            approval_id=approval_id,
             kind=kind,
             adapter=adapter,
         )
+        self.key = approval_id
 
 
 class _Transcript:
@@ -357,13 +360,12 @@ class _Transcript:
         self.records.append((agent_id, conversation_id, publication_id, text))
 
 
-def _card(*, approval_id: str = str(APPROVAL_ID)) -> ApprovalCardRef:
+def _card() -> ApprovalCardRef:
     return ApprovalCardRef(
         channel="C0EXAMPLE1",
         ts="1700000000.000050",
         summary="Publish these repository changes?",
         requested_by="requester@example.test",
-        approval_id=approval_id,
         kind="slack",
     )
 
@@ -469,7 +471,7 @@ async def test_publication_card_outbox_posts_and_remembers_before_ack(
     assert store.card_pending is None
     assert cards.ref is not None
     assert cards.ref.ts == "1700000000.000050"
-    assert cards.ref.approval_id == str(APPROVAL_ID)
+    assert cards.key == str(APPROVAL_ID)
     event = replies.events[0][0]
     assert event.event == "reply.post"
     assert event.target.conversation_id == "1700000000.000100"
@@ -780,13 +782,14 @@ async def test_terminal_result_settles_card_with_durable_resolution_identity(
     assert cards.restored == []
 
 
-async def test_mismatched_approval_card_is_restored_without_wrong_settlement(
+async def test_result_does_not_consume_a_card_stored_under_another_approval(
     publication: Any,
 ) -> None:
     cards = _Cards()
     loop, store, _, _, _, replies = _loop(publication, cards)
-    mismatched = _card(approval_id="44444444-4444-4444-8444-444444444444")
+    mismatched = _card()
     cards.ref = mismatched
+    cards.key = "44444444-4444-4444-8444-444444444444"
     store.pending[PUBLICATION_ID] = {
         "outcome": "published",
         "pr_url": PR_URL,
@@ -795,7 +798,7 @@ async def test_mismatched_approval_card_is_restored_without_wrong_settlement(
     await loop.deliver_pending_result(PUBLICATION_ID)
 
     assert cards.ref == mismatched
-    assert cards.restored == [(_target().conversation_id, mismatched)]
+    assert cards.restored == []
     assert len(replies.events) == 1
     assert replies.events[0][0].settled is None
     assert PUBLICATION_ID in store.delivered
@@ -830,7 +833,7 @@ async def test_terminal_result_is_persisted_and_credentials_removed_before_reply
     assert len(cluster.terminals_cleaned) == 1
     assert credentials.calls == [PUBLICATION_ID]
     assert cards.ref == _card()
-    assert cards.restored == [(_target().conversation_id, _card())]
+    assert cards.restored == [(str(APPROVAL_ID), _card())]
 
     await loop.deliver_pending_result(PUBLICATION_ID)
 

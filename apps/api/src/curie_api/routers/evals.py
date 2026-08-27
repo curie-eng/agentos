@@ -11,6 +11,7 @@ from ..evalqueue import now_iso
 from ..evals import build_matrix
 from ..github_checks import GitHubReportError
 from ..models import Environment
+from ..repo_full_name import InvalidRepoFullName
 from ..schemas import (
     EvalMatrix,
     EvalReportResult,
@@ -135,6 +136,8 @@ async def report_eval(
             report.total,
             report.target_url,
         )
+    except InvalidRepoFullName as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
     except GitHubReportError as exc:
         # A GitHub rejection is a caller/input problem (unknown repo or commit,
         # bad token), not an API server fault: surface it as a 4xx with the

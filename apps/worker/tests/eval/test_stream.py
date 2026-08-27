@@ -21,7 +21,7 @@ import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -863,6 +863,72 @@ def test_pending_entry_from_a_dead_consumer_is_reclaimed(make_eval_harness, bund
     asyncio.run(go())
 
 
+def test_pending_entry_from_a_dead_consumer_is_reclaimed_without_waiting_min_idle(
+    make_eval_harness, bundles
+) -> None:
+    """Eval sibling of the #1532 dead-consumer prompt reclaim: the 15-minute
+    XAUTOCLAIM idle must not be what recovers the entry."""
+    store, upload = bundles
+
+    async def go() -> None:
+        async with make_eval_harness() as (base_url, fake, _client):
+            fake.responses = {"q": "ok"}
+            bundle_ref = upload(
+                EvalSuite(
+                    name="recl-fast",
+                    cases=[
+                        EvalCase(id="1", input="q", grader=Grader(kind=CONTAINS, expected="ok"))
+                    ],
+                )
+            )
+            token = uuid.uuid4().hex[:8]
+            cfg = _cfg(
+                f"test:evals:{token}",
+                f"g-{token}",
+                reclaim_min_idle_ms=900000,
+                reclaim_interval_s=0.05,
+            )
+            client = AsyncRedis(host=_VH, port=_VP, password=_VPW, decode_responses=True)
+            reports: list[dict[str, Any]] = []
+            async with httpx.AsyncClient(timeout=30.0) as lf_client:
+                consumer = _build_consumer(
+                    redis_client=client,
+                    cfg=cfg,
+                    bundle_store=store,
+                    substrate=_UnusedSubstrate(),
+                    reports=reports,
+                    lf_client=lf_client,
+                )
+                # Production eval pins this to reclaim_min_idle_ms because its
+                # read loop is inline. Pin 0 here so this sibling proves the
+                # shared helper, not XAUTOCLAIM.
+                consumer._delivery = replace(consumer._delivery, dead_consumer_idle_ms=0)
+                await consumer.ensure_group()
+                sha = f"sha-{token}"
+                item = _item(suite="recl-fast", sha=sha, bundle_ref=bundle_ref, target_url=base_url)
+                await client.xadd(cfg.eval_stream, {"payload": item.model_dump_json()})
+                await client.xreadgroup(
+                    cfg.eval_consumer_group,
+                    "dead-consumer",
+                    {cfg.eval_stream: ">"},
+                    count=10,
+                )
+                pending = await client.xpending(cfg.eval_stream, cfg.eval_consumer_group)
+                assert pending["pending"] == 1
+
+                await _drain_one(consumer, reports)
+
+                assert reports[0]["sha"] == sha
+                assert reports[0]["passed_count"] == 1
+                summary = await client.xpending(cfg.eval_stream, cfg.eval_consumer_group)
+                assert summary["pending"] == 0
+
+            await client.delete(cfg.eval_stream)
+            await client.aclose()
+
+    asyncio.run(go())
+
+
 # --- Per-sandbox runner token threading (issue #63) ---------------------------
 # The env-var name is the cross-package contract with the runner; asserted by its
 # literal string so the module never depends on a constant that only exists after
@@ -951,6 +1017,29 @@ def test_eval_boot_env_mints_runner_token() -> None:
     item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.zip", target_url=None)
     env = consumer._boot_env(item)
     assert env.get(RUNNER_TOKEN_ENV), "_boot_env must mint a non-empty runner token"
+
+
+def test_eval_lane_boot_env_omits_memory_ref() -> None:
+    """#1909 sibling: the platform eval lane already boots without ambient memory.
+
+    The message-path local/cluster eval must match this: no CURIE_MEMORY_REF,
+    so a deployed agent's durable log cannot change a static suite result.
+    """
+
+    consumer = EvalStreamConsumer(
+        redis=None,  # type: ignore[arg-type]
+        config=WorkerConfig(),
+        bundle_store=None,  # type: ignore[arg-type]
+        substrate=None,  # type: ignore[arg-type]
+        reporter=None,  # type: ignore[arg-type]
+        recorder=None,  # type: ignore[arg-type]
+        repo_lookup=None,
+    )
+    item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.zip", target_url=None)
+    env = consumer._boot_env(item)
+    assert "CURIE_MEMORY_REF" not in env
+    assert "CURIE_MEMORY_TOKEN" not in env
+    assert "CURIE_HISTORY_REF" not in env
 
 
 def test_eval_requested_model_boots_and_tags_that_model() -> None:
@@ -1471,6 +1560,7 @@ def test_eval_threads_claim_token_into_run_eval_suite(monkeypatch) -> None:
         fake: Any = None,
         stream_id: str | None,
         scorer: Any = None,
+        samples: Any = None,
     ) -> EvalRunResult:
         captured["base_url"] = base_url
         captured["token"] = token
@@ -1506,6 +1596,51 @@ def test_eval_threads_claim_token_into_run_eval_suite(monkeypatch) -> None:
     assert captured["token"] == "tok-eval-xyz"
     assert captured["stream_id"] == "test-stream-id"
     assert captured["scorer"] is None
+
+
+def test_eval_threads_sample_config_from_env_into_run_eval_suite(
+    monkeypatch,
+) -> None:
+    """#1907: the production eval consumer must honor CURIE_EVAL_SAMPLES rather
+    than silently running n=1. The capture is the run_eval_suite seam."""
+    from curie_worker.eval import stream as stream_module
+    from curie_worker.eval.sampling import AggregationPolicy, SampleConfig
+
+    monkeypatch.setenv("CURIE_EVAL_SAMPLES", "3")
+    monkeypatch.setenv("CURIE_EVAL_AGGREGATION", "majority")
+    captured: dict[str, Any] = {}
+
+    async def _capture_run(
+        suite: EvalSuite, *, version: str, samples: Any = None, **_kw: Any
+    ) -> EvalRunResult:
+        captured["samples"] = samples
+        return EvalRunResult(version=version, suite=suite.name, results=[])
+
+    monkeypatch.setattr(stream_module, "run_eval_suite", _capture_run)
+
+    suite = EvalSuite(
+        name="s",
+        cases=[EvalCase(id="1", input="q", grader=Grader(kind=CONTAINS, expected="a"))],
+    )
+    consumer = EvalStreamConsumer(
+        redis=None,  # type: ignore[arg-type]
+        config=WorkerConfig(),
+        bundle_store=_FakeBundleStore(_suite_bundle(suite)),  # type: ignore[arg-type]
+        substrate=_TokenSubstrate("tok-eval-xyz"),  # type: ignore[arg-type]
+        reporter=_FakeReporter(),  # type: ignore[arg-type]
+        recorder=None,  # type: ignore[arg-type]
+        repo_lookup=_StubRepo(),
+    )
+    item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.tgz", target_url=None)
+
+    async def go() -> None:
+        await consumer._run_and_report(item, "test-stream-id")
+
+    asyncio.run(go())
+
+    assert captured["samples"] == SampleConfig(
+        n=3, policy=AggregationPolicy.MAJORITY, k=1
+    )
 
 
 @pytest.mark.parametrize("fake_model", [True, False])

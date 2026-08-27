@@ -27,7 +27,7 @@ flowchart TB
     end
 
     InP{{"Channel / ingress<br/>QueuedTurn"}}
-    OutP{{"SlackSink"}}
+    OutP{{"ReplySink"}}
     QP{{"StreamBroker"}}
     SubP{{"SandboxClient"}}
     ACIP{{"ACI protocol<br/>versioned wire"}}
@@ -44,7 +44,8 @@ flowchart TB
     Slack["Slack (Socket Mode)<br/>CLI synthetic event"] --> InP --> Disp
     Disp --> QP --> Valkey["Valkey (redis-py)"]
     Valkey --> QP --> Worker
-    Worker --> OutP --> SlackOut["Slack chat.update"]
+    Worker --> OutP --> SlackOut["SlackReplyAdapter<br/>chat.update + Block Kit"]
+    OutP --> HttpOut["HttpReplyAdapter<br/>neutral JSON events"]
     Worker --> SubP
     SubP --> K8s["KubernetesSandboxClient"]
     SubP --> Dock["DockerSandboxClient"]
@@ -72,8 +73,8 @@ on that table.
 | `SandboxClient` | [`apps/worker/src/curie_worker/sandbox/k8s.py`](../../apps/worker/src/curie_worker/sandbox/k8s.py) | k8s + docker | **CLEAN, 2 impls.** The strongest claim on this page: two real substrates. [Drawn in detail](kubernetes.md). |
 | ACI protocol | [`packages/aci-protocol`](../../packages/aci-protocol) | 1 + reference | **A-.** Versioned wire, tri-language, wire-lock gated. [See the ACI](aci.md). |
 | `ModelSession` | [`runner/src/curie_runner/adapter.py`](../../runner/src/curie_runner/adapter.py) | claude-agent-sdk + fake | **A-.** In-proc harness seam. |
-| Channel / ingress | [`interfaces/channel-ingress`](../interfaces/channel-ingress/INTERFACE.md) | Slack, email | **C, 2 impls.** The weakest line here. `QueuedTurn` and `ReplySink` are both channel-neutral; only Slack's edit-in-place semantics remain vendor-specific. |
-| `SlackSink` | [`slack_sink.py`](../../apps/worker/src/curie_worker/slack_sink.py) | Slack `chat.update` | Egress assumes edit-in-place. A channel-neutral post/update sink is the open work. |
+| Channel / ingress | [`interfaces/channel-ingress`](../interfaces/channel-ingress/INTERFACE.md) | Slack, CLI stub | **B-, 1 proven production channel.** `QueuedTurn` and the reply wire are neutral, but only Slack is exercised as a first-party production channel. |
+| `ReplySink` | [`reply_sink.py`](../../apps/worker/src/curie_worker/reply_sink.py) | `SlackReplyAdapter` plus `HttpReplyAdapter` | Versioned neutral events route through one port. The HTTP adapter proves the wire, not a complete second production channel; Slack-specific rendering and interaction handling remain in [`slack_sink.py`](../../apps/worker/src/curie_worker/slack_sink.py). |
 | `StreamBroker` | [`broker.py`](../../apps/worker/src/curie_worker/broker.py) | redis-py / Valkey | **CLEAN, 1 impl.** Thin port at a non-sacred seam; second broker deferred by decision (ADR-0027). |
 | `ObjectStore` | [`storage.py`](../../apps/api/src/curie_api/storage.py) | RustFS / S3 | **B+.** The API's port: read + write. The non-S3 adapter is deferred until real demand (ADR-0026). |
 | `BundleReader` | [`bundle_store.py`](../../apps/worker/src/curie_worker/bundle_store.py) | RustFS / S3 | The worker's own read-only slice (`get(key) -> bytes`), a **local Protocol** — the worker deliberately does not import the API package. Two adapters hit the same backend; a second backend must satisfy both. |

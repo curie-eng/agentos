@@ -3,6 +3,11 @@
 Date: 2026-07-13
 Status: Accepted
 
+**Superseded in part by [ADR 0114](0114-cluster-up-infers-detected-install-facts.md).**
+The first Decision clause and rejected Alternative 1 no longer require an
+explicit provider when the effective credential prefix selects one provider.
+Every other egress rule remains unchanged.
+
 Implements [#362](https://github.com/curie-eng/curie/issues/362).
 
 ## Context

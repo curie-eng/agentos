@@ -135,16 +135,17 @@ kubectl get pods -n curie-dev -w
 Reach the Langfuse UI after a stock install:
 
 ```bash
-kubectl port-forward -n curie svc/curie-langfuse-web 3000:3000
-# http://localhost:3000
-kubectl get secret curie-secrets -n curie -o jsonpath='{.data.langfuseInitProjectSecretKey}' | base64 -d; echo
-kubectl get secret curie-secrets -n curie -o jsonpath='{.data.langfuseInitUserPassword}' | base64 -d; echo
+curie cluster observability
 ```
 
-Log in as `dev@curie.local` with the retrieved admin password. The first
-command retrieves the project secret key for API and OTel authentication.
-The development overlay retains the published development keys
-`pk-lf-curie-dev` and `sk-lf-curie-dev`.
+The command reports the Langfuse UI URL and a connection hint when the Service
+is not externally reachable. Pass `--open` to open a reachable Langfuse URL in
+your browser. It reports access surfaces only and does not read or rotate
+Langfuse credentials.
+
+For a sealed install, Helm's post install notes show how to retrieve the
+generated Langfuse admin password. Sign in as `dev@curie.local` unless
+`langfuse.init.userEmail` was overridden.
 
 ## Collector operation and backends
 
@@ -1097,3 +1098,52 @@ and needs no coordination with any repository:
 Installations, permissions, and the App ID are untouched. This is a real
 advantage over a personal access token, where rotation means re-issuing the
 credential *and* re-authorizing what it could reach.
+
+### The other direct-passthrough credentials
+
+The GitHub App key was the first of nine credential keys read straight from
+`.Values` with no in-chart generation (`charts/curie/templates/secrets.yaml`
+calls these direct passthrough, as opposed to the eleven keys
+`curie.managedSecret` generates and persists). Issue #1759 gave the other
+eight the same `existingSecret` / `existingSecretKey` escape, one pair per
+key, all winning over their plain value when set:
+
+| Credential | Plain value | BYO fields |
+|---|---|---|
+| Model credential | `agentSandbox.runner.credentials` | `agentSandbox.runner.credentialsExistingSecret` / `credentialsExistingSecretKey` (default key `agentCredentials`) |
+| Per-adapter egress secrets | `worker.adapterCredentials` | `worker.adapterCredentialsExistingSecret` / `adapterCredentialsExistingSecretKey` (default key `adapterCredentials`) -- the referenced key must hold the already-JSON-encoded map |
+| Outbound GitHub token | `api.githubToken` | `api.githubTokenExistingSecret` / `githubTokenExistingSecretKey` (default key `githubToken`) |
+| Sealing private key | `sealing.privateKey` | `sealing.privateKeyExistingSecret` / `privateKeyExistingSecretKey` (default key `sealingPrivateKey`) |
+| Sealing previous private key | `sealing.previousPrivateKey` | `sealing.previousPrivateKeyExistingSecret` / `previousPrivateKeyExistingSecretKey` (default key `sealingPreviousPrivateKey`) |
+| Slack app token | `dispatcher.slack.appToken` | `dispatcher.slack.appTokenExistingSecret` / `appTokenExistingSecretKey` (default key `slackAppToken`) |
+| Slack bot token | `dispatcher.slack.botToken` | `dispatcher.slack.botTokenExistingSecret` / `botTokenExistingSecretKey` (default key `slackBotToken`) |
+| Slack signing secret | `dispatcher.slack.signingSecret` | `dispatcher.slack.signingSecretExistingSecret` / `signingSecretExistingSecretKey` (default key `slackSigningSecret`) |
+
+For example, to keep the model credential and both Slack tokens entirely out
+of helm values and release history:
+
+```yaml
+agentSandbox:
+  runner:
+    credentialsExistingSecret: my-model-credential
+    credentialsExistingSecretKey: agentCredentials   # the default
+dispatcher:
+  slack:
+    appTokenExistingSecret: my-slack-tokens
+    appTokenExistingSecretKey: slackAppToken          # the default
+    botTokenExistingSecret: my-slack-tokens
+    botTokenExistingSecretKey: slackBotToken          # the default
+```
+
+As with `githubAppExistingSecret`, a Secret missing the referenced key fails
+that one pod at `CreateContainerConfigError` rather than the chart silently
+falling back to an empty credential.
+
+**Known gap, tracked in #1801.** None of these 16 new fields are yet covered
+by the CLI's preserved-values mechanism (the same one `COMMS_MANAGED_KEYS` and
+`GITHUB_APP_MANAGED_KEYS` give the Slack tokens and the GitHub App identity in
+`cli/src/ops.rs`). A plain `curie cluster up` runs a full `helm upgrade
+--install` with no `--reuse-values`, so it resets any values key it does not
+explicitly re-supply -- set one of these fields today and keep it declared in
+the values file you pass to every `cluster up`/`helm upgrade`, the same way you
+would for any other values key the CLI does not manage yet.

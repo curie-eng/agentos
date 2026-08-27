@@ -25,7 +25,7 @@
 //!      satisfied by the case's OWN input verbatim, beyond an explicit baseline
 //!      of cases that are input-satisfiable today. This is what catches the
 //!      `contains: "weather"` vacuousness class -- a grader the input itself
-//!      guarantees -- which the no-op control cannot see (the fake's "all done"
+//!      guarantees -- which the null agent control cannot see (the fake's "all done"
 //!      does not contain the input). The baseline keeps the gate green on main
 //!      without editing a committed case; any NEW input-satisfiable case fails.
 //!

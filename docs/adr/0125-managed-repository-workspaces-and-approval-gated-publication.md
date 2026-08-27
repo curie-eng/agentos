@@ -1,11 +1,11 @@
-# 114. Managed repository workspaces and approval-gated publication are platform capabilities
+# 125. Managed repository workspaces and approval-gated publication are platform capabilities
 
 Date: 2026-08-23
 
 Status: Accepted
 
 Maintainer approval supplied for this decision on 2026-08-20 authorizes ADR
-0114 to land Accepted with its realizing code paths in this PR.
+0125 to land Accepted with its realizing code paths in this PR.
 
 ## Context
 

@@ -68,16 +68,12 @@ impl<T: TierDefaults> From<AgentTarget<T>> for AgentActionOpts {
 }
 
 /// The connection surface for a cluster governance verb (#524). Unlike the local
-/// tier (which correctly defaults to the compose stack on localhost), a real Helm
-/// release serves the API through its UI `/api` NodePort proxy and randomizes
-/// `api.apiKey` at `cluster up` — so BOTH default to `None` and are DISCOVERED
-/// from the release (mirroring how `cluster deploy` already discovers the URL),
-/// rather than defaulting to `http://localhost:8000` + the `curie-dev-key`
-/// sentinel, which parse cleanly and then fail to connect / 401. An explicit
-/// `--api-url`/`--api-key` (or `CURIE_API_URL`/`CURIE_API_KEY`) still wins.
+/// tier, an omitted URL self-plumbs a loopback tunnel to the release API and an
+/// omitted key is read from the release Secret. An explicit `--api-url` or
+/// `--api-key` value still wins.
 #[derive(Args, Debug, Clone)]
 struct ClusterConn {
-    /// Platform API base URL. Omit to discover the release's UI `/api` proxy.
+    /// Platform API base URL. Omit to self-plumb a loopback tunnel to the release API.
     #[arg(long, env = "CURIE_API_URL")]
     api_url: Option<String>,
     /// Platform API key. Omit to read the release's `api.apiKey` from its Secret.
@@ -325,26 +321,143 @@ struct ClusterAgentTarget {
     dry_run: bool,
 }
 
-/// Resolve a cluster verb's `(api_url, api_key)`: an explicit flag/env value wins;
-/// otherwise discover it from the release (UI `/api` proxy for the URL, the chart
-/// Secret for the key). Discovery failures are actionable errors naming the
-/// release (see `ops::discover_api_url` / `ops::discover_api_key`).
-async fn resolve_cluster_conn(conn: ClusterConn) -> anyhow::Result<(String, String)> {
+/// Stand up the connectors this version declares, and prune what it dropped.
+///
+/// Split across the two components on purpose (ADR-0086): the API RENDERS the
+/// Kubernetes objects -- a pure function of the bundle, so it needs no cluster
+/// access and keeps its read-only RBAC on the service that receives internet
+/// webhooks -- and the CLI APPLIES them under the operator's own kubectl
+/// credentials, where cluster-write authority already lived.
+///
+/// A bundle with no `connectors.yaml` still reaches the prune: that is the case
+/// where a connector was REMOVED, and leaving it running with a credential
+/// mounted and nothing referencing it is the leak nobody notices.
+async fn sync_connectors(
+    api_url: &str,
+    api_key: &str,
+    namespace: &str,
+    release: &str,
+    agent_id: &str,
+    agent_name: &str,
+    version_id: &str,
+) -> anyhow::Result<()> {
+    let app_name = curie::connectors::discover_app_name(namespace, release).await?;
+    let connector_version = ConnectorVersion {
+        agent_id,
+        agent_name,
+        version_id,
+    };
+    let prepared = prepare_connectors(
+        api_url,
+        api_key,
+        namespace,
+        release,
+        &app_name,
+        connector_version,
+    )
+    .await?;
+    apply_connectors(prepared).await
+}
+
+struct ConnectorVersion<'a> {
+    agent_id: &'a str,
+    agent_name: &'a str,
+    version_id: &'a str,
+}
+
+async fn prepare_connectors(
+    api_url: &str,
+    api_key: &str,
+    namespace: &str,
+    release: &str,
+    app_name: &str,
+    connector_version: ConnectorVersion<'_>,
+) -> anyhow::Result<curie::connectors::PreparedConnectorSync> {
+    let client = curie::api::ApiClient::new(api_url, api_key)?;
+    let rendered = client
+        .version_connectors(
+            connector_version.agent_id,
+            connector_version.version_id,
+            release,
+            namespace,
+            app_name,
+        )
+        .await?;
+    curie::connectors::prepare(
+        &rendered.manifests,
+        &rendered.mcp_entries,
+        &rendered.owned_secret_name,
+        &rendered.owned_secret_keys,
+        namespace,
+        connector_version.agent_name,
+        &BTreeMap::new(),
+    )
+}
+
+async fn apply_connectors(
+    prepared: curie::connectors::PreparedConnectorSync,
+) -> anyhow::Result<()> {
+    let synced = curie::connectors::sync(prepared).await?;
+    let ui = curie::ui::ui();
+    for (name, url) in &synced.urls {
+        ui.note(&format!("connector {name}: {url}"));
+    }
+    Ok(())
+}
+
+/// Resolve a cluster verb's API URL, key, and optional loopback tunnel. Explicit
+/// values win. An omitted URL self-plumbs the release API service, while an
+/// omitted key is read from the release Secret.
+async fn resolve_cluster_conn(
+    conn: ClusterConn,
+    dry_run: bool,
+) -> anyhow::Result<(String, String, Option<tokio::process::Child>)> {
     let ClusterConn {
         api_url,
         api_key,
         namespace,
         release,
     } = conn;
-    let api_url = match api_url {
-        Some(url) => url,
-        None => ops::discover_api_url(&namespace, &release).await?,
-    };
+    let api_key = commands::normalize_deploy_api_key(api_key);
+    let key_auto_discovered = api_key.is_none();
+    let local_port = 0;
+    if dry_run {
+        return Ok((
+            api_url.unwrap_or_else(|| format!("http://localhost:{local_port}")),
+            api_key.unwrap_or_default(),
+            None,
+        ));
+    }
     let api_key = match api_key {
         Some(key) => key,
         None => ops::discover_api_key(&namespace, &release).await?,
     };
-    Ok((api_url, api_key))
+    let (api_url, port_forward) = match commands::deploy_port_forward(
+        api_url.as_deref(),
+        &namespace,
+        &release,
+        local_port,
+        message::API_REMOTE_PORT,
+    ) {
+        Some(pf_cmd) => {
+            let (child, effective_port) =
+                message::start_port_forward(&pf_cmd, local_port, "cluster api").await?;
+            (format!("http://127.0.0.1:{effective_port}"), Some(child))
+        }
+        None => {
+            let url = api_url.expect("explicit url when no port-forward");
+            if key_auto_discovered && api::is_insecure_endpoint(&url) {
+                bail!(
+                    "refusing to send the auto-discovered release key over cleartext \
+                     HTTP to {url}: the strong key would leak on the wire. Pass \
+                     --api-key explicitly to acknowledge, use an https:// URL, or omit \
+                     --api-url to reach the release over the loopback port-forward."
+                );
+            }
+            (url, None)
+        }
+    };
+    Ok((api_url, api_key, port_forward))
 }
 
 async fn run_local_observability_query(
@@ -404,7 +517,7 @@ async fn run_cluster_observability_query(
         Some(key) => key,
         None => ops::discover_api_key(&namespace, &release).await?,
     };
-    let local_port = message::DEFAULT_API_LOCAL_PORT;
+    let local_port = 0;
     let _port_forward;
     let api_url = match commands::deploy_port_forward(
         conn.api_url.as_deref(),
@@ -414,9 +527,10 @@ async fn run_cluster_observability_query(
         message::API_REMOTE_PORT,
     ) {
         Some(command) => {
-            _port_forward =
-                Some(message::start_port_forward(&command, local_port, "observability api").await?);
-            format!("http://localhost:{local_port}")
+            let (child, effective_port) =
+                message::start_port_forward(&command, local_port, "observability api").await?;
+            _port_forward = Some(child);
+            format!("http://127.0.0.1:{effective_port}")
         }
         None => {
             _port_forward = None;
@@ -691,6 +805,9 @@ enum Command {
     /// The file states the whole intent, so `apply` never has to be told what
     /// it was told last time -- the gap behind the dropped-settings failures
     /// the `--set`/`--reuse-values` shape kept producing.
+    ///
+    /// A worked common installation is available at `examples/curie.yaml` in
+    /// the Curie repository.
     Apply {
         /// Path to the installation file.
         #[arg(short = 'f', long = "file", default_value = "curie.yaml")]
@@ -842,12 +959,40 @@ enum DevAction {
     /// Run the cold-start parity ladder across the skill, local, and cluster
     /// tiers, fake model by default (#690, `bash cli/scripts/e2e-ladder.sh`).
     E2eLadder,
+    /// Select the end to end tiers CI would run for paths or revisions.
+    E2eCiSelection {
+        /// Changed path. Repeat for every path in the candidate change.
+        #[arg(
+            long,
+            required_unless_present_any = ["base", "push"],
+            conflicts_with_all = ["base", "head", "push"]
+        )]
+        path: Vec<PathBuf>,
+        /// Base revision for a local branch comparison.
+        #[arg(long, requires = "head", conflicts_with = "push")]
+        base: Option<String>,
+        /// Head revision for a local branch comparison.
+        #[arg(long, requires = "base", conflicts_with = "push")]
+        head: Option<String>,
+        /// Select every tier, matching a push event.
+        #[arg(long, conflicts_with_all = ["path", "base", "head"])]
+        push: bool,
+    },
     /// Runtime E2E the Helm chart on a local cluster: install a trimmed slice,
     /// seed a bundle into RustFS, run the sandbox bundle-fetch init pair, and
     /// exec-assert the runner's view -- the one-command way to satisfy a
     /// chart/sandbox runtime acceptance criterion static checks cannot (#199,
     /// `bash scripts/chart-runtime-e2e.sh`).
-    ChartRuntimeE2e,
+    ChartRuntimeE2e {
+        /// Allow running against a kube context other than `k8scratch`.
+        ///
+        /// The script refuses a non-`k8scratch` context and names `--force` as
+        /// the override. Without this passthrough that override was unreachable
+        /// from the `curie` surface, so a contributor whose scratch context has
+        /// another name could not run this gate the documented way at all.
+        #[arg(long)]
+        force: bool,
+    },
     /// Lint the interface catalog docs (`bash scripts/check-docs.sh`).
     DocsLint,
     /// Validate every `examples/` bundle against Claude Code (`bash scripts/check-plugin-compat.sh`).
@@ -918,6 +1063,29 @@ enum SecretsAction {
         /// Environment-variable-style secret name.
         name: String,
     },
+}
+
+/// Shared `--samples` / `--aggregation` / `--pass-at-k` flags for every eval
+/// tier (#1907). Default n=1 majority is documented rather than silent.
+#[derive(Args, Debug, Clone)]
+struct EvalSamplingArgs {
+    /// Independent samples per case for live-model grading. Default: 1. A
+    /// single sample is not proof of tier drift; raise this to distinguish
+    /// variance from a real miss. Same policy on skill, local, and cluster.
+    #[arg(long, default_value_t = 1, env = "CURIE_EVAL_SAMPLES", value_parser = clap::value_parser!(u32).range(1..))]
+    samples: u32,
+    /// How to reduce N sample verdicts. Default: majority.
+    #[arg(long, default_value_t = curie::eval_sampling::AggregationPolicy::Majority, env = "CURIE_EVAL_AGGREGATION")]
+    aggregation: curie::eval_sampling::AggregationPolicy,
+    /// Pass@k threshold when --aggregation pass_at_k. Default: 1.
+    #[arg(long = "pass-at-k", default_value_t = 1, env = "CURIE_EVAL_PASS_AT_K", value_parser = clap::value_parser!(u32).range(1..))]
+    pass_at_k: u32,
+}
+
+impl EvalSamplingArgs {
+    fn config(self) -> anyhow::Result<curie::eval_sampling::SampleConfig> {
+        curie::eval_sampling::SampleConfig::new(self.samples, self.aggregation, self.pass_at_k)
+    }
 }
 
 #[derive(Subcommand)]
@@ -1127,6 +1295,8 @@ enum SkillAction {
         /// resolution as `skill up`.
         #[arg(long)]
         image: Option<String>,
+        #[command(flatten)]
+        sampling: EvalSamplingArgs,
     },
     /// Interview to generate a starter `evals/cases.json` (guided eval generation).
     EvalInit {
@@ -1404,6 +1574,8 @@ enum LocalAction {
         /// value above 1 is refused rather than silently run sequentially.
         #[arg(long, default_value_t = 1)]
         concurrency: usize,
+        #[command(flatten)]
+        sampling: EvalSamplingArgs,
         /// Print the plan that a real run would produce, and exit.
         #[arg(long)]
         dry_run: bool,
@@ -1484,9 +1656,14 @@ enum LocalAction {
         target: AgentTarget<LocalTier>,
     },
     /// Show what an agent has learned (its memory log; `GET /agents/{id}/memory`).
+    /// `--add <content>` seeds an operator-authored record; a fresh session is
+    /// required before it is injected at boot.
     Memory {
         #[command(flatten)]
         target: AgentTarget<LocalTier>,
+        /// Append this content as an operator-authored memory record.
+        #[arg(long, value_name = "CONTENT")]
+        add: Option<String>,
     },
     /// The human-in-the-loop plane: list and resolve pending approval records,
     /// and view or set the tools whose calls require approval. Which channel an
@@ -1700,12 +1877,12 @@ enum ClusterAction {
     /// (CURIE_MODEL_CREDENTIALS is a deprecated alias) to install with the real
     /// model. A fresh install without it uses fake mode. A rerun preserves the
     /// recorded model configuration. Use --fake-model to explicitly downgrade
-    /// to fake mode. A real model is still unreachable behind the fail-closed
-    /// sandbox until you
-    /// open its egress with --allow-egress-host <provider> (or --allow-web-egress
-    /// <CIDR> for a raw range). Zhipu, Moonshot, and DeepSeek also require their
-    /// matching base URL in worker runtime configuration, in addition to a
-    /// credential and named egress.
+    /// to fake mode. An sk-ant- or sk-or- credential infers its provider egress
+    /// when --allow-egress-host is absent. Other credential shapes remain sealed
+    /// until their provider or a raw range is explicit. Existing singleton
+    /// resources are reused only from complete Helm ownership metadata. An exact
+    /// admission result that the gvisor RuntimeClass is absent applies
+    /// security.gvisor.mode=off and retries once. Every inferred value is printed.
     Up {
         /// Kubernetes namespace.
         #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
@@ -1736,8 +1913,11 @@ enum ClusterAction {
             conflicts_with = "fake_model"
         )]
         local_model: Option<String>,
-        /// Open runner egress to a named model provider's API host(s), resolved to
-        /// narrow host routes at install time (repeatable). One of: anthropic,
+        /// Explicitly open runner egress to a named model provider's API host(s),
+        /// resolved to narrow host routes at install time (repeatable). An sk-ant-
+        /// or sk-or- credential infers anthropic or openrouter when this flag is
+        /// absent. An explicit list that omits the detected provider is an error.
+        /// One of: anthropic,
         /// openrouter, zhipu, moonshot, deepseek. Provider native Zhipu,
         /// Moonshot, and DeepSeek also need their matching worker runtime base
         /// URL; a credential plus egress alone does not reach them. For a raw
@@ -1745,8 +1925,8 @@ enum ClusterAction {
         #[arg(long = "allow-egress-host", value_name = "PROVIDER")]
         allow_egress_host: Vec<String>,
         /// Open runner egress to a declared destination for skill web access,
-        /// repeatable CIDR, TCP 443. Additive to the provider egress; omit to stay
-        /// fully sealed.
+        /// repeatable CIDR, TCP 443. Additive to provider egress. Omit to keep
+        /// general web egress sealed.
         #[arg(long = "allow-web-egress", value_name = "CIDR")]
         allow_web_egress: Vec<String>,
         /// GitHub credential the API uses for the git-flow bundle clone and the
@@ -1781,8 +1961,12 @@ enum ClusterAction {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Uninstall the release and sweep its runtime namespaces (helm uninstall +
-    /// kubectl delete namespace). The agents.x-k8s.io CRDs are left in place.
+    /// Uninstall the release and sweep its runtime namespaces, running helm
+    /// uninstall followed by kubectl delete namespace. The namespace delete
+    /// is scoped to namespaces this release created, matched by both its
+    /// release name and install namespace, so another release's namespaces
+    /// on the same cluster are never touched. Pre-existing namespaces and
+    /// the agents.x-k8s.io CRDs are left in place.
     Down {
         /// Kubernetes namespace.
         #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
@@ -1983,10 +2167,10 @@ enum ClusterAction {
         #[arg(long)]
         listen_host: Option<String>,
         /// Port the stub binds (0.0.0.0); the worker posts here.
-        #[arg(long, default_value_t = message::DEFAULT_LISTEN_PORT)]
+        #[arg(long, default_value_t = 0)]
         listen_port: u16,
         /// Local port the Valkey port-forward binds.
-        #[arg(long, default_value_t = message::DEFAULT_VALKEY_LOCAL_PORT)]
+        #[arg(long, default_value_t = 0)]
         valkey_local_port: u16,
         /// Valkey password. Omit to read the release's own password from its
         /// chart Secret. Prefer the CURIE_VALKEY_PASSWORD env var over passing
@@ -2000,7 +2184,7 @@ enum ClusterAction {
         )]
         valkey_password: Option<String>,
         /// Local port the API port-forward binds (default-channel lookup).
-        #[arg(long, default_value_t = message::DEFAULT_API_LOCAL_PORT)]
+        #[arg(long, default_value_t = 0)]
         api_local_port: u16,
         /// Platform API key for the default-channel lookup. Omit to read the
         /// release's own key from its chart Secret.
@@ -2048,10 +2232,12 @@ enum ClusterAction {
         #[arg(long)]
         listen_host: Option<String>,
         /// Port the stub binds (0.0.0.0); the worker posts here.
-        #[arg(long, default_value_t = message::DEFAULT_LISTEN_PORT)]
+        /// Default 0 lets the kernel assign an ephemeral port.
+        #[arg(long, default_value_t = 0)]
         listen_port: u16,
         /// Local port the Valkey port-forward binds.
-        #[arg(long, default_value_t = message::DEFAULT_VALKEY_LOCAL_PORT)]
+        /// Default 0 lets kubectl assign an ephemeral local port.
+        #[arg(long, default_value_t = 0)]
         valkey_local_port: u16,
         /// Valkey password. Omit to read the release's own password from its
         /// chart Secret. Prefer the CURIE_VALKEY_PASSWORD env var over passing
@@ -2065,7 +2251,8 @@ enum ClusterAction {
         )]
         valkey_password: Option<String>,
         /// Local port the API port-forward binds (default-channel lookup).
-        #[arg(long, default_value_t = message::DEFAULT_API_LOCAL_PORT)]
+        /// Default 0 is kernel-assigned, matching `cluster message`.
+        #[arg(long, default_value_t = 0)]
         api_local_port: u16,
         /// Platform API key for the default-channel lookup. Omit to read the
         /// release's own key from its chart Secret.
@@ -2090,6 +2277,8 @@ enum ClusterAction {
         /// value above 1 is refused rather than silently run sequentially.
         #[arg(long, default_value_t = 1)]
         concurrency: usize,
+        #[command(flatten)]
+        sampling: EvalSamplingArgs,
         /// Print the kubectl commands, stub URL, and enqueue description that a
         /// real run would produce, and exit without executing anything.
         #[arg(long)]
@@ -2321,9 +2510,14 @@ enum ClusterAction {
         target: ClusterAgentTarget,
     },
     /// Show what an agent has learned (its memory log; `GET /agents/{id}/memory`).
+    /// `--add <content>` seeds an operator-authored record; a fresh session is
+    /// required before it is injected at boot.
     Memory {
         #[command(flatten)]
         target: ClusterAgentTarget,
+        /// Append this content as an operator-authored memory record.
+        #[arg(long, value_name = "CONTENT")]
+        add: Option<String>,
     },
     /// The human-in-the-loop plane: list and resolve pending approval records,
     /// and view or set the tools whose calls require approval. Which channel an
@@ -2456,8 +2650,9 @@ async fn main() {
     ui::init(Ui::from_process(cli.color, cli.debug, cli.quiet, cli.json));
     // main never returns Err (which would give anyhow's default exit 1 and skip
     // classification). Run the command, then map any error to a semantic exit
-    // code: the JSON payload goes to stdout under --json, else the human error
-    // to stderr (matching anyhow's default), and the class picks the exit code.
+    // code: the JSON payload goes to stdout under --json. Otherwise the human
+    // presentation goes to stderr, debug receives the full cause chain, and the
+    // class picks the exit code.
     if let Err(err) = run(cli.command).await {
         let (class, _fix) = curie::exit::classify(&err);
         if ui::ui().json() {
@@ -2465,7 +2660,12 @@ async fn main() {
                 .unwrap_or_else(|| curie::exit::error_json(&err));
             ui::ui().emit_json(&payload);
         } else {
-            eprintln!("Error: {err:#}");
+            let (message, remedy) = curie::exit::present_error(&err);
+            eprintln!("Error: {message}");
+            if let Some(remedy) = remedy {
+                eprintln!("Fix: {remedy}");
+            }
+            ui::ui().plumbing(&format!("{err:#}"));
         }
         std::process::exit(class.code());
     }
@@ -2571,8 +2771,17 @@ async fn run(command: Option<Command>) -> Result<()> {
             }
             DevAction::E2e => commands::dev_script("cli/scripts/e2e.sh", &[]).await,
             DevAction::E2eLadder => commands::dev_script("cli/scripts/e2e-ladder.sh", &[]).await,
-            DevAction::ChartRuntimeE2e => {
-                commands::dev_script("scripts/chart-runtime-e2e.sh", &[]).await
+            DevAction::E2eCiSelection {
+                path,
+                base,
+                head,
+                push,
+            } => {
+                commands::dev_e2e_ci_selection(&path, base.as_deref(), head.as_deref(), push).await
+            }
+            DevAction::ChartRuntimeE2e { force } => {
+                let args: &[&str] = if force { &["--force"] } else { &[] };
+                commands::dev_script("scripts/chart-runtime-e2e.sh", args).await
             }
             DevAction::DocsLint => commands::dev_script("scripts/check-docs.sh", &[]).await,
             DevAction::PluginCompat => {
@@ -2720,13 +2929,14 @@ async fn run(command: Option<Command>) -> Result<()> {
                 model,
                 secret,
                 image,
+                sampling,
             } => {
                 let image = artifacts::resolve_image(
                     image.as_deref(),
                     artifacts::Channel::current(),
                     artifacts::version(),
                 );
-                commands::eval(cases, url, model, secret, image).await
+                commands::eval(cases, url, model, secret, image, sampling.config()?).await
             }
             SkillAction::EvalInit { out, force } => {
                 curie::eval_init::run(curie::eval_init::EvalInitOpts { out, force })
@@ -2962,6 +3172,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 timeout_secs,
                 model,
                 concurrency,
+                sampling,
                 dry_run,
             } => {
                 message::eval(message::EvalOpts {
@@ -2983,6 +3194,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                     api_url,
                     models: model,
                     concurrency,
+                    sampling: sampling.config()?,
                 })
                 .await
             }
@@ -3000,33 +3212,33 @@ async fn run(command: Option<Command>) -> Result<()> {
                 label,
                 secret,
             } => {
-                let connect_hint = format!(
-                    "the platform API at {api_url} is unreachable. Start the local stack first with `curie local up`, then re-run (or pass --api-url if your API is elsewhere)."
-                );
-                emit(
-                    commands::deploy(DeployOpts {
-                        plugin_dir,
-                        agent,
-                        target,
-                        api_url,
-                        api_key,
-                        slack_channel,
-                        repo,
-                        workspace: commands::WorkspaceIntent::from_flags(workspace, no_workspace),
-                        env,
-                        label,
-                        secret,
-                        // `local deploy` offers `--secret`, so enforce the
-                        // declared-secrets policy gate (#464).
-                        secret_binding_supported: true,
-                        connect_hint: connect_hint.clone(),
-                        tier: commands::DeployTier::Local,
-                    })
-                    .await?,
-                )
+                let local_api_url = api_url.clone();
+                let result = commands::deploy(DeployOpts {
+                    plugin_dir,
+                    agent,
+                    target,
+                    api_url,
+                    api_key,
+                    slack_channel,
+                    repo,
+                    workspace: commands::WorkspaceIntent::from_flags(workspace, no_workspace),
+                    tier: commands::DeployTier::Local,
+                    env,
+                    label,
+                    secret,
+                    // `local deploy` offers `--secret`, so enforce the
+                    // declared-secrets policy gate (#464).
+                    secret_binding_supported: true,
+                    connect_hint: "the platform API is unreachable.".to_string(),
+                })
+                .await;
+                emit(local::with_deploy_unreachable_hint(result, &local_api_url).await?)
             }
             LocalAction::Versions { target } => emit(commands::versions(target.into()).await?),
-            LocalAction::Memory { target } => emit(commands::memory(target.into()).await?),
+            LocalAction::Memory { target, add } => match add {
+                None => emit(commands::memory(target.into()).await?),
+                Some(content) => emit(commands::memory_add(target.into(), content).await?),
+            },
             LocalAction::Approvals {
                 target,
                 gate,
@@ -3546,6 +3758,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 timeout_secs,
                 model,
                 concurrency,
+                sampling,
                 dry_run,
             } => {
                 // `cluster up` randomizes both credentials per release, so an
@@ -3586,6 +3799,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                     api_url: None,
                     models: model,
                     concurrency,
+                    sampling: sampling.config()?,
                 })
                 .await
             }
@@ -3639,13 +3853,13 @@ async fn run(command: Option<Command>) -> Result<()> {
                     message::API_REMOTE_PORT,
                 ) {
                     Some(pf_cmd) => {
-                        _deploy_pf = Some(
-                            message::start_port_forward(&pf_cmd, local_port, "deploy api").await?,
-                        );
+                        let (deploy_pf, effective_port) =
+                            message::start_port_forward(&pf_cmd, local_port, "deploy api").await?;
+                        _deploy_pf = Some(deploy_pf);
                         // svc/<release>-api serves the platform API at ROOT, so the
                         // base URL has NO /api suffix (the /api in ADR-0024 was only
                         // because the request went through the UI pod).
-                        format!("http://localhost:{local_port}")
+                        format!("http://127.0.0.1:{effective_port}")
                     }
                     None => {
                         _deploy_pf = None;
@@ -3713,13 +3927,147 @@ async fn run(command: Option<Command>) -> Result<()> {
                     vec![target]
                 };
 
-                // Single target deploy retains its existing output. All target
-                // deploy accumulates complete results in the API's declared order.
-                let mut last_deployed = None;
-                let mut completed = Vec::new();
-                for target in targets {
-                    let target_name = target.clone();
-                    let deployed = match commands::deploy(DeployOpts {
+                if all_targets {
+                    let first_target = targets
+                        .first()
+                        .cloned()
+                        .flatten()
+                        .expect("all target entries always have a target name");
+                    let app_name =
+                        match curie::connectors::discover_app_name(&namespace, &release).await {
+                            Ok(app_name) => app_name,
+                            Err(err) => {
+                                let payload = commands::all_targets_deploy_failure_json(
+                                    &first_target,
+                                    &[],
+                                    None,
+                                    &err,
+                                );
+                                return Err(curie::exit::with_json_payload(err, payload));
+                            }
+                        };
+
+                    // Resolve every target and every connector credential before
+                    // activating the first deployment. Preparation may create
+                    // agents and versions, but it does not POST a deployment.
+                    let mut prepared_targets = Vec::new();
+                    for target in targets {
+                        let target = target.expect("all target entries always have a target name");
+                        let prepared_deploy = match commands::prepare_deploy(DeployOpts {
+                            plugin_dir: plugin_dir.clone(),
+                            agent: agent.clone(),
+                            target: Some(target.clone()),
+                            api_url: api_url.clone(),
+                            api_key: api_key.clone(),
+                            slack_channel: slack_channel.clone(),
+                            repo: repo.clone(),
+                            workspace: commands::WorkspaceIntent::from_flags(
+                                workspace,
+                                no_workspace,
+                            ),
+                            tier: commands::DeployTier::Cluster,
+                            env,
+                            label: label.clone(),
+                            secret: Vec::new(),
+                            secret_binding_supported: false,
+                            connect_hint: connect_hint.clone(),
+                        })
+                        .await
+                        {
+                            Ok(prepared) => prepared,
+                            Err(err) => {
+                                let payload = commands::all_targets_deploy_failure_json(
+                                    &target,
+                                    &[],
+                                    None,
+                                    &err,
+                                );
+                                return Err(curie::exit::with_json_payload(err, payload));
+                            }
+                        };
+                        let connector_version = ConnectorVersion {
+                            agent_id: prepared_deploy.agent_id(),
+                            agent_name: prepared_deploy.agent_name(),
+                            version_id: prepared_deploy.version_id(),
+                        };
+                        let prepared_connectors = match prepare_connectors(
+                            &api_url,
+                            &api_key,
+                            &namespace,
+                            &release,
+                            &app_name,
+                            connector_version,
+                        )
+                        .await
+                        {
+                            Ok(prepared) => prepared,
+                            Err(err) => {
+                                let payload = commands::all_targets_deploy_failure_json(
+                                    &target,
+                                    &[],
+                                    None,
+                                    &err,
+                                );
+                                return Err(curie::exit::with_json_payload(err, payload));
+                            }
+                        };
+                        prepared_targets.push((target, prepared_deploy, prepared_connectors));
+                    }
+
+                    // Activate and reconcile in the API's declared target order.
+                    let mut completed = Vec::new();
+                    for (target, prepared_deploy, prepared_connectors) in prepared_targets {
+                        let deployed = match commands::deploy_prepared(prepared_deploy).await {
+                            Ok(deployed) => deployed,
+                            Err(err) => {
+                                let payload = commands::all_targets_deploy_failure_json(
+                                    &target, &completed, None, &err,
+                                );
+                                return Err(curie::exit::with_json_payload(err, payload));
+                            }
+                        };
+
+                        if !secret.is_empty() {
+                            if let Err(err) = bind_cluster_connector_secrets(
+                                &namespace,
+                                &release,
+                                chart.as_deref(),
+                                &deployed.agent_name,
+                                &secret,
+                            )
+                            .await
+                            {
+                                let payload = commands::all_targets_deploy_failure_json(
+                                    &target,
+                                    &completed,
+                                    Some(&deployed),
+                                    &err,
+                                );
+                                return Err(curie::exit::with_json_payload(err, payload));
+                            }
+                        }
+
+                        if let Err(err) = apply_connectors(prepared_connectors).await {
+                            let payload = commands::all_targets_deploy_failure_json(
+                                &target,
+                                &completed,
+                                Some(&deployed),
+                                &err,
+                            );
+                            return Err(curie::exit::with_json_payload(err, payload));
+                        }
+                        completed.push(commands::AllTargetsDeployResult {
+                            target,
+                            result: deployed,
+                        });
+                    }
+                    emit(commands::AllTargetsDeployOutput { results: completed })
+                } else {
+                    let target = targets
+                        .into_iter()
+                        .next()
+                        .expect("the target list is never empty");
+                    let deployed = commands::deploy(DeployOpts {
                         plugin_dir: plugin_dir.clone(),
                         agent: agent.clone(),
                         target,
@@ -3735,93 +4083,36 @@ async fn run(command: Option<Command>) -> Result<()> {
                         connect_hint: connect_hint.clone(),
                         tier: commands::DeployTier::Cluster,
                     })
-                    .await
-                    {
-                        Ok(deployed) => deployed,
-                        Err(err) if all_targets => {
-                            let failed_target = target_name
-                                .as_deref()
-                                .expect("all target entries always have a target name");
-                            let payload = commands::all_targets_deploy_failure_json(
-                                failed_target,
-                                &completed,
-                                None,
-                                &err,
-                            );
-                            return Err(curie::exit::with_json_payload(err, payload));
-                        }
-                        Err(err) => return Err(err),
-                    };
+                    .await?;
 
-                    // Stand up whatever the bundle's connectors.yaml declares
-                    // (ADR-0086, #1063). After the deploy, so the objects exist
-                    // before the next turn reaches for them; the credentials here
-                    // are the CONNECTOR's, resolved locally and written straight to
-                    // a K8s Secret, which is a different path from the sandbox
-                    // secret delivery #1488 tracks.
                     if !secret.is_empty() {
-                        if let Err(err) = bind_cluster_connector_secrets(
+                        bind_cluster_connector_secrets(
                             &namespace,
                             &release,
                             chart.as_deref(),
                             &deployed.agent_name,
                             &secret,
                         )
-                        .await
-                        {
-                            if all_targets {
-                                let failed_target = target_name
-                                    .as_deref()
-                                    .expect("all target entries always have a target name");
-                                let payload = commands::all_targets_deploy_failure_json(
-                                    failed_target,
-                                    &completed,
-                                    Some(&deployed),
-                                    &err,
-                                );
-                                return Err(curie::exit::with_json_payload(err, payload));
-                            }
-                            return Err(err);
-                        }
+                        .await?;
                     }
-                    if let Err(err) = curie::connectors::sync_deployed_version(
+
+                    // Stand up whatever the bundle's connectors.yaml declares
+                    // (ADR-0086, #1063). After the deploy, so the objects exist
+                    // before the next turn reaches for them; the credentials here
+                    // are the CONNECTOR's, resolved locally and written straight to
+                    // a K8s Secret, which is a different path from the sandbox
+                    // secret delivery #440 tracks.
+                    sync_connectors(
                         &api_url,
                         &api_key,
                         &namespace,
                         &release,
-                        &deployed,
-                        &BTreeMap::new(),
+                        &deployed.agent_id,
+                        &deployed.agent_name,
+                        &deployed.version_id,
                     )
-                    .await
-                    {
-                        if all_targets {
-                            let failed_target = target_name
-                                .as_deref()
-                                .expect("all target entries always have a target name");
-                            let payload = commands::all_targets_deploy_failure_json(
-                                failed_target,
-                                &completed,
-                                Some(&deployed),
-                                &err,
-                            );
-                            return Err(curie::exit::with_json_payload(err, payload));
-                        }
-                        return Err(err);
-                    }
-                    if all_targets {
-                        completed.push(commands::AllTargetsDeployResult {
-                            target: target_name
-                                .expect("all target entries always have a target name"),
-                            result: deployed,
-                        });
-                    } else {
-                        last_deployed = Some(deployed);
-                    }
-                }
-                if all_targets {
-                    emit(commands::AllTargetsDeployOutput { results: completed })
-                } else {
-                    emit(last_deployed.expect("the target list is never empty"))
+                    .await?;
+                    emit(deployed)
                 }
             }
             ClusterAction::Kill {
@@ -3830,7 +4121,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                 yes,
                 dry_run,
             } => {
-                let (api_url, api_key) = resolve_cluster_conn(conn).await?;
+                let (api_url, api_key, _cluster_api_pf) =
+                    resolve_cluster_conn(conn, dry_run).await?;
                 emit(
                     commands::kill(
                         AgentActionOpts {
@@ -3849,7 +4141,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                 conn,
                 dry_run,
             } => {
-                let (api_url, api_key) = resolve_cluster_conn(conn).await?;
+                let (api_url, api_key, _cluster_api_pf) =
+                    resolve_cluster_conn(conn, dry_run).await?;
                 emit(
                     commands::resume(AgentActionOpts {
                         api_url,
@@ -3876,7 +4169,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                 let model = commands::OverrideChange::resolve("model", model, clear_model)?;
                 let thinking =
                     commands::OverrideChange::resolve("thinking", thinking, clear_thinking)?;
-                let (api_url, api_key) = resolve_cluster_conn(conn).await?;
+                let (api_url, api_key, _cluster_api_pf) =
+                    resolve_cluster_conn(conn, dry_run).await?;
                 emit(
                     commands::overrides(
                         AgentActionOpts {
@@ -3905,7 +4199,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 // cost a cluster lookup, nor be reported as a connection
                 // failure instead of the usage error it is.
                 let change = commands::ChannelChange::resolve(add, remove, endpoint, adapter)?;
-                let (api_url, api_key) = resolve_cluster_conn(conn).await?;
+                let (api_url, api_key, _port_forward) = resolve_cluster_conn(conn, dry_run).await?;
                 emit(
                     commands::channel_bindings(
                         AgentActionOpts {
@@ -3925,7 +4219,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                 conn,
                 dry_run,
             } => {
-                let (api_url, api_key) = resolve_cluster_conn(conn).await?;
+                let (api_url, api_key, _cluster_api_pf) =
+                    resolve_cluster_conn(conn, dry_run).await?;
                 emit(
                     commands::budget(
                         AgentActionOpts {
@@ -3946,7 +4241,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                 yes,
                 dry_run,
             } => {
-                let (api_url, api_key) = resolve_cluster_conn(conn).await?;
+                let (api_url, api_key, _cluster_api_pf) =
+                    resolve_cluster_conn(conn, dry_run).await?;
                 emit(
                     commands::reset_thread(
                         AgentActionOpts {
@@ -3967,7 +4263,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                 yes,
                 dry_run,
             } => {
-                let (api_url, api_key) = resolve_cluster_conn(conn).await?;
+                let (api_url, api_key, _cluster_api_pf) =
+                    resolve_cluster_conn(conn, dry_run).await?;
                 emit(
                     commands::delete(
                         AgentActionOpts {
@@ -3987,7 +4284,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                     conn,
                     dry_run,
                 } = target;
-                let (api_url, api_key) = resolve_cluster_conn(conn).await?;
+                let (api_url, api_key, _cluster_api_pf) =
+                    resolve_cluster_conn(conn, dry_run).await?;
                 emit(
                     commands::versions(AgentActionOpts {
                         api_url,
@@ -3998,22 +4296,24 @@ async fn run(command: Option<Command>) -> Result<()> {
                     .await?,
                 )
             }
-            ClusterAction::Memory { target } => {
+            ClusterAction::Memory { target, add } => {
                 let ClusterAgentTarget {
                     agent,
                     conn,
                     dry_run,
                 } = target;
-                let (api_url, api_key) = resolve_cluster_conn(conn).await?;
-                emit(
-                    commands::memory(AgentActionOpts {
-                        api_url,
-                        api_key,
-                        agent,
-                        dry_run,
-                    })
-                    .await?,
-                )
+                let (api_url, api_key, _cluster_api_pf) =
+                    resolve_cluster_conn(conn, dry_run).await?;
+                let opts = AgentActionOpts {
+                    api_url,
+                    api_key,
+                    agent,
+                    dry_run,
+                };
+                match add {
+                    None => emit(commands::memory(opts).await?),
+                    Some(content) => emit(commands::memory_add(opts, content).await?),
+                }
             }
             ClusterAction::Approvals {
                 target,
@@ -4036,7 +4336,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                     conn,
                     dry_run,
                 } = target;
-                let (api_url, api_key) = resolve_cluster_conn(conn).await?;
+                let (api_url, api_key, _cluster_api_pf) =
+                    resolve_cluster_conn(conn, dry_run).await?;
                 emit(
                     commands::approvals(
                         AgentActionOpts {
@@ -4632,7 +4933,18 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Command::Dev {
-                action: DevAction::ChartRuntimeE2e
+                action: DevAction::ChartRuntimeE2e { force: false }
+            })
+        ));
+        // The script's context guard names `--force` as its only override, so the
+        // flag has to survive the `curie dev` hop or the guard is unoverridable
+        // through the documented entry point.
+        let cli = Cli::try_parse_from(["curie", "dev", "chart-runtime-e2e", "--force"])
+            .expect("dev chart-runtime-e2e --force should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Dev {
+                action: DevAction::ChartRuntimeE2e { force: true }
             })
         ));
     }
@@ -4763,6 +5075,70 @@ mod tests {
             }) => {
                 assert_eq!(api_key, Some("K".to_string()));
                 assert_eq!(valkey_password, Some("P".to_string()));
+            }
+            _ => panic!("expected cluster eval command"),
+        }
+    }
+
+    /// #1908: a red cluster eval used to leak a kubectl child bound to the
+    /// fixed 56381 default, so the next eval selected that same occupied port.
+    /// Omitted eval ports must request kernel-assigned 0, matching `cluster
+    /// message` (#1652 / #1740).
+    #[test]
+    fn cluster_eval_omitted_ports_default_to_ephemeral() {
+        let cli =
+            Cli::try_parse_from(["curie", "cluster", "eval"]).expect("cluster eval should parse");
+        match cli.command {
+            Some(Command::Cluster {
+                action:
+                    ClusterAction::Eval {
+                        listen_port,
+                        valkey_local_port,
+                        api_local_port,
+                        ..
+                    },
+            }) => {
+                assert_eq!(listen_port, 0, "an omitted --listen-port must request 0");
+                assert_eq!(
+                    valkey_local_port, 0,
+                    "an omitted --valkey-local-port must request 0"
+                );
+                assert_eq!(
+                    api_local_port, 0,
+                    "an omitted --api-local-port must request 0"
+                );
+            }
+            _ => panic!("expected cluster eval command"),
+        }
+    }
+
+    #[test]
+    fn cluster_eval_preserves_explicit_port_overrides() {
+        let cli = Cli::try_parse_from([
+            "curie",
+            "cluster",
+            "eval",
+            "--listen-port",
+            "18155",
+            "--valkey-local-port",
+            "18156",
+            "--api-local-port",
+            "18157",
+        ])
+        .expect("cluster eval with explicit ports should parse");
+        match cli.command {
+            Some(Command::Cluster {
+                action:
+                    ClusterAction::Eval {
+                        listen_port,
+                        valkey_local_port,
+                        api_local_port,
+                        ..
+                    },
+            }) => {
+                assert_eq!(listen_port, 18155);
+                assert_eq!(valkey_local_port, 18156);
+                assert_eq!(api_local_port, 18157);
             }
             _ => panic!("expected cluster eval command"),
         }
@@ -4934,11 +5310,12 @@ mod tests {
             namespace: "curie".into(),
             release: "curie".into(),
         };
-        let (url, key) = resolve_cluster_conn(conn)
+        let (url, key, port_forward) = resolve_cluster_conn(conn, false)
             .await
             .expect("explicit conn resolves");
         assert_eq!(url, "https://api.example.test");
         assert_eq!(key, "real-release-key");
+        assert!(port_forward.is_none());
     }
 
     #[test]
@@ -5136,6 +5513,62 @@ mod tests {
         // local budget/kill/resume are the mirrored lifecycle verbs.
         assert!(Cli::try_parse_from(["curie", "local", "budget", "gh", "--limit", "1"]).is_ok());
         assert!(Cli::try_parse_from(["curie", "local", "kill", "gh", "--yes"]).is_ok());
+    }
+
+    #[test]
+    fn local_memory_add_parses_agent_and_content() {
+        let cli = Cli::try_parse_from([
+            "curie",
+            "local",
+            "memory",
+            "translation-bot",
+            "--add",
+            "ask before translating to French",
+        ])
+        .expect("local memory --add should parse");
+        match cli.command {
+            Some(Command::Local {
+                action: LocalAction::Memory { target, add },
+            }) => {
+                assert_eq!(target.agent, "translation-bot");
+                assert_eq!(add.as_deref(), Some("ask before translating to French"));
+            }
+            _ => panic!("expected local memory"),
+        }
+    }
+
+    #[test]
+    fn cluster_memory_add_parses_agent_and_content() {
+        let cli = Cli::try_parse_from([
+            "curie",
+            "cluster",
+            "memory",
+            "translation-bot",
+            "--add",
+            "ask before translating to French",
+        ])
+        .expect("cluster memory --add should parse");
+        match cli.command {
+            Some(Command::Cluster {
+                action: ClusterAction::Memory { target, add },
+            }) => {
+                assert_eq!(target.agent, "translation-bot");
+                assert_eq!(add.as_deref(), Some("ask before translating to French"));
+            }
+            _ => panic!("expected cluster memory"),
+        }
+    }
+
+    #[test]
+    fn local_memory_list_still_parses_without_add() {
+        assert!(matches!(
+            Cli::try_parse_from(["curie", "local", "memory", "translation-bot"])
+                .expect("local memory list")
+                .command,
+            Some(Command::Local {
+                action: LocalAction::Memory { add: None, .. }
+            })
+        ));
     }
 
     #[test]

@@ -150,6 +150,32 @@ def test_the_installation_is_discovered_not_configured(private_key: str, github:
     assert "github_app_installation_id" not in Settings.model_fields
 
 
+def test_a_valid_repository_is_preserved_in_app_lookup_and_token_scope(
+    private_key: str, github: Recorder
+) -> None:
+    repo = "Octo-Corp/repo.name_with-parts"
+
+    GitHubCredentials(settings=app_settings(private_key)).token_for(repo)
+
+    lookup = [call for call in github.calls if call[1].endswith("/installation")]
+    mint = [call for call in github.calls if call[1].endswith("/access_tokens")]
+    assert lookup[0][1] == f"https://api.github.com/repos/{repo}/installation"
+    assert mint[0][2] == {"repositories": ["repo.name_with-parts"]}
+
+
+def test_invalid_repo_full_name_never_reaches_github_app_http(
+    private_key: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorder = Recorder()
+    monkeypatch.setattr("curie_api.github_app.httpx.Client", serve(recorder.handle))
+    creds = GitHubCredentials(settings=app_settings(private_key))
+
+    with pytest.raises(GitHubAppError):
+        creds.token_for("octo/../escape?token=x")
+
+    assert recorder.calls == []
+
+
 # --------------------------------------------------------------------------- #
 # Caching
 # --------------------------------------------------------------------------- #

@@ -19,6 +19,7 @@ pub mod discover;
 pub mod docker;
 pub mod doctor;
 pub mod eval_init;
+pub mod eval_sampling;
 pub mod evals;
 pub mod examples;
 pub mod exit;
@@ -29,6 +30,7 @@ pub mod interactive;
 pub mod local;
 pub mod message;
 pub mod migrate_store;
+pub mod modelpin;
 pub mod ndjson;
 pub mod observability;
 pub mod ops;
@@ -49,3 +51,6 @@ pub mod state;
 pub mod ui;
 
 pub use retired::retired_hint;
+
+#[cfg(test)]
+pub(crate) static PROCESS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

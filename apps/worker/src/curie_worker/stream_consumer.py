@@ -73,6 +73,7 @@ class DeliverySpec:
     max_delivery: int
     dead_letter_maxlen: int
     reclaim_min_idle_ms: int
+    dead_consumer_idle_ms: int
     read_count: int
     cap_scan_page: int
     telemetry_source: str
@@ -383,6 +384,82 @@ class StreamConsumer:
             cursor = f"({pending[-1]['message_id']}"
         return over_cap
 
+    async def _reclaim_dead_consumers(self, over_cap: set[str]) -> int:
+        """Claim pending entries from consumers that have gone quiet.
+
+        ``reclaim_min_idle_ms`` is an *entry* idle and must stay long enough
+        that a healthy in-flight turn is not stolen from a live replica.
+        Consumer idle is independent: a live worker keeps issuing XREADGROUP
+        every ``read_block_ms`` while its handler runs, so a peer whose last
+        group interaction is older than ``dead_consumer_idle_ms`` is gone, and
+        its PEL can be taken without waiting the 15-minute entry window
+        (#1532).
+        """
+        try:
+            consumers = await self._redis.xinfo_consumers(self._spec.stream, self._spec.group)
+        except ResponseError:
+            return 0
+        reclaimed = 0
+        for info in consumers:
+            if self._stop.is_set():
+                break
+            name = str(info["name"])
+            if name == self._spec.consumer:
+                continue
+            if int(info.get("pending") or 0) <= 0:
+                continue
+            if int(info.get("idle") or 0) < self._spec.dead_consumer_idle_ms:
+                continue
+            try:
+                reclaimed += await self._claim_consumer_pending(name, over_cap)
+            except Exception:
+                self._spec.logger.exception(
+                    "dead-consumer reclaim failed for %s on stream %s; left pending",
+                    name,
+                    self._spec.stream,
+                )
+        return reclaimed
+
+    async def _claim_consumer_pending(self, name: str, over_cap: set[str]) -> int:
+        """XCLAIM one dead consumer's pending page and dispatch each entry."""
+        reclaimed = 0
+        cursor = "-"
+        page_size = self._spec.read_count
+        while not self._stop.is_set():
+            rows = await self._redis.xpending_range(
+                self._spec.stream,
+                self._spec.group,
+                min=cursor,
+                max="+",
+                count=page_size,
+                consumername=name,
+            )
+            if not rows:
+                break
+            ids = [
+                str(row["message_id"])
+                for row in rows
+                if str(row["message_id"]) not in self._inflight_ids
+                and str(row["message_id"]) not in over_cap
+            ]
+            if ids:
+                claimed = await self._redis.xclaim(
+                    self._spec.stream,
+                    self._spec.group,
+                    self._spec.consumer,
+                    0,
+                    ids,
+                )
+                for entry_id, fields in cast("list[StreamEntry]", claimed or []):
+                    if entry_id in self._inflight_ids or entry_id in over_cap:
+                        continue
+                    reclaimed += 1
+                    await self._spec.handler(entry_id, dict(fields))
+            if len(rows) < page_size:
+                break
+            cursor = f"({rows[-1]['message_id']}"
+        return reclaimed
+
     async def _reclaim_once(self) -> int:
         """Reclaim entries pending too long from any (dead) consumer and retry.
 
@@ -391,9 +468,12 @@ class StreamConsumer:
         XAUTOCLAIM still claims an over-cap entry whose dead-letter failed (it is
         still pending), so the ids it reports are skipped rather than dispatched:
         the cap binds even when the graveyard is unwritable.
+
+        Dead consumers are claimed by consumer idle first so a rollout that
+        strands a PEL does not wait ``reclaim_min_idle_ms``.
         """
         over_cap = await self._dead_letter_over_cap()
-        reclaimed = 0
+        reclaimed = await self._reclaim_dead_consumers(over_cap)
         cursor: str = "0-0"
         while not self._stop.is_set():
             raw = await self._redis.xautoclaim(

@@ -121,8 +121,8 @@ That set is not hand-maintained prose: `cli/schema/index.json` carries one
 - **Committed JSON Schemas with a drift gate (since #841).** Each `to_json` is no
   longer schema-free: there are 45 committed schemas under `cli/schema/` with an
   index (`cli/schema/index.json`), a `syn`-based inventory gate over every `impl
-  CliOutput`, and per-family output validation — all 45 are validated against real
-  `to_json()` output across 69 tests in `cli/tests/json_contract.rs`. Those tests
+  CliOutput`, and per-family output validation — all 40 are validated against real
+  `to_json()` output across 70 tests in `cli/tests/json_contract.rs`. Those tests
   drive each output type's `to_json()` once per output variant rather than calling
   the pure builder functions behind it, so a variant whose `to_json()` arm drifts
   from the schema is caught even when the builder it delegates to still validates.

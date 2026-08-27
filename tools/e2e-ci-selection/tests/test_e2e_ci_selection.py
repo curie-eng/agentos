@@ -27,6 +27,21 @@ OUTPUT_KEYS = {
     "local-release": "local_release",
     "cluster": "cluster",
 }
+APPROVED_ROOT_DOCS = (
+    "AGENTS.md",
+    "ARCHITECTURE.md",
+    "CLAUDE.md",
+    "CODE_OF_CONDUCT.md",
+    "CONTRIBUTING.md",
+    "LICENSE",
+    "NOTICE",
+    "QUICKSTART.md",
+    "README.md",
+    "SECURITY.md",
+    "SUPPORT.md",
+    "TRADEMARKS.md",
+    "llms.txt",
+)
 
 
 def _invoke_selector(
@@ -121,11 +136,54 @@ def test_weather_and_enforcement_paths_select_every_tier(tmp_path: Path, path: s
     _assert_selection(tmp_path, path, TIERS)
 
 
-def test_ignored_unknown_and_union_selection_are_deterministic(tmp_path: Path) -> None:
-    ignored, ignored_output = _invoke_selector(tmp_path, "docs/example.md")
-    assert ignored.returncode == 0, ignored.stderr
-    assert ignored_output == _expected_output()
+@pytest.mark.parametrize(
+    "path",
+    [*APPROVED_ROOT_DOCS, "docs/example.md", "docs/guides/getting-started.md"],
+)
+def test_genuine_documentation_only_selects_no_runtime_e2e_tiers(
+    tmp_path: Path,
+    path: str,
+) -> None:
+    _assert_selection(tmp_path, path, ())
 
+
+@pytest.mark.parametrize(
+    ("path", "selected"),
+    [
+        (".github/e2e-selection.yaml", TIERS),
+        (".github/workflows/ci.yaml", TIERS),
+        (".github/workflows/README.md", TIERS),
+        (".github/action.yml", TIERS),
+        ("scripts/README.md", TIERS),
+        ("scripts/check-docs.sh", TIERS),
+        ("apps/api/README.md", ("local", "local-release", "cluster")),
+        ("apps/api/runtime-config.yaml", ("local", "local-release", "cluster")),
+        ("packages/plugin-format/README.md", TIERS),
+        ("packages/plugin-format/plugin.yaml", TIERS),
+        ("examples/weather/README.md", TIERS),
+        ("examples/weather/skill-config.yaml", TIERS),
+        ("tests/README.md", TIERS),
+        ("tests/selector-config.yaml", TIERS),
+        ("UNAPPROVED.md", TIERS),
+    ],
+)
+def test_non_allowlisted_paths_never_bypass_runtime_e2e_selection(
+    tmp_path: Path,
+    path: str,
+    selected: tuple[str, ...],
+) -> None:
+    _assert_selection(tmp_path, path, selected)
+
+
+def test_mixed_root_documentation_and_runtime_diff_selects_runtime_tiers(
+    tmp_path: Path,
+) -> None:
+    completed, output = _invoke_selector(tmp_path, "ARCHITECTURE.md", "apps/api/main.py")
+    assert completed.returncode == 0, completed.stderr
+    assert output == _expected_output("local", "local-release", "cluster")
+
+
+def test_unknown_and_union_selection_are_deterministic(tmp_path: Path) -> None:
     unknown, unknown_output = _invoke_selector(tmp_path, "new-surface/module.py")
     assert unknown.returncode == 0, unknown.stderr
     assert unknown_output == _expected_output(*TIERS)
@@ -389,6 +447,30 @@ def _run_aggregate(
         text=True,
         check=False,
     )
+
+
+def test_e2e_required_validates_docs_only_ladder_skips(tmp_path: Path) -> None:
+    selected, output = _invoke_selector(tmp_path, "ARCHITECTURE.md")
+    assert selected.returncode == 0, selected.stderr
+    assert output == _expected_output()
+    outputs = dict(line.split("=", maxsplit=1) for line in output.splitlines())
+
+    skipped = _run_aggregate(
+        skill_selected=outputs["skill"],
+        local_selected=outputs["local"],
+        local_release_selected=outputs["local_release"],
+        cluster_selected=outputs["cluster"],
+    )
+    assert skipped.returncode == 0, skipped.stdout + skipped.stderr
+
+    unexpected_result = _run_aggregate(
+        skill_selected=outputs["skill"],
+        local_selected=outputs["local"],
+        local_release_selected=outputs["local_release"],
+        cluster_selected=outputs["cluster"],
+        skill_local_result="success",
+    )
+    assert unexpected_result.returncode != 0
 
 
 @pytest.mark.parametrize(

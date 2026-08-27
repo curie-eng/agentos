@@ -27,8 +27,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from typing import TYPE_CHECKING, TypeVar, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 from urllib.parse import urlsplit
 
 import aiohttp
@@ -104,6 +105,35 @@ _DEFAULT_PORTS = {"http": 80, "https": 443}
 _TrustedOrigin = tuple[str, str, int | None]
 
 
+# Slack names a thread by its parent message's timestamp: `<seconds>.<micros>`.
+_SLACK_TS = re.compile(r"^\d+\.\d+$")
+
+
+def _thread_ts(conversation_id: str | None) -> str | None:
+    """The Slack thread this conversation id names, or None when it names none.
+
+    ``ReplyTarget.conversation_id`` is "in the channel's own terms"
+    (``channel_protocol.reply``), and for a Slack-ingress turn those terms are the
+    parent message's ts -- which is why it used to be passed straight through as
+    ``thread_ts``.
+
+    A TRIGGERED turn's conversation id is not a ts. ``POST /hooks/{agent}/{name}``
+    mints ``hook:<agent>:<name>``, deliberately disjoint from Slack thread ids so a
+    hook can never land inside a human conversation. Sent as ``thread_ts`` that
+    string makes Slack refuse the entire delivery with ``invalid_thread_ts``, and it
+    does so AFTER the turn has run: the work is done, the money is spent, and the
+    answer is dropped on the floor.
+
+    So anything that is not a timestamp names no thread. The reply then posts at
+    channel level and the ts it mints becomes the ``reply_ref`` the rest of the turn
+    edits, which is the placeholder-less path ADR-0079 already describes.
+    """
+
+    if conversation_id is None or not _SLACK_TS.match(conversation_id):
+        return None
+    return conversation_id
+
+
 class UntrustedSlackEndpointError(RuntimeError):
     """A turn named a Slack endpoint outside the configured Slack origin.
 
@@ -149,11 +179,11 @@ def _configured_origins(origins: Sequence[str]) -> set[_TrustedOrigin]:
 
     An entry that names a PORT keeps it and is matched exactly. An entry that
     omits the port (``http://host.docker.internal``) carries ``None``, which
-    trusts any port on that scheme+host: the CLI's stub binds an EPHEMERAL port
-    on `curie chat` and on ``cluster message --listen-port 0``, so there is no
-    port an operator could write down in advance. It is a dev affordance and
-    nothing else -- it widens trust to every port on a named host, so it belongs
-    on a loopback or docker-host name, never in production.
+    trusts any port on that scheme and host. The CLI stub uses an EPHEMERAL
+    callback port by default for ``cluster message``, so an operator must use a
+    portless origin such as ``http://10.0.0.7`` for a LAN or kind callback host
+    to admit the kernel assigned port. This is dev only because it trusts every
+    port on that exact host. Leave the override empty in production.
     """
     configured: set[_TrustedOrigin] = set()
     for raw in origins:
@@ -176,6 +206,42 @@ def _nav_pack(nav: NavAffordance | None) -> NavPack | None:
     if nav is None:
         return None
     return NavPack(enabled=True, hub_label=nav.label, hub_command=nav.command)
+
+
+async def _post_with_block_fallback(
+    client: AsyncWebClient,
+    *,
+    channel: str,
+    text: str,
+    blocks: list[dict[str, Any]] | None,
+    thread_ts: str | None,
+    client_msg_id: str | None = None,
+) -> AsyncSlackResponse:
+    try:
+        if blocks is not None:
+            return await client.chat_postMessage(
+                channel=channel,
+                text=text,
+                blocks=blocks,
+                thread_ts=thread_ts,
+                client_msg_id=client_msg_id,
+            )
+        return await client.chat_postMessage(
+            channel=channel,
+            text=text,
+            thread_ts=thread_ts,
+            client_msg_id=client_msg_id,
+        )
+    except SlackApiError:
+        if blocks is None:
+            raise
+        logger.warning("chat_postMessage with blocks rejected; retrying text-only")
+        return await client.chat_postMessage(
+            channel=channel,
+            text=text,
+            thread_ts=thread_ts,
+            client_msg_id=client_msg_id,
+        )
 
 
 # "Unreachable" reply-endpoint errors (#530): the endpoint's HOST did not answer
@@ -248,7 +314,7 @@ class SlackReplyAdapter:
         if isinstance(event, TurnStatus):
             await self._set_status(
                 channel=target.address,
-                thread_ts=target.conversation_id or "",
+                thread_ts=_thread_ts(target.conversation_id) or "",
                 status=event.status,
                 endpoint=endpoint,
             )
@@ -287,7 +353,7 @@ class SlackReplyAdapter:
                 # placeholder-less turn into a silent delivery failure.
                 ref = await self._post_text(
                     channel=target.address,
-                    thread_ts=target.conversation_id,
+                    thread_ts=_thread_ts(target.conversation_id),
                     text=event.text or "",
                     nav=event.nav,
                     endpoint=endpoint,
@@ -308,7 +374,7 @@ class SlackReplyAdapter:
                 channel=target.address,
                 message=event.message,
                 requested_by=event.requested_by,
-                thread_ts=target.conversation_id,
+                thread_ts=_thread_ts(target.conversation_id),
                 endpoint=endpoint,
             )
             return ReplyAck(ref=ref)
@@ -535,30 +601,15 @@ class SlackReplyAdapter:
         """
         rendered_text, blocks = render(text, _nav_pack(nav))
 
-        async def op(client: AsyncWebClient) -> AsyncSlackResponse:
-            try:
-                if blocks is not None:
-                    return await client.chat_postMessage(
-                        channel=channel,
-                        text=rendered_text,
-                        blocks=blocks,
-                        thread_ts=thread_ts,
-                    )
-                return await client.chat_postMessage(
-                    channel=channel, text=rendered_text, thread_ts=thread_ts
-                )
-            except SlackApiError as exc:
-                if blocks is None:
-                    raise
-                _record_reply_retry("post", _slack_retry_class(exc))
-                logger.warning("chat_postMessage with blocks rejected; retrying text-only")
-                return await client.chat_postMessage(
-                    channel=channel, text=rendered_text, thread_ts=thread_ts
-                )
-
         response = await self._with_transport_fallback(
             endpoint,
-            op,
+            lambda client: _post_with_block_fallback(
+                client,
+                channel=channel,
+                text=rendered_text,
+                blocks=blocks,
+                thread_ts=thread_ts,
+            ),
             describe="chat_postMessage",
             operation="post",
             best_effort_unreachable=best_effort_unreachable,
@@ -608,38 +659,18 @@ class SlackReplyAdapter:
         # A rejected Block Kit payload falls back to text-only, mirroring
         # ``update``: the card is the resolve UI, but a plain-text notice still
         # beats losing the message (the API resolve path works regardless).
-        async def op(client: AsyncWebClient) -> AsyncSlackResponse:
-            try:
-                if blocks is not None:
-                    return await client.chat_postMessage(
-                        channel=channel,
-                        text=text,
-                        blocks=blocks,
-                        thread_ts=thread_ts,
-                        client_msg_id=client_msg_id,
-                    )
-                return await client.chat_postMessage(
-                    channel=channel,
-                    text=text,
-                    thread_ts=thread_ts,
-                    client_msg_id=client_msg_id,
-                )
-            except SlackApiError as exc:
-                if blocks is None:
-                    raise
-                _record_reply_retry("post", _slack_retry_class(exc))
-                logger.warning(
-                    "chat_postMessage with blocks rejected; retrying text-only"
-                )
-                return await client.chat_postMessage(
-                    channel=channel,
-                    text=text,
-                    thread_ts=thread_ts,
-                    client_msg_id=client_msg_id,
-                )
-
         response = await self._with_transport_fallback(
-            endpoint, op, describe="chat_postMessage", operation="post"
+            endpoint,
+            lambda client: _post_with_block_fallback(
+                client,
+                channel=channel,
+                text=text,
+                blocks=blocks,
+                thread_ts=thread_ts,
+                client_msg_id=client_msg_id,
+            ),
+            describe="chat_postMessage",
+            operation="post",
         )
         ts = response.get("ts")
         return str(ts) if ts else None
@@ -675,11 +706,8 @@ class SlackReplyAdapter:
         # expiry notice still beats leaving live-looking buttons.
         async def op(client: AsyncWebClient) -> None:
             try:
-                await client.chat_update(
-                    channel=channel, ts=ts, text=text, blocks=blocks
-                )
-            except SlackApiError as exc:
-                _record_reply_retry("update", _slack_retry_class(exc))
+                await client.chat_update(channel=channel, ts=ts, text=text, blocks=blocks)
+            except SlackApiError:
                 logger.warning(
                     "card chat_update with blocks rejected for %s; retrying text-only",
                     ts,

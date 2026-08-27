@@ -9,10 +9,15 @@
 //! them. That split keeps the argv construction unit-testable with no cluster
 //! and gives one place to mask secrets before anything is printed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::process::Stdio;
+#[cfg(unix)]
+use std::sync::{LazyLock, Mutex, MutexGuard, OnceLock};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use tokio::process::Command;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::process::{Child, ChildStdout, Command};
 
 /// One external command: the program plus its argument vector, with secret
 /// argument values tagged so they can be masked in any printed form.
@@ -25,6 +30,10 @@ pub struct OpsCommand {
 }
 
 /// A single argv token.
+///
+/// `HelmSetExpression` preserves a complete `--set` or `--set-string`
+/// expression for execution while masking credential shaped values in every
+/// rendered form.
 ///
 /// `SecretSet` is a `helm --set key=value` whose value is a credential: the real
 /// value is used for execution, but only a masked prefix is ever printed (dry-run
@@ -40,6 +49,7 @@ pub struct OpsCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CmdArg {
     Plain(String),
+    HelmSetExpression(String),
     SecretSet { key: String, value: String },
     SecretValuesFile(Vec<(String, String)>),
 }
@@ -53,6 +63,7 @@ impl CmdArg {
     fn value_tokens(&self) -> Vec<String> {
         match self {
             CmdArg::Plain(s) => vec![s.clone()],
+            CmdArg::HelmSetExpression(expression) => vec![expression.clone()],
             CmdArg::SecretSet { key, value } => vec![format!("{key}={value}")],
             CmdArg::SecretValuesFile(_) => {
                 debug_assert!(
@@ -71,6 +82,9 @@ impl CmdArg {
     fn masked_tokens(&self) -> Vec<String> {
         match self {
             CmdArg::Plain(s) => vec![s.clone()],
+            CmdArg::HelmSetExpression(expression) => {
+                vec![mask_helm_set_expression(expression)]
+            }
             CmdArg::SecretSet { key, value } => vec![format!("{key}={}", mask_secret(value))],
             CmdArg::SecretValuesFile(pairs) => {
                 let masked: Vec<String> = pairs
@@ -141,9 +155,10 @@ impl OpsCommand {
     /// Materialize every [`CmdArg::SecretValuesFile`] into a private (0600)
     /// temporary values file and return an equivalent command whose secrets are
     /// delivered via `helm -f <path>` instead of the argv, plus RAII guards that
-    /// delete those files when dropped (so they are cleaned up even if the helm
-    /// run fails). Commands without a secret values file are returned unchanged
-    /// with no guards. Hold the returned guards until the process has finished.
+    /// delete any remaining files when dropped. The signal cleanup handler also
+    /// removes registered files on SIGINT or SIGTERM. Commands without a secret
+    /// values file are returned unchanged with no guards. Hold the returned guards
+    /// until the process has finished.
     pub(crate) fn materialize_secret_files(
         &self,
     ) -> Result<(OpsCommand, Vec<SecretValuesFileGuard>)> {
@@ -172,8 +187,124 @@ impl OpsCommand {
     }
 }
 
-/// A 0600 temporary helm values file holding secret values; deleted on drop so
-/// the secret never outlives the `helm` invocation, even on error.
+#[cfg(unix)]
+#[derive(Default)]
+struct SecretFileRegistry {
+    terminating: bool,
+    paths: BTreeSet<std::path::PathBuf>,
+}
+
+#[cfg(unix)]
+static SECRET_FILE_REGISTRY: LazyLock<Mutex<SecretFileRegistry>> =
+    LazyLock::new(|| Mutex::new(SecretFileRegistry::default()));
+
+#[cfg(unix)]
+static SECRET_SIGNAL_INSTALLATION: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+
+#[cfg(unix)]
+fn lock_secret_file_registry() -> MutexGuard<'static, SecretFileRegistry> {
+    SECRET_FILE_REGISTRY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(unix)]
+fn ensure_secret_signal_cleanup() -> Result<()> {
+    match SECRET_SIGNAL_INSTALLATION
+        .get_or_init(|| install_secret_signal_cleanup().map_err(|error| error.to_string()))
+    {
+        Ok(()) => Ok(()),
+        Err(error) => bail!("installing secret values signal cleanup: {error}"),
+    }
+}
+
+#[cfg(not(unix))]
+fn ensure_secret_signal_cleanup() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn install_secret_signal_cleanup() -> std::io::Result<()> {
+    let mut signals = signal_hook::iterator::Signals::new([
+        signal_hook::consts::signal::SIGINT,
+        signal_hook::consts::signal::SIGTERM,
+    ])?;
+    std::thread::Builder::new()
+        .name("curie-secret-cleanup".to_string())
+        .spawn(move || {
+            if let Some(signal) = signals.forever().next() {
+                terminate_after_secret_cleanup(signal);
+            }
+        })?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn terminate_after_secret_cleanup(signal: i32) -> ! {
+    {
+        let mut registry = lock_secret_file_registry();
+        registry.terminating = true;
+        for path in std::mem::take(&mut registry.paths) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    test_mark_coordination("CURIE_TEST_SECRET_SIGNAL_CLEANED");
+    test_wait_for_coordination("CURIE_TEST_SECRET_RESUME_SIGNAL");
+
+    let _ = signal_hook::low_level::emulate_default_handler(signal);
+    signal_hook::low_level::exit(128 + signal);
+}
+
+#[cfg(unix)]
+fn park_terminating_secret_writer() -> ! {
+    test_mark_coordination("CURIE_TEST_SECRET_WRITER_PARKED");
+    loop {
+        std::thread::park();
+    }
+}
+
+#[cfg(debug_assertions)]
+fn test_mark_coordination(env_name: &str) {
+    if let Some(path) = std::env::var_os(env_name).map(std::path::PathBuf::from) {
+        let _ = std::fs::write(path, b"ready");
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn test_mark_coordination(_env_name: &str) {}
+
+#[cfg(debug_assertions)]
+fn test_wait_for_coordination(env_name: &str) {
+    if let Some(path) = std::env::var_os(env_name).map(std::path::PathBuf::from) {
+        while !path.exists() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn test_wait_for_coordination(_env_name: &str) {}
+
+#[cfg(debug_assertions)]
+fn test_pause_after_first_secret_file() {
+    static PAUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    if std::env::var_os("CURIE_TEST_SECRET_FIRST_FILE_WRITTEN").is_none()
+        || PAUSED.swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        return;
+    }
+    test_mark_coordination("CURIE_TEST_SECRET_FIRST_FILE_WRITTEN");
+    test_wait_for_coordination("CURIE_TEST_SECRET_RESUME_WRITER");
+}
+
+#[cfg(not(debug_assertions))]
+fn test_pause_after_first_secret_file() {}
+
+/// A 0600 temporary helm values file holding secret values. Signal cleanup
+/// removes it on SIGINT or SIGTERM; `Drop` removes it on normal completion or
+/// error, so the secret never outlives the `helm` invocation.
 pub(crate) struct SecretValuesFileGuard {
     path: std::path::PathBuf,
 }
@@ -184,40 +315,83 @@ impl SecretValuesFileGuard {
     /// with restrictive permissions atomically so the secret is never briefly
     /// world-readable.
     fn write(pairs: &[(String, String)]) -> Result<Self> {
+        ensure_secret_signal_cleanup()?;
+
         let doc = nest_dotted_keys(pairs);
         let body = serde_json::to_vec(&doc).context("serializing secret helm values")?;
 
         let mut path = std::env::temp_dir();
         path.push(format!("curie-helm-values-{}.yaml", uuid::Uuid::new_v4()));
 
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create_new(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
+            let mut registry = lock_secret_file_registry();
+            if registry.terminating {
+                drop(registry);
+                park_terminating_secret_writer();
+            }
+            if !registry.paths.insert(path.clone()) {
+                bail!(
+                    "secret helm values file path collision at {}",
+                    path.display()
+                );
+            }
+            if let Err(error) = create_secret_values_file(&path, &body) {
+                let _ = std::fs::remove_file(&path);
+                registry.paths.remove(&path);
+                return Err(error);
+            }
         }
-        let mut file = opts
-            .open(&path)
-            .with_context(|| format!("creating secret helm values file {}", path.display()))?;
-        // Belt-and-suspenders on platforms where create-time mode is not honored.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-                .with_context(|| format!("securing secret helm values file {}", path.display()))?;
+
+        #[cfg(not(unix))]
+        if let Err(error) = create_secret_values_file(&path, &body) {
+            let _ = std::fs::remove_file(&path);
+            return Err(error);
         }
-        use std::io::Write;
-        file.write_all(&body)
-            .with_context(|| format!("writing secret helm values file {}", path.display()))?;
-        Ok(Self { path })
+
+        let guard = Self { path };
+        test_pause_after_first_secret_file();
+        Ok(guard)
     }
+}
+
+fn create_secret_values_file(path: &std::path::Path, body: &[u8]) -> Result<()> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts
+        .open(path)
+        .with_context(|| format!("creating secret helm values file {}", path.display()))?;
+    // Belt-and-suspenders on platforms where create-time mode is not honored.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("securing secret helm values file {}", path.display()))?;
+    }
+    use std::io::Write;
+    file.write_all(body)
+        .with_context(|| format!("writing secret helm values file {}", path.display()))?;
+    Ok(())
 }
 
 impl Drop for SecretValuesFileGuard {
     fn drop(&mut self) {
         // Best-effort cleanup; nothing actionable if the temp file is already gone.
-        let _ = std::fs::remove_file(&self.path);
+        #[cfg(unix)]
+        {
+            let mut registry = lock_secret_file_registry();
+            let _ = std::fs::remove_file(&self.path);
+            registry.paths.remove(&self.path);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -256,10 +430,12 @@ pub(crate) fn secret_set(key: &str, value: &str) -> CmdArg {
     }
 }
 
-/// Mask a secret for display: the first 8 characters, then `***`. Long enough to
-/// recognise a token by its prefix (e.g. `xoxb-...`), short enough to leak
-/// nothing usable.
+/// Mask a secret for display. Values of eight characters or fewer are fully
+/// masked; longer values retain the first eight characters for recognition.
 pub fn mask_secret(value: &str) -> String {
+    if value.chars().nth(8).is_none() {
+        return "***".to_string();
+    }
     let shown: String = value.chars().take(8).collect();
     format!("{shown}***")
 }
@@ -544,6 +720,25 @@ pub fn default_route_egress_warning(cidrs: &[String]) -> Option<String> {
     ))
 }
 
+/// Credential prefixes whose runtime routing selects one unambiguous provider.
+/// Keep this aligned with `runner/src/curie_runner/sdk_auth.py`: credentials
+/// outside these exact prefixes do not carry enough information to infer an
+/// egress destination.
+const CREDENTIAL_PREFIX_PROVIDERS: &[(&str, &str)] =
+    &[("sk-ant-", "anthropic"), ("sk-or-", "openrouter")];
+
+/// Return the provider unambiguously selected by a credential prefix.
+///
+/// Callers that inspect a credential must discard it after deriving this
+/// non-secret provider name; it is safe to render the returned value but never
+/// the credential itself.
+pub fn provider_from_credential_prefix(credential: &str) -> Option<&'static str> {
+    CREDENTIAL_PREFIX_PROVIDERS
+        .iter()
+        .find(|(prefix, _)| credential.starts_with(prefix))
+        .map(|(_, provider)| *provider)
+}
+
 /// The canonical model providers `--allow-egress-host` accepts, each paired with
 /// the API hostname(s) its runner must reach, in the order shown in help and
 /// error text. The single source of truth for both the accepted-provider set and
@@ -635,7 +830,12 @@ fn validate_credential_egress_consistency(
         return Ok(());
     }
 
-    let explicit = opts.allow_egress_host.join(", ");
+    let explicit = opts
+        .allow_egress_host
+        .iter()
+        .map(|provider| format!("--allow-egress-host {provider}"))
+        .collect::<Vec<_>>()
+        .join(" ");
     Err(crate::exit::CliError::usage(format!(
         "the configured model credential identifies `{detected}`, but `--allow-egress-host` permits only: {explicit}"
     ))
@@ -1022,10 +1222,18 @@ fn random_hex(n_bytes: usize) -> Result<String> {
     Ok(out)
 }
 
-/// The operator's `--set` arguments split into raw `(key, value)` halves: the
-/// single parser behind [`operator_set_keys`] and
-/// [`set_passthrough_leaks_github_token`], though not the only reader of this
-/// grammar in the file ([`explicit_runner_model`] hand-rolls a last-wins
+/// Split one Helm set element into raw `(key, value)` halves. This is the one
+/// entry parser shared by rendering and the consumers of operator sets.
+fn operator_set_entry(part: &str) -> Option<(&str, &str)> {
+    part.split_once('=')
+}
+
+/// The operator's `--set` arguments split into raw `(key, value)` halves for
+/// [`operator_set_keys`] and [`set_passthrough_leaks_github_token`]. Rendering
+/// uses the separate [`mask_helm_set_expression`] parser, which preserves
+/// escaped commas and brace lists while masking credential-shaped values; do
+/// not reuse this naive split for rendering. This is not the only reader of
+/// this grammar in the file ([`explicit_runner_model`] hand-rolls a last-wins
 /// prefix match with different semantics, and is deliberately left alone).
 /// Handles both repeated
 /// `--set` flags and helm's comma-joined `a=1,b=2` form; an element with no `=`
@@ -1039,8 +1247,62 @@ fn random_hex(n_bytes: usize) -> Result<String> {
 fn operator_set_entries(sets: &[String]) -> Vec<(&str, &str)> {
     sets.iter()
         .flat_map(|s| s.split(','))
-        .filter_map(|part| part.split_once('='))
+        .filter_map(operator_set_entry)
         .collect()
+}
+
+/// Render one complete Helm set expression while preserving every executed
+/// byte except credential values, which are replaced by their standard mask.
+fn mask_helm_set_expression(expression: &str) -> String {
+    let render_part = |part: &str| match operator_set_entry(part) {
+        Some((key, value)) if !value.is_empty() && is_secret_value_key(key.trim()) => {
+            format!("{key}={}", mask_secret(value))
+        }
+        _ => part.to_string(),
+    };
+
+    let mut rendered = String::with_capacity(expression.len());
+    let mut start = 0;
+    let mut in_brace_list = false;
+    let mut escaped = false;
+    let mut has_equals = false;
+    let mut at_value_start = false;
+
+    for (index, ch) in expression.char_indices() {
+        if escaped {
+            escaped = false;
+            at_value_start = false;
+            continue;
+        }
+
+        match ch {
+            '\\' => escaped = true,
+            '=' if !has_equals => {
+                has_equals = true;
+                at_value_start = true;
+            }
+            '{' if at_value_start => {
+                in_brace_list = true;
+                at_value_start = false;
+            }
+            '}' if in_brace_list => in_brace_list = false,
+            ',' if !in_brace_list => {
+                rendered.push_str(&render_part(&expression[start..index]));
+                rendered.push(',');
+                start = index + ch.len_utf8();
+                has_equals = false;
+                at_value_start = false;
+            }
+            _ => at_value_start = false,
+        }
+    }
+
+    if in_brace_list {
+        return "<secret helm set expression>".to_string();
+    }
+
+    rendered.push_str(&render_part(&expression[start..]));
+    rendered
 }
 
 /// The bare value keys an operator already pinned through `--set` (so the CLI
@@ -1068,6 +1330,32 @@ fn lookup_dotted(values: &serde_json::Value, dotted: &str) -> Option<String> {
 /// resurrected on the next plain `up`.
 fn preserved_value(existing: Option<&serde_json::Value>, key: &str) -> Option<String> {
     lookup_dotted(existing?, key).filter(|current| !current.is_empty())
+}
+
+/// Which Secret and key a direct-passthrough credential (issue #1759) should
+/// be read from, given the release's recorded Helm values: the operator's own
+/// `existingSecret` when one is configured for this key, otherwise `None` (the
+/// caller falls back to the chart's own release Secret and the published key
+/// name for this credential).
+///
+/// MUST stay the same decision as the chart's own BYO-wins precedence
+/// (`curie.secretRef.*` and the per-key if/else in
+/// `charts/curie/templates/{worker,dispatcher,api,agent-sandbox}.yaml`): a CLI
+/// read that resolves a different Secret than the workload's own env would
+/// report a plausible but wrong value, which is worse than reporting none.
+/// Pure and testable; the actual `helm get values` read stays in the async
+/// caller.
+fn resolve_existing_secret_ref(
+    existing: Option<&serde_json::Value>,
+    existing_secret_key: &str,
+    existing_secret_key_key: &str,
+    default_data_key: &str,
+) -> Option<(String, String)> {
+    let secret_name = lookup_dotted(existing?, existing_secret_key).filter(|s| !s.is_empty())?;
+    let data_key = lookup_dotted(existing?, existing_secret_key_key)
+        .filter(|k| !k.is_empty())
+        .unwrap_or_else(|| default_data_key.to_string());
+    Some((secret_name, data_key))
 }
 
 /// Re-supply the [`COMMS_MANAGED_KEYS`] a previous `cluster comms` recorded.
@@ -1252,6 +1540,7 @@ pub(crate) const MODEL_CREDENTIAL_KEY: &str = "agentSandbox.runner.credentials";
 pub(crate) const FAKE_MODEL_KEY: &str = "agentSandbox.runner.fakeModel";
 
 const ALLOWED_EGRESS_KEY: &str = "security.networkPolicy.allowedEgress";
+const WORKER_EXTRA_ENV_KEY: &str = "worker.extraEnv";
 
 fn key_is_or_descends_from(key: &str, parent: &str) -> bool {
     key == parent
@@ -1260,9 +1549,79 @@ fn key_is_or_descends_from(key: &str, parent: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with('[') || suffix.starts_with('.'))
 }
 
+fn escape_helm_set_string_value(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(ch, '\\' | ',' | '{' | '}') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
+fn helm_set_string_entries(expression: &str) -> Vec<(String, String)> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut in_brace_list = false;
+    let mut escaped = false;
+    let mut has_equals = false;
+    let mut at_value_start = false;
+
+    for (index, ch) in expression.char_indices() {
+        if escaped {
+            escaped = false;
+            at_value_start = false;
+            continue;
+        }
+
+        match ch {
+            '\\' => escaped = true,
+            '=' if !has_equals => {
+                has_equals = true;
+                at_value_start = true;
+            }
+            '{' if at_value_start => {
+                in_brace_list = true;
+                at_value_start = false;
+            }
+            '}' if in_brace_list => in_brace_list = false,
+            ',' if !in_brace_list => {
+                parts.push(&expression[start..index]);
+                start = index + ch.len_utf8();
+                has_equals = false;
+                at_value_start = false;
+            }
+            _ => at_value_start = false,
+        }
+    }
+    parts.push(&expression[start..]);
+
+    parts
+        .into_iter()
+        .filter_map(operator_set_entry)
+        .map(|(key, value)| {
+            let mut decoded = String::with_capacity(value.len());
+            let mut chars = value.chars();
+            while let Some(ch) = chars.next() {
+                if ch == '\\' {
+                    if let Some(next) = chars.next() {
+                        decoded.push(next);
+                    } else {
+                        decoded.push(ch);
+                    }
+                } else {
+                    decoded.push(ch);
+                }
+            }
+            (key.trim().to_string(), decoded)
+        })
+        .collect()
+}
+
 /// Carry the runner configuration recorded by a prior real model install into
 /// a plain rerun. Explicit inputs replace their recorded family.
-fn resolve_preserved_runner_values(
+fn resolve_preserved_runner_identity_values(
     opts: &mut UpOpts,
     existing: Option<&serde_json::Value>,
     operator_sets: &[String],
@@ -1284,13 +1643,41 @@ fn resolve_preserved_runner_values(
     {
         opts.model = preserved_value(existing, RUNNER_MODEL_KEY);
     }
+}
 
-    let egress_replaced = !opts.allow_egress_host.is_empty()
-        || !opts.allow_web_egress.is_empty()
-        || overridden
-            .iter()
-            .any(|key| key_is_or_descends_from(key, ALLOWED_EGRESS_KEY));
-    if egress_replaced {
+/// Carry an inferred gVisor posture into a later plain `cluster up`.
+///
+/// The RuntimeClass admission recovery writes `security.gvisor.mode=off` only
+/// on its retry. Helm records that successful retry, but a normal `up` is a
+/// full upgrade rather than `--reuse-values`; without re-supplying the recorded
+/// posture, the next run falls back to the chart's `auto` default and repeats
+/// the failed preflight. As with the other recorded-value families, an explicit
+/// operator setting owns the key and always wins.
+fn resolve_preserved_gvisor_mode_value(
+    opts: &mut UpOpts,
+    existing: Option<&serde_json::Value>,
+    operator_sets: &[String],
+) {
+    if operator_set_keys(operator_sets).contains(GVISOR_MODE_KEY) {
+        return;
+    }
+    if let Some(mode) = preserved_value(existing, GVISOR_MODE_KEY) {
+        opts.set.push(format!("{GVISOR_MODE_KEY}={mode}"));
+    }
+}
+
+/// Carry the worker environment recorded by a prior install into a plain rerun.
+/// Explicit inputs replace the recorded family.
+fn resolve_preserved_worker_extra_env_values(
+    opts: &mut UpOpts,
+    existing: Option<&serde_json::Value>,
+    operator_sets: &[String],
+) {
+    let overridden = operator_set_keys(operator_sets);
+    if overridden
+        .iter()
+        .any(|key| key_is_or_descends_from(key, WORKER_EXTRA_ENV_KEY))
+    {
         return;
     }
 
@@ -1298,20 +1685,103 @@ fn resolve_preserved_runner_values(
     if let Some(values) = existing {
         crate::installation::flatten_values(values, "", &mut recorded);
     }
+    opts.set_string.extend(
+        recorded
+            .into_iter()
+            .filter(|(key, _)| key_is_or_descends_from(key, WORKER_EXTRA_ENV_KEY))
+            .map(|(key, value)| format!("{key}={}", escape_helm_set_string_value(&value))),
+    );
+}
+
+fn resolve_preserved_runner_egress_values(
+    opts: &mut UpOpts,
+    existing: Option<&serde_json::Value>,
+    operator_sets: &[String],
+    provider_was_inferred: bool,
+) -> (usize, BTreeSet<String>) {
+    let overridden = operator_set_keys(operator_sets);
+    let egress_replaced = (!opts.allow_egress_host.is_empty() && !provider_was_inferred)
+        || !opts.allow_web_egress.is_empty()
+        || overridden
+            .iter()
+            .any(|key| key_is_or_descends_from(key, ALLOWED_EGRESS_KEY));
+    if egress_replaced {
+        return (0, BTreeSet::new());
+    }
+
+    let mut recorded = BTreeMap::new();
+    if let Some(values) = existing {
+        crate::installation::flatten_values(values, "", &mut recorded);
+    }
+    let next_index = recorded
+        .keys()
+        .filter_map(|key| {
+            key.strip_prefix(ALLOWED_EGRESS_KEY)?
+                .strip_prefix('[')?
+                .split_once(']')?
+                .0
+                .parse::<usize>()
+                .ok()
+        })
+        .max()
+        .map_or(0, |index| index + 1);
+    let recorded_cidrs = recorded
+        .iter()
+        .filter_map(|(key, value)| {
+            let suffix = key.strip_prefix(ALLOWED_EGRESS_KEY)?.strip_prefix('[')?;
+            let (index, field) = suffix.split_once(']')?;
+            (index.parse::<usize>().is_ok() && field == ".cidr").then(|| value.clone())
+        })
+        .collect();
     opts.set.extend(
         recorded
             .into_iter()
             .filter(|(key, _)| key_is_or_descends_from(key, ALLOWED_EGRESS_KEY))
             .map(|(key, value)| format!("{key}={value}")),
     );
+    (next_index, recorded_cidrs)
+}
+
+fn resolve_provider_egress_for_up(opts: &mut UpOpts, resolve: bool) -> Result<()> {
+    if resolve && !opts.allow_egress_host.is_empty() && opts.resolved_egress_cidrs.is_empty() {
+        opts.resolved_egress_cidrs =
+            resolve_provider_egress_cidrs_for_current_environment(&opts.allow_egress_host)
+                .context("resolving named provider egress hosts")?;
+    }
+    Ok(())
+}
+
+fn reindex_inferred_provider_egress(
+    opts: &mut UpOpts,
+    start_index: usize,
+    recorded_cidrs: &BTreeSet<String>,
+) {
+    let resolved = std::mem::take(&mut opts.resolved_egress_cidrs);
+    for (offset, cidr) in resolved
+        .into_iter()
+        .filter(|cidr| !recorded_cidrs.contains(cidr))
+        .enumerate()
+    {
+        let index = start_index + offset;
+        opts.set
+            .push(format!("{ALLOWED_EGRESS_KEY}[{index}].cidr={cidr}"));
+        opts.set.push(format!(
+            "{ALLOWED_EGRESS_KEY}[{index}].ports[0].protocol=TCP"
+        ));
+        opts.set.push(format!(
+            "{ALLOWED_EGRESS_KEY}[{index}].ports[0].port={EGRESS_TCP_PORT}"
+        ));
+    }
 }
 
 /// Does a plain `cluster up` carry this key forward when nothing re-passes it?
 ///
 /// The honest half of `curie diff`. `up` does a FULL upgrade, so a key present
 /// on the release but absent from `curie.yaml` is normally reset to the chart
-/// default -- except for the families [`resolve_preserved_values`] and
-/// [`resolve_preserved_runner_values`] re-supply, which survive untouched.
+/// default -- except for the families [`resolve_preserved_values`],
+/// [`resolve_preserved_runner_identity_values`], and
+/// [`resolve_preserved_runner_egress_values`], and
+/// [`resolve_preserved_gvisor_mode_value`] re-supply, which survive untouched.
 /// Reporting those as removals would be the exact
 /// "proposing to delete what it did not create" failure ADR-0097 named.
 ///
@@ -1331,6 +1801,7 @@ pub fn is_preserved_by_up(key: &str) -> bool {
         || GITHUB_APP_MANAGED_KEYS.contains(&key)
         || REQUIRED_SECRETS.iter().any(|(k, _)| *k == key)
         || crate::sealing::SEALING_MANAGED_KEYS.contains(&key)
+        || key == GVISOR_MODE_KEY
 }
 
 /// Substrings that mark a chart key as carrying a credential.
@@ -1372,7 +1843,12 @@ const SECRET_KEY_MARKERS: &[&str] = &[
 /// is true of a renamed key, a legacy key, and an operator's own `--set`, none
 /// of which any list can enumerate in advance.
 pub fn is_secret_value_key(key: &str) -> bool {
-    if is_preserved_by_up(key) || key == GITHUB_TOKEN_KEY || key == MODEL_CREDENTIAL_KEY {
+    // Most preserve-on-up keys are credentials, but an inferred gVisor posture
+    // is ordinary safety configuration and must remain visible in `curie diff`.
+    if (is_preserved_by_up(key) && key != GVISOR_MODE_KEY)
+        || key == GITHUB_TOKEN_KEY
+        || key == MODEL_CREDENTIAL_KEY
+    {
         return true;
     }
     let lowered = key.to_ascii_lowercase();
@@ -1726,6 +2202,392 @@ mod release_secret_name_tests {
         assert_eq!(pick_release_secret(""), None);
         assert_eq!(pick_release_secret("sh.helm.release.v1.t.v1\n"), None);
         assert_eq!(pick_release_secret("only-connector-secrets\n"), None);
+    }
+}
+
+#[cfg(test)]
+mod api_key_discovery_tests {
+
+    // --- #1030: the worker Deployment lookup ---------------------------------
+
+    #[test]
+    fn the_worker_selector_does_not_guess_the_deployment_name() {
+        // The chart names it `{{ curie.fullname }}-worker`, which equals
+        // `<release>-worker` only when the release name contains the chart name.
+        // `acme-prod` renders `acme-prod-curie-worker`, and nameOverride moves it
+        // again. Selecting on labels is what `release_secret_name` already does.
+        let selector = worker_deployment_selector("acme-prod");
+        assert!(selector.contains("app.kubernetes.io/instance=acme-prod"));
+        assert!(selector.contains("app.kubernetes.io/component=worker"));
+        assert!(
+            !selector.contains("acme-prod-worker"),
+            "the selector must not encode a guessed name: {selector}"
+        );
+    }
+
+    #[test]
+    fn a_failed_lookup_is_unknown_and_never_reads_as_real_slack() {
+        // The distinction that keeps #1030 from returning in another shape. A
+        // kubectl failure is not evidence that the worker talks to real Slack, and
+        // treating it as such posts a real token wherever real Slack is while the
+        // worker edits through a proxy the CLI never saw.
+        assert_eq!(parse_slack_api_base(false, ""), SlackApiBase::Unknown);
+        assert_eq!(
+            parse_slack_api_base(false, "https://proxy.example/api"),
+            SlackApiBase::Unknown
+        );
+    }
+
+    #[test]
+    fn an_empty_successful_lookup_means_real_slack() {
+        // The chart renders SLACK_API_BASE_URL only when worker.slackApiBaseUrl is
+        // non-empty, so a clean empty result is the ordinary case, not a failure.
+        assert_eq!(parse_slack_api_base(true, ""), SlackApiBase::RealSlack);
+        assert_eq!(parse_slack_api_base(true, "  \n "), SlackApiBase::RealSlack);
+    }
+
+    #[test]
+    fn a_configured_base_is_returned_trimmed() {
+        assert_eq!(
+            parse_slack_api_base(true, "  https://proxy.example/api \n"),
+            SlackApiBase::Configured("https://proxy.example/api".to_string())
+        );
+    }
+
+    #[test]
+    fn two_containers_reporting_a_base_is_unknown_not_a_coin_flip() {
+        // Cannot happen in this chart today. If it ever does, picking one half is
+        // exactly the ambiguity this issue is about, so say so instead.
+        assert_eq!(
+            parse_slack_api_base(true, "https://a/api\nhttps://b/api\n"),
+            SlackApiBase::Unknown
+        );
+    }
+    use super::*;
+
+    struct EnvRestore {
+        path: Option<std::ffi::OsString>,
+        requested: Option<std::ffi::OsString>,
+        requested_default: Option<std::ffi::OsString>,
+        all: Option<std::ffi::OsString>,
+        all_default: Option<std::ffi::OsString>,
+        all_forbidden: Option<std::ffi::OsString>,
+        log: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (name, previous) in [
+                ("PATH", &self.path),
+                ("CURIE_TEST_HELM_REQUESTED", &self.requested),
+                ("CURIE_TEST_HELM_REQUESTED_DEFAULT", &self.requested_default),
+                ("CURIE_TEST_HELM_ALL", &self.all),
+                ("CURIE_TEST_HELM_ALL_DEFAULT", &self.all_default),
+                ("CURIE_TEST_HELM_ALL_FORBIDDEN", &self.all_forbidden),
+                ("CURIE_TEST_HELM_LOG", &self.log),
+            ] {
+                match previous {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    fn write_executable(path: &std::path::Path, body: &str) {
+        std::fs::write(path, body).expect("write fake cluster executable");
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(path)
+            .expect("read fake cluster executable metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).expect("make fake cluster executable runnable");
+    }
+
+    fn install_cluster_diagnosis_tools(tools: &std::path::Path) -> EnvRestore {
+        write_executable(
+            &tools.join("kubectl"),
+            r#"#!/bin/sh
+case "$*" in
+  *"get secret -l app.kubernetes.io/instance=curie"*)
+    printf '%s\n' 'curie-secrets'
+    ;;
+  *"get secret curie-secrets"*)
+    printf '%s\n' 'Error from server (NotFound): secrets "curie-secrets" not found' >&2
+    exit 1
+    ;;
+  *)
+    printf 'unexpected kubectl invocation: %s\n' "$*" >&2
+    exit 64
+    ;;
+esac
+"#,
+        );
+        write_executable(
+            &tools.join("helm"),
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> "$CURIE_TEST_HELM_LOG"
+case "$*" in
+  *"-n curie"*)
+    case "$*" in
+      *"--all"*) printf '%s\n' "$CURIE_TEST_HELM_REQUESTED" ;;
+      *) printf '%s\n' "${CURIE_TEST_HELM_REQUESTED_DEFAULT:-$CURIE_TEST_HELM_REQUESTED}" ;;
+    esac
+    ;;
+  *)
+    if [ "${CURIE_TEST_HELM_ALL_FORBIDDEN:-}" = 1 ]; then
+      printf '%s\n' 'forbidden: cannot list releases across namespaces' >&2
+      exit 1
+    fi
+    case "$*" in
+      *"--all"*) printf '%s\n' "$CURIE_TEST_HELM_ALL" ;;
+      *) printf '%s\n' "${CURIE_TEST_HELM_ALL_DEFAULT:-$CURIE_TEST_HELM_ALL}" ;;
+    esac
+    ;;
+esac
+"#,
+        );
+
+        let restore = EnvRestore {
+            path: std::env::var_os("PATH"),
+            requested: std::env::var_os("CURIE_TEST_HELM_REQUESTED"),
+            requested_default: std::env::var_os("CURIE_TEST_HELM_REQUESTED_DEFAULT"),
+            all: std::env::var_os("CURIE_TEST_HELM_ALL"),
+            all_default: std::env::var_os("CURIE_TEST_HELM_ALL_DEFAULT"),
+            all_forbidden: std::env::var_os("CURIE_TEST_HELM_ALL_FORBIDDEN"),
+            log: std::env::var_os("CURIE_TEST_HELM_LOG"),
+        };
+        let mut path = vec![tools.to_path_buf()];
+        path.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        std::env::set_var("PATH", std::env::join_paths(path).expect("join test PATH"));
+        restore
+    }
+
+    fn assert_state_was_read(log: &std::path::Path) {
+        let invocations = std::fs::read_to_string(log).expect("read Helm invocation log");
+        assert!(
+            invocations
+                .lines()
+                .any(|line| line == "list -n curie --all -o json"),
+            "the requested release state was not read: {invocations}"
+        );
+        assert!(
+            invocations
+                .lines()
+                .any(|line| line == "list -A --all -o json"),
+            "the all namespace release state was not read: {invocations}"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_key_failure_names_a_deployed_same_name_release_in_another_namespace() {
+        let _lock = crate::PROCESS_ENV_LOCK
+            .lock()
+            .expect("lock test environment");
+        let tools = tempfile::tempdir().expect("create fake cluster tools");
+        let _restore = install_cluster_diagnosis_tools(tools.path());
+        let log = tools.path().join("helm.log");
+        std::env::set_var("CURIE_TEST_HELM_LOG", &log);
+        std::env::set_var(
+            "CURIE_TEST_HELM_REQUESTED",
+            r#"[{"name":"curie","namespace":"curie","status":"failed"}]"#,
+        );
+        std::env::set_var(
+            "CURIE_TEST_HELM_ALL",
+            r#"[{"name":"curie","namespace":"curie","status":"failed"},{"name":"curie","namespace":"healthy","status":"deployed"}]"#,
+        );
+
+        let error = discover_api_key("curie", "curie")
+            .await
+            .expect_err("an unreadable secret must not yield an API key");
+        let message = error.to_string();
+
+        assert_eq!(
+            crate::exit::classify(&error).0,
+            crate::exit::ExitClass::Usage,
+            "release state guidance must preserve the command's usage exit"
+        );
+        assert!(
+            message.contains("failed"),
+            "missing requested state: {message}"
+        );
+        assert!(
+            message.contains("healthy"),
+            "missing deployed alternate namespace: {message}"
+        );
+        assert!(
+            !message.contains("--api-key") && !message.contains("CURIE_API_KEY"),
+            "a failed release cannot be repaired by supplying its key: {message}"
+        );
+        assert_state_was_read(&log);
+    }
+
+    #[tokio::test]
+    async fn api_key_failure_without_a_deployed_alternate_does_not_offer_a_key_remedy() {
+        let _lock = crate::PROCESS_ENV_LOCK
+            .lock()
+            .expect("lock test environment");
+        let tools = tempfile::tempdir().expect("create fake cluster tools");
+        let _restore = install_cluster_diagnosis_tools(tools.path());
+        let log = tools.path().join("helm.log");
+        std::env::set_var("CURIE_TEST_HELM_LOG", &log);
+        std::env::set_var(
+            "CURIE_TEST_HELM_REQUESTED",
+            r#"[{"name":"curie","namespace":"curie","status":"failed"}]"#,
+        );
+        std::env::set_var(
+            "CURIE_TEST_HELM_ALL",
+            r#"[{"name":"curie","namespace":"curie","status":"failed"}]"#,
+        );
+
+        let error = discover_api_key("curie", "curie")
+            .await
+            .expect_err("a failed release with no healthy alternate must fail");
+        let message = error.to_string();
+
+        assert!(
+            message.contains("failed"),
+            "missing requested state: {message}"
+        );
+        assert!(
+            !message.contains("--api-key") && !message.contains("CURIE_API_KEY"),
+            "a failed release cannot be repaired by supplying its key: {message}"
+        );
+        assert_state_was_read(&log);
+    }
+
+    #[tokio::test]
+    async fn deployed_release_key_failure_does_not_require_all_namespace_access() {
+        let _lock = crate::PROCESS_ENV_LOCK
+            .lock()
+            .expect("lock test environment");
+        let tools = tempfile::tempdir().expect("create fake cluster tools");
+        let _restore = install_cluster_diagnosis_tools(tools.path());
+        let log = tools.path().join("helm.log");
+        std::env::set_var("CURIE_TEST_HELM_LOG", &log);
+        std::env::set_var(
+            "CURIE_TEST_HELM_REQUESTED",
+            r#"[{"name":"curie","namespace":"curie","status":"deployed"}]"#,
+        );
+        std::env::set_var("CURIE_TEST_HELM_ALL", "[]");
+
+        let error = discover_api_key("curie", "curie")
+            .await
+            .expect_err("an unreadable secret must not yield an API key");
+        let message = error.to_string();
+
+        assert_eq!(
+            crate::exit::classify(&error).0,
+            crate::exit::ExitClass::Usage,
+            "a missing deployed release key remains a usage error"
+        );
+        assert!(
+            message.contains("--api-key"),
+            "missing flag remedy: {message}"
+        );
+        assert!(
+            message.contains("CURIE_API_KEY"),
+            "missing environment remedy: {message}"
+        );
+
+        let invocations = std::fs::read_to_string(&log).expect("read Helm invocation log");
+        assert!(
+            invocations
+                .lines()
+                .any(|line| line == "list -n curie --all -o json"),
+            "the requested release state was not read: {invocations}"
+        );
+        assert!(
+            !invocations
+                .lines()
+                .any(|line| line == "list -A --all -o json"),
+            "cluster wide Helm access is forbidden once the requested release is deployed: {invocations}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_upgrade_is_read_instead_of_reported_as_a_missing_release() {
+        let _lock = crate::PROCESS_ENV_LOCK
+            .lock()
+            .expect("lock test environment");
+        let tools = tempfile::tempdir().expect("create fake cluster tools");
+        let _restore = install_cluster_diagnosis_tools(tools.path());
+        let log = tools.path().join("helm.log");
+        std::env::set_var("CURIE_TEST_HELM_LOG", &log);
+        std::env::set_var(
+            "CURIE_TEST_HELM_REQUESTED",
+            r#"[{"name":"curie","namespace":"curie","status":"pending-upgrade"}]"#,
+        );
+        std::env::set_var("CURIE_TEST_HELM_REQUESTED_DEFAULT", "[]");
+        std::env::set_var(
+            "CURIE_TEST_HELM_ALL",
+            r#"[{"name":"curie","namespace":"curie","status":"pending-upgrade"}]"#,
+        );
+        std::env::set_var("CURIE_TEST_HELM_ALL_DEFAULT", "[]");
+
+        let error = discover_api_key("curie", "curie")
+            .await
+            .expect_err("a pending release must not yield an API key");
+        let message = error.to_string();
+
+        assert!(
+            message.contains("pending-upgrade"),
+            "pending Helm state was hidden: {message}"
+        );
+        assert!(
+            !message.contains("no deployed release named")
+                && !message.contains("deploy the release"),
+            "pending state was mistaken for a missing release: {message}"
+        );
+        assert!(
+            !message.contains("--api-key") && !message.contains("CURIE_API_KEY"),
+            "a pending release cannot be repaired by configuring its key: {message}"
+        );
+        assert_state_was_read(&log);
+    }
+
+    #[tokio::test]
+    async fn failed_release_state_survives_a_forbidden_all_namespace_scan() {
+        let _lock = crate::PROCESS_ENV_LOCK
+            .lock()
+            .expect("lock test environment");
+        let tools = tempfile::tempdir().expect("create fake cluster tools");
+        let _restore = install_cluster_diagnosis_tools(tools.path());
+        let log = tools.path().join("helm.log");
+        std::env::set_var("CURIE_TEST_HELM_LOG", &log);
+        std::env::set_var(
+            "CURIE_TEST_HELM_REQUESTED",
+            r#"[{"name":"curie","namespace":"curie","status":"failed"}]"#,
+        );
+        std::env::set_var("CURIE_TEST_HELM_ALL", "[]");
+        std::env::set_var("CURIE_TEST_HELM_ALL_FORBIDDEN", "1");
+
+        let error = discover_api_key("curie", "curie")
+            .await
+            .expect_err("a failed release must not yield an API key");
+        let message = error.to_string();
+        let (class, fix) = crate::exit::classify(&error);
+
+        assert_eq!(class, crate::exit::ExitClass::Usage);
+        assert!(
+            message.contains("failed"),
+            "known requested release state was discarded: {message}"
+        );
+        assert!(
+            !message.contains("could not inspect Helm state across namespaces"),
+            "the optional namespace scan replaced known state: {message}"
+        );
+        assert!(
+            !message.contains("--api-key") && !message.contains("CURIE_API_KEY"),
+            "a failed release cannot be repaired by configuring its key: {message}"
+        );
+        assert!(
+            fix.as_deref()
+                .is_some_and(|guidance| guidance.contains("curie cluster status")),
+            "missing cluster status guidance: {fix:?}"
+        );
     }
 }
 
@@ -2120,18 +2982,16 @@ fn resolve_github_token(
     }
 }
 
-/// Finish an already validated up plan with the one live values read and, when
-/// requested, resolved provider addresses. This is kept separate from command
-/// execution so apply and diff can compare the same completed values.
-pub(crate) fn complete_up_opts(
+fn complete_up_opts_without_runner_egress(
     mut opts: UpOpts,
     existing: Option<&serde_json::Value>,
     github_token: Option<&str>,
     clear_github_token: bool,
-    resolve_provider_egress: bool,
 ) -> Result<UpOpts> {
     let operator_sets = opts.operator_sets();
-    resolve_preserved_runner_values(&mut opts, existing, &operator_sets);
+    resolve_preserved_runner_identity_values(&mut opts, existing, &operator_sets);
+    resolve_preserved_gvisor_mode_value(&mut opts, existing, &operator_sets);
+    resolve_preserved_worker_extra_env_values(&mut opts, existing, &operator_sets);
     if !opts.dev {
         opts.secrets = resolve_generated_secrets(existing, &operator_sets)?;
         opts.secrets.extend(resolve_managed_values_for_up(
@@ -2142,14 +3002,24 @@ pub(crate) fn complete_up_opts(
     }
     opts.github_token =
         resolve_github_token(existing, &operator_sets, github_token, clear_github_token);
-    if resolve_provider_egress
-        && !opts.allow_egress_host.is_empty()
-        && opts.resolved_egress_cidrs.is_empty()
-    {
-        opts.resolved_egress_cidrs =
-            resolve_provider_egress_cidrs_for_current_environment(&opts.allow_egress_host)
-                .context("resolving named provider egress hosts")?;
-    }
+    Ok(opts)
+}
+
+/// Finish an already validated up plan with the one live values read and, when
+/// requested, resolved provider addresses. This is kept separate from command
+/// execution so apply and diff can compare the same completed values.
+pub(crate) fn complete_up_opts(
+    opts: UpOpts,
+    existing: Option<&serde_json::Value>,
+    github_token: Option<&str>,
+    clear_github_token: bool,
+    resolve_provider_egress: bool,
+) -> Result<UpOpts> {
+    let mut opts =
+        complete_up_opts_without_runner_egress(opts, existing, github_token, clear_github_token)?;
+    let operator_sets = opts.operator_sets();
+    resolve_preserved_runner_egress_values(&mut opts, existing, &operator_sets, false);
+    resolve_provider_egress_for_up(&mut opts, resolve_provider_egress)?;
     Ok(opts)
 }
 
@@ -2157,9 +3027,9 @@ pub(crate) fn complete_up_opts(
 /// [`GITHUB_TOKEN_KEY`], i.e. whether the complete token is riding in argv.
 ///
 /// The pass-through stays legal (it is verbatim by design and breaking it would
-/// break existing operators), but a non-empty one leaks into the process table,
-/// shell history and the printed plan, so `up` steers the operator to the
-/// private input. An EMPTY assignment is the operator clearing the key by hand:
+/// break existing operators), but a non-empty one leaks into the process table
+/// and shell history, so `up` steers the operator to the private input. An EMPTY
+/// assignment is the operator clearing the key by hand:
 /// nothing leaks, so warning about it would be noise on a correct command.
 /// Reads the same [`operator_set_entries`] parse the rest of this file does,
 /// since helm accepts the comma-joined `a=1,b=2` form.
@@ -2337,10 +3207,17 @@ impl UpValuePlan {
     }
 
     fn set_string_expression(&mut self, expression: String) {
-        let effective = operator_set_entries(std::slice::from_ref(&expression))
-            .into_iter()
-            .map(|(key, value)| (key.trim().to_string(), value.to_string()))
-            .collect();
+        let effective = if expression
+            .split_once('=')
+            .is_some_and(|(key, _)| key_is_or_descends_from(key.trim(), WORKER_EXTRA_ENV_KEY))
+        {
+            helm_set_string_entries(&expression)
+        } else {
+            operator_set_entries(std::slice::from_ref(&expression))
+                .into_iter()
+                .map(|(key, value)| (key.trim().to_string(), value.to_string()))
+                .collect()
+        };
         self.entries.push(PlannedHelmValues::Set {
             flag: HelmSetFlag::SetString,
             expression,
@@ -2365,7 +3242,7 @@ impl UpValuePlan {
                         HelmSetFlag::Set => "--set",
                         HelmSetFlag::SetString => "--set-string",
                     }));
-                    args.push(plain(expression));
+                    args.push(CmdArg::HelmSetExpression(expression.clone()));
                 }
                 PlannedHelmValues::SecretFile { values, .. } => {
                     args.push(CmdArg::SecretValuesFile(values.clone()));
@@ -2469,6 +3346,62 @@ pub(crate) fn up_value_plan(o: &UpOpts) -> UpValuePlan {
     plan
 }
 
+fn gvisor_preflight_job_name_from_render(rendered: &str) -> Result<Option<String>> {
+    let mut found = None;
+    for document in rendered.split("\n---") {
+        let document = document.trim();
+        if document.is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = serde_norway::from_str(document)
+            .context("could not parse the rendered gVisor preflight Job")?;
+        if value.is_null() {
+            continue;
+        }
+        if value.get("kind").and_then(|kind| kind.as_str()) != Some("Job") {
+            continue;
+        }
+        let name = value
+            .get("metadata")
+            .and_then(|metadata| metadata.get("name"))
+            .and_then(|name| name.as_str())
+            .filter(|name| !name.is_empty())
+            .context("the rendered gVisor preflight Job has no name")?;
+        if found.replace(name.to_string()).is_some() {
+            bail!("the gVisor preflight template rendered more than one Job");
+        }
+    }
+    Ok(found)
+}
+
+async fn rendered_gvisor_preflight_job(
+    chart: &str,
+    common: &CommonOpts,
+    plan: &UpValuePlan,
+) -> Result<Option<String>> {
+    let mut args = vec![
+        plain("template"),
+        plain(&common.release),
+        plain(chart),
+        plain("-n"),
+        plain(&common.namespace),
+    ];
+    plan.append_command_args(&mut args);
+    args.push(plain("--show-only"));
+    args.push(plain("templates/preflight-gvisor.yaml"));
+    let (ok, out, err) = run_capture(&OpsCommand::new("helm", args)).await?;
+    if !ok {
+        if err.trim() == "Error: could not find template templates/preflight-gvisor.yaml in chart" {
+            return Ok(None);
+        }
+        bail!(
+            "could not render the gVisor preflight Job: {}",
+            failure_reason(&err)
+        );
+    }
+    gvisor_preflight_job_name_from_render(&out)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PriorityClassRole {
     Platform,
@@ -2493,6 +3426,112 @@ impl PriorityClassRole {
     }
 }
 
+const CONTROLLER_DEPLOYMENT_NAME: &str = "agent-sandbox-controller";
+const CONTROLLER_DEPLOYMENT_NAMESPACE: &str = "agent-sandbox-system";
+const CONTROLLER_DEPLOY_KEY: &str = "agentSandbox.controller.deploy";
+const GVISOR_MODE_KEY: &str = "security.gvisor.mode";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ClusterUpInference {
+    Provider {
+        provider: &'static str,
+    },
+    PriorityClassReuse {
+        role: PriorityClassRole,
+        name: String,
+        owner_release: String,
+    },
+    ControllerReuse {
+        owner_release: String,
+    },
+    GvisorOff,
+}
+
+impl ClusterUpInference {
+    fn render(&self, ui: &crate::ui::Ui) {
+        match self {
+            Self::Provider { provider } => ui.note(&format!(
+                "inferred model provider from the bound credential prefix; applying `--allow-egress-host {provider}`"
+            )),
+            Self::PriorityClassReuse {
+                role,
+                name,
+                owner_release,
+            } => ui.note(&format!(
+                "inferred reuse of PriorityClass `{name}` from Helm release `{owner_release}`; applying `--set priorityClasses.{}.create=false`",
+                role.key()
+            )),
+            Self::ControllerReuse { owner_release } => ui.note(&format!(
+                "inferred reuse of `{CONTROLLER_DEPLOYMENT_NAME}` from Helm release `{owner_release}`; applying `--set {CONTROLLER_DEPLOY_KEY}=false`"
+            )),
+            Self::GvisorOff => ui.note(&format!(
+                "inferred that the cluster has no `gvisor` RuntimeClass from admission; applying `--set {GVISOR_MODE_KEY}=off`"
+            )),
+        }
+    }
+}
+
+fn final_operator_value<'a>(opts: &'a UpOpts, key: &str) -> Option<&'a str> {
+    let in_lane = |sets: &'a [String]| {
+        operator_set_entries(sets)
+            .into_iter()
+            .rev()
+            .find_map(|(candidate, value)| (candidate.trim() == key).then_some(value.trim()))
+    };
+    in_lane(&opts.set_string).or_else(|| in_lane(&opts.set))
+}
+
+fn detected_provider_from_plan(opts: &UpOpts, plan: &UpValuePlan) -> Option<&'static str> {
+    if opts.fake_model || opts.local_model.is_some() {
+        return None;
+    }
+    plan.effective_values()
+        .get(MODEL_CREDENTIAL_KEY)
+        .and_then(|credential| provider_from_credential_prefix(credential))
+}
+
+fn provider_contradiction(opts: &UpOpts, plan: &UpValuePlan) -> Result<()> {
+    let Some(provider) = detected_provider_from_plan(opts, plan) else {
+        return Ok(());
+    };
+    if opts.allow_egress_host.is_empty()
+        || opts
+            .allow_egress_host
+            .iter()
+            .any(|declared| declared == provider)
+    {
+        return Ok(());
+    }
+    let declared = opts
+        .allow_egress_host
+        .iter()
+        .map(|value| format!("--allow-egress-host {value}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let fix =
+        format!("include `--allow-egress-host {provider}`, or remove the explicit provider list");
+    Err(crate::exit::CliError::usage(format!(
+        "the bound credential selects provider `{provider}`, but the explicit provider list `{declared}` omits it; {fix}"
+    ))
+    .with_fix(fix)
+    .into())
+}
+
+fn reconcile_provider_inference(
+    opts: &mut UpOpts,
+    plan: &UpValuePlan,
+) -> Result<Option<ClusterUpInference>> {
+    provider_contradiction(opts, plan)?;
+    let Some(provider) = detected_provider_from_plan(opts, plan) else {
+        return Ok(None);
+    };
+    if !opts.allow_egress_host.is_empty() {
+        return Ok(None);
+    }
+    opts.allow_egress_host.push(provider.to_string());
+    Ok(Some(ClusterUpInference::Provider { provider }))
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct PriorityClassOwner {
     release: String,
@@ -2500,10 +3539,16 @@ struct PriorityClassOwner {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+enum PriorityClassOwnership {
+    Absent,
+    Existing(Option<PriorityClassOwner>),
+}
+
+#[derive(Debug, PartialEq, Eq)]
 struct PriorityClassConflict {
     role: PriorityClassRole,
     name: String,
-    owner: PriorityClassOwner,
+    owner: Option<PriorityClassOwner>,
 }
 
 fn priority_class_name_from_render(
@@ -2598,9 +3643,7 @@ fn priority_class_read_error(
     detail: impl std::fmt::Display,
     transient: bool,
 ) -> anyhow::Error {
-    let fix = format!(
-        "check cluster reachability and permission with `kubectl get priorityclass {name} -o json`"
-    );
+    let fix = "run `curie cluster status`".to_string();
     let message = format!("could not inspect PriorityClass `{name}`: {detail}; {fix}");
     let error = if transient {
         crate::exit::CliError::transient(message)
@@ -2642,7 +3685,7 @@ fn priority_class_metadata_value<'a>(
     }
 }
 
-async fn priority_class_owner(name: &str) -> Result<Option<PriorityClassOwner>> {
+async fn priority_class_owner(name: &str) -> Result<PriorityClassOwnership> {
     let cmd = OpsCommand::new(
         "kubectl",
         vec![
@@ -2663,7 +3706,7 @@ async fn priority_class_owner(name: &str) -> Result<Option<PriorityClassOwner>> 
         ));
     }
     if out.trim().is_empty() {
-        return Ok(None);
+        return Ok(PriorityClassOwnership::Absent);
     }
     let value: serde_json::Value = serde_json::from_str(out.trim())
         .map_err(|_| priority_class_read_error(name, "kubectl returned invalid JSON", false))?;
@@ -2691,46 +3734,55 @@ async fn priority_class_owner(name: &str) -> Result<Option<PriorityClassOwner>> 
     let labels = priority_class_metadata_map(metadata, "labels", name)?;
     if priority_class_metadata_value(labels, "app.kubernetes.io/managed-by", name)? != Some("Helm")
     {
-        return Ok(None);
+        return Ok(PriorityClassOwnership::Existing(None));
     }
     let annotations = priority_class_metadata_map(metadata, "annotations", name)?;
     let Some(release) =
         priority_class_metadata_value(annotations, "meta.helm.sh/release-name", name)?
     else {
-        return Ok(None);
+        return Ok(PriorityClassOwnership::Existing(None));
     };
     let Some(namespace) =
         priority_class_metadata_value(annotations, "meta.helm.sh/release-namespace", name)?
     else {
-        return Ok(None);
+        return Ok(PriorityClassOwnership::Existing(None));
     };
-    Ok(Some(PriorityClassOwner {
+    Ok(PriorityClassOwnership::Existing(Some(PriorityClassOwner {
         release: release.to_string(),
         namespace: namespace.to_string(),
-    }))
+    })))
 }
 
-async fn preflight_priority_class_ownership(opts: &UpOpts, plan: &UpValuePlan) -> Result<()> {
+async fn priority_class_observations(
+    opts: &UpOpts,
+    plan: &UpValuePlan,
+) -> Result<Vec<PriorityClassConflict>> {
     let rendered = rendered_priority_classes(&opts.chart, &opts.common, plan).await?;
-    let mut conflicts = Vec::new();
+    let mut observations = Vec::new();
     for (role, name) in rendered {
-        let Some(owner) = priority_class_owner(&name).await? else {
-            continue;
+        let owner = match priority_class_owner(&name).await? {
+            PriorityClassOwnership::Absent => continue,
+            PriorityClassOwnership::Existing(owner) => owner,
         };
-        if owner.release != opts.common.release || owner.namespace != opts.common.namespace {
-            conflicts.push(PriorityClassConflict { role, name, owner });
-        }
+        observations.push(PriorityClassConflict { role, name, owner });
     }
-    if conflicts.is_empty() {
-        return Ok(());
-    }
+    Ok(observations)
+}
 
+fn priority_class_conflict_error(conflicts: Vec<PriorityClassConflict>) -> anyhow::Error {
     let mut message = String::from("PriorityClass ownership conflicts block installation:");
     for conflict in conflicts {
-        message.push_str(&format!(
-            "\nPriorityClass `{}` is owned by Helm release `{}` in namespace `{}`.",
-            conflict.name, conflict.owner.release, conflict.owner.namespace
-        ));
+        if let Some(owner) = conflict.owner {
+            message.push_str(&format!(
+                "\nPriorityClass `{}` is owned by Helm release `{}` in namespace `{}`.",
+                conflict.name, owner.release, owner.namespace
+            ));
+        } else {
+            message.push_str(&format!(
+                "\nPriorityClass `{}` exists without complete Helm ownership metadata.",
+                conflict.name
+            ));
+        }
         message.push_str(&format!(
             "\nReuse it with `--set priorityClasses.{}.create=false --set priorityClasses.{}.name={}`.",
             conflict.role.key(),
@@ -2742,7 +3794,240 @@ async fn preflight_priority_class_ownership(opts: &UpOpts, plan: &UpValuePlan) -
             conflict.role.key()
         ));
     }
-    Err(crate::exit::CliError::failure(message).into())
+    crate::exit::CliError::failure(message).into()
+}
+
+async fn preflight_priority_class_ownership(opts: &UpOpts, plan: &UpValuePlan) -> Result<()> {
+    let mut conflicts = Vec::new();
+    for observation in priority_class_observations(opts, plan).await? {
+        let PriorityClassConflict { role, name, owner } = observation;
+        let conflicts_with_target = match owner.as_ref() {
+            None => true,
+            Some(owner) => {
+                owner.release != opts.common.release || owner.namespace != opts.common.namespace
+            }
+        };
+        if conflicts_with_target {
+            conflicts.push(PriorityClassConflict { role, name, owner });
+        }
+    }
+    if conflicts.is_empty() {
+        return Ok(());
+    }
+
+    Err(priority_class_conflict_error(conflicts))
+}
+
+async fn reconcile_priority_class_ownership(
+    opts: &UpOpts,
+    plan: &mut UpValuePlan,
+) -> Result<Vec<ClusterUpInference>> {
+    let mut conflicts = Vec::new();
+    let mut inferred = Vec::new();
+    for observation in priority_class_observations(opts, plan).await? {
+        let PriorityClassConflict { role, name, owner } = observation;
+        let Some(owner) = owner else {
+            conflicts.push(PriorityClassConflict {
+                role,
+                name,
+                owner: None,
+            });
+            continue;
+        };
+        if owner.release == opts.common.release && owner.namespace == opts.common.namespace {
+            continue;
+        }
+        let key = format!("priorityClasses.{}.create", role.key());
+        match final_operator_value(opts, &key) {
+            Some("true") => {
+                let assignment = format!("{key}=true");
+                let fix = format!("remove `--set {assignment}`, or pass `--set {key}=false`");
+                return Err(crate::exit::CliError::usage(format!(
+                    "PriorityClass `{name}` is owned by Helm release `{}` in namespace `{}`, which contradicts explicit `{assignment}`; {fix}",
+                    owner.release, owner.namespace
+                ))
+                .with_fix(fix)
+                .into());
+            }
+            Some(_) => {}
+            None => inferred.push(ClusterUpInference::PriorityClassReuse {
+                role,
+                name,
+                owner_release: owner.release,
+            }),
+        }
+    }
+    if !conflicts.is_empty() {
+        return Err(priority_class_conflict_error(conflicts));
+    }
+    for inference in &inferred {
+        if let ClusterUpInference::PriorityClassReuse { role, .. } = inference {
+            plan.set(format!("priorityClasses.{}.create", role.key()), "false");
+        }
+    }
+    Ok(inferred)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ControllerOwnership {
+    Absent,
+    Existing(Option<PriorityClassOwner>),
+}
+
+fn controller_read_error(detail: impl std::fmt::Display, transient: bool) -> anyhow::Error {
+    let fix = "run `curie cluster status`".to_string();
+    let message = format!(
+        "could not inspect Deployment `{CONTROLLER_DEPLOYMENT_NAME}` in namespace `{CONTROLLER_DEPLOYMENT_NAMESPACE}`: {detail}; {fix}"
+    );
+    let error = if transient {
+        crate::exit::CliError::transient(message)
+    } else {
+        crate::exit::CliError::failure(message)
+    };
+    error.with_fix(fix).into()
+}
+
+fn controller_metadata_map<'a>(
+    metadata: &'a serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<Option<&'a serde_json::Map<String, serde_json::Value>>> {
+    match metadata.get(field) {
+        None => Ok(None),
+        Some(serde_json::Value::Object(values)) => Ok(Some(values)),
+        Some(_) => Err(controller_read_error(
+            format!("kubectl returned invalid object JSON with nonobject metadata.{field}"),
+            false,
+        )),
+    }
+}
+
+fn controller_metadata_value<'a>(
+    values: Option<&'a serde_json::Map<String, serde_json::Value>>,
+    key: &str,
+) -> Result<Option<&'a str>> {
+    match values.and_then(|values| values.get(key)) {
+        None => Ok(None),
+        Some(serde_json::Value::String(value)) => Ok(Some(value)),
+        Some(_) => Err(controller_read_error(
+            format!("kubectl returned invalid object JSON at metadata key `{key}`"),
+            false,
+        )),
+    }
+}
+
+async fn controller_owner() -> Result<ControllerOwnership> {
+    let cmd = OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("get"),
+            plain("deployment"),
+            plain(CONTROLLER_DEPLOYMENT_NAME),
+            plain("-n"),
+            plain(CONTROLLER_DEPLOYMENT_NAMESPACE),
+            plain("--ignore-not-found"),
+            plain("-o"),
+            plain("json"),
+        ],
+    );
+    let (ok, out, err) = run_capture(&cmd).await?;
+    if !ok {
+        let missing_namespace = err.contains("NotFound")
+            && err.contains("namespaces")
+            && err.contains(CONTROLLER_DEPLOYMENT_NAMESPACE);
+        if missing_namespace {
+            return Ok(ControllerOwnership::Absent);
+        }
+        return Err(controller_read_error(
+            failure_reason(&err),
+            is_connectivity_failure(&err),
+        ));
+    }
+    if out.trim().is_empty() {
+        return Ok(ControllerOwnership::Absent);
+    }
+    let value: serde_json::Value = serde_json::from_str(out.trim())
+        .map_err(|_| controller_read_error("kubectl returned invalid JSON", false))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| controller_read_error("kubectl returned invalid object JSON", false))?;
+    if object.get("kind").and_then(|value| value.as_str()) != Some("Deployment") {
+        return Err(controller_read_error(
+            "kubectl returned an object that is not a Deployment",
+            false,
+        ));
+    }
+    let metadata = object
+        .get("metadata")
+        .and_then(|metadata| metadata.as_object())
+        .ok_or_else(|| {
+            controller_read_error(
+                "kubectl returned invalid object JSON without metadata",
+                false,
+            )
+        })?;
+    if metadata.get("name").and_then(|value| value.as_str()) != Some(CONTROLLER_DEPLOYMENT_NAME) {
+        return Err(controller_read_error(
+            "kubectl returned invalid object JSON with another metadata.name",
+            false,
+        ));
+    }
+    let labels = controller_metadata_map(metadata, "labels")?;
+    if controller_metadata_value(labels, "app.kubernetes.io/managed-by")? != Some("Helm") {
+        return Ok(ControllerOwnership::Existing(None));
+    }
+    let annotations = controller_metadata_map(metadata, "annotations")?;
+    let Some(release) = controller_metadata_value(annotations, "meta.helm.sh/release-name")? else {
+        return Ok(ControllerOwnership::Existing(None));
+    };
+    let Some(namespace) = controller_metadata_value(annotations, "meta.helm.sh/release-namespace")?
+    else {
+        return Ok(ControllerOwnership::Existing(None));
+    };
+    Ok(ControllerOwnership::Existing(Some(PriorityClassOwner {
+        release: release.to_string(),
+        namespace: namespace.to_string(),
+    })))
+}
+
+async fn reconcile_controller_ownership(
+    opts: &UpOpts,
+    plan: &mut UpValuePlan,
+) -> Result<Option<ClusterUpInference>> {
+    let explicit = final_operator_value(opts, CONTROLLER_DEPLOY_KEY);
+    if explicit == Some("false") {
+        return Ok(None);
+    }
+    let owner = match controller_owner().await? {
+        ControllerOwnership::Absent => return Ok(None),
+        ControllerOwnership::Existing(Some(owner)) => owner,
+        ControllerOwnership::Existing(None) => {
+            return Err(controller_read_error(
+                "the Deployment exists without complete Helm ownership metadata",
+                false,
+            ));
+        }
+    };
+    if owner.release == opts.common.release && owner.namespace == opts.common.namespace {
+        return Ok(None);
+    }
+    if explicit == Some("true") {
+        let assignment = format!("{CONTROLLER_DEPLOY_KEY}=true");
+        let fix =
+            format!("remove `--set {assignment}`, or pass `--set {CONTROLLER_DEPLOY_KEY}=false`");
+        return Err(crate::exit::CliError::usage(format!(
+            "Deployment `{CONTROLLER_DEPLOYMENT_NAME}` is owned by Helm release `{}` in namespace `{}`, which contradicts explicit `{assignment}`; {fix}",
+            owner.release, owner.namespace
+        ))
+        .with_fix(fix)
+        .into());
+    }
+    if explicit.is_some() {
+        return Ok(None);
+    }
+    plan.set(CONTROLLER_DEPLOY_KEY, "false");
+    Ok(Some(ClusterUpInference::ControllerReuse {
+        owner_release: owner.release,
+    }))
 }
 
 fn up_commands_with_plan(o: &UpOpts, plan: &UpValuePlan) -> Vec<OpsCommand> {
@@ -2842,11 +4127,28 @@ pub(crate) fn nodes_cmd() -> OpsCommand {
 
 /// `helm uninstall` then a namespace sweep of only the namespaces THIS release
 /// created (runtime sandboxes, PVCs and job pods Helm does not own). #707: the
-/// sweep is scoped by the release ownership label `up` stamped
-/// (`curietech.ai/created-by=<release>`) rather than a hardcoded namespace pair,
-/// so a pre-existing (unlabeled) namespace is never deleted. `--ignore-not-found`
-/// keeps a partial teardown re-runnable and the label selector tolerates zero
-/// matches. CRDs are never targeted (retention is by-construction).
+/// sweep is scoped by the ownership labels `up` stamped rather than a hardcoded
+/// namespace pair, so a pre-existing (unlabeled) namespace is never deleted.
+/// `--ignore-not-found` keeps a partial teardown re-runnable and the label
+/// selector tolerates zero matches. CRDs are never targeted (retention is
+/// by-construction).
+///
+/// #1654: the selector is the CONJUNCTION of both ownership labels
+/// (`curietech.ai/created-by=<release>,curietech.ai/created-in=<namespace>`),
+/// because a release name alone is not an identity on a shared cluster. Two
+/// independent installs normally both take the default release name `curie`
+/// while living in different install namespaces, so a `created-by`-only
+/// selector matched the OTHER install's namespaces and one `cluster down`
+/// deleted them (observed live: `agent-sandbox-system` stamped
+/// `created-by=curie` but annotated `meta.helm.sh/release-namespace: curie-other`,
+/// i.e. owned by a different release, swept anyway). The identity is therefore
+/// the PAIR (release name, install namespace), and both terms are required.
+///
+/// A namespace stamped by an older CLI carries only `created-by` and so does
+/// NOT match this selector: that is deliberate. The sweep fails safe toward
+/// retention rather than deleting a namespace whose owner cannot be
+/// established; there is no fallback selector, since a fallback is exactly the
+/// cross-release delete #1654 reports.
 pub fn down_commands(o: &CommonOpts) -> Vec<OpsCommand> {
     vec![
         OpsCommand::new(
@@ -2864,7 +4166,10 @@ pub fn down_commands(o: &CommonOpts) -> Vec<OpsCommand> {
                 plain("delete"),
                 plain("namespace"),
                 plain("-l"),
-                plain(format!("curietech.ai/created-by={}", o.release)),
+                plain(format!(
+                    "curietech.ai/created-by={},curietech.ai/created-in={}",
+                    o.release, o.namespace
+                )),
                 plain("--ignore-not-found"),
             ],
         ),
@@ -3174,14 +4479,31 @@ fn teardown_result(
 }
 
 /// #707 ownership stamp. Returns the single `kubectl label namespace` step that
-/// records THIS release as the creator of `o.namespace`, but ONLY when `up`
-/// actually created the namespace (`namespace_existed == false`); an empty vec
-/// when the namespace pre-existed, so a namespace `up` merely adopted is never
-/// stamped and therefore never swept by a later `down`. A release-scoped label
-/// (not a per-invocation run-id) is what lets a separate `down` invocation match
-/// what `up` created. `--overwrite` keeps a re-run idempotent, so an `up`
-/// interrupted after create but before stamp fails safe toward retention.
-fn ownership_label_commands(o: &CommonOpts, namespace_existed: bool) -> Vec<OpsCommand> {
+/// records THIS release as the creator of the target namespace `o.namespace`
+/// (callers retarget `o` with `ns_common`, so this is the namespace being
+/// labelled, NOT the release's install namespace), but ONLY when `up` actually
+/// created it (`namespace_existed == false`); an empty vec when the namespace
+/// pre-existed, so a namespace `up` merely adopted is never stamped and
+/// therefore never swept by a later `down`. A release-scoped label (not a
+/// per-invocation run-id) is what lets a separate `down` invocation match what
+/// `up` created. `--overwrite` keeps a re-run idempotent, so an `up` interrupted
+/// after create but before stamp fails safe toward retention.
+///
+/// #1654: the stamp carries TWO labels,
+/// `curietech.ai/created-by=<release>` plus
+/// `curietech.ai/created-in=<release_namespace>`, written in a single
+/// `kubectl label` invocation so the step and checklist accounting is
+/// unchanged. `release_namespace` is passed explicitly rather than read off
+/// `o.namespace`, which the `ns_common` retarget has already pointed at the
+/// namespace being labelled rather than at the install namespace. See
+/// `down_commands` for why the PAIR (release name, install namespace) is the
+/// identity and why a namespace stamped by an older, single-label CLI is
+/// deliberately left unswept.
+fn ownership_label_commands(
+    o: &CommonOpts,
+    release_namespace: &str,
+    namespace_existed: bool,
+) -> Vec<OpsCommand> {
     if namespace_existed {
         return Vec::new();
     }
@@ -3192,6 +4514,7 @@ fn ownership_label_commands(o: &CommonOpts, namespace_existed: bool) -> Vec<OpsC
             plain("namespace"),
             plain(&o.namespace),
             plain(format!("curietech.ai/created-by={}", o.release)),
+            plain(format!("curietech.ai/created-in={release_namespace}")),
             plain("--overwrite"),
         ],
     )]
@@ -3281,6 +4604,458 @@ pub async fn run_capture(cmd: &OpsCommand) -> Result<(bool, String, String)> {
     ))
 }
 
+fn finish_captured_step(
+    step: crate::ui::Step,
+    ok_detail: &str,
+    cmd: &OpsCommand,
+    ok: bool,
+    out: String,
+    err: String,
+) -> Result<String> {
+    let ui = crate::ui::ui();
+    if ok {
+        step.done(ok_detail);
+    } else {
+        step.fail("failed");
+    }
+    for line in out.lines().chain(err.lines()) {
+        ui.plumbing(line);
+    }
+    // One implementation, shared with the teardown Display message (#1230):
+    // an inline second copy of this rule is how the two drifted before.
+    if !ok {
+        let reason = failure_reason(&err);
+        ui.failure(&format!("`{}` failed: {reason}", cmd.program));
+        bail!("`{}` exited nonzero", cmd.program);
+    }
+    Ok(out)
+}
+
+struct RunningInstall {
+    child: Child,
+    stdout: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+    stderr: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+    _secret_files: Vec<SecretValuesFileGuard>,
+    program: String,
+}
+
+impl RunningInstall {
+    fn spawn(cmd: &OpsCommand) -> Result<Self> {
+        let (cmd, secret_files) = cmd.materialize_secret_files()?;
+        let mut child = Command::new(&cmd.program)
+            .args(cmd.argv())
+            .envs(cmd.env.iter().chain(cmd.secret_env.iter()).cloned())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| format!("failed to invoke `{}`; is it on PATH?", cmd.program))?;
+        let mut stdout = child
+            .stdout
+            .take()
+            .expect("piped install stdout must be available");
+        let mut stderr = child
+            .stderr
+            .take()
+            .expect("piped install stderr must be available");
+        let stdout = tokio::spawn(async move {
+            let mut output = Vec::new();
+            stdout.read_to_end(&mut output).await?;
+            Ok(output)
+        });
+        let stderr = tokio::spawn(async move {
+            let mut output = Vec::new();
+            stderr.read_to_end(&mut output).await?;
+            Ok(output)
+        });
+        Ok(Self {
+            child,
+            stdout,
+            stderr,
+            _secret_files: secret_files,
+            program: cmd.program,
+        })
+    }
+
+    async fn finish(
+        mut self,
+        status: std::io::Result<std::process::ExitStatus>,
+    ) -> Result<(bool, String, String)> {
+        let status = match status {
+            Ok(status) => status,
+            Err(error) => {
+                let _ = terminate_process(&mut self.child).await;
+                return Err(error).with_context(|| {
+                    format!("failed to invoke `{}`; is it on PATH?", self.program)
+                });
+            }
+        };
+        let stdout = self
+            .stdout
+            .await
+            .context("joining the Helm stdout reader")??;
+        let stderr = self
+            .stderr
+            .await
+            .context("joining the Helm stderr reader")??;
+        Ok((
+            status.success(),
+            String::from_utf8_lossy(&stdout).to_string(),
+            String::from_utf8_lossy(&stderr).to_string(),
+        ))
+    }
+
+    async fn terminate(mut self) {
+        let _ = terminate_helm_process(&mut self.child).await;
+        self.stdout.abort();
+        self.stderr.abort();
+        let _ = self.stdout.await;
+        let _ = self.stderr.await;
+    }
+}
+
+struct RunningGvisorEventWatch {
+    child: Child,
+    stdout: tokio::io::Lines<BufReader<ChildStdout>>,
+    existing_event_uids: BTreeSet<String>,
+}
+
+fn gvisor_event_selector(namespace: &str, job: &str) -> String {
+    format!(
+        "involvedObject.kind=Job,involvedObject.namespace={namespace},involvedObject.name={job},reason=FailedCreate"
+    )
+}
+
+fn gvisor_event_watch_cmd(namespace: &str, job: &str) -> OpsCommand {
+    OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("get"),
+            plain("events"),
+            plain("-n"),
+            plain(namespace),
+            plain("--field-selector"),
+            plain(gvisor_event_selector(namespace, job)),
+            plain("--watch"),
+            plain("--output-watch-events"),
+            plain("-o"),
+            plain(
+                r#"jsonpath={.type}{"\u001f"}{.object.metadata.uid}{"\u001f"}{.object.involvedObject.kind}{"\u001f"}{.object.involvedObject.namespace}{"\u001f"}{.object.involvedObject.name}{"\u001f"}{.object.reason}{"\u001f"}{.object.message}{"\n"}"#,
+            ),
+        ],
+    )
+}
+
+fn gvisor_existing_event_uids_cmd(namespace: &str, job: &str) -> OpsCommand {
+    OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("get"),
+            plain("events"),
+            plain("-n"),
+            plain(namespace),
+            plain("--field-selector"),
+            plain(gvisor_event_selector(namespace, job)),
+            plain("-o"),
+            plain(r#"jsonpath={range .items[*]}{.metadata.uid}{"\n"}{end}"#),
+        ],
+    )
+}
+
+enum GvisorEventWatchStart {
+    Watching(Box<RunningGvisorEventWatch>),
+    Unavailable,
+}
+
+enum GvisorEventWatchLine {
+    RuntimeClassRejected(String),
+    Ignore,
+}
+
+async fn gvisor_existing_event_uids(namespace: &str, job: &str) -> Option<BTreeSet<String>> {
+    let ui = crate::ui::ui();
+    let snapshot = gvisor_existing_event_uids_cmd(namespace, job);
+    ui.plumbing(&format!("+ {}", snapshot.display()));
+    match run_capture(&snapshot).await {
+        Ok((true, out, _)) => Some(
+            out.lines()
+                .map(str::trim)
+                .filter(|uid| !uid.is_empty())
+                .map(str::to_string)
+                .collect(),
+        ),
+        Ok((false, out, err)) => {
+            let detail = [err.trim(), out.trim()]
+                .into_iter()
+                .find(|detail| !detail.is_empty())
+                .unwrap_or("kubectl exited nonzero with no output");
+            ui.plumbing(&format!("gVisor event snapshot unavailable: {detail}"));
+            None
+        }
+        Err(error) => {
+            ui.plumbing(&format!("gVisor event snapshot unavailable: {error}"));
+            None
+        }
+    }
+}
+
+fn start_gvisor_event_watch(
+    namespace: &str,
+    job: &str,
+    existing_event_uids: BTreeSet<String>,
+) -> GvisorEventWatchStart {
+    let ui = crate::ui::ui();
+    let watch = gvisor_event_watch_cmd(namespace, job);
+    ui.plumbing(&format!("+ {}", watch.display()));
+    let mut child = match Command::new(&watch.program)
+        .args(watch.argv())
+        .envs(watch.env.iter().chain(watch.secret_env.iter()).cloned())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            ui.plumbing(&format!("gVisor event watch unavailable: {error}"));
+            return GvisorEventWatchStart::Unavailable;
+        }
+    };
+    let stdout = child
+        .stdout
+        .take()
+        .expect("piped kubectl event stdout must be available");
+    GvisorEventWatchStart::Watching(Box::new(RunningGvisorEventWatch {
+        child,
+        stdout: BufReader::new(stdout).lines(),
+        existing_event_uids,
+    }))
+}
+
+fn gvisor_event_watch_line(
+    line: &str,
+    namespace: &str,
+    job: &str,
+    existing_event_uids: &BTreeSet<String>,
+) -> GvisorEventWatchLine {
+    let mut fields = line.splitn(7, '\u{001f}');
+    let source = fields.next().unwrap_or_default();
+    let uid = fields.next().unwrap_or_default();
+    let inspect = match source {
+        "ADDED" | "MODIFIED" => !existing_event_uids.contains(uid),
+        _ => false,
+    };
+    if uid.is_empty() || !inspect {
+        return GvisorEventWatchLine::Ignore;
+    }
+    let kind = fields.next().unwrap_or_default();
+    let event_namespace = fields.next().unwrap_or_default();
+    let name = fields.next().unwrap_or_default();
+    let reason = fields.next().unwrap_or_default();
+    let message = fields.next().unwrap_or_default();
+    let missing_runtimeclass = message.contains("RuntimeClass \"gvisor\" not found");
+    if kind == "Job"
+        && event_namespace == namespace
+        && name == job
+        && reason == "FailedCreate"
+        && missing_runtimeclass
+    {
+        GvisorEventWatchLine::RuntimeClassRejected(message.to_string())
+    } else {
+        GvisorEventWatchLine::Ignore
+    }
+}
+
+async fn terminate_process(child: &mut Child) -> std::io::Result<std::process::ExitStatus> {
+    if let Ok(Some(status)) = child.try_wait() {
+        return Ok(status);
+    }
+    let _ = child.start_kill();
+    child.wait().await
+}
+
+/// Give Helm its interrupt path so it can mark the release failed before a
+/// bounded forced cleanup. A pending install would block the printed recovery.
+async fn terminate_helm_process(child: &mut Child) -> std::io::Result<std::process::ExitStatus> {
+    if let Ok(Some(status)) = child.try_wait() {
+        return Ok(status);
+    }
+    let interrupted = match child.id() {
+        Some(pid) => Command::new("kill")
+            .arg("-INT")
+            .arg(pid.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .is_ok_and(|status| status.success()),
+        None => false,
+    };
+    if interrupted {
+        if let Ok(status) = tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
+            return status;
+        }
+    }
+    terminate_process(child).await
+}
+
+enum GvisorInstallRace {
+    Helm(std::io::Result<std::process::ExitStatus>),
+    RuntimeClassRejected(String),
+}
+
+enum GvisorInstallOutcome {
+    Installed,
+    RuntimeClassRejected {
+        rejection: String,
+        step: crate::ui::Step,
+    },
+}
+
+async fn run_install_with_gvisor_observer(
+    cl: &crate::ui::Checklist,
+    label: &str,
+    ok_detail: &str,
+    cmd: &OpsCommand,
+    namespace: &str,
+    job: &str,
+    namespace_existed_before_install: bool,
+) -> Result<GvisorInstallOutcome> {
+    let ui = crate::ui::ui();
+    ui.plumbing(&format!("+ {}", cmd.display()));
+    let step = cl.step(label);
+    let mut watch_start = if namespace_existed_before_install {
+        Some(match gvisor_existing_event_uids(namespace, job).await {
+            Some(existing_event_uids) => {
+                start_gvisor_event_watch(namespace, job, existing_event_uids)
+            }
+            None => GvisorEventWatchStart::Unavailable,
+        })
+    } else {
+        None
+    };
+    let mut install = match RunningInstall::spawn(cmd) {
+        Ok(install) => install,
+        Err(error) => {
+            if let Some(GvisorEventWatchStart::Watching(watch)) = &mut watch_start {
+                let _ = terminate_process(&mut watch.child).await;
+            }
+            step.fail("failed");
+            return Err(error);
+        }
+    };
+
+    let mut early_helm_status = None;
+    if !namespace_existed_before_install {
+        // Helm owns `--create-namespace`. Wait for that one object, then use a
+        // single list and watch request that cannot lose an Event between calls.
+        let mut retry_delay = Duration::from_millis(50);
+        loop {
+            match namespace_exists(namespace).await {
+                Ok(true) => {
+                    watch_start = Some(start_gvisor_event_watch(namespace, job, BTreeSet::new()));
+                    break;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    ui.plumbing(&format!(
+                        "gVisor event watch unavailable while waiting for namespace: {error:#}"
+                    ));
+                    watch_start = Some(GvisorEventWatchStart::Unavailable);
+                    break;
+                }
+            }
+            match install.child.try_wait() {
+                Ok(Some(status)) => {
+                    early_helm_status = Some(Ok(status));
+                    break;
+                }
+                Err(error) => {
+                    early_helm_status = Some(Err(error));
+                    break;
+                }
+                Ok(None) => {}
+            }
+            tokio::time::sleep(retry_delay).await;
+            retry_delay = retry_delay
+                .saturating_mul(2)
+                .min(Duration::from_millis(500));
+        }
+    }
+
+    let watch_start = watch_start.unwrap_or(GvisorEventWatchStart::Unavailable);
+    let mut watch = None;
+    let race = if let Some(status) = early_helm_status {
+        GvisorInstallRace::Helm(status)
+    } else {
+        match watch_start {
+            GvisorEventWatchStart::Watching(running_watch) => {
+                watch = Some(*running_watch);
+                let running_watch = watch.as_mut().expect("watch was just installed");
+                let existing_event_uids = running_watch.existing_event_uids.clone();
+                loop {
+                    let outcome = tokio::select! {
+                        status = install.child.wait() => Some(GvisorInstallRace::Helm(status)),
+                        line = running_watch.stdout.next_line() => {
+                            match line {
+                                Ok(Some(line)) => match gvisor_event_watch_line(
+                                    &line,
+                                    namespace,
+                                    job,
+                                    &existing_event_uids,
+                                ) {
+                                    GvisorEventWatchLine::RuntimeClassRejected(rejection) => {
+                                        Some(GvisorInstallRace::RuntimeClassRejected(rejection))
+                                    }
+                                    GvisorEventWatchLine::Ignore => None,
+                                },
+                                Ok(None) | Err(_) => {
+                                    let _ = terminate_process(&mut running_watch.child).await;
+                                    Some(GvisorInstallRace::Helm(install.child.wait().await))
+                                }
+                            }
+                        }
+                    };
+                    if let Some(outcome) = outcome {
+                        break outcome;
+                    }
+                }
+            }
+            GvisorEventWatchStart::Unavailable => {
+                GvisorInstallRace::Helm(install.child.wait().await)
+            }
+        }
+    };
+
+    match race {
+        GvisorInstallRace::Helm(status) => {
+            if let Some(watch) = watch.as_mut() {
+                let _ = terminate_process(&mut watch.child).await;
+            }
+            let captured = install.finish(status).await;
+            match captured {
+                Ok((ok, out, err)) => {
+                    finish_captured_step(step, ok_detail, cmd, ok, out, err)?;
+                    Ok(GvisorInstallOutcome::Installed)
+                }
+                Err(error) => {
+                    step.fail("failed");
+                    Err(error)
+                }
+            }
+        }
+        GvisorInstallRace::RuntimeClassRejected(rejection) => {
+            if let Some(watch) = watch.as_mut() {
+                let _ = terminate_process(&mut watch.child).await;
+            }
+            install.terminate().await;
+            Ok(GvisorInstallOutcome::RuntimeClassRejected { rejection, step })
+        }
+    }
+}
+
 /// Run one command under a checklist `step` labeled `label`, capturing its
 /// stdio. Echoes the masked command line and replays the captured output as dim
 /// plumbing (both no-ops unless `--debug`, so default runs stay quiet and the
@@ -3297,22 +5072,7 @@ pub(crate) async fn run_step(
     ui.plumbing(&format!("+ {}", cmd.display()));
     let step = cl.step(label);
     let (ok, out, err) = run_capture(cmd).await?;
-    if ok {
-        step.done(ok_detail);
-    } else {
-        step.fail("failed");
-    }
-    for line in out.lines().chain(err.lines()) {
-        ui.plumbing(line);
-    }
-    if !ok {
-        // One implementation, shared with the teardown Display message (#1230):
-        // an inline second copy of this rule is how the two drifted before.
-        let reason = failure_reason(&err);
-        ui.failure(&format!("`{}` failed: {reason}", cmd.program));
-        bail!("`{}` exited nonzero", cmd.program);
-    }
-    Ok(out)
+    finish_captured_step(step, ok_detail, cmd, ok, out, err)
 }
 
 // ---------------------------------------------------------------------------
@@ -3366,15 +5126,19 @@ fn should_read_existing(dev: bool, dry_run: bool) -> bool {
     !dry_run
 }
 
+enum UpInferencePolicy {
+    Detect(Vec<ClusterUpInference>),
+    Disabled,
+}
+
 pub async fn up(
-    opts: UpOpts,
+    mut opts: UpOpts,
     github_token: Option<String>,
     clear_github_token: bool,
 ) -> Result<ClusterUpOutput> {
     validate_up_inputs(&opts, github_token.as_deref(), clear_github_token)?;
-    // Reject contradictions already visible in argv or the environment before
-    // reading cluster state.
     validate_credential_egress_consistency(&opts)?;
+    provider_contradiction(&opts, &up_value_plan(&opts))?;
     let resolve_provider_egress = !opts.common.dry_run;
     let existing = if should_read_existing(opts.dev, opts.common.dry_run) {
         require_on_path("helm")?;
@@ -3382,26 +5146,45 @@ pub async fn up(
     } else {
         None
     };
-    let mut opts = complete_up_opts(
+    opts = complete_up_opts_without_runner_egress(
         opts,
         existing.as_ref(),
         github_token.as_deref(),
         clear_github_token,
-        false,
     )?;
-    // A release read can restore a credential that was absent from argv and the
-    // environment. Validate that effective value before provider DNS or Helm.
     validate_credential_egress_consistency(&opts)?;
-    if resolve_provider_egress
-        && !opts.allow_egress_host.is_empty()
-        && opts.resolved_egress_cidrs.is_empty()
-    {
-        opts.resolved_egress_cidrs =
-            resolve_provider_egress_cidrs_for_current_environment(&opts.allow_egress_host)
-                .context("resolving named provider egress hosts")?;
+    let completed_identity_plan = up_value_plan(&opts);
+    let mut inferences = Vec::new();
+    let provider_inference = reconcile_provider_inference(&mut opts, &completed_identity_plan)?;
+    let provider_was_inferred = provider_inference.is_some();
+    if let Some(inference) = provider_inference {
+        inferences.push(inference);
+    }
+    let operator_sets = opts.operator_sets();
+    let (next_preserved_egress_index, recorded_egress_cidrs) =
+        resolve_preserved_runner_egress_values(
+            &mut opts,
+            existing.as_ref(),
+            &operator_sets,
+            provider_was_inferred,
+        );
+    resolve_provider_egress_for_up(&mut opts, resolve_provider_egress)?;
+    if provider_was_inferred && next_preserved_egress_index > 0 {
+        reindex_inferred_provider_egress(
+            &mut opts,
+            next_preserved_egress_index,
+            &recorded_egress_cidrs,
+        );
     }
     let value_plan = up_value_plan(&opts);
-    run_prepared_up(opts, value_plan, existing, github_token.as_deref()).await
+    run_prepared_up(
+        opts,
+        value_plan,
+        existing,
+        github_token.as_deref(),
+        UpInferencePolicy::Detect(inferences),
+    )
+    .await
 }
 
 /// Execute an up plan whose local validation and live completion already ran.
@@ -3414,16 +5197,31 @@ pub(crate) async fn up_prepared(
     github_token: Option<String>,
 ) -> Result<ClusterUpOutput> {
     validate_up_inputs(&opts, github_token.as_deref(), false)?;
-    run_prepared_up(opts, value_plan, existing, github_token.as_deref()).await
+    run_prepared_up(
+        opts,
+        value_plan,
+        existing,
+        github_token.as_deref(),
+        UpInferencePolicy::Disabled,
+    )
+    .await
 }
 
 async fn run_prepared_up(
     opts: UpOpts,
-    value_plan: UpValuePlan,
+    mut value_plan: UpValuePlan,
     existing: Option<serde_json::Value>,
     github_token: Option<&str>,
+    inference_policy: UpInferencePolicy,
 ) -> Result<ClusterUpOutput> {
     let ui = crate::ui::ui();
+    let (detect_facts, initial_inferences) = match inference_policy {
+        UpInferencePolicy::Detect(inferences) => (true, inferences),
+        UpInferencePolicy::Disabled => (false, Vec::new()),
+    };
+    for inference in &initial_inferences {
+        inference.render(ui);
+    }
     if !opts.dev {
         let operator_sets = opts.operator_sets();
         let preserved = resolve_preserved_values(existing.as_ref(), &operator_sets);
@@ -3550,7 +5348,7 @@ async fn run_prepared_up(
         }
     }
     if set_passthrough_leaks_github_token(&opts.operator_sets()) {
-        ui.warn("a GitHub credential passed with --set lands in the process table, shell history and the printed plan; use --github-token, or CURIE_GITHUB_TOKEN to keep it out of shell history too");
+        ui.warn("a GitHub credential passed with --set lands in the process table and shell history; use --github-token, or CURIE_GITHUB_TOKEN to keep it out of shell history too");
     }
 
     if !opts.allow_egress_host.is_empty()
@@ -3608,7 +5406,11 @@ async fn run_prepared_up(
         if opts.common.dry_run {
             // existed_before is provably false on this branch (set above).
             let common = ns_common(&opts.common, &ns, true);
-            cmds.extend(ownership_label_commands(&common, false));
+            cmds.extend(ownership_label_commands(
+                &common,
+                &opts.common.namespace,
+                false,
+            ));
         }
         ownership_candidates.push((ns, existed_before));
     }
@@ -3652,12 +5454,77 @@ async fn run_prepared_up(
             lines: cmds.iter().map(|cmd| cmd.display()).collect(),
         }));
     }
+    let release_namespace_existed_before_install = ownership_candidates
+        .iter()
+        .find_map(|(namespace, existed)| (namespace == &opts.common.namespace).then_some(*existed))
+        .unwrap_or(false);
     require_on_path("helm")?;
-    preflight_priority_class_ownership(&opts, &value_plan).await?;
+    if detect_facts {
+        for inference in reconcile_priority_class_ownership(&opts, &mut value_plan).await? {
+            inference.render(ui);
+        }
+        if let Some(inference) = reconcile_controller_ownership(&opts, &mut value_plan).await? {
+            inference.render(ui);
+        }
+    } else {
+        preflight_priority_class_ownership(&opts, &value_plan).await?;
+    }
+    cmds = up_commands_with_plan(&opts, &value_plan);
+    let gvisor_preflight_job =
+        rendered_gvisor_preflight_job(&opts.chart, &opts.common, &value_plan).await?;
     let cl = ui.checklist();
     let label = format!("installing release {}", opts.common.release);
     for cmd in &cmds {
-        run_step(&cl, &label, "installed", cmd).await?;
+        if let Some(job) = gvisor_preflight_job.as_deref() {
+            let outcome = run_install_with_gvisor_observer(
+                &cl,
+                &label,
+                "installed",
+                cmd,
+                &opts.common.namespace,
+                job,
+                release_namespace_existed_before_install,
+            )
+            .await?;
+            match outcome {
+                GvisorInstallOutcome::Installed => {}
+                GvisorInstallOutcome::RuntimeClassRejected { rejection, step } if detect_facts => {
+                    if let Some(mode @ ("auto" | "require")) =
+                        final_operator_value(&opts, GVISOR_MODE_KEY)
+                    {
+                        step.fail("failed");
+                        let assignment = format!("{GVISOR_MODE_KEY}={mode}");
+                        let fix = format!(
+                            "remove the explicit `{assignment}` setting and rerun to accept the inferred gVisor posture"
+                        );
+                        return Err(crate::exit::CliError::usage(format!(
+                            "explicit `{assignment}` contradicts the detected admission result `{rejection}`; {fix}"
+                        ))
+                        .with_fix(fix)
+                        .into());
+                    }
+                    step.warn("retrying");
+                    value_plan.set(GVISOR_MODE_KEY, "off");
+                    ClusterUpInference::GvisorOff.render(ui);
+                    let retry = up_commands_with_plan(&opts, &value_plan)
+                        .into_iter()
+                        .next()
+                        .expect("cluster up always has one Helm command");
+                    run_step(&cl, &label, "installed", &retry).await?;
+                }
+                GvisorInstallOutcome::RuntimeClassRejected { rejection, step } => {
+                    step.fail("failed");
+                    let fix = "curie cluster up --set security.gvisor.mode=off";
+                    return Err(crate::exit::CliError::failure(format!(
+                        "gVisor preflight Job `{job}` could not create its pod: {rejection}. To install without gVisor isolation, run `{fix}`."
+                    ))
+                    .with_fix(fix)
+                    .into());
+                }
+            }
+        } else {
+            run_step(&cl, &label, "installed", cmd).await?;
+        }
     }
 
     // #707 stamp ownership only on namespaces this run actually created. A
@@ -3678,7 +5545,7 @@ async fn run_prepared_up(
             continue;
         }
         let common = ns_common(&opts.common, ns, false);
-        for cmd in ownership_label_commands(&common, false) {
+        for cmd in ownership_label_commands(&common, &opts.common.namespace, false) {
             run_step(&cl, &label, "installed", &cmd).await?;
         }
     }
@@ -3885,13 +5752,13 @@ pub async fn down(opts: DownOpts) -> Result<ClusterDownOutput> {
         }));
     }
     ui.warn(&format!(
-        "this uninstalls release '{0}' and deletes the namespaces it created (labeled curietech.ai/created-by={0}), leaving any pre-existing namespaces untouched",
-        opts.common.release
+        "this uninstalls release '{0}' in namespace '{1}' and deletes only the namespaces that release created (labeled curietech.ai/created-by={0} AND curietech.ai/created-in={1}, so a namespace another release created is out of reach), leaving any pre-existing namespaces untouched",
+        opts.common.release, opts.common.namespace
     ));
     if !opts.yes
         && !confirm(&format!(
-            "This uninstalls release '{0}' and deletes the namespaces it created (labeled curietech.ai/created-by={0}). Continue? [y/N] ",
-            opts.common.release
+            "This uninstalls release '{0}' in namespace '{1}' and deletes only the namespaces that release created (labeled curietech.ai/created-by={0} AND curietech.ai/created-in={1}, so a namespace another release created is out of reach). Continue? [y/N] ",
+            opts.common.release, opts.common.namespace
         ))?
     {
         return Ok(ClusterDownOutput::Aborted);
@@ -4140,6 +6007,73 @@ fn api_key_usage_err(msg: impl Into<String>) -> anyhow::Error {
         .into()
 }
 
+/// A release-state failure while discovering an API key. The release cannot be
+/// authenticated until its state is known, so do not suggest an API key as a
+/// remedy for an unreadable Helm inspection.
+fn api_key_state_err(namespace: &str, release: &str, msg: impl Into<String>) -> anyhow::Error {
+    crate::exit::CliError::usage(msg)
+        .with_fix(format!(
+            "run `curie cluster status --namespace {namespace} --release {release}` and retry"
+        ))
+        .into()
+}
+
+fn helm_release_entries(output: &str) -> Result<Vec<serde_json::Value>> {
+    let releases: serde_json::Value =
+        serde_json::from_str(output.trim()).context("malformed Helm release list JSON")?;
+    releases
+        .as_array()
+        .cloned()
+        .context("malformed Helm release list JSON: expected an array")
+}
+
+/// Find the requested release's Helm status in a `helm list -o json` result.
+/// Missing releases are a valid result; malformed Helm output is not.
+fn helm_release_status(output: &str, release: &str) -> Result<Option<String>> {
+    let releases = helm_release_entries(output)?;
+    let Some(found) = releases
+        .iter()
+        .find(|entry| entry.get("name").and_then(|name| name.as_str()) == Some(release))
+    else {
+        return Ok(None);
+    };
+    found
+        .get("status")
+        .and_then(|status| status.as_str())
+        .map(|status| Some(status.to_string()))
+        .context("malformed Helm release list JSON: release has no status")
+}
+
+/// Find a deployed release with the requested name in another namespace.
+/// The all-namespace Helm listing makes a same-name alternate explicit rather
+/// than guessing that a credential override can repair a failed release.
+fn deployed_release_namespace(
+    output: &str,
+    release: &str,
+    requested_namespace: &str,
+) -> Result<Option<String>> {
+    let releases = helm_release_entries(output)?;
+
+    for entry in releases {
+        if entry.get("name").and_then(|name| name.as_str()) != Some(release)
+            || !entry
+                .get("status")
+                .and_then(|status| status.as_str())
+                .is_some_and(|status| status.eq_ignore_ascii_case("deployed"))
+        {
+            continue;
+        }
+        let namespace = entry
+            .get("namespace")
+            .and_then(|namespace| namespace.as_str())
+            .context("malformed Helm release list JSON: deployed release has no namespace")?;
+        if namespace != requested_namespace {
+            return Ok(Some(namespace.to_string()));
+        }
+    }
+    Ok(None)
+}
+
 /// Discover a Helm release's platform API key by reading it out of the chart
 /// Secret (`<release>-secrets`, data key `apiKey`), decoded server-side by
 /// kubectl's `base64decode` so the plaintext never lands in argv (#524). The
@@ -4149,14 +6083,104 @@ fn api_key_usage_err(msg: impl Into<String>) -> anyhow::Error {
 /// wins (the caller only reaches here when neither was supplied). The value is
 /// never printed — it flows straight into the `X-API-Key` header.
 pub async fn discover_api_key(namespace: &str, release: &str) -> Result<String> {
-    read_release_secret(namespace, release, "apiKey")
+    if let Some(api_key) = read_release_secret(namespace, release, "apiKey").await {
+        return Ok(api_key);
+    }
+
+    let requested_cmd = OpsCommand::new(
+        "helm",
+        vec![
+            plain("list"),
+            plain("-n"),
+            plain(namespace),
+            plain("--all"),
+            plain("-o"),
+            plain("json"),
+        ],
+    );
+    let (requested_ok, requested_output, requested_error) = run_capture(&requested_cmd)
         .await
-        .ok_or_else(|| {
-            api_key_usage_err(format!(
-                "could not read the API key from the chart Secret for release {release} in namespace {namespace}; \
-                 pass --api-key or set CURIE_API_KEY to the release's api.apiKey"
-            ))
-        })
+        .map_err(|error| {
+            api_key_state_err(
+                namespace,
+                release,
+                format!("could not inspect Helm state for release {release} in namespace {namespace}: {error}"),
+            )
+        })?;
+    if !requested_ok {
+        return Err(api_key_state_err(
+            namespace,
+            release,
+            format!(
+                "could not inspect Helm state for release {release} in namespace {namespace}: {}",
+                failure_reason(&requested_error)
+            ),
+        ));
+    }
+    let requested_status = helm_release_status(&requested_output, release).map_err(|error| {
+        api_key_state_err(
+            namespace,
+            release,
+            format!("could not inspect Helm state for release {release} in namespace {namespace}: {error}"),
+        )
+    })?;
+
+    if requested_status
+        .as_deref()
+        .is_some_and(|status| status.eq_ignore_ascii_case("deployed"))
+    {
+        return Err(api_key_usage_err(format!(
+            "release {release} in namespace {namespace} is deployed, but its chart Secret API key could not be read; \
+             pass --api-key or set CURIE_API_KEY to the release's api.apiKey"
+        )));
+    }
+
+    let all_cmd = OpsCommand::new(
+        "helm",
+        vec![
+            plain("list"),
+            plain("-A"),
+            plain("--all"),
+            plain("-o"),
+            plain("json"),
+        ],
+    );
+    let deployed_alternate = match run_capture(&all_cmd).await {
+        Ok((true, all_output, _)) => {
+            deployed_release_namespace(&all_output, release, namespace).unwrap_or(None)
+        }
+        _ => None,
+    };
+
+    let status_command =
+        format!("`curie cluster status --namespace {namespace} --release {release}`");
+    let (message, fix) = match (requested_status, deployed_alternate) {
+        (Some(status), Some(alternate_namespace)) => (
+            format!(
+                "release {release} in namespace {namespace} is {status}, not deployed; a deployed release named {release} is available in namespace {alternate_namespace}. Inspect the failed release with {status_command} or retry this command with `--namespace {alternate_namespace}`"
+            ),
+            format!("retry this command with `--namespace {alternate_namespace}`"),
+        ),
+        (Some(status), None) => (
+            format!(
+                "release {release} in namespace {namespace} is {status}, not deployed; inspect its state with {status_command}"
+            ),
+            format!("run {status_command} and repair or redeploy the release"),
+        ),
+        (None, Some(alternate_namespace)) => (
+            format!(
+                "no release named {release} was found in namespace {namespace}; a deployed release with that name is available in namespace {alternate_namespace}. Retry this command with `--namespace {alternate_namespace}`"
+            ),
+            format!("retry this command with `--namespace {alternate_namespace}`"),
+        ),
+        (None, None) => (
+            format!(
+                "no deployed release named {release} was found in namespace {namespace}; inspect the target with {status_command}"
+            ),
+            format!("run {status_command} and deploy the release before retrying"),
+        ),
+    };
+    Err(crate::exit::CliError::usage(message).with_fix(fix).into())
 }
 
 /// A usage error (exit 2) whose fix hint points the operator at
@@ -4194,25 +6218,114 @@ fn slack_bot_token_usage_err(msg: impl Into<String>) -> anyhow::Error {
         .into()
 }
 
-/// Discover a Helm release's Slack bot token from the same chart Secret
-/// (`<release>-secrets`, data key `slackBotToken`). In connected mode
-/// `cluster message` posts a real placeholder to the workspace with this token so
-/// the approval card and resumed reply ride the connected transport, instead of
-/// the throwaway stub (#770/ADR-0078). Only reached when a `<release>-dispatcher`
-/// is present (a workspace IS connected), so the token is expected to be set; an
-/// empty or unreadable value is an actionable error. The value is never printed
-/// -- it flows only into the `chat.postMessage` auth header.
+/// Discover a Helm release's Slack bot token from the chart Secret
+/// (`<release>-secrets`, data key `slackBotToken`), or from the operator's own
+/// `dispatcher.slack.botTokenExistingSecret` when one is configured (#1759).
+/// In connected mode `cluster message` posts a real placeholder to the
+/// workspace with this token so the approval card and resumed reply ride the
+/// connected transport, instead of the throwaway stub (#770/ADR-0078). Only
+/// reached when a `<release>-dispatcher` is present (a workspace IS
+/// connected), so the token is expected to be set; an empty or unreadable
+/// value is an actionable error. The value is never printed -- it flows only
+/// into the `chat.postMessage` auth header.
 pub async fn discover_slack_bot_token(namespace: &str, release: &str) -> Result<String> {
-    read_release_secret(namespace, release, "slackBotToken")
-        .await
-        .filter(|token| !token.is_empty())
-        .ok_or_else(|| {
+    read_direct_passthrough_secret(
+        namespace,
+        release,
+        "slackBotToken",
+        "dispatcher.slack.botTokenExistingSecret",
+        "dispatcher.slack.botTokenExistingSecretKey",
+    )
+    .await
+    .filter(|token| !token.is_empty())
+    .ok_or_else(|| {
             slack_bot_token_usage_err(format!(
                 "could not read a Slack bot token from the chart Secret for release {release} in namespace \
                  {namespace}; the workspace may not be connected (run `curie cluster comms \
                  --slack`), or set CURIE_SLACK_BOT_TOKEN"
             ))
         })
+}
+
+/// What a Slack API base lookup found for a release.
+///
+/// The three outcomes are deliberately distinct because they demand different
+/// behavior, and collapsing them is how #1030 could come back wearing a different
+/// hat. "Configured nothing" is the ordinary case and means real Slack. "Could not
+/// look" is not evidence of anything and must not be read as the ordinary case,
+/// because the CLI would then post a real token wherever real Slack is while the
+/// worker edits through a proxy the CLI never saw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlackApiBase {
+    /// The worker renders `SLACK_API_BASE_URL` with this value.
+    Configured(String),
+    /// The worker renders no `SLACK_API_BASE_URL`, so it talks to real Slack.
+    RealSlack,
+    /// The lookup itself could not run or could not find the worker.
+    Unknown,
+}
+
+/// The label selector that finds a release's worker Deployment whatever it is named.
+///
+/// The name is `{{ include "curie.fullname" . }}-worker`, which equals
+/// `<release>-worker` only when the release name happens to contain the chart
+/// name. A release named `acme-prod` renders `acme-prod-curie-worker`, and
+/// `nameOverride`/`fullnameOverride` move it again. Guessing the name is the
+/// defect `release_secret_name` already avoids by selecting on labels, and this
+/// selects the same way for the same reason.
+fn worker_deployment_selector(release: &str) -> String {
+    format!("app.kubernetes.io/instance={release},app.kubernetes.io/component=worker")
+}
+
+/// Parse `kubectl get deployment -o jsonpath=...` output into an outcome.
+///
+/// Pure, so every branch is unit-testable without a cluster. `ok=false` is the
+/// case that must not read as "nothing configured": see [`SlackApiBase`].
+fn parse_slack_api_base(ok: bool, out: &str) -> SlackApiBase {
+    if !ok {
+        return SlackApiBase::Unknown;
+    }
+    let value = out.trim();
+    if value.is_empty() {
+        return SlackApiBase::RealSlack;
+    }
+    // The jsonpath ranges over containers, so two containers each rendering the
+    // var would concatenate. That cannot happen in this chart (the worker
+    // Deployment has one container), and if it ever does, guessing which half is
+    // the base is exactly the ambiguity this issue is about.
+    if value.lines().count() > 1 {
+        return SlackApiBase::Unknown;
+    }
+    SlackApiBase::Configured(value.to_string())
+}
+
+/// The Slack API base the release's own worker is configured with.
+///
+/// Read from the SAME release the bot token is read from (#1030). The base used to
+/// come from `SLACK_API_BASE_URL` in the CLI's own process environment while the
+/// token came from the release Secret, so a developer with a stub URL exported
+/// from earlier testing sent a production workspace token to their local stub.
+/// The two halves now share one source.
+pub async fn discover_slack_api_base_url(namespace: &str, release: &str) -> SlackApiBase {
+    let cmd = OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("-n"),
+            plain(namespace),
+            plain("get"),
+            plain("deployment"),
+            plain("-l"),
+            plain(worker_deployment_selector(release)),
+            plain("-o"),
+            plain(
+                "jsonpath={range .items[*].spec.template.spec.containers[*]}                 {.env[?(@.name=='SLACK_API_BASE_URL')].value}{\"\\n\"}{end}",
+            ),
+        ],
+    );
+    match run_capture(&cmd).await {
+        Ok((ok, out, _)) => parse_slack_api_base(ok, &out),
+        Err(_) => SlackApiBase::Unknown,
+    }
 }
 
 /// Whether a `<release>-dispatcher` Deployment exists in `namespace` -- i.e. a
@@ -4329,7 +6442,9 @@ pub async fn release_secret_name_or_default(namespace: &str, release: &str) -> S
 }
 
 /// The release's sealing keys (ADR-0094): current first, then the previous one
-/// if a rotation is in progress.
+/// if a rotation is in progress. Follows the operator's own
+/// `sealing.{privateKey,previousPrivateKey}ExistingSecret` when configured
+/// (#1759), otherwise the chart's own Secret.
 ///
 /// Returns whatever is present. An empty vector means this release has no
 /// sealing key, which the caller must report rather than work around -- sealing
@@ -4337,8 +6452,27 @@ pub async fn release_secret_name_or_default(namespace: &str, release: &str) -> S
 /// that starts and then fails every call.
 pub async fn read_sealing_keys(namespace: &str, release: &str) -> Vec<String> {
     let mut keys = Vec::new();
-    for data_key in ["sealingPrivateKey", "sealingPreviousPrivateKey"] {
-        if let Some(value) = read_release_secret(namespace, release, data_key).await {
+    for (default_data_key, existing_secret_key, existing_secret_key_key) in [
+        (
+            "sealingPrivateKey",
+            "sealing.privateKeyExistingSecret",
+            "sealing.privateKeyExistingSecretKey",
+        ),
+        (
+            "sealingPreviousPrivateKey",
+            "sealing.previousPrivateKeyExistingSecret",
+            "sealing.previousPrivateKeyExistingSecretKey",
+        ),
+    ] {
+        if let Some(value) = read_direct_passthrough_secret(
+            namespace,
+            release,
+            default_data_key,
+            existing_secret_key,
+            existing_secret_key_key,
+        )
+        .await
+        {
             if !value.trim().is_empty() {
                 keys.push(value);
             }
@@ -4353,6 +6487,15 @@ pub async fn read_sealing_keys(namespace: &str, release: &str) -> Vec<String> {
 /// that into an actionable error naming its own escape-hatch flag.
 async fn read_release_secret(namespace: &str, release: &str, data_key: &str) -> Option<String> {
     let secret = release_secret_name(namespace, release).await?;
+    read_secret_key(namespace, &secret, data_key).await
+}
+
+/// Read one data key out of a NAMED Secret -- not necessarily the release's own
+/// chart Secret, since a direct-passthrough credential's `existingSecret` names
+/// an operator-managed Secret elsewhere in the namespace. Decoded server-side by
+/// kubectl's `base64decode` so the plaintext never lands in argv (#524). `None`
+/// when the Secret, the key, or the cluster is unreachable.
+async fn read_secret_key(namespace: &str, secret_name: &str, data_key: &str) -> Option<String> {
     let cmd = OpsCommand::new(
         "kubectl",
         vec![
@@ -4360,7 +6503,7 @@ async fn read_release_secret(namespace: &str, release: &str, data_key: &str) -> 
             plain(namespace),
             plain("get"),
             plain("secret"),
-            plain(secret),
+            plain(secret_name),
             plain("-o"),
             plain(format!(
                 "go-template={{{{ index .data \"{data_key}\" | base64decode }}}}"
@@ -4370,6 +6513,39 @@ async fn read_release_secret(namespace: &str, release: &str, data_key: &str) -> 
     match run_capture(&cmd).await {
         Ok((true, out, _)) if !out.trim().is_empty() => Some(out.trim().to_string()),
         _ => None,
+    }
+}
+
+/// Read a direct-passthrough credential (issue #1759), following the operator's
+/// own `existingSecret` when one is configured for this key and otherwise
+/// falling back to the chart's own Secret and its published key name -- the
+/// same BYO-wins precedence the chart templates themselves use.
+///
+/// Without this, a CLI verb that reads the credential straight from the
+/// chart's own Secret (as every one of these did before the BYO escape
+/// existed) silently reads nothing for anyone who adopts it, even though the
+/// deployed workload resolves correctly from the operator's Secret.
+async fn read_direct_passthrough_secret(
+    namespace: &str,
+    release: &str,
+    default_data_key: &str,
+    existing_secret_key: &str,
+    existing_secret_key_key: &str,
+) -> Option<String> {
+    let common = CommonOpts {
+        namespace: namespace.to_string(),
+        release: release.to_string(),
+        dry_run: false,
+    };
+    let existing = fetch_existing_values(&common).await.ok().flatten();
+    match resolve_existing_secret_ref(
+        existing.as_ref(),
+        existing_secret_key,
+        existing_secret_key_key,
+        default_data_key,
+    ) {
+        Some((secret_name, data_key)) => read_secret_key(namespace, &secret_name, &data_key).await,
+        None => read_release_secret(namespace, release, default_data_key).await,
     }
 }
 
@@ -4487,6 +6663,12 @@ enum ServiceUrlKind {
 }
 
 impl ServiceUrl {
+    /// Build the shared port-forward text after the caller chooses whether the
+    /// URL target is plain (JSON) or styled (human output).
+    fn port_forward_hint(&self, local: u16, port: u16, target: &str) -> String {
+        port_forward_hint_with(&self.namespace, &self.name, local, port, target)
+    }
+
     fn to_json(&self) -> serde_json::Value {
         let (url, note): (Option<String>, Option<String>) = match &self.kind {
             ServiceUrlKind::NodePortUrl(url) => (Some(url.clone()), None),
@@ -4502,9 +6684,7 @@ impl ServiceUrl {
                 let suffix_path = api_suffix_path(self.api);
                 (
                     None,
-                    Some(port_forward_hint_with(
-                        &self.namespace,
-                        &self.name,
+                    Some(self.port_forward_hint(
                         *local,
                         *port,
                         &format!("http://localhost:{local}{suffix_path}"),
@@ -4535,9 +6715,7 @@ impl ServiceUrl {
                 let suffix_path = api_suffix_path(self.api);
                 ui.kv(
                     &self.label,
-                    &port_forward_hint_with(
-                        &self.namespace,
-                        &self.name,
+                    &self.port_forward_hint(
                         *local,
                         *port,
                         &ui.url(&format!("http://localhost:{local}{suffix_path}")),
@@ -4623,7 +6801,8 @@ pub enum ServiceEndpoint {
     /// Type NodePort but no nodePort assigned yet.
     UnassignedNodePort,
     /// ClusterIP/other: reachable only via a port-forward.
-    /// `local = if port == 0 { 8080 } else { port }`.
+    /// `local` is non-privileged: service ports below 1024 are offset by
+    /// 18000, while an absent service port falls back to 8080.
     PortForwardHint { local: u16, port: u16 },
     /// `parse_service` returned None (malformed/unreadable JSON).
     Unreadable,
@@ -4649,7 +6828,11 @@ fn resolve_service_endpoint(svc_json: &str, host: &str, api: bool) -> ServiceEnd
             None => ServiceEndpoint::UnassignedNodePort,
         },
         Some((_, _, port)) => ServiceEndpoint::PortForwardHint {
-            local: if port == 0 { 8080 } else { port },
+            local: match port {
+                0 => 8080,
+                1..=1023 => port + 18000,
+                _ => port,
+            },
             port,
         },
         None => ServiceEndpoint::Unreadable,
@@ -4879,6 +7062,38 @@ mod tests {
     }
 
     #[test]
+    fn credential_prefix_inference_matches_the_shared_provider_registry() {
+        #[derive(serde::Deserialize)]
+        struct Registry {
+            providers: Vec<Provider>,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct Provider {
+            name: String,
+            inferred_provider: Option<String>,
+            credential_examples: Vec<String>,
+        }
+
+        let registry: Registry = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/vectors/model-provider-registry.json"
+        )))
+        .expect("parse provider registry");
+
+        for provider in registry.providers {
+            for credential in provider.credential_examples {
+                assert_eq!(
+                    provider_from_credential_prefix(&credential),
+                    provider.inferred_provider.as_deref(),
+                    "credential example for {}",
+                    provider.name
+                );
+            }
+        }
+    }
+
+    #[test]
     fn up_defaults_expose_ui_and_langfuse() {
         let cmds = up_commands(&UpOpts {
             common: common(),
@@ -4903,6 +7118,169 @@ mod tests {
             line,
             "helm upgrade --install curie charts/curie -n curie --create-namespace \
              --set ui.service.type=NodePort --set langfuse.web.service.type=NodePort"
+        );
+    }
+
+    #[test]
+    fn plain_up_re_supplies_recorded_worker_extra_env_without_reuse_values() {
+        let existing = serde_json::json!({
+            "worker": {
+                "extraEnv": [
+                    {
+                        "name": "PROVIDER_BASE_URL",
+                        "value": "https://provider.example.com/v1"
+                    },
+                    {
+                        "name": "FALLBACK_BASE_URL",
+                        "value": "https://fallback.example.com/v1"
+                    }
+                ]
+            }
+        });
+        let opts = complete_up_opts_without_runner_egress(
+            UpOpts {
+                common: common(),
+                github_token: GithubTokenPlan::Untouched,
+                allow_egress_host: vec![],
+                resolved_egress_cidrs: vec![],
+                chart: "charts/curie".into(),
+                secrets: vec![],
+                dev: false,
+                no_expose: false,
+                set: vec![],
+                set_string: vec![],
+                allow_web_egress: vec![],
+                fake_model: false,
+                credentials: None,
+                local_model: None,
+                model: None,
+            },
+            Some(&existing),
+            None,
+            false,
+        )
+        .unwrap();
+
+        let (materialized, _guards) = up_commands(&opts)[0].materialize_secret_files().unwrap();
+        let argv = materialized.argv().join(" ");
+        for assignment in [
+            "worker.extraEnv[0].name=PROVIDER_BASE_URL",
+            "worker.extraEnv[0].value=https://provider.example.com/v1",
+            "worker.extraEnv[1].name=FALLBACK_BASE_URL",
+            "worker.extraEnv[1].value=https://fallback.example.com/v1",
+        ] {
+            assert!(
+                argv.contains(&format!("--set-string {assignment}")),
+                "plain up dropped recorded worker extraEnv leaf {assignment}: {argv}"
+            );
+        }
+        assert!(
+            !argv.contains("--reuse-values"),
+            "up must remain a full Helm upgrade: {argv}"
+        );
+    }
+
+    #[test]
+    fn explicit_worker_extra_env_leaves_override_the_recorded_family() {
+        let existing = serde_json::json!({
+            "worker": {
+                "extraEnv": [{
+                    "name": "RECORDED_PROVIDER_BASE_URL",
+                    "value": "https://recorded.example.com/v1"
+                }]
+            }
+        });
+        let opts = complete_up_opts_without_runner_egress(
+            UpOpts {
+                common: common(),
+                github_token: GithubTokenPlan::Untouched,
+                allow_egress_host: vec![],
+                resolved_egress_cidrs: vec![],
+                chart: "charts/curie".into(),
+                secrets: vec![],
+                dev: false,
+                no_expose: true,
+                set: vec![],
+                set_string: vec![
+                    "worker.extraEnv[0].name=OPERATOR_PROVIDER_BASE_URL".into(),
+                    "worker.extraEnv[0].value=https://operator.example.com/v1".into(),
+                ],
+                allow_web_egress: vec![],
+                fake_model: false,
+                credentials: None,
+                local_model: None,
+                model: None,
+            },
+            Some(&existing),
+            None,
+            false,
+        )
+        .unwrap();
+
+        let (materialized, _guards) = up_commands(&opts)[0].materialize_secret_files().unwrap();
+        let argv = materialized.argv().join(" ");
+        assert!(
+            argv.contains("--set-string worker.extraEnv[0].name=OPERATOR_PROVIDER_BASE_URL"),
+            "the explicit worker extraEnv name must reach Helm: {argv}"
+        );
+        assert!(
+            argv.contains("--set-string worker.extraEnv[0].value=https://operator.example.com/v1"),
+            "the explicit worker extraEnv value must reach Helm: {argv}"
+        );
+        assert!(
+            !argv.contains("RECORDED_PROVIDER_BASE_URL")
+                && !argv.contains("https://recorded.example.com/v1"),
+            "explicit worker extraEnv input must suppress the recorded family: {argv}"
+        );
+    }
+
+    #[test]
+    fn plain_up_escapes_commas_in_recorded_worker_extra_env_values() {
+        let existing = serde_json::json!({
+            "worker": {
+                "extraEnv": [{
+                    "name": "NO_PROXY",
+                    "value": "10.0.0.0/8,localhost"
+                }]
+            }
+        });
+        let opts = complete_up_opts_without_runner_egress(
+            UpOpts {
+                common: common(),
+                github_token: GithubTokenPlan::Untouched,
+                allow_egress_host: vec![],
+                resolved_egress_cidrs: vec![],
+                chart: "charts/curie".into(),
+                secrets: vec![],
+                dev: false,
+                no_expose: true,
+                set: vec![],
+                set_string: vec![],
+                allow_web_egress: vec![],
+                fake_model: false,
+                credentials: None,
+                local_model: None,
+                model: None,
+            },
+            Some(&existing),
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            up_value_plan(&opts)
+                .effective_values()
+                .get("worker.extraEnv[0].value"),
+            Some(&"10.0.0.0/8,localhost".to_string()),
+            "the escaped Helm expression must retain the recorded semantic value"
+        );
+
+        let (materialized, _guards) = up_commands(&opts)[0].materialize_secret_files().unwrap();
+        let argv = materialized.argv();
+        assert!(
+            argv.contains(&"worker.extraEnv[0].value=10.0.0.0/8\\,localhost".into()),
+            "recorded worker extraEnv values must escape commas for Helm: {argv:?}"
         );
     }
 
@@ -5573,10 +7951,12 @@ mod tests {
         assert_eq!(cmds.len(), 2);
         assert_eq!(cmds[0].display(), "helm uninstall prod-release -n agent-ns");
         let sweep = cmds[1].display();
-        // Label-selector-scoped delete keyed on THIS release's ownership label.
+        // Label-selector-scoped delete keyed on THIS release's ownership labels.
+        // #1654: the selector is the conjunction of release name AND install
+        // namespace, so it cannot reach another release's namespaces.
         assert_eq!(
             sweep,
-            "kubectl delete namespace -l curietech.ai/created-by=prod-release --ignore-not-found"
+            "kubectl delete namespace -l curietech.ai/created-by=prod-release,curietech.ai/created-in=agent-ns --ignore-not-found"
         );
         // Negative case: the pre-existing shared namespace is no longer an
         // unconditional delete target (that would strand pre-existing state).
@@ -5607,7 +7987,8 @@ mod tests {
     // SYMBOL: a pure builder that gates the ownership stamp on the
     // pre-existence probe result:
     //
-    //   fn ownership_label_commands(o: &CommonOpts, namespace_existed: bool) -> Vec<OpsCommand>
+    //   fn ownership_label_commands(o: &CommonOpts, release_namespace: &str,
+    //                               namespace_existed: bool) -> Vec<OpsCommand>
     //
     // It returns the `kubectl label namespace` stamp step ONLY when `up` created
     // the namespace (namespace_existed == false); an empty vec when the namespace
@@ -5615,22 +7996,138 @@ mod tests {
     // existing/fresh split), keeping this builder pure and unit-testable.
     #[test]
     fn up_stamps_ownership_label_when_namespace_created() {
-        let cmds = ownership_label_commands(&common_distinct_release(), false);
+        let cmds = ownership_label_commands(&common_distinct_release(), "install-ns", false);
         assert_eq!(cmds.len(), 1);
-        // namespace arg is the namespace; the label VALUE is the release.
+        // namespace arg is the TARGET namespace; the created-by label VALUE is
+        // the release, and the #1654 created-in label VALUE is the release's
+        // INSTALL namespace (distinct from the target here, so neither value can
+        // be satisfied by the other).
         assert_eq!(
             cmds[0].display(),
-            "kubectl label namespace agent-ns curietech.ai/created-by=prod-release --overwrite"
+            "kubectl label namespace agent-ns curietech.ai/created-by=prod-release curietech.ai/created-in=install-ns --overwrite"
         );
     }
 
     #[test]
     fn up_does_not_stamp_ownership_label_when_namespace_preexisting() {
-        let cmds = ownership_label_commands(&common_distinct_release(), true);
+        let cmds = ownership_label_commands(&common_distinct_release(), "install-ns", true);
         assert!(
             cmds.is_empty(),
             "a pre-existing namespace must not be stamped (would adopt then delete pre-existing state): {:?}",
             cmds.iter().map(OpsCommand::display).collect::<Vec<_>>()
+        );
+    }
+
+    /// Parse a `kubectl label namespace <ns> k=v [k=v ...] --overwrite` stamp
+    /// into the label map it would actually set on that namespace.
+    fn parse_stamped_labels(cmd: &OpsCommand) -> std::collections::BTreeMap<String, String> {
+        let line = cmd.display();
+        let mut parts = line.split_whitespace();
+        assert_eq!(parts.next(), Some("kubectl"), "{line}");
+        assert_eq!(parts.next(), Some("label"), "{line}");
+        assert_eq!(parts.next(), Some("namespace"), "{line}");
+        parts.next().expect("the target namespace arg");
+        parts
+            .take_while(|tok| !tok.starts_with("--"))
+            .map(|tok| {
+                let (k, v) = tok.split_once('=').unwrap_or_else(|| {
+                    panic!("every stamped label must be key=value, got {tok:?}: {line}")
+                });
+                (k.to_string(), v.to_string())
+            })
+            .collect()
+    }
+
+    /// Parse the `-l` selector out of a `kubectl delete namespace -l <sel>
+    /// --ignore-not-found` sweep into the `key=value` terms it REQUIRES (a
+    /// comma-joined kubectl selector is a conjunction: all terms must match).
+    fn parse_selector_terms(cmd: &OpsCommand) -> Vec<(String, String)> {
+        let line = cmd.display();
+        let toks: Vec<&str> = line.split_whitespace().collect();
+        let at = toks.iter().position(|t| *t == "-l").expect("a -l selector");
+        toks[at + 1]
+            .split(',')
+            .map(|term| {
+                let (k, v) = term.split_once('=').unwrap_or_else(|| {
+                    panic!("every selector term must be key=value, got {term:?}: {line}")
+                });
+                (k.to_string(), v.to_string())
+            })
+            .collect()
+    }
+
+    /// Whether a sweep selector's required terms are all satisfied by the labels
+    /// a namespace actually carries, i.e. whether that sweep would delete it.
+    fn selector_matches(
+        terms: &[(String, String)],
+        labels: &std::collections::BTreeMap<String, String>,
+    ) -> bool {
+        terms
+            .iter()
+            .all(|(k, v)| labels.get(k).map(String::as_str) == Some(v.as_str()))
+    }
+
+    // #1654 cross-release teardown scope. Two independent Curie installs on one
+    // cluster normally BOTH take the default release name `curie` and differ
+    // only in their install namespace, so a sweep selector keyed on the release
+    // name alone matched the OTHER install's namespaces and deleted them
+    // (observed live: `agent-sandbox-system` stamped `created-by=curie` while
+    // annotated `meta.helm.sh/release-namespace: curie-other`, swept by an
+    // unrelated release's `cluster down`, killing a running bot).
+    //
+    // Modeled BEHAVIORALLY rather than by string comparison: stamp release B's
+    // namespace, build release A's sweep selector, then evaluate that selector
+    // against those labels the way kubectl would. A FAILURE on the first
+    // assertion means release A's teardown can delete a namespace release B
+    // created -- the #1654 defect itself, which is what dropping `created-in`
+    // from either the stamp or the selector reintroduces. The second assertion
+    // is the anti-vacuity control: a selector that matched nothing at all would
+    // also pass the first one, so release A must still sweep its OWN namespace.
+    #[test]
+    fn down_selector_never_matches_another_releases_namespace() {
+        // Release B: name `curie`, installed into `curie-other`, and it created
+        // the shared-looking `agent-sandbox-system`.
+        let b = CommonOpts {
+            namespace: "curie-other".into(),
+            release: "curie".into(),
+            dry_run: false,
+        };
+        let b_stamp = ownership_label_commands(
+            &ns_common(&b, "agent-sandbox-system", false),
+            &b.namespace,
+            false,
+        );
+        assert_eq!(b_stamp.len(), 1);
+        let b_labels = parse_stamped_labels(&b_stamp[0]);
+
+        // Release A: the SAME release name, installed into a different
+        // namespace. Its teardown sweep must not reach release B's namespace.
+        let a = CommonOpts {
+            namespace: "curie-a".into(),
+            release: "curie".into(),
+            dry_run: false,
+        };
+        let a_sweep = down_commands(&a);
+        let a_terms = parse_selector_terms(&a_sweep[1]);
+        assert!(
+            !selector_matches(&a_terms, &b_labels),
+            "release A's sweep selector {a_terms:?} must NOT match release B's namespace labels \
+             {b_labels:?}; matching means one install's `cluster down` deletes another live \
+             install's namespaces (#1654)"
+        );
+
+        // Anti-vacuity: release A must still sweep a namespace A itself created.
+        let a_stamp = ownership_label_commands(
+            &ns_common(&a, "agent-sandbox-system", false),
+            &a.namespace,
+            false,
+        );
+        assert_eq!(a_stamp.len(), 1);
+        let a_labels = parse_stamped_labels(&a_stamp[0]);
+        assert!(
+            selector_matches(&a_terms, &a_labels),
+            "release A's sweep selector {a_terms:?} must still match its OWN stamp {a_labels:?}; \
+             a selector that matches nothing is not a fix"
         );
     }
 
@@ -5710,12 +8207,12 @@ mod tests {
         let cmd = resume_command(&[TeardownStep::NamespaceSweep], &o);
         assert_eq!(
             cmd,
-            "kubectl delete namespace -l curietech.ai/created-by=prod-release --ignore-not-found"
+            "kubectl delete namespace -l curietech.ai/created-by=prod-release,curietech.ai/created-in=agent-ns --ignore-not-found"
         );
         // #707 ownership-scope invariant: the sweep stays keyed on THIS release's
         // label and is never widened to an unconditional namespace delete.
         assert!(
-            cmd.contains("curietech.ai/created-by=prod-release"),
+            cmd.contains("curietech.ai/created-by=prod-release,curietech.ai/created-in=agent-ns"),
             "{cmd}"
         );
         assert!(
@@ -5750,7 +8247,7 @@ mod tests {
         );
         let helm_cmd = "helm uninstall prod-release -n agent-ns";
         let sweep_cmd =
-            "kubectl delete namespace -l curietech.ai/created-by=prod-release --ignore-not-found";
+            "kubectl delete namespace -l curietech.ai/created-by=prod-release,curietech.ai/created-in=agent-ns --ignore-not-found";
         assert_eq!(
             cmd,
             format!(
@@ -5782,7 +8279,7 @@ mod tests {
         );
         // The sweep half stays label-scoped even when combined with helm.
         assert!(
-            cmd.contains("curietech.ai/created-by=prod-release"),
+            cmd.contains("curietech.ai/created-by=prod-release,curietech.ai/created-in=agent-ns"),
             "{cmd}"
         );
         assert!(cmd.contains("--ignore-not-found"), "{cmd}");
@@ -6072,14 +8569,14 @@ mod tests {
         // P1: the resume command is IN the human Display message, not only the fix.
         let shown = err.to_string();
         assert!(
-            shown.contains("curietech.ai/created-by=prod-release"),
+            shown.contains("curietech.ai/created-by=prod-release,curietech.ai/created-in=agent-ns"),
             "the human message must carry the label-scoped resume command: {shown}"
         );
 
         // --json path: the fix carries the same label-scoped resume command.
         let fix = fix.expect("a fail-forward teardown carries a resume command");
         assert!(
-            fix.contains("curietech.ai/created-by=prod-release"),
+            fix.contains("curietech.ai/created-by=prod-release,curietech.ai/created-in=agent-ns"),
             "fix must carry the label-scoped resume command: {fix}"
         );
     }
@@ -6211,7 +8708,7 @@ mod tests {
         // Fail-forward still surfaces the resume command in message and fix.
         let shown = err.to_string();
         assert!(
-            shown.contains("curietech.ai/created-by=prod-release"),
+            shown.contains("curietech.ai/created-by=prod-release,curietech.ai/created-in=agent-ns"),
             "even a permanent failure surfaces the label-scoped resume command: {shown}"
         );
         // Codex P2: the permanent-failure message must surface the underlying
@@ -6223,7 +8720,7 @@ mod tests {
         );
         let fix = fix.expect("a fail-forward teardown carries a resume command");
         assert!(
-            fix.contains("curietech.ai/created-by=prod-release"),
+            fix.contains("curietech.ai/created-by=prod-release,curietech.ai/created-in=agent-ns"),
             "{fix}"
         );
     }
@@ -6372,9 +8869,15 @@ mod tests {
     }
 
     #[test]
-    fn mask_secret_shows_eight_then_stars() {
+    fn mask_secret_uses_shared_long_and_short_contract() {
         assert_eq!(mask_secret("xoxb-abcdefghijk"), "xoxb-abc***");
-        assert_eq!(mask_secret("short"), "short***");
+        for value in ["", "a", "short", "12345678"] {
+            assert_eq!(
+                mask_secret(value),
+                "***",
+                "values of eight characters or fewer must reveal no characters: {value:?}"
+            );
+        }
     }
 
     #[test]
@@ -6537,6 +9040,77 @@ mod tests {
         );
         assert_eq!(lookup_dotted(&v, "postgres.auth.missing"), None);
         assert_eq!(lookup_dotted(&serde_json::Value::Null, "api.apiKey"), None);
+    }
+
+    #[test]
+    fn resolve_existing_secret_ref_prefers_operator_secret_and_custom_key() {
+        // #1759 follow-up: a release with a BYO existingSecret configured must
+        // resolve to that Secret and its (possibly overridden) key name, not
+        // the chart's own Secret -- this is the read-path half of the bug
+        // `curie seal`/`curie cluster message` hit before this fix, where they
+        // read straight from the chart's own Secret and never checked for a
+        // BYO override.
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"sealing":{"privateKeyExistingSecret":"my-sealing-secret","privateKeyExistingSecretKey":"customKey"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_existing_secret_ref(
+                Some(&v),
+                "sealing.privateKeyExistingSecret",
+                "sealing.privateKeyExistingSecretKey",
+                "sealingPrivateKey"
+            ),
+            Some(("my-sealing-secret".to_string(), "customKey".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolve_existing_secret_ref_defaults_key_when_key_field_absent() {
+        // The chart's own default for *ExistingSecretKey is the published key
+        // name (e.g. `botTokenExistingSecretKey: slackBotToken`), so a release
+        // that set only the Secret name and left the key at its default must
+        // still resolve to the published key, not an empty/missing key.
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"dispatcher":{"slack":{"botTokenExistingSecret":"my-slack-secret"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_existing_secret_ref(
+                Some(&v),
+                "dispatcher.slack.botTokenExistingSecret",
+                "dispatcher.slack.botTokenExistingSecretKey",
+                "slackBotToken"
+            ),
+            Some(("my-slack-secret".to_string(), "slackBotToken".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolve_existing_secret_ref_none_when_not_configured() {
+        // Negative control: no release at all, and a release that only set the
+        // plain value (no BYO escape) -- both must fall through to None so the
+        // caller reads the chart's own Secret, exactly as it did before #1759.
+        assert_eq!(
+            resolve_existing_secret_ref(
+                None,
+                "sealing.privateKeyExistingSecret",
+                "sealing.privateKeyExistingSecretKey",
+                "sealingPrivateKey"
+            ),
+            None
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"sealing":{"privateKey":"plain-value"}}"#).unwrap();
+        assert_eq!(
+            resolve_existing_secret_ref(
+                Some(&v),
+                "sealing.privateKeyExistingSecret",
+                "sealing.privateKeyExistingSecretKey",
+                "sealingPrivateKey"
+            ),
+            None
+        );
     }
 
     #[test]
@@ -7071,16 +9645,40 @@ mod tests {
 
     #[test]
     fn resolve_service_endpoint_clusterip_yields_a_port_forward_hint() {
-        // ClusterIP: not node-exposed, so the caller must port-forward. The local
-        // port mirrors the service port.
-        let clusterip = r#"{"spec":{"type":"ClusterIP","ports":[{"port":80}]}}"#;
-        assert_eq!(
-            resolve_service_endpoint(clusterip, "10.0.0.5", true),
-            ServiceEndpoint::PortForwardHint {
-                local: 80,
-                port: 80
-            }
+        // ClusterIP: not node-exposed, so the caller must port-forward. Each
+        // privileged service port maps to a deterministic non-privileged local port.
+        let http_clusterip = r#"{"spec":{"type":"ClusterIP","ports":[{"port":80}]}}"#;
+        let http_endpoint = resolve_service_endpoint(http_clusterip, "10.0.0.5", true);
+        let ServiceEndpoint::PortForwardHint {
+            local: http_local,
+            port: http_port,
+        } = http_endpoint
+        else {
+            panic!("ClusterIP services must yield a port-forward hint");
+        };
+        assert_eq!(http_local, 18080);
+        assert_eq!(http_port, 80);
+        assert!(
+            http_local >= 1024,
+            "the local port must be bindable by a non-root user"
         );
+
+        let https_clusterip = r#"{"spec":{"type":"ClusterIP","ports":[{"port":443}]}}"#;
+        let https_endpoint = resolve_service_endpoint(https_clusterip, "10.0.0.5", true);
+        let ServiceEndpoint::PortForwardHint {
+            local: https_local,
+            port: https_port,
+        } = https_endpoint
+        else {
+            panic!("ClusterIP services must yield a port-forward hint");
+        };
+        assert_eq!(https_local, 18443);
+        assert_eq!(https_port, 443);
+        assert!(
+            https_local >= 1024,
+            "the local port must be bindable by a non-root user"
+        );
+
         // An absent port parses as 0, which falls back to local port 8080.
         let no_port = r#"{"spec":{"type":"ClusterIP","ports":[{}]}}"#;
         assert_eq!(
@@ -7121,13 +9719,75 @@ mod tests {
         // The exact hint `cluster status` prints today for a ClusterIP service
         // (PR#34 visual-parity guard): two spaces before `then`.
         assert_eq!(
-            port_forward_hint("curie", "curie-ui", 80, 80, "/?api=1"),
-            "kubectl -n curie port-forward svc/curie-ui 80:80  then http://localhost:80/?api=1"
+            port_forward_hint("curie", "curie-ui", 18080, 80, "/?api=1"),
+            "kubectl -n curie port-forward svc/curie-ui 18080:80  then http://localhost:18080/?api=1"
         );
         // The 0-port fallback surfaces local 8080 while still forwarding to 0.
         assert_eq!(
             port_forward_hint("curie", "curie-langfuse-web", 8080, 0, ""),
             "kubectl -n curie port-forward svc/curie-langfuse-web 8080:0  then http://localhost:8080"
+        );
+    }
+
+    #[test]
+    fn service_url_json_uses_the_privileged_port_forward_hint() {
+        let clusterip = r#"{"spec":{"type":"ClusterIP","ports":[{"port":80}]}}"#;
+        let endpoint = resolve_service_endpoint(clusterip, "10.0.0.5", true);
+        let ServiceEndpoint::PortForwardHint { local, port } = endpoint else {
+            panic!("ClusterIP services must yield a port-forward hint");
+        };
+        let service_url = ServiceUrl {
+            label: "UI".to_string(),
+            name: "curie-ui".to_string(),
+            namespace: "curie".to_string(),
+            api: true,
+            kind: ServiceUrlKind::PortForward { local, port },
+        };
+
+        assert_eq!(
+            service_url.to_json(),
+            serde_json::json!({
+                "name": "UI",
+                "url": null,
+                "note": "kubectl -n curie port-forward svc/curie-ui 18080:80  then http://localhost:18080/?api=1",
+            })
+        );
+    }
+
+    #[test]
+    fn service_url_port_forward_hint_preserves_a_human_identity_target() {
+        let service_url = ServiceUrl {
+            label: "UI".to_string(),
+            name: "curie-ui".to_string(),
+            namespace: "curie".to_string(),
+            api: true,
+            kind: ServiceUrlKind::PortForward {
+                local: 18080,
+                port: 80,
+            },
+        };
+        let ui = crate::ui::Ui::resolve(
+            crate::ui::ColorFlag::Never,
+            false,
+            false,
+            false,
+            &crate::ui::UiEnv {
+                no_color: false,
+                clicolor_zero: false,
+                clicolor_force: false,
+                term_dumb: false,
+                ci: false,
+                stderr_tty: true,
+                stdout_tty: true,
+                utf8: true,
+                truecolor: false,
+            },
+        );
+        let target = ui.url("http://localhost:18080/?api=1");
+        assert_eq!(target, "http://localhost:18080/?api=1");
+        assert_eq!(
+            service_url.port_forward_hint(18080, 80, &target),
+            "kubectl -n curie port-forward svc/curie-ui 18080:80  then http://localhost:18080/?api=1"
         );
     }
 

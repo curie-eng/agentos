@@ -37,6 +37,9 @@ Components deployed:
 App services:
 {{- if .Values.api.deploy }}
   - api ({{ .Values.api.image.repository }}:{{ .Values.api.image.tag }}) on Service {{ include "curie.fullname" . }}-api:{{ .Values.api.service.port }}
+{{- if and (eq .Values.api.service.type "NodePort") .Values.api.service.nodePort }}
+    NodePort {{ .Values.api.service.nodePort }} is pinned by api.service.nodePort. Set it to an empty string to let Kubernetes allocate a port.
+{{- end }}
 {{- end }}
 {{- if include "curie.dispatcher.enabled" . }}
   - dispatcher ({{ .Values.dispatcher.image.repository }}:{{ .Values.dispatcher.image.tag }}) [Slack Socket Mode, no Service]
@@ -205,6 +208,10 @@ manage yourself, so it never passes through helm values or release history:
 
   api.githubAppExistingSecret: my-github-app
 
-  Create it with kubectl, External Secrets, or Sealed Secrets. See
-  charts/curie/README.md#secrets-at-rest.
+  The model credential, the Slack tokens, and five other direct-passthrough
+  keys carry the same escape (issue #1759): <field>ExistingSecret plus
+  <field>ExistingSecretKey, one pair per key. See
+  charts/curie/README.md#secrets-at-rest for the full list.
+
+  Create any of them with kubectl, External Secrets, or Sealed Secrets.
 ─────────────────────────────────────────────────────────────────────────────

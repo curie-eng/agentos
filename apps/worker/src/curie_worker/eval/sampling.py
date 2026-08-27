@@ -87,6 +87,18 @@ def _summed_cost(samples: list[EvalCaseResult]) -> float | None:
     return sum(known) if known else None
 
 
+def _sample_completed(sample: EvalCaseResult) -> bool:
+    """Did this sample reach a verdict, matching ``_completed`` in the API.
+
+    A PASS always completed. A FAIL completed only when ``error`` is unset --
+    that is the runner's convention that ``error`` means the turn never
+    produced a verdict (issue #857). Plumbing is a completed fake turn.
+    """
+    if sample.outcome is EvalOutcome.FAIL:
+        return not sample.error
+    return True
+
+
 def aggregate(
     case_id: str, samples: list[EvalCaseResult], config: SampleConfig
 ) -> EvalCaseResult:
@@ -96,12 +108,17 @@ def aggregate(
     one). A single sample is returned unchanged so ``n=1`` is bit-for-bit the
     pre-#332 behavior. All-plumbing (the fake tier) stays non-graded: there is no
     verdict to vote on.
+
+    Variance rides ``variance`` / ``samples`` / ``passes`` / ``policy``.
+    ``error`` is set only when no sample completed, so a graded FAIL cannot be
+    misread as a never-answered turn (issue #857, ADR-0068).
     """
     if len(samples) == 1:
         return samples[0]
 
     total_latency = round(sum(s.latency_ms for s in samples), 2)
     cost = _summed_cost(samples)
+    policy = config.policy.value
 
     # The fake tier is never graded, so an all-plumbing set has no verdict to
     # aggregate -- it stays PLUMBING_OK. (fake runs are per-run, so a set is
@@ -115,6 +132,9 @@ def aggregate(
             latency_ms=total_latency,
             detail=rep.detail,
             cost_usd=cost,
+            samples=len(samples),
+            passes=0,
+            policy=policy,
         )
 
     graded = [s for s in samples if s.outcome is not EvalOutcome.PLUMBING_OK]
@@ -131,15 +151,17 @@ def aggregate(
     outcome = EvalOutcome.PASS if green else EvalOutcome.FAIL
     variance = f"{passes}/{graded_count} samples passed ({bar})"
     representative = _representative(samples, outcome)
-    # Variance rides `error` only on a RED aggregate, matching the runner's
-    # convention that `error` explains why a case is not green; a flaky-but-green
-    # case (e.g. 2/3 under majority) reports GREEN and leaves `error` clear.
+    none_completed = not any(_sample_completed(s) for s in samples)
     return EvalCaseResult(
         case_id=case_id,
         outcome=outcome,
         output=representative.output,
         latency_ms=total_latency,
-        error=None if green else f"variance-aware grading failed: {variance}",
+        error=f"variance-aware grading failed: {variance}" if none_completed else None,
         detail=representative.detail,
         cost_usd=cost,
+        samples=len(samples),
+        passes=passes,
+        policy=policy,
+        variance=variance,
     )

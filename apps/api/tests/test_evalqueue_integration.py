@@ -152,6 +152,7 @@ def _build_bare_repo(base_dir: Path, repo_full_name: str) -> tuple[str, str]:
     _git("add", "-A", cwd=work)
     _git("commit", "-q", "-m", "init", cwd=work)
     sha = _git("rev-parse", "HEAD", cwd=work)
+    _git("branch", "main", cwd=work)
     bare = base_dir / f"{repo_full_name}.git"
     bare.parent.mkdir(parents=True, exist_ok=True)
     _git("clone", "--quiet", "--bare", str(work), str(bare))

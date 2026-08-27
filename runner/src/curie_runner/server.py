@@ -41,7 +41,7 @@ from .workspace_snapshot import WorkspaceSnapshot, WorkspaceSnapshotError
 
 _NDJSON = "application/x-ndjson"
 
-# The three ACI POST routes that drive a turn; gated when a token is configured.
+# The five runner POST routes; gated when a token is configured.
 # /healthz and /status stay open so the chart readinessProbe (no auth header)
 # keeps working.
 _GATED_PATHS = frozenset({"/v1/event", "/v1/steer", "/v1/interrupt", "/v1/reset", "/v1/snapshot"})
@@ -89,7 +89,7 @@ def create_app(
 ) -> web.Application:
     """Build the aiohttp application bound to a started SessionRunner.
 
-    When ``token`` is set, the three ACI POST routes require a matching bearer
+    When ``token`` is set, the five runner POST routes require a matching bearer
     token; when it is ``None`` the app is a pass-through (CLI, fake-model CI, and
     pre-token sandboxes stay unauthenticated).
     """

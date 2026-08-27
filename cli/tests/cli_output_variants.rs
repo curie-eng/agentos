@@ -274,6 +274,13 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
             "DryRun" => MemoryOutput::DryRun(plan()),
             "Empty" => MemoryOutput::Empty { agent: "a".to_string() },
             "List" => MemoryOutput::List { agent: "a".to_string(), entries: vec![memory_entry()] },
+            "Added" => MemoryOutput::Added {
+                agent: "a".to_string(),
+                index: 0,
+                content: "remembered fact".to_string(),
+                source: "operator".to_string(),
+                fresh_session_required: true,
+            },
         ],
     );
     m.insert(

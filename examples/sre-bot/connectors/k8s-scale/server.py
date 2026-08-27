@@ -72,7 +72,9 @@ mcp = FastMCP(
     "k8s-scale",
     host=os.environ.get("BIND_ADDRESS", "0.0.0.0"),
     port=int(os.environ.get("PORT", "8000")),
-    streamable_http_path="/",
+    # Curie addresses hosted connectors at the exact, redirect-free /mcp path.
+    # MCP 1.28 mounts this value literally; "/" would leave /mcp returning 404.
+    streamable_http_path="/mcp",
 )
 
 # idempotentHint=True is the honest value and the difference from restart:

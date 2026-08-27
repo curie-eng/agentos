@@ -32,10 +32,54 @@ pub const DEFAULT_VALKEY_URL: &str = "redis://:valkeypass@localhost:26379";
 /// The worker's consumer group (CURIE_CONSUMER_GROUP default); used to detect
 /// completion (the worker acks an entry only after the turn finalizes).
 pub const WORKER_GROUP: &str = WORKER_GROUP_DEFAULT;
+/// Valkey SET the API, worker, and CLI share for thread-reset requests.
+/// Frozen in `tests/vectors/thread-reset-set.json` (#1534).
+pub const THREAD_RESET_SET: &str = "curie:thread-reset-requests";
 
 /// Prefix on the synthetic event id so dedupe can never collide with a real
 /// Slack event id (which are `Ev...`, not `EvSIM-...`).
 const EVENT_ID_PREFIX: &str = "EvSIM-";
+
+/// Prefix on a local/cluster eval `conversation_id` so the worker omits
+/// ambient agent memory from that sandbox (#1909). Frozen in
+/// `tests/vectors/eval-memory-isolation.json`. Disjoint from Slack thread
+/// timestamps the same way `hook:` ids are.
+pub const EVAL_ISOLATE_THREAD_PREFIX: &str = "eval:";
+
+/// Stamp the eval-isolate prefix onto a fresh synthetic thread ts.
+pub fn eval_isolate_conversation_id(thread_ts: &str) -> String {
+    format!("{EVAL_ISOLATE_THREAD_PREFIX}{thread_ts}")
+}
+
+/// True when `thread_key` is a hermetic local/cluster eval conversation.
+pub fn is_eval_isolate_thread(thread_key: &str) -> bool {
+    thread_key.starts_with(EVAL_ISOLATE_THREAD_PREFIX)
+}
+
+/// Mint the QueuedTurn `run_eval_turns` enqueues: a synthetic turn whose
+/// `conversation_id` carries the isolate prefix so the worker omits ambient
+/// agent memory (#1909). The only production mint for local/cluster eval
+/// cases; tests assert the stamped id rather than scanning source.
+pub fn eval_case_turn(
+    kind: impl Into<String>,
+    channel: impl Into<String>,
+    author: impl Into<String>,
+    text: impl Into<String>,
+    thread_ts: impl Into<String>,
+    placeholder: impl Into<String>,
+    endpoint: Option<String>,
+) -> QueuedTurn {
+    let thread_ts = thread_ts.into();
+    synthetic_turn(
+        kind,
+        channel,
+        author,
+        text,
+        eval_isolate_conversation_id(&thread_ts),
+        placeholder,
+        endpoint,
+    )
+}
 
 /// Build a synthetic turn: a fresh `EvSIM-` id and the current UTC time, with the
 /// given conversation/reply coordinates. Maps the Slack-facing drivers' inputs
@@ -138,6 +182,22 @@ pub async fn xadd(
         .await
         .with_context(|| format!("XADD onto {stream}"))?;
     Ok(stream_id)
+}
+
+/// Queue `thread_key` for a forced sandbox release on the worker's next drain
+/// (`THREAD_RESET_SET`, the same SET `reset-thread` uses). Idempotent.
+///
+/// `curie local eval` / `curie cluster eval` call this after every case so
+/// eval-owned `curie-thread-*` sandboxes do not pin quota until
+/// `routeTtlSeconds` (#1534).
+pub async fn queue_thread_reset(conn: &mut MultiplexedConnection, thread_key: &str) -> Result<()> {
+    let _: i32 = redis::cmd("SADD")
+        .arg(THREAD_RESET_SET)
+        .arg(thread_key)
+        .query_async(conn)
+        .await
+        .with_context(|| format!("SADD {THREAD_RESET_SET} {thread_key}"))?;
+    Ok(())
 }
 
 /// The Valkey stream id of the first entry whose decoded `QueuedTurn` carries
@@ -373,6 +433,63 @@ mod tests {
     }
 
     #[test]
+    fn eval_isolate_prefix_matches_the_frozen_vector() {
+        // Rust half of the CLI/worker eval-isolate prefix gate (#1909).
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct EvalIsolateVector {
+            #[serde(rename = "comment")]
+            _comment: String,
+            conversation_id_prefix: String,
+        }
+        let raw = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/vectors/eval-memory-isolation.json"
+        ))
+        .expect("read tests/vectors/eval-memory-isolation.json");
+        let parsed: EvalIsolateVector = serde_json::from_str(&raw).unwrap_or_else(|err| {
+            panic!(
+                "parse tests/vectors/eval-memory-isolation.json: {err}\n\
+                 An unknown field is rejected on purpose: a key this lane cannot see \
+                 would pass vacuously. Teach the new key to EvalIsolateVector here, to \
+                 _EXPECTED_VECTOR_KEYS in \
+                 apps/worker/tests/binding/test_eval_memory_isolation.py, and to both \
+                 lanes' assertions."
+            )
+        });
+        assert_eq!(EVAL_ISOLATE_THREAD_PREFIX, parsed.conversation_id_prefix);
+        assert_eq!(
+            eval_isolate_conversation_id("1720000000.000100"),
+            format!("{}1720000000.000100", parsed.conversation_id_prefix)
+        );
+        assert!(is_eval_isolate_thread("eval:1720000000.000100"));
+        assert!(!is_eval_isolate_thread("thread-1"));
+        assert!(!is_eval_isolate_thread("eval-thread-1"));
+    }
+
+    #[test]
+    fn eval_case_turn_stamps_the_isolate_prefix_on_conversation_id() {
+        // The object run_eval_turns XADDs, not a source scan: the worker
+        // boots from QueuedTurn.conversation_id (#1909).
+        let turn = eval_case_turn(
+            "slack",
+            "C1",
+            "U1",
+            "ping",
+            "1720000000.000100",
+            "1720000000.000200",
+            Some("http://127.0.0.1:8155/api/".into()),
+        );
+        assert_eq!(
+            turn.conversation_id,
+            eval_isolate_conversation_id("1720000000.000100")
+        );
+        assert!(turn.conversation_id.starts_with(EVAL_ISOLATE_THREAD_PREFIX));
+        assert_eq!(turn.text, "ping");
+        assert_eq!(turn.reply_handle.channel, "C1");
+    }
+
+    #[test]
     fn queued_turn_matches_cross_language_golden() {
         // The same committed wire fixture the Python producer (apps/dispatcher)
         // round-trips: the generated QueuedTurn must deserialize it and
@@ -564,5 +681,32 @@ mod tests {
         assert!(!id_ge("4-9", "5-0"));
         // Unparseable compares false (not-yet-delivered).
         assert!(!id_ge("0-0", "not-an-id"));
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ThreadResetVector {
+        #[serde(rename = "comment")]
+        _comment: String,
+        thread_reset_set: String,
+        thread_reset_inflight_set: String,
+    }
+
+    #[test]
+    fn thread_reset_set_matches_the_frozen_vector() {
+        let raw = include_str!("../../tests/vectors/thread-reset-set.json");
+        let parsed: ThreadResetVector = serde_json::from_str(raw).unwrap_or_else(|err| {
+            panic!(
+                "parse tests/vectors/thread-reset-set.json: {err}\n\
+                 An unknown field is rejected on purpose: a key this lane cannot see \
+                 would pass vacuously. Teach the new key to ThreadResetVector here \
+                 and to _EXPECTED_KEYS in the API and worker vector tests."
+            )
+        });
+        assert_eq!(parsed.thread_reset_set, THREAD_RESET_SET);
+        assert_eq!(
+            parsed.thread_reset_inflight_set,
+            "curie:thread-reset-inflight"
+        );
     }
 }
