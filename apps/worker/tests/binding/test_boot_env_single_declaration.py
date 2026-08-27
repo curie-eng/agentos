@@ -180,7 +180,7 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_EVAL_TARGET_URL",
         "CURIE_EVAL_VERSION",
         # Multi-sample / variance-aware grading policy (#332), read by the eval
-        # entrypoint (run.py::_sample_config_from_env), not a sandbox boot key.
+        # entrypoint (run.py::sample_config_from_env), not a sandbox boot key.
         "CURIE_EVAL_SAMPLES",
         "CURIE_EVAL_AGGREGATION",
         "CURIE_EVAL_PASS_AT_K",

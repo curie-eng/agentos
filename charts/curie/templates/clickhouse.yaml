@@ -52,15 +52,24 @@ spec:
   template:
     metadata:
       annotations:
+        {{- with (include "curie.placement.annotations" .Values.placement.data) }}
+        {{- . | nindent 8 }}
+        {{- end }}
         # Roll the pod when the rendered logging overlay changes. Without this a
         # ConfigMap edit renders a new ConfigMap and the
         # running server keeps the old config until something else restarts it
         # -- i.e. the fix would appear applied while the node kept starving.
         checksum/config: {{ include "curie.clickhouse.loggingConfig" . | sha256sum }}
       labels:
+        {{- with (include "curie.placement.labels" .Values.placement.data) }}
+        {{- . | nindent 8 }}
+        {{- end }}
         {{- include "curie.labels" . | nindent 8 }}
         {{- include "curie.selectorLabels" (dict "root" . "component" "clickhouse") | nindent 8 }}
     spec:
+      {{- with (include "curie.placement.spec" .Values.placement.data) }}
+      {{- . | nindent 6 }}
+      {{- end }}
       {{- with .Values.priorityClasses.platform.name }}
       priorityClassName: {{ . }}
       {{- end }}

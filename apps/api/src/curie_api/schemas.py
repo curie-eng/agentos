@@ -31,6 +31,7 @@ from pydantic import (
 
 from .config import get_settings
 from .models import GIT_FLOW_CREATED_BY, Environment
+from .repo_full_name import RepoFullName
 from .workspace_policy import REPOSITORY_FULL_NAME_PATTERN, valid_repository_name
 
 # Slack channel IDs start with C (public/private channel), D (DM), or G (legacy
@@ -868,7 +869,7 @@ class AgentCreate(BaseModel):
     # phase 2). `AgentOut.channels` stays a list of read-only `{kind, address}`
     # pairs. Additional bindings are added through the subresource, never here.
     channel: ChannelBindingWrite
-    repo_full_name: str | None = None
+    repo_full_name: RepoFullName | None = None
     behavior_packs: BehaviorPacksConfig | None = None
     # Per-agent model id, forwarded as CURIE_MODEL at boot (#254). None uses the
     # platform default model.
@@ -940,13 +941,8 @@ class AgentUpdate(BaseModel):
     # SECOND agent of a repo, which the unique index forbade from carrying it --
     # has no other way to be bound. Without this, git-flow cannot find that
     # agent and a target naming it is rejected as unknown.
-    repo_full_name: str | None = None
-    # New value for whether this agent's bindings share one workflow-state
-    # namespace (#1525 follow-up). Omitted (None) leaves it unchanged; unlike
-    # `model`/`thinking` there is no separate "platform default" a null would
-    # clear back to, so the router checks `is not None` rather than
-    # `model_fields_set` -- an explicit `"memory": null` is refused by the
-    # type rather than accepted as a third state.
+    repo_full_name: RepoFullName | None = None
+    # Whether this agent's bindings share one workflow-state namespace.
     memory: bool | None = None
 
     _check_model = field_validator("model")(_validate_model_override)
@@ -1819,11 +1815,17 @@ class StateNamespaceOut(BaseModel):
 
 
 class MemoryProvenanceOut(BaseModel):
-    """Where a memory entry was learned from (#264 ``Provenance`` shape)."""
+    """Where a memory entry was learned from (#264 ``Provenance`` shape).
+
+    ``source`` distinguishes an operator-seeded record (``operator``) from a
+    session-learned one. Absent or null means learned/unspecified, matching
+    records written before the operator seed path existed.
+    """
 
     learned_from_session_id: str | None = None
     source_trace_ids: list[str] = Field(default_factory=list)
     recorded_at: str = ""
+    source: str | None = None
 
 
 class SourceTraceOut(BaseModel):
@@ -1870,6 +1872,24 @@ class MemoryEntryEdit(BaseModel):
 
     content: str
     expected_version: int
+
+
+class MemoryEntryCreate(BaseModel):
+    """Append one operator-authored memory record (#1904).
+
+    Provenance is stamped by the server. Extra body fields, including a
+    caller-supplied provenance object, are ignored rather than trusted.
+    """
+
+    content: str
+
+    @field_validator("content")
+    @classmethod
+    def _content_not_blank(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("content must not be empty")
+        return stripped
 
 
 # --- console sessions (ADR-0083, #1044) -------------------------------------

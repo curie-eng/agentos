@@ -75,8 +75,13 @@ if [ "$MODE" = source ]; then
   echo "==> cargo install --path cli --force (build curie and install it to ~/.cargo/bin)"
   cargo install --path cli --force
 
-  echo "==> curie install ${UPDATE_ARGS[*]} (deps + runner image as needed)"
-  "$CURIE_BIN" install "${UPDATE_ARGS[@]}"
+  # `${a[@]+...}` rather than a bare `"${UPDATE_ARGS[*]}"`/`"${UPDATE_ARGS[@]}"`:
+  # expanding an EMPTY array under `set -u` is an "unbound variable" error until
+  # bash 4.4, and macOS ships 3.2 as /bin/bash. UPDATE_ARGS is empty on exactly
+  # the FIRST run (no installed binary yet, so no --update), which is the run
+  # this script exists for -- a fresh Mac clone aborted here before installing.
+  echo "==> curie install ${UPDATE_ARGS[*]+${UPDATE_ARGS[*]}} (deps + runner image as needed)"
+  "$CURIE_BIN" install ${UPDATE_ARGS[@]+"${UPDATE_ARGS[@]}"}
 
   echo
   echo "Done. If 'curie' is not found in this shell, add ~/.cargo/bin to PATH"

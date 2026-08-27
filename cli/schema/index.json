@@ -115,7 +115,7 @@
       "result": "EvalOutput",
       "kind": "CliOutput",
       "schema": "eval.schema.json",
-      "version": "1.2"
+      "version": "1.3"
     },
     {
       "result": "GithubAppOutput",
@@ -175,7 +175,7 @@
       "result": "MemoryOutput",
       "kind": "CliOutput",
       "schema": "memory.schema.json",
-      "version": "1.0"
+      "version": "1.1"
     },
     {
       "result": "MessageDryRunOutput",
@@ -289,7 +289,7 @@
       "result": "eval_json",
       "kind": "builder",
       "schema": "eval.schema.json",
-      "version": "1.2"
+      "version": "1.3"
     },
     {
       "result": "message_awaiting_approval_json",

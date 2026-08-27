@@ -138,31 +138,37 @@ def extract_declared(plugin_dir: str) -> list[dict[str, Any]]:
             )
             seen.add(name)
 
+    def _add_server(name: str, source: str, form: str, server: Any) -> None:
+        _add(
+            name,
+            source,
+            form,
+            _is_authed(server),
+            _cred_vars(server),
+            _is_remote(server),
+        )
+
     manifest_path = resolve_manifest(root)
     manifest = _read_json(manifest_path) if manifest_path is not None else None
     mcp = manifest.get("mcpServers") if isinstance(manifest, dict) else None
 
     if isinstance(mcp, dict):
         for name, server in mcp.items():
-            _add(
+            _add_server(
                 str(name),
                 "plugin.json",
                 "inline",
-                _is_authed(server),
-                _cred_vars(server),
-                _is_remote(server),
+                server,
             )
     elif isinstance(mcp, str):
         pointed = _servers_map(_read_json(root / mcp))
         if pointed:
             for name, server in pointed.items():
-                _add(
+                _add_server(
                     str(name),
                     "plugin.json",
                     "string_pointer",
-                    _is_authed(server),
-                    _cred_vars(server),
-                    _is_remote(server),
+                    server,
                 )
         else:
             # Pointed file missing/unparseable: the intent (a string-pointer
@@ -174,13 +180,11 @@ def extract_declared(plugin_dir: str) -> list[dict[str, Any]]:
 
     bare = _servers_map(_read_json(root / ".mcp.json"))
     for name, server in bare.items():
-        _add(
+        _add_server(
             str(name),
             ".mcp.json",
             "bare_file",
-            _is_authed(server),
-            _cred_vars(server),
-            _is_remote(server),
+            server,
         )
 
     return declared

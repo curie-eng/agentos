@@ -3,6 +3,12 @@
 Date: 2026-07-04
 Status: Accepted
 
+**Superseded in part by [ADR 0114](0114-cluster-up-infers-detected-install-facts.md).**
+The final Consequences clause no longer requires gVisor absence to fail review
+when `curie cluster up` receives the exact admission rejection that the
+`gvisor` RuntimeClass is absent. The Decision still keeps gVisor enabled by
+default, and every other security rail remains unchanged.
+
 ## Context
 
 The input channel (Slack) is prompt-injectable by anyone in the channel, and the runner holds customer credentials. An enterprise leave-behind will be security-reviewed. Retrofitting isolation costs more than defaulting it, and a boundary that is *believed* to hold but doesn't (e.g. an egress policy on a non-enforcing CNI) ships an incident. So the security posture had to be proven, not assumed.

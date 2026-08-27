@@ -66,11 +66,20 @@ spec:
   template:
     metadata:
       annotations:
+        {{- with (include "curie.placement.annotations" .Values.placement.platform) }}
+        {{- . | nindent 8 }}
+        {{- end }}
         checksum/config: {{ printf "%s|%s" (include "curie.otelCollector.config" .) (include "curie.otlpAuthHeader" .) | sha256sum }}
       labels:
+        {{- with (include "curie.placement.labels" .Values.placement.platform) }}
+        {{- . | nindent 8 }}
+        {{- end }}
         {{- include "curie.labels" . | nindent 8 }}
         {{- include "curie.selectorLabels" (dict "root" . "component" "otel-collector") | nindent 8 }}
     spec:
+      {{- with (include "curie.placement.spec" .Values.placement.platform) }}
+      {{- . | nindent 6 }}
+      {{- end }}
       terminationGracePeriodSeconds: {{ .Values.otelCollector.terminationGracePeriodSeconds }}
       {{- with .Values.otelCollector.podSecurityContext }}
       securityContext:

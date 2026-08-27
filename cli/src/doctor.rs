@@ -20,6 +20,8 @@
 
 use serde::Serialize;
 
+use crate::modelpin::{classify, PinStatus};
+
 /// What one check found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -67,6 +69,12 @@ pub struct Facts {
     pub model_credential: Option<String>,
     /// Where it came from, for the detail line.
     pub model_credential_source: Option<String>,
+    /// The configured model id, verbatim. A value here is not a claim that the
+    /// id is valid, only that something set it.
+    pub model_pin: Option<String>,
+    /// Non-secret provider inferred from the bound `CURIE_CREDENTIALS` value.
+    /// The credential itself is deliberately discarded during observation.
+    pub model_credential_provider: Option<&'static str>,
     pub docker_ok: bool,
     /// Plugin name from `.claude-plugin/plugin.json` in the working directory.
     pub bundle_name: Option<String>,
@@ -122,6 +130,17 @@ fn skipped(id: &'static str, title: &'static str, detail: impl Into<String>) -> 
     }
 }
 
+/// The recovery command for a missing cluster release. Provider egress follows
+/// the same credential-prefix map as `cluster up`; an absent or unrecognized
+/// credential leaves egress sealed rather than guessing Anthropic.
+fn missing_release_recovery(provider: Option<&str>) -> String {
+    let mut command = "curie cluster up --namespace <ns> --release <name>".to_string();
+    if let Some(provider) = provider {
+        command.push_str(&format!(" --allow-egress-host {provider}"));
+    }
+    command
+}
+
 /// Judge the gathered facts. Pure.
 pub fn evaluate(f: &Facts) -> Vec<Check> {
     let mut out = Vec::new();
@@ -140,6 +159,34 @@ pub fn evaluate(f: &Facts) -> Vec<Check> {
             "export CURIE_CREDENTIALS=sk-ant-...   (or `curie secrets set CURIE_CREDENTIALS`; \
              `curie skill up --fake-model` needs none)",
         ),
+    });
+
+    out.push(match classify(f.model_pin.as_deref()) {
+        PinStatus::Unset => skipped(
+            "model-pin",
+            "Model pin",
+            "no CURIE_MODEL set, so the platform default applies",
+        ),
+        PinStatus::Pinned { id, date } => {
+            ok("model-pin", "Model pin", format!("{id} (snapshot {date})"))
+        }
+        // Ok rather than Missing, deliberately: a floating name works, and a
+        // working install must not report as unready. What is at risk is
+        // reproducibility, so this carries a fix without failing the check.
+        PinStatus::Floating { id } => Check {
+            id: "model-pin",
+            title: "Model pin",
+            state: State::Ok,
+            detail: format!(
+                "{id} is a floating name; the provider can repoint it at new \
+                 weights with no change here, and no gate would see it"
+            ),
+            fix: Some(
+                "export CURIE_MODEL=<id>-YYYYMMDD   (pin the dated snapshot, so a \
+                 graded bundle keeps the weights it was graded on)"
+                    .into(),
+            ),
+        },
     });
 
     out.push(if f.docker_ok {
@@ -190,7 +237,7 @@ pub fn evaluate(f: &Facts) -> Vec<Check> {
             "release",
             "Curie release",
             "not installed in this namespace",
-            "curie cluster up --namespace <ns> --release <name> --allow-egress-host anthropic",
+            missing_release_recovery(f.model_credential_provider),
         ));
         for (id, title) in [
             ("slack", "Slack"),
@@ -482,15 +529,25 @@ mod tests {
     /// This output gets pasted into issues and chat.
     #[test]
     fn no_check_can_carry_a_credential_value() {
+        let credential = "sk-or-PLACEHOLDER";
         let f = Facts {
             model_credential: Some("CURIE_CREDENTIALS".into()),
             model_credential_source: Some("environment".into()),
+            model_credential_provider: crate::ops::provider_from_credential_prefix(credential),
             clone_credential: Some("github app (app_id=4475970)".into()),
             slack_configured: true,
             ..laptop()
         };
         let rendered = format!("{:?}", evaluate(&f));
-        for leaked in ["sk-ant-", "xoxb-", "xapp-", "ghp_", "-----BEGIN"] {
+        for leaked in [
+            credential,
+            "sk-or-",
+            "sk-ant-",
+            "xoxb-",
+            "xapp-",
+            "ghp_",
+            "-----BEGIN",
+        ] {
             assert!(!rendered.contains(leaked), "{leaked} leaked: {rendered}");
         }
     }
@@ -546,6 +603,54 @@ mod tests {
             let s = summary(&evaluate(&facts));
             assert!(s.contains(expected), "expected {expected:?} in {s:?}");
         }
+    }
+
+    /// A floating model name is reported without failing the install: it works
+    /// today, so `Missing` would make a usable setup look broken. The fix is
+    /// what carries the advice.
+    #[test]
+    fn a_floating_model_reports_ok_with_a_fix() {
+        let f = Facts {
+            model_pin: Some("gpt-4o".into()),
+            ..Default::default()
+        };
+        let c = evaluate(&f)
+            .into_iter()
+            .find(|c| c.id == "model-pin")
+            .expect("model-pin check");
+        assert_eq!(c.state, State::Ok);
+        assert!(c.detail.contains("gpt-4o"), "{}", c.detail);
+        assert!(
+            c.fix.as_deref().unwrap_or("").contains("CURIE_MODEL"),
+            "the fix must name the variable to set"
+        );
+    }
+
+    /// A dated snapshot is clean: no advice, nothing to do.
+    #[test]
+    fn a_pinned_snapshot_carries_no_fix() {
+        let f = Facts {
+            model_pin: Some("claude-haiku-4-5-20251001".into()),
+            ..Default::default()
+        };
+        let c = evaluate(&f)
+            .into_iter()
+            .find(|c| c.id == "model-pin")
+            .expect("model-pin check");
+        assert_eq!(c.state, State::Ok);
+        assert!(c.fix.is_none(), "a pinned snapshot needs no fix");
+        assert!(c.detail.contains("20251001"), "{}", c.detail);
+    }
+
+    /// No model configured is not a gap: the platform default is a valid way to
+    /// run, so this must not count against readiness.
+    #[test]
+    fn an_unset_model_is_not_applicable() {
+        let c = evaluate(&Facts::default())
+            .into_iter()
+            .find(|c| c.id == "model-pin")
+            .expect("model-pin check");
+        assert_eq!(c.state, State::NotApplicable);
     }
 
     /// Every failing check must be actionable. A report that says "missing"
@@ -741,10 +846,22 @@ pub async fn gather(namespace: &str, release: &str, api: Option<(&str, &str)>) -
         ..Default::default()
     };
 
+    // Names, never values: the id is the configuration, not a secret.
+    f.model_pin = std::env::var(curie_aci_protocol::env_keys::CURIE_MODEL).ok();
+
     for name in crate::commands::MODEL_CREDENTIAL_ENV_NAMES {
-        if std::env::var(name).map(|v| !v.is_empty()).unwrap_or(false) {
+        if let Ok(value) = std::env::var(name) {
+            if value.is_empty() {
+                continue;
+            }
             f.model_credential = Some(name.to_string());
             f.model_credential_source = Some("environment".into());
+            // `cluster up` binds its real-model credential from the canonical
+            // CURIE_CREDENTIALS variable. Derive only its safe provider name
+            // for the recovery command, then drop the credential value.
+            f.model_credential_provider = (name == "CURIE_CREDENTIALS")
+                .then(|| crate::ops::provider_from_credential_prefix(&value))
+                .flatten();
             break;
         }
         if crate::secrets::is_saved(name).unwrap_or(false) {

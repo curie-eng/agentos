@@ -16,7 +16,10 @@
 
 use std::process::{Command, Output};
 
-use curie::state::{self, RunnerState};
+use curie::{
+    docker::RUNNER_CONTAINER_LOCAL,
+    state::{self, RunnerState},
+};
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_curie")
@@ -76,6 +79,32 @@ fn skill_up(dir: &tempfile::TempDir, recorded: &RunnerState, extra: &[&str]) -> 
         .args(extra)
         .output()
         .expect("run curie skill up")
+}
+
+#[test]
+fn a_recorded_runner_refusal_names_the_replace_recovery_command() {
+    let (dir, mut recorded) = bundle_with_recorded_runner(false);
+    recorded.container_name = RUNNER_CONTAINER_LOCAL.into();
+    state::save(&dir.path().join("bundle"), &recorded).expect("save default recorded runner");
+    let out = Command::new(bin())
+        .current_dir(dir.path().join("bundle"))
+        .args(["skill", "up"])
+        .output()
+        .expect("run curie skill up");
+    let stderr = err_str(&out);
+
+    assert!(
+        !out.status.success(),
+        "a recorded runner must refuse a new run"
+    );
+    assert!(
+        stderr.contains("curie skill down"),
+        "the stop first recovery must remain available, got stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("curie skill up --replace --name curie-runner-local"),
+        "the one step replace recovery must be named, got stderr: {stderr}"
+    );
 }
 
 /// The record survives a run that aborts before the replacement happens.

@@ -884,7 +884,11 @@ for entry in plan:
 # this assertion as a claim about pre-existing sandboxes.
 assert_model_mode() {
     local label="$1" observed="$2" truthy=0
-    case "${observed,,}" in
+    # `tr` rather than `${observed,,}`: case-conversion expansion is bash 4+ and
+    # macOS ships 3.2 as /bin/bash, where the `,,` is a syntax error that kills
+    # the whole ladder -- and AGENTS.md tells contributors to run these rungs
+    # locally before pushing.
+    case "$(printf '%s' "$observed" | tr '[:upper:]' '[:lower:]')" in
         1|true|yes) truthy=1 ;;
     esac
     if [[ "$LIVE" == "1" ]]; then
@@ -3204,12 +3208,12 @@ print("yes" if isinstance(d, dict) and d.get("release_found") is True else "no")
 
     echo
     echo "=== curie cluster eval --dry-run (suite parity) ==="
-    # ONE array feeding BOTH cluster eval calls (this dry-run plan and the live
-    # grade below), so `--listen-host` cannot reach one and be forgotten on the
-    # other. `--json` is deliberately NOT in the array: both call sites need it
-    # for DIFFERENT reasons -- a machine-readable `--dry-run` plan here, an
-    # auditable green on the live grade below -- and passing it once per call site
-    # is what keeps it from being passed twice at either.
+    # ONE array feeding every cluster eval call (the dry-run plan, the live
+    # grade, and the #1534 retention pair), so `--listen-host` cannot reach one
+    # and be forgotten on another. `--json` is deliberately NOT in the array:
+    # call sites need it for DIFFERENT reasons -- a machine-readable `--dry-run`
+    # plan here, an auditable green on the live/retention grades -- and passing
+    # it once per call site is what keeps it from being passed twice at any.
     local eval_args=(cluster eval)
     if [[ ! -f "$WORKDIR/bundle/evals/trajectory.json" ]]; then
         eval_args+=(--cases "$WORKDIR/bundle/evals/cases.json")
@@ -3232,14 +3236,7 @@ print("yes" if isinstance(d, dict) and d.get("release_found") is True else "no")
         # satisfy identity and order. Fetch success remains unproved, and this
         # oracle cannot distinguish an attempt from successful execution.
         # Fatal grading requires proof that fetch succeeds, not merely that it
-        # was requested. Post trajectory run 32347598515 stopped before a case
-        # verdict because its result had no resolved model. That was #1709,
-        # fixed by PR #1715 on main and pending the normal forward merge to
-        # next, so the run is historical evidence rather than the remaining
-        # reason for report only. The skill and local rungs passed their
-        # trajectory grades in that run, which proves request sequence rather
-        # than fetch success. The local release rung did not reach eval because
-        # its UI image was missing, so it supplied no grade evidence.
+        # was requested. The skill and local rungs still fail on a bad grade.
         # The rung is NOT blind either way: the plumbing assertions above (the
         # turn finalizes with a reply, and under live mode that reply is not the
         # fake sentinel) still fail it, and they are what caught the sandbox
@@ -3248,6 +3245,35 @@ print("yes" if isinstance(d, dict) and d.get("release_found") is True else "no")
             echo "cluster: eval did not produce a passing grade. Not failing the rung: this eval is report only (#1603)." >&2
         fi
     fi
+
+    echo
+    echo "=== #1534 repeated cluster eval then message still claims ==="
+    # Eval-owned sandboxes must be released on every suite path so a second
+    # suite, then an ordinary message, can still claim against the default
+    # 8-CPU ResourceQuota instead of waiting the 90s claim timeout.
+    local eval_i
+    for eval_i in 1 2; do
+        echo "=== curie cluster eval (retention suite $eval_i of 2; report only) ==="
+        if ! (cd "$WORKDIR/bundle" && "$BIN" --json "${eval_args[@]}"); then
+            echo "cluster: retention eval suite $eval_i reported a failing case. Not failing the rung: this rung's grade is report only (#1603)." >&2
+        fi
+    done
+    local retention_args=(--json cluster message "$PROMPT")
+    if [[ -n "${CURIE_E2E_LISTEN_HOST:-}" ]]; then
+        retention_args+=(--listen-host "$CURIE_E2E_LISTEN_HOST")
+    fi
+    echo "=== curie cluster message after repeated eval ==="
+    local retention_out retention_rc
+    set +e
+    retention_out="$(timeout 45 "$BIN" "${retention_args[@]}")"
+    retention_rc=$?
+    set -e
+    printf '%s\n' "$retention_out"
+    if [[ "$retention_rc" -eq 124 ]]; then
+        echo "cluster: message after repeated eval timed out at 45s; eval-owned sandboxes likely still hold the quota (#1534)." >&2
+        return 1
+    fi
+    assert_finalized_reply "cluster" "$retention_out"
 
     assert_bundle_identity "cluster" "$digest"
 }

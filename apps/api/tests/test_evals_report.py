@@ -1,5 +1,6 @@
 """POST /evals/report -> GitHub commit status (GitHub mocked via a fake reporter)."""
 
+import asyncio
 from typing import Any
 
 import httpx
@@ -120,6 +121,73 @@ def test_report_still_rejects_a_structurally_invalid_body(
     assert resp.status_code == 422, resp.text
     assert resp.json()["detail"][0]["loc"] == ["body", "passed_count"]
     assert reporter.calls == []
+
+
+def test_invalid_repo_full_name_returns_422_without_github_http(
+    auth_headers: dict[str, str],
+) -> None:
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(201, json={})
+
+    github_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    reporter = GitHubStatusReporter(
+        github_client,
+        api_url="https://api.github.com",
+        token="t",
+        context="curie/evals",
+    )
+    app = create_app()
+    app.dependency_overrides[get_github_reporter] = lambda: reporter
+    try:
+        with TestClient(app) as client:
+            resp = client.post(
+                "/evals/report",
+                json={
+                    "repo_full_name": "octo/../escape?token=x",
+                    "sha": "abc123",
+                    "passed_count": 1,
+                    "total": 1,
+                },
+                headers=auth_headers,
+            )
+    finally:
+        asyncio.run(github_client.aclose())
+
+    assert resp.status_code == 422, resp.text
+    assert captured == []
+
+
+def test_report_without_token_accepts_unbound_agent_sentinel() -> None:
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(201, json={})
+
+    github_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    reporter = GitHubStatusReporter(
+        github_client,
+        api_url="https://api.github.com",
+        token="",
+        context="curie/evals",
+    )
+    try:
+        state = asyncio.run(
+            reporter.report_eval(
+                "00000000-0000-0000-0000-000000000001",
+                "abc123",
+                1,
+                1,
+            )
+        )
+    finally:
+        asyncio.run(github_client.aclose())
+
+    assert state == "success"
+    assert captured == []
 
 
 def test_report_requires_api_key(client: Any) -> None:

@@ -341,10 +341,10 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         api_key=config.api_key,
         client=eval_http,
         worker_token=config.internal_worker_token,
+        # This read runs inside per thread ordering. A short timeout safely
+        # defers card settlement without changing creation or shared clients.
+        read_timeout_s=2.0,
     )
-    # The action ledger (ADR-0117), on the same API lane. Wired unconditionally:
-    # an unwired ledger records nothing, and a deployment that can create an
-    # approval can record what a turn did.
     action_client = ActionClient(
         api_base_url=config.api_base_url,
         api_key=config.api_key,

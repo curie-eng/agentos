@@ -690,6 +690,46 @@ export const commandManifest = {
               "long": "image",
               "positional": false,
               "required": false
+            },
+            {
+              "default_values": [
+                "1"
+              ],
+              "env": "CURIE_EVAL_SAMPLES",
+              "global": false,
+              "help": "Independent samples per case for live-model grading. Default: 1. A single sample is not proof of tier drift; raise this to distinguish variance from a real miss. Same policy on skill, local, and cluster",
+              "id": "samples",
+              "long": "samples",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "majority"
+              ],
+              "env": "CURIE_EVAL_AGGREGATION",
+              "global": false,
+              "help": "How to reduce N sample verdicts. Default: majority",
+              "id": "aggregation",
+              "long": "aggregation",
+              "positional": false,
+              "possible_values": [
+                "majority",
+                "pass_at_k"
+              ],
+              "required": false
+            },
+            {
+              "default_values": [
+                "1"
+              ],
+              "env": "CURIE_EVAL_PASS_AT_K",
+              "global": false,
+              "help": "Pass@k threshold when --aggregation pass_at_k. Default: 1",
+              "id": "pass_at_k",
+              "long": "pass-at-k",
+              "positional": false,
+              "required": false
             }
           ],
           "hidden": false,
@@ -1324,6 +1364,46 @@ export const commandManifest = {
               "required": false
             },
             {
+              "default_values": [
+                "1"
+              ],
+              "env": "CURIE_EVAL_SAMPLES",
+              "global": false,
+              "help": "Independent samples per case for live-model grading. Default: 1. A single sample is not proof of tier drift; raise this to distinguish variance from a real miss. Same policy on skill, local, and cluster",
+              "id": "samples",
+              "long": "samples",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "majority"
+              ],
+              "env": "CURIE_EVAL_AGGREGATION",
+              "global": false,
+              "help": "How to reduce N sample verdicts. Default: majority",
+              "id": "aggregation",
+              "long": "aggregation",
+              "positional": false,
+              "possible_values": [
+                "majority",
+                "pass_at_k"
+              ],
+              "required": false
+            },
+            {
+              "default_values": [
+                "1"
+              ],
+              "env": "CURIE_EVAL_PASS_AT_K",
+              "global": false,
+              "help": "Pass@k threshold when --aggregation pass_at_k. Default: 1",
+              "id": "pass_at_k",
+              "long": "pass-at-k",
+              "positional": false,
+              "required": false
+            },
+            {
               "global": false,
               "help": "Print the plan that a real run would produce, and exit",
               "id": "dry_run",
@@ -1513,7 +1593,7 @@ export const commandManifest = {
           "name": "versions"
         },
         {
-          "about": "Show what an agent has learned (its memory log; `GET /agents/{id}/memory`)",
+          "about": "Show what an agent has learned (its memory log; `GET /agents/{id}/memory`). `--add <content>` seeds an operator-authored record; a fresh session is required before it is injected at boot",
           "args": [
             {
               "global": false,
@@ -1553,6 +1633,14 @@ export const commandManifest = {
                 "true",
                 "false"
               ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Append this content as an operator-authored memory record",
+              "id": "add",
+              "long": "add",
+              "positional": false,
               "required": false
             }
           ],
@@ -2394,7 +2482,7 @@ export const commandManifest = {
       "name": "cluster",
       "subcommands": [
         {
-          "about": "Install or upgrade the Curie release via Helm (helm upgrade --install). By default it puts the UI and Langfuse on node ports for tailnet/LAN access; pass --no-expose to keep them ClusterIP-only. Set CURIE_CREDENTIALS to a supported model provider credential (CURIE_MODEL_CREDENTIALS is a deprecated alias) to install with the real model. A fresh install without it uses fake mode. A rerun preserves the recorded model configuration. Use --fake-model to explicitly downgrade to fake mode. A real model is still unreachable behind the fail-closed sandbox until you open its egress with --allow-egress-host <provider> (or --allow-web-egress <CIDR> for a raw range). Zhipu, Moonshot, and DeepSeek also require their matching base URL in worker runtime configuration, in addition to a credential and named egress",
+          "about": "Install or upgrade the Curie release via Helm (helm upgrade --install). By default it puts the UI and Langfuse on node ports for tailnet/LAN access; pass --no-expose to keep them ClusterIP-only. Set CURIE_CREDENTIALS to a supported model provider credential (CURIE_MODEL_CREDENTIALS is a deprecated alias) to install with the real model. A fresh install without it uses fake mode. A rerun preserves the recorded model configuration. Use --fake-model to explicitly downgrade to fake mode. An sk-ant- or sk-or- credential infers its provider egress when --allow-egress-host is absent. Other credential shapes remain sealed until their provider or a raw range is explicit. Existing singleton resources are reused only from complete Helm ownership metadata. An exact admission result that the gvisor RuntimeClass is absent applies security.gvisor.mode=off and retries once. Every inferred value is printed",
           "args": [
             {
               "default_values": [
@@ -2473,7 +2561,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Open runner egress to a named model provider's API host(s), resolved to narrow host routes at install time (repeatable). One of: anthropic, openrouter, zhipu, moonshot, deepseek. Provider native Zhipu, Moonshot, and DeepSeek also need their matching worker runtime base URL; a credential plus egress alone does not reach them. For a raw CIDR, use --allow-web-egress",
+              "help": "Explicitly open runner egress to a named model provider's API host(s), resolved to narrow host routes at install time (repeatable). An sk-ant- or sk-or- credential infers anthropic or openrouter when this flag is absent. An explicit list that omits the detected provider is an error. One of: anthropic, openrouter, zhipu, moonshot, deepseek. Provider native Zhipu, Moonshot, and DeepSeek also need their matching worker runtime base URL; a credential plus egress alone does not reach them. For a raw CIDR, use --allow-web-egress",
               "id": "allow_egress_host",
               "long": "allow-egress-host",
               "positional": false,
@@ -2481,7 +2569,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Open runner egress to a declared destination for skill web access, repeatable CIDR, TCP 443. Additive to the provider egress; omit to stay fully sealed",
+              "help": "Open runner egress to a declared destination for skill web access, repeatable CIDR, TCP 443. Additive to provider egress. Omit to keep general web egress sealed",
               "id": "allow_web_egress",
               "long": "allow-web-egress",
               "positional": false,
@@ -2545,7 +2633,7 @@ export const commandManifest = {
           "name": "up"
         },
         {
-          "about": "Uninstall the release and sweep its runtime namespaces (helm uninstall + kubectl delete namespace). The agents.x-k8s.io CRDs are left in place",
+          "about": "Uninstall the release and sweep its runtime namespaces, running helm uninstall followed by kubectl delete namespace. The namespace delete is scoped to namespaces this release created, matched by both its release name and install namespace, so another release's namespaces on the same cluster are never touched. Pre-existing namespaces and the agents.x-k8s.io CRDs are left in place",
           "args": [
             {
               "default_values": [
@@ -3209,7 +3297,7 @@ export const commandManifest = {
             },
             {
               "default_values": [
-                "8155"
+                "0"
               ],
               "global": false,
               "help": "Port the stub binds (0.0.0.0); the worker posts here",
@@ -3220,7 +3308,7 @@ export const commandManifest = {
             },
             {
               "default_values": [
-                "56381"
+                "0"
               ],
               "global": false,
               "help": "Local port the Valkey port-forward binds",
@@ -3240,7 +3328,7 @@ export const commandManifest = {
             },
             {
               "default_values": [
-                "8123"
+                "0"
               ],
               "global": false,
               "help": "Local port the API port-forward binds (default-channel lookup)",
@@ -3357,10 +3445,10 @@ export const commandManifest = {
             },
             {
               "default_values": [
-                "8155"
+                "0"
               ],
               "global": false,
-              "help": "Port the stub binds (0.0.0.0); the worker posts here",
+              "help": "Port the stub binds (0.0.0.0); the worker posts here. Default 0 lets the kernel assign an ephemeral port",
               "id": "listen_port",
               "long": "listen-port",
               "positional": false,
@@ -3368,10 +3456,10 @@ export const commandManifest = {
             },
             {
               "default_values": [
-                "56381"
+                "0"
               ],
               "global": false,
-              "help": "Local port the Valkey port-forward binds",
+              "help": "Local port the Valkey port-forward binds. Default 0 lets kubectl assign an ephemeral local port",
               "id": "valkey_local_port",
               "long": "valkey-local-port",
               "positional": false,
@@ -3388,10 +3476,10 @@ export const commandManifest = {
             },
             {
               "default_values": [
-                "8123"
+                "0"
               ],
               "global": false,
-              "help": "Local port the API port-forward binds (default-channel lookup)",
+              "help": "Local port the API port-forward binds (default-channel lookup). Default 0 is kernel-assigned, matching `cluster message`",
               "id": "api_local_port",
               "long": "api-local-port",
               "positional": false,
@@ -3456,6 +3544,46 @@ export const commandManifest = {
               "help": "Number of eval cases to run concurrently. Sequential (1) is the only supported value today; parallel dispatch is tracked in #709, so any value above 1 is refused rather than silently run sequentially",
               "id": "concurrency",
               "long": "concurrency",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "1"
+              ],
+              "env": "CURIE_EVAL_SAMPLES",
+              "global": false,
+              "help": "Independent samples per case for live-model grading. Default: 1. A single sample is not proof of tier drift; raise this to distinguish variance from a real miss. Same policy on skill, local, and cluster",
+              "id": "samples",
+              "long": "samples",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "majority"
+              ],
+              "env": "CURIE_EVAL_AGGREGATION",
+              "global": false,
+              "help": "How to reduce N sample verdicts. Default: majority",
+              "id": "aggregation",
+              "long": "aggregation",
+              "positional": false,
+              "possible_values": [
+                "majority",
+                "pass_at_k"
+              ],
+              "required": false
+            },
+            {
+              "default_values": [
+                "1"
+              ],
+              "env": "CURIE_EVAL_PASS_AT_K",
+              "global": false,
+              "help": "Pass@k threshold when --aggregation pass_at_k. Default: 1",
+              "id": "pass_at_k",
+              "long": "pass-at-k",
               "positional": false,
               "required": false
             },
@@ -3651,7 +3779,7 @@ export const commandManifest = {
             {
               "env": "CURIE_API_URL",
               "global": false,
-              "help": "Platform API base URL. Omit to discover the release's UI `/api` proxy",
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
               "id": "api_url",
               "long": "api-url",
               "positional": false,
@@ -3730,7 +3858,7 @@ export const commandManifest = {
             {
               "env": "CURIE_API_URL",
               "global": false,
-              "help": "Platform API base URL. Omit to discover the release's UI `/api` proxy",
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
               "id": "api_url",
               "long": "api-url",
               "positional": false,
@@ -3837,7 +3965,7 @@ export const commandManifest = {
             {
               "env": "CURIE_API_URL",
               "global": false,
-              "help": "Platform API base URL. Omit to discover the release's UI `/api` proxy",
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
               "id": "api_url",
               "long": "api-url",
               "positional": false,
@@ -3937,7 +4065,7 @@ export const commandManifest = {
             {
               "env": "CURIE_API_URL",
               "global": false,
-              "help": "Platform API base URL. Omit to discover the release's UI `/api` proxy",
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
               "id": "api_url",
               "long": "api-url",
               "positional": false,
@@ -4013,7 +4141,7 @@ export const commandManifest = {
             {
               "env": "CURIE_API_URL",
               "global": false,
-              "help": "Platform API base URL. Omit to discover the release's UI `/api` proxy",
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
               "id": "api_url",
               "long": "api-url",
               "positional": false,
@@ -4088,7 +4216,7 @@ export const commandManifest = {
             {
               "env": "CURIE_API_URL",
               "global": false,
-              "help": "Platform API base URL. Omit to discover the release's UI `/api` proxy",
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
               "id": "api_url",
               "long": "api-url",
               "positional": false,
@@ -4167,7 +4295,7 @@ export const commandManifest = {
             {
               "env": "CURIE_API_URL",
               "global": false,
-              "help": "Platform API base URL. Omit to discover the release's UI `/api` proxy",
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
               "id": "api_url",
               "long": "api-url",
               "positional": false,
@@ -4246,7 +4374,7 @@ export const commandManifest = {
             {
               "env": "CURIE_API_URL",
               "global": false,
-              "help": "Platform API base URL. Omit to discover the release's UI `/api` proxy",
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
               "id": "api_url",
               "long": "api-url",
               "positional": false,
@@ -4300,7 +4428,7 @@ export const commandManifest = {
           "name": "versions"
         },
         {
-          "about": "Show what an agent has learned (its memory log; `GET /agents/{id}/memory`)",
+          "about": "Show what an agent has learned (its memory log; `GET /agents/{id}/memory`). `--add <content>` seeds an operator-authored record; a fresh session is required before it is injected at boot",
           "args": [
             {
               "global": false,
@@ -4312,7 +4440,7 @@ export const commandManifest = {
             {
               "env": "CURIE_API_URL",
               "global": false,
-              "help": "Platform API base URL. Omit to discover the release's UI `/api` proxy",
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
               "id": "api_url",
               "long": "api-url",
               "positional": false,
@@ -4360,6 +4488,14 @@ export const commandManifest = {
                 "false"
               ],
               "required": false
+            },
+            {
+              "global": false,
+              "help": "Append this content as an operator-authored memory record",
+              "id": "add",
+              "long": "add",
+              "positional": false,
+              "required": false
             }
           ],
           "hidden": false,
@@ -4378,7 +4514,7 @@ export const commandManifest = {
             {
               "env": "CURIE_API_URL",
               "global": false,
-              "help": "Platform API base URL. Omit to discover the release's UI `/api` proxy",
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
               "id": "api_url",
               "long": "api-url",
               "positional": false,
@@ -4928,7 +5064,64 @@ export const commandManifest = {
           "name": "e2e-ladder"
         },
         {
+          "about": "Select the end to end tiers CI would run for paths or revisions",
+          "args": [
+            {
+              "global": false,
+              "help": "Changed path. Repeat for every path in the candidate change",
+              "id": "path",
+              "long": "path",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Base revision for a local branch comparison",
+              "id": "base",
+              "long": "base",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Head revision for a local branch comparison",
+              "id": "head",
+              "long": "head",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Select every tier, matching a push event",
+              "id": "push",
+              "long": "push",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "e2e-ci-selection"
+        },
+        {
           "about": "Runtime E2E the Helm chart on a local cluster: install a trimmed slice, seed a bundle into RustFS, run the sandbox bundle-fetch init pair, and exec-assert the runner's view -- the one-command way to satisfy a chart/sandbox runtime acceptance criterion static checks cannot (#199, `bash scripts/chart-runtime-e2e.sh`)",
+          "args": [
+            {
+              "global": false,
+              "help": "Allow running against a kube context other than `k8scratch`",
+              "id": "force",
+              "long": "force",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
           "hidden": false,
           "name": "chart-runtime-e2e"
         },
@@ -5098,7 +5291,7 @@ export const commandManifest = {
         }
       ],
       "hidden": false,
-      "long_about": "Converge a cluster to a `curie.yaml` installation file (ADR-0097).\n\nThe file states the whole intent, so `apply` never has to be told what it was told last time -- the gap behind the dropped-settings failures the `--set`/`--reuse-values` shape kept producing.",
+      "long_about": "Converge a cluster to a `curie.yaml` installation file (ADR-0097).\n\nThe file states the whole intent, so `apply` never has to be told what it was told last time -- the gap behind the dropped-settings failures the `--set`/`--reuse-values` shape kept producing.\n\nA worked common installation is available at `examples/curie.yaml` in the Curie repository.",
       "name": "apply"
     },
     {

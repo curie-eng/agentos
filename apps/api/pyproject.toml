@@ -23,6 +23,7 @@ dependencies = [
     "plugin-format",
     "aci-protocol",
     "curie-telemetry",
+    "curie-telemetry-schema",
 ]
 
 [build-system]

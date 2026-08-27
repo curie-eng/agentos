@@ -224,3 +224,8 @@ def test_a_refusal_reports_neither_state(tmp_path, monkeypatch):
     assert reply["ok"] is False
     assert reply["prior"] is None
     assert reply["post"] is None
+
+
+def test_streamable_http_is_mounted_at_curie_connector_path(tmp_path):
+    srv = _load(tmp_path)
+    assert [route.path for route in srv.mcp.streamable_http_app().routes] == ["/mcp"]

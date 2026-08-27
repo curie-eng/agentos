@@ -172,6 +172,12 @@ fn the_scaffolded_fake_loop_exits_zero_and_reports_plumbing_not_a_pass() {
         case["passed"].is_null(),
         "`passed` is tri-state; a non-graded row claims neither: {body}"
     );
+    // #1907: even a plumbing row reports the sampling policy so n=1 is explicit.
+    assert_eq!(body["samples"], 1, "{body}");
+    assert_eq!(body["policy"], "majority", "{body}");
+    assert_eq!(case["samples"], 1, "{body}");
+    assert_eq!(case["passes"], 0, "{body}");
+    assert_eq!(case["policy"], "majority", "{body}");
 }
 
 /// The human rollup for an all-plumbing run must read as plumbing. `1/1 passed`

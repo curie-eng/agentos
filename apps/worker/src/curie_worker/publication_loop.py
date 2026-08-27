@@ -280,13 +280,12 @@ class PublicationReconciler:
                     "publication approval card has no session conversation"
                 )
             await self._card_store.remember(
-                conversation_id,
+                str(work.approval_id),
                 channel=work.target.address,
                 ts=ack.ref,
                 summary=work.summary,
                 endpoint=work.route.endpoint,
                 requested_by=work.requested_by,
-                approval_id=str(work.approval_id),
                 kind=work.target.kind,
                 adapter=work.route.adapter,
             )
@@ -419,20 +418,13 @@ class PublicationReconciler:
             text = f"Publication failed safely after approval: {result.error}"
         conversation_id = result.target.conversation_id
         card_ref: ApprovalCardRef | None = None
+        approval_id = str(result.approval_id)
         transcript_retry_error: Exception | None = None
         try:
             if self._card_store is not None:
-                card_ref = self._retained_card_refs.pop(conversation_id, None)
+                card_ref = self._retained_card_refs.pop(approval_id, None)
                 if card_ref is None:
-                    card_ref = await self._card_store.pop(conversation_id)
-                if card_ref is not None and card_ref.approval_id != str(
-                    result.approval_id
-                ):
-                    await self._card_store.restore(
-                        conversation_id,
-                        card_ref,
-                    )
-                    card_ref = None
+                    card_ref = await self._card_store.pop(approval_id)
             if self._transcript is not None:
                 try:
                     await _resolve(
@@ -464,14 +456,14 @@ class PublicationReconciler:
             if card_ref is not None and self._card_store is not None:
                 try:
                     await self._card_store.restore(
-                        conversation_id,
+                        approval_id,
                         card_ref,
                     )
                 except Exception:
                     # Keep the only surviving copy available to this process.
                     # The routed-delivery error remains the failure charged to
                     # the outbox instead of being masked by a Valkey outage.
-                    self._retained_card_refs[conversation_id] = card_ref
+                    self._retained_card_refs[approval_id] = card_ref
                     logger.exception(
                         "publication approval card restore failed after result "
                         "delivery error publication_id=%s original_error=%s",

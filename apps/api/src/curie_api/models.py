@@ -14,9 +14,10 @@ from typing import Any
 
 from sqlalchemy import Enum, ForeignKey, Index, LargeBinary, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from .db import SCHEMA, Base
+from .repo_full_name import normalize_repo_full_name
 
 GIT_FLOW_CREATED_BY = "git-flow"
 
@@ -68,6 +69,13 @@ class Agent(Base):
     # sharing a repository is intended, two sharing a channel is silent
     # shadowing.
     repo_full_name: Mapped[str | None] = mapped_column(default=None, index=True)
+
+    @validates("repo_full_name")
+    def _validate_repo_full_name(self, _key: str, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return normalize_repo_full_name(value)
+
     # Per-agent budget (L1). Field names match the frozen ACI SessionConfig
     # CURIE_BUDGET so the worker passes them straight through at sandbox boot;
     # NULL means platform defaults apply.

@@ -113,6 +113,15 @@ pub fn get_value(name: &str) -> Result<Option<String>> {
     Ok(read_credentials()?.values.get(name).cloned())
 }
 
+pub(crate) fn resolve_env_or_saved(name: &str) -> Result<Option<String>> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(Ok)
+        .or_else(|| get_value(name).transpose())
+        .transpose()
+}
+
 /// Check the non-secret index without opening any credential values.
 /// UI status rendering must use this instead of `get_value`.
 pub fn is_saved(name: &str) -> Result<bool> {

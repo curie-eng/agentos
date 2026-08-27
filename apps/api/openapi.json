@@ -564,6 +564,9 @@
           "repo_full_name": {
             "anyOf": [
               {
+                "maxLength": 140,
+                "minLength": 3,
+                "pattern": "^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*/[A-Za-z0-9._-]+$",
                 "type": "string"
               },
               {
@@ -793,6 +796,9 @@
           "repo_full_name": {
             "anyOf": [
               {
+                "maxLength": 140,
+                "minLength": 3,
+                "pattern": "^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*/[A-Za-z0-9._-]+$",
                 "type": "string"
               },
               {
@@ -2736,6 +2742,20 @@
         "title": "LoadPackConfig",
         "type": "object"
       },
+      "MemoryEntryCreate": {
+        "description": "Append one operator-authored memory record (#1904).\n\nProvenance is stamped by the server. Extra body fields, including a\ncaller-supplied provenance object, are ignored rather than trusted.",
+        "properties": {
+          "content": {
+            "title": "Content",
+            "type": "string"
+          }
+        },
+        "required": [
+          "content"
+        ],
+        "title": "MemoryEntryCreate",
+        "type": "object"
+      },
       "MemoryEntryEdit": {
         "description": "Edit one memory entry using its parent log version.\n\nThe required version prevents a stale positional index from changing an\nentry after the log has changed. Provenance is preserved.",
         "properties": {
@@ -2784,7 +2804,7 @@
         "type": "object"
       },
       "MemoryProvenanceOut": {
-        "description": "Where a memory entry was learned from (#264 ``Provenance`` shape).",
+        "description": "Where a memory entry was learned from (#264 ``Provenance`` shape).\n\n``source`` distinguishes an operator-seeded record (``operator``) from a\nsession-learned one. Absent or null means learned/unspecified, matching\nrecords written before the operator seed path existed.",
         "properties": {
           "learned_from_session_id": {
             "anyOf": [
@@ -2801,6 +2821,17 @@
             "default": "",
             "title": "Recorded At",
             "type": "string"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source"
           },
           "source_trace_ids": {
             "items": {
@@ -5597,6 +5628,74 @@
           }
         },
         "summary": "List Memory",
+        "tags": [
+          "memory"
+        ]
+      },
+      "post": {
+        "description": "Append an operator-authored memory record (#1904).\n\nCreates the ``memory/log`` key when absent, otherwise appends under the same\nrow lock the state-append path uses. Provenance is stamped here so a caller\ncannot claim a session or traces they did not produce. The runner rehydrates\nthe log at the next session boot; a live thread keeps the memory it booted\nwith.",
+        "operationId": "create_memory_agents__agent_id__memory_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemoryEntryCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryEntryOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Memory",
         "tags": [
           "memory"
         ]

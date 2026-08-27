@@ -3,12 +3,12 @@
 //!
 //! This is the behavioral coverage the mechanism pivot lost when the injectable
 //! `await_resume_reply` seam was replaced by a concrete Valkey connection: it
-//! drives the seam the way it actually runs. No compose stack is needed -- only a
-//! reachable Valkey (the compose dev one on host port 26379 is fine) and the
-//! in-process stub. The test uses a unique test-scoped stream it deletes
-//! afterward, so it never touches the real `curie:runs` stream. When no Valkey
-//! is reachable it SKIPS (like `chat_enqueue.rs`), so CI without the stack is
-//! unaffected; run it locally with the compose Valkey up, or point
+//! drives the seam the way it actually runs. It needs a reachable Valkey (the
+//! compose dev one on host port 26379 is fine) and the in-process stub. The test
+//! uses a unique test-scoped stream it deletes afterward, so it never touches
+//! the real `curie:runs` stream. Local runs skip when no Valkey is reachable, but
+//! CI sets `CI_REQUIRE_VALKEY_TESTS` and starts Valkey, so these tests execute
+//! there. For equivalent local coverage, run the compose Valkey or point
 //! `TEST_VALKEY_URL` at another instance.
 
 #[cfg(target_os = "linux")]

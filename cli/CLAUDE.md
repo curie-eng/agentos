@@ -152,10 +152,14 @@ Helm and the deployed release with `up`, `status`, `down`, `comms`, `message`,
   fetch via `ensure_cached`; pure argv builders never fetch, and `--dry-run`
   never touches the network.
 - **Credentials are masked, never printed.** Secret `helm --set` values use the
-  `CmdArg::SecretSet` variant (only a masked prefix is echoed, in dry-run or the
-  printed command line) and token flags read from env with `hide_env_values`.
-  Never widen a secret to `Plain` or otherwise print it. The `up` model
-  credential (from `CURIE_MODEL_CREDENTIALS`) flows through this path.
+  `CmdArg::SecretSet` variant, while generic `--set` and `--set-string`
+  credential-shaped values use `CmdArg::HelmSetExpression`: raw expressions stay
+  unchanged for execution, but every rendered form masks them. Malformed
+  expressions fail safe: an unbalanced brace list renders as a fully masked
+  placeholder.
+  Token flags read from env with `hide_env_values`; never widen a secret to
+  `Plain` or otherwise print it. The `up` model credential (from
+  `CURIE_MODEL_CREDENTIALS`) flows through this path.
   `curie cluster comms --slack` uses the same `SecretSet` masking for
   `SLACK_APP_TOKEN` and `SLACK_BOT_TOKEN`, while `--disconnect --dry-run`
   prints only the empty clears. After the helm upgrade it also rolls the
@@ -210,6 +214,9 @@ Helm and the deployed release with `up`, `status`, `down`, `comms`, `message`,
 ```bash
 cd cli && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 ```
+The Rust CI job sets `CI_REQUIRE_VALKEY_TESTS` and starts Valkey, so Valkey-backed
+tests execute in CI. Contributors need a reachable Valkey, such as the compose
+Valkey, for equivalent local coverage.
 
 Scripted E2E (real runner container, fake model, fully offline by default):
 ```bash

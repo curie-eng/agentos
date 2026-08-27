@@ -602,12 +602,21 @@ if [[ -z "${CURIE_E2E_BUNDLE:-}" ]]; then
 fi
 
 echo
-echo "=== curie skill down ==="
-"$BIN" skill down
-
-echo
-echo "=== #1087 AC3: re-up on the mutated source, confirm a NEW bundle digest is packed ==="
-"$BIN" skill up "${START_ARGS[@]}"
+echo "=== #1905 / #1087 AC3: plain re-up on the mutated source, confirm a NEW bundle digest is packed ==="
+# Leave the recorded runner up. A second `skill up` without `--replace` must
+# recognize this directory's runner, replace it, and boot the edited snapshot.
+UP_OUTPUT_2="$("$BIN" skill up "${START_ARGS[@]}" 2>&1)"
+printf '%s\n' "$UP_OUTPUT_2"
+if printf '%s' "$UP_OUTPUT_2" | grep -q "a local runner is already recorded"; then
+    echo "error: plain \`skill up\` after an edit refused and asked for --replace." >&2
+    echo "expected: a verified same-directory runner is replaced automatically (#1905)." >&2
+    exit 1
+fi
+if ! printf '%s' "$UP_OUTPUT_2" | grep -q "bundle changed: replacing the recorded runner"; then
+    echo "error: plain \`skill up\` after an edit did not report that it replaced the recorded runner." >&2
+    echo "output: $UP_OUTPUT_2" >&2
+    exit 1
+fi
 STATUS_JSON_2="$("$BIN" skill status --json)"
 DIGEST_2="$(printf '%s' "$STATUS_JSON_2" | python3 -c 'import json,sys; print(json.load(sys.stdin)["bundle_digest"])')"
 if [[ -z "$DIGEST_2" || "$DIGEST_2" == "None" ]]; then
@@ -621,6 +630,14 @@ if [[ "$DIGEST_2" == "$DIGEST_1" ]]; then
     exit 1
 fi
 echo "confirmed: re-up on changed source produced a new bundle digest ($DIGEST_1 -> $DIGEST_2)"
+
+MOUNTED_SKILL_MD_2="$(docker exec "$CONTAINER" cat "/plugin/$SKILL_FILE_REL")"
+if ! grep -qF "$MARKER" <<<"$MOUNTED_SKILL_MD_2"; then
+    echo "error: after plain \`skill up\` the running container's /plugin/$SKILL_FILE_REL does not contain the host edit marker '$MARKER'." >&2
+    echo "expected: the replacement runner serves the edited snapshot (#1905)." >&2
+    exit 1
+fi
+echo "confirmed: the replacement runner's /plugin mount serves the edited snapshot ($SKILL_FILE_REL)"
 
 echo
 echo "=== restore the source and tear down the second runner ==="

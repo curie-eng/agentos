@@ -71,20 +71,27 @@ class Provenance:
     learned_from_session_id: str | None = None
     source_trace_ids: tuple[str, ...] = ()
     recorded_at: str = ""
+    # ``operator`` for CLI/API-seeded records (#1904); None/absent for learned.
+    source: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "learned_from_session_id": self.learned_from_session_id,
             "source_trace_ids": list(self.source_trace_ids),
             "recorded_at": self.recorded_at,
         }
+        if self.source is not None:
+            payload["source"] = self.source
+        return payload
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> Provenance:
+        source = data.get("source")
         return cls(
             learned_from_session_id=data.get("learned_from_session_id"),
             source_trace_ids=tuple(data.get("source_trace_ids") or ()),
             recorded_at=data.get("recorded_at", ""),
+            source=str(source) if source else None,
         )
 
 
@@ -318,10 +325,16 @@ def merge_provenance(a: Provenance, b: Provenance) -> Provenance:
     session_id = a.learned_from_session_id or b.learned_from_session_id
     stamps = [s for s in (a.recorded_at, b.recorded_at) if s]
     recorded_at = min(stamps) if stamps else ""
+    source: str | None
+    if a.source == "operator" or b.source == "operator":
+        source = "operator"
+    else:
+        source = a.source or b.source
     return Provenance(
         learned_from_session_id=session_id,
         source_trace_ids=tuple(trace_ids),
         recorded_at=recorded_at,
+        source=source,
     )
 
 

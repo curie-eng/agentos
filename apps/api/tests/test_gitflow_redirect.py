@@ -27,6 +27,7 @@ from curie_api.gitflow import GitFlowError, clone_and_archive
 
 _REPO = "octo/demo-agent"
 _VALID_SHA1 = "a" * 40
+_DEV_REF = "refs/heads/dev"
 
 
 @dataclass
@@ -153,7 +154,13 @@ def test_a_cross_host_redirect_receives_no_request_from_the_clone(
     payload_url = f"{base}/{_REPO}.git"
 
     with pytest.raises(GitFlowError):
-        clone_and_archive(payload_url, _VALID_SHA1, settings, repo_full_name=_REPO)
+        clone_and_archive(
+            payload_url,
+            _VALID_SHA1,
+            settings,
+            repo_full_name=_REPO,
+            ref=_DEV_REF,
+        )
 
     # Non-vacuity: git really did reach the origin and really was handed a 302.
     assert redirect_servers.origin_requests != [], "git never reached the origin"

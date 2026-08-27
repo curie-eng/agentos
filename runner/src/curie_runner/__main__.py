@@ -22,6 +22,7 @@ from .adapter import ClaudeAgentSession, ModelSession, build_options
 from .approval import (
     APPROVAL_SERVER_NAME,
     ApprovalPolicyError,
+    assert_gates_not_shadowed,
     build_approval_gate,
     build_approval_server,
     build_can_use_tool,
@@ -195,6 +196,13 @@ def build_runner(
             connector_servers=resolution.connector_servers,
             managed_workspace=mounted_workspace is not None,
         )
+        # The third fail-closed boot check (#1852). The two above refuse a policy
+        # that cannot be armed as declared; this one refuses a policy that WOULD
+        # arm and then be bypassed, because the bundle's own skill permissions
+        # preauthorize a gated tool before can_use_tool is ever consulted. It sits
+        # here rather than in build_approval_gate because only this scope holds
+        # both the assembled gate and the bundle directory.
+        assert_gates_not_shadowed(config.session.plugin_dir, approval_gate, resolution)
     except ApprovalPolicyError as exc:
         # Log then re-raise, matching the module's other two fatal boot paths
         # (credential resolution, session start): a bare traceback is the one
