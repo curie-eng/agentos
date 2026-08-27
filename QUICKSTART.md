@@ -112,8 +112,7 @@ That is the full loop: `curie skill up` starts the runner container,
 
 Edit `skills/my-agent/SKILL.md` and re-run steps 2–3 to see your change
 answered — `skill up` runs an immutable snapshot of the bundle, so an edit
-only reaches a runner you've restarted (`curie skill up --replace` if one is
-still running).
+only reaches a runner after you run `curie skill up` again.
 
 A committed first-party example lives at `examples/weather/`: `cd
 examples/weather && curie skill up` runs it from a clean clone. For the

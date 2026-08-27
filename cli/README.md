@@ -318,12 +318,13 @@ in Langfuse traces.
 `skill up` also packs the bundle into a content-addressed snapshot under
 `<bundle>/.curie/snapshots/<digest>/` and mounts that read-only, matching what
 the local and cluster tiers do with a deployed bundle. So editing a bundle file
-on the host does not reach the running runner: re-run `curie skill up
---replace` and confirm the new `bundle_digest` in `curie skill status --json`.
-`evals/cases.json` and its optional `evals/trajectory.json` sidecar are the
-exceptions. `skill eval` reads them live from source, so an eval edit needs no
-restart. `skill down` and `--replace` release the snapshot along with the
-container.
+on the host does not reach the running runner: re-run `curie skill up` and
+confirm the new `bundle_digest` in `curie skill status --json`. A verified
+same-directory runner is replaced automatically; `--replace` still forces a
+restart of an unchanged snapshot or a leftover name. `evals/cases.json` and its
+optional `evals/trajectory.json` sidecar are the exceptions. `skill eval` reads
+them live from source, so an eval edit needs no restart. `skill down` and a
+replacement `up` release the snapshot along with the container.
 
 #### `local` target
 

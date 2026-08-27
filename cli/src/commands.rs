@@ -12,7 +12,6 @@ use anyhow::{bail, Context, Result};
 use clap::ValueEnum;
 use curie_aci_protocol::{Budget, EventType, OutboundEvent, SessionStatus};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::api::{ApiClient, BudgetConfig, ChannelOutcome};
 use crate::bundle::pack_tar_gz;
@@ -1448,32 +1447,82 @@ fn load_model_credentials_from_env_file(
     Ok(resolved)
 }
 
-/// What a recorded runner means for a fresh `skill up` (#747).
+/// What a recorded runner means for a fresh `skill up` (#747, #1905).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordedStatePlan {
     /// Nothing recorded; boot.
     Proceed,
-    /// `--replace` names the very container the record describes, so the record
-    /// is about to become stale anyway: clear it and boot.
+    /// Tear the recorded runner down and boot. Either `--replace` names that
+    /// exact container, or a verified same-bundle identity is serving a stale
+    /// snapshot of this source.
     ClearAndProceed,
-    /// A runner is recorded that `--replace` does not cover; refuse, so a second
-    /// bundle's live runner cannot be silently forgotten.
+    /// The recorded runner is this bundle and already serves the current
+    /// source; do not restart.
+    AlreadyRunning,
+    /// A runner is recorded that this `up` must not remove: a different name,
+    /// a foreign or unverifiable identity, or a snapshot that cannot be
+    /// compared. Refuse so a second bundle's live runner cannot be silently
+    /// forgotten.
     Refuse,
 }
 
-/// Resolve the recorded-state gate. Pure so both branches are testable without a
-/// bundle on disk. `--replace` only clears the record when it is replacing that
-/// exact container: a record naming a DIFFERENT runner still blocks, since
-/// removing one container is no reason to forget another.
-pub fn plan_recorded_state(
-    recorded: Option<&str>,
-    target: &str,
-    replace: bool,
-) -> RecordedStatePlan {
-    match recorded {
-        None => RecordedStatePlan::Proceed,
-        Some(container) if replace && container == target => RecordedStatePlan::ClearAndProceed,
-        Some(_) => RecordedStatePlan::Refuse,
+/// Inputs to [`plan_recorded_state`]. Identity fields are optional so the
+/// `--replace` name gate stays testable without Docker; auto-reload requires
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordedStateQuery<'a> {
+    pub recorded_name: Option<&'a str>,
+    pub target_name: &'a str,
+    pub replace: bool,
+    pub recorded_id: Option<&'a str>,
+    pub live_id: Option<&'a str>,
+    pub same_bundle_dir: bool,
+    pub recorded_digest: Option<&'a str>,
+    pub current_digest: Option<&'a str>,
+}
+
+/// Whether a recorded container id and a `docker ps` id name the same
+/// container. `docker ps` reports a 12-char short id while `docker run`
+/// returns the full 64-char one, so identity is a prefix match, not equality.
+/// An empty recorded id cannot be compared and is not a match: auto-reload
+/// must not treat an unverified identity as owned (#1905 / #747).
+pub fn recorded_ids_match(recorded_id: &str, live_id: &str) -> bool {
+    !recorded_id.is_empty()
+        && (recorded_id.starts_with(live_id) || live_id.starts_with(recorded_id))
+}
+
+/// Resolve the recorded-state gate. Pure so every branch is testable without a
+/// bundle on disk or a Docker daemon.
+///
+/// `--replace` still clears only the record for the exact target name: a record
+/// naming a DIFFERENT runner still blocks, since removing one container is no
+/// reason to forget another (#747). Without `--replace`, a verified
+/// same-directory runner whose snapshot no longer matches this source is
+/// replaced automatically (#1905); an unverified identity never is.
+pub fn plan_recorded_state(q: RecordedStateQuery<'_>) -> RecordedStatePlan {
+    let Some(recorded) = q.recorded_name else {
+        return RecordedStatePlan::Proceed;
+    };
+    if q.replace && recorded == q.target_name {
+        return RecordedStatePlan::ClearAndProceed;
+    }
+    if recorded != q.target_name {
+        return RecordedStatePlan::Refuse;
+    }
+    let identity_verified = q.same_bundle_dir
+        && match (q.recorded_id, q.live_id) {
+            (Some(recorded_id), Some(live_id)) => recorded_ids_match(recorded_id, live_id),
+            _ => false,
+        };
+    if !identity_verified {
+        return RecordedStatePlan::Refuse;
+    }
+    match (q.recorded_digest, q.current_digest) {
+        (Some(recorded_digest), Some(current_digest)) if recorded_digest == current_digest => {
+            RecordedStatePlan::AlreadyRunning
+        }
+        (Some(_), Some(_)) => RecordedStatePlan::ClearAndProceed,
+        _ => RecordedStatePlan::Refuse,
     }
 }
 
@@ -1534,11 +1583,45 @@ pub async fn start(opts: StartOpts) -> Result<()> {
     // Decided here, ACTED ON below: refusing is free, but replacing tears down a
     // live runner and must not happen until nothing cheap can still abort (#747).
     let recorded_runner = state::load(&plugin_dir)?;
-    let recorded_plan = plan_recorded_state(
-        recorded_runner.as_ref().map(|s| s.container_name.as_str()),
-        &opts.name,
-        opts.replace,
-    );
+    // `--replace` decides from the name alone and must stay a cheap abort
+    // until budget / model preflights pass (#747). Auto-reload needs the live
+    // container id, so only probe Docker when that path could fire.
+    let live_for_plan = match recorded_runner.as_ref() {
+        Some(saved) if !opts.replace => docker::container_facts(&saved.container_name).await?,
+        _ => None,
+    };
+    let same_bundle_dir = recorded_runner.as_ref().is_some_and(|saved| {
+        Path::new(&saved.plugin_dir)
+            .canonicalize()
+            .ok()
+            .is_some_and(|recorded| recorded == plugin_dir)
+    });
+    let identity_verified = recorded_runner.as_ref().is_some_and(|saved| {
+        same_bundle_dir
+            && live_for_plan
+                .as_ref()
+                .is_some_and(|facts| recorded_ids_match(&saved.container_id, &facts.id))
+    });
+    // Packing is cheap relative to teardown and is how we know the snapshot is
+    // stale. Skip it unless auto-reload could actually fire: `--replace` does
+    // not need a digest, and an unverified identity must still refuse.
+    let current_digest = if identity_verified && !opts.replace {
+        crate::bundle::digest_source(&plugin_dir).ok()
+    } else {
+        None
+    };
+    let recorded_plan = plan_recorded_state(RecordedStateQuery {
+        recorded_name: recorded_runner.as_ref().map(|s| s.container_name.as_str()),
+        target_name: &opts.name,
+        replace: opts.replace,
+        recorded_id: recorded_runner.as_ref().map(|s| s.container_id.as_str()),
+        live_id: live_for_plan.as_ref().map(|f| f.id.as_str()),
+        same_bundle_dir,
+        recorded_digest: recorded_runner
+            .as_ref()
+            .and_then(|s| s.bundle_digest.as_deref()),
+        current_digest: current_digest.as_deref(),
+    });
     if recorded_plan == RecordedStatePlan::Refuse {
         let recorded_name = &recorded_runner
             .as_ref()
@@ -1548,6 +1631,18 @@ pub async fn start(opts: StartOpts) -> Result<()> {
             "a local runner is already recorded in {}/.curie/runner.json; run 'curie skill down' there first, or rerun 'curie skill up --replace --name {recorded_name}' to replace it",
             plugin_dir.display(),
         )));
+    }
+    if recorded_plan == RecordedStatePlan::AlreadyRunning {
+        let saved = recorded_runner.expect("already-running requires a recorded runner");
+        let ui = crate::ui::ui();
+        ui.success(&format!(
+            "runner '{}' is already running this bundle snapshot",
+            saved.container_name
+        ));
+        if let Some(digest) = saved.bundle_digest.as_deref() {
+            ui.note(&format!("bundle {}", short_digest(digest)));
+        }
+        return Ok(());
     }
 
     // Parse (not just forward) the budget so a typo fails here, not in-container.
@@ -1591,10 +1686,12 @@ pub async fn start(opts: StartOpts) -> Result<()> {
     // network, then the file -- because clearing the record while its runner is
     // still live strands exactly the untracked orphan this ticket removes (#747).
     if let (RecordedStatePlan::ClearAndProceed, Some(saved)) = (recorded_plan, recorded_runner) {
-        crate::ui::ui().note(&format!(
-            "--replace: tearing down the recorded runner '{}' first",
-            saved.container_name
-        ));
+        let reason = if opts.replace {
+            "--replace: tearing down the recorded runner"
+        } else {
+            "bundle changed: replacing the recorded runner"
+        };
+        crate::ui::ui().note(&format!("{reason} '{}' first", saved.container_name));
         let live = docker::container_facts(&saved.container_name).await?;
         stop_recorded(&plugin_dir, crate::ui::ui(), saved, live.as_ref()).await?;
     }
@@ -1969,9 +2066,10 @@ pub fn plan_recorded_teardown(
     };
     // `docker ps` reports a 12-char short id while `docker run` returns the full
     // 64-char one, so identity is a prefix match, not equality. A record with no
-    // id at all cannot be compared, so it keeps the old name-based behavior
-    // rather than refusing to tear down.
-    if recorded_id.is_empty() || recorded_id.starts_with(live) || live.starts_with(recorded_id) {
+    // id at all cannot be compared, so teardown keeps the old name-based
+    // behavior rather than refusing to tear down. Auto-reload does NOT use this
+    // empty-id fallback: [`recorded_ids_match`] rejects it (#1905).
+    if recorded_id.is_empty() || recorded_ids_match(recorded_id, live) {
         return RecordedTeardown::Remove {
             id: live.to_string(),
         };
@@ -2518,24 +2616,20 @@ pub struct SkillMessageOutput {
 fn editable_bundle_warning(saved: Option<&state::RunnerState>, url: &str) -> Option<String> {
     let saved = saved.filter(|saved| saved.base_url == url)?;
     let recorded_digest = saved.bundle_digest.as_deref()?;
-    let archive = match pack_tar_gz(Path::new(&saved.plugin_dir)) {
-        Ok(archive) => archive,
+    let editable_digest = match crate::bundle::digest_source(Path::new(&saved.plugin_dir)) {
+        Ok(digest) => digest,
         Err(_) => {
             return Some(
-                "could not compare the editable bundle with the running snapshot. Run `curie skill up --replace` after fixing the bundle."
+                "could not compare the editable bundle with the running snapshot. Run `curie skill up` after fixing the bundle."
                     .to_string(),
             );
         }
     };
-    let editable_digest: String = Sha256::digest(&archive)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
     if editable_digest == recorded_digest {
         return None;
     }
     Some(
-        "editable bundle differs from the running snapshot. Run `curie skill up --replace` to load the changes."
+        "editable bundle differs from the running snapshot. Run `curie skill up` to load the changes."
             .to_string(),
     )
 }
@@ -3349,10 +3443,10 @@ pub fn resolve_cases_path(
             return Ok(in_snapshot);
         }
         return Err(crate::exit::CliError::usage(format!(
-            "no eval cases found in the running snapshot: {}. Run `curie skill up --replace` or pass --cases",
+            "no eval cases found in the running snapshot: {}. Run `curie skill up` or pass --cases",
             in_snapshot.display()
         ))
-        .with_fix("run `curie skill up --replace` or pass --cases")
+        .with_fix("run `curie skill up` or pass --cases")
         .into());
     }
     let local = cwd.join("evals/cases.json");
@@ -5936,11 +6030,11 @@ mod tests {
     use super::{
         absent_container_note, merge_secret_env, model_credential_summary,
         parse_credential_env_file, parse_manifest_gates, plan_recorded_state,
-        plan_recorded_teardown, plan_skill_down, replace_first_line, report_sweep,
-        resolve_cases_path, resolve_env_file_credentials, seed_env_if_missing,
+        plan_recorded_teardown, plan_skill_down, recorded_ids_match, replace_first_line,
+        report_sweep, resolve_cases_path, resolve_env_file_credentials, seed_env_if_missing,
         select_in_force_deployment, select_passthrough_env, sweep_json_row, sweep_table_row,
         validate_channel_binding, ApprovalGateDecl, DownPlan, EnvSeed, RecordedStatePlan,
-        RecordedTeardown, SweepRow,
+        RecordedStateQuery, RecordedTeardown, SweepRow,
     };
     use serde::Deserialize;
     use std::path::{Path, PathBuf};
@@ -6090,17 +6184,38 @@ mod tests {
         assert!(msg.contains("model-beta"), "{msg}");
     }
 
+    fn recorded_query<'a>(
+        recorded: Option<&'a str>,
+        target: &'a str,
+        replace: bool,
+    ) -> RecordedStateQuery<'a> {
+        RecordedStateQuery {
+            recorded_name: recorded,
+            target_name: target,
+            replace,
+            recorded_id: None,
+            live_id: None,
+            same_bundle_dir: true,
+            recorded_digest: None,
+            current_digest: None,
+        }
+    }
+
     #[test]
     fn replace_clears_a_stale_record_for_the_very_container_it_replaces() {
         // A bundle holding both a stale runner.json and a live container of that
         // name was unrecoverable with --replace: the record refused the boot
         // before the preflight could remove anything (#747).
         assert_eq!(
-            plan_recorded_state(Some("curie-runner-local"), "curie-runner-local", true),
+            plan_recorded_state(recorded_query(
+                Some("curie-runner-local"),
+                "curie-runner-local",
+                true
+            )),
             RecordedStatePlan::ClearAndProceed
         );
         assert_eq!(
-            plan_recorded_state(None, "curie-runner-local", false),
+            plan_recorded_state(recorded_query(None, "curie-runner-local", false)),
             RecordedStatePlan::Proceed
         );
     }
@@ -6110,13 +6225,99 @@ mod tests {
         // Removing one container is no reason to forget another: a record for a
         // different, still-live runner keeps refusing, with or without --replace.
         assert_eq!(
-            plan_recorded_state(Some("curie-runner-local"), "curie-example-42", true),
+            plan_recorded_state(recorded_query(
+                Some("curie-runner-local"),
+                "curie-example-42",
+                true
+            )),
             RecordedStatePlan::Refuse
         );
         assert_eq!(
-            plan_recorded_state(Some("curie-runner-local"), "curie-runner-local", false),
+            plan_recorded_state(recorded_query(
+                Some("curie-runner-local"),
+                "curie-runner-local",
+                false
+            )),
             RecordedStatePlan::Refuse
         );
+    }
+
+    fn verified_query<'a>(
+        replace: bool,
+        recorded_digest: Option<&'a str>,
+        current_digest: Option<&'a str>,
+    ) -> RecordedStateQuery<'a> {
+        RecordedStateQuery {
+            recorded_name: Some("curie-runner-local"),
+            target_name: "curie-runner-local",
+            replace,
+            recorded_id: Some("deadbeef00001111"),
+            live_id: Some("deadbeef0000"),
+            same_bundle_dir: true,
+            recorded_digest,
+            current_digest,
+        }
+    }
+
+    #[test]
+    fn plain_up_replaces_a_verified_same_bundle_when_the_snapshot_differs() {
+        assert_eq!(
+            plan_recorded_state(verified_query(false, Some("aaa"), Some("bbb"))),
+            RecordedStatePlan::ClearAndProceed
+        );
+    }
+
+    #[test]
+    fn plain_up_reports_already_running_when_the_verified_snapshot_matches() {
+        assert_eq!(
+            plan_recorded_state(verified_query(false, Some("aaa"), Some("aaa"))),
+            RecordedStatePlan::AlreadyRunning
+        );
+    }
+
+    #[test]
+    fn replace_still_restarts_a_verified_unchanged_bundle() {
+        assert_eq!(
+            plan_recorded_state(verified_query(true, Some("aaa"), Some("aaa"))),
+            RecordedStatePlan::ClearAndProceed
+        );
+    }
+
+    #[test]
+    fn plain_up_refuses_when_the_snapshot_cannot_be_compared() {
+        assert_eq!(
+            plan_recorded_state(verified_query(false, None, Some("aaa"))),
+            RecordedStatePlan::Refuse
+        );
+        assert_eq!(
+            plan_recorded_state(verified_query(false, Some("aaa"), None)),
+            RecordedStatePlan::Refuse
+        );
+    }
+
+    #[test]
+    fn plain_up_refuses_a_verified_name_whose_container_id_does_not_match() {
+        let mut q = verified_query(false, Some("aaa"), Some("bbb"));
+        q.live_id = Some("cccccccccccc");
+        assert_eq!(plan_recorded_state(q), RecordedStatePlan::Refuse);
+    }
+
+    #[test]
+    fn plain_up_refuses_when_the_record_is_not_this_bundle_directory() {
+        let mut q = verified_query(false, Some("aaa"), Some("bbb"));
+        q.same_bundle_dir = false;
+        assert_eq!(plan_recorded_state(q), RecordedStatePlan::Refuse);
+    }
+
+    #[test]
+    fn recorded_ids_match_across_short_and_long_docker_ids() {
+        assert!(recorded_ids_match(
+            "9f2c1d3e4b5a6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f",
+            "9f2c1d3e4b5a"
+        ));
+        assert!(recorded_ids_match("9f2c1d3e4b5a", "9f2c1d3e4b5a6c7d"));
+        assert!(!recorded_ids_match("", "9f2c1d3e4b5a"));
+        assert!(!recorded_ids_match("aaaa", "bbbb"));
     }
 
     #[test]

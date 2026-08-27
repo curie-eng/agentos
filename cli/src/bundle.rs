@@ -165,6 +165,22 @@ pub fn pack_tar_gz(dir: &Path) -> Result<Vec<u8>> {
     encoder.finish().context("finalizing gzip stream")
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// sha256 of [`pack_tar_gz`] bytes for `source`, lowercase hex.
+///
+/// Same digest `snapshot` records and `apps/api` stores on deploy. Used by
+/// `skill up` to decide whether an already-recorded runner is still serving
+/// this source (#1905) and by `skill message` to warn when it is not (#1087).
+pub fn digest_source(source: &Path) -> Result<String> {
+    Ok(sha256_hex(&pack_tar_gz(source)?))
+}
+
 /// A materialized, content-addressed copy of a bundle source tree (#1087).
 ///
 /// The skill tier runs one of these rather than the editable source, matching
@@ -233,10 +249,7 @@ fn snapshot_into(source: &Path, dir_name: Option<&str>) -> Result<BundleSnapshot
         }
     }
     let bytes = pack_tar_gz(source)?;
-    let digest: String = Sha256::digest(&bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    let digest = sha256_hex(&bytes);
     let dest = snapshot_root(source).join(dir_name.unwrap_or(&digest));
     if dest.exists() {
         std::fs::remove_dir_all(&dest)
@@ -359,6 +372,11 @@ mod tests {
         assert!(names.contains(&".claude-plugin/plugin.json".to_string()));
         assert!(names.contains(&"skills/deal-desk/SKILL.md".to_string()));
         assert!(names.contains(&".mcp.json".to_string()));
+        assert_eq!(
+            digest_source(dir.path()).unwrap(),
+            snapshot(dir.path()).unwrap().digest,
+            "skill up's reload comparison must use the same digest snapshot records"
+        );
         assert!(!names.iter().any(|n| n.starts_with(".curie")));
         assert!(!names.iter().any(|n| n.starts_with(".git/")));
     }
