@@ -23,6 +23,8 @@ from redeploy import (  # noqa: E402
     BUNDLE_PREFIX,
     SelfUpgradeError,
     bundle_from_repo_tarball,
+    deployed_bundle_file,
+    with_connectors_from,
 )
 
 
@@ -103,3 +105,79 @@ def test_a_symlink_inside_the_bundle_is_dropped() -> None:
         link.linkname = "../../../../etc/passwd"
         tar.addfile(link)
     assert _names(bundle_from_repo_tarball(out.getvalue())) == [".claude-plugin/plugin.json"]
+
+
+# --- carrying the deployed connector declaration forward ----------------------
+#
+# The repository's `connectors.yaml` declares `build:`, which records a LOCAL
+# image id the cluster tier refuses. Resolving those to published digests is the
+# installer's job. This job carries the DEPLOYED declaration forward instead,
+# which is only sound while that declaration has not changed -- checked by the
+# caller, and refused rather than guessed.
+
+
+def _bundle(files: dict[str, bytes]) -> bytes:
+    out = io.BytesIO()
+    with tarfile.open(fileobj=out, mode="w:gz") as tar:
+        for name, body in files.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(body)
+            tar.addfile(info, io.BytesIO(body))
+    return out.getvalue()
+
+
+def _read(bundle: bytes) -> dict[str, bytes]:
+    with tarfile.open(fileobj=io.BytesIO(bundle), mode="r:gz") as tar:
+        return {
+            member.name: tar.extractfile(member).read()
+            for member in tar.getmembers()
+            if member.isfile()
+        }
+
+
+def test_only_the_connector_declaration_is_carried_forward() -> None:
+    new = _bundle(
+        {
+            "connectors.yaml": b"connectors:\n  tempo:\n    build: connectors/tempo\n",
+            "skills/sre-bot/SKILL.md": b"the new skill",
+            ".claude-plugin/plugin.json": b'{"name":"sre-bot"}',
+        }
+    )
+    deployed = b"connectors:\n  tempo:\n    image: ghcr.io/x@sha256:deadbeef\n"
+
+    merged = _read(with_connectors_from(new, deployed))
+
+    assert merged["connectors.yaml"] == deployed, "the resolved declaration must win"
+    assert merged["skills/sre-bot/SKILL.md"] == b"the new skill", (
+        "everything else must come from the new bundle -- carrying the whole "
+        "deployed bundle forward would make the upgrade a no-op"
+    )
+    assert merged[".claude-plugin/plugin.json"] == b'{"name":"sre-bot"}'
+
+
+def test_a_bundle_with_no_connector_declaration_still_round_trips() -> None:
+    # `build:`-free bundles exist (the weather example), and the substitution must
+    # not invent a file that was never there.
+    new = _bundle({"skills/sre-bot/SKILL.md": b"only a skill"})
+    merged = _read(with_connectors_from(new, b"unused"))
+    assert merged == {"skills/sre-bot/SKILL.md": b"only a skill"}
+
+
+def test_a_missing_deployed_declaration_is_an_error_not_a_default() -> None:
+    # Falling back to the repository's `build:` copy here would deploy a bundle
+    # whose connectors cannot start, and report success doing it.
+    class _Stub:
+        @staticmethod
+        def urlopen(*_args, **_kwargs):  # pragma: no cover - not reached
+            raise AssertionError("no network in this test")
+
+    import redeploy
+
+    original = redeploy._api
+    redeploy._api = lambda *_a, **_k: b'{"files": [{"path": "skills/sre-bot/SKILL.md"}]}'
+    try:
+        with pytest.raises(SelfUpgradeError) as excinfo:
+            deployed_bundle_file("http://api", "k", "agent", "version", "connectors.yaml")
+    finally:
+        redeploy._api = original
+    assert "connectors.yaml" in str(excinfo.value)
