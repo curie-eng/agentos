@@ -2723,7 +2723,7 @@ pub async fn eval(
     .await?;
     bar.finish();
 
-    report_eval(&results, bundle_digest.as_deref())
+    report_eval(&results, bundle_digest.as_deref(), ())
 }
 
 /// Whether the runner `skill eval` is about to drive is the fake. Learned from
@@ -3341,7 +3341,12 @@ pub fn report_sweep(rows: &[SweepRow], bundle_digest: Option<&str>) -> Result<()
 /// graded is confirmable from the machine surface. Callers pass `None` when no
 /// locally snapshotted bundle applies (the local/cluster tiers grade a deployed
 /// version), never a digest they did not observe.
-pub fn report_eval(report: &EvalReport, bundle_digest: Option<&str>) -> Result<()> {
+///
+/// `guards` are dropped before a red eval's non-unwinding `process::exit`
+/// (#1908). `std::process::exit` does not run Drop, so a `kubectl port-forward`
+/// child or Slack stub still in the caller's scope would otherwise be orphaned
+/// onto PID 1. Callers with no such resource pass `()`.
+pub fn report_eval<G>(report: &EvalReport, bundle_digest: Option<&str>, guards: G) -> Result<()> {
     let (_passed, failed, _plumbing_ok) = eval_counts(&report.rows);
     // Emit through the one success point (#474), then apply the exit-code side
     // effect for BOTH paths -- the json path had it inline, the human path after.
@@ -3352,7 +3357,7 @@ pub fn report_eval(report: &EvalReport, bundle_digest: Option<&str>) -> Result<(
         bundle_digest,
     });
     if failed > 0 {
-        std::process::exit(crate::exit::ExitClass::Failure.code());
+        crate::exit::exit_after_drop(crate::exit::ExitClass::Failure, guards);
     }
     Ok(())
 }

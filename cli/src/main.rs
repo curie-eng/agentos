@@ -1729,10 +1729,12 @@ enum ClusterAction {
         #[arg(long)]
         listen_host: Option<String>,
         /// Port the stub binds (0.0.0.0); the worker posts here.
-        #[arg(long, default_value_t = message::DEFAULT_LISTEN_PORT)]
+        /// Default 0 lets the kernel assign an ephemeral port.
+        #[arg(long, default_value_t = 0)]
         listen_port: u16,
         /// Local port the Valkey port-forward binds.
-        #[arg(long, default_value_t = message::DEFAULT_VALKEY_LOCAL_PORT)]
+        /// Default 0 lets kubectl assign an ephemeral local port.
+        #[arg(long, default_value_t = 0)]
         valkey_local_port: u16,
         /// Valkey password. Omit to read the release's own password from its
         /// chart Secret. Prefer the CURIE_VALKEY_PASSWORD env var over passing
@@ -1746,7 +1748,8 @@ enum ClusterAction {
         )]
         valkey_password: Option<String>,
         /// Local port the API port-forward binds (default-channel lookup).
-        #[arg(long, default_value_t = message::DEFAULT_API_LOCAL_PORT)]
+        /// Default 0 is kernel-assigned, matching `cluster message`.
+        #[arg(long, default_value_t = 0)]
         api_local_port: u16,
         /// Platform API key for the default-channel lookup. Omit to read the
         /// release's own key from its chart Secret.
@@ -4287,6 +4290,70 @@ mod tests {
             }) => {
                 assert_eq!(api_key, Some("K".to_string()));
                 assert_eq!(valkey_password, Some("P".to_string()));
+            }
+            _ => panic!("expected cluster eval command"),
+        }
+    }
+
+    /// #1908: a red cluster eval used to leak a kubectl child bound to the
+    /// fixed 56381 default, so the next eval selected that same occupied port.
+    /// Omitted eval ports must request kernel-assigned 0, matching `cluster
+    /// message` (#1652 / #1740).
+    #[test]
+    fn cluster_eval_omitted_ports_default_to_ephemeral() {
+        let cli =
+            Cli::try_parse_from(["curie", "cluster", "eval"]).expect("cluster eval should parse");
+        match cli.command {
+            Some(Command::Cluster {
+                action:
+                    ClusterAction::Eval {
+                        listen_port,
+                        valkey_local_port,
+                        api_local_port,
+                        ..
+                    },
+            }) => {
+                assert_eq!(listen_port, 0, "an omitted --listen-port must request 0");
+                assert_eq!(
+                    valkey_local_port, 0,
+                    "an omitted --valkey-local-port must request 0"
+                );
+                assert_eq!(
+                    api_local_port, 0,
+                    "an omitted --api-local-port must request 0"
+                );
+            }
+            _ => panic!("expected cluster eval command"),
+        }
+    }
+
+    #[test]
+    fn cluster_eval_preserves_explicit_port_overrides() {
+        let cli = Cli::try_parse_from([
+            "curie",
+            "cluster",
+            "eval",
+            "--listen-port",
+            "18155",
+            "--valkey-local-port",
+            "18156",
+            "--api-local-port",
+            "18157",
+        ])
+        .expect("cluster eval with explicit ports should parse");
+        match cli.command {
+            Some(Command::Cluster {
+                action:
+                    ClusterAction::Eval {
+                        listen_port,
+                        valkey_local_port,
+                        api_local_port,
+                        ..
+                    },
+            }) => {
+                assert_eq!(listen_port, 18155);
+                assert_eq!(valkey_local_port, 18156);
+                assert_eq!(api_local_port, 18157);
             }
             _ => panic!("expected cluster eval command"),
         }
