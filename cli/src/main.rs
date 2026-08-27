@@ -809,6 +809,15 @@ enum SreBotAction {
         /// Omit to install read only.
         #[arg(long, value_name = "NS/NAME[,NS/NAME]")]
         write_allowlist: Option<String>,
+        /// Kubernetes namespace of the Curie release. Default: curie.
+        #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
+        namespace: String,
+        /// Helm release name of the Curie install. Default: curie.
+        #[arg(long, default_value = "curie")]
+        release: String,
+        /// Kubernetes namespace of the retained observability stack. Default: observability.
+        #[arg(long, default_value = "observability")]
+        observability_namespace: String,
     },
 }
 
@@ -2471,6 +2480,9 @@ async fn run(command: Option<Command>) -> Result<()> {
                             dry_run,
                             slack_channel,
                             write_allowlist,
+                            namespace,
+                            release,
+                            observability_namespace,
                         },
                 },
         }) => match curie::examples::install_sre_bot(curie::examples::SreBotInstallOpts {
@@ -2478,6 +2490,9 @@ async fn run(command: Option<Command>) -> Result<()> {
             dry_run,
             slack_channel,
             write_allowlist,
+            namespace,
+            release,
+            observability_namespace,
         })
         .await?
         {

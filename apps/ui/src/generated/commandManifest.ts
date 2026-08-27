@@ -4601,6 +4601,40 @@ export const commandManifest = {
                   "long": "write-allowlist",
                   "positional": false,
                   "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "env": "CURIE_NAMESPACE",
+                  "global": false,
+                  "help": "Kubernetes namespace of the Curie release. Default: curie",
+                  "id": "namespace",
+                  "long": "namespace",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "global": false,
+                  "help": "Helm release name of the Curie install. Default: curie",
+                  "id": "release",
+                  "long": "release",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "observability"
+                  ],
+                  "global": false,
+                  "help": "Kubernetes namespace of the retained observability stack. Default: observability",
+                  "id": "observability_namespace",
+                  "long": "observability-namespace",
+                  "positional": false,
+                  "required": false
                 }
               ],
               "hidden": false,
