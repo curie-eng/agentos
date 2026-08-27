@@ -186,9 +186,9 @@ before running it: getting it wrong means deleting the agent and recreating it. 
 
 Plain `cluster up` infers Anthropic or OpenRouter egress from an unambiguous
 credential prefix. On minikube, the first admission attempt reports that its
-`gvisor` RuntimeClass is absent, so Curie applies
-`security.gvisor.mode=off` and retries once. Each inference is printed with the
-equivalent override. Ambiguous credential shapes still need an explicit
+`gvisor` RuntimeClass is absent, so Curie shows that attempt as retrying,
+applies `security.gvisor.mode=off`, and retries once. Each inference is printed
+with the equivalent override. Ambiguous credential shapes still need an explicit
 `--allow-egress-host`, and explicit values that contradict detected facts are
 errors.
 

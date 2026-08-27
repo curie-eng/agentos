@@ -314,7 +314,7 @@ pub fn primer() -> Primer {
             },
             Landmine {
                 title: "Missing gVisor is inferred only from admission",
-                detail: "A real model install first keeps the gVisor chart default. When admission reports exactly that RuntimeClass gvisor is not found, direct `curie cluster up` applies security.gvisor.mode=off, prints the override, and retries once. Other failures remain closed. Explicit auto or require modes contradict the detected result and are errors.",
+                detail: "A real model install first keeps the gVisor chart default. When admission reports exactly that RuntimeClass gvisor is not found, direct `curie cluster up` shows that attempt as retrying, applies security.gvisor.mode=off, prints the override, and retries once. Other failures remain closed. Explicit auto or require modes contradict the detected result and are errors.",
             },
         ],
         recovery: vec![

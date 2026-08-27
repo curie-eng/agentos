@@ -18,7 +18,7 @@ Targets, see the target comparison table in the
 |---|---|
 | `kubectl` and `helm` on PATH | Every `cluster` verb wraps one or both of them. |
 | A reachable cluster | Every verb talks to the cluster's Kubernetes API server directly -- there's nothing to install onto or inspect without one. The chart's own preflights additionally need the `agents.x-k8s.io` Agent Sandbox CRDs (Custom Resource Definitions) installable and a NetworkPolicy-enforcing CNI (Container Network Interface) already present; see `charts/curie/README.md`. |
-| `runsc` (gVisor) on every node for full kernel isolation | A real model first installs with gVisor enabled. If admission reports exactly that the `gvisor` RuntimeClass is absent, plain `cluster up` applies `security.gvisor.mode=off` and retries once. Other preflight failures remain closed. Fake model installs do not need it. |
+| `runsc` (gVisor) on every node for full kernel isolation | A real model first installs with gVisor enabled. If admission reports exactly that the `gvisor` RuntimeClass is absent, plain `cluster up` shows that attempt as retrying, applies `security.gvisor.mode=off`, and retries once. Other preflight failures remain closed. Fake model installs do not need it. |
 
 **For testing**, pick between **k3s**, **kind**, and **minikube** based on
 your host and how disposable the cluster needs to be. A single-node **k3s**
@@ -151,11 +151,13 @@ the detected owner is a usage error.
 
 The first gVisor preflight keeps the chart default. Only the exact admission
 result `RuntimeClass "gvisor" not found` authorizes
-`security.gvisor.mode=off` and one retry. An explicit `auto` or `require` mode
-contradicts that result and errors. Other admission failures and an unavailable
-event watch remain closed. Curie prints one standard error line for every
-inference, including the equivalent override. Prepared `apply` and `diff`
-paths do not infer live cluster facts.
+`security.gvisor.mode=off` and one retry. That first attempt renders as
+retrying, not as a failed install; the retry is the one installed or failed
+result. An explicit `auto` or `require` mode contradicts that result and
+errors. Other admission failures and an unavailable event watch remain closed.
+Curie prints one standard error line for every inference, including the
+equivalent override. Prepared `apply` and `diff` paths do not infer live
+cluster facts.
 
 ### `curie cluster status`
 

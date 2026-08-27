@@ -74,7 +74,8 @@ curie cluster deploy --plugin-dir . --namespace my-agent --release my-agent \
 
 The plain install reads the exported `sk-ant-` credential and infers Anthropic
 egress. If admission reports that the cluster has no `gvisor` RuntimeClass,
-Curie applies `security.gvisor.mode=off` and retries once. It also reuses
+Curie shows that attempt as retrying, applies `security.gvisor.mode=off`, and
+retries once. It also reuses
 PriorityClasses and the sandbox controller when their complete Helm ownership
 metadata names an existing release. Every applied inference is printed with
 its equivalent override.
