@@ -194,13 +194,25 @@ class RecordingSubstrate:
         self.claims: list[tuple[str, str]] = []
         self.lookups: list[str] = []
 
-    def claim(self, thread_key: str, *, env: dict[str, str] | None = None) -> Any:
-        handle = self._inner.claim(thread_key, env=env)
+    def claim(
+        self,
+        thread_key: str,
+        *,
+        env: dict[str, str] | None = None,
+        agent_name: str | None = None,
+    ) -> Any:
+        handle = self._inner.claim(thread_key, env=env, agent_name=agent_name)
         self.claims.append((thread_key, handle.sandbox_name))
         return handle
 
-    def resume(self, thread_key: str, *, env: dict[str, str] | None = None) -> Any:
-        handle = self._inner.resume(thread_key, env=env)
+    def resume(
+        self,
+        thread_key: str,
+        *,
+        env: dict[str, str] | None = None,
+        agent_name: str | None = None,
+    ) -> Any:
+        handle = self._inner.resume(thread_key, env=env, agent_name=agent_name)
         self.claims.append((thread_key, handle.sandbox_name))
         return handle
 

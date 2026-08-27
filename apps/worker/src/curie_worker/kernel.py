@@ -1023,7 +1023,7 @@ class Kernel:
                     )
                     return
                 agent_id = resolved.agent_id
-                agent_name = resolved.agent_name
+                agent_name = getattr(resolved, "agent_name", None)
                 # The scoped key, not the bare conversation id: this mints the
                 # sandbox's history ref and session id, so two channels sharing
                 # a conversation id must not rehydrate one another's transcript.

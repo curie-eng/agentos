@@ -920,7 +920,9 @@ class _TokenSubstrate:
         self._token = token
         self.released: list[str] = []
 
-    def claim(self, _key: str, *, env: dict[str, str] | None = None) -> _FakeHandle:
+    def claim(
+        self, _key: str, *, env: dict[str, str] | None = None, **_: object
+    ) -> _FakeHandle:
         return _FakeHandle(base_url="http://sandbox.local:8080", token=self._token)
 
     def release(self, key: str) -> None:
@@ -1062,7 +1064,9 @@ class _ConcurrencyProbeSubstrate:
         self.peak = 0
         self.claims = 0
 
-    def claim(self, _key: str, *, env: dict[str, str] | None = None) -> _FakeHandle:
+    def claim(
+        self, _key: str, *, env: dict[str, str] | None = None, **_: object
+    ) -> _FakeHandle:
         with self._lock:
             self._live += 1
             self.claims += 1
