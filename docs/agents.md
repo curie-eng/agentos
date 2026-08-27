@@ -90,6 +90,31 @@ deployed bundle. The deploy receipt's `bundle_sha256` is the parity identity
 for local and cluster. A case with no matching spec fails closed with an
 explanatory `detail`; it never passes by omission.
 
+Trajectory records a tool request before that tool executes. A denied or failed
+request can therefore satisfy tool identity and order. A trajectory green proves
+that the expected request sequence was observed. It does not prove the tool was
+reachable or that execution succeeded.
+
+**A parity example case is falsifiable only when it goes RED after the specific
+capability under test is removed.** Run the same case after removing that
+capability and record the RED result. A null agent run is still a useful
+vacuousness control, but it is not sufficient on its own because it removes the
+whole agent shape rather than the identity of the capability being proved.
+Use an executable control through the real consumer path. One valid example is
+to keep a tool declared, route it through an approval gate, supply no approval,
+and observe that the tool is denied. Other controls are valid when they make
+the named capability unavailable through the surface the case exercises.
+
+Keep capability denial and oracle discrimination as separate observations when
+one run cannot prove both. For weather, the live ungranted approval gate made
+WebFetch unavailable, but the turn awaited approval and eval failed before
+trajectory scoring. A separate focused regression completed a turn with
+WebSearch but no WebFetch and observed the committed trajectory oracle go RED.
+That regression proves a missing WebFetch request is detected. Do not describe
+the approval denial run as a trajectory grade. More generally, a turn that does
+not complete can fail before graders run, so one RED result may prove only the
+earlier failure and not the named grader.
+
 **Success on an eval is `failed` equal to 0 AND `plumbing_ok` equal to 0.**
 `plumbing_ok` counts cases that completed on the fake model and were therefore
 never graded (ADR-0055), and `passed + failed + plumbing_ok == total`. Each

@@ -1,12 +1,15 @@
 #!/bin/bash
-# Falsifiability gate, real-path negative control (issue #619).
+# Null agent negative control for falsifiability (issues #619 and #1649).
 #
-# This is a FALSIFIABILITY gate, NOT an E2E test: it never runs a real agent or
-# makes a model call. It boots the runner's scripted FAKE model (offline, no
-# credential, no network) -- a do-nothing agent whose only reply is the canned
-# final "all done" -- and runs every COMMITTED eval suite through the real
-# `curie skill eval` path. A genuinely falsifiable case (#527) must go RED
-# against this do-nothing agent, so the gate FAILS if ANY committed case passes.
+# This is an offline null agent control, NOT capability removal proof and NOT an
+# E2E test. It never runs a real agent or makes a model call. It boots the
+# runner's scripted FAKE model with no credential or network. That null agent's
+# only reply is the canned final "all done". Every COMMITTED eval suite runs
+# through the real `curie skill eval` path, and the control FAILS if any case
+# passes. This catches vacuous graders, but it is not sufficient on its own:
+# removing the whole agent shape does not prove that removing the specific
+# capability under test makes the case go RED. That capability identity
+# mutation is separate evidence required by the parity example convention.
 #
 # Suites are discovered, not hardcoded: every examples/*/evals/cases.json plus
 # the `curie init` scaffold seed at apps/worker/schema/eval-cases.example.json.
@@ -106,10 +109,10 @@ for suite in "${SUITES[@]}"; do
         FAILED=1
         continue
     fi
-    echo "    $passed/$total passed against the do-nothing fake agent"
+    echo "    $passed/$total passed against the null agent"
     if [[ "$passed" != "0" ]]; then
         greeners="$(printf '%s' "$out" | python3 -c 'import json,sys; print(", ".join(c["id"] for c in json.load(sys.stdin)["cases"] if c["passed"]))' 2>/dev/null || echo "(unparseable)")"
-        echo "    UNFALSIFIABLE: these cases pass against a do-nothing agent (#527): $greeners" >&2
+        echo "    NULL CONTROL FAILED: these cases pass against the null agent (#527): $greeners" >&2
         FAILED=1
     fi
 done
@@ -120,9 +123,9 @@ echo "=== curie skill down ==="
 
 if (( FAILED )); then
     echo
-    echo "FALSIFIABILITY GATE FAILED: at least one committed eval case greens against the fake model." >&2
+    echo "NULL AGENT CONTROL FAILED: at least one committed eval case greens against the null agent." >&2
     exit 1
 fi
 
 echo
-echo "FALSIFIABILITY GATE PASS: every committed eval case is red against the fake model."
+echo "NULL AGENT CONTROL PASS: every committed eval case is red against the null agent. Capability removal proof is separate."
