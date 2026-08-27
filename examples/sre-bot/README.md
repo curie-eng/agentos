@@ -89,7 +89,22 @@ curie example sre-bot install --observability
 ```
 
 This installs the bot and its self referential observability stack with no
-values files. The installer makes a read only runtime copy of the checked in
+values files. With no targeting flags, Curie lands as release `curie` in
+namespace `curie`, and the retained Grafana/Loki/Alloy/Tempo/Prometheus stack
+lands in namespace `observability`. To install beside an existing release, pass
+the same identity the rest of the cluster CLI uses:
+
+```bash
+curie example sre-bot install --observability \
+  --namespace soak \
+  --release soak \
+  --observability-namespace soak-obs
+```
+
+`--namespace` also reads `CURIE_NAMESPACE`. The installer threads those three
+values through every Helm, kubectl, manifest, secret-discovery, connector, and
+deploy step, including the embedded `read-access.yaml` and observability
+service DNS. The installer makes a read only runtime copy of the checked in
 bundle by removing the write connector and its matching approval gate together.
 The declared write path remains in the source bundle for the explicit Level up
 build and deploy flow below.

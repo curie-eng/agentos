@@ -59,6 +59,8 @@ struct Fixture {
     action_log: PathBuf,
     grafana_stdin: PathBuf,
     connector_stdin: PathBuf,
+    applied_dir: PathBuf,
+    helm_values_dir: PathBuf,
     nodes: String,
     pods: String,
     nodes_mode: &'static str,
@@ -92,6 +94,10 @@ impl Fixture {
         let action_log = temp.path().join("actions.log");
         let grafana_stdin = temp.path().join("grafana.stdin");
         let connector_stdin = temp.path().join("connector.stdin");
+        let applied_dir = temp.path().join("applied");
+        let helm_values_dir = temp.path().join("helm-values");
+        fs::create_dir(&applied_dir).expect("create applied-file capture directory");
+        fs::create_dir(&helm_values_dir).expect("create helm-values capture directory");
 
         write_exec(
             &bin_dir,
@@ -99,6 +105,14 @@ impl Fixture {
             r#"#!/bin/sh
 printf '%s\n' "$*" >> "$CURIE_TEST_KUBECTL_LOG"
 printf 'KUBECTL %s\n' "$*" >> "$CURIE_TEST_ACTION_LOG"
+
+prev=""
+for arg in "$@"; do
+    if [ "$prev" = "-f" ] && [ "$arg" != "-" ] && [ -f "$arg" ]; then
+        cp "$arg" "$CURIE_TEST_APPLIED_DIR/$(basename "$arg")"
+    fi
+    prev=$arg
+done
 
 case " $* " in
     *" get nodes "*|*" get node "*)
@@ -180,12 +194,12 @@ case " $* " in
                 ;;
         esac
         ;;
-    *" -n curie apply -f - "*)
-        cat > "$CURIE_TEST_CONNECTOR_STDIN"
-        printf '%s\n' 'connector objects configured'
-        exit 0
-        ;;
     *" apply -f - "*)
+        if printf ' %s ' "$*" | grep -q ' -n '; then
+            cat > "$CURIE_TEST_CONNECTOR_STDIN"
+            printf '%s\n' 'connector objects configured'
+            exit 0
+        fi
         cat > "$CURIE_TEST_GRAFANA_STDIN"
         if [ "$CURIE_TEST_GRAFANA_SECRET_MODE" = "apply-failure" ]; then
             printf '%s\n' 'Error from server (Forbidden): cannot apply grafana-admin' >&2
@@ -194,17 +208,17 @@ case " $* " in
         printf '%s\n' 'secret/grafana-admin configured'
         exit 0
         ;;
-    *" -n curie get deployment "*" app.kubernetes.io/instance=curie "*)
+    *" get deployment "*" app.kubernetes.io/instance="*)
         printf '%s\n' 'curie'
         exit 0
         ;;
-    *" -n curie delete deployment,service,networkpolicy,secret "*)
+    *" delete deployment,service,networkpolicy,secret "*)
         exit 0
         ;;
     *" apply "*|*" rollout status "*)
         exit 0
         ;;
-    *" get secret "*" app.kubernetes.io/instance=curie "*)
+    *" get secret "*" app.kubernetes.io/instance="*)
         printf '%s\n' 'curie-secrets'
         exit 0
         ;;
@@ -229,6 +243,14 @@ exit 64
             r#"#!/bin/sh
 printf '%s\n' "$*" >> "$CURIE_TEST_HELM_LOG"
 printf 'HELM %s\n' "$*" >> "$CURIE_TEST_ACTION_LOG"
+
+prev=""
+for arg in "$@"; do
+    if [ "$prev" = "-f" ] && [ -f "$arg" ]; then
+        cp "$arg" "$CURIE_TEST_HELM_VALUES_DIR/$(basename "$arg")"
+    fi
+    prev=$arg
+done
 
 if [ "$1" = "get" ] && [ "$2" = "values" ]; then
     if [ "${CURIE_TEST_HELM_VALUES:-absent}" = "absent" ]; then
@@ -276,7 +298,7 @@ if [ "$1" = "upgrade" ] && [ "$2" = "--install" ]; then
     esac
 fi
 
-if [ "$1" = "upgrade" ] && [ "$2" = "curie" ]; then
+if [ "$1" = "upgrade" ] && [ "$2" != "--install" ]; then
     exit 0
 fi
 
@@ -364,6 +386,8 @@ exit 64
             action_log,
             grafana_stdin,
             connector_stdin,
+            applied_dir,
+            helm_values_dir,
             nodes: nodes.to_string(),
             pods: pods.to_string(),
             nodes_mode,
@@ -438,6 +462,8 @@ exit 64
             .env("CURIE_TEST_ACTION_LOG", &self.action_log)
             .env("CURIE_TEST_GRAFANA_STDIN", &self.grafana_stdin)
             .env("CURIE_TEST_CONNECTOR_STDIN", &self.connector_stdin)
+            .env("CURIE_TEST_APPLIED_DIR", &self.applied_dir)
+            .env("CURIE_TEST_HELM_VALUES_DIR", &self.helm_values_dir)
             .env("CURIE_TEST_NODES_JSON", &self.nodes)
             .env("CURIE_TEST_PODS_JSON", &self.pods)
             .env("CURIE_TEST_NODES_MODE", self.nodes_mode)
@@ -451,6 +477,8 @@ exit 64
                 &self.registry_endpoint,
             )
             .env_remove("CURIE_API_KEY")
+            .env_remove("CURIE_NAMESPACE")
+            .env_remove("CURIE_RELEASE")
             .env_remove("CURIE_CREDENTIALS")
             .env_remove("CURIE_MODEL_CREDENTIALS")
             .env_remove("CURIE_GITHUB_TOKEN")
@@ -481,6 +509,16 @@ exit 64
 
     fn connector_stdin(&self) -> Vec<u8> {
         fs::read(&self.connector_stdin).unwrap_or_default()
+    }
+
+    fn applied_file(&self, name: &str) -> String {
+        fs::read_to_string(self.applied_dir.join(name))
+            .unwrap_or_else(|error| panic!("read applied {name}: {error}"))
+    }
+
+    fn helm_values_file(&self, name: &str) -> String {
+        fs::read_to_string(self.helm_values_dir.join(name))
+            .unwrap_or_else(|error| panic!("read helm values {name}: {error}"))
     }
 
     fn actions(&self) -> Vec<String> {
@@ -695,11 +733,15 @@ fn clap_routes_the_one_command_and_exposes_no_operator_configuration_or_credenti
         text.contains("--slack-channel"),
         "the install surface must permit the optional Slack binding: {text}"
     );
+    for required in ["--namespace", "--release", "--observability-namespace"] {
+        assert!(
+            text.contains(required),
+            "the install surface must expose targeting flag {required}: {text}"
+        );
+    }
     for forbidden in [
         "--values",
         "--file",
-        "--namespace",
-        "--release",
         "--api-key",
         "--grafana-token",
         "--service-account-token",
@@ -1819,5 +1861,405 @@ fn all_capacity_reads_are_cluster_wide_and_json_shaped() {
         (pod_read.contains("--all-namespaces") || pod_read.contains(" -A"))
             && (pod_read.contains("-o json") || pod_read.contains("--output json")),
         "pod request accounting must be cluster wide structured JSON: {pod_read}"
+    );
+}
+
+const CUSTOM_NAMESPACE: &str = "soak";
+const CUSTOM_RELEASE: &str = "soak-rel";
+const CUSTOM_OBS_NAMESPACE: &str = "soak-obs";
+
+fn custom_target_args() -> [&'static str; 6] {
+    [
+        "--namespace",
+        CUSTOM_NAMESPACE,
+        "--release",
+        CUSTOM_RELEASE,
+        "--observability-namespace",
+        CUSTOM_OBS_NAMESPACE,
+    ]
+}
+
+fn dry_run_plan_lines(output: &Output) -> Vec<String> {
+    let documents: Vec<Value> = serde_json::Deserializer::from_slice(&output.stdout)
+        .into_iter::<Value>()
+        .collect::<Result<_, _>>()
+        .unwrap_or_else(|error| panic!("dry run stdout must contain only JSON: {error}"));
+    assert_eq!(
+        documents.len(),
+        1,
+        "dry run must emit exactly one JSON object"
+    );
+    documents[0]["plan"]
+        .as_array()
+        .expect("dry run object must carry its ordered plan")
+        .iter()
+        .map(|line| line.as_str().expect("plan entries are strings").to_string())
+        .collect()
+}
+
+fn assert_no_default_curie_or_observability_targets(lines: &[String]) {
+    let plan = lines.join("\n");
+    for forbidden in [
+        "--namespace observability",
+        "--namespace curie",
+        " -n curie ",
+        "helm upgrade --install curie ",
+        "helm upgrade curie ",
+        "curie cluster deploy --plugin-dir embedded:examples/sre-bot --namespace curie --release curie",
+        "in namespace observability",
+        "kubectl wait --namespace curie ",
+    ] {
+        assert!(
+            !plan.contains(forbidden),
+            "custom targeting must not retain default identity `{forbidden}`: {lines:?}"
+        );
+    }
+}
+
+#[test]
+fn no_flag_dry_run_preserves_curie_and_observability_defaults() {
+    let fixture = Fixture::new(nodes(vec![node("node-a", "4Gi", true)]), pods(vec![]));
+    let output = fixture.run(&["--dry-run", "--json"]);
+    let text = shown(&output);
+    assert!(
+        output.status.success(),
+        "default dry run must succeed: {text}"
+    );
+    let lines = dry_run_plan_lines(&output);
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("helm upgrade --install grafana ")
+                && line.contains("--namespace observability")
+        }),
+        "no-flag plan must keep the observability namespace default: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("helm upgrade --install curie") && line.contains(" -n curie ")
+        }),
+        "no-flag plan must keep the Curie namespace and release defaults: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| line.contains(
+            "curie cluster deploy --plugin-dir embedded:examples/sre-bot --namespace curie --release curie"
+        )),
+        "no-flag deploy must keep the Curie identity defaults: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("preserve or create Secret grafana-admin in namespace observability")
+        }),
+        "no-flag plan must keep the Grafana Secret in observability: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("kubectl wait --namespace curie ")
+                && line.contains("secret/sre-bot-reader-token")
+        }),
+        "no-flag token wait must keep the Curie namespace: {lines:?}"
+    );
+}
+
+#[test]
+fn custom_target_dry_run_reports_and_uses_only_the_selected_identities() {
+    let fixture = Fixture::new(nodes(vec![node("node-a", "4Gi", true)]), pods(vec![]));
+    let mut args = custom_target_args().to_vec();
+    args.extend(["--dry-run", "--json"]);
+    let output = fixture.run(&args);
+    let text = shown(&output);
+    assert!(
+        output.status.success(),
+        "custom-target dry run must succeed: {text}"
+    );
+    let lines = dry_run_plan_lines(&output);
+    assert_no_default_curie_or_observability_targets(&lines);
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("preserve or create Secret grafana-admin in namespace soak-obs")
+        }),
+        "Grafana Secret plan must name the selected observability namespace: {lines:?}"
+    );
+    for release in ["grafana", "loki", "alloy", "prometheus"] {
+        assert!(
+            lines.iter().any(|line| {
+                line.contains(&format!("helm upgrade --install {release} "))
+                    && line.contains("--namespace soak-obs")
+            }),
+            "upstream {release} must target soak-obs: {lines:?}"
+        );
+    }
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("kubectl apply")
+                && line.contains("--namespace soak-obs")
+                && line.contains("tempo.yaml")
+        }),
+        "Tempo apply must target soak-obs: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("helm upgrade --install soak-rel") && line.contains(" -n soak ")
+        }),
+        "guarded Curie apply must use the selected release and namespace: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("helm upgrade soak-rel")
+                && !line.contains("--install")
+                && line.contains("--namespace soak")
+                && line.contains("--reuse-values")
+                && line.contains("curie-values.yaml")
+        }),
+        "integration upgrade must use the selected Curie identity: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("kubectl wait --namespace soak ")
+                && line.contains("secret/sre-bot-reader-token")
+        }),
+        "reader token wait must use the selected Curie namespace: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| line.contains(
+            "curie cluster deploy --plugin-dir embedded:examples/sre-bot --namespace soak --release soak-rel"
+        )),
+        "deploy plan must report the selected Curie identity: {lines:?}"
+    );
+}
+
+#[test]
+fn custom_targets_thread_through_helm_kubectl_manifests_secret_discovery_and_connectors() {
+    let fixture = Fixture::with_modes(
+        nodes(vec![node("node-a", "4Gi", true)]),
+        pods(vec![]),
+        "success",
+        "success",
+        "success",
+    )
+    .with_grafana_secret_mode("absent");
+    let output = fixture.run(&custom_target_args());
+    let text = shown(&output);
+    assert!(
+        output.status.success(),
+        "custom-target install must succeed: {text}"
+    );
+
+    let helm = fixture.helm_calls();
+    assert!(
+        helm.iter().any(|call| {
+            call.starts_with("upgrade --install grafana ") && call.contains("--namespace soak-obs")
+        }),
+        "Grafana Helm must target soak-obs: {helm:?}"
+    );
+    assert!(
+        helm.iter().any(
+            |call| call.starts_with("status grafana ") && call.contains("--namespace soak-obs")
+        ),
+        "Grafana status must inspect soak-obs: {helm:?}"
+    );
+    assert!(
+        helm.iter().any(|call| {
+            call.starts_with("upgrade --install soak-rel ") && call.contains(" -n soak ")
+        }),
+        "guarded Curie apply must target soak/soak-rel: {helm:?}"
+    );
+    assert!(
+        helm.iter().any(|call| {
+            call.starts_with("upgrade soak-rel ")
+                && call.contains("--namespace soak")
+                && call.contains("--reuse-values")
+        }),
+        "integration upgrade must target soak/soak-rel: {helm:?}"
+    );
+    assert!(
+        helm.iter().all(|call| {
+            !call.contains("--namespace observability")
+                && !call.contains(" -n curie ")
+                && !call.contains("--namespace curie")
+                && !call.starts_with("upgrade --install curie ")
+                && !call.starts_with("upgrade curie ")
+        }),
+        "Helm must not retain default Curie or observability identities: {helm:?}"
+    );
+
+    let kubectl = fixture.kubectl_calls();
+    assert!(
+        kubectl.iter().any(|call| {
+            call.contains("get secret grafana-admin") && call.contains("--namespace soak-obs")
+        }),
+        "Grafana admin inspect must use soak-obs: {kubectl:?}"
+    );
+    assert!(
+        kubectl.iter().any(|call| {
+            call.contains("apply")
+                && call.contains("--namespace soak-obs")
+                && call.contains("tempo.yaml")
+        }),
+        "Tempo apply must use soak-obs: {kubectl:?}"
+    );
+    assert!(
+        kubectl.iter().any(|call| {
+            call.contains("wait")
+                && call.contains("--namespace soak")
+                && call.contains("secret/sre-bot-reader-token")
+        }),
+        "reader token wait must use soak: {kubectl:?}"
+    );
+    assert!(
+        kubectl.iter().any(|call| {
+            call.contains("get secret sre-bot-reader-token") && call.contains("--namespace soak")
+        }),
+        "reader token read must use soak: {kubectl:?}"
+    );
+    assert!(
+        kubectl.iter().any(|call| call.contains("get secret")
+            && call.contains("app.kubernetes.io/instance=soak-rel")
+            && (call.contains("-n soak") || call.contains("--namespace soak"))),
+        "API key discovery must use the selected Curie identity: {kubectl:?}"
+    );
+    assert!(
+        kubectl.iter().any(|call| call == "-n soak apply -f -"),
+        "connector reconciliation must apply in soak: {kubectl:?}"
+    );
+    assert!(
+        kubectl.iter().any(|call| {
+            call.starts_with("-n soak delete deployment,service,networkpolicy,secret ")
+        }),
+        "stale connector objects must be deleted from soak: {kubectl:?}"
+    );
+    assert!(
+        kubectl.iter().all(|call| {
+            !call.contains("--namespace observability")
+                && !call.contains("-n curie")
+                && !call.contains("--namespace curie")
+                && !call.contains("instance=curie")
+        }),
+        "kubectl must not retain default Curie or observability identities: {kubectl:?}"
+    );
+
+    let grafana: Value = serde_json::from_slice(&fixture.kubectl_stdin())
+        .expect("Grafana admin Secret stdin must be JSON");
+    assert_eq!(grafana["kind"], "Secret");
+    assert_eq!(grafana["metadata"]["namespace"], CUSTOM_OBS_NAMESPACE);
+
+    let read_access = fixture.applied_file("read-access.yaml");
+    assert!(
+        read_access.contains("namespace: soak"),
+        "read-access must render the selected Curie namespace: {read_access}"
+    );
+    assert!(
+        !read_access.contains("namespace: curie"),
+        "read-access must not retain the default Curie namespace: {read_access}"
+    );
+
+    let tempo = fixture.applied_file("tempo.yaml");
+    assert!(
+        tempo.contains("namespace: soak-obs"),
+        "Tempo must render the selected observability namespace: {tempo}"
+    );
+    assert!(
+        !tempo.contains("namespace: observability"),
+        "Tempo must not retain the default observability namespace: {tempo}"
+    );
+
+    let grafana_values = fixture.helm_values_file("grafana-values.yaml");
+    assert!(
+        grafana_values.contains("loki.soak-obs.svc.cluster.local"),
+        "Grafana values must point at soak-obs: {grafana_values}"
+    );
+    assert!(
+        !grafana_values.contains(".observability.svc.cluster.local"),
+        "Grafana values must not retain observability DNS: {grafana_values}"
+    );
+
+    let alloy_values = fixture.helm_values_file("alloy-values.yaml");
+    assert!(
+        alloy_values.contains("loki.soak-obs.svc.cluster.local"),
+        "Alloy values must point at soak-obs: {alloy_values}"
+    );
+    assert!(
+        !alloy_values.contains(".observability.svc.cluster.local"),
+        "Alloy values must not retain observability DNS: {alloy_values}"
+    );
+
+    let curie_values = fixture.helm_values_file("curie-values.yaml");
+    assert!(
+        curie_values.contains("tempo.soak-obs.svc.cluster.local")
+            && curie_values.contains("grafana.soak-obs.svc.cluster.local")
+            && curie_values.contains("namespace: soak-obs"),
+        "Curie integration values must point at soak-obs: {curie_values}"
+    );
+    assert!(
+        !curie_values.contains(".observability.svc.cluster.local")
+            && !curie_values.contains("namespace: observability"),
+        "Curie integration values must not retain observability: {curie_values}"
+    );
+
+    let connectors = String::from_utf8(uploaded_bundle_file(&fixture, "connectors.yaml"))
+        .expect("uploaded connectors are UTF-8");
+    assert!(
+        connectors.contains("grafana.soak-obs.svc.cluster.local"),
+        "runtime connectors must point Grafana at soak-obs: {connectors}"
+    );
+    assert!(
+        !connectors.contains("grafana.observability.svc.cluster.local"),
+        "runtime connectors must not retain observability DNS: {connectors}"
+    );
+}
+
+#[test]
+fn selected_observability_namespace_is_the_only_managed_capacity_namespace() {
+    let mut items = managed_stack_pods("node-a");
+    items.push(labeled_pod(
+        "unrelated",
+        "node-a",
+        OBSERVABILITY_NAMESPACE,
+        json!({"app.kubernetes.io/instance": "other"}),
+        "64Mi",
+    ));
+    let fixture = Fixture::new(
+        nodes(vec![node("node-a", "1376Mi", true)]),
+        pods(items.clone()),
+    );
+    let default_output = fixture.run(&[]);
+    assert_reached_helm_upgrade(&fixture, &default_output);
+
+    let custom = Fixture::new(nodes(vec![node("node-a", "1376Mi", true)]), pods(items));
+    let output = custom.run(&custom_target_args());
+    let text = assert_refused_before_helm(&custom, &output);
+    assert!(
+        text.contains("required 1312Mi"),
+        "load in the default observability namespace must count when targeting soak-obs: {text}"
+    );
+}
+
+#[test]
+fn helm_timeout_recovery_names_the_selected_observability_namespace() {
+    let fixture = Fixture::with_modes(
+        nodes(vec![node("node-a", "8Gi", true)]),
+        pods(vec![]),
+        "success",
+        "success",
+        "timeout",
+    );
+    let output = fixture.run(&custom_target_args());
+    let text = shown(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "Helm timeout must fail: {text}"
+    );
+    let recovery =
+        "kubectl delete secret -n soak-obs -l owner=helm,name=grafana,status=pending-upgrade";
+    let normalized = text.replace(['\'', '"'], "");
+    assert!(
+        normalized.contains(recovery),
+        "timeout recovery must name soak-obs, not observability: {text}"
+    );
+    assert!(
+        !normalized.contains(
+            "kubectl delete secret -n observability -l owner=helm,name=grafana,status=pending-upgrade"
+        ),
+        "timeout recovery must not name the default observability namespace: {text}"
     );
 }
