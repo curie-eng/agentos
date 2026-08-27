@@ -542,6 +542,46 @@
               "long": "image",
               "positional": false,
               "required": false
+            },
+            {
+              "default_values": [
+                "1"
+              ],
+              "env": "CURIE_EVAL_SAMPLES",
+              "global": false,
+              "help": "Independent samples per case for live-model grading. Default: 1. A single sample is not proof of tier drift; raise this to distinguish variance from a real miss. Same policy on skill, local, and cluster",
+              "id": "samples",
+              "long": "samples",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "majority"
+              ],
+              "env": "CURIE_EVAL_AGGREGATION",
+              "global": false,
+              "help": "How to reduce N sample verdicts. Default: majority",
+              "id": "aggregation",
+              "long": "aggregation",
+              "positional": false,
+              "possible_values": [
+                "majority",
+                "pass_at_k"
+              ],
+              "required": false
+            },
+            {
+              "default_values": [
+                "1"
+              ],
+              "env": "CURIE_EVAL_PASS_AT_K",
+              "global": false,
+              "help": "Pass@k threshold when --aggregation pass_at_k. Default: 1",
+              "id": "pass_at_k",
+              "long": "pass-at-k",
+              "positional": false,
+              "required": false
             }
           ],
           "hidden": false,
@@ -1135,6 +1175,46 @@
               "help": "Number of eval cases to run concurrently. Sequential (1) is the only supported value today; parallel dispatch is tracked in #709, so any value above 1 is refused rather than silently run sequentially",
               "id": "concurrency",
               "long": "concurrency",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "1"
+              ],
+              "env": "CURIE_EVAL_SAMPLES",
+              "global": false,
+              "help": "Independent samples per case for live-model grading. Default: 1. A single sample is not proof of tier drift; raise this to distinguish variance from a real miss. Same policy on skill, local, and cluster",
+              "id": "samples",
+              "long": "samples",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "majority"
+              ],
+              "env": "CURIE_EVAL_AGGREGATION",
+              "global": false,
+              "help": "How to reduce N sample verdicts. Default: majority",
+              "id": "aggregation",
+              "long": "aggregation",
+              "positional": false,
+              "possible_values": [
+                "majority",
+                "pass_at_k"
+              ],
+              "required": false
+            },
+            {
+              "default_values": [
+                "1"
+              ],
+              "env": "CURIE_EVAL_PASS_AT_K",
+              "global": false,
+              "help": "Pass@k threshold when --aggregation pass_at_k. Default: 1",
+              "id": "pass_at_k",
+              "long": "pass-at-k",
               "positional": false,
               "required": false
             },
@@ -2754,6 +2834,46 @@
               "help": "Number of eval cases to run concurrently. Sequential (1) is the only supported value today; parallel dispatch is tracked in #709, so any value above 1 is refused rather than silently run sequentially",
               "id": "concurrency",
               "long": "concurrency",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "1"
+              ],
+              "env": "CURIE_EVAL_SAMPLES",
+              "global": false,
+              "help": "Independent samples per case for live-model grading. Default: 1. A single sample is not proof of tier drift; raise this to distinguish variance from a real miss. Same policy on skill, local, and cluster",
+              "id": "samples",
+              "long": "samples",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "majority"
+              ],
+              "env": "CURIE_EVAL_AGGREGATION",
+              "global": false,
+              "help": "How to reduce N sample verdicts. Default: majority",
+              "id": "aggregation",
+              "long": "aggregation",
+              "positional": false,
+              "possible_values": [
+                "majority",
+                "pass_at_k"
+              ],
+              "required": false
+            },
+            {
+              "default_values": [
+                "1"
+              ],
+              "env": "CURIE_EVAL_PASS_AT_K",
+              "global": false,
+              "help": "Pass@k threshold when --aggregation pass_at_k. Default: 1",
+              "id": "pass_at_k",
+              "long": "pass-at-k",
               "positional": false,
               "required": false
             },

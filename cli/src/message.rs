@@ -2765,6 +2765,8 @@ pub struct EvalOpts {
     /// real parallel dispatch is worker-side and tracked in #709, so any value
     /// above 1 is refused up front rather than silently run sequentially.
     pub concurrency: usize,
+    /// Independent samples per case and the aggregation policy (#1907).
+    pub sampling: crate::eval_sampling::SampleConfig,
 }
 
 /// Resolve the requested eval concurrency to the only value the CLI eval loop
@@ -2946,6 +2948,10 @@ pub fn eval_dry_run_lines(opts: &EvalOpts, suite_name: &str, case_count: usize) 
     }
     lines.push(format!("concurrency: sequential ({})", opts.concurrency));
     lines.push(format!(
+        "sampling: {} sample(s), {}",
+        opts.sampling.n, opts.sampling.policy
+    ));
+    lines.push(format!(
         "enqueue one synthetic QueuedTurn per case on stream {}",
         opts.stream
     ));
@@ -2981,70 +2987,95 @@ async fn run_eval_turns(
     stub: &mut SlackStub,
 ) -> Result<crate::commands::EvalReport> {
     let ui = crate::ui::ui();
+    let sampling = opts.sampling;
     let total = suite.cases.len();
-    let bar = ui.progress_bar(total as u64, "running evals");
+    let bar = ui.progress_bar(
+        (total as u64).saturating_mul(u64::from(sampling.n)),
+        "running evals",
+    );
     let mut results: Vec<crate::commands::EvalRow> = Vec::with_capacity(total);
-    let mut eval_threads: Vec<String> = Vec::with_capacity(total);
+    let mut sample_passes = std::collections::BTreeMap::new();
+    let mut details = std::collections::BTreeMap::new();
+    let mut eval_threads: Vec<String> = Vec::with_capacity(total * sampling.n as usize);
     let run = async {
         for case in &suite.cases {
-            // Each case is its own thread so turns never cross-talk on the stub
-            // (#550). Prefix the conversation_id so the worker omits ambient
-            // agent memory from that sandbox (#1909): durable memory is
-            // per-agent and would otherwise load on a fresh thread. Thread
-            // reset (#1534) must use the same prefixed key the worker claimed.
-            let (channel_id, thread_ts, placeholder_ts) = resolve_targets(Some(channel), None);
-            let reply_endpoint = stub.base_api_url().to_string();
-            let event = eval_case_turn(
-                "slack",
-                &channel_id,
-                &opts.user,
-                &case.input,
-                &thread_ts,
-                &placeholder_ts,
-                Some(reply_endpoint),
-            );
-            let conversation_id = event.conversation_id.clone();
-            eval_threads.push(conversation_id.clone());
-            let started = Instant::now();
-            let stream_id = xadd(conn, &opts.stream, &event).await?;
-            let outcome = await_reply(
-                stub,
-                conn,
-                &opts.stream,
-                &stream_id,
-                &placeholder_ts,
-                Duration::from_secs(opts.timeout_secs),
-            )
-            .await;
-            // Release this case's sandbox on every completed/red/timed-out
-            // path so a three-case suite run twice cannot pin eight
-            // curie-thread-* claims against the default ResourceQuota (#1534).
-            queue_thread_reset(conn, &conversation_id).await?;
-            let elapsed = started.elapsed().as_secs_f64();
-            // Carry the reply text (#548) so a red case is diagnosable from --json /
-            // the human summary; a non-Replied outcome has no gradeable text.
-            let output = match &outcome {
-                Outcome::Replied(reply) => reply.clone(),
-                Outcome::AwaitingApproval(reply) => reply.clone().unwrap_or_default(),
-                Outcome::CompletedNoEdit => String::new(),
-                // A timed-out case surfaces the stream/consumer diagnostics the same
-                // way the non-eval message path does (#706), so the failure is not a
-                // silent empty string but the stream state that explains it.
-                Outcome::TimedOut => diagnostics(conn, &opts.stream, &stream_id).await,
-            };
-            results.push((
-                case.id.clone(),
-                if reply_passes(case, &outcome) {
-                    crate::evals::CaseOutcome::Pass
-                } else {
-                    crate::evals::CaseOutcome::Fail
-                },
-                elapsed,
-                output,
-            ));
-            bar.inc(1);
+            let mut samples = Vec::with_capacity(sampling.n as usize);
+            for _ in 0..sampling.n {
+                // Each sample is its own thread so draws never inherit prior
+                // turns (#550). Prefix the conversation_id so the worker omits
+                // ambient agent memory from that sandbox (#1909): durable memory
+                // is per-agent and would otherwise load on a fresh thread.
+                // Thread reset (#1534) must use the same prefixed key the
+                // worker claimed.
+                let (channel_id, thread_ts, placeholder_ts) = resolve_targets(Some(channel), None);
+                let reply_endpoint = stub.base_api_url().to_string();
+                let event = eval_case_turn(
+                    "slack",
+                    &channel_id,
+                    &opts.user,
+                    &case.input,
+                    &thread_ts,
+                    &placeholder_ts,
+                    Some(reply_endpoint),
+                );
+                let conversation_id = event.conversation_id.clone();
+                eval_threads.push(conversation_id.clone());
+                let started = Instant::now();
+                let stream_id = xadd(conn, &opts.stream, &event).await?;
+                let outcome = await_reply(
+                    stub,
+                    conn,
+                    &opts.stream,
+                    &stream_id,
+                    &placeholder_ts,
+                    Duration::from_secs(opts.timeout_secs),
+                )
+                .await;
+                // Release this sample's sandbox on every completed/red/timed-out
+                // path so a three-case suite run twice cannot pin eight
+                // curie-thread-* claims against the default ResourceQuota (#1534).
+                queue_thread_reset(conn, &conversation_id).await?;
+                let elapsed = started.elapsed().as_secs_f64();
+                let output = match &outcome {
+                    Outcome::Replied(reply) => reply.clone(),
+                    Outcome::AwaitingApproval(reply) => reply.clone().unwrap_or_default(),
+                    Outcome::CompletedNoEdit => String::new(),
+                    Outcome::TimedOut => diagnostics(conn, &opts.stream, &stream_id).await,
+                };
+                let passed = reply_passes(case, &outcome);
+                let completed = matches!(
+                    outcome,
+                    Outcome::Replied(_) | Outcome::AwaitingApproval(_) | Outcome::CompletedNoEdit
+                );
+                samples.push(crate::eval_sampling::SampleRecord {
+                    outcome: if passed {
+                        crate::evals::CaseOutcome::Pass
+                    } else {
+                        crate::evals::CaseOutcome::Fail
+                    },
+                    output,
+                    seconds: elapsed,
+                    error: if completed {
+                        None
+                    } else {
+                        Some("turn did not complete".into())
+                    },
+                });
+                bar.inc(1);
+            }
+            let agg = crate::eval_sampling::aggregate_samples(&samples, sampling);
+            sample_passes.insert(case.id.clone(), agg.passes);
+            if let Some(variance) = &agg.variance {
+                details.insert(case.id.clone(), variance.clone());
+            }
+            results.push((case.id.clone(), agg.outcome, agg.seconds, agg.output));
         }
-        anyhow::Ok(crate::commands::EvalReport::from_rows(results))
+        anyhow::Ok(crate::commands::EvalReport {
+            rows: results,
+            details,
+            sampling,
+            sample_passes,
+        })
     };
     let result = run.await;
     // Suite error/cancel: still queue every case we enqueued, including the
@@ -3090,6 +3121,20 @@ pub async fn eval(opts: EvalOpts) -> Result<()> {
                 ),
             ));
         }
+        if opts.sampling.n > 1 {
+            return Err(anyhow::Error::from(
+                crate::exit::CliError::unsupported(
+                    "--samples has no effect on a --model sweep: the sweep enqueues a frozen \
+                     EvalJob that cannot carry a sample count, so in-CLI N never reaches the \
+                     worker",
+                )
+                .with_fix(
+                    "drop --samples to sweep at the worker default, set CURIE_EVAL_SAMPLES on \
+                     the worker to raise N on the production eval path, or omit --model to \
+                     grade in-CLI with `curie <local|cluster> eval --samples N`",
+                ),
+            ));
+        }
         let loaded = resolve_eval(opts.cases.clone())?;
         return eval_sweep(opts, loaded.suite).await;
     }
@@ -3102,6 +3147,18 @@ pub async fn eval(opts: EvalOpts) -> Result<()> {
                 )
                 .with_fix(
                     "drop --cases to grade the deployed trajectory suite, or use skill eval to grade the local file",
+                ),
+            ));
+        }
+        if opts.sampling.n > 1 {
+            return Err(anyhow::Error::from(
+                crate::exit::CliError::unsupported(
+                    "--samples has no effect on a local/cluster trajectory eval: scoring \
+                     runs on the worker eval plane, and the frozen EvalJob cannot carry N",
+                )
+                .with_fix(
+                    "drop --samples, set CURIE_EVAL_SAMPLES on the worker, or use \
+                     `curie skill eval --samples N` to sample in-CLI",
                 ),
             ));
         }
@@ -3642,7 +3699,9 @@ fn trajectory_matrix_report(
             rows.len()
         );
     }
-    Ok(Some(crate::commands::EvalReport { rows, details }))
+    Ok(Some(crate::commands::EvalReport::with_details(
+        rows, details,
+    )))
 }
 
 /// The wanted models' rows in the matrix for the TRIGGERED sha, scoped to the
@@ -4739,6 +4798,7 @@ mod tests {
             api_url: None,
             models: Vec::new(),
             concurrency: 1,
+            sampling: crate::eval_sampling::SampleConfig::default(),
         }
     }
 
@@ -4842,6 +4902,17 @@ mod tests {
                 .iter()
                 .any(|l| l.contains("without ambient durable agent memory")),
             "default local eval must declare memory isolation: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn eval_dry_run_plan_names_sampling_policy() {
+        let lines = eval_dry_run_lines(&eval_opts(true, None), "smoke", 1);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("sampling: 1 sample(s), majority")),
+            "dry-run must document the default one-sample majority policy: {lines:?}"
         );
     }
 

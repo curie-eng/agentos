@@ -92,6 +92,42 @@ fn eval_json_validates_against_eval_schema() {
     );
 }
 
+/// #1907: a single sample must still report N, passes, and policy so a
+/// stochastic miss is labeled as one draw, not unexplained tier drift.
+#[test]
+fn eval_json_exposes_sampling_on_every_row() {
+    let schema = load_schema("eval.schema.json");
+    let results = vec![
+        (
+            "identity".to_string(),
+            CaseOutcome::Fail,
+            10.6_f64,
+            "¿Quién eres?".to_string(),
+        ),
+        (
+            "translate".to_string(),
+            CaseOutcome::Pass,
+            1.0_f64,
+            "hola".to_string(),
+        ),
+    ];
+    let value = eval_json(&results, None);
+    assert!(
+        validator(&schema).is_valid(&value),
+        "sampling fields must validate: {value}"
+    );
+    assert_eq!(value["samples"], 1, "{value}");
+    assert_eq!(value["policy"], "majority", "{value}");
+    let identity = &value["cases"][0];
+    assert_eq!(identity["id"], "identity", "{value}");
+    assert_eq!(identity["samples"], 1, "{value}");
+    assert_eq!(identity["passes"], 0, "{value}");
+    assert_eq!(identity["policy"], "majority", "{value}");
+    let translate = &value["cases"][1];
+    assert_eq!(translate["samples"], 1, "{value}");
+    assert_eq!(translate["passes"], 1, "{value}");
+}
+
 /// #1087 AC2 is a "confirm" criterion, so the digest has to be readable from the
 /// MACHINE surface: `docs/agents.md` bans stderr as agent-facing evidence, and a
 /// human note is all the sweep used to emit. Both states are pinned -- a real

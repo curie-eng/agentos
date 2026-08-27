@@ -2335,15 +2335,32 @@ pub type EvalRow = (String, CaseOutcome, f64, String);
 pub struct EvalReport {
     pub rows: Vec<EvalRow>,
     pub details: BTreeMap<String, String>,
+    /// Sampling policy this run used (#1907). Default n=1 majority.
+    pub sampling: crate::eval_sampling::SampleConfig,
+    /// Per-case count of samples that passed, keyed by case id.
+    pub sample_passes: BTreeMap<String, u32>,
 }
 
 impl EvalReport {
     pub fn from_rows(rows: Vec<EvalRow>) -> Self {
+        Self::with_details(rows, BTreeMap::new())
+    }
+
+    pub fn with_details(rows: Vec<EvalRow>, details: BTreeMap<String, String>) -> Self {
+        let sample_passes = n1_sample_passes(&rows);
         Self {
             rows,
-            details: BTreeMap::new(),
+            details,
+            sampling: crate::eval_sampling::SampleConfig::default(),
+            sample_passes,
         }
     }
+}
+
+fn n1_sample_passes(rows: &[EvalRow]) -> BTreeMap<String, u32> {
+    rows.iter()
+        .map(|(id, outcome, _, _)| (id.clone(), u32::from(*outcome == CaseOutcome::Pass)))
+        .collect()
 }
 
 /// The three counts every eval surface reports. Split out so the `--json`
@@ -2372,21 +2389,21 @@ fn eval_counts(results: &[EvalRow]) -> (usize, usize, usize) {
 /// snapshotted bundle, and on a skill run against a runner this checkout never
 /// recorded.
 pub fn eval_json(results: &[EvalRow], bundle_digest: Option<&str>) -> serde_json::Value {
-    eval_json_with_details(results, &BTreeMap::new(), bundle_digest)
+    eval_json_with_details(&EvalReport::from_rows(results.to_vec()), bundle_digest)
 }
 
-fn eval_json_with_details(
-    results: &[EvalRow],
-    details: &BTreeMap<String, String>,
-    bundle_digest: Option<&str>,
-) -> serde_json::Value {
+fn eval_json_with_details(report: &EvalReport, bundle_digest: Option<&str>) -> serde_json::Value {
     // Derive every count from `results` in one pass so the rollup can never
     // disagree with the per-case rows (no caller-supplied passed/total to drift).
+    let results = &report.rows;
     let total = results.len();
     let (passed, failed, plumbing_ok) = eval_counts(results);
+    let n = report.sampling.n;
+    let policy = report.sampling.policy.as_str();
     let cases: Vec<serde_json::Value> = results
         .iter()
         .map(|(id, outcome, seconds, output)| {
+            let sample_passes = report.sample_passes.get(id).copied().unwrap_or(0);
             let mut row = serde_json::json!({
                 "id": id,
                 "outcome": outcome,
@@ -2397,9 +2414,22 @@ fn eval_json_with_details(
                 "passed": outcome.passed(),
                 "seconds": seconds,
                 "output": output,
+                "samples": n,
+                "passes": sample_passes,
+                "policy": policy,
             });
-            if let Some(detail) = details.get(id) {
+            if let Some(detail) = report.details.get(id) {
                 row["detail"] = serde_json::json!(detail);
+            }
+            if n > 1 {
+                let bar = match report.sampling.policy {
+                    crate::eval_sampling::AggregationPolicy::PassAtK => {
+                        format!("pass@{}", report.sampling.effective_k())
+                    }
+                    crate::eval_sampling::AggregationPolicy::Majority => "majority".to_string(),
+                };
+                row["variance"] =
+                    serde_json::json!(format!("{sample_passes}/{n} samples passed ({bar})"));
             }
             row
         })
@@ -2410,6 +2440,8 @@ fn eval_json_with_details(
         "failed": failed,
         "plumbing_ok": plumbing_ok,
         "bundle_digest": bundle_digest,
+        "samples": n,
+        "policy": policy,
         "cases": cases,
     })
 }
@@ -2657,6 +2689,7 @@ pub async fn eval(
     models: Vec<String>,
     secrets: Vec<String>,
     image: String,
+    sampling: crate::eval_sampling::SampleConfig,
 ) -> Result<()> {
     let saved = state::load(Path::new("."))?;
     let state_plugin_dir = saved.as_ref().map(|s| PathBuf::from(s.plugin_dir.clone()));
@@ -2683,6 +2716,7 @@ pub async fn eval(
             &image,
             sweep_snapshot(saved.as_ref()),
             state_plugin_dir.as_deref(),
+            sampling,
         )
         .await;
     }
@@ -2709,15 +2743,19 @@ pub async fn eval(
     let bundle_digest = recorded_bundle_digest(saved.as_ref(), &url);
     let client = RunnerClient::new(&url)?;
     let ui = crate::ui::ui();
-    let bar = ui.progress_bar(loaded.suite.cases.len() as u64, "running evals");
     // `run_suite_cases` also tallies completion for the `--model` sweep path;
     // the single-runner report doesn't need the count (it already reports the
     // per-case `Fail` either way and exits on any of them), so it is discarded.
+    let bar = ui.progress_bar(
+        (loaded.suite.cases.len() as u64).saturating_mul(u64::from(sampling.n)),
+        "running evals",
+    );
     let (results, _completed) = run_suite_cases(
         &client,
         &loaded.suite,
         fake,
         loaded.trajectory.as_ref(),
+        sampling,
         |_| bar.inc(1),
     )
     .await?;
@@ -2755,51 +2793,71 @@ async fn run_suite_cases(
     suite: &EvalSuite,
     fake: bool,
     trajectory_scorer: Option<&TrajectoryScorer>,
-    mut on_case: impl FnMut(usize),
+    sampling: crate::eval_sampling::SampleConfig,
+    mut on_sample: impl FnMut(usize),
 ) -> Result<(EvalReport, usize)> {
     let mut results = Vec::with_capacity(suite.cases.len());
     let mut details = BTreeMap::new();
+    let mut sample_passes = BTreeMap::new();
     let mut completed = 0usize;
-    for (i, case) in suite.cases.iter().enumerate() {
-        // Fresh conversation by default (#550): reset the runner before a case so
-        // it cannot answer from an earlier case's history instead of actually
-        // invoking its tools. A shared_history case skips the reset and inherits
-        // the prior case's conversation on purpose (a multi-turn scenario).
-        if !case.shared_history {
-            client.reset().await.with_context(|| {
-                format!(
-                    "resetting the runner conversation before case {:?}",
-                    case.id
-                )
-            })?;
+    for case in &suite.cases {
+        let mut samples = Vec::with_capacity(sampling.n as usize);
+        let mut case_completed = false;
+        for _ in 0..sampling.n {
+            // Fresh conversation before every sample (#550 / #1907): two samples
+            // of the same case must each start clean, or the second inherits the
+            // first's turn. A shared_history case still skips the reset.
+            if !case.shared_history {
+                client.reset().await.with_context(|| {
+                    format!(
+                        "resetting the runner conversation before case {:?}",
+                        case.id
+                    )
+                })?;
+            }
+            let started = Instant::now();
+            let events = client
+                .send_event(EventType::EvalCase, &case.input, "U-eval", |_| {})
+                .await?;
+            let elapsed = started.elapsed().as_secs_f64();
+            let sample_completed = turn_completed(case, &events);
+            if sample_completed {
+                case_completed = true;
+            }
+            let scored = score_turn(case, &events, fake, trajectory_scorer);
+            if let Some(detail) = scored.detail.clone() {
+                details.insert(case.id.clone(), detail);
+            }
+            samples.push(crate::eval_sampling::SampleRecord {
+                outcome: scored.outcome,
+                output: graded_answer(&events),
+                seconds: elapsed,
+                error: if sample_completed {
+                    None
+                } else {
+                    Some("turn did not complete".into())
+                },
+            });
+            on_sample(0);
         }
-        let started = Instant::now();
-        let events = client
-            .send_event(EventType::EvalCase, &case.input, "U-eval", |_| {})
-            .await?;
-        let elapsed = started.elapsed().as_secs_f64();
-        if turn_completed(case, &events) {
+        if case_completed {
             completed += 1;
         }
-        // Capture the graded answer -- the exact text `turn_outcome` judged -- so
-        // a red case can be diagnosed from `--json` without a manual re-run
-        // (#548). A fake row carries its canned reply for the same reason.
-        let scored = score_turn(case, &events, fake, trajectory_scorer);
-        if let Some(detail) = scored.detail {
-            details.insert(case.id.clone(), detail);
+        let agg = crate::eval_sampling::aggregate_samples(&samples, sampling);
+        sample_passes.insert(case.id.clone(), agg.passes);
+        if let Some(variance) = &agg.variance {
+            details
+                .entry(case.id.clone())
+                .or_insert_with(|| variance.clone());
         }
-        results.push((
-            case.id.clone(),
-            scored.outcome,
-            elapsed,
-            graded_answer(&events),
-        ));
-        on_case(i);
+        results.push((case.id.clone(), agg.outcome, agg.seconds, agg.output));
     }
     Ok((
         EvalReport {
             rows: results,
             details,
+            sampling,
+            sample_passes,
         },
         completed,
     ))
@@ -3101,6 +3159,7 @@ mod eval_bundle {
 }
 
 /// Run the suite once per model in a fresh runner and report pass-rate per model.
+#[allow(clippy::too_many_arguments)]
 async fn eval_sweep(
     suite: &EvalSuite,
     trajectory_scorer: Option<&TrajectoryScorer>,
@@ -3109,6 +3168,7 @@ async fn eval_sweep(
     image: &str,
     recorded: Option<(PathBuf, String)>,
     state_plugin_dir: Option<&Path>,
+    sampling: crate::eval_sampling::SampleConfig,
 ) -> Result<()> {
     let ui = crate::ui::ui();
     // The mount is decided once, purely, by `resolve_sweep_mount`, then
@@ -3147,7 +3207,8 @@ async fn eval_sweep(
             // `boot_eval_runner` pins `fake_model: false`, so every sweep runner is a
             // REAL model whatever the standing dev runner is -- the sweep grades,
             // so this in-CLI path never produces a plumbing-only row.
-            let run = run_suite_cases(&client, suite, false, trajectory_scorer, |_| {}).await;
+            let run =
+                run_suite_cases(&client, suite, false, trajectory_scorer, sampling, |_| {}).await;
             let _ = docker::remove_container(&name).await;
             let (results, completed) = run?;
             let passed = results
@@ -3375,23 +3436,39 @@ struct EvalOutput<'a> {
 
 impl crate::ui::CliOutput for EvalOutput<'_> {
     fn to_json(&self) -> serde_json::Value {
-        eval_json_with_details(&self.report.rows, &self.report.details, self.bundle_digest)
+        eval_json_with_details(self.report, self.bundle_digest)
     }
 
     fn render(&self, ui: &crate::ui::Ui) {
         let results = &self.report.rows;
         let (passed, failed, plumbing_ok) = eval_counts(results);
+        let n = self.report.sampling.n;
         let rows: Vec<Vec<String>> = results
             .iter()
             .map(|(name, outcome, seconds, _)| {
-                vec![
+                let passes = self.report.sample_passes.get(name).copied().unwrap_or(0);
+                let mut cols = vec![
                     name.clone(),
                     outcome_label(*outcome),
                     format!("{seconds:.1}s"),
-                ]
+                ];
+                if n > 1 {
+                    cols.insert(2, format!("{passes}/{n}"));
+                }
+                cols
             })
             .collect();
-        ui.payload_plain(&crate::ui::table(&["case", "result", "time"], &rows, &[2]));
+        let headers: &[&str] = if n > 1 {
+            &["case", "result", "samples", "time"]
+        } else {
+            &["case", "result", "time"]
+        };
+        let right_align: &[usize] = if n > 1 { &[3] } else { &[2] };
+        ui.payload_plain(&crate::ui::table(headers, &rows, right_align));
+        ui.note(&format!(
+            "sampling: {} sample(s), {}",
+            n, self.report.sampling.policy
+        ));
         if failed == 0 {
             ui.success(&rollup_line(passed, failed, plumbing_ok));
             if plumbing_ok > 0 {

@@ -358,6 +358,7 @@ fn eval_dry_run_plan_names_sequential_concurrency() {
         api_url: None,
         models: Vec::new(),
         concurrency: 1,
+        sampling: curie::eval_sampling::SampleConfig::default(),
     };
     let lines = eval_dry_run_lines(&opts, "weather", 3);
     assert!(
