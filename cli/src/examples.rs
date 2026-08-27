@@ -1133,11 +1133,10 @@ async fn resolve_embedded_cluster_connection(
         crate::message::API_REMOTE_PORT,
     ) {
         Some(command) => {
-            let port_forward = Some(
+            let (child, effective_port) =
                 crate::message::start_port_forward(&command, local_port, "SRE bot deploy API")
-                    .await?,
-            );
-            (format!("http://localhost:{local_port}"), port_forward)
+                    .await?;
+            (format!("http://localhost:{effective_port}"), Some(child))
         }
         None => {
             let url = explicit_api_url.expect("explicit API URL when no port forward is planned");

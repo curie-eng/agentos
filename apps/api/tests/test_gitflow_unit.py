@@ -3,7 +3,10 @@
 import base64
 import hashlib
 import hmac
+import io
 import subprocess
+import tarfile
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -25,6 +28,7 @@ _VALID_SHA256 = "a" * 64
 # because the trusted origin is derived from the stored binding plus config and
 # the payload's clone URL is only ever compared against it (#1122).
 _REPO = "octo/demo-agent"
+_DEV_REF = "refs/heads/dev"
 _LOCAL_BASE = "file:///tmp/gitflow-none"
 _ALLOWED_URL = f"{_LOCAL_BASE}/{_REPO}.git"
 _GITHUB_URL = f"https://github.com/{_REPO}.git"
@@ -78,7 +82,13 @@ def test_clone_and_archive_refuses_disallowed_scheme() -> None:
     # asserting the error is not a CloneOriginMismatch pins that ordering.
     settings = _local_settings()
     with pytest.raises(GitFlowError) as err:
-        clone_and_archive("ext::sh -c whoami", "0" * 40, settings, repo_full_name=_REPO)
+        clone_and_archive(
+            "ext::sh -c whoami",
+            "0" * 40,
+            settings,
+            repo_full_name=_REPO,
+            ref=_DEV_REF,
+        )
     assert not isinstance(err.value, CloneOriginMismatch)
     assert "scheme" in str(err.value)
 
@@ -112,12 +122,134 @@ def test_clone_and_archive_rejects_invalid_sha_before_any_subprocess(
     settings = _local_settings()
     with mock.patch("curie_api.gitflow.subprocess.run") as run:
         with pytest.raises(GitFlowError):
-            clone_and_archive(_ALLOWED_URL, bad_sha, settings, repo_full_name=_REPO)
+            clone_and_archive(
+                _ALLOWED_URL,
+                bad_sha,
+                settings,
+                repo_full_name=_REPO,
+                ref=_DEV_REF,
+            )
     run.assert_not_called()
 
 
-def _completed(stdout: bytes = b"") -> subprocess.CompletedProcess:
-    return subprocess.CompletedProcess(args=[], returncode=0, stdout=stdout)
+def _completed(
+    stdout: bytes = b"", *, returncode: int = 0, stderr: bytes = b""
+) -> subprocess.CompletedProcess:
+    return subprocess.CompletedProcess(
+        args=[], returncode=returncode, stdout=stdout, stderr=stderr
+    )
+
+
+def _real_git(cwd: Path, *args: str) -> str:
+    completed = subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t", *args],
+        cwd=cwd,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return completed.stdout.strip()
+
+
+def test_clone_and_archive_ignores_replacement_objects(tmp_path: Path) -> None:
+    base = tmp_path / "remotes"
+    work = tmp_path / "work"
+    bare = base / f"{_REPO}.git"
+    work.mkdir()
+    bare.parent.mkdir(parents=True)
+
+    _real_git(work, "init", "-q", "-b", "dev")
+    marker = work / "marker.txt"
+    marker.write_text("approved tree\n")
+    _real_git(work, "add", marker.name)
+    _real_git(work, "commit", "-q", "-m", "approved")
+    approved_sha = _real_git(work, "rev-parse", "HEAD")
+
+    marker.write_text("replacement tree\n")
+    _real_git(work, "add", marker.name)
+    replacement_tree = _real_git(work, "write-tree")
+    replacement_sha = _real_git(work, "commit-tree", replacement_tree, "-m", "replacement")
+    _real_git(work, "replace", approved_sha, replacement_sha)
+    _real_git(tmp_path, "clone", "--quiet", "--mirror", str(work), str(bare))
+
+    archive = clone_and_archive(
+        f"file://{bare}",
+        approved_sha,
+        Settings(github_clone_base=f"file://{base}"),
+        repo_full_name=_REPO,
+        ref=_DEV_REF,
+    )
+
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as contents:
+        archived_marker = contents.extractfile("marker.txt")
+        assert archived_marker is not None
+        assert archived_marker.read() == b"approved tree\n"
+
+
+def test_clone_and_archive_allows_a_commit_reachable_from_the_payload_ref() -> None:
+    settings = _local_settings()
+    with mock.patch("curie_api.gitflow.subprocess.run") as run:
+        run.side_effect = [
+            _completed(),
+            _completed(returncode=0),
+            _completed(b"tar-bytes"),
+        ]
+        result = clone_and_archive(
+            _ALLOWED_URL,
+            _VALID_SHA1,
+            settings,
+            repo_full_name=_REPO,
+            ref=_DEV_REF,
+        )
+
+    assert result == b"tar-bytes"
+    merge_base_argv = run.call_args_list[1].args[0]
+    assert merge_base_argv[-4:] == [
+        "merge-base",
+        "--is-ancestor",
+        _VALID_SHA1,
+        _DEV_REF,
+    ]
+
+
+def test_clone_and_archive_rejects_a_commit_unreachable_from_the_payload_ref() -> None:
+    from curie_api.gitflow import CommitNotOnBranch
+
+    settings = _local_settings()
+    with mock.patch("curie_api.gitflow.subprocess.run") as run:
+        run.side_effect = [_completed(), _completed(returncode=1)]
+        with pytest.raises(CommitNotOnBranch):
+            clone_and_archive(
+                _ALLOWED_URL,
+                _VALID_SHA1,
+                settings,
+                repo_full_name=_REPO,
+                ref=_DEV_REF,
+            )
+
+    assert len(run.call_args_list) == 2
+
+
+def test_clone_and_archive_treats_other_merge_base_failures_as_operational() -> None:
+    from curie_api.gitflow import CommitNotOnBranch
+
+    settings = _local_settings()
+    with mock.patch("curie_api.gitflow.subprocess.run") as run:
+        run.side_effect = [
+            _completed(),
+            _completed(returncode=2, stderr=b"fatal: invalid object"),
+        ]
+        with pytest.raises(GitFlowError) as err:
+            clone_and_archive(
+                _ALLOWED_URL,
+                _VALID_SHA1,
+                settings,
+                repo_full_name=_REPO,
+                ref=_DEV_REF,
+            )
+
+    assert not isinstance(err.value, CommitNotOnBranch)
+    assert len(run.call_args_list) == 2
 
 
 @pytest.mark.parametrize("good_sha", [_VALID_SHA1, _VALID_SHA256])
@@ -130,7 +262,13 @@ def test_clone_and_archive_accepts_valid_hex_and_inserts_dash_dash(
     settings = _local_settings()
     with mock.patch("curie_api.gitflow.subprocess.run") as run:
         run.return_value = _completed(b"tar-bytes")
-        result = clone_and_archive(_ALLOWED_URL, good_sha, settings, repo_full_name=_REPO)
+        result = clone_and_archive(
+            _ALLOWED_URL,
+            good_sha,
+            settings,
+            repo_full_name=_REPO,
+            ref=_DEV_REF,
+        )
 
     assert result == b"tar-bytes"
 
@@ -154,6 +292,7 @@ def test_clone_refuses_a_foreign_host_before_any_subprocess() -> None:
                 _VALID_SHA1,
                 settings,
                 repo_full_name=_REPO,
+                ref=_DEV_REF,
             )
     run.assert_not_called()
 
@@ -206,7 +345,13 @@ def test_clone_refuses_every_mismatch_dimension_before_any_subprocess(
     settings = Settings(github_token="ghs-secret-token")
     with mock.patch("curie_api.gitflow.subprocess.run") as run:
         with pytest.raises(CloneOriginMismatch):
-            clone_and_archive(payload_url, _VALID_SHA1, settings, repo_full_name=_REPO)
+            clone_and_archive(
+                payload_url,
+                _VALID_SHA1,
+                settings,
+                repo_full_name=_REPO,
+                ref=_DEV_REF,
+            )
     run.assert_not_called()
 
 
@@ -234,7 +379,13 @@ def test_clone_accepts_the_registered_origin_in_its_equivalent_forms(
     settings = Settings()
     with mock.patch("curie_api.gitflow.subprocess.run") as run:
         run.return_value = _completed(b"tar-bytes")
-        result = clone_and_archive(payload_url, _VALID_SHA1, settings, repo_full_name=_REPO)
+        result = clone_and_archive(
+            payload_url,
+            _VALID_SHA1,
+            settings,
+            repo_full_name=_REPO,
+            ref=_DEV_REF,
+        )
 
     assert result == b"tar-bytes"
     assert _GITHUB_URL in run.call_args_list[0].args[0]
@@ -259,6 +410,7 @@ def test_clone_refuses_a_mixed_case_scheme() -> None:
                 _VALID_SHA1,
                 settings,
                 repo_full_name=_REPO,
+                ref=_DEV_REF,
             )
     assert not isinstance(err.value, CloneOriginMismatch)
     run.assert_not_called()
@@ -290,7 +442,13 @@ def test_clone_refuses_a_configured_base_outside_the_scheme_allowlist(
     settings = Settings(github_token="ghs-secret-token", github_clone_base=clone_base)
     with mock.patch("curie_api.gitflow.subprocess.run") as run:
         with pytest.raises(GitFlowError) as err:
-            clone_and_archive(_GITHUB_URL, _VALID_SHA1, settings, repo_full_name=_REPO)
+            clone_and_archive(
+                _GITHUB_URL,
+                _VALID_SHA1,
+                settings,
+                repo_full_name=_REPO,
+                ref=_DEV_REF,
+            )
     assert not isinstance(err.value, CloneOriginMismatch)
     run.assert_not_called()
 
@@ -308,7 +466,13 @@ def test_clone_refuses_a_configured_base_git_would_read_as_an_option() -> None:
     )
     with mock.patch("curie_api.gitflow.subprocess.run") as run:
         with pytest.raises(GitFlowError) as err:
-            clone_and_archive(_GITHUB_URL, _VALID_SHA1, settings, repo_full_name=_REPO)
+            clone_and_archive(
+                _GITHUB_URL,
+                _VALID_SHA1,
+                settings,
+                repo_full_name=_REPO,
+                ref=_DEV_REF,
+            )
     assert not isinstance(err.value, CloneOriginMismatch)
     run.assert_not_called()
 
@@ -321,7 +485,13 @@ def test_clone_argv_inserts_dash_dash_before_the_url() -> None:
     settings = Settings()
     with mock.patch("curie_api.gitflow.subprocess.run") as run:
         run.return_value = _completed(b"tar-bytes")
-        clone_and_archive(_GITHUB_URL, _VALID_SHA1, settings, repo_full_name=_REPO)
+        clone_and_archive(
+            _GITHUB_URL,
+            _VALID_SHA1,
+            settings,
+            repo_full_name=_REPO,
+            ref=_DEV_REF,
+        )
 
     clone_argv = next(call.args[0] for call in run.call_args_list if "clone" in call.args[0])
     assert "--" in clone_argv, clone_argv
@@ -339,7 +509,13 @@ def test_clone_accepts_a_well_formed_https_base() -> None:
     settings = Settings(github_clone_base=base)
     with mock.patch("curie_api.gitflow.subprocess.run") as run:
         run.return_value = _completed(b"tar-bytes")
-        result = clone_and_archive(derived, _VALID_SHA1, settings, repo_full_name=_REPO)
+        result = clone_and_archive(
+            derived,
+            _VALID_SHA1,
+            settings,
+            repo_full_name=_REPO,
+            ref=_DEV_REF,
+        )
 
     assert result == b"tar-bytes"
     assert derived in run.call_args_list[0].args[0]
@@ -356,7 +532,13 @@ def test_clone_hands_git_the_derived_origin_not_the_payload_url() -> None:
     settings = Settings(github_token="ghs-secret-token")
     with mock.patch("curie_api.gitflow.subprocess.run") as run:
         run.return_value = _completed(b"tar-bytes")
-        clone_and_archive(payload_url, _VALID_SHA1, settings, repo_full_name=_REPO)
+        clone_and_archive(
+            payload_url,
+            _VALID_SHA1,
+            settings,
+            repo_full_name=_REPO,
+            ref=_DEV_REF,
+        )
 
     argv = run.call_args_list[0].args[0]
     assert _GITHUB_URL in argv
@@ -387,7 +569,13 @@ def test_clone_credential_is_keyed_to_the_derived_origin(
     settings = Settings(github_token="ghs-secret-token", github_clone_base=clone_base)
     with mock.patch("curie_api.gitflow.subprocess.run") as run:
         run.return_value = _completed(b"tar-bytes")
-        clone_and_archive(derived, _VALID_SHA1, settings, repo_full_name=repo)
+        clone_and_archive(
+            derived,
+            _VALID_SHA1,
+            settings,
+            repo_full_name=repo,
+            ref=_DEV_REF,
+        )
 
     clone_call = run.call_args_list[0]
     argv = clone_call.args[0]
@@ -416,7 +604,13 @@ def test_clone_pins_redirect_following_off() -> None:
     settings = _local_settings()
     with mock.patch("curie_api.gitflow.subprocess.run") as run:
         run.return_value = _completed(b"tar-bytes")
-        clone_and_archive(_ALLOWED_URL, _VALID_SHA1, settings, repo_full_name=_REPO)
+        clone_and_archive(
+            _ALLOWED_URL,
+            _VALID_SHA1,
+            settings,
+            repo_full_name=_REPO,
+            ref=_DEV_REF,
+        )
 
     argv = run.call_args_list[0].args[0]
     assert "-c" in argv, argv
@@ -434,6 +628,7 @@ def test_clone_sends_no_credential_when_none_is_configured() -> None:
             _VALID_SHA1,
             settings,
             repo_full_name="acme/public",
+            ref=_DEV_REF,
         )
     env = run.call_args_list[0].kwargs["env"]
     assert "GIT_CONFIG_COUNT" not in env
@@ -450,10 +645,11 @@ def test_clone_does_not_send_the_credential_over_plain_http() -> None:
     with mock.patch("curie_api.gitflow.subprocess.run") as run:
         run.return_value = _completed(b"tar-bytes")
         clone_and_archive(
-            "http://insecure.example/repo.git",
+            "http://insecure.example/acme/repo.git",
             _VALID_SHA1,
             settings,
-            repo_full_name="repo",
+            repo_full_name="acme/repo",
+            ref=_DEV_REF,
         )
     assert "GIT_CONFIG_COUNT" not in run.call_args_list[0].kwargs["env"]
 
@@ -468,7 +664,13 @@ def test_clone_failure_reports_git_stderr_not_the_exit_code() -> None:
     )
     with mock.patch("curie_api.gitflow.subprocess.run", side_effect=failure):
         with pytest.raises(GitFlowError) as err:
-            clone_and_archive(_ALLOWED_URL, _VALID_SHA1, settings, repo_full_name=_REPO)
+            clone_and_archive(
+                _ALLOWED_URL,
+                _VALID_SHA1,
+                settings,
+                repo_full_name=_REPO,
+                ref=_DEV_REF,
+            )
     assert "Repository not found" in str(err.value)
 
 

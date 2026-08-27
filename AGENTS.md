@@ -88,6 +88,9 @@ Set `base=next` when your worktree targets `next`.
     sleep 3
   done
   curl -fsS http://localhost:23000/api/public/health >/dev/null
+git fetch --force --tags origin refs/heads/main:refs/remotes/origin/main
+  uv run python scripts/check-released-upgrade.py --self-test
+  uv run python scripts/check-released-upgrade.py
   (cd apps/api && uv run alembic upgrade head)
   git fetch --no-tags --depth=1 origin "$base" || true
   git show "origin/$base:packages/aci-protocol/schema/wire.lock" > "$wire_lock" 2>/dev/null || true
@@ -107,6 +110,9 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 ```
+The Rust CI job sets `CI_REQUIRE_VALKEY_TESTS` and starts Valkey, so Valkey-backed
+tests execute in CI. Contributors need a reachable Valkey, such as the compose
+Valkey, for equivalent local coverage.
 If `cargo fmt`/`clippy` report a missing component: `rustup component add rustfmt clippy`.
 
 **UI:** `cd apps/ui && pnpm install && pnpm lint && pnpm typecheck && pnpm test && pnpm e2e`.
@@ -331,6 +337,17 @@ Known seam pairs:
   `APPROVE_ACTION_ID_PREFIX` (`cli/src/chat.rs`) can't share code across
   Python/Rust, so they are frozen together in
   `tests/vectors/approval-action-ids.json`.
+- API vs worker vs CLI thread-reset SET -- `THREAD_RESET_SET` /
+  `THREAD_RESET_INFLIGHT_SET` (`apps/api/src/curie_api/threadreset.py`,
+  `apps/worker/src/curie_worker/consumer.py`) and the CLI's `THREAD_RESET_SET`
+  (`cli/src/queue.rs`) can't share code across Python/Rust. Operator
+  `reset-thread` and `local`/`cluster` eval (#1534) both SADD the same set.
+  Frozen in `tests/vectors/thread-reset-set.json`.
+- worker vs CLI eval-isolate prefix -- `EVAL_ISOLATE_THREAD_PREFIX`
+  (`apps/worker/src/curie_worker/binding.py`) and the CLI copy
+  (`cli/src/queue.rs`, stamped in `cli/src/message.rs::run_eval_turns`)
+  cannot share code across Python/Rust, so they are frozen together in
+  `tests/vectors/eval-memory-isolation.json`.
 - real SDK vs fake model session in the runner (`FakeModelSession`, `runner/src/curie_runner/fake.py`).
 - runs lane vs eval lane stream consumers (`apps/worker/src/curie_worker/consumer.py` vs `eval/stream.py`, both on the shared `stream_consumer.py`).
 - CLI-side vs API-side input validation (validate at the API/persistence boundary, mirror in the CLI).
@@ -494,13 +511,15 @@ commands.
 
 ## Release train, branch, and commit conventions
 
-`main` is the stable v0.6.x line. `next` is the v0.7.0 integration branch. It
-is one release train, not a second product line.
+`main` is the stable line. `next` is the integration branch for the next
+feature release. It is one release train, not a second product line. These are
+roles, not versions: neither branch is pinned to a particular release number,
+and the role is what selects your base.
 
 | Change | Worktree base and PR target |
 | --- | --- |
 | General bug fix, security fix, or change shared by both lines | `main` |
-| v0.7 feature or a bug unique to unreleased v0.7 work | `next` |
+| Feature for the next feature release, or a bug unique to that unreleased work | `next` |
 
 Create a short lived `task/<short-description>` branch from the selected base:
 
@@ -510,7 +529,8 @@ git worktree add <path> -b task/<short-description> "$(git rev-parse origin/<bas
 ```
 
 Never commit directly to `main` or `next`. `main` remains the default GitHub
-contributor target. Select `next` only for v0.7 work.
+contributor target. Select `next` only for work belonging to the next feature
+release.
 
 Before accepting PRs against either branch, an administrator must protect both
 `main` and `next` with the same pull request review and required check rules,
@@ -518,9 +538,9 @@ and must prohibit force pushes and branch deletion. Do not use an unprotected
 release train branch.
 
 Bug fixes, security fixes, and anything shared by both lines land on the stable
-`main` line first. v0.7 features land on `next`.
+`main` line first. Features for the next feature release land on `next`.
 
-To cut a v0.7.0 release candidate, merge `main` into `next` through a PR, tag
+To cut a feature release candidate, merge `main` into `next` through a PR, tag
 the release candidate on `next`, and test that candidate extensively. The
 forward merge from `main` into `next` happens at release candidate prep, not
 after every individual fix. Do not routinely cherry pick fixes between release
@@ -534,7 +554,7 @@ CURIE_E2E_TIERS=all curie dev e2e-ladder
 CURIE_E2E_TIERS=local-release curie dev e2e-ladder
 ```
 
-Tag the final v0.7.0 release on `main` only after both commands pass. Only an
+Tag the final feature release on `main` only after both commands pass. Only an
 administrator may retire `next`. Before deleting it, the administrator must
 merge one release workflow and contract test change that removes `next` from the
 workflow trigger branch list, removes the `RELEASE_NEXT_BRANCH` environment
@@ -556,6 +576,10 @@ branch list, restores the `RELEASE_NEXT_BRANCH` environment alias and the
   keyword in a PR that targets `next` never fires on its own. Issues referenced
   by a `next` targeted PR are closed at the `next` into `main` merge, where the
   magic words fire once on the default branch.
+- PR bodies must contain real line breaks. The PR body guard rejects escaped
+  newline sequences because GitHub treats them as text, making closing keywords
+  inert. Run `scripts/check-pr-body.sh <body-file>` before opening or editing a
+  PR.
 - **Never mention any AI assistant (Claude, Codex, GPT, etc.) or AI in general in
   commit messages, and never add `Co-Authored-By` lines referencing AI.**
   CI enforces this on every PR (issue #962); check before pushing with:

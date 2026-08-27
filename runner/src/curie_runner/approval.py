@@ -35,8 +35,9 @@ import logging
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
+import yaml
 from claude_agent_sdk import create_sdk_mcp_server, tool
 from claude_agent_sdk.types import (
     CanUseTool,
@@ -952,3 +953,274 @@ def build_approval_gate(
         grant_tool=safe_grant_tool,
         grantable_by_route=grantable_by_route or {},
     )
+
+
+# --- Bundle permissions that would bypass a gate (#1852) ------------------------
+#
+# A skill's ``allowed-tools`` frontmatter becomes a Claude Code permission rule,
+# and a permission rule is applied BEFORE the SDK consults ``can_use_tool``. A
+# bundle that gates Bash and also ships a skill declaring ``allowed-tools: [Bash]``
+# therefore arms a gate the callback never sees: the tool runs, no approval record
+# is created, and ``curie <tier> approvals`` still reports the gate as active. A
+# gate that reports itself armed while executing silently is worse than no gate,
+# because it is the one an operator trusts.
+#
+# The SDK does warn about this, but only for entries in
+# ``ClaudeAgentOptions.allowed_tools``. Skill frontmatter never appears there --
+# the CLI reads it out of the bundle -- so the SDK's own warning is structurally
+# unable to fire for this case, which is why it went unnoticed.
+
+
+class ShadowedGate(NamedTuple):
+    """One skill permission rule that preauthorizes an approval-gated tool.
+
+    Attributes:
+        skill: The SKILL.md path relative to the bundle root, so the message names
+            the file to edit rather than only the conflict.
+        entry: The verbatim ``allowed-tools`` entry, so the author can find the
+            line instead of guessing which entry matched.
+        tool: The gated runtime tool name the entry preauthorizes.
+        whole: True when the entry allows the tool outright (``Bash``, ``Bash()``,
+            ``Bash(*)``); False when it allows only matching invocations
+            (``Bash(ls:*)``). Both defeat a gate, the second for exactly the calls
+            it matches, and naming which one was found keeps the message concrete.
+    """
+
+    skill: str
+    entry: str
+    tool: str
+    whole: bool
+
+
+def _whole_tool_allowed(entry: str) -> str | None:
+    """Return the tool an ``allowed-tools`` entry allows OUTRIGHT, else None.
+
+    Mirrors the CLI rule parser, which is also what the SDK implements for its own
+    shadowing warning: an entry allows a whole tool when it carries no ``(...)``
+    specifier (``Read``), or when the specifier is empty or a lone wildcard
+    (``Read()``, ``Read(*)``). A real specifier (``Bash(ls:*)``) allows only
+    matching invocations. A malformed entry is read as a bare tool name by the
+    CLI, so it matches nothing.
+
+    A test pins this against the SDK's implementation, because the CLI applies the
+    SDK's reading and not ours: a divergence in either direction is a fail-open or
+    a false refusal.
+    """
+
+    if not entry.strip():
+        return None
+    open_index = entry.find("(")
+    if open_index == -1:
+        return entry
+    if open_index == 0 or not entry.endswith(")"):
+        return None
+    return entry[:open_index] if entry[open_index + 1 : -1] in ("", "*") else None
+
+
+def _entry_tool(entry: str) -> str | None:
+    """Return the tool an entry names, specifier or not.
+
+    ``_whole_tool_allowed`` answers "does this allow the whole tool"; a gate needs
+    the broader "which tool is this about". Gating ``Bash`` means every Bash call
+    is approval-required, so ``Bash(ls:*)`` still preauthorizes part of what the
+    gate claims to cover.
+    """
+
+    if not entry.strip():
+        return None
+    open_index = entry.find("(")
+    if open_index == -1:
+        return entry
+    if open_index == 0 or not entry.endswith(")"):
+        return None
+    return entry[:open_index]
+
+
+def _skill_allowed_tools(root: Path) -> list[tuple[str, list[str]]]:
+    """Read every skill's ``allowed-tools`` list from a bundle directory.
+
+    Deliberately tolerant: a skill whose frontmatter is missing, unterminated,
+    unparseable, or not a mapping contributes nothing. ``validate_bundle`` already
+    reports those, and failing the gate check on a malformed skill would report
+    the wrong defect and hide the real one.
+
+    Args:
+        root: The bundle root directory.
+
+    Returns:
+        ``(skill_path_relative_to_root, entries)`` per skill that declares a list,
+        sorted by path so output is deterministic.
+    """
+
+    skills_dir = root / "skills"
+    if not skills_dir.is_dir():
+        return []
+    found: list[tuple[str, list[str]]] = []
+    for skill_file in sorted(skills_dir.rglob("SKILL.md")):
+        try:
+            text = skill_file.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if not text.startswith("---"):
+            continue
+        parts = text.split("---", 2)
+        if len(parts) < 3:
+            continue
+        try:
+            loaded = yaml.safe_load(parts[1])
+        except yaml.YAMLError:
+            continue
+        if not isinstance(loaded, dict):
+            continue
+        entries = loaded.get("allowed-tools")
+        if not isinstance(entries, list):
+            continue
+        found.append(
+            (
+                str(skill_file.relative_to(root)),
+                [entry for entry in entries if isinstance(entry, str)],
+            )
+        )
+    return found
+
+
+def _gated_names_for_entry(
+    tool: str,
+    required: frozenset[str],
+    resolution: ApprovalPolicyResolution | None,
+) -> str | None:
+    """Return the gated runtime name a skill entry would preauthorize, else None.
+
+    Direct equality answers the built-in case (``Bash`` gated, ``Bash`` allowed).
+    It does NOT answer the MCP case, and that gap is a fail-open rather than a
+    cosmetic one: ``build_approval_gate`` arms an MCP gate under its live name
+    (``mcp__plugin_<bundle>_<server>__<tool>``), while a skill author writes the
+    natural ``mcp__<server>__<tool>`` shorthand. Compared raw, those two strings
+    never match and the conflict is missed entirely.
+
+    So a non-matching entry is run through ``effective_operator_gates`` -- the SAME
+    normalization ``build_approval_gate`` applies to an operator's shorthand -- and
+    the result is intersected with the armed set. Reusing that function rather than
+    writing a second shorthand parser is deliberate: two parsers for one naming
+    rule is the defect #1495 and #1564 were both about.
+
+    Args:
+        tool: The tool name the entry names.
+        required: The armed runtime tool names.
+        resolution: The bundle's resolved identity, or None when unavailable, in
+            which case only direct equality is possible.
+
+    Returns:
+        The armed name this entry preauthorizes, or None.
+    """
+
+    if tool in required:
+        return tool
+    if resolution is None:
+        return None
+    effective = effective_operator_gates(
+        resolution.bundle_name,
+        resolution.mcp_servers,
+        tool,
+        connector_servers=resolution.connector_servers,
+    )
+    if effective is None:
+        return None
+    overlap = sorted(effective & required)
+    return overlap[0] if overlap else None
+
+
+def shadowed_gates(
+    plugin_dir: str | Path,
+    required: frozenset[str],
+    resolution: ApprovalPolicyResolution | None = None,
+) -> tuple[ShadowedGate, ...]:
+    """Find skill permission rules that preauthorize an approval-gated tool.
+
+    Args:
+        plugin_dir: The bundle root directory.
+        required: The runtime tool names the gate arms.
+        resolution: The bundle identity used to normalize an MCP shorthand.
+
+    Returns:
+        Every conflict found, ordered by skill path then entry so the message is
+        stable across runs. Empty when the bundle preauthorizes nothing gated.
+    """
+
+    if not required:
+        return ()
+    conflicts: list[ShadowedGate] = []
+    for skill, entries in _skill_allowed_tools(Path(plugin_dir)):
+        for entry in entries:
+            named = _entry_tool(entry)
+            if named is None:
+                continue
+            gated = _gated_names_for_entry(named, required, resolution)
+            if gated is None:
+                continue
+            conflicts.append(
+                ShadowedGate(
+                    skill=skill,
+                    entry=entry,
+                    tool=gated,
+                    whole=_whole_tool_allowed(entry) is not None,
+                )
+            )
+    return tuple(conflicts)
+
+
+def describe_shadowed_gates(conflicts: Sequence[ShadowedGate]) -> str:
+    """Render conflicts as an operator-facing message that names the fix.
+
+    The message has to survive being read from a pod log by someone who did not
+    write the bundle, so it names the file, the entry, the tool, and the edit --
+    not merely that a conflict exists.
+    """
+
+    lines = [
+        "approval gate defeated by the bundle's own skill permissions: a skill"
+        " 'allowed-tools' entry preauthorizes a tool the approval policy gates, and a"
+        " permission rule is applied before the approval callback runs, so the gate"
+        " would be armed but never consulted.",
+    ]
+    for conflict in sorted(conflicts):
+        how = "allows the whole tool" if conflict.whole else "allows matching calls"
+        lines.append(
+            f"  {conflict.skill}: allowed-tools entry {conflict.entry!r} {how}"
+            f" {conflict.tool!r}, which is approval-required"
+        )
+    lines.append(
+        "Remove those entries from the skill frontmatter, or stop gating the tool."
+        " Narrowing an entry does not help: a narrowed rule still preauthorizes the"
+        " calls it matches."
+    )
+    return "\n".join(lines)
+
+
+def assert_gates_not_shadowed(
+    plugin_dir: str | None,
+    gate: ApprovalGate | None,
+    resolution: ApprovalPolicyResolution | None = None,
+) -> None:
+    """Refuse to boot when the bundle preauthorizes a tool the gate arms (#1852).
+
+    This runs at session boot rather than at deploy time on purpose. Deploy-time
+    validation can only see gates the BUNDLE declares; an operator who arms a gate
+    afterwards with ``curie cluster approvals --gate`` never re-runs it. Boot sees
+    both halves of the union, so it is the only place the whole conflict is
+    visible, which is also what the issue's acceptance criteria require.
+
+    Args:
+        plugin_dir: The mounted bundle root, or None when no bundle is mounted.
+        gate: The assembled gate, or None when nothing is gated.
+        resolution: The bundle identity used to normalize an MCP shorthand.
+
+    Raises:
+        ApprovalPolicyError: When any skill permission rule names a gated tool.
+    """
+
+    if gate is None or plugin_dir is None:
+        return
+    conflicts = shadowed_gates(plugin_dir, gate.required, resolution)
+    if conflicts:
+        raise ApprovalPolicyError(describe_shadowed_gates(conflicts))

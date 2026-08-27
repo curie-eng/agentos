@@ -94,7 +94,7 @@ generation spans use a closed, versioned attribute schema, not an open bag of `g
 keys:
 
 - **The vocabulary is closed and committed.** `SpanAttributeKey`
-  (`runner/src/curie_runner/otel.py::SpanAttributeKey`) is the only key set the runner
+  (`packages/telemetry-schema/src/curie_telemetry_schema/__init__.py::SpanAttributeKey`) is the only key set the runner
   may attach: `langfuse.trace.name`, `langfuse.session.id`, `langfuse.user.id`,
   `gen_ai.approval.decision`, `gen_ai.request.model`, a bare `model`,
   `gen_ai.usage.input_tokens` / `output_tokens` / `cache_read_input_tokens` /

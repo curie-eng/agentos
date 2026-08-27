@@ -37,7 +37,7 @@ curie skill up && curie skill message "hello, what can you do?"
 ```
 
 You now have a working agent. Edit `skills/my-agent/SKILL.md` to change what it <!-- doclint:ignore-line -->
-does, then `curie skill up --replace` to reload it.
+does, then `curie skill up` again to reload it.
 
 No credential handy? `curie skill up --fake-model` runs the whole loop offline
 with scripted replies — enough to prove the plumbing, not to judge the agent.
@@ -63,9 +63,7 @@ channel → *View channel details*, it's at the bottom and looks like `C0…`.
 ## 3. Put it on the cluster (10 min)
 
 ```bash
-curie cluster up --namespace my-agent --release my-agent \
-  --set agentSandbox.runner.credentials="$CURIE_CREDENTIALS" \
-  --allow-egress-host anthropic
+curie cluster up --namespace my-agent --release my-agent
 
 curie cluster comms --slack --namespace my-agent --release my-agent \
   --app-token "$SLACK_APP_TOKEN" --bot-token "$SLACK_BOT_TOKEN"
@@ -73,6 +71,14 @@ curie cluster comms --slack --namespace my-agent --release my-agent \
 curie cluster deploy --plugin-dir . --namespace my-agent --release my-agent \
   --repo <owner>/<repo> --slack-channel C0YOURCHANNEL
 ```
+
+The plain install reads the exported `sk-ant-` credential and infers Anthropic
+egress. If admission reports that the cluster has no `gvisor` RuntimeClass,
+Curie shows that attempt as retrying, applies `security.gvisor.mode=off`, and
+retries once. It also reuses
+PriorityClasses and the sandbox controller when their complete Helm ownership
+metadata names an existing release. Every applied inference is printed with
+its equivalent override.
 
 `@mention` the bot in that channel. That's the whole thing.
 

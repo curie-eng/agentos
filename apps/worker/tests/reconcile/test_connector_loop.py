@@ -8,10 +8,11 @@ wrong: one bad agent, a raising client, a database that will not answer.
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
 
+import httpx
 import pytest
-from curie_worker import connector_loop as connector_loop_module
 from curie_worker.connector_agent import AgentOutcome, RenderedConnectors
 from curie_worker.connector_apply import ApplyReport
 from curie_worker.connector_loop import AgentTarget, ConnectorReconcileLoop, PassSummary
@@ -38,11 +39,17 @@ class Loop(ConnectorReconcileLoop):
     """
 
     def __init__(self, targets: list[AgentTarget], outcomes: dict[str, Any], **kw: Any) -> None:
+        super().__init__(
+            engine=None,  # type: ignore[arg-type]
+            source=None,  # type: ignore[arg-type]
+            client=None,  # type: ignore[arg-type]
+            namespace="curie",
+            db_schema="curie",
+            interval_seconds=kw.get("interval_seconds", 0.01),
+        )
         self._targets = targets
         self._outcomes = outcomes
         self.seen: list[str] = []
-        self._namespace = "curie"
-        self._interval = kw.get("interval_seconds", 0.01)
 
     async def targets(self) -> list[AgentTarget]:  # type: ignore[override]
         return list(self._targets)
@@ -62,6 +69,16 @@ def ok(agent: str, applied: int = 0, deleted: int = 0) -> AgentOutcome:
             applied=[("Service", f"s{i}") for i in range(applied)],
             deleted=[("Service", f"d{i}") for i in range(deleted)],
         ),
+    )
+
+
+def platform_server_error(status_code: int = 503) -> httpx.HTTPStatusError:
+    request = httpx.Request("GET", "http://api:8000/agents/a/connectors")
+    response = httpx.Response(status_code, request=request)
+    return httpx.HTTPStatusError(
+        f"platform API returned {status_code}",
+        request=request,
+        response=response,
     )
 
 
@@ -155,54 +172,163 @@ async def test_a_pass_that_did_work_says_so(caplog) -> None:
     assert any("2 applied, 1 deleted" in r.getMessage() for r in caplog.records)
 
 
-async def test_each_connector_pass_reports_bounded_success_and_failure_metrics(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    points: list[tuple[str, float, dict[str, str]]] = []
+async def test_platform_5xx_escalates_only_after_three_consecutive_passes(caplog) -> None:
+    loop = Loop([target("a")], {"a": platform_server_error()})
 
-    def capture(
-        name: str,
-        value: float = 1,
-        *,
-        attributes: dict[str, str],
-    ) -> None:
-        points.append((name, value, attributes))
+    with caplog.at_level(logging.DEBUG, logger="curie_worker.connector_loop"):
+        for pass_number in range(1, 6):
+            caplog.clear()
+            summary = await loop.one_pass()
+            agent_records = [r for r in caplog.records if "agent=a" in r.getMessage()]
 
-    monkeypatch.setattr(connector_loop_module, "record_metric", capture)
-    times = iter([1.0, 10.0, 17.0])
-    monkeypatch.setattr(connector_loop_module, "_monotonic", lambda: next(times))
-    loop = Loop([target("bad")], {"bad": RuntimeError()})
+            assert agent_records, f"pass {pass_number} did not log the retry"
+            if pass_number <= 3:
+                assert summary.failed == 0
+                assert all(r.levelno < logging.ERROR for r in agent_records)
+                assert all(r.exc_info is None for r in agent_records)
+                assert all("returned 503" in r.getMessage() for r in agent_records)
+                assert all(f"({pass_number}/3)" in r.getMessage() for r in agent_records)
+            else:
+                assert summary.failed == 1
+                assert any(
+                    r.levelno >= logging.ERROR and r.exc_info is not None for r in agent_records
+                )
 
-    await loop.one_pass()
 
-    assert points[0] == (
-        "curie.background.loop",
-        1,
-        {
-            "service.name": "curie-worker",
-            "operation": "connector-reconciler",
-            "role": "background",
-            "outcome": "failure",
-        },
-    )
-    assert len(points) == 1, "a first failure has no successful instant to age from"
+async def test_platform_5xx_streak_is_per_agent(caplog) -> None:
+    loop = Loop([target("a")], {"a": platform_server_error()})
 
-    loop._outcomes["bad"] = ok("bad")
-    await loop.one_pass()
-    loop._outcomes["bad"] = RuntimeError()
-    await loop.one_pass()
+    with caplog.at_level(logging.DEBUG, logger="curie_worker.connector_loop"):
+        for _ in range(3):
+            await loop.one_pass()
 
-    ages = [point for point in points if point[0] == "curie.background.last_success.age"]
-    assert [point[1] for point in ages] == [0.0, 7.0]
-    assert all(
-        point[2]
-        == {
-            "service.name": "curie-worker",
-            "operation": "connector-reconciler",
-            "role": "background",
+        loop._targets = [target("b")]
+        loop._outcomes = {"b": platform_server_error()}
+        caplog.clear()
+        summary = await loop.one_pass()
+
+    agent_records = [r for r in caplog.records if "agent=b" in r.getMessage()]
+    assert summary.failed == 0
+    assert agent_records
+    assert all(r.levelno < logging.ERROR for r in agent_records)
+    assert all(r.exc_info is None for r in agent_records)
+    assert all("returned 503" in r.getMessage() for r in agent_records)
+    assert all("(1/3)" in r.getMessage() for r in agent_records)
+
+
+async def test_non_5xx_failure_resets_platform_5xx_streak_for_the_same_agent(caplog) -> None:
+    loop = Loop([target("a")], {"a": platform_server_error()})
+
+    with caplog.at_level(logging.DEBUG, logger="curie_worker.connector_loop"):
+        for _ in range(3):
+            assert (await loop.one_pass()).failed == 0
+
+        loop._outcomes["a"] = platform_server_error(404)
+        caplog.clear()
+        loud_summary = await loop.one_pass()
+        loud_records = [r for r in caplog.records if "agent=a" in r.getMessage()]
+
+        loop._outcomes["a"] = platform_server_error()
+        caplog.clear()
+        quiet_summary = await loop.one_pass()
+
+    quiet_records = [r for r in caplog.records if "agent=a" in r.getMessage()]
+    assert loud_summary.failed == 1
+    assert len(loud_records) == 1
+    assert loud_records[0].levelno >= logging.ERROR
+    assert loud_records[0].exc_info is not None
+    assert quiet_summary.failed == 0
+    assert quiet_records
+    assert all(r.levelno < logging.ERROR for r in quiet_records)
+    assert all(r.exc_info is None for r in quiet_records)
+    assert all("returned 503" in r.getMessage() for r in quiet_records)
+    assert all("(1/3)" in r.getMessage() for r in quiet_records)
+
+
+async def test_platform_5xx_streaks_are_isolated_within_one_pass(caplog) -> None:
+    agent_a = target("a")
+    agent_b = target("b")
+    loop = Loop([agent_a], {"a": platform_server_error()})
+
+    with caplog.at_level(logging.DEBUG, logger="curie_worker.connector_loop"):
+        for _ in range(3):
+            await loop.one_pass()
+
+        loop._targets = [agent_a, agent_b]
+        loop._outcomes = {
+            "a": platform_server_error(),
+            "b": platform_server_error(),
         }
-        for point in ages
+        loop.seen.clear()
+        caplog.clear()
+        summary = await loop.one_pass()
+
+    agent_a_records = [r for r in caplog.records if "agent=a" in r.getMessage()]
+    agent_b_records = [r for r in caplog.records if "agent=b" in r.getMessage()]
+    error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+    assert loop.seen == ["a", "b"]
+    assert summary.reconciled == 2
+    assert summary.failed == 1
+    assert agent_a_records
+    assert any(
+        r.levelno >= logging.ERROR and r.exc_info is not None for r in agent_a_records
     )
+    assert agent_b_records
+    assert all(r.levelno < logging.ERROR for r in agent_b_records)
+    assert all(r.exc_info is None for r in agent_b_records)
+    assert all("returned 503" in r.getMessage() for r in agent_b_records)
+    assert all("(1/3)" in r.getMessage() for r in agent_b_records)
+    assert len(error_records) == 1
+    assert "agent=a" in error_records[0].getMessage()
+
+
+async def test_success_resets_platform_5xx_streak_for_the_same_agent(caplog) -> None:
+    loop = Loop([target("a")], {"a": platform_server_error()})
+
+    with caplog.at_level(logging.DEBUG, logger="curie_worker.connector_loop"):
+        for _ in range(3):
+            await loop.one_pass()
+
+        loop._outcomes["a"] = ok("a")
+        assert (await loop.one_pass()).failed == 0
+
+        loop._outcomes["a"] = platform_server_error()
+        caplog.clear()
+        summary = await loop.one_pass()
+
+    agent_records = [r for r in caplog.records if "agent=a" in r.getMessage()]
+    assert summary.failed == 0
+    assert agent_records
+    assert all(r.levelno < logging.ERROR for r in agent_records)
+    assert all(r.exc_info is None for r in agent_records)
+    assert all("returned 503" in r.getMessage() for r in agent_records)
+    assert all("(1/3)" in r.getMessage() for r in agent_records)
+
+
+async def test_non_5xx_exception_fails_immediately_with_traceback(caplog) -> None:
+    loop = Loop([target("a")], {"a": RuntimeError("render is invalid")})
+
+    with caplog.at_level(logging.DEBUG, logger="curie_worker.connector_loop"):
+        summary = await loop.one_pass()
+
+    agent_records = [r for r in caplog.records if "agent=a" in r.getMessage()]
+    assert summary.failed == 1
+    assert any(r.levelno >= logging.ERROR and r.exc_info is not None for r in agent_records)
+
+
+async def test_platform_404_fails_immediately_with_traceback(caplog) -> None:
+    loop = Loop([target("a")], {"a": platform_server_error(404)})
+
+    with caplog.at_level(logging.DEBUG, logger="curie_worker.connector_loop"):
+        summary = await loop.one_pass()
+
+    agent_records = [r for r in caplog.records if "agent=a" in r.getMessage()]
+    assert summary.reconciled == 1
+    assert summary.failed == 1
+    assert len(agent_records) == 1
+    assert agent_records[0].levelno >= logging.ERROR
+    assert agent_records[0].exc_info is not None
 
 
 # --------------------------------------------------------------------------- #

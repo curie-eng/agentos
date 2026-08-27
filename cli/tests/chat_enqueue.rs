@@ -1,9 +1,11 @@
 //! Integration: the chat enqueue seam against real Valkey, and the embedded
 //! Slack stub exercised over real HTTP.
 //!
-//! The redis client is NOT mocked: the XADD runs against the compose dev Valkey
-//! (host port 26379, password `valkeypass`) on a unique test-scoped stream that
-//! the test deletes afterward. It never touches the real `curie:runs` stream.
+//! The redis client is NOT mocked: the XADD runs against the Valkey selected by
+//! `TEST_VALKEY_URL`, which is the compose dev Valkey locally (host port 26379,
+//! password `valkeypass`) and a passwordless Valkey in CI. It uses a unique
+//! test-scoped stream that the test deletes afterward and never touches the real
+//! `curie:runs` stream.
 //! The Slack stub is the real one; only its client (reqwest) stands in for the
 //! worker.
 
@@ -12,7 +14,7 @@ use std::time::Duration;
 use curie::chat::{resolve_targets, SlackStub};
 use curie::message::{enqueue_over_connected_transport, MessageOpts};
 use curie::queue::{diagnostics, entry_acked, synthetic_turn, xadd, WORKER_GROUP};
-use curie::slack::post_placeholder;
+use curie::slack::{post_placeholder, SlackTransport};
 use curie::state::{load_turn, TurnContext, TurnVerb};
 use curie_aci_protocol::QueuedTurn;
 
@@ -368,22 +370,29 @@ async fn stub_captures_json_body_and_never_404s_other_methods() {
 /// drives the real client over real HTTP against the recording HTTP stub and pins
 /// both branches from the request bodies that actually went out.
 ///
-/// Valkey-free by design: it is the only CI-executing coverage of this seam, and
-/// the Valkey-backed tests in this file skip where no compose stack runs.
+/// Valkey-free by design, this path uses only the recording HTTP stub. CI also
+/// starts Valkey and executes the Valkey-backed tests in this file. Contributors
+/// need a reachable Valkey, such as the compose Valkey, for equivalent local
+/// coverage.
 #[tokio::test]
 async fn post_placeholder_threads_the_outbound_post_only_when_a_thread_is_named() {
     let _slack_base = SLACK_BASE_URL_LOCK.lock().await;
     const NAMED_THREAD: &str = "1717171717.000100";
     let slack =
         support::serve(|_req| Response::json(200, r#"{"ok": true, "ts": "1717171717.000900"}"#));
-    std::env::set_var("SLACK_API_BASE_URL", &slack.base_url);
+    // The destination is an argument now (#1030), not an ambient read. Exporting
+    // the variable that used to decide it is left in place deliberately: if the
+    // ambient read ever comes back, these posts land at real Slack instead of the
+    // stub and the recorded-request assertions below fail.
+    std::env::set_var("SLACK_API_BASE_URL", "http://127.0.0.1:1/never-used");
+    let transport = SlackTransport::new(Some(slack.base_url.clone()), "xoxb-test".into());
 
-    let ts = post_placeholder("xoxb-test", "C-real", "\u{2026}", Some(NAMED_THREAD))
+    let ts = post_placeholder(&transport, "C-real", "\u{2026}", Some(NAMED_THREAD))
         .await
         .expect("the stub answers ok with a ts");
     assert!(!ts.is_empty(), "post_placeholder returned the created ts");
 
-    post_placeholder("xoxb-test", "C-real", "\u{2026}", None)
+    post_placeholder(&transport, "C-real", "\u{2026}", None)
         .await
         .expect("the stub answers ok with a ts");
 
@@ -498,7 +507,7 @@ async fn enqueue_connected(
         // local ladder; Cluster retains the frozen-payload direct helper.
         TurnVerb::Cluster,
         "C-REAL-CONNECTED",
-        "xoxb-test",
+        &SlackTransport::new(std::env::var("SLACK_API_BASE_URL").ok(), "xoxb-test".into()),
     )
     .await
     .expect("the connected enqueue completes against the stub and Valkey");

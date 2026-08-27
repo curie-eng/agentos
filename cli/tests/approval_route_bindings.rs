@@ -314,7 +314,7 @@ async fn routes_from_builds_the_strict_split_route_shape() {
                     .map(|target| target.address.as_str()),
                 Some("C0EXAMPLE2")
             );
-            assert!(binding.approvers.is_none());
+            assert!(routes["deal_desk"].approvers.is_none());
         }
         _ => panic!("expected the Routes output"),
     }
@@ -460,6 +460,31 @@ async fn list_routes_reads_without_writing() {
         }
         _ => panic!("expected the Routes output"),
     }
+}
+
+#[tokio::test]
+async fn list_routes_json_preserves_an_empty_resolution_address() {
+    // Response decoding is tolerant enough to report a malformed stored target
+    // without rewriting it into a plausible channel.
+    let routes = r#"{"intentionally_empty":{"resolution":{"kind":"slack","address":""}}}"#;
+    let server = stub(routes, routes);
+
+    let out = run(
+        &server,
+        ApprovalCmd {
+            list_routes: true,
+            ..ApprovalCmd::default()
+        },
+    )
+    .await
+    .expect("--list-routes should preserve an empty stored address");
+
+    assert_no_write(&server);
+    let json = out.to_json();
+    assert_eq!(
+        json["routes"]["intentionally_empty"]["resolution"]["address"], "",
+        "an explicit empty API address must remain an empty string in list-routes JSON"
+    );
 }
 
 #[tokio::test]
@@ -1008,4 +1033,63 @@ async fn an_api_response_tolerates_a_field_the_cli_does_not_model() {
         }
         _ => panic!("expected the Routes output"),
     }
+}
+
+#[tokio::test]
+async fn a_malformed_routes_file_writes_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("routes.json");
+    // Valid JSON, invalid binding: the file path must be validated with the same
+    // rules the flag path uses, or the two input forms disagree about what a
+    // legal binding is.
+    std::fs::write(&path, r#"{"finance":{"channel":"finance-room"}}"#).expect("write");
+
+    let server = stub("null", "null");
+
+    let Err(err) = run(
+        &server,
+        ApprovalCmd {
+            routes_from: Some(path),
+            ..ApprovalCmd::default()
+        },
+    )
+    .await
+    else {
+        panic!("a bad channel in the file must be refused");
+    };
+
+    assert!(
+        err.to_string().contains("unknown field `channel`"),
+        "unexpected error: {err}"
+    );
+    assert_no_write(&server);
+}
+
+#[tokio::test]
+async fn a_routes_file_without_a_channel_writes_nothing() {
+    // API responses preserve a missing channel for diagnosis, but an operator
+    // supplied route must name where its approval card is posted.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("routes.json");
+    std::fs::write(&path, r#"{"legacy":{}}"#).expect("write");
+
+    let server = stub("null", "null");
+
+    let Err(err) = run(
+        &server,
+        ApprovalCmd {
+            routes_from: Some(path),
+            ..ApprovalCmd::default()
+        },
+    )
+    .await
+    else {
+        panic!("a route file binding without a channel must be refused");
+    };
+
+    assert!(
+        err.to_string().contains("resolution"),
+        "the error must identify the required field: {err}"
+    );
+    assert_no_write(&server);
 }

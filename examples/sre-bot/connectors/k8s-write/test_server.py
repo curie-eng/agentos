@@ -304,3 +304,8 @@ def test_inline_ca_data_is_materialised_for_verification(tmp_path, monkeypatch):
     import ssl as _ssl
     assert isinstance(seen["verify"], _ssl.SSLContext), "verify must be an in-memory SSLContext"
     assert seen["verify"].get_ca_certs(), "the CA was not loaded"
+
+
+def test_streamable_http_is_mounted_at_curie_connector_path(tmp_path):
+    srv = _load(tmp_path)
+    assert [route.path for route in srv.mcp.streamable_http_app().routes] == ["/mcp"]

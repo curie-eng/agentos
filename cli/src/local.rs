@@ -529,6 +529,84 @@ pub fn status_command(o: &LocalOpts) -> OpsCommand {
     compose(&o.file, &["ps"])
 }
 
+/// Whether the URL points at the default local deploy API.
+fn uses_default_local_api(api_url: &str) -> bool {
+    api_url.trim_end_matches('/') == crate::message::DEFAULT_LOCAL_API_URL
+}
+
+/// Format recovery for a local deploy that could not reach its API. The
+/// compose output is deliberately an input so its state classification is
+/// testable without Docker.
+pub fn deploy_unreachable_hint(api_url: &str, compose_ps: Option<&str>) -> String {
+    if !uses_default_local_api(api_url) {
+        return format!(
+            "the platform API at {api_url} is unreachable. Check that --api-url points to a reachable API, then re-run. If you meant to use the local stack, inspect it with `curie local status`."
+        );
+    }
+
+    let lines: Vec<_> = compose_ps
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let rows = if lines
+        .first()
+        .is_some_and(|line| line.starts_with("NAME") && line.contains("STATUS"))
+    {
+        &lines[1..]
+    } else {
+        &lines[..]
+    };
+
+    if rows.iter().any(|line| {
+        let status = line.to_ascii_lowercase();
+        status.contains("(starting)") || status.contains("(health: starting)")
+    }) {
+        format!(
+            "the platform API at {api_url} is unreachable because the local stack is still starting. Run `curie local status`, wait for the API to become healthy, then re-run."
+        )
+    } else if rows.is_empty() {
+        format!(
+            "the platform API at {api_url} is unreachable because no local services are running. Start them with `curie local up`, confirm with `curie local status`, then re-run."
+        )
+    } else {
+        format!(
+            "the platform API at {api_url} is unreachable although local services are present. Inspect them with `curie local status`, then re-run."
+        )
+    }
+}
+
+/// Attach a compose state aware recovery only after a local deploy's API
+/// request has already failed as transient. The diagnostic itself is best
+/// effort: a missing Docker binary must not hide the original API failure.
+pub async fn with_deploy_unreachable_hint<T>(result: Result<T>, api_url: &str) -> Result<T> {
+    match result {
+        Err(err) if crate::exit::is_transient_reqwest(&err) => {
+            if !uses_default_local_api(api_url) {
+                return Err(crate::exit::operator_context(
+                    err,
+                    deploy_unreachable_hint(api_url, None),
+                    None,
+                ));
+            }
+
+            let cmd = OpsCommand::new(
+                "docker",
+                vec![plain("compose"), plain("-p"), plain("curie"), plain("ps")],
+            );
+            let hint = match run_capture(&cmd).await {
+                Ok((true, out, _)) => deploy_unreachable_hint(api_url, Some(&out)),
+                Ok((false, _, _)) | Err(_) => format!(
+                    "the platform API at {api_url} is unreachable, and Curie could not read local compose state. Run `curie local status`, then re-run."
+                ),
+            };
+            Err(crate::exit::operator_context(err, hint, None))
+        }
+        result => result,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Verb handlers
 // ---------------------------------------------------------------------------
@@ -726,7 +804,7 @@ pub async fn up(mut o: LocalOpts, model: Option<String>) -> Result<LocalUpOutput
             ModelMode::FakePinnedDespiteCredential => ui.warn(
                 "Running the FAKE model despite an available credential: CURIE_FAKE_MODEL is pinned on. Unset it or set CURIE_FAKE_MODEL=0 to go live.",
             ),
-            ModelMode::DefaultFake => ui.note(
+            ModelMode::DefaultFake => ui.warn(
                 "Running the fake model (no credential set). Provide a credential (ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN / CURIE_CREDENTIALS) or --local-model to go live.",
             ),
         }
@@ -1036,6 +1114,68 @@ pub async fn down(o: LocalDownOpts) -> Result<LocalDownOutput> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct DeployDiagnosisEnvRestore {
+        path: Option<std::ffi::OsString>,
+        log: Option<std::ffi::OsString>,
+        output: Option<std::ffi::OsString>,
+        fail: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for DeployDiagnosisEnvRestore {
+        fn drop(&mut self) {
+            for (name, previous) in [
+                ("PATH", &self.path),
+                ("CURIE_TEST_DOCKER_LOG", &self.log),
+                ("CURIE_TEST_DOCKER_OUTPUT", &self.output),
+                ("CURIE_TEST_DOCKER_FAIL", &self.fail),
+            ] {
+                match previous {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    fn install_recording_docker(
+        tools: &std::path::Path,
+        log: &std::path::Path,
+    ) -> DeployDiagnosisEnvRestore {
+        let docker = tools.join("docker");
+        std::fs::write(
+            &docker,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CURIE_TEST_DOCKER_LOG\"\n\
+             if [ \"$*\" = 'compose -p curie ps' ]; then\n\
+               if [ \"$CURIE_TEST_DOCKER_FAIL\" = '1' ]; then exit 91; fi\n\
+               printf '%s\\n' \"$CURIE_TEST_DOCKER_OUTPUT\"\n\
+               exit 0\n\
+             fi\n\
+             exit 91\n",
+        )
+        .expect("write fake docker executable");
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&docker)
+            .expect("read fake docker metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&docker, permissions)
+            .expect("make fake docker executable runnable");
+
+        let restore = DeployDiagnosisEnvRestore {
+            path: std::env::var_os("PATH"),
+            log: std::env::var_os("CURIE_TEST_DOCKER_LOG"),
+            output: std::env::var_os("CURIE_TEST_DOCKER_OUTPUT"),
+            fail: std::env::var_os("CURIE_TEST_DOCKER_FAIL"),
+        };
+        let mut path = vec![tools.to_path_buf()];
+        path.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        std::env::set_var("PATH", std::env::join_paths(path).expect("join test PATH"));
+        std::env::set_var("CURIE_TEST_DOCKER_LOG", log);
+        restore
+    }
 
     fn opts(file: &str) -> LocalOpts {
         LocalOpts {
@@ -1604,6 +1744,219 @@ mod tests {
     fn status_runs_ps() {
         let cmd = status_command(&opts(DEFAULT_COMPOSE_FILE));
         assert_eq!(cmd.display(), "docker compose -f compose.dev.yaml ps");
+    }
+
+    #[test]
+    fn deploy_unreachable_hint_reports_a_starting_local_stack_without_restarting_it() {
+        let hint = deploy_unreachable_hint(
+            "http://localhost:28000",
+            Some(
+                "NAME              IMAGE             SERVICE     STATUS\n\
+                 curie-api-1       curie-api:dev     curie-api   Up 8 seconds (health: starting)",
+            ),
+        );
+
+        assert!(
+            hint.contains("local stack is still starting"),
+            "starting compose state must be named in the deploy recovery: {hint}"
+        );
+        assert!(
+            hint.contains("curie local status"),
+            "the deploy recovery must direct the operator to inspect the stack: {hint}"
+        );
+        assert!(
+            !hint.contains("curie local up"),
+            "a stack already starting must not be told to start again: {hint}"
+        );
+    }
+
+    #[test]
+    fn deploy_unreachable_hint_reports_an_absent_local_stack_and_status_recovery() {
+        for compose_ps in [
+            None,
+            Some(""),
+            Some("NAME   IMAGE   COMMAND   SERVICE   CREATED   STATUS   PORTS"),
+        ] {
+            let hint = deploy_unreachable_hint("http://localhost:28000", compose_ps);
+
+            assert!(
+                hint.contains("no local services are running"),
+                "an empty compose state must be named in the deploy recovery: {hint}"
+            );
+            assert!(
+                hint.contains("curie local up"),
+                "an absent stack must be told how to start: {hint}"
+            );
+            assert!(
+                hint.contains("curie local status"),
+                "the recovery must include state inspection: {hint}"
+            );
+        }
+    }
+
+    #[test]
+    fn deploy_unreachable_hint_treats_restarting_as_services_present() {
+        let hint = deploy_unreachable_hint(
+            crate::message::DEFAULT_LOCAL_API_URL,
+            Some(
+                "NAME          IMAGE           SERVICE     STATUS\n\
+                 curie-api-1   curie-api:dev   curie-api   Restarting (1) 2 seconds ago",
+            ),
+        );
+
+        assert!(
+            hint.contains("local services are present"),
+            "a restarting service is present, not starting: {hint}"
+        );
+        assert!(
+            !hint.contains("local stack is still starting"),
+            "restarting must not be reported as initial startup: {hint}"
+        );
+        assert!(
+            !hint.contains("curie local up"),
+            "a present service must not be told to start again: {hint}"
+        );
+    }
+
+    #[test]
+    fn deploy_unreachable_hint_reports_nonstarting_services_as_present() {
+        let hint = deploy_unreachable_hint(
+            crate::message::DEFAULT_LOCAL_API_URL,
+            Some(
+                "NAME          IMAGE           SERVICE     STATUS\n\
+                 curie-api-1   curie-api:dev   curie-api   Up 30 seconds (healthy)",
+            ),
+        );
+
+        assert!(
+            hint.contains("local services are present"),
+            "a running service must be reported as present: {hint}"
+        );
+        assert!(
+            hint.contains("curie local status"),
+            "present service guidance must retain status inspection: {hint}"
+        );
+        assert!(
+            !hint.contains("curie local up"),
+            "a running service must not be told to start again: {hint}"
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_api_deploy_failure_does_not_read_local_compose_state() {
+        let _lock = crate::PROCESS_ENV_LOCK.lock().await;
+        let tools = tempfile::tempdir().expect("create fake docker directory");
+        let log = tools.path().join("docker.log");
+        let _restore = install_recording_docker(tools.path(), &log);
+        let transient = reqwest::Client::new()
+            .get("http://127.0.0.1:1")
+            .send()
+            .await
+            .expect_err("port 1 must refuse the test connection");
+
+        let result: anyhow::Result<()> = Err(transient.into());
+        let error = with_deploy_unreachable_hint(result, "https://api.example.com")
+            .await
+            .expect_err("the original deploy failure must remain an error");
+        let rendered = format!("{error:#}");
+
+        assert!(
+            rendered.contains("Check that --api-url points to a reachable API"),
+            "custom API guidance was replaced: {rendered}"
+        );
+        assert!(
+            !log.exists(),
+            "custom API failure must not invoke docker; calls: {}",
+            std::fs::read_to_string(&log).unwrap_or_default()
+        );
+    }
+
+    #[tokio::test]
+    async fn default_api_deploy_failure_reads_the_running_curie_project() {
+        let _lock = crate::PROCESS_ENV_LOCK.lock().await;
+        let tools = tempfile::tempdir().expect("create fake docker directory");
+        let log = tools.path().join("docker.log");
+        let _restore = install_recording_docker(tools.path(), &log);
+        std::env::set_var(
+            "CURIE_TEST_DOCKER_OUTPUT",
+            "curie-api-1   curie-api:dev   curie-api   Up 8 seconds (health: starting)",
+        );
+        let transient = reqwest::Client::new()
+            .get("http://127.0.0.1:1")
+            .send()
+            .await
+            .expect_err("port 1 must refuse the test connection");
+
+        let result: anyhow::Result<()> = Err(crate::exit::operator_context(
+            transient.into(),
+            "the API request failed",
+            None,
+        ));
+        let error = with_deploy_unreachable_hint(result, crate::message::DEFAULT_LOCAL_API_URL)
+            .await
+            .expect_err("the original deploy failure must remain an error");
+        let (normal_message, _) = crate::exit::present_error(&error);
+        let rendered = format!("{error:#}");
+        let invocations = std::fs::read_to_string(&log).expect("read docker invocation log");
+
+        assert_eq!(
+            invocations.trim(),
+            "compose -p curie ps",
+            "diagnosis must inspect the running Curie project by name"
+        );
+        assert!(
+            normal_message.contains("local stack is still starting"),
+            "normal output must select the state aware compose diagnosis: {normal_message}"
+        );
+        assert!(
+            !normal_message.contains("the API request failed"),
+            "normal output must not select the inner generic context: {normal_message}"
+        );
+        assert!(
+            rendered.contains("local stack is still starting"),
+            "starting state was not reported: {rendered}"
+        );
+        assert!(
+            rendered.contains("curie local status"),
+            "state inspection guidance was omitted: {rendered}"
+        );
+        assert!(
+            !rendered.contains("curie local up"),
+            "a starting stack must not be told to start again: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_api_deploy_failure_keeps_status_guidance_when_compose_is_unreadable() {
+        let _lock = crate::PROCESS_ENV_LOCK.lock().await;
+        let tools = tempfile::tempdir().expect("create fake docker directory");
+        let log = tools.path().join("docker.log");
+        let _restore = install_recording_docker(tools.path(), &log);
+        std::env::set_var("CURIE_TEST_DOCKER_FAIL", "1");
+        let transient = reqwest::Client::new()
+            .get("http://127.0.0.1:1")
+            .send()
+            .await
+            .expect_err("port 1 must refuse the test connection");
+
+        let result: anyhow::Result<()> = Err(transient.into());
+        let error = with_deploy_unreachable_hint(result, crate::message::DEFAULT_LOCAL_API_URL)
+            .await
+            .expect_err("the original deploy failure must remain an error");
+        let rendered = format!("{error:#}");
+
+        assert!(
+            rendered.contains("could not read local compose state"),
+            "compose failure must remain explicit: {rendered}"
+        );
+        assert!(
+            rendered.contains("curie local status"),
+            "unreadable compose state must retain status guidance: {rendered}"
+        );
+        assert!(
+            !rendered.contains("curie local up"),
+            "unreadable state must not claim services are absent: {rendered}"
+        );
     }
 
     #[test]

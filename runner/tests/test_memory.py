@@ -83,6 +83,28 @@ def test_preamble_empty_is_none() -> None:
     assert format_memory_preamble([]) is None
 
 
+def test_operator_provenance_survives_round_trip_and_merge() -> None:
+    record = MemoryRecord.from_dict(
+        {
+            "content": "ask before French",
+            "provenance": {
+                "learned_from_session_id": None,
+                "source_trace_ids": [],
+                "recorded_at": "2026-08-27T00:00:00+00:00",
+                "source": "operator",
+            },
+        }
+    )
+    assert record.provenance.source == "operator"
+    assert record.to_dict()["provenance"]["source"] == "operator"
+    merged = merge_provenance(
+        record.provenance,
+        Provenance(learned_from_session_id="sess-1", source_trace_ids=("t1",)),
+    )
+    assert merged.source == "operator"
+    assert merged.source_trace_ids == ("t1",)
+
+
 def test_preamble_includes_content_and_traces() -> None:
     records = [
         MemoryRecord(

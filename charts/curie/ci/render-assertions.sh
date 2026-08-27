@@ -35,6 +35,10 @@
 # repos only") and an explicit value must render verbatim. The negative control
 # routes it through the generating helper and requires the assert to fire.
 #
+# Issue #1762 (quiet API migration startup), Assertion 14 and its negative
+# control. The migration init container must wait for Postgres with bounded,
+# quiet retries before preserving the original Alembic upgrade command.
+#
 # Runnable locally (from anywhere) and from CI. Fails loudly, naming the key.
 set -euo pipefail
 
@@ -56,19 +60,42 @@ KEYS=(
   apiKey
   githubWebhookSecret
 )
-declare -A DEFAULTS=(
-  [postgresPassword]="postgres"
-  [valkeyPassword]="valkeypass"
-  [clickhousePassword]="clickhouse"
-  [rustfsSecretKey]="rustfssecret"
-  [langfuseSalt]="dev-salt-change-me"
-  [langfuseEncryptionKey]="0000000000000000000000000000000000000000000000000000000000000000"
-  [langfuseNextauthSecret]="dev-nextauth-secret-change-me"
-  [langfuseInitProjectSecretKey]="sk-lf-curie-dev"
-  [langfuseInitUserPassword]="curie-dev-password"
-  [apiKey]="curie-dev-key"
-  [githubWebhookSecret]="dev-webhook-secret"
-)
+# The published dev default for each of those keys. A `case` lookup rather than
+# `declare -A`: associative arrays are bash 4+, and macOS ships bash 3.2 (the
+# last GPLv2 release) as /bin/bash, which `#!/usr/bin/env bash` finds unless the
+# contributor installed a newer one. Under `set -u` the unsupported `declare -A`
+# made the first key look like an unbound variable, so `curie dev chart-check`
+# failed on every stock Mac with "postgresPassword: unbound variable" -- an error
+# that named nothing real and pointed at no fix. The other twenty-one assertion
+# scripts already run on 3.2; this was the only one that did not.
+default_for() {
+  case "$1" in
+    postgresPassword)             printf '%s\n' "postgres" ;;
+    valkeyPassword)               printf '%s\n' "valkeypass" ;;
+    clickhousePassword)           printf '%s\n' "clickhouse" ;;
+    rustfsSecretKey)              printf '%s\n' "rustfssecret" ;;
+    langfuseSalt)                 printf '%s\n' "dev-salt-change-me" ;;
+    langfuseEncryptionKey)        printf '%s\n' "0000000000000000000000000000000000000000000000000000000000000000" ;;
+    langfuseNextauthSecret)       printf '%s\n' "dev-nextauth-secret-change-me" ;;
+    langfuseInitProjectSecretKey) printf '%s\n' "sk-lf-curie-dev" ;;
+    langfuseInitUserPassword)     printf '%s\n' "curie-dev-password" ;;
+    apiKey)                       printf '%s\n' "curie-dev-key" ;;
+    githubWebhookSecret)          printf '%s\n' "dev-webhook-secret" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Prove the lookup is total over KEYS here, at startup, rather than relying on a
+# failure at the point of use. `default_for` is called inside a command
+# substitution, where a nonzero exit cannot abort the script the way the old
+# `set -u` array miss did -- and one call site sits under `||`, which suspends
+# `set -e` for the whole function body. Checking up front keeps the old property
+# that a key with no published default is a hard error, not a silent empty
+# string that makes the generation detector pass by accident.
+for key in "${KEYS[@]}"; do
+  default_for "$key" >/dev/null \
+    || { echo "FAIL: default_for() has no published default for key '$key'" >&2; exit 1; }
+done
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -106,7 +133,7 @@ check_generated_key() {
   # $1 = rendered Secret, $2 = key, $3 = render label
   local out="$1" key="$2" label="$3" val def
   val="$(read_key "$out" "$key")"
-  def="${DEFAULTS[$key]}"
+  def="$(default_for "$key")"
   if [[ "$val" == "$def" ]]; then
     echo "$label still emits the published dev default for '$key' (value == '$def'); expected a generated value." >&2
     return 1
@@ -156,7 +183,7 @@ echo "  ok: langfuseEncryptionKey is 64 lowercase-hex chars"
 echo "=== Assertion 3: dev overlay keeps the deterministic published defaults ==="
 for key in "${KEYS[@]}"; do
   val="$(read_key "$DEV" "$key")"
-  def="${DEFAULTS[$key]}"
+  def="$(default_for "$key")"
   if [[ "$val" != "$def" ]]; then
     fail "dev overlay must keep the published default for '$key'; expected '$def', got '$val'."
   fi
@@ -759,6 +786,316 @@ if check_github_token_empty "$GHT_MUTANT_RENDER" "mutant (githubToken via curie.
 fi
 echo "  ok: a generated githubToken is rejected (the assert can fail)"
 
+echo "=== Placement assertion 1: every rendered pod surface receives its placement class ==="
+PLACEMENT_VALUES="$TMP/placement-values.yaml"
+cat > "$PLACEMENT_VALUES" <<'YAMLEOF'
+placement:
+  platform:
+    podLabels:
+      example.com/fargate-profile: platform
+    annotations:
+      example.com/placement: platform
+    nodeSelector:
+      example.com/node-class: platform
+    tolerations:
+      - key: example.com/dedicated
+        operator: Equal
+        value: platform
+        effect: NoSchedule
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: example.com/node-class
+                  operator: In
+                  values: [platform]
+  data:
+    podLabels:
+      example.com/fargate-profile: data
+    annotations:
+      example.com/placement: data
+    nodeSelector:
+      example.com/node-class: data
+    tolerations:
+      - key: example.com/dedicated
+        operator: Equal
+        value: data
+        effect: NoSchedule
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: example.com/node-class
+                  operator: In
+                  values: [data]
+  sandbox:
+    podLabels:
+      example.com/fargate-profile: sandbox
+    annotations:
+      example.com/placement: sandbox
+    nodeSelector:
+      example.com/node-class: sandbox
+    tolerations:
+      - key: example.com/dedicated
+        operator: Equal
+        value: sandbox
+        effect: NoSchedule
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: example.com/node-class
+                  operator: In
+                  values: [sandbox]
+  hooks:
+    podLabels:
+      example.com/fargate-profile: hooks
+    annotations:
+      example.com/placement: hooks
+    nodeSelector:
+      example.com/node-class: hooks
+    tolerations:
+      - key: example.com/dedicated
+        operator: Equal
+        value: hooks
+        effect: NoSchedule
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: example.com/node-class
+                  operator: In
+                  values: [hooks]
+  controller:
+    podLabels:
+      example.com/fargate-profile: controller
+    annotations:
+      example.com/placement: controller
+    nodeSelector:
+      example.com/node-class: controller
+    tolerations:
+      - key: example.com/dedicated
+        operator: Equal
+        value: controller
+        effect: NoSchedule
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: example.com/node-class
+                  operator: In
+                  values: [controller]
+YAMLEOF
+
+PLACEMENT_CHECK="$TMP/check_placement.py"
+cat > "$PLACEMENT_CHECK" <<'PYEOF'
+"""Assert placement classes on every chart rendered pod surface.
+
+argv: <rendered-dir> <populated|default|platform-only>
+Exits 0 on pass, 1 naming the missing, extra, or mismatched surface on failure.
+"""
+import pathlib
+import sys
+
+import yaml
+
+rendered, mode = sys.argv[1], sys.argv[2]
+prefix = "placement-render-curie"
+
+expected = {
+    ("Deployment", f"{prefix}-api"): "platform",
+    ("Deployment", f"{prefix}-dispatcher"): "platform",
+    ("Deployment", f"{prefix}-worker"): "platform",
+    ("Deployment", f"{prefix}-ui"): "platform",
+    ("Deployment", f"{prefix}-inference"): "platform",
+    ("Deployment", f"{prefix}-otel-collector"): "platform",
+    ("Deployment", f"{prefix}-langfuse-web"): "platform",
+    ("Deployment", f"{prefix}-langfuse-worker"): "platform",
+    ("StatefulSet", f"{prefix}-postgres"): "data",
+    ("StatefulSet", f"{prefix}-valkey"): "data",
+    ("StatefulSet", f"{prefix}-clickhouse"): "data",
+    ("StatefulSet", f"{prefix}-rustfs"): "data",
+    ("SandboxTemplate", f"{prefix}-runner"): "sandbox",
+    ("DaemonSet", f"{prefix}-runner-prewarm"): "sandbox",
+    ("Job", f"{prefix}-rustfs-init"): "hooks",
+    ("Job", f"{prefix}-preflight-avx"): "hooks",
+    ("Job", f"{prefix}-preflight-gvisor"): "hooks",
+    ("Job", f"{prefix}-preflight-controller"): "hooks",
+    ("Job", f"{prefix}-netpol-probe"): "hooks",
+    ("Job", f"{prefix}-security-probe"): "hooks",
+    ("Job", f"{prefix}-langfuse-model-pricing"): "hooks",
+    ("Pod", f"{prefix}-security-probe-hardening"): "hooks",
+    ("Deployment", "agent-sandbox-controller"): "controller",
+}
+
+
+def pod_surface(doc):
+    kind = doc.get("kind")
+    if kind in {"Deployment", "StatefulSet", "DaemonSet", "Job"}:
+        return doc.get("spec", {}).get("template", {}) or {}
+    if kind == "Pod":
+        return {"metadata": doc.get("metadata", {}) or {}, "spec": doc.get("spec", {}) or {}}
+    if kind == "SandboxTemplate":
+        return doc.get("spec", {}).get("podTemplate", {}) or {}
+    return None
+
+
+surfaces = {}
+for path in sorted(pathlib.Path(rendered).rglob("*.yaml")):
+    for doc in yaml.safe_load_all(path.read_text()):
+        if not isinstance(doc, dict):
+            continue
+        surface = pod_surface(doc)
+        if surface is None:
+            continue
+        key = (doc.get("kind"), doc.get("metadata", {}).get("name"))
+        if key in surfaces:
+            sys.stderr.write(f"duplicate rendered pod surface {key!r}\n")
+            sys.exit(1)
+        surfaces[key] = surface
+
+missing = sorted(set(expected) - set(surfaces))
+unexpected = sorted(set(surfaces) - set(expected))
+if missing or unexpected:
+    if missing:
+        sys.stderr.write(f"render is missing expected pod surfaces: {missing!r}\n")
+    if unexpected:
+        sys.stderr.write(f"render has unclassified pod surfaces: {unexpected!r}\n")
+    sys.exit(1)
+
+
+def wanted_placement(class_name):
+    return {
+        "label": class_name,
+        "annotation": class_name,
+        "nodeSelector": {"example.com/node-class": class_name},
+        "tolerations": [{
+            "key": "example.com/dedicated",
+            "operator": "Equal",
+            "value": class_name,
+            "effect": "NoSchedule",
+        }],
+        "affinity": {
+            "nodeAffinity": {
+                "requiredDuringSchedulingIgnoredDuringExecution": {
+                    "nodeSelectorTerms": [{
+                        "matchExpressions": [{
+                            "key": "example.com/node-class",
+                            "operator": "In",
+                            "values": [class_name],
+                        }],
+                    }],
+                },
+            },
+        },
+    }
+
+
+def assert_populated(key, surface, class_name):
+    metadata = surface.get("metadata", {}) or {}
+    spec = surface.get("spec", {}) or {}
+    labels = metadata.get("labels", {}) or {}
+    annotations = metadata.get("annotations", {}) or {}
+    want = wanted_placement(class_name)
+    got = {
+        "label": labels.get("example.com/fargate-profile"),
+        "annotation": annotations.get("example.com/placement"),
+        "nodeSelector": spec.get("nodeSelector"),
+        "tolerations": spec.get("tolerations"),
+        "affinity": spec.get("affinity"),
+    }
+    if got != want:
+        sys.stderr.write(
+            f"pod surface {key!r} has placement {got!r}, expected class "
+            f"{class_name!r} with placement {want!r}\n"
+        )
+        sys.exit(1)
+
+
+if mode == "populated":
+    for key, class_name in expected.items():
+        assert_populated(key, surfaces[key], class_name)
+    print(f"  ok: all {len(expected)} pod surfaces carry their exact populated placement class")
+elif mode == "default":
+    for key, surface in surfaces.items():
+        metadata = surface.get("metadata", {}) or {}
+        labels = metadata.get("labels", {}) or {}
+        annotations = metadata.get("annotations", {}) or {}
+        spec = surface.get("spec", {}) or {}
+        if "example.com/fargate-profile" in labels:
+            sys.stderr.write(f"default pod surface {key!r} unexpectedly has the placement marker label\n")
+            sys.exit(1)
+        if "example.com/placement" in annotations:
+            sys.stderr.write(f"default pod surface {key!r} unexpectedly has the placement marker annotation\n")
+            sys.exit(1)
+        present = [field for field in ("nodeSelector", "tolerations", "affinity") if field in spec]
+        if present:
+            sys.stderr.write(
+                f"default pod surface {key!r} unexpectedly has placement fields {present!r}\n"
+            )
+            sys.exit(1)
+    print(f"  ok: all {len(expected)} pod surfaces omit placement markers and scheduling fields by default")
+elif mode == "platform-only":
+    marker = "example.com/fargate-profile"
+    for key, class_name in expected.items():
+        labels = surfaces[key].get("metadata", {}).get("labels", {}) or {}
+        got = labels.get(marker)
+        if class_name == "platform" and got != "platform":
+            sys.stderr.write(
+                f"platform pod surface {key!r} has {marker}={got!r}, expected 'platform'\n"
+            )
+            sys.exit(1)
+        if class_name != "platform" and marker in labels:
+            sys.stderr.write(
+                f"unselected {class_name} pod surface {key!r} leaked platform marker {got!r}\n"
+            )
+            sys.exit(1)
+    print("  ok: the platform marker reaches only platform pods and is absent from data, sandbox, hooks, and controller pods")
+else:
+    sys.stderr.write(f"unknown placement check mode {mode!r}\n")
+    sys.exit(2)
+PYEOF
+
+# Enable every conditional pod surface so the expected inventory is exhaustive.
+PLACEMENT_HELM_ARGS=(
+  --set dispatcher.slack.appToken=xapp-placement-render
+  --set dispatcher.slack.botToken=xoxb-placement-render
+  --set inference.deploy=true
+  --set security.gvisor.mode=require
+)
+
+PLACEMENT_OUT="$(mktemp -d -p "$TMP")"
+helm template placement-render "$CHART" --output-dir "$PLACEMENT_OUT" \
+  -f "$PLACEMENT_VALUES" "${PLACEMENT_HELM_ARGS[@]}" > /dev/null
+python3 "$PLACEMENT_CHECK" "$PLACEMENT_OUT" populated \
+  || fail "populated placement classes did not reach every exact rendered pod surface."
+
+echo "=== Placement assertion 2: empty placement defaults preserve all pod surfaces ==="
+PLACEMENT_DEFAULT_OUT="$(mktemp -d -p "$TMP")"
+helm template placement-render "$CHART" --output-dir "$PLACEMENT_DEFAULT_OUT" \
+  "${PLACEMENT_HELM_ARGS[@]}" > /dev/null
+python3 "$PLACEMENT_CHECK" "$PLACEMENT_DEFAULT_OUT" default \
+  || fail "empty placement defaults changed rendered pod metadata or scheduling fields."
+
+echo "=== Placement assertion 3: a platform-only marker does not leak across classes ==="
+PLACEMENT_PLATFORM_ONLY="$TMP/placement-platform-only.yaml"
+cat > "$PLACEMENT_PLATFORM_ONLY" <<'YAMLEOF'
+placement:
+  platform:
+    podLabels:
+      example.com/fargate-profile: platform
+YAMLEOF
+PLACEMENT_PLATFORM_ONLY_OUT="$(mktemp -d -p "$TMP")"
+helm template placement-render "$CHART" --output-dir "$PLACEMENT_PLATFORM_ONLY_OUT" \
+  -f "$PLACEMENT_PLATFORM_ONLY" "${PLACEMENT_HELM_ARGS[@]}" > /dev/null
+python3 "$PLACEMENT_CHECK" "$PLACEMENT_PLATFORM_ONLY_OUT" platform-only \
+  || fail "the platform-only marker was absent from a platform pod or leaked into another placement class."
+
 echo "=== Assertion 12c: worker API URL and key wiring (#1529, #1578) ==="
 WORKER_API_CHECK="$TMP/check_worker_api.py"
 cat > "$WORKER_API_CHECK" <<'PYEOF'
@@ -854,7 +1191,11 @@ assert_worker_api() {
   [[ -f "$manifest" ]] || fail "$name: worker.yaml did not render"
   [[ -f "$secret_manifest" ]] || fail "$name: secrets.yaml did not render"
   local error
-  if ! error="$(python3 "$WORKER_API_CHECK" "$manifest" "$secret_manifest" "$expected_url" "$key_source" "${key_args[@]}" 2>&1)"; then
+  # `${a[@]+"${a[@]}"}` rather than a bare `"${key_args[@]}"`: expanding an EMPTY
+  # array under `set -u` is an "unbound variable" error until bash 4.4, and macOS
+  # ships 3.2. key_args is empty for every non-operator key source, which is most
+  # of the call sites below.
+  if ! error="$(python3 "$WORKER_API_CHECK" "$manifest" "$secret_manifest" "$expected_url" "$key_source" ${key_args[@]+"${key_args[@]}"} 2>&1)"; then
     fail "$name: $error"
   fi
 }
@@ -949,8 +1290,284 @@ if failures:
 print(f"  ok: DATATIER_TARGETS includes {expected!r} and excludes {forbidden!r}")
 PYEOF
 
-echo "=== Assertion 14: durable three-signal OTel Collector contract (#1818, #1819) ==="
-bash "$SCRIPT_DIR/otel-collector-durability-assertions.sh"
+echo "=== Assertion 14: API migration waits quietly for Postgres before Alembic (#1762) ==="
+API_MIGRATE_OUT="$TMP/api_migrate"
+helm template curie "$CHART" --output-dir "$API_MIGRATE_OUT" >/dev/null
+API_MIGRATE_RENDER="$API_MIGRATE_OUT/curie/templates/api.yaml"
+[[ -f "$API_MIGRATE_RENDER" ]] || fail "api.yaml did not render"
+
+API_MIGRATE_CHECK="$TMP/check_api_migrate_wait.py"
+cat > "$API_MIGRATE_CHECK" <<'PYEOF'
+"""Execute the rendered API migration init command with fake dependencies."""
+
+import os
+import pathlib
+import subprocess
+import sys
+import tempfile
+
+import yaml
+
+
+def fail(message):
+    raise SystemExit(message)
+
+
+def migrate_container(manifest):
+    matches = []
+    for doc in yaml.safe_load_all(pathlib.Path(manifest).read_text()):
+        if not isinstance(doc, dict) or doc.get("kind") != "Deployment":
+            continue
+        containers = (
+            doc.get("spec", {})
+            .get("template", {})
+            .get("spec", {})
+            .get("initContainers", [])
+        )
+        matches.extend(item for item in containers if item.get("name") == "migrate")
+    if len(matches) != 1:
+        fail(f"expected exactly one migrate init container, found {len(matches)}")
+    return matches[0]
+
+
+def shell_process(container):
+    process = list(container.get("command") or []) + list(container.get("args") or [])
+    if len(process) < 3 or pathlib.Path(process[0]).name not in {"sh", "bash"}:
+        fail(
+            "migrate init container must use a shell readiness wait before "
+            "exec alembic; a direct Alembic command is not retry-safe"
+        )
+    if process[1] != "-c":
+        fail("migrate init container shell command must use -c")
+    script = process[2]
+    migration = "exec alembic -c alembic.ini upgrade head"
+    if migration not in script:
+        fail(f"migrate init command must preserve {migration!r}")
+    if not any(token in script[: script.index(migration)] for token in ("python", "python3")):
+        fail("migrate init command has no supported Postgres readiness probe before Alembic")
+    env_names = {item.get("name") for item in container.get("env", [])}
+    if "DATABASE_URL" not in env_names:
+        fail("migrate init container must receive DATABASE_URL from the Postgres environment")
+    return process
+
+
+def write_program(path, text):
+    path.write_text("#!/bin/sh\n" + text)
+    path.chmod(0o755)
+
+
+def run_case(process, readiness_failures):
+    with tempfile.TemporaryDirectory() as temp:
+        root = pathlib.Path(temp)
+        fake_bin = root / "bin"
+        fake_bin.mkdir()
+        (fake_bin / "python").symlink_to(sys.executable)
+        fake_modules = root / "modules"
+        fake_modules.mkdir()
+        attempts = root / "readiness-attempts"
+        alembic_calls = root / "alembic-calls"
+
+        write_program(fake_bin / "sleep", "exit 0\n")
+        write_program(
+            fake_bin / "alembic",
+            "printf '%s\\n' \"$*\" >> \"$ALEMBIC_CALLS\"\n",
+        )
+        (fake_modules / "asyncpg.py").write_text(
+            """\
+import os
+import pathlib
+
+
+class InvalidPasswordError(Exception):
+    pass
+
+
+class Connection:
+    async def close(self):
+        pass
+
+
+async def connect(database_url, timeout):
+    attempts = pathlib.Path(os.environ["READINESS_ATTEMPTS"])
+    lines = attempts.read_text().splitlines() if attempts.exists() else []
+    count = int(lines[-1]) + 1 if lines else 1
+    with attempts.open("a") as stream:
+        stream.write(f"{count}\\n")
+    if count <= int(os.environ["READINESS_FAILURES"]):
+        raise InvalidPasswordError("asyncpg-password-sentinel-must-not-leak")
+    return Connection()
+"""
+        )
+
+        env = os.environ.copy()
+        env.update(
+            {
+                "ALEMBIC_CALLS": str(alembic_calls),
+                "DATABASE_URL": (
+                    "postgresql+asyncpg://curie:EXAMPLE_NOT_A_SECRET@postgres:5432/curie"
+                ),
+                "PATH": f"{fake_bin}:{env['PATH']}",
+                "PYTHONPATH": (
+                    f"{fake_modules}{os.pathsep}{env['PYTHONPATH']}"
+                    if env.get("PYTHONPATH")
+                    else str(fake_modules)
+                ),
+                "READINESS_ATTEMPTS": str(attempts),
+                "READINESS_FAILURES": str(readiness_failures),
+            }
+        )
+        try:
+            result = subprocess.run(
+                process,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            fail("migrate readiness wait did not terminate within 60 seconds with fake sleep")
+
+        attempt_lines = attempts.read_text().splitlines() if attempts.exists() else []
+        calls = alembic_calls.read_text().splitlines() if alembic_calls.exists() else []
+        return result, attempt_lines, calls
+
+
+container = migrate_container(sys.argv[1])
+process = shell_process(container)
+
+ready, ready_attempts, ready_calls = run_case(process, 0)
+if ready.returncode != 0:
+    fail(f"immediate readiness exited {ready.returncode}: {ready.stdout}{ready.stderr}")
+if len(ready_attempts) != 1:
+    fail(f"immediate readiness ran the probe {len(ready_attempts)} times, expected once")
+if ready_calls != ["-c alembic.ini upgrade head"]:
+    fail(f"immediate readiness did not invoke the original Alembic command: {ready_calls!r}")
+
+delayed, delayed_attempts, delayed_calls = run_case(process, 2)
+if delayed.returncode != 0:
+    fail(f"delayed readiness exited {delayed.returncode}: {delayed.stdout}{delayed.stderr}")
+if len(delayed_attempts) != 3:
+    fail(f"delayed readiness ran the probe {len(delayed_attempts)} times, expected three")
+if delayed_calls != ["-c alembic.ini upgrade head"]:
+    fail(f"delayed readiness did not invoke the original Alembic command: {delayed_calls!r}")
+delayed_output = [
+    line.strip()
+    for line in (delayed.stdout + delayed.stderr).splitlines()
+    if line.strip()
+]
+if delayed_output != ["Waiting for Postgres readiness"]:
+    fail(f"delayed readiness must log one concise wait line: {delayed_output!r}")
+
+exhausted, exhausted_attempts, exhausted_calls = run_case(process, 60)
+if exhausted.returncode == 0:
+    fail("readiness exhaustion must exit nonzero so the init container can restart")
+if len(exhausted_attempts) != 60:
+    fail(f"readiness exhaustion must make exactly 60 attempts; observed {len(exhausted_attempts)}")
+if exhausted_calls:
+    fail(f"readiness exhaustion must not invoke Alembic; got {exhausted_calls!r}")
+
+output_lines = [
+    line.strip()
+    for line in (exhausted.stdout + exhausted.stderr).splitlines()
+    if line.strip()
+]
+if not output_lines:
+    fail("readiness exhaustion must emit one concise terminal message")
+if len(output_lines) > 2:
+    fail(f"readiness exhaustion emitted {len(output_lines)} lines, expected at most 2")
+if output_lines[0] != "Waiting for Postgres readiness":
+    fail(f"first readiness failure must emit one concise wait message: {output_lines!r}")
+lower_output = " ".join(output_lines).lower()
+if "postgres" not in lower_output or not any(
+    word in lower_output for word in ("ready", "wait", "timeout", "unavailable")
+):
+    fail(f"readiness exhaustion message must explain the Postgres wait: {output_lines!r}")
+if "InvalidPasswordError" not in " ".join(output_lines):
+    fail(f"readiness exhaustion must retain the final probe error class: {output_lines!r}")
+if "traceback" in lower_output or "sqlalchemy.exc" in lower_output:
+    fail(f"readiness exhaustion emitted a traceback: {output_lines!r}")
+if any(
+    secret in lower_output
+    for secret in (
+        "example_not_a_secret",
+        "postgresql+asyncpg://",
+        "asyncpg-password-sentinel-must-not-leak",
+    )
+):
+    fail(f"readiness exhaustion exposed database credentials: {output_lines!r}")
+
+print(
+    "  ok: immediate and delayed readiness run the original migration; bounded "
+    "exhaustion stays concise, exits nonzero, and never invokes Alembic"
+)
+PYEOF
+
+python3 "$API_MIGRATE_CHECK" "$API_MIGRATE_RENDER" \
+  || fail "API migrate init command does not implement the bounded quiet readiness contract."
+
+echo "=== Assertion 14 negative control: changed readiness bound FAILS ==="
+API_MIGRATE_BOUND_MUTANT="$TMP/mutant-api-migrate-bound"
+cp -a "$CHART" "$API_MIGRATE_BOUND_MUTANT"
+python3 - "$API_MIGRATE_BOUND_MUTANT/templates/api.yaml" <<'PYEOF'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+old = "              max_attempts=60\n"
+if text.count(old) != 1:
+    sys.stderr.write("bound negative control could not find the readiness bound\n")
+    sys.exit(1)
+path.write_text(text.replace(old, "              max_attempts=4\n", 1))
+PYEOF
+API_MIGRATE_BOUND_MUTANT_OUT="$TMP/api_migrate_bound_mutant"
+helm template curie "$API_MIGRATE_BOUND_MUTANT" \
+  --output-dir "$API_MIGRATE_BOUND_MUTANT_OUT" >/dev/null
+API_MIGRATE_BOUND_MUTANT_RENDER="$API_MIGRATE_BOUND_MUTANT_OUT/curie/templates/api.yaml"
+[[ -f "$API_MIGRATE_BOUND_MUTANT_RENDER" ]] || fail "bound mutant api.yaml did not render"
+api_migrate_bound_negative_output=""
+if api_migrate_bound_negative_output="$(python3 "$API_MIGRATE_CHECK" "$API_MIGRATE_BOUND_MUTANT_RENDER" 2>&1)"; then
+  fail "negative control did not fire: a changed readiness bound passed the contract."
+fi
+if [[ "$api_migrate_bound_negative_output" != *"must make exactly 60 attempts"* ]]; then
+  fail "readiness-bound negative control failed unexpectedly: $api_migrate_bound_negative_output"
+fi
+echo "  ok: a changed readiness bound is rejected (the boundedness assert can fail)"
+
+echo "=== Assertion 14 negative control: direct Alembic migration FAILS ==="
+# Mutate a temporary chart copy to the pre-fix command and require the same
+# rendered-command checker to reject it.
+API_MIGRATE_MUTANT="$TMP/mutant-api-migrate"
+cp -a "$CHART" "$API_MIGRATE_MUTANT"
+python3 - "$API_MIGRATE_MUTANT/templates/api.yaml" <<'PYEOF'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+start_marker = '          command: ["/bin/sh", "-c"]\n'
+end_marker = "          env:\n"
+start = text.find(start_marker)
+end = text.find(end_marker, start)
+if start == -1 or end == -1:
+    sys.stderr.write("negative control could not find the migration readiness command\n")
+    sys.exit(1)
+direct_command = '          command: ["alembic", "-c", "alembic.ini", "upgrade", "head"]\n'
+path.write_text(text[:start] + direct_command + text[end:])
+PYEOF
+API_MIGRATE_MUTANT_OUT="$TMP/api_migrate_mutant"
+helm template curie "$API_MIGRATE_MUTANT" --output-dir "$API_MIGRATE_MUTANT_OUT" >/dev/null
+API_MIGRATE_MUTANT_RENDER="$API_MIGRATE_MUTANT_OUT/curie/templates/api.yaml"
+[[ -f "$API_MIGRATE_MUTANT_RENDER" ]] || fail "mutant api.yaml did not render"
+api_migrate_negative_output=""
+if api_migrate_negative_output="$(python3 "$API_MIGRATE_CHECK" "$API_MIGRATE_MUTANT_RENDER" 2>&1)"; then
+  fail "negative control did not fire: the pre-fix direct Alembic command passed the readiness contract."
+fi
+if [[ "$api_migrate_negative_output" != *"direct Alembic command is not retry-safe"* ]]; then
+  fail "direct-Alembic negative control failed unexpectedly: $api_migrate_negative_output"
+fi
+echo "  ok: the reverted direct-Alembic command is rejected (the assert can fail)"
 
 echo
-echo "PASS: sealed render generates strong values for all 11 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every control-plane pod, the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases; the security probe uses the configured RustFS port in DATATIER_TARGETS; and the Collector render carries durable bounded delivery for traces, logs, and metrics."
+echo "PASS: sealed render generates strong values for all 11 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every control-plane pod, the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; every rendered pod surface receives its exact placement class while empty defaults omit placement fields and a platform-only label does not leak across classes; the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases; the security probe uses the configured RustFS port in DATATIER_TARGETS; and the API migration init command waits quietly with bounded retries before preserving the original Alembic upgrade, with readiness exhaustion proven to exit nonzero without invoking Alembic."

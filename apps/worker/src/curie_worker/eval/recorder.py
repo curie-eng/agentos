@@ -123,6 +123,10 @@ class LangfuseEvalRecorder:
                     "cost_usd": result.cost_usd,
                     "detail": result.detail,
                     "error": result.error,
+                    "samples": result.samples,
+                    "passes": result.passes,
+                    "policy": result.policy,
+                    "variance": result.variance,
                 },
             },
         }

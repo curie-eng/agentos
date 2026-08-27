@@ -103,6 +103,13 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/render-assertions.sh
 
+      # Prove the API Service keeps a stable NodePort when enabled, allows an
+      # override, and omits the field for ClusterIP or explicit auto allocation.
+      - name: helm render assertions (api service NodePort)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/api-service-nodeport-assertions.sh
+
       # Prove the BYO-model LiteLLM sidecar (issue #253) is off by default,
       # renders fully when its values flag is enabled, and yields to local
       # inference. Runs the chart-owned assertion script.
@@ -110,6 +117,19 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/litellm-sidecar-assertions.sh
+
+      # Prove the direct-passthrough existingSecret escape (issue #1759): the
+      # eight keys that previously had none now resolve to the chart's own
+      # Secret by default and to an operator-named Secret when
+      # <field>ExistingSecret is set, in EVERY consumer of a multi-consumer
+      # key (agentCredentials, slackBotToken) and winning over a stale inline
+      # value; and the two parity-seam gates the escape would otherwise trip
+      # (curie.dispatcher.enabled, the agentCredentials render gate) now open
+      # on a BYO-only credential too.
+      - name: helm render assertions (direct-passthrough existingSecret)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/direct-passthrough-existing-secret-assertions.sh
 
       # Prove ClickHouse's own telemetry stays bounded: logger at `warning`, the
       # four firehose system log tables removed, and whatever remains carrying a

@@ -30,6 +30,7 @@ before -- and independent of whether -- the release actually completed.
 
 import redis.asyncio as redis
 
+# Frozen with the worker and CLI copies in tests/vectors/thread-reset-set.json.
 THREAD_RESET_SET = "curie:thread-reset-requests"
 
 # Claimed-but-not-yet-released requests (#812). The worker SPOPs a request off

@@ -557,7 +557,10 @@ def test_flaky_case_that_passes_one_of_three_is_red_with_variance(make_eval_harn
 
             case = result.results[0]
             assert case.passed is False
-            assert case.error is not None and "1/3 samples passed" in case.error
+            assert case.error is None
+            assert case.variance is not None and "1/3 samples passed" in case.variance
+            assert case.samples == 3
+            assert case.passes == 1
 
     asyncio.run(go())
 

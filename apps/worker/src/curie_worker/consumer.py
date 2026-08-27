@@ -73,9 +73,13 @@ _CAP_SCAN_PAGE = 1000
 
 # An operator-requested thread reset (#713): the API SADDs a thread_key here
 # (`apps/api/src/curie_api/threadreset.py`) and the maintenance tick SPOPs
-# it to force-release that thread's sandbox. Not a stream -- a one-shot
-# administrative signal has no ordering/redelivery/dead-letter needs, so a
-# plain Valkey SET is enough.
+# it to force-release that thread's sandbox. `curie local eval` /
+# `curie cluster eval` SADDs each eval-owned conversation_id onto the same
+# set (#1534) so the next turn's `_handle` (and the tick) release that
+# case's sandbox instead of pinning quota until routeTtlSeconds. Frozen
+# with the CLI copy in tests/vectors/thread-reset-set.json. Not a stream --
+# a one-shot administrative signal has no ordering/redelivery/dead-letter
+# needs, so a plain Valkey SET is enough.
 THREAD_RESET_SET = "curie:thread-reset-requests"
 
 # Claimed-but-not-yet-released thread-reset requests (#812). The drain SPOPs a
@@ -141,6 +145,7 @@ class Consumer(StreamConsumer):
             max_delivery=config.max_delivery,
             dead_letter_maxlen=config.dead_letter_maxlen,
             reclaim_min_idle_ms=config.reclaim_min_idle_ms,
+            dead_consumer_idle_ms=config.dead_consumer_idle_ms,
             read_count=config.read_count,
             cap_scan_page=_CAP_SCAN_PAGE,
             telemetry_source="worker",
@@ -286,6 +291,20 @@ class Consumer(StreamConsumer):
                         "outcome": "accepted",
                     },
                 )
+                # Eval (and operator reset-thread) SADDs onto THREAD_RESET_SET
+                # when a sandbox should be released. Drain those before this
+                # turn claims so a following eval case or cluster message does
+                # not wait for the maintenance tick with quota already full.
+                # A failed drain must not fail the turn; the next handle or
+                # maintenance tick retries the remaining requests (#1534).
+                try:
+                    if await self._valkey.scard(THREAD_RESET_SET):
+                        await self._drain_thread_reset_requests()
+                except Exception:
+                    logger.exception(
+                        "thread-reset drain before turn %s failed; continuing",
+                        entry_id,
+                    )
                 try:
                     await self._kernel.process_event(qevent)
                 except Exception as exc:
@@ -317,6 +336,7 @@ class Consumer(StreamConsumer):
                     "curie.queue.settle",
                     attributes={**metric_attributes, "outcome": "ack"},
                 )
+                return
         finally:
             record_metric(
                 "curie.queue.process.duration",

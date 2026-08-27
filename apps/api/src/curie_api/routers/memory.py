@@ -1,4 +1,4 @@
-"""Agent memory API: inspect, trace-back, edit, and delete what an agent learned.
+"""Agent memory API: inspect, trace-back, seed, edit, and delete what an agent learned.
 
 Memory is a scoped namespace over the durable state store (#264, ADR-0025): the
 runner writes an append-only log at namespace ``memory`` key ``log``, each item a
@@ -6,11 +6,13 @@ runner writes an append-only log at namespace ``memory`` key ``log``, each item 
 is the operator's read/write surface over that one log key -- it does NOT add a
 second store. #266 adds the learned-from trace-back (resolve an entry's session +
 source traces); #267 adds edit/delete (an edit preserves the entry's provenance;
-a delete removes exactly one entry). Because the runner rehydrates from the same
-key, edits and deletes are reflected at the next boot.
+a delete removes exactly one entry); #1904 adds operator seed (append a validated
+record with operator provenance). Because the runner rehydrates from the same
+key, creates, edits, and deletes are reflected at the next boot.
 """
 
 import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
@@ -22,6 +24,7 @@ from ..config import get_settings
 from ..deps import SessionDep
 from ..models import WorkflowStateEntry
 from ..schemas import (
+    MemoryEntryCreate,
     MemoryEntryEdit,
     MemoryEntryOut,
     MemoryProvenanceOut,
@@ -38,6 +41,9 @@ router = APIRouter(
 # single log-shaped key inside the reserved ``memory`` namespace).
 MEMORY_NAMESPACE = "memory"
 MEMORY_LOG_KEY = "log"
+# Provenance ``source`` stamped on operator-seeded records (#1904). Distinct from
+# session-learned entries, which omit the field or leave it null.
+OPERATOR_MEMORY_SOURCE = "operator"
 
 
 async def _require_agent(session: SessionDep, agent_id: uuid.UUID) -> None:
@@ -58,11 +64,55 @@ async def _get_log_entry(
     return entry
 
 
+def _records_from_value(value: Any) -> list[dict[str, Any]]:
+    """The log's ``{content, provenance}`` records, or [] when absent/malformed."""
+    if not isinstance(value, list):
+        return []
+    return [r for r in value if isinstance(r, dict) and "content" in r]
+
+
 def _records_of(entry: WorkflowStateEntry | None) -> list[dict[str, Any]]:
     """The log's ``{content, provenance}`` records, or [] when absent/malformed."""
-    if entry is None or not isinstance(entry.value, list):
+    if entry is None:
         return []
-    return [r for r in entry.value if isinstance(r, dict) and "content" in r]
+    return _records_from_value(entry.value)
+
+
+def _operator_record(content: str) -> dict[str, Any]:
+    """One operator-authored log item. Provenance is server-stamped, never trusted."""
+    return {
+        "content": content,
+        "provenance": {
+            "learned_from_session_id": None,
+            "source_trace_ids": [],
+            "recorded_at": datetime.now(UTC).isoformat(),
+            "source": OPERATOR_MEMORY_SOURCE,
+        },
+    }
+
+
+async def _locked_log(
+    session: SessionDep, agent_id: uuid.UUID, expected_version: int
+) -> tuple[WorkflowStateEntry, list[dict[str, Any]]]:
+    """Load and lock the memory log, then validate its expected parent version."""
+    await _require_agent(session, agent_id)
+    entry: WorkflowStateEntry | None = await session.scalar(
+        select(WorkflowStateEntry)
+        .where(
+            WorkflowStateEntry.agent_id == agent_id,
+            WorkflowStateEntry.namespace == MEMORY_NAMESPACE,
+            WorkflowStateEntry.key == MEMORY_LOG_KEY,
+        )
+        .with_for_update()
+    )
+    if entry is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "memory entry not found")
+    if expected_version != entry.version:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"version mismatch: expected {expected_version}, stored {entry.version}",
+        )
+    return entry, _records_of(entry)
 
 
 def _provenance_of(record: dict[str, Any]) -> dict[str, Any]:
@@ -93,6 +143,63 @@ async def list_memory(agent_id: uuid.UUID, session: SessionDep) -> list[MemoryEn
     if entry is None:
         return []
     return [_to_out(i, r, entry.version) for i, r in enumerate(_records_of(entry))]
+
+
+@router.post(
+    "/{agent_id}/memory",
+    response_model=MemoryEntryOut,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_memory(
+    agent_id: uuid.UUID, data: MemoryEntryCreate, session: SessionDep
+) -> MemoryEntryOut:
+    """Append an operator-authored memory record (#1904).
+
+    Creates the ``memory/log`` key when absent, otherwise appends under the same
+    row lock the state-append path uses. Provenance is stamped here so a caller
+    cannot claim a session or traces they did not produce. The runner rehydrates
+    the log at the next session boot; a live thread keeps the memory it booted
+    with.
+    """
+    await _require_agent(session, agent_id)
+    record = _operator_record(data.content)
+    entry: WorkflowStateEntry | None = await session.scalar(
+        select(WorkflowStateEntry)
+        .where(
+            WorkflowStateEntry.agent_id == agent_id,
+            WorkflowStateEntry.namespace == MEMORY_NAMESPACE,
+            WorkflowStateEntry.key == MEMORY_LOG_KEY,
+        )
+        .with_for_update()
+    )
+    if entry is None:
+        new_value = [record]
+        await _enforce_caps(
+            session, agent_id, None, MEMORY_NAMESPACE, MEMORY_LOG_KEY, new_value
+        )
+        entry = WorkflowStateEntry(
+            agent_id=agent_id,
+            namespace=MEMORY_NAMESPACE,
+            key=MEMORY_LOG_KEY,
+            value=new_value,
+        )
+        session.add(entry)
+    else:
+        if not isinstance(entry.value, list):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "cannot append: stored value is not a JSON array",
+            )
+        new_value = [*entry.value, record]
+        await _enforce_caps(
+            session, agent_id, None, MEMORY_NAMESPACE, MEMORY_LOG_KEY, new_value
+        )
+        entry.value = new_value
+        entry.version += 1
+    await session.commit()
+    await session.refresh(entry)
+    index = len(_records_from_value(entry.value)) - 1
+    return _to_out(index, record, entry.version)
 
 
 @router.get(
@@ -136,25 +243,7 @@ async def edit_memory(
     provenance is carried through unchanged. A stale version conflicts before
     the positional index can address a changed or reordered log.
     """
-    await _require_agent(session, agent_id)
-    entry: WorkflowStateEntry | None = await session.scalar(
-        select(WorkflowStateEntry)
-        .where(
-            WorkflowStateEntry.agent_id == agent_id,
-            WorkflowStateEntry.namespace == MEMORY_NAMESPACE,
-            WorkflowStateEntry.key == MEMORY_LOG_KEY,
-        )
-        .with_for_update()
-    )
-    if entry is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "memory entry not found")
-    if data.expected_version != entry.version:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            f"version mismatch: expected {data.expected_version}, "
-            f"stored {entry.version}",
-        )
-    records = _records_of(entry)
+    entry, records = await _locked_log(session, agent_id, data.expected_version)
     if index < 0 or index >= len(records):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "memory entry not found")
     updated = {**records[index], "content": data.content}
@@ -190,24 +279,7 @@ async def delete_memory(
     Remaining entries keep their order. A stale version conflicts before the
     positional index can address a changed or reordered log.
     """
-    await _require_agent(session, agent_id)
-    entry: WorkflowStateEntry | None = await session.scalar(
-        select(WorkflowStateEntry)
-        .where(
-            WorkflowStateEntry.agent_id == agent_id,
-            WorkflowStateEntry.namespace == MEMORY_NAMESPACE,
-            WorkflowStateEntry.key == MEMORY_LOG_KEY,
-        )
-        .with_for_update()
-    )
-    if entry is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "memory entry not found")
-    if expected_version != entry.version:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            f"version mismatch: expected {expected_version}, stored {entry.version}",
-        )
-    records = _records_of(entry)
+    entry, records = await _locked_log(session, agent_id, expected_version)
     if index < 0 or index >= len(records):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "memory entry not found")
     entry.value = [*records[:index], *records[index + 1 :]]

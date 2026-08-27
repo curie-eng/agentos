@@ -1,4 +1,4 @@
-# 115. Runtime repository selection is sticky authorized thread state
+# 126. Runtime repository selection is sticky authorized thread state
 
 Date: 2026-08-24
 
@@ -9,7 +9,7 @@ Accepted with its realizing code paths in the same pull request.
 
 ## Context
 
-[ADR 0114](0114-managed-repository-workspaces-and-approval-gated-publication.md)
+[ADR 0125](0125-managed-repository-workspaces-and-approval-gated-publication.md)
 made repository workspaces and approval-gated publication platform
 capabilities, but selected one repository when a deployment was configured.
 That is sufficient for one purpose-built deployment and insufficient for the
@@ -68,7 +68,7 @@ operator removal revokes existing threads and approved-but-not-yet-published
 work. Credential resolver caches are bounded because their keys now originate
 from authorized runtime input.
 
-After selection, workspace preparation retains ADR 0114's credential isolation:
+After selection, workspace preparation retains ADR 0125's credential isolation:
 the API prefers a repository-scoped GitHub App installation token and falls
 back to `api.githubToken`; the trusted worker supplies it only as an ephemeral
 clone header, immediately rewrites and verifies the checkout remote, and sends
@@ -143,7 +143,7 @@ conversation's target to every other thread on the deployment.
 ### Let the sandbox interpret the URL and clone directly
 
 Rejected. It would place the operator credential or GitHub authentication flow
-inside prompt-controlled code and undo ADR 0114's credential isolation.
+inside prompt-controlled code and undo ADR 0125's credential isolation.
 
 ### Key repository selection by deployment
 

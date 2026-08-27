@@ -30,6 +30,7 @@ from aci_protocol import STREAM_PAYLOAD_FIELD
 from curie_api import bundles, crud
 from curie_api.config import get_settings
 from curie_test_support.scaffold import scaffolded_deploy_yaml
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 SECRET = get_settings().github_webhook_secret
@@ -101,7 +102,32 @@ def _build_bare_repo(base_dir: Path, repo_full_name: str, files: dict[str, str])
     bare = base_dir / f"{repo_full_name}.git"
     bare.parent.mkdir(parents=True, exist_ok=True)
     _git("clone", "--quiet", "--bare", str(work), str(bare))
+    _git("update-ref", "refs/heads/main", sha, cwd=bare)
     return f"file://{bare}", sha
+
+
+def _build_bare_repo_with_pull_only_commit(
+    base_dir: Path, repo_full_name: str, files: dict[str, str]
+) -> tuple[str, str]:
+    """Add a valid commit only at ``refs/pull/1/head`` in the bare repo."""
+
+    clone_url, _dev_sha = _build_bare_repo(base_dir, repo_full_name, files)
+    work = base_dir / "_work" / repo_full_name
+    marker = work / "PULL_ONLY.txt"
+    marker.write_text("reachable only from the pull ref\n")
+    _git("add", marker.name, cwd=work)
+    _git("commit", "-q", "-m", "pull ref commit", cwd=work)
+    pull_sha = _git("rev-parse", "HEAD", cwd=work)
+
+    bare = base_dir / f"{repo_full_name}.git"
+    _git(
+        "push",
+        "--quiet",
+        str(bare),
+        f"{pull_sha}:refs/pull/1/head",
+        cwd=work,
+    )
+    return clone_url, pull_sha
 
 
 def _post(client: Any, event: str, payload: dict[str, Any], secret: str = SECRET) -> Any:
@@ -143,6 +169,22 @@ def _insert_partial_version(agent_id: str, sha: str) -> None:
                 version_label=sha[:12],
                 created_by="git-flow",
                 commit_sha=sha,
+            )
+        await engine.dispose()
+
+    asyncio.run(_run())
+
+
+def _set_legacy_repo_full_name(agent_id: str, repo_full_name: str) -> None:
+    async def _run() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "UPDATE curie.agents SET repo_full_name = :repo_full_name "
+                    "WHERE id = :agent_id"
+                ),
+                {"repo_full_name": repo_full_name, "agent_id": uuid.UUID(agent_id)},
             )
         await engine.dispose()
 
@@ -192,6 +234,67 @@ def test_dev_push_deploys_dev_bot(
     ).json()
     assert len(deployments) == 1
     assert deployments[0]["environment"] == "dev"
+
+
+def test_signed_push_rejects_a_commit_unreachable_from_its_branch(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    agent_id = _register_agent(client, auth_headers)
+    clone_url, pull_sha = _build_bare_repo_with_pull_only_commit(
+        trusted_clone_base, REPO, VALID_FILES
+    )
+
+    response = _post(
+        client,
+        "push",
+        _push_payload("refs/heads/dev", pull_sha, clone_url),
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "rejected", body
+    assert {error["code"] for error in body["errors"]} == {
+        "git.commit_not_on_branch"
+    }
+    assert client.get(f"/agents/{agent_id}/versions", headers=auth_headers).json() == []
+    assert (
+        client.get("/deployments", params={"agent_id": agent_id}, headers=auth_headers).json()
+        == []
+    )
+
+
+def test_signed_push_rejects_an_invalid_legacy_repository_binding(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    agent_id = _register_agent(client, auth_headers)
+    invalid_repo = "octo/.."
+    _set_legacy_repo_full_name(agent_id, invalid_repo)
+    payload = _push_payload(
+        "refs/heads/dev",
+        "a" * 40,
+        f"file://{trusted_clone_base}/{REPO}.git",
+    )
+    payload["repository"]["full_name"] = invalid_repo
+
+    response = _post(client, "push", payload)
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "rejected", body
+    assert {error["code"] for error in body["errors"]} == {
+        "git.invalid_repository"
+    }
+    assert client.get(f"/agents/{agent_id}/versions", headers=auth_headers).json() == []
+    assert (
+        client.get("/deployments", params={"agent_id": agent_id}, headers=auth_headers).json()
+        == []
+    )
 
 
 def test_patched_repo_binding_routes_a_push(

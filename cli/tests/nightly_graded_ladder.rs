@@ -644,6 +644,28 @@ fn live_cluster_rung_emits_the_graded_reply_for_passing_cases() {
     );
 }
 
+#[test]
+fn cluster_rung_repeats_eval_then_messages_inside_claim_timeout() {
+    let text = ladder();
+    assert!(
+        text.contains("#1534 repeated cluster eval then message still claims"),
+        "the cluster rung must run repeated eval suites then a message so \
+         retained eval sandboxes cannot exhaust the default ResourceQuota; \
+         ladder contents:\n{text}"
+    );
+    assert!(
+        text.contains(r#"timeout 45 "$BIN" "${retention_args[@]}""#),
+        "the post-eval message must be bounded well inside the 90s claim \
+         timeout; a hang until ClaimTimeoutError is the #1534 failure; \
+         ladder contents:\n{text}"
+    );
+    assert!(
+        text.contains(r#"assert_finalized_reply "cluster" "$retention_out""#),
+        "the post-eval message must still finalize a reply, proving a normal \
+         turn can claim after repeated evals; ladder contents:\n{text}"
+    );
+}
+
 // --- Assertion group 6: the EXECUTING parity controls -----------------------
 //
 // Everything below runs the real `cli/scripts/e2e-ladder.sh` against a stub
@@ -859,7 +881,18 @@ json.dump(d, open(p, "w"))' "$(cat "$STUB_STATE/last_plugin_dir")/evals/cases.js
         # resolve the way the real CLI resolves them: a host edit after boot is
         # invisible to the running runner, and a re-up on the edited source packs
         # a NEW digest.
+        #
+        # A second `up` after a source edit (#1905) also prints the replacement
+        # line e2e.sh greps for, and snapshots SKILL.md so `docker exec` of the
+        # /plugin mount sees the bytes packed at THIS up, not the live host file.
+        if [ -f "$STUB_STATE/skill_digest" ]; then
+            echo "bundle changed: replacing the recorded runner 'curie-e2e-runner' first"
+        fi
         printf '%s' "$(sha_of_bundle "$PWD")" > "$STUB_STATE/skill_digest"
+        skill=$(find "$PWD/skills" -mindepth 2 -maxdepth 2 -name SKILL.md | sort | head -1)
+        if [ -n "$skill" ]; then
+            cp "$skill" "$STUB_STATE/mounted_skill.md"
+        fi
         echo "stub: runner up"
         # e2e.sh asserts the boot panel NAMES the model path it resolved, and
         # that it does not cry wolf about a missing credential. This arm is the
@@ -1032,33 +1065,38 @@ esac
 "#,
     );
 
-    // The ladder's raw-docker uses are all either "is a stack already running"
-    // or "assert nothing survived", so an unrecognized invocation returning
-    // nothing is the honest default here; the two reads that carry a real
-    // answer (the compose-worker selection and its env inspect) get explicit
-    // arms above it.
+    // The ladder's raw-docker uses are "is a stack already running",
+    // "assert nothing survived", and e2e.sh's /plugin mount proof. An
+    // unrecognized invocation returning nothing is the honest default; the
+    // reads that carry a real answer (compose-worker selection, env inspect,
+    // and the snapshotted SKILL.md) get explicit arms.
     write_executable(
         &dir.join("docker"),
         r#"#!/bin/sh
 set -u
 case "$*" in
-    "ps -q --filter name=curie-api")
-        if [ "${STUB_EXISTING_LOCAL_STACK:-0}" = "1" ]; then
-            echo "stub-existing-curie-api"
-        fi
-        ;;
     "inspect curie-runner-local")
-        # The first-run credential check refuses to touch an existing shared
-        # local runner. Its harness begins with no such runner, while all
-        # other inspect shapes retain their existing configured behavior.
-        echo "stub docker: no such object: curie-runner-local" >&2
+        # e2e.sh's ownership precondition: the standard interactive runner is
+        # absent in this isolated harness unless a control explicitly says
+        # otherwise.
         exit 1
         ;;
     "inspect curie-ladder-hermetic-"*)
-        # The hermetic negative's session read: assert_no_connector_containers
-        # refuses an empty project scope by design, so the runner env must
-        # carry a session id for the sweep to be non-vacuous.
+        # Keep the connector-free negative non-vacuous by giving its runner the
+        # same session-scoped project identity the real skill tier records.
         echo "CURIE_SESSION_ID=local-stub-hermetic"
+        ;;
+    *"name=curie-api"*)
+        if [ "${STUB_EXISTING_LOCAL_STACK:-0}" = "1" ]; then
+            echo "stub-curie-api"
+        fi
+        ;;
+    "exec "*" cat /plugin/"*)
+        # e2e.sh proves the /plugin mount is the snapshot packed at skill up,
+        # not the live host file. Replay the SKILL.md bytes that arm saved.
+        if [ -f "$STUB_STATE/mounted_skill.md" ]; then
+            cat "$STUB_STATE/mounted_skill.md"
+        fi
         ;;
     "inspect "*)
         # A failed env read, on its own knob: an inspect that dies (the worker
@@ -1540,7 +1578,7 @@ fn ladder_selects_platform_trajectory_eval_without_overriding_deployed_cases() {
         .lines()
         .filter(|line| line.contains("local eval") || line.contains("cluster eval"))
         .collect::<Vec<_>>();
-    assert_eq!(trajectory_evals.len(), 4, "{trajectory_invocations}");
+    assert_eq!(trajectory_evals.len(), 6, "{trajectory_invocations}");
     assert!(
         trajectory_evals
             .iter()
@@ -1581,7 +1619,7 @@ fn ladder_selects_platform_trajectory_eval_without_overriding_deployed_cases() {
         .lines()
         .filter(|line| line.contains("local eval") || line.contains("cluster eval"))
         .collect::<Vec<_>>();
-    assert_eq!(ordinary_evals.len(), 4, "{ordinary_invocations}");
+    assert_eq!(ordinary_evals.len(), 6, "{ordinary_invocations}");
     assert!(
         ordinary_evals.iter().all(|line| line.contains("--cases")),
         "ordinary eval must retain its explicit cases path: {ordinary_invocations}"
@@ -2083,8 +2121,7 @@ fn parity_fails_when_a_second_active_deployment_exists() {
 /// cluster rung the grade is REPORT ONLY (#1603): the eval still runs and still
 /// prints, but a red case must not fail the rung while cluster fetch success is
 /// unproved. The trajectory sidecar records requested tool identity, not
-/// successful execution. The model routing defect in #1709 was fixed by #1715
-/// on main and awaits its forward merge to next.
+/// successful execution.
 ///
 /// This is the successor of the #872 coverage (commit 1d266a73's third bullet),
 /// which asserted the ladder EXITED 42 on a red deployed evaluator. #1603

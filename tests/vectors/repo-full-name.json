@@ -1,0 +1,275 @@
+{
+  "comment": "Shared repository full name grammar for Python API writes and URL consumers plus Rust CLI deploy preflight. Both lanes preserve valid spelling exactly and reject every invalid value before persistence or network access.",
+  "valid": [
+    {
+      "name": "simple",
+      "value": "octo/demo",
+      "why": "The common owner and repository pair is accepted.",
+      "url_path": "octo/demo"
+    },
+    {
+      "name": "mixed_case_preserved",
+      "value": "OctoCorp/RelayCore",
+      "why": "Owner and repository casing is valid and must not be normalized.",
+      "url_path": "OctoCorp/RelayCore"
+    },
+    {
+      "name": "owner_hyphen",
+      "value": "octo-corp/demo",
+      "why": "A nonterminal single hyphen is legal in a GitHub owner login.",
+      "url_path": "octo-corp/demo"
+    },
+    {
+      "name": "repository_punctuation",
+      "value": "octo/repo.name_with-parts",
+      "why": "Repository dots, underscores, and hyphens are all legal.",
+      "url_path": "octo/repo.name_with-parts"
+    },
+    {
+      "name": "repository_leading_dot",
+      "value": "octo/.github",
+      "why": "A repository may begin with a dot when it is not exactly dot or dot dot.",
+      "url_path": "octo/.github"
+    },
+    {
+      "name": "single_character_segments",
+      "value": "a/r",
+      "why": "One character owner and repository names are valid.",
+      "url_path": "a/r"
+    },
+    {
+      "name": "maximum_owner_length",
+      "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/repo",
+      "why": "A GitHub owner login may contain 39 characters.",
+      "url_path": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/repo"
+    },
+    {
+      "name": "maximum_repository_length",
+      "value": "octo/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+      "why": "A repository may contain 100 characters.",
+      "url_path": "octo/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"
+    }
+  ],
+  "invalid": [
+    {
+      "name": "empty",
+      "value": "",
+      "why": "A repository binding needs both segments."
+    },
+    {
+      "name": "missing_separator",
+      "value": "octo",
+      "why": "The owner and repository must be separated by exactly one slash."
+    },
+    {
+      "name": "empty_owner",
+      "value": "/demo",
+      "why": "The owner segment cannot be empty."
+    },
+    {
+      "name": "empty_repository",
+      "value": "octo/",
+      "why": "The repository segment cannot be empty."
+    },
+    {
+      "name": "extra_path_segment",
+      "value": "octo/demo/extra",
+      "why": "Only one owner and repository pair is accepted."
+    },
+    {
+      "name": "double_separator",
+      "value": "octo//demo",
+      "why": "An empty segment cannot hide inside extra slashes."
+    },
+    {
+      "name": "dot_owner_traversal",
+      "value": "./demo",
+      "why": "A dot owner is a path traversal segment."
+    },
+    {
+      "name": "parent_owner_traversal",
+      "value": "../demo",
+      "why": "A dot dot owner is a path traversal segment."
+    },
+    {
+      "name": "dot_repository_traversal",
+      "value": "octo/.",
+      "why": "A dot repository is a path traversal segment."
+    },
+    {
+      "name": "parent_repository_traversal",
+      "value": "octo/..",
+      "why": "A dot dot repository is a path traversal segment."
+    },
+    {
+      "name": "encoded_traversal",
+      "value": "octo/%2e%2e",
+      "why": "Percent encoded traversal is not repository syntax."
+    },
+    {
+      "name": "https_url",
+      "value": "https://github.com/octo/demo",
+      "why": "A full URL is not a repository full name."
+    },
+    {
+      "name": "ssh_url",
+      "value": "git@github.com:octo/demo.git",
+      "why": "An SSH URL is not a repository full name."
+    },
+    {
+      "name": "scheme_character",
+      "value": "octo:corp/demo",
+      "why": "A colon cannot introduce URL scheme syntax."
+    },
+    {
+      "name": "userinfo_character",
+      "value": "octo@corp/demo",
+      "why": "An at sign cannot introduce URL user information."
+    },
+    {
+      "name": "carriage_return",
+      "value": "octo/demo\rheader",
+      "why": "A carriage return cannot enter a repository or HTTP path."
+    },
+    {
+      "name": "line_feed",
+      "value": "octo/demo\npath",
+      "why": "A line feed cannot enter a repository or HTTP path."
+    },
+    {
+      "name": "tab",
+      "value": "octo/demo\tpath",
+      "why": "A tab cannot enter a repository or HTTP path."
+    },
+    {
+      "name": "percent_syntax",
+      "value": "octo/demo%2Fother",
+      "why": "Percent syntax cannot smuggle a path delimiter."
+    },
+    {
+      "name": "query_syntax",
+      "value": "octo/demo?ref=main",
+      "why": "A question mark cannot escape into a URL query."
+    },
+    {
+      "name": "fragment_syntax",
+      "value": "octo/demo#fragment",
+      "why": "A hash cannot escape into a URL fragment."
+    },
+    {
+      "name": "backslash",
+      "value": "octo/demo\\other",
+      "why": "A backslash is not a repository character or structural separator."
+    },
+    {
+      "name": "leading_space",
+      "value": " octo/demo",
+      "why": "Whitespace is rejected instead of silently trimmed."
+    },
+    {
+      "name": "trailing_space",
+      "value": "octo/demo ",
+      "why": "Whitespace is rejected instead of silently trimmed."
+    },
+    {
+      "name": "embedded_space",
+      "value": "octo/demo repo",
+      "why": "Whitespace cannot appear inside either segment."
+    },
+    {
+      "name": "owner_leading_hyphen",
+      "value": "-octo/demo",
+      "why": "A GitHub owner login cannot begin with a hyphen."
+    },
+    {
+      "name": "owner_trailing_hyphen",
+      "value": "octo-/demo",
+      "why": "A GitHub owner login cannot end with a hyphen."
+    },
+    {
+      "name": "owner_consecutive_hyphens",
+      "value": "octo--corp/demo",
+      "why": "A GitHub owner login cannot contain consecutive hyphens."
+    },
+    {
+      "name": "owner_underscore",
+      "value": "octo_corp/demo",
+      "why": "A GitHub owner login does not accept repository punctuation."
+    },
+    {
+      "name": "owner_dot",
+      "value": "octo.corp/demo",
+      "why": "A GitHub owner login does not accept repository punctuation."
+    },
+    {
+      "name": "owner_too_long",
+      "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/repo",
+      "why": "A GitHub owner login cannot exceed 39 characters."
+    },
+    {
+      "name": "repository_too_long",
+      "value": "octo/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+      "why": "A repository cannot exceed 100 characters."
+    },
+    {
+      "name": "unicode_repository",
+      "value": "octo/répo",
+      "why": "The repository grammar is ASCII only."
+    },
+    {
+      "name": "reserved_bang",
+      "value": "octo/demo!",
+      "why": "A reserved URL character is not repository syntax."
+    },
+    {
+      "name": "reserved_dollar",
+      "value": "octo/demo$",
+      "why": "A reserved URL character is not repository syntax."
+    },
+    {
+      "name": "reserved_ampersand",
+      "value": "octo/demo&other",
+      "why": "A reserved URL character is not repository syntax."
+    },
+    {
+      "name": "reserved_quote",
+      "value": "octo/demo'other",
+      "why": "A reserved URL character is not repository syntax."
+    },
+    {
+      "name": "reserved_parentheses",
+      "value": "octo/demo(other)",
+      "why": "Reserved URL characters are not repository syntax."
+    },
+    {
+      "name": "reserved_asterisk",
+      "value": "octo/demo*",
+      "why": "A reserved URL character is not repository syntax."
+    },
+    {
+      "name": "reserved_plus",
+      "value": "octo/demo+other",
+      "why": "A reserved URL character is not repository syntax."
+    },
+    {
+      "name": "reserved_comma",
+      "value": "octo/demo,other",
+      "why": "A reserved URL character is not repository syntax."
+    },
+    {
+      "name": "reserved_semicolon",
+      "value": "octo/demo;other",
+      "why": "A reserved URL character is not repository syntax."
+    },
+    {
+      "name": "reserved_equals",
+      "value": "octo/demo=other",
+      "why": "A reserved URL character is not repository syntax."
+    },
+    {
+      "name": "reserved_brackets",
+      "value": "octo/demo[other]",
+      "why": "Reserved URL characters are not repository syntax."
+    }
+  ]
+}

@@ -52,7 +52,13 @@ fi
 "$BIN" --version
 
 # Discover every committed suite: examples/*/evals/cases.json + the scaffold seed.
-mapfile -t SUITES < <(find "$REPO_ROOT/examples" -mindepth 2 -maxdepth 3 -path '*/evals/cases.json' | sort)
+# A read loop rather than `mapfile`, which is bash 4+ while macOS still ships 3.2
+# as /bin/bash -- CONTRIBUTING.md points Mac contributors at this gate, so the
+# `mapfile` form aborted with "command not found" before it checked anything.
+SUITES=()
+while IFS= read -r suite; do
+    SUITES+=("$suite")
+done < <(find "$REPO_ROOT/examples" -mindepth 2 -maxdepth 3 -path '*/evals/cases.json' | sort)
 SUITES+=("$REPO_ROOT/apps/worker/schema/eval-cases.example.json")
 echo
 echo "=== Committed suites under gate (${#SUITES[@]}) ==="

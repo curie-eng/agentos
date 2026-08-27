@@ -120,6 +120,9 @@ regexes = [
   '''\bi-0123456789abcdef0\b''',
   '''\b000000000000\b''',
   '''\bexample\.com\b''',
+  # The provider prefix is intentionally present in the public fixture. The
+  # complete finding is anchored so no other OpenRouter shaped value is covered.
+  '''^credentials":"sk-or-v1-PLACEHOLDER"$''',
   # Slack token fixtures. The prefix is the whole point of the test that uses
   # them (curie seal / credcheck), so they cannot be shortened past it -- the
   # EXAMPLE marker is what makes them obviously not a live token.

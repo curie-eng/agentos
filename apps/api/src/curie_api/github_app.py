@@ -35,6 +35,11 @@ import httpx
 import jwt
 
 from .config import Settings
+from .repo_full_name import (
+    InvalidRepoFullName,
+    normalize_repo_full_name,
+    repo_url_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -172,6 +177,11 @@ class GitHubCredentials:
         token as "send no Authorization header".
         """
 
+        try:
+            repo_full_name = normalize_repo_full_name(repo_full_name)
+        except InvalidRepoFullName as exc:
+            raise GitHubAppError(str(exc)) from exc
+
         if not self.app_configured:
             return self.settings.github_token
 
@@ -213,7 +223,10 @@ class GitHubCredentials:
             self._installations.move_to_end(repo_full_name)
             return known
 
-        url = f"{self.settings.github_api_url.rstrip('/')}/repos/{repo_full_name}/installation"
+        url = (
+            f"{self.settings.github_api_url.rstrip('/')}"
+            f"/repos/{repo_url_path(repo_full_name)}/installation"
+        )
         data = self._get(url)
         installation_id = data.get("id")
         if not isinstance(installation_id, int):
@@ -233,7 +246,7 @@ class GitHubCredentials:
         # Scoped to this one repository even though the installation may cover
         # more. A credential that leaks is then useless against the others --
         # the narrowing ADR-0092 buys over an org-wide PAT.
-        owner, _, repo = repo_full_name.partition("/")
+        _, repo = repo_full_name.split("/", 1)
         data = self._post(url, {"repositories": [repo]} if repo else None)
 
         token = data.get("token")

@@ -25,7 +25,7 @@ ADR-0027 the stream verbs are drawn behind a thin **broker port** at the two non
 seams — a `StreamPublisher` `Protocol` on the producer (`apps/dispatcher/src/curie_dispatcher/queue.py::StreamPublisher`:
 `xadd` + the `SET NX EX` dedupe-claim) and a `StreamBroker` `Protocol` on the consumer
 transport (`apps/worker/src/curie_worker/broker.py::StreamBroker`:
-`xgroup_create`/`xreadgroup`/`xack`/`xautoclaim`/`xpending_range`/`xrange`/`xadd`).
+`xgroup_create`/`xreadgroup`/`xack`/`xautoclaim`/`xinfo_consumers`/`xclaim`/`xpending_range`/`xrange`/`xadd`).
 The routing, consumer-group concurrency, dedupe, and reclaim rules stay opinionated
 **core**. `redis.Redis` / `redis.asyncio.Redis` structurally satisfy the ports, so
 redis-py is the one backing today with no adapter; a redis-compatible backend (Valkey,
@@ -77,7 +77,8 @@ Idempotency lives beside the stream, not in it: `claim_event` does a
 
 One, redis-py against Valkey. The dispatcher `XADD`s
 (`apps/dispatcher/src/curie_dispatcher/queue.py::enqueue`); the worker runs
-a consumer group with `XREADGROUP`/`XACK`, crash-recovery `XAUTOCLAIM`, and the
+a consumer group with `XREADGROUP`/`XACK`, crash-recovery `XAUTOCLAIM`,
+dead-consumer prompt reclaim `XINFO CONSUMERS`/`XCLAIM` (#1532), and the
 delivery-cap dead-letter path's `XPENDING`/`XRANGE`/`XADD`. All of those verbs are
 issued from the shared base (`apps/worker/src/curie_worker/stream_consumer.py::StreamConsumer`);
 the sacred `apps/worker/src/curie_worker/consumer.py::Consumer` subclass supplies the
@@ -98,7 +99,8 @@ is not touched:
   `SET NX EX` dedupe-claim. `enqueue`/`claim_event` type against it.
 - **Consumer transport** — `StreamBroker` (`apps/worker/src/curie_worker/broker.py::StreamBroker`):
   `xgroup_create`/`xreadgroup`/`xack`/`xautoclaim`, plus — since the bounded-delivery
-  dead-letter path (#505, ADR-0039) — `xpending_range`/`xrange`/`xadd`. The non-sacred `StreamConsumer`
+  dead-letter path (#505, ADR-0039) — `xpending_range`/`xrange`/`xadd`, plus — since
+  dead-consumer prompt reclaim (#1532) — `xinfo_consumers`/`xclaim`. The non-sacred `StreamConsumer`
   base (`apps/worker/src/curie_worker/stream_consumer.py`) holds a `StreamBroker`; the sacred `consumer.py` subclass
   inherits it unchanged (its `XAUTOCLAIM` reclaim now targets the port by inheritance).
 

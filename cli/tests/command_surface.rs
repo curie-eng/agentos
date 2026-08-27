@@ -1,3 +1,5 @@
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
 use curie::retired_hint;
@@ -78,6 +80,35 @@ fn assert_status_plan_namespace(plan: &[String], namespace: &str) {
     assert!(
         namespaced.iter().any(|line| line.starts_with("kubectl ")),
         "the kubectl status commands must use {namespace}: {plan:?}"
+    );
+}
+
+#[test]
+fn apply_help_references_shipped_curie_yaml_example() {
+    let output = run_help(&["apply"]);
+    assert!(
+        output.status.success(),
+        "expected success for apply help\n{}",
+        output_text(&output)
+    );
+    let text = output_text(&output);
+    assert!(
+        text.contains("examples/curie.yaml"),
+        "apply help must reference the shipped example\n{text}"
+    );
+}
+
+#[test]
+fn operations_references_shipped_curie_yaml_example() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("cli crate has a repository root");
+    let operations = fs::read_to_string(repo_root.join("docs/operations.md"))
+        .expect("read the operations guide");
+
+    assert!(
+        operations.contains("[`examples/curie.yaml`](../examples/curie.yaml)"),
+        "operations guide must link to the shipped example"
     );
 }
 
@@ -283,6 +314,93 @@ fn process_dev_help_lists_verify_fix_pin() {
     assert!(
         leaf_text.contains("<CHANGE>") && leaf_text.contains("<SELECTOR>"),
         "verify-fix-pin help must require a change and selector\n{leaf_text}"
+    );
+}
+
+#[test]
+fn process_dev_e2e_ci_selection_delegates_path_selection() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("cli crate has a repository root");
+    let tools = tempfile::tempdir().expect("create fake tool directory");
+    let uv = tools.path().join("uv");
+    let marker = tools.path().join("uv-invoked");
+    fs::write(
+        &uv,
+        r#"#!/bin/sh
+set -eu
+
+if [ "$#" -ne 12 ] ||
+   [ "$1" != "run" ] ||
+   [ "$2" != "--no-project" ] ||
+   [ "$3" != "--with" ] ||
+   [ "$4" != "pyyaml==6.0.3" ] ||
+   [ "$5" != "python" ] ||
+   [ "$6" != "tools/e2e-ci-selection/select_tiers.py" ] ||
+   [ "$7" != "--registry" ] ||
+   [ "$8" != ".github/e2e-selection.yaml" ] ||
+   [ "$9" != "--path" ] ||
+   [ "${10}" != "compose.dev.yaml" ] ||
+   [ "${11}" != "--path" ] ||
+   [ "${12}" != "docs/example.md" ]; then
+    printf 'unexpected uv invocation: %s\n' "$*" >&2
+    exit 64
+fi
+
+printf 'invoked\n' > "${CURIE_TEST_UV_MARKER:?}"
+printf '%s\n' \
+    'skill=false' \
+    'local=true' \
+    'local_release=false' \
+    'cluster=false' \
+    'skill_local_tiers=local' > "${GITHUB_OUTPUT:?}"
+"#,
+    )
+    .expect("write fake uv executable");
+    let mut permissions = fs::metadata(&uv)
+        .expect("read fake uv metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&uv, permissions).expect("make fake uv executable");
+
+    let mut paths = vec![tools.path().to_path_buf()];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let path = std::env::join_paths(paths).expect("join fake tool PATH");
+    let output = Command::new(bin())
+        .args([
+            "dev",
+            "e2e-ci-selection",
+            "--path",
+            "compose.dev.yaml",
+            "--path",
+            "docs/example.md",
+        ])
+        .current_dir(repo_root)
+        .env("PATH", path)
+        .env("CURIE_TEST_UV_MARKER", &marker)
+        .output()
+        .expect("run curie dev e2e-ci-selection");
+
+    assert!(
+        output.status.success(),
+        "expected e2e CI selection to succeed\n{}",
+        output_text(&output)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("selector output is utf-8"),
+        "skill=false\n\
+         local=true\n\
+         local_release=false\n\
+         cluster=false\n\
+         skill_local_tiers=local\n",
+        "the CLI wrapper must preserve the selector's union and ignored-path semantics"
+    );
+    assert_eq!(
+        fs::read_to_string(marker).expect("fake uv invocation marker"),
+        "invoked\n",
+        "the CLI wrapper must delegate selection through the pinned uv command"
     );
 }
 

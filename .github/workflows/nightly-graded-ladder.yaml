@@ -115,7 +115,7 @@ jobs:
       # (#697/#791/#803). Same pinned actions and gha scopes as ci.yaml.
       - name: Set up a cache-only buildx builder (named, NOT the default -- preserves compose FROM, #803)
         id: laddercache
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
         with:
           use: false
       - name: Build the runner image locally (gha layer cache)
@@ -209,7 +209,7 @@ jobs:
       # (#697/#791/#803). Same pinned actions and gha cache scopes as ci.yaml.
       - name: Set up a cache-only buildx builder (named, NOT the default -- preserves compose FROM, #803)
         id: releasecache
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
         with:
           use: false
       - name: Build the runner image locally (gha layer cache)
@@ -300,7 +300,7 @@ jobs:
       # cluster round trip needs; the dispatcher is not deployed.
       - name: Set up a cache-only buildx builder (named, NOT the default)
         id: clustercache
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
         with:
           use: false
       - name: Build the api image locally
@@ -430,10 +430,10 @@ jobs:
       # runsc on kind nodes -- a real-model install fails closed without this),
       # and drop the dispatcher (no Slack; its presence would trip the
       # `cluster message` reply-hijack guard). The secret travels in env, never
-      # on argv. worker.slackTrustedOrigins is a CI-only widening that lets the
-      # worker answer the host-side reply stub (port = STUB_PORT in
-      # cli/scripts/e2e-ladder.sh); the chart default stays empty and
-      # fail-closed.
+      # on argv. worker.slackTrustedOrigins is a CI only widening that lets the
+      # worker answer the host side reply stub on any kernel assigned port on
+      # this host. The portless origin is intentional because `cluster message`
+      # requests an ephemeral port; the chart default stays empty and fail closed.
       - name: Install the platform (curie cluster up, graded)
         env:
           CURIE_BIN: cli/target/release/curie
@@ -447,7 +447,7 @@ jobs:
             --allow-egress-host openrouter \
             --set security.gvisor.mode=off \
             --set dispatcher.deploy=false \
-            --set worker.slackTrustedOrigins="http://${CURIE_E2E_LISTEN_HOST}:8155" \
+            --set worker.slackTrustedOrigins="http://${CURIE_E2E_LISTEN_HOST}" \
             --set api.image.repository=curie-api --set api.image.tag=local --set api.image.pullPolicy=Never \
             --set worker.image.repository=curie-worker --set worker.image.tag=local --set worker.image.pullPolicy=Never \
             --set ui.image.repository=curie-ui --set ui.image.tag=local --set ui.image.pullPolicy=Never \
