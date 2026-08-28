@@ -47,6 +47,7 @@ from .connector_agent import (
     AgentOutcome,
     ManifestSource,
     RenderedConnectors,
+    prune_agent,
     reconcile_agent,
 )
 from .connector_apply import ConnectorClient
@@ -57,21 +58,41 @@ _PLATFORM_5XX_GRACE_PASSES = 3
 
 
 # Every agent with an in-force deployment, and the version that deployment
-# points at. Mirrors binding.py's precedence so the connectors a thread gets
-# belong to the same version its sandbox boots: prod outranks dev, then most
-# recent. DISTINCT ON collapses an agent with both active to that one winner --
-# without it an agent would be reconciled twice per pass, the second undoing
-# the first.
+# points at. RANK FIRST, DECIDE SECOND: this must select the SAME winner
+# binding.py's _RESOLVE_SQL does -- prod outranks dev, then most recent
+# deployed_at -- because the connectors a thread gets have to belong to the
+# version its sandbox actually boots. DISTINCT ON collapses an agent with both
+# active to that one winner; without it an agent would be reconciled twice per
+# pass, the second undoing the first.
+#
+# The bundle is REPORTED (has_bundle), never filtered on (#1216). The predicate
+# used to read `WHERE v.bundle_ref IS NOT NULL`, which filtered before ranking:
+# when the true winner was a bundleless version, the row vanished and the
+# NEXT-ranked version -- a lower-precedence one the sandbox is not booting --
+# was silently promoted and its connector objects applied, with nothing to
+# converge them away. Filtering here can only ever disagree with binding; a
+# version we cannot render for is a fact about what this pass may DO, not about
+# which version is in force, so it is decided in _reconcile_one instead.
+#
+# The trailing `d.id DESC` carries no meaning of its own -- id order is not a
+# precedence rule and nothing may start reading one into it. It exists only to
+# make the order TOTAL: two active deployments in the same environment with an
+# identical `deployed_at` leave the first two keys tied, and an undefined tie
+# lets this query and binding.py's _RESOLVE_SQL -- different joins, different
+# plans -- pick different winners for the same agent. Since the prune path
+# above, that disagreement costs a DESTRUCTIVE prune (this loop deletes the
+# connector objects of the version the sandbox is actually booting), not merely
+# a stale apply, so the key is duplicated verbatim in both statements.
 _TARGETS_SQL = """
 SELECT DISTINCT ON (a.id)
        a.id AS agent_id,
        a.name AS agent_name,
-       v.id AS version_id
+       v.id AS version_id,
+       v.bundle_ref IS NOT NULL AS has_bundle
 FROM {schema}.agents a
 JOIN {schema}.deployments d ON d.agent_id = a.id AND d.status = 'active'
 JOIN {schema}.agent_versions v ON v.id = d.version_id AND v.agent_id = a.id
-WHERE v.bundle_ref IS NOT NULL
-ORDER BY a.id, (d.environment = 'prod') DESC, d.deployed_at DESC
+ORDER BY a.id, (d.environment = 'prod') DESC, d.deployed_at DESC, d.id DESC
 """
 
 
@@ -80,6 +101,12 @@ class AgentTarget:
     agent_id: uuid.UUID
     agent_name: str
     version_id: uuid.UUID
+    # Whether the in-force version has a stored bundle. False means the render
+    # endpoint has nothing to serve, so this agent gets the prune-only path
+    # rather than a reconcile (#1216). Defaults True so a caller constructing a
+    # target for the ordinary case says nothing about a condition that is the
+    # exception.
+    has_bundle: bool = True
 
 
 class HttpManifestSource:
@@ -170,11 +197,26 @@ class ConnectorReconcileLoop:
                 agent_id=row["agent_id"],
                 agent_name=row["agent_name"],
                 version_id=row["version_id"],
+                has_bundle=bool(row["has_bundle"]),
             )
             for row in rows
         ]
 
     def _reconcile_one(self, target: AgentTarget) -> AgentOutcome:
+        if not target.has_bundle:
+            # The in-force version has no stored bundle, so the render endpoint
+            # 404s for it and `raise_for_status()` would mark this agent failed
+            # every pass, forever, with no pass ever able to clear it. Falling
+            # back to a bundled runner-up is the #1216 bug itself. What is left
+            # is the honest reading: this version declares no connectors we can
+            # reach, so everything we own for the agent is undeclared and the
+            # prune-only path converges it -- minus the Secret, which we must
+            # not touch without a render to name it.
+            return prune_agent(
+                self._client,
+                agent=target.agent_name,
+                namespace=self._namespace,
+            )
         return reconcile_agent(
             self._source,
             self._client,
