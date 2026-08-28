@@ -75,6 +75,9 @@ struct Fixture {
     helm_mode: &'static str,
     grafana_secret_mode: &'static str,
     reader_token_mode: &'static str,
+    /// Whether the `sre-bot-writer` ServiceAccount already exists, i.e. fresh
+    /// install (`absent`, the default) versus re-install (`existing`).
+    writer_identity_mode: &'static str,
     helm_values: String,
     api: MockServer,
     registry: MockServer,
@@ -157,6 +160,23 @@ case " $* " in
         exit 0
         ;;
     *" get priorityclass "*|*" get priorityclasses "*)
+        exit 0
+        ;;
+    # Existence probe for the writer identity, which is what decides the ORDER of
+    # the write-RBAC apply relative to the deploy. Absent (the default) means a
+    # fresh install and the deferred, post-deploy ordering every other test in
+    # this file asserts; `existing` means a re-install, where the ceiling must be
+    # tightened BEFORE the new version activates.
+    #
+    # Mirrors `--ignore-not-found`: absent is empty stdout and exit 0, never a
+    # NotFound failure. Deliberately placed ABOVE every `get secret` arm, and
+    # keyed on a token none of those arms contain, so neither group can shadow
+    # the other in either direction.
+    *" get serviceaccount "*)
+        case "$CURIE_TEST_WRITER_IDENTITY_MODE" in
+            existing) printf '%s\n' 'serviceaccount/sre-bot-writer' ;;
+            absent) ;;
+        esac
         exit 0
         ;;
     *" get secret grafana-admin "*)
@@ -465,6 +485,9 @@ exit 64
             helm_mode,
             grafana_secret_mode: "existing",
             reader_token_mode: "success",
+            // Fresh install by default, so every existing test keeps asserting
+            // the deferred post-deploy ordering it was written against.
+            writer_identity_mode: "absent",
             helm_values: "absent".to_string(),
             api,
             registry,
@@ -490,6 +513,13 @@ exit 64
 
     fn with_reader_token_mode(mut self, mode: &'static str) -> Self {
         self.reader_token_mode = mode;
+        self
+    }
+
+    /// Present the cluster as one where the writer identity already exists, i.e.
+    /// a RE-INSTALL rather than a first install.
+    fn with_writer_identity_mode(mut self, mode: &'static str) -> Self {
+        self.writer_identity_mode = mode;
         self
     }
 
@@ -550,6 +580,7 @@ exit 64
             .env("CURIE_TEST_HELM_VALUES", &self.helm_values)
             .env("CURIE_TEST_GRAFANA_SECRET_MODE", self.grafana_secret_mode)
             .env("CURIE_TEST_READER_TOKEN_MODE", self.reader_token_mode)
+            .env("CURIE_TEST_WRITER_IDENTITY_MODE", self.writer_identity_mode)
             .env(
                 "CURIE_TEST_SRE_BOT_REGISTRY_ENDPOINT",
                 &self.registry_endpoint,
@@ -2454,8 +2485,8 @@ fn helm_timeout_recovery_names_the_selected_observability_namespace() {
 ///
 /// This is the assertion that NEVER SKIPS. It is a pure-Rust mirror of what
 /// `lock_preflight` enforces at `DeployTier::Cluster`, so it holds the same
-/// property as the bundle validator below without needing `uv` on PATH -- and
-/// the validator test does not run in the `rust:` CI job at all.
+/// property as the bundle validator below without needing `uv` on PATH -- so the
+/// property stays gated on a local run where that validator test skips.
 ///
 /// The connector properties are asserted by ITERATING the uploaded declaration
 /// rather than by naming `k8s-write`. A per-connector assertion is what makes a
@@ -2592,23 +2623,131 @@ fn write_allowlist_install_uploads_a_bundle_the_cluster_tier_accepts() {
     );
 }
 
+/// The MIRROR IMAGE of the ordering above, for the re-install path.
+///
+/// The incident this pins: an operator NARROWS the allowlist on a re-install
+/// (`prod/admin` -> `prod/api`). `sync_deployed_version` reconciles the connector
+/// Deployment and its kubeconfig Secret only after the deploy has ACTIVATED the
+/// new version, so if the write RBAC were also deferred past the deploy there
+/// would be a window in which the new version is live while BOTH the old, wider
+/// Role and the old connector's wider env are still in force. A `patch` on
+/// `prod/admin` succeeds in that window -- the install fails OPEN on precisely
+/// the change an operator made to close something down.
+///
+/// So the ordering is keyed on whether the writer identity already exists, and
+/// the invariant has two halves: never create a NEW privileged identity before
+/// the deploy, and always tighten an EXISTING one before the deploy. This test
+/// and `a_failed_deploy_leaves_no_write_rbac_or_writer_token_behind` are THE SAME
+/// SCENARIO -- `--write-allowlist prod/api` against a deploy the platform
+/// refuses -- differing in exactly one input, whether the writer
+/// ServiceAccount already existed. The opposite outcomes ARE the invariant:
+/// there the apply must be absent, here it must be present.
+///
+/// Why the oracle is a failed deploy rather than a position in the kubectl log.
+/// `deploy_embedded_sre_bot` is API-driven and emits no kubectl calls at all, so
+/// the log has no marker for "the deploy happened". On BOTH orderings the
+/// write-role apply lands after the connection-setup lookups (API key discovery
+/// belongs to `resolve_embedded_cluster_connection`, which is setup, not
+/// activation) and before the post-deploy connector sync. Any index comparison
+/// therefore either passes on both paths or fails on both, and proves nothing.
+/// Failing the deploy makes the causal relationship itself observable: the apply
+/// can only appear in the log of a run whose deploy failed if it ran BEFORE that
+/// deploy. Nothing is stranded by applying early on this path, because every
+/// object the apply touches already exists.
+#[test]
+fn an_existing_writer_identity_is_tightened_before_the_deploy_that_can_fail() {
+    let fixture = Fixture::with_modes(
+        nodes(vec![node("node-a", "4Gi", true)]),
+        pods(vec![]),
+        "success",
+        "success",
+        "success",
+    )
+    .with_writer_identity_mode("existing")
+    .with_deploy_failure();
+    let output = fixture.run(&["--write-allowlist", "prod/api"]);
+    let text = shown(&output);
+    assert!(
+        !output.status.success(),
+        "a refused deployment must fail the install: {text}"
+    );
+
+    let kubectl = fixture.kubectl_calls();
+    assert!(
+        kubectl.iter().any(|call| {
+            call.contains("get serviceaccount sre-bot-writer")
+                && call.contains("--ignore-not-found")
+        }),
+        "the ordering can only be chosen if the installer probes for the existing writer \
+         identity: {kubectl:?}"
+    );
+    // THE LOAD-BEARING ASSERTION. The deploy failed, so this call exists only if
+    // the narrowed ceiling was applied before it -- the exact call the
+    // fresh-install twin proves is absent under the same failure.
+    assert!(
+        kubectl.iter().any(|call| {
+            call.starts_with("apply -f ") && call.ends_with("manifests/write-role.yaml")
+        }),
+        "on a re-install the narrowed ceiling must land BEFORE the deploy, so a FAILED deploy \
+         must still have applied it: {kubectl:?}"
+    );
+    // `apply_write_access` mints the kubeconfig in the same step, so the token
+    // half of the identity moves with the RBAC half and is asserted with it.
+    assert!(
+        kubectl
+            .iter()
+            .any(|call| call.contains("wait") && call.contains("secret/sre-bot-writer-token")),
+        "the tightening step must have waited for the writer token: {kubectl:?}"
+    );
+    assert!(
+        kubectl
+            .iter()
+            .any(|call| call.contains("get secret sre-bot-writer-token")),
+        "the tightening step must have read the writer token: {kubectl:?}"
+    );
+
+    // ANTI-VACUITY. "The apply is present in a failed run" is only evidence of
+    // ordering if the run actually reached and attempted the deploy. Without
+    // this the test would pass on any earlier abort -- a capacity refusal, a
+    // registry failure -- which is how a reordering bug would hide behind green.
+    let requests = fixture.api.recorded();
+    let version = requests
+        .iter()
+        .position(|request| {
+            request.method == "POST" && request.path == format!("/agents/{AGENT_ID}/versions")
+        })
+        .unwrap_or_else(|| panic!("the run must have created a version: {requests:?}"));
+    let upload = requests
+        .iter()
+        .position(|request| request.method == "PUT" && request.path.ends_with("/bundle"))
+        .unwrap_or_else(|| panic!("the run must have uploaded the bundle: {requests:?}"));
+    let deployment = requests
+        .iter()
+        .position(|request| request.method == "POST" && request.path == "/deployments")
+        .unwrap_or_else(|| panic!("the run must have attempted the deployment: {requests:?}"));
+    assert!(
+        version < upload && upload < deployment,
+        "the failure must be the DEPLOY, reached after the bundle was already uploaded: \
+         version at {version}, upload at {upload}, deployment at {deployment}"
+    );
+}
+
 /// AC3, the bundle-validator leg: hand the uploaded bundle to the authoritative
 /// `plugin_format.validate_bundle` and take its verdict rather than a
 /// re-derivation of it.
 ///
-/// SKIPS WHEN `uv` IS ABSENT, and one thing differs from the `chart_check.rs`
-/// precedent this posture is borrowed from, so it is stated rather than
-/// implied: `chart_check.rs` skips locally but its assertions are guaranteed to
-/// run in `helm-ci`, which installs `uv` and runs `uv sync`. The `rust:` job in
-/// `.github/workflows/ci.yaml` does NOT install `uv`, so this test skips in CI
-/// today and gates nothing there. It is a local-developer check.
+/// SKIPS WHEN `uv` IS ABSENT, which now follows the same posture as the
+/// `chart_check.rs` precedent it is borrowed from rather than diverging from it:
+/// `chart_check.rs` skips locally but its assertions run in `helm-ci`, which
+/// installs `uv`. The `rust:` job in `.github/workflows/ci.yaml` now installs
+/// `uv` too, so this test RUNS in CI and its verdict gates there; the skip is
+/// left in place only for a local developer who has no `uv` on PATH.
 ///
+/// The skip branch is still a real hole in local runs, so it is not the only
+/// thing standing behind this property.
 /// `write_allowlist_install_uploads_a_bundle_the_cluster_tier_accepts` above is
-/// the assertion that GATES, and its properties are written to stand alone
-/// without Python for exactly that reason. Installing `uv` in the `rust:` job is
-/// a deferred follow-up: it is a workflow edit, which pulls in the workflow-path
-/// gate and a full-suite requirement, and that is a different review than this
-/// one.
+/// the backstop: its properties are written to stand alone without Python for
+/// exactly that reason, so they never skip anywhere.
 ///
 /// Negative control, recorded so the skip is not mistaken for a test that
 /// cannot bite: if `build:` survived into the uploaded bundle, this validator
