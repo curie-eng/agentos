@@ -195,6 +195,15 @@ def _parse_resume_event_id(event_id: str) -> uuid.UUID | None:
     except ValueError:
         return None
 
+# The trailing `d.id DESC` carries no meaning of its own -- id order is not a
+# precedence rule and nothing may start reading one into it. It exists only to
+# make the order TOTAL: two active deployments in the same environment with an
+# identical `deployed_at` leave the first two keys tied, and an undefined tie
+# lets this query and connector_loop.py's _TARGETS_SQL -- different joins,
+# different plans -- pick different winners for the same agent. Since #1216 that
+# disagreement costs a DESTRUCTIVE prune (the reconciler removes the connector
+# objects of the version the sandbox is actually booting), not merely a stale
+# apply, so the key is duplicated verbatim in both statements.
 _RESOLVE_SQL = """
 SELECT a.id AS agent_id,
        a.name AS agent_name,
@@ -216,7 +225,7 @@ JOIN {schema}.agent_channels c ON c.agent_id = a.id
 JOIN {schema}.deployments d ON d.agent_id = a.id AND d.status = 'active'
 JOIN {schema}.agent_versions v ON v.id = d.version_id AND v.agent_id = a.id
 WHERE c.kind = :kind AND c.address = :address
-ORDER BY (d.environment = 'prod') DESC, d.deployed_at DESC
+ORDER BY (d.environment = 'prod') DESC, d.deployed_at DESC, d.id DESC
 """
 
 

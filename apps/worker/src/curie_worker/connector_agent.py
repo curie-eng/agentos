@@ -43,6 +43,13 @@ Connectors using the reference form (`secrets: [{from_secret: ...}]`, #1163)
 have no owned keys at all, so they reconcile with no exception. That is the
 path ADR-0090 calls the prerequisite, and it is why this restriction shrinks as
 bundles adopt it rather than being permanent.
+
+`prune_agent` is the same reasoning reached from the other direction (#1216).
+When the in-force version has no stored bundle there is no render at all -- not
+an empty one, an absent one -- so nothing this agent owns can be declared, and
+the same no-Secret-of-any-name exclusion applies for the same reason: without a
+render we do not know which Secret name is ours, and the one live there is the
+operator's real, unrecoverable credential.
 """
 
 from __future__ import annotations
@@ -113,6 +120,35 @@ def own(obj: dict[str, Any], agent: str) -> dict[str, Any]:
     metadata["labels"] = {**(metadata.get("labels") or {}), OWNER_LABEL: agent}
     stamped["metadata"] = metadata
     return stamped
+
+
+def _execute_and_report(
+    client: ConnectorClient,
+    carried: ReconcilePlan,
+    *,
+    agent: str,
+    namespace: str,
+    skipped: str | None = None,
+) -> AgentOutcome:
+    """Run a decided plan and turn it into an outcome.
+
+    Exists so the failure-log format lives in exactly one place: every caller
+    here deletes, so every caller can fail deletes, and a finalizer or an RBAC
+    gap recurs every pass. Returning straight off `execute()` left the object
+    name and the error in no log stream at all -- `connector_apply` does not log
+    delete failures either. It deliberately does NOT own the `is_noop` fast
+    path: the two callers disagree on what a no-op returns (see each).
+    """
+
+    report = execute(client, carried, namespace=namespace, agent=agent)
+    if not report.ok:
+        logger.warning(
+            "connector reconcile agent=%s had %d failure(s): %s",
+            agent,
+            len(report.failures),
+            "; ".join(f"{kind}/{name}: {err}" for kind, name, err in report.failures),
+        )
+    return AgentOutcome(agent=agent, skipped=skipped, plan=carried, report=report)
 
 
 def reconcile_agent(
@@ -197,16 +233,59 @@ def reconcile_agent(
     else:
         carried = computed
 
-    report = execute(client, carried, namespace=namespace, agent=agent)
-    # Shared with the skip branch on purpose: that branch deletes, so it can fail
-    # deletes, and a finalizer or an RBAC gap there recurs every pass. Returning
-    # straight off `execute()` left the object name and the error in no log
-    # stream at all -- `connector_apply` does not log delete failures either.
-    if not report.ok:
-        logger.warning(
-            "connector reconcile agent=%s had %d failure(s): %s",
-            agent,
-            len(report.failures),
-            "; ".join(f"{kind}/{name}: {err}" for kind, name, err in report.failures),
-        )
-    return AgentOutcome(agent=agent, skipped=skipped, plan=carried, report=report)
+    return _execute_and_report(
+        client, carried, agent=agent, namespace=namespace, skipped=skipped
+    )
+
+
+def prune_agent(
+    client: ConnectorClient,
+    *,
+    agent: str,
+    namespace: str,
+) -> AgentOutcome:
+    """Converge an agent whose in-force version declares nothing we can read.
+
+    Reached when the version the deployment points at has no stored bundle
+    (#1216). There is no render to ask for -- the API answers "no bundle stored
+    for this version" -- so the desired set is empty, and every object this
+    agent owns is by definition undeclared. Pruning them is the correct
+    convergence, not a fallback: the alternative the loop used to take was to
+    quietly reconcile a LOWER-precedence bundled version instead, which left the
+    cluster serving connectors from a version no sandbox boots.
+
+    **No Secret of any name is manageable here**, exactly as on the
+    `unprovisioned` branch above and for the same reason. The owned Secret is
+    minted by `curie cluster deploy` from values the cluster deliberately does
+    not hold (ADR-0086); only a render names it, and there is no render on this
+    path. So an owner-labelled Secret alive here cannot be told apart from the
+    operator's live credential, and deleting it is unrecoverable and breaks
+    every connector pod on its next restart. Kind is the safe discriminator
+    here, and only here.
+
+    The outcome is `skipped` rather than a plain reconcile: the applies were not
+    merely unnecessary, they were suppressed by a condition an operator can fix
+    (push the bundle, or deploy a version that has one), so the pass summary
+    must say so instead of reporting a quiet prune.
+    """
+
+    live = client.list_owned(namespace, agent)
+    manageable = [obj for obj in live if identity(obj)[0] != "Secret"]
+    computed = plan([], manageable, agent=agent)
+
+    # Named without the version id: the operator's action is the same either
+    # way, and `curie agent deploy` is what reports the version it stored.
+    reason = (
+        "the in-force version has no stored bundle, so no connectors can be "
+        "rendered for it; objects this agent still owns were pruned"
+    )
+    if computed.is_noop:
+        # Converged: nothing owned, nothing to remove. Returning an empty report
+        # rather than calling execute() keeps the steady state free of a
+        # cluster round-trip, matching reconcile_agent's no-op early return.
+        return AgentOutcome(agent=agent, skipped=reason, plan=computed, report=ApplyReport())
+
+    logger.warning("connector reconcile skipped agent=%s: %s", agent, reason)
+    return _execute_and_report(
+        client, computed, agent=agent, namespace=namespace, skipped=reason
+    )
