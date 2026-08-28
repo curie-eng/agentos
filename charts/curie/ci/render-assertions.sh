@@ -1096,6 +1096,104 @@ helm template placement-render "$CHART" --output-dir "$PLACEMENT_PLATFORM_ONLY_O
 python3 "$PLACEMENT_CHECK" "$PLACEMENT_PLATFORM_ONLY_OUT" platform-only \
   || fail "the platform-only marker was absent from a platform pod or leaked into another placement class."
 
+echo "=== Placement assertion 4: a legacy release's retained placement: null still renders (#2008) ==="
+# `helm upgrade --reuse-values` replays the STORED release config as this
+# upgrade's user-supplied values -- it is not a merge over the chart's current
+# defaults. Helm's values coalescing then deletes any top-level key whose
+# replayed value is YAML null outright, so a release created before placement
+# classes existed, which stored `placement: null`, hands that null straight
+# back in on every future upgrade. `.Values.placement` is then nil and every
+# `.Values.placement.<class>` lookup in the templates panics with a nil
+# pointer template error (issue #2008). A live `helm upgrade --dry-run
+# --reuse-values` reproduction needs an actual prior Helm release, which this
+# chart-only CI has no cluster or release history to provide -- rendering a
+# fixture that reproduces the exact coalesced shape (`placement: null`
+# alongside an ordinary retained setting, so this reads as a real retained
+# values file and not a one-key probe) is the faithful, cluster-free stand-in
+# for the same upgrade path.
+PLACEMENT_LEGACY_NULL="$TMP/placement-legacy-null.yaml"
+cat > "$PLACEMENT_LEGACY_NULL" <<'YAMLEOF'
+placement: null
+global:
+  storageClass: gp3-legacy
+YAMLEOF
+
+PLACEMENT_LEGACY_NULL_OUT="$(mktemp -d -p "$TMP")"
+PLACEMENT_LEGACY_NULL_ERR="$TMP/placement-legacy-null.err"
+# set -euo pipefail would otherwise kill the script silently at this line on
+# the very failure we are testing for; capture stderr and check the exit
+# status explicitly so a broken render reports a useful message instead.
+if ! helm template placement-render "$CHART" --output-dir "$PLACEMENT_LEGACY_NULL_OUT" \
+  -f "$PLACEMENT_LEGACY_NULL" "${PLACEMENT_HELM_ARGS[@]}" \
+  > /dev/null 2>"$PLACEMENT_LEGACY_NULL_ERR"; then
+  fail "a legacy release's retained 'placement: null' failed to render (#2008): $(cat "$PLACEMENT_LEGACY_NULL_ERR")"
+fi
+python3 "$PLACEMENT_CHECK" "$PLACEMENT_LEGACY_NULL_OUT" default \
+  || fail "a legacy release's retained 'placement: null' rendered but did not degrade to the chart's empty placement defaults (#2008): every expected pod surface must still be present and none may carry a placement marker or scheduling field."
+
+echo "=== Placement assertion 4 negative control: reverting the nil-safe placement accessor FAILS ==="
+# Mandatory, per Assertion 7's convention: an assert that has never been shown
+# failing is not a pin. Mutate a TEMP COPY of the chart's _helpers.tpl and
+# require the legacy-null render to fail again.
+#
+# The #2008 fix has not landed on this branch yet, so this mutation cannot
+# target known-existing text the way Assertion 7's and 12b's negative
+# controls do. It instead locates its mutation target -- the nil-safe
+# placement accessor in _helpers.tpl -- by NAME: the `curie.placement.class`
+# define the fix is expected to introduce. It mutates that define's body back
+# into a raw, nil-UNSAFE `.Values.placement.<class>`-style dereference by
+# stripping this chart's own established `| default dict` nil-guard idiom
+# (see _helpers.tpl:766) from inside it. If the define cannot be found, or is
+# found but does not use that idiom, the mutation script fails loudly naming
+# what it could not find rather than silently no-op'ing, so a renamed or
+# differently-shaped fix does not leave this negative control quietly
+# pinning nothing.
+PLACEMENT_MUTANT="$TMP/mutant-placement"
+cp -a "$CHART" "$PLACEMENT_MUTANT"
+python3 - "$PLACEMENT_MUTANT/templates/_helpers.tpl" <<'PYEOF'
+import pathlib
+import re
+import sys
+
+p = pathlib.Path(sys.argv[1])
+text = p.read_text()
+
+block_re = re.compile(
+    r'{{-?\s*define "curie\.placement\.class"\s*-?}}.*?{{-?\s*end\s*-?}}',
+    re.DOTALL,
+)
+m = block_re.search(text)
+if not m:
+    sys.stderr.write(
+        "negative control could not find a 'curie.placement.class' define in "
+        "_helpers.tpl to mutate. That is the nil-safe placement accessor "
+        "Assertion 4 (#2008) expects the fix to introduce; if the fix named "
+        "it something else, update this negative control's anchor to match.\n"
+    )
+    sys.exit(1)
+
+block = m.group(0)
+if "| default dict" not in block:
+    sys.stderr.write(
+        "negative control found 'curie.placement.class' but no '| default "
+        "dict' nil-guard idiom (this chart's established pattern, see "
+        "_helpers.tpl:766) inside it to strip. Update this negative control "
+        "to match however the #2008 fix actually guards against nil "
+        ".Values.placement.\n"
+    )
+    sys.exit(1)
+
+mutated_block = block.replace("| default dict", "", 1)
+p.write_text(text.replace(block, mutated_block, 1))
+PYEOF
+
+PLACEMENT_MUTANT_OUT="$(mktemp -d -p "$TMP")"
+if helm template placement-render "$PLACEMENT_MUTANT" --output-dir "$PLACEMENT_MUTANT_OUT" \
+  -f "$PLACEMENT_LEGACY_NULL" "${PLACEMENT_HELM_ARGS[@]}" > /dev/null 2>&1; then
+  fail "negative control did not fire: a legacy release's retained 'placement: null' still rendered after stripping the nil-guard from curie.placement.class, so Placement assertion 4 (#2008) is not actually pinning anything."
+fi
+echo "  ok: stripping the nil-guard from curie.placement.class makes the legacy-null render fail again (the assert can fail)"
+
 echo "=== Assertion 12c: worker API URL and key wiring (#1529, #1578) ==="
 WORKER_API_CHECK="$TMP/check_worker_api.py"
 cat > "$WORKER_API_CHECK" <<'PYEOF'
