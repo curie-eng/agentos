@@ -12,6 +12,8 @@ use std::io::{Cursor, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use flate2::read::GzDecoder;
 use serde_json::{json, Value};
@@ -77,6 +79,11 @@ struct Fixture {
     api: MockServer,
     registry: MockServer,
     registry_endpoint: String,
+    /// Flips `POST /deployments` to a 500. Shared with the mock API's handler
+    /// closure rather than baked in at construction, because the server thread
+    /// is already running by the time a builder method is called -- the handler
+    /// reads it per request, and the CLI is not launched until `run()`.
+    deploy_fails: Arc<AtomicBool>,
 }
 
 impl Fixture {
@@ -200,9 +207,15 @@ case " $* " in
         esac
         ;;
     # The write identity is part of the DEFAULT install now, so the stub answers
-    # for it the way it does for the reader. Keyed on the same mode variable: the
-    # writer is only reached after the reader succeeds, so one switch still
-    # describes the whole token path.
+    # for it the way it does for the reader. The writer is reached only after the
+    # DEPLOY succeeds -- the identity is minted last on purpose, so a failed
+    # install cannot strand a live write credential (#1946).
+    #
+    # Keyed on the same mode variable regardless: a reader-token timeout or read
+    # failure aborts before the deploy is ever attempted, so there is no reachable
+    # run in which the reader path fails and the writer path is still consulted.
+    # One switch still describes the whole token path, and a second knob would
+    # only be able to express states the installer cannot produce.
     *" wait "*" secret/sre-bot-writer-token "*)
         case "$CURIE_TEST_READER_TOKEN_MODE" in
             success|read-failure) exit 0 ;;
@@ -337,8 +350,10 @@ exit 64
 "#,
         );
 
+        let deploy_fails = Arc::new(AtomicBool::new(false));
+        let handler_deploy_fails = Arc::clone(&deploy_fails);
         let api = serve(
-            |request| match (request.method.as_str(), request.path.as_str()) {
+            move |request| match (request.method.as_str(), request.path.as_str()) {
                 ("GET", "/agents") => Response::json(200, "[]"),
                 ("POST", "/agents") => Response::json(
                     201,
@@ -361,6 +376,17 @@ exit 64
                             r#"{{"version_id":"{VERSION_ID}","bundle_ref":"bundles/sre-bot.tar.gz","bundle_sha256":"fixture-digest","size_bytes":512}}"#
                         ),
                     )
+                }
+                // The deploy-failure knob fails HERE and nowhere earlier. This
+                // leg runs after agent creation, version creation, and the
+                // bundle upload, so the fixture reproduces the case the ticket
+                // describes: a genuine deploy failure with the bundle already
+                // on the platform. Failing the upload instead would also make
+                // the test pass while proving far less -- an abort that early
+                // never reaches the window where a write credential could be
+                // stranded.
+                ("POST", "/deployments") if handler_deploy_fails.load(Ordering::SeqCst) => {
+                    Response::json(500, r#"{"error":"fixture deploy failure"}"#)
                 }
                 ("POST", "/deployments") => Response::json(
                     201,
@@ -443,6 +469,7 @@ exit 64
             api,
             registry,
             registry_endpoint,
+            deploy_fails,
         }
     }
 
@@ -463,6 +490,13 @@ exit 64
 
     fn with_reader_token_mode(mut self, mode: &'static str) -> Self {
         self.reader_token_mode = mode;
+        self
+    }
+
+    /// Make the platform API refuse the deployment after it has accepted the
+    /// agent, the version, and the uploaded bundle.
+    fn with_deploy_failure(self) -> Self {
+        self.deploy_fails.store(true, Ordering::SeqCst);
         self
     }
 
@@ -594,7 +628,13 @@ fn expected_tempo_digest() -> String {
     format!("sha256:{hex}")
 }
 
-fn uploaded_bundle_file(fixture: &Fixture, wanted: &str) -> Vec<u8> {
+/// The gzip stream out of the recorded multipart bundle upload.
+///
+/// Extracted so the whole-archive readers below locate the upload exactly the
+/// way `uploaded_bundle_file` always has -- one place that knows the upload is
+/// a multipart body with the archive somewhere inside it, so a change to the
+/// wire shape breaks every reader at once instead of one of them.
+fn uploaded_bundle_archive(fixture: &Fixture) -> Vec<u8> {
     let upload = fixture
         .api
         .recorded()
@@ -606,7 +646,57 @@ fn uploaded_bundle_file(fixture: &Fixture, wanted: &str) -> Vec<u8> {
         .windows(2)
         .position(|window| window == [0x1f, 0x8b])
         .expect("multipart upload must contain a gzip archive");
-    let decoder = GzDecoder::new(Cursor::new(&upload.body[gzip_start..]));
+    upload.body[gzip_start..].to_vec()
+}
+
+/// Every path the uploaded archive carries, in archive order.
+///
+/// The absence of a file is as much a bundle property as its contents -- a
+/// `connectors.lock.yaml` that should not exist cannot be asserted by reading
+/// one named entry.
+fn uploaded_bundle_paths(fixture: &Fixture) -> Vec<String> {
+    let decoder = GzDecoder::new(Cursor::new(uploaded_bundle_archive(fixture)));
+    let mut archive = tar::Archive::new(decoder);
+    archive
+        .entries()
+        .expect("read uploaded bundle archive")
+        .map(|entry| {
+            let entry = entry.expect("read uploaded bundle entry");
+            entry.path().expect("bundle path").display().to_string()
+        })
+        .collect()
+}
+
+/// Unpack the WHOLE uploaded archive into a temporary directory.
+///
+/// The bundle validator takes a bundle DIRECTORY, not a file: it cross-checks
+/// the manifest against the skills, the connectors, and the deploy targets
+/// beside it, so no single-file read can stand in for it. The returned
+/// `TempDir` owns the directory, so callers must hold it for as long as they
+/// read the path.
+fn unpacked_uploaded_bundle(fixture: &Fixture) -> tempfile::TempDir {
+    let directory = tempfile::tempdir().expect("temporary directory for the uploaded bundle");
+    let decoder = GzDecoder::new(Cursor::new(uploaded_bundle_archive(fixture)));
+    let mut archive = tar::Archive::new(decoder);
+    archive
+        .unpack(directory.path())
+        .expect("unpack the uploaded bundle archive");
+    directory
+}
+
+/// Parse a rendered multi-document manifest into its documents.
+fn manifest_documents(rendered: &str) -> Vec<Value> {
+    serde_norway::Deserializer::from_str(rendered)
+        .into_iter()
+        .map(|document| -> Value {
+            serde::Deserialize::deserialize(document)
+                .unwrap_or_else(|error| panic!("rendered manifest must be valid YAML: {error}"))
+        })
+        .collect()
+}
+
+fn uploaded_bundle_file(fixture: &Fixture, wanted: &str) -> Vec<u8> {
+    let decoder = GzDecoder::new(Cursor::new(uploaded_bundle_archive(fixture)));
     let mut archive = tar::Archive::new(decoder);
     for entry in archive.entries().expect("read uploaded bundle archive") {
         let mut entry = entry.expect("read uploaded bundle entry");
@@ -2351,5 +2441,479 @@ fn helm_timeout_recovery_names_the_selected_observability_namespace() {
             "kubectl delete secret -n observability -l owner=helm,name=grafana,status=pending-upgrade"
         ),
         "timeout recovery must not name the default observability namespace: {text}"
+    );
+}
+
+/// AC3: the `--write-allowlist` path must upload a bundle the CLUSTER tier will
+/// accept, and it must mint its write identity only after the deploy landed.
+///
+/// Issue #1946's evidence block is this bundle being refused: a connector that
+/// declares only `build:` records a LOCAL image id, and `BUNDLE_FILES` carries
+/// no `connectors/` build context, so the cluster preflight had nothing to pull
+/// and nothing to build. Nothing pinned that, which is why it regressed once and
+/// could regress again the next time a connector is added.
+///
+/// This is the assertion that NEVER SKIPS. It is a pure-Rust mirror of what
+/// `lock_preflight` enforces at `DeployTier::Cluster`, so it holds the same
+/// property as the bundle validator below without needing `uv` on PATH -- and
+/// the validator test does not run in the `rust:` CI job at all.
+///
+/// The connector properties are asserted by ITERATING the uploaded declaration
+/// rather than by naming `k8s-write`. A per-connector assertion is what makes a
+/// future connector fail this test instead of slipping past it; naming the one
+/// we already know about would pin the incident and not the class.
+#[test]
+fn write_allowlist_install_uploads_a_bundle_the_cluster_tier_accepts() {
+    let fixture = Fixture::with_modes(
+        nodes(vec![node("node-a", "4Gi", true)]),
+        pods(vec![]),
+        "success",
+        "success",
+        "success",
+    );
+    let output = fixture.run(&["--write-allowlist", "prod/api"]);
+    let text = shown(&output);
+    assert!(
+        output.status.success(),
+        "the named-target write install must complete: {text}"
+    );
+
+    let connectors_yaml = String::from_utf8(uploaded_bundle_file(&fixture, "connectors.yaml"))
+        .expect("uploaded connectors are UTF-8");
+    let declaration: Value = serde_norway::from_str(&connectors_yaml)
+        .expect("uploaded connectors must remain valid YAML");
+    let connectors = declaration["connectors"].as_object().unwrap_or_else(|| {
+        panic!("the uploaded bundle must declare connectors: {connectors_yaml}")
+    });
+    assert!(
+        !connectors.is_empty(),
+        "an empty connector map would satisfy every loop below vacuously: {connectors_yaml}"
+    );
+    for (name, connector) in connectors {
+        assert!(
+            connector.get("build").is_none(),
+            "connector {name} still asks the cluster deploy path to build it; a `build:` \
+             declaration records a local image id the cluster tier refuses, and the bundle \
+             carries no build context to fall back on: {connector:?}"
+        );
+        if let Some(image) = connector.get("image") {
+            let image = image
+                .as_str()
+                .unwrap_or_else(|| panic!("connector {name} image must be a string: {image:?}"));
+            assert!(
+                image.contains("@sha256:"),
+                "connector {name} must be pinned by digest rather than by a mutable tag, got \
+                 {image}"
+            );
+        }
+    }
+    let write = &declaration["connectors"]["k8s-write"];
+    let write_image = write["image"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the write connector must carry a resolved image: {write:?}"));
+    assert!(
+        write_image.starts_with("ghcr.io/curie-eng/curie-sre-bot-k8s-write@sha256:"),
+        "the write connector must run the PUBLISHED image, pinned by digest, got {write_image}"
+    );
+    assert_eq!(
+        write["env"]["K8S_WRITE_ALLOWLIST"], "prod/api",
+        "the connector-side ceiling must state exactly the targets named at install time"
+    );
+    // Correct precisely BECAUSE no connector declares `build:`: a lock file
+    // exists to record the image id of something that had to be built, so a
+    // fully digest-pinned declaration needs none. If one ever appears here it
+    // means a build declaration came back with it.
+    let paths = uploaded_bundle_paths(&fixture);
+    assert!(
+        !paths.iter().any(|path| path == "connectors.lock.yaml"),
+        "a fully digest-pinned declaration needs no connector lock: {paths:?}"
+    );
+
+    // The API-server-side half of the ceiling. #1886's incident was these two
+    // allowlists drifting apart, which is a 403 AFTER a human approved the call.
+    let write_role = fixture.applied_file("write-role.yaml");
+    let documents = manifest_documents(&write_role);
+    let role = documents
+        .iter()
+        .find(|document| document["kind"] == "Role")
+        .unwrap_or_else(|| panic!("named targets must render a Role: {write_role}"));
+    assert_eq!(
+        role["metadata"]["namespace"], "prod",
+        "the Role must live in the target's namespace: {write_role}"
+    );
+    assert_eq!(
+        role["rules"][0]["resourceNames"],
+        json!(["api"]),
+        "the Role must be scoped to exactly the named Deployment: {write_role}"
+    );
+    let binding = documents
+        .iter()
+        .find(|document| document["kind"] == "RoleBinding")
+        .unwrap_or_else(|| panic!("named targets must render a RoleBinding: {write_role}"));
+    assert_eq!(binding["metadata"]["namespace"], "prod");
+    assert_eq!(binding["roleRef"]["name"], "sre-bot-writer");
+    assert_eq!(binding["subjects"][0]["name"], "sre-bot-writer");
+    // The occurrence the shipped manifest's own comment warns is easy to miss:
+    // a RoleBinding whose subject namespace is wrong still applies cleanly and
+    // grants nothing.
+    assert_eq!(
+        binding["subjects"][0]["namespace"], "curie",
+        "the RoleBinding must bind the ServiceAccount in the Curie namespace: {write_role}"
+    );
+
+    // AC2, pinned in one log. The writer is a NON-EXPIRING ServiceAccount token
+    // carrying `get,patch` on `apps/deployments`, so it must not exist until the
+    // deploy it belongs to has landed. Before #1946 the apply ran before the
+    // release API key was even discovered, which put the whole deploy inside the
+    // window where a failure stranded a live write credential.
+    let kubectl = fixture.kubectl_calls();
+    let write_role_apply = kubectl
+        .iter()
+        .position(|call| {
+            call.starts_with("apply -f ") && call.ends_with("manifests/write-role.yaml")
+        })
+        .unwrap_or_else(|| {
+            panic!("the installer must apply the rendered write identity: {kubectl:?}")
+        });
+    let api_key_discovery = kubectl
+        .iter()
+        .rposition(|call| {
+            call.contains("get secret") && call.contains("app.kubernetes.io/instance=curie")
+        })
+        .unwrap_or_else(|| panic!("the deploy must discover the release API key: {kubectl:?}"));
+    let reader_token_read = kubectl
+        .iter()
+        .position(|call| call.contains("get secret sre-bot-reader-token"))
+        .unwrap_or_else(|| panic!("the installer must read the reader token: {kubectl:?}"));
+    assert!(
+        write_role_apply > api_key_discovery && write_role_apply > reader_token_read,
+        "the write identity must be minted AFTER the deploy: write-role apply at \
+         {write_role_apply}, API key discovery at {api_key_discovery}, reader token read at \
+         {reader_token_read}: {kubectl:?}"
+    );
+}
+
+/// AC3, the bundle-validator leg: hand the uploaded bundle to the authoritative
+/// `plugin_format.validate_bundle` and take its verdict rather than a
+/// re-derivation of it.
+///
+/// SKIPS WHEN `uv` IS ABSENT, and one thing differs from the `chart_check.rs`
+/// precedent this posture is borrowed from, so it is stated rather than
+/// implied: `chart_check.rs` skips locally but its assertions are guaranteed to
+/// run in `helm-ci`, which installs `uv` and runs `uv sync`. The `rust:` job in
+/// `.github/workflows/ci.yaml` does NOT install `uv`, so this test skips in CI
+/// today and gates nothing there. It is a local-developer check.
+///
+/// `write_allowlist_install_uploads_a_bundle_the_cluster_tier_accepts` above is
+/// the assertion that GATES, and its properties are written to stand alone
+/// without Python for exactly that reason. Installing `uv` in the `rust:` job is
+/// a deferred follow-up: it is a workflow edit, which pulls in the workflow-path
+/// gate and a full-suite requirement, and that is a different review than this
+/// one.
+///
+/// Negative control, recorded so the skip is not mistaken for a test that
+/// cannot bite: if `build:` survived into the uploaded bundle, this validator
+/// reports `connectors.build_context_missing`, because the bundle allowlist
+/// carries no `connectors/` directory. That is issue #1946's own evidence
+/// block.
+#[test]
+fn write_allowlist_bundle_passes_the_real_bundle_validator() {
+    if Command::new("uv").arg("--version").output().is_err() {
+        eprintln!(
+            "skipping write_allowlist_bundle_passes_the_real_bundle_validator: uv is not on PATH"
+        );
+        return;
+    }
+
+    let fixture = Fixture::with_modes(
+        nodes(vec![node("node-a", "4Gi", true)]),
+        pods(vec![]),
+        "success",
+        "success",
+        "success",
+    );
+    let output = fixture.run(&["--write-allowlist", "prod/api"]);
+    let text = shown(&output);
+    assert!(
+        output.status.success(),
+        "the named-target write install must complete: {text}"
+    );
+
+    let bundle = unpacked_uploaded_bundle(&fixture);
+    let validation = Command::new("uv")
+        .current_dir(repo_root())
+        .args([
+            "run",
+            "--frozen",
+            "python",
+            "-c",
+            "import sys\n\
+             from plugin_format import validate_bundle\n\
+             print(validate_bundle(sys.argv[1]).model_dump_json())\n",
+        ])
+        .arg(bundle.path())
+        .output()
+        .expect("run the bundle validator");
+    let stdout = String::from_utf8_lossy(&validation.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&validation.stderr).to_string();
+    assert!(
+        validation.status.success(),
+        "the bundle validator must run: stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let reported = stdout
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_else(|| panic!("the validator must report a result: stderr:\n{stderr}"));
+    let result: Value = serde_json::from_str(reported)
+        .unwrap_or_else(|error| panic!("validator output must be JSON ({error}): {reported}"));
+    assert_eq!(
+        result["errors"],
+        json!([]),
+        "the uploaded bundle must carry no validation errors: {reported}"
+    );
+    assert_eq!(
+        result["valid"],
+        json!(true),
+        "the uploaded bundle must be valid: {reported}"
+    );
+}
+
+/// AC2: a failed deploy must leave NO write RBAC and NO writer token behind.
+///
+/// The writer identity is a non-expiring `kubernetes.io/service-account-token`
+/// plus, with named targets, `get,patch` on `apps/deployments` -- and `patch` on
+/// a Deployment is `set image` and `set env`, not just a restart. Creating it
+/// before the deploy meant any failure in between (unreachable API server,
+/// rate-limited RBAC, a dead port-forward) left that credential standing with no
+/// bot attached and no teardown path.
+///
+/// The remedy is DEFERRAL, not rollback, so this test looks for the apply never
+/// having happened rather than for a compensating delete: a rollback needs the
+/// same cluster API call that just failed.
+#[test]
+fn a_failed_deploy_leaves_no_write_rbac_or_writer_token_behind() {
+    let fixture = Fixture::with_modes(
+        nodes(vec![node("node-a", "4Gi", true)]),
+        pods(vec![]),
+        "success",
+        "success",
+        "success",
+    )
+    .with_deploy_failure();
+    let output = fixture.run(&["--write-allowlist", "prod/api"]);
+    let text = shown(&output);
+    assert!(
+        !output.status.success(),
+        "a refused deployment must fail the install: {text}"
+    );
+
+    let kubectl = fixture.kubectl_calls();
+    assert!(
+        !kubectl
+            .iter()
+            .any(|call| call.contains("manifests/write-role.yaml")),
+        "a failed deploy must not have applied the write RBAC: {kubectl:?}"
+    );
+    assert!(
+        !kubectl
+            .iter()
+            .any(|call| call.contains("sre-bot-writer-token")),
+        "a failed deploy must neither wait for nor read the writer token: {kubectl:?}"
+    );
+    // Asserted as an absent file rather than through `applied_file`, which
+    // panics on a miss and would report the wrong thing.
+    assert!(
+        !fixture.applied_dir.join("write-role.yaml").exists(),
+        "a failed deploy must leave no rendered write identity behind: {:?}",
+        fs::read_dir(&fixture.applied_dir).map(|entries| entries
+            .flatten()
+            .map(|entry| entry.file_name())
+            .collect::<Vec<_>>())
+    );
+
+    // ANTI-VACUITY. Without this the test passes trivially on any early abort --
+    // a capacity refusal, a registry failure, a reader-token timeout -- which is
+    // exactly how a reordering bug would hide behind a green run. The assertions
+    // above only mean something if this run really did get as far as the deploy.
+    assert!(
+        fixture.applied_dir.join("read-access.yaml").exists(),
+        "the run must have reached the reader RBAC apply"
+    );
+    assert!(
+        kubectl
+            .iter()
+            .any(|call| call.contains("get secret sre-bot-reader-token")),
+        "the run must have read the reader token: {kubectl:?}"
+    );
+    let requests = fixture.api.recorded();
+    let version = requests
+        .iter()
+        .position(|request| {
+            request.method == "POST" && request.path == format!("/agents/{AGENT_ID}/versions")
+        })
+        .unwrap_or_else(|| panic!("the run must have created a version: {requests:?}"));
+    let upload = requests
+        .iter()
+        .position(|request| request.method == "PUT" && request.path.ends_with("/bundle"))
+        .unwrap_or_else(|| panic!("the run must have uploaded the bundle: {requests:?}"));
+    let deployment = requests
+        .iter()
+        .position(|request| request.method == "POST" && request.path == "/deployments")
+        .unwrap_or_else(|| panic!("the run must have attempted the deployment: {requests:?}"));
+    assert!(
+        version < upload && upload < deployment,
+        "the failure must be the DEPLOY, reached after the bundle was already uploaded: \
+         version at {version}, upload at {upload}, deployment at {deployment}"
+    );
+}
+
+/// AC4a: `--no-write` stays behaviourally read only, asserted on the wire.
+///
+/// `read_only_install_is_unchanged_by_the_new_flag` and
+/// `opting_out_leaves_the_write_connector_absent` prove this at helper level;
+/// both stay, because they are cheaper and they localise a failure. This lifts
+/// the same property to what the platform actually receives, which is where a
+/// regression would be visible to an operator.
+#[test]
+fn no_write_install_stays_behaviourally_read_only() {
+    let fixture = Fixture::with_modes(
+        nodes(vec![node("node-a", "4Gi", true)]),
+        pods(vec![]),
+        "success",
+        "success",
+        "success",
+    );
+    let output = fixture.run(&["--no-write"]);
+    let text = shown(&output);
+    assert!(
+        output.status.success(),
+        "the read only install must complete: {text}"
+    );
+
+    let connectors_yaml = String::from_utf8(uploaded_bundle_file(&fixture, "connectors.yaml"))
+        .expect("uploaded connectors are UTF-8");
+    let declaration: Value = serde_norway::from_str(&connectors_yaml)
+        .expect("uploaded connectors must remain valid YAML");
+    let connectors = declaration["connectors"].as_object().unwrap_or_else(|| {
+        panic!("the uploaded bundle must declare connectors: {connectors_yaml}")
+    });
+    for absent in ["k8s-write", "k8s-scale"] {
+        assert!(
+            !connectors.contains_key(absent),
+            "the read only install must not ship connector {absent}: {connectors_yaml}"
+        );
+    }
+
+    let plugin: Value = serde_json::from_slice(&uploaded_bundle_file(
+        &fixture,
+        ".claude-plugin/plugin.json",
+    ))
+    .expect("uploaded plugin manifest must remain valid JSON");
+    // A gate naming a connector this install removed fails bundle validation for
+    // everyone, so the policy leaves WITH the connectors it guards.
+    assert!(
+        plugin.get("approvalPolicy").is_none(),
+        "a bundle with no write verbs must declare no approval policy: {plugin}"
+    );
+
+    assert!(
+        !fixture.applied_dir.join("write-role.yaml").exists(),
+        "the read only install must render and apply no write identity"
+    );
+    let kubectl = fixture.kubectl_calls();
+    assert!(
+        !kubectl
+            .iter()
+            .any(|call| call.contains("sre-bot-writer-token")),
+        "the read only install must never touch the writer token: {kubectl:?}"
+    );
+
+    // The registry count is the observable proof that the connector was dropped
+    // BEFORE its image was resolved -- a `--no-write` install must make no
+    // registry call for an image it will never run. Counted rather than merely
+    // absent, and asserted here rather than by relaxing the count in
+    // `successful_install_uploads_only_the_resolved_tempo_index_digest`, which
+    // pins the four-request default.
+    let registry = fixture.registry.recorded();
+    assert_eq!(
+        registry.len(),
+        2,
+        "only Tempo may be resolved, at one scoped token plus one index request: {:?}",
+        registry
+            .iter()
+            .map(|request| request.path.clone())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !registry
+            .iter()
+            .any(|request| request.path.contains("curie-sre-bot-k8s-write")),
+        "the read only install must make no registry request for the write image: {:?}",
+        registry
+            .iter()
+            .map(|request| request.path.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+/// AC4b: the no-flag default keeps the connector with an EMPTY ceiling and
+/// renders NO Role.
+///
+/// This is #1886's load-bearing invariant and no integration test pinned it. An
+/// RBAC rule whose `resourceNames` is empty or absent does not grant nothing --
+/// it grants the verb on EVERY resource of that type. So the empty case must
+/// OMIT the Role rather than render one with no names, and a nameless Role would
+/// hand the bot patch on every Deployment in the namespace: the opposite of what
+/// an empty allowlist reads like, and it would look correct in review.
+///
+/// The identity is still minted, because bring-up refuses without
+/// `K8S_WRITE_KUBECONFIG`; an identity that can do nothing is what makes
+/// "installed, ceiling empty" a state the platform can boot.
+#[test]
+fn default_install_keeps_the_empty_ceiling_and_renders_no_role() {
+    let fixture = Fixture::with_modes(
+        nodes(vec![node("node-a", "4Gi", true)]),
+        pods(vec![]),
+        "success",
+        "success",
+        "success",
+    );
+    let output = fixture.run(&[]);
+    let text = shown(&output);
+    assert!(
+        output.status.success(),
+        "the default install must complete: {text}"
+    );
+
+    let connectors_yaml = String::from_utf8(uploaded_bundle_file(&fixture, "connectors.yaml"))
+        .expect("uploaded connectors are UTF-8");
+    let declaration: Value = serde_norway::from_str(&connectors_yaml)
+        .expect("uploaded connectors must remain valid YAML");
+    assert_eq!(
+        declaration["connectors"]["k8s-write"]["env"]["K8S_WRITE_ALLOWLIST"], "",
+        "with no targets named the connector-side ceiling must be empty, so every call is \
+         refused: {connectors_yaml}"
+    );
+
+    let write_role = fixture.applied_file("write-role.yaml");
+    let kinds: Vec<String> = manifest_documents(&write_role)
+        .iter()
+        .filter_map(|document| document["kind"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        kinds.iter().any(|kind| kind == "ServiceAccount"),
+        "the identity is minted either way: {write_role}"
+    );
+    assert!(
+        kinds.iter().any(|kind| kind == "Secret"),
+        "the non-expiring token Secret rides with the ServiceAccount: {write_role}"
+    );
+    assert!(
+        !kinds
+            .iter()
+            .any(|kind| kind == "Role" || kind == "RoleBinding"),
+        "an empty ceiling must render NO Role -- an empty resourceNames grants every \
+         Deployment, not none: {kinds:?} in {write_role}"
     );
 }
