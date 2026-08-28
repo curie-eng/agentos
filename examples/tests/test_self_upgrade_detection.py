@@ -25,6 +25,7 @@ from redeploy import (  # noqa: E402
     BUNDLE_PREFIX,
     SelfUpgradeError,
     bundle_from_repo_tarball,
+    deploy,
     deployed_commit,
     member_of,
     pin_build_connectors,
@@ -270,3 +271,42 @@ def test_no_active_deployment_reads_as_unknown(monkeypatch: pytest.MonkeyPatch) 
     _patched(monkeypatch, api)
     _agent, commit, version_id = deployed_commit("http://api", "k", "sre-bot")
     assert commit is None and version_id is None
+
+
+# --- the bundle upload is a form, not a body ---------------------------------
+#
+# The endpoint is an upload rather than a document write. A raw PUT is refused
+# with a 422 naming a field the caller never knew about:
+#     {"loc": ["body", "file"], "msg": "Field required"}
+# It failed exactly there on the live install, after the job had already fetched
+# the bundle, resolved three image digests and created the version -- so the cost
+# of getting this wrong is a version row with no bundle behind it.
+
+
+def test_the_bundle_is_uploaded_as_a_multipart_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import redeploy
+
+    seen: list[dict] = []
+
+    def _fake(api_url, api_key, path, *, method="GET", body=None, content_type="application/json"):
+        seen.append({"path": path, "method": method, "body": body, "content_type": content_type})
+        if path.endswith("/versions"):
+            return json.dumps({"id": "v-1"}).encode()
+        return b"{}"
+
+    monkeypatch.setattr(redeploy, "_api", _fake)
+    deploy("http://api", "k", "agent-1", b"BUNDLEBYTES", "d" * 40)
+
+    upload = next(c for c in seen if c["path"].endswith("/bundle"))
+    assert upload["content_type"].startswith("multipart/form-data; boundary=")
+    boundary = upload["content_type"].split("boundary=", 1)[1]
+    assert upload["body"].startswith(f"--{boundary}\r\n".encode())
+    assert b'name="file"; filename="bundle.tar.gz"' in upload["body"]
+    assert b"BUNDLEBYTES" in upload["body"], "the bundle itself must survive the framing"
+    assert upload["body"].endswith(f"\r\n--{boundary}--\r\n".encode())
+
+    # And the order still holds: create, upload, then deploy -- so a failure
+    # never leaves a version marked active with no bundle behind it.
+    assert [c["path"].rsplit("/", 1)[-1] for c in seen] == ["versions", "bundle", "deployments"]
