@@ -44,6 +44,14 @@ spec:
       {{- with (include "curie.placement.spec" .Values.placement.platform) }}
       {{- . | nindent 6 }}
       {{- end }}
+      {{- if .Values.langfuse.clickhouseReadiness.enabled }}
+      initContainers:
+        {{- include "curie.langfuse.clickhouseGate" (dict
+             "root" .
+             "image" .Values.langfuse.image.web
+             "containerSecurityContext" .Values.langfuse.web.containerSecurityContext
+             "resources" .Values.langfuse.web.resources) | nindent 8 }}
+      {{- end }}
       containers:
         - name: langfuse-web
           image: "{{ .Values.langfuse.image.web }}:{{ .Values.langfuse.image.tag }}"
@@ -138,6 +146,14 @@ spec:
     spec:
       {{- with (include "curie.placement.spec" .Values.placement.platform) }}
       {{- . | nindent 6 }}
+      {{- end }}
+      {{- if .Values.langfuse.clickhouseReadiness.enabled }}
+      initContainers:
+        {{- include "curie.langfuse.clickhouseGate" (dict
+             "root" .
+             "image" .Values.langfuse.image.worker
+             "containerSecurityContext" .Values.langfuse.worker.containerSecurityContext
+             "resources" .Values.langfuse.worker.resources) | nindent 8 }}
       {{- end }}
       containers:
         - name: langfuse-worker
