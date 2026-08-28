@@ -12,17 +12,19 @@
 # `state`-scoped token and nothing else, deliberately. So the work sits outside
 # the sandbox, and the bot's own authority is unchanged by this file.
 #
-# WHY IT ONLY REPORTS. See redeploy.py's header: the bundle in the repository
-# declares `build:` for three connectors, and a cluster deploy is refused for an
-# image that exists only in a local Docker daemon. Deploying the repository copy
-# verbatim would create a version whose connectors cannot start -- a redeploy
-# that reports success and leaves the bot with no tools. The missing step is
-# digest resolution, which needs those connectors published first (curie#1945).
+# HOW IT DEPLOYS SAFELY. The bundle in the repository declares `build:` for its
+# connectors, which records a LOCAL image id the cluster tier refuses, and it
+# ships PLACEHOLDER allowlists. Deploying it verbatim would produce a bot whose
+# connectors cannot start, or one that refuses every write and looks like it
+# simply chose not to act. So the job pins each `build:` connector to the image
+# `release.yaml` published for THIS commit (`sha-<commit>`, so the images can
+# only ever be the ones built from the bundle being deployed), and carries the
+# ceilings the install is actually running across from the rendered objects.
 #
-# THE TOKEN. `GITHUB_TOKEN` needs `contents: read` on the repository and nothing
-# else. Without it the job exits non-zero and says so: a job that cannot tell
-# whether it is behind must not report success, because a silent "nothing to do"
-# is indistinguishable from "up to date" and can stay that way for months.
+# THE TOKEN. Optional while the repository is public. On a private one
+# `GITHUB_TOKEN` needs `contents: read` and nothing else; without it the job
+# exits non-zero and says so, because a silent "nothing to do" is
+# indistinguishable from "up to date" and can stay that way for months.
 ---
 apiVersion: batch/v1
 kind: CronJob
@@ -49,9 +51,12 @@ spec:
             seccompProfile: { type: RuntimeDefault }
           containers:
             - name: check
-              # Any image with a python3 and no extra packages: the script is
-              # stdlib only, on purpose, so this needs no build of its own.
-              image: python:3.13-alpine
+              # The platform's own API image, because the script needs a YAML
+              # parser to rewrite the connector declaration and this image
+              # already carries one. A bare `python:` image plus a pip install
+              # would put a package download in the deploy path.
+              # CHANGE ME to match the release's version.
+              image: ghcr.io/curie-eng/curie-api:0.7.0
               command: ["python3", "/opt/self-upgrade/redeploy.py"]
               env:
                 - name: CURIE_API_URL
@@ -63,6 +68,12 @@ spec:
                   value: main
                 - name: CURIE_SELF_UPGRADE_AGENT
                   value: sre-bot
+                # The rendered connector objects are namespaced by the release
+                # that owns them, so reading the running ceilings needs both.
+                - name: CURIE_SELF_UPGRADE_RELEASE
+                  value: curie
+                - name: CURIE_SELF_UPGRADE_NAMESPACE
+                  value: curie
                 - name: CURIE_API_KEY
                   valueFrom:
                     secretKeyRef:

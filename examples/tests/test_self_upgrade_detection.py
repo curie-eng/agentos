@@ -16,6 +16,7 @@ import tarfile
 from pathlib import Path
 
 import pytest
+import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "sre-bot" / "self-upgrade"))
 
@@ -23,8 +24,9 @@ from redeploy import (  # noqa: E402
     BUNDLE_PREFIX,
     SelfUpgradeError,
     bundle_from_repo_tarball,
-    deployed_bundle_file,
-    with_connectors_from,
+    member_of,
+    pin_build_connectors,
+    replace_member,
 )
 
 
@@ -107,13 +109,17 @@ def test_a_symlink_inside_the_bundle_is_dropped() -> None:
     assert _names(bundle_from_repo_tarball(out.getvalue())) == [".claude-plugin/plugin.json"]
 
 
-# --- carrying the deployed connector declaration forward ----------------------
+# --- pinning images from the commit being deployed ---------------------------
 #
-# The repository's `connectors.yaml` declares `build:`, which records a LOCAL
-# image id the cluster tier refuses. Resolving those to published digests is the
-# installer's job. This job carries the DEPLOYED declaration forward instead,
-# which is only sound while that declaration has not changed -- checked by the
-# caller, and refused rather than guessed.
+# The repository declares `build:` for its connectors, which records a LOCAL
+# image id the cluster tier refuses. `release.yaml` publishes each connector on
+# every release-branch push tagged `sha-<commit>`, so the images that belong with
+# a bundle are derivable from the bundle's own commit.
+#
+# The second substitution is the one that is easy to forget: the declaration in
+# the repository ships PLACEHOLDER allowlists, and deploying those verbatim would
+# leave every write connector refusing every call -- which reads exactly like a
+# working bot that has decided not to act.
 
 
 def _bundle(files: dict[str, bytes]) -> bytes:
@@ -135,49 +141,54 @@ def _read(bundle: bytes) -> dict[str, bytes]:
         }
 
 
-def test_only_the_connector_declaration_is_carried_forward() -> None:
-    new = _bundle(
-        {
-            "connectors.yaml": b"connectors:\n  tempo:\n    build: connectors/tempo\n",
-            "skills/sre-bot/SKILL.md": b"the new skill",
-            ".claude-plugin/plugin.json": b'{"name":"sre-bot"}',
-        }
-    )
-    deployed = b"connectors:\n  tempo:\n    image: ghcr.io/x@sha256:deadbeef\n"
-
-    merged = _read(with_connectors_from(new, deployed))
-
-    assert merged["connectors.yaml"] == deployed, "the resolved declaration must win"
-    assert merged["skills/sre-bot/SKILL.md"] == b"the new skill", (
-        "everything else must come from the new bundle -- carrying the whole "
-        "deployed bundle forward would make the upgrade a no-op"
-    )
-    assert merged[".claude-plugin/plugin.json"] == b'{"name":"sre-bot"}'
+DECLARATION = b"""connectors:
+  kubernetes:
+    image: ghcr.io/containers/kubernetes-mcp-server@sha256:aaa
+  k8s-write:
+    build:
+      context: connectors/k8s-write
+    env:
+      K8S_WRITE_ALLOWLIST: <namespace>/<deployment>
+"""
 
 
-def test_a_bundle_with_no_connector_declaration_still_round_trips() -> None:
-    # `build:`-free bundles exist (the weather example), and the substitution must
-    # not invent a file that was never there.
-    new = _bundle({"skills/sre-bot/SKILL.md": b"only a skill"})
-    merged = _read(with_connectors_from(new, b"unused"))
-    assert merged == {"skills/sre-bot/SKILL.md": b"only a skill"}
-
-
-def test_a_missing_deployed_declaration_is_an_error_not_a_default() -> None:
-    # Falling back to the repository's `build:` copy here would deploy a bundle
-    # whose connectors cannot start, and report success doing it.
-    class _Stub:
-        @staticmethod
-        def urlopen(*_args, **_kwargs):  # pragma: no cover - not reached
-            raise AssertionError("no network in this test")
-
+@pytest.fixture
+def offline_registry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No registry in a unit test; the resolution itself is exercised live."""
     import redeploy
 
-    original = redeploy._api
-    redeploy._api = lambda *_a, **_k: b'{"files": [{"path": "skills/sre-bot/SKILL.md"}]}'
-    try:
-        with pytest.raises(SelfUpgradeError) as excinfo:
-            deployed_bundle_file("http://api", "k", "agent", "version", "connectors.yaml")
-    finally:
-        redeploy._api = original
-    assert "connectors.yaml" in str(excinfo.value)
+    monkeypatch.setattr(redeploy, "resolve_digest", lambda _c, _commit: "sha256:fixture")
+
+
+def test_a_build_connector_is_pinned_to_the_commits_published_image(
+    offline_registry: None,
+) -> None:
+    parsed = yaml.safe_load(pin_build_connectors(DECLARATION, "c" * 40, {"k8s-write": {}}))
+    write = parsed["connectors"]["k8s-write"]
+    assert "build" not in write, "a build declaration cannot reach a cluster deploy"
+    assert write["image"] == ("ghcr.io/curie-eng/curie-sre-bot-k8s-write@sha256:fixture")
+    # An already-pinned connector is left alone rather than re-resolved.
+    assert parsed["connectors"]["kubernetes"]["image"].endswith("@sha256:aaa")
+
+
+def test_the_running_ceiling_survives_the_upgrade(offline_registry: None) -> None:
+    # The placeholder in the repository would refuse every call, and a bot that
+    # refuses everything looks exactly like a bot that chose not to act.
+    parsed = yaml.safe_load(
+        pin_build_connectors(
+            DECLARATION, "c" * 40, {"k8s-write": {"K8S_WRITE_ALLOWLIST": "ns/one,ns/two"}}
+        )
+    )
+    assert parsed["connectors"]["k8s-write"]["env"]["K8S_WRITE_ALLOWLIST"] == "ns/one,ns/two"
+
+
+def test_replacing_one_member_leaves_the_others_byte_for_byte() -> None:
+    original = _bundle({"connectors.yaml": b"old", "skills/sre-bot/SKILL.md": b"the skill"})
+    swapped = _read(replace_member(original, "connectors.yaml", b"new"))
+    assert swapped["connectors.yaml"] == b"new"
+    assert swapped["skills/sre-bot/SKILL.md"] == b"the skill"
+
+
+def test_a_missing_member_is_an_error_rather_than_an_empty_file() -> None:
+    with pytest.raises(SelfUpgradeError):
+        member_of(_bundle({"skills/sre-bot/SKILL.md": b"x"}), "connectors.yaml")

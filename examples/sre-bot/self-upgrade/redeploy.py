@@ -235,65 +235,144 @@ def bundle_from_repo_tarball(archive: bytes, prefix: str = BUNDLE_PREFIX) -> byt
     return out.getvalue()
 
 
-def paths_changed(repo: str, base: str, head: str, token: str | None) -> set[str]:
-    """Repository paths that differ between two commits.
+def resolve_digest(connector: str, commit: str) -> str:
+    """The published image digest for one connector at one commit.
 
-    One API call, and it replaces the thing this job cannot do: parse
-    `connectors.yaml`. The runtime image is `python:3.13-alpine` with the standard
-    library and no YAML parser, and adding one to install a dependency at job time
-    would buy a parser in exchange for a network dependency in the deploy path.
+    `release.yaml` publishes every example connector on each push to a release
+    branch, tagged `sha-<commit>`. So the images that belong with a bundle are
+    derivable from the bundle's own commit -- no constant to keep in step, and a
+    deploy of commit X can only ever run images built from commit X.
+
+    Anonymous: the packages are public, like the repository. Verified against the
+    live registry rather than assumed.
     """
 
-    body = _get(
-        f"https://api.github.com/repos/{repo}/compare/{base}...{head}",
-        token,
-        "application/vnd.github+json",
+    repository = f"curie-eng/curie-sre-bot-{connector}"
+    token = json.loads(
+        _get(
+            f"https://ghcr.io/token?service=ghcr.io&scope=repository:{repository}:pull",
+            None,
+            "application/json",
+        )
+    ).get("token")
+    if not token:
+        raise SelfUpgradeError(f"ghcr.io issued no pull token for {repository}")
+    request = urllib.request.Request(
+        f"https://ghcr.io/v2/{repository}/manifests/sha-{commit}",
+        headers={
+            "Authorization": f"Bearer {token}",
+            # An index, not a single manifest: the cluster is arm64 here and
+            # amd64 elsewhere, and pinning one architecture's manifest would
+            # deploy an image that cannot run on the other.
+            "Accept": (
+                "application/vnd.oci.image.index.v1+json, "
+                "application/vnd.docker.distribution.manifest.list.v2+json"
+            ),
+            "User-Agent": "curie-sre-bot-self-upgrade",
+        },
+        method="HEAD",
     )
-    files = json.loads(body).get("files") or []
-    return {entry.get("filename", "") for entry in files}
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            digest = response.headers.get("Docker-Content-Digest")
+    except urllib.error.HTTPError as exc:
+        raise SelfUpgradeError(
+            f"no published image for {connector} at commit {commit[:12]} "
+            f"(HTTP {exc.code}). Every release-branch push publishes one, so a "
+            f"missing image means this commit's release build has not finished "
+            f"or did not run."
+        ) from exc
+    if not digest:
+        raise SelfUpgradeError(f"{repository} returned no digest header")
+    return str(digest)
 
 
-def deployed_bundle_file(
-    api_url: str, api_key: str, agent_id: str, version_id: str, path: str
+def pin_build_connectors(
+    declaration: bytes, commit: str, carried: dict[str, dict[str, str]]
 ) -> bytes:
-    """One file out of the version that is currently deployed."""
+    """Turn every `build:` connector into a digest-pinned `image:`.
 
-    body = _api(api_url, api_key, f"/agents/{agent_id}/versions/{version_id}/files")
-    for entry in json.loads(body).get("files") or []:
-        if entry.get("path") == path:
-            return str(entry.get("content", "")).encode()
-    raise SelfUpgradeError(
-        f"the deployed version carries no {path}; this job reuses it rather than "
-        f"resolving connector images itself, so it cannot proceed without it"
-    )
-
-
-def with_connectors_from(bundle: bytes, connectors: bytes) -> bytes:
-    """The new bundle, but keeping the deployed `connectors.yaml`.
-
-    The repository's copy declares `build:`, which records a LOCAL image id that
-    the cluster tier refuses -- a cluster cannot pull an image that exists only in
-    one machine's Docker daemon. Resolving those to published digests is the
-    installer's job and it needs a registry conversation this job has no business
-    having. The deployed copy already carries resolved digests, so the safe move
-    is to carry it forward unchanged.
-
-    Only sound while the declaration itself has not changed, which the caller
-    checks first and refuses on.
+    Two substitutions, and the second is the one that is easy to forget. A
+    `build:` block records a LOCAL image id, which the cluster tier refuses. And
+    the declaration in the repository ships PLACEHOLDER allowlists -- deploying
+    those verbatim would leave every write connector refusing every call, which
+    reads exactly like a working bot that has decided not to act. So the ceilings
+    the install is actually running are carried across.
     """
+
+    import yaml
+
+    parsed = yaml.safe_load(declaration)
+    for name, spec in (parsed.get("connectors") or {}).items():
+        if "build" in spec:
+            spec.pop("build")
+            spec["image"] = f"ghcr.io/curie-eng/curie-sre-bot-{name}@{resolve_digest(name, commit)}"
+        for key, value in (carried.get(name) or {}).items():
+            spec.setdefault("env", {})[key] = value
+    return yaml.safe_dump(parsed, sort_keys=False).encode()
+
+
+def running_connector_env(
+    api_url: str,
+    api_key: str,
+    agent_id: str,
+    version_id: str,
+    release: str,
+    namespace: str,
+) -> dict[str, dict[str, str]]:
+    """The env each connector is running with, read off the rendered objects.
+
+    The SOURCE `connectors.yaml` is not retrievable -- a version's file listing
+    carries the authored text (skill, manifest, eval cases) and not the connector
+    declaration. The RENDERED objects are, and they carry the resolved values,
+    which is what has to survive an upgrade.
+    """
+
+    query = f"?release={release}&namespace={namespace}&app_name=curie"
+    rendered = json.loads(
+        _api(api_url, api_key, f"/agents/{agent_id}/versions/{version_id}/connectors{query}")
+    )
+    out: dict[str, dict[str, str]] = {}
+    for manifest in rendered.get("manifests") or []:
+        if manifest.get("kind") != "Deployment":
+            continue
+        name = manifest["metadata"]["name"].rsplit("-mcp-", 1)[-1]
+        container = manifest["spec"]["template"]["spec"]["containers"][0]
+        out[name] = {
+            entry["name"]: entry["value"]
+            for entry in container.get("env") or []
+            if "value" in entry
+        }
+    return out
+
+
+def member_of(bundle: bytes, name: str) -> bytes:
+    """One file out of a bundle tarball."""
+
+    with tarfile.open(fileobj=io.BytesIO(bundle), mode="r:gz") as tar:
+        try:
+            extracted = tar.extractfile(name)
+        except KeyError:
+            extracted = None
+        if extracted is None:
+            raise SelfUpgradeError(f"the bundle carries no {name}")
+        return extracted.read()
+
+
+def replace_member(bundle: bytes, name: str, body: bytes) -> bytes:
+    """The same bundle with one file swapped, everything else byte for byte."""
 
     out = io.BytesIO()
     source = tarfile.open(fileobj=io.BytesIO(bundle), mode="r:gz")
     with source, tarfile.open(fileobj=out, mode="w:gz") as target:
         for member in source.getmembers():
-            if member.name == "connectors.yaml":
-                replacement = tarfile.TarInfo("connectors.yaml")
-                replacement.size = len(connectors)
+            if member.name == name:
+                replacement = tarfile.TarInfo(name)
+                replacement.size = len(body)
                 replacement.mode = member.mode
-                target.addfile(replacement, io.BytesIO(connectors))
+                target.addfile(replacement, io.BytesIO(body))
                 continue
-            extracted = source.extractfile(member)
-            target.addfile(member, extracted)
+            target.addfile(member, source.extractfile(member))
     return out.getvalue()
 
 
@@ -360,6 +439,10 @@ def main() -> int:
     api_key = os.environ.get("CURIE_API_KEY")
     token = os.environ.get("GITHUB_TOKEN") or None
     dry_run = os.environ.get("CURIE_SELF_UPGRADE_DRY_RUN", "").lower() in ("1", "true")
+    # The rendered connector objects are namespaced by the release that owns
+    # them, so the lookup needs both. Defaults match the chart's own.
+    release = os.environ.get("CURIE_SELF_UPGRADE_RELEASE", "curie")
+    namespace = os.environ.get("CURIE_SELF_UPGRADE_NAMESPACE", "curie")
 
     if not api_url or not api_key:
         print("CURIE_API_URL and CURIE_API_KEY are required", flush=True)
@@ -393,27 +476,18 @@ def main() -> int:
         return 1
 
     try:
-        # The one thing this job will not do. Resolving `build:` connectors to
-        # published digests is the installer's work; carrying the deployed
-        # declaration forward is only sound while that declaration has not moved.
-        if f"{BUNDLE_PREFIX}/connectors.yaml" in paths_changed(repo, current, tip, token):
-            print(
-                "connectors.yaml changed between the deployed commit and the tip. "
-                "This job carries the deployed connector declaration forward rather "
-                "than resolving images itself, so it refuses instead of deploying a "
-                "bundle whose connectors it cannot vouch for. Run the installer.",
-                flush=True,
-            )
-            return 1
-
         archive = _get(
             f"https://api.github.com/repos/{repo}/tarball/{tip}",
             token,
             "application/vnd.github+json",
         )
         bundle = bundle_from_repo_tarball(archive)
-        connectors = deployed_bundle_file(api_url, api_key, agent_id, version_id, "connectors.yaml")
-        bundle = with_connectors_from(bundle, connectors)
+        carried = running_connector_env(api_url, api_key, agent_id, version_id, release, namespace)
+        bundle = replace_member(
+            bundle,
+            "connectors.yaml",
+            pin_build_connectors(member_of(bundle, "connectors.yaml"), tip, carried),
+        )
         new_version = deploy(api_url, api_key, agent_id, bundle, tip)
     except SelfUpgradeError as exc:
         print(f"deploy failed: {exc}", flush=True)
