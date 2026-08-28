@@ -634,8 +634,13 @@ livenessProbe:
     secretKeyRef:
       name: {{ .Values.rustfs.existingSecret | default (include "curie.secretName" .) }}
       key: rustfsSecretKey
+{{- /* Both endpoints go through curie.rustfs.endpoint, never a literal
+       scheme. They were hardcoded http:// while api/worker/sandbox used the
+       helper, so a BYO store on rustfs.port 443 got https:// everywhere except
+       Langfuse, and trace ingestion died at the TLS handshake -- with the rest
+       of the release healthy, which is why nothing pointed at the cause. */}}
 - name: LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT
-  value: http://{{ include "curie.rustfs.host" . }}:{{ .Values.rustfs.port }}
+  value: {{ include "curie.rustfs.endpoint" . }}
 - name: LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE
   value: "true"
 - name: LANGFUSE_S3_EVENT_UPLOAD_PREFIX
@@ -652,7 +657,7 @@ livenessProbe:
       name: {{ .Values.rustfs.existingSecret | default (include "curie.secretName" .) }}
       key: rustfsSecretKey
 - name: LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT
-  value: http://{{ include "curie.rustfs.host" . }}:{{ .Values.rustfs.port }}
+  value: {{ include "curie.rustfs.endpoint" . }}
 - name: LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE
   value: "true"
 - name: LANGFUSE_S3_MEDIA_UPLOAD_PREFIX
