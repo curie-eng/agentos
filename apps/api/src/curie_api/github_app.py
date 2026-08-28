@@ -26,6 +26,7 @@ in GitHub" that ADR-0092 is buying.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -99,6 +100,23 @@ class GitHubAppError(RuntimeError):
     """The App is configured but could not produce a token."""
 
 
+class _GitHubNotFound(GitHubAppError):
+    """GitHub answered 404.
+
+    A subclass rather than a `not_found_message` parameter because the caller,
+    not `_request`, is the only thing that knows which 404 this is: the same
+    status on `/repos/{repo}/installation` means "the App was never installed"
+    while on `/access_tokens` it usually means "the id we cached was retired by
+    a reinstall". Callers that do not catch it still see the identical
+    `GitHubAppError` with the identical message, so `_request`'s contract is
+    unchanged.
+
+    Carries no extra state: the type IS the signal, and a `status_code`
+    attribute nothing ever read only invited a second way to ask the same
+    question.
+    """
+
+
 @dataclass
 class _CachedToken:
     token: str
@@ -114,11 +132,23 @@ class GitHubCredentials:
 
     Holds a token cache keyed by repository, so a burst of pushes to one repo
     costs one token exchange rather than one per push.
+
+    `clone_and_archive` runs under `run_in_threadpool`, so concurrent webhook
+    pushes hit this object from genuine OS threads. The per-repository mint lock
+    below is what stops eight simultaneous pushes from doing eight token
+    exchanges (measured: 8 threads, 5 distinct tokens) -- every one of those
+    tokens is valid, so this is rate-limit pressure rather than a correctness
+    bug, but it is free to avoid.
     """
 
     settings: Settings
     _tokens: dict[str, _CachedToken] = field(default_factory=dict)
     _installations: dict[str, int] = field(default_factory=dict)
+    # Per-repository, never global: a mint for one repo must not serialize a
+    # mint for another, and the HTTP call happens while this is held.
+    _mint_locks: dict[str, threading.Lock] = field(default_factory=dict)
+    # Guards only the dict above, and is never held across a network call.
+    _mint_locks_guard: threading.Lock = field(default_factory=threading.Lock)
 
     @property
     def app_configured(self) -> bool:
@@ -183,14 +213,28 @@ class GitHubCredentials:
         if not self.app_configured:
             return self.settings.github_token
 
-        now = time.time()
         cached = self._tokens.get(repo_full_name)
-        if cached is not None and cached.usable(now):
+        if cached is not None and cached.usable(time.time()):
             return cached.token
 
-        token, expires_at = self._mint_installation_token(repo_full_name)
-        self._tokens[repo_full_name] = _CachedToken(token=token, expires_at=expires_at)
-        return token
+        with self._mint_lock_for(repo_full_name):
+            # Double-checked: the thread that held this lock has almost
+            # certainly just populated the cache we lost the race to read.
+            cached = self._tokens.get(repo_full_name)
+            if cached is not None and cached.usable(time.time()):
+                return cached.token
+
+            token, expires_at = self._mint_installation_token(repo_full_name)
+            self._tokens[repo_full_name] = _CachedToken(token=token, expires_at=expires_at)
+            return token
+
+    def _mint_lock_for(self, repo_full_name: str) -> threading.Lock:
+        with self._mint_locks_guard:
+            lock = self._mint_locks.get(repo_full_name)
+            if lock is None:
+                lock = threading.Lock()
+                self._mint_locks[repo_full_name] = lock
+            return lock
 
     # -- GitHub App plumbing -------------------------------------------------
 
@@ -209,12 +253,21 @@ class GitHubCredentials:
                 f"is the App's full PEM private key: {type(exc).__name__}"
             ) from exc
 
-    def _installation_id(self, repo_full_name: str) -> int:
-        """The App's installation on this repository, discovered and cached."""
+    def _installation_id(self, repo_full_name: str) -> tuple[int, bool]:
+        """The App's installation on this repository, and whether it was cached.
+
+        The second element is what makes the retry in `_mint_installation_token`
+        safe to bound: re-discovering an id that discovery just produced would
+        only repeat the same 404.
+        """
 
         known = self._installations.get(repo_full_name)
         if known is not None:
-            return known
+            return known, True
+        return self._discover_installation_id(repo_full_name), False
+
+    def _discover_installation_id(self, repo_full_name: str) -> int:
+        """Ask GitHub which installation covers this repository, and cache it."""
 
         url = (
             f"{self.settings.github_api_url.rstrip('/')}"
@@ -228,7 +281,43 @@ class GitHubCredentials:
         return installation_id
 
     def _mint_installation_token(self, repo_full_name: str) -> tuple[str, float]:
-        installation_id = self._installation_id(repo_full_name)
+        installation_id, from_cache = self._installation_id(repo_full_name)
+        try:
+            return self._mint_for_installation(repo_full_name, installation_id)
+        except _GitHubNotFound as exc:
+            if not from_cache:
+                raise self._mint_404_error(
+                    repo_full_name, installation_id, re_discovered=False
+                ) from exc
+            # Reinstalling the App retires the old installation and issues a new
+            # id. `_installations` had no expiry, so every later mint POSTed to
+            # the retired id, 404'd, and never re-ran discovery -- recovery meant
+            # restarting the API. Evict and re-discover ONCE; the id we just used
+            # came from the cache, so a fresh one is genuinely new information.
+            logger.info(
+                "cached GitHub installation %s for %r 404'd on mint; re-discovering",
+                installation_id,
+                repo_full_name,
+            )
+            self._installations.pop(repo_full_name, None)
+
+        # Deliberately back through `_installation_id`, which reads the cache
+        # first, rather than calling `_discover_installation_id` directly: that
+        # is what makes the eviction above load-bearing. We hold this repo's
+        # mint lock, so nothing can repopulate the entry we just popped, and the
+        # lookup therefore misses and discovers. Call discovery directly and the
+        # eviction becomes decorative -- deleting it leaves every test green
+        # (#1257), because discovery would overwrite the stale entry anyway.
+        installation_id, _ = self._installation_id(repo_full_name)
+        try:
+            return self._mint_for_installation(repo_full_name, installation_id)
+        except _GitHubNotFound as exc:
+            # One retry, never a loop: discovery has now spoken twice.
+            raise self._mint_404_error(repo_full_name, installation_id, re_discovered=True) from exc
+
+    def _mint_for_installation(
+        self, repo_full_name: str, installation_id: int
+    ) -> tuple[str, float]:
         url = (
             f"{self.settings.github_api_url.rstrip('/')}"
             f"/app/installations/{installation_id}/access_tokens"
@@ -245,6 +334,41 @@ class GitHubCredentials:
         return token, self._expiry_seconds(data.get("expires_at"))
 
     @staticmethod
+    def _mint_404_error(
+        repo_full_name: str, installation_id: int, *, re_discovered: bool
+    ) -> GitHubAppError:
+        """The mint 404'd on an id discovery resolved. Two operator states, two texts.
+
+        Deliberately NOT the discovery wording in either case. Discovery
+        succeeded, so the App *is* registered on the repository, and telling the
+        operator to install it is precisely the advice that wasted their time
+        after a reinstall.
+
+        The two states are genuinely different and one sentence cannot be true of
+        both. On the fresh path nothing was ever cached, nothing was evicted and
+        nothing was re-discovered, so claiming a cached installation went stale
+        describes a sequence that did not happen and sends the operator hunting a
+        cache bug instead of the App's repository permissions (#1257).
+        """
+
+        if re_discovered:
+            middle = (
+                "The previously cached installation was stale, so it was evicted and "
+                "re-discovered -- and the re-discovered installation cannot mint either. "
+            )
+        else:
+            middle = (
+                "Discovery resolved that installation just now and nothing was cached, "
+                "so the App is registered on the repository. "
+            )
+        return GitHubAppError(
+            f"GitHub returned 404 minting an installation token for {repo_full_name!r} via "
+            f"installation {installation_id}. "
+            + middle
+            + f"Check the App's repository access and permissions for {repo_full_name!r}."
+        )
+
+    @staticmethod
     def _expiry_seconds(raw: Any) -> float:
         """When the token dies, as a monotonic-ish epoch second.
 
@@ -253,13 +377,23 @@ class GitHubCredentials:
         caching a dead token would fail every clone until restart.
         """
 
-        from datetime import datetime
+        from datetime import UTC, datetime
 
         if isinstance(raw, str):
             try:
-                return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+                parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
             except ValueError:
                 logger.warning("unparseable GitHub token expiry; assuming one hour")
+            else:
+                if parsed.tzinfo is None:
+                    # GitHub documents these as UTC. A value without `Z` or an
+                    # offset would otherwise be read in the container's local
+                    # zone by `.timestamp()`: under TZ=America/Los_Angeles a
+                    # 3600s token caches as 28800s and every clone 401s for
+                    # about seven hours. github.com always sends `Z`, but this
+                    # module already promises to survive one that does not.
+                    parsed = parsed.replace(tzinfo=UTC)
+                return parsed.timestamp()
         return time.time() + 3600
 
     # -- HTTP ----------------------------------------------------------------
@@ -286,8 +420,10 @@ class GitHubCredentials:
 
         if response.status_code == 404:
             # The single most likely operator mistake, and the one whose default
-            # message ("Not Found") explains nothing.
-            raise GitHubAppError(
+            # message ("Not Found") explains nothing. Raised as the subclass so
+            # the mint path can tell a retired installation id apart from an App
+            # that was never installed; uncaught, it reads identically.
+            raise _GitHubNotFound(
                 f"GitHub returned 404 for {url}. Usually this means the App is not "
                 "installed on that repository -- install it, or add the repository "
                 "to the existing installation."
