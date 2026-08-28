@@ -884,9 +884,22 @@ Create that Secret however you like — `kubectl create secret generic`, Externa
 Secrets Operator against AWS Secrets Manager or Vault, or Sealed Secrets. This
 is the same bring-your-own idiom every backing store in this chart uses.
 
+The CLI can point a release at it instead of a values file:
+
+```bash
+curie cluster github-app --app-id 1234567 --existing-secret my-github-app
+```
+
+`--existing-secret-key` defaults to `privateKey`, the same default as the chart.
+The command also rolls the API deployment onto the referenced Secret, so there
+is nothing further to restart.
+
 **Quick trial — let the chart hold it.** `curie cluster github-app --app-id …
 --private-key …` puts the PEM in the chart's own Secret. Fine to prove the flow
-works; move to `githubAppExistingSecret` before you rely on it.
+works; move to `githubAppExistingSecret` before you rely on it. Once a release
+has `githubAppExistingSecret` set, `--private-key` is refused rather than
+silently ignored — run `--existing-secret` again to adopt a (possibly new)
+BYO Secret, or `--disconnect` first to go back to the chart-held path.
 
 ### Rotating the key
 
@@ -894,12 +907,26 @@ A GitHub App can hold several private keys at once, so rotation has no downtime
 and needs no coordination with any repository:
 
 1. Generate a second private key on the App's settings page — both are now valid
-2. Deploy the new one (update your Secret, or re-run `curie cluster github-app`)
+2. Deploy the new one, and roll the API onto it:
+   - **BYO Secret**: update the Secret, then run
+     `curie cluster github-app --app-id <id> --existing-secret <name>` — it
+     performs the rollout for you. Updating the Secret alone is not enough.
+   - **Chart-held**: re-run
+     `curie cluster github-app --app-id <id> --private-key <path>` — same
+     rollout.
+   - If you update the Secret by hand and skip the CLI, you must run
+     `kubectl -n <ns> rollout restart deployment/<release>-api` yourself
+     before the next step.
 3. Delete the first key on GitHub
 
 Installations, permissions, and the App ID are untouched. This is a real
 advantage over a personal access token, where rotation means re-issuing the
 credential *and* re-authorizing what it could reach.
+
+Step 2 needs an explicit rollout because `GITHUB_APP_PRIVATE_KEY` reaches the
+api pod as a `secretKeyRef` environment variable, and Kubernetes resolves that
+exactly once, at pod start — nothing re-reads the Secret until the pod
+restarts.
 
 ### The other direct-passthrough credentials
 

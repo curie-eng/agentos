@@ -1669,6 +1669,14 @@ enum ClusterAction {
         /// with --set-file, so the key's contents never enter argv.
         #[arg(long, default_value = "")]
         private_key: String,
+        /// Name of a Secret you manage that holds the App's PEM. The chart only
+        /// references it, so the key never enters helm release history. The
+        /// recommended path; mutually exclusive with --private-key.
+        #[arg(long, default_value = "")]
+        existing_secret: String,
+        /// Data key inside --existing-secret holding the PEM.
+        #[arg(long, default_value = crate_github_app::DEFAULT_APP_KEY_DATA_KEY)]
+        existing_secret_key: String,
         /// Where the platform clones from. Change only for GitHub Enterprise.
         #[arg(long, default_value = crate_github_app::DEFAULT_CLONE_BASE)]
         clone_base: String,
@@ -2955,6 +2963,8 @@ async fn run(command: Option<Command>) -> Result<()> {
             ClusterAction::GithubApp {
                 app_id,
                 private_key,
+                existing_secret,
+                existing_secret_key,
                 clone_base,
                 disconnect,
                 namespace,
@@ -2981,6 +2991,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                             chart,
                             app_id,
                             private_key_path: private_key,
+                            existing_secret,
+                            existing_secret_key,
                             disconnect,
                         },
                         &clone_base,

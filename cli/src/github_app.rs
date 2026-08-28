@@ -8,10 +8,20 @@
 //! `--set-file` puts only the *path* there. This is the one credential in the
 //! chart that can mint tokens for every repository in the installation, so it
 //! is the one that most deserves never being in a process list.
+//!
+//! `--existing-secret` (#1255) goes one better and hands helm nothing at all:
+//! the release records a Secret NAME, the chart resolves it with a
+//! `secretKeyRef`, and no path and no PEM ever reach helm -- so the key cannot
+//! land in retained release history the way #1236 found it. That path is only
+//! reachable when the operator asks for it; `--set-file` above is still what a
+//! chart-held connect does.
 
 use anyhow::{bail, Result};
 
-use crate::ops::{plain, require_on_path, run_step, CommonOpts, OpsCommand};
+use crate::ops::{
+    fetch_release_values, plain, require_on_path, resolve_existing_secret_ref, run_step,
+    CommonOpts, OpsCommand,
+};
 
 #[derive(Debug, Clone)]
 pub struct GithubAppOpts {
@@ -21,6 +31,14 @@ pub struct GithubAppOpts {
     pub app_id: String,
     /// Path to the App's PEM private key. The path, never the contents.
     pub private_key_path: String,
+    /// Name of an operator-managed Secret holding the PEM. The chart only
+    /// REFERENCES it, so the key never passes through helm values and cannot
+    /// land in retained release history. Empty means the chart-held path.
+    pub existing_secret: String,
+    /// Which data key inside `existing_secret` holds the PEM. Always emitted
+    /// alongside `existing_secret` so `--existing-secret X` is deterministic
+    /// rather than silently inheriting a stale custom key from a previous run.
+    pub existing_secret_key: String,
     /// Clear the App credentials and fall back to `api.githubToken`.
     pub disconnect: bool,
 }
@@ -32,32 +50,76 @@ pub struct GithubAppOpts {
 /// exactly the wrong context to debug that, so we set both together.
 pub const DEFAULT_CLONE_BASE: &str = "https://github.com";
 
+/// The data key the chart defaults to inside a BYO Secret
+/// (`charts/curie/values.yaml`: `api.githubAppExistingSecretKey: privateKey`,
+/// and the fallback `charts/curie/templates/api.yaml` renders). Mirrored here
+/// so `--existing-secret-key` has a discoverable default in `--help` and in the
+/// command manifest. If the two ever drift, `--existing-secret X` with no
+/// `--existing-secret-key` writes a key name the chart never defaults to and
+/// the api pod fails to start on a Secret that is perfectly correct.
+pub const DEFAULT_APP_KEY_DATA_KEY: &str = "privateKey";
+
 pub fn connect_commands(opts: &GithubAppOpts, clone_base: &str) -> Vec<OpsCommand> {
-    vec![OpsCommand::new(
-        "helm",
-        vec![
-            plain("upgrade"),
-            plain(&opts.common.release),
-            plain(&opts.chart),
-            plain("-n"),
-            plain(&opts.common.namespace),
-            plain("--reuse-values"),
-            // --set-string, NOT --set. A numeric App ID round-trips through
-            // helm's stored values as a float64, and `| quote` then renders it
-            // in scientific notation: app id 1234567 reaches the API as
-            // "1.234567e+06", the JWT's `iss` claim is wrong, and GitHub answers
-            // 401 on every call. Found on a live cluster; a chart-render test
-            // cannot see it, because it only appears once a real numeric value
-            // has been through a --reuse-values round trip.
-            plain("--set-string"),
-            plain(format!("api.githubAppId={}", opts.app_id)),
-            // The key's CONTENTS never enter argv; helm reads the file itself.
-            plain("--set-file"),
-            plain(format!("api.githubAppPrivateKey={}", opts.private_key_path)),
-            plain("--set"),
-            plain(format!("api.githubCloneBase={clone_base}")),
-        ],
-    )]
+    let mut args = vec![
+        plain("upgrade"),
+        plain(&opts.common.release),
+        plain(&opts.chart),
+        plain("-n"),
+        plain(&opts.common.namespace),
+        plain("--reuse-values"),
+        // --set-string, NOT --set. A numeric App ID round-trips through
+        // helm's stored values as a float64, and `| quote` then renders it
+        // in scientific notation: app id 1234567 reaches the API as
+        // "1.234567e+06", the JWT's `iss` claim is wrong, and GitHub answers
+        // 401 on every call. Found on a live cluster; a chart-render test
+        // cannot see it, because it only appears once a real numeric value
+        // has been through a --reuse-values round trip.
+        plain("--set-string"),
+        plain(format!("api.githubAppId={}", opts.app_id)),
+    ];
+    if opts.existing_secret.trim().is_empty() {
+        // The key's CONTENTS never enter argv; helm reads the file itself.
+        args.push(plain("--set-file"));
+        args.push(plain(format!(
+            "api.githubAppPrivateKey={}",
+            opts.private_key_path
+        )));
+    } else {
+        // The BYO path emits no --set-file at all: helm is never told where
+        // the PEM lives, so it cannot copy the contents into the release the
+        // way #1236 found them sitting in revision 15 of a live install. The
+        // release holds a Secret NAME, and the chart resolves it at pod start.
+        //
+        // --set-string for BOTH entries, never --set. `1234567` is a valid
+        // RFC-1123 label and a valid Secret data key; under --set helm parses
+        // it as a number, a --reuse-values round trip stores it as a float64,
+        // and the next upgrade renders `1.234567e+06` -- the secretKeyRef then
+        // names a Secret that does not exist and the api pod never starts.
+        // That is #1236's App-ID float bug transplanted into a new field, and
+        // a chart-render test cannot see it because it only appears after a
+        // real round trip.
+        args.push(plain("--set-string"));
+        args.push(plain(format!(
+            "api.githubAppExistingSecret={}",
+            opts.existing_secret
+        )));
+        args.push(plain("--set-string"));
+        args.push(plain(format!(
+            "api.githubAppExistingSecretKey={}",
+            opts.existing_secret_key
+        )));
+        // Clear the inline key while adopting the Secret. --reuse-values
+        // copies a still-set api.githubAppPrivateKey into every future
+        // revision forever -- including the ones `curie cluster up` runs --
+        // so leaving it gives the operator the ceremony of the recommended
+        // path and none of its benefit. Harmless to the running pod: the
+        // chart's BYO branch wins, so it was already reading the Secret.
+        args.push(plain("--set"));
+        args.push(plain("api.githubAppPrivateKey="));
+    }
+    args.push(plain("--set"));
+    args.push(plain(format!("api.githubCloneBase={clone_base}")));
+    vec![OpsCommand::new("helm", args)]
 }
 
 pub fn disconnect_commands(opts: &GithubAppOpts) -> Vec<OpsCommand> {
@@ -74,6 +136,17 @@ pub fn disconnect_commands(opts: &GithubAppOpts) -> Vec<OpsCommand> {
             plain("api.githubAppId="),
             plain("--set"),
             plain("api.githubAppPrivateKey="),
+            // Only the Secret NAME is cleared. Setting
+            // api.githubAppExistingSecretKey="" would NOT restore the chart
+            // default (`privateKey`) -- --reuse-values re-supplies the empty
+            // string on every later upgrade, so the release overrides the
+            // default permanently. An operator who later hand-set
+            // githubAppExistingSecret with no key would then render `key: ""`
+            // and the api pod would sit in CreateContainerConfigError with
+            // nothing in the release to explain why. The field is inert while
+            // the name is empty, so leaving it alone is strictly safer.
+            plain("--set"),
+            plain("api.githubAppExistingSecret="),
         ],
     )]
 }
@@ -108,6 +181,80 @@ pub fn rollout_commands(namespace: &str, release: &str) -> Vec<OpsCommand> {
     ]
 }
 
+/// The BYO Secret the RELEASE currently resolves the App private key from, if
+/// any: `(secret name, data key)`.
+///
+/// Pure over the values JSON `helm get values -o json` returns; the async read
+/// stays in the caller. Delegates to [`resolve_existing_secret_ref`] rather
+/// than re-deriving the precedence, because a CLI read that disagreed with the
+/// chart's own BYO-wins rule would report a plausible but wrong answer, which
+/// is worse than reporting none (#1759). The three literals are the exact
+/// strings `charts/curie/templates/api.yaml` reads.
+pub fn configured_existing_secret(
+    existing: Option<&serde_json::Value>,
+) -> Option<(String, String)> {
+    resolve_existing_secret_ref(
+        existing,
+        "api.githubAppExistingSecret",
+        "api.githubAppExistingSecretKey",
+        DEFAULT_APP_KEY_DATA_KEY,
+    )
+}
+
+/// True when this invocation could silently write a key nothing reads: a
+/// chart-held connect (`--private-key`, no `--existing-secret`) that we have
+/// not yet checked against the release.
+///
+/// Cheap predicate so a `--disconnect` or an explicit BYO connect never pays
+/// for a `helm get values` round trip -- neither needs anything from the
+/// release, and on a real run the read would add a hard failure when the
+/// cluster is unreachable to two paths that never had one.
+pub fn needs_byo_conflict_check(opts: &GithubAppOpts) -> bool {
+    !opts.disconnect
+        && opts.existing_secret.trim().is_empty()
+        && !opts.private_key_path.trim().is_empty()
+}
+
+/// Refuse rather than report success over an unchanged live key.
+///
+/// The chart resolves `GITHUB_APP_PRIVATE_KEY` from the BYO Secret whenever
+/// `api.githubAppExistingSecret` is non-empty, so `--set-file
+/// api.githubAppPrivateKey=...` on such a release writes a value nothing
+/// reads, rolls the API, and prints "GitHub App configured" while the pod
+/// keeps signing with the OLD key. The README's next rotation step is "delete
+/// the first key on GitHub", at which point every clone 401s and nothing the
+/// CLI printed ever hinted at it.
+///
+/// We refuse instead of writing into the Secret: it is operator-managed
+/// precisely so External Secrets or Sealed Secrets can own it, and a CLI write
+/// there would be reverted on the next reconcile -- a second, subtler
+/// misreport.
+pub fn guard_byo_key_conflict(
+    opts: &GithubAppOpts,
+    existing: Option<&serde_json::Value>,
+) -> Result<()> {
+    if !needs_byo_conflict_check(opts) {
+        return Ok(());
+    }
+    let Some((name, key)) = configured_existing_secret(existing) else {
+        return Ok(());
+    };
+    // CliError::failure + with_fix rather than bail!, so the --json path emits
+    // an actionable `fix` alongside `error` (ADR-0021) instead of an untyped
+    // anyhow the agent driving the CLI cannot act on.
+    Err(crate::exit::CliError::failure(format!(
+        "release {} already reads the GitHub App private key from Secret {name} (key {key}); \
+         --private-key would write a value the API never reads and report success over the OLD key",
+        opts.common.release
+    ))
+    .with_fix(format!(
+        "update Secret {name} yourself, then re-run with --existing-secret {name} \
+         --existing-secret-key {key} to roll the API onto it; or run --disconnect first \
+         to go back to the chart-held key"
+    ))
+    .into())
+}
+
 pub enum GithubAppOutput {
     DryRun(crate::ui::DryRunPlan),
     Done { configured: bool },
@@ -132,7 +279,35 @@ impl crate::ui::CliOutput for GithubAppOutput {
 
 pub async fn github_app(opts: GithubAppOpts, clone_base: &str) -> Result<GithubAppOutput> {
     let ui = crate::ui::ui();
-    require_connect_inputs(opts.disconnect, &opts.app_id, &opts.private_key_path)?;
+    require_connect_inputs(&opts)?;
+
+    // On a real run helm must be on PATH before either the values read below
+    // or the upgrade further down; a --dry-run has always worked with no
+    // tooling and no cluster, so it stays exempt.
+    if !opts.common.dry_run {
+        require_on_path("helm")?;
+    }
+    let existing = if needs_byo_conflict_check(&opts) {
+        if opts.common.dry_run {
+            // Best effort: a dry run must never hard-fail on connectivity or
+            // on a missing binary. When the read does succeed the guard still
+            // runs, because a dry run that prints a plan the tool would refuse
+            // to execute is the same misreport class this guard exists for.
+            if require_on_path("helm").is_ok() {
+                fetch_release_values(&opts.common).await.ok().flatten()
+            } else {
+                None
+            }
+        } else {
+            // The typed error propagates: the `helm upgrade` two steps later
+            // would fail identically, and failing before any mutation is
+            // strictly better than failing part-way through one.
+            fetch_release_values(&opts.common).await?
+        }
+    } else {
+        None
+    };
+    guard_byo_key_conflict(&opts, existing.as_ref())?;
 
     let cmds = if opts.disconnect {
         disconnect_commands(&opts)
@@ -151,7 +326,6 @@ pub async fn github_app(opts: GithubAppOpts, clone_base: &str) -> Result<GithubA
         }));
     }
 
-    require_on_path("helm")?;
     require_on_path("kubectl")?;
     let cl = ui.checklist();
     let label = if opts.disconnect {
@@ -181,6 +355,17 @@ pub async fn github_app(opts: GithubAppOpts, clone_base: &str) -> Result<GithubA
     }
     if opts.disconnect {
         ui.note("GitHub App cleared; the platform falls back to api.githubToken");
+    } else if !opts.existing_secret.trim().is_empty() {
+        // The Secret NAME is safe to print -- it is a name, not a credential,
+        // and the CLI never reads the Secret's contents on this path at all.
+        // Naming it is the point: the operator has to know which Secret and
+        // which data key they now own the rotation of.
+        ui.note(&format!(
+            "GitHub App configured to read its private key from Secret {} (key {}); \
+             the API has been rolled onto it. You own that Secret's contents -- rotate \
+             by updating it and re-running this command.",
+            opts.existing_secret, opts.existing_secret_key
+        ));
     } else {
         ui.note(
             "GitHub App configured. Install it on the repositories you deploy from, \
@@ -192,24 +377,64 @@ pub async fn github_app(opts: GithubAppOpts, clone_base: &str) -> Result<GithubA
     })
 }
 
-pub fn require_connect_inputs(disconnect: bool, app_id: &str, key_path: &str) -> Result<()> {
-    if disconnect {
+/// Validate the flag combination before anything reaches helm.
+///
+/// Takes the whole record rather than five positional `&str`/`bool` arguments:
+/// the old three-argument form was already one argument swap away from a
+/// silent bug, and the rules below now read five of the fields.
+pub fn require_connect_inputs(opts: &GithubAppOpts) -> Result<()> {
+    let existing_secret = opts.existing_secret.trim();
+    // Trimmed only to answer "was one supplied"; the path itself is used
+    // verbatim for the stat and the message, as it has been since #1223.
+    let key_path = &opts.private_key_path;
+
+    // "--disconnect --existing-secret X" reads as "point at X while
+    // disconnecting". Accepting it would clear the release and leave the
+    // operator believing a reference to X was set. Every OTHER connect input
+    // stays silently tolerated under --disconnect, as it has been since #1223.
+    if opts.disconnect {
+        if !existing_secret.is_empty() {
+            bail!(
+                "--existing-secret contradicts --disconnect: --disconnect clears the App \
+                 credentials, so there is nothing left to point at a Secret. Run --disconnect \
+                 on its own, or drop it to configure the Secret."
+            );
+        }
         return Ok(());
     }
-    if app_id.trim().is_empty() {
+    if !existing_secret.is_empty() && !key_path.trim().is_empty() {
+        bail!(
+            "--existing-secret and --private-key are two mutually exclusive ways to supply \
+             the App's private key; pick one. --existing-secret references a Secret you \
+             manage, --private-key hands the PEM to the chart."
+        );
+    }
+    if existing_secret.is_empty() && opts.existing_secret_key.trim() != DEFAULT_APP_KEY_DATA_KEY {
+        bail!(
+            "--existing-secret-key configures nothing without --existing-secret: the chart \
+             only reads a data key once a Secret name is set. Pass --existing-secret <name>, \
+             or drop --existing-secret-key."
+        );
+    }
+    if opts.app_id.trim().is_empty() {
         bail!(
             "--app-id is required. Find it on the App's settings page \
              (Settings -> Developer settings -> GitHub Apps -> your app)."
         );
     }
-    if key_path.trim().is_empty() {
-        bail!(
-            "--private-key is required: the path to the App's PEM file, \
-             downloaded from the App's settings page under 'Private keys'."
-        );
-    }
-    if !std::path::Path::new(key_path).is_file() {
-        bail!("--private-key: no such file: {key_path}");
+    // Both remaining checks are chart-held only: a BYO run supplies no PEM by
+    // design, so it must never be asked for one and must never stat a path it
+    // was never given.
+    if existing_secret.is_empty() {
+        if key_path.trim().is_empty() {
+            bail!(
+                "--private-key is required: the path to the App's PEM file, \
+                 downloaded from the App's settings page under 'Private keys'."
+            );
+        }
+        if !std::path::Path::new(key_path).is_file() {
+            bail!("--private-key: no such file: {key_path}");
+        }
     }
     Ok(())
 }
