@@ -153,35 +153,54 @@ def _api(
 
 
 def deployed_commit(api_url: str, api_key: str, agent: str) -> tuple[str, str | None, str | None]:
-    """``(agent_id, commit_sha, version_id)`` for the agent's newest version.
+    """``(agent_id, commit_sha, version_id)`` for the version this agent is SERVING.
 
-    ``None`` for the sha when the newest version records none -- a version
+    The active deployment, not the newest version row. Those are different facts
+    and confusing them is how this job read a version that was created and never
+    deployed -- then tried to read a connector surface out of it and got "no
+    bundle stored for this version", which reads like a broken agent rather than
+    like a question asked about the wrong row.
+
+    ``None`` for the sha when the deployed version records none: a version
     deployed by hand from a working copy has no commit, and that must read as
     "unknown", never as "up to date".
     """
 
-    request = urllib.request.Request(
-        f"{api_url.rstrip('/')}/agents", headers={"X-API-Key": api_key}
-    )
-    with urllib.request.urlopen(request, timeout=60) as response:
-        agents = json.load(response)
+    def get(path: str) -> list[dict[str, object]]:
+        request = urllib.request.Request(
+            f"{api_url.rstrip('/')}{path}", headers={"X-API-Key": api_key}
+        )
+        with urllib.request.urlopen(request, timeout=60) as response:
+            payload: list[dict[str, object]] = json.load(response)
+        return payload
+
+    agents = get("/agents")
     match = next((a for a in agents if a.get("name") == agent), None)
     if match is None:
         raise SelfUpgradeError(
             f"no agent named {agent!r} on {api_url}; this job redeploys an agent "
             f"that already exists rather than creating one"
         )
-    agent_id = match["id"]
-    request = urllib.request.Request(
-        f"{api_url.rstrip('/')}/agents/{agent_id}/versions",
-        headers={"X-API-Key": api_key},
-    )
-    with urllib.request.urlopen(request, timeout=60) as response:
-        versions = json.load(response)
-    if not versions:
+    agent_id = str(match["id"])
+
+    active = [
+        d
+        for d in get("/deployments")
+        if d.get("agent_id") == agent_id and d.get("status") == "active"
+    ]
+    if not active:
         return agent_id, None, None
-    newest = sorted(versions, key=lambda v: v["created_at"])[-1]
-    return agent_id, newest.get("commit_sha"), newest.get("id")
+    deployment = sorted(active, key=lambda d: str(d["deployed_at"]))[-1]
+    version_id = deployment.get("version_id")
+
+    versions = get(f"/agents/{agent_id}/versions")
+    row = next((v for v in versions if v.get("id") == version_id), None)
+    if row is None:
+        return agent_id, None, None
+    # The deployment carries a commit too; prefer the version's own, and fall
+    # back rather than reporting "unknown" when only the deployment recorded it.
+    commit = row.get("commit_sha") or deployment.get("commit_sha")
+    return agent_id, str(commit) if commit else None, str(version_id)
 
 
 def _wanted(name: str) -> bool:

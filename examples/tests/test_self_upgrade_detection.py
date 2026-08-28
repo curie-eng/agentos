@@ -11,6 +11,7 @@ Both are cheap to get subtly wrong in the direction that reports success:
 """
 
 import io
+import json
 import sys
 import tarfile
 from pathlib import Path
@@ -24,6 +25,7 @@ from redeploy import (  # noqa: E402
     BUNDLE_PREFIX,
     SelfUpgradeError,
     bundle_from_repo_tarball,
+    deployed_commit,
     member_of,
     pin_build_connectors,
     replace_member,
@@ -192,3 +194,79 @@ def test_replacing_one_member_leaves_the_others_byte_for_byte() -> None:
 def test_a_missing_member_is_an_error_rather_than_an_empty_file() -> None:
     with pytest.raises(SelfUpgradeError):
         member_of(_bundle({"skills/sre-bot/SKILL.md": b"x"}), "connectors.yaml")
+
+
+# --- the version being SERVED, not the newest row -----------------------------
+#
+# Those are different facts. A version can be created and never deployed, and
+# reading that one made the job ask for a connector surface that does not exist
+# -- "no bundle stored for this version", which reads like a broken agent rather
+# than a question asked about the wrong row.
+
+
+class _FakeApi:
+    """Answers the three GETs deployed_commit makes, in order."""
+
+    def __init__(self, deployments: list[dict], versions: list[dict]) -> None:
+        self.routes = {
+            "/agents": [{"id": "agent-1", "name": "sre-bot"}],
+            "/deployments": deployments,
+            "/agents/agent-1/versions": versions,
+        }
+
+    def __call__(self, request, timeout=0):  # noqa: ANN001 - urlopen's shape
+        path = request.full_url.replace("http://api", "")
+        import io as _io
+
+        return _io.BytesIO(json.dumps(self.routes[path]).encode())
+
+
+def _patched(monkeypatch: pytest.MonkeyPatch, api: _FakeApi) -> None:
+    import redeploy
+
+    class _Ctx:
+        def __init__(self, body):
+            self.body = body
+
+        def __enter__(self):
+            return self.body
+
+        def __exit__(self, *_):
+            return False
+
+    monkeypatch.setattr(redeploy.urllib.request, "urlopen", lambda r, timeout=0: _Ctx(api(r)))
+
+
+def test_the_served_version_wins_over_a_newer_undeployed_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = _FakeApi(
+        deployments=[
+            {
+                "agent_id": "agent-1",
+                "version_id": "served",
+                "status": "active",
+                "deployed_at": "2026-01-01T00:00:00",
+                "commit_sha": None,
+            }
+        ],
+        versions=[
+            {"id": "served", "commit_sha": "a" * 40, "created_at": "2026-01-01T00:00:00"},
+            # Newer, and never deployed: exactly the row that used to win.
+            {"id": "never-deployed", "commit_sha": "b" * 40, "created_at": "2026-06-01T00:00:00"},
+        ],
+    )
+    _patched(monkeypatch, api)
+
+    agent_id, commit, version_id = deployed_commit("http://api", "k", "sre-bot")
+
+    assert version_id == "served"
+    assert commit == "a" * 40
+
+
+def test_no_active_deployment_reads_as_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Never "up to date". A job that cannot tell must not report success.
+    api = _FakeApi(deployments=[], versions=[{"id": "v", "commit_sha": "c" * 40}])
+    _patched(monkeypatch, api)
+    _agent, commit, version_id = deployed_commit("http://api", "k", "sre-bot")
+    assert commit is None and version_id is None
