@@ -2526,6 +2526,28 @@ export const commandManifest = {
             },
             {
               "default_values": [
+                ""
+              ],
+              "global": false,
+              "help": "Name of a Secret you manage that holds the App's PEM. The chart only references it, so the key never enters helm release history. The recommended path; mutually exclusive with --private-key",
+              "id": "existing_secret",
+              "long": "existing-secret",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "privateKey"
+              ],
+              "global": false,
+              "help": "Data key inside --existing-secret holding the PEM",
+              "id": "existing_secret_key",
+              "long": "existing-secret-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
                 "https://github.com"
               ],
               "global": false,

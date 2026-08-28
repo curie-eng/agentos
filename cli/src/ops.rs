@@ -1337,7 +1337,7 @@ fn preserved_value(existing: Option<&serde_json::Value>, key: &str) -> Option<St
 /// report a plausible but wrong value, which is worse than reporting none.
 /// Pure and testable; the actual `helm get values` read stays in the async
 /// caller.
-fn resolve_existing_secret_ref(
+pub(crate) fn resolve_existing_secret_ref(
     existing: Option<&serde_json::Value>,
     existing_secret_key: &str,
     existing_secret_key_key: &str,
