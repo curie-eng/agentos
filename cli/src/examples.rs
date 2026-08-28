@@ -495,15 +495,6 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
                     write_allowlist_value(targets)
                 ));
             }
-            lines.push(write_role_command.display(&chart));
-            lines.push(format!(
-                "kubectl wait --namespace {} --for=jsonpath={{.data.token}} secret/{WRITER_TOKEN_SECRET} --timeout={READER_TOKEN_TIMEOUT}",
-                identity.namespace
-            ));
-            lines.push(
-                "build the gated write Kubernetes connector kubeconfig in memory from the ServiceAccount token"
-                    .to_string(),
-            );
         }
         let mut deploy = format!(
             "curie cluster deploy --plugin-dir embedded:examples/sre-bot --namespace {} --release {}",
@@ -513,6 +504,23 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
             deploy.push_str(&format!(" --slack-channel {channel}"));
         }
         lines.push(deploy);
+        if write_targets.is_some() {
+            lines.push(format!(
+                "{} -- applied HERE only on a fresh install; when ServiceAccount \
+                 {WRITER_IDENTITY} already exists in namespace {} the same apply runs BEFORE the \
+                 deploy above, so a narrowed allowlist is in force before the new version activates",
+                write_role_command.display(&chart),
+                identity.namespace
+            ));
+            lines.push(format!(
+                "kubectl wait --namespace {} --for=jsonpath={{.data.token}} secret/{WRITER_TOKEN_SECRET} --timeout={READER_TOKEN_TIMEOUT}",
+                identity.namespace
+            ));
+            lines.push(
+                "build the gated write Kubernetes connector kubeconfig in memory from the ServiceAccount token"
+                    .to_string(),
+            );
+        }
         lines.push(
             "render and reconcile the deployed version connectors with the owned Kubernetes kubeconfig Secret override"
                 .to_string(),
@@ -545,18 +553,66 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
     run_install_command(&integration_command, &workspace, &chart).await?;
     run_install_command(&read_access_command, &workspace, &chart).await?;
     let kubeconfig = read_only_connector_kubeconfig(&identity.namespace).await?;
-    let write_kubeconfig = match write_targets {
-        Some(_) => {
-            run_install_command(&write_role_command, &workspace, &chart).await?;
-            Some(write_connector_kubeconfig(&identity.namespace).await?)
-        }
-        None => None,
-    };
 
     let bundle_dir = workspace.bundle_dir();
     let connection = resolve_embedded_cluster_connection(&identity).await?;
+    // The write Role and the writer kubeconfig are ordered around the deploy by
+    // PRIVILEGE DIRECTION, keyed on whether the writer identity already exists:
+    //
+    //     never create a NEW privileged identity before the deploy;
+    //     always tighten an EXISTING one before the deploy.
+    //
+    // FRESH INSTALL -- no `sre-bot-writer` ServiceAccount in the namespace, so
+    // the apply is DEFERRED to after the deploy succeeds. The identity it mints
+    // is a NON-EXPIRING ServiceAccount token, and with named targets it carries
+    // get,patch on apps/deployments. Nothing between the workspace render and
+    // the deploy needs it -- the only consumer is sync_deployed_version below --
+    // so creating it any sooner buys nothing and leaves a live write credential
+    // in the cluster for the whole length of the deploy.
+    //
+    // Deferred rather than rolled back. A rollback would need the same cluster
+    // API call that just failed: if the deploy died because the API server is
+    // unreachable, the RBAC write is being throttled, or the port-forward
+    // dropped, the compensating delete fails too and the credential is still
+    // standing -- now behind a log line claiming it was cleaned up. Deferring
+    // means the exposure window does not exist, rather than merely being
+    // shorter, and it adds no new failure path of its own.
+    //
+    // What this does NOT cover: a failure between that apply and
+    // sync_deployed_version still strands the identity, now with a deployed bot
+    // in front of it. That residual window is one API call wide, and it is the
+    // price of declining a rollback path.
+    //
+    // RE-INSTALL / UPGRADE -- the ServiceAccount is already there, so the same
+    // apply runs BEFORE the deploy. Applying early strands nothing, because
+    // every object it names already exists; and it is the only ordering that
+    // fails CLOSED when an operator NARROWS the allowlist. sync_deployed_version
+    // reconciles the connector Deployment's K8S_WRITE_ALLOWLIST only AFTER the
+    // new version is activated, so deferring the Role on an upgrade leaves the
+    // activation-to-sync window with the OLD wide Role still on the API server
+    // AND the OLD wide env still on the running connector pod: both halves
+    // permit, and an approved call can patch a target the operator just removed.
+    // That is the #1886 class -- the two allowlists disagreeing in the dangerous
+    // direction. Tightening the Role first makes that same window 403 instead.
+    let writer_identity_present = match write_targets {
+        Some(_) => writer_identity_exists(&identity.namespace).await?,
+        None => false,
+    };
+    let mut write_kubeconfig = None;
+    if writer_identity_present {
+        write_kubeconfig = Some(
+            apply_write_access(&write_role_command, &workspace, &chart, &identity.namespace)
+                .await?,
+        );
+    }
     let deployed =
         deploy_embedded_sre_bot(&bundle_dir, &connection, opts.slack_channel.as_deref()).await?;
+    if write_targets.is_some() && !writer_identity_present {
+        write_kubeconfig = Some(
+            apply_write_access(&write_role_command, &workspace, &chart, &identity.namespace)
+                .await?,
+        );
+    }
     let mut secret_overrides = BTreeMap::from([(KUBECONFIG_SECRET_KEY.to_string(), kubeconfig)]);
     if let Some(write_kubeconfig) = write_kubeconfig {
         secret_overrides.insert(WRITE_KUBECONFIG_SECRET_KEY.to_string(), write_kubeconfig);
@@ -1078,6 +1134,61 @@ async fn read_only_connector_kubeconfig(namespace: &str) -> Result<String> {
 
 async fn write_connector_kubeconfig(namespace: &str) -> Result<String> {
     connector_kubeconfig(WRITER_IDENTITY, WRITER_TOKEN_SECRET, namespace).await
+}
+
+/// Apply the rendered write Role and mint the writer identity's kubeconfig.
+///
+/// One helper because the install issues this from two places -- before the
+/// deploy on an upgrade, after it on a fresh install -- and the two orderings
+/// must stay identical in what they apply and what they hand back.
+async fn apply_write_access(
+    write_role_command: &InstallCommand,
+    workspace: &EmbeddedWorkspace,
+    chart: &Path,
+    namespace: &str,
+) -> Result<String> {
+    run_install_command(write_role_command, workspace, chart).await?;
+    write_connector_kubeconfig(namespace).await
+}
+
+/// Does the gated write ServiceAccount already exist in `namespace`?
+///
+/// This is what picks the ordering of the write Role apply around the deploy, so
+/// it must not confuse "absent" with "could not tell". `--ignore-not-found`
+/// makes absence an exit-0 with empty stdout, which separates the two cleanly
+/// without parsing stderr: any nonzero exit is a real probe failure and is
+/// surfaced as an error. Reporting an unreadable cluster as a fresh install
+/// would pick the deferred ordering on an upgrade and re-open exactly the
+/// fail-open window this probe exists to close.
+async fn writer_identity_exists(namespace: &str) -> Result<bool> {
+    let args = [
+        "get",
+        "serviceaccount",
+        WRITER_IDENTITY,
+        "--namespace",
+        namespace,
+        "--ignore-not-found",
+        "-o",
+        "name",
+    ];
+    crate::ui::ui().plumbing(&format!("+ kubectl {}", args.join(" ")));
+    let output = tokio::process::Command::new("kubectl")
+        .args(args)
+        .output()
+        .await
+        .context("probing for the gated write ServiceAccount")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "could not determine whether ServiceAccount {WRITER_IDENTITY} already exists in namespace {namespace}, and the write Role apply is ordered on that answer; check the cluster with `kubectl get serviceaccount {WRITER_IDENTITY} -n {namespace}` and retry: {}",
+            if stderr.trim().is_empty() {
+                "kubectl exited nonzero"
+            } else {
+                stderr.trim()
+            }
+        );
+    }
+    Ok(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
 }
 
 /// Build one connector's in-memory kubeconfig from a ServiceAccount token Secret.

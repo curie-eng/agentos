@@ -42,6 +42,13 @@ pub struct LocalCommsOpts {
     /// `otel_endpoint_env_override` as `up_command` so `local comms` never
     /// re-points a collector-less stack at a collector that is not running.
     pub minimal: bool,
+    /// The image env the running stack is already on (#1925), resolved by
+    /// `local::resolve_stack_image_env`. Same parity obligation as `model_mode`
+    /// and `minimal`: `up -d --wait curie-worker curie-dispatcher` recreates
+    /// those services AND their `depends_on` dependencies, so without this the
+    /// verb silently reverts five services from a `--build` stack's tag to
+    /// `:latest`.
+    pub stack_image_env: Vec<(String, String)>,
 }
 
 pub fn connect_commands(opts: &CommsOpts) -> Vec<OpsCommand> {
@@ -89,6 +96,7 @@ pub fn local_connect_commands(o: &LocalCommsOpts) -> Vec<OpsCommand> {
         env.push(("CURIE_MODEL".into(), model.clone()));
     }
     env.extend(otel_endpoint_env_override(o.minimal));
+    env.extend(o.stack_image_env.iter().cloned());
     vec![OpsCommand::new(
         "docker",
         vec![
@@ -127,6 +135,7 @@ pub fn local_disconnect_commands(o: &LocalCommsOpts) -> Vec<OpsCommand> {
         worker_env.push(("CURIE_MODEL".into(), model.clone()));
     }
     worker_env.extend(otel_endpoint_env_override(o.minimal));
+    worker_env.extend(o.stack_image_env.iter().cloned());
     vec![
         OpsCommand::new(
             "docker",
@@ -630,6 +639,7 @@ mod tests {
             model_credentials: vec![],
             model: None,
             minimal,
+            stack_image_env: Vec::new(),
         }
     }
 
@@ -645,6 +655,7 @@ mod tests {
             model_credentials: vec![],
             model: None,
             minimal: false,
+            stack_image_env: Vec::new(),
         });
         assert_eq!(cmds.len(), 1);
         let line = cmds[0].display();
@@ -795,7 +806,8 @@ mod tests {
                 slack: false,
                 model_mode: mode,
                 env_file: None,
-                build: false,
+                build: None,
+                stack_image_env: Vec::new(),
             })
             .env;
             let connect_env = local_connect_commands(&local_comms_opts(false, mode))[0]
@@ -832,7 +844,8 @@ mod tests {
                 slack: false,
                 model_mode: mode,
                 env_file: None,
-                build: false,
+                build: None,
+                stack_image_env: Vec::new(),
             })
             .env;
             let disconnect_env = local_disconnect_commands(&local_comms_opts(true, mode))[1]
@@ -867,7 +880,8 @@ mod tests {
                 slack: false,
                 model_mode: ModelMode::DefaultFake,
                 env_file: None,
-                build: false,
+                build: None,
+                stack_image_env: Vec::new(),
             })
             .env;
             let connect_env = local_connect_commands(&local_comms_opts_with(
@@ -906,7 +920,8 @@ mod tests {
                 slack: false,
                 model_mode: ModelMode::DefaultFake,
                 env_file: None,
-                build: false,
+                build: None,
+                stack_image_env: Vec::new(),
             })
             .env;
             let disconnect_env = local_disconnect_commands(&local_comms_opts_with(

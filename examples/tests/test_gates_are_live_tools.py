@@ -288,3 +288,54 @@ def test_a_rejected_host_says_so_instead_of_reading_as_unreachable(
     assert r.returncode == 2
     assert "rejected the Host it was sent" in r.stderr
     assert "--host k8s-write=<host:port>" in r.stderr
+
+
+# --- a server mounted at /mcp/ answers /mcp with a 307 ------------------------
+#
+# urllib does not follow a redirect for a POST, so the connector read as
+# unreachable -- and this script treats unreachable as fatal, so one missing
+# slash failed the whole check with a message naming the wrong cause. Measured on
+# a live pair: two connectors from the same bundle differed, because their
+# FastMCP versions did.
+
+
+class _RedirectingHandler(_Handler):
+    """Serves only `/mcp/`, and 307s `/mcp` to it."""
+
+    def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's spelling
+        if self.path == "/mcp":
+            self.send_response(307)
+            self.send_header("Location", "/mcp/")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        super().do_POST()
+
+
+@pytest.fixture
+def redirecting_connector() -> Iterator[Callable[[list[dict[str, object]]], str]]:
+    servers: list[http.server.HTTPServer] = []
+
+    def start(tools: list[dict[str, object]]) -> str:
+        handler = type("Handler", (_RedirectingHandler,), {"tools": tools})
+        server = http.server.HTTPServer(("127.0.0.1", 0), handler)
+        servers.append(server)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return f"http://127.0.0.1:{server.server_address[1]}/mcp"
+
+    yield start
+    for server in servers:
+        server.shutdown()
+        server.server_close()
+
+
+def test_a_307_to_the_trailing_slash_is_followed(
+    tmp_path: Path, redirecting_connector: Callable[[list[dict[str, object]]], str]
+) -> None:
+    url = redirecting_connector([WRITE_TOOL])
+    b = bundle(tmp_path, ["mcp__k8s-write__restart_deployment"])
+
+    r = run(b, f"k8s-write={url}")
+
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "all 1 gate(s) match a live tool" in r.stdout

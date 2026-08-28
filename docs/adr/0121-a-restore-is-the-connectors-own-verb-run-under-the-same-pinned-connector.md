@@ -165,8 +165,11 @@ executor should not ship before it.
 
 ## Alternatives considered
 
-- **An MCP client in the worker** (ADR-0117's first candidate). The smallest
-  change, and the reason to reject it is decision 2. The worker is the control
+- **An MCP client in the worker** (ADR-0117's first candidate). The spike
+  measured the streamable-HTTP MCP client and call primitive at 13 lines. That
+  primitive is the same in either process, so transport-client cost does not
+  choose between them; total integration cost in either location remains
+  unmeasured, and decision 2 chooses by policy boundary. The worker is the control
   plane; giving it a direct client of tenant connectors makes the platform
   reachable to places ADR-0008 keeps separate, and the undo would then run under
   the control plane's network reachability rather than the sandbox's. An undo
@@ -196,18 +199,41 @@ executor should not ship before it.
 
 ## Consequences
 
-- **The runner must invoke an MCP tool outside the model loop, which it cannot do
-  today.** This is the largest cost and it was ADR-0117's stated reason for
-  deferring: the SDK owns the client sessions, so a second client inside the
-  runner is new mechanism. It is a smaller mechanism than it looked, because it
-  is needed for exactly one verb with a fixed argument shape and no model in the
-  path.
+- **The streamable-HTTP MCP client and call primitive is small; total runner
+  integration cost remains unmeasured.** The client was written up as the
+  largest cost, inherited from ADR-0117's stated reason for deferring: "the SDK
+  owns the client sessions", so a second client in the runner is "a large new
+  mechanism for one job".
+
+  Measured, that primitive is not large. A hosted connector's MCP entry is
+  `{"type": "http", "url": ".../mcp"}` -- streamable HTTP, not a stdio
+  subprocess the SDK spawned -- so no SDK-owned session has to be reused.
+  Against the real `k8s-scale` connector, with no agent SDK in the process, the
+  client and one call are **13 lines**: open the transport, initialize the
+  session, call the tool. Probes on `spike/adr-0121-restore-executor`.
+
+  This removes transport-client cost as the selector in decision 2. It does not
+  measure the complete runner integration: sandbox lifecycle, pinned connector
+  selection, policy, failure handling, and completion confirmation remain to be
+  built. The case for the sandbox rests on reachability and the policy envelope,
+  not on a measured claim about total relative effort.
 
 - **A write connector that wants to be undoable now has two verbs to write, not
   one.** ADR-0117 already charged authors for returning JSON; this adds the
   return leg. The honest mitigation is that both are the same tool's read and
   write halves, and a connector that cannot restore can still report prose and be
   honestly irreversible.
+
+- **The ruling-to-restore leg has run through the real API, Postgres, and
+  connector.** `probe_roundtrip.py` on that spike branch: an agent scales 3 to
+  10, the ledger records the prior state, a refused undo leaves the world
+  untouched at 10 and never reaches the connector, an authorized undo returns
+  `{target, prior_state}`, and the executor replays it back to 3. No mapping
+  table exists anywhere, which is decision 1's claim surviving contact.
+
+  The complete loop has not run: `POST /actions/{id}/confirm-undo` returns 404,
+  so confirmation remains absent and decision 4's compromise stands until that
+  endpoint exists.
 
 - **A restore is a sandbox turn without a model**, which is a shape the platform
   does not have. Whether it reuses the existing sandbox lifecycle or gets a
