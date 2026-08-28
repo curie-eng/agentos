@@ -871,6 +871,17 @@ async fn guard_stateful_removal(
     Ok(GuardVerdict::WouldRemove(removed))
 }
 
+/// The one rendering of a component the target chart does not render at all.
+/// Both refusals show this line, and an operator matching what one message
+/// said against what the other says needs them identical, so the phrasing
+/// lives once (#1501).
+fn component_gone_line(removal: &crate::ops::StatefulRemoval) -> String {
+    format!(
+        "{} ({}, not rendered at all)",
+        removal.name, removal.component
+    )
+}
+
 /// The refusal text, factored out so its ordering is testable with no cluster.
 ///
 /// Branches on the CAUSE, because the two causes need opposite advice and a
@@ -885,9 +896,7 @@ fn stateful_removal_message(removed: &[crate::ops::StatefulRemoval]) -> String {
     let listed = removed
         .iter()
         .map(|r| match &r.cause {
-            RemovalCause::ComponentGone => {
-                format!("{} ({}, not rendered at all)", r.name, r.component)
-            }
+            RemovalCause::ComponentGone => component_gone_line(r),
             RemovalCause::RenamedTo(to) => format!("{} -> {}", r.name, to),
         })
         .collect::<Vec<_>>()
@@ -1017,13 +1026,32 @@ pub async fn apply(opts: ApplyOpts) -> Result<ApplyOutput> {
         // the private values file.
         match guard_stateful_removal(&up, &up_values).await? {
             GuardVerdict::Clear => false,
+            // All-ComponentGone was the whole bypass condition, and it is only
+            // HALF the question. `--migrate-store` carries the OBJECT STORE and
+            // nothing else -- `migrate_store::detect_store` knows `minio` and
+            // `rustfs` -- so a batch of {minio gone, postgres gone} (postgres
+            // goes ComponentGone the moment target values set
+            // `postgres.deploy=false`) passed the check, and apply migrated the
+            // store while silently DELETING the database beside it, exit 0
+            // (#1501). The cause says the data must be carried; only the
+            // COMPONENT says whether this flag can carry it.
             GuardVerdict::WouldRemove(removed)
                 if migrate_store
                     && removed.iter().all(|removal| {
                         matches!(&removal.cause, crate::ops::RemovalCause::ComponentGone)
                     }) =>
             {
-                true
+                let uncarriable: Vec<&crate::ops::StatefulRemoval> = removed
+                    .iter()
+                    .filter(|removal| {
+                        !crate::migrate_store::is_object_store_component(&removal.component)
+                    })
+                    .collect();
+                if uncarriable.is_empty() {
+                    true
+                } else {
+                    bail!("{}", uncarriable_removal_message(&uncarriable))
+                }
             }
             GuardVerdict::WouldRemove(removed) => {
                 bail!("{}", stateful_removal_message(&removed))
@@ -1034,7 +1062,20 @@ pub async fn apply(opts: ApplyOpts) -> Result<ApplyOutput> {
     // Stage BEFORE the upgrade deletes the old store. A failure here leaves the
     // cluster untouched.
     if migrating {
-        crate::migrate_store::run_export(&up.common, &up.chart, BUNDLE_BUCKET).await?;
+        // Same values the guard rendered with, and the same values the upgrade
+        // below will apply. Rendering the export's copy of the chart with NO
+        // values made the two halves plan different upgrades: the guard saw the
+        // store removed and waved the migration through, the export saw a store
+        // to migrate INTO, and the disagreement only surfaced after the
+        // irreversible upgrade had run (#1501). Borrowed here, before
+        // `up_prepared` takes ownership.
+        crate::migrate_store::run_export_with_values(
+            &up.common,
+            &up.chart,
+            BUNDLE_BUCKET,
+            &up_values,
+        )
+        .await?;
     }
 
     let up_out = crate::ops::up_prepared(up, up_values, live, github_token).await?;
@@ -1095,6 +1136,34 @@ pub async fn apply(opts: ApplyOpts) -> Result<ApplyOutput> {
         release: cfg.install.release,
         comms: configured_comms,
     })
+}
+
+/// The refusal for removals `--migrate-store` cannot carry.
+///
+/// Separate from [`stateful_removal_message`] rather than a branch inside it,
+/// because the operator is in a different position: they already reached for
+/// the flag that keeps data, and the answer is that this flag's reach stops at
+/// the object store. So it names the COMPONENTS -- "some component" would be a
+/// wall, and their next move is finding which of their values drops this one --
+/// and it does not re-offer `--migrate-store`, which is what sent them here.
+fn uncarriable_removal_message(uncarriable: &[&crate::ops::StatefulRemoval]) -> String {
+    let listed = uncarriable
+        .iter()
+        .map(|r| component_gone_line(r))
+        .collect::<Vec<_>>()
+        .join("\n  ");
+
+    format!(
+        "refusing to apply: --migrate-store carries the OBJECT STORE and nothing else, \
+         and this apply would also DELETE {} stateful component(s) it cannot carry, \
+         with the persistent data in them:\n  {listed}\n\n\
+         A component the target chart does not render at all is usually a values \
+         difference -- a `<component>.deploy=false` in the file, or a chart version \
+         that dropped it. Fix the values so these components are still rendered, then \
+         re-run with --migrate-store to carry the store across.\n\n\
+         Use --allow-stateful-removal only to proceed WITHOUT their data.",
+        uncarriable.len(),
+    )
 }
 
 /// The bundle bucket the platform reads, mirroring the chart's `BUNDLE_BUCKET`.

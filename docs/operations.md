@@ -376,12 +376,15 @@ swap it would be.
 
 `curie apply` refuses outright when the upgrade would delete a StatefulSet the
 release is running, and names it. `--migrate-store` is the option to reach
-for: apply stages every object, upgrades, loads them back, and verifies per
-object, all in one command, so the data survives. It is opt-in rather than
-automatic because the migration has a window where the store is empty and the
-bot cannot answer, so an apply that only changes a log level must never
-silently start moving data. `--allow-stateful-removal` proceeds WITHOUT the
-data instead, for a store you genuinely intend to discard. The two flags are
+for: apply stages the object store, upgrades, loads it back, and verifies it,
+all in one command, so the store's data survives. It carries the object store
+only; if the same upgrade would also delete another stateful component, apply
+still refuses and names that component, since `--migrate-store` gives it no
+way to carry that data too. It is opt-in rather than automatic because the
+migration has a window where the store is empty and the bot cannot answer, so
+an apply that only changes a log level must never silently start moving data.
+`--allow-stateful-removal` proceeds WITHOUT the data instead, for a store you
+genuinely intend to discard. The two flags are
 mutually exclusive: passing both is rejected by the parser with a nonzero
 exit, never silently resolved by picking one.
 
