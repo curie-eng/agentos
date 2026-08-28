@@ -806,7 +806,7 @@ mod tests {
                 slack: false,
                 model_mode: mode,
                 env_file: None,
-                build: false,
+                build: None,
                 stack_image_env: Vec::new(),
             })
             .env;
@@ -844,7 +844,7 @@ mod tests {
                 slack: false,
                 model_mode: mode,
                 env_file: None,
-                build: false,
+                build: None,
                 stack_image_env: Vec::new(),
             })
             .env;
@@ -880,7 +880,7 @@ mod tests {
                 slack: false,
                 model_mode: ModelMode::DefaultFake,
                 env_file: None,
-                build: false,
+                build: None,
                 stack_image_env: Vec::new(),
             })
             .env;
@@ -920,7 +920,7 @@ mod tests {
                 slack: false,
                 model_mode: ModelMode::DefaultFake,
                 env_file: None,
-                build: false,
+                build: None,
                 stack_image_env: Vec::new(),
             })
             .env;
