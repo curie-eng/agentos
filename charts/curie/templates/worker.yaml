@@ -115,7 +115,7 @@ spec:
   template:
     metadata:
       annotations:
-        {{- with (include "curie.placement.annotations" .Values.placement.platform) }}
+        {{- with (include "curie.placement.annotations" (dict "root" $ "class" "platform")) }}
         {{- . | nindent 8 }}
         {{- end }}
         # Roll the workers when the per-adapter egress credentials change
@@ -139,13 +139,13 @@ spec:
         # secretKeyRef env resolves once at pod start).
         checksum/adapter-credentials: {{ include "curie.adapterCredentialsChecksumSource" . | sha256sum }}
       labels:
-        {{- with (include "curie.placement.labels" .Values.placement.platform) }}
+        {{- with (include "curie.placement.labels" (dict "root" $ "class" "platform")) }}
         {{- . | nindent 8 }}
         {{- end }}
         {{- include "curie.labels" . | nindent 8 }}
         {{- include "curie.selectorLabels" (dict "root" . "component" "worker") | nindent 8 }}
     spec:
-      {{- with (include "curie.placement.spec" .Values.placement.platform) }}
+      {{- with (include "curie.placement.spec" (dict "root" $ "class" "platform")) }}
       {{- . | nindent 6 }}
       {{- end }}
       terminationGracePeriodSeconds: {{ .Values.worker.terminationGracePeriodSeconds }}
