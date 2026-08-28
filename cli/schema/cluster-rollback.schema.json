@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/cluster-rollback/v1.json",
+  "title": "curie cluster rollback --json",
+  "description": "The agent-facing payload of `curie cluster rollback`: the dry-run plan, an operator abort, or the completed rollback. `skipped` lists only the revisions passed over that were ineligible (status not `deployed`/`superseded`); an explicit `--revision` can step over eligible revisions too, and those are deliberately not listed here. `forced` is true only when `--allow-failed-revision` admitted the target.",
+  "$defs": {
+    "dryRun": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "dry_run": {
+          "const": true
+        },
+        "plan": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "dry_run",
+        "plan"
+      ]
+    }
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/dryRun"
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "rolled_back": {
+          "const": false
+        },
+        "aborted": {
+          "const": true
+        }
+      },
+      "required": [
+        "rolled_back",
+        "aborted"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "rolled_back": {
+          "const": true
+        },
+        "from_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "to_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "skipped": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "forced": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "rolled_back",
+        "from_revision",
+        "to_revision",
+        "skipped",
+        "forced"
+      ]
+    }
+  ]
+}

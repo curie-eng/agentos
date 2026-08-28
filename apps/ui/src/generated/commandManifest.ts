@@ -2150,6 +2150,80 @@ export const commandManifest = {
           "name": "down"
         },
         {
+          "about": "Roll the release back to the newest revision that is actually known good",
+          "args": [
+            {
+              "global": false,
+              "help": "Roll back to this exact revision instead of the newest safe one. A revision that is not `deployed` or `superseded` is refused unless --allow-failed-revision is also passed",
+              "id": "revision",
+              "long": "revision",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Permit --revision to name a revision helm never finished applying (`failed`, `pending-*`, `uninstalling`). Off by default. Requires --revision -- auto-select never chooses an ineligible revision, so this flag alone would otherwise be a silent no-op",
+              "id": "allow_failed_revision",
+              "long": "allow-failed-revision",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": false,
+              "help": "Kubernetes namespace",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": false,
+              "help": "Helm release name",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Skip the interactive confirmation prompt",
+              "id": "yes",
+              "long": "yes",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Print the commands that would run and exit without executing",
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "long_about": "Roll the release back to the newest revision that is actually known good.\n\nA bare `helm rollback` targets the immediately preceding revision. On a cluster with no `runsc` RuntimeClass that is the wrong one: `cluster up` records a FAILED revision before its successful gVisor-off retry, so the history alternates failed/superseded and the preceding revision is a failed one -- a manifest helm never finished applying.\n\nThis verb skips every revision whose status is not `deployed` or `superseded` and rolls back to the newest one below the current revision that is, printing which revisions it passed over. See issue #1899.",
+          "name": "rollback"
+        },
+        {
           "about": "Carry bundle objects across a chart upgrade that renames the object store (issue #1324)",
           "args": [
             {

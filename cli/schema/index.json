@@ -52,6 +52,12 @@
       "version": "1.0"
     },
     {
+      "result": "ClusterRollbackOutput",
+      "kind": "CliOutput",
+      "schema": "cluster-rollback.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "ClusterStatusOutput",
       "kind": "CliOutput",
       "schema": "cluster-status.schema.json",
