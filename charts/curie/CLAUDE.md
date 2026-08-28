@@ -50,6 +50,19 @@ component and rail detail in `charts/curie/README.md`.
 - **Values keys are camelCase, not hyphenated.** Go templates cannot
   dot-index a hyphenated key. Keep this consistent across any new values
   additions.
+- **Placement-class lookups go through `curie.placement.class`; never
+  index `.Values.placement.<class>` directly in a template.** Helm's
+  values coalescing deletes a key whose replayed value is YAML null, so
+  `helm upgrade --reuse-values` on a release created before placement
+  classes existed -- which stored `placement: null` -- leaves
+  `.Values.placement` nil, and a direct dereference crashes the render
+  before any cluster mutation (#2008). A nil or missing tree/class
+  degrades to the chart's empty defaults; a tree or class that is present
+  but not a map is refused with `fail`, deliberately -- `fromYaml` returns
+  an error map rather than an error for a non-map document, so softening
+  that refusal into a default would silently drop every scheduling
+  constraint the operator asked for. A new pod surface added to the chart
+  uses the helper with its class name rather than a fresh direct index.
 - **Fail-closed egress, always.** `security.networkPolicy.allowedEgress` is
   empty by default; an unset allowlist must never mean allow-all. If you add
   a new egress destination the runner needs, it goes into this allowlist
@@ -130,7 +143,12 @@ component and rail detail in `charts/curie/README.md`.
     instead by the worker's own boot-time refusal. Both checks are
     load-bearing -- the schema catches a bad value early for the common
     cases, the worker's refusal is the backstop for the coalescing gap the
-    schema cannot see.
+    schema cannot see. `placement` is the second instance of this exact
+    coalescing gap -- a release created before placement classes existed
+    can store `placement: null`, and `--reuse-values` on upgrade replays
+    it, deleting the key -- and the `curie.placement.class` helper (see
+    the values-keys invariant above) is its template-level backstop
+    (#2008).
 
 ## Verify
 
