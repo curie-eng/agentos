@@ -4651,9 +4651,17 @@ pub async fn run_capture(cmd: &OpsCommand) -> Result<(bool, String, String)> {
     // end of this function, so the temp files are removed after `helm` exits
     // (including on error paths below).
     let (cmd, _secret_files) = cmd.materialize_secret_files()?;
+    // `kill_on_drop` so a caller that ABANDONS this future does not leave the
+    // child running. Dropping the future only stops the wait; without this the
+    // process keeps going, which is worst precisely where the abandonment is
+    // deliberate -- `message::local_connected_transport` bounds its `docker`
+    // reads by a timeout for a wedged daemon, and each timed-out call would
+    // otherwise strand another hung `docker` client (#1031). Inert for every
+    // caller that awaits to completion: the child has already exited by then.
     let output = Command::new(&cmd.program)
         .args(cmd.argv())
         .envs(cmd.env.iter().chain(cmd.secret_env.iter()).cloned())
+        .kill_on_drop(true)
         .output()
         .await
         .with_context(|| format!("failed to invoke `{}`; is it on PATH?", cmd.program))?;

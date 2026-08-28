@@ -2237,9 +2237,6 @@ const LOCAL_STUB_BOT_TOKEN: &str = "xoxb-dev";
 /// points here talks to the in-compose stub, never to Slack.
 const LOCAL_SLACK_STUB_HOST: &str = "localhost:8155";
 
-/// The compose service (and container) that holds the worker's Slack transport.
-const LOCAL_WORKER_CONTAINER: &str = "curie-worker";
-
 /// The Slack transport the RUNNING compose worker is actually configured with:
 /// `(SLACK_API_BASE_URL, SLACK_BOT_TOKEN)` as the container holds them.
 type WorkerTransport = (Option<String>, Option<String>);
@@ -2264,6 +2261,19 @@ type WorkerTransport = (Option<String>, Option<String>);
 ///    definitive signal: it is literally the transport the worker will use to
 ///    edit the placeholder, so if it is the stub, no real post can ever be
 ///    updated, whatever any token says.
+///
+///    An **empty** value is the CONNECTED signal here, not the disconnected one,
+///    and reading it the other way is what made this whole path unreachable
+///    (#1031). `local comms --connect` un-wires the stub by setting
+///    `SLACK_API_BASE_URL` to the empty string (`comms::local_connect_commands`),
+///    compose's single-dash `${SLACK_API_BASE_URL-http://localhost:8155/api/}`
+///    preserves an explicitly empty value rather than re-defaulting it, and
+///    `docs/slack-local-runbook.md` documents the convention; the cluster tier
+///    says the same thing with `worker.slackApiBaseUrl=`. Empty therefore means
+///    "no override -> real slack.com", which is exactly what
+///    `SlackTransport::new(None, ..)` resolves to. What genuinely carries no
+///    information is an ABSENT value (`None`): the probe could not read the
+///    container at all, and that stays the stub path.
 /// 2. the token must be a real one, not the `xoxb-dev` sentinel.
 ///
 /// Returning the worker's OWN token (rather than one the CLI resolved) also
@@ -2281,44 +2291,121 @@ type WorkerTransport = (Option<String>, Option<String>);
 /// Pure, so both conditions are unit-testable without Docker.
 fn connected_worker_transport(transport: WorkerTransport) -> Option<crate::slack::SlackTransport> {
     let (api_base, token) = transport;
-    let api_base = api_base.unwrap_or_default();
-    // Wired to the stub (or to nothing resolvable) means not connected.
-    if api_base.is_empty() || api_base.contains(LOCAL_SLACK_STUB_HOST) {
+    // Absent, not empty. `None` means the value was never read off the container
+    // -- there is no worker transport to trust, so take the stub path (#1031).
+    let api_base = api_base?;
+    // Wired to the stub is not connected: the stub is literally the transport the
+    // worker will edit the placeholder over, so no real post can ever be updated.
+    if api_base.contains(LOCAL_SLACK_STUB_HOST) {
         return None;
     }
     let token = token?.trim().to_string();
+    // An EMPTY base is carried through as "the source named no base", which
+    // `SlackTransport::new` resolves to real Slack -- the same answer the worker
+    // itself reaches. See the empty-is-connected paragraph above (#1031).
     (!token.is_empty() && token != LOCAL_STUB_BOT_TOKEN)
         .then(|| crate::slack::SlackTransport::new(Some(api_base), token))
 }
 
+/// How long the whole worker-transport probe (resolve the container, then read
+/// its env) may take before `local message` gives up on it.
+///
+/// A wedged docker daemon accepts the request and then never answers, so an
+/// unbounded probe hangs `curie local message` forever -- which also makes the
+/// "a probe failure falls back to the safe stub path" claim vacuous, since
+/// nothing ever fails. Two local `docker` reads have no business taking longer
+/// than this (#1031).
+const WORKER_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Read the running compose worker's Slack transport out of the container.
 ///
 /// `docker inspect` on the worker container, so what we act on is what the worker
-/// holds -- the reconciliation #957 asks for. Any failure (no stack up, docker
-/// absent, container renamed) reads as "no transport", which falls back to the
-/// stub path: the safe direction, since the stub path never posts to real Slack.
-async fn running_worker_transport() -> WorkerTransport {
-    let out = match crate::docker::docker_capture(&[
-        "inspect".to_string(),
-        "--format".to_string(),
-        "{{range .Config.Env}}{{println .}}{{end}}".to_string(),
-        LOCAL_WORKER_CONTAINER.to_string(),
-    ])
-    .await
-    {
-        Ok((status, stdout, _)) if status.success() => stdout,
-        _ => return (None, None),
-    };
+/// holds -- the reconciliation #957 asks for.
+///
+/// The container is resolved through the compose SERVICE LABEL
+/// ([`local_worker_container`] / [`COMPOSE_WORKER_SERVICE`]), never by a
+/// hardcoded name. Container names carry the compose project
+/// (`<project>-curie-worker-1`, and the CLI pins `COMPOSE_PROJECT_NAME=curie`),
+/// so inspecting a bare `curie-worker` matched nothing on a default stack and
+/// silently classified every stack as disconnected (#1031). The selector also
+/// closes the inverse hazard: an unrelated container that merely happens to be
+/// NAMED `curie-worker` carries no compose service label, so it can no longer
+/// impersonate the worker and hand this probe a real token the actual worker
+/// does not hold.
+///
+/// Failures are returned rather than swallowed, so the caller can say that the
+/// probe could not run instead of asserting a disconnected stack it never saw.
+async fn running_worker_transport() -> Result<WorkerTransport> {
+    let worker = local_worker_container().await?;
+    let cmd = OpsCommand::new(
+        "docker",
+        vec![
+            plain("inspect"),
+            plain(&worker),
+            plain("--format"),
+            plain("{{range .Config.Env}}{{println .}}{{end}}"),
+        ],
+    );
+    let (ok, stdout, stderr) = run_capture(&cmd).await?;
+    if !ok {
+        bail!(
+            "inspecting the local worker container {worker}: {}",
+            stderr.trim()
+        );
+    }
     let find = |key: &str| -> Option<String> {
-        out.lines()
+        stdout
+            .lines()
             .find_map(|l| l.strip_prefix(key).map(|v| v.to_string()))
     };
-    (find("SLACK_API_BASE_URL="), find("SLACK_BOT_TOKEN="))
+    Ok((find("SLACK_API_BASE_URL="), find("SLACK_BOT_TOKEN=")))
+}
+
+/// Bound `probe` by `budget`, flattening both a probe error and a timeout into
+/// one operator-facing reason string. Generic over the future purely so the
+/// timeout itself is testable without a wedged daemon.
+async fn bounded_worker_probe<F>(
+    probe: F,
+    budget: Duration,
+) -> std::result::Result<WorkerTransport, String>
+where
+    F: std::future::Future<Output = Result<WorkerTransport>>,
+{
+    match tokio::time::timeout(budget, probe).await {
+        Ok(Ok(transport)) => Ok(transport),
+        Ok(Err(err)) => Err(format!("{err:#}")),
+        Err(_) => Err(format!("the docker probe did not answer within {budget:?}")),
+    }
+}
+
+/// The warning a probe that could not RUN emits, mirroring the cluster sibling
+/// (`ops::dispatcher_connected`, #957 mode C) that the same diff introduced this
+/// path alongside. A probe that could not run is not evidence that no workspace
+/// is connected: silently downgrading to the stub path means the operator asked
+/// for the connected mode, got the other one, and was told nothing. Still fall
+/// back -- the stub path never posts to real Slack, and failing the whole command
+/// on a flaky docker would be worse -- but say so (#1031).
+fn worker_probe_warning(reason: &str) -> String {
+    format!(
+        "could not determine whether a Slack workspace is connected (the local worker \
+         transport probe failed: {}); assuming NOT connected and using the local reply stub",
+        reason.trim().lines().next().unwrap_or("no detail")
+    )
 }
 
 /// Process-level wrapper: the transport to post over, or `None` for the stub path.
-async fn local_connected_transport() -> Option<crate::slack::SlackTransport> {
-    connected_worker_transport(running_worker_transport().await)
+///
+/// `pub` so `cli/tests/local_connectedness_probe.rs` can drive the whole probe
+/// (resolve by label -> inspect -> classify) against a `docker` shim; the pure
+/// predicate alone cannot see the wiring both #1031 defects lived in.
+pub async fn local_connected_transport() -> Option<crate::slack::SlackTransport> {
+    match bounded_worker_probe(running_worker_transport(), WORKER_PROBE_TIMEOUT).await {
+        Ok(transport) => connected_worker_transport(transport),
+        Err(reason) => {
+            crate::ui::ui().warn(&worker_probe_warning(&reason));
+            None
+        }
+    }
 }
 
 /// The human dry-run line noting that a connected workspace changes the plan
@@ -3406,9 +3493,9 @@ async fn probe_fake_model(opts: &EvalOpts) -> Result<bool> {
 
 /// The compose service the worker runs as, per `compose.dev.yaml`. Container
 /// NAMES vary with the compose project (`<project>-curie-worker-1`), so the
-/// service label is the only stable selector; `cli/tests/fake_tier_plumbing.rs`
-/// pins this against the compose file so a service rename cannot silently
-/// blind the probe again.
+/// service label is the only stable selector; the unit test
+/// `the_probe_matches_the_worker_service_compose_declares` pins this against the
+/// compose file so a service rename cannot silently blind the probe again.
 pub(crate) const COMPOSE_WORKER_SERVICE: &str = "curie-worker";
 
 /// The label selector the probe matches on, quoted into diagnostics so an
@@ -3431,10 +3518,13 @@ fn worker_ps_command() -> OpsCommand {
 }
 
 /// Pick the one running compose worker from `docker ps` output. Zero or many is
-/// an explicit diagnostic: guessing which stack the sweep would hit is exactly
+/// an explicit diagnostic: guessing which stack the caller would hit is exactly
 /// the fabrication this probe exists to prevent. Both diagnostics name the
 /// selector rather than asserting a stack-wide fact the probe did not check --
 /// "no container matched X" is verifiable; "there is no stack" is not.
+///
+/// Shared by the `--model` sweep and the `local message` connectedness probe
+/// (#1031), so the wording names the worker rather than either caller's verb.
 fn select_worker_container(stdout: &str) -> Result<String> {
     let names: Vec<&str> = stdout
         .lines()
@@ -3444,13 +3534,13 @@ fn select_worker_container(stdout: &str) -> Result<String> {
     match names.as_slice() {
         [only] => Ok((*only).to_string()),
         [] => bail!(
-            "no running container matches `{}`, so the sweep cannot read which model the local \
-             stack is running. Start a stack with `curie local up`.",
+            "no running container matches `{}`, so the local worker's own configuration \
+             cannot be read. Start a stack with `curie local up`.",
             worker_label_selector()
         ),
         many => bail!(
-            "{} running containers match `{}` ({}); a sweep cannot tell which stack it would \
-             measure. Stop the extras with `curie local down`.",
+            "{} running containers match `{}` ({}); the local worker cannot be identified \
+             unambiguously. Stop the extras with `curie local down`.",
             many.len(),
             worker_label_selector(),
             many.join(", ")
@@ -4139,6 +4229,13 @@ mod tests {
             select_worker_container("curie-curie-worker-1\n").unwrap(),
             "curie-curie-worker-1"
         );
+        // #1031(a): container NAMES carry the compose project, so a non-default
+        // `COMPOSE_PROJECT_NAME` renames the container out from under any
+        // hardcoded name. The label selector is what still resolves it.
+        assert_eq!(
+            select_worker_container("acme-staging-curie-worker-1\n").unwrap(),
+            "acme-staging-curie-worker-1"
+        );
     }
 
     /// Zero and many are diagnostics about the SELECTOR, never a claim about
@@ -4584,9 +4681,22 @@ mod tests {
             connected_worker_transport((t("https://slack.com/api/"), t(LOCAL_STUB_BOT_TOKEN))),
             None
         );
-        // No stack running / nothing resolvable -> stub path, never a real post.
+        // #1031: an EMPTY `SLACK_API_BASE_URL` is this repo's "talk to real Slack"
+        // signal, not its "nothing configured" one. `local comms --connect` sets
+        // exactly that (`comms::local_connect_commands`), compose's single-dash
+        // `${SLACK_API_BASE_URL-...}` preserves it, and the runbook documents it.
+        // Reading it as disconnected made the connected local transport
+        // unreachable. Connected, over real Slack's own base.
+        let empty_base = connected_worker_transport((t(""), t("xoxb-real")))
+            .expect("an empty SLACK_API_BASE_URL is the connected signal, not the stub one");
+        assert_eq!(empty_base.api_base, crate::slack::DEFAULT_API_BASE);
+        assert_eq!(empty_base.bot_token, "xoxb-real");
+
+        // Absent is NOT empty. `None` means the value was never read off the
+        // container (no stack, docker down, container renamed), so there is no
+        // worker transport to trust -> stub path, never a real post.
         assert_eq!(connected_worker_transport((None, None)), None);
-        assert_eq!(connected_worker_transport((t(""), t("xoxb-real"))), None);
+        assert_eq!(connected_worker_transport((None, t("xoxb-real"))), None);
         assert_eq!(
             connected_worker_transport((t("https://slack.com/api/"), None)),
             None
@@ -4594,6 +4704,191 @@ mod tests {
         assert_eq!(
             connected_worker_transport((t("https://slack.com/api/"), t("  "))),
             None
+        );
+    }
+
+    fn local_comms_opts(disconnect: bool) -> crate::comms::LocalCommsOpts {
+        crate::comms::LocalCommsOpts {
+            file: "compose.dev.yaml".to_string(),
+            dry_run: false,
+            app_token: "xapp-real-workspace".to_string(),
+            bot_token: "xoxb-real-workspace".to_string(),
+            disconnect,
+            model_mode: crate::local::ModelMode::DefaultFake,
+            minimal: false,
+        }
+    }
+
+    /// The worker Slack env a `local comms` command actually applies, read back
+    /// out of the built `OpsCommand`s the same way compose would.
+    fn worker_slack_env(commands: &[crate::ops::OpsCommand]) -> WorkerTransport {
+        let get = |key: &str| -> Option<String> {
+            commands
+                .iter()
+                .flat_map(|cmd| cmd.env.iter().chain(cmd.secret_env.iter()))
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.clone())
+        };
+        (get("SLACK_API_BASE_URL"), get("SLACK_BOT_TOKEN"))
+    }
+
+    /// #1031 end to end across the two modules: the env `curie local comms
+    /// --connect` really applies to the worker must classify as CONNECTED, and
+    /// `--disconnect`'s must classify as NOT connected. Both halves are read from
+    /// the command builder rather than restated here, so inverting either the
+    /// predicate or the builder fails this test instead of silently stranding the
+    /// connected path (which is exactly how the defect shipped).
+    #[test]
+    fn local_comms_connect_and_disconnect_round_trip_through_the_probe() {
+        let connect = crate::comms::local_connect_commands(&local_comms_opts(false));
+        let connected_env = worker_slack_env(&connect);
+        assert_eq!(
+            connected_env.0,
+            Some(String::new()),
+            "`local comms --connect` un-wires the stub by setting an EMPTY base; if that \
+             ever changes, the probe's reading of empty must change with it"
+        );
+
+        let transport = connected_worker_transport(connected_env)
+            .expect("`local comms --connect` must leave the worker classified as connected");
+        assert_eq!(transport.api_base, crate::slack::DEFAULT_API_BASE);
+        assert_eq!(transport.bot_token, "xoxb-real-workspace");
+
+        // Negative control on the same seam: --disconnect restores the stub, which
+        // must stay classified as not connected however real the token looks.
+        let disconnect = crate::comms::local_disconnect_commands(&local_comms_opts(true));
+        let disconnected_env = worker_slack_env(&disconnect);
+        assert!(
+            disconnected_env
+                .0
+                .as_deref()
+                .is_some_and(|base| base.contains(LOCAL_SLACK_STUB_HOST)),
+            "`local comms --disconnect` must point the worker back at the stub: {:?}",
+            disconnected_env.0
+        );
+        assert_eq!(connected_worker_transport(disconnected_env), None);
+    }
+
+    /// #1031 mode C at the local tier: a probe that could not RUN is not evidence
+    /// that no workspace is connected, so it says so rather than silently taking
+    /// the stub path (the asymmetry `ops::dispatcher_connected` already closed).
+    #[test]
+    fn a_probe_that_could_not_run_warns_rather_than_claiming_disconnected() {
+        let warning = worker_probe_warning("no running container matches `label=x`");
+        assert!(
+            warning.contains("could not determine")
+                && warning.contains("no running container matches `label=x`")
+                && warning.contains("NOT connected"),
+            "{warning}"
+        );
+        // Only the first line of a multi-line failure, so a docker stack trace
+        // cannot swamp the operator's terminal.
+        let multi = worker_probe_warning("first line\nsecond line");
+        assert!(
+            multi.contains("first line") && !multi.contains("second line"),
+            "{multi}"
+        );
+    }
+
+    /// #1031(d): a wedged docker daemon accepts the request and never answers.
+    /// Without a bound, `curie local message` hangs forever -- which contradicts
+    /// the "probe failure is the safe direction" claim, because it never fails.
+    /// `std::future::pending()` is that daemon; the assertion is that the probe
+    /// RETURNS at all.
+    #[tokio::test]
+    async fn a_wedged_docker_daemon_times_the_probe_out_instead_of_hanging() {
+        let budget = Duration::from_millis(20);
+        // The outer bound is the test harness's own safety net: without the guard
+        // under test this call never returns, and a CI job that HANGS is a worse
+        // signal than one that fails. Five seconds is 250x the budget, so it can
+        // only fire when the budget is not being applied at all.
+        let reason = tokio::time::timeout(
+            Duration::from_secs(5),
+            bounded_worker_probe(std::future::pending(), budget),
+        )
+        .await
+        .expect("the probe must be bounded; it never returned")
+        .expect_err("a probe that never answers must time out, not hang");
+        assert!(
+            reason.contains("did not answer within"),
+            "the timeout must be reported as a timeout: {reason}"
+        );
+    }
+
+    /// The `/proc` state letter for `pid`: `None` once the entry is gone, `Some('Z')`
+    /// while it is a reaped-pending zombie, `Some('S')` while it is still sleeping.
+    #[cfg(target_os = "linux")]
+    fn proc_state(pid: u32) -> Option<char> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // comm can contain spaces and parens, so the fields start after the LAST ')'.
+        let rest = stat.rsplit_once(')')?.1;
+        rest.split_whitespace().next()?.chars().next()
+    }
+
+    /// #1031(d), second half: bounding the WAIT is not bounding the WORK. A
+    /// timeout that only drops the future leaves the `docker` client running
+    /// against the wedged daemon, so every timed-out `local message` strands
+    /// another one -- the leak is worst in exactly the scenario the timeout
+    /// exists for. `run_capture` sets `kill_on_drop`, so abandoning the probe
+    /// takes the child with it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_timed_out_probe_kills_the_docker_child_it_abandoned() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let pidfile = temp.path().join("pid");
+        let script = temp.path().join("wedged-docker");
+        std::fs::write(&script, "#!/bin/sh\necho $$ > \"$1\"\nexec sleep 60\n")
+            .expect("write wedged docker shim");
+        let mut permissions = std::fs::metadata(&script)
+            .expect("shim metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).expect("make shim executable");
+
+        let cmd = OpsCommand::new(
+            script.to_str().expect("shim path is UTF 8"),
+            vec![plain(pidfile.to_str().expect("pidfile path is UTF 8"))],
+        );
+        let reason = bounded_worker_probe(
+            async {
+                let (_ok, _out, _err) = run_capture(&cmd).await?;
+                Ok((None, None))
+            },
+            Duration::from_millis(300),
+        )
+        .await
+        .expect_err("a shim that never answers must time out");
+        assert!(reason.contains("did not answer within"), "{reason}");
+
+        let pid: u32 = std::fs::read_to_string(&pidfile)
+            .expect("the shim recorded its pid before sleeping")
+            .trim()
+            .parse()
+            .expect("the recorded pid is a number");
+
+        // The kill is delivered on drop; give the kernel a moment to land it.
+        let mut state = proc_state(pid);
+        for _ in 0..100 {
+            if !matches!(state, Some('S') | Some('R') | Some('D')) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            state = proc_state(pid);
+        }
+        assert!(
+            !matches!(state, Some('S') | Some('R') | Some('D')),
+            "the abandoned child is still running (pid {pid}, state {state:?})"
+        );
+    }
+
+    #[test]
+    fn the_probe_budget_is_bounded_and_usable() {
+        assert!(
+            WORKER_PROBE_TIMEOUT > Duration::ZERO
+                && WORKER_PROBE_TIMEOUT <= Duration::from_secs(30),
+            "{WORKER_PROBE_TIMEOUT:?}"
         );
     }
 
