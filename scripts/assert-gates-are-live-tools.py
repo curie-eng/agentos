@@ -66,6 +66,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from typing import Any
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -88,6 +89,46 @@ def with_url_port(host: str, url: str) -> str:
         return host
     port = urllib.parse.urlsplit(url).port
     return f"{host}:{port}" if port else host
+
+
+class _KeepMethodRedirect(urllib.request.HTTPRedirectHandler):
+    """Follow 307/308 for a POST, which urllib will not do on its own.
+
+    A streamable-HTTP server mounted at `/mcp/` answers `/mcp` with a 307. urllib
+    raises rather than re-issuing the POST, so the connector reads as unreachable
+    -- and this script treats unreachable as fatal, so one missing slash fails the
+    whole check with a message naming the wrong cause. Measured on a live pair:
+    two connectors from the same bundle differed, because their FastMCP versions
+    did.
+
+    Only 307 and 308, which are defined to preserve the method and body. A 301 or
+    302 would turn this POST into a GET, and silently checking a different request
+    than the one asked for is worse than failing.
+    """
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        if code not in (307, 308):
+            redirected: urllib.request.Request | None = super().redirect_request(
+                req, fp, code, msg, headers, newurl
+            )
+            return redirected
+        return urllib.request.Request(
+            newurl,
+            data=req.data,
+            headers=dict(req.header_items()),
+            method=req.get_method(),
+        )
+
+
+_OPENER = urllib.request.build_opener(_KeepMethodRedirect)
 
 
 def list_tools(url: str, timeout: float, host: str | None = None) -> list[tuple[str, bool]]:
@@ -123,7 +164,7 @@ def list_tools(url: str, timeout: float, host: str | None = None) -> list[tuple[
             headers["Host"] = host
         headers.update(session)
         req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers=headers)
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with _OPENER.open(req, timeout=timeout) as r:
             sid = r.headers.get("Mcp-Session-Id")
             if sid:
                 session["Mcp-Session-Id"] = sid
