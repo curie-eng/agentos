@@ -22,10 +22,10 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "sre-bot" / "self-upgrade"))
 
 from redeploy import (  # noqa: E402
-    deploy,
     BUNDLE_PREFIX,
     SelfUpgradeError,
     bundle_from_repo_tarball,
+    deploy,
     deployed_commit,
     member_of,
     pin_build_connectors,
