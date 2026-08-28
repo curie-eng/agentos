@@ -13,7 +13,7 @@ use clap::ValueEnum;
 use curie_aci_protocol::{Budget, EventType, OutboundEvent, SessionStatus};
 use serde::{Deserialize, Serialize};
 
-use crate::api::{ApiClient, BudgetConfig, ChannelOutcome};
+use crate::api::{ApiClient, BudgetConfig, ChannelOutcome, RoutingCheck};
 use crate::bundle::pack_tar_gz;
 use crate::docker::{self, CheckSpec, StartSpec};
 use crate::evals::{
@@ -3668,6 +3668,11 @@ pub struct PreparedDeploy {
     label: String,
     env: String,
     requested_repo: Option<String>,
+    /// The bundle's `deploy.yaml` TEXT, or None when the bundle has no such
+    /// file. Carried rather than re-read so the routing check (#1221) asks
+    /// about the file that was actually packed, and unparsed because ADR-0089
+    /// keeps exactly one parser for this format and it is not in this binary.
+    deploy_targets_yaml: Option<String>,
     connect_hint: String,
     step: crate::ui::Step,
 }
@@ -3732,17 +3737,23 @@ pub async fn prepare_deploy(opts: DeployOpts) -> Result<PreparedDeploy> {
     // Resolve a declared target, if one was named (ADR-0089). The file is sent
     // as TEXT and parsed server-side: one parser means the CLI and the
     // validator cannot disagree about where this deploy lands.
+    // Read ONCE, for two consumers: `--target` resolution below and the
+    // post-deploy routing check (#1221). Absence is the ordinary case, not an
+    // error -- most bundles declare no targets -- so the read is kept as a
+    // Result only so `--target` can still name the io failure precisely.
+    let deploy_targets_path = plugin_dir.join("deploy.yaml");
+    let deploy_targets_read = std::fs::read_to_string(&deploy_targets_path);
+    let deploy_targets_yaml = deploy_targets_read.as_ref().ok().cloned();
     let resolved = match &opts.target {
         Some(name) => {
-            let path = plugin_dir.join("deploy.yaml");
-            let content = std::fs::read_to_string(&path).map_err(|err| {
+            let content = deploy_targets_read.as_ref().map_err(|err| {
                 crate::exit::usage(format!(
                     "--target {name} needs a deploy.yaml in the bundle, but {} could not be \
                      read: {err}",
-                    path.display()
+                    deploy_targets_path.display()
                 ))
             })?;
-            Some(client.resolve_deploy_target(&content, name).await?)
+            Some(client.resolve_deploy_target(content, name).await?)
         }
         None => None,
     };
@@ -3829,9 +3840,77 @@ pub async fn prepare_deploy(opts: DeployOpts) -> Result<PreparedDeploy> {
         label,
         env: env.to_string(),
         requested_repo: opts.repo,
+        deploy_targets_yaml,
         connect_hint: opts.connect_hint,
         step,
     })
+}
+
+/// The operator-facing text for a repository whose pushes no longer route (#1221).
+///
+/// Pure, so the wording is unit-testable without a platform. Three things it
+/// must do and one it must not:
+///
+/// - name the repository and every agent now bound to it, because the operator
+///   who just deployed one of them cannot otherwise tell who else is affected;
+/// - carry the resolver's own `message` VERBATIM -- paraphrasing it would put a
+///   second statement of the routing rule in the client, free to drift from the
+///   one `gitflow.py` enforces on a push (the drift #1212 exists to correct);
+/// - say plainly that the affected pushes break for EVERY agent bound to the
+///   repository, including ones this deploy never touched, since the surprise
+///   is that a working agent breaks without being deployed to.
+///
+/// What it must NOT do is widen the damage past what the resolver reported. A
+/// bundle can declare a valid `dev` target and a `prod` target naming an agent
+/// that does not exist: the answer comes back unresolvable carrying ONLY the
+/// prod problem, while dev pushes still deploy exactly as before. Claiming
+/// every push is rejected would be false there, and appending a fixed "declare
+/// a target" remedy would be worse than false -- targets already exist, and the
+/// real remedy is the one the resolver named in its own `message`. So the
+/// affected environments are read off `unresolvable`, and no generic remedy is
+/// appended at all: each problem's own text carries the fix for its own code
+/// (`deploy.no_targets` already ends with "Declare a target (ADR-0089)."), and
+/// a hardcoded second remedy could only contradict it.
+fn routing_warning(check: &RoutingCheck) -> String {
+    let agents = if check.agents.is_empty() {
+        "(none)".to_string()
+    } else {
+        check.agents.join(", ")
+    };
+    // Environments as the resolver named them, deduplicated in the order it
+    // sent them. A problem with a blank `environment` (the field is
+    // `serde(default)`) contributes no name rather than an empty one.
+    let mut envs: Vec<&str> = Vec::new();
+    for problem in &check.unresolvable {
+        let env = problem.environment.trim();
+        if !env.is_empty() && !envs.contains(&env) {
+            envs.push(env);
+        }
+    }
+    // With no environment named, the response says routing is broken without
+    // saying where. Staying vague is the honest rendering: inventing a list
+    // would be the same overstatement this function exists to avoid.
+    let scope = if envs.is_empty() {
+        "some pushes to this repository no longer deploy anything".to_string()
+    } else {
+        format!(
+            "pushes that deploy the {} environment{} no longer deploy anything",
+            envs.join(", "),
+            if envs.len() == 1 { "" } else { "s" }
+        )
+    };
+    let mut lines = vec![format!(
+        "git-flow routing for {} is broken: {} agents are bound to it ({agents}), and {scope} \
+         -- for every one of those agents, including agents this deploy did not touch.",
+        check.repo_full_name, check.agent_count
+    )];
+    for problem in &check.unresolvable {
+        lines.push(format!(
+            "  {} ({}): {}",
+            problem.environment, problem.code, problem.message
+        ));
+    }
+    lines.join("\n")
 }
 
 pub async fn deploy_prepared(prepared: PreparedDeploy) -> Result<DeployOutput> {
@@ -3843,6 +3922,7 @@ pub async fn deploy_prepared(prepared: PreparedDeploy) -> Result<DeployOutput> {
         label,
         env,
         requested_repo,
+        deploy_targets_yaml,
         connect_hint,
         step,
     } = prepared;
@@ -3877,6 +3957,28 @@ pub async fn deploy_prepared(prepared: PreparedDeploy) -> Result<DeployOutput> {
         ui.note(&format!(
             "repo binding: git-flow pushes to {repo} deploy this agent"
         ));
+        // ...unless they no longer route anywhere (#1221). Migration 0018
+        // (ADR-0091) dropped the unique index on `repo_full_name`, so a SECOND
+        // agent may bind the same repository -- and with no declared targets
+        // that silently flips every future push for the agent that was ALREADY
+        // bound from "deploys" to "rejected". This is the one point BOTH
+        // binding paths converge on: an agent bound at creation and one bound
+        // by a later PATCH (#1212) both arrive here.
+        //
+        // The API answers, because the API owns the resolver. Asking it is what
+        // keeps this warning from becoming a second copy of the routing rule,
+        // free to drift from the one a push actually enforces. It is advisory
+        // in every direction: an older platform, an unreachable one, or an
+        // undecodable answer all print nothing rather than souring a deploy
+        // that already succeeded.
+        if let Ok(Some(check)) = client
+            .check_git_flow_routing(repo, deploy_targets_yaml.as_deref())
+            .await
+        {
+            if !check.resolvable {
+                ui.warn(&routing_warning(&check));
+            }
+        }
     }
 
     let channel = match &outcome.channel {
@@ -6181,13 +6283,126 @@ mod tests {
         absent_container_note, merge_secret_env, model_credential_summary,
         parse_credential_env_file, parse_manifest_gates, plan_recorded_state,
         plan_recorded_teardown, plan_skill_down, recorded_ids_match, replace_first_line,
-        report_sweep, resolve_cases_path, resolve_env_file_credentials, seed_env_if_missing,
-        select_in_force_deployment, select_passthrough_env, sweep_json_row, sweep_table_row,
-        validate_channel_binding, ApprovalGateDecl, DownPlan, EnvSeed, RecordedStatePlan,
-        RecordedStateQuery, RecordedTeardown, SweepRow,
+        report_sweep, resolve_cases_path, resolve_env_file_credentials, routing_warning,
+        seed_env_if_missing, select_in_force_deployment, select_passthrough_env, sweep_json_row,
+        sweep_table_row, validate_channel_binding, ApprovalGateDecl, DownPlan, EnvSeed,
+        RecordedStatePlan, RecordedStateQuery, RecordedTeardown, SweepRow,
     };
     use serde::Deserialize;
     use std::path::{Path, PathBuf};
+
+    /// The platform's answer for a repository two agents bind with no declared
+    /// targets -- built by deserializing the WIRE shape, so the test cannot
+    /// drift from what the endpoint actually sends (#1221).
+    fn unroutable_check() -> crate::api::RoutingCheck {
+        serde_json::from_str(
+            r#"{
+                "repo_full_name": "octo/shared-repo",
+                "agent_count": 2,
+                "agents": ["acme-bot", "acme-dev"],
+                "resolvable": false,
+                "unresolvable": [
+                    {
+                        "environment": "dev",
+                        "code": "deploy.no_targets",
+                        "message": "2 agents are built from this repository but the bundle has no deploy.yaml, so there is nothing to say which one this branch deploys to. Declare a target (ADR-0089)."
+                    }
+                ]
+            }"#,
+        )
+        .expect("the routing-check wire shape should decode")
+    }
+
+    #[test]
+    fn the_routing_warning_names_the_repository_and_every_bound_agent() {
+        // The operator just deployed ONE of these agents. Naming only that one
+        // would hide the actual damage: the sibling that was working stops
+        // deploying without anyone touching it.
+        let warning = routing_warning(&unroutable_check());
+        assert!(warning.contains("octo/shared-repo"), "was {warning}");
+        assert!(warning.contains("acme-bot"), "was {warning}");
+        assert!(warning.contains("acme-dev"), "was {warning}");
+    }
+
+    #[test]
+    fn the_routing_warning_carries_the_resolvers_own_words_verbatim() {
+        // Paraphrasing here would put a second statement of the routing rule in
+        // the client, free to drift from the one a push enforces (#1212).
+        let check = unroutable_check();
+        let warning = routing_warning(&check);
+        assert!(
+            warning.contains(&check.unresolvable[0].message),
+            "was {warning}"
+        );
+        assert!(warning.contains("deploy.no_targets"), "was {warning}");
+        assert!(warning.contains("dev"), "was {warning}");
+    }
+
+    #[test]
+    fn the_routing_warning_states_the_blast_radius_it_was_told_about() {
+        let warning = routing_warning(&unroutable_check());
+        // The damage is real and must read as such, but scoped to the
+        // environment the resolver actually named.
+        assert!(warning.contains("dev"), "was {warning}");
+        assert!(
+            warning.contains("no longer deploy anything"),
+            "was {warning}"
+        );
+        assert!(
+            warning.contains("did not touch"),
+            "the warning must say untouched agents are affected too: {warning}"
+        );
+        // The remedy is the resolver's, carried in its own message. A second,
+        // hardcoded one is what made this warning misleading for a bundle that
+        // already declares targets.
+        assert!(
+            !warning.contains("Fix: declare a target"),
+            "the client must not append its own remedy: {warning}"
+        );
+    }
+
+    /// One environment broken and one fine -- a bundle with a good `dev` target
+    /// and a `prod` target naming an agent that does not exist. Dev pushes
+    /// still deploy, so the warning must not say otherwise (#1221).
+    fn prod_only_unroutable_check() -> crate::api::RoutingCheck {
+        serde_json::from_str(
+            r#"{
+                "repo_full_name": "octo/shared-repo",
+                "agent_count": 2,
+                "agents": ["acme-bot", "acme-dev"],
+                "resolvable": false,
+                "unresolvable": [
+                    {
+                        "environment": "prod",
+                        "code": "deploy.unknown_agent",
+                        "message": "The prod target names agent 'acme-prod', which does not exist."
+                    }
+                ]
+            }"#,
+        )
+        .expect("the routing-check wire shape should decode")
+    }
+
+    #[test]
+    fn the_routing_warning_does_not_widen_one_broken_environment_to_all() {
+        let check = prod_only_unroutable_check();
+        let warning = routing_warning(&check);
+        assert!(warning.contains("prod"), "was {warning}");
+        assert!(
+            warning.contains(&check.unresolvable[0].message),
+            "was {warning}"
+        );
+        // Nothing may suggest the dev lane broke: it did not, and telling the
+        // operator it did sends them to fix working configuration.
+        assert!(
+            !warning.contains("dev environment"),
+            "dev still routes and must not be named as broken: {warning}"
+        );
+        assert!(
+            !warning.contains("every push"),
+            "only the reported environments are affected: {warning}"
+        );
+    }
 
     #[test]
     fn env_file_resolver_respects_shell_and_vault_precedence() {

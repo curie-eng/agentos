@@ -978,6 +978,53 @@ class ListedTargets(BaseModel):
     targets: list[NamedTarget] = []
 
 
+class RoutingCheckRequest(BaseModel):
+    """Ask whether a repository's pushes can still be routed to an agent (#1221).
+
+    Migration 0018 (ADR-0091) dropped the unique index on ``repo_full_name``, so
+    binding a SECOND agent to a repository is legal -- and silently flips every
+    future push for the agent that was already bound from "deploys" to
+    "rejected", because nothing says which of the two a branch belongs to. The
+    caller sends the bundle's ``deploy.yaml`` TEXT for the same reason
+    ``ResolveTargetRequest`` does: the API owns the resolver rule, so a client
+    restating it here would drift from the rule actually enforced on a push.
+    """
+
+    repo_full_name: str
+    # The bundle's deploy.yaml TEXT, or None when the bundle has no such file.
+    # None and an empty `targets:` map say the same thing about routing (#1210),
+    # and the resolver already treats them identically.
+    content: str | None = None
+
+
+class RoutingCheckProblem(BaseModel):
+    """One environment whose pushes this repository can no longer route.
+
+    ``message`` is the resolver's OWN text, carried verbatim so the CLI can
+    print it without paraphrasing the rule.
+    """
+
+    environment: str
+    code: str
+    message: str
+
+
+class RoutingCheck(BaseModel):
+    """Whether pushes to a repository still resolve to an agent (#1221).
+
+    ``resolvable`` is false only when the real resolver raised: a branch with no
+    matching target resolves to "ignore", which is intended behaviour, not a
+    problem. An unbound repository (``agent_count`` 0) stays resolvable too --
+    this reports ROUTING, not whether anything is bound.
+    """
+
+    repo_full_name: str
+    agent_count: int = 0
+    agents: list[str] = Field(default_factory=list)
+    resolvable: bool = True
+    unresolvable: list[RoutingCheckProblem] = Field(default_factory=list)
+
+
 class ConnectorManifests(BaseModel):
     """Kubernetes objects derived from a version's ``connectors.yaml``.
 
