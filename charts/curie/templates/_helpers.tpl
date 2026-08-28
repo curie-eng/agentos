@@ -43,28 +43,46 @@ app.kubernetes.io/instance: {{ .root.Release.Name }}
 app.kubernetes.io/component: {{ .component }}
 {{- end -}}
 
+{{/* Resolve one named placement class. Pass a dict with "root" (the top
+     context) and "class" (the placement class name). Every class lookup in the
+     chart goes through this helper rather than indexing the placement values
+     directly, so that a legacy release whose retained values carry
+     `placement: null` (issue #2008) degrades to the chart's empty defaults
+     instead of crashing the render. Helm's coalescing deletes a null-valued key
+     outright, so when `helm upgrade --reuse-values` replays the stored config of
+     a release created before placement classes existed, the placement map is nil
+     -- even though values.yaml defines all five classes -- and every direct
+     per-class dereference in a template would panic on that nil. The
+     `| default dict` on the class lookup itself likewise covers a placement map
+     that is present but missing this class. */}}
+{{- define "curie.placement.class" -}}
+{{- $classes := .root.Values.placement | default dict -}}
+{{- toYaml (index $classes .class | default dict) -}}
+{{- end -}}
+
 {{- define "curie.placement.labels" -}}
-{{- with .podLabels }}
+{{- with (fromYaml (include "curie.placement.class" .)).podLabels }}
 {{- toYaml . }}
 {{- end }}
 {{- end -}}
 
 {{- define "curie.placement.annotations" -}}
-{{- with .annotations }}
+{{- with (fromYaml (include "curie.placement.class" .)).annotations }}
 {{- toYaml . }}
 {{- end }}
 {{- end -}}
 
 {{- define "curie.placement.spec" -}}
-{{- with .nodeSelector }}
+{{- $class := fromYaml (include "curie.placement.class" .) -}}
+{{- with $class.nodeSelector }}
 nodeSelector:
 {{- toYaml . | nindent 2 }}
 {{- end }}
-{{- with .tolerations }}
+{{- with $class.tolerations }}
 tolerations:
 {{- toYaml . | nindent 2 }}
 {{- end }}
-{{- with .affinity }}
+{{- with $class.affinity }}
 affinity:
 {{- toYaml . | nindent 2 }}
 {{- end }}

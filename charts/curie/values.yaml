@@ -28,6 +28,12 @@ global:
 # and prewarm, Helm hooks, and the sandbox controller, respectively.
 # podLabels can drive platform selectors. nodeSelector, tolerations, and
 # affinity remain generic Kubernetes placement fields for any substrate.
+# A release upgraded from a pre-placement chart can replay `placement: null`
+# back in through `helm upgrade --reuse-values`, because Helm's coalescing
+# deletes a null-valued key outright rather than falling back to this file. The
+# templates therefore resolve every class through the `curie.placement.class`
+# helper, so that case degrades to the empty defaults below instead of failing
+# the render (#2008).
 placement:
   platform:
     podLabels: {}

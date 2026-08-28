@@ -37,13 +37,13 @@ spec:
   template:
     metadata:
       labels:
-        {{- with (include "curie.placement.labels" .Values.placement.sandbox) }}
+        {{- with (include "curie.placement.labels" (dict "root" $ "class" "sandbox")) }}
         {{- . | nindent 8 }}
         {{- end }}
         {{- include "curie.labels" . | nindent 8 }}
         {{- include "curie.selectorLabels" (dict "root" . "component" "runner-prewarm") | nindent 8 }}
       annotations:
-        {{- with (include "curie.placement.annotations" .Values.placement.sandbox) }}
+        {{- with (include "curie.placement.annotations" (dict "root" $ "class" "sandbox")) }}
         {{- . | nindent 8 }}
         {{- end }}
         # Rolls the prewarm pods on every `helm upgrade` so imagePullPolicy Always
@@ -51,7 +51,7 @@ spec:
         # alter the pod spec). See the file header.
         curietech.ai/prewarm-revision: {{ .Release.Revision | quote }}
     spec:
-      {{- with (include "curie.placement.spec" .Values.placement.sandbox) }}
+      {{- with (include "curie.placement.spec" (dict "root" $ "class" "sandbox")) }}
       {{- . | nindent 6 }}
       {{- end }}
       {{- with $runner.imagePullSecrets }}
