@@ -23,3 +23,12 @@ required.
 Snapshots under `snapshots/` are immutable historical views. `versions.json`
 selects the default and populates the version picker. Use the project-local
 `update-architecture-atlas` skill to create and research a new snapshot.
+
+Every tagged release must register a snapshot with the same version id before
+the tag is pushed. Generate it from the final architecture-bearing commit, then
+make only the release version edits. The release workflow fails before image or
+binary builds if the snapshot is absent, its manifest and repository metadata
+disagree, its pinned commit is not tag ancestry, or any path other than the
+snapshot registration and release-coupled version files changed after the pin.
+This ordering avoids the impossible requirement for a commit to contain its own
+SHA while still proving the tag has no un-atlased architecture changes.
