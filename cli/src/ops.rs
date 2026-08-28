@@ -991,11 +991,22 @@ pub fn sealed_credential_warning(
     }
 }
 
+/// Shared tail of the no-credential guidance: both the live fake-model note
+/// and the dry-run fresh-install note end with exactly this text, so the two
+/// paths cannot drift apart (#1898).
+const NO_CREDENTIAL_GUIDANCE: &str = "Set CURIE_CREDENTIALS to an Anthropic, OpenRouter, Zhipu, \
+     Moonshot, or DeepSeek credential and configure matching egress before re-running \
+     `curie cluster up` to enable the real model. Provider native Zhipu, Moonshot, and \
+     DeepSeek also need their matching worker runtime base URL.";
+
 /// The ordered model+egress status lines `up` prints, as (is_warning, message)
 /// pairs, derived purely so every credential/egress combination is unit-tested.
 /// The web-egress *count* note and the default-route warning stay in the handler
 /// (they keep their own tested helpers). `any_egress_opened` folds resolved
 /// provider routes, declared web egress, and (under dry-run) the intent to open.
+/// Under `--dry-run`, the no-credential arm reports that whether the model is
+/// preserved is unknown offline, instead of asserting the fake-model outcome
+/// (#1898).
 pub fn model_egress_status_lines(
     credentials_present: bool,
     local_model: bool,
@@ -1026,7 +1037,7 @@ pub fn model_egress_status_lines(
             false,
             "local model enabled; installing the chart inference deployment".into(),
         ));
-    } else if !fake_model {
+    } else if !fake_model && !dry_run {
         lines.push((
             true,
             format!(
@@ -1040,7 +1051,34 @@ pub fn model_egress_status_lines(
         ));
         lines.push((
             false,
-            "Replies will be canned. Set CURIE_CREDENTIALS to an Anthropic, OpenRouter, Zhipu, Moonshot, or DeepSeek credential and configure matching egress before re-running `curie cluster up` to enable the real model. Provider native Zhipu, Moonshot, and DeepSeek also need their matching worker runtime base URL.".into(),
+            format!("Replies will be canned. {NO_CREDENTIAL_GUIDANCE}"),
+        ));
+    } else if !fake_model {
+        // `--dry-run` stays offline (#1898): it cannot read the release's
+        // recorded model configuration the way `resolve_preserved_runner_identity_values`
+        // does on the live path, so it cannot know whether a rerun would
+        // preserve a real credential or land on the fake model. Asserting the
+        // fake-model outcome here contradicted the live run and `cluster up
+        // --help`, which is corrosive for the one preflight signal an operator
+        // has before an upgrade -- so state what is unknown offline instead.
+        lines.push((
+            true,
+            format!(
+                "no CURIE_CREDENTIALS set; a live run preserves the release's recorded model \
+                 configuration when there is one -- not read under --dry-run{}",
+                if any_egress_opened {
+                    ""
+                } else {
+                    "; no model egress is opened by this run"
+                }
+            ),
+        ));
+        lines.push((
+            false,
+            format!(
+                "With nothing recorded -- a fresh install -- the release comes up on the fake \
+                 model and replies will be canned. {NO_CREDENTIAL_GUIDANCE}"
+            ),
         ));
     }
     lines
@@ -10385,6 +10423,118 @@ mod tests {
             model_egress_status_lines(true, false, false, &["anthropic".to_string()], true, true);
         for (_, m) in &lines {
             assert!(!m.contains("egress opened"), "{m}");
+        }
+    }
+
+    #[test]
+    fn model_egress_status_lines_dry_run_does_not_assert_fake_model() {
+        // #1898: under --dry-run there is no `existing` release to read, so the
+        // no-credential arm must not assert the fake-model outcome -- it must
+        // say preservation is unknown offline instead, as a warning. It also
+        // must not claim the sandbox "stays sealed": a live rerun could
+        // re-supply the release's recorded egress, so that assertion would be
+        // just as false offline as the fake-model one.
+        let lines = model_egress_status_lines(false, false, false, &[], false, true);
+        let msgs: Vec<&str> = lines.iter().map(|(_, m)| m.as_str()).collect();
+        for m in &msgs {
+            assert!(!m.contains("installing with the fake model"), "{m}");
+            assert!(!m.contains("sealed"), "{m}");
+        }
+        let (is_warning, preservation_msg) = lines
+            .iter()
+            .find(|(_, m)| m.contains("preserves the release's recorded model configuration"))
+            .expect("a preservation-unknown message");
+        assert!(
+            preservation_msg.contains("not read under --dry-run"),
+            "{preservation_msg}"
+        );
+        assert!(*is_warning, "{msgs:?}");
+    }
+
+    #[test]
+    fn model_egress_status_lines_live_run_still_asserts_fake_model_install() {
+        // Sibling of model_egress_status_lines_dry_run_does_not_assert_fake_model:
+        // same inputs but a live run, which must keep asserting the fake-model
+        // outcome. Pins that only the dry-run path changed under #1898.
+        let lines = model_egress_status_lines(false, false, false, &[], false, false);
+        let msgs: Vec<&str> = lines.iter().map(|(_, m)| m.as_str()).collect();
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("installing with the fake model")),
+            "{msgs:?}"
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("(model egress stays sealed)")),
+            "{msgs:?}"
+        );
+        for m in &msgs {
+            assert!(!m.contains("not read under --dry-run"), "{m}");
+        }
+    }
+
+    #[test]
+    fn model_egress_status_lines_dry_run_keeps_credential_guidance() {
+        // An operator on a fresh install must still be told how to enable the
+        // real model, so softening the assertion under --dry-run must not drop
+        // the guidance.
+        let lines = model_egress_status_lines(false, false, false, &[], false, true);
+        let note = lines
+            .iter()
+            .find(|(is_warning, _)| !*is_warning)
+            .map(|(_, m)| m.as_str())
+            .expect("a non-warn note");
+        assert!(note.contains("CURIE_CREDENTIALS"), "{note}");
+        assert!(note.contains("fresh install"), "{note}");
+        assert!(note.contains("replies will be canned"), "{note}");
+        assert!(note.contains("worker runtime base URL"), "{note}");
+    }
+
+    #[test]
+    fn model_egress_status_lines_dry_run_open_egress_never_says_sealed() {
+        // Dry-run sibling of model_egress_status_lines_no_cred_open_egress_never_says_sealed:
+        // no credential, dry-run, but a provider egress is opened. The
+        // preservation-unknown line must not carry the live-only "sealed" or
+        // "installing with the fake model" language, and its "no model egress
+        // is opened by this run" suffix must drop when egress is in fact open.
+        let lines =
+            model_egress_status_lines(false, false, false, &["anthropic".to_string()], true, true);
+        let msgs: Vec<&str> = lines.iter().map(|(_, m)| m.as_str()).collect();
+        for m in &msgs {
+            assert!(!m.contains("sealed"), "{m}");
+            assert!(!m.contains("installing with the fake model"), "{m}");
+            assert!(!m.contains("no model egress is opened by this run"), "{m}");
+        }
+        assert!(
+            msgs.iter().any(|m| m.contains("not read under --dry-run")),
+            "{msgs:?}"
+        );
+    }
+
+    #[test]
+    fn model_egress_status_lines_explicit_fake_model_stays_silent_under_dry_run() {
+        // No test above ever passes fake_model = true. An explicit --fake-model
+        // run has already declared the outcome, so this helper must emit
+        // nothing for it even under --dry-run.
+        let lines = model_egress_status_lines(false, false, true, &[], false, true);
+        let msgs: Vec<&str> = lines.iter().map(|(_, m)| m.as_str()).collect();
+        assert!(lines.is_empty(), "{msgs:?}");
+    }
+
+    #[test]
+    fn model_egress_status_lines_local_model_wins_over_dry_run_arm() {
+        // No test above ever passes local_model = true. --dry-run --local-model
+        // must keep reporting the local-model install, not the new
+        // preservation-unknown warning.
+        let lines = model_egress_status_lines(false, true, false, &[], false, true);
+        let msgs: Vec<&str> = lines.iter().map(|(_, m)| m.as_str()).collect();
+        assert!(
+            msgs.iter().any(|m| m.contains("local model enabled")),
+            "{msgs:?}"
+        );
+        for m in &msgs {
+            assert!(!m.contains("not read under --dry-run"), "{m}");
+            assert!(!m.contains("installing with the fake model"), "{m}");
         }
     }
 
