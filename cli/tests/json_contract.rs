@@ -1115,6 +1115,11 @@ fn diff_output_validates() {
         // carry the key so a consumer that reads it cannot mistake "not
         // reported" for "no removals".
         stateful_removals: Vec::new(),
+        // #1352: and the same reasoning for the rename discriminator -- an
+        // upgrade that renames no object store must say so as `null`, not by
+        // omitting the key, or a consumer cannot tell it from a CLI that does
+        // not report renames at all.
+        migration: None,
     };
     let json = out.to_json();
     assert_valid("diff.schema.json", &json);
@@ -1122,6 +1127,15 @@ fn diff_output_validates() {
         json["stateful_removals"],
         serde_json::json!([]),
         "an empty removal list must still be emitted as an array: {json}"
+    );
+    assert_eq!(
+        json["migration"],
+        serde_json::Value::Null,
+        "no store rename must still be emitted, as an explicit null: {json}"
+    );
+    assert!(
+        json.get("migration").is_some(),
+        "the migration key must be PRESENT, not merely absent-and-read-as-null: {json}"
     );
 
     // Every classification the schema enumerates must be reachable from a real
@@ -1206,6 +1220,13 @@ fn diff_output_with_stateful_removals_validates() {
                 cause: curie::ops::RemovalCause::RenamedTo("acme-bot-curie-postgres".to_string()),
             },
         ],
+        // The discriminator that makes the `component_gone` remedy actionable:
+        // the store IS renamed here, so `--migrate-store` is the operator's
+        // path for the minio removal above -- and would still be a dead end for
+        // the postgres rename beside it. COMPONENT names, never resource names:
+        // `acme-bot-minio` embeds the chart fullname, which a `nameOverride`
+        // moves, while `minio` is what every consumer can match on (#1352).
+        migration: Some(("minio".to_string(), "rustfs".to_string())),
     };
 
     let json = out.to_json();
@@ -1245,6 +1266,17 @@ fn diff_output_with_stateful_removals_validates() {
         serde_json::json!(3),
         "one changed entry plus two removals: {json}"
     );
+
+    // `to_json` writes this object by hand too, so nothing but this holds the
+    // `from`/`to` spelling in place. Both removals above report the SAME
+    // `component_gone`/`renamed` pair whether or not a store moves, so without
+    // this object the payload cannot say which of them `--migrate-store` can
+    // actually carry -- the ambiguity #1352 exists to close.
+    assert_eq!(
+        json["migration"],
+        serde_json::json!({"from": "minio", "to": "rustfs"}),
+        "the store rename must survive to_json as a component pair: {json}"
+    );
 }
 
 #[test]
@@ -1276,9 +1308,61 @@ fn diff_schema_keeps_unresolved_credential_marker_optional() {
     );
 }
 
+// #1352: `curie diff --chart` reports the version of the chart it actually
+// RENDERS, so it reads that chart's own Chart.yaml rather than this CLI's
+// package version. Answered from the real file the flag points at: a stub
+// inventing a version here would make the CHART VERSION MISMATCH note this
+// run emits a fiction. Shell builtins only -- PATH here holds these two
+// stubs and nothing else, so `cat` would silently produce an empty chart.
+// This is shell text spliced verbatim into a generated `helm` stub script
+// (not a Rust comment), so the explanation travels with the branch into
+// every stub that embeds it.
+const HELM_SHOW_CHART_STUB_BRANCH: &str = r#"if [ "$1" = show ] && [ "$2" = chart ]; then
+    # #1352: `curie diff --chart` reports the version of the chart it actually
+    # RENDERS, so it reads that chart's own Chart.yaml rather than this CLI's
+    # package version. Answered from the real file the flag points at: a stub
+    # inventing a version here would make the CHART VERSION MISMATCH note this
+    # run emits a fiction. Shell builtins only -- PATH here holds these two
+    # stubs and nothing else, so `cat` would silently produce an empty chart.
+    while IFS= read -r chart_line; do
+        printf '%s\n' "$chart_line"
+    done < "$3/Chart.yaml"
+    exit 0
+fi
+"#;
+
+// #1352: `curie diff` now reads the live StatefulSets before it will render
+// the target chart, the same stateful-removal guard `curie apply` runs. An
+// empty live list is the "fresh install, nothing at stake" answer, so the
+// guard short-circuits before it would ever need the chart's rendered
+// StatefulSet specs -- which is why this stub needs no `template` branch,
+// unlike the helm stub's `show chart` branch above.
+fn write_stateful_probe_stubs(bin_dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let kubectl = bin_dir.join("kubectl");
+    std::fs::write(
+        &kubectl,
+        r#"#!/bin/sh
+if [ "$1" = get ] && [ "$2" = statefulset ]; then
+    printf '%s\n' '{"apiVersion":"v1","items":[],"kind":"List","metadata":{"resourceVersion":""}}'
+    exit 0
+fi
+exit 64
+"#,
+    )
+    .expect("write kubectl stub");
+    let mut permissions = std::fs::metadata(&kubectl)
+        .expect("kubectl stub metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&kubectl, permissions).expect("make kubectl stub executable");
+}
+
 #[test]
 fn credentialless_diff_human_output_names_export_and_never_claims_a_reset() {
     use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
     use std::process::Command;
 
     let temp = tempfile::tempdir().expect("temporary directory");
@@ -1300,8 +1384,10 @@ fn credentialless_diff_human_output_names_export_and_never_claims_a_reset() {
     let helm = bin_dir.join("helm");
     std::fs::write(
         &helm,
-        r#"#!/bin/sh
-if [ "$1" = get ] && [ "$2" = values ]; then
+        format!(
+            "#!/bin/sh\n{}{}",
+            HELM_SHOW_CHART_STUB_BRANCH,
+            r#"if [ "$1" = get ] && [ "$2" = values ]; then
     printf '%s\n' '{"agentSandbox":{"runner":{"credentials":"model live","fakeModel":false}},"ui":{"service":{"type":"NodePort"}},"langfuse":{"web":{"service":{"type":"NodePort"}}}}'
     exit 0
 fi
@@ -1310,7 +1396,8 @@ if [ "$1" = list ]; then
     exit 0
 fi
 exit 64
-"#,
+"#
+        ),
     )
     .expect("write helm stub");
     let mut permissions = std::fs::metadata(&helm)
@@ -1319,10 +1406,20 @@ exit 64
     permissions.set_mode(0o755);
     std::fs::set_permissions(&helm, permissions).expect("make helm stub executable");
 
+    write_stateful_probe_stubs(&bin_dir);
+
     let output = Command::new(env!("CARGO_BIN_EXE_curie"))
         .arg("diff")
         .arg("--file")
         .arg(&config)
+        // #1352: diff now resolves a chart exactly as apply does, so a dev
+        // build with no `charts/curie` under the process cwd errors before
+        // ever reaching the credential-leniency behaviour under test. The
+        // test binary's cwd is the `cli` crate dir, which has no
+        // `charts/curie`, so point at the repository's own chart the same
+        // way an operator would with `--chart`.
+        .arg("--chart")
+        .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../charts/curie"))
         .env("PATH", &bin_dir)
         .env("CURIE_CONFIG_DIR", temp.path().join("config"))
         .env_remove("CURIE_MODEL")
@@ -1373,6 +1470,7 @@ exit 64
 #[test]
 fn credentialless_diff_without_a_release_does_not_claim_every_declared_value_is_created() {
     use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
     use std::process::Command;
 
     let temp = tempfile::tempdir().expect("temporary directory");
@@ -1394,8 +1492,10 @@ fn credentialless_diff_without_a_release_does_not_claim_every_declared_value_is_
     let helm = bin_dir.join("helm");
     std::fs::write(
         &helm,
-        r##"#!/bin/sh
-if [ "$1" = get ] && [ "$2" = values ]; then
+        format!(
+            "#!/bin/sh\n{}{}",
+            HELM_SHOW_CHART_STUB_BRANCH,
+            r##"if [ "$1" = get ] && [ "$2" = values ]; then
     printf '%s\n' 'Error: release: not found' >&2
     exit 1
 fi
@@ -1404,7 +1504,8 @@ if [ "$1" = list ]; then
     exit 0
 fi
 exit 64
-"##,
+"##
+        ),
     )
     .expect("write helm stub");
     let mut permissions = std::fs::metadata(&helm)
@@ -1413,10 +1514,20 @@ exit 64
     permissions.set_mode(0o755);
     std::fs::set_permissions(&helm, permissions).expect("make helm stub executable");
 
+    write_stateful_probe_stubs(&bin_dir);
+
     let output = Command::new(env!("CARGO_BIN_EXE_curie"))
         .arg("diff")
         .arg("--file")
         .arg(&config)
+        // #1352: diff now resolves a chart exactly as apply does, so a dev
+        // build with no `charts/curie` under the process cwd errors before
+        // ever reaching the credential-leniency behaviour under test. The
+        // test binary's cwd is the `cli` crate dir, which has no
+        // `charts/curie`, so point at the repository's own chart the same
+        // way an operator would with `--chart`.
+        .arg("--chart")
+        .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../charts/curie"))
         .env("PATH", &bin_dir)
         .env("CURIE_CONFIG_DIR", temp.path().join("config"))
         .env_remove("CURIE_MODEL")

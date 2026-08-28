@@ -139,6 +139,15 @@ if [ "$1" = get ] && [ "$2" = values ]; then
             ;;
     esac
 fi
+if [ "$1" = show ] && [ "$2" = chart ]; then
+    # Only `curie diff --chart` reaches this: the default path reports
+    # `artifacts::version()` and makes no such call at all. Answered from the
+    # real Chart.yaml the flag points at rather than an invented version --
+    # the version REPORTED has to be the version RENDERED, and a stub that made
+    # one up would hide a regression that swapped them (#1352).
+    cat "$3/Chart.yaml"
+    exit 0
+fi
 if [ "$1" = template ]; then
     case " $* " in
         *" --show-only templates/preflight-gvisor.yaml "*)
@@ -658,10 +667,16 @@ exit 0
     }
 
     fn diff(&self, env: &[(&str, &str)]) -> Output {
-        self.run(
-            &["diff", "--file", self.file.to_str().expect("UTF 8 path")],
-            env,
-        )
+        self.diff_with(&[], env)
+    }
+
+    /// The same `--json` diff with extra argv, so a test can exercise a flag
+    /// rather than only the default resolution. `diff` delegates here, so no
+    /// existing call site changes.
+    fn diff_with(&self, extra: &[&str], env: &[(&str, &str)]) -> Output {
+        let mut args = vec!["diff", "--file", self.file.to_str().expect("UTF 8 path")];
+        args.extend_from_slice(extra);
+        self.run(&args, env)
     }
 
     /// `curie diff` without `--json`: the operator-facing render.
@@ -989,6 +1004,29 @@ fn live_rustfs_statefulset() -> String {
             "metadata": {"name": "parity-rustfs"},
             "spec": {"selector": {"matchLabels": {"app.kubernetes.io/component": "rustfs"}}}
         }]
+    })
+    .to_string()
+}
+
+/// A live release running the store the default render ALSO produces, beside a
+/// bundled `postgres` that render drops. The store half is what makes this
+/// distinct from `live_postgres_statefulset`: both sides run `rustfs`, so the
+/// upgrade renames no store and `migration` is `null` while the removal list is
+/// not empty -- the values-gated drop `--migrate-store` cannot carry (#1352).
+fn live_rustfs_and_postgres_statefulsets() -> String {
+    json!({
+        "apiVersion": "v1",
+        "kind": "List",
+        "items": [
+            {
+                "metadata": {"name": "parity-rustfs"},
+                "spec": {"selector": {"matchLabels": {"app.kubernetes.io/component": "rustfs"}}}
+            },
+            {
+                "metadata": {"name": "parity-postgres"},
+                "spec": {"selector": {"matchLabels": {"app.kubernetes.io/component": "postgres"}}}
+            }
+        ]
     })
     .to_string()
 }
@@ -3548,5 +3586,354 @@ fn an_unreadable_cluster_fails_the_diff_rather_than_reporting_no_removals() {
     assert!(
         !forbidden_message.to_ascii_lowercase().contains("apply"),
         "the shared guard's context must stay verb neutral: {forbidden_error}"
+    );
+}
+
+/// The `migration` field `diff --json` must ALWAYS carry, as an object or as
+/// `null`.
+///
+/// A missing key panics rather than reading as `null`: "this CLI does not
+/// report store renames" and "this upgrade renames no store" are the two
+/// answers the field exists to separate, and letting an absent key stand in for
+/// the second would make every assertion below pass against a payload that
+/// never grew the field.
+fn migration(diff: &Value) -> &Value {
+    diff.get("migration")
+        .unwrap_or_else(|| panic!("diff must always emit a migration key: {diff}"))
+}
+
+#[test]
+fn diff_reports_the_store_rename_migrate_store_carries_the_data_across() {
+    // The discriminator the removals list alone cannot supply, and the reason
+    // the `component_gone` remedy is not universal. Here the live release runs
+    // `minio` while the target render produces `rustfs`: a store SWAP, which is
+    // exactly the case `curie apply --migrate-store` carries the objects
+    // across. It reports the same `component_gone` cause as the values-gated
+    // drop below, and only `migration` tells the two apart.
+    //
+    // Red on revert through the `expect` in `migration`: without the field the
+    // payload carries the removal and nothing else, so a consumer -- human or
+    // agent -- reading `component_gone` has to guess whether the flag the
+    // remedy names can help, and half of them guess wrong (#1352).
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
+    let live = live_minio_statefulset();
+
+    let diff = json_output(
+        fixture.diff(&[("CURIE_TEST_KUBECTL_STS", live.as_str())]),
+        "diff",
+    );
+
+    // COMPONENT names on both sides, never resource names: the live object is
+    // `parity-minio`, and a `migration` reporting that could not be matched
+    // against `minio` by any consumer, since the fullname moves under a
+    // `nameOverride` while the component does not.
+    assert_eq!(
+        migration(&diff),
+        &json!({"from": "minio", "to": "rustfs"}),
+        "the store swap must be reported as the component pair `--migrate-store` moves between: {diff}"
+    );
+
+    let removal = stateful_removal(&diff, "parity-minio");
+    assert_eq!(
+        removal["component"], "minio",
+        "the removal must carry the component identity the migration is keyed on: {removal}"
+    );
+    assert_eq!(
+        removal["cause"], "component_gone",
+        "the target chart renders rustfs, so the live minio component is gone entirely: {removal}"
+    );
+    assert!(
+        removal.get("renamed_to").is_none(),
+        "a component that is gone has no rename target: {removal}"
+    );
+}
+
+#[test]
+fn diff_reports_no_migration_for_a_values_gated_stateful_drop() {
+    // The issue's own reproduction, and the half `--migrate-store` cannot
+    // reach. The live release runs `rustfs` -- the SAME store the target render
+    // produces, so no store is renamed -- beside a bundled `postgres` the
+    // render drops, which is what a curie.yaml that stops deploying postgres
+    // (the chart's BYO gate) does to a running database.
+    //
+    // `migration: null` beside a NON EMPTY `stateful_removals` is the payload
+    // that says there is no automatic carry: `curie apply --migrate-store`
+    // copies OBJECT STORE buckets only, so it has nothing to move here and
+    // apply keeps refusing until the file is fixed. Pre-fix a consumer could
+    // not tell this from the store swap above at all -- both reported the same
+    // `component_gone`, and only one of them has a flag that helps (#1352).
+    //
+    // Red on revert through the `expect` in `migration`, and red on a fix that
+    // reported a migration unconditionally: `null` here is a fact about this
+    // upgrade, not a missing value.
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
+    let live = live_rustfs_and_postgres_statefulsets();
+
+    let diff = json_output(
+        fixture.diff(&[("CURIE_TEST_KUBECTL_STS", live.as_str())]),
+        "diff",
+    );
+
+    assert_eq!(
+        migration(&diff),
+        &Value::Null,
+        "both sides run rustfs, so this upgrade renames no store: {diff}"
+    );
+    let removals = stateful_removals(&diff);
+    assert_eq!(
+        removals.len(),
+        1,
+        "the live postgres is dropped while the store survives in place: {diff}"
+    );
+    let removal = stateful_removal(&diff, "parity-postgres");
+    assert_eq!(
+        removal["component"], "postgres",
+        "the dropped component is the database, not the store: {removal}"
+    );
+    assert_eq!(
+        removal["cause"], "component_gone",
+        "the target chart does not render postgres at all: {removal}"
+    );
+    // The control that keeps `migration: null` meaningful: a run that reported
+    // the store as removed too would make the null merely wrong rather than
+    // informative.
+    assert!(
+        !removals
+            .iter()
+            .any(|reported| reported["name"] == "parity-rustfs"),
+        "the store the render also produces is not at risk: {diff}"
+    );
+}
+
+#[test]
+fn diff_does_not_offer_a_flag_apply_would_refuse_for_an_uncarriable_removal() {
+    // The #1352 / #1501 interaction. #1352 made `diff` reuse
+    // `stateful_removal_remedies` -- the helper apply's refusal composes -- so
+    // the two surfaces cannot name different fixes. #1501 then established that
+    // `--migrate-store` carries the OBJECT STORE and nothing else, and made
+    // `apply --migrate-store` REFUSE any batch holding anything else. Between
+    // them, a remedy that offered `--migrate-store` for EVERY `component_gone`
+    // told the operator of a dropped `postgres` to re-run with a flag apply
+    // then refuses: a brand new diff-vs-apply disagreement, which is the exact
+    // defect class #1352 exists to close.
+    //
+    // The fixture is the issue's own reproduction: live `rustfs` (the store the
+    // target render also produces, so nothing is being migrated between) beside
+    // a bundled `postgres` the render drops. Red on revert on the first
+    // assertion -- the pre-fix remedy names `--migrate-store` unconditionally.
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
+    let live = live_rustfs_and_postgres_statefulsets();
+    let env = [("CURIE_TEST_KUBECTL_STS", live.as_str())];
+
+    let human = fixture.diff_human(&env);
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&human.stdout),
+        String::from_utf8_lossy(&human.stderr)
+    );
+
+    assert!(
+        !rendered.contains("re-run with --migrate-store"),
+        "diff must not send the operator to the flag apply refuses for this batch:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("apply will carry the data across itself"),
+        "there is nothing --migrate-store can carry here, so it must not be promised:\n{rendered}"
+    );
+    // The remedy that replaces it has to be actionable, not merely absent: the
+    // component's identity, and where the drop actually comes from.
+    assert!(
+        rendered.contains("parity-postgres") && rendered.contains("postgres"),
+        "the render must name the component whose data is at risk:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("carries the OBJECT STORE and nothing else"),
+        "the render must say why --migrate-store is not the fix here:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("`<component>.deploy=false`"),
+        "the render must point at the values that drop the component:\n{rendered}"
+    );
+
+    // The other half of the parity claim: the SAME file and the SAME cluster,
+    // through the flag diff no longer recommends. A second fixture because the
+    // first one's call log has already recorded the diff run.
+    let apply_fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
+    let apply = apply_fixture.apply(&["--migrate-store"], &env);
+    assert!(
+        !apply.status.success(),
+        "apply --migrate-store must refuse the batch diff declined to recommend it for; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&apply.stdout),
+        String::from_utf8_lossy(&apply.stderr)
+    );
+    let error = json_error(apply, "apply");
+    let message = error["error"].as_str().expect("apply error message string");
+    assert!(
+        message.contains("parity-postgres"),
+        "apply's refusal must name the same component diff reported: {error}"
+    );
+    assert!(
+        message.contains("cannot carry"),
+        "apply's refusal must be the uncarriable one, not the generic guard: {error}"
+    );
+    assert!(
+        !apply_fixture.calls().contains("HELM_CALL: upgrade"),
+        "the refusal must precede the irreversible upgrade:\n{}",
+        apply_fixture.calls()
+    );
+}
+
+#[test]
+fn the_diff_summary_does_not_claim_a_refused_file_would_be_applied() {
+    // `N change(s) would be applied` on a file `curie apply` REFUSES is the
+    // original defect's wording, and folding the removals into `changes()`
+    // without touching this line merely made it a bigger number telling the
+    // same lie. The operator reads the last summary line and approves; the
+    // apply then exits 1 having applied nothing.
+    //
+    // Red on revert on the `would be applied` half specifically: the REFUSE
+    // note below the summary already existed in the first pass, so a run that
+    // kept the old summary line would still satisfy an assertion that only
+    // looked for `REFUSE` anywhere in the output. The count must SURVIVE --
+    // automation and humans both read it -- so this pins the outcome, not the
+    // number (#1352).
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
+    let live = live_postgres_statefulset();
+
+    let human = fixture.diff_human(&[("CURIE_TEST_KUBECTL_STS", live.as_str())]);
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&human.stdout),
+        String::from_utf8_lossy(&human.stderr)
+    );
+
+    assert!(
+        !rendered.contains("would be applied"),
+        "nothing about a file apply refuses would be applied:\n{rendered}"
+    );
+    let summary = rendered
+        .lines()
+        .find(|line| line.contains("change(s)"))
+        .unwrap_or_else(|| panic!("the render must still summarise the change count:\n{rendered}"));
+    // The expected count comes from the payload the SAME input produces rather
+    // than a literal, so an unrelated chart default gaining or losing a value
+    // cannot make this test lie in either direction -- and so the human and
+    // JSON projections are pinned to the same number, which is the parity claim
+    // #1352 rests on. A second fixture because the first one's call log has
+    // already recorded the human run.
+    let json_fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
+    let diff = json_output(
+        json_fixture.diff(&[("CURIE_TEST_KUBECTL_STS", live.as_str())]),
+        "diff",
+    );
+    let changes = diff["changes"].as_u64().expect("changes is an integer");
+    assert!(
+        summary.starts_with(&format!("{changes} change(s)")),
+        "the count must still be reported, and must be the count the payload carries: {summary}"
+    );
+    assert!(
+        summary.contains(&format!(
+            "including {} stateful removal(s)",
+            stateful_removals(&diff).len()
+        )),
+        "the summary must say how much of that count is destruction: {summary}"
+    );
+    assert!(
+        summary.contains("REFUSE"),
+        "the summary line itself must state the outcome, not leave it to a note further down: {summary}"
+    );
+}
+
+#[test]
+fn diff_answers_the_same_against_an_explicitly_passed_chart() {
+    // `--chart` exists on this verb because diff RENDERS the chart to decide
+    // what survives, and `resolve_chart`'s own remedy text on a dev build with
+    // no `charts/curie` in cwd literally says "pass --chart" (#1352). The
+    // fixture runs from the repository root, so the DEFAULT path already
+    // resolves `charts/curie` implicitly -- which is exactly why the flag needs
+    // its own coverage: every other diff test would stay green with the
+    // argument unwired.
+    //
+    // Red on revert two ways: a `--chart` clap surface that does not exist
+    // fails argument parsing, and one that parses but is dropped before the
+    // render would answer from the implicitly resolved chart, which this test
+    // cannot distinguish -- so the assertion is that the OVERRIDDEN path
+    // produces the same removal, i.e. the flag reaches a chart that renders.
+    let default_fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
+    let live = live_postgres_statefulset();
+    let env = [("CURIE_TEST_KUBECTL_STS", live.as_str())];
+    let expected = json_output(default_fixture.diff(&env), "diff");
+
+    let chart = repo_root().join("charts/curie");
+    let overridden_fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
+    let overridden = json_output(
+        overridden_fixture.diff_with(
+            &["--chart", chart.to_str().expect("UTF 8 chart path")],
+            &env,
+        ),
+        "diff",
+    );
+
+    assert_eq!(
+        stateful_removals(&overridden),
+        stateful_removals(&expected),
+        "an explicit chart must answer the stateful question exactly as the resolved default does: {overridden}"
+    );
+    assert_eq!(
+        migration(&overridden),
+        migration(&expected),
+        "the store rename is read from the same render, so it cannot differ either: {overridden}"
+    );
+    // The flag has to reach the RESOLUTION, not merely parse. `helm show chart`
+    // fires on the overridden path ONLY -- the default reports
+    // `artifacts::version()` and never asks -- so this is the one call that
+    // distinguishes "the argument was honoured" from "the argument was accepted
+    // and dropped", which the identical answers above cannot.
+    let calls = overridden_fixture.calls();
+    assert!(
+        calls.contains(&format!(
+            "HELM_CALL: show chart {}",
+            chart.to_str().expect("UTF 8 chart path")
+        )),
+        "the version REPORTED must be read from the chart the flag named:\n{calls}"
+    );
+    assert!(
+        !default_fixture.calls().contains("HELM_CALL: show chart"),
+        "the default path must stay exactly as it was, with no extra helm call:\n{}",
+        default_fixture.calls()
+    );
+    // And it has to reach the RENDER too: the chart the probe renders is the
+    // chart apply would use, and a diff rendering one chart while reporting
+    // another is the two-sources-of-truth defect in a new place.
+    assert!(
+        calls.contains(&format!(
+            "HELM_CALL: template parity {}",
+            chart.to_str().expect("UTF 8 chart path")
+        )),
+        "the overridden chart must actually be the one rendered:\n{calls}"
     );
 }
