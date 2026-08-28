@@ -246,7 +246,7 @@ if [ "$#" -ne 12 ] ||
    [ "$3" != "--with" ] ||
    [ "$4" != "pyyaml==6.0.3" ] ||
    [ "$5" != "python" ] ||
-   [ "$6" != "tools/e2e-ci-selection/select.py" ] ||
+   [ "$6" != "tools/e2e-ci-selection/select_tiers.py" ] ||
    [ "$7" != "--registry" ] ||
    [ "$8" != ".github/e2e-selection.yaml" ] ||
    [ "$9" != "--path" ] ||
