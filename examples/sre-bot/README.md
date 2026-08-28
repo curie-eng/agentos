@@ -368,6 +368,58 @@ you wanted.
 
 ---
 
+## Level up: upgrading itself on request
+
+`self-upgrade/cronjob.yaml` already knew how to redeploy this bot from its
+repository. What it could not do was happen because someone asked -- it ran on a
+schedule, so the answer to "upgrade yourself" was "wait until :17".
+
+The `self-upgrade` connector is the button. One gated tool, `upgrade_self`,
+taking **no arguments**: it creates a Job from that CronJob's template, and the
+approval card goes to the same channel as every other write.
+
+**The bot does not perform the upgrade, and that is the point.** Creating an
+agent version needs the platform API key, and every `/agents/**` route requires
+it. The sandbox holds a per-turn `state`-scoped token and nothing else, so a
+successful prompt injection cannot walk away with a credential. Handing the
+sandbox the platform key to make this feature work would trade that property for
+a convenience. The key stays in the Job; the bot only presses the button and
+reads the Job's name.
+
+**Read [`manifests/upgrade-role.yaml`](manifests/upgrade-role.yaml) before you
+install this.** Its grant is the widest in the bundle: `create` on `jobs` cannot
+be narrowed with `resourceNames`, because a create has no name to match. The
+ceiling is the connector -- one tool, no arguments, posting the named CronJob's
+template verbatim -- not RBAC. That file says so plainly and explains what is
+left.
+
+To install it:
+
+1. Apply `manifests/upgrade-role.yaml` (edit its namespace to the one the Curie
+   release runs in) and store the resulting kubeconfig as
+   `SELF_UPGRADE_KUBECONFIG`.
+2. Install the CronJob it starts, following the header of
+   [`self-upgrade/cronjob.yaml`](self-upgrade/cronjob.yaml). It ships
+   `suspend: true`: the template exists to be started on request. Set
+   `suspend: false` to *also* run it on the schedule -- the two are not
+   exclusive.
+
+Then ask it in Slack. The bot investigates, calls the tool, says it is
+requesting approval, and stops. A human approves; the Job runs; the bot watches
+it with the read-only tools and reports what happened.
+
+**There is no undo.** Putting the previous version back is an operator action
+with the platform API key, and `SKILL.md` tells the agent to say so rather than
+offer a rollback it cannot perform.
+
+**Turning it off in a hurry** works the same way as the write path:
+
+```bash
+kubectl delete rolebinding sre-bot-upgrader -n <namespace>
+```
+
+---
+
 ## Make it yours
 
 **`SKILL.md` is the brain.** Tone, what it checks first, its defaults, its hard
@@ -543,8 +595,13 @@ in the environment section so the bot can say which one it hit.
 | `evals/cases.json` | The falsifiable test suite / promotion gate |
 | `manifests/read-access.yaml` | The read-only ServiceAccount, ClusterRole and token |
 | `manifests/write-role.yaml` | The write identity, for the gated write path |
+| `manifests/scale-role.yaml` | The scale identity, scoped to the `deployments/scale` subresource |
+| `manifests/upgrade-role.yaml` | The upgrade identity -- **the widest grant here; read it first** |
 | `connectors/k8s-write/` | Source, Dockerfile and tests for the one-tool write connector |
+| `connectors/k8s-scale/` | Source, Dockerfile and tests for the one-tool scale connector |
+| `connectors/self-upgrade/` | Source, Dockerfile and tests for the one-tool upgrade connector |
 | `connectors/tempo/` | Source, Dockerfile and tests for the traces connector |
+| `self-upgrade/` | The Job that redeploys this bot, and the CronJob template it runs from |
 
 To change how the bot *behaves*, edit `SKILL.md`. To change what it can *reach*,
 edit `connectors.yaml`.

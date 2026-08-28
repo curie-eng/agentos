@@ -12,6 +12,21 @@
 # `state`-scoped token and nothing else, deliberately. So the work sits outside
 # the sandbox, and the bot's own authority is unchanged by this file.
 #
+# SUSPENDED BY DEFAULT, AND STARTED BY ASKING. The work above is what runs; the
+# schedule below is only one way to reach it, and not the one this bundle leads
+# with. "Upgrade yourself" is a thing a person says, and answering it with "at
+# :17" is a worse product than answering it now. So the `self-upgrade` connector
+# exposes one gated, no-argument tool that creates a Job from THIS template, and
+# a human approves it in the channel.
+#
+# Nothing about the authority boundary moves: the connector may start this Job
+# and read its name, and that is all. What runs is whatever is written below, and
+# the API key stays here rather than in the sandbox.
+#
+# To go back to (or additionally have) a schedule, set `suspend: false`. The two
+# are not exclusive -- a suspended CronJob is a template that happens not to
+# fire, and the connector starts Jobs from it either way.
+#
 # HOW IT DEPLOYS SAFELY. The bundle in the repository declares `build:` for its
 # connectors, which records a LOCAL image id the cluster tier refuses, and it
 # ships PLACEHOLDER allowlists. Deploying it verbatim would produce a bot whose
@@ -33,9 +48,19 @@ metadata:
   # CHANGE ME: the namespace the Curie release runs in.
   namespace: curie
 spec:
-  # Hourly. The thing being watched moves on human timescales, and the GitHub
-  # API is rate limited per token, so a tighter schedule buys nothing.
+  # A CronJob must carry a valid schedule even when it never fires, so this
+  # stays. Hourly if you unsuspend it: the thing being watched moves on human
+  # timescales, and the GitHub API is rate limited per token, so a tighter
+  # schedule buys nothing.
   schedule: "17 * * * *"
+  # The default is prompt-driven: this template exists to be started by the
+  # `self-upgrade` connector, on request, with an approval in front of it. Set
+  # this to false to ALSO run it on the schedule above.
+  #
+  # Note what `concurrencyPolicy` does and does not cover: it governs Jobs this
+  # CronJob's controller creates, and says nothing about one created by the
+  # connector. The connector does its own active-Job check for that reason.
+  suspend: true
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 1
   failedJobsHistoryLimit: 3

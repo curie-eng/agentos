@@ -496,6 +496,9 @@ jobs:
           - name: sre-bot-k8s-scale
             context: examples/sre-bot/connectors/k8s-scale
             dockerfile: examples/sre-bot/connectors/k8s-scale/Dockerfile
+          - name: sre-bot-self-upgrade
+            context: examples/sre-bot/connectors/self-upgrade
+            dockerfile: examples/sre-bot/connectors/self-upgrade/Dockerfile
             platforms: linux/amd64,linux/arm64
     steps:
       - uses: actions/checkout@v7
