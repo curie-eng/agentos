@@ -104,20 +104,31 @@ def container_env(docs, kind, component, container_name, init=False):
     """Select by the component LABEL and the container NAME.
 
     `endswith("-worker")` also matches `<release>-curie-langfuse-worker`, which
-    renders earlier and legitimately has no object-store env -- so a suffix
-    match silently inspected Langfuse and reported the curie worker as
-    misconfigured while the chart was correct. The label is unambiguous, and the
-    container name keeps a sidecar rendered first from being inspected instead
-    of the application container.
+    renders earlier -- so a suffix match silently inspected Langfuse and reported
+    the curie worker as misconfigured while the chart was correct. The label is
+    unambiguous, and the container name keeps a sidecar rendered first from being
+    inspected instead of the application container.
+
+    The component label is read off the object, falling back to the pod template:
+    the Langfuse Deployments label only their pod template (they mirror the
+    compose stack's service shape), so reading object metadata alone matched no
+    Langfuse workload at all -- indistinguishable from a Langfuse workload that is
+    configured correctly. Object metadata still wins where the two differ, which is
+    how the SandboxTemplate (`agent-sandbox` on the object, `runner-sandbox` on the
+    pod) keeps being selected by the name its caller uses.
     """
 
     for d in docs:
         if d.get("kind") != kind:
             continue
-        if d["metadata"].get("labels", {}).get("app.kubernetes.io/component") != component:
-            continue
         pod_template = "template" if kind == "Deployment" else "podTemplate"
-        pod_spec = d["spec"][pod_template]["spec"]
+        pod = d["spec"][pod_template]
+        labelled = d["metadata"].get("labels", {}).get(
+            "app.kubernetes.io/component"
+        ) or pod.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/component")
+        if labelled != component:
+            continue
+        pod_spec = pod["spec"]
         containers = pod_spec.get("initContainers" if init else "containers", [])
         matches = [c for c in containers if c.get("name") == container_name]
         assert len(matches) == 1, (
@@ -149,9 +160,18 @@ def assert_contract(docs, label, expected_endpoint):
     bundle_fetch = env_of(
         docs, "SandboxTemplate", "agent-sandbox", "bundle-fetch", init=True
     )
+    # Langfuse is a fourth and fifth reader of the same store, on both of its
+    # workloads. It is inspected here because it was NOT: its endpoints were built
+    # from a literal http:// while api/worker/sandbox used the chart's scheme-aware
+    # helper, so a BYO store on port 443 got https:// everywhere except Langfuse
+    # and trace ingestion died at the TLS handshake (#1500).
+    langfuse_web = env_of(docs, "Deployment", "langfuse-web", "langfuse-web")
+    langfuse_worker = env_of(docs, "Deployment", "langfuse-worker", "langfuse-worker")
     assert api is not None, "api Deployment not rendered"
     assert worker is not None, "worker Deployment not rendered"
     assert bundle_fetch is not None, "SandboxTemplate bundle-fetch not rendered"
+    assert langfuse_web is not None, "langfuse-web Deployment not rendered"
+    assert langfuse_worker is not None, "langfuse-worker Deployment not rendered"
 
     failures = []
 
@@ -248,14 +268,22 @@ def assert_contract(docs, label, expected_endpoint):
                     f"      {source} = {value_source(env[api_key])}"
                 )
 
-    for source, env, key in (
+    # The full value, not merely the scheme: a scheme-only check would still pass
+    # the day one of these is pointed at a different-but-same-scheme host, which is
+    # the same agreement bug the rest of this file exists to catch.
+    endpoint_sites = (
         ("api", api, "S3_ENDPOINT_URL"),
         ("worker", worker, "S3_ENDPOINT_URL"),
         ("bundle fetch", bundle_fetch, "S3_ENDPOINT"),
-    ):
+        ("langfuse-web", langfuse_web, "LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT"),
+        ("langfuse-web", langfuse_web, "LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT"),
+        ("langfuse-worker", langfuse_worker, "LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT"),
+        ("langfuse-worker", langfuse_worker, "LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT"),
+    )
+    for source, env, key in endpoint_sites:
         if env.get(key, {}).get("value") != expected_endpoint:
             failures.append(
-                f"{label} {source} endpoint must be {expected_endpoint}, got {env.get(key)}"
+                f"{label} {source} {key} must be {expected_endpoint}, got {env.get(key)}"
             )
 
     # The compose default must never be what a Kubernetes pod receives.
@@ -290,15 +318,19 @@ def assert_contract(docs, label, expected_endpoint):
     print(f"ok: {label}: api and worker agree on {', '.join(sorted(keys))}")
     for k in sorted(keys):
         print(f"      {k:18} = {shown(api[k])}")
-    print(f"ok: {label}: all S3 endpoints are {expected_endpoint}")
+    print(f"ok: {label}: all {len(endpoint_sites)} S3 endpoints are {expected_endpoint}")
+    for source, _env, key in endpoint_sites:
+        print(f"      {source:15} {key}")
     print(f"ok: {label}: S3_SECRET_KEY is a ref -> {ref['name']}/{ref['key']}")
 
 
-def expect_failure(docs, messages):
+def expect_failure(
+    docs, messages, label="default probe", expected_endpoint="http://curie-rustfs:9000"
+):
     captured = io.StringIO()
     try:
         with redirect_stdout(captured):
-            assert_contract(docs, "default probe", "http://curie-rustfs:9000")
+            assert_contract(docs, label, expected_endpoint)
     except SystemExit as error:
         assert error.code == 1
     else:
@@ -372,5 +404,30 @@ expect_failure(
     ("worker is missing S3_ACCESS_KEY",),
 )
 
-assert_contract(render(EXTERNAL_VALUES), "external", "https://s3.example.com:443")
+external_docs = render(EXTERNAL_VALUES)
+assert_contract(external_docs, "external", "https://s3.example.com:443")
+
+# Rebuilding either Langfuse endpoint from a literal http:// is exactly the
+# regression this gate exists for, and it is invisible on the in-cluster default
+# (which is http:// anyway), so the probe runs against the external render. Both
+# workloads are probed: a probe on langfuse-web alone would stay green while
+# langfuse-worker regressed.
+for component in ("langfuse-web", "langfuse-worker"):
+    for key in ("LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT", "LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT"):
+        hardcoded_scheme = copy.deepcopy(external_docs)
+        langfuse_env = container_env(hardcoded_scheme, "Deployment", component, component)
+        assert langfuse_env is not None, f"{component} Deployment was not rendered"
+        endpoint = next(entry for entry in langfuse_env if entry.get("name") == key)
+        endpoint["value"] = "http://s3.example.com:443"
+        expect_failure(
+            hardcoded_scheme,
+            (f"external probe {component} {key} must be https://s3.example.com:443",),
+            label="external probe",
+            expected_endpoint="https://s3.example.com:443",
+        )
+
+print(
+    "ok: a literal http:// on either Langfuse endpoint, on either Langfuse "
+    "workload, fails the external-store contract"
+)
 PY

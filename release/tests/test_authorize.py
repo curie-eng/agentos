@@ -1291,10 +1291,10 @@ class TestLegitimateSkips:
         )
         script_path = tmp_path / "filter.sh"
         script_path.write_text(script)
-        selector_path = tmp_path / "tools" / "e2e-ci-selection" / "select.py"
+        selector_path = tmp_path / "tools" / "e2e-ci-selection" / "select_tiers.py"
         selector_path.parent.mkdir(parents=True)
         shutil.copy2(
-            REPO_ROOT / "tools" / "e2e-ci-selection" / "select.py", selector_path
+            REPO_ROOT / "tools" / "e2e-ci-selection" / "select_tiers.py", selector_path
         )
         registry_path = tmp_path / ".github" / "e2e-selection.yaml"
         registry_path.parent.mkdir()

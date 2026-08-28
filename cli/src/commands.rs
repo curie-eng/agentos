@@ -627,7 +627,7 @@ pub async fn dev_e2e_ci_selection(
         "runner/Dockerfile not found here or in any parent directory. Run `curie dev` \
          from a curie source checkout.",
     )?;
-    let selector = root.join("tools/e2e-ci-selection/select.py");
+    let selector = root.join("tools/e2e-ci-selection/select_tiers.py");
     let registry = root.join(".github/e2e-selection.yaml");
     if !selector.is_file() {
         bail!("selector not found: {}", selector.display());
@@ -660,7 +660,7 @@ pub async fn dev_e2e_ci_selection(
                 "--with",
                 "pyyaml==6.0.3",
                 "python",
-                "tools/e2e-ci-selection/select.py",
+                "tools/e2e-ci-selection/select_tiers.py",
                 "--registry",
                 ".github/e2e-selection.yaml",
             ])

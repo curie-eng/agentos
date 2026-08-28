@@ -603,6 +603,57 @@ pub fn missing_local_model_assets_message(
     lines.join("\n")
 }
 
+/// The ADR-0093 refusal as a tagged [`crate::exit::CliError`], so the runnable
+/// fetch command reaches an agent in the ADR-0021 `fix` field instead of only
+/// inside the prose (#1261). A bare `bail!` classified as Failure with a null
+/// `fix`, which is exactly the shape an agent consumer cannot branch on.
+///
+/// The class stays [`crate::exit::ExitClass::Failure`] (exit 1): the argv was
+/// well-formed and `--local-model <m>` is a legitimate request, so this is a
+/// machine-state failure and not a usage error -- re-running the same argv after
+/// the fetch succeeds, which is the opposite of what exit 2 promises.
+///
+/// Pure and synchronous on purpose: [`preflight_local_model`] shells out to
+/// docker and so is not unit-testable, while this guard -- the part that
+/// carries the contract -- is. It also owns the `image_missing || model_missing`
+/// decision itself, not just the error shape, so `preflight_local_model` has no
+/// refusal branch of its own left to revert to a bare `bail!`: the async docker
+/// probing stays there, but everything that carries the ADR-0021 contract lives
+/// in this pure, testable function.
+///
+/// Args:
+///   image: the pinned Ollama image, named when it is the missing one.
+///   image_missing: whether the image has to be downloaded.
+///   model: the requested model reference, named when it is the missing one.
+///   model_missing: whether the model has to be downloaded.
+///   fetch_hint: the exact `curie` command that fetches what is missing.
+///
+/// Returns:
+///   `Ok(())` when neither asset is missing; otherwise an `Err` whose message
+///   is [`missing_local_model_assets_message`] and whose `fix` is `fetch_hint`
+///   alone -- the command, not the prose around it.
+pub fn refuse_missing_local_model_assets(
+    image: &str,
+    image_missing: bool,
+    model: &str,
+    model_missing: bool,
+    fetch_hint: &str,
+) -> anyhow::Result<()> {
+    if !image_missing && !model_missing {
+        return Ok(());
+    }
+    Err(anyhow::Error::from(
+        crate::exit::CliError::failure(missing_local_model_assets_message(
+            image,
+            image_missing,
+            model,
+            model_missing,
+            fetch_hint,
+        ))
+        .with_fix(fetch_hint),
+    ))
+}
+
 /// Refuse a `--local-model` run whose assets are not already on the machine
 /// (ADR 0093). Shared by `skill up` and `local up` so the two tiers answer the
 /// verb the same way (ADR 0041); only the volume and the fix hint differ.
@@ -618,8 +669,9 @@ pub fn missing_local_model_assets_message(
 ///   fetch_hint: the exact `curie` command that provisions what is missing.
 ///
 /// Returns:
-///   `Ok(())` when both assets are present; otherwise an error whose message is
-///   `missing_local_model_assets_message`.
+///   `Ok(())` when both assets are present; otherwise whatever
+///   [`refuse_missing_local_model_assets`] returns -- exit 1 with the fetch
+///   command in the ADR-0021 `fix` field.
 pub async fn preflight_local_model(
     image: &str,
     volume: &str,
@@ -635,16 +687,7 @@ pub async fn preflight_local_model(
     } else {
         !model_present_in_volume(volume, image, model).await?
     };
-    if image_missing || model_missing {
-        bail!(missing_local_model_assets_message(
-            image,
-            image_missing,
-            model,
-            model_missing,
-            fetch_hint
-        ));
-    }
-    Ok(())
+    refuse_missing_local_model_assets(image, image_missing, model, model_missing, fetch_hint)
 }
 
 /// The `docker run` argument vector (after the `docker` executable) that boots
@@ -1487,6 +1530,56 @@ mod tests {
         );
         assert!(!msg.contains("docker pull"), "{msg}");
         assert!(!msg.contains("docker run"), "{msg}");
+    }
+
+    // The prose satisfies a human; an agent branches on the ADR-0021 `fix`
+    // field, which a bare `bail!` leaves null (#1261). Asserting on Some(fix)
+    // is what arms this test: reverting this guard's body to
+    // `bail!(missing_local_model_assets_message(...))` makes `classify` return
+    // (Failure, None) and the `expect` below fails.
+    #[test]
+    fn the_missing_assets_refusal_carries_the_fetch_command_as_its_fix() {
+        let hint = "curie local up --local-model qwen3:4b --pull-model";
+        let err =
+            refuse_missing_local_model_assets("ollama/ollama:0.24.0", true, "qwen3:4b", true, hint)
+                .unwrap_err();
+        let (class, fix) = crate::exit::classify(&err);
+        // Exit 1, not 2: the argv was well-formed and re-running it after the
+        // fetch succeeds, which exit 2 would deny.
+        assert_eq!(class, crate::exit::ExitClass::Failure);
+        let fix = fix.expect("the refusal must carry a fix, not a null one");
+        assert!(fix.contains(hint), "the fix must be runnable: {fix}");
+        // Separate from the prose: dumping the whole message into `fix` would
+        // also contain the hint, so pin that the lead-in is NOT in there.
+        assert!(
+            !fix.contains("local model assets are not on this machine"),
+            "the fix must be the command alone, not the prose: {fix}"
+        );
+
+        let json = crate::exit::error_json(&err);
+        assert!(
+            json["fix"] != serde_json::Value::Null,
+            "the rendered payload must not have a null fix: {json}"
+        );
+        assert!(
+            json["error"]
+                .as_str()
+                .expect("error is a string")
+                .contains("does not download them implicitly"),
+            "the prose still rides the error field: {json}"
+        );
+
+        // Positive control: an always-Err guard would also pass every
+        // assertion above, so pin that the guard refuses ONLY when something
+        // is actually missing.
+        assert!(refuse_missing_local_model_assets(
+            "ollama/ollama:0.24.0",
+            false,
+            "qwen3:4b",
+            false,
+            hint,
+        )
+        .is_ok());
     }
 
     #[test]

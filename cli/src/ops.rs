@@ -1,4 +1,4 @@
-//! `curie cluster up | cluster status | cluster down`: the operator
+//! `curie cluster up | cluster status | cluster rollback | cluster down`: the operator
 //! day-1 lifecycle, wrapping the Helm chart and `kubectl` the way linkerd or
 //! cilium wrap theirs -- a deliberately thin CLI over the chart, which stays the
 //! source of truth. Every verb shells out to the `helm`/`kubectl` binaries; the
@@ -537,6 +537,18 @@ pub struct DownOpts {
     pub yes: bool,
 }
 
+pub struct RollbackOpts {
+    pub common: CommonOpts,
+    /// An operator-named revision. `None` lets [`select_rollback_revision`] pick
+    /// the newest `deployed`/`superseded` revision below the current one, which
+    /// is the whole point of the verb (#1899).
+    pub revision: Option<u32>,
+    /// Admit a `--revision` whose status is not `deployed`/`superseded`. Refused
+    /// without this flag, since helm never finished applying such a revision.
+    pub allow_failed_revision: bool,
+    pub yes: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Command builders (pure; unit-tested below)
 // ---------------------------------------------------------------------------
@@ -991,11 +1003,22 @@ pub fn sealed_credential_warning(
     }
 }
 
+/// Shared tail of the no-credential guidance: both the live fake-model note
+/// and the dry-run fresh-install note end with exactly this text, so the two
+/// paths cannot drift apart (#1898).
+const NO_CREDENTIAL_GUIDANCE: &str = "Set CURIE_CREDENTIALS to an Anthropic, OpenRouter, Zhipu, \
+     Moonshot, or DeepSeek credential and configure matching egress before re-running \
+     `curie cluster up` to enable the real model. Provider native Zhipu, Moonshot, and \
+     DeepSeek also need their matching worker runtime base URL.";
+
 /// The ordered model+egress status lines `up` prints, as (is_warning, message)
 /// pairs, derived purely so every credential/egress combination is unit-tested.
 /// The web-egress *count* note and the default-route warning stay in the handler
 /// (they keep their own tested helpers). `any_egress_opened` folds resolved
 /// provider routes, declared web egress, and (under dry-run) the intent to open.
+/// Under `--dry-run`, the no-credential arm reports that whether the model is
+/// preserved is unknown offline, instead of asserting the fake-model outcome
+/// (#1898).
 pub fn model_egress_status_lines(
     credentials_present: bool,
     local_model: bool,
@@ -1026,7 +1049,7 @@ pub fn model_egress_status_lines(
             false,
             "local model enabled; installing the chart inference deployment".into(),
         ));
-    } else if !fake_model {
+    } else if !fake_model && !dry_run {
         lines.push((
             true,
             format!(
@@ -1040,7 +1063,34 @@ pub fn model_egress_status_lines(
         ));
         lines.push((
             false,
-            "Replies will be canned. Set CURIE_CREDENTIALS to an Anthropic, OpenRouter, Zhipu, Moonshot, or DeepSeek credential and configure matching egress before re-running `curie cluster up` to enable the real model. Provider native Zhipu, Moonshot, and DeepSeek also need their matching worker runtime base URL.".into(),
+            format!("Replies will be canned. {NO_CREDENTIAL_GUIDANCE}"),
+        ));
+    } else if !fake_model {
+        // `--dry-run` stays offline (#1898): it cannot read the release's
+        // recorded model configuration the way `resolve_preserved_runner_identity_values`
+        // does on the live path, so it cannot know whether a rerun would
+        // preserve a real credential or land on the fake model. Asserting the
+        // fake-model outcome here contradicted the live run and `cluster up
+        // --help`, which is corrosive for the one preflight signal an operator
+        // has before an upgrade -- so state what is unknown offline instead.
+        lines.push((
+            true,
+            format!(
+                "no CURIE_CREDENTIALS set; a live run preserves the release's recorded model \
+                 configuration when there is one -- not read under --dry-run{}",
+                if any_egress_opened {
+                    ""
+                } else {
+                    "; no model egress is opened by this run"
+                }
+            ),
+        ));
+        lines.push((
+            false,
+            format!(
+                "With nothing recorded -- a fresh install -- the release comes up on the fake \
+                 model and replies will be canned. {NO_CREDENTIAL_GUIDANCE}"
+            ),
         ));
     }
     lines
@@ -1484,6 +1534,11 @@ pub(crate) const FAKE_MODEL_KEY: &str = "agentSandbox.runner.fakeModel";
 const ALLOWED_EGRESS_KEY: &str = "security.networkPolicy.allowedEgress";
 const WORKER_EXTRA_ENV_KEY: &str = "worker.extraEnv";
 
+/// The ADDITIONAL Slack origins a per-turn reply endpoint may name (ADR-0096
+/// D4.4). Named here so `up`'s preservation, `diff`'s reset reporting, and the
+/// secret classifier below all read the one key.
+const SLACK_TRUSTED_ORIGINS_KEY: &str = "worker.slackTrustedOrigins";
+
 fn key_is_or_descends_from(key: &str, parent: &str) -> bool {
     key == parent
         || key
@@ -1635,6 +1690,37 @@ fn resolve_preserved_worker_extra_env_values(
     );
 }
 
+/// Carry an operator-recorded Slack trusted-origin list into a later plain
+/// `cluster up` (issue #1897).
+///
+/// `up` is a FULL helm upgrade, not `--reuse-values`, so a
+/// `worker.slackTrustedOrigins` an operator set once is reset to the chart's
+/// fail-closed `""` default by the next unrelated `up` -- the #1256
+/// preservation class again, and it silently re-breaks the dev reply path the
+/// operator had working. Emitted via `--set-string` with
+/// [`escape_helm_set_string_value`] because the value is a COMMA-SEPARATED
+/// origin list: an unescaped comma would make Helm read it as a list.
+///
+/// Preserves, never invents. [`preserved_value`] already filters an empty
+/// record, so a release that never set the key -- or one whose value was
+/// deliberately cleared -- supplies nothing and keeps the chart default. An
+/// explicit operator `--set` / `--set-string` owns the key and always wins.
+fn resolve_preserved_slack_trusted_origins_value(
+    opts: &mut UpOpts,
+    existing: Option<&serde_json::Value>,
+    operator_sets: &[String],
+) {
+    if operator_set_keys(operator_sets).contains(SLACK_TRUSTED_ORIGINS_KEY) {
+        return;
+    }
+    if let Some(origins) = preserved_value(existing, SLACK_TRUSTED_ORIGINS_KEY) {
+        opts.set_string.push(format!(
+            "{SLACK_TRUSTED_ORIGINS_KEY}={}",
+            escape_helm_set_string_value(&origins)
+        ));
+    }
+}
+
 fn resolve_preserved_runner_egress_values(
     opts: &mut UpOpts,
     existing: Option<&serde_json::Value>,
@@ -1722,8 +1808,10 @@ fn reindex_inferred_provider_egress(
 /// on the release but absent from `curie.yaml` is normally reset to the chart
 /// default -- except for the families [`resolve_preserved_values`],
 /// [`resolve_preserved_runner_identity_values`], and
-/// [`resolve_preserved_runner_egress_values`], and
-/// [`resolve_preserved_gvisor_mode_value`] re-supply, which survive untouched.
+/// [`resolve_preserved_runner_egress_values`],
+/// [`resolve_preserved_gvisor_mode_value`], and
+/// [`resolve_preserved_slack_trusted_origins_value`] re-supply, which survive
+/// untouched.
 /// Reporting those as removals would be the exact
 /// "proposing to delete what it did not create" failure ADR-0097 named.
 ///
@@ -1744,6 +1832,7 @@ pub fn is_preserved_by_up(key: &str) -> bool {
         || REQUIRED_SECRETS.iter().any(|(k, _)| *k == key)
         || crate::sealing::SEALING_MANAGED_KEYS.contains(&key)
         || key == GVISOR_MODE_KEY
+        || key == SLACK_TRUSTED_ORIGINS_KEY
 }
 
 /// Substrings that mark a chart key as carrying a credential.
@@ -1787,7 +1876,11 @@ const SECRET_KEY_MARKERS: &[&str] = &[
 pub fn is_secret_value_key(key: &str) -> bool {
     // Most preserve-on-up keys are credentials, but an inferred gVisor posture
     // is ordinary safety configuration and must remain visible in `curie diff`.
-    if (is_preserved_by_up(key) && key != GVISOR_MODE_KEY)
+    // A Slack trusted-origin list (issue #1897) is the same shape: it is
+    // operator-visible dev configuration -- hostnames, not a token -- and
+    // masking it would hide the very value the operator opens `curie diff` to
+    // confirm survived the upgrade.
+    if (is_preserved_by_up(key) && key != GVISOR_MODE_KEY && key != SLACK_TRUSTED_ORIGINS_KEY)
         || key == GITHUB_TOKEN_KEY
         || key == MODEL_CREDENTIAL_KEY
     {
@@ -2934,6 +3027,7 @@ fn complete_up_opts_without_runner_egress(
     resolve_preserved_runner_identity_values(&mut opts, existing, &operator_sets);
     resolve_preserved_gvisor_mode_value(&mut opts, existing, &operator_sets);
     resolve_preserved_worker_extra_env_values(&mut opts, existing, &operator_sets);
+    resolve_preserved_slack_trusted_origins_value(&mut opts, existing, &operator_sets);
     if !opts.dev {
         opts.secrets = resolve_generated_secrets(existing, &operator_sets)?;
         opts.secrets.extend(resolve_managed_values_for_up(
@@ -3149,10 +3243,10 @@ impl UpValuePlan {
     }
 
     fn set_string_expression(&mut self, expression: String) {
-        let effective = if expression
-            .split_once('=')
-            .is_some_and(|(key, _)| key_is_or_descends_from(key.trim(), WORKER_EXTRA_ENV_KEY))
-        {
+        let effective = if expression.split_once('=').is_some_and(|(key, _)| {
+            key_is_or_descends_from(key.trim(), WORKER_EXTRA_ENV_KEY)
+                || key_is_or_descends_from(key.trim(), SLACK_TRUSTED_ORIGINS_KEY)
+        }) {
             helm_set_string_entries(&expression)
         } else {
             operator_set_entries(std::slice::from_ref(&expression))
@@ -5772,6 +5866,541 @@ pub async fn down(opts: DownOpts) -> Result<ClusterDownOutput> {
     )
 }
 
+// ---------------------------------------------------------------------------
+// `cluster rollback` (#1899)
+// ---------------------------------------------------------------------------
+
+/// One row of `helm history -o json`. Only the fields the rollback decision
+/// needs are modelled; helm adds others (`updated`, `app_version`) that are
+/// deliberately ignored so a helm version bump cannot break parsing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HelmRevision {
+    pub revision: u32,
+    pub status: String,
+    pub chart: String,
+    pub description: String,
+}
+
+/// The revision statuses it is safe to roll back TO. Everything else
+/// (`failed`, the four `pending-*` states, `uninstalling`, `uninstalled`,
+/// `unknown`) names a revision helm never finished putting on the cluster, so
+/// rolling back to it re-applies a manifest that was never known good.
+const ROLLBACK_ELIGIBLE_STATUSES: [&str; 2] = ["deployed", "superseded"];
+
+fn is_eligible_rollback_status(status: &str) -> bool {
+    ROLLBACK_ELIGIBLE_STATUSES.contains(&status.trim().to_ascii_lowercase().as_str())
+}
+
+/// The revision the release is on right now.
+///
+/// Normally that is the one helm marks `deployed`. The fallback to the highest
+/// revision is the real recovery case this verb exists for: when the newest
+/// revision FAILED there is no `deployed` row at all, and treating the failed
+/// revision as "current" is what lets the selector look below it.
+fn current_revision(history: &[HelmRevision]) -> Option<u32> {
+    history
+        .iter()
+        .filter(|r| r.status.trim().eq_ignore_ascii_case("deployed"))
+        .map(|r| r.revision)
+        .max()
+        .or_else(|| history.iter().map(|r| r.revision).max())
+}
+
+/// [`current_revision`], or the error every entry point owes an operator whose
+/// history came back empty. One copy on purpose: the wording here has already
+/// been reworked twice, and a second hand-written copy would silently keep the
+/// old text the next time it changes.
+fn require_current_revision(history: &[HelmRevision]) -> Result<u32> {
+    match current_revision(history) {
+        Some(current) => Ok(current),
+        None => Err(crate::exit::CliError::failure(
+            "`helm history` returned no revisions for this release, so there is nothing to roll back to",
+        )
+        .with_fix("confirm the release name and namespace with `helm list -n <namespace>`")
+        .into()),
+    }
+}
+
+/// The INELIGIBLE revisions between `to` and `from`. The status filter is not
+/// redundant: it is only the auto-select path that leaves nothing eligible in
+/// the gap. An operator-named `--revision` can step over revisions that were
+/// perfectly good, and reporting those as "not deployed/superseded" is a false
+/// claim in both the note and the `--json` `skipped` field, so the list is
+/// computed rather than assumed. Reporting the rest is the whole point of AC2.
+///
+/// Deduplicated defensively: [`parse_helm_history`] already collapses a corrupt
+/// history to one row per revision, but this is pure over any slice a caller
+/// hands it, and a number must never surface twice in the report.
+fn skipped_between(history: &[HelmRevision], to: u32, from: u32) -> Vec<u32> {
+    let mut skipped: Vec<u32> = history
+        .iter()
+        .filter(|r| r.revision > to && r.revision < from)
+        .filter(|r| !is_eligible_rollback_status(&r.status))
+        .map(|r| r.revision)
+        .collect();
+    skipped.sort_unstable();
+    skipped.dedup();
+    skipped
+}
+
+/// A resolved rollback: where the release is now, where it is going, and what
+/// was stepped over on the way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RollbackChoice {
+    pub from_revision: u32,
+    pub to_revision: u32,
+    pub skipped: Vec<u32>,
+    /// True only when `--allow-failed-revision` admitted a revision whose status
+    /// is not `deployed`/`superseded`.
+    pub forced: bool,
+}
+
+/// The outcome of the pure selection. `NoEligible` is a legitimate reading of a
+/// real history (a first install, or a release whose every prior revision
+/// failed), not a parse error, so it is carried as a value and turned into the
+/// operator-facing refusal by [`RollbackTarget::require_eligible`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RollbackTarget {
+    Eligible(RollbackChoice),
+    NoEligible { current: u32, skipped: Vec<u32> },
+}
+
+impl RollbackTarget {
+    /// The chosen revision, or the AC4 refusal: never a silent no-op, and never
+    /// a rollback to a revision helm never finished applying.
+    pub fn require_eligible(self) -> Result<RollbackChoice> {
+        match self {
+            RollbackTarget::Eligible(choice) => Ok(choice),
+            RollbackTarget::NoEligible { current, skipped } => {
+                let detail = if skipped.is_empty() {
+                    format!("revision {current} is the only revision in its history")
+                } else {
+                    format!(
+                        "every revision below {current} ({}) has a status helm never finished applying",
+                        skipped
+                            .iter()
+                            .map(u32::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
+                // The next step rides in the message as well as the fix: a bare
+                // `CliError` shows only its message to a human presenter, so an
+                // operator on a TTY would otherwise never learn there is one.
+                Err(crate::exit::CliError::failure(format!(
+                    "no revision is safe to roll back to: {detail}; inspect \
+                     `helm history <release> -n <namespace>` and, if you accept the risk, name one \
+                     explicitly with --revision <n> --allow-failed-revision"
+                ))
+                .with_fix(
+                    "inspect `helm history <release> -n <namespace>` and, if you accept the risk, \
+                     name one explicitly with --revision <n> --allow-failed-revision",
+                )
+                .into())
+            }
+        }
+    }
+}
+
+/// Pick the rollback target: the NEWEST revision strictly below the current one
+/// whose status is `deployed` or `superseded`.
+///
+/// This is the whole fix for #1899. A `cluster up` against a cluster with no
+/// `runsc` RuntimeClass records a FAILED revision before its successful retry,
+/// so the history alternates failed/superseded and the immediately preceding
+/// revision -- the one bare `helm rollback` targets -- is a failed one. Skipping
+/// ineligible statuses is what stops an operator having to know that.
+///
+/// Pure by construction so the decision is unit-testable with no cluster.
+pub fn select_rollback_revision(history: &[HelmRevision]) -> Result<RollbackTarget> {
+    let current = require_current_revision(history)?;
+
+    match history
+        .iter()
+        .filter(|r| r.revision < current && is_eligible_rollback_status(&r.status))
+        .map(|r| r.revision)
+        .max()
+    {
+        Some(to_revision) => Ok(RollbackTarget::Eligible(RollbackChoice {
+            from_revision: current,
+            to_revision,
+            skipped: skipped_between(history, to_revision, current),
+            forced: false,
+        })),
+        None => Ok(RollbackTarget::NoEligible {
+            current,
+            skipped: skipped_between(history, 0, current),
+        }),
+    }
+}
+
+/// Validate an operator-named `--revision`. A revision that is not in the
+/// history is always refused (helm would otherwise fail obscurely mid-rollback);
+/// an ineligible status is refused unless `allow_failed` was passed, and the
+/// refusal names both the status and the override so the operator does not have
+/// to guess (AC3).
+pub fn resolve_explicit_revision(
+    history: &[HelmRevision],
+    revision: u32,
+    allow_failed: bool,
+) -> Result<RollbackChoice> {
+    let current = require_current_revision(history)?;
+
+    let row = history.iter().find(|r| r.revision == revision).ok_or_else(|| {
+        let known: Vec<String> = history.iter().map(|r| r.revision.to_string()).collect();
+        crate::exit::CliError::usage(format!(
+            "revision {revision} is not in this release's Helm history (it has {})",
+            known.join(", ")
+        ))
+        .with_fix("run `curie cluster rollback` with no --revision to let it pick the newest safe revision")
+    })?;
+
+    let eligible = is_eligible_rollback_status(&row.status);
+    if !eligible && !allow_failed {
+        return Err(crate::exit::CliError::usage(format!(
+            "revision {revision} has status `{}`, not `deployed` or `superseded`; \
+             helm never finished applying it, so rolling back to it re-applies a manifest \
+             that was never known good; pass --allow-failed-revision to roll back to it anyway, \
+             or omit --revision to let Curie pick the newest safe one",
+            row.status
+        ))
+        .with_fix("pass --allow-failed-revision to roll back to it anyway, or omit --revision to let Curie pick the newest safe one")
+        .into());
+    }
+
+    Ok(RollbackChoice {
+        from_revision: current,
+        to_revision: revision,
+        skipped: skipped_between(history, revision, current),
+        forced: !eligible,
+    })
+}
+
+/// Parse `helm history -o json`: an array of objects. Unknown fields are
+/// tolerated (helm adds them across versions) and `revision` is accepted as a
+/// JSON number or a string, since that shape has moved between helm releases.
+/// Never panics on operator-visible input -- a malformed payload becomes a
+/// `CliError` naming the command to run by hand.
+pub fn parse_helm_history(json: &str) -> Result<Vec<HelmRevision>> {
+    let malformed = |detail: String| {
+        crate::exit::CliError::failure(format!(
+            "could not read `helm history -o json` output: {detail}"
+        ))
+        .with_fix(
+            "run `helm history <release> -n <namespace> -o json` by hand to see what helm returned",
+        )
+    };
+
+    let rows: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| malformed(e.to_string()))?;
+    let rows = rows
+        .as_array()
+        .ok_or_else(|| malformed("expected a JSON array of revisions".to_string()))?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let revision = row
+            .get("revision")
+            .and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+            })
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| {
+                malformed(format!("a revision has no usable `revision` field: {row}"))
+            })?;
+        let field = |name: &str| {
+            row.get(name)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        // A row with no `status` is treated as `unknown`, which is ineligible:
+        // the safe reading of a field we could not see is "not known good".
+        let status = match field("status").as_str() {
+            "" => "unknown".to_string(),
+            s => s.to_string(),
+        };
+        out.push(HelmRevision {
+            revision,
+            status,
+            chart: field("chart"),
+            description: field("description"),
+        });
+    }
+    // The invariant every consumer below relies on: ascending by revision, and
+    // exactly ONE row per revision number. Eligibility is a property of the
+    // REVISION, not of a row, so both the auto-selector (which filters rows by
+    // status) and `--revision` (which looks a row up) must read the same answer
+    // for the same number. A truncated or corrupt helm secret can yield two
+    // rows for one revision that disagree -- say 20 `superseded` and 20
+    // `failed` -- and before collapsing them the two paths contradicted each
+    // other: `--revision 20` refused it as failed while a bare rollback happily
+    // picked it. A revision whose own history contradicts itself was never
+    // known good, so it collapses to its ineligible reading: sort ineligible
+    // first within a revision number (`false` orders before `true`), then keep
+    // the first row of each run.
+    out.sort_by_key(|r| (r.revision, is_eligible_rollback_status(&r.status)));
+    out.dedup_by_key(|r| r.revision);
+    Ok(out)
+}
+
+/// `helm history` for the release, as JSON. `--max 256` because helm's default
+/// of 10 silently truncates the history, and a truncated history would make the
+/// selector pick a revision that merely looks like the newest safe one.
+pub fn helm_history_cmd(o: &CommonOpts) -> OpsCommand {
+    OpsCommand::new(
+        "helm",
+        vec![
+            plain("history"),
+            plain(&o.release),
+            plain("-n"),
+            plain(&o.namespace),
+            plain("-o"),
+            plain("json"),
+            plain("--max"),
+            plain("256"),
+        ],
+    )
+}
+
+/// `helm rollback` to an explicit revision. Always explicit: the whole point of
+/// the verb is that helm's own default target (the immediately preceding
+/// revision) is the wrong one on a failed/superseded history.
+pub fn helm_rollback_cmd(o: &CommonOpts, revision: u32) -> OpsCommand {
+    helm_rollback_cmd_to(o, revision.to_string())
+}
+
+/// The revision slot of the rollback argv, as printed by `--dry-run` before the
+/// history that decides it has been read.
+const SELECTED_REVISION: &str = "<selected-revision>";
+
+/// [`helm_rollback_cmd`] with the revision slot left as text, so the plan a dry
+/// run prints and the command a live run executes are built by one function
+/// rather than a builder and a `format!` that drift apart.
+fn helm_rollback_cmd_to(o: &CommonOpts, revision: String) -> OpsCommand {
+    OpsCommand::new(
+        "helm",
+        vec![
+            plain("rollback"),
+            plain(&o.release),
+            plain(revision),
+            plain("-n"),
+            plain(&o.namespace),
+        ],
+    )
+}
+
+/// The commands `curie cluster rollback` runs (and prints under `--dry-run`):
+/// the history read that decides the target, then the rollback itself. A `None`
+/// revision is one the caller has not resolved yet, and stands in the argv as
+/// [`SELECTED_REVISION`].
+pub fn rollback_commands(o: &CommonOpts, revision: Option<u32>) -> Vec<OpsCommand> {
+    let target = revision.map_or_else(|| SELECTED_REVISION.to_string(), |r| r.to_string());
+    vec![helm_history_cmd(o), helm_rollback_cmd_to(o, target)]
+}
+
+/// One printed plan line. `display()` everywhere, except that it shell-quotes
+/// [`SELECTED_REVISION`] (the angle brackets are not shell-safe) into something
+/// that reads like a literal argument. The placeholder is a prompt to the
+/// reader, not a value, so it is unquoted back out; everything else in the line
+/// keeps `display()`'s quoting and masking.
+fn plan_line(cmd: &OpsCommand) -> String {
+    cmd.display()
+        .replace(&shell_quote(SELECTED_REVISION), SELECTED_REVISION)
+}
+
+/// Output of `cluster rollback`: the dry-run plan, an operator abort, or the
+/// completed rollback. `skipped` is carried into `--json` so an agent sees the
+/// revisions bare `helm rollback` would have landed on.
+#[derive(Debug)]
+pub enum ClusterRollbackOutput {
+    DryRun(crate::ui::DryRunPlan),
+    Aborted,
+    RolledBack {
+        from_revision: u32,
+        to_revision: u32,
+        skipped: Vec<u32>,
+        forced: bool,
+    },
+}
+
+impl crate::ui::CliOutput for ClusterRollbackOutput {
+    fn to_json(&self) -> serde_json::Value {
+        match self {
+            ClusterRollbackOutput::DryRun(plan) => plan.to_json(),
+            ClusterRollbackOutput::Aborted => {
+                serde_json::json!({"rolled_back": false, "aborted": true})
+            }
+            ClusterRollbackOutput::RolledBack {
+                from_revision,
+                to_revision,
+                skipped,
+                forced,
+            } => serde_json::json!({
+                "rolled_back": true,
+                "from_revision": from_revision,
+                "to_revision": to_revision,
+                "skipped": skipped,
+                "forced": forced,
+            }),
+        }
+    }
+
+    fn render(&self, ui: &crate::ui::Ui) {
+        match self {
+            ClusterRollbackOutput::DryRun(plan) => plan.render(ui),
+            ClusterRollbackOutput::Aborted => ui.note("aborted"),
+            ClusterRollbackOutput::RolledBack {
+                from_revision,
+                to_revision,
+                skipped,
+                forced,
+            } => {
+                ui.payload(&format!(
+                    "curie rolled back from revision {from_revision} to revision {to_revision}"
+                ));
+                if let Some(note) = skipped_note(skipped, *from_revision) {
+                    ui.note(&note);
+                }
+                if *forced {
+                    ui.warn(&format!(
+                        "revision {to_revision} was admitted by --allow-failed-revision; helm never finished applying it, so verify the release with `curie cluster status`"
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// The AC2 line: which revisions were passed over, and -- only when it is
+/// actually so -- which of them a bare `helm rollback` would have targeted.
+///
+/// helm's own default target is always the revision immediately below `from`,
+/// so that half of the sentence is true only when the highest skipped revision
+/// IS `from - 1`. On an explicit `--revision` the gap can contain eligible
+/// revisions that are not in this list, and naming the highest ineligible one
+/// as helm's target would be a fabrication. `None` when nothing was skipped, so
+/// the common case stays quiet.
+fn skipped_note(skipped: &[u32], from: u32) -> Option<String> {
+    let highest = *skipped.iter().max()?;
+    let list = skipped
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(if from.checked_sub(1) == Some(highest) {
+        format!(
+            "skipped revision(s) {list} (not deployed/superseded); a bare `helm rollback` would have targeted {highest}"
+        )
+    } else {
+        format!("skipped revision(s) {list} (not deployed/superseded)")
+    })
+}
+
+pub async fn rollback(opts: RollbackOpts) -> Result<ClusterRollbackOutput> {
+    let ui = crate::ui::ui();
+    let history_cmd = helm_history_cmd(&opts.common);
+
+    if opts.common.dry_run {
+        // The target revision is a function of the live history, so a dry run
+        // that has not read it can only name the revision when the operator did.
+        return Ok(ClusterRollbackOutput::DryRun(crate::ui::DryRunPlan {
+            lines: rollback_commands(&opts.common, opts.revision)
+                .iter()
+                .map(plan_line)
+                .collect(),
+        }));
+    }
+    require_on_path("helm")?;
+
+    ui.plumbing(&format!("+ {}", history_cmd.display()));
+    let (ok, history_out, history_err) = run_capture(&history_cmd).await?;
+    if !ok {
+        // A missing release fails HERE, with helm's own words, rather than
+        // downstream as a misleading "no eligible revision" (AC6).
+        let detail = history_err
+            .trim()
+            .lines()
+            .next()
+            .unwrap_or("helm exited nonzero with no message");
+        return Err(crate::exit::CliError::failure(format!(
+            "could not read the Helm history of release '{}' in namespace '{}': {detail}",
+            opts.common.release, opts.common.namespace
+        ))
+        .with_fix(format!(
+            "confirm the release exists with `helm list -n {}`",
+            opts.common.namespace
+        ))
+        .into());
+    }
+    let history = parse_helm_history(&history_out)?;
+
+    let choice = match opts.revision {
+        Some(revision) => {
+            resolve_explicit_revision(&history, revision, opts.allow_failed_revision)?
+        }
+        None => select_rollback_revision(&history)?.require_eligible()?,
+    };
+
+    // Disclosed BEFORE the prompt, and on stderr like `cluster down` does it:
+    // the operator confirms knowing both the target and what was passed over,
+    // which is the difference this verb exists to make. It cannot go through
+    // `payload` -- ADR-0021 (#474) reserves that channel for `CliOutput::render`,
+    // and routing it here told an operator who then declined the prompt that the
+    // release was rolling back, on stdout, while printing it twice on success.
+    ui.note(&format!(
+        "rolling release '{}' back from revision {} to revision {}",
+        opts.common.release, choice.from_revision, choice.to_revision
+    ));
+    if let Some(note) = skipped_note(&choice.skipped, choice.from_revision) {
+        ui.warn(&note);
+    }
+
+    if !opts.yes
+        && !confirm(&format!(
+            "This rolls back release '{}' in namespace '{}' from revision {} to revision {}. Continue? [y/N] ",
+            opts.common.release, opts.common.namespace, choice.from_revision, choice.to_revision
+        ))?
+    {
+        return Ok(ClusterRollbackOutput::Aborted);
+    }
+
+    let cl = ui.checklist();
+    let rollback_cmd = helm_rollback_cmd(&opts.common, choice.to_revision);
+    ui.plumbing(&format!("+ {}", rollback_cmd.display()));
+    let step = cl.step("rolling back release");
+    let (ok, out, err) = run_capture(&rollback_cmd).await?;
+    for line in out.lines().chain(err.lines()) {
+        ui.plumbing(line);
+    }
+    if !ok {
+        step.fail("failed");
+        let detail = err
+            .trim()
+            .lines()
+            .next()
+            .unwrap_or("helm exited nonzero with no message");
+        return Err(crate::exit::CliError::failure(format!(
+            "helm could not roll release '{}' back to revision {}: {detail}",
+            opts.common.release, choice.to_revision
+        ))
+        .with_fix(format!(
+            "inspect the release with `curie cluster status --release {} --namespace {}`",
+            opts.common.release, opts.common.namespace
+        ))
+        .into());
+    }
+    step.done("rolled back");
+
+    Ok(ClusterRollbackOutput::RolledBack {
+        from_revision: choice.from_revision,
+        to_revision: choice.to_revision,
+        skipped: choice.skipped,
+        forced: choice.forced,
+    })
+}
+
 /// Read a y/N confirmation from stderr/stdin for `down` when `--yes` is absent.
 /// Prompt on stderr for a y/N confirmation of a destructive action, returning
 /// whether the operator affirmed. The one canonical implementation (#497): every
@@ -7221,6 +7850,251 @@ mod tests {
         assert!(
             argv.contains(&"worker.extraEnv[0].value=10.0.0.0/8\\,localhost".into()),
             "recorded worker extraEnv values must escape commas for Helm: {argv:?}"
+        );
+    }
+
+    /// A plain `cluster up` for an unrelated reason must not silently switch
+    /// the worker back to refusing every dev reply endpoint the operator had
+    /// already trusted (issue #1897).
+    #[test]
+    fn plain_up_re_supplies_recorded_slack_trusted_origins_without_reuse_values() {
+        let existing = serde_json::json!({
+            "worker": { "slackTrustedOrigins": "http://host.docker.internal" }
+        });
+        let opts = complete_up_opts_without_runner_egress(
+            UpOpts {
+                common: common(),
+                github_token: GithubTokenPlan::Untouched,
+                allow_egress_host: vec![],
+                resolved_egress_cidrs: vec![],
+                chart: "charts/curie".into(),
+                secrets: vec![],
+                dev: false,
+                no_expose: true,
+                set: vec![],
+                set_string: vec![],
+                allow_web_egress: vec![],
+                fake_model: false,
+                credentials: None,
+                local_model: None,
+                model: None,
+            },
+            Some(&existing),
+            None,
+            false,
+        )
+        .unwrap();
+
+        let (materialized, _guards) = up_commands(&opts)[0].materialize_secret_files().unwrap();
+        let argv = materialized.argv().join(" ");
+        assert!(
+            argv.contains("--set-string worker.slackTrustedOrigins=http://host.docker.internal"),
+            "plain up dropped the recorded Slack trusted origin: {argv}"
+        );
+        assert!(
+            !argv.contains("--reuse-values"),
+            "up must remain a full Helm upgrade: {argv}"
+        );
+    }
+
+    /// An operator who names the trusted origins on this run owns the key: the
+    /// stale recorded list must not be smuggled back alongside it, or the
+    /// worker keeps trusting a host the operator just removed.
+    #[test]
+    fn explicit_slack_trusted_origins_override_the_recorded_value() {
+        let existing = serde_json::json!({
+            "worker": { "slackTrustedOrigins": "https://recorded.example.com" }
+        });
+        let opts = complete_up_opts_without_runner_egress(
+            UpOpts {
+                common: common(),
+                github_token: GithubTokenPlan::Untouched,
+                allow_egress_host: vec![],
+                resolved_egress_cidrs: vec![],
+                chart: "charts/curie".into(),
+                secrets: vec![],
+                dev: false,
+                no_expose: true,
+                set: vec![],
+                set_string: vec!["worker.slackTrustedOrigins=https://trusted.example.com".into()],
+                allow_web_egress: vec![],
+                fake_model: false,
+                credentials: None,
+                local_model: None,
+                model: None,
+            },
+            Some(&existing),
+            None,
+            false,
+        )
+        .unwrap();
+
+        let (materialized, _guards) = up_commands(&opts)[0].materialize_secret_files().unwrap();
+        let argv = materialized.argv().join(" ");
+        assert!(
+            argv.contains("--set-string worker.slackTrustedOrigins=https://trusted.example.com"),
+            "the explicit Slack trusted origin must reach Helm: {argv}"
+        );
+        assert!(
+            !argv.contains("recorded.example.com"),
+            "explicit trusted origins must suppress the recorded value: {argv}"
+        );
+    }
+
+    /// A plain `--set` names the trusted origins on this run just as much as
+    /// `--set-string` does -- an operator using the shorthand flag must still
+    /// own the key, not have the stale recorded list smuggled back alongside it.
+    #[test]
+    fn explicit_set_slack_trusted_origins_override_the_recorded_value() {
+        let existing = serde_json::json!({
+            "worker": { "slackTrustedOrigins": "https://recorded.example.com" }
+        });
+        let opts = complete_up_opts_without_runner_egress(
+            UpOpts {
+                common: common(),
+                github_token: GithubTokenPlan::Untouched,
+                allow_egress_host: vec![],
+                resolved_egress_cidrs: vec![],
+                chart: "charts/curie".into(),
+                secrets: vec![],
+                dev: false,
+                no_expose: true,
+                set: vec!["worker.slackTrustedOrigins=https://trusted.example.com".into()],
+                set_string: vec![],
+                allow_web_egress: vec![],
+                fake_model: false,
+                credentials: None,
+                local_model: None,
+                model: None,
+            },
+            Some(&existing),
+            None,
+            false,
+        )
+        .unwrap();
+
+        let (materialized, _guards) = up_commands(&opts)[0].materialize_secret_files().unwrap();
+        let argv = materialized.argv().join(" ");
+        assert!(
+            argv.contains("--set worker.slackTrustedOrigins=https://trusted.example.com"),
+            "the explicit Slack trusted origin must reach Helm: {argv}"
+        );
+        assert!(
+            !argv.contains("recorded.example.com"),
+            "explicit trusted origins must suppress the recorded value: {argv}"
+        );
+    }
+
+    /// The key is a COMMA-SEPARATED origin list, so an operator who trusts two
+    /// hosts must not have Helm read the second one as a list element and the
+    /// diff report an origin the worker was never sent.
+    #[test]
+    fn plain_up_round_trips_multi_origin_slack_trusted_origins() {
+        let recorded = "http://host.docker.internal,http://10.20.30.40";
+        let existing = serde_json::json!({
+            "worker": { "slackTrustedOrigins": recorded }
+        });
+        let opts = complete_up_opts_without_runner_egress(
+            UpOpts {
+                common: common(),
+                github_token: GithubTokenPlan::Untouched,
+                allow_egress_host: vec![],
+                resolved_egress_cidrs: vec![],
+                chart: "charts/curie".into(),
+                secrets: vec![],
+                dev: false,
+                no_expose: true,
+                set: vec![],
+                set_string: vec![],
+                allow_web_egress: vec![],
+                fake_model: false,
+                credentials: None,
+                local_model: None,
+                model: None,
+            },
+            Some(&existing),
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            up_value_plan(&opts)
+                .effective_values()
+                .get("worker.slackTrustedOrigins"),
+            Some(&recorded.to_string()),
+            "the escaped Helm expression must retain the recorded origin list verbatim"
+        );
+
+        let (materialized, _guards) = up_commands(&opts)[0].materialize_secret_files().unwrap();
+        let argv = materialized.argv();
+        assert!(
+            argv.contains(
+                &"worker.slackTrustedOrigins=http://host.docker.internal\\,http://10.20.30.40"
+                    .into()
+            ),
+            "a recorded origin list must escape its commas for Helm: {argv:?}"
+        );
+    }
+
+    /// Preservation must never widen where the platform bot token can go: a
+    /// release that never trusted an extra origin -- whose list was
+    /// deliberately cleared, or that has no recorded release at all (a fresh
+    /// install) -- keeps the chart's fail-closed empty default.
+    #[test]
+    fn up_invents_no_slack_trusted_origins_when_none_is_recorded() {
+        for existing in [
+            Some(serde_json::json!({ "worker": { "slackTrustedOrigins": "" } })),
+            Some(serde_json::json!({ "worker": {} })),
+            None,
+        ] {
+            let opts = complete_up_opts_without_runner_egress(
+                UpOpts {
+                    common: common(),
+                    github_token: GithubTokenPlan::Untouched,
+                    allow_egress_host: vec![],
+                    resolved_egress_cidrs: vec![],
+                    chart: "charts/curie".into(),
+                    secrets: vec![],
+                    dev: false,
+                    no_expose: true,
+                    set: vec![],
+                    set_string: vec![],
+                    allow_web_egress: vec![],
+                    fake_model: false,
+                    credentials: None,
+                    local_model: None,
+                    model: None,
+                },
+                existing.as_ref(),
+                None,
+                false,
+            )
+            .unwrap();
+
+            let (materialized, _guards) = up_commands(&opts)[0].materialize_secret_files().unwrap();
+            let argv = materialized.argv().join(" ");
+            assert!(
+                !argv.contains("slackTrustedOrigins"),
+                "up must not supply a trusted-origin value it has no record of: {argv}"
+            );
+        }
+    }
+
+    /// `curie diff` has to agree with what `up` actually does: announcing a
+    /// reset for a value `up` hands straight back sends the operator chasing a
+    /// change that never happens. And the list is hostnames, not a credential
+    /// -- masking it would hide the very dev configuration the operator opens
+    /// `diff` to confirm.
+    #[test]
+    fn slack_trusted_origins_are_preserved_and_never_masked() {
+        assert!(
+            is_preserved_by_up("worker.slackTrustedOrigins"),
+            "diff must not report a reset for a key up re-supplies"
+        );
+        assert!(
+            !is_secret_value_key("worker.slackTrustedOrigins"),
+            "the trusted-origin list is operator-visible configuration, not a credential"
         );
     }
 
@@ -10385,6 +11259,118 @@ mod tests {
             model_egress_status_lines(true, false, false, &["anthropic".to_string()], true, true);
         for (_, m) in &lines {
             assert!(!m.contains("egress opened"), "{m}");
+        }
+    }
+
+    #[test]
+    fn model_egress_status_lines_dry_run_does_not_assert_fake_model() {
+        // #1898: under --dry-run there is no `existing` release to read, so the
+        // no-credential arm must not assert the fake-model outcome -- it must
+        // say preservation is unknown offline instead, as a warning. It also
+        // must not claim the sandbox "stays sealed": a live rerun could
+        // re-supply the release's recorded egress, so that assertion would be
+        // just as false offline as the fake-model one.
+        let lines = model_egress_status_lines(false, false, false, &[], false, true);
+        let msgs: Vec<&str> = lines.iter().map(|(_, m)| m.as_str()).collect();
+        for m in &msgs {
+            assert!(!m.contains("installing with the fake model"), "{m}");
+            assert!(!m.contains("sealed"), "{m}");
+        }
+        let (is_warning, preservation_msg) = lines
+            .iter()
+            .find(|(_, m)| m.contains("preserves the release's recorded model configuration"))
+            .expect("a preservation-unknown message");
+        assert!(
+            preservation_msg.contains("not read under --dry-run"),
+            "{preservation_msg}"
+        );
+        assert!(*is_warning, "{msgs:?}");
+    }
+
+    #[test]
+    fn model_egress_status_lines_live_run_still_asserts_fake_model_install() {
+        // Sibling of model_egress_status_lines_dry_run_does_not_assert_fake_model:
+        // same inputs but a live run, which must keep asserting the fake-model
+        // outcome. Pins that only the dry-run path changed under #1898.
+        let lines = model_egress_status_lines(false, false, false, &[], false, false);
+        let msgs: Vec<&str> = lines.iter().map(|(_, m)| m.as_str()).collect();
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("installing with the fake model")),
+            "{msgs:?}"
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("(model egress stays sealed)")),
+            "{msgs:?}"
+        );
+        for m in &msgs {
+            assert!(!m.contains("not read under --dry-run"), "{m}");
+        }
+    }
+
+    #[test]
+    fn model_egress_status_lines_dry_run_keeps_credential_guidance() {
+        // An operator on a fresh install must still be told how to enable the
+        // real model, so softening the assertion under --dry-run must not drop
+        // the guidance.
+        let lines = model_egress_status_lines(false, false, false, &[], false, true);
+        let note = lines
+            .iter()
+            .find(|(is_warning, _)| !*is_warning)
+            .map(|(_, m)| m.as_str())
+            .expect("a non-warn note");
+        assert!(note.contains("CURIE_CREDENTIALS"), "{note}");
+        assert!(note.contains("fresh install"), "{note}");
+        assert!(note.contains("replies will be canned"), "{note}");
+        assert!(note.contains("worker runtime base URL"), "{note}");
+    }
+
+    #[test]
+    fn model_egress_status_lines_dry_run_open_egress_never_says_sealed() {
+        // Dry-run sibling of model_egress_status_lines_no_cred_open_egress_never_says_sealed:
+        // no credential, dry-run, but a provider egress is opened. The
+        // preservation-unknown line must not carry the live-only "sealed" or
+        // "installing with the fake model" language, and its "no model egress
+        // is opened by this run" suffix must drop when egress is in fact open.
+        let lines =
+            model_egress_status_lines(false, false, false, &["anthropic".to_string()], true, true);
+        let msgs: Vec<&str> = lines.iter().map(|(_, m)| m.as_str()).collect();
+        for m in &msgs {
+            assert!(!m.contains("sealed"), "{m}");
+            assert!(!m.contains("installing with the fake model"), "{m}");
+            assert!(!m.contains("no model egress is opened by this run"), "{m}");
+        }
+        assert!(
+            msgs.iter().any(|m| m.contains("not read under --dry-run")),
+            "{msgs:?}"
+        );
+    }
+
+    #[test]
+    fn model_egress_status_lines_explicit_fake_model_stays_silent_under_dry_run() {
+        // No test above ever passes fake_model = true. An explicit --fake-model
+        // run has already declared the outcome, so this helper must emit
+        // nothing for it even under --dry-run.
+        let lines = model_egress_status_lines(false, false, true, &[], false, true);
+        let msgs: Vec<&str> = lines.iter().map(|(_, m)| m.as_str()).collect();
+        assert!(lines.is_empty(), "{msgs:?}");
+    }
+
+    #[test]
+    fn model_egress_status_lines_local_model_wins_over_dry_run_arm() {
+        // No test above ever passes local_model = true. --dry-run --local-model
+        // must keep reporting the local-model install, not the new
+        // preservation-unknown warning.
+        let lines = model_egress_status_lines(false, true, false, &[], false, true);
+        let msgs: Vec<&str> = lines.iter().map(|(_, m)| m.as_str()).collect();
+        assert!(
+            msgs.iter().any(|m| m.contains("local model enabled")),
+            "{msgs:?}"
+        );
+        for m in &msgs {
+            assert!(!m.contains("not read under --dry-run"), "{m}");
+            assert!(!m.contains("installing with the fake model"), "{m}");
         }
     }
 

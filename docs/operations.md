@@ -199,6 +199,44 @@ once the cluster is reachable again. See ADR-0064 (Architecture Decision
 Record; `docs/adr/0064-fail-forward-cluster-teardown.md`) for the full
 fail-forward design.
 
+### `curie cluster rollback`
+
+```bash
+curie cluster rollback
+```
+
+| Flag | What it does |
+|---|---|
+| `--revision <n>` | Roll back to this exact revision instead of the newest safe one. |
+| `--allow-failed-revision` | Permit a `--revision` that Helm never finished applying. |
+| `--yes` | Skip the confirmation prompt. |
+| `--dry-run` | Print the commands that would run and exit. |
+
+`curie cluster rollback` puts the release back on the newest revision that
+Helm actually finished applying.
+
+That is not what a bare `helm rollback` does, and the difference bites on a
+cluster without gVisor. `cluster up` tries the install with the chart's
+gVisor default first; if the cluster has no `runsc` RuntimeClass, that attempt
+is recorded as a **failed** Helm revision before the successful retry with
+gVisor off. Do that a few times and the release history alternates
+failed/superseded/failed/superseded. `helm rollback` with no revision targets
+the immediately preceding revision -- which, on that history, is a failed one:
+a manifest Helm never finished putting on the cluster. Rolling back to it does
+not restore a working release, it re-applies a broken one.
+
+So this verb reads the history first, skips every revision whose status is not
+`deployed` or `superseded`, and rolls back to the newest one that is. It prints
+which revisions it passed over, so you can see exactly what a bare
+`helm rollback` would have landed on instead.
+
+If you know which revision you want, `--revision <n>` takes it. A revision that
+isn't in the history is refused, and so is one Helm never finished applying --
+unless you also pass `--allow-failed-revision` to say you accept that. If no
+revision is safe to roll back to (a first install, or a release whose every
+prior revision failed), the command tells you so rather than doing nothing or
+rolling back to something broken. See issue #1899 for the original report.
+
 ## Deploying your plugin bundle onto the Curie platform
 
 ### Manually, with `curie cluster deploy`
@@ -376,12 +414,15 @@ swap it would be.
 
 `curie apply` refuses outright when the upgrade would delete a StatefulSet the
 release is running, and names it. `--migrate-store` is the option to reach
-for: apply stages every object, upgrades, loads them back, and verifies per
-object, all in one command, so the data survives. It is opt-in rather than
-automatic because the migration has a window where the store is empty and the
-bot cannot answer, so an apply that only changes a log level must never
-silently start moving data. `--allow-stateful-removal` proceeds WITHOUT the
-data instead, for a store you genuinely intend to discard. The two flags are
+for: apply stages the object store, upgrades, loads it back, and verifies it,
+all in one command, so the store's data survives. It carries the object store
+only; if the same upgrade would also delete another stateful component, apply
+still refuses and names that component, since `--migrate-store` gives it no
+way to carry that data too. It is opt-in rather than automatic because the
+migration has a window where the store is empty and the bot cannot answer, so
+an apply that only changes a log level must never silently start moving data.
+`--allow-stateful-removal` proceeds WITHOUT the data instead, for a store you
+genuinely intend to discard. The two flags are
 mutually exclusive: passing both is rejected by the parser with a nonzero
 exit, never silently resolved by picking one.
 

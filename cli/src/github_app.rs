@@ -16,7 +16,7 @@
 //! reachable when the operator asks for it; `--set-file` above is still what a
 //! chart-held connect does.
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 
 use crate::ops::{
     fetch_release_values, plain, require_on_path, resolve_existing_secret_ref, run_step,
@@ -587,6 +587,21 @@ fn describe_rejected_value(value: &str) -> String {
 /// Takes the whole record rather than five positional `&str`/`bool` arguments:
 /// the old three-argument form was already one argument swap away from a
 /// silent bug, and the rules below now read five of the fields.
+///
+/// All eight refusals here are deterministic input errors -- the identical argv
+/// fails identically every time -- so they exit 2 (ADR-0021 Usage) with a
+/// non-null `fix` naming the flag to correct (#1261). A bare `bail!` classified
+/// them as exit 1 with a null fix -- indistinguishable to an agent from the helm
+/// upgrade itself failing, which is retryable and these are not. clap gives
+/// every one of these flags a `default_value`, so clap never raises its own exit
+/// 2 for them and this is the only place the class is set. That covers the three
+/// original refusals (a missing `--app-id`, a missing `--private-key`, a
+/// `--private-key` path that is not a file) and the five `--existing-secret`
+/// rules #1255 adds below; they are the same category and take the same class.
+///
+/// The refusals that are NOT here stay `CliError::failure` on purpose:
+/// [`guard_byo_key_conflict`] and [`opaque_byo_field_error`] judge the state of
+/// the DEPLOYED release, so the same argv succeeds once the operator updates it.
 pub fn require_connect_inputs(opts: &GithubAppOpts) -> Result<()> {
     // The one fact every rule below branches on: an empty --existing-secret is
     // the chart-held path, a non-empty one is BYO. Bound once so a new rule
@@ -602,11 +617,17 @@ pub fn require_connect_inputs(opts: &GithubAppOpts) -> Result<()> {
     // stays silently tolerated under --disconnect, as it has been since #1223.
     if opts.disconnect {
         if byo {
-            bail!(
-                "--existing-secret contradicts --disconnect: --disconnect clears the App \
-                 credentials, so there is nothing left to point at a Secret. Run --disconnect \
-                 on its own, or drop it to configure the Secret."
-            );
+            return Err(anyhow::Error::from(
+                crate::exit::CliError::usage(
+                    "--existing-secret contradicts --disconnect: --disconnect clears the App \
+                     credentials, so there is nothing left to point at a Secret. Run \
+                     --disconnect on its own, or drop it to configure the Secret.",
+                )
+                .with_fix(
+                    "drop --existing-secret to clear the App, or drop --disconnect to point \
+                     the release at that Secret",
+                ),
+            ));
         }
         return Ok(());
     }
@@ -620,55 +641,86 @@ pub fn require_connect_inputs(opts: &GithubAppOpts) -> Result<()> {
     // a trimmed check and still reach helm -- and k8s -- wrong.
     if byo {
         if !is_rfc1123_subdomain(&opts.existing_secret) {
-            bail!(
-                "--existing-secret {} is not a Kubernetes Secret name. It must be an RFC-1123 \
-                 subdomain: lowercase letters, digits, '-' and '.', starting and ending with a \
-                 letter or digit, at most {MAX_SECRET_NAME_LEN} characters. It names a Secret \
-                 you already created; to hand the PEM itself to the chart, use --private-key.",
-                describe_rejected_value(&opts.existing_secret)
-            );
+            return Err(anyhow::Error::from(
+                crate::exit::CliError::usage(format!(
+                    "--existing-secret {} is not a Kubernetes Secret name. It must be an \
+                     RFC-1123 subdomain: lowercase letters, digits, '-' and '.', starting and \
+                     ending with a letter or digit, at most {MAX_SECRET_NAME_LEN} characters. \
+                     It names a Secret you already created; to hand the PEM itself to the \
+                     chart, use --private-key.",
+                    describe_rejected_value(&opts.existing_secret)
+                ))
+                .with_fix(
+                    "rerun with --existing-secret <the name of a Secret you already created>, \
+                     or use --private-key <path to the PEM> to hand the key to the chart",
+                ),
+            ));
         }
         if !is_secret_data_key(&opts.existing_secret_key) {
-            bail!(
-                "--existing-secret-key {} is not a Kubernetes Secret data key. It must be one or \
-                 more of [-._a-zA-Z0-9] and cannot be '.' or '..'. It names a key INSIDE that \
-                 Secret -- not the PEM, and not a helm expression.",
-                describe_rejected_value(&opts.existing_secret_key)
-            );
+            return Err(anyhow::Error::from(
+                crate::exit::CliError::usage(format!(
+                    "--existing-secret-key {} is not a Kubernetes Secret data key. It must be \
+                     one or more of [-._a-zA-Z0-9] and cannot be '.' or '..'. It names a key \
+                     INSIDE that Secret -- not the PEM, and not a helm expression.",
+                    describe_rejected_value(&opts.existing_secret_key)
+                ))
+                .with_fix(
+                    "rerun with --existing-secret-key <the data key inside that Secret>, made \
+                     only of [-._a-zA-Z0-9]",
+                ),
+            ));
         }
     }
     if byo && !key_path.trim().is_empty() {
-        bail!(
-            "--existing-secret and --private-key are two mutually exclusive ways to supply \
-             the App's private key; pick one. --existing-secret references a Secret you \
-             manage, --private-key hands the PEM to the chart."
-        );
+        return Err(anyhow::Error::from(
+            crate::exit::CliError::usage(
+                "--existing-secret and --private-key are two mutually exclusive ways to supply \
+                 the App's private key; pick one. --existing-secret references a Secret you \
+                 manage, --private-key hands the PEM to the chart.",
+            )
+            .with_fix("pass either --existing-secret <name> or --private-key <path>, not both"),
+        ));
     }
     if !byo && opts.existing_secret_key.trim() != DEFAULT_APP_KEY_DATA_KEY {
-        bail!(
-            "--existing-secret-key configures nothing without --existing-secret: the chart \
-             only reads a data key once a Secret name is set. Pass --existing-secret <name>, \
-             or drop --existing-secret-key."
-        );
+        return Err(anyhow::Error::from(
+            crate::exit::CliError::usage(
+                "--existing-secret-key configures nothing without --existing-secret: the chart \
+                 only reads a data key once a Secret name is set. Pass --existing-secret <name>, \
+                 or drop --existing-secret-key.",
+            )
+            .with_fix(
+                "rerun with --existing-secret <the Secret that holds the PEM>, or drop \
+                 --existing-secret-key to stay on the chart-held key",
+            ),
+        ));
     }
     if opts.app_id.trim().is_empty() {
-        bail!(
-            "--app-id is required. Find it on the App's settings page \
-             (Settings -> Developer settings -> GitHub Apps -> your app)."
-        );
+        return Err(anyhow::Error::from(
+            crate::exit::CliError::usage(
+                "--app-id is required. Find it on the App's settings page \
+                 (Settings -> Developer settings -> GitHub Apps -> your app).",
+            )
+            .with_fix("rerun with --app-id <numeric app id from the App's settings page>"),
+        ));
     }
     // Both remaining checks are chart-held only: a BYO run supplies no PEM by
     // design, so it must never be asked for one and must never stat a path it
     // was never given.
     if !byo {
         if key_path.trim().is_empty() {
-            bail!(
-                "--private-key is required: the path to the App's PEM file, \
-                 downloaded from the App's settings page under 'Private keys'."
-            );
+            return Err(anyhow::Error::from(
+                crate::exit::CliError::usage(
+                    "--private-key is required: the path to the App's PEM file, \
+                     downloaded from the App's settings page under 'Private keys'.",
+                )
+                .with_fix("rerun with --private-key <path to the App's PEM file>"),
+            ));
         }
         if !std::path::Path::new(key_path).is_file() {
-            bail!("--private-key: no such file: {key_path}");
+            return Err(anyhow::Error::from(
+                crate::exit::CliError::usage(format!("--private-key: no such file: {key_path}"))
+                    .with_fix("rerun with --private-key pointing at an existing PEM file"),
+            ));
         }
     }
     Ok(())
@@ -1316,6 +1368,109 @@ mod tests {
         o.private_key_path = "/nope/missing.pem".into();
         let err = require_connect_inputs(&o).unwrap_err();
         assert!(err.to_string().contains("no such file"));
+    }
+
+    /// Both halves of the #1261 contract for one refusal, checked through the
+    /// very `exit::classify` and `exit::error_json` the `--json` error emitter
+    /// uses: it classifies as Usage (exit 2), and it carries a non-null `fix`
+    /// naming the flag to correct. A revert to `bail!` classifies as
+    /// (Failure, None), so the class assertion fails and so does the `expect`.
+    fn assert_usage_with_a_fix_naming(err: &anyhow::Error, flag: &str, case: &str) {
+        let (class, fix) = crate::exit::classify(err);
+        assert_eq!(
+            class,
+            crate::exit::ExitClass::Usage,
+            "a deterministic input error must exit 2 ({case}): {err:#}"
+        );
+        let fix = fix.expect("a usage refusal must carry a fix, not a null one");
+        assert!(!fix.trim().is_empty(), "the fix must not be empty ({case})");
+        assert!(
+            fix.contains(flag),
+            "the fix must name the offending flag {flag} ({case}): {fix}"
+        );
+        let json = crate::exit::error_json(err);
+        assert!(
+            json["fix"] != serde_json::Value::Null,
+            "the rendered payload must not have a null fix ({case}): {json}"
+        );
+    }
+
+    // Each of the three arms is a deterministic input error: the same argv fails
+    // identically, so it is exit 2 and must name the flag to fix (#1261).
+    #[test]
+    fn each_missing_input_is_a_usage_error_with_a_flag_naming_fix() {
+        for (app_id, key_path, flag) in [
+            ("", "/tmp/app.pem", "--app-id"),
+            ("1", "", "--private-key"),
+            ("1", "/nope/missing.pem", "--private-key"),
+        ] {
+            let mut o = opts(false);
+            o.app_id = app_id.into();
+            o.private_key_path = key_path.into();
+            let err = require_connect_inputs(&o).unwrap_err();
+            assert_usage_with_a_fix_naming(
+                &err,
+                flag,
+                &format!("--app-id {app_id:?}, --private-key {key_path:?}"),
+            );
+        }
+    }
+
+    // The five refusals #1255 adds are the same category as the three above:
+    // argv-only input errors where the identical argv fails identically. Class
+    // them as the retryable exit 1 and the agent driving the CLI is told to
+    // retry a command that can never succeed (#1261). The two refusals that
+    // stay `failure` -- `guard_byo_key_conflict` and the non-string field --
+    // are deliberately absent: they judge the deployed release, not the argv.
+    #[test]
+    fn each_new_flag_refusal_is_a_usage_error_with_a_flag_naming_fix() {
+        let (_dir, path) = key_fixture();
+
+        let mut disconnect_and_byo = opts(true);
+        disconnect_and_byo.existing_secret = "my-github-app".into();
+
+        let mut injected_name = byo_opts();
+        injected_name.existing_secret = "my-github-app,api.githubAppId=999".into();
+
+        let mut injected_data_key = byo_opts();
+        injected_data_key.existing_secret_key = "privateKey,api.githubAppExistingSecret=".into();
+
+        let mut both_key_sources = byo_opts();
+        both_key_sources.private_key_path = path;
+
+        let mut orphan_data_key = opts(false);
+        orphan_data_key.existing_secret_key = "app-pem".into();
+
+        for (case, o, flag) in [
+            (
+                "--disconnect with a Secret name",
+                disconnect_and_byo,
+                "--existing-secret",
+            ),
+            (
+                "a Secret name that is not an RFC-1123 subdomain",
+                injected_name,
+                "--existing-secret",
+            ),
+            (
+                "a data key that is not a Secret data key",
+                injected_data_key,
+                "--existing-secret-key",
+            ),
+            (
+                "both ways of supplying the key at once",
+                both_key_sources,
+                "--private-key",
+            ),
+            (
+                "a data key with no Secret name",
+                orphan_data_key,
+                "--existing-secret",
+            ),
+        ] {
+            let err = require_connect_inputs(&o).expect_err(&format!("{case} must be refused"));
+            assert_usage_with_a_fix_naming(&err, flag, case);
+        }
     }
 
     #[test]
