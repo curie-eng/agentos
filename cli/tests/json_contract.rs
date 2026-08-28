@@ -1111,9 +1111,18 @@ fn diff_output_validates() {
         chart_deployed: Some("curie-0.5.1".to_string()),
         chart_target: "0.6.0".to_string(),
         entries,
+        // #1352: the common case is nothing to lose, and the payload must still
+        // carry the key so a consumer that reads it cannot mistake "not
+        // reported" for "no removals".
+        stateful_removals: Vec::new(),
     };
     let json = out.to_json();
     assert_valid("diff.schema.json", &json);
+    assert_eq!(
+        json["stateful_removals"],
+        serde_json::json!([]),
+        "an empty removal list must still be emitted as an array: {json}"
+    );
 
     // Every classification the schema enumerates must be reachable from a real
     // plan, or the enum is documenting states the code cannot produce.
@@ -1157,6 +1166,84 @@ fn diff_output_validates() {
     assert_eq!(
         unknown["unresolved_credential"],
         "CURIE_1426_GITHUB_CREDENTIAL"
+    );
+}
+
+/// #1352: the schema addition has to be EXERCISED, not merely accepted. A
+/// removal-carrying payload is the shape an agent consumer gates a destructive
+/// apply on, and `RemovalCause` has no serde derive -- `to_json` writes the
+/// encoding by hand, so nothing but this test holds the two cause spellings and
+/// the conditional `renamed_to` in place.
+#[test]
+fn diff_output_with_stateful_removals_validates() {
+    let out = curie::installation::DiffOutput {
+        unresolved_credentials: Vec::new(),
+        namespace: "acme-bot".to_string(),
+        release: "acme-bot".to_string(),
+        release_exists: true,
+        chart_deployed: Some("curie-0.6.0".to_string()),
+        chart_target: "0.6.0".to_string(),
+        entries: vec![curie::installation::DiffEntry {
+            key: "worker.replicas".to_string(),
+            kind: curie::installation::DiffKind::Change,
+            from: Some("1".to_string()),
+            to: Some("2".to_string()),
+            unresolved_credential: None,
+        }],
+        stateful_removals: vec![
+            // The chart does not render this component at all: a chart version
+            // renamed or dropped it, and `--migrate-store` is the remedy.
+            curie::ops::StatefulRemoval {
+                name: "acme-bot-minio".to_string(),
+                component: "minio".to_string(),
+                cause: curie::ops::RemovalCause::ComponentGone,
+            },
+            // The component survives under another resource name: a values
+            // difference, whose remedy is declaring `nameOverride` instead.
+            curie::ops::StatefulRemoval {
+                name: "acme-bot-postgres".to_string(),
+                component: "postgres".to_string(),
+                cause: curie::ops::RemovalCause::RenamedTo("acme-bot-curie-postgres".to_string()),
+            },
+        ],
+    };
+
+    let json = out.to_json();
+    assert_valid("diff.schema.json", &json);
+
+    let removals = json["stateful_removals"]
+        .as_array()
+        .expect("stateful_removals is an array");
+    assert_eq!(
+        removals.len(),
+        2,
+        "both removals must survive to_json: {json}"
+    );
+
+    let gone = &removals[0];
+    assert_eq!(gone["name"], "acme-bot-minio");
+    assert_eq!(gone["component"], "minio");
+    assert_eq!(gone["cause"], "component_gone");
+    assert!(
+        gone.get("renamed_to").is_none(),
+        "a component that is gone has no rename target: {gone}"
+    );
+
+    let renamed = &removals[1];
+    assert_eq!(renamed["name"], "acme-bot-postgres");
+    assert_eq!(renamed["component"], "postgres");
+    assert_eq!(renamed["cause"], "renamed");
+    assert_eq!(
+        renamed["renamed_to"], "acme-bot-curie-postgres",
+        "the rename target is the half the operator needs to fix their file: {renamed}"
+    );
+
+    // The count an agent gates on has to include the removals, or a payload
+    // whose only change is store destruction reads as `changes: 1`.
+    assert_eq!(
+        json["changes"],
+        serde_json::json!(3),
+        "one changed entry plus two removals: {json}"
     );
 }
 

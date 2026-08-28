@@ -558,6 +558,19 @@ exit 0
     }
 
     fn run(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
+        self.run_with_globals(&["--json"], args, env)
+    }
+
+    /// The same stubbed run with NO global flags, so a test can assert on the
+    /// HUMAN render rather than the `--json` payload. `render` and `to_json`
+    /// are two independent projections of the same output object, and a
+    /// removal reported in one but not the other is exactly the surface
+    /// disagreement #1352 is about.
+    fn run_human(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
+        self.run_with_globals(&[], args, env)
+    }
+
+    fn run_with_globals(&self, globals: &[&str], args: &[&str], env: &[(&str, &str)]) -> Output {
         let mut paths = vec![self.temp.path().join("bin")];
         if let Some(current) = std::env::var_os("PATH") {
             paths.extend(std::env::split_paths(&current));
@@ -567,7 +580,7 @@ exit 0
         let mut command = Command::new(bin());
         command
             .current_dir(repo_root())
-            .arg("--json")
+            .args(globals)
             .args(args)
             .env("PATH", path)
             .env("CURIE_TEST_CALL_LOG", &self.log)
@@ -646,6 +659,14 @@ exit 0
 
     fn diff(&self, env: &[(&str, &str)]) -> Output {
         self.run(
+            &["diff", "--file", self.file.to_str().expect("UTF 8 path")],
+            env,
+        )
+    }
+
+    /// `curie diff` without `--json`: the operator-facing render.
+    fn diff_human(&self, env: &[(&str, &str)]) -> Output {
+        self.run_human(
             &["diff", "--file", self.file.to_str().expect("UTF 8 path")],
             env,
         )
@@ -881,6 +902,23 @@ fn live_minio_statefulset() -> String {
     .to_string()
 }
 
+/// A live release running the bundled `postgres`, in the shape
+/// `kubectl get statefulset -o json` returns it. The default helm stub renders
+/// `rustfs` and nothing else, so against that render this component is
+/// `ComponentGone` -- the issue's reproduction, where a curie.yaml that stops
+/// deploying postgres reads as an ordinary values add.
+fn live_postgres_statefulset() -> String {
+    json!({
+        "apiVersion": "v1",
+        "kind": "List",
+        "items": [{
+            "metadata": {"name": "parity-postgres"},
+            "spec": {"selector": {"matchLabels": {"app.kubernetes.io/component": "postgres"}}}
+        }]
+    })
+    .to_string()
+}
+
 fn live_mixed_store_statefulsets() -> String {
     json!({
         "apiVersion": "v1",
@@ -1054,9 +1092,19 @@ fn existing_values_absent_is_fresh_for_all_consumers() {
     );
     let diff = json_output(fixture.diff(&[]), "diff");
     assert_eq!(diff["release_exists"], false, "{diff}");
+    // #1352 grew this list by exactly ONE call. `diff` now runs the same
+    // stateful-removal probe `apply` does, from the shared plan, so it reads the
+    // live StatefulSets between the values read and the deployed-chart read.
+    // The fixture's default kubectl answer is the empty List, and the guard
+    // short-circuits on an empty live list, so an absent release never reaches
+    // `helm template` -- asserting a render here would fail a correct
+    // implementation and pressure removal of the short circuit that saves a
+    // render on every fresh apply.
     assert_eq!(
         fixture.calls().trim(),
-        "HELM_CALL: get values parity -n parity -o json\nHELM_CALL: list -n parity -o json"
+        "HELM_CALL: get values parity -n parity -o json\n\
+         KUBECTL_CALL: get statefulset -n parity -o json\n\
+         HELM_CALL: list -n parity -o json"
     );
 }
 
@@ -3199,5 +3247,306 @@ fn a_namespace_with_no_statefulsets_still_passes_the_guard() {
     assert!(
         calls.contains("HELM_CALL: upgrade"),
         "the upgrade must run:\n{calls}"
+    );
+}
+
+/// The `stateful_removals` array `diff --json` must ALWAYS carry, even empty.
+///
+/// `expect` rather than `unwrap_or(&[])` on purpose: an omitted key is the
+/// pre-#1352 shape, and defaulting it to an empty slice would let every
+/// assertion below pass against a payload that never grew the field.
+fn stateful_removals(diff: &Value) -> &Vec<Value> {
+    diff["stateful_removals"]
+        .as_array()
+        .unwrap_or_else(|| panic!("diff must always emit a stateful_removals array: {diff}"))
+}
+
+/// The one removal naming `name`, or a panic naming what was reported instead.
+fn stateful_removal<'a>(diff: &'a Value, name: &str) -> &'a Value {
+    stateful_removals(diff)
+        .iter()
+        .find(|removal| removal["name"] == name)
+        .unwrap_or_else(|| panic!("no stateful removal reported for {name}: {diff}"))
+}
+
+/// How many entries `changes` counts on its own, derived from the payload the
+/// run actually emitted rather than a hardcoded total, so the arithmetic
+/// relationship is what is pinned and an unrelated chart-default gaining or
+/// losing a value cannot make this test lie in either direction.
+fn change_kind_entries(diff: &Value) -> usize {
+    diff["entries"]
+        .as_array()
+        .expect("diff entries array")
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry["kind"].as_str().expect("diff entry kind"),
+                "add" | "change" | "reset to chart default" | "unknown"
+            )
+        })
+        .count()
+}
+
+#[test]
+fn diff_reports_the_stateful_removal_apply_refuses_on() {
+    // AC1, the issue's reproduction and the core of #1352. `diff()` called
+    // `complete_installation_plan` + `fetch_release_chart` and nothing else, so
+    // it never read a StatefulSet: a file that would DELETE a live stateful
+    // component rendered as an ordinary values change, exit 0, while `apply` on
+    // the SAME file and the SAME cluster exited 1 refusing. Two surfaces, one
+    // input, opposite answers.
+    //
+    // Red on revert: without the fix `stateful_removals` is absent entirely, so
+    // the `expect` in `stateful_removals` panics. Note that a bare
+    // `changes > 0` assertion would pass TODAY -- the values delta already
+    // counts -- which is why the count is pinned as arithmetic over the
+    // payload's own entries plus the removals, not as a threshold.
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
+    let live = live_postgres_statefulset();
+    let env = [("CURIE_TEST_KUBECTL_STS", live.as_str())];
+
+    let diff = json_output(fixture.diff(&env), "diff");
+
+    let removals = stateful_removals(&diff);
+    assert_eq!(
+        removals.len(),
+        1,
+        "the live postgres StatefulSet is the only removal in this render: {diff}"
+    );
+    let removal = stateful_removal(&diff, "parity-postgres");
+    assert_eq!(
+        removal["component"], "postgres",
+        "the removal must carry the component identity the guard matched on: {removal}"
+    );
+    assert_eq!(
+        removal["cause"], "component_gone",
+        "the target chart does not render postgres at all: {removal}"
+    );
+    assert!(
+        removal.get("renamed_to").is_none(),
+        "a component that is gone has no rename target: {removal}"
+    );
+    assert_eq!(
+        diff["changes"].as_u64().expect("changes is an integer") as usize,
+        change_kind_entries(&diff) + removals.len(),
+        "a removal that is not counted is a removal an agent consumer gating on `changes` never sees: {diff}"
+    );
+
+    // The human render is an independent projection of the same output object;
+    // a removal reported only in the JSON leaves the operator reading `diff`
+    // in a terminal with the exact pre-fix experience.
+    let human = fixture.diff_human(&env);
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&human.stdout),
+        String::from_utf8_lossy(&human.stderr)
+    );
+    assert!(
+        rendered.contains("parity-postgres"),
+        "the render must name the live resource an operator recognises:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("DELETED"),
+        "the render must say the component would be DELETED, not merely changed:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("curie apply") && rendered.contains("REFUSE"),
+        "the render must say `curie apply` will refuse, so the operator is not surprised by exit 1:\n{rendered}"
+    );
+
+    // The other half of the parity claim: the same file and the same cluster,
+    // through `apply`. A second fixture because the first one's call log has
+    // already recorded the diff run.
+    let apply_fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
+    let apply = apply_fixture.apply(&[], &env);
+    assert_eq!(
+        apply.status.code(),
+        Some(1),
+        "apply must still refuse the same input; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&apply.stdout),
+        String::from_utf8_lossy(&apply.stderr)
+    );
+    let error = json_error(apply, "apply");
+    let message = error["error"].as_str().expect("apply error message string");
+    assert!(
+        message.contains("refusing to apply") && message.contains("parity-postgres"),
+        "apply's refusal must name the same resource diff reported: {error}"
+    );
+    assert!(
+        !apply_fixture.calls().contains("HELM_CALL: upgrade"),
+        "the refusal must stop before the upgrade:\n{}",
+        apply_fixture.calls()
+    );
+}
+
+#[test]
+fn diff_reports_a_renamed_stateful_component_with_its_rename_target() {
+    // AC2, the #1323 shape. Here the chart DOES render postgres -- under
+    // `parity-curie-postgres` rather than the live `parity-postgres`, which is
+    // what a curie.yaml that does not reproduce the release's `nameOverride`
+    // produces. Helm deletes the old object and creates the new one empty
+    // beside the orphaned volumes, so it is exactly as destructive as a drop,
+    // and the two causes have OPPOSITE remedies (`--migrate-store` vs.
+    // declaring `nameOverride`).
+    //
+    // Red on revert twice over: `stateful_removals` does not exist pre-fix, and
+    // a fix that collapsed the removals to bare names would lose the cause the
+    // remedy is chosen from. The mixed render stub is load-bearing -- against
+    // the default rustfs-only render a live postgres is `ComponentGone`, so an
+    // AC2 written without it is a mislabelled AC1 and a rename regression still
+    // ships.
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
+    let live = live_mixed_store_statefulsets();
+
+    let diff = json_output(
+        fixture.diff(&[
+            ("CURIE_TEST_HELM_MIXED_STATEFULSETS", "1"),
+            ("CURIE_TEST_KUBECTL_STS", live.as_str()),
+        ]),
+        "diff",
+    );
+
+    let renamed = stateful_removal(&diff, "parity-postgres");
+    assert_eq!(
+        renamed["component"], "postgres",
+        "the rename is same-component, different-name: {renamed}"
+    );
+    assert_eq!(
+        renamed["cause"], "renamed",
+        "a component the render keeps under another name is a rename, not a drop: {renamed}"
+    );
+    assert_eq!(
+        renamed["renamed_to"], "parity-curie-postgres",
+        "without the rename target the operator cannot tell which name to declare: {renamed}"
+    );
+
+    // The same payload must still distinguish the other cause, or the two
+    // remedies collapse into one.
+    let gone = stateful_removal(&diff, "parity-minio");
+    assert_eq!(gone["cause"], "component_gone", "{gone}");
+    assert!(
+        gone.get("renamed_to").is_none(),
+        "`renamed_to` belongs only to the rename cause: {gone}"
+    );
+
+    assert_eq!(
+        diff["changes"].as_u64().expect("changes is an integer") as usize,
+        change_kind_entries(&diff) + stateful_removals(&diff).len(),
+        "every removal must be counted, renames included: {diff}"
+    );
+}
+
+#[test]
+fn diff_reports_no_stateful_removal_when_live_and_rendered_agree() {
+    // AC3, the no-false-alarm control. A guard that cries wolf teaches
+    // operators to pass the override flag by reflex, which is worse than no
+    // guard at all for the one case that is real. The live release runs
+    // `rustfs` under exactly the name the default render produces, so there is
+    // nothing to report.
+    //
+    // Red on revert through the `expect` in `stateful_removals`: the key must
+    // be PRESENT as `[]`. An omitted optional key would re-hide the field from
+    // every consumer that looks for it, and would make this test's emptiness
+    // assertion vacuously true.
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
+    let live = live_rustfs_statefulset();
+
+    let diff = json_output(
+        fixture.diff(&[("CURIE_TEST_KUBECTL_STS", live.as_str())]),
+        "diff",
+    );
+
+    assert!(
+        stateful_removals(&diff).is_empty(),
+        "a release whose live components match the render loses nothing: {diff}"
+    );
+    assert_eq!(
+        diff["changes"].as_u64().expect("changes is an integer") as usize,
+        change_kind_entries(&diff),
+        "with no removals `changes` must stay exactly the entry count it always was: {diff}"
+    );
+}
+
+#[test]
+fn an_unreadable_cluster_fails_the_diff_rather_than_reporting_no_removals() {
+    // AC5, the strongest red-on-revert available: pre-fix `diff` never calls
+    // kubectl at all, so both of these runs currently produce a SUCCESSFUL
+    // diff reporting no removals -- the #1351 vacuous-pass shape, pointed at
+    // the read-only surface. "I could not find out" must never render as
+    // "nothing would be deleted", because that is the answer an operator
+    // approves an apply on.
+    //
+    // The values response is an EXISTING release: an unreadable cluster is
+    // interesting precisely when there is a live release with data to lose.
+    let live_values = || {
+        HelmValuesResponse::Object(json!({
+            "api": {"githubToken": "ghp-live-token"}
+        }))
+    };
+
+    // ADR-0021's exit-code contract: an unreachable apiserver is exit 3
+    // Transient (retry the same argv), because an apiserver rolling restart
+    // clears on its own.
+    let fixture = HelmFixture::new(installation_for_the_stateful_guard(), live_values());
+    let output = fixture.diff(&[("CURIE_TEST_KUBECTL_FAIL", "1")]);
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "an unreachable apiserver is transient, not a clean diff; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let error = json_error(output, "diff");
+    let message = error["error"].as_str().expect("error message string");
+    assert!(
+        message.contains("parity"),
+        "the failure must name the namespace it could not read: {error}"
+    );
+    assert!(
+        message.contains("The connection to the server localhost:8080 was refused"),
+        "the failure must carry kubectl's own words: {error}"
+    );
+    // R4: the guard's framing is now SHARED by apply and diff, so wording that
+    // names one verb reports a check the other caller was not performing. A
+    // `curie diff` that says "this apply" is the seam leaking.
+    assert!(
+        !message.to_ascii_lowercase().contains("apply"),
+        "the shared guard's context must stay verb neutral: {error}"
+    );
+
+    // Exit 1 Failure, not 3: a permission denial will not clear on its own, so
+    // telling an automation loop to retry the same argv is wrong advice.
+    let forbidden_fixture = HelmFixture::new(installation_for_the_stateful_guard(), live_values());
+    let forbidden = forbidden_fixture.diff(&[("CURIE_TEST_KUBECTL_FORBIDDEN", "1")]);
+    assert_eq!(
+        forbidden.status.code(),
+        Some(1),
+        "a Forbidden cluster read is permanent, not transient or a silent success; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&forbidden.stdout),
+        String::from_utf8_lossy(&forbidden.stderr)
+    );
+    let forbidden_error = json_error(forbidden, "diff");
+    let forbidden_message = forbidden_error["error"]
+        .as_str()
+        .expect("error message string");
+    assert!(
+        forbidden_message.contains("cannot list resource \"statefulsets\""),
+        "the failure must carry kubectl's own Forbidden wording, so an RBAC problem reads differently from an unreachable cluster: {forbidden_error}"
+    );
+    assert!(
+        !forbidden_message.to_ascii_lowercase().contains("apply"),
+        "the shared guard's context must stay verb neutral: {forbidden_error}"
     );
 }
