@@ -19,6 +19,14 @@
 #                           bring-up refuses cleanly before any connector starts,
 #                           so read-only operation remains the default. See
 #                           README.md, "Level up: the gated write path".
+#   k8s-scale     DECLARED. One gated, reversible scale verb, on its own
+#                           subresource-scoped identity. Same shape as
+#                           k8s-write: no K8S_SCALE_KUBECONFIG, no scale path.
+#   self-upgrade  DECLARED. One gated verb that starts this bot's own upgrade,
+#                           so it happens when asked rather than on a schedule.
+#                           Needs SELF_UPGRADE_KUBECONFIG and the CronJob it
+#                           starts. Read manifests/upgrade-role.yaml first: its
+#                           grant is the widest in this bundle.
 #   grafana       ON.       Logs, metrics, alerts and profiles from the bundled
 #                           observability stack.
 #   tempo         ON.       Distributed traces from the bundled stack.
@@ -246,6 +254,54 @@ connectors:
     # subresource ceiling that is this connector's whole security argument.
     secret_files:
       K8S_SCALE_KUBECONFIG: /secrets/kubeconfig
+
+# ---------------------------------------------------------------------------
+# THE GATED SELF-UPGRADE CONNECTOR -- SO THE UPGRADE IS ASKED FOR, NOT SCHEDULED.
+#
+# `self-upgrade/cronjob.yaml` already knows how to redeploy this bot from its
+# repository. What it could not do is happen because someone asked: it ran on a
+# schedule, so the answer to "upgrade yourself" was "wait until :17".
+#
+# This connector is the button. One tool, `upgrade_self`, taking NO ARGUMENTS at
+# all -- the repository, branch, image and command all come from the CronJob's
+# own template, read from the cluster at call time. It starts that Job and
+# returns its name; the bot then watches it with the read-only Kubernetes tools
+# and reports what happened.
+#
+# WHY THE BOT DOES NOT JUST DO THE UPGRADE. Creating an agent version needs the
+# platform API key, and every `/agents/**` route requires it. The sandbox holds a
+# per-turn `state`-scoped token and nothing else, deliberately: that is what
+# makes a successful prompt injection unable to walk away with a credential.
+# Handing the sandbox the platform key to make this work would trade that
+# property for a convenience. So the key stays in the Job, and the bot only ever
+# presses the button.
+#
+# THE GRANT IS THE WIDEST IN THIS BUNDLE and manifests/upgrade-role.yaml says so
+# plainly: `create` on `jobs` cannot be narrowed with `resourceNames`, because a
+# create has no name to match. Read that file before installing this.
+#
+# Before bring-up: apply `manifests/upgrade-role.yaml`, store the resulting
+# kubeconfig as SELF_UPGRADE_KUBECONFIG, and install the CronJob (suspended --
+# see self-upgrade/cronjob.yaml) that this starts. Without the credential,
+# bring-up refuses cleanly, exactly like the other two write connectors.
+  self-upgrade:
+    build:
+      context: connectors/self-upgrade
+      platforms: [linux/amd64, linux/arm64]
+    env:
+      # Which upgrade this starts. Must agree with the `resourceNames` in
+      # manifests/upgrade-role.yaml. EMPTY MEANS EVERY CALL IS REFUSED.
+      SELF_UPGRADE_CRONJOB: sre-bot-self-upgrade
+      # The namespace the Curie release runs in. Left unset, the connector reads
+      # its own ServiceAccount namespace, which is the same place -- stated here
+      # so a cross-namespace install does not silently look in the wrong one.
+      SELF_UPGRADE_NAMESPACE: ""
+    # A FOURTH kubeconfig, bound to the ServiceAccount in
+    # manifests/upgrade-role.yaml. Never one of the other three: those are
+    # scoped to the workloads this bot may touch, and this one is scoped to the
+    # platform's own namespace. Reusing either direction would widen both.
+    secret_files:
+      SELF_UPGRADE_KUBECONFIG: /secrets/kubeconfig
 # ---------------------------------------------------------------------------
 
   # Both grafana and tempo below read GRAFANA_SERVICE_ACCOUNT_TOKEN from the
