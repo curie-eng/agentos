@@ -3183,6 +3183,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 sampling,
                 dry_run,
             } => {
+                message::validate_eval_models(&model)?;
                 // `cluster up` randomizes both credentials per release, so an
                 // omitted flag reads the release's own Secret rather than the
                 // dev sentinel that 401s / fails Valkey auth on a real install

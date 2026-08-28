@@ -3257,11 +3257,26 @@ async fn run_eval_turns(
     result
 }
 
+/// Reject blank model entries before a target performs environment discovery.
+/// The shared eval handler calls this again so direct callers remain safe.
+pub fn validate_eval_models(models: &[String]) -> Result<()> {
+    if models.iter().any(|model| model.trim().is_empty()) {
+        return Err(anyhow::Error::from(
+            crate::exit::CliError::usage("--model cannot be empty or whitespace-only").with_fix(
+                "pass a non-empty model identifier to --model, or omit --model to run the \
+                 deployed/default model",
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// The shared `eval` handler: run the bundle's `evals/cases.json` through the
 /// target tier's message enqueue+await path and grade with the shared grader,
 /// so a suite that passes at `skill` can be re-asserted verbatim at `local` and
 /// `cluster` (issue #344, the per-tier parity gate).
 pub async fn eval(opts: EvalOpts) -> Result<()> {
+    validate_eval_models(&opts.models)?;
     // Refuse `--concurrency > 1` before any enqueue or work (#706): the CLI eval
     // loop is sequential and real parallel dispatch is tracked in #709, so a
     // request above 1 fails fast rather than silently running sequentially.
