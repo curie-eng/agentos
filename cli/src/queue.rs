@@ -117,6 +117,9 @@ pub fn synthetic_turn(
         // rather than left to serde's default for the same reason `kind` is --
         // the operator lane should say what it produces.
         source: TurnSource::Slack,
+        // The CLI never mints a delegated turn -- only the API's delegate
+        // router does (ADR-0115) -- so this is always absent here.
+        delegation: None,
     }
 }
 
@@ -526,6 +529,10 @@ mod tests {
             vec![
                 "author",
                 "conversation_id",
+                // ADR-0115: absent (null) for every turn the CLI mints -- the
+                // CLI never delegates -- but still present in the serialized
+                // shape, since the field has no `skip_serializing_if`.
+                "delegation",
                 "event_id",
                 "received_at",
                 "reply_handle",
@@ -620,6 +627,7 @@ mod tests {
             },
             received_at: "2026-07-21T00:00:00Z".into(),
             source: TurnSource::Slack,
+            delegation: None,
         };
         (stream_id.to_string(), payload_json(&turn).unwrap())
     }

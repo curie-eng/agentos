@@ -34,6 +34,7 @@ from .routers import (
     config,
     console,
     control,
+    delegate,
     deploy_targets,
     deployments,
     evals,
@@ -277,6 +278,9 @@ def create_app() -> FastAPI:
     app.include_router(approvals.router)
     app.include_router(channels.router)
     app.include_router(hooks.router)
+    # ADR-0115: agent-to-agent delegate calls.
+    app.include_router(delegate.router)
+    app.include_router(delegate.grants_router)
     return app
 
 
