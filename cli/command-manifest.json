@@ -959,7 +959,7 @@
             }
           ],
           "hidden": false,
-          "long_about": "Rebuild + recreate ONE compose service (e.g. after a code change) without losing the stack's already-resolved credential/model-mode wiring.\n\nA raw `docker compose up --no-deps <service>` silently reverts that one service to compose's fake-model/dev-stub defaults, because compose's `${VAR-default}` substitution reads THIS invocation's shell, not what the rest of the stack is running with -- export the same credential / CURIE_FAKE_MODEL you want, same as `local up`.",
+          "long_about": "Rebuild + recreate ONE compose service (e.g. after a code change) without losing the stack's already-resolved credential/model-mode wiring.\n\nA raw `docker compose up --no-deps <service>` silently reverts that one service to compose's fake-model/dev-stub defaults, because compose's `${VAR-default}` substitution reads THIS invocation's shell, not what the rest of the stack is running with -- export the same credential / CURIE_FAKE_MODEL you want, same as `local up`.\n\nThe image tag is the exception: it is read back off the running api container rather than the shell, so a service rebuilt against a stack started with `local up --build` comes back on that build's tag (#1925).",
           "name": "rebuild"
         },
         {

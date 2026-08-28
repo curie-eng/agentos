@@ -1377,6 +1377,11 @@ enum LocalAction {
         ///
         /// Requires a compose file that substitutes the image tags, so a
         /// release-channel curie must pass `-f compose.dev.yaml` (#1926).
+        ///
+        /// The tag survives the command: `rebuild`, `comms` and a later plain
+        /// `up` read it back off the running api container, so they recreate
+        /// services onto what this built rather than silently re-resolving every
+        /// image to `:latest` (#1925).
         #[arg(long)]
         build: bool,
     },
@@ -1388,6 +1393,10 @@ enum LocalAction {
     /// `${VAR-default}` substitution reads THIS invocation's shell, not what the
     /// rest of the stack is running with -- export the same credential /
     /// CURIE_FAKE_MODEL you want, same as `local up`.
+    ///
+    /// The image tag is the exception: it is read back off the running api
+    /// container rather than the shell, so a service rebuilt against a stack
+    /// started with `local up --build` comes back on that build's tag (#1925).
     Rebuild {
         /// The compose service to rebuild, e.g. `curie-worker`.
         service: String,
@@ -2998,6 +3007,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                             model_mode: local::model_mode_from_env(),
                             env_file,
                             build,
+                            stack_image_env: Vec::new(),
                         },
                         model,
                     )
@@ -3028,7 +3038,11 @@ async fn run(command: Option<Command>) -> Result<()> {
                             env_file,
                             // `local rebuild` recreates ONE service against the
                             // stack already running; it never re-tags images.
+                            // The tag it recreates ONTO still has to match that
+                            // stack, which is `resolve_stack_image_env` below,
+                            // not this flag (#1925).
                             build: None,
+                            stack_image_env: Vec::new(),
                         },
                         service,
                         model,
@@ -3055,6 +3069,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                             model_mode: local::ModelMode::DefaultFake,
                             env_file: None,
                             build: None,
+                            stack_image_env: Vec::new(),
                         },
                         wipe,
                         yes,
@@ -3075,6 +3090,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         model_mode: local::ModelMode::DefaultFake,
                         env_file: None,
                         build: None,
+                        stack_image_env: Vec::new(),
                     })
                     .await?,
                 )
@@ -3109,9 +3125,15 @@ async fn run(command: Option<Command>) -> Result<()> {
                     model_mode: local::model_mode_from_env(),
                     env_file: None,
                     build: None,
+                    stack_image_env: Vec::new(),
                 };
                 let model_credentials =
                     local::apply_credential_plan(&mut model_opts, crate::ui::ui())?;
+                // #1925: `comms connect` recreates the worker and dispatcher --
+                // and, via `depends_on`, the api and migrate behind them. Derive
+                // the running stack's tag here, alongside the credential plan
+                // this same throwaway `LocalOpts` already exists to resolve.
+                local::resolve_stack_image_env(&mut model_opts).await;
                 emit(
                     comms::local_comms(LocalCommsOpts {
                         file: resolved_file,
@@ -3123,6 +3145,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         model_credentials,
                         model,
                         minimal,
+                        stack_image_env: model_opts.stack_image_env,
                     })
                     .await?,
                 )
