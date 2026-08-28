@@ -1769,13 +1769,18 @@ fn doctor_output_validates() {
         model_release_key: Some(curie::doctor::ReleaseModelKey::Runner),
         model_release_fake: false,
         model_agent_overrides: vec![],
-        target: Some(("curie".to_string(), "curie".to_string())),
         model_credential_provider: None,
         docker_ok: true,
         bundle_name: Some("my-agent".to_string()),
         kube_context: Some("minikube".to_string()),
-        release: Some(("acme".to_string(), "curie-0.6.0".to_string())),
-        slack_configured: true,
+        target: Some(("acme".to_string(), "acme".to_string())),
+        release: curie::doctor::ReleaseProbe::Installed {
+            chart: "curie-0.6.0".to_string(),
+        },
+        sandbox_egress_cidrs: vec!["160.79.104.0/23".to_string()],
+        sandbox_egress_is_reproducible: true,
+        slack_app_token: true,
+        slack_bot_token: true,
         clone_credential: Some("github app (app_id=1234567)".to_string()),
         api_exposure: None,
         agents: Some(vec![("bot".to_string(), None)]),
@@ -1798,6 +1803,15 @@ fn doctor_output_validates() {
     assert!(states.contains("ok"), "{states:?}");
     assert!(states.contains("missing"), "{states:?}");
 
+    // `ready` is the field a machine consumer gates on, and it was hardcoded
+    // true for long enough that no test ever read it. This fixture has two
+    // Missing checks (webhook, repo-binding), so `ready` must be false.
+    assert_eq!(
+        json["ready"],
+        serde_json::Value::Bool(false),
+        "a report carrying a missing check is not ready: {json}"
+    );
+
     // This payload is pasted into issues; it must never carry a secret value.
     let rendered = serde_json::to_string(&json).expect("serializes");
     for leaked in ["sk-ant-", "xoxb-", "xapp-", "ghp_", "BEGIN RSA"] {
@@ -1806,6 +1820,48 @@ fn doctor_output_validates() {
             "{leaked} in payload: {rendered}"
         );
     }
+}
+
+/// The other direction of the same gate: a fixture with nothing missing must
+/// report `ready: true`, so a constant in either position fails.
+#[test]
+fn doctor_ready_tracks_the_checks() {
+    let facts = curie::doctor::Facts {
+        model_credential: Some("CURIE_CREDENTIALS".to_string()),
+        model_credential_source: Some("environment".to_string()),
+        model_shell: Some("claude-haiku-4-5-20251001".to_string()),
+        model_release_default: None,
+        model_release_key: None,
+        model_release_fake: false,
+        model_agent_overrides: vec![],
+        model_credential_provider: None,
+        docker_ok: true,
+        bundle_name: Some("my-agent".to_string()),
+        kube_context: Some("minikube".to_string()),
+        target: Some(("acme".to_string(), "acme".to_string())),
+        release: curie::doctor::ReleaseProbe::Installed {
+            chart: "curie-0.6.0".to_string(),
+        },
+        sandbox_egress_cidrs: vec![],
+        sandbox_egress_is_reproducible: true,
+        slack_app_token: true,
+        slack_bot_token: true,
+        clone_credential: Some("github app (secret=gh-app)".to_string()),
+        api_exposure: Some("NodePort 30799".to_string()),
+        agents: Some(vec![("bot".to_string(), Some("acme/bot".to_string()))]),
+    };
+    let checks = curie::doctor::evaluate(&facts);
+    let out = curie::doctor::DoctorOutput {
+        summary: curie::doctor::summary(&checks),
+        checks,
+    };
+    let json = out.to_json();
+    assert_valid("doctor.schema.json", &json);
+    assert_eq!(
+        json["ready"],
+        serde_json::Value::Bool(true),
+        "a fully wired report is ready: {json}"
+    );
 }
 
 #[test]

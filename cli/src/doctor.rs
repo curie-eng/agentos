@@ -799,6 +799,9 @@ pub fn summary(checks: &[Check]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::CliOutput;
+    use serde_json::json;
+    use std::collections::BTreeSet;
 
     fn laptop() -> Facts {
         Facts {
@@ -909,17 +912,28 @@ mod tests {
         );
     }
 
-    /// Cluster, release, Slack and clone credential all in place.
+    /// Cluster, release, Slack and clone credential all in place. The target is
+    /// `acme/acme` rather than the default, so a fix string that hardcodes
+    /// `curie` is visible to every test built on this fixture.
     fn wired() -> Facts {
         Facts {
             model_credential: Some("CURIE_CREDENTIALS".into()),
             kube_context: Some("minikube".into()),
-            release: Some(("acme".into(), "curie-0.6.0".into())),
-            slack_configured: true,
+            target: Some(("acme".into(), "acme".into())),
+            release: ReleaseProbe::Installed {
+                chart: "curie-0.6.0".into(),
+            },
+            slack_app_token: true,
+            slack_bot_token: true,
             clone_credential: Some("github app".into()),
             api_exposure: Some("NodePort 30799".into()),
             ..laptop()
         }
+    }
+
+    /// `wired()` with one release probe outcome swapped in, for the D5 matrix.
+    fn probed(release: ReleaseProbe) -> Facts {
+        Facts { release, ..wired() }
     }
 
     fn find<'a>(checks: &'a [Check], id: &str) -> &'a Check {
@@ -929,6 +943,19 @@ mod tests {
     /// The one check this issue is about, pulled out of a full `evaluate`.
     fn model_pin(f: &Facts) -> Check {
         find(&evaluate(f), "model-pin").clone()
+    }
+
+    /// The set of check ids whose fix is a `curie cluster ...` command.
+    fn cluster_fix_ids(checks: &[Check]) -> BTreeSet<&'static str> {
+        checks
+            .iter()
+            .filter(|c| {
+                c.fix
+                    .as_deref()
+                    .is_some_and(|f| f.starts_with("curie cluster "))
+            })
+            .map(|c| c.id)
+            .collect()
     }
 
     /// The laptop rung is a complete way to use Curie. Reporting five failures
@@ -974,7 +1001,8 @@ mod tests {
             model_credential_source: Some("environment".into()),
             model_credential_provider: crate::ops::provider_from_credential_prefix(credential),
             clone_credential: Some("github app (app_id=4475970)".into()),
-            slack_configured: true,
+            slack_app_token: true,
+            slack_bot_token: true,
             ..laptop()
         };
         let rendered = format!("{:?}", evaluate(&f));
@@ -993,6 +1021,12 @@ mod tests {
 
     /// Each rung's summary has to say what you can DO, not how many checks
     /// passed -- a count tells an operator nothing about where they are.
+    ///
+    /// The rungs below name `curie/acme`: these fixtures only ever set the
+    /// release, so the namespace half was the rendering default, and the pair
+    /// is carried over verbatim rather than tidied to `acme/acme` -- nothing
+    /// here reads a target, and a fixture edit is not the place to change what
+    /// a fix string would print.
     #[test]
     fn the_summary_reports_capability_at_each_rung() {
         let cases = [
@@ -1009,7 +1043,10 @@ mod tests {
                 Facts {
                     model_credential: Some("CURIE_CREDENTIALS".into()),
                     kube_context: Some("minikube".into()),
-                    release: Some(("acme".into(), "curie-0.6.0".into())),
+                    target: Some(("curie".into(), "acme".into())),
+                    release: ReleaseProbe::Installed {
+                        chart: "curie-0.6.0".into(),
+                    },
                     ..laptop()
                 },
                 "Slack is not wired",
@@ -1018,8 +1055,12 @@ mod tests {
                 Facts {
                     model_credential: Some("CURIE_CREDENTIALS".into()),
                     kube_context: Some("minikube".into()),
-                    release: Some(("acme".into(), "curie-0.6.0".into())),
-                    slack_configured: true,
+                    target: Some(("curie".into(), "acme".into())),
+                    release: ReleaseProbe::Installed {
+                        chart: "curie-0.6.0".into(),
+                    },
+                    slack_app_token: true,
+                    slack_bot_token: true,
                     ..laptop()
                 },
                 "Git-push deploys are not wired",
@@ -1028,8 +1069,12 @@ mod tests {
                 Facts {
                     model_credential: Some("CURIE_CREDENTIALS".into()),
                     kube_context: Some("minikube".into()),
-                    release: Some(("acme".into(), "curie-0.6.0".into())),
-                    slack_configured: true,
+                    target: Some(("curie".into(), "acme".into())),
+                    release: ReleaseProbe::Installed {
+                        chart: "curie-0.6.0".into(),
+                    },
+                    slack_app_token: true,
+                    slack_bot_token: true,
                     clone_credential: Some("github app".into()),
                     api_exposure: Some("NodePort 30799".into()),
                     agents: Some(vec![("bot".into(), Some("acme/bot".into()))]),
@@ -2056,10 +2101,21 @@ mod tests {
     }
 
     /// Every failing check must be actionable. A report that says "missing"
-    /// without saying what to run is the checklist problem restated.
+    /// without saying what to run is the checklist problem restated. The four
+    /// `ReleaseProbe` outcomes are included because #1261's rule -- no `missing`
+    /// without a `fix` -- covers the states D5 introduces too.
     #[test]
     fn every_missing_check_carries_a_command() {
-        let facts = [Facts::default(), laptop()];
+        let facts = vec![
+            Facts::default(),
+            laptop(),
+            probed(ReleaseProbe::HelmMissing),
+            probed(ReleaseProbe::ProbeFailed),
+            probed(ReleaseProbe::NotInstalled),
+            probed(ReleaseProbe::Installed {
+                chart: "curie-0.7.0".into(),
+            }),
+        ];
         for f in facts {
             for c in evaluate(&f).iter().filter(|c| c.state == State::Missing) {
                 let fix = c.fix.as_deref().unwrap_or("");
@@ -2180,8 +2236,12 @@ mod tests {
         let f = Facts {
             model_credential: Some("CURIE_CREDENTIALS".into()),
             kube_context: Some("default".into()),
-            release: Some(("sre-bot".into(), "curie-0.6.0".into())),
-            slack_configured: true,
+            target: Some(("sre-bot".into(), "sre-bot".into())),
+            release: ReleaseProbe::Installed {
+                chart: "curie-0.6.0".into(),
+            },
+            slack_app_token: true,
+            slack_bot_token: true,
             clone_credential: Some("github app".into()),
             api_exposure: Some("NodePort 30799".into()),
             agents: Some(vec![("sre-bot".into(), Some("acme/sre-bot".into()))]),
@@ -2201,12 +2261,9 @@ mod tests {
     #[test]
     fn no_known_exposure_is_hedged_not_asserted() {
         let f = Facts {
-            model_credential: Some("CURIE_CREDENTIALS".into()),
-            kube_context: Some("minikube".into()),
-            release: Some(("acme".into(), "curie-0.6.0".into())),
-            slack_configured: true,
+            api_exposure: None,
             clone_credential: Some("pat".into()),
-            ..laptop()
+            ..wired()
         };
         let c = find(&evaluate(&f), "webhook").clone();
         assert_eq!(c.state, State::Missing);
@@ -2220,8 +2277,12 @@ mod tests {
         let f = Facts {
             model_credential: Some("CURIE_CREDENTIALS".into()),
             kube_context: Some("minikube".into()),
-            release: Some(("acme".into(), "curie-0.6.0".into())),
-            slack_configured: true,
+            target: Some(("acme".into(), "acme".into())),
+            release: ReleaseProbe::Installed {
+                chart: "curie-0.6.0".into(),
+            },
+            slack_app_token: true,
+            slack_bot_token: true,
             ..laptop()
         };
         let checks = evaluate(&f);
@@ -2338,6 +2399,10 @@ esac
     /// default the operator never supplied is visible at all.
     const HELM_STUB: &str = r#"#!/bin/sh
 case "$*" in
+  # `gather()` asks whether helm exists at all before it asks what is
+  # installed, so that "no helm" and "helm could not answer" stay distinct
+  # states rather than one absence claim (#1358). A real helm answers this.
+  version*) printf 'v3.14.0+gstub\n' ;;
   list*) printf '%s\n' "$CURIE_TEST_DOCTOR_HELM_LIST" ;;
   *"--all"*) printf '%s\n' "$CURIE_TEST_DOCTOR_HELM_COMPUTED" ;;
   "get values"*) printf '%s\n' "$CURIE_TEST_DOCTOR_HELM_VALUES" ;;
@@ -2443,9 +2508,15 @@ esac
 
         let f = gather("ns", "rel", None).await;
 
+        // `Installed` alone proves the stub's `rel` entry was matched:
+        // `classify_release_probe` finds the release BY NAME, so the name half
+        // of the pair this assertion used to carry is structural here rather
+        // than dropped (#1358).
         assert_eq!(
             f.release,
-            Some(("rel".to_string(), "curie-0.6.0".to_string())),
+            ReleaseProbe::Installed {
+                chart: "curie-0.6.0".to_string()
+            },
             "the stubbed release was never read, so gather() bailed out before \
              the model reads and the assertions below are judging nothing"
         );
@@ -2481,9 +2552,15 @@ esac
 
         let f = gather("ns", "rel", None).await;
 
+        // `Installed` alone proves the stub's `rel` entry was matched:
+        // `classify_release_probe` finds the release BY NAME, so the name half
+        // of the pair this assertion used to carry is structural here rather
+        // than dropped (#1358).
         assert_eq!(
             f.release,
-            Some(("rel".to_string(), "curie-0.6.0".to_string())),
+            ReleaseProbe::Installed {
+                chart: "curie-0.6.0".to_string()
+            },
             "the stubbed release was never read, so gather() bailed out before \
              the model reads and the assertions below are judging nothing"
         );
@@ -2500,6 +2577,1141 @@ esac
             "the fix string is built from this key, and `--set \
              agentSandbox.runner.model=` on a --local-model install changes nothing"
         );
+    }
+
+    // -- D1: every cluster fix names the invoked target ----------------------
+
+    /// The fix strings were pasted verbatim with `<ns>`/`<name>` placeholders or
+    /// no target at all, so an operator running doctor against `acme/acme` was
+    /// handed commands that would act on `curie/curie` -- a different release,
+    /// silently. Two fixtures because the two fix populations are DISJOINT:
+    /// `NotInstalled` short-circuits the four downstream checks, and `Installed`
+    /// never produces the missing-release recovery. Asserting the exact id set
+    /// (not "whatever fixes exist are targeted") is what keeps this honest: a
+    /// fix that stops being produced fails here rather than passing vacuously.
+    #[test]
+    fn every_cluster_fix_names_the_invoked_target() {
+        assert_targeted_fix_sets("acme", "acme");
+    }
+
+    /// The same two fixtures on the DEFAULT target. Emission is unconditional by
+    /// decision: making it conditional would couple doctor's defaults to
+    /// `cluster up`'s defaults, which is the exact assumption class that
+    /// produced this bug. Without this test the obvious "only print it when it
+    /// differs" shortcut passes.
+    #[test]
+    fn the_target_is_emitted_even_when_it_equals_the_default() {
+        assert_targeted_fix_sets("curie", "curie");
+    }
+
+    fn assert_targeted_fix_sets(namespace: &str, release: &str) {
+        // Fixture A: no release yet. Only the missing-release recovery fires.
+        let absent = Facts {
+            target: Some((namespace.into(), release.into())),
+            release: ReleaseProbe::NotInstalled,
+            ..wired()
+        };
+        let checks = evaluate(&absent);
+        assert_eq!(
+            cluster_fix_ids(&checks),
+            BTreeSet::from(["release"]),
+            "an absent release produces exactly the recovery fix: {checks:?}"
+        );
+        assert_each_fix_targets(&checks, namespace, release);
+
+        // Fixture B: a release IS installed, and every downstream check is in
+        // its Missing state, so all four of the other cluster fixes fire.
+        let installed = Facts {
+            target: Some((namespace.into(), release.into())),
+            release: ReleaseProbe::Installed {
+                chart: "curie-0.7.0".into(),
+            },
+            slack_app_token: false,
+            slack_bot_token: false,
+            clone_credential: None,
+            api_exposure: None,
+            agents: Some(vec![("bot".into(), None)]),
+            ..wired()
+        };
+        let checks = evaluate(&installed);
+        assert_eq!(
+            cluster_fix_ids(&checks),
+            BTreeSet::from(["clone-credential", "repo-binding", "slack", "webhook"]),
+            "an installed release produces exactly the four downstream fixes: {checks:?}"
+        );
+        assert_each_fix_targets(&checks, namespace, release);
+    }
+
+    fn assert_each_fix_targets(checks: &[Check], namespace: &str, release: &str) {
+        for c in checks.iter().filter(|c| {
+            c.fix
+                .as_deref()
+                .is_some_and(|f| f.starts_with("curie cluster "))
+        }) {
+            let fix = c.fix.as_deref().expect("filtered on having a fix");
+            assert!(
+                fix.contains(&format!("--namespace {namespace}")),
+                "{} must name the namespace doctor was invoked with: {fix}",
+                c.id
+            );
+            assert!(
+                fix.contains(&format!("--release {release}")),
+                "{} must name the release doctor was invoked with: {fix}",
+                c.id
+            );
+        }
+    }
+
+    /// A fixture that never exercised targeting carries no target, and a fix
+    /// rendered as `--namespace  --release ` is not runnable. The rendering
+    /// fallback is `curie`; resolution itself lives in `resolve_target`.
+    #[test]
+    fn an_untargeted_fixture_still_renders_a_runnable_fix() {
+        let f = Facts {
+            target: None,
+            release: ReleaseProbe::NotInstalled,
+            ..wired()
+        };
+        let fix = find(&evaluate(&f), "release")
+            .fix
+            .clone()
+            .expect("a missing release must offer a recovery command");
+        assert!(
+            fix.contains("--namespace curie --release curie"),
+            "an empty target must render as the default, not as blanks: {fix}"
+        );
+    }
+
+    // -- D2: the webhook fix reproduces the allowlist, or refuses -------------
+
+    fn webhook_facts(cidrs: &[&str], reproducible: bool) -> Facts {
+        Facts {
+            api_exposure: None,
+            sandbox_egress_cidrs: cidrs.iter().map(|c| (*c).to_string()).collect(),
+            sandbox_egress_is_reproducible: reproducible,
+            ..wired()
+        }
+    }
+
+    fn webhook_fix(f: &Facts) -> String {
+        find(&evaluate(f), "webhook")
+            .fix
+            .clone()
+            .expect("an unexposed API must offer a fix")
+    }
+
+    /// `cluster up` is a full upgrade: a value nothing re-supplies is dropped.
+    /// The webhook fix used to supply only the two ingress `--set`s, so an
+    /// operator who followed doctor's advice sealed the sandbox's egress
+    /// allowlist and broke the model path on a release that had been working.
+    #[test]
+    fn the_webhook_fix_resupplies_a_reproducible_egress_allowlist() {
+        let f = webhook_facts(&["160.79.104.0/23", "192.0.2.0/24"], true);
+        let fix = webhook_fix(&f);
+        let first = fix
+            .find("--allow-web-egress 160.79.104.0/23")
+            .unwrap_or_else(|| panic!("the first recorded CIDR must be re-supplied: {fix}"));
+        let second = fix
+            .find("--allow-web-egress 192.0.2.0/24")
+            .unwrap_or_else(|| panic!("the second recorded CIDR must be re-supplied: {fix}"));
+        assert!(
+            first < second,
+            "the allowlist must be re-supplied in recorded order: {fix}"
+        );
+        assert!(
+            !fix.contains("--allow-egress-host"),
+            "a CIDR read back off a release cannot be reversed to a provider \
+             name, and ADR-0114 errors when an explicit provider list omits the \
+             detected one: {fix}"
+        );
+    }
+
+    /// Nothing recorded means nothing to preserve. An implementation that
+    /// always appends the flag would emit `--allow-web-egress` with no value.
+    #[test]
+    fn an_empty_allowlist_adds_no_egress_flags() {
+        let fix = webhook_fix(&webhook_facts(&[], true));
+        assert!(
+            !fix.contains("--allow-web-egress"),
+            "an empty allowlist has nothing to re-supply: {fix}"
+        );
+        assert!(
+            !fix.contains("WARNING"),
+            "an empty allowlist is trivially reproducible, so there is no hazard \
+             to warn about: {fix}"
+        );
+    }
+
+    /// The key negative. `up_value_plan` rewrites every supplied entry as
+    /// TCP/443, so a UDP or port-53 rule cannot be reproduced by either flag,
+    /// and a capped list drops entries outright -- both NARROW a live
+    /// NetworkPolicy. A caveat is read after the policy is already broken, so
+    /// the only safe direction is to emit nothing. A caveat-based design would
+    /// have PASSED a test that only checked for a warning.
+    #[test]
+    fn a_non_reproducible_allowlist_emits_no_egress_flags() {
+        let owned: Vec<String> = (0..11).map(|i| format!("192.0.2.{i}/32")).collect();
+        let eleven: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let cases = [
+            // (a) a rule that is not TCP/443 -- reproducing it would coerce it.
+            (vec!["192.0.2.0/24"], "a non-TCP/443 rule"),
+            // (b) more entries than the readability bound -- which must never
+            // silently truncate.
+            (eleven, "an eleven-entry allowlist"),
+        ];
+        for (cidrs, what) in cases {
+            let fix = webhook_fix(&webhook_facts(&cidrs, false));
+            assert_eq!(
+                fix.matches("--allow-web-egress").count(),
+                0,
+                "{what} must emit ZERO egress flags rather than a lossy subset: {fix}"
+            );
+            assert!(
+                fix.contains("WARNING"),
+                "{what} must name the hazard: {fix}"
+            );
+            assert!(
+                fix.contains("helm get values"),
+                "{what} must point at the recorded policy: {fix}"
+            );
+        }
+    }
+
+    /// Every shape `security.networkPolicy.allowedEgress` can take, and the one
+    /// bit that decides whether the webhook fix may re-supply it.
+    ///
+    /// `up_value_plan` coerces every supplied entry to exactly one TCP/443 port
+    /// rule, so anything else on the release cannot be reproduced by
+    /// `--allow-web-egress`; the count bound is readability only and flips the
+    /// gate rather than truncating. An unreadable ENTRY is not skipped either --
+    /// skipping one would hand the operator a `cluster up` carrying fewer CIDRs
+    /// than the release records, which is D2 wearing a different hat.
+    #[test]
+    fn sandbox_egress_faithfulness_rule() {
+        let tcp443 = || json!([{"protocol": "TCP", "port": 443}]);
+        let policy = |entries: serde_json::Value| json!({"security": {"networkPolicy": {"allowedEgress": entries}}});
+        let cidrs_of =
+            |n: u64| -> Vec<String> { (0..n).map(|i| format!("192.0.2.{i}/32")).collect() };
+        let entries_of = |n: u64| -> serde_json::Value {
+            serde_json::Value::Array(
+                cidrs_of(n)
+                    .into_iter()
+                    .map(|cidr| json!({"cidr": cidr, "ports": tcp443()}))
+                    .collect(),
+            )
+        };
+
+        let reproducible: Vec<(&str, serde_json::Value, Vec<String>)> = vec![
+            (
+                "one plain HTTPS entry",
+                policy(json!([{"cidr": "160.79.104.0/23", "ports": tcp443()}])),
+                vec!["160.79.104.0/23".to_string()],
+            ),
+            (
+                "a string-typed port, which a values file produces",
+                policy(json!([{"cidr": "160.79.104.0/23",
+                               "ports": [{"protocol": "TCP", "port": "443"}]}])),
+                vec!["160.79.104.0/23".to_string()],
+            ),
+            (
+                "a lower-case protocol, which a values file also produces",
+                policy(json!([{"cidr": "160.79.104.0/23",
+                               "ports": [{"protocol": "tcp", "port": 443}]}])),
+                vec!["160.79.104.0/23".to_string()],
+            ),
+            ("an empty allowlist", policy(json!([])), vec![]),
+            (
+                "ten entries -- the readability bound is inclusive",
+                policy(entries_of(10)),
+                cidrs_of(10),
+            ),
+            // No policy recorded at all is not a lossy read: emitting no flags
+            // reproduces "nothing" exactly, so the gate stays open. Otherwise
+            // every release without an allowlist would carry the hazard clause.
+            (
+                "no allowedEgress key at all",
+                json!({"security": {"networkPolicy": {}}}),
+                vec![],
+            ),
+            (
+                "an explicitly null allowedEgress",
+                policy(serde_json::Value::Null),
+                vec![],
+            ),
+            ("no security block at all", json!({}), vec![]),
+        ];
+        for (what, values, expected) in reproducible {
+            let (cidrs, ok) = sandbox_egress_from_values(&values);
+            assert_eq!(cidrs, expected, "{what}: recorded order and content");
+            assert!(ok, "{what} must be reproducible");
+        }
+
+        let not_reproducible: Vec<(&str, serde_json::Value)> = vec![
+            (
+                "a UDP rule",
+                policy(json!([{"cidr": "192.0.2.0/24",
+                               "ports": [{"protocol": "UDP", "port": 443}]}])),
+            ),
+            (
+                "a port-53 rule",
+                policy(json!([{"cidr": "192.0.2.0/24",
+                               "ports": [{"protocol": "TCP", "port": 53}]}])),
+            ),
+            (
+                "two port rules on one entry",
+                policy(json!([{"cidr": "192.0.2.0/24",
+                               "ports": [{"protocol": "TCP", "port": 443},
+                                         {"protocol": "TCP", "port": 80}]}])),
+            ),
+            (
+                "an entry with no ports at all",
+                policy(json!([{"cidr": "192.0.2.0/24"}])),
+            ),
+            (
+                "an entry with an empty ports list",
+                policy(json!([{"cidr": "192.0.2.0/24", "ports": []}])),
+            ),
+            (
+                "a port rule with no protocol",
+                policy(json!([{"cidr": "192.0.2.0/24", "ports": [{"port": 443}]}])),
+            ),
+            ("eleven entries", policy(entries_of(11))),
+            // A recorded rule this reader cannot name is still a recorded rule.
+            // Dropping it and calling the rest faithful is the narrowing this
+            // whole gate exists to prevent.
+            (
+                "an entry with no cidr",
+                policy(json!([{"ports": tcp443()}])),
+            ),
+            (
+                "an entry whose cidr is empty after trimming",
+                policy(json!([{"cidr": "   ", "ports": tcp443()}])),
+            ),
+            (
+                "an entry whose cidr is not a scalar",
+                policy(json!([{"cidr": ["192.0.2.0/24"], "ports": tcp443()}])),
+            ),
+            (
+                "one good entry beside one with no cidr",
+                policy(json!([{"cidr": "160.79.104.0/23", "ports": tcp443()},
+                              {"ports": tcp443()}])),
+            ),
+            (
+                "an allowedEgress that is not a list at all",
+                policy(json!("not-a-list")),
+            ),
+            (
+                "an allowedEgress recorded as an object",
+                policy(json!({"cidr": "192.0.2.0/24"})),
+            ),
+        ];
+        for (what, values) in not_reproducible {
+            let (cidrs, ok) = sandbox_egress_from_values(&values);
+            assert!(!ok, "{what} must NOT be reproducible");
+            assert!(
+                cidrs.is_empty(),
+                "{what} must return nothing to re-supply, got {cidrs:?}"
+            );
+        }
+    }
+
+    /// The invariant the whole faithfulness gate rests on, asserted on its own
+    /// so it cannot be lost in a table: **a false gate always returns an empty
+    /// vec.** Any non-empty list beside a false gate is a partial allowlist, and
+    /// a partial allowlist pasted into `cluster up` NARROWS a live NetworkPolicy
+    /// -- the exact failure D2 exists to prevent, reintroduced one entry at a
+    /// time instead of all at once.
+    #[test]
+    fn a_false_egress_gate_never_returns_a_partial_list() {
+        let tcp443 = || json!([{"protocol": "TCP", "port": 443}]);
+        let good = || json!({"cidr": "160.79.104.0/23", "ports": tcp443()});
+        let policy = |entries: serde_json::Value| json!({"security": {"networkPolicy": {"allowedEgress": entries}}});
+        let many: Vec<serde_json::Value> = (0..11)
+            .map(|i| json!({"cidr": format!("192.0.2.{i}/32"), "ports": tcp443()}))
+            .collect();
+
+        // Each case pairs at least one perfectly readable entry with one this
+        // reader cannot reproduce, so an implementation that filters instead of
+        // refusing returns a non-empty -- and lossy -- list.
+        let mixed = [
+            policy(
+                json!([good(), {"cidr": "192.0.2.0/24", "ports": [{"protocol": "UDP", "port": 443}]}]),
+            ),
+            policy(
+                json!([good(), {"cidr": "192.0.2.0/24", "ports": [{"protocol": "TCP", "port": 53}]}]),
+            ),
+            policy(json!([good(), {"cidr": "192.0.2.0/24"}])),
+            policy(json!([good(), {"cidr": "", "ports": tcp443()}])),
+            policy(json!([good(), {"ports": tcp443()}])),
+            policy(serde_json::Value::Array(many)),
+            policy(json!("not-a-list")),
+        ];
+        for values in mixed {
+            let (cidrs, ok) = sandbox_egress_from_values(&values);
+            assert!(!ok, "{values} must not read as reproducible");
+            assert!(
+                cidrs.is_empty(),
+                "a false gate must yield NO cidrs, or the fix emits a narrowed \
+                 allowlist: {cidrs:?} from {values}"
+            );
+        }
+    }
+
+    /// The sibling that must NOT be "fixed" to match. `missing_release_recovery`
+    /// fires only when there is no release, so there is nothing recorded to
+    /// preserve, and its credential-derived `--allow-egress-host` is the right
+    /// flag for a FRESH install (#1813). Rewriting it to use `--allow-web-egress`
+    /// would regress the provider inference that ticket landed.
+    #[test]
+    fn the_missing_release_recovery_keeps_allow_egress_host() {
+        let f = Facts {
+            release: ReleaseProbe::NotInstalled,
+            model_credential_provider: crate::ops::provider_from_credential_prefix(
+                "sk-ant-PLACEHOLDER",
+            ),
+            sandbox_egress_cidrs: vec!["160.79.104.0/23".into()],
+            sandbox_egress_is_reproducible: true,
+            ..wired()
+        };
+        let fix = find(&evaluate(&f), "release")
+            .fix
+            .clone()
+            .expect("a missing release must offer a recovery command");
+        assert!(
+            fix.contains("--allow-egress-host anthropic"),
+            "the fresh-install recovery keeps its provider inference: {fix}"
+        );
+        assert!(
+            !fix.contains("--allow-web-egress"),
+            "there is no recorded policy to preserve on a release that does not \
+             exist: {fix}"
+        );
+    }
+
+    // -- D3: the BYO-Secret clone credential ---------------------------------
+
+    /// The chart calls `githubAppExistingSecret` the RECOMMENDED path, and
+    /// doctor reported an install using it as having no clone credential at all
+    /// -- telling an operator to run `cluster github-app` over a working setup.
+    #[test]
+    fn a_secret_backed_github_app_is_a_clone_credential() {
+        let f = Facts {
+            clone_credential: Some("github app (secret=gh-app)".into()),
+            ..wired()
+        };
+        let c = find(&evaluate(&f), "clone-credential").clone();
+        assert_eq!(c.state, State::Ok);
+        assert!(
+            c.detail.contains("gh-app"),
+            "the Secret must be reported by name: {}",
+            c.detail
+        );
+        assert!(c.fix.is_none(), "a working credential needs no fix");
+    }
+
+    /// The chart template consumes the existing Secret when one is set, so that
+    /// is what the report must name. Reporting both would invite an operator to
+    /// "fix" an install that is already working.
+    #[test]
+    fn clone_credential_prefers_the_existing_secret_over_inline_key_material() {
+        assert_eq!(
+            clone_credential_from_values(&json!({"api": {"githubAppExistingSecret": "gh-app"}})),
+            Some("github app (secret=gh-app)".to_string())
+        );
+        assert_eq!(
+            clone_credential_from_values(&json!({"api": {"githubAppId": "4475970"}})),
+            Some("github app (app_id=4475970)".to_string())
+        );
+        assert_eq!(
+            clone_credential_from_values(&json!({"api": {"githubToken": "ghp_PLACEHOLDER"}})),
+            Some("personal access token".to_string())
+        );
+        assert_eq!(
+            clone_credential_from_values(&json!({"api": {
+                "githubAppExistingSecret": "gh-app",
+                "githubAppId": "4475970"
+            }})),
+            Some("github app (secret=gh-app)".to_string()),
+            "the Secret path is what the chart consumes, so it wins the report"
+        );
+        assert_eq!(
+            clone_credential_from_values(&json!({"api": {}})),
+            None,
+            "nothing recorded is still nothing"
+        );
+    }
+
+    /// Names, never values (#1348). The Secret's KEY name is adjacent in the
+    /// same values block, and reading the wrong field is how key material
+    /// reaches a payload that gets pasted into issues.
+    #[test]
+    fn a_secret_backed_credential_never_reports_key_material() {
+        let values = json!({"api": {
+            "githubAppExistingSecret": "gh-app",
+            "githubAppExistingSecretKey": "private-key.pem"
+        }});
+        let f = Facts {
+            clone_credential: clone_credential_from_values(&values),
+            ..wired()
+        };
+        let detail = find(&evaluate(&f), "clone-credential").detail.clone();
+        assert!(detail.contains("gh-app"), "{detail}");
+        assert!(
+            !detail.contains("private-key.pem"),
+            "the key name is not the Secret name: {detail}"
+        );
+        assert!(!detail.contains("-----BEGIN"), "{detail}");
+    }
+
+    // -- D4: type-tolerant reads ---------------------------------------------
+
+    /// #1253: an unquoted `githubAppId: 4475970` in a values file is a live,
+    /// GitOps-common shape, and a `as_str()`-only read called that install
+    /// credential-less. The scientific-notation form is the same value.
+    #[test]
+    fn a_numeric_app_id_in_a_values_file_is_still_a_clone_credential() {
+        assert_eq!(
+            clone_credential_from_values(&json!({"api": {"githubAppId": 4475970}})),
+            Some("github app (app_id=4475970)".to_string())
+        );
+        assert_eq!(
+            clone_credential_from_values(&json!({"api": {"githubAppId": 4.47597e6}})),
+            Some("github app (app_id=4475970)".to_string()),
+            "an integral float is the same app id, not a new one"
+        );
+    }
+
+    /// The issue's §4 symptom, asserted as the operator sees it: an install
+    /// whose ingress is already on printed `MISS  Webhook exposure`, because
+    /// `--set-string api.ingress.enabled=true` and a quoted values-file entry
+    /// both record a STRING and the read was `as_bool()`-only. Asserted through
+    /// the exposure string and the check state, not through the predicate --
+    /// a truthiness helper can be right while the report is still wrong.
+    #[test]
+    fn a_string_typed_ingress_flag_counts_as_enabled() {
+        let values = json!({"api": {"ingress": {"enabled": "true", "host": "bot.example.com"}}});
+        assert_eq!(
+            api_exposure_from_values(&values, None),
+            Some("ingress (bot.example.com)".to_string()),
+            "a quoted true is how helm --set-string records it"
+        );
+
+        // And the user-visible half: that exposure must land the check on Ok.
+        let f = Facts {
+            api_exposure: api_exposure_from_values(&values, None),
+            ..wired()
+        };
+        let c = find(&evaluate(&f), "webhook").clone();
+        assert_eq!(
+            c.state,
+            State::Ok,
+            "an install with ingress on must not read as MISS: {}",
+            c.detail
+        );
+        assert!(c.detail.contains("bot.example.com"), "{}", c.detail);
+        assert!(c.fix.is_none(), "there is nothing to fix: {:?}", c.fix);
+    }
+
+    /// The rest of the exposure decision, in the one place it is now pure: a
+    /// real bool still works, a host-less ingress keeps its existing wording,
+    /// the NodePort fallback is only consulted when ingress is off, and a value
+    /// that is not truthy must fall through rather than claim an ingress.
+    #[test]
+    fn exposure_falls_back_to_the_nodeport_only_when_ingress_is_off() {
+        let on = json!({"api": {"ingress": {"enabled": true, "host": "bot.example.com"}}});
+        assert_eq!(
+            api_exposure_from_values(&on, Some("30799".to_string())),
+            Some("ingress (bot.example.com)".to_string()),
+            "an enabled ingress wins over a NodePort that also exists"
+        );
+
+        let hostless = json!({"api": {"ingress": {"enabled": true}}});
+        assert_eq!(
+            api_exposure_from_values(&hostless, None),
+            Some("ingress".to_string()),
+            "an ingress with no host keeps its existing wording"
+        );
+
+        let off = json!({"api": {"ingress": {"enabled": false}}});
+        assert_eq!(
+            api_exposure_from_values(&off, Some("30799".to_string())),
+            Some("NodePort 30799".to_string())
+        );
+        assert_eq!(
+            api_exposure_from_values(&off, None),
+            None,
+            "neither mechanism in place is reported as unknown, not as broken"
+        );
+
+        // The negative that matters here: "1" is not the literal true, so it
+        // must NOT be reported as an ingress the operator does not have.
+        let typo = json!({"api": {"ingress": {"enabled": "1", "host": "bot.example.com"}}});
+        assert_eq!(
+            api_exposure_from_values(&typo, None),
+            None,
+            "a value that is not the literal true must not claim an ingress"
+        );
+        assert_eq!(
+            api_exposure_from_values(&typo, Some("30799".to_string())),
+            Some("NodePort 30799".to_string()),
+            "and it falls through to the NodePort read like any other off state"
+        );
+    }
+
+    /// The negative that keeps the widening honest. Treating any non-empty
+    /// string as true would report an install as exposed on a typo -- a
+    /// security-relevant over-claim, in a check whose whole job is to say
+    /// whether the API is reachable from outside.
+    #[test]
+    fn only_a_true_bool_or_the_literal_string_true_enables_ingress() {
+        for enabled in [json!(true), json!("true"), json!("TRUE"), json!(" True ")] {
+            assert!(truthy(Some(&enabled)), "{enabled} must enable ingress");
+        }
+        for disabled in [
+            json!(false),
+            json!("false"),
+            json!("1"),
+            json!("yes"),
+            json!("on"),
+            json!(""),
+            json!(0),
+            json!(1),
+            json!(null),
+            json!([true]),
+            json!({"enabled": true}),
+        ] {
+            assert!(
+                !truthy(Some(&disabled)),
+                "{disabled} must NOT enable ingress"
+            );
+        }
+        assert!(!truthy(None), "an absent flag must not enable ingress");
+    }
+
+    /// The empty-string filter predates the coercion widening and must survive
+    /// it: a chart default of `""` is an unset field, not a credential.
+    #[test]
+    fn an_empty_string_value_is_still_absent() {
+        assert_eq!(
+            scalar_at(
+                &json!({"api": {"githubAppId": ""}}),
+                &["api", "githubAppId"]
+            ),
+            None
+        );
+        assert_eq!(
+            clone_credential_from_values(&json!({"api": {"githubAppId": ""}})),
+            None,
+            "an empty app id is not a clone credential"
+        );
+    }
+
+    /// Widening string|number|bool must not become "stringify anything": an
+    /// array or an object at a scalar path is a shape this reader does not
+    /// understand, and rendering its debug form into a detail is how structure
+    /// leaks into a report.
+    #[test]
+    fn a_non_scalar_value_is_absent() {
+        assert_eq!(
+            scalar_at(
+                &json!({"api": {"githubAppId": ["4475970"]}}),
+                &["api", "githubAppId"]
+            ),
+            None
+        );
+        assert_eq!(
+            scalar_at(
+                &json!({"api": {"githubAppId": {"value": "4475970"}}}),
+                &["api", "githubAppId"]
+            ),
+            None
+        );
+        assert_eq!(
+            scalar_at(
+                &json!({"api": {"githubAppId": null}}),
+                &["api", "githubAppId"]
+            ),
+            None
+        );
+        assert_eq!(
+            scalar_at(&json!({"api": {}}), &["api", "githubAppId"]),
+            None,
+            "an absent path is absent"
+        );
+    }
+
+    // -- D5: helm-missing, could-not-answer and absent are distinguishable ----
+
+    /// The three states were byte-identical: `fetch_release_chart` collapsed
+    /// every nonzero `helm list` to `Ok(None)`, so a laptop with no helm, an
+    /// expired cluster credential, and a genuinely empty namespace all printed
+    /// "not installed in this namespace".
+    #[test]
+    fn classify_release_probe_separates_every_outcome() {
+        assert_eq!(
+            classify_release_probe(false, true, "[]", "acme"),
+            ReleaseProbe::HelmMissing,
+            "no helm means the release cannot be inspected at all"
+        );
+        assert_eq!(
+            classify_release_probe(
+                true,
+                true,
+                r#"[{"name":"acme","chart":"curie-0.7.0"}]"#,
+                "acme"
+            ),
+            ReleaseProbe::Installed {
+                chart: "curie-0.7.0".to_string()
+            }
+        );
+        assert_eq!(
+            classify_release_probe(true, true, "[]", "acme"),
+            ReleaseProbe::NotInstalled
+        );
+        assert_eq!(
+            classify_release_probe(true, true, "null", "acme"),
+            ReleaseProbe::NotInstalled,
+            "helm prints null for an empty namespace in some versions"
+        );
+        assert_eq!(
+            classify_release_probe(true, true, "   ", "acme"),
+            ReleaseProbe::NotInstalled,
+            "empty stdout on success is the empty-namespace shape"
+        );
+        for stdout in ["", "[]", r#"[{"name":"acme","chart":"curie-0.7.0"}]"#] {
+            assert_eq!(
+                classify_release_probe(true, false, stdout, "acme"),
+                ReleaseProbe::ProbeFailed,
+                "a nonzero exit is not an answer, whatever landed on stdout"
+            );
+        }
+    }
+
+    /// The namespace can hold other releases. Taking the first array element
+    /// would report someone else's chart as this release's.
+    #[test]
+    fn exit_zero_for_a_different_release_is_not_installed() {
+        assert_eq!(
+            classify_release_probe(
+                true,
+                true,
+                r#"[{"name":"other","chart":"curie-0.7.0"}]"#,
+                "acme"
+            ),
+            ReleaseProbe::NotInstalled
+        );
+    }
+
+    /// The key negative. Turning "I could not read the answer" into "there is no
+    /// release" is a positive absence claim built on no evidence -- the #1354
+    /// shape -- and it is what `fetch_existing_values` already fails closed on
+    /// ("the release state is unknown"). A helm whose `list -o json` shape
+    /// changes must make doctor say so, not report a live release as gone.
+    #[test]
+    fn exit_zero_with_unreadable_stdout_is_probe_failed_not_not_installed() {
+        for stdout in [
+            "not json at all",
+            r#"{"releases":[]}"#,
+            r#"[{"name":"acme"}]"#,
+        ] {
+            assert_eq!(
+                classify_release_probe(true, true, stdout, "acme"),
+                ReleaseProbe::ProbeFailed,
+                "unreadable stdout {stdout:?} must not become an absence claim"
+            );
+        }
+    }
+
+    /// The user-visible half of the same defect: four different causes must not
+    /// produce the same two lines. Pairwise distinctness is the assertion the
+    /// issue's report ("byte-identical") maps onto directly.
+    #[test]
+    fn each_release_probe_renders_a_distinct_report() {
+        let variants = [
+            ReleaseProbe::HelmMissing,
+            ReleaseProbe::ProbeFailed,
+            ReleaseProbe::NotInstalled,
+            ReleaseProbe::Installed {
+                chart: "curie-0.7.0".into(),
+            },
+        ];
+        let mut seen: Vec<(ReleaseProbe, (State, String, State, String))> = Vec::new();
+        for probe in variants {
+            let checks = evaluate(&probed(probe.clone()));
+            let cluster = find(&checks, "cluster");
+            let release = find(&checks, "release");
+            let report = (
+                cluster.state,
+                cluster.detail.clone(),
+                release.state,
+                release.detail.clone(),
+            );
+            if probe != ReleaseProbe::NotInstalled {
+                assert!(
+                    !release.detail.contains("no deployed release"),
+                    "{probe:?} must not claim the release is absent: {}",
+                    release.detail
+                );
+            }
+            for (other, previous) in &seen {
+                assert_ne!(
+                    &report, previous,
+                    "{probe:?} and {other:?} render the same report"
+                );
+            }
+            seen.push((probe, report));
+        }
+    }
+
+    /// A JSON consumer gates on `ready`. Reporting `true` while doctor could not
+    /// see the release at all would let a pipeline proceed on no evidence.
+    #[test]
+    fn an_unknown_release_is_never_ready() {
+        for probe in [ReleaseProbe::HelmMissing, ReleaseProbe::ProbeFailed] {
+            let checks = evaluate(&probed(probe.clone()));
+            let out = DoctorOutput {
+                summary: summary(&checks),
+                checks,
+            };
+            assert_eq!(
+                out.to_json()["ready"],
+                serde_json::Value::Bool(false),
+                "{probe:?} knows nothing about the release, so it is not ready"
+            );
+        }
+    }
+
+    /// #1354 recurring through the states D5 introduces, in both directions: a
+    /// probe that failed and a missing helm must not roll up to the verdict
+    /// reserved for "helm answered, and there is no release here".
+    #[test]
+    fn a_failed_probe_does_not_claim_the_release_is_absent() {
+        let failed = summary(&evaluate(&probed(ReleaseProbe::ProbeFailed)));
+        assert!(!failed.contains("No cluster release yet"), "{failed}");
+        assert!(
+            failed.contains("Cluster line"),
+            "the verdict must send the operator to the line that explains it: {failed}"
+        );
+
+        let no_helm = summary(&evaluate(&probed(ReleaseProbe::HelmMissing)));
+        assert!(!no_helm.contains("No cluster release yet"), "{no_helm}");
+        assert!(
+            no_helm.contains("helm"),
+            "a missing helm is the reason, and the verdict must say so: {no_helm}"
+        );
+    }
+
+    /// `Ok` on the cluster check means a kube context is configured -- not that
+    /// anything reached the cluster. When helm never ran, nothing contacted it,
+    /// and claiming otherwise is the over-claim this check exists to avoid.
+    #[test]
+    fn the_cluster_detail_says_whether_the_cluster_was_contacted() {
+        for probe in [
+            ReleaseProbe::NotInstalled,
+            ReleaseProbe::Installed {
+                chart: "curie-0.7.0".into(),
+            },
+        ] {
+            let detail = find(&evaluate(&probed(probe.clone())), "cluster")
+                .detail
+                .clone();
+            assert!(detail.contains("reached"), "{probe:?}: {detail}");
+        }
+        let detail = find(&evaluate(&probed(ReleaseProbe::HelmMissing)), "cluster")
+            .detail
+            .clone();
+        assert!(
+            !detail.contains("reached"),
+            "helm never ran, so nothing contacted the cluster: {detail}"
+        );
+        assert!(
+            detail.contains("kubeconfig"),
+            "it must say where the context came from instead: {detail}"
+        );
+    }
+
+    /// The standing structural guard. doctor's payload is pasted into issues,
+    /// and helm's own output is an ARBITRARY external line: it can carry an
+    /// `Authorization` header, an exec-plugin's argv, or a token-bearing URL.
+    /// No prefix denylist can enumerate that, so the property is that NOTHING
+    /// from a subprocess survives -- asserted over the whole planted string,
+    /// token by token, not over a list of credential shapes.
+    #[test]
+    fn no_subprocess_output_ever_reaches_a_check() {
+        // Every token is distinctive on purpose: the assertion is that NONE of
+        // them survives, so a token that doctor could legitimately author (say,
+        // "cluster") would make the guard fail for the wrong reason.
+        //
+        // The credential-shaped tokens are ASSEMBLED AT RUNTIME rather than
+        // written out. A complete `xoxb-...` / `ghp_...` / `github_pat_...`
+        // string sitting in this source trips the repo's secret scanners even
+        // on a placeholder, and gitleaks scans full history, so one that lands
+        // and is removed later still fails. The planted string is byte-for-byte
+        // what it always was, so this plants the same input and proves the same
+        // property. Do NOT "tidy" these back into single literals.
+        let ph = "PLACEHOLDER";
+        let planted_owned = [
+            format!("sk-ant-{ph}"),
+            format!("sk-or-{ph}"),
+            format!("{}{ph}", "xoxb-"),
+            format!("{}{ph}", "xapp-"),
+            format!("{}{ph}", "ghp_"),
+            format!("{}{ph}", "github_pat_"),
+            format!("{}{} RSA PRIVATE KEY", "-----", "BEGIN"),
+            format!("Authorization: Bearer {ph}"),
+            format!("https://example.invalid/?access_token={ph}"),
+            "curie-doctor-subprocess-marker-1358".to_string(),
+        ]
+        .join(" ");
+        let planted = planted_owned.as_str();
+
+        // The classifier is the one place a subprocess's bytes are handed to
+        // doctor, so route the planted output through it on both exit paths.
+        let mut probes = vec![
+            classify_release_probe(true, false, planted, "acme"),
+            classify_release_probe(true, true, planted, "acme"),
+            ReleaseProbe::HelmMissing,
+            ReleaseProbe::NotInstalled,
+            ReleaseProbe::Installed {
+                chart: "curie-0.7.0".into(),
+            },
+        ];
+        probes.dedup();
+
+        for probe in probes {
+            let checks = evaluate(&probed(probe.clone()));
+            let rendered = format!("{checks:?}");
+            for token in planted.split_whitespace() {
+                assert!(
+                    !rendered.contains(token),
+                    "{probe:?} echoed {token:?} from the subprocess: {rendered}"
+                );
+            }
+            assert!(
+                !summary(&checks).contains("curie-doctor-subprocess-marker-1358"),
+                "the summary echoed the subprocess too"
+            );
+        }
+    }
+
+    // -- D6a: Slack partial state --------------------------------------------
+
+    /// The check read only `botToken` and then claimed "app and bot tokens
+    /// recorded". Socket mode needs BOTH, so a half-configured release read as
+    /// fully wired and the bot silently never connected.
+    #[test]
+    fn a_bot_token_without_an_app_token_is_not_ok() {
+        let f = Facts {
+            slack_bot_token: true,
+            slack_app_token: false,
+            ..wired()
+        };
+        let checks = evaluate(&f);
+        let c = find(&checks, "slack");
+        assert_eq!(c.state, State::Missing);
+        assert!(
+            c.detail.contains("only the bot token"),
+            "the detail must say which token was observed: {}",
+            c.detail
+        );
+        assert!(
+            c.detail.contains("socket mode needs both"),
+            "and why one is not enough: {}",
+            c.detail
+        );
+        let fix = c.fix.as_deref().expect("a partial state must be fixable");
+        assert!(fix.contains("--namespace acme"), "{fix}");
+        assert!(fix.contains("--release acme"), "{fix}");
+        assert!(
+            !summary(&checks).contains("Fully wired"),
+            "{}",
+            summary(&checks)
+        );
+    }
+
+    /// The mirror case. An app token with no bot token is the same failure in
+    /// the other direction, and an implementation that only special-cases one
+    /// of the two passes the sibling test alone.
+    #[test]
+    fn an_app_token_without_a_bot_token_is_not_ok() {
+        let f = Facts {
+            slack_bot_token: false,
+            slack_app_token: true,
+            ..wired()
+        };
+        let checks = evaluate(&f);
+        let c = find(&checks, "slack");
+        assert_eq!(c.state, State::Missing);
+        assert!(
+            c.detail.contains("only the app token"),
+            "the detail must say which token was observed: {}",
+            c.detail
+        );
+        assert!(
+            c.detail.contains("socket mode needs both"),
+            "and why one is not enough: {}",
+            c.detail
+        );
+        assert!(c.fix.is_some(), "a partial state must be fixable");
+        assert!(
+            !summary(&checks).contains("Fully wired"),
+            "{}",
+            summary(&checks)
+        );
+    }
+
+    /// The positive path keeps its wording: both tokens recorded is Ok, with no
+    /// fix and nothing to do.
+    #[test]
+    fn both_tokens_recorded_is_ok() {
+        let c = find(&evaluate(&wired()), "slack").clone();
+        assert_eq!(c.state, State::Ok);
+        assert_eq!(c.detail, "app and bot tokens recorded");
+        assert!(c.fix.is_none());
+    }
+
+    /// Neither token keeps the original wording and stays fixable.
+    #[test]
+    fn no_tokens_recorded_is_reported_as_none() {
+        let f = Facts {
+            slack_bot_token: false,
+            slack_app_token: false,
+            ..wired()
+        };
+        let c = find(&evaluate(&f), "slack").clone();
+        assert_eq!(c.state, State::Missing);
+        assert_eq!(c.detail, "no tokens recorded");
+    }
+
+    // -- D6b: curie.yaml precedence ------------------------------------------
+
+    /// doctor hardcoded `curie/curie` and never looked at the `curie.yaml` in
+    /// the directory it was run from, so in an installation directory it
+    /// reported on a release that did not exist. Resolution is per FIELD: an
+    /// all-or-nothing implementation drops the file's release the moment
+    /// `--namespace` alone is passed. An inference is announced, never silent.
+    #[test]
+    fn resolve_target_precedence() {
+        let declared = Some(("acme", "acme"));
+
+        let both = resolve_target(Some("ops"), Some("ops-bot"), declared);
+        assert_eq!(both.namespace, "ops");
+        assert_eq!(both.release, "ops-bot");
+        assert_eq!(
+            both.announcement, None,
+            "nothing was inferred, so there is nothing to announce"
+        );
+
+        let inferred = resolve_target(None, None, declared);
+        assert_eq!(inferred.namespace, "acme");
+        assert_eq!(inferred.release, "acme");
+        let note = inferred
+            .announcement
+            .expect("an inferred target must be announced");
+        assert!(note.contains("curie.yaml"), "must name the source: {note}");
+        assert!(note.contains("acme"), "must name the value: {note}");
+
+        // Secondary path: one flag set, one field taken from the file.
+        let mixed = resolve_target(Some("ops"), None, declared);
+        assert_eq!(mixed.namespace, "ops", "the flag wins its own field");
+        assert_eq!(
+            mixed.release, "acme",
+            "the other field still comes from curie.yaml"
+        );
+        let note = mixed
+            .announcement
+            .expect("a partially inferred target is still an inference");
+        assert!(note.contains("curie.yaml"), "{note}");
+
+        let defaults = resolve_target(None, None, None);
+        assert_eq!(defaults.namespace, "curie");
+        assert_eq!(defaults.release, "curie");
+        assert_eq!(
+            defaults.announcement, None,
+            "the built-in default is not an inference from a file"
+        );
+    }
+
+    // -- D6c: the three surviving mutations ----------------------------------
+
+    /// Hardcoding the Ok arm of the docker check survived the whole suite: no
+    /// test ever set `docker_ok: false` alongside a bundle, so the Missing arm
+    /// and the summary branch that depends on it were both unreached.
+    #[test]
+    fn docker_not_reachable_is_reported_and_gates_the_summary() {
+        let f = Facts {
+            docker_ok: false,
+            ..laptop()
+        };
+        let checks = evaluate(&f);
+        let c = find(&checks, "docker");
+        assert_eq!(c.state, State::Missing);
+        assert!(
+            c.fix.as_deref().unwrap_or("").contains("Docker"),
+            "the fix must name Docker: {:?}",
+            c.fix
+        );
+        assert!(
+            summary(&checks).contains("Docker is not reachable"),
+            "{}",
+            summary(&checks)
+        );
+    }
+
+    /// The clone-credential check never reached Missing in any test, so an
+    /// implementation that could not produce that arm at all stayed green. The
+    /// detail has to name the CONSEQUENCE: the symptom is a push that appears
+    /// to work and deploys nothing.
+    #[test]
+    fn a_release_with_no_clone_credential_reports_missing() {
+        let f = Facts {
+            clone_credential: None,
+            ..wired()
+        };
+        let c = find(&evaluate(&f), "clone-credential").clone();
+        assert_eq!(c.state, State::Missing);
+        assert!(
+            c.detail.contains("git-push deploys will fail"),
+            "must name the consequence: {}",
+            c.detail
+        );
+        let fix = c.fix.as_deref().expect("must offer a fix");
+        assert!(fix.contains("--namespace acme"), "{fix}");
+        assert!(fix.contains("--release acme"), "{fix}");
+    }
+
+    /// `"ready": true` hardcoded in `to_json` survived every test, because no
+    /// test read `ready` at all. Both directions are asserted, so a constant in
+    /// either position fails. Docker is the lever deliberately, NOT `model-pin`:
+    /// #1663 established that a floating pin is Ok-with-a-fix and must never
+    /// make a working install read as unready.
+    #[test]
+    fn ready_is_false_when_any_check_is_missing() {
+        let clean = Facts {
+            agents: Some(vec![("bot".into(), Some("acme/bot".into()))]),
+            ..wired()
+        };
+        let checks = evaluate(&clean);
+        assert!(
+            checks.iter().all(|c| c.state != State::Missing),
+            "the clean fixture must have no Missing check: {checks:?}"
+        );
+        let out = DoctorOutput {
+            summary: summary(&checks),
+            checks,
+        };
+        assert_eq!(out.to_json()["ready"], serde_json::Value::Bool(true));
+
+        let broken = Facts {
+            docker_ok: false,
+            ..clean
+        };
+        let checks = evaluate(&broken);
+        let out = DoctorOutput {
+            summary: summary(&checks),
+            checks,
+        };
+        assert_eq!(out.to_json()["ready"], serde_json::Value::Bool(false));
     }
 }
 
