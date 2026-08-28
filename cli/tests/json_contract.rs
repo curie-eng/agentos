@@ -884,7 +884,10 @@ use curie::comms::CommsOutput;
 use curie::local::{
     LocalDownOutput, LocalRebuildOutput, LocalStatusOutput, LocalUpOutput, ModelMode,
 };
-use curie::ops::{ClusterDownOutput, ClusterStatus, ClusterStatusOutput, ClusterUpOutput, PodRow};
+use curie::ops::{
+    ClusterDownOutput, ClusterRollbackOutput, ClusterStatus, ClusterStatusOutput, ClusterUpOutput,
+    PodRow,
+};
 use curie::secrets::SecretsListOutput;
 
 fn assert_valid(schema_file: &str, value: &serde_json::Value) {
@@ -1852,6 +1855,32 @@ fn cluster_down_output_validates_all_variants() {
         lines: vec!["helm uninstall".to_string()],
     });
     assert_valid("cluster-down.schema.json", &dry.to_json());
+}
+
+#[test]
+fn cluster_rollback_output_validates_all_variants() {
+    let dry = ClusterRollbackOutput::DryRun(DryRunPlan {
+        lines: vec!["helm rollback".to_string()],
+    });
+    assert_valid("cluster-rollback.schema.json", &dry.to_json());
+    assert_valid(
+        "cluster-rollback.schema.json",
+        &ClusterRollbackOutput::Aborted.to_json(),
+    );
+    let rolled_back = ClusterRollbackOutput::RolledBack {
+        from_revision: 4,
+        to_revision: 3,
+        skipped: vec![],
+        forced: false,
+    };
+    assert_valid("cluster-rollback.schema.json", &rolled_back.to_json());
+    let forced = ClusterRollbackOutput::RolledBack {
+        from_revision: 5,
+        to_revision: 2,
+        skipped: vec![4, 3],
+        forced: true,
+    };
+    assert_valid("cluster-rollback.schema.json", &forced.to_json());
 }
 
 #[test]

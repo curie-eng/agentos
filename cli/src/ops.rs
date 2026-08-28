@@ -1,4 +1,4 @@
-//! `curie cluster up | cluster status | cluster down`: the operator
+//! `curie cluster up | cluster status | cluster rollback | cluster down`: the operator
 //! day-1 lifecycle, wrapping the Helm chart and `kubectl` the way linkerd or
 //! cilium wrap theirs -- a deliberately thin CLI over the chart, which stays the
 //! source of truth. Every verb shells out to the `helm`/`kubectl` binaries; the
@@ -534,6 +534,18 @@ impl UpOpts {
 
 pub struct DownOpts {
     pub common: CommonOpts,
+    pub yes: bool,
+}
+
+pub struct RollbackOpts {
+    pub common: CommonOpts,
+    /// An operator-named revision. `None` lets [`select_rollback_revision`] pick
+    /// the newest `deployed`/`superseded` revision below the current one, which
+    /// is the whole point of the verb (#1899).
+    pub revision: Option<u32>,
+    /// Admit a `--revision` whose status is not `deployed`/`superseded`. Refused
+    /// without this flag, since helm never finished applying such a revision.
+    pub allow_failed_revision: bool,
     pub yes: bool,
 }
 
@@ -5770,6 +5782,541 @@ pub async fn down(opts: DownOpts) -> Result<ClusterDownOutput> {
         &sweep_err,
         &opts.common,
     )
+}
+
+// ---------------------------------------------------------------------------
+// `cluster rollback` (#1899)
+// ---------------------------------------------------------------------------
+
+/// One row of `helm history -o json`. Only the fields the rollback decision
+/// needs are modelled; helm adds others (`updated`, `app_version`) that are
+/// deliberately ignored so a helm version bump cannot break parsing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HelmRevision {
+    pub revision: u32,
+    pub status: String,
+    pub chart: String,
+    pub description: String,
+}
+
+/// The revision statuses it is safe to roll back TO. Everything else
+/// (`failed`, the four `pending-*` states, `uninstalling`, `uninstalled`,
+/// `unknown`) names a revision helm never finished putting on the cluster, so
+/// rolling back to it re-applies a manifest that was never known good.
+const ROLLBACK_ELIGIBLE_STATUSES: [&str; 2] = ["deployed", "superseded"];
+
+fn is_eligible_rollback_status(status: &str) -> bool {
+    ROLLBACK_ELIGIBLE_STATUSES.contains(&status.trim().to_ascii_lowercase().as_str())
+}
+
+/// The revision the release is on right now.
+///
+/// Normally that is the one helm marks `deployed`. The fallback to the highest
+/// revision is the real recovery case this verb exists for: when the newest
+/// revision FAILED there is no `deployed` row at all, and treating the failed
+/// revision as "current" is what lets the selector look below it.
+fn current_revision(history: &[HelmRevision]) -> Option<u32> {
+    history
+        .iter()
+        .filter(|r| r.status.trim().eq_ignore_ascii_case("deployed"))
+        .map(|r| r.revision)
+        .max()
+        .or_else(|| history.iter().map(|r| r.revision).max())
+}
+
+/// [`current_revision`], or the error every entry point owes an operator whose
+/// history came back empty. One copy on purpose: the wording here has already
+/// been reworked twice, and a second hand-written copy would silently keep the
+/// old text the next time it changes.
+fn require_current_revision(history: &[HelmRevision]) -> Result<u32> {
+    match current_revision(history) {
+        Some(current) => Ok(current),
+        None => Err(crate::exit::CliError::failure(
+            "`helm history` returned no revisions for this release, so there is nothing to roll back to",
+        )
+        .with_fix("confirm the release name and namespace with `helm list -n <namespace>`")
+        .into()),
+    }
+}
+
+/// The INELIGIBLE revisions between `to` and `from`. The status filter is not
+/// redundant: it is only the auto-select path that leaves nothing eligible in
+/// the gap. An operator-named `--revision` can step over revisions that were
+/// perfectly good, and reporting those as "not deployed/superseded" is a false
+/// claim in both the note and the `--json` `skipped` field, so the list is
+/// computed rather than assumed. Reporting the rest is the whole point of AC2.
+///
+/// Deduplicated defensively: [`parse_helm_history`] already collapses a corrupt
+/// history to one row per revision, but this is pure over any slice a caller
+/// hands it, and a number must never surface twice in the report.
+fn skipped_between(history: &[HelmRevision], to: u32, from: u32) -> Vec<u32> {
+    let mut skipped: Vec<u32> = history
+        .iter()
+        .filter(|r| r.revision > to && r.revision < from)
+        .filter(|r| !is_eligible_rollback_status(&r.status))
+        .map(|r| r.revision)
+        .collect();
+    skipped.sort_unstable();
+    skipped.dedup();
+    skipped
+}
+
+/// A resolved rollback: where the release is now, where it is going, and what
+/// was stepped over on the way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RollbackChoice {
+    pub from_revision: u32,
+    pub to_revision: u32,
+    pub skipped: Vec<u32>,
+    /// True only when `--allow-failed-revision` admitted a revision whose status
+    /// is not `deployed`/`superseded`.
+    pub forced: bool,
+}
+
+/// The outcome of the pure selection. `NoEligible` is a legitimate reading of a
+/// real history (a first install, or a release whose every prior revision
+/// failed), not a parse error, so it is carried as a value and turned into the
+/// operator-facing refusal by [`RollbackTarget::require_eligible`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RollbackTarget {
+    Eligible(RollbackChoice),
+    NoEligible { current: u32, skipped: Vec<u32> },
+}
+
+impl RollbackTarget {
+    /// The chosen revision, or the AC4 refusal: never a silent no-op, and never
+    /// a rollback to a revision helm never finished applying.
+    pub fn require_eligible(self) -> Result<RollbackChoice> {
+        match self {
+            RollbackTarget::Eligible(choice) => Ok(choice),
+            RollbackTarget::NoEligible { current, skipped } => {
+                let detail = if skipped.is_empty() {
+                    format!("revision {current} is the only revision in its history")
+                } else {
+                    format!(
+                        "every revision below {current} ({}) has a status helm never finished applying",
+                        skipped
+                            .iter()
+                            .map(u32::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
+                // The next step rides in the message as well as the fix: a bare
+                // `CliError` shows only its message to a human presenter, so an
+                // operator on a TTY would otherwise never learn there is one.
+                Err(crate::exit::CliError::failure(format!(
+                    "no revision is safe to roll back to: {detail}; inspect \
+                     `helm history <release> -n <namespace>` and, if you accept the risk, name one \
+                     explicitly with --revision <n> --allow-failed-revision"
+                ))
+                .with_fix(
+                    "inspect `helm history <release> -n <namespace>` and, if you accept the risk, \
+                     name one explicitly with --revision <n> --allow-failed-revision",
+                )
+                .into())
+            }
+        }
+    }
+}
+
+/// Pick the rollback target: the NEWEST revision strictly below the current one
+/// whose status is `deployed` or `superseded`.
+///
+/// This is the whole fix for #1899. A `cluster up` against a cluster with no
+/// `runsc` RuntimeClass records a FAILED revision before its successful retry,
+/// so the history alternates failed/superseded and the immediately preceding
+/// revision -- the one bare `helm rollback` targets -- is a failed one. Skipping
+/// ineligible statuses is what stops an operator having to know that.
+///
+/// Pure by construction so the decision is unit-testable with no cluster.
+pub fn select_rollback_revision(history: &[HelmRevision]) -> Result<RollbackTarget> {
+    let current = require_current_revision(history)?;
+
+    match history
+        .iter()
+        .filter(|r| r.revision < current && is_eligible_rollback_status(&r.status))
+        .map(|r| r.revision)
+        .max()
+    {
+        Some(to_revision) => Ok(RollbackTarget::Eligible(RollbackChoice {
+            from_revision: current,
+            to_revision,
+            skipped: skipped_between(history, to_revision, current),
+            forced: false,
+        })),
+        None => Ok(RollbackTarget::NoEligible {
+            current,
+            skipped: skipped_between(history, 0, current),
+        }),
+    }
+}
+
+/// Validate an operator-named `--revision`. A revision that is not in the
+/// history is always refused (helm would otherwise fail obscurely mid-rollback);
+/// an ineligible status is refused unless `allow_failed` was passed, and the
+/// refusal names both the status and the override so the operator does not have
+/// to guess (AC3).
+pub fn resolve_explicit_revision(
+    history: &[HelmRevision],
+    revision: u32,
+    allow_failed: bool,
+) -> Result<RollbackChoice> {
+    let current = require_current_revision(history)?;
+
+    let row = history.iter().find(|r| r.revision == revision).ok_or_else(|| {
+        let known: Vec<String> = history.iter().map(|r| r.revision.to_string()).collect();
+        crate::exit::CliError::usage(format!(
+            "revision {revision} is not in this release's Helm history (it has {})",
+            known.join(", ")
+        ))
+        .with_fix("run `curie cluster rollback` with no --revision to let it pick the newest safe revision")
+    })?;
+
+    let eligible = is_eligible_rollback_status(&row.status);
+    if !eligible && !allow_failed {
+        return Err(crate::exit::CliError::usage(format!(
+            "revision {revision} has status `{}`, not `deployed` or `superseded`; \
+             helm never finished applying it, so rolling back to it re-applies a manifest \
+             that was never known good; pass --allow-failed-revision to roll back to it anyway, \
+             or omit --revision to let Curie pick the newest safe one",
+            row.status
+        ))
+        .with_fix("pass --allow-failed-revision to roll back to it anyway, or omit --revision to let Curie pick the newest safe one")
+        .into());
+    }
+
+    Ok(RollbackChoice {
+        from_revision: current,
+        to_revision: revision,
+        skipped: skipped_between(history, revision, current),
+        forced: !eligible,
+    })
+}
+
+/// Parse `helm history -o json`: an array of objects. Unknown fields are
+/// tolerated (helm adds them across versions) and `revision` is accepted as a
+/// JSON number or a string, since that shape has moved between helm releases.
+/// Never panics on operator-visible input -- a malformed payload becomes a
+/// `CliError` naming the command to run by hand.
+pub fn parse_helm_history(json: &str) -> Result<Vec<HelmRevision>> {
+    let malformed = |detail: String| {
+        crate::exit::CliError::failure(format!(
+            "could not read `helm history -o json` output: {detail}"
+        ))
+        .with_fix(
+            "run `helm history <release> -n <namespace> -o json` by hand to see what helm returned",
+        )
+    };
+
+    let rows: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| malformed(e.to_string()))?;
+    let rows = rows
+        .as_array()
+        .ok_or_else(|| malformed("expected a JSON array of revisions".to_string()))?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let revision = row
+            .get("revision")
+            .and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+            })
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| {
+                malformed(format!("a revision has no usable `revision` field: {row}"))
+            })?;
+        let field = |name: &str| {
+            row.get(name)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        // A row with no `status` is treated as `unknown`, which is ineligible:
+        // the safe reading of a field we could not see is "not known good".
+        let status = match field("status").as_str() {
+            "" => "unknown".to_string(),
+            s => s.to_string(),
+        };
+        out.push(HelmRevision {
+            revision,
+            status,
+            chart: field("chart"),
+            description: field("description"),
+        });
+    }
+    // The invariant every consumer below relies on: ascending by revision, and
+    // exactly ONE row per revision number. Eligibility is a property of the
+    // REVISION, not of a row, so both the auto-selector (which filters rows by
+    // status) and `--revision` (which looks a row up) must read the same answer
+    // for the same number. A truncated or corrupt helm secret can yield two
+    // rows for one revision that disagree -- say 20 `superseded` and 20
+    // `failed` -- and before collapsing them the two paths contradicted each
+    // other: `--revision 20` refused it as failed while a bare rollback happily
+    // picked it. A revision whose own history contradicts itself was never
+    // known good, so it collapses to its ineligible reading: sort ineligible
+    // first within a revision number (`false` orders before `true`), then keep
+    // the first row of each run.
+    out.sort_by_key(|r| (r.revision, is_eligible_rollback_status(&r.status)));
+    out.dedup_by_key(|r| r.revision);
+    Ok(out)
+}
+
+/// `helm history` for the release, as JSON. `--max 256` because helm's default
+/// of 10 silently truncates the history, and a truncated history would make the
+/// selector pick a revision that merely looks like the newest safe one.
+pub fn helm_history_cmd(o: &CommonOpts) -> OpsCommand {
+    OpsCommand::new(
+        "helm",
+        vec![
+            plain("history"),
+            plain(&o.release),
+            plain("-n"),
+            plain(&o.namespace),
+            plain("-o"),
+            plain("json"),
+            plain("--max"),
+            plain("256"),
+        ],
+    )
+}
+
+/// `helm rollback` to an explicit revision. Always explicit: the whole point of
+/// the verb is that helm's own default target (the immediately preceding
+/// revision) is the wrong one on a failed/superseded history.
+pub fn helm_rollback_cmd(o: &CommonOpts, revision: u32) -> OpsCommand {
+    helm_rollback_cmd_to(o, revision.to_string())
+}
+
+/// The revision slot of the rollback argv, as printed by `--dry-run` before the
+/// history that decides it has been read.
+const SELECTED_REVISION: &str = "<selected-revision>";
+
+/// [`helm_rollback_cmd`] with the revision slot left as text, so the plan a dry
+/// run prints and the command a live run executes are built by one function
+/// rather than a builder and a `format!` that drift apart.
+fn helm_rollback_cmd_to(o: &CommonOpts, revision: String) -> OpsCommand {
+    OpsCommand::new(
+        "helm",
+        vec![
+            plain("rollback"),
+            plain(&o.release),
+            plain(revision),
+            plain("-n"),
+            plain(&o.namespace),
+        ],
+    )
+}
+
+/// The commands `curie cluster rollback` runs (and prints under `--dry-run`):
+/// the history read that decides the target, then the rollback itself. A `None`
+/// revision is one the caller has not resolved yet, and stands in the argv as
+/// [`SELECTED_REVISION`].
+pub fn rollback_commands(o: &CommonOpts, revision: Option<u32>) -> Vec<OpsCommand> {
+    let target = revision.map_or_else(|| SELECTED_REVISION.to_string(), |r| r.to_string());
+    vec![helm_history_cmd(o), helm_rollback_cmd_to(o, target)]
+}
+
+/// One printed plan line. `display()` everywhere, except that it shell-quotes
+/// [`SELECTED_REVISION`] (the angle brackets are not shell-safe) into something
+/// that reads like a literal argument. The placeholder is a prompt to the
+/// reader, not a value, so it is unquoted back out; everything else in the line
+/// keeps `display()`'s quoting and masking.
+fn plan_line(cmd: &OpsCommand) -> String {
+    cmd.display()
+        .replace(&shell_quote(SELECTED_REVISION), SELECTED_REVISION)
+}
+
+/// Output of `cluster rollback`: the dry-run plan, an operator abort, or the
+/// completed rollback. `skipped` is carried into `--json` so an agent sees the
+/// revisions bare `helm rollback` would have landed on.
+#[derive(Debug)]
+pub enum ClusterRollbackOutput {
+    DryRun(crate::ui::DryRunPlan),
+    Aborted,
+    RolledBack {
+        from_revision: u32,
+        to_revision: u32,
+        skipped: Vec<u32>,
+        forced: bool,
+    },
+}
+
+impl crate::ui::CliOutput for ClusterRollbackOutput {
+    fn to_json(&self) -> serde_json::Value {
+        match self {
+            ClusterRollbackOutput::DryRun(plan) => plan.to_json(),
+            ClusterRollbackOutput::Aborted => {
+                serde_json::json!({"rolled_back": false, "aborted": true})
+            }
+            ClusterRollbackOutput::RolledBack {
+                from_revision,
+                to_revision,
+                skipped,
+                forced,
+            } => serde_json::json!({
+                "rolled_back": true,
+                "from_revision": from_revision,
+                "to_revision": to_revision,
+                "skipped": skipped,
+                "forced": forced,
+            }),
+        }
+    }
+
+    fn render(&self, ui: &crate::ui::Ui) {
+        match self {
+            ClusterRollbackOutput::DryRun(plan) => plan.render(ui),
+            ClusterRollbackOutput::Aborted => ui.note("aborted"),
+            ClusterRollbackOutput::RolledBack {
+                from_revision,
+                to_revision,
+                skipped,
+                forced,
+            } => {
+                ui.payload(&format!(
+                    "curie rolled back from revision {from_revision} to revision {to_revision}"
+                ));
+                if let Some(note) = skipped_note(skipped, *from_revision) {
+                    ui.note(&note);
+                }
+                if *forced {
+                    ui.warn(&format!(
+                        "revision {to_revision} was admitted by --allow-failed-revision; helm never finished applying it, so verify the release with `curie cluster status`"
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// The AC2 line: which revisions were passed over, and -- only when it is
+/// actually so -- which of them a bare `helm rollback` would have targeted.
+///
+/// helm's own default target is always the revision immediately below `from`,
+/// so that half of the sentence is true only when the highest skipped revision
+/// IS `from - 1`. On an explicit `--revision` the gap can contain eligible
+/// revisions that are not in this list, and naming the highest ineligible one
+/// as helm's target would be a fabrication. `None` when nothing was skipped, so
+/// the common case stays quiet.
+fn skipped_note(skipped: &[u32], from: u32) -> Option<String> {
+    let highest = *skipped.iter().max()?;
+    let list = skipped
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(if from.checked_sub(1) == Some(highest) {
+        format!(
+            "skipped revision(s) {list} (not deployed/superseded); a bare `helm rollback` would have targeted {highest}"
+        )
+    } else {
+        format!("skipped revision(s) {list} (not deployed/superseded)")
+    })
+}
+
+pub async fn rollback(opts: RollbackOpts) -> Result<ClusterRollbackOutput> {
+    let ui = crate::ui::ui();
+    let history_cmd = helm_history_cmd(&opts.common);
+
+    if opts.common.dry_run {
+        // The target revision is a function of the live history, so a dry run
+        // that has not read it can only name the revision when the operator did.
+        return Ok(ClusterRollbackOutput::DryRun(crate::ui::DryRunPlan {
+            lines: rollback_commands(&opts.common, opts.revision)
+                .iter()
+                .map(plan_line)
+                .collect(),
+        }));
+    }
+    require_on_path("helm")?;
+
+    ui.plumbing(&format!("+ {}", history_cmd.display()));
+    let (ok, history_out, history_err) = run_capture(&history_cmd).await?;
+    if !ok {
+        // A missing release fails HERE, with helm's own words, rather than
+        // downstream as a misleading "no eligible revision" (AC6).
+        let detail = history_err
+            .trim()
+            .lines()
+            .next()
+            .unwrap_or("helm exited nonzero with no message");
+        return Err(crate::exit::CliError::failure(format!(
+            "could not read the Helm history of release '{}' in namespace '{}': {detail}",
+            opts.common.release, opts.common.namespace
+        ))
+        .with_fix(format!(
+            "confirm the release exists with `helm list -n {}`",
+            opts.common.namespace
+        ))
+        .into());
+    }
+    let history = parse_helm_history(&history_out)?;
+
+    let choice = match opts.revision {
+        Some(revision) => {
+            resolve_explicit_revision(&history, revision, opts.allow_failed_revision)?
+        }
+        None => select_rollback_revision(&history)?.require_eligible()?,
+    };
+
+    // Disclosed BEFORE the prompt, and on stderr like `cluster down` does it:
+    // the operator confirms knowing both the target and what was passed over,
+    // which is the difference this verb exists to make. It cannot go through
+    // `payload` -- ADR-0021 (#474) reserves that channel for `CliOutput::render`,
+    // and routing it here told an operator who then declined the prompt that the
+    // release was rolling back, on stdout, while printing it twice on success.
+    ui.note(&format!(
+        "rolling release '{}' back from revision {} to revision {}",
+        opts.common.release, choice.from_revision, choice.to_revision
+    ));
+    if let Some(note) = skipped_note(&choice.skipped, choice.from_revision) {
+        ui.warn(&note);
+    }
+
+    if !opts.yes
+        && !confirm(&format!(
+            "This rolls back release '{}' in namespace '{}' from revision {} to revision {}. Continue? [y/N] ",
+            opts.common.release, opts.common.namespace, choice.from_revision, choice.to_revision
+        ))?
+    {
+        return Ok(ClusterRollbackOutput::Aborted);
+    }
+
+    let cl = ui.checklist();
+    let rollback_cmd = helm_rollback_cmd(&opts.common, choice.to_revision);
+    ui.plumbing(&format!("+ {}", rollback_cmd.display()));
+    let step = cl.step("rolling back release");
+    let (ok, out, err) = run_capture(&rollback_cmd).await?;
+    for line in out.lines().chain(err.lines()) {
+        ui.plumbing(line);
+    }
+    if !ok {
+        step.fail("failed");
+        let detail = err
+            .trim()
+            .lines()
+            .next()
+            .unwrap_or("helm exited nonzero with no message");
+        return Err(crate::exit::CliError::failure(format!(
+            "helm could not roll release '{}' back to revision {}: {detail}",
+            opts.common.release, choice.to_revision
+        ))
+        .with_fix(format!(
+            "inspect the release with `curie cluster status --release {} --namespace {}`",
+            opts.common.release, opts.common.namespace
+        ))
+        .into());
+    }
+    step.done("rolled back");
+
+    Ok(ClusterRollbackOutput::RolledBack {
+        from_revision: choice.from_revision,
+        to_revision: choice.to_revision,
+        skipped: choice.skipped,
+        forced: choice.forced,
+    })
 }
 
 /// Read a y/N confirmation from stderr/stdin for `down` when `--yes` is absent.

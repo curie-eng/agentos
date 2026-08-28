@@ -18,7 +18,7 @@ use curie::docker;
 use curie::github_app as crate_github_app;
 use curie::local::{self, LocalDownOpts, LocalOpts};
 use curie::message::{self, MessageOpts};
-use curie::ops::{self, CommonOpts, DownOpts, UpOpts};
+use curie::ops::{self, CommonOpts, DownOpts, RollbackOpts, UpOpts};
 use curie::secrets;
 use curie::state::{apply_continue, load_turn, CliTurnArgs, TurnVerb};
 use curie::ui::{self, ColorFlag, Ui};
@@ -1538,6 +1538,42 @@ enum ClusterAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Roll the release back to the newest revision that is actually known good.
+    ///
+    /// A bare `helm rollback` targets the immediately preceding revision. On a
+    /// cluster with no `runsc` RuntimeClass that is the wrong one: `cluster up`
+    /// records a FAILED revision before its successful gVisor-off retry, so the
+    /// history alternates failed/superseded and the preceding revision is a
+    /// failed one -- a manifest helm never finished applying.
+    ///
+    /// This verb skips every revision whose status is not `deployed` or
+    /// `superseded` and rolls back to the newest one below the current revision
+    /// that is, printing which revisions it passed over. See issue #1899.
+    Rollback {
+        /// Roll back to this exact revision instead of the newest safe one. A
+        /// revision that is not `deployed` or `superseded` is refused unless
+        /// --allow-failed-revision is also passed.
+        #[arg(long)]
+        revision: Option<u32>,
+        /// Permit --revision to name a revision helm never finished applying
+        /// (`failed`, `pending-*`, `uninstalling`). Off by default. Requires
+        /// --revision -- auto-select never chooses an ineligible revision, so
+        /// this flag alone would otherwise be a silent no-op.
+        #[arg(long, requires = "revision")]
+        allow_failed_revision: bool,
+        /// Kubernetes namespace.
+        #[arg(long, default_value = "curie")]
+        namespace: String,
+        /// Helm release name.
+        #[arg(long, default_value = "curie")]
+        release: String,
+        /// Skip the interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+        /// Print the commands that would run and exit without executing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Carry bundle objects across a chart upgrade that renames the object
     /// store (issue #1324).
     ///
@@ -2851,6 +2887,26 @@ async fn run(command: Option<Command>) -> Result<()> {
                         release,
                         dry_run,
                     },
+                    yes,
+                })
+                .await?,
+            ),
+            ClusterAction::Rollback {
+                revision,
+                allow_failed_revision,
+                namespace,
+                release,
+                yes,
+                dry_run,
+            } => emit(
+                ops::rollback(RollbackOpts {
+                    common: CommonOpts {
+                        namespace,
+                        release,
+                        dry_run,
+                    },
+                    revision,
+                    allow_failed_revision,
                     yes,
                 })
                 .await?,
