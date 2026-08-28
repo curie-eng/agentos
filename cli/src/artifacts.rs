@@ -92,7 +92,7 @@ pub fn resolve_compose(
         // ./compose, which is absent from a fetched copy), so there is nothing
         // safe to fall back to. Error instead of fetching a file that cannot run.
         Channel::Dev => Err(anyhow!(
-            "dev build with no local compose.dev.yaml in cwd; pass -f <compose> or use a released binary"
+            "dev build with no local compose.dev.yaml in cwd; pass -f <compose>, or use a released binary (which resolves the version-pinned release compose and so cannot serve --build)"
         )),
     }
 }
