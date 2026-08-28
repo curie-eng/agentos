@@ -30,7 +30,7 @@ the ordinary operating condition of a chat agent.
 The obvious mitigation is a permission gate: declare the mutating tools in
 `approval_required_tools` and let [ADR-0010](0010-approval-gates-and-human-in-the-loop.md)
 pause each call for a human. That machinery works and is already load-bearing
-elsewhere — `agents/revenue-leak-agentos` gates its triage writes exactly that
+elsewhere — the first adopting agent repo gates its triage writes exactly that
 way. It is not sufficient here, for a reason specific to *what* is being
 approved.
 
@@ -116,6 +116,12 @@ rendered before a rename cannot delete the renamed agent.
 Adding to either table is a code change under review.
 
 ### Screens, and why a button is the right primitive
+
+**Acceptance prerequisite.** Linked prototype #1935 proves the fleet API
+behavior only. Before this ADR is accepted or implemented, the trusted
+`ScreenOut` → channel adapter → authenticated operator click →
+`/fleet/screens/actions` round trip must be defined and demonstrated end to
+end. The model neither composes the screen nor handles the click.
 
 A chat agent that operates a platform through conversation alone has a specific
 failure: the model is the one resolving "roll it back" into an agent id and a
