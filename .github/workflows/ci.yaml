@@ -536,16 +536,24 @@ jobs:
           - name: sre-bot-tempo
             context: examples/sre-bot/connectors/tempo
             dockerfile: examples/sre-bot/connectors/tempo/Dockerfile
+            platforms: linux/amd64,linux/arm64
           - name: sre-bot-k8s-write
             context: examples/sre-bot/connectors/k8s-write
             dockerfile: examples/sre-bot/connectors/k8s-write/Dockerfile
+            platforms: linux/amd64,linux/arm64
           - name: sre-bot-k8s-scale
             context: examples/sre-bot/connectors/k8s-scale
             dockerfile: examples/sre-bot/connectors/k8s-scale/Dockerfile
+            platforms: linux/amd64,linux/arm64
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      # Only reached by the entries that ask for a foreign architecture; a
+      # native-only build does not need the emulator and does not pay for it.
+      - name: Set up QEMU
+        if: matrix.platforms
+        uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
       - name: Set up Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
       - name: Build (no push)
@@ -553,6 +561,12 @@ jobs:
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
+          # Empty for the platform images, which build for the runner's own
+          # architecture. The example connectors set both, because release.yaml
+          # publishes both and validating only amd64 leaves an arm64-only
+          # Dockerfile failure to appear for the first time during a release --
+          # failing the release rather than the pull request that caused it.
+          platforms: ${{ matrix.platforms }}
           push: false
           load: false
           cache-from: type=gha

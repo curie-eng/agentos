@@ -24,6 +24,11 @@ const REQUIRED_MIB: u64 = 1312;
 const TEMPO_TAGGED_IMAGE: &str = "ghcr.io/curie-eng/curie-sre-bot-tempo:0.8.0";
 const REGISTRY_INDEX: &str =
     r#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}"#;
+/// Mirrors `examples::RUNTIME_PLUGIN_WRITE_DESCRIPTION`. Duplicated deliberately:
+/// the constant is private to the CLI crate, and an integration test asserting the
+/// uploaded bundle should read the wire, not the producer's own constant.
+const RUNTIME_PLUGIN_WRITE_DESCRIPTION_TEXT: &str = "SRE triage assistant for plain English production health and Kubernetes questions in Slack. This installer deploys read only Kubernetes, Grafana, and Tempo connectors, plus one approval-gated Kubernetes restart tool scoped to the Deployments named at install time. Every restart requires a human approval; no other write verb is available.";
+
 const REGISTRY_INDEX_WITHOUT_REQUIRED_FIELDS: &str =
     r#"{"mediaType":"application/vnd.oci.image.index.v1+json"}"#;
 const AGENT_ID: &str = "00000000-0000-0000-0000-000000000001";
@@ -190,6 +195,31 @@ case " $* " in
                 ;;
             read-failure)
                 printf '%s\n' 'Error from server (Forbidden): secrets "sre-bot-reader-token" is forbidden' >&2
+                exit 1
+                ;;
+        esac
+        ;;
+    # The write identity is part of the DEFAULT install now, so the stub answers
+    # for it the way it does for the reader. Keyed on the same mode variable: the
+    # writer is only reached after the reader succeeds, so one switch still
+    # describes the whole token path.
+    *" wait "*" secret/sre-bot-writer-token "*)
+        case "$CURIE_TEST_READER_TOKEN_MODE" in
+            success|read-failure) exit 0 ;;
+            timeout)
+                printf '%s\n' 'error: timed out waiting for the condition' >&2
+                exit 1
+                ;;
+        esac
+        ;;
+    *" get secret sre-bot-writer-token "*)
+        case "$CURIE_TEST_READER_TOKEN_MODE" in
+            success)
+                printf '%s\n' '{"apiVersion":"v1","kind":"Secret","data":{"ca.crt":"Zml4dHVyZS1jYQ==","token":"eXl5eXl5eXl5eXl5"}}'
+                exit 0
+                ;;
+            read-failure)
+                printf '%s\n' 'Error from server (Forbidden): secrets "sre-bot-writer-token" is forbidden' >&2
                 exit 1
                 ;;
         esac
@@ -365,6 +395,20 @@ exit 64
                     status: 200,
                     content_type: "application/vnd.oci.image.index.v1+json".into(),
                     body: REGISTRY_INDEX_WITHOUT_REQUIRED_FIELDS.as_bytes().to_vec(),
+                };
+            }
+            // The gated write connector resolves its own digest the same way, so
+            // the mock answers for any published sre-bot connector rather than
+            // one hard-coded repository -- otherwise adding a connector silently
+            // turns these into "registry unreachable" tests.
+            if request.path.starts_with("/v2/curie-eng/curie-sre-bot-")
+                && request.path.contains("/manifests/")
+                && !request.path.contains("curie-sre-bot-tempo/manifests/0.8.0")
+            {
+                return Response {
+                    status: 200,
+                    content_type: "application/vnd.oci.image.index.v1+json".into(),
+                    body: REGISTRY_INDEX.as_bytes().to_vec(),
                 };
             }
             if request.path == "/v2/curie-eng/curie-sre-bot-tempo/manifests/0.8.0" {
@@ -1261,9 +1305,29 @@ fn successful_install_uploads_only_the_resolved_tempo_index_digest() {
         declaration["connectors"]["tempo"].get("build").is_none(),
         "the uploaded runtime declaration must not ask the cluster deploy path to build Tempo"
     );
+    // The default install now KEEPS the gated write connector (it is what the bot
+    // can be asked to do), and closes its ceiling instead of removing the tool.
+    // Same digest treatment as Tempo, for the same reason: a `build:` declaration
+    // records a local image id the cluster tier refuses.
+    let write = &declaration["connectors"]["k8s-write"];
     assert!(
-        declaration["connectors"].get("k8s-write").is_none(),
-        "the credential free installer must omit the gated write connector from its runtime bundle"
+        !write.is_null(),
+        "the default install must ship the gated write connector"
+    );
+    assert!(
+        write.get("build").is_none(),
+        "the uploaded declaration must not ask the cluster deploy path to build the write connector"
+    );
+    assert!(
+        write["image"]
+            .as_str()
+            .is_some_and(|image| image.contains("@sha256:")),
+        "the write connector must be pinned by digest, got {:?}",
+        write["image"]
+    );
+    assert_eq!(
+        write["env"]["K8S_WRITE_ALLOWLIST"], "",
+        "with no targets named the ceiling must be empty, so every call is refused"
     );
 
     let plugin: Value = serde_json::from_slice(&uploaded_bundle_file(
@@ -1271,14 +1335,21 @@ fn successful_install_uploads_only_the_resolved_tempo_index_digest() {
         ".claude-plugin/plugin.json",
     ))
     .expect("uploaded plugin manifest must remain valid JSON");
-    assert!(
-        plugin.get("approvalPolicy").is_none(),
-        "the runtime bundle must remove the write gate with its omitted connector"
-    );
+    // The gate ships WITH the connector: keeping the tool and dropping the gate is
+    // the pairing that produced an ungated write path downstream, so the two are
+    // decided together and neither can arrive alone.
+    let gates = plugin["approvalPolicy"]["gates"]
+        .as_array()
+        .expect("the default install must declare its write gate");
     assert_eq!(
-        plugin["description"],
-        "SRE triage assistant for plain English production health and Kubernetes questions in Slack. This installer deploys read only Kubernetes, Grafana, and Tempo connectors. It omits the source bundle's gated write connector and approval policy; enable that path only through the documented explicit build and deploy flow.",
-        "the runtime manifest must describe the installer bundle's read only surface"
+        gates.len(),
+        1,
+        "exactly the restart gate, and nothing that names an absent connector"
+    );
+    assert_eq!(gates[0]["gate"], "mcp__k8s-write__restart_deployment");
+    assert_eq!(
+        plugin["description"], RUNTIME_PLUGIN_WRITE_DESCRIPTION_TEXT,
+        "the runtime manifest must describe the surface it actually ships"
     );
 
     // GitHub documents anonymous public GHCR pulls, and the Distribution token
@@ -1286,27 +1357,46 @@ fn successful_install_uploads_only_the_resolved_tempo_index_digest() {
     // https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry
     // https://distribution.github.io/distribution/spec/auth/token/
     let registry = fixture.registry.recorded();
+    // Two connectors are resolved now -- Tempo and the gated write connector --
+    // and each costs a scoped token plus an index request.
     assert_eq!(
         registry.len(),
-        2,
-        "resolution must use token then index requests"
+        4,
+        "each resolved connector must use token then index requests"
     );
-    assert!(
-        registry[0].path.starts_with("/token?")
-            && registry[0]
+    // Asserted by repository rather than by position: the count alone would pass
+    // if one connector were resolved twice.
+    for repository in ["curie-sre-bot-tempo", "curie-sre-bot-k8s-write"] {
+        let scope = format!("repository%3Acurie-eng%2F{repository}%3Apull");
+        assert!(
+            registry
+                .iter()
+                .any(|request| request.path.starts_with("/token?")
+                    && request.path.contains(&scope)),
+            "{repository} must be resolved through its own scoped pull token"
+        );
+        assert!(
+            registry.iter().any(|request| request
                 .path
-                .contains("repository%3Acurie-eng%2Fcurie-sre-bot-tempo%3Apull")
-    );
-    assert_eq!(
-        registry[1].header("authorization"),
-        Some("Bearer anonymous-pull-token")
-    );
-    assert!(
-        registry[1]
-            .header("accept")
-            .is_some_and(|accept| accept.contains("application/vnd.oci.image.index.v1+json")),
-        "manifest request must require a multi-platform image index"
-    );
+                .starts_with(&format!("/v2/curie-eng/{repository}/manifests/"))),
+            "{repository} must be resolved to an index digest before any cluster mutation"
+        );
+    }
+    for request in registry
+        .iter()
+        .filter(|request| request.path.contains("/manifests/"))
+    {
+        assert_eq!(
+            request.header("authorization"),
+            Some("Bearer anonymous-pull-token")
+        );
+        assert!(
+            request
+                .header("accept")
+                .is_some_and(|accept| accept.contains("application/vnd.oci.image.index.v1+json")),
+            "manifest request must require a multi-platform image index"
+        );
+    }
 }
 
 #[test]

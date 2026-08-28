@@ -920,12 +920,16 @@ enum SreBotAction {
         /// Bind the installed bot to this Slack channel.
         #[arg(long, value_name = "CHANNEL")]
         slack_channel: Option<String>,
-        /// Keep the approval-gated restart tool, scoped to these Deployments
+        /// Scope the approval-gated restart tool to these Deployments
         /// (`namespace/name`, comma separated). One list renders BOTH ceilings:
         /// the Role's resourceNames and the connector's K8S_WRITE_ALLOWLIST.
-        /// Omit to install read only.
+        /// Omit and the connector is still installed, gated, with an empty
+        /// ceiling that refuses every call until targets are named.
         #[arg(long, value_name = "NS/NAME[,NS/NAME]")]
         write_allowlist: Option<String>,
+        /// Leave the gated write connector out of the install entirely.
+        #[arg(long)]
+        no_write: bool,
         /// Kubernetes namespace of the Curie release. Default: curie.
         #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
         namespace: String,
@@ -2714,6 +2718,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                             dry_run,
                             slack_channel,
                             write_allowlist,
+                            no_write,
                             namespace,
                             release,
                             observability_namespace,
@@ -2724,6 +2729,7 @@ async fn run(command: Option<Command>) -> Result<()> {
             dry_run,
             slack_channel,
             write_allowlist,
+            no_write,
             namespace,
             release,
             observability_namespace,

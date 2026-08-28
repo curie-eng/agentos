@@ -1,0 +1,95 @@
+# Notice when a newer version of this bundle exists in the repository.
+#
+#   kubectl -n <curie-namespace> create configmap sre-bot-self-upgrade \
+#     --from-file=redeploy.py=examples/sre-bot/self-upgrade/redeploy.py
+#   kubectl -n <curie-namespace> apply -f examples/sre-bot/self-upgrade/cronjob.yaml
+#
+# EDIT BEFORE APPLYING: the namespace on both objects, and `CURIE_API_URL`'s
+# service name if the release is not called `curie`.
+#
+# WHY A JOB AND NOT THE BOT. Creating an agent version needs the platform API
+# key, and every `/agents/**` route requires it. The sandbox holds a per-turn
+# `state`-scoped token and nothing else, deliberately. So the work sits outside
+# the sandbox, and the bot's own authority is unchanged by this file.
+#
+# WHY IT ONLY REPORTS. See redeploy.py's header: the bundle in the repository
+# declares `build:` for three connectors, and a cluster deploy is refused for an
+# image that exists only in a local Docker daemon. Deploying the repository copy
+# verbatim would create a version whose connectors cannot start -- a redeploy
+# that reports success and leaves the bot with no tools. The missing step is
+# digest resolution, which needs those connectors published first (curie#1945).
+#
+# THE TOKEN. `GITHUB_TOKEN` needs `contents: read` on the repository and nothing
+# else. Without it the job exits non-zero and says so: a job that cannot tell
+# whether it is behind must not report success, because a silent "nothing to do"
+# is indistinguishable from "up to date" and can stay that way for months.
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: sre-bot-self-upgrade
+  # CHANGE ME: the namespace the Curie release runs in.
+  namespace: curie
+spec:
+  # Hourly. The thing being watched moves on human timescales, and the GitHub
+  # API is rate limited per token, so a tighter schedule buys nothing.
+  schedule: "17 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            seccompProfile: { type: RuntimeDefault }
+          containers:
+            - name: check
+              # Any image with a python3 and no extra packages: the script is
+              # stdlib only, on purpose, so this needs no build of its own.
+              image: python:3.13-alpine
+              command: ["python3", "/opt/self-upgrade/redeploy.py"]
+              env:
+                - name: CURIE_API_URL
+                  # CHANGE ME with the release name if it is not `curie`.
+                  value: http://curie-api:8000
+                - name: CURIE_SELF_UPGRADE_REPO
+                  value: curie-eng/curie
+                - name: CURIE_SELF_UPGRADE_BRANCH
+                  value: main
+                - name: CURIE_SELF_UPGRADE_AGENT
+                  value: sre-bot
+                - name: CURIE_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      # The release's own Secret. CHANGE ME with the release name.
+                      name: curie-secrets
+                      key: apiKey
+                - name: GITHUB_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: curie-secrets
+                      key: githubToken
+                      # Optional so the job starts and reports the missing token
+                      # itself, rather than sitting in CreateContainerConfigError
+                      # where the cause is a pod event nobody is watching.
+                      optional: true
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: { drop: ["ALL"] }
+              resources:
+                requests: { cpu: 10m, memory: 64Mi }
+                limits: { cpu: 200m, memory: 128Mi }
+              volumeMounts:
+                - name: script
+                  mountPath: /opt/self-upgrade
+                  readOnly: true
+          volumes:
+            - name: script
+              configMap:
+                name: sre-bot-self-upgrade
