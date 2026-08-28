@@ -13,15 +13,15 @@ sync fixtures.
 from __future__ import annotations
 
 import contextlib
-import uuid
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from typing import Any
 
 import aiohttp
 import pytest
 import redis
-from aci_protocol import Final, OutboundEvent, SessionStatus
+from aci_protocol import Final, OutboundEvent, QueuedTurn, SessionStatus
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 from channel_protocol import OutboundMessage
@@ -44,9 +44,6 @@ from curie_test_support.valkey import (
 from curie_test_support.valkey import (
     VALKEY_PW as _VALKEY_PW,
 )
-from curie_test_support.valkey import (
-    connect_or_skip,
-)
 from curie_worker.approval_cards import ApprovalCardStore
 from curie_worker.config import WorkerConfig
 from curie_worker.kernel import Kernel
@@ -63,29 +60,10 @@ from curie_worker.sandbox.types import ClaimView, SandboxView
 from curie_worker.threadlock import ThreadLock
 from redis.asyncio import Redis as AsyncRedis
 
-
-@pytest.fixture
-def sync_redis() -> Iterator[redis.Redis]:
-    client = connect_or_skip(decode_responses=True)
-    yield client
-    client.close()
-
-
-@pytest.fixture
-def names(sync_redis: redis.Redis) -> Iterator[dict[str, str]]:
-    """Per-test-unique stream / group / key prefixes on the shared Valkey."""
-    token = uuid.uuid4().hex
-    ns = {
-        "stream": f"test:curie:runs:{token}",
-        "group": f"g-{token}",
-        "prefix": f"test:curie:worker:{token}",
-        "sandbox_prefix": f"test:curie:sandbox:{token}",
-    }
-    yield ns
-    for pat in (f"{ns['prefix']}*", f"{ns['sandbox_prefix']}*", ns["stream"]):
-        keys = list(sync_redis.scan_iter(match=pat))
-        if keys:
-            sync_redis.delete(*keys)
+# ``sync_redis`` and ``names`` (the per-test-unique stream / group / key
+# prefixes on the shared Valkey) live in ``tests/conftest.py``: they are used
+# here AND by ``tests/test_delivery_lease.py``, which drives the lease store
+# directly against the same real Valkey without a full kernel harness.
 
 
 def make_config(names: dict[str, str], **overrides: object) -> WorkerConfig:
@@ -490,6 +468,54 @@ class FakeRunner:
         if self.hold is not None:
             self.hold.set()  # type: ignore[attr-defined]
         return web.json_response({"ok": True})
+
+
+# --- Delivery-lease test helpers (ADR-0131, #1971) -----------------------------
+#
+# Shared by ``test_delivery_ownership.py`` and ``test_long_turn_evidence.py``,
+# which both drive real ``Consumer``/``Kernel`` pairs against the delivery
+# lease. Living here rather than duplicated in each file keeps them from
+# quietly diverging on the ``lease is None`` forwarding branch, which encodes
+# the kernel's optional-lease call contract: a signature change to
+# ``Kernel.process_event`` breaks both call sites identically.
+
+
+class _ProcessEventSpy:
+    """Wraps ``kernel.process_event``, recording each call and its lease.
+
+    The lease is what the whole feature threads through the sacred handler, so
+    recording it (rather than only counting calls) is what lets a test assert on
+    the generation and the inherited deadline the kernel actually received. The
+    ``lease is None`` branch forwards the ORIGINAL one-argument call so that,
+    before the feature lands, these tests fail on a missing lease rather than on
+    a ``TypeError`` from a keyword the signature does not have yet.
+    """
+
+    def __init__(self, kernel: Any) -> None:
+        self._inner = kernel.process_event
+        self.calls: list[tuple[str, Any]] = []
+        kernel.process_event = self
+
+    async def __call__(self, qevent: QueuedTurn, *, lease: Any = None) -> None:
+        self.calls.append((qevent.event_id, lease))
+        if lease is None:
+            await self._inner(qevent)
+        else:
+            await self._inner(qevent, lease=lease)
+
+    def leases_for(self, event_id: str) -> list[Any]:
+        return [lease for eid, lease in self.calls if eid == event_id]
+
+    def entries_for(self, event_id: str) -> int:
+        return sum(1 for eid, _ in self.calls if eid == event_id)
+
+
+async def _pending_rows(h: Any) -> dict[str, int]:
+    """Every pending entry id -> its current ``times_delivered``."""
+    rows = await h.async_redis.xpending_range(
+        h.config.stream, h.config.consumer_group, min="-", max="+", count=50
+    )
+    return {row["message_id"]: int(row["times_delivered"]) for row in rows}
 
 
 @dataclass

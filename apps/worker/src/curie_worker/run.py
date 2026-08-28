@@ -35,6 +35,7 @@ from .config import WorkerConfig
 from .connector_loop import ConnectorReconcileLoop, HttpManifestSource
 from .consumer import Consumer
 from .dead_letter_alert import install_dead_letter_alerting
+from .delivery_lease import DeliveryLeaseStore
 from .eval import EvalReporter, EvalStreamConsumer, LangfuseEvalRecorder
 from .heartbeat import run_heartbeat
 from .kernel import Kernel
@@ -387,7 +388,17 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
     )
     killswitch = KillSwitch(async_redis, on_kill=kernel.interrupt_agent)
     kernel.attach_killswitch(killswitch)
-    consumer = Consumer(redis=async_redis, kernel=kernel, config=config)
+    # Delivery ownership leases (ADR-0131), built from the CONCRETE async client
+    # for the same reason ``Markers`` above is: the fence needs Lua scripting and
+    # server ``TIME``, which the ``StreamBroker`` port deliberately does not
+    # carry. Each lane gets its own store bound to its own connection, so the
+    # eval lane's blocking read can never stall a runs-lane heartbeat.
+    consumer = Consumer(
+        redis=async_redis,
+        kernel=kernel,
+        config=config,
+        leases=DeliveryLeaseStore(async_redis, config),
+    )
 
     # The eval lane (F3): a second consumer group on curie:evals, on its own
     # Valkey connection so its blocking read never stalls the runs consumer. It
@@ -404,6 +415,7 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
     eval_consumer = EvalStreamConsumer(
         redis=eval_redis,
         config=config,
+        leases=DeliveryLeaseStore(eval_redis, config),
         bundle_store=BundleStore(config),
         substrate=substrate,
         reporter=EvalReporter(

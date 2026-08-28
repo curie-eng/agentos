@@ -352,6 +352,71 @@ worker claims runner containers on the same Docker daemon exactly as the
 compose-managed one would. For an offline round-trip, add `CURIE_FAKE_MODEL=1`
 to the env above and drop the credential.
 
+## Delivery ownership: one deadline, one fenced owner (ADR-0131)
+
+Owning a PEL row is necessary but not sufficient to execute or settle a
+delivery. Every `(stream, group, entry_id)` also carries an absolute Valkey-time
+deadline (created once, never restarted by a retry or a reclaim) and a short
+renewable lease holding an opaque owner token and a monotonically increasing
+fencing generation (`delivery_lease.py`, driven by the shared lifecycle in
+`stream_consumer.py` so the runs and eval lanes share one implementation). A
+heartbeat renews it; a renewal that Valkey cannot confirm fails **closed** —
+the owner is lease-lost, its runner is interrupted through the bounded control
+path, and it may no longer settle anything.
+
+### Capability audit: every owner verb and the fence that gates it
+
+One row per verb a delivery owner can perform that produces a durable or
+user-visible effect.
+
+| Verb | Where | What fences it |
+|---|---|---|
+| Execute or retry a turn | `kernel.py` (the attempt loop; `start_turn` / `steer`) | The lease is checked before every attempt, and attempts consume the one overall deadline. A loss mid-turn fires the base's lease-lost handler, which interrupts the live turn. |
+| Re-execute a *reclaimed* delivery | `kernel.py` reclaim preflight (generation > 1) | A side-effect marker forbids replay and escalates; a runner still reporting an active turn is interrupted and waited out; an unreadable runner fails closed. |
+| ACK (runs lane) | `consumer.py`, immediately before `XACK` | `lease.raise_if_lost()`. A refusal leaves the entry pending for the current owner. |
+| ACK (eval lane) | `eval/stream.py`, immediately before `XACK` | The same pre-ACK `raise_if_lost()`. |
+| ACK **via dead-letter**, handler path | `stream_consumer.py` `_dead_letter` → `_dead_letter_refusal` | Dead-letter is a terminal settlement (it ACKs, then deletes the lease and delivery state). A handler holds a registered lease, so the question is whether that lease is still ours. |
+| ACK **via dead-letter**, over-cap scan | `stream_consumer.py` `_dead_letter_over_cap` | A live-lease check runs *before* cap evaluation, so a healthy long turn cannot be dead-lettered, and `_dead_letter_refusal` re-reads the lease before writing. Both fail closed on an unreadable answer. |
+| Write the done marker + the completion-outbox record | `markers.py` `settle_fenced`, whose only caller is `kernel.py` `_complete` — the only `mark_done` call site | One Lua script verifies the lease token and the fencing generation and then performs the terminal write. A loser writes nothing and returns `None`. |
+| Emit the terminal reply (`turn.completed`) | `kernel.py` `_complete` → `_deliver_completion` | Only reachable past `settle_fenced`; the fenced-out owner returns having emitted nothing. |
+| Clear an outbox record | `markers.py` `clear_completion`, via `_deliver_completion` | The same fence, plus the record-generation compare-and-check, so a stale pass cannot delete a fresh record. |
+| Publish an eval report | `eval/stream.py` `_report` → `POST /evals/report` | The lease is resolved from the entry's stream id (never from a field that is `None` on the failure paths) and checked immediately before the send. A fenced lane whose lease cannot be resolved refuses to publish. |
+
+Stated plainly, as ADR-0131 requires: **a fenced-out owner is refused ACK,
+dead-letter, outbox clearing, and terminal emit** — and is refused starting a
+new attempt.
+
+Two verbs are **deliberately not lease-fenced**, and neither is an oversight:
+
+- **The side-effect marker** (`markers.mark_side_effect`, written from
+  `kernel.py` the instant a `side_effect_flag` is seen). A side effect that
+  happened must be recorded even by an owner that has since lost its fence. The
+  marker is itself a hard no-replay fence, and it is what stops the
+  *replacement* from re-running a non-idempotent action; fencing the write would
+  let a lost lease erase the evidence. This is the one place where fail-closed
+  means "write anyway".
+- **The completion-outbox sweeper** (`kernel.py` `sweep_pending_completions`).
+  The sweeper is not an owner: it drains records for entries that may already be
+  acked off the group, where no lease exists or ever will. Its guard is the
+  record's done flag plus the compare-and-checked `clear_completion`, not a
+  lease. Do not "complete the fence" by adding one here.
+
+### Adapter idempotency: which channel may claim one terminal effect
+
+Terminal transport is at-least-once; the completion outbox retries by stable
+`event_id`. Exactly-once therefore means **one user-visible terminal effect for
+that identifier, never one network send** — ADR-0131 states exactly-once network
+delivery is impossible, and nothing below claims it. An adapter may claim the
+property only when its receiving boundary applies `event_id` idempotently or the
+adapter mutates one stable target.
+
+| Adapter / path | Receiving boundary | Idempotent apply? | Claim |
+|---|---|---|---|
+| `SlackReplyAdapter` (`slack_sink.py`) | One Slack message: `chat.update` on the placeholder's stable `(channel, ts)`. `turn.completed` has no Slack expression and sends nothing, so an outbox retry is a no-op on this channel. | Yes — by **stable target**, not by `event_id`; Slack exposes no idempotency key. | One user-visible terminal effect per `event_id`. |
+| `SlackReplyAdapter`, placeholder-less turn (`reply_ref is None`, the ADR-0079 triggered turn) | `chat.postMessage` — a **create**, not a mutation, until the minted ts is adopted as the turn's ref. | No. | Explicitly at-least-once for that first post; the edits that follow it are covered by the row above. |
+| `HttpReplyAdapter` (`reply_sink.py`) | Whatever the binding's operator-controlled endpoint does with one POST. `turn.completed` carries `event_id` in the body, so the key is on the wire, but this repo cannot verify what the receiver does with it. | Unknown — receiver-owned, unverifiable from here. | **Explicitly at-least-once.** May not advertise exactly-once terminal effect. |
+| Eval report (`eval/stream.py` `_report` → `POST /evals/report`) | The platform API's report endpoint. `EvalReport` carries `repo_full_name`, `sha`, and counts — no idempotency key. | No. | **Explicitly at-least-once.** The pre-send lease check closes most of the window, not the send-then-lose-the-ack window; closing it needs eval-report idempotency at the platform API (follow-up F2). |
+
 ## The sandbox substrate (`curie_worker.sandbox`)
 
 The lifecycle seam between the worker kernel and kubernetes-sigs/agent-sandbox

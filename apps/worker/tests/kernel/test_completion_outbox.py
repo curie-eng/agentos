@@ -509,3 +509,212 @@ def test_an_escalated_turn_reports_the_escalated_outcome(make_harness) -> None:
             assert [c.outcome for c in h.sink.completions] == ["escalated"]
 
     asyncio.run(go())
+
+
+# --- R6 (ADR-0131): ONE user-visible terminal effect, and the fence that keeps
+# --- a stale owner from producing a second one -------------------------------
+#
+# The named idempotent receiving boundary, per ADR-0131's requirement that tests
+# and documentation NAME it before claiming exactly-once terminal effect: the
+# ``turn.completed`` event carries this turn's ``event_id``, and the recording
+# sink below is the stand-in for a receiving adapter that applies that id
+# idempotently (one message per event_id, edited in place). The ADR is explicit
+# that exactly-once TRANSPORT is impossible, so everything here asserts one
+# user-visible EFFECT at that boundary -- never one network send.
+
+_R6_LEASE_KNOBS: dict[str, object] = {
+    "delivery_budget_s": 60.0,
+    "delivery_lease_ttl_s": 1.0,
+    "delivery_lease_heartbeat_s": 0.3,
+    "runner_total_timeout_s": 30.0,
+}
+
+
+async def _dispatch_and_settle(consumer: Consumer, entry_id: str, fields: dict) -> None:
+    await consumer._dispatch(entry_id, fields)
+    await asyncio.gather(*list(consumer._inflight), return_exceptions=True)
+
+
+async def _read_one(h, consumer_name: str) -> tuple[str, dict]:
+    rows = await h.async_redis.xreadgroup(
+        h.config.consumer_group, consumer_name, {h.config.stream: ">"}, count=1
+    )
+    assert rows, "expected an entry to read"
+    entry_id, fields = rows[0][1][0]
+    return entry_id, dict(fields)
+
+
+def test_a_failed_terminal_send_recovers_to_exactly_one_user_visible_effect(
+    make_harness,
+) -> None:
+    """R6, the recovery half, driven through the fenced consumer.
+
+    Three deliveries of the SAME event id: the first turn's terminal send fails,
+    the second recovers it from the stored record, and the third adds nothing.
+    Exactly ONE ``turn.completed`` reaches the idempotent receiving boundary
+    across all three.
+
+    This also pins the settlement of the delivery state on BOTH terminal paths --
+    the successful ACK (C2) and the already-done skip (C11). Red on reverting
+    either ``settle`` call: a dead-lettered-and-redelivered event id then
+    accumulates delivery-state keys until their one-day retention TTL.
+
+    The negative control is the fourth delivery, of a DIFFERENT event id: it
+    still produces its own effect, so "no further effect" above is the
+    idempotency key doing its job and not a sink that stopped recording.
+    """
+    # Imported inside the test on purpose: ``delivery_lease`` does not exist
+    # until this ticket lands, and a module-level import would fail COLLECTION
+    # for this whole file, turning every unrelated test in it red.
+    from curie_worker.delivery_lease import DeliveryLeaseStore
+
+    async def go() -> None:
+        async with make_harness(
+            shimmer=False, completion_sweep_grace_s=0.0, **_R6_LEASE_KNOBS
+        ) as h:
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(
+                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
+            )
+            await consumer.ensure_group()
+            h.runner.default_script = [Final(text="answer", status=DONE)]
+
+            # Delivery 1: the terminal send fails. The turn IS complete; the
+            # completion is owed and durably recorded.
+            h.sink.fail_events = {"turn.completed"}
+            await h.async_redis.xadd(
+                h.config.stream, to_stream_fields(_qevent(thread="tR6", event_id="r6-1"))
+            )
+            entry_1, fields_1 = await _read_one(h, h.config.consumer_name)
+            await _dispatch_and_settle(consumer, entry_1, fields_1)
+
+            assert h.sink.completions == []
+            assert await h.async_redis.exists(h.config.completion_key("r6-1"))
+            assert await store.peek(h.config.stream, h.config.consumer_group, entry_1) == {}, (
+                "the delivery state outlived a terminal ACK"
+            )
+
+            # Delivery 2: the same event id under a new stream entry (a genuine
+            # redelivery). The already-done skip re-emits from the STORED record.
+            h.sink.fail_events = set()
+            await h.async_redis.xadd(
+                h.config.stream, to_stream_fields(_qevent(thread="tR6", event_id="r6-1"))
+            )
+            entry_2, fields_2 = await _read_one(h, h.config.consumer_name)
+            await _dispatch_and_settle(consumer, entry_2, fields_2)
+
+            assert [c.event_id for c in h.sink.completions] == ["r6-1"]
+            assert await store.peek(h.config.stream, h.config.consumer_group, entry_2) == {}, (
+                "the already-done skip left its delivery state behind"
+            )
+
+            # Delivery 3 adds nothing at the boundary, and neither does a sweep.
+            await h.async_redis.xadd(
+                h.config.stream, to_stream_fields(_qevent(thread="tR6", event_id="r6-1"))
+            )
+            entry_3, fields_3 = await _read_one(h, h.config.consumer_name)
+            await _dispatch_and_settle(consumer, entry_3, fields_3)
+            await h.kernel.sweep_pending_completions()
+            assert [c.event_id for c in h.sink.completions] == ["r6-1"]
+
+            # NEGATIVE CONTROL: a different event id still lands its own effect.
+            await h.async_redis.xadd(
+                h.config.stream, to_stream_fields(_qevent(thread="tR6", event_id="r6-2"))
+            )
+            entry_4, fields_4 = await _read_one(h, h.config.consumer_name)
+            await _dispatch_and_settle(consumer, entry_4, fields_4)
+            assert [c.event_id for c in h.sink.completions] == ["r6-1", "r6-2"]
+
+    asyncio.run(go())
+
+
+def test_a_stale_generation_owner_writes_no_marker_clears_nothing_and_emits_nothing(
+    make_harness,
+) -> None:
+    """R6, the stale-owner half, and AC4's four refused verbs at the settle point.
+
+    An owner holding generation N runs to a terminal outcome while the delivery
+    state already holds N+1 -- the "slow owner whose lease expired and was taken"
+    case. ``settle_fenced`` must refuse atomically: no done marker, no write to
+    (and no clear of) the outbox record another writer owns, and no terminal
+    emit. The refusal to ACK is pinned separately, in
+    ``tests/kernel/test_delivery_ownership.py``.
+
+    Red on reverting ``_complete``'s fenced settlement to the two-call
+    ``mark_completion_pending`` + ``mark_done`` pair: the loser then writes the
+    marker and emits, and the user sees the turn finish twice.
+
+    The positive control is the CURRENT owner running the identical path
+    immediately afterwards. Without it this test passes just as well if
+    ``settle_fenced`` refuses everybody.
+    """
+    # Imported inside the test on purpose: ``delivery_lease`` does not exist
+    # until this ticket lands, and a module-level import would fail COLLECTION
+    # for this whole file, turning every unrelated test in it red.
+    from curie_worker.delivery_lease import DeliveryLeaseStore
+
+    async def go() -> None:
+        async with make_harness(shimmer=False, **_R6_LEASE_KNOBS) as h:
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(
+                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
+            )
+            await consumer.ensure_group()
+            h.runner.default_script = [Final(text="answer", status=DONE)]
+
+            qe = _qevent(thread="tR6s", event_id="r6-stale")
+            await h.async_redis.xadd(h.config.stream, to_stream_fields(qe))
+            entry_id, _fields = await _read_one(h, h.config.consumer_name)
+
+            stale = await store.acquire(
+                h.config.stream,
+                h.config.consumer_group,
+                entry_id,
+                consumer=h.config.consumer_name,
+            )
+            assert (
+                await store.release(
+                    h.config.stream, h.config.consumer_group, entry_id, owner=stale.owner
+                )
+                is True
+            )
+            current = await store.acquire(
+                h.config.stream,
+                h.config.consumer_group,
+                entry_id,
+                consumer=h.config.consumer_name,
+            )
+            assert (stale.generation, current.generation) == (1, 2)
+
+            # An outbox record owned by another writer, deliberately NOT done so
+            # the already-done skip does not short-circuit the run under test.
+            await Markers(h.async_redis, h.config).mark_completion_pending(
+                "r6-stale", _record("r6-stale", thread="tR6s", done=False)
+            )
+            assert await h.async_redis.smembers(h.config.completions_pending_key()) == {
+                "r6-stale"
+            }
+
+            await h.kernel.process_event(qe, lease=stale)
+
+            assert h.sink.completions == [], "a fenced-out owner emitted a terminal result"
+            assert await h.async_redis.exists(h.config.done_key("r6-stale")) == 0, (
+                "a fenced-out owner wrote the done marker"
+            )
+            assert await h.async_redis.exists(h.config.completion_key("r6-stale")), (
+                "a fenced-out owner cleared an outbox record it does not own"
+            )
+            assert (
+                await h.async_redis.hget(h.config.completion_key("r6-stale"), "done") == "0"
+            ), "a fenced-out owner flagged another writer's record done"
+
+            # POSITIVE CONTROL: the current owner settles and emits, so the
+            # refusal above is the generation check and not a dead settle path.
+            await h.kernel.process_event(
+                _qevent(thread="tR6s", event_id="r6-stale"), lease=current
+            )
+            assert [c.event_id for c in h.sink.completions] == ["r6-stale"]
+            assert await h.async_redis.exists(h.config.done_key("r6-stale"))
+            assert await h.async_redis.exists(h.config.completion_key("r6-stale")) == 0
+
+    asyncio.run(go())

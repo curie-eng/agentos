@@ -256,6 +256,33 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # its own env to pick the active harness, unset selects the built-in
         # Claude. Not a boot contract key.
         "CURIE_HARNESS",
+        # Delivery budget and ownership lease (ADR-0131, #1971), read from the
+        # WORKER's env by WorkerConfig. Never a sandbox boot key: they govern
+        # how the worker paces and reclaims its own delivery loop, not
+        # anything injected into a runner claim.
+        # - CURIE_DELIVERY_BUDGET_S: the overall wall-clock deadline for one
+        #   delivery (claim, every runner request, retries, reclaim, cleanup).
+        # - CURIE_DELIVERY_LEASE_TTL_S: how long the fenced ownership lease on
+        #   an in-flight delivery is valid before it is reclaimable.
+        # - CURIE_DELIVERY_LEASE_HEARTBEAT_S: how often the owner renews that
+        #   lease while the delivery is still healthy.
+        # - CURIE_DELIVERY_SHUTDOWN_RESERVE_S: time reserved near the budget's
+        #   end for terminal cleanup instead of another runner attempt.
+        # - CURIE_RECLAIM_INTERVAL_S: the maintenance-tick cadence that scans
+        #   for expired leases to reclaim; same reclaim family as
+        #   CURIE_RECLAIM_MIN_IDLE_MS in the code above, worker-side policy
+        #   decided before any sandbox exists.
+        "CURIE_DELIVERY_BUDGET_S",
+        "CURIE_DELIVERY_LEASE_TTL_S",
+        "CURIE_DELIVERY_LEASE_HEARTBEAT_S",
+        "CURIE_DELIVERY_SHUTDOWN_RESERVE_S",
+        "CURIE_RECLAIM_INTERVAL_S",
+        # The platform's voluntary termination grace (ADR-0131, #1971),
+        # injected by the chart from the SAME value it renders onto the Pod's
+        # ``terminationGracePeriodSeconds`` so the worker's own shutdown
+        # validator and the platform can never drift apart. Read from the
+        # WORKER's env by WorkerConfig; the sandbox never sees it.
+        "CURIE_TERMINATION_GRACE_PERIOD_S",
     }
 )
 

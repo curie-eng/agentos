@@ -53,7 +53,8 @@ from opentelemetry.trace import SpanKind, StatusCode
 from redis.asyncio import Redis
 
 from .config import WorkerConfig
-from .kernel import Kernel
+from .delivery_lease import DeliveryLeaseStore, LeaseLostError
+from .kernel import Kernel, _thread_key_for
 from .stream_consumer import DeliverySpec, ReadLoopSpec, StreamConsumer
 
 logger = logging.getLogger(__name__)
@@ -117,8 +118,17 @@ class Consumer(StreamConsumer):
         kernel: Kernel,
         config: WorkerConfig,
         max_concurrency: int = 16,
+        leases: DeliveryLeaseStore | None = None,
     ) -> None:
-        super().__init__(redis)
+        # The delivery-ownership fence (ADR-0131) lives entirely in the shared
+        # base: acquisition, the background heartbeat, release, and the reclaim
+        # liveness guards. This lane supplies only the store and the lane-specific
+        # way to stop a runner when the fence moves, so runs and evals share one
+        # implementation by construction. ``leases=None`` keeps every pre-ADR-0131
+        # construction (and the tests that use it) behaving exactly as before.
+        super().__init__(
+            redis, leases=leases, on_lease_lost=self._interrupt_on_lease_lost
+        )
         # The base class narrows self._redis to the StreamBroker port (stream
         # verbs only, by design -- a second broker implementation need not
         # support anything else). The thread-reset drain (#713) needs a plain
@@ -251,92 +261,148 @@ class Consumer(StreamConsumer):
                     span.add_event("trace.context.malformed", {"outcome": "failure"})
                 elif TRACEPARENT_STREAM_FIELD not in fields:
                     span.add_event("trace.context.missing", {"outcome": "success"})
-                try:
-                    qevent = from_stream_fields(fields)
-                except Exception as exc:
-                    if hasattr(span, "set_status"):
-                        span.set_status(StatusCode.ERROR)
-                    span.add_event(
-                        "queue.message.unparseable",
-                        {"outcome": "failure", "error.class": type(exc).__name__},
-                    )
-                    record_metric(
-                        "curie.queue.process",
-                        attributes={**metric_attributes, "outcome": "failure"},
-                    )
-                    logger.exception("unparseable stream entry %s; dead-lettering", entry_id)
-                    await self._dead_letter(
-                        entry_id,
-                        fields,
-                        reason="unparseable",
-                        delivery_count=await self._pending_delivery_count(entry_id),
-                    )
-                    return
 
-                age = self._message_age_seconds(qevent.received_at)
-                for name in (
-                    "curie.queue.wait.duration",
-                    "curie.queue.message.age",
-                ):
+                # ADR-0131: hold delivery AUTHORITY for the whole body. Owning
+                # the PEL row is necessary but not sufficient -- a peer replica
+                # that took the row (a reclaim, an XAUTOCLAIM) is refused here
+                # rather than allowed to run the same turn a second time. The
+                # lifecycle (acquire, background heartbeat, release) lives in the
+                # shared base so this lane and the eval lane cannot diverge.
+                async with self._delivery_lease(entry_id, fields) as lease:
+                    if lease is None:
+                        # Another owner holds it. Return WITHOUT acking: the
+                        # entry stays pending for whoever legitimately owns it.
+                        # A refusal is a normal early return, never an exception
+                        # -- an exception here would be caught by ``_consume``'s
+                        # isolation guard and logged as a failure, which is a
+                        # stack trace per entry for the routine case of losing a
+                        # race.
+                        return
+                    try:
+                        qevent = from_stream_fields(fields)
+                    except Exception as exc:
+                        if hasattr(span, "set_status"):
+                            span.set_status(StatusCode.ERROR)
+                        span.add_event(
+                            "queue.message.unparseable",
+                            {"outcome": "failure", "error.class": type(exc).__name__},
+                        )
+                        record_metric(
+                            "curie.queue.process",
+                            attributes={**metric_attributes, "outcome": "failure"},
+                        )
+                        logger.exception("unparseable stream entry %s; dead-lettering", entry_id)
+                        await self._dead_letter(
+                            entry_id,
+                            fields,
+                            reason="unparseable",
+                            delivery_count=await self._pending_delivery_count(entry_id),
+                        )
+                        return
+
+                    age = self._message_age_seconds(qevent.received_at)
+                    for name in (
+                        "curie.queue.wait.duration",
+                        "curie.queue.message.age",
+                    ):
+                        record_metric(
+                            name,
+                            age,
+                            attributes={**metric_attributes, "outcome": "success"},
+                        )
                     record_metric(
-                        name,
-                        age,
-                        attributes={**metric_attributes, "outcome": "success"},
+                        "curie.turn.accepted",
+                        attributes={
+                            "service.name": "curie-worker",
+                            "source": "worker",
+                            "outcome": "accepted",
+                        },
                     )
-                record_metric(
-                    "curie.turn.accepted",
-                    attributes={
-                        "service.name": "curie-worker",
-                        "source": "worker",
-                        "outcome": "accepted",
-                    },
-                )
-                # Eval (and operator reset-thread) SADDs onto THREAD_RESET_SET
-                # when a sandbox should be released. Drain those before this
-                # turn claims so a following eval case or cluster message does
-                # not wait for the maintenance tick with quota already full.
-                # A failed drain must not fail the turn; the next handle or
-                # maintenance tick retries the remaining requests (#1534).
-                try:
-                    if await self._valkey.scard(THREAD_RESET_SET):
-                        await self._drain_thread_reset_requests()
-                except Exception:
-                    logger.exception(
-                        "thread-reset drain before turn %s failed; continuing",
-                        entry_id,
-                    )
-                try:
-                    await self._kernel.process_event(qevent)
-                except Exception as exc:
-                    # Leave the entry pending: XAUTOCLAIM will reclaim and retry.
-                    if hasattr(span, "set_status"):
-                        span.set_status(StatusCode.ERROR)
-                    span.add_event(
-                        "queue.processing.failed",
-                        {"outcome": "failure", "error.class": type(exc).__name__},
-                    )
+                    # Eval (and operator reset-thread) SADDs onto THREAD_RESET_SET
+                    # when a sandbox should be released. Drain those before this
+                    # turn claims so a following eval case or cluster message does
+                    # not wait for the maintenance tick with quota already full.
+                    # A failed drain must not fail the turn; the next handle or
+                    # maintenance tick retries the remaining requests (#1534).
+                    try:
+                        if await self._valkey.scard(THREAD_RESET_SET):
+                            await self._drain_thread_reset_requests()
+                    except Exception:
+                        logger.exception(
+                            "thread-reset drain before turn %s failed; continuing",
+                            entry_id,
+                        )
+                    try:
+                        if self._leases is None:
+                            # No fence configured: call the kernel EXACTLY as it
+                            # was called before ADR-0131. The base yields a
+                            # permissive sentinel so this handler body stays
+                            # uniform, but forwarding that sentinel would claim
+                            # an authority nobody holds -- and ``process_event``
+                            # keeps its lease optional for precisely this caller.
+                            await self._kernel.process_event(qevent)
+                        else:
+                            await self._kernel.process_event(qevent, lease=lease)
+                    except Exception as exc:
+                        # Leave the entry pending: XAUTOCLAIM will reclaim and retry.
+                        if hasattr(span, "set_status"):
+                            span.set_status(StatusCode.ERROR)
+                        span.add_event(
+                            "queue.processing.failed",
+                            {"outcome": "failure", "error.class": type(exc).__name__},
+                        )
+                        record_metric(
+                            "curie.queue.process",
+                            attributes={**metric_attributes, "outcome": "failure"},
+                        )
+                        record_metric(
+                            "curie.queue.settle",
+                            attributes={**metric_attributes, "outcome": "pending"},
+                        )
+                        logger.exception("processing failed for entry %s; left pending", entry_id)
+                        return
+                    try:
+                        # A stale owner may not ACK. Checked immediately before
+                        # the ack, because the fence can move at any point during
+                        # a long turn and the ack is the irreversible one: it
+                        # takes the entry off the group, out from under the
+                        # replacement that now owns it.
+                        lease.raise_if_lost()
+                    except LeaseLostError:
+                        logger.warning(
+                            "refusing to ack entry %s: this owner lost the delivery "
+                            "lease mid-turn; leaving it pending for the current owner",
+                            entry_id,
+                        )
+                        record_metric(
+                            "curie.queue.process",
+                            attributes={**metric_attributes, "outcome": "failure"},
+                        )
+                        record_metric(
+                            "curie.queue.settle",
+                            attributes={**metric_attributes, "outcome": "pending"},
+                        )
+                        return
+                    await self._ack(entry_id)
+                    # Terminal acknowledgement: remove the delivery state as well
+                    # as the lease (the base's release drops only the lease). The
+                    # state's one-day retention is the backstop for a crash
+                    # between the ack and here, not the normal way it goes away --
+                    # without this a dead-lettered-and-redelivered event id
+                    # accumulates state keys until that TTL. Best-effort: the ack
+                    # above already happened.
+                    await self._settle_delivery_best_effort(entry_id)
+                    process_outcome = "success"
+                    span.add_event("queue.message.acked", {"outcome": "ack"})
                     record_metric(
                         "curie.queue.process",
-                        attributes={**metric_attributes, "outcome": "failure"},
+                        attributes={**metric_attributes, "outcome": "success"},
                     )
                     record_metric(
                         "curie.queue.settle",
-                        attributes={**metric_attributes, "outcome": "pending"},
+                        attributes={**metric_attributes, "outcome": "ack"},
                     )
-                    logger.exception("processing failed for entry %s; left pending", entry_id)
                     return
-                await self._ack(entry_id)
-                process_outcome = "success"
-                span.add_event("queue.message.acked", {"outcome": "ack"})
-                record_metric(
-                    "curie.queue.process",
-                    attributes={**metric_attributes, "outcome": "success"},
-                )
-                record_metric(
-                    "curie.queue.settle",
-                    attributes={**metric_attributes, "outcome": "ack"},
-                )
-                return
         finally:
             record_metric(
                 "curie.queue.process.duration",
@@ -345,6 +411,33 @@ class Consumer(StreamConsumer):
             )
             self._inflight_ids.discard(entry_id)
             self._sem.release()
+
+    async def _interrupt_on_lease_lost(self, entry_id: str, fields: dict[str, str]) -> None:
+        """Stop the live runner for a delivery whose fence has moved (ADR-0131).
+
+        Wired as the base's ``on_lease_lost``. It uses ``interrupt_thread`` --
+        the EXISTING bounded control path -- and nothing else. Cancelling the
+        handler task instead would look tidier and be wrong: a bare cancel skips
+        the runner-side stop and leaves a turn producing effects on a sandbox
+        this process no longer owns, which is exactly what the replacement's
+        reclaim preflight then has to clean up.
+
+        Every failure is logged and swallowed. Failing to interrupt must not mask
+        the lease loss itself, which ``lease.lost`` has already recorded and which
+        the pre-ack fence enforces on its own; and the replacement's preflight is
+        the second, independent guard against a turn that keeps running here.
+        """
+        try:
+            qevent = from_stream_fields(fields)
+            await self._kernel.interrupt_thread(
+                _thread_key_for(qevent), "delivery lease lost"
+            )
+        except Exception:
+            logger.exception(
+                "could not interrupt the runner for entry %s after its delivery "
+                "lease was lost; the fence still refuses every terminal write",
+                entry_id,
+            )
 
     @staticmethod
     def _message_age_seconds(received_at: str) -> float:
