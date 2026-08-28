@@ -179,8 +179,11 @@ Rules (detailed-architecture 2b), each with an integration test that provokes it
   instead of retrying. The flag is persisted to Valkey the instant it is seen, so
   a worker crash mid-side-effect still escalates on reclaim rather than re-running
   a non-idempotent action. Flag-clean failures retry by classification:
-  `rate-limit` and `runner-error` are transient (bounded exponential backoff);
-  `budget-exceeded` and everything else escalate.
+  `rate-limit`, `runner-error` and `runner-timeout` are transient (bounded
+  exponential backoff); `budget-exceeded` and everything else escalate.
+  `runner-timeout` is the runner's streaming budget expiring mid-turn (#2011),
+  told apart from `runner-error` -- the sandbox or the transport dying -- so an
+  operator can see which one happened.
 - **Idempotency + crash recovery.** The Slack event id gates a `done` marker, so
   a redelivered or reclaimed entry that already finished is skipped.
   `XAUTOCLAIM` reclaims entries a dead consumer took but never acked and

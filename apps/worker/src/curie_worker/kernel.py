@@ -14,8 +14,8 @@ Rules implemented here (detailed-architecture section 2b):
 5. No auto-retry after side effects. A failed run that emitted ``side_effect_flag``
    escalates to a human instead of retrying; the flag is persisted the instant it
    is seen so a crash mid-side-effect still escalates on reclaim. Flag-clean
-   failures retry by error classification (rate-limit / runner-error are
-   transient; budget-exceeded and everything else escalate).
+   failures retry by error classification (rate-limit / runner-error /
+   runner-timeout are transient; budget-exceeded and everything else escalate).
 
 Idempotency: the Slack event id gates a ``done`` marker so a redelivered or
 reclaimed event that already finished is skipped.
@@ -101,6 +101,7 @@ from .reply_sink import ObservedReplySink, ReplySink, TargetRoute
 from .runner_client import (
     RunnerClient,
     RunnerError,
+    RunnerStreamTimeout,
     RunnerWorkspaceSnapshot,
     TurnStream,
 )
@@ -274,9 +275,30 @@ def _nav_affordance(nav: NavPack | None) -> NavAffordance | None:
     return NavAffordance(label=nav.hub_label, command=nav.hub_command)
 
 
+def _exception_reason(exc: BaseException) -> str:
+    """A never-empty operator-facing reason for a caught exception (#2011).
+
+    ``str(TimeoutError())`` is the empty string, so logging a caught exception
+    directly can print nothing at all where the reason belongs. Prefer the
+    class name plus the message, and fall back to the class name alone when the
+    exception carries no message.
+    """
+    text = str(exc).strip()
+    if text:
+        return f"{type(exc).__name__}: {text}"
+    return type(exc).__name__
+
+
 # Failure classifications that are worth retrying (transient). Everything else
 # (budget-exceeded, model/server errors) escalates rather than looping.
-RETRYABLE_CLASSIFICATIONS = frozenset({"rate-limit", "runner-error"})
+# ``runner-timeout`` (#2011) is the streaming budget expiring mid-turn. It is
+# named separately from ``runner-error`` so an operator can tell "the model ran
+# past the budget" from "the sandbox died", but it stays HERE because retry
+# semantics are unchanged by that naming: a flag-clean timeout was transient
+# before it had a name and still is. The side-effect check in ``_attempt`` runs
+# BEFORE retryability is consulted (ADR-0013), so a timeout that arrives after a
+# side-effect frame still escalates and is never retried.
+RETRYABLE_CLASSIFICATIONS = frozenset({"rate-limit", "runner-error", "runner-timeout"})
 
 # The floor of remaining DELIVERY budget below which a fresh attempt is not
 # started (ADR-0131). The runner cannot claim a sandbox, open a turn and stream a
@@ -3170,12 +3192,40 @@ class Kernel:
                     if isinstance(frame, Final):
                         break
         except (aiohttp.ClientError, TimeoutError) as exc:
-            # Stream dropped mid-run (sandbox killed, network fault). No final.
-            logger.warning("turn stream dropped for %s: %s", qevent.event_id, exc)
+            # Stream dropped mid-run (sandbox killed, network fault, or the
+            # client's streaming budget expiring). No final.
+            #
+            # #2011: both halves of this used to lose information. ``str()`` of a
+            # bare TimeoutError is the EMPTY STRING, so the operator log read
+            # "turn stream dropped for <id>: " with nothing after the colon; and
+            # a timeout collapsed into the same "runner-error" a killed sandbox
+            # produces. ``_exception_reason`` guarantees a non-empty reason for
+            # EVERY exception this clause catches, and a runner timeout gets its
+            # own classification. An ErrorEvent-supplied ``acc.classification``
+            # still wins: the runner's own account of why the turn failed
+            # outranks the transport symptom the worker observed.
+            #
+            # The classification test is the CONCRETE ``RunnerStreamTimeout``,
+            # never the ``TimeoutError`` base class: this clause spans frame
+            # application, and ``_apply_frame`` delivers the reply, whose HTTP
+            # adapter has its own 30s budget. A stalled reply endpoint raises a
+            # plain ``TimeoutError`` while the runner was answering normally, so
+            # it is not a runner timeout and must not borrow the name -- it
+            # falls back to "runner-error". ``TurnStream.__aiter__`` converts
+            # every stream-budget expiry into ``RunnerStreamTimeout``, so a
+            # genuine runner timeout still lands here as "runner-timeout".
+            logger.warning(
+                "turn stream dropped for %s: %s",
+                qevent.event_id,
+                _exception_reason(exc),
+            )
+            classification = acc.classification or (
+                "runner-timeout" if isinstance(exc, RunnerStreamTimeout) else "runner-error"
+            )
             return TurnOutcome(
                 terminal_ok=False,
                 saw_side_effect=acc.saw_side_effect,
-                classification=acc.classification or "runner-error",
+                classification=classification,
                 text=acc.rendered(),
             )
         except ActionBackendError as exc:

@@ -2164,3 +2164,211 @@ def test_an_unreadable_runner_fails_closed_and_leaves_a_reclaimed_delivery_pendi
             assert summary["pending"] == 0
 
     asyncio.run(go())
+
+
+# --- The streaming budget expiring is its OWN failure, not a generic one (#2011)
+# When aiohttp's total/sock_read budget expires mid-stream the kernel used to
+# see a BARE ``TimeoutError`` whose ``str()`` is the empty string: the operator
+# log read "turn stream dropped for <id>: " with nothing after the colon, and
+# the outcome collapsed into the same "runner-error" a killed sandbox or a
+# broken socket produces. A timeout is a distinct, actionable condition (the
+# model ran past the budget) and must classify and log as one.
+
+
+def test_stream_timeout_classifies_as_runner_timeout_with_a_named_reason(
+    make_harness, caplog
+) -> None:
+    """#2011: a mid-stream timeout is classified ``runner-timeout`` and logged
+    with a NON-EMPTY reason.
+
+    The runner streams a side-effect frame and then hangs without a ``Final``,
+    so the client's short total budget expires while the kernel is iterating.
+    Today the outcome comes back as the generic ``runner-error`` and the warning
+    ends at a bare colon, which is exactly the pair this pins."""
+
+    async def go() -> None:
+        async with make_harness(runner_total_timeout_s=0.5) as h:
+            hold = asyncio.Event()  # never set: the response hangs open
+            h.runner.hold = hold
+            h.runner.default_script = [SideEffectFlag(tool="deploy")]
+            released: list[bool] = []
+
+            def release_order() -> None:
+                released.append(True)
+
+            qe = _qevent("go", thread="tStreamTimeout")
+            try:
+                with caplog.at_level(logging.WARNING, logger="curie_worker.kernel"):
+                    outcome = await h.kernel._attempt(qe, TargetRoute(), release_order)
+            finally:
+                hold.set()  # let the fake runner's handler unwind
+
+            assert outcome.terminal_ok is False
+            assert outcome.classification == "runner-timeout"
+            assert outcome.saw_side_effect is True
+            assert released, "the order lock was not released on the timed-out turn"
+
+            dropped = [
+                r.getMessage()
+                for r in caplog.records
+                if "turn stream dropped" in r.getMessage()
+            ]
+            assert dropped, caplog.text
+            message = dropped[-1]
+            # "turn stream dropped for <event_id>: <reason>" -- the reason is what
+            # #2011 lost. A bare TimeoutError stringifies to "", so today this is
+            # the empty tail the operator sees.
+            reason = message.rsplit(":", 1)[1].strip()
+            assert reason, f"the drop reason is empty: {message!r}"
+            assert "Timeout" in message, message
+
+    asyncio.run(go())
+
+
+def test_stream_timeout_after_a_side_effect_escalates_without_retry(make_harness) -> None:
+    """#2011 x rule 4: a timeout that arrives after a side-effect frame is
+    escalated to a human, never retried, and the escalation names the new
+    ``runner-timeout`` classification rather than the generic runner-error.
+
+    Same shape as test_side_effect_failure_escalates_without_retry, but the
+    failure is the streaming budget expiring instead of an ErrorEvent."""
+
+    async def go() -> None:
+        async with make_harness(runner_total_timeout_s=0.5, max_attempts=3) as h:
+            hold = asyncio.Event()
+            h.runner.hold = hold
+            h.runner.default_script = [SideEffectFlag(tool="deploy")]
+            ev = _qevent("do it", thread="tTimeoutSideEffect")
+            try:
+                await h.kernel.process_event(ev)
+            finally:
+                hold.set()
+
+            assert h.runner.opened == ["do it"]  # exactly one attempt, no retry
+            assert h.sink.last_text is not None
+            assert "human" in h.sink.last_text.lower()
+            assert "runner-timeout" in h.sink.last_text
+            assert await h.async_redis.exists(h.config.side_effect_key(ev.event_id))
+            assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+
+    asyncio.run(go())
+
+
+def test_stream_timeout_without_a_side_effect_still_retries(make_harness, monkeypatch) -> None:
+    """#2011, the negative path: naming the timeout must not change retry
+    semantics. A flag-clean timeout is still transient, so ``runner-timeout``
+    belongs in RETRYABLE_CLASSIFICATIONS and in the ``retry_class`` metric
+    allowlist -- ``record_metric`` RAISES on an out-of-domain attribute value,
+    so the real (un-probed) telemetry here is what catches a missing entry.
+
+    Attempt 1 streams a delta and then hangs until the client's budget expires;
+    the hold is released while the kernel backs off, so attempt 2 finds an idle
+    runner (a 409 on the steer probe) and opens a fresh turn that completes.
+
+    Two independent things make the runner idle again before attempt 2 probes
+    it -- the client's disconnect cancels the hanging handler, and the releaser
+    below sets ``hold`` just past the budget -- and ``FakeRunner._event`` now
+    clears ``turn_active`` on both paths. That matters because /v1/steer answers
+    200 while a turn is still marked live: a runner left wrongly busy would have
+    the retry folded into the dead turn as a STEER instead of opening a second
+    one, which is what ``steers == []`` below guards."""
+
+    real_record_metric = kernel_module.record_metric
+    recorded: list[tuple[str, dict[str, str]]] = []
+
+    def spy(name: str, value: float = 1, *, attributes: dict[str, str] | None = None) -> None:
+        recorded.append((name, dict(attributes or {})))
+        # Delegate to the real recorder so the metric allowlist still validates.
+        real_record_metric(name, value, attributes=attributes)
+
+    monkeypatch.setattr(kernel_module, "record_metric", spy)
+
+    async def go() -> None:
+        async with make_harness(
+            runner_total_timeout_s=0.5,
+            max_attempts=3,
+            retry_backoff_base_s=0.5,
+            retry_backoff_max_s=0.6,
+        ) as h:
+            hold = asyncio.Event()
+            h.runner.hold = hold
+            h.runner.turn_scripts = [
+                [TextDelta(text="partial")],
+                [Final(text="recovered", status=DONE)],
+            ]
+
+            async def release_after_the_budget_expires() -> None:
+                # The turn is open; the client gives up 0.5s later and the kernel
+                # then backs off 0.5s before attempt 2 probes the runner. Release
+                # just past the client's budget so a handler that was not already
+                # cancelled by the disconnect unwinds inside that window; either
+                # way the probe finds an idle session (409 on the steer) and a
+                # NEW turn is opened.
+                await _wait_until(lambda: len(h.runner.opened) >= 1)
+                await asyncio.sleep(0.6)
+                hold.set()
+
+            releasing = asyncio.create_task(release_after_the_budget_expires())
+            ev = _qevent("go", thread="tTimeoutRetry")
+            try:
+                await h.kernel.process_event(ev)
+            finally:
+                hold.set()
+                await releasing
+
+            # Asserted FIRST: this is the #2011 property. Leaving it behind the
+            # shape assertions would let a harness-timing slip surface instead of
+            # the classification the test exists to pin.
+            retries = [attrs for name, attrs in recorded if name == "curie.queue.retry"]
+            assert retries, recorded
+            assert retries[-1]["retry_class"] == "runner-timeout"
+
+            assert h.runner.opened == ["go", "go"]  # timed out, then retried
+            assert h.runner.steers == []  # the retry opened a turn, it did not steer
+            assert h.sink.last_text == "recovered"
+            assert not await h.async_redis.exists(h.config.side_effect_key(ev.event_id))
+
+    asyncio.run(go())
+
+
+def test_reply_delivery_timeout_is_not_a_runner_timeout(make_harness, caplog, monkeypatch) -> None:
+    """#2011, the boundary: only a RUNNER timeout may claim ``runner-timeout``.
+
+    The `except (aiohttp.ClientError, TimeoutError)` clause in `_consume` spans
+    frame application, and delivering a reply has its own HTTP budget
+    (`HttpReplyAdapter` builds a 30s `ClientTimeout`). So a stalled reply
+    endpoint raises a bare `TimeoutError` while the runner was answering
+    perfectly well -- classifying that as ``runner-timeout`` would point an
+    operator at the model budget for a delivery fault. It must stay
+    ``runner-error``, while still logging a NON-EMPTY reason like every other
+    exception this clause catches."""
+
+    async def go() -> None:
+        async with make_harness() as h:
+            h.runner.default_script = [TextDelta(text="partial")]
+
+            async def stalled_delivery(*_args: object, **_kwargs: object) -> None:
+                # Not a RunnerStreamTimeout: this is what aiohttp raises when the
+                # reply endpoint stops answering mid-turn.
+                raise TimeoutError()
+
+            monkeypatch.setattr(h.kernel, "_apply_frame", stalled_delivery)
+
+            qe = _qevent("go", thread="tReplyTimeout")
+            with caplog.at_level(logging.WARNING, logger="curie_worker.kernel"):
+                outcome = await h.kernel._attempt(qe, TargetRoute(), lambda: None)
+
+            assert outcome.terminal_ok is False
+            assert outcome.classification == "runner-error"
+
+            dropped = [
+                r.getMessage()
+                for r in caplog.records
+                if "turn stream dropped" in r.getMessage()
+            ]
+            assert dropped, caplog.text
+            message = dropped[-1]
+            reason = message.rsplit(":", 1)[1].strip()
+            assert reason, f"the drop reason is empty: {message!r}"
+
+    asyncio.run(go())

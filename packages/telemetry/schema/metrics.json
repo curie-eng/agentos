@@ -194,10 +194,11 @@
         "retry_class": [
           "redelivery",
           "rate-limit",
-          "runner-error"
+          "runner-error",
+          "runner-timeout"
         ]
       },
-      "cardinality_bound": 6
+      "cardinality_bound": 8
     },
     "curie.queue.dead_letter": {
       "type": "counter",

@@ -66,7 +66,12 @@ _QUEUE_ATTRIBUTES = {
 _QUEUE_RETRY_ATTRIBUTES = {
     "service.name": ["curie-worker"],
     "source": ["worker", "eval"],
-    "retry_class": ["redelivery", "rate-limit", "runner-error"],
+    # "runner-timeout" (#2011): the runner streaming budget expiring is its own
+    # retry cause, distinct from the generic "runner-error". It MUST be declared
+    # here -- ``record_metric`` raises on an out-of-domain attribute value, so a
+    # retryable classification missing from this allowlist crashes the worker on
+    # the retry emission rather than silently dropping a point.
+    "retry_class": ["redelivery", "rate-limit", "runner-error", "runner-timeout"],
 }
 _THREAD_ATTRIBUTES = {
     "service.name": ["curie-worker"],

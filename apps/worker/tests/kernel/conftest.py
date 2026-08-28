@@ -444,13 +444,26 @@ class FakeRunner:
         resp = web.StreamResponse(status=200, headers={"Content-Type": "application/x-ndjson"})
         await resp.prepare(request)
         self.turn_active = True
-        for frame in script:
-            await resp.write((frame.model_dump_json() + "\n").encode("utf-8"))
-        if self.hold is not None:
-            await self.hold.wait()  # type: ignore[attr-defined]
-            for frame in self.tail:
+        # Cleared on EVERY exit path, not just the normal one. A client that
+        # gives up mid-stream (its total/sock-read budget expiring, #2011)
+        # releases the response, and aiohttp then CANCELS this handler while it
+        # is parked on ``hold`` -- so a fake that only cleared the flag on its
+        # way out would stay "busy" forever, and every later turn on the thread
+        # would be answered by a 200 from /v1/steer and folded into the dead
+        # turn instead of opening a fresh one. The real runner's session ends
+        # with the process/turn that died, so idle-after-a-drop is the faithful
+        # model, and it is what makes the timeout retry path testable at all.
+        try:
+            for frame in script:
                 await resp.write((frame.model_dump_json() + "\n").encode("utf-8"))
-        self.turn_active = False
+            if self.hold is not None:
+                await self.hold.wait()  # type: ignore[attr-defined]
+                for frame in self.tail:
+                    await resp.write((frame.model_dump_json() + "\n").encode("utf-8"))
+        finally:
+            self.turn_active = False
+        # Normal path only: on a dead transport this raises, and there is no
+        # eof to send to a client that already went away.
         await resp.write_eof()
         return resp
 
@@ -543,7 +556,12 @@ def make_harness(
     ledger recorder), ``with_killswitch``
     (build a real KillSwitch wired to the kernel) and ``sink`` (any ``ReplySink``
     -- a real ``ReplySinkRouter`` for the adapter-selection tests, T-B3/T-B4);
-    the rest are config overrides."""
+    the rest are config overrides. ``runner_total_timeout_s`` is an ordinary
+    config override: it drives BOTH the ``WorkerConfig`` and the
+    ``RunnerClient``'s streaming budget (mirroring ``run.py``), so a test that
+    expires the stream mid-flight (#2011) passes a fractional value and the
+    config's own ``runner_total_timeout_s <= delivery_budget_s`` validator still
+    judges what the client actually does."""
 
     def factory(**overrides: object) -> contextlib.AbstractAsyncContextManager[Harness]:
         return kernel_harness(names, sync_redis, **overrides)
@@ -592,7 +610,14 @@ async def kernel_harness(
         host=_VALKEY_HOST, port=_VALKEY_PORT, password=_VALKEY_PW or None, decode_responses=True
     )
     reply_sink = FakeSink() if sink is None else sink
-    runner_client = RunnerClient(total_timeout_s=30.0)
+    # One source of truth, exactly as production does it (``run.py`` builds the
+    # real client with ``total_timeout_s=config.runner_total_timeout_s``):
+    # ``runner_total_timeout_s`` flows through ``**config_overrides`` into the
+    # ``WorkerConfig`` and the client is built from the resulting config. A
+    # harness whose client budget could silently disagree with its own config
+    # would slip past the config's ``runner_total_timeout_s <=
+    # delivery_budget_s`` validator, which now couples the two.
+    runner_client = RunnerClient(total_timeout_s=config.runner_total_timeout_s)
     card_store = ApprovalCardStore(async_redis, config)
     kernel = Kernel(
         substrate=substrate,
