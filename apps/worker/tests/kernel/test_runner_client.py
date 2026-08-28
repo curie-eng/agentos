@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import tracemalloc
 from typing import Any
 
@@ -19,7 +20,7 @@ from curie_runner import RunTracer, SideEffectClassifier, create_app
 from curie_runner import server as runner_server
 from curie_runner.fake import FakeModelSession
 from curie_runner.session import SessionRunner
-from curie_worker.runner_client import RunnerClient, RunnerError
+from curie_worker.runner_client import RunnerClient, RunnerError, RunnerStreamTimeout
 
 DONE = SessionStatus.DONE
 
@@ -658,5 +659,61 @@ def test_interrupt_keeps_its_own_timeout_under_a_huge_streaming_budget() -> None
             runner.hang.set()
             await client.close()
             await server.close()
+
+    asyncio.run(go())
+
+
+# --- The streaming boundary owns its own timeout terminal record (#2011) ------
+# ``start_turn``'s ``_rpc`` span has already closed by the time the NDJSON body
+# is streamed, so an expiring total/sock_read budget used to leave NO record at
+# this boundary at all, and handed the kernel a bare ``TimeoutError`` whose
+# ``str()`` is the empty string.
+
+
+def test_stream_timeout_raises_a_named_timeout_and_logs_the_expired_budget(
+    make_harness, caplog
+) -> None:
+    """#2011: iterating a turn whose runner hangs past the client's budget must
+    raise a ``RunnerStreamTimeout`` -- still a ``TimeoutError``, so every
+    existing ``except TimeoutError`` keeps catching it -- whose message names the
+    normalized exception class and the budget that expired, and must emit a
+    correlated WARNING on the client's own logger. Today the raised exception is
+    a bare ``TimeoutError`` that stringifies to "" and nothing is logged here."""
+
+    async def go() -> None:
+        async with make_harness() as h:
+            hold = asyncio.Event()  # never set: the response hangs after a prefix
+            h.runner.hold = hold
+            h.runner.default_script = [TextDelta(text="x")]
+            handle = await asyncio.to_thread(h.substrate.claim, "tStreamTimeout")
+            client = RunnerClient(total_timeout_s=0.5)
+            try:
+                with caplog.at_level(logging.WARNING, logger="curie_worker.runner_client"):
+                    turn = await client.start_turn(handle.base_url, _event())
+                    with pytest.raises(TimeoutError) as excinfo:
+                        async with turn:
+                            async for _frame in turn:
+                                pass
+
+                exc = excinfo.value
+                assert isinstance(exc, RunnerStreamTimeout)
+                assert isinstance(exc, TimeoutError)  # existing handlers still catch it
+                assert str(exc).strip(), "a stream timeout must not stringify to nothing"
+                assert "Timeout" in str(exc)  # the normalized underlying class
+                assert "0.5" in str(exc)  # the budget that expired, in seconds
+
+                warnings = [
+                    record.getMessage()
+                    for record in caplog.records
+                    if record.name == "curie_worker.runner_client"
+                    and record.levelno >= logging.WARNING
+                ]
+                assert warnings, caplog.text
+                assert any("Timeout" in message and "0.5" in message for message in warnings), (
+                    warnings
+                )
+            finally:
+                hold.set()
+                await client.close()
 
     asyncio.run(go())

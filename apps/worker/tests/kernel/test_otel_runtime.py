@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 from aci_protocol import (
     ErrorEvent,
+    Event,
     Final,
     QueuedTurn,
     ReplyHandle,
@@ -813,3 +814,58 @@ def test_planned_shared_telemetry_api_is_the_runtime_dependency() -> None:
     assert callable(extract_trace_context)
     assert callable(operation_span)
     assert callable(record_metric)
+
+
+def test_stream_timeout_emits_a_timeout_rpc_result_and_a_failed_span(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#2011: the runner RPC boundary must produce terminal evidence when the
+    streaming budget expires.
+
+    ``start_turn``'s span closes as soon as the response headers arrive, so a
+    budget that expires while the NDJSON body is being read currently emits
+    nothing here at all: the only ``curie.runner.rpc.result`` point for the turn
+    says ``outcome="success"``. The stream boundary must record its own
+    ``outcome="timeout"`` point and mark its span ERROR, or a timed-out turn is
+    invisible in the RPC telemetry."""
+
+    async def go() -> None:
+        probe = _install(monkeypatch)
+        async with make_harness() as h:
+            hold = asyncio.Event()  # never set: the response hangs after a prefix
+            h.runner.hold = hold
+            h.runner.default_script = [TextDelta(text="x")]
+            handle = await asyncio.to_thread(h.substrate.claim, "thread-stream-timeout")
+            client = runner_client_module.RunnerClient(total_timeout_s=0.5)
+            try:
+                turn = await client.start_turn(
+                    handle.base_url, Event(type="message", text="hi", user="U", ts="1")
+                )
+                with pytest.raises(TimeoutError):
+                    async with turn:
+                        async for _frame in turn:
+                            pass
+
+                results = _metrics(probe, "curie.runner.rpc.result")
+                timeouts = [
+                    point for point in results if point.attributes.get("outcome") == "timeout"
+                ]
+                assert timeouts, [point.attributes for point in results]
+                attributes = timeouts[-1].attributes
+                assert attributes["service.name"] == "curie-worker"
+                assert attributes["operation"] == "event"
+                assert attributes["role"] == "client"
+                assert set(attributes) <= _BOUNDED_KEYS
+
+                failed = [
+                    span
+                    for span in _spans(probe, "curie.runner.rpc")
+                    if span.status is StatusCode.ERROR
+                ]
+                assert failed, "the stream boundary must mark its span failed"
+            finally:
+                hold.set()
+                await client.close()
+
+    asyncio.run(go())

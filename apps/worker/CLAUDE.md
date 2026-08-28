@@ -34,7 +34,8 @@ stop -- that is scope creep on the sacred module.
    `side_effect_flag` escalates to a human instead of retrying; the flag is
    persisted to Valkey the instant it is seen so a crash mid-side-effect
    still escalates on reclaim. Flag-clean failures retry by classification
-   (`rate-limit`/`runner-error` transient, everything else escalates).
+   (`rate-limit`/`runner-error`/`runner-timeout` transient, everything else
+   escalates).
 
 ## Delivery is bounded (ADR-0039, #505)
 
