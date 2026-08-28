@@ -174,6 +174,26 @@ YAML
             esac
             exit 0
             ;;
+        *" --set-string rustfs.host=s3.example.com "*)
+            # #1501: the file points the object store at an external instance
+            # (the BYO block every store carries in values.yaml), so the render
+            # has NO in-cluster store. Keyed on the VALUE rather than on a mode
+            # env var deliberately: the stub can then only diverge when the two
+            # callers really do pass different values, which is the whole defect
+            # -- the guard rendered with the effective values and saw no store,
+            # the export rendered with none at all and saw rustfs.
+            cat <<'YAML'
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: parity-curie-postgres
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: postgres
+YAML
+            exit 0
+            ;;
     esac
     if [ "${CURIE_TEST_HELM_MIXED_STATEFULSETS:-}" = 1 ]; then
         cat <<'YAML'
@@ -885,6 +905,42 @@ fn live_mixed_store_statefulsets() -> String {
         ]
     })
     .to_string()
+}
+
+/// A live release running a `minio` object store BESIDE a `postgres` one: the
+/// two-component batch #1501 is about. Against a chart render that has neither,
+/// BOTH are `ComponentGone`, which used to be the entire `--migrate-store`
+/// bypass condition -- and only one of the two is something the migration can
+/// actually carry.
+fn live_minio_and_postgres_statefulsets() -> String {
+    json!({
+        "apiVersion": "v1",
+        "kind": "List",
+        "items": [
+            {
+                "metadata": {"name": "parity-minio"},
+                "spec": {"selector": {"matchLabels": {"app.kubernetes.io/component": "minio"}}}
+            },
+            {
+                "metadata": {"name": "parity-postgres"},
+                "spec": {"selector": {"matchLabels": {"app.kubernetes.io/component": "postgres"}}}
+            }
+        ]
+    })
+    .to_string()
+}
+
+/// The stateful-guard installation with the object store pointed at an EXTERNAL
+/// instance in the file's own values, so the target chart renders no in-cluster
+/// store. `rustfs.deploy: "false"` is the other half of that BYO block, but a
+/// `set:` map refuses boolean-shaped values by design (every `--set` is a
+/// string, and Helm reads every nonempty string as true), so the host key alone
+/// carries the intent here. The guard renders WITH these values; before #1501
+/// the export rendered with NONE, so the two halves of the same apply planned
+/// different upgrades and the disagreement only surfaced once the irreversible
+/// half had run.
+fn installation_that_turns_the_store_off() -> &'static str {
+    "version: 1\ninstall:\n  namespace: parity\n  release: parity\nset:\n  rustfs.host: s3.example.com\n"
 }
 
 fn live_rustfs_statefulset() -> String {
@@ -2027,6 +2083,149 @@ fn migrate_store_refuses_a_live_store_that_disagrees_with_the_planned_target() {
     assert!(
         !calls[upgrade..].contains("KUBECTL_CALL: delete pod"),
         "a target disagreement must retain the staged copy:\n{calls}"
+    );
+}
+
+#[test]
+fn migrate_store_refuses_a_component_it_cannot_carry() {
+    // AC1 (#1501): the bypass may only wave through removals the migration can
+    // actually carry, and it carries the OBJECT STORE alone -- `detect_store`
+    // knows `minio` and `rustfs` and nothing else. A batch of {minio gone,
+    // postgres gone} satisfied the old all-ComponentGone condition, so apply
+    // migrated the store, DELETED the database beside it, and exited 0. The
+    // refusal has to land before the export as well as before the upgrade: a
+    // staged copy is worthless once the postgres volume is orphaned.
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
+    let live_before = live_minio_and_postgres_statefulsets();
+
+    let output = fixture.apply(
+        &["--migrate-store"],
+        &[("CURIE_TEST_KUBECTL_STS", live_before.as_str())],
+    );
+
+    let calls = fixture.calls();
+    assert!(
+        !output.status.success(),
+        "--migrate-store must refuse a batch holding a component it cannot carry; stdout:\n{}\nstderr:\n{}\ncalls:\n{calls}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !calls.contains("HELM_CALL: upgrade"),
+        "the refusal must precede the irreversible upgrade:\n{calls}"
+    );
+    assert!(
+        !calls.contains("aws s3 sync s3://curie-bundles /stage"),
+        "nothing may be staged for a migration that will not run:\n{calls}"
+    );
+    // The fixture runs with `--json`, so the refusal is the error payload on
+    // stdout. Assert the COMPONENT name: "some component" would be a wall, and
+    // the operator's next move is to find which of their values drops it.
+    let reported = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        reported.contains("postgres"),
+        "the refusal must name the component it cannot carry; stdout:\n{reported}"
+    );
+    // The bare "postgres" substring is not enough on its own: it also matches
+    // the live resource name `parity-postgres`, so it stays green even if the
+    // bypass falls through to the PRE-EXISTING `stateful_removal_message`.
+    // That message ends by telling the operator to "re-run with --migrate-store
+    // and apply will carry the data across itself" -- sending them straight
+    // back to the flag that just refused them, which is exactly the
+    // operator-recruitment loop #1501 is about. So pin both halves: that the
+    // refusal is the uncarriable one, and that it does NOT re-offer the flag.
+    assert!(
+        reported.contains("cannot carry"),
+        "the refusal must say --migrate-store cannot carry these component(s); stdout:\n{reported}"
+    );
+    assert!(
+        !reported.contains("apply will carry the data across itself"),
+        "the refusal must not re-offer the flag that just refused them (#1501); stdout:\n{reported}"
+    );
+}
+
+#[test]
+fn migrate_store_refuses_a_values_file_that_turns_the_store_off() {
+    // AC2 (#1501): the guard and the export must render the SAME chart. The
+    // guard renders with the effective values, so a file that points the store
+    // at an external instance over a live minio release reads as "the store is
+    // gone" and the bypass accepts it. The export used to render with `UpValuePlan::default()`, saw the
+    // rustfs the values had switched off, and planned minio -> rustfs -- so the
+    // staging pod went up, the upgrade DELETED minio, and only then did the
+    // run fail, telling the operator to re-run the upgrade that had already
+    // happened. The refusal has to come first, while it is still reversible.
+    let fixture = HelmFixture::new(
+        installation_that_turns_the_store_off(),
+        HelmValuesResponse::Absent,
+    );
+    let live_before = live_minio_statefulset();
+
+    let output = fixture.apply(
+        &["--migrate-store"],
+        &[("CURIE_TEST_KUBECTL_STS", live_before.as_str())],
+    );
+
+    let calls = fixture.calls();
+    assert!(
+        !output.status.success(),
+        "a values file that leaves no target store cannot be migrated into; stdout:\n{}\nstderr:\n{}\ncalls:\n{calls}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !calls.contains("HELM_CALL: upgrade"),
+        "the refusal must precede the irreversible upgrade:\n{calls}"
+    );
+    assert!(
+        !calls.contains("KUBECTL_CALL: run"),
+        "no staging pod may be created for a migration that cannot complete:\n{calls}"
+    );
+    assert!(
+        !calls.contains("aws s3 sync s3://curie-bundles /stage"),
+        "nothing may be staged for a migration that will not run:\n{calls}"
+    );
+    let reported = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        reported.contains("renders no known object store"),
+        "the refusal must say the target chart has no store to migrate into; stdout:\n{reported}"
+    );
+    // The direct AC2 assertion (#1501): the guard and the export must render
+    // the chart with the SAME values. Pinning one `--set-string` would survive
+    // a mutation that threads only that value and drops the rest of the plan,
+    // and a real chart could then again disagree about which StatefulSets
+    // exist. Both halves build the command identically -- `helm template
+    // <release> <chart> -n <namespace> <value-plan args>` -- so the two
+    // full-chart renders must be byte-identical. `--show-only` renders are the
+    // priorityclass/preflight probes, not stateful-component detection. The one
+    // provably incidental difference is the per-call temp values file, whose
+    // name carries a fresh uuid, so that token alone is normalised.
+    let full_chart_renders: Vec<String> = calls
+        .lines()
+        .filter(|line| line.starts_with("HELM_CALL: template "))
+        .filter(|line| !line.contains("--show-only"))
+        .map(|line| {
+            line.split_whitespace()
+                .map(|token| {
+                    if token.starts_with("/tmp/curie-helm-values-") {
+                        "<values-file>"
+                    } else {
+                        token
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect();
+    assert!(
+        full_chart_renders.len() >= 2,
+        "the guard and the export must each render the full chart:\n{calls}"
+    );
+    assert_eq!(
+        full_chart_renders[0], full_chart_renders[1],
+        "the guard and the export must render the chart with the SAME values:\n{calls}"
     );
 }
 
