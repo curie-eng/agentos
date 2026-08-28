@@ -890,9 +890,10 @@ The CLI can point a release at it instead of a values file:
 curie cluster github-app --app-id 1234567 --existing-secret my-github-app
 ```
 
-`--existing-secret-key` defaults to `privateKey`, the same default as the chart.
-The command also rolls the API deployment onto the referenced Secret, so there
-is nothing further to restart.
+`--existing-secret-key` defaults to `privateKey`, the same default as the
+chart — pass it explicitly if your Secret uses a different key, since the CLI
+always sets this field. The command also rolls the API deployment onto the
+referenced Secret, so there is nothing further to restart.
 
 **Quick trial — let the chart hold it.** `curie cluster github-app --app-id …
 --private-key …` puts the PEM in the chart's own Secret. Fine to prove the flow
@@ -909,8 +910,11 @@ and needs no coordination with any repository:
 1. Generate a second private key on the App's settings page — both are now valid
 2. Deploy the new one, and roll the API onto it:
    - **BYO Secret**: update the Secret, then run
-     `curie cluster github-app --app-id <id> --existing-secret <name>` — it
-     performs the rollout for you. Updating the Secret alone is not enough.
+     `curie cluster github-app --app-id <id> --existing-secret <name>
+     --existing-secret-key <key>` — it performs the rollout for you. Pass
+     `--existing-secret-key` whenever the Secret uses a non-default key: the
+     CLI always sets this field, so omitting it resets the reference to
+     `privateKey`. Updating the Secret alone is not enough.
    - **Chart-held**: re-run
      `curie cluster github-app --app-id <id> --private-key <path>` — same
      rollout.

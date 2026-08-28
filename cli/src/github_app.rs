@@ -181,6 +181,84 @@ pub fn rollout_commands(namespace: &str, release: &str) -> Vec<OpsCommand> {
     ]
 }
 
+/// What the RELEASE's raw `api.githubAppExistingSecret` leaf means to the
+/// CHART, judged by Helm's own truthiness rather than by Rust's idea of a
+/// string.
+///
+/// The chart's BYO branch is `{{- if .Values.api.githubAppExistingSecret }}` --
+/// plain Go-template truthiness, which sees far more than strings.
+/// [`configured_existing_secret`] delegates to `resolve_existing_secret_ref`,
+/// which reads the leaf with `.as_str()` and so answers `None` for ANY
+/// non-string value. On its own that makes the conflict guard fail OPEN: a
+/// release configured by hand as `--set api.githubAppExistingSecret=true`, or
+/// with an all-digit Secret name (which helm stores as a float64 -- #1236), is
+/// genuinely BYO to the chart while the guard concludes "no BYO configured".
+/// The next `--private-key` then writes an ignored PEM, rolls the API and
+/// reports success over the OLD key, which is exactly the false-success bug
+/// #1255 exists to remove.
+///
+/// Classified here, locally, rather than by widening `resolve_existing_secret_ref`:
+/// that helper is shared with the eight other direct-passthrough credentials
+/// (#1759), so changing its contract would silently change behaviour for all of
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ByoSecretField {
+    /// Falsy to Helm's `if` -- absent, `null`, `""`, `false`, `0`, or an empty
+    /// list/map. The chart really does take the chart-held branch, so a
+    /// `--private-key` connect is legitimate here and must NOT be refused:
+    /// refusing would brick the documented chart-held rotation.
+    ChartHeld,
+    /// A non-empty string: the chart takes the BYO branch and the CLI can say
+    /// which Secret it resolves.
+    Named,
+    /// Truthy to Helm, but not a name. The chart WILL take the BYO branch while
+    /// the CLI cannot determine which Secret the API is reading. Fail closed.
+    Opaque,
+}
+
+/// Classify the raw `api.githubAppExistingSecret` leaf by Helm's truthiness.
+///
+/// A small local walk of the values JSON, deliberately not
+/// `resolve_existing_secret_ref` -- see [`ByoSecretField`] for why the shared
+/// helper must not learn about non-string values.
+pub fn classify_existing_secret_field(existing: Option<&serde_json::Value>) -> ByoSecretField {
+    let Some(value) = existing
+        .and_then(|v| v.get("api"))
+        .and_then(|api| api.get("githubAppExistingSecret"))
+    else {
+        return ByoSecretField::ChartHeld;
+    };
+    match value {
+        serde_json::Value::Null => ByoSecretField::ChartHeld,
+        serde_json::Value::Bool(true) => ByoSecretField::Opaque,
+        serde_json::Value::Bool(false) => ByoSecretField::ChartHeld,
+        serde_json::Value::String(s) if s.is_empty() => ByoSecretField::ChartHeld,
+        serde_json::Value::String(_) => ByoSecretField::Named,
+        // A Go template treats zero as false. Compared as f64 because a
+        // --reuse-values round trip stores every number as one (#1236).
+        serde_json::Value::Number(n) if n.as_f64() == Some(0.0) => ByoSecretField::ChartHeld,
+        // An EMPTY list or map is falsy to a Go template exactly as `""` is, so
+        // it leaves the chart on the chart-held branch; only a populated one
+        // reaches the BYO branch we cannot read a name out of.
+        serde_json::Value::Array(a) if a.is_empty() => ByoSecretField::ChartHeld,
+        serde_json::Value::Object(o) if o.is_empty() => ByoSecretField::ChartHeld,
+        _ => ByoSecretField::Opaque,
+    }
+}
+
+/// The JSON type of the leaf, for a refusal that tells the operator what shape
+/// their release is actually in. The type only, never the value.
+fn json_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "list",
+        serde_json::Value::Object(_) => "map",
+    }
+}
+
 /// The BYO Secret the RELEASE currently resolves the App private key from, if
 /// any: `(secret name, data key)`.
 ///
@@ -215,6 +293,21 @@ pub fn needs_byo_conflict_check(opts: &GithubAppOpts) -> bool {
         && !opts.private_key_path.trim().is_empty()
 }
 
+/// True when THIS invocation must read the release's values before it acts.
+///
+/// A `--dry-run` answers false unconditionally. `cli/CLAUDE.md` makes it a
+/// load-bearing invariant that pure argv builders never fetch and that
+/// `--dry-run` never touches the network, and that invariant outranks the
+/// convenience of refusing a plan: a best-effort read that silently degrades to
+/// "no conflict" the moment `helm get values` fails is worse than no read at
+/// all, because automation cannot tell a conflict-checked plan from a plan
+/// whose check was skipped. Nothing is lost -- [`guard_byo_key_conflict`] runs
+/// on the real invocation BEFORE any mutation, so a misconfigured release is
+/// never written to either way.
+pub fn needs_release_read(opts: &GithubAppOpts) -> bool {
+    !opts.common.dry_run && needs_byo_conflict_check(opts)
+}
+
 /// Refuse rather than report success over an unchanged live key.
 ///
 /// The chart resolves `GITHUB_APP_PRIVATE_KEY` from the BYO Secret whenever
@@ -229,12 +322,32 @@ pub fn needs_byo_conflict_check(opts: &GithubAppOpts) -> bool {
 /// precisely so External Secrets or Sealed Secrets can own it, and a CLI write
 /// there would be reverted on the next reconcile -- a second, subtler
 /// misreport.
+///
+/// Judged in two stages, because "non-empty" is a Rust question and the chart
+/// asks a Helm one. [`classify_existing_secret_field`] answers what the CHART
+/// will do with the raw leaf, and only a leaf that is a real string goes on to
+/// [`configured_existing_secret`] to be named. A leaf that is truthy to Helm
+/// but not a string is refused without a name rather than read as "nothing
+/// configured", which is the same false success one layer down.
+///
+/// Called with `existing = None` under `--dry-run` (see [`needs_release_read`]),
+/// where it is a no-op: the plan is offline, and the refusal comes on the real
+/// invocation before helm is ever run.
 pub fn guard_byo_key_conflict(
     opts: &GithubAppOpts,
     existing: Option<&serde_json::Value>,
 ) -> Result<()> {
     if !needs_byo_conflict_check(opts) {
         return Ok(());
+    }
+    match classify_existing_secret_field(existing) {
+        // Falsy to the chart's own `{{- if }}`, so the API really is on the
+        // chart-held key and this rotation is exactly what it looks like.
+        ByoSecretField::ChartHeld => return Ok(()),
+        // Truthy to the chart, unreadable to us. Refusing is the only honest
+        // answer: guessing "not configured" here is the #1255 bug itself.
+        ByoSecretField::Opaque => return Err(opaque_byo_field_error(opts, existing)),
+        ByoSecretField::Named => {}
     }
     let Some((name, key)) = configured_existing_secret(existing) else {
         return Ok(());
@@ -253,6 +366,36 @@ pub fn guard_byo_key_conflict(
          to go back to the chart-held key"
     ))
     .into())
+}
+
+/// The refusal for a release whose `api.githubAppExistingSecret` is truthy to
+/// the chart but not a string.
+///
+/// An error on the centralized error emit, never a new `GithubAppOutput`
+/// variant: `cli/schema/github-app.schema.json` is a frozen committed contract,
+/// and a refusal is not a success-path value.
+fn opaque_byo_field_error(
+    opts: &GithubAppOpts,
+    existing: Option<&serde_json::Value>,
+) -> anyhow::Error {
+    let kind = existing
+        .and_then(|v| v.get("api"))
+        .and_then(|api| api.get("githubAppExistingSecret"))
+        .map(json_type_name)
+        .unwrap_or("non-string value");
+    crate::exit::CliError::failure(format!(
+        "release {} stores api.githubAppExistingSecret as a {kind}, not a string. The chart's \
+         BYO branch is plain truthiness, so the API IS reading its private key from a Secret -- \
+         but the CLI cannot determine WHICH Secret, and it will not guess by writing a \
+         --private-key the API may never read",
+        opts.common.release
+    ))
+    .with_fix(
+        "re-set the field as a string, e.g. helm upgrade --reuse-values --set-string \
+         api.githubAppExistingSecret=<secret-name>, then re-run; or run --disconnect first to go \
+         back to the chart-held key",
+    )
+    .into()
 }
 
 pub enum GithubAppOutput {
@@ -287,26 +430,19 @@ pub async fn github_app(opts: GithubAppOpts, clone_base: &str) -> Result<GithubA
     if !opts.common.dry_run {
         require_on_path("helm")?;
     }
-    let existing = if needs_byo_conflict_check(&opts) {
-        if opts.common.dry_run {
-            // Best effort: a dry run must never hard-fail on connectivity or
-            // on a missing binary. When the read does succeed the guard still
-            // runs, because a dry run that prints a plan the tool would refuse
-            // to execute is the same misreport class this guard exists for.
-            if require_on_path("helm").is_ok() {
-                fetch_release_values(&opts.common).await.ok().flatten()
-            } else {
-                None
-            }
-        } else {
-            // The typed error propagates: the `helm upgrade` two steps later
-            // would fail identically, and failing before any mutation is
-            // strictly better than failing part-way through one.
-            fetch_release_values(&opts.common).await?
-        }
+    let existing = if needs_release_read(&opts) {
+        // The typed error propagates: the `helm upgrade` two steps later would
+        // fail identically, and failing before any mutation is strictly better
+        // than failing part-way through one.
+        fetch_release_values(&opts.common).await?
     } else {
         None
     };
+    // Under `--dry-run` this is a no-op by construction: `needs_release_read`
+    // answered false, so `existing` is None and the guard has nothing to judge.
+    // The plan therefore stays offline, and the guard still runs on the REAL
+    // invocation above -- before any mutation -- so nothing is ever written to
+    // a release whose key the API would ignore.
     guard_byo_key_conflict(&opts, existing.as_ref())?;
 
     let cmds = if opts.disconnect {
@@ -377,6 +513,73 @@ pub async fn github_app(opts: GithubAppOpts, clone_base: &str) -> Result<GithubA
     })
 }
 
+/// The Kubernetes cap on an RFC-1123 subdomain, which is what a Secret name is.
+const MAX_SECRET_NAME_LEN: usize = 253;
+
+/// True when `value` is a syntactically valid Kubernetes Secret NAME: an
+/// RFC-1123 subdomain.
+///
+/// Validated positively, against the syntax the flag names, because
+/// `--set-string` is NOT an escaping mechanism. It stops helm *typing* a value,
+/// but helm still splits the expression on commas STRUCTURALLY, so
+/// `--existing-secret-key 'privateKey,api.githubAppExistingSecret='` is one
+/// argv entry that helm reads as TWO assignments -- the second blanking the BYO
+/// reference the same command just set. The run then also clears the inline
+/// key, rolls the API and reports success on a release with no usable key at
+/// all. An unvalidated name here is an EXPRESSION-INJECTION vector, not merely
+/// an invalid name, and k8s never gets to reject it with its own message
+/// because the injected assignment blanked the field before it ever rendered.
+///
+/// A positive charset rather than a blocklist of dangerous characters: `,`,
+/// `=`, `\`, spaces and newlines fall out as rejected by construction, along
+/// with whatever a future helm decides is structural.
+fn is_rfc1123_subdomain(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_SECRET_NAME_LEN
+        && value.split('.').all(is_rfc1123_label)
+}
+
+/// One dot-separated label of an RFC-1123 subdomain: lowercase alphanumerics
+/// and `-`, starting and ending alphanumeric, never empty.
+fn is_rfc1123_label(label: &str) -> bool {
+    let alnum = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();
+    let (Some(first), Some(last)) = (label.chars().next(), label.chars().next_back()) else {
+        return false;
+    };
+    alnum(first) && alnum(last) && label.chars().all(|c| alnum(c) || c == '-')
+}
+
+/// True when `value` is a syntactically valid Secret DATA key: `[-._a-zA-Z0-9]+`
+/// and neither `.` nor `..`, which is what the API server accepts inside a
+/// Secret's `data` map. Same injection reasoning as [`is_rfc1123_subdomain`];
+/// the charset is wider because the key names a map entry, not a DNS name.
+fn is_secret_data_key(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
+/// Render a rejected value for an error message without echoing something that
+/// might be key material.
+///
+/// Both flags take short names, so a short value is quoted back verbatim (with
+/// `{:?}`, so an embedded newline or tab shows as an escape rather than
+/// mangling the message). Anything long enough to be a pasted PEM is described
+/// by its length only -- the operator knows what they typed, and the terminal,
+/// the shell history and the `--json` error payload do not need a copy of it.
+fn describe_rejected_value(value: &str) -> String {
+    const MAX_ECHO: usize = 63;
+    let len = value.chars().count();
+    if len <= MAX_ECHO {
+        format!("{value:?}")
+    } else {
+        format!("<{len} characters, not shown>")
+    }
+}
+
 /// Validate the flag combination before anything reaches helm.
 ///
 /// Takes the whole record rather than five positional `&str`/`bool` arguments:
@@ -401,6 +604,34 @@ pub fn require_connect_inputs(opts: &GithubAppOpts) -> Result<()> {
             );
         }
         return Ok(());
+    }
+    // Syntax-checked BEFORE any command is constructed, because helm splits a
+    // --set-string expression on commas structurally: an unvalidated name is an
+    // expression-injection vector, not merely an invalid name. See
+    // `is_rfc1123_subdomain` for the full mechanism.
+    //
+    // The RAW values, not the trimmed one used above to answer "was one
+    // supplied": `connect_commands` formats the raw field into argv, so a name
+    // with surrounding whitespace would pass a trimmed check and still reach
+    // helm -- and k8s -- wrong.
+    if !existing_secret.is_empty() {
+        if !is_rfc1123_subdomain(&opts.existing_secret) {
+            bail!(
+                "--existing-secret {} is not a Kubernetes Secret name. It must be an RFC-1123 \
+                 subdomain: lowercase letters, digits, '-' and '.', starting and ending with a \
+                 letter or digit, at most {MAX_SECRET_NAME_LEN} characters. It names a Secret \
+                 you already created; to hand the PEM itself to the chart, use --private-key.",
+                describe_rejected_value(&opts.existing_secret)
+            );
+        }
+        if !is_secret_data_key(&opts.existing_secret_key) {
+            bail!(
+                "--existing-secret-key {} is not a Kubernetes Secret data key. It must be one or \
+                 more of [-._a-zA-Z0-9] and cannot be '.' or '..'. It names a key INSIDE that \
+                 Secret -- not the PEM, and not a helm expression.",
+                describe_rejected_value(&opts.existing_secret_key)
+            );
+        }
     }
     if !existing_secret.is_empty() && !key_path.trim().is_empty() {
         bail!(
@@ -1206,6 +1437,242 @@ mod tests {
         assert!(
             !has_entry_starting(&args, "api.githubAppExistingSecret"),
             "an empty --existing-secret took the BYO branch: {args:?}"
+        );
+    }
+
+    // ---- T12: the new flags are Kubernetes syntax, not helm expressions -----
+
+    #[test]
+    fn the_comma_injection_through_the_data_key_is_refused() {
+        // The literal attack from the #1255 review. `--set-string` stops helm
+        // TYPING a value, but helm still splits the expression on commas
+        // STRUCTURALLY: this one argv entry is read as TWO assignments, and the
+        // second blanks api.githubAppExistingSecret that the entry before it
+        // just set. The run then also clears the inline private key, rolls the
+        // API and reports success on a release with NO usable key at all -- and
+        // k8s never gets to reject an invalid name, because the injected
+        // assignment blanked the field before it could ever render.
+        let mut o = byo_opts();
+        o.existing_secret_key = "privateKey,api.githubAppExistingSecret=".into();
+        let err = require_connect_inputs(&o).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--existing-secret-key"),
+            "the refusal must name the offending flag: {msg}"
+        );
+        assert!(
+            msg.contains("[-._a-zA-Z0-9]"),
+            "the refusal must say what the allowed form is: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_comma_in_the_secret_name_is_refused() {
+        // Same injection, other flag. Here the second assignment would point
+        // the chart-held key at an attacker-chosen path via --set-string, so
+        // the Secret NAME field is no less structural than the data key.
+        let mut o = byo_opts();
+        o.existing_secret = "my-github-app,api.githubAppId=999".into();
+        let err = require_connect_inputs(&o).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--existing-secret"),
+            "the refusal must name the offending flag: {msg}"
+        );
+        assert!(
+            msg.contains("RFC-1123"),
+            "the refusal must say what the allowed form is: {msg}"
+        );
+    }
+
+    #[test]
+    fn realistic_secret_names_and_data_keys_are_accepted() {
+        // The other half of the validator's contract, and the more dangerous
+        // half to get wrong: a validator that rejected a LEGAL Kubernetes name
+        // would break real installs while looking like hardening. A dotted
+        // Secret name and a data key carrying '.', '_' and '-' are both
+        // ordinary, and so is the all-digit pair #1236's float coercion is
+        // about -- none of them may be refused.
+        for (name, key) in [
+            ("curie.github-app.prod", "app.private-key_2026"),
+            ("1234567", "8901234"),
+            ("my-github-app", DEFAULT_APP_KEY_DATA_KEY),
+        ] {
+            let mut o = byo_opts();
+            o.existing_secret = name.into();
+            o.existing_secret_key = key.into();
+            assert!(
+                require_connect_inputs(&o).is_ok(),
+                "a legal Secret name/key pair was refused ({name}, {key}): {:?}",
+                require_connect_inputs(&o).err()
+            );
+            let args = argv(&connect_commands(&o, DEFAULT_CLONE_BASE)[0]);
+            assert!(
+                has_entry(&args, &format!("api.githubAppExistingSecret={name}")),
+                "the accepted Secret name did not reach helm verbatim: {args:?}"
+            );
+            assert!(
+                has_entry(&args, &format!("api.githubAppExistingSecretKey={key}")),
+                "the accepted data key did not reach helm verbatim: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pem_pasted_into_existing_secret_is_refused_without_echoing_it() {
+        // --existing-secret and --private-key sit next to each other in --help,
+        // so the PEM lands in the wrong one eventually. It must be refused (it
+        // is not a Secret name), the refusal must point at the flag that DOES
+        // take a PEM, and it must not print the key material back into the
+        // terminal, the shell history or the --json error payload.
+        let (_dir, path) = key_fixture();
+        let body = std::fs::read_to_string(&path).expect("fixture readable");
+        let mut o = byo_opts();
+        o.existing_secret = body.clone();
+        let err = require_connect_inputs(&o).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--private-key"),
+            "the refusal must name the flag that takes a PEM: {msg}"
+        );
+        for line in body.lines().filter(|l| !l.trim().is_empty()) {
+            assert!(
+                !msg.contains(line),
+                "key material was echoed back in the refusal: {line}"
+            );
+        }
+    }
+
+    // ---- T13: the guard fails CLOSED on a non-string stored value -----------
+
+    #[test]
+    fn a_truthy_non_string_byo_field_refuses_rather_than_guessing() {
+        // The guard's inputs come from `helm get values -o json`, and helm
+        // stores what it was given: `--set api.githubAppExistingSecret=true`
+        // lands as a bool, and an all-digit Secret name lands as a float64
+        // (#1236). The chart's BYO branch is plain truthiness, so both ARE
+        // reading the operator's Secret -- but a guard that reads the leaf with
+        // .as_str() sees None and concludes "no BYO configured". It then writes
+        // an ignored PEM, rolls the API and reports success over the OLD key,
+        // which is #1255 itself.
+        for value in [
+            serde_json::json!(true),
+            serde_json::json!(42),
+            serde_json::json!(1234567.0),
+        ] {
+            let existing = serde_json::json!({"api": {"githubAppExistingSecret": value}});
+            let err = guard_byo_key_conflict(&opts(false), Some(&existing))
+                .expect_err("a truthy non-string BYO field must refuse");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("api.githubAppExistingSecret"),
+                "the refusal must name the field the operator has to fix: {msg}"
+            );
+            let fix = fix_of(&err);
+            assert!(
+                fix.contains("--set-string"),
+                "the fix must name the way to make it a string: {fix}"
+            );
+            assert!(
+                fix.contains("--disconnect"),
+                "the fix must name the way back: {fix}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_falsy_byo_field_does_not_refuse() {
+        // The mirror obligation, and the one that keeps the fail-closed rule
+        // from bricking a legitimate rotation. `false`, `0` and `""` are all
+        // FALSY to the chart's `{{- if .Values.api.githubAppExistingSecret }}`,
+        // so the release genuinely is on the chart-held key and --private-key
+        // is exactly the right command. Refusing here would leave an operator
+        // with no CLI way to rotate at all.
+        for value in [
+            serde_json::json!(false),
+            serde_json::json!(0),
+            serde_json::json!(0.0),
+            serde_json::json!(""),
+            serde_json::Value::Null,
+        ] {
+            let existing = serde_json::json!({"api": {"githubAppExistingSecret": value}});
+            let outcome = guard_byo_key_conflict(&opts(false), Some(&existing));
+            assert!(
+                outcome.is_ok(),
+                "a value the chart treats as falsy is not a BYO release: {:?}",
+                outcome.err()
+            );
+        }
+    }
+
+    #[test]
+    fn a_string_byo_field_still_resolves_exactly_as_before() {
+        // Fail-closed must not disturb the ordinary path: a non-empty string
+        // still delegates to resolve_existing_secret_ref, and the refusal still
+        // names the real Secret and the real data key rather than the generic
+        // non-string message.
+        let existing = serde_json::json!({
+            "api": {
+                "githubAppExistingSecret": "my-github-app",
+                "githubAppExistingSecretKey": "app-pem"
+            }
+        });
+        assert_eq!(
+            classify_existing_secret_field(Some(&existing)),
+            ByoSecretField::Named
+        );
+        assert_eq!(
+            configured_existing_secret(Some(&existing)),
+            Some(("my-github-app".to_string(), "app-pem".to_string()))
+        );
+        let err = guard_byo_key_conflict(&opts(false), Some(&existing))
+            .expect_err("a BYO release must refuse --private-key");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("my-github-app") && msg.contains("app-pem"),
+            "the string path must still name the Secret and its data key: {msg}"
+        );
+    }
+
+    // ---- T14: --dry-run is offline --------------------------------------
+
+    #[test]
+    fn a_dry_run_never_reads_the_release() {
+        // cli/CLAUDE.md: pure argv builders never fetch, and --dry-run never
+        // touches the network. A best-effort `helm get values` under --dry-run
+        // also degrades silently, so automation cannot tell a conflict-checked
+        // plan from one whose check was skipped because the read failed --
+        // false assurance, which is worse than none. The guard still runs on
+        // the real invocation, before any mutation.
+        //
+        // `opts(_)` is already a dry run; the real-run cases flip the flag.
+        assert!(
+            !needs_release_read(&opts(false)),
+            "a dry run must make no cluster read at all"
+        );
+        let mut real = opts(false);
+        real.common.dry_run = false;
+        assert!(
+            needs_release_read(&real),
+            "a real chart-held connect is the one path that must read the release"
+        );
+        let mut real_byo = byo_opts();
+        real_byo.common.dry_run = false;
+        assert!(
+            !needs_release_read(&real_byo),
+            "an explicit BYO connect needs nothing from the release"
+        );
+        let mut real_disconnect = opts(true);
+        real_disconnect.common.dry_run = false;
+        assert!(
+            !needs_release_read(&real_disconnect),
+            "a disconnect needs nothing from the release"
+        );
+        // What a dry run therefore hands the guard, and the guard's answer to
+        // it: no read, no refusal, an offline plan.
+        assert!(
+            guard_byo_key_conflict(&opts(false), None).is_ok(),
+            "a dry run must still produce a plan with no release knowledge"
         );
     }
 }
