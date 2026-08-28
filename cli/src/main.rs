@@ -1374,6 +1374,9 @@ enum LocalAction {
         /// published. The skew does not announce itself: it surfaces as a serde
         /// error about a field name, or `No module named` from inside a
         /// container. Builds only what the selected profiles run.
+        ///
+        /// Requires a compose file that substitutes the image tags, so a
+        /// release-channel curie must pass `-f compose.dev.yaml` (#1926).
         #[arg(long)]
         build: bool,
     },
@@ -2581,6 +2584,10 @@ enum ClusterAction {
     },
 }
 
+/// Resolve, and materialize, the compose file for a local verb.
+///
+/// `local up` does not call this: it inlines the same two steps so the
+/// `--build` channel guard can run between them (#1926).
 async fn resolve_compose_file(file: Option<String>, dry_run: bool) -> Result<String> {
     let resolved = artifacts::resolve_compose(
         file.as_deref(),
@@ -2960,7 +2967,25 @@ async fn run(command: Option<Command>) -> Result<()> {
                 env_file,
                 build,
             } => {
-                let file = resolve_compose_file(file, dry_run).await?;
+                // The `--build` channel guard runs between the resolve and
+                // the materialize (#1926), so a refused run never downloads the
+                // release compose, never prints the compose-source note, and
+                // never emits a dry-run plan. That ordering is why these three
+                // steps are inlined here instead of going through
+                // `resolve_compose_file`.
+                let resolved = artifacts::resolve_compose(
+                    file.as_deref(),
+                    artifacts::Channel::current(),
+                    artifacts::version(),
+                    artifacts::cache_root,
+                    std::path::Path::new(local::DEFAULT_COMPOSE_FILE).exists(),
+                )?;
+                let build = if build {
+                    Some(local::ensure_build_reaches_the_stack(&resolved)?)
+                } else {
+                    None
+                };
+                let file = materialize_artifact(resolved, dry_run, "compose").await?;
                 emit(
                     local::up(
                         LocalOpts {
@@ -3003,7 +3028,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                             env_file,
                             // `local rebuild` recreates ONE service against the
                             // stack already running; it never re-tags images.
-                            build: false,
+                            build: None,
                         },
                         service,
                         model,
@@ -3029,7 +3054,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                             slack: false,
                             model_mode: local::ModelMode::DefaultFake,
                             env_file: None,
-                            build: false,
+                            build: None,
                         },
                         wipe,
                         yes,
@@ -3049,7 +3074,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         slack: false,
                         model_mode: local::ModelMode::DefaultFake,
                         env_file: None,
-                        build: false,
+                        build: None,
                     })
                     .await?,
                 )
@@ -3083,7 +3108,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                     slack: true,
                     model_mode: local::model_mode_from_env(),
                     env_file: None,
-                    build: false,
+                    build: None,
                 };
                 let model_credentials =
                     local::apply_credential_plan(&mut model_opts, crate::ui::ui())?;
