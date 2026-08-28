@@ -34,6 +34,7 @@ instead of re-dispatching.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import uuid
@@ -47,6 +48,8 @@ from curie_worker.config import WorkerConfig
 from curie_worker.consumer import Consumer
 from curie_worker.dead_letter_alert import install_dead_letter_alerting
 from pydantic import ValidationError
+
+from .conftest import _pending_rows
 
 DONE = SessionStatus.DONE
 
@@ -102,18 +105,6 @@ async def _deliver_new(consumer: Consumer, h) -> int:
 async def _reclaim_and_settle(consumer: Consumer) -> None:
     await consumer._reclaim_once()
     await asyncio.gather(*list(consumer._inflight))
-
-
-async def _pending_rows(h) -> dict[str, int]:
-    """Every pending entry id -> its current ``times_delivered``."""
-    rows = await h.async_redis.xpending_range(
-        h.config.stream,
-        h.config.consumer_group,
-        min="-",
-        max="+",
-        count=50,
-    )
-    return {row["message_id"]: int(row["times_delivered"]) for row in rows}
 
 
 async def _pending_ids(h) -> set[str]:
@@ -951,3 +942,871 @@ def test_dead_letter_stream_equal_to_source_stream_is_rejected() -> None:
         ).dead_letter_stream
         == "curie:runs:dead"
     )
+
+
+# --- ADR-0131: a live lease is checked BEFORE cap evaluation ------------------
+
+
+def test_a_live_lease_holds_off_the_cap_and_releasing_it_dead_letters_normally(
+    make_harness,
+) -> None:
+    """R4. "A live lease is checked before cap evaluation so a healthy long turn
+    cannot be dead-lettered" (ADR-0131), directly.
+
+    The entry is driven to ``times_delivered >= max_delivery`` -- the exact state
+    that dead-letters today -- while a peer replica holds a LIVE lease on it. The
+    cap scan must skip it. ``_inflight_ids`` is asserted empty throughout, so the
+    pre-existing same-process guard cannot be what saved it: only the new
+    cross-replica lease check can.
+
+    Red on reverting the ``is_live`` guard inserted between the ``_inflight_ids``
+    skip and the ``delivered = int(row["times_delivered"])`` read in
+    ``_dead_letter_over_cap``: a healthy long turn on a peer is dead-lettered
+    mid-run, its reply is lost, and the graveyard reports it as poison.
+
+    The positive control is the second pass: once the lease is released the very
+    same entry dead-letters normally, so the skip above is the fence and not a
+    cap that stopped working. The cap itself, its ``>=`` boundary and its
+    PEL-backed count are untouched -- weakening ``max_delivery`` is the #505
+    total-stall regression, not a simplification.
+    """
+    # Imported inside the test on purpose: ``delivery_lease`` does not exist
+    # until this ticket lands, and a module-level import would fail COLLECTION
+    # for this whole file, turning every unrelated test in it red.
+    from curie_worker.delivery_lease import DeliveryLeaseStore
+
+    async def go() -> None:
+        async with make_harness(
+            max_delivery=2,
+            reclaim_min_idle_ms=0,
+            delivery_budget_s=60.0,
+            delivery_lease_ttl_s=1.0,
+            delivery_lease_heartbeat_s=0.3,
+            runner_total_timeout_s=30.0,
+        ) as h:
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(
+                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
+            )
+            await consumer.ensure_group()
+
+            qe = _qevent("healthy long turn", thread="tcap", event_id="cap-live")
+            await h.async_redis.xadd(h.config.stream, to_stream_fields(qe))
+
+            # Delivery #1 (XREADGROUP) then #2 (XCLAIM) -> at the cap of 2, and
+            # pending under a PEER, so this consumer's own in-flight guard is not
+            # in play.
+            rows = await h.async_redis.xreadgroup(
+                h.config.consumer_group, "peer-worker", {h.config.stream: ">"}, count=1
+            )
+            entry_id = rows[0][1][0][0]
+            await h.async_redis.xclaim(
+                h.config.stream, h.config.consumer_group, "peer-worker", 0, [entry_id]
+            )
+            assert (await _pending_rows(h))[entry_id] >= h.config.max_delivery
+
+            lease = await store.acquire(
+                h.config.stream, h.config.consumer_group, entry_id, consumer="peer-worker"
+            )
+            assert await store.is_live(h.config.stream, h.config.consumer_group, entry_id)
+            assert consumer._inflight_ids == set(), (
+                "the in-flight guard would mask the lease guard under test"
+            )
+
+            over_cap = await consumer._dead_letter_over_cap()
+            assert over_cap == set(), "a healthy long turn was judged against the cap"
+            assert await _dead_rows(h) == [], "a healthy long turn was dead-lettered"
+            assert entry_id in await _pending_ids(h)
+
+            # POSITIVE CONTROL: with the lease gone the same entry, at the same
+            # count, dead-letters on the next pass.
+            assert (
+                await store.release(
+                    h.config.stream, h.config.consumer_group, entry_id, owner=lease.owner
+                )
+                is True
+            )
+            over_cap = await consumer._dead_letter_over_cap()
+            assert over_cap == {entry_id}
+            rows = await _dead_rows(h)
+            assert len(rows) == 1
+            assert rows[0][1]["dl_original_id"] == entry_id
+            assert entry_id not in await _pending_ids(h)
+
+    asyncio.run(go())
+
+
+# --- ADR-0131: dead-letter is FENCED (the four terminal verbs) ----------------
+#
+# ADR-0131: a fenced-out owner "may not ACK, dead-letter, clear an outbox
+# record, or emit a terminal result." ``_dead_letter`` settles a delivery three
+# ways at once -- it XADDs the graveyard row, XACKs the entry off the group, and
+# then deletes the lease and delivery-state keys -- so an unfenced one lets a
+# stale process ack somebody else's delivery AND delete the current owner's
+# keys. ``_dead_letter_refusal`` is the precondition that stops it, and it asks
+# a DIFFERENT question of each of its two callers; the tests below pin both
+# branches with a positive control each, so a fence that refused everything
+# (equally broken: a graveyard that never fills is #505's stall) fails too.
+
+
+async def _park_over_cap(h, consumer_name: str) -> str:
+    """One entry, pending under ``consumer_name`` at ``times_delivered >= cap``.
+
+    The exact state ``_dead_letter_over_cap`` hands to ``_dead_letter``: read
+    once by XREADGROUP (delivery #1) then claimed once (delivery #2).
+    """
+    qe = _qevent("long turn", thread="tfence", event_id=f"fence-{uuid.uuid4().hex[:8]}")
+    await h.async_redis.xadd(h.config.stream, to_stream_fields(qe))
+    rows = await h.async_redis.xreadgroup(
+        h.config.consumer_group, consumer_name, {h.config.stream: ">"}, count=1
+    )
+    entry_id = rows[0][1][0][0]
+    await h.async_redis.xclaim(
+        h.config.stream, h.config.consumer_group, consumer_name, 0, [entry_id]
+    )
+    assert (await _pending_rows(h))[entry_id] >= h.config.max_delivery
+    return entry_id
+
+
+def _lease_keys(h, entry_id: str) -> tuple[str, str]:
+    return (
+        h.config.delivery_lease_key(h.config.stream, h.config.consumer_group, entry_id),
+        h.config.delivery_state_key(h.config.stream, h.config.consumer_group, entry_id),
+    )
+
+
+# Short lease clocks so a real fence loss is observed in-test without touching a
+# clock. ``delivery_budget_s`` floors at 60.0 and a validator rejects
+# ``runner_total_timeout_s`` above it, so the runner ceiling comes down too --
+# that is the whole compression lever here. ``max_delivery`` is NOT touched:
+# weakening the ADR-0039 cap is the #505 regression, not a test convenience.
+_FENCE_CONFIG: dict[str, object] = {
+    "max_delivery": 2,
+    "reclaim_min_idle_ms": 0,
+    "delivery_budget_s": 60.0,
+    "runner_total_timeout_s": 30.0,
+    "delivery_lease_ttl_s": 1.0,
+    "delivery_lease_heartbeat_s": 0.3,
+}
+
+
+def test_a_consumer_with_no_lease_store_dead_letters_exactly_as_before(
+    make_harness,
+) -> None:
+    """The leaseless regression guard: no lease store means no fence at all.
+
+    ``_dead_letter_refusal`` returns None immediately when ``self._leases is
+    None``, so a base-only consumer (the second-broker port, the ``_FakeBroker``
+    units, every pre-ADR-0131 deployment) dead-letters an over-cap entry exactly
+    as it did before the fence existed.
+
+    Red if the fence is ever made unconditional -- e.g. dropping the
+    ``if self._leases is None: return None`` early return from
+    ``_dead_letter_refusal``, or having a missing store read as "somebody owns
+    it". Either turns the graveyard off for every leaseless consumer, which is
+    #505's permanent stall reached from the new code.
+    """
+
+    async def go() -> None:
+        async with make_harness(max_delivery=2, reclaim_min_idle_ms=0) as h:
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            await consumer.ensure_group()
+            assert consumer._leases is None
+
+            try:
+                entry_id = await _park_over_cap(h, "peer-worker")
+
+                over_cap = await consumer._dead_letter_over_cap()
+
+                assert over_cap == {entry_id}
+                rows = await _dead_rows(h)
+                assert len(rows) == 1, f"a leaseless consumer stopped dead-lettering: {rows}"
+                assert rows[0][1]["dl_original_id"] == entry_id
+                assert entry_id not in await _pending_ids(h)
+            finally:
+                await h.async_redis.delete(_dead_stream(h.config))
+
+    asyncio.run(go())
+
+
+def test_the_maintenance_scan_refuses_to_dead_letter_once_another_owner_acquires(
+    make_harness,
+) -> None:
+    """A lease taken in the window between the cap read and the settle wins.
+
+    ``_dead_letter_over_cap``'s own pre-cap ``_lease_is_live`` check cannot cover
+    this: it is a READ, and a new owner may acquire in the window between it and
+    the terminal writes. So ``_dead_letter`` is called directly here, exactly as
+    the scan calls it, with a live peer lease in place -- the only way to reach
+    the second line of defense the review asked for.
+
+    All three settle effects must be absent: nothing on ``<stream>:dead``, the
+    entry NOT acked (still pending, delivery count untouched), and neither the
+    lease key nor the delivery-state key deleted out from under the live owner.
+
+    Red on removing the ``_dead_letter_refusal`` precondition from
+    ``_dead_letter``: a stale scan acks the new owner's delivery off the group,
+    writes it to the graveyard as poison, and deletes the keys the owner is
+    heartbeating -- ADR-0131's split brain, from the maintenance side.
+    """
+    from curie_worker.delivery_lease import DeliveryLeaseStore
+
+    async def go() -> None:
+        async with make_harness(**_FENCE_CONFIG) as h:
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(
+                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
+            )
+            await consumer.ensure_group()
+
+            try:
+                entry_id = await _park_over_cap(h, "peer-worker")
+                lease_key, state_key = _lease_keys(h, entry_id)
+
+                await store.acquire(
+                    h.config.stream, h.config.consumer_group, entry_id, consumer="peer-worker"
+                )
+                # The maintenance branch, not the handler branch: this process
+                # holds no lease of its own, so the refusal must come from the
+                # re-read of somebody ELSE's liveness.
+                assert consumer._held_leases == {}
+
+                before = (await _pending_rows(h))[entry_id]
+                await consumer._dead_letter(
+                    entry_id,
+                    await consumer._entry_fields(entry_id),
+                    reason="max-delivery-exceeded",
+                    delivery_count=before,
+                )
+
+                assert await _dead_rows(h) == [], "settled a delivery another owner holds"
+                assert entry_id in await _pending_ids(h), "acked another owner's delivery"
+                assert (await _pending_rows(h))[entry_id] == before
+                assert await h.async_redis.exists(lease_key) == 1, "deleted the owner's lease"
+                assert await h.async_redis.exists(state_key) == 1, "deleted the owner's state"
+            finally:
+                await h.async_redis.delete(_dead_stream(h.config))
+
+    asyncio.run(go())
+
+
+def test_the_maintenance_scan_dead_letters_normally_when_nobody_owns_the_entry(
+    make_harness,
+) -> None:
+    """POSITIVE CONTROL for the two maintenance refusals above and below.
+
+    Byte-for-byte the same setup and the same direct ``_dead_letter`` call, with
+    the single difference that no live lease exists and the store is readable.
+    Without this test a fence that refused unconditionally -- or a
+    ``_dead_letter`` broken outright -- would leave the refusal tests green
+    while the graveyard silently stopped filling, which is #505's stall wearing
+    the fence's clothes.
+
+    All three settle effects must happen: the graveyard row, the ACK, and the
+    ``settle`` that removes BOTH the lease and delivery-state keys (ADR-0131:
+    delivery state is "removed after terminal acknowledgement or dead-letter
+    settlement").
+
+    Red on a fence that refuses when ``_lease_is_live`` says False, or on
+    dropping the ``self._leases.settle(...)`` call after the ACK.
+    """
+    from curie_worker.delivery_lease import DeliveryLeaseStore
+
+    async def go() -> None:
+        async with make_harness(**_FENCE_CONFIG) as h:
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(
+                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
+            )
+            await consumer.ensure_group()
+
+            try:
+                entry_id = await _park_over_cap(h, "peer-worker")
+                lease_key, state_key = _lease_keys(h, entry_id)
+
+                # Acquired and RELEASED, so the delivery-state key exists (release
+                # deliberately preserves it) and only ``settle`` can remove it.
+                lease = await store.acquire(
+                    h.config.stream, h.config.consumer_group, entry_id, consumer="peer-worker"
+                )
+                assert (
+                    await store.release(
+                        h.config.stream, h.config.consumer_group, entry_id, owner=lease.owner
+                    )
+                    is True
+                )
+                live = await store.is_live(h.config.stream, h.config.consumer_group, entry_id)
+                assert live is False
+                assert await h.async_redis.exists(state_key) == 1
+                assert consumer._held_leases == {}
+
+                delivered = (await _pending_rows(h))[entry_id]
+                await consumer._dead_letter(
+                    entry_id,
+                    await consumer._entry_fields(entry_id),
+                    reason="max-delivery-exceeded",
+                    delivery_count=delivered,
+                )
+
+                rows = await _dead_rows(h)
+                assert len(rows) == 1, f"an unowned over-cap entry was not dead-lettered: {rows}"
+                assert rows[0][1]["dl_original_id"] == entry_id
+                assert rows[0][1]["dl_delivery_count"] == str(delivered)
+                assert entry_id not in await _pending_ids(h), "dead-lettered but never acked"
+                assert await h.async_redis.exists(lease_key) == 0
+                assert await h.async_redis.exists(state_key) == 0, "delivery state outlived settle"
+            finally:
+                await h.async_redis.delete(_dead_stream(h.config))
+
+    asyncio.run(go())
+
+
+# --- The settle asymmetry: RAISE at the dead-letter, SWALLOW after the ACK ----
+#
+# ``_settle_delivery`` (raises through) and ``_settle_delivery_best_effort``
+# (catches and logs a WARNING) are deliberately two methods on the shared base,
+# and WHICH ONE a call site picks is the entire point of the split. The two
+# tests below drive a real ``DeliveryLeaseStore`` whose ``settle`` cannot
+# complete and assert OPPOSITE outcomes at the two call sites, so swapping
+# either one for the other variant turns exactly one of them red.
+
+
+def test_a_failed_settle_makes_the_dead_letter_report_failure_not_a_clean_row(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The dead-letter settle RAISES THROUGH: a half-settled entry says so.
+
+    ``_dead_letter`` finishes with ``_settle_delivery`` -- the raising variant --
+    from inside the try that marks the span, records ``curie.queue.dead_letter``
+    and re-raises. A settle that fails there leaves the entry HALF settled: the
+    graveyard row is written and the entry is acked off the group, but its
+    delivery state is still on the box. That must be reported as a failed
+    dead-letter; swallowing it would hand the caller, the alerting and the
+    metric a dead-letter that looks clean while the state key silently outlives
+    it to its retention TTL.
+
+    Red on flipping that call to ``_settle_delivery_best_effort``, and equally
+    red on re-introducing a subclass override of ``_settle_delivery`` that
+    swallows -- the shape both lanes carried before the base consolidated them,
+    and the reason the raising variant is the overridable base method rather
+    than a private one.
+
+    The store is real and so is the failure: ONLY ``settle`` is replaced, so the
+    acquire/release that created the delivery-state key ran for real, and that
+    key surviving is the observable proof the settle genuinely did not happen
+    (an injection that silently no-opped would leave this test green on nothing).
+
+    ``record_metric`` is wrapped rather than replaced so the real declaration
+    check still runs on every point this path emits.
+    """
+    from curie_worker import stream_consumer as stream_consumer_module
+    from curie_worker.delivery_lease import DeliveryLeaseStore
+
+    points: list[tuple[str, dict[str, str]]] = []
+    real_record_metric = stream_consumer_module.record_metric
+
+    def recording_metric(
+        name: str, value: float = 1, *, attributes: dict[str, str] | None = None
+    ) -> None:
+        points.append((name, dict(attributes or {})))
+        real_record_metric(name, value, attributes=attributes)
+
+    def outcomes(name: str) -> list[str]:
+        return [attrs.get("outcome", "") for point, attrs in points if point == name]
+
+    async def go() -> None:
+        async with make_harness(**_FENCE_CONFIG) as h:
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(
+                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
+            )
+            await consumer.ensure_group()
+
+            try:
+                entry_id = await _park_over_cap(h, "peer-worker")
+                lease_key, state_key = _lease_keys(h, entry_id)
+
+                # Acquired and RELEASED, exactly as the positive control above:
+                # the fence permits, the state key exists, and only ``settle``
+                # can remove it.
+                lease = await store.acquire(
+                    h.config.stream, h.config.consumer_group, entry_id, consumer="peer-worker"
+                )
+                await store.release(
+                    h.config.stream, h.config.consumer_group, entry_id, owner=lease.owner
+                )
+                assert await h.async_redis.exists(state_key) == 1
+                assert consumer._held_leases == {}
+
+                boom = RuntimeError("valkey refused the terminal settle")
+
+                async def exploding_settle(*_args: object, **_kwargs: object) -> None:
+                    raise boom
+
+                monkeypatch.setattr(store, "settle", exploding_settle)
+                monkeypatch.setattr(
+                    stream_consumer_module, "record_metric", recording_metric
+                )
+
+                delivered = (await _pending_rows(h))[entry_id]
+                with pytest.raises(RuntimeError) as raised:
+                    await consumer._dead_letter(
+                        entry_id,
+                        await consumer._entry_fields(entry_id),
+                        reason="max-delivery-exceeded",
+                        delivery_count=delivered,
+                    )
+                assert raised.value is boom, (
+                    "the settle failure was swallowed and something else raised"
+                )
+
+                # Reported as a FAILED dead-letter, not a successful one.
+                assert outcomes("curie.queue.dead_letter") == ["failure"], (
+                    "a dead-letter whose settle failed was recorded as clean: "
+                    f"{points}"
+                )
+                assert outcomes("curie.queue.settle") == ["pending"]
+
+                # ...and the two writes that precede the settle DID happen, in
+                # that order: the graveyard row first (the neighbouring ordering
+                # test pins XADD-before-XACK against a graveyard that cannot be
+                # written), then the ACK. A failed settle must not be mistaken
+                # for a refused dead-letter, which writes neither.
+                rows = await _dead_rows(h)
+                assert len(rows) == 1, f"the graveyard row was rolled back: {rows}"
+                assert rows[0][1]["dl_original_id"] == entry_id
+                assert entry_id not in await _pending_ids(h), "the entry was never acked"
+                assert await h.async_redis.exists(lease_key) == 0, (
+                    "the lease key vanished, so the injected settle did not fire"
+                )
+                assert await h.async_redis.exists(state_key) == 1, (
+                    "the delivery state was removed, so the settle under test ran"
+                )
+            finally:
+                await h.async_redis.delete(_dead_stream(h.config))
+
+    asyncio.run(go())
+
+
+def test_a_failed_settle_after_the_ack_is_warned_about_and_the_turn_still_succeeds(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The MIRROR of the test above, at the post-ack call site: it SWALLOWS.
+
+    ``Consumer._handle`` settles after its terminal ACK, and by then the entry
+    is already off the group: raising there would turn a turn that ran, replied
+    and acked into a logged handler failure, and there is nothing left to retry
+    -- the state key's own retention is the backstop. So this site calls
+    ``_settle_delivery_best_effort``, which catches and logs one WARNING.
+
+    Same real store, same injected ``settle`` failure, opposite assertion: the
+    handler task completes normally, the turn is acked and answered, and the
+    only trace is a WARNING carrying the entry id and the exception. Red on
+    flipping this call site to the raising ``_settle_delivery`` (the handler
+    task ends in an exception and the success metric is never recorded), and red
+    on downgrading the log to silence.
+    """
+    from curie_worker.delivery_lease import DeliveryLeaseStore
+
+    async def go() -> None:
+        async with make_harness(**_FENCE_CONFIG) as h:
+            h.runner.default_script = [Final(text="answered", status=DONE)]
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(
+                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
+            )
+            await consumer.ensure_group()
+
+            async def exploding_settle(*_args: object, **_kwargs: object) -> None:
+                raise RuntimeError("valkey refused the terminal settle")
+
+            monkeypatch.setattr(store, "settle", exploding_settle)
+
+            try:
+                qe = _qevent(
+                    "post-ack settle",
+                    thread="tdl-postack",
+                    event_id=f"postack-{uuid.uuid4().hex[:8]}",
+                )
+                await h.async_redis.xadd(h.config.stream, to_stream_fields(qe))
+                rows = await h.async_redis.xreadgroup(
+                    h.config.consumer_group,
+                    h.config.consumer_name,
+                    {h.config.stream: ">"},
+                    count=1,
+                )
+                entry_id, fields = rows[0][1][0]
+
+                with caplog.at_level(logging.DEBUG, logger="curie_worker.consumer"):
+                    await consumer._dispatch(entry_id, dict(fields))
+                    handlers = list(consumer._inflight)
+                    results = await asyncio.gather(*handlers, return_exceptions=True)
+
+                assert [r for r in results if isinstance(r, BaseException)] == [], (
+                    "a settle failure AFTER the ack escaped the handler and "
+                    "failed a turn that had already succeeded"
+                )
+                assert h.runner.opened == ["post-ack settle"]
+                assert h.sink.last_text == "answered"
+                assert entry_id not in await _pending_ids(h), "the turn never acked"
+                assert await _dead_rows(h) == [], "a settled turn reached the graveyard"
+
+                settle_logs = [
+                    r for r in caplog.records if "settling the delivery state" in r.getMessage()
+                ]
+                assert len(settle_logs) == 1, (
+                    f"expected exactly one settle-failure log, got: "
+                    f"{[r.getMessage() for r in settle_logs]}"
+                )
+                record = settle_logs[0]
+                assert record.levelno == logging.WARNING, (
+                    f"the post-ack settle failure was logged at {record.levelname}, not WARNING"
+                )
+                assert entry_id in record.getMessage()
+                assert record.exc_info is not None, (
+                    "the swallowed exception was not attached, so an operator "
+                    "cannot tell WHY the state key was left behind"
+                )
+            finally:
+                await h.async_redis.delete(_dead_stream(h.config))
+
+    asyncio.run(go())
+
+
+def test_the_settle_split_survives_on_the_consumer_subclass_itself(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The same asymmetry asserted where the REGRESSION would land: on ``Consumer``.
+
+    The two tests above drive the two call sites. This one drives the two
+    METHODS, on a real ``Consumer``, because the likeliest regression is not a
+    changed call site at all: the method deleted from ``consumer.py`` when the
+    base consolidated the three copies had exactly the name ``_settle_delivery``
+    and exactly the SWALLOWING shape. ``Consumer`` now inherits three coupled
+    things -- ``_settle_delivery`` (raises), ``_settle_delivery_best_effort``
+    (swallows) and ``_dead_letter``, which deliberately calls the raising one --
+    so a future "make settle best-effort everywhere" cleanup that re-adds
+    ``Consumer._settle_delivery`` would not only change the post-ack site: it
+    would silently convert the INHERITED dead-letter's settle into a swallow.
+    A half-settled dead-letter then reports as a clean one -- the CRITICAL alert
+    fires as normal, no failure metric is recorded, and the lease and
+    delivery-state keys leak to their retention TTL with no signal anywhere.
+
+    Deliberately Valkey-free: a fake store is enough to make ``settle`` fail, and
+    an override anywhere must be caught on every box, not only where the compose
+    stack happens to be up.
+    """
+
+    class _RefusingLeaseStore:
+        """A lease store whose terminal settle cannot complete.
+
+        Records its calls so a variant that never reached the store at all --
+        the other way this test could go quietly vacuous -- is visible.
+        """
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str, str]] = []
+
+        async def settle(self, stream: str, group: str, entry_id: str) -> None:
+            self.calls.append((stream, group, entry_id))
+            raise RuntimeError("valkey refused the terminal settle")
+
+    config = WorkerConfig(
+        stream="curie:runs", consumer_group="curie-workers", consumer_name="worker-1"
+    )
+    store = _RefusingLeaseStore()
+    consumer = Consumer(
+        redis=None,  # type: ignore[arg-type]
+        kernel=None,  # type: ignore[arg-type]
+        config=config,
+        leases=store,  # type: ignore[arg-type]
+    )
+    entry_id = "1700000000000-0"
+
+    # The dead-letter's variant: raises through, so ``_dead_letter``'s own
+    # handler can mark the span, record the failure metric and re-raise.
+    with pytest.raises(RuntimeError, match="refused the terminal settle"):
+        asyncio.run(consumer._settle_delivery(entry_id))
+
+    # The post-ack variant: same failure, same store, returns normally.
+    with caplog.at_level(logging.DEBUG, logger="curie_worker.consumer"):
+        asyncio.run(consumer._settle_delivery_best_effort(entry_id))
+
+    assert store.calls == [
+        (config.stream, config.consumer_group, entry_id),
+        (config.stream, config.consumer_group, entry_id),
+    ], f"a variant never reached the lease store at all: {store.calls}"
+
+    settle_logs = [r for r in caplog.records if "settling the delivery state" in r.getMessage()]
+    assert len(settle_logs) == 1, (
+        "the swallowed settle failure must leave exactly one trace; got "
+        f"{[r.getMessage() for r in settle_logs]}"
+    )
+    record = settle_logs[0]
+    assert record.name == "curie_worker.consumer", (
+        f"the settle warning came from {record.name}; the dead-letter alerting and "
+        "the operator's log filters both key off this logger"
+    )
+    assert record.levelno == logging.WARNING, (
+        f"the swallowed settle failure was logged at {record.levelname}, not WARNING"
+    )
+    assert entry_id in record.getMessage()
+    assert record.exc_info is not None, (
+        "the swallowed exception was not attached, so an operator cannot tell WHY "
+        "the delivery state was left behind"
+    )
+
+
+def test_the_maintenance_scan_fails_closed_when_lease_liveness_is_unreadable(
+    make_harness,
+) -> None:
+    """An unreadable ownership store reads as OWNED, never as permission.
+
+    ADR-0131: "loss of the ownership store cannot be treated as permission to
+    continue producing effects." The store here is a REAL ``DeliveryLeaseStore``
+    over a real client pointed at a dead port -- no mock -- so ``is_live``
+    raises for real and ``_lease_is_live``'s ``except`` arm is what answers.
+
+    The cost of failing closed is one skipped maintenance pass: the entry stays
+    pending and is dead-lettered on a later tick once Valkey answers again. The
+    cost of failing OPEN is a healthy turn's delivery settled underneath its
+    owner during a blip -- unrecoverable.
+
+    Red on removing the ``_dead_letter_refusal`` precondition, and equally red
+    on flipping ``_lease_is_live``'s exception handler to ``return False``. The
+    positive control is the test above: a READABLE store with no live lease
+    proceeds, so this is fail-closed and not a fence that refuses everything.
+    """
+    from curie_worker.delivery_lease import DeliveryLeaseStore
+    from redis.asyncio import Redis as AsyncRedis
+    from redis.exceptions import ConnectionError as RedisConnectionError
+
+    async def go() -> None:
+        async with make_harness(**_FENCE_CONFIG) as h:
+            # A real client that cannot reach anything: port 1 is never a Valkey.
+            unreachable = AsyncRedis(
+                host="127.0.0.1", port=1, socket_connect_timeout=0.5, decode_responses=True
+            )
+            store = DeliveryLeaseStore(unreachable, h.config)
+            consumer = Consumer(
+                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
+            )
+            await consumer.ensure_group()
+
+            try:
+                entry_id = await _park_over_cap(h, "peer-worker")
+                with pytest.raises(RedisConnectionError):
+                    await store.is_live(h.config.stream, h.config.consumer_group, entry_id)
+
+                before = (await _pending_rows(h))[entry_id]
+                await consumer._dead_letter(
+                    entry_id,
+                    await consumer._entry_fields(entry_id),
+                    reason="max-delivery-exceeded",
+                    delivery_count=before,
+                )
+
+                assert await _dead_rows(h) == [], "settled a delivery it could not vouch for"
+                assert entry_id in await _pending_ids(h)
+                assert (await _pending_rows(h))[entry_id] == before
+            finally:
+                with contextlib.suppress(Exception):
+                    await unreachable.aclose()
+                await h.async_redis.delete(_dead_stream(h.config))
+
+    asyncio.run(go())
+
+
+def test_a_handler_that_lost_its_lease_mid_flight_may_not_dead_letter(
+    make_harness,
+) -> None:
+    """The handler branch: our OWN lease going lost is authority we no longer have.
+
+    The unparseable path reaches the graveyard from INSIDE ``_delivery_lease``,
+    so its lease is registered in ``_held_leases`` and the fence asks
+    ``held.lost`` rather than re-reading liveness. The loss here is genuine: a
+    peer XCLAIMs the PEL row, the real heartbeat's next renewal comes back
+    ``not-owner``, and ``lost`` is set by production code -- no clock is patched
+    and nothing is mocked.
+
+    A lost lease means the entry now belongs to whoever holds the fence, so the
+    refusal must leave it PENDING for them and write nothing.
+
+    Red on removing the ``_dead_letter_refusal`` precondition from
+    ``_dead_letter``: the graveyard row is written (the later
+    ``held.raise_if_lost()`` guard fires only AFTER the XADD, by design), so a
+    fenced-out owner poisons a delivery the new owner is still working.
+    """
+    from curie_worker.delivery_lease import DeliveryLeaseStore
+
+    async def go() -> None:
+        async with make_harness(**_FENCE_CONFIG) as h:
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(
+                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
+            )
+            await consumer.ensure_group()
+
+            try:
+                fields = {"garbage": "x", "trace": uuid.uuid4().hex[:8]}
+                await h.async_redis.xadd(h.config.stream, fields)
+                rows = await h.async_redis.xreadgroup(
+                    h.config.consumer_group,
+                    h.config.consumer_name,
+                    {h.config.stream: ">"},
+                    count=1,
+                )
+                entry_id = rows[0][1][0][0]
+
+                async with consumer._delivery_lease(entry_id, fields) as lease:
+                    assert lease is not None
+                    assert consumer._held_leases.get(entry_id) is lease, (
+                        "the handler branch of the fence is not the one under test"
+                    )
+
+                    # The real fence move: a peer takes the PEL row, so our next
+                    # renewal is refused and the heartbeat marks us lost.
+                    await h.async_redis.xclaim(
+                        h.config.stream, h.config.consumer_group, "peer-worker", 0, [entry_id]
+                    )
+                    await asyncio.wait_for(lease.lost.wait(), timeout=10.0)
+
+                    await consumer._dead_letter(
+                        entry_id, fields, reason="unparseable", delivery_count=1
+                    )
+
+                    assert await _dead_rows(h) == [], "a fenced-out owner wrote a graveyard row"
+                    assert entry_id in await _pending_ids(h), (
+                        "a fenced-out owner acked the current owner's delivery"
+                    )
+            finally:
+                await h.async_redis.delete(_dead_stream(h.config))
+
+    asyncio.run(go())
+
+
+def test_a_handler_holding_a_healthy_lease_dead_letters_normally(
+    make_harness,
+) -> None:
+    """POSITIVE CONTROL for the handler-branch refusal above.
+
+    Same path, same registered lease, same ``_dead_letter`` call -- the only
+    difference is that nothing fenced us out, so the unparseable entry must
+    reach the graveyard and be acked exactly as it always has. Without this,
+    a ``_dead_letter_refusal`` that returned a reason for every held lease
+    would leave the refusal test green while silently disabling the unparseable
+    path, and poison would go back to being reclaimed forever.
+
+    Red on a handler-branch fence that refuses a lease whose ``lost`` is clear.
+    """
+    from curie_worker.delivery_lease import DeliveryLeaseStore
+
+    async def go() -> None:
+        async with make_harness(**_FENCE_CONFIG) as h:
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(
+                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
+            )
+            await consumer.ensure_group()
+
+            try:
+                token = uuid.uuid4().hex[:8]
+                fields = {"garbage": "x", "trace": token}
+                await h.async_redis.xadd(h.config.stream, fields)
+                rows = await h.async_redis.xreadgroup(
+                    h.config.consumer_group,
+                    h.config.consumer_name,
+                    {h.config.stream: ">"},
+                    count=1,
+                )
+                entry_id = rows[0][1][0][0]
+                lease_key, state_key = _lease_keys(h, entry_id)
+
+                async with consumer._delivery_lease(entry_id, fields) as lease:
+                    assert lease is not None
+                    assert not lease.lost.is_set()
+                    assert consumer._held_leases.get(entry_id) is lease
+
+                    await consumer._dead_letter(
+                        entry_id, fields, reason="unparseable", delivery_count=1
+                    )
+
+                    dead = await _dead_rows(h)
+                    assert len(dead) == 1, f"a healthy owner could not dead-letter: {dead}"
+                    assert dead[0][1]["dl_original_id"] == entry_id
+                    assert dead[0][1]["dl_reason"] == "unparseable"
+                    assert dead[0][1]["trace"] == token
+                    assert entry_id not in await _pending_ids(h)
+                    assert await h.async_redis.exists(lease_key) == 0
+                    assert await h.async_redis.exists(state_key) == 0
+            finally:
+                await h.async_redis.delete(_dead_stream(h.config))
+
+    asyncio.run(go())
+
+
+def test_the_graveyard_write_precedes_the_ack_so_a_failed_write_leaves_it_pending(
+    make_harness,
+) -> None:
+    """XADD before XACK, observed through a graveyard that cannot be written.
+
+    The fence added above is a gate in FRONT of this sequence, not a reordering
+    of it, so the ordering rationale still has to hold: a crash (or a failing
+    write) between the two must cost a DUPLICATE graveyard row on the retry,
+    never a lost entry. The target is turned into a plain string key, so the
+    real XADD raises WRONGTYPE against real Valkey -- no patched client.
+
+    With XADD first, the failure happens before the ACK: the entry is still
+    pending and will be re-reclaimed and re-dead-lettered. Reverse the two and
+    this test goes red the interesting way -- the entry is acked off the group
+    with no graveyard row anywhere, which is the silent-loss failure mode the
+    ordering exists to avoid. The delivery-state key surviving is the same
+    proof from the settle side: nothing terminal ran.
+    """
+    from curie_worker.delivery_lease import DeliveryLeaseStore
+    from redis.exceptions import ResponseError
+
+    async def go() -> None:
+        async with make_harness(**_FENCE_CONFIG) as h:
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(
+                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
+            )
+            await consumer.ensure_group()
+            dead = _dead_stream(h.config)
+
+            try:
+                entry_id = await _park_over_cap(h, "peer-worker")
+                _lease_key, state_key = _lease_keys(h, entry_id)
+                # Give the delivery a state key to watch, then leave it unowned so
+                # the fence permits: what stops this dead-letter is the write.
+                lease = await store.acquire(
+                    h.config.stream, h.config.consumer_group, entry_id, consumer="peer-worker"
+                )
+                await store.release(
+                    h.config.stream, h.config.consumer_group, entry_id, owner=lease.owner
+                )
+
+                await h.async_redis.set(dead, "not-a-stream")
+                before = (await _pending_rows(h))[entry_id]
+
+                with pytest.raises(ResponseError):
+                    await consumer._dead_letter(
+                        entry_id,
+                        await consumer._entry_fields(entry_id),
+                        reason="max-delivery-exceeded",
+                        delivery_count=before,
+                    )
+
+                assert entry_id in await _pending_ids(h), (
+                    "the entry was acked without a graveyard row: XACK ran before XADD"
+                )
+                assert (await _pending_rows(h))[entry_id] == before
+                assert await h.async_redis.exists(state_key) == 1
+            finally:
+                await h.async_redis.delete(dead)
+
+    asyncio.run(go())

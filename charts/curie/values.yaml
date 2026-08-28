@@ -1097,7 +1097,16 @@ mailAdapter:
 worker:
   deploy: true
   replicas: 1
-  terminationGracePeriodSeconds: 1800
+  # Must be >= deliveryBudgetSeconds + deliveryShutdownReserveSeconds
+  # (ADR-0131): 1800 + 60 = 1860 covers the ADR's maximum configurable budget.
+  # The prior 1800 (#1570, "Give worker turns time to drain") was sized
+  # against max_attempts * runner_total_timeout_s with zero headroom for
+  # settlement -- a worker draining a maximum-budget turn was SIGKILLed at
+  # exactly the moment it would have settled. Voluntary termination may now
+  # take up to the configured budget plus reserve, so a rollout can take up
+  # to ~31 minutes per pod at the maximum budget; operators choose that cost
+  # when they choose a long execution budget.
+  terminationGracePeriodSeconds: 1860
   image:
     repository: ghcr.io/curie-eng/curie-worker
     # Empty -> chart appVersion (immutable). Set to pin an explicit version tag.
@@ -1276,6 +1285,32 @@ worker:
   # is accepted by YAML, renders fine, and used to boot healthy and then hang
   # every turn while leaking a sandbox per attempt (#1388).
   suspendedRouteTtlSeconds: 86400
+  # Delivery budget and ownership lease (ADR-0131, #1971). One overall
+  # wall-clock deadline and one renewable fenced owner per delivery, replacing
+  # the old dead pair of a flat per-request HTTP timeout and a 900s idle-based
+  # steal window. Integers, not floats -- as with routeTtlSeconds, a YAML
+  # float renders through the template's `| quote` as scientific notation for
+  # larger values, which the worker then cannot parse.
+  #
+  # The OVERALL deadline for one delivery: claim, every runner request, every
+  # retry backoff, reclaim, and terminal cleanup. Must be between 60 and 1800
+  # (the ADR's stated maximum); values.schema.json enforces this at
+  # install/template time and the worker's own validator enforces it again at
+  # boot.
+  deliveryBudgetSeconds: 600
+  # How long the renewable ownership lease lives before it is considered
+  # expired and transferable. Must span at least 3 heartbeat periods
+  # (deliveryLeaseHeartbeatSeconds) so a single missed heartbeat never drops a
+  # healthy owner's lease -- enforced by the worker's own validator.
+  deliveryLeaseTtlSeconds: 45
+  # How often the owner renews its lease and resets its PEL idle via
+  # `XCLAIM ... JUSTID`, which does NOT increase the stream entry's delivery
+  # count.
+  deliveryLeaseHeartbeatSeconds: 10
+  # Budget reserved for terminal settlement (fenced ACK/dead-letter/outbox
+  # clear) after the runner work is done. `terminationGracePeriodSeconds`
+  # above must be at least deliveryBudgetSeconds + this value.
+  deliveryShutdownReserveSeconds: 60
   # The Slack assistant-thread "shimmer" (#1182): the animated caption Slack
   # shows next to the app's name while a turn runs. On by default -- the
   # placeholder message only changes when the model emits text, so a model that

@@ -13,8 +13,10 @@ per-message business logic and passes them in.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import cast
@@ -32,12 +34,21 @@ from redis.exceptions import (
 )
 
 from .broker import StreamBroker
+from .delivery_lease import (
+    DeliveryLease,
+    DeliveryLeaseStore,
+    LeaseRefused,
+    unfenced_lease,
+)
 
 # One stream entry as redis returns it with decode_responses=True.
 StreamEntry = tuple[str, dict[str, str]]
 
 # An async per-message handler: (entry_id, fields) -> None.
 EntryHandler = Callable[[str, dict[str, str]], Awaitable[None]]
+
+# Called once when a delivery's lease is lost mid-flight: (entry_id, fields).
+LeaseLostHandler = Callable[[str, dict[str, str]], Awaitable[None]]
 
 
 @dataclass(frozen=True)
@@ -93,7 +104,14 @@ class StreamConsumer:
     business logic.
     """
 
-    def __init__(self, redis: StreamBroker, delivery: DeliverySpec | None = None) -> None:
+    def __init__(
+        self,
+        redis: StreamBroker,
+        delivery: DeliverySpec | None = None,
+        *,
+        leases: DeliveryLeaseStore | None = None,
+        on_lease_lost: LeaseLostHandler | None = None,
+    ) -> None:
         # The stream broker behind the port (#284). ``redis.asyncio.Redis`` is the
         # one backing today and structurally satisfies ``StreamBroker``; a second
         # broker is a drop-in. Named ``_redis`` still so the sacred consumer.py
@@ -108,6 +126,38 @@ class StreamConsumer:
         # The reclaim/dead-letter knobs, or None for a base-only reader that
         # exercises just ``_consume`` (no reclaim machinery).
         self._delivery = delivery
+        # Delivery ownership leases (ADR-0131). Like ``consumer.py``'s
+        # ``self._valkey``, this collaborator is built from the CONCRETE
+        # ``redis.asyncio.Redis`` rather than the ``StreamBroker`` port above:
+        # the fence needs Lua scripting, server ``TIME``, and string-key verbs
+        # the port deliberately does not carry (see delivery_lease.py's module
+        # docstring). Optional, and None for a base-only consumer or a second
+        # broker implementation -- that construction must keep working exactly
+        # as it did before the lease existed.
+        self._leases: DeliveryLeaseStore | None = leases
+        # Leases this process is holding RIGHT NOW, keyed by entry id, populated
+        # and cleared by ``_delivery_lease``. It is the ONE registry of in-flight
+        # leases -- a lane that kept its own second copy would have to stay in
+        # lockstep with this one by hand, and the two fences reading different
+        # dicts is exactly how a fence silently stops seeing its lease.
+        #
+        # It exists so a caller that did not receive the lease can still find it
+        # without threading one through a shared signature. ``_dead_letter`` uses
+        # it to tell which of its two callers it is serving: a handler path is
+        # registered here, the maintenance scan is not (see
+        # ``_dead_letter_refusal`` for what the fence asks in each case). The
+        # eval lane reads it the same way at its report fence and its budget.
+        #
+        # Only a REAL lease is registered; the permissive ``unfenced_lease()``
+        # sentinel is not, so absence here means either "not in a handler" or
+        # "this consumer has no lease store at all", and every reader must
+        # disambiguate on ``self._leases`` rather than on absence alone.
+        self._held_leases: dict[str, DeliveryLease] = {}
+        # Fired once when a lease is lost mid-flight, so the owning lane can
+        # stop its runner through its own bounded control path. The base never
+        # cancels a handler task itself: a bare cancel skips the runner-side
+        # stop and leaves a turn producing effects on a sandbox we no longer own.
+        self._on_lease_lost: LeaseLostHandler | None = on_lease_lost
 
     @property
     def _spec(self) -> DeliverySpec:
@@ -199,11 +249,280 @@ class StreamConsumer:
     async def _ack(self, entry_id: str) -> None:
         await self._redis.xack(self._spec.stream, self._spec.group, entry_id)
 
+    async def _settle_delivery(self, entry_id: str) -> None:
+        """Remove this delivery's lease AND its state after a terminal settlement.
+
+        ADR-0131: delivery state is "removed after terminal acknowledgement or
+        dead-letter settlement". The base's lease release drops only the lease,
+        so without this a dead-lettered-and-redelivered entry id accumulates
+        state keys until their retention TTL expires them.
+
+        RAISES THROUGH on failure. It is the caller that knows whether a settle
+        failure is recoverable, and the two shapes genuinely differ: a caller
+        that is already inside its own error handling (``_dead_letter``, which
+        must mark the span and the metric and re-raise) needs the exception, and
+        a caller that has already acked wants
+        :meth:`_settle_delivery_best_effort` instead. Both lanes read the
+        delivery off ``self._spec``, which is exactly the runs/eval difference
+        (``stream`` vs ``eval_stream``) each lane used to spell out itself.
+        """
+        if self._leases is None:
+            return
+        await self._leases.settle(self._spec.stream, self._spec.group, entry_id)
+
+    async def _settle_delivery_best_effort(self, entry_id: str) -> None:
+        """:meth:`_settle_delivery` for a caller that has ALREADY acked.
+
+        Best-effort by construction: the entry is already off the group by the
+        time this runs, so raising here would only turn a settled turn or suite
+        into a logged failure. The state key's own retention is the backstop for
+        a crash between the ack and here, not the normal way it goes away.
+        """
+        if self._delivery is None or self._leases is None:
+            # Nothing to settle without both a bound DeliverySpec and a lease
+            # store -- ``_settle_delivery`` would no-op on a missing lease
+            # store anyway, and a missing DeliverySpec must be handled here,
+            # before the try, because the except below reads ``self._spec``
+            # for its logger and that property raises on a None delivery too.
+            # Swallowing is this method's whole contract, so bail out early
+            # rather than let that second read escape uncaught.
+            return
+        try:
+            await self._settle_delivery(entry_id)
+        except Exception:
+            self._spec.logger.warning(
+                "settling the delivery state for entry %s on stream %s failed; "
+                "leaving it to its retention TTL",
+                entry_id,
+                self._spec.stream,
+                exc_info=True,
+            )
+
     async def _entry_fields(self, entry_id: str) -> dict[str, str] | None:
         """The original entry's fields, or None if it was already trimmed off the
         stream (then a metadata-only graveyard row is written)."""
         rows = await self._redis.xrange(self._spec.stream, min=entry_id, max=entry_id)
         return dict(rows[0][1]) if rows else None
+
+    async def _lease_is_live(self, entry_id: str) -> bool:
+        """Does some owner hold this delivery right now?
+
+        FAIL CLOSED on an unreadable answer. Every caller uses this to decide
+        whether it may dead-letter or dispatch a delivery, and ADR-0131 is
+        explicit that "loss of the ownership store cannot be treated as
+        permission to continue producing effects" -- so a Valkey blip reads as
+        "somebody owns it", which costs one skipped maintenance pass, rather
+        than as "nobody owns it", which costs a duplicate turn or a healthy
+        turn's dead-letter.
+
+        With no lease store configured at all there is no fence to consult and
+        the answer is False, leaving the pre-ADR-0131 behavior intact.
+        """
+        if self._leases is None:
+            return False
+        try:
+            return await self._leases.is_live(
+                self._spec.stream, self._spec.group, entry_id
+            )
+        except Exception:
+            self._spec.logger.warning(
+                "lease liveness unreadable for entry %s on stream %s; "
+                "treating it as OWNED and skipping this pass",
+                entry_id,
+                self._spec.stream,
+                exc_info=True,
+            )
+            return True
+
+    @asynccontextmanager
+    async def _delivery_lease(
+        self, entry_id: str, fields: dict[str, str]
+    ) -> AsyncIterator[DeliveryLease | None]:
+        """Hold delivery authority for the body of a handler (ADR-0131).
+
+        Lives HERE, once, rather than in each lane, because the ADR requires the
+        runs and eval consumers to share the lease implementation by
+        construction: "a fix on only one consumer lane is incomplete."
+
+        Yields the lease on success and ``None`` when acquisition was refused --
+        a refusal is a normal early return from the handler, never an exception.
+        An exception would be caught by ``_consume``'s isolation guard and
+        logged as a failure, which is correct but noisy for the routine case of
+        losing a race to a peer that is already working the entry.
+
+        With no lease store, yields the permissive sentinel so a base-only
+        consumer is unchanged. That is the one place a missing lease is read as
+        permission; nowhere else may it be.
+        """
+        if self._leases is None:
+            yield unfenced_lease()
+            return
+
+        spec = self._spec
+        try:
+            lease = await self._leases.acquire(
+                spec.stream, spec.group, entry_id, consumer=spec.consumer
+            )
+        except LeaseRefused as refused:
+            if refused.reason == "held":
+                # Routine under contention: a peer holds a live lease and is
+                # working this entry. Return without acking; it stays pending
+                # for its true owner.
+                spec.logger.debug(
+                    "entry %s on stream %s is leased elsewhere; not dispatching",
+                    entry_id,
+                    spec.stream,
+                )
+            else:
+                # The PEL and our belief have diverged -- we were about to fence
+                # a delivery Valkey never gave us. Not routine.
+                spec.logger.warning(
+                    "refused the delivery lease for entry %s on stream %s (%s); "
+                    "this consumer does not hold the pending entry",
+                    entry_id,
+                    spec.stream,
+                    refused.reason,
+                )
+            yield None
+            return
+
+        heartbeat = asyncio.create_task(self._heartbeat_lease(lease, entry_id, fields))
+        # Registered BEFORE the body runs, so the dead-letter fence can find this
+        # lease from anywhere inside the handler -- including the unparseable
+        # path, which reaches the graveyard without ever naming its lease.
+        self._held_leases[entry_id] = lease
+        try:
+            yield lease
+        finally:
+            # Deregistered FIRST: once the body is done this process is no longer
+            # a holder, and a later maintenance-scan dead-letter of the same id
+            # must fall through to the "does anybody else own it" question rather
+            # than consulting a lease we have already finished with.
+            self._held_leases.pop(entry_id, None)
+            heartbeat.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat
+            try:
+                await self._leases.release(
+                    spec.stream, spec.group, entry_id, owner=lease.owner
+                )
+            except Exception:
+                # Releasing is an optimization: the lease expires on its own at
+                # ``delivery_lease_ttl_s``. Raising out of this ``finally`` would
+                # mask whatever the handler was already failing with.
+                spec.logger.warning(
+                    "releasing the delivery lease for entry %s failed; "
+                    "leaving it to expire",
+                    entry_id,
+                    exc_info=True,
+                )
+
+    async def _heartbeat_lease(
+        self, lease: DeliveryLease, entry_id: str, fields: dict[str, str]
+    ) -> None:
+        """Renew the lease until it is lost or the handler finishes.
+
+        Sleeps with a PLAIN ``asyncio.sleep``, never ``_sleep_or_stop``. A
+        SIGTERM sets ``_stop`` while the worker is deliberately draining its
+        in-flight turns, and a stop-aware sleep here would drop every in-flight
+        lease the instant the signal landed -- turning a graceful rollout into a
+        fleet-wide fence-out, the exact opposite of draining. The platform
+        termination grace is sized to cover the budget plus the shutdown
+        reserve precisely so this loop may keep running through shutdown.
+
+        Any refusal OR any exception is lease-lost. ADR-0131: "if Valkey cannot
+        confirm renewal, the owner fails closed as lease-lost."
+        """
+        assert self._leases is not None
+        spec = self._spec
+        while True:
+            await asyncio.sleep(self._leases.heartbeat_interval_s)
+            try:
+                budget = await self._leases.heartbeat(
+                    spec.stream,
+                    spec.group,
+                    entry_id,
+                    consumer=spec.consumer,
+                    owner=lease.owner,
+                    generation=lease.generation,
+                )
+            except Exception as exc:  # noqa: BLE001 - any failure is lease-lost
+                budget = None
+                reason = f"renewal raised {type(exc).__name__}: {exc}"
+            else:
+                reason = "renewal refused by Valkey"
+            if budget is None:
+                lease.lost.set()
+                spec.logger.warning(
+                    "delivery lease LOST for entry %s on stream %s "
+                    "(owner=%s generation=%d): %s; this owner may no longer ack, "
+                    "dead-letter, or emit a terminal result",
+                    entry_id,
+                    spec.stream,
+                    lease.owner,
+                    lease.generation,
+                    reason,
+                )
+                if self._on_lease_lost is not None:
+                    try:
+                        await self._on_lease_lost(entry_id, fields)
+                    except Exception:
+                        # A failure to stop the runner must not mask the loss
+                        # itself, which ``lease.lost`` has already recorded and
+                        # which the settle boundaries enforce on their own.
+                        spec.logger.exception(
+                            "lease-lost handler failed for entry %s on stream %s",
+                            entry_id,
+                            spec.stream,
+                        )
+                return
+            # Re-anchor in place so the holder always reads the freshest
+            # observation. The DEADLINE never moves: only the anchor does.
+            lease.budget = budget
+
+    async def _dead_letter_refusal(self, entry_id: str) -> str | None:
+        """Why this process may NOT dead-letter ``entry_id``, or None if it may.
+
+        ADR-0131 names dead-letter as one of the four verbs a fenced-out owner
+        loses: *"A stale owner that fails a renewal immediately loses authority
+        ... and may not ACK, dead-letter, clear an outbox record, or emit a
+        terminal result."* Dead-letter is a terminal settlement -- it ACKs the
+        delivery off the group and then deletes the lease and delivery state --
+        so an unfenced one lets a stale process settle a delivery that now
+        belongs to somebody else, and delete the CURRENT owner's keys on the way
+        out.
+
+        The two callers arrive from opposite sides of the fence, so the question
+        asked is different at each:
+
+        - **A handler path** (the unparseable/poison entry) is INSIDE
+          ``_delivery_lease`` and is registered in ``_held_leases``. The question
+          is whether our own lease is still ours: a heartbeat that failed while
+          the graveyard row was being prepared has already set ``lost``, and a
+          lost lease is authority we no longer have.
+        - **``_dead_letter_over_cap``** holds no lease -- it got here precisely
+          because ``_lease_is_live`` said nobody did. The question is whether
+          that is STILL true: a new owner may have acquired in the window since
+          that read, and its delivery must not be settled underneath it. The
+          re-read fails closed on an unreadable answer, like every other use.
+
+        With no lease store there is no fence to consult and nothing is ever
+        refused, so a consumer built without leases dead-letters exactly as it
+        did before ADR-0131.
+        """
+        if self._leases is None:
+            return None
+        held = self._held_leases.get(entry_id)
+        if held is not None:
+            if held.lost.is_set():
+                return (
+                    "this owner's delivery lease was lost mid-flight "
+                    f"(owner={held.owner}, generation={held.generation})"
+                )
+            return None
+        if await self._lease_is_live(entry_id):
+            return "another owner now holds the delivery lease"
+        return None
 
     async def _dead_letter(
         self,
@@ -230,6 +549,12 @@ class StreamConsumer:
         ``dl_`` -- so the metadata always wins AND the original is fully
         recoverable.
 
+        Fenced (ADR-0131): dead-letter is a terminal settlement, so it is gated on
+        this process still holding delivery authority. ``_dead_letter_refusal``
+        explains what that means for each caller; a refusal returns having
+        written nothing and acked nothing, leaving the entry pending for whoever
+        now owns it.
+
         XADD before XACK, deliberately: a crash between the two leaves the entry
         pending, so it is re-reclaimed and re-dead-lettered -- a duplicate
         graveyard row, which is strictly safer than the XACK-first ordering's
@@ -246,6 +571,33 @@ class StreamConsumer:
         node boundaries, so the stream is bounded at *at least* the configured
         length, not exactly it.
         """
+        attributes = {
+            "service.name": "curie-worker",
+            "source": self._spec.telemetry_source,
+        }
+        # The fence, asked as a PRECONDITION (ADR-0131; see
+        # ``_dead_letter_refusal``). Asked here rather than further down so a
+        # refusal costs nothing: no graveyard row is written for a delivery we
+        # are not going to settle, and the XADD-before-XACK ordering below is
+        # untouched -- this is a new gate in front of the sequence, not a
+        # reordering of it. Refusal returns rather than raising: losing the fence
+        # is the routine outcome of a peer taking over, and an exception would
+        # reach ``_consume``'s isolation guard as a per-entry stack trace.
+        refusal = await self._dead_letter_refusal(entry_id)
+        if refusal is not None:
+            self._spec.logger.warning(
+                "refusing to dead-letter entry %s on stream %s (%s); leaving it "
+                "pending for its current owner and touching no lease or state key",
+                entry_id,
+                self._spec.stream,
+                refusal,
+            )
+            record_metric(
+                "curie.queue.settle",
+                attributes={**attributes, "outcome": "pending"},
+            )
+            return
+
         target = self._spec.dead_letter_target
         # Escape the original's own ``dl_*`` keys (see above) so the metadata
         # written last always wins and the original stays recoverable.
@@ -260,10 +612,6 @@ class StreamConsumer:
                 "dl_dead_lettered_at": datetime.now(UTC).isoformat(),
             }
         )
-        attributes = {
-            "service.name": "curie-worker",
-            "source": self._spec.telemetry_source,
-        }
         error: Exception | None = None
         with operation_span(
             "curie.queue.dead-letter",
@@ -284,7 +632,27 @@ class StreamConsumer:
                     reason,
                     target,
                 )
+                # The XADD above is a round trip, so a heartbeat can fail while
+                # it is in flight. Re-read the fence immediately before the ACK
+                # to close that window -- but only the FREE in-process flag a
+                # held lease already carries, never a second Valkey read, so the
+                # ordering is unchanged and the maintenance path (which holds no
+                # lease) pays nothing. Fails closed by raising: the graveyard row
+                # is already written, so unlike the precondition above there is
+                # no clean early return left, and a duplicate row on the true
+                # owner's later dead-letter is the ordering's accepted cost.
+                held = self._held_leases.get(entry_id)
+                if held is not None:
+                    held.raise_if_lost()
                 await self._ack(entry_id)
+                # ADR-0131: delivery state is "removed after terminal
+                # acknowledgement or dead-letter settlement". After the ACK and
+                # inside the same try, and deliberately the RAISING settle rather
+                # than the best-effort one the post-ack handler paths use: here a
+                # settle failure must be caught by the handler below and reported
+                # as a failed dead-letter, not swallowed into a half-settled
+                # entry. The XADD-before-XACK ordering above is untouched.
+                await self._settle_delivery(entry_id)
             except Exception as exc:
                 error = exc
                 if hasattr(span, "set_status"):
@@ -361,6 +729,15 @@ class StreamConsumer:
                 # guard stays ahead of the cap check.
                 if entry_id in self._inflight_ids:
                     continue
+                # ADR-0131: "a live lease is checked before cap evaluation so a
+                # healthy long turn cannot be dead-lettered." This is the
+                # cross-replica sibling of the guard above -- that one protects
+                # our OWN in-flight entry, this one protects a peer's. It sits
+                # ahead of the cap check for the same reason: an entry somebody
+                # is actively working has not spent its budget on failures, and
+                # its count must not be judged.
+                if await self._lease_is_live(entry_id):
+                    continue
                 delivered = int(row["times_delivered"])
                 if delivered < self._spec.max_delivery:
                     continue
@@ -394,6 +771,13 @@ class StreamConsumer:
         group interaction is older than ``dead_consumer_idle_ms`` is gone, and
         its PEL can be taken without waiting the 15-minute entry window
         (#1532).
+
+        Since ADR-0131 this discovery is CANDIDATE DISCOVERY ONLY and is not
+        authority to steal a delivery. The ADR rejected process discovery as the
+        sole authority "because process discovery and retained runner lifetime
+        can diverge. Dead-consumer state remains a useful candidate signal
+        behind the lease fence." The fence itself is applied one level down, in
+        ``_claim_consumer_pending``.
         """
         try:
             consumers = await self._redis.xinfo_consumers(self._spec.stream, self._spec.group)
@@ -436,12 +820,18 @@ class StreamConsumer:
             )
             if not rows:
                 break
-            ids = [
-                str(row["message_id"])
-                for row in rows
-                if str(row["message_id"]) not in self._inflight_ids
-                and str(row["message_id"]) not in over_cap
-            ]
+            ids: list[str] = []
+            for row in rows:
+                candidate = str(row["message_id"])
+                if candidate in self._inflight_ids or candidate in over_cap:
+                    continue
+                # The dead peer's process may be gone while its delivery's lease
+                # is still live -- a replacement that already took it, or the
+                # peer's own last renewal not yet expired. A dead consumer is a
+                # candidate, never authority (see the docstring above).
+                if await self._lease_is_live(candidate):
+                    continue
+                ids.append(candidate)
             if ids:
                 claimed = await self._redis.xclaim(
                     self._spec.stream,
@@ -452,6 +842,11 @@ class StreamConsumer:
                 )
                 for entry_id, fields in cast("list[StreamEntry]", claimed or []):
                     if entry_id in self._inflight_ids or entry_id in over_cap:
+                        continue
+                    # Re-checked after the XCLAIM: the window between the filter
+                    # above and the claim is exactly long enough for a
+                    # replacement to acquire the lease.
+                    if await self._lease_is_live(entry_id):
                         continue
                     reclaimed += 1
                     await self._spec.handler(entry_id, dict(fields))
@@ -491,6 +886,30 @@ class StreamConsumer:
                     continue  # still being processed here; not an orphan
                 if entry_id in over_cap:
                     continue  # budget spent; never dispatch it again
+                # A live lease elsewhere: another owner is working it (ADR-0131).
+                # Note the ordering consequence -- XAUTOCLAIM has ALREADY claimed
+                # the entry to us by the time we see it here, which bumps the
+                # healthy peer's PEL delivery count. That is why the pre-cap
+                # check in ``_dead_letter_over_cap`` matters more than this one:
+                # this guard prevents the DISPATCH, that one prevents the
+                # DEAD-LETTER.
+                #
+                # The owner does NOT get the PEL row back. ``_HEARTBEAT_LUA``
+                # fails CLOSED: its guards run before any write, and a row that
+                # has moved to another consumer returns ``not-owner``, which the
+                # heartbeat loop reads as lease-lost. Its ``XCLAIM ... JUSTID``
+                # sits BEHIND that guard and only resets idle on a row the owner
+                # still holds; it is not a re-claim arm, and there must not be
+                # one -- an owner that stole its row back
+                # would be un-fencing itself against a replacement Valkey has
+                # legitimately handed the delivery to, which is the exact split
+                # brain ADR-0131 exists to prevent. So the cost of this
+                # XAUTOCLAIM is a bumped delivery count and, if the reclaimer is
+                # a different process, the healthy owner discovering on its next
+                # renewal that it has been fenced out. That is why the count is
+                # cap-checked BEFORE the claim rather than after.
+                if await self._lease_is_live(entry_id):
+                    continue
                 reclaimed += 1
                 record_metric(
                     "curie.queue.retry",

@@ -1073,3 +1073,33 @@ securityContext:
 securityContext:
 {{- toYaml . | nindent 2 }}
 {{- end -}}
+
+{{/* ---- ADR-0131 drain-budget relationship (worker) ----
+     `worker.terminationGracePeriodSeconds` must cover
+     `worker.deliveryBudgetSeconds` + `worker.deliveryShutdownReserveSeconds`.
+     The chart renders that same grace value BOTH onto the Pod's
+     `spec.terminationGracePeriodSeconds` and into the worker's
+     `CURIE_TERMINATION_GRACE_PERIOD_S`, where `WorkerConfig` re-checks the
+     inequality at boot -- and that check raises before `asyncio.run`, so the
+     supervisor cannot catch it and the pod CrashLoopBackOffs.
+
+     Without this render-time guard, an existing install that overrides
+     `worker.terminationGracePeriodSeconds` to any value the schema accepts but
+     the inequality rejects `helm upgrade`s CLEANLY and then takes the entire
+     turn plane down: a silent breaking upgrade. `values.schema.json` cannot
+     close it -- JSON Schema has no cross-field arithmetic -- and the CI
+     render-assertion never sees operator values. So the fence has to be here,
+     where `helm template`/`install`/`upgrade` all pass through it.
+
+     This does NOT replace the worker's boot validator, which remains the
+     backstop for the non-Helm substrates (Compose, bare env). It only moves the
+     Helm-shaped failure from pod boot to render time, where it is actionable. */}}
+{{- define "curie.worker.validateDrainBudget" -}}
+{{- $grace := int64 .Values.worker.terminationGracePeriodSeconds -}}
+{{- $budget := int64 .Values.worker.deliveryBudgetSeconds -}}
+{{- $reserve := int64 .Values.worker.deliveryShutdownReserveSeconds -}}
+{{- $required := add $budget $reserve -}}
+{{- if lt $grace $required -}}
+{{- fail (printf "worker.terminationGracePeriodSeconds (%d) must be at least worker.deliveryBudgetSeconds (%d) + worker.deliveryShutdownReserveSeconds (%d) = %d (ADR-0131). At %d a worker draining a full-budget delivery is SIGKILLed before it can settle, and the worker refuses this configuration at boot, so the Pod CrashLoopBackOffs instead of starting. Fix: raise worker.terminationGracePeriodSeconds to %d or more, or lower worker.deliveryBudgetSeconds and/or worker.deliveryShutdownReserveSeconds so their sum is at most %d." $grace $budget $reserve $required $grace $required $grace) -}}
+{{- end -}}
+{{- end -}}
