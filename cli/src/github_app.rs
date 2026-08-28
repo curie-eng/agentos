@@ -9,7 +9,7 @@
 //! chart that can mint tokens for every repository in the installation, so it
 //! is the one that most deserves never being in a process list.
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 
 use crate::ops::{plain, require_on_path, run_step, CommonOpts, OpsCommand};
 
@@ -192,24 +192,39 @@ pub async fn github_app(opts: GithubAppOpts, clone_base: &str) -> Result<GithubA
     })
 }
 
+/// All three refusals here are deterministic input errors, so they exit 2
+/// (ADR-0021 Usage) with a non-null `fix` naming the flag to correct (#1261).
+/// A bare `bail!` classified them as exit 1 with a null fix -- indistinguishable
+/// to an agent from the helm upgrade itself failing, which is retryable and
+/// these are not. clap gives both flags `default_value = ""`, so clap never
+/// raises its own exit 2 for them and this is the only place the class is set.
 pub fn require_connect_inputs(disconnect: bool, app_id: &str, key_path: &str) -> Result<()> {
     if disconnect {
         return Ok(());
     }
     if app_id.trim().is_empty() {
-        bail!(
-            "--app-id is required. Find it on the App's settings page \
-             (Settings -> Developer settings -> GitHub Apps -> your app)."
-        );
+        return Err(anyhow::Error::from(
+            crate::exit::CliError::usage(
+                "--app-id is required. Find it on the App's settings page \
+                 (Settings -> Developer settings -> GitHub Apps -> your app).",
+            )
+            .with_fix("rerun with --app-id <numeric app id from the App's settings page>"),
+        ));
     }
     if key_path.trim().is_empty() {
-        bail!(
-            "--private-key is required: the path to the App's PEM file, \
-             downloaded from the App's settings page under 'Private keys'."
-        );
+        return Err(anyhow::Error::from(
+            crate::exit::CliError::usage(
+                "--private-key is required: the path to the App's PEM file, \
+                 downloaded from the App's settings page under 'Private keys'.",
+            )
+            .with_fix("rerun with --private-key <path to the App's PEM file>"),
+        ));
     }
     if !std::path::Path::new(key_path).is_file() {
-        bail!("--private-key: no such file: {key_path}");
+        return Err(anyhow::Error::from(
+            crate::exit::CliError::usage(format!("--private-key: no such file: {key_path}"))
+                .with_fix("rerun with --private-key pointing at an existing PEM file"),
+        ));
     }
     Ok(())
 }
@@ -374,6 +389,38 @@ mod tests {
         // upgrade has already started.
         let err = require_connect_inputs(false, "1", "/nope/missing.pem").unwrap_err();
         assert!(err.to_string().contains("no such file"));
+    }
+
+    // Each of the three arms is a deterministic input error: the same argv fails
+    // identically, so it is exit 2 and must name the flag to fix (#1261). Both
+    // halves arm the test against a revert to `bail!`, which classifies as
+    // (Failure, None): the class assertion fails and so does the `expect`.
+    #[test]
+    fn each_missing_input_is_a_usage_error_with_a_flag_naming_fix() {
+        for (app_id, key_path, flag) in [
+            ("", "/tmp/app.pem", "--app-id"),
+            ("1", "", "--private-key"),
+            ("1", "/nope/missing.pem", "--private-key"),
+        ] {
+            let err = require_connect_inputs(false, app_id, key_path).unwrap_err();
+            let (class, fix) = crate::exit::classify(&err);
+            assert_eq!(
+                class,
+                crate::exit::ExitClass::Usage,
+                "a deterministic input error must exit 2: {err:#}"
+            );
+            let fix = fix.expect("a usage refusal must carry a fix, not a null one");
+            assert!(!fix.trim().is_empty(), "the fix must not be empty");
+            assert!(
+                fix.contains(flag),
+                "the fix must name the offending flag {flag}: {fix}"
+            );
+            let json = crate::exit::error_json(&err);
+            assert!(
+                json["fix"] != serde_json::Value::Null,
+                "the rendered payload must not have a null fix: {json}"
+            );
+        }
     }
 
     #[test]
