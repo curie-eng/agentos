@@ -59,6 +59,7 @@ it will redeploy the bundle afterwards.
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -425,13 +426,24 @@ def deploy(
         )
     )
     version_id = str(created["id"])
+    # A multipart form with a `file` part, not a raw body. The endpoint is an
+    # upload rather than a document write, and a raw PUT is refused with a 422
+    # naming a field the caller never knew about:
+    #     {"loc": ["body", "file"], "msg": "Field required"}
+    boundary = "----curie" + hashlib.sha256(bundle).hexdigest()[:24]
+    form = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="file"; filename="bundle.tar.gz"\r\n'
+        "Content-Type: application/gzip\r\n\r\n"
+    ).encode()
+    form += bundle + f"\r\n--{boundary}--\r\n".encode()
     _api(
         api_url,
         api_key,
         f"/agents/{agent_id}/versions/{version_id}/bundle",
         method="PUT",
-        body=bundle,
-        content_type="application/gzip",
+        body=form,
+        content_type=f"multipart/form-data; boundary={boundary}",
     )
     _api(
         api_url,
