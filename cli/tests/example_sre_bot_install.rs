@@ -687,7 +687,6 @@ fn unpacked_uploaded_bundle(fixture: &Fixture) -> tempfile::TempDir {
 /// Parse a rendered multi-document manifest into its documents.
 fn manifest_documents(rendered: &str) -> Vec<Value> {
     serde_norway::Deserializer::from_str(rendered)
-        .into_iter()
         .map(|document| -> Value {
             serde::Deserialize::deserialize(document)
                 .unwrap_or_else(|error| panic!("rendered manifest must be valid YAML: {error}"))

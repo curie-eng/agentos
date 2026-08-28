@@ -495,6 +495,16 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
                     write_allowlist_value(targets)
                 ));
             }
+        }
+        let mut deploy = format!(
+            "curie cluster deploy --plugin-dir embedded:examples/sre-bot --namespace {} --release {}",
+            identity.namespace, identity.release
+        );
+        if let Some(channel) = &opts.slack_channel {
+            deploy.push_str(&format!(" --slack-channel {channel}"));
+        }
+        lines.push(deploy);
+        if write_targets.is_some() {
             lines.push(write_role_command.display(&chart));
             lines.push(format!(
                 "kubectl wait --namespace {} --for=jsonpath={{.data.token}} secret/{WRITER_TOKEN_SECRET} --timeout={READER_TOKEN_TIMEOUT}",
@@ -505,14 +515,6 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
                     .to_string(),
             );
         }
-        let mut deploy = format!(
-            "curie cluster deploy --plugin-dir embedded:examples/sre-bot --namespace {} --release {}",
-            identity.namespace, identity.release
-        );
-        if let Some(channel) = &opts.slack_channel {
-            deploy.push_str(&format!(" --slack-channel {channel}"));
-        }
-        lines.push(deploy);
         lines.push(
             "render and reconcile the deployed version connectors with the owned Kubernetes kubeconfig Secret override"
                 .to_string(),
@@ -545,6 +547,31 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
     run_install_command(&integration_command, &workspace, &chart).await?;
     run_install_command(&read_access_command, &workspace, &chart).await?;
     let kubeconfig = read_only_connector_kubeconfig(&identity.namespace).await?;
+
+    let bundle_dir = workspace.bundle_dir();
+    let connection = resolve_embedded_cluster_connection(&identity).await?;
+    let deployed =
+        deploy_embedded_sre_bot(&bundle_dir, &connection, opts.slack_channel.as_deref()).await?;
+    // The writer identity is minted HERE, after the deploy succeeded, and not
+    // earlier: it is a NON-EXPIRING ServiceAccount token, and with named targets
+    // it carries get,patch on apps/deployments. Nothing between the workspace
+    // render and this line needs it -- the only consumer is
+    // sync_deployed_version just below -- so creating it any sooner buys nothing
+    // and leaves a live write credential in the cluster for the whole length of
+    // the deploy.
+    //
+    // Deferred rather than rolled back. A rollback would need the same cluster
+    // API call that just failed: if the deploy died because the API server is
+    // unreachable, the RBAC write is being throttled, or the port-forward
+    // dropped, the compensating delete fails too and the credential is still
+    // standing -- now behind a log line claiming it was cleaned up. Deferring
+    // means the exposure window does not exist, rather than merely being
+    // shorter, and it adds no new failure path of its own.
+    //
+    // What this does NOT cover: a failure between this apply and
+    // sync_deployed_version still strands the identity, now with a deployed bot
+    // in front of it. That residual window is one API call wide, and it is the
+    // price of declining a rollback path.
     let write_kubeconfig = match write_targets {
         Some(_) => {
             run_install_command(&write_role_command, &workspace, &chart).await?;
@@ -552,11 +579,6 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
         }
         None => None,
     };
-
-    let bundle_dir = workspace.bundle_dir();
-    let connection = resolve_embedded_cluster_connection(&identity).await?;
-    let deployed =
-        deploy_embedded_sre_bot(&bundle_dir, &connection, opts.slack_channel.as_deref()).await?;
     let mut secret_overrides = BTreeMap::from([(KUBECONFIG_SECRET_KEY.to_string(), kubeconfig)]);
     if let Some(write_kubeconfig) = write_kubeconfig {
         secret_overrides.insert(WRITE_KUBECONFIG_SECRET_KEY.to_string(), write_kubeconfig);
