@@ -254,9 +254,15 @@ exit 1
                 perms.set_mode(0o755);
                 std::fs::set_permissions(&path, perms).expect("chmod shim");
             }
+            // Deliberately NOT PEM-shaped: `require_connect_inputs` only stats
+            // this path with `Path::is_file`, and the chart-held branch hands
+            // helm the PATH (never the contents) via `--set-file`. No
+            // assertion in this file reads or checks the file's bytes, so a
+            // credential-shaped body here would be a secret-scanner tripwire
+            // with no test value.
             std::fs::write(
                 dir.path().join("app.pem"),
-                "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAtestkeymaterial\n-----END RSA PRIVATE KEY-----\n",
+                "placeholder; these bytes are never read -- the CLI only stats this path\n",
             )
             .expect("write pem fixture");
             Self { dir }

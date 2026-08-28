@@ -202,7 +202,7 @@ pub fn rollout_commands(namespace: &str, release: &str) -> Vec<OpsCommand> {
 /// (#1759), so changing its contract would silently change behaviour for all of
 /// them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ByoSecretField {
+pub(crate) enum ByoSecretField {
     /// Falsy to Helm's `if` -- absent, `null`, `""`, `false`, `0`, or an empty
     /// list/map. The chart really does take the chart-held branch, so a
     /// `--private-key` connect is legitimate here and must NOT be refused:
@@ -221,7 +221,9 @@ pub enum ByoSecretField {
 /// A small local walk of the values JSON, deliberately not
 /// `resolve_existing_secret_ref` -- see [`ByoSecretField`] for why the shared
 /// helper must not learn about non-string values.
-pub fn classify_existing_secret_field(existing: Option<&serde_json::Value>) -> ByoSecretField {
+pub(crate) fn classify_existing_secret_field(
+    existing: Option<&serde_json::Value>,
+) -> ByoSecretField {
     let Some(value) = existing
         .and_then(|v| v.get("api"))
         .and_then(|api| api.get("githubAppExistingSecret"))
@@ -268,7 +270,7 @@ fn json_type_name(value: &serde_json::Value) -> &'static str {
 /// chart's own BYO-wins rule would report a plausible but wrong answer, which
 /// is worse than reporting none (#1759). The three literals are the exact
 /// strings `charts/curie/templates/api.yaml` reads.
-pub fn configured_existing_secret(
+pub(crate) fn configured_existing_secret(
     existing: Option<&serde_json::Value>,
 ) -> Option<(String, String)> {
     resolve_existing_secret_ref(
@@ -287,7 +289,7 @@ pub fn configured_existing_secret(
 /// for a `helm get values` round trip -- neither needs anything from the
 /// release, and on a real run the read would add a hard failure when the
 /// cluster is unreachable to two paths that never had one.
-pub fn needs_byo_conflict_check(opts: &GithubAppOpts) -> bool {
+pub(crate) fn needs_byo_conflict_check(opts: &GithubAppOpts) -> bool {
     !opts.disconnect
         && opts.existing_secret.trim().is_empty()
         && !opts.private_key_path.trim().is_empty()
@@ -304,7 +306,7 @@ pub fn needs_byo_conflict_check(opts: &GithubAppOpts) -> bool {
 /// whose check was skipped. Nothing is lost -- [`guard_byo_key_conflict`] runs
 /// on the real invocation BEFORE any mutation, so a misconfigured release is
 /// never written to either way.
-pub fn needs_release_read(opts: &GithubAppOpts) -> bool {
+pub(crate) fn needs_release_read(opts: &GithubAppOpts) -> bool {
     !opts.common.dry_run && needs_byo_conflict_check(opts)
 }
 
@@ -333,7 +335,7 @@ pub fn needs_release_read(opts: &GithubAppOpts) -> bool {
 /// Called with `existing = None` under `--dry-run` (see [`needs_release_read`]),
 /// where it is a no-op: the plan is offline, and the refusal comes on the real
 /// invocation before helm is ever run.
-pub fn guard_byo_key_conflict(
+pub(crate) fn guard_byo_key_conflict(
     opts: &GithubAppOpts,
     existing: Option<&serde_json::Value>,
 ) -> Result<()> {
@@ -586,9 +588,12 @@ fn describe_rejected_value(value: &str) -> String {
 /// the old three-argument form was already one argument swap away from a
 /// silent bug, and the rules below now read five of the fields.
 pub fn require_connect_inputs(opts: &GithubAppOpts) -> Result<()> {
-    let existing_secret = opts.existing_secret.trim();
-    // Trimmed only to answer "was one supplied"; the path itself is used
-    // verbatim for the stat and the message, as it has been since #1223.
+    // The one fact every rule below branches on: an empty --existing-secret is
+    // the chart-held path, a non-empty one is BYO. Bound once so a new rule
+    // cannot pick the wrong polarity.
+    let byo = !opts.existing_secret.trim().is_empty();
+    // The path itself is used verbatim for the stat and the message, as it
+    // has been since #1223.
     let key_path = &opts.private_key_path;
 
     // "--disconnect --existing-secret X" reads as "point at X while
@@ -596,7 +601,7 @@ pub fn require_connect_inputs(opts: &GithubAppOpts) -> Result<()> {
     // operator believing a reference to X was set. Every OTHER connect input
     // stays silently tolerated under --disconnect, as it has been since #1223.
     if opts.disconnect {
-        if !existing_secret.is_empty() {
+        if byo {
             bail!(
                 "--existing-secret contradicts --disconnect: --disconnect clears the App \
                  credentials, so there is nothing left to point at a Secret. Run --disconnect \
@@ -610,11 +615,10 @@ pub fn require_connect_inputs(opts: &GithubAppOpts) -> Result<()> {
     // expression-injection vector, not merely an invalid name. See
     // `is_rfc1123_subdomain` for the full mechanism.
     //
-    // The RAW values, not the trimmed one used above to answer "was one
-    // supplied": `connect_commands` formats the raw field into argv, so a name
-    // with surrounding whitespace would pass a trimmed check and still reach
-    // helm -- and k8s -- wrong.
-    if !existing_secret.is_empty() {
+    // The checks below use the RAW value, not `byo`: `connect_commands` formats
+    // the raw field into argv, so a name with surrounding whitespace would pass
+    // a trimmed check and still reach helm -- and k8s -- wrong.
+    if byo {
         if !is_rfc1123_subdomain(&opts.existing_secret) {
             bail!(
                 "--existing-secret {} is not a Kubernetes Secret name. It must be an RFC-1123 \
@@ -633,14 +637,14 @@ pub fn require_connect_inputs(opts: &GithubAppOpts) -> Result<()> {
             );
         }
     }
-    if !existing_secret.is_empty() && !key_path.trim().is_empty() {
+    if byo && !key_path.trim().is_empty() {
         bail!(
             "--existing-secret and --private-key are two mutually exclusive ways to supply \
              the App's private key; pick one. --existing-secret references a Secret you \
              manage, --private-key hands the PEM to the chart."
         );
     }
-    if existing_secret.is_empty() && opts.existing_secret_key.trim() != DEFAULT_APP_KEY_DATA_KEY {
+    if !byo && opts.existing_secret_key.trim() != DEFAULT_APP_KEY_DATA_KEY {
         bail!(
             "--existing-secret-key configures nothing without --existing-secret: the chart \
              only reads a data key once a Secret name is set. Pass --existing-secret <name>, \
@@ -656,7 +660,7 @@ pub fn require_connect_inputs(opts: &GithubAppOpts) -> Result<()> {
     // Both remaining checks are chart-held only: a BYO run supplies no PEM by
     // design, so it must never be asked for one and must never stat a path it
     // was never given.
-    if existing_secret.is_empty() {
+    if !byo {
         if key_path.trim().is_empty() {
             bail!(
                 "--private-key is required: the path to the App's PEM file, \
