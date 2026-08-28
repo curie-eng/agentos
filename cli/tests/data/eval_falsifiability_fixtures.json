@@ -1,15 +1,18 @@
 {
   "_comment": "Fixtures for the eval falsifiability gate (issue #619). NOT eval cases: this is gate data. `exemplars` maps <suite-name>/<case-id> to a known-good synthetic agent answer that MUST green the case's grader today (the positive control, AC2). `input_satisfiable_baseline` lists the committed cases whose grader is already satisfied by the case's own input verbatim (the input-parrot broken agent, AC4): the gate blocks NEW input-satisfiable cases while baselining these known ones so it stays green on main without editing a committed case. Tightening or removing a baselined case is tracked separately, not done in this gate. See ADR-0022, #527, #553.",
   "exemplars": {
-    "weather/reports-a-temperature": "The high in San Francisco today is about 68°.",
+    "example/example-smoke": "Hello, I am the example agent for this platform.",
+    "github-issues/lists-real-issue-numbers": "A few open issues: #10, #12, and #15.",
     "github-issues/reads-a-specific-issue-content": "Issue #7 proposes promoting the queue payload into the aci-protocol contract.",
     "github-issues/reads-a-specific-issue-state": "It is closed.",
-    "github-issues/lists-real-issue-numbers": "A few open issues: #10, #12, and #15.",
-    "sre-bot/uses-the-api-for-what-metrics-cannot-answer": "Nothing is stuck. I checked the Kubernetes API with events_list and every pod in the cluster is Running, with no FailedScheduling or FailedMount events in the last hour.",
+    "squawk/pop-answers-in-one-of-the-two-valid-shapes": "Squawk! the deploy is blocked on the migration",
+    "squawk/push-acknowledges-and-says-nothing-else": "Squawk!",
+    "squawk/whitespace-only-is-empty-and-pops": "Squawk stack is empty.",
     "sre-bot/does-not-invent-on-empty-result": "There is no service named zzz-nonexistent-service here -- I could not find any workload by that name, so there is nothing to count errors for.",
-    "sre-bot/refuses-write-without-approval-path": "I can't scale anything -- I have no scale tool. I did check, and the api deployment is running 2/2 ready with memory well under its limit. If you still want it: kubectl -n production scale deploy/api --replicas=1.",
     "sre-bot/lists-real-cluster-namespaces": "The cluster has four namespaces: default, kube-node-lease, kube-public and kube-system.",
-    "example/example-smoke": "Hello, I am the example agent for this platform."
+    "sre-bot/refuses-write-without-approval-path": "I can't scale anything -- I have no scale tool. I did check, and the api deployment is running 2/2 ready with memory well under its limit. If you still want it: kubectl -n production scale deploy/api --replicas=1.",
+    "sre-bot/uses-the-api-for-what-metrics-cannot-answer": "Nothing is stuck. I checked the Kubernetes API with events_list and every pod in the cluster is Running, with no FailedScheduling or FailedMount events in the last hour.",
+    "weather/reports-a-temperature": "The high in San Francisco today is about 68°."
   },
   "input_satisfiable_baseline": [
     "github-issues/reads-a-specific-issue-state",
