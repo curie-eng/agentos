@@ -724,6 +724,58 @@ def test_connector_accepts_traffic_only_from_the_sandbox() -> None:
     assert src[0]["podSelector"]["matchLabels"] == r.sandbox_selector("release-r", "app-name")
 
 
+# This sits BESIDE the test above, which already goes red on the same mutation
+# via its `set(src[0]) == {"podSelector"}` line. That coverage is incidental:
+# it lives inside a test named for pod-scope narrowness, and its failure points
+# a reader at label identity, not at namespace scope. A future edit could
+# reasonably relax or split it without any signal that one line of it was the
+# only thing standing between the repo and the #1502 widening. This test's
+# whole stated purpose IS the namespace axis, so it cannot be relaxed by
+# accident. Keep both; they are complements, not duplicates (#1450, #1502).
+def test_ingress_source_peer_is_namespace_scoped_by_omission() -> None:
+    """The ingress `from` peer must stay a BARE podSelector -- no namespaceSelector.
+
+    The widening this exists to catch is `namespaceSelector: {}` merged INTO
+    the existing peer, rather than added as a second peer:
+
+        from:
+          - podSelector: {matchLabels: {...sandbox labels...}}
+            namespaceSelector: {}            # <-- the mutation
+
+    A bare podSelector peer is implicitly scoped to the policy's own namespace,
+    so this merge relaxes the NAMESPACE axis while leaving the pod axis exactly
+    as narrow as it was: every sandbox-labelled pod in EVERY namespace is then
+    admitted to a connector that holds a production credential and
+    authenticates nobody.
+
+    The cluster gate cannot see it. `scripts/check-netpol-enforcement.sh`'s
+    deny prober `netpol-probe-outside` is unlabelled and lives in the
+    connectors' own namespace, so it differs from a sandbox on the POD axis
+    only -- the merged peer still denies it and the gate stays green while the
+    boundary is gone. That script's `netpol-probe-foreign` (sandbox labels,
+    different namespace) is the cluster-side complement; this test needs no
+    cluster at all.
+    """
+    src = _ingress_np(_objs(release="release-r", app="app-name"))["spec"]["ingress"][0]["from"]
+    assert len(src) == 1, (
+        "exactly one source peer; a second peer widens the source set as surely "
+        "as widening this one does"
+    )
+    assert set(src[0]) == {"podSelector"}, (
+        "the peer must carry podSelector and NOTHING else: a bare podSelector peer is "
+        "namespace-local, and any sibling key here widens the source beyond this namespace"
+    )
+    assert "namespaceSelector" not in src[0], (
+        "a bare podSelector peer is namespace-local; a namespaceSelector here would admit "
+        "sandbox-labelled pods in EVERY namespace, which the unlabelled same-namespace "
+        "cluster probe cannot observe (#1502)"
+    )
+    assert src[0]["podSelector"]["matchLabels"] == r.sandbox_selector("release-r", "app-name"), (
+        "the peer must still name exactly this release's sandbox on the pod axis; "
+        "the namespace axis is held closed by omission, not by these labels"
+    )
+
+
 def test_ingress_policy_selects_the_connector_not_the_sandbox() -> None:
     # Getting this backwards yields a policy that parses, applies, and protects
     # the wrong pod -- the sandbox gains an ingress restriction it does not need
