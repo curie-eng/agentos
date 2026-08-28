@@ -456,7 +456,8 @@ rustfs:
   deploy: true
   image: rustfs/rustfs:1.0.0-beta.12
   awsCliImage: amazon/aws-cli:2.32.6
-  # For the API, worker, and sandbox bundle fetch endpoints, an external RustFS on port 443 uses HTTPS. All other configurations use HTTP.
+  # Applies to every object-store endpoint the chart renders (API, worker, sandbox bundle fetch,
+  # and Langfuse's event/media upload endpoints): an external RustFS on port 443 uses HTTPS. All other configurations use HTTP.
   host: ""
   port: 9000
   # Signing region for sandbox bundle fetches. Keep it aligned with the regional S3 endpoint.
