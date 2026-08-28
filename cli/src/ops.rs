@@ -1522,6 +1522,11 @@ pub(crate) const FAKE_MODEL_KEY: &str = "agentSandbox.runner.fakeModel";
 const ALLOWED_EGRESS_KEY: &str = "security.networkPolicy.allowedEgress";
 const WORKER_EXTRA_ENV_KEY: &str = "worker.extraEnv";
 
+/// The ADDITIONAL Slack origins a per-turn reply endpoint may name (ADR-0096
+/// D4.4). Named here so `up`'s preservation, `diff`'s reset reporting, and the
+/// secret classifier below all read the one key.
+const SLACK_TRUSTED_ORIGINS_KEY: &str = "worker.slackTrustedOrigins";
+
 fn key_is_or_descends_from(key: &str, parent: &str) -> bool {
     key == parent
         || key
@@ -1673,6 +1678,37 @@ fn resolve_preserved_worker_extra_env_values(
     );
 }
 
+/// Carry an operator-recorded Slack trusted-origin list into a later plain
+/// `cluster up` (issue #1897).
+///
+/// `up` is a FULL helm upgrade, not `--reuse-values`, so a
+/// `worker.slackTrustedOrigins` an operator set once is reset to the chart's
+/// fail-closed `""` default by the next unrelated `up` -- the #1256
+/// preservation class again, and it silently re-breaks the dev reply path the
+/// operator had working. Emitted via `--set-string` with
+/// [`escape_helm_set_string_value`] because the value is a COMMA-SEPARATED
+/// origin list: an unescaped comma would make Helm read it as a list.
+///
+/// Preserves, never invents. [`preserved_value`] already filters an empty
+/// record, so a release that never set the key -- or one whose value was
+/// deliberately cleared -- supplies nothing and keeps the chart default. An
+/// explicit operator `--set` / `--set-string` owns the key and always wins.
+fn resolve_preserved_slack_trusted_origins_value(
+    opts: &mut UpOpts,
+    existing: Option<&serde_json::Value>,
+    operator_sets: &[String],
+) {
+    if operator_set_keys(operator_sets).contains(SLACK_TRUSTED_ORIGINS_KEY) {
+        return;
+    }
+    if let Some(origins) = preserved_value(existing, SLACK_TRUSTED_ORIGINS_KEY) {
+        opts.set_string.push(format!(
+            "{SLACK_TRUSTED_ORIGINS_KEY}={}",
+            escape_helm_set_string_value(&origins)
+        ));
+    }
+}
+
 fn resolve_preserved_runner_egress_values(
     opts: &mut UpOpts,
     existing: Option<&serde_json::Value>,
@@ -1760,8 +1796,10 @@ fn reindex_inferred_provider_egress(
 /// on the release but absent from `curie.yaml` is normally reset to the chart
 /// default -- except for the families [`resolve_preserved_values`],
 /// [`resolve_preserved_runner_identity_values`], and
-/// [`resolve_preserved_runner_egress_values`], and
-/// [`resolve_preserved_gvisor_mode_value`] re-supply, which survive untouched.
+/// [`resolve_preserved_runner_egress_values`],
+/// [`resolve_preserved_gvisor_mode_value`], and
+/// [`resolve_preserved_slack_trusted_origins_value`] re-supply, which survive
+/// untouched.
 /// Reporting those as removals would be the exact
 /// "proposing to delete what it did not create" failure ADR-0097 named.
 ///
@@ -1782,6 +1820,7 @@ pub fn is_preserved_by_up(key: &str) -> bool {
         || REQUIRED_SECRETS.iter().any(|(k, _)| *k == key)
         || crate::sealing::SEALING_MANAGED_KEYS.contains(&key)
         || key == GVISOR_MODE_KEY
+        || key == SLACK_TRUSTED_ORIGINS_KEY
 }
 
 /// Substrings that mark a chart key as carrying a credential.
@@ -1825,7 +1864,11 @@ const SECRET_KEY_MARKERS: &[&str] = &[
 pub fn is_secret_value_key(key: &str) -> bool {
     // Most preserve-on-up keys are credentials, but an inferred gVisor posture
     // is ordinary safety configuration and must remain visible in `curie diff`.
-    if (is_preserved_by_up(key) && key != GVISOR_MODE_KEY)
+    // A Slack trusted-origin list (issue #1897) is the same shape: it is
+    // operator-visible dev configuration -- hostnames, not a token -- and
+    // masking it would hide the very value the operator opens `curie diff` to
+    // confirm survived the upgrade.
+    if (is_preserved_by_up(key) && key != GVISOR_MODE_KEY && key != SLACK_TRUSTED_ORIGINS_KEY)
         || key == GITHUB_TOKEN_KEY
         || key == MODEL_CREDENTIAL_KEY
     {
@@ -2972,6 +3015,7 @@ fn complete_up_opts_without_runner_egress(
     resolve_preserved_runner_identity_values(&mut opts, existing, &operator_sets);
     resolve_preserved_gvisor_mode_value(&mut opts, existing, &operator_sets);
     resolve_preserved_worker_extra_env_values(&mut opts, existing, &operator_sets);
+    resolve_preserved_slack_trusted_origins_value(&mut opts, existing, &operator_sets);
     if !opts.dev {
         opts.secrets = resolve_generated_secrets(existing, &operator_sets)?;
         opts.secrets.extend(resolve_managed_values_for_up(
@@ -3187,10 +3231,10 @@ impl UpValuePlan {
     }
 
     fn set_string_expression(&mut self, expression: String) {
-        let effective = if expression
-            .split_once('=')
-            .is_some_and(|(key, _)| key_is_or_descends_from(key.trim(), WORKER_EXTRA_ENV_KEY))
-        {
+        let effective = if expression.split_once('=').is_some_and(|(key, _)| {
+            key_is_or_descends_from(key.trim(), WORKER_EXTRA_ENV_KEY)
+                || key_is_or_descends_from(key.trim(), SLACK_TRUSTED_ORIGINS_KEY)
+        }) {
             helm_set_string_entries(&expression)
         } else {
             operator_set_entries(std::slice::from_ref(&expression))
@@ -7259,6 +7303,251 @@ mod tests {
         assert!(
             argv.contains(&"worker.extraEnv[0].value=10.0.0.0/8\\,localhost".into()),
             "recorded worker extraEnv values must escape commas for Helm: {argv:?}"
+        );
+    }
+
+    /// A plain `cluster up` for an unrelated reason must not silently switch
+    /// the worker back to refusing every dev reply endpoint the operator had
+    /// already trusted (issue #1897).
+    #[test]
+    fn plain_up_re_supplies_recorded_slack_trusted_origins_without_reuse_values() {
+        let existing = serde_json::json!({
+            "worker": { "slackTrustedOrigins": "http://host.docker.internal" }
+        });
+        let opts = complete_up_opts_without_runner_egress(
+            UpOpts {
+                common: common(),
+                github_token: GithubTokenPlan::Untouched,
+                allow_egress_host: vec![],
+                resolved_egress_cidrs: vec![],
+                chart: "charts/curie".into(),
+                secrets: vec![],
+                dev: false,
+                no_expose: true,
+                set: vec![],
+                set_string: vec![],
+                allow_web_egress: vec![],
+                fake_model: false,
+                credentials: None,
+                local_model: None,
+                model: None,
+            },
+            Some(&existing),
+            None,
+            false,
+        )
+        .unwrap();
+
+        let (materialized, _guards) = up_commands(&opts)[0].materialize_secret_files().unwrap();
+        let argv = materialized.argv().join(" ");
+        assert!(
+            argv.contains("--set-string worker.slackTrustedOrigins=http://host.docker.internal"),
+            "plain up dropped the recorded Slack trusted origin: {argv}"
+        );
+        assert!(
+            !argv.contains("--reuse-values"),
+            "up must remain a full Helm upgrade: {argv}"
+        );
+    }
+
+    /// An operator who names the trusted origins on this run owns the key: the
+    /// stale recorded list must not be smuggled back alongside it, or the
+    /// worker keeps trusting a host the operator just removed.
+    #[test]
+    fn explicit_slack_trusted_origins_override_the_recorded_value() {
+        let existing = serde_json::json!({
+            "worker": { "slackTrustedOrigins": "https://recorded.example.com" }
+        });
+        let opts = complete_up_opts_without_runner_egress(
+            UpOpts {
+                common: common(),
+                github_token: GithubTokenPlan::Untouched,
+                allow_egress_host: vec![],
+                resolved_egress_cidrs: vec![],
+                chart: "charts/curie".into(),
+                secrets: vec![],
+                dev: false,
+                no_expose: true,
+                set: vec![],
+                set_string: vec!["worker.slackTrustedOrigins=https://trusted.example.com".into()],
+                allow_web_egress: vec![],
+                fake_model: false,
+                credentials: None,
+                local_model: None,
+                model: None,
+            },
+            Some(&existing),
+            None,
+            false,
+        )
+        .unwrap();
+
+        let (materialized, _guards) = up_commands(&opts)[0].materialize_secret_files().unwrap();
+        let argv = materialized.argv().join(" ");
+        assert!(
+            argv.contains("--set-string worker.slackTrustedOrigins=https://trusted.example.com"),
+            "the explicit Slack trusted origin must reach Helm: {argv}"
+        );
+        assert!(
+            !argv.contains("recorded.example.com"),
+            "explicit trusted origins must suppress the recorded value: {argv}"
+        );
+    }
+
+    /// A plain `--set` names the trusted origins on this run just as much as
+    /// `--set-string` does -- an operator using the shorthand flag must still
+    /// own the key, not have the stale recorded list smuggled back alongside it.
+    #[test]
+    fn explicit_set_slack_trusted_origins_override_the_recorded_value() {
+        let existing = serde_json::json!({
+            "worker": { "slackTrustedOrigins": "https://recorded.example.com" }
+        });
+        let opts = complete_up_opts_without_runner_egress(
+            UpOpts {
+                common: common(),
+                github_token: GithubTokenPlan::Untouched,
+                allow_egress_host: vec![],
+                resolved_egress_cidrs: vec![],
+                chart: "charts/curie".into(),
+                secrets: vec![],
+                dev: false,
+                no_expose: true,
+                set: vec!["worker.slackTrustedOrigins=https://trusted.example.com".into()],
+                set_string: vec![],
+                allow_web_egress: vec![],
+                fake_model: false,
+                credentials: None,
+                local_model: None,
+                model: None,
+            },
+            Some(&existing),
+            None,
+            false,
+        )
+        .unwrap();
+
+        let (materialized, _guards) = up_commands(&opts)[0].materialize_secret_files().unwrap();
+        let argv = materialized.argv().join(" ");
+        assert!(
+            argv.contains("--set worker.slackTrustedOrigins=https://trusted.example.com"),
+            "the explicit Slack trusted origin must reach Helm: {argv}"
+        );
+        assert!(
+            !argv.contains("recorded.example.com"),
+            "explicit trusted origins must suppress the recorded value: {argv}"
+        );
+    }
+
+    /// The key is a COMMA-SEPARATED origin list, so an operator who trusts two
+    /// hosts must not have Helm read the second one as a list element and the
+    /// diff report an origin the worker was never sent.
+    #[test]
+    fn plain_up_round_trips_multi_origin_slack_trusted_origins() {
+        let recorded = "http://host.docker.internal,http://10.20.30.40";
+        let existing = serde_json::json!({
+            "worker": { "slackTrustedOrigins": recorded }
+        });
+        let opts = complete_up_opts_without_runner_egress(
+            UpOpts {
+                common: common(),
+                github_token: GithubTokenPlan::Untouched,
+                allow_egress_host: vec![],
+                resolved_egress_cidrs: vec![],
+                chart: "charts/curie".into(),
+                secrets: vec![],
+                dev: false,
+                no_expose: true,
+                set: vec![],
+                set_string: vec![],
+                allow_web_egress: vec![],
+                fake_model: false,
+                credentials: None,
+                local_model: None,
+                model: None,
+            },
+            Some(&existing),
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            up_value_plan(&opts)
+                .effective_values()
+                .get("worker.slackTrustedOrigins"),
+            Some(&recorded.to_string()),
+            "the escaped Helm expression must retain the recorded origin list verbatim"
+        );
+
+        let (materialized, _guards) = up_commands(&opts)[0].materialize_secret_files().unwrap();
+        let argv = materialized.argv();
+        assert!(
+            argv.contains(
+                &"worker.slackTrustedOrigins=http://host.docker.internal\\,http://10.20.30.40"
+                    .into()
+            ),
+            "a recorded origin list must escape its commas for Helm: {argv:?}"
+        );
+    }
+
+    /// Preservation must never widen where the platform bot token can go: a
+    /// release that never trusted an extra origin -- whose list was
+    /// deliberately cleared, or that has no recorded release at all (a fresh
+    /// install) -- keeps the chart's fail-closed empty default.
+    #[test]
+    fn up_invents_no_slack_trusted_origins_when_none_is_recorded() {
+        for existing in [
+            Some(serde_json::json!({ "worker": { "slackTrustedOrigins": "" } })),
+            Some(serde_json::json!({ "worker": {} })),
+            None,
+        ] {
+            let opts = complete_up_opts_without_runner_egress(
+                UpOpts {
+                    common: common(),
+                    github_token: GithubTokenPlan::Untouched,
+                    allow_egress_host: vec![],
+                    resolved_egress_cidrs: vec![],
+                    chart: "charts/curie".into(),
+                    secrets: vec![],
+                    dev: false,
+                    no_expose: true,
+                    set: vec![],
+                    set_string: vec![],
+                    allow_web_egress: vec![],
+                    fake_model: false,
+                    credentials: None,
+                    local_model: None,
+                    model: None,
+                },
+                existing.as_ref(),
+                None,
+                false,
+            )
+            .unwrap();
+
+            let (materialized, _guards) = up_commands(&opts)[0].materialize_secret_files().unwrap();
+            let argv = materialized.argv().join(" ");
+            assert!(
+                !argv.contains("slackTrustedOrigins"),
+                "up must not supply a trusted-origin value it has no record of: {argv}"
+            );
+        }
+    }
+
+    /// `curie diff` has to agree with what `up` actually does: announcing a
+    /// reset for a value `up` hands straight back sends the operator chasing a
+    /// change that never happens. And the list is hostnames, not a credential
+    /// -- masking it would hide the very dev configuration the operator opens
+    /// `diff` to confirm.
+    #[test]
+    fn slack_trusted_origins_are_preserved_and_never_masked() {
+        assert!(
+            is_preserved_by_up("worker.slackTrustedOrigins"),
+            "diff must not report a reset for a key up re-supplies"
+        );
+        assert!(
+            !is_secret_value_key("worker.slackTrustedOrigins"),
+            "the trusted-origin list is operator-visible configuration, not a credential"
         );
     }
 

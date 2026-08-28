@@ -982,6 +982,12 @@ worker:
   # where the platform bot token can go and belong only in development. The
   # empty default remains the fail-closed production posture.
   # Rendered only when non-empty.
+  #
+  # A plain `curie cluster up` carries a recorded non-empty value forward
+  # (issue #1897) instead of resetting it to this default, so an unrelated
+  # upgrade no longer silently drops the origins you set. It preserves and
+  # never invents: an empty or absent record still yields the fail-closed
+  # default, and an explicit `--set` or `--set-string` on the run wins.
   slackTrustedOrigins: ""
   # Per-ADAPTER egress credentials (ADR-0096 D4.2), a map of adapter slug ->
   # shared secret. The slug is the operator-chosen `adapter` on the agent's
