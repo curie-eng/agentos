@@ -1728,70 +1728,6 @@ fn compose_config_files(label: &str) -> Result<Vec<String>> {
     Ok(files)
 }
 
-/// The tag in an image reference, or None when it carries none.
-///
-/// Not a naive rsplit on ':'. A digest pin (`repo@sha256:...`) and a registry
-/// host with a port (`localhost:5000/repo`) both contain a colon that is not a
-/// tag separator, and reading either as one would pin the one-shot producer to
-/// a tag that does not exist.
-fn image_tag(image: &str) -> Option<&str> {
-    let last_segment = image.rsplit('/').next().unwrap_or(image);
-    if last_segment.contains('@') {
-        return None;
-    }
-    last_segment.split_once(':').map(|(_, tag)| tag)
-}
-
-/// `docker ps` for the running API container, by compose service label.
-///
-/// The API, deliberately, not the worker. The worker is `build:` in
-/// `compose.dev.yaml` (an overlay over the published base), so its
-/// `.Config.Image` is the compose-built `curie-curie-worker` with no tag at all
-/// -- reading a tag there yields nothing useful, and reading `latest` off it
-/// would pin the producer to the very image the override exists to avoid. The
-/// API container's image IS `ghcr.io/curie-eng/curie-api:${CURIE_BASE_TAG}`, so
-/// it carries the answer directly.
-fn api_ps_command() -> OpsCommand {
-    OpsCommand::new(
-        "docker",
-        vec![
-            plain("ps"),
-            plain("--filter"),
-            plain("label=com.docker.compose.service=curie-api"),
-            plain("--format"),
-            plain("{{.Names}}"),
-        ],
-    )
-}
-
-/// `docker inspect --format {{.Config.Image}} <container>`: the image reference
-/// the running container was created from.
-fn container_image_command(container: &str) -> OpsCommand {
-    OpsCommand::new(
-        "docker",
-        vec![
-            plain("inspect"),
-            plain("--format"),
-            plain("{{ .Config.Image }}"),
-            plain(container),
-        ],
-    )
-}
-
-/// `docker image inspect <ref>` -- succeeds only if the image is present.
-fn image_present_command(image: &str) -> OpsCommand {
-    OpsCommand::new(
-        "docker",
-        vec![
-            plain("image"),
-            plain("inspect"),
-            plain("--format"),
-            plain("{{ .Id }}"),
-            plain(image),
-        ],
-    )
-}
-
 /// The dispatcher image the one-shot producer should run, or None to leave
 /// compose's default alone.
 ///
@@ -1810,22 +1746,16 @@ fn image_present_command(image: &str) -> OpsCommand {
 ///
 /// Best-effort throughout: any unreadable step leaves compose's default in
 /// force, which is the behaviour that existed before #1915.
+///
+/// Both halves now live in `local.rs` (#1925), because every `local` verb that
+/// recreates a service needs the same derivation -- this one just narrows it to
+/// the single image the one-shot producer runs.
 async fn one_shot_dispatcher_image() -> Option<String> {
-    let (ok, stdout, _) = run_capture(&api_ps_command()).await.ok()?;
-    if !ok {
-        return None;
-    }
-    let container = stdout.lines().map(str::trim).find(|l| !l.is_empty())?;
-    let (ok, image, _) = run_capture(&container_image_command(container))
+    let tag = crate::local::running_stack_tag().await?;
+    let candidate = crate::local::image_ref("curie-dispatcher", &tag);
+    crate::local::image_present(&candidate)
         .await
-        .ok()?;
-    if !ok {
-        return None;
-    }
-    let tag = image_tag(image.trim())?;
-    let candidate = format!("ghcr.io/curie-eng/curie-dispatcher:{tag}");
-    let (present, _, _) = run_capture(&image_present_command(&candidate)).await.ok()?;
-    present.then_some(candidate)
+        .then_some(candidate)
 }
 
 fn worker_compose_config_command(container: &str) -> OpsCommand {
@@ -6270,19 +6200,5 @@ mod tests {
         );
 
         assert!(!cmd.env.iter().any(|(k, _)| k == "CURIE_DISPATCHER_IMAGE"));
-    }
-
-    #[test]
-    fn an_image_reference_yields_its_tag() {
-        assert_eq!(image_tag("ghcr.io/curie-eng/curie-worker:dev"), Some("dev"));
-        assert_eq!(
-            image_tag("ghcr.io/curie-eng/curie-worker:latest"),
-            Some("latest")
-        );
-        // A digest pin has no tag, and the colon inside it must not be read as
-        // one -- the registry host's port must not either.
-        assert_eq!(image_tag("ghcr.io/curie-eng/curie-worker@sha256:abc"), None);
-        assert_eq!(image_tag("localhost:5000/curie-worker"), None);
-        assert_eq!(image_tag("localhost:5000/curie-worker:dev"), Some("dev"));
     }
 }
