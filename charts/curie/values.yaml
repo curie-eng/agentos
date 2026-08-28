@@ -103,6 +103,25 @@ langfuse:
     tag: "3"
   telemetryEnabled: false
   enableExperimentalFeatures: true
+  # Startup gate on the ClickHouse endpoint Langfuse boots against (issue
+  # #2009). Both Langfuse deployments run their schema migrations at boot; when
+  # a Helm upgrade recreates the chart-owned ClickHouse Service, the new pods
+  # can start before that Service is resolvable and die with
+  # `failed to open database: dial tcp: lookup curie-clickhouse ... no such
+  # host`, converging only via CrashLoopBackOff retries. An init container polls
+  # ClickHouse's HTTP `/ping` until it answers, so the application container is
+  # not started at all until the dependency is up. Bounded on purpose: after
+  # `maxAttempts` polls the init container exits non-zero and Kubernetes
+  # restarts it, which is the same backstop `api.migrate` uses for Postgres.
+  # Attempt budget matches that gate (60 attempts, 2s apart); `timeoutSeconds`
+  # caps how long one `/ping` may hang, so the worst-case wait before a restart
+  # is maxAttempts x (timeoutSeconds + intervalSeconds). Raise it for a BYO
+  # ClickHouse that answers slowly rather than letting every attempt time out.
+  clickhouseReadiness:
+    enabled: true
+    maxAttempts: 60
+    intervalSeconds: 2
+    timeoutSeconds: 2
   # NEXTAUTH_URL the browser reaches the web UI at. Override for a real ingress.
   nextauthUrl: http://localhost:23000
   # Dev-only secret material. Override in prod or set `existingSecret` to a

@@ -1103,3 +1103,72 @@ securityContext:
 {{- fail (printf "worker.terminationGracePeriodSeconds (%d) must be at least worker.deliveryBudgetSeconds (%d) + worker.deliveryShutdownReserveSeconds (%d) = %d (ADR-0131). At %d a worker draining a full-budget delivery is SIGKILLed before it can settle, and the worker refuses this configuration at boot, so the Pod CrashLoopBackOffs instead of starting. Fix: raise worker.terminationGracePeriodSeconds to %d or more, or lower worker.deliveryBudgetSeconds and/or worker.deliveryShutdownReserveSeconds so their sum is at most %d." $grace $budget $reserve $required $grace $required $grace) -}}
 {{- end -}}
 {{- end -}}
+
+{{/* ---- Langfuse ClickHouse startup gate (issue #2009) ----
+     Both Langfuse deployments run their ClickHouse migrations during boot, so a
+     Helm upgrade that recreates the ClickHouse Service can start them before the
+     name resolves; Langfuse then exits with `failed to open database: dial tcp:
+     lookup <release>-clickhouse ... no such host` and the rollout converges only
+     through CrashLoopBackOff. This init container polls ClickHouse's HTTP
+     `/ping` until it answers 200, so the application container is not started
+     until the dependency is actually accepting connections -- the same
+     wait-then-hand-over shape `templates/api.yaml` uses for Postgres.
+
+     `node` is the Langfuse images' own runtime, so the probe needs no extra
+     tooling in the image. Bounded like the Postgres gate: after `maxAttempts`
+     polls the container exits non-zero and the kubelet restarts it, which keeps
+     a genuinely-down ClickHouse visible instead of hanging forever. Every probe
+     setting (attempts, interval, per-request timeout) comes from values rather
+     than the template, per the chart's probe-settings invariant -- a BYO
+     ClickHouse that answers slowly needs a longer timeout, not a patched chart.
+
+     Call with a dict: `root` (the chart context), `image` (the component's
+     image repository), `containerSecurityContext` and `resources` (the
+     component's, so the gate inherits the same posture and the pod's effective
+     request is unchanged -- init and app container requests are maxed, not
+     summed). */}}
+{{- define "curie.langfuse.clickhouseGate" -}}
+{{- $root := .root -}}
+- name: wait-for-clickhouse
+  image: "{{ .image }}:{{ $root.Values.langfuse.image.tag }}"
+  imagePullPolicy: {{ $root.Values.global.imagePullPolicy }}
+  {{- with .containerSecurityContext }}
+  securityContext:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  command: ["/bin/sh", "-c"]
+  args:
+    - |
+      attempt=1
+      max_attempts={{ $root.Values.langfuse.clickhouseReadiness.maxAttempts }}
+      interval={{ $root.Values.langfuse.clickhouseReadiness.intervalSeconds }}
+      probe_timeout_ms={{ mulf $root.Values.langfuse.clickhouseReadiness.timeoutSeconds 1000 | int }}
+      while [ "$attempt" -le "$max_attempts" ]; do
+        if PROBE_TIMEOUT_MS="$probe_timeout_ms" node -e '
+      const http = require("http");
+      const request = http.get(process.env.CLICKHOUSE_URL + "/ping", { timeout: Number(process.env.PROBE_TIMEOUT_MS) }, (response) => {
+        response.resume();
+        process.exit(response.statusCode === 200 ? 0 : 1);
+      });
+      request.on("timeout", () => { request.destroy(); process.exit(1); });
+      request.on("error", () => { process.exit(1); });
+      ' 2>/dev/null; then
+          echo "ClickHouse ready after $attempt attempt(s); starting Langfuse"
+          exit 0
+        fi
+        if [ "$attempt" -eq 1 ]; then
+          echo "Waiting for ClickHouse readiness at $CLICKHOUSE_URL"
+        fi
+        if [ "$attempt" -lt "$max_attempts" ]; then
+          sleep "$interval"
+        fi
+        attempt=$((attempt + 1))
+      done
+      echo "ClickHouse unreachable at $CLICKHOUSE_URL after $max_attempts readiness attempts; exiting for init container restart" >&2
+      exit 1
+  env:
+    - name: CLICKHOUSE_URL
+      value: http://{{ include "curie.clickhouse.host" $root }}:{{ $root.Values.clickhouse.httpPort }}
+  resources:
+    {{- toYaml .resources | nindent 4 }}
+{{- end -}}
