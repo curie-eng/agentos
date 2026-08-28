@@ -2082,6 +2082,30 @@ pub(crate) async fn chart_stateful_components(
     Ok(parse_statefulset_components(&out))
 }
 
+/// The version declared by the chart at `chart`, read from its own `Chart.yaml`.
+///
+/// `helm show chart` accepts every reference form `--chart` does -- a
+/// directory, a `.tgz`, a repo ref -- so this is the version of the chart that
+/// was actually rendered rather than one guessed from the reference's spelling.
+///
+/// A non-zero exit is fatal on purpose: this feeds the CHART VERSION MISMATCH
+/// comparison, and failing open to a guessed version would raise (or suppress)
+/// that warning about a chart nothing looked at (#1352).
+pub async fn chart_version(chart: &str) -> Result<String> {
+    let cmd = OpsCommand::new("helm", vec![plain("show"), plain("chart"), plain(chart)]);
+    let (ok, out, err) = run_capture(&cmd).await?;
+    if !ok {
+        bail!("could not read the chart version of {chart}: {err}");
+    }
+    let chart_yaml: serde_json::Value = serde_norway::from_str(&out)
+        .with_context(|| format!("could not parse the Chart.yaml of {chart}"))?;
+    chart_yaml
+        .get("version")
+        .and_then(|version| version.as_str())
+        .map(str::to_string)
+        .with_context(|| format!("the Chart.yaml of {chart} declares no version"))
+}
+
 /// The component identities of StatefulSets in a multi-document helm render.
 ///
 /// Split-and-parse rather than a regex: a `kind: StatefulSet` line can appear

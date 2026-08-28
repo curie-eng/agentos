@@ -407,10 +407,28 @@ data too.
 curie diff -f curie.yaml
 ```
 
-`chart_version_differs: true` means the comparison above it is values-only and
-cannot see a component added, removed, or renamed between versions. A renamed
+`diff` reads the release's live StatefulSets and renders the target chart, so a
+stateful component that chart would DELETE is reported directly as
+`stateful_removals` and counted in `changes`, instead of surfacing as an
+ordinary value add. A non-empty list is not a routine change count: `curie
+apply` on that same file will REFUSE.
+
+`migration` names the object-store rename (`minio` → `rustfs`) that `curie
+apply --migrate-store` carries the data across. Its absence beside a non-empty
+`stateful_removals` means there is no automatic carry -- a store disabled
+through the chart's own BYO gate (`postgres.deploy: false`) removes a component
+`--migrate-store` has nothing to move.
+
+`chart_version_differs: true` means the value-level entry comparison cannot see
+a NON-STATEFUL component added, removed, or renamed between versions. A renamed
 component's old keys appear as ordinary resets, which reads far milder than the
-swap it would be.
+swap it would be. Stateful components are the exception: those come from the
+live read above, whatever the chart versions say.
+
+`curie diff --chart <ref>` points the comparison at the same chart `curie apply
+--chart <ref>` would use, and reports that chart's version as the target. A dev
+build run outside a source checkout needs it, since resolving and rendering a
+chart is now part of `diff`.
 
 `curie apply` refuses outright when the upgrade would delete a StatefulSet the
 release is running, and names it. `--migrate-store` is the option to reach
@@ -432,6 +450,11 @@ unreachable cluster classifies as transient (exit code 3), so an automation
 loop can retry the same command. This also applies to `--dry-run`: a dry run
 that could not read the cluster cannot honestly claim the store is safe, so it
 now errors instead of printing a plan.
+
+`curie diff` fails closed the same way, and classifies the same: it mutates
+nothing and resolves no credential (an unresolvable one is reported, never
+fatal), but answering "no removals" when the cluster read failed is the false
+assurance this check exists to prevent.
 
 Without the CLI, the same check by hand:
 

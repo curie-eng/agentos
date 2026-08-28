@@ -4590,6 +4590,14 @@ export const commandManifest = {
           "positional": false,
           "required": false,
           "short": "f"
+        },
+        {
+          "global": false,
+          "help": "Chart reference override, as `cluster up` takes. Diff RENDERS this chart to detect stateful components the apply would delete, so point it at the same chart `curie apply --chart` would use",
+          "id": "chart",
+          "long": "chart",
+          "positional": false,
+          "required": false
         }
       ],
       "hidden": false,

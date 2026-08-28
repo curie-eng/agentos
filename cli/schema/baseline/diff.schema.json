@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/diff/v2.1.json",
+  "$id": "https://schemas.curietech.ai/cli/diff/v2.2.json",
   "title": "curie diff --json",
   "description": "The agent facing payload of `curie diff`: every chart value the effective installation plan and the live release disagree about, plus the values the release carries that the plan does not declare. Read only. Available credentials and provider addresses are resolved to construct the same plan used by apply. Comparisons that depend on an unavailable declared credential are marked unknown. No cluster state is mutated. Secret values are rendered as the literal string `<secret>` and never in the clear.",
   "type": "object",
@@ -19,7 +19,7 @@
     "changes": {
       "type": "integer",
       "minimum": 0,
-      "description": "How many entries are known changes or unresolved comparisons: add, change, reset, and unknown. Unknown counts conservatively so zero still means applying the file is a no op."
+      "description": "How many differences this diff found between the file and the live release: the entries that are known changes or unresolved comparisons (add, change, reset, unknown) PLUS the length of `stateful_removals`. Unknown counts conservatively, and a stateful removal counts even though it is not an entry, so zero still means applying the file is a no op. A NON ZERO COUNT IS NOT PERMISSION TO APPLY, and it is not a count of what apply would do: a non empty `stateful_removals` means `curie apply` REFUSES this file outright rather than making any of these changes."
     },
     "entries": {
       "type": "array",
@@ -78,11 +78,67 @@
     },
     "chart_target": {
       "type": "string",
-      "description": "The chart version this CLI would apply."
+      "description": "The version of the chart this run would apply: this CLI's own by default, or the version declared by the `--chart` override when one was given. Always the chart the comparison actually rendered, so `chart_version_differs` compares like with like."
     },
     "chart_version_differs": {
       "type": "boolean",
-      "description": "True when the deployed chart version differs from the one this CLI would apply. The entry comparison is VALUES-ONLY and cannot see a component added, removed, or renamed between chart versions -- a renamed component's old keys appear as ordinary resets. Treat a true here as 'this diff does not describe a safe apply'."
+      "description": "True when the deployed chart version differs from the one this CLI would apply. The `entries` comparison is VALUES-ONLY: a non stateful component added, removed, or renamed between chart versions is invisible to it, and a renamed one's old keys appear as ordinary resets. STATEFUL components are the exception -- those are reported directly in `stateful_removals`, which is populated from a live read and is independent of this flag. Treat a true here as 'the entry comparison does not describe a safe apply'."
+    },
+    "stateful_removals": {
+      "type": "array",
+      "description": "Live stateful components the target chart would NOT recreate in place, each of which apply would delete along with its persistent data. THIS CLI always emits the key, including as `[]`, and `[]` means the live StatefulSets were read and none are at risk; the property is left out of the top level `required` list only so a consumer pinned to the previous `$id` still validates against this schema (adding it would be a MAJOR bump). A NON EMPTY array means `curie apply` on this exact file WILL REFUSE, so a consumer must not read the exit code alone as permission to apply. The two causes have OPPOSITE remedies: `component_gone` means the target chart does not render the component at all -- `curie apply --migrate-store` carries the data across ONLY when that component is the object store, and the `migration` field is the discriminator, so a component gone for any other reason (a store disabled through the chart BYO gate, e.g. `postgres.deploy: false`) has no automatic carry and apply keeps refusing; `renamed` means the component survives under a different resource name because the release was installed with a `nameOverride` the file does not declare, which is fixed by declaring it in curie.yaml (`--migrate-store` cannot help there).",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The live resource name, which is what an operator recognises in their own cluster."
+          },
+          "component": {
+            "type": "string",
+            "description": "The `app.kubernetes.io/component` label the identity is keyed on. Names embed the chart fullname, so the component, not the name, is what makes two objects the same thing."
+          },
+          "cause": {
+            "enum": [
+              "component_gone",
+              "renamed"
+            ],
+            "description": "`component_gone`: the target chart does not render this component at all. `renamed`: it is rendered, under a different resource name, so helm deletes the old object and creates the new one empty beside the orphaned volume."
+          },
+          "renamed_to": {
+            "type": "string",
+            "description": "The resource name the target chart renders this component as. Present ONLY when `cause` is `renamed`."
+          }
+        },
+        "required": [
+          "name",
+          "component",
+          "cause"
+        ]
+      }
+    },
+    "migration": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "description": "The object store rename this upgrade performs. NON NULL means the target chart renders the object store under a different component than the live release does, which is exactly the case `curie apply --migrate-store` carries the data across. NULL beside a NON EMPTY `stateful_removals` means there is no automatic carry for what would be deleted, and apply will keep refusing until the file is fixed. This CLI always emits the key, as an object or as `null`; the property is left out of the top level `required` list only so a consumer pinned to the previous `$id` still validates.",
+      "properties": {
+        "from": {
+          "type": "string",
+          "description": "The `app.kubernetes.io/component` name of the live object store (`minio`, `rustfs`). A COMPONENT, never a resource name: resource names embed the chart fullname, so a `nameOverride` changes all of them."
+        },
+        "to": {
+          "type": "string",
+          "description": "The `app.kubernetes.io/component` name of the object store the target chart renders (`minio`, `rustfs`). A COMPONENT, never a resource name, for the same reason as `from`."
+        }
+      },
+      "required": [
+        "from",
+        "to"
+      ]
     },
     "unresolved_credentials": {
       "type": "array",

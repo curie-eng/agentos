@@ -566,6 +566,11 @@ enum Command {
         /// Path to the installation file.
         #[arg(short = 'f', long = "file", default_value = "curie.yaml")]
         file: std::path::PathBuf,
+        /// Chart reference override, as `cluster up` takes. Diff RENDERS this
+        /// chart to detect stateful components the apply would delete, so point
+        /// it at the same chart `curie apply --chart` would use.
+        #[arg(long)]
+        chart: Option<String>,
     },
 }
 
@@ -3849,16 +3854,47 @@ async fn run(command: Option<Command>) -> Result<()> {
             let api = api_url.as_deref().zip(api_key.as_deref());
             emit(curie::doctor::doctor(&namespace, &release, api).await)
         }
-        Some(Command::Diff { file }) => {
+        Some(Command::Diff { file, chart }) => {
             let cfg = curie::installation::Installation::load(&file)?;
             // Lenient on purpose: `diff` mutates nothing, so a credential it
             // cannot resolve must not withhold the answer. See
             // installation::resolve_credentials_lenient.
             let (local, missing) = curie::installation::plan_installation_lenient(cfg)?;
+            // Resolved exactly as `Apply` does, so both verbs answer about the
+            // same chart. `resolve_chart` errors on the Dev channel with no
+            // `charts/curie` in cwd and its remedy text literally says "pass
+            // --chart", so the flag has to exist on this verb too (#1352).
+            let overridden = chart.is_some();
+            let resolved = artifacts::resolve_chart(
+                chart.as_deref(),
+                artifacts::Channel::current(),
+                artifacts::version(),
+                artifacts::cache_root,
+                std::path::Path::new("charts/curie").is_dir(),
+            )?;
+            // `false`, never `dry_run`-style `true`: `true` returns a
+            // `planned_target()` path that may not exist, and diff must actually
+            // render the chart rather than plan a fetch of it.
+            let chart = materialize_artifact(resolved, false, "chart").await?;
+            // The version REPORTED has to be the version RENDERED. Under
+            // `--chart` those are different charts, and reporting this CLI's
+            // own package version there would compare the deployed release
+            // against a chart the probe never looked at -- raising a false
+            // CHART VERSION MISMATCH, or suppressing a real one. That is the
+            // same two-sources-of-truth defect #1352 is about, in a new place.
+            // The default path keeps `artifacts::version()` exactly as before,
+            // so it makes no extra helm call.
+            let chart_target = if overridden {
+                curie::ops::chart_version(&chart).await?
+            } else {
+                artifacts::version().to_string()
+            };
             emit(
                 curie::installation::diff(curie::installation::DiffOpts {
                     local,
                     unresolved_credentials: missing,
+                    chart,
+                    chart_target,
                 })
                 .await?,
             )
