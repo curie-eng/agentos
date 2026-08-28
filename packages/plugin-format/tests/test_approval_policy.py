@@ -132,6 +132,10 @@ def test_sre_bot_declares_gated_write_connector_and_validates(tmp_path: Path) ->
             "gate": "mcp__k8s-scale__scale_deployment",
             "route": "sre-approvals",
         },
+        {
+            "gate": "mcp__self-upgrade__upgrade_self",
+            "route": "sre-approvals",
+        },
     ]
     assert connectors["connectors"]["k8s-write"]["build"] == {
         "context": "connectors/k8s-write",
@@ -150,6 +154,19 @@ def test_sre_bot_declares_gated_write_connector_and_validates(tmp_path: Path) ->
     }
     assert connectors["connectors"]["k8s-scale"]["build"] == {
         "context": "connectors/k8s-scale",
+        "platforms": ["linux/amd64", "linux/arm64"],
+    }
+    # A FOURTH kubeconfig, and the one bound to the widest grant in the bundle:
+    # `create` on `jobs` cannot be narrowed with `resourceNames`, so the ceiling
+    # is the connector taking no arguments rather than RBAC
+    # (manifests/upgrade-role.yaml). Reusing any of the other three would either
+    # widen them into the platform's own namespace or widen this one into the
+    # workloads the bot may touch.
+    assert connectors["connectors"]["self-upgrade"]["secret_files"] == {
+        "SELF_UPGRADE_KUBECONFIG": "/secrets/kubeconfig"
+    }
+    assert connectors["connectors"]["self-upgrade"]["build"] == {
+        "context": "connectors/self-upgrade",
         "platforms": ["linux/amd64", "linux/arm64"],
     }
 
