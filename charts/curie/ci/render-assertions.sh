@@ -1194,6 +1194,61 @@ if helm template placement-render "$PLACEMENT_MUTANT" --output-dir "$PLACEMENT_M
 fi
 echo "  ok: stripping the nil-guard from curie.placement.class makes the legacy-null render fail again (the assert can fail)"
 
+echo "=== Placement assertion 5: a malformed placement class is refused, not silently dropped (#2008) ==="
+# The #2008 nil tolerance routes every class lookup through
+# `curie.placement.class`, which hands its result to the three consumers as
+# YAML. Helm's `fromYaml` returns an ERROR MAP rather than raising on a non-map
+# document, so without a kind refusal in that helper a malformed class renders
+# clean with `.podLabels`/`.annotations`/`.nodeSelector` all resolving to
+# nothing -- every scheduling constraint the operator asked for silently
+# dropped, and workloads free to land on unintended nodes. The pre-#2008
+# templates aborted on this shape; these asserts pin that the fix stayed
+# fail-CLOSED on it while only the nil case became tolerant.
+PLACEMENT_MALFORMED_CLASS="$TMP/placement-malformed-class.yaml"
+cat > "$PLACEMENT_MALFORMED_CLASS" <<'YAMLEOF'
+placement:
+  platform: spot
+YAMLEOF
+
+PLACEMENT_MALFORMED_CLASS_OUT="$(mktemp -d -p "$TMP")"
+PLACEMENT_MALFORMED_CLASS_ERR="$TMP/placement-malformed-class.err"
+# Same `set -euo pipefail` care as assertion 4: the expected outcome here is a
+# FAILING render, so check the exit status explicitly instead of letting the
+# non-zero status kill the script.
+if helm template placement-render "$CHART" --output-dir "$PLACEMENT_MALFORMED_CLASS_OUT" \
+  -f "$PLACEMENT_MALFORMED_CLASS" "${PLACEMENT_HELM_ARGS[@]}" \
+  > /dev/null 2>"$PLACEMENT_MALFORMED_CLASS_ERR"; then
+  fail "a malformed placement class ('placement.platform: spot', a scalar where a map of placement fields belongs) rendered successfully and silently dropped its scheduling constraints -- that is the #2008 fail-open regression: the chart must refuse the shape, not quietly schedule the workload anywhere."
+fi
+grep -q 'placement\.platform' "$PLACEMENT_MALFORMED_CLASS_ERR" \
+  || fail "a malformed placement class was refused, but the error never names the offending class ('placement.platform'), so the refusal is an incidental crash rather than an actionable message: $(cat "$PLACEMENT_MALFORMED_CLASS_ERR")"
+
+PLACEMENT_MALFORMED_TOP="$TMP/placement-malformed-top.yaml"
+cat > "$PLACEMENT_MALFORMED_TOP" <<'YAMLEOF'
+placement: spot
+YAMLEOF
+
+PLACEMENT_MALFORMED_TOP_OUT="$(mktemp -d -p "$TMP")"
+PLACEMENT_MALFORMED_TOP_ERR="$TMP/placement-malformed-top.err"
+if helm template placement-render "$CHART" --output-dir "$PLACEMENT_MALFORMED_TOP_OUT" \
+  -f "$PLACEMENT_MALFORMED_TOP" "${PLACEMENT_HELM_ARGS[@]}" \
+  > /dev/null 2>"$PLACEMENT_MALFORMED_TOP_ERR"; then
+  fail "a malformed top-level 'placement: spot' rendered successfully and silently dropped every placement class -- the chart must refuse a non-map placement, not quietly schedule every workload anywhere (#2008 fail-open regression)."
+fi
+grep -q 'placement' "$PLACEMENT_MALFORMED_TOP_ERR" \
+  || fail "a malformed top-level placement was refused, but the error never mentions 'placement', so the refusal is an incidental crash rather than an actionable message: $(cat "$PLACEMENT_MALFORMED_TOP_ERR")"
+
+# Positive control: the refusal must be narrow. The legacy nil path from
+# assertion 4 -- the whole point of #2008 -- must still render.
+PLACEMENT_REFUSAL_CONTROL_OUT="$(mktemp -d -p "$TMP")"
+PLACEMENT_REFUSAL_CONTROL_ERR="$TMP/placement-refusal-control.err"
+if ! helm template placement-render "$CHART" --output-dir "$PLACEMENT_REFUSAL_CONTROL_OUT" \
+  -f "$PLACEMENT_LEGACY_NULL" "${PLACEMENT_HELM_ARGS[@]}" \
+  > /dev/null 2>"$PLACEMENT_REFUSAL_CONTROL_ERR"; then
+  fail "the malformed-placement refusal is too broad: a legacy release's retained 'placement: null' no longer renders, so the fail-closed guard swallowed the #2008 nil tolerance it was supposed to preserve: $(cat "$PLACEMENT_REFUSAL_CONTROL_ERR")"
+fi
+echo "  ok: malformed placement values are refused by name, and legacy 'placement: null' still renders"
+
 echo "=== Assertion 12c: worker API URL and key wiring (#1529, #1578) ==="
 WORKER_API_CHECK="$TMP/check_worker_api.py"
 cat > "$WORKER_API_CHECK" <<'PYEOF'

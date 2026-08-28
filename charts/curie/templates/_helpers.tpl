@@ -53,11 +53,37 @@ app.kubernetes.io/component: {{ .component }}
      a release created before placement classes existed, the placement map is nil
      -- even though values.yaml defines all five classes -- and every direct
      per-class dereference in a template would panic on that nil. The
-     `| default dict` on the class lookup itself likewise covers a placement map
-     that is present but missing this class. */}}
+     empty-dict substitution on the class lookup itself likewise covers a
+     placement map that is present but missing this class.
+
+     The kind checks are the fail-CLOSED half of that tolerance, and they are
+     not optional: this helper hands its result to consumers as YAML, and
+     Helm's `fromYaml` on a non-map document returns an error map rather than
+     raising, so a malformed class (say `placement.platform: spot`) would
+     resolve `.podLabels`, `.annotations`, and `.nodeSelector` to nothing and
+     render clean -- silently dropping every scheduling constraint the operator
+     meant to apply and letting workloads land on unintended nodes. The
+     pre-#2008 templates dereferenced the class directly and aborted on that
+     shape; refusing here keeps that behavior while still degrading a *nil*
+     placement to the chart's empty defaults. The refusal lives in the template
+     rather than in `values.schema.json` because that schema is deliberately
+     permissive and does not type `placement` at all (see charts/curie/CLAUDE.md),
+     so a template-level refusal is this chart's established backstop for the
+     gap. Note the kind tests use `kindIs`/`kindOf` and not truthiness: an
+     `and $class (...)` guard would read a `false` or `0` class as absent and
+     default it away, which is the same fail-open bug in a different costume. */}}
 {{- define "curie.placement.class" -}}
 {{- $classes := .root.Values.placement | default dict -}}
-{{- toYaml (index $classes .class | default dict) -}}
+{{- if not (kindIs "map" $classes) -}}
+{{- fail (printf "placement must be a map of placement classes, got %s" (kindOf $classes)) -}}
+{{- end -}}
+{{- $class := index $classes .class -}}
+{{- if kindIs "invalid" $class -}}
+{{- $class = dict -}}
+{{- else if not (kindIs "map" $class) -}}
+{{- fail (printf "placement.%s must be a map of placement fields (podLabels, annotations, nodeSelector, tolerations, affinity), got %s" .class (kindOf $class)) -}}
+{{- end -}}
+{{- toYaml $class -}}
 {{- end -}}
 
 {{- define "curie.placement.labels" -}}
