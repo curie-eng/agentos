@@ -228,12 +228,69 @@ mod tests {
             chart: "charts/curie".into(),
             app_id: "12345".into(),
             private_key_path: "/tmp/app.pem".into(),
+            existing_secret: String::new(),
+            existing_secret_key: DEFAULT_APP_KEY_DATA_KEY.into(),
             disconnect,
         }
     }
 
+    /// A valid BYO connect: the operator owns the Secret, so no PEM path is
+    /// supplied at all. Supplying both is what `require_connect_inputs` refuses
+    /// (`existing_secret_with_a_private_key_is_refused`), so this is the shape
+    /// a real `--existing-secret` invocation actually has.
+    fn byo_opts() -> GithubAppOpts {
+        let mut o = opts(false);
+        o.private_key_path = String::new();
+        o.existing_secret = "my-github-app".into();
+        o
+    }
+
     fn argv(cmd: &OpsCommand) -> Vec<String> {
         cmd.argv()
+    }
+
+    /// True when `args` carries `value` as a WHOLE argv entry.
+    ///
+    /// Whole entries, never `contains` on the joined string:
+    /// `contains("api.githubAppExistingSecret=")` is also satisfied by
+    /// `api.githubAppExistingSecret=something-else`, so it tests for a prefix
+    /// rather than for the value that was actually set (#1263).
+    fn has_entry(args: &[String], value: &str) -> bool {
+        args.iter().any(|a| a == value)
+    }
+
+    /// True when any whole entry begins with `prefix`. Only ever used to assert
+    /// ABSENCE of a whole value family, which is the one question a prefix
+    /// legitimately answers.
+    fn has_entry_starting(args: &[String], prefix: &str) -> bool {
+        args.iter().any(|a| a.starts_with(prefix))
+    }
+
+    /// The whole argv entry immediately preceding `value`.
+    ///
+    /// Panics rather than returning an Option: a test that silently skips its
+    /// own assertion because the entry moved is the decoration #1263 found.
+    fn flag_before(args: &[String], value: &str) -> String {
+        let at = args
+            .iter()
+            .position(|a| a == value)
+            .unwrap_or_else(|| panic!("no argv entry equal to `{value}`: {args:?}"));
+        assert!(at > 0, "`{value}` has no preceding flag: {args:?}");
+        args[at - 1].clone()
+    }
+
+    /// The ADR-0021 `fix` hint an error carries, recovered through the very
+    /// `exit::classify` the `--json` error emitter uses. A refusal whose fix
+    /// does not survive that path is invisible to the agent driving the CLI,
+    /// which is the consumer this ticket exists to stop misleading.
+    fn fix_of(err: &anyhow::Error) -> String {
+        let (class, fix) = crate::exit::classify(err);
+        assert_eq!(
+            class,
+            crate::exit::ExitClass::Failure,
+            "the refusal must exit non-zero as a real classification: {err}"
+        );
+        fix.unwrap_or_else(|| panic!("the refusal must carry an actionable fix: {err}"))
     }
 
     #[test]
@@ -318,9 +375,11 @@ mod tests {
     fn the_upgrade_reuses_existing_values() {
         // Dropping --reuse-values resets every other value to chart defaults:
         // Slack tokens, the model credential, the connector reconciler flag.
-        // Silent, destructive, and uncaught (#1263).
+        // Silent, destructive, and uncaught (#1263). The BYO branch is a third
+        // command builder and carries the same obligation.
         for cmds in [
             connect_commands(&opts(false), DEFAULT_CLONE_BASE),
+            connect_commands(&byo_opts(), DEFAULT_CLONE_BASE),
             disconnect_commands(&opts(true)),
         ] {
             let flat = argv(&cmds[0]).join(" ");
@@ -360,11 +419,432 @@ mod tests {
         assert!(flat[1].contains("rollout status deployment/curie-api"));
     }
 
+    // ---- T1: the BYO connect names the Secret and its data key -------------
+
+    #[test]
+    fn the_byo_connect_names_the_secret_and_the_data_key_as_whole_entries() {
+        // AC1. If either entry is missing, the chart falls back to the inline
+        // key that this same command just cleared: GITHUB_APP_PRIVATE_KEY
+        // resolves to nothing, the api pod mints no JWT, and every clone 401s
+        // -- while the CLI still reports "GitHub App configured".
+        let args = argv(&connect_commands(&byo_opts(), DEFAULT_CLONE_BASE)[0]);
+        assert!(
+            has_entry(&args, "api.githubAppExistingSecret=my-github-app"),
+            "the BYO Secret name never reached helm: {args:?}"
+        );
+        assert!(
+            has_entry(&args, "api.githubAppExistingSecretKey=privateKey"),
+            "the BYO data key never reached helm: {args:?}"
+        );
+        assert_eq!(
+            flag_before(&args, "api.githubAppExistingSecret=my-github-app"),
+            "--set-string",
+            "the Secret name must not be helm-typed: {args:?}"
+        );
+        assert_eq!(
+            flag_before(&args, "api.githubAppExistingSecretKey=privateKey"),
+            "--set-string",
+            "the data key must not be helm-typed: {args:?}"
+        );
+    }
+
+    // ---- T2: a custom data key is honoured ---------------------------------
+
+    #[test]
+    fn a_custom_existing_secret_key_is_honoured() {
+        // Passing the default (`privateKey`) and asserting the default appears
+        // also passes when the parameter is ignored entirely (#1263). An
+        // operator whose ESO-managed Secret stores the PEM under `app-pem`
+        // would get `key: privateKey`, a key that does not exist in that
+        // Secret, and the api pod would sit in CreateContainerConfigError.
+        let mut o = byo_opts();
+        o.existing_secret_key = "app-pem".into();
+        let args = argv(&connect_commands(&o, DEFAULT_CLONE_BASE)[0]);
+        assert!(
+            has_entry(&args, "api.githubAppExistingSecretKey=app-pem"),
+            "the supplied data key was ignored: {args:?}"
+        );
+        assert!(
+            !has_entry(&args, "api.githubAppExistingSecretKey=privateKey"),
+            "the chart default was emitted over the supplied key: {args:?}"
+        );
+    }
+
+    // ---- T3: the security property -----------------------------------------
+
+    #[test]
+    fn the_byo_connect_never_passes_the_pem_path_to_helm() {
+        // THE security property of this path. `--set-file` makes helm read the
+        // file and write its CONTENTS into the release, where every retained
+        // revision keeps them and `helm get values` prints them back (#1236
+        // found the PEM in revision 15 of a live release). On the BYO path the
+        // release holds a Secret NAME only, so the PEM's path must not be in
+        // the plan at all -- helm must never be told where the file is.
+        //
+        // These opts also carry a real key path, a combination
+        // `require_connect_inputs` refuses. That is deliberate: the input
+        // check must not be the only thing standing between a PEM and helm, so
+        // the builder is proven to drop the path on its own.
+        let (_dir, path) = key_fixture();
+        let body = std::fs::read_to_string(&path).expect("fixture readable");
+        let mut o = byo_opts();
+        o.private_key_path = path.clone();
+
+        let args = argv(&connect_commands(&o, DEFAULT_CLONE_BASE)[0]);
+        assert!(
+            !has_entry(&args, "--set-file"),
+            "the BYO plan makes helm read a file off disk: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a.contains(&path)),
+            "the PEM's path reached the BYO plan: {args:?}"
+        );
+        assert!(
+            !has_entry_starting(&args, "api.githubAppPrivateKey=/"),
+            "the BYO plan carries a filesystem path as the key: {args:?}"
+        );
+        for line in body.lines().filter(|l| !l.trim().is_empty()) {
+            assert!(
+                !args.iter().any(|a| a.contains(line)),
+                "key material reached argv: {line}"
+            );
+        }
+    }
+
+    // ---- T4: adopting BYO clears the inline key ----------------------------
+
+    #[test]
+    fn the_byo_connect_clears_the_inline_private_key() {
+        // Decision 2, half one, and the whole reason the BYO path exists.
+        // `--reuse-values` copies a still-set api.githubAppPrivateKey into
+        // every future revision forever, and `curie cluster up` runs exactly
+        // that. Adopting the recommended path while leaving the PEM in release
+        // history gives the operator its ceremony and none of its benefit.
+        let args = argv(&connect_commands(&byo_opts(), DEFAULT_CLONE_BASE)[0]);
+        assert!(
+            has_entry(&args, "api.githubAppPrivateKey="),
+            "the inline key rides every later revision unless cleared: {args:?}"
+        );
+    }
+
+    // ---- T5: the chart-held branch must not leak the BYO fields ------------
+
+    #[test]
+    fn the_chart_held_connect_never_mentions_the_byo_fields() {
+        // Sibling path. If the branch leaks, a plain `--private-key` run writes
+        // api.githubAppExistingSecret= into the release and, through
+        // --reuse-values, permanently overrides an operator's hand-set BYO
+        // reference -- silently moving a working install off the Secret their
+        // External Secrets Operator owns.
+        let args = argv(&connect_commands(&opts(false), DEFAULT_CLONE_BASE)[0]);
+        assert!(
+            !has_entry_starting(&args, "api.githubAppExistingSecret"),
+            "the BYO branch leaked into the chart-held path: {args:?}"
+        );
+    }
+
+    // ---- T6: the chart-held plan is unchanged ------------------------------
+
+    #[test]
+    fn the_chart_held_connect_plan_is_byte_identical_to_before() {
+        // The chart-held path is what every existing install already runs;
+        // this ticket adds a branch beside it and must not perturb it. An
+        // exact whole-vector comparison pins order, flags, values and the
+        // absence of any extra entry at once -- a `contains` sweep cannot see
+        // an ADDED entry, which is exactly how a leaked BYO clear arrives.
+        let args = argv(&connect_commands(&opts(false), DEFAULT_CLONE_BASE)[0]);
+        assert_eq!(
+            args,
+            vec![
+                "upgrade",
+                "curie",
+                "charts/curie",
+                "-n",
+                "curie",
+                "--reuse-values",
+                "--set-string",
+                "api.githubAppId=12345",
+                "--set-file",
+                "api.githubAppPrivateKey=/tmp/app.pem",
+                "--set",
+                "api.githubCloneBase=https://github.com",
+            ]
+        );
+    }
+
+    // ---- T7 / T8: disconnect (AC3) ----------------------------------------
+
+    #[test]
+    fn disconnect_clears_the_byo_secret_name() {
+        // AC3. Without this, `--disconnect` leaves api.githubAppExistingSecret
+        // set: the CLI reports "GitHub App cleared", the chart still resolves
+        // GITHUB_APP_PRIVATE_KEY from the operator's Secret, and the platform
+        // keeps authenticating as an App the operator believes is gone.
+        let args = argv(&disconnect_commands(&opts(true))[0]);
+        assert!(
+            has_entry(&args, "api.githubAppExistingSecret="),
+            "the BYO Secret reference survived the disconnect: {args:?}"
+        );
+        assert!(
+            has_entry(&args, "api.githubAppId="),
+            "the App id was not cleared to empty: {args:?}"
+        );
+        assert!(
+            has_entry(&args, "api.githubAppPrivateKey="),
+            "the private key was not cleared to empty: {args:?}"
+        );
+    }
+
+    #[test]
+    fn disconnect_does_not_clear_the_byo_data_key_name() {
+        // Decision 2, half two, and the test that stops a future "for
+        // symmetry, clear both" refactor.
+        //
+        // api.githubAppExistingSecretKey has a chart default of `privateKey`.
+        // Setting it to "" does NOT restore that default -- `--reuse-values`
+        // re-supplies the empty string on every later upgrade, so the release
+        // overrides the default permanently. An operator who later hand-sets
+        // githubAppExistingSecret with no key then renders `key: ""`, and the
+        // api pod sits in CreateContainerConfigError with nothing in the
+        // release to explain why. The field is inert while the Secret NAME is
+        // empty, so leaving it alone is both correct and strictly safer.
+        let args = argv(&disconnect_commands(&opts(true))[0]);
+        assert!(
+            !has_entry_starting(&args, "api.githubAppExistingSecretKey"),
+            "clearing the data key overrides the chart default forever: {args:?}"
+        );
+    }
+
+    // ---- T9: --set-string, not --set ---------------------------------------
+
+    #[test]
+    fn an_all_digit_secret_name_and_data_key_are_set_as_strings() {
+        // `1234567` is a valid RFC-1123 label and a valid Secret data key.
+        // Under `--set`, helm parses it as a number and a --reuse-values round
+        // trip stores it as a float64: the next upgrade renders
+        // `1.234567e+06`, the secretKeyRef names a Secret that does not exist,
+        // and the api pod never starts. This is #1236's App-ID float bug
+        // transplanted into a new field, and a chart-render test cannot see it
+        // because it only appears after a real round trip.
+        let mut o = byo_opts();
+        o.existing_secret = "1234567".into();
+        o.existing_secret_key = "8901234".into();
+        let args = argv(&connect_commands(&o, DEFAULT_CLONE_BASE)[0]);
+        assert_eq!(
+            flag_before(&args, "api.githubAppExistingSecret=1234567"),
+            "--set-string",
+            "an all-digit Secret name must not go through --set: {args:?}"
+        );
+        assert_eq!(
+            flag_before(&args, "api.githubAppExistingSecretKey=8901234"),
+            "--set-string",
+            "an all-digit data key must not go through --set: {args:?}"
+        );
+    }
+
+    // ---- T10: the AC2 guard ------------------------------------------------
+
+    #[test]
+    fn a_configured_byo_secret_refuses_a_chart_held_private_key() {
+        // THIS IS THE TICKET. Without the guard the CLI prints "GitHub App
+        // configured", returns {"github_app_configured": true} and rolls the
+        // API, while the pod keeps signing with the OLD key -- because the
+        // chart resolves GITHUB_APP_PRIVATE_KEY from the BYO Secret whenever
+        // api.githubAppExistingSecret is non-empty, so --set-file writes a
+        // value nothing reads. The README's next rotation step is "delete the
+        // first key on GitHub", at which point every clone 401s and nothing
+        // the CLI printed ever hinted at it.
+        let existing = serde_json::json!({"api": {"githubAppExistingSecret": "my-github-app"}});
+        let refusal = guard_byo_key_conflict(&opts(false), Some(&existing));
+        let err = refusal.expect_err("a BYO release must refuse --private-key");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("my-github-app"),
+            "the refusal must name the Secret the release actually reads: {msg}"
+        );
+        assert!(
+            msg.contains("privateKey"),
+            "the refusal must name the data key inside it: {msg}"
+        );
+        let fix = fix_of(&err);
+        assert!(
+            fix.contains("--existing-secret"),
+            "the fix must name the way forward: {fix}"
+        );
+        assert!(
+            fix.contains("--disconnect"),
+            "the fix must name the way back: {fix}"
+        );
+        assert!(
+            fix.contains("my-github-app"),
+            "the fix must name the Secret the operator has to update: {fix}"
+        );
+    }
+
+    #[test]
+    fn a_present_but_empty_byo_secret_does_not_refuse() {
+        // `--disconnect` writes api.githubAppExistingSecret="", so the key is
+        // PRESENT and empty on every disconnected release. A guard that fires
+        // on presence rather than on a non-empty value bricks the documented
+        // recovery path: after a disconnect the operator could never return to
+        // a chart-held key through the CLI at all.
+        let existing = serde_json::json!({"api": {"githubAppExistingSecret": ""}});
+        let outcome = guard_byo_key_conflict(&opts(false), Some(&existing));
+        assert!(
+            outcome.is_ok(),
+            "an empty BYO reference is not a BYO release: {:?}",
+            outcome.err()
+        );
+    }
+
+    #[test]
+    fn an_absent_release_does_not_refuse() {
+        // `fetch_release_values` returns Ok(None) only when helm positively
+        // reports the release does not exist. Refusing there would make the
+        // verb unusable on a fresh install, and helm's own "release not found"
+        // two lines later is the honest error.
+        let outcome = guard_byo_key_conflict(&opts(false), None);
+        assert!(
+            outcome.is_ok(),
+            "a release that does not exist configures nothing: {:?}",
+            outcome.err()
+        );
+    }
+
+    #[test]
+    fn a_release_with_null_values_does_not_refuse() {
+        // helm prints `null` for an existing release with no user-supplied
+        // values -- the shape of a default install. Reading that as "a BYO
+        // Secret is configured" would refuse the very first github-app run on
+        // every such cluster.
+        let existing = serde_json::Value::Null;
+        let outcome = guard_byo_key_conflict(&opts(false), Some(&existing));
+        assert!(
+            outcome.is_ok(),
+            "null values configure nothing: {:?}",
+            outcome.err()
+        );
+    }
+
+    #[test]
+    fn a_custom_data_key_is_echoed_in_the_refusal() {
+        // The operator must be told WHICH data key to update, not the chart
+        // default. Naming `privateKey` when the release reads `app-pem` sends
+        // them to write the PEM into a key nothing reads -- the same
+        // misreport one layer down. Non-default value, per #1263.
+        let existing = serde_json::json!({
+            "api": {"githubAppExistingSecret": "s", "githubAppExistingSecretKey": "app-pem"}
+        });
+        let refusal = guard_byo_key_conflict(&opts(false), Some(&existing));
+        let err = refusal.expect_err("a BYO release must refuse --private-key");
+        let both = format!("{}\n{}", err, fix_of(&err));
+        assert!(
+            both.contains("app-pem"),
+            "the refusal must name the release's own data key: {both}"
+        );
+        assert!(
+            !both.contains("privateKey"),
+            "the refusal named the chart default over the real key: {both}"
+        );
+    }
+
+    #[test]
+    fn the_guard_does_not_fire_on_an_explicit_byo_connect() {
+        // Re-running `--existing-secret` on a BYO release IS the supported
+        // rotation path: the operator updated the Secret and needs the rollout
+        // this verb performs. A guard that refuses here leaves them with no
+        // CLI way to roll the API at all.
+        let existing = serde_json::json!({"api": {"githubAppExistingSecret": "my-github-app"}});
+        let outcome = guard_byo_key_conflict(&byo_opts(), Some(&existing));
+        assert!(
+            outcome.is_ok(),
+            "re-pointing at the same Secret is the rotation path: {:?}",
+            outcome.err()
+        );
+    }
+
+    #[test]
+    fn the_guard_does_not_fire_on_disconnect() {
+        // Clearing a reference must always be possible. A guard that refuses
+        // `--disconnect` on a BYO release makes that release unrecoverable
+        // through the CLI -- the operator would have to hand-run helm, which
+        // is the thing this verb exists to avoid.
+        let existing = serde_json::json!({"api": {"githubAppExistingSecret": "my-github-app"}});
+        let outcome = guard_byo_key_conflict(&opts(true), Some(&existing));
+        assert!(
+            outcome.is_ok(),
+            "a disconnect must never be blocked by what it clears: {:?}",
+            outcome.err()
+        );
+    }
+
+    #[test]
+    fn only_a_chart_held_connect_pays_for_the_values_read() {
+        // `needs_byo_conflict_check` decides whether the verb makes a `helm
+        // get values` round trip at all. Answering `true` for a disconnect or
+        // an explicit BYO connect adds a cluster read -- and on a real run a
+        // hard failure when helm is unreachable -- to two paths that need
+        // nothing from the release. Answering `false` for a chart-held connect
+        // disables the guard entirely and restores the bug.
+        assert!(
+            needs_byo_conflict_check(&opts(false)),
+            "the chart-held connect is the only path that can misreport"
+        );
+        assert!(
+            !needs_byo_conflict_check(&opts(true)),
+            "a disconnect must not pay for a values read"
+        );
+        assert!(
+            !needs_byo_conflict_check(&byo_opts()),
+            "an explicit BYO connect must not pay for a values read"
+        );
+    }
+
+    #[test]
+    fn the_configured_secret_is_read_with_the_charts_own_key_names() {
+        // The three literals must be the exact strings
+        // charts/curie/templates/api.yaml reads. A CLI that looked up a
+        // different values key would resolve a different Secret than the
+        // workload's own env and report a plausible but wrong answer, which is
+        // worse than reporting none (#1759).
+        let custom = serde_json::json!({
+            "api": {"githubAppExistingSecret": "s", "githubAppExistingSecretKey": "app-pem"}
+        });
+        assert_eq!(
+            configured_existing_secret(Some(&custom)),
+            Some(("s".to_string(), "app-pem".to_string()))
+        );
+        let defaulted = serde_json::json!({"api": {"githubAppExistingSecret": "s"}});
+        assert_eq!(
+            configured_existing_secret(Some(&defaulted)),
+            Some(("s".to_string(), DEFAULT_APP_KEY_DATA_KEY.to_string())),
+            "an unset data key must fall back to the chart's own default"
+        );
+        assert_eq!(configured_existing_secret(None), None);
+    }
+
+    #[test]
+    fn the_default_data_key_mirrors_the_chart_default() {
+        // DEFAULT_APP_KEY_DATA_KEY mirrors charts/curie/values.yaml's
+        // api.githubAppExistingSecretKey. If the two drift, `--existing-secret
+        // X` with no `--existing-secret-key` writes a key name the chart never
+        // defaults to, and the api pod fails to start on a Secret that is
+        // perfectly correct.
+        assert_eq!(DEFAULT_APP_KEY_DATA_KEY, "privateKey");
+    }
+
+    // ---- T11: input validation ---------------------------------------------
+
     #[test]
     fn missing_inputs_say_where_to_find_them() {
-        let err = require_connect_inputs(false, "", "/tmp/app.pem").unwrap_err();
+        let mut o = opts(false);
+        o.app_id = String::new();
+        let err = require_connect_inputs(&o).unwrap_err();
         assert!(err.to_string().contains("Developer settings"));
-        let err = require_connect_inputs(false, "1", "").unwrap_err();
+
+        let mut o = opts(false);
+        o.private_key_path = String::new();
+        let err = require_connect_inputs(&o).unwrap_err();
         assert!(err.to_string().contains("Private keys"));
     }
 
@@ -372,12 +852,135 @@ mod tests {
     fn a_key_path_that_does_not_exist_fails_before_helm_runs() {
         // helm's own error for a missing --set-file is opaque, and by then the
         // upgrade has already started.
-        let err = require_connect_inputs(false, "1", "/nope/missing.pem").unwrap_err();
+        let mut o = opts(false);
+        o.private_key_path = "/nope/missing.pem".into();
+        let err = require_connect_inputs(&o).unwrap_err();
         assert!(err.to_string().contains("no such file"));
     }
 
     #[test]
     fn disconnect_needs_no_inputs() {
-        assert!(require_connect_inputs(true, "", "").is_ok());
+        let mut o = opts(true);
+        o.app_id = String::new();
+        o.private_key_path = String::new();
+        assert!(require_connect_inputs(&o).is_ok());
+    }
+
+    #[test]
+    fn existing_secret_with_a_private_key_is_refused() {
+        // Two mutually exclusive ways to supply one key. Picking one silently
+        // is a guess about operator intent on the single credential that can
+        // mint read tokens for every repository in the installation -- and
+        // whichever we guessed, the other would look configured and not be.
+        let (_dir, path) = key_fixture();
+        let mut o = byo_opts();
+        o.private_key_path = path;
+        let err = require_connect_inputs(&o).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--existing-secret"),
+            "the refusal must name the flag that was accepted: {msg}"
+        );
+        assert!(
+            msg.contains("--private-key"),
+            "the refusal must name the flag that was ignored: {msg}"
+        );
+    }
+
+    #[test]
+    fn existing_secret_with_disconnect_is_refused() {
+        // "--disconnect --existing-secret X" reads as "point at X while
+        // disconnecting". Accepting it clears the release and leaves the
+        // operator believing a reference to X was set.
+        let mut o = opts(true);
+        o.existing_secret = "my-github-app".into();
+        let err = require_connect_inputs(&o).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--existing-secret"),
+            "the refusal must name the contradicting flag: {msg}"
+        );
+        assert!(
+            msg.contains("--disconnect"),
+            "the refusal must name what it contradicts: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_data_key_without_a_secret_name_is_refused() {
+        // A non-default data key with no Secret name configures nothing at
+        // all: the BYO branch never runs, and the operator who typed
+        // `--existing-secret-key app-pem` gets a chart-held connect reported
+        // as success. Silently doing nothing is this ticket's own defect
+        // class, so it must not be reintroduced by the new flag pair.
+        let mut o = opts(false);
+        o.existing_secret_key = "app-pem".into();
+        let outcome = require_connect_inputs(&o);
+        assert!(
+            outcome.is_err(),
+            "a data key with no Secret name configures nothing"
+        );
+
+        // The DEFAULT key with no Secret name is the ordinary chart-held run
+        // and must stay accepted, or every existing invocation breaks.
+        let (_dir, path) = key_fixture();
+        let mut o = opts(false);
+        o.private_key_path = path;
+        let outcome = require_connect_inputs(&o);
+        assert!(
+            outcome.is_ok(),
+            "the chart-held default must stay accepted: {:?}",
+            outcome.err()
+        );
+    }
+
+    #[test]
+    fn the_app_id_is_still_required_on_the_byo_path() {
+        // The chart needs BOTH githubAppId and a key; the App id is not secret
+        // and "set both, or neither" is the existing contract. Without the id
+        // the JWT carries no `iss` and every GitHub call 401s -- with a
+        // perfectly configured Secret sitting right there.
+        let mut o = byo_opts();
+        o.app_id = String::new();
+        let err = require_connect_inputs(&o).unwrap_err();
+        assert!(err.to_string().contains("Developer settings"));
+    }
+
+    #[test]
+    fn a_private_key_is_not_required_on_the_byo_path() {
+        // Directly falsifies "we forgot to move the two chart-held checks
+        // under the branch". Left where they are, the empty path trips
+        // "--private-key is required" (and then the is_file check), so EVERY
+        // BYO invocation dies before helm ever runs and the recommended path
+        // stays unreachable from the CLI -- which is this ticket.
+        let outcome = require_connect_inputs(&byo_opts());
+        assert!(
+            outcome.is_ok(),
+            "the BYO path supplies no PEM by design: {:?}",
+            outcome.err()
+        );
+    }
+
+    #[test]
+    fn an_empty_existing_secret_degrades_to_the_chart_held_path() {
+        // `--existing-secret ""` is indistinguishable from omitting it. There
+        // is no third mode: it must still require --private-key and still emit
+        // --set-file, rather than take the BYO branch with an empty name and
+        // write api.githubAppExistingSecret= over an operator's real one.
+        let mut o = opts(false);
+        o.existing_secret = String::new();
+        o.private_key_path = String::new();
+        let err = require_connect_inputs(&o).unwrap_err();
+        assert!(err.to_string().contains("Private keys"), "{err}");
+
+        let args = argv(&connect_commands(&opts(false), DEFAULT_CLONE_BASE)[0]);
+        assert!(
+            has_entry(&args, "--set-file"),
+            "an empty --existing-secret must still read the PEM: {args:?}"
+        );
+        assert!(
+            !has_entry_starting(&args, "api.githubAppExistingSecret"),
+            "an empty --existing-secret took the BYO branch: {args:?}"
+        );
     }
 }
