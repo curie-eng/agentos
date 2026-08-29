@@ -56,6 +56,7 @@ from urllib.parse import quote
 
 import httpx
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 log = logging.getLogger("tempo-mcp")
@@ -113,14 +114,24 @@ READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldH
 def _proxy(path: str, params: dict[str, Any] | None = None) -> Any:
     """GET one Tempo path through Grafana's datasource proxy.
 
-    Every error is returned as a STRING rather than raised. A raised exception
-    reaches the model as a stack trace, which it will either paste into Slack or
-    treat as a transient failure and retry. A sentence it can read out loud is
-    more useful and stops the retry loop.
+    Every error is raised as a `ToolError` rather than returned. A returned
+    string is `isError: false` on the wire, so a refused read and an empty one
+    are the same result to anything reading the protocol -- an eval grader, a
+    ledger, a retry policy -- and a refusal gets counted as an answer.
+
+    The concern that first argued for returning strings does not apply to
+    `ToolError`: FastMCP puts the message on the wire behind a fixed
+    `Error executing tool <tool_name>: ` prefix and adds nothing else -- no
+    traceback, no stack frames -- so there is nothing for the model to paste
+    into Slack, and the sentence after the prefix is the same sentence it read
+    before: still one it can read out loud, and still one that says whether
+    retrying is worth anything.
     """
 
     if not GRAFANA_URL or not TOKEN:
-        return "not configured: GRAFANA_URL and GRAFANA_SERVICE_ACCOUNT_TOKEN must both be set"
+        raise ToolError(
+            "not configured: GRAFANA_URL and GRAFANA_SERVICE_ACCOUNT_TOKEN must both be set"
+        )
     url = f"{GRAFANA_URL}/api/datasources/proxy/uid/{quote(DS_UID)}{path}"
     try:
         r = httpx.get(
@@ -129,24 +140,26 @@ def _proxy(path: str, params: dict[str, Any] | None = None) -> Any:
             headers={"Authorization": f"Bearer {TOKEN}", "Accept": "application/json"},
             timeout=TIMEOUT,
         )
-    except httpx.TimeoutException:
-        return f"Tempo did not respond within {TIMEOUT:g}s. Narrow the time range and try again."
+    except httpx.TimeoutException as exc:
+        raise ToolError(
+            f"Tempo did not respond within {TIMEOUT:g}s. Narrow the time range and try again."
+        ) from exc
     except httpx.HTTPError as exc:
         # str(exc) carries the URL, never the Authorization header.
-        return f"could not reach Grafana: {exc}"
+        raise ToolError(f"could not reach Grafana: {exc}") from exc
 
     if r.status_code == 401 or r.status_code == 403:
-        return (
+        raise ToolError(
             f"Grafana refused the request ({r.status_code}). The service account token is "
             "missing or lacks access to the Tempo datasource. This will not fix itself on retry."
         )
     if r.status_code == 404:
-        return (
+        raise ToolError(
             f"no such Tempo endpoint or datasource uid {DS_UID!r} ({r.status_code}). "
             "Check TEMPO_DATASOURCE_UID."
         )
     if r.status_code >= 400:
-        return f"Tempo returned {r.status_code}: {r.text[:300]}"
+        raise ToolError(f"Tempo returned {r.status_code}: {r.text[:300]}")
 
     # Check the advertised size first so an oversized body can be refused
     # without parsing it, then fall back to what actually arrived -- Content-
@@ -154,16 +167,20 @@ def _proxy(path: str, params: dict[str, Any] | None = None) -> Any:
     # trace tends to come back.
     too_big = _oversized(r)
     if too_big is not None:
-        return too_big
+        raise ToolError(too_big)
 
     try:
         return r.json()
-    except ValueError:
-        return f"Tempo returned non-JSON: {r.text[:300]}"
+    except ValueError as exc:
+        raise ToolError(f"Tempo returned non-JSON: {r.text[:300]}") from exc
 
 
 def _oversized(r: httpx.Response) -> str | None:
-    """The refusal message if this body exceeds the cap, else None."""
+    """The refusal message if this body exceeds the cap, else None.
+
+    A pure helper, so it reports rather than raises; `_proxy` is the one that
+    turns the message into a `ToolError`.
+    """
 
     declared = r.headers.get("content-length")
     size = None
@@ -227,13 +244,14 @@ def get_trace(trace_id: str) -> Any:
     searching and reading the summary unless the span detail is the question.
 
     Responses over 1 MiB are REFUSED rather than returned, so a trace from a
-    very busy request will not come back at all. That is a ceiling, not a
+    very busy request will not come back at all. The refusal arrives as a tool
+    error carrying that sentence, not as a result. That is a ceiling, not a
     transient failure -- narrow the search instead of retrying.
     """
 
     trace_id = trace_id.strip()
     if not trace_id:
-        return "trace_id is required -- get one from search_traces"
+        raise ToolError("trace_id is required -- get one from search_traces")
     return _proxy(f"/api/traces/{quote(trace_id)}")
 
 
@@ -257,7 +275,7 @@ def list_trace_tag_values(tag: str) -> Any:
 
     tag = tag.strip()
     if not tag:
-        return "tag is required, e.g. resource.service.name"
+        raise ToolError("tag is required, e.g. resource.service.name")
     return _proxy(f"/api/v2/search/tag/{quote(tag)}/values")
 
 

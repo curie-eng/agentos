@@ -57,6 +57,7 @@ from typing import Any
 import httpx
 import yaml
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 log = logging.getLogger("k8s-write-mcp")
@@ -99,22 +100,31 @@ WRITE = ToolAnnotations(
 )
 
 
-def _client() -> Any:
-    """Build an httpx client from the mounted kubeconfig, or return a string.
+def _client() -> httpx.Client:
+    """Build an httpx client from the mounted kubeconfig, or raise `ToolError`.
 
     The kubeconfig is a static one built for this identity (the bundle README's
     write-path section has the assembly steps).
     Parsed here rather than pulling in the full Kubernetes client, so the
     failure modes are ones this file can explain.
+
+    Every failure raises `ToolError` so the tool result carries `isError: true`.
+    FastMCP puts the message on the wire behind a fixed `Error executing tool
+    <tool_name>: ` prefix and adds nothing else -- no traceback, no stack frames
+    -- so the sentence the model reads is still the one it read when these were
+    returned, and a caller that only reads the protocol can now tell a refused
+    write from a completed one.
     """
 
     try:
         with open(KUBECONFIG, encoding="utf-8") as fh:
             cfg = yaml.safe_load(fh)
     except FileNotFoundError:
-        return f"no kubeconfig at {KUBECONFIG}: the write credential is not mounted"
+        raise ToolError(
+            f"no kubeconfig at {KUBECONFIG}: the write credential is not mounted"
+        ) from None
     except (OSError, yaml.YAMLError) as exc:
-        return f"could not read the kubeconfig at {KUBECONFIG}: {exc}"
+        raise ToolError(f"could not read the kubeconfig at {KUBECONFIG}: {exc}") from exc
 
     try:
         cluster = cfg["clusters"][0]["cluster"]
@@ -122,7 +132,7 @@ def _client() -> Any:
         server = cluster["server"]
         token = user["token"]
     except (KeyError, IndexError, TypeError):
-        return "kubeconfig is missing a cluster server or a user token"
+        raise ToolError("kubeconfig is missing a cluster server or a user token") from None
 
     # Both CA shapes, because a kubeconfig may carry either and getting this
     # wrong fails as CERTIFICATE_VERIFY_FAILED -- which reads like a cluster
@@ -144,19 +154,23 @@ def _client() -> Any:
         try:
             pem = base64.b64decode(ca_data).decode("ascii")
         except (ValueError, TypeError, UnicodeDecodeError) as exc:
-            return f"kubeconfig certificate-authority-data is not a valid base64 PEM: {exc}"
+            raise ToolError(
+                f"kubeconfig certificate-authority-data is not a valid base64 PEM: {exc}"
+            ) from exc
         ctx = ssl.create_default_context()
         try:
             ctx.load_verify_locations(cadata=pem)
         except ssl.SSLError as exc:
-            return f"kubeconfig certificate-authority-data is not a usable CA certificate: {exc}"
+            raise ToolError(
+                f"kubeconfig certificate-authority-data is not a usable CA certificate: {exc}"
+            ) from exc
         verify = ctx
     elif ca_path:
         verify = ca_path
     elif cluster.get("insecure-skip-tls-verify"):
         # Never silently. A write path that skips verification is a write path
         # that can be pointed at an impostor API server.
-        return (
+        raise ToolError(
             "kubeconfig sets insecure-skip-tls-verify; refusing to write over an "
             "unverified connection"
         )
@@ -185,6 +199,13 @@ def restart_deployment(namespace: str, name: str) -> str:
     do NOT call it again: check the rollout's state with the read-only Kubernetes
     tools first, because the restart may well have started.
 
+    Every failure is a tool error rather than a returned sentence, so a program
+    reading the result -- an eval grader, an audit ledger, a retry policy -- sees
+    `isError: true` and does not count a refusal as a restart. The text it
+    carries is that same sentence a human would have read, behind FastMCP's
+    fixed `Error executing tool restart_deployment: ` prefix and nothing else --
+    never a traceback.
+
     Verify afterwards with the read-only connector (`pods_list`, `events_list`)
     rather than assuming success from this tool's return value.
     """
@@ -192,34 +213,36 @@ def restart_deployment(namespace: str, name: str) -> str:
     namespace = (namespace or "").strip()
     name = (name or "").strip()
     if not namespace or not name:
-        return "both namespace and name are required"
+        raise ToolError("both namespace and name are required")
 
     target = f"{namespace}/{name}"
     if target not in ALLOWLIST:
         permitted = ", ".join(sorted(ALLOWLIST)) or "(none configured)"
-        return (
+        raise ToolError(
             f"refusing: {target} is not in this connector's allowlist. "
             f"Permitted: {permitted}. This is a deliberate ceiling -- widening it "
             "is an operator change, not something to work around."
         )
 
     client = _client()
-    if isinstance(client, str):
-        return client
 
     path = f"/apis/apps/v1/namespaces/{namespace}/deployments/{name}"
     try:
         with client:
             existing = client.get(path)
             if existing.status_code == 404:
-                return f"no Deployment {target}. Check the name with the read-only tools."
+                raise ToolError(
+                    f"no Deployment {target}. Check the name with the read-only tools."
+                )
             if existing.status_code in (401, 403):
-                return (
+                raise ToolError(
                     f"the API server refused the read ({existing.status_code}). The write "
                     "credential lacks access to this Deployment. This will not fix itself on retry."
                 )
             if existing.status_code >= 400:
-                return f"could not read {target}: {existing.status_code} {existing.text[:200]}"
+                raise ToolError(
+                    f"could not read {target}: {existing.status_code} {existing.text[:200]}"
+                )
 
             # The patch body is constant apart from the timestamp. Nothing a
             # caller supplied reaches it.
@@ -238,22 +261,24 @@ def restart_deployment(namespace: str, name: str) -> str:
                 content=json.dumps(patch),
                 headers={"Content-Type": "application/strategic-merge-patch+json"},
             )
-    except httpx.TimeoutException:
-        return (
+    except httpx.TimeoutException as exc:
+        raise ToolError(
             f"the API server did not respond within {TIMEOUT:g}s. The restart MAY have "
             "started -- check the rollout with the read-only tools before doing anything else. "
             "Do not call this again."
-        )
+        ) from exc
     except httpx.HTTPError as exc:
-        return f"could not reach the API server: {exc}"
+        raise ToolError(f"could not reach the API server: {exc}") from exc
 
     if applied.status_code in (401, 403):
-        return (
+        raise ToolError(
             f"the API server refused the patch ({applied.status_code}). The write credential "
             "can read this Deployment but not patch it. This will not fix itself on retry."
         )
     if applied.status_code >= 400:
-        return f"the restart was rejected: {applied.status_code} {applied.text[:200]}"
+        raise ToolError(
+            f"the restart was rejected: {applied.status_code} {applied.text[:200]}"
+        )
 
     return (
         f"restart triggered for {target} at {stamp}. New pods are rolling out under the "
