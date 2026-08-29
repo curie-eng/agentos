@@ -955,15 +955,33 @@ def test_gate_kind_check_constraint_rejects_unknown_values(
         asyncio.run(_insert("bogus"))
 
 
-def test_route_bound_approval_authorizes_against_card_channel(
+def test_route_bound_approval_with_no_agent_resolves_through_neither_channel(
     approvals_client: TestClient,
     auth_headers: dict[str, str],
     clean_db: None,
     valkey: redis.Redis,
     runs_stream: str,
 ) -> None:
-    """#247: when a route binding placed the card in another channel, THAT
-    channel's members are the approvers; the requesting channel no longer is."""
+    """#247 narrowed by ADR-0123 (#1081). Retargeted from
+    ``..._authorizes_against_card_channel``, whose second half asserted a 200.
+
+    #247's intent was that when a route binding placed the card in another
+    channel, THAT channel's members are the approvers and the requesting channel
+    no longer is. This record names a route but ``_payload`` sets no
+    ``agent_id``, so there is no agent, no route map, and nothing to read: the
+    binding comes back absent. Under ADR-0123 a routed approval with
+    ``agent_id: null`` therefore fails closed -- the split is on
+    ``approval.route`` alone, with no ``agent_id`` carve-out, because
+    ``crud.get_approval_route_binding`` returns the same bare ``None`` for an
+    agentless approval as for a route somebody deleted while it pended.
+
+    So BOTH channels are refused here, and both for the same unbound-route
+    reason -- asserted below precisely so the two 403s are not mistaken for the
+    channel discrimination they used to prove. That discrimination is not lost:
+    it is pinned by ``test_binding_without_approvers_keeps_channel_membership``,
+    where a binding actually exists and the card channel really does hold the
+    authority.
+    """
 
     created = approvals_client.post(
         "/approvals",
@@ -972,24 +990,32 @@ def test_route_bound_approval_authorizes_against_card_channel(
     ).json()
     assert created["route"] == "managers"
     assert created["card_channel"] == "C_MGRS"
+    assert created["agent_id"] is None
     resolve_url = f"/approvals/{created['id']}/resolve"
 
-    # The requesting channel (C1) is NOT the approvers' channel anymore.
+    # The requesting channel (C1) is still not the approvers' channel.
     from_requesting = approvals_client.post(
         resolve_url,
         json={"decision": "approved", "resolved_by": "U9", "actor_channel": "C1"},
         headers=auth_headers,
     )
     assert from_requesting.status_code == 403
+    assert "no longer bound" in from_requesting.json()["detail"]
 
-    # A member of the route-bound channel resolves it.
-    ok = approvals_client.post(
+    # And the card channel is no longer enough either: this was the 200.
+    from_card = approvals_client.post(
         resolve_url,
         json={"decision": "approved", "resolved_by": "U9", "actor_channel": "C_MGRS"},
         headers=auth_headers,
     )
-    assert ok.status_code == 200
-    assert len(valkey.xrange(runs_stream)) == 1
+    assert from_card.status_code == 403, from_card.text
+    assert "no longer bound" in from_card.json()["detail"]
+
+    _assert_unbound_route_denial(approvals_client, auth_headers, created["id"])
+
+    record = approvals_client.get(f"/approvals/{created['id']}", headers=auth_headers)
+    assert record.json()["status"] == "pending"
+    assert valkey.xrange(runs_stream) == []
 
 
 def test_audit_log_records_attempts_with_authorizer_snapshots(
@@ -1695,6 +1721,32 @@ def _resolve(
     )
 
 
+def _assert_unbound_route_denial(
+    client: TestClient,
+    headers: dict[str, str],
+    approval_id: str,
+    *,
+    route: str = "managers",
+) -> Any:
+    """The ADR-0123 refusal as the audit trail records it, asserted in one place.
+
+    Four tests read this same row back, and the row is the ONLY place the ADR's
+    "names the missing binding as its reason" clause is observable -- the reason
+    string echoed to the clicker deliberately carries the class of failure, not
+    the route. Kept as a helper so a change to the evidence shape breaks one
+    assertion rather than silently passing three of four call sites. Returns the
+    row so a caller can add the assertions specific to it.
+    """
+
+    row = client.get(f"/approvals/{approval_id}/audit", headers=headers).json()[-1]
+    assert row["authorized"] is False
+    assert row["authorizer"] == "UnboundRouteBinding"
+    assert row["evidence"]["kind"] == "route_binding"
+    assert row["evidence"]["route"] == route
+    assert row["evidence"]["binding_present"] is False
+    return row
+
+
 # --- AC1: a group binding narrows authority inside a broad channel -------------
 
 
@@ -2195,7 +2247,13 @@ def test_group_lookup_failure_denies_and_audits_the_failure(
     assert valkey.xrange(runs_stream) == []
 
 
-# --- AC4: no approvers declared keeps today's behavior exactly -----------------
+# --- AC4: no approvers DECLARED keeps today's behavior; no BINDING does not ----
+#
+# ADR-0123 (#1081) splits these two. A binding that is present and declares no
+# approvers is still the zero-setup channel default (the first test below, which
+# is the negative control and must stay untouched). A routed approval with NO
+# binding is refused outright -- the two tests after it were retargeted from
+# asserting the old channel fallback.
 
 
 def test_binding_without_approvers_keeps_channel_membership(
@@ -2225,16 +2283,26 @@ def test_binding_without_approvers_keeps_channel_membership(
     assert len(valkey.xrange(runs_stream)) == 1
 
 
-def test_agentless_approval_keeps_channel_membership(
+def test_agentless_routed_approval_fails_closed_without_a_binding(
     approvals_client: TestClient,
     auth_headers: dict[str, str],
     clean_db: None,
     valkey: redis.Redis,
     runs_stream: str,
 ) -> None:
-    """AC4 / edge case 7: ``agent_id`` is nullable by design (the generic/dev
-    path). With no agent there is no binding to read, so the record falls back to
-    channel membership on its card_channel -- today's behavior, unchanged."""
+    """ADR-0123 (#1081) applied literally, and the announced consequence of
+    doing so. This test previously asserted the 200 below; it is retargeted, not
+    dropped, so the reversal stays visible in one place.
+
+    ``agent_id`` is nullable by design (the generic/dev path), so this record
+    has no agent and therefore no binding -- but it NAMES a route, and the
+    Decision splits on that alone. ``crud.get_approval_route_binding`` returns a
+    bare ``None`` for all four misses (agentless, routeless, agent deleted,
+    route unbound), so the selector cannot carve out the agentless case without
+    a richer return type ADR-0123 does not authorize. Inferring an exemption
+    from that ``None`` would reintroduce the very substitution the ADR rejects,
+    so a routed agentless approval fails closed too.
+    """
 
     created = approvals_client.post(
         "/approvals", json=_routed_payload(None, author=_APPROVER), headers=auth_headers
@@ -2245,28 +2313,44 @@ def test_agentless_approval_keeps_channel_membership(
     outside = _resolve(approvals_client, auth_headers, created["id"], _OTHER, _ELSEWHERE)
     assert outside.status_code == 403, outside.text
 
-    # AC2 survives the no-binding path: the author is refused from the card
-    # channel, where anyone else would be allowed.
+    # AC2 survives the new path: self-approval is still refused BEFORE the set
+    # is asked, so the author is told about the self-approval, not the route.
     author = _resolve(approvals_client, auth_headers, created["id"], _APPROVER)
     assert author.status_code == 403, author.text
     assert "self-approval" in author.json()["detail"]
 
+    # The card channel used to be enough here. It is not any more.
     inside = _resolve(approvals_client, auth_headers, created["id"], _OTHER)
-    assert inside.status_code == 200, inside.text
-    assert len(valkey.xrange(runs_stream)) == 1
+    assert inside.status_code == 403, inside.text
+    assert "no longer bound" in inside.json()["detail"]
+
+    _assert_unbound_route_denial(approvals_client, auth_headers, created["id"])
+
+    record = approvals_client.get(f"/approvals/{created['id']}", headers=auth_headers)
+    assert record.json()["status"] == "pending"
+    assert valkey.xrange(runs_stream) == []
 
 
-def test_unbound_route_name_keeps_channel_membership(
+def test_a_route_absent_from_the_map_is_unresolvable_and_borrows_no_other_route(
     approvals_client: TestClient,
     auth_headers: dict[str, str],
     clean_db: None,
     valkey: redis.Redis,
     runs_stream: str,
 ) -> None:
-    """AC4 / edge case 8: the approval names a route the agent's map does not
-    bind (renamed or removed while pending). Fresh-read semantics say current
-    config wins, and current config declares no approvers for this route, so it
-    is channel membership -- mirroring the worker's unbound-route card fallback.
+    """ADR-0123 (#1081), retargeted from ``..._keeps_channel_membership``.
+
+    The approval names a route the agent's map does not bind (renamed or
+    removed while pending). Fresh-read semantics still hold -- current config
+    wins -- but current config no longer says "no approvers declared" for this
+    route, it says the route is not bound, and that is refused outright rather
+    than degraded to card-channel membership.
+
+    Two separate 403s live here and must not be conflated: the sibling route's
+    allowlist must not leak onto this route (it never could), AND the actor
+    standing in the card channel is now refused for the unbound-route reason
+    rather than allowed. Both are asserted on their reason, not merely on "not
+    200".
     """
 
     agent_id = _agent_with_routes(
@@ -2280,17 +2364,116 @@ def test_unbound_route_name_keeps_channel_membership(
         headers=auth_headers,
     ).json()
 
-    # The OTHER route's allowlist must not leak onto this one.
+    # The OTHER route's allowlist must not leak onto this one -- and the reason
+    # proves the legal binding was never consulted in the first place.
     listed_elsewhere = _resolve(
         approvals_client, auth_headers, created["id"], _LISTED, _ELSEWHERE
     )
     assert listed_elsewhere.status_code == 403, listed_elsewhere.text
+    assert "no longer bound" in listed_elsewhere.json()["detail"]
 
-    # AC2 survives the unbound-route path too.
+    # AC2 survives the unbound-route path too: self-approval is refused before
+    # the set is asked, so this one keeps the self-approval reason.
     author = _resolve(approvals_client, auth_headers, created["id"], _APPROVER)
     assert author.status_code == 403, author.text
     assert "self-approval" in author.json()["detail"]
 
+    # This was a 200 before ADR-0123: right room, vanished authority.
     inside = _resolve(approvals_client, auth_headers, created["id"], _OTHER)
-    assert inside.status_code == 200, inside.text
+    assert inside.status_code == 403, inside.text
+    assert "no longer bound" in inside.json()["detail"]
+
+    _assert_unbound_route_denial(approvals_client, auth_headers, created["id"])
+
+    record = approvals_client.get(f"/approvals/{created['id']}", headers=auth_headers)
+    assert record.json()["status"] == "pending"
+    assert valkey.xrange(runs_stream) == []
+
+
+# --- #1081 / ADR-0123: rewriting a route map while an approval pends -----------
+
+
+def test_clearing_a_bound_route_makes_a_pending_approval_unresolvable_not_wider(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+) -> None:
+    """The #1081 escalation, end to end, in ADR-0123's own three steps. This is
+    the regression test: it must be RED if the selector split is reverted.
+
+    A route bound to a user group narrows authority to a server-enforced set.
+    Rewriting the agent's route map without that route used to convert the
+    already-pending approval to ``SlackChannelMembers``, which is CALLER-asserted
+    on the axis that matters -- the resolver supplies ``actor_channel``. So the
+    same person who cleared the route could then resolve an approval they were
+    never in the approver set for. That is a change of KIND, not of width, and
+    the audit row recorded only ``ChannelMembershipAuthorizer``.
+
+    A route write is a full replacement, so patching to a map containing only
+    ``legal`` is the same operator action as ``--clear-routes`` or a
+    ``--routes-from`` file that omits the route.
+    """
+
+    calls: list[httpx.Request] = []
+    _fake_slack(approvals_client, [_APPROVER], calls=calls)
+    agent_id = _agent_with_routes(
+        approvals_client,
+        auth_headers,
+        {"managers": {"channel": _BROAD, "approvers": {"group": _GROUP}}},
+    )
+    created = approvals_client.post(
+        "/approvals", json=_routed_payload(agent_id), headers=auth_headers
+    ).json()
+
+    # Step 1: while the binding stands, a non-member of the group is refused
+    # even standing in the card channel. This is the authority being protected.
+    blocked = _resolve(approvals_client, auth_headers, created["id"], _OTHER)
+    assert blocked.status_code == 403, blocked.text
+    assert "not an approver" in blocked.json()["detail"]
+
+    # Step 2: the route map is rewritten without `managers`.
+    rewritten = approvals_client.patch(
+        f"/agents/{agent_id}",
+        json={"approval_routes": {"legal": {"channel": _ELSEWHERE}}},
+        headers=auth_headers,
+    )
+    assert rewritten.status_code == 200, rewritten.text
+    assert "managers" not in rewritten.json()["approval_routes"]
+
+    # Step 3: the SAME refused actor asserts the card channel. Before ADR-0123
+    # this returned 200 and the escalation was complete.
+    escalated = _resolve(approvals_client, auth_headers, created["id"], _OTHER)
+    assert escalated.status_code == 403, escalated.text
+    assert "no longer bound" in escalated.json()["detail"]
+
+    # The audit row names the missing binding, which is the ADR's fourth clause
+    # and the only place it is observable.
+    row = _assert_unbound_route_denial(approvals_client, auth_headers, created["id"])
+    assert row["action"] == "denied"
+    assert row["actor"] == _OTHER
+    assert row["reason"]
+
+    # The refusal is total: nothing claimed, nothing woken.
+    record = approvals_client.get(f"/approvals/{created['id']}", headers=auth_headers)
+    assert record.json()["status"] == "pending"
+    assert valkey.xrange(runs_stream) == []
+
+    # ADR-0123's stated recovery: restore the binding and the approval resolves
+    # normally. The operator has a stuck approval, not a lost one.
+    restored = approvals_client.patch(
+        f"/agents/{agent_id}",
+        json={
+            "approval_routes": {
+                "managers": {"channel": _BROAD, "approvers": {"group": _GROUP}}
+            }
+        },
+        headers=auth_headers,
+    )
+    assert restored.status_code == 200, restored.text
+
+    ok = _resolve(approvals_client, auth_headers, created["id"], _APPROVER)
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["status"] == "approved"
     assert len(valkey.xrange(runs_stream)) == 1

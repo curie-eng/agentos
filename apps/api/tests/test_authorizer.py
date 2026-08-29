@@ -11,6 +11,12 @@ reached exclusively through a MockTransport-backed real client.
 Self-approval is deliberately NOT tested at the set level: a set is never asked
 about it (ADR-0034), so a set-level self-approval test would assert an invariant
 that does not live there. It is pinned on the authorizer, once per set, below.
+
+The ADR-0123 (#1081) section pins the last piece: an ABSENT binding is not the
+same fact as a binding that declares no approvers. These go through the same
+``_authorize`` helper, so they stay binding-to-decision tests of the real
+selector rather than assertions about a class in isolation -- which is also why
+the new set is never imported here by name.
 """
 
 import asyncio
@@ -95,7 +101,12 @@ _CARD_CHANNEL = "C0BROAD01"
 _REQUEST_CHANNEL = "C0REQ0001"
 
 
-def _bound_approval(*, author: str = _AUTHOR, card_channel: str = _CARD_CHANNEL) -> Approval:
+def _bound_approval(
+    *,
+    author: str = _AUTHOR,
+    card_channel: str = _CARD_CHANNEL,
+    route: str = "managers",
+) -> Approval:
     """An approval whose card a route binding placed in ``card_channel`` (#247).
 
     Distinct from ``_approval`` above: the #420 story is about a card sitting in
@@ -110,7 +121,7 @@ def _bound_approval(*, author: str = _AUTHOR, card_channel: str = _CARD_CHANNEL)
         reply_channel=_REQUEST_CHANNEL,
         reply_placeholder="p-1",
         dedupe_key="ev-420",
-        route="managers",
+        route=route,
         card_channel=card_channel,
     )
 
@@ -446,21 +457,144 @@ def test_authorizer_falls_back_to_channel_membership_without_approvers() -> None
     assert elsewhere.evidence["actor_channel"] == "C0WRONG01"
 
 
-def test_authorizer_falls_back_to_channel_membership_without_a_binding() -> None:
-    """AC4: no binding at all (an agentless or unbound-route approval) is the
-    zero-setup path and must keep resolving against the card channel."""
+# --- ADR-0123 (#1081): an absent binding is not "no approvers declared" -------
+#
+# The axis under test is `_bound_approval()` (route="managers") against
+# `_approval()` (no route), each with `binding=None`. Same missing binding, two
+# different answers, because the Decision splits on whether the approval NAMED
+# a route. Everything below the divider that the #420 tests already cover
+# (users-beats-group precedence, the group lookup, the malformed-block and
+# malformed-binding fail-closed cases) must stay green untouched.
+
+
+def test_authorizer_refuses_a_routed_approval_whose_binding_is_gone() -> None:
+    """ADR-0123 (#1081): a pending approval that NAMED a route is resolvable
+    only through that route's binding. With the binding absent there is no set
+    to resolve and no channel fallback applies.
+
+    This retargets the old ``..._without_a_binding`` test, whose "an agentless
+    or unbound-route approval is the zero-setup path" claim ADR-0123 supersedes.
+    Falling through to the card channel swaps a server-enforced approver set for
+    a caller-asserted ``actor_channel`` check on an approval that is ALREADY
+    pending, which is the whole escalation. The actor below stands IN the card
+    channel, so the old behavior ALLOWED them: reverting the selector split
+    flips this test to allowed and fails it, which is what makes it
+    red-on-revert rather than vacuously green.
+
+    A route bound to JSON ``null`` reaches the selector as ``binding=None`` too
+    (crud returns a bare ``None`` for it), so that edge case is this case.
+    """
 
     name, in_channel = _authorize(
         _bound_approval(), _OUTSIDER, _CARD_CHANNEL, binding=None
     )
-    assert name == "ChannelMembershipAuthorizer"
-    assert in_channel.allowed
+    assert name == "UnboundRouteBinding"
+    assert not in_channel.allowed
+    assert "no longer bound" in in_channel.reason
+    assert in_channel.evidence is not None
+    assert in_channel.evidence["kind"] == "route_binding"
+    assert in_channel.evidence["route"] == "managers"
+    assert in_channel.evidence["binding_present"] is False
 
-    _name, elsewhere = _authorize(
+    # The set admits nobody, so the wrong channel is refused for the same
+    # reason rather than the channel-membership one.
+    elsewhere_name, elsewhere = _authorize(
         _bound_approval(), _OUTSIDER, "C0WRONG01", binding=None
     )
+    assert elsewhere_name == "UnboundRouteBinding"
     assert not elsewhere.allowed
-    assert "not an approver" in elsewhere.reason
+    assert "no longer bound" in elsewhere.reason
+
+
+def test_authorizer_keeps_channel_membership_for_a_routeless_approval() -> None:
+    """ADR-0123's third bullet: an approval that named NO route never had a
+    narrower set to lose, so an absent binding is still the #420 AC4 zero-setup
+    default. ``_decide`` at the top of this file already walks the decision;
+    what is pinned here is the audit NAME, which is the half that moves
+    silently if the selector splits on the binding alone instead of on
+    ``approval.route and binding is None``."""
+
+    name, decision = _authorize(_approval(), "U_MANAGER", "C_MGRS", binding=None)
+    assert name == "ChannelMembershipAuthorizer"
+    assert decision.allowed
+
+
+def test_authorizer_treats_an_empty_binding_as_present_not_absent() -> None:
+    """ADR-0123 edge case: a route bound to ``{}`` is BOUND. The operator
+    declared no approvers; they did not remove the route. Only ``None`` is
+    absence, so this keeps channel membership and the routed actor standing in
+    the card channel is allowed.
+
+    An implementation written as ``if approval.route and not binding`` instead
+    of ``binding is None`` refuses here. This is the exact off-by-one, and this
+    test is the only thing that catches it."""
+
+    name, decision = _authorize(
+        _bound_approval(), _OUTSIDER, _CARD_CHANNEL, binding={}
+    )
+    assert name == "ChannelMembershipAuthorizer"
+    assert decision.allowed
+
+
+def test_an_empty_route_string_is_routeless_and_keeps_channel_membership() -> None:
+    """Two files must agree on what "named a route" means, and they agree by
+    TRUTHINESS, not by ``is not None``.
+
+    ``crud.get_approval_route_binding`` returns early on ``not approval.route``,
+    so an approval carrying ``route=""`` is already routeless there and yields a
+    ``None`` binding. The selector's fail-closed branch must key on the same
+    truthiness (``approval.route and binding is None``). An implementer writing
+    ``approval.route is not None`` instead would refuse this approval in the
+    selector while crud had already classified it as routeless -- a silent
+    divergence between two files, in the fail-closed direction, that nothing
+    else pins.
+    """
+
+    name, decision = _authorize(
+        _bound_approval(route=""), _OUTSIDER, _CARD_CHANNEL, binding=None
+    )
+    assert name == "ChannelMembershipAuthorizer"
+    assert decision.allowed
+
+
+def test_an_unbound_route_and_an_unreadable_block_stay_distinct_in_the_audit() -> None:
+    """Audit vocabulary (approvers.py's frozen ``audit_name`` strings): both
+    undetermined sets refuse everyone, but an operator reading the append-only
+    trail must be able to tell "the route you named is gone" from "the
+    approvers block does not parse". ADR-0123 adds a NEW string and renames
+    nothing, so the malformed case must NOT drift onto the new name."""
+
+    gone, _gone_decision = _authorize(
+        _bound_approval(), _OUTSIDER, _CARD_CHANNEL, binding=None
+    )
+    unreadable, decision = _authorize(
+        _bound_approval(),
+        _OUTSIDER,
+        _CARD_CHANNEL,
+        binding={"channel": _CARD_CHANNEL, "approvers": {"group": 123}},
+    )
+    assert gone == "UnboundRouteBinding"
+    assert unreadable == "InvalidApproversSpec"
+    assert not decision.allowed
+    assert decision.evidence is not None
+    assert decision.evidence["kind"] == "approvers_config"
+
+
+def test_self_approval_wins_over_a_missing_binding_but_the_audit_still_names_it() -> None:
+    """Ordering (ADR-0034, unchanged by ADR-0123): self-approval is refused
+    BEFORE the set is asked, so an author clicking their own request on a route
+    whose binding is gone is told about the self-approval, not about the route.
+    The audit name still comes from the set that WOULD have decided and carries
+    no evidence -- the same contract the malformed-block case pins, now for the
+    new set. Both branches deny, so nothing is widened either way."""
+
+    name, decision = _authorize(
+        _bound_approval(author=_AUTHOR), _AUTHOR, _CARD_CHANNEL, binding=None
+    )
+    assert name == "UnboundRouteBinding"
+    assert not decision.allowed
+    assert "self-approval" in decision.reason
+    assert decision.evidence is None
 
 
 def test_authorizer_denies_a_malformed_approvers_block_without_channel_fallback() -> None:
