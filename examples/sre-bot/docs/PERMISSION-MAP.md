@@ -22,7 +22,7 @@ They are not substitutes. A narrow capability surface with no authorization
 decision is an ungated write — that is exactly the incident behind
 `scripts/check-write-path-gated.py`. An authorization decision over a
 capability surface wide enough to do something else is a gate on the wrong
-thing. Both entries below are read on both axes.
+thing. Every entry below is read on both axes.
 
 A connector publishes capabilities against an external system. A skill owns
 deterministic workflow logic and sequencing. Neither may widen the builder's
@@ -88,7 +88,7 @@ Two limits to state rather than imply:
 - Curie's posture today is approval-required plus **allow-by-omission**. A tool
   no gate names is callable. So "which tools are gated" is the whole policy, and
   a forgotten gate is a silent grant rather than a refusal. See the prerequisite
-  in entry 2.
+  in entry 4.
 
 ### Deliberately not granted
 
@@ -98,7 +98,133 @@ Two limits to state rather than imply:
 
 ---
 
-## 2. Upgrading Curie — a workflow, not a tool
+## 2. `scale_deployment` — setting a named Deployment's replica count
+
+| | |
+|---|---|
+| Tool | `mcp__k8s-scale__scale_deployment(namespace, name, replicas)` |
+| Kubernetes verbs | `get`, `patch` on `apps/deployments/scale` |
+| Scoped by | `resourceNames`, one namespace, plus `K8S_SCALE_ALLOWLIST` and `K8S_SCALE_MAX_REPLICAS` |
+| Authorization | `approvalPolicy` gate — a human approves each call |
+| Status | Implemented, ships with its credential absent |
+
+### What that grant actually permits
+
+This is the one entry in this document where **RBAC is the strong constraint and
+the connector is defense in depth**, rather than the other way round. Entry 1
+has to enforce its own narrowness in Python because `patch` on `deployments` is
+the same grant as `set image`, `set env`, and replacing the container command --
+Kubernetes cannot tell those apart. Scaling can be told apart: `scale` is its own
+subresource, so `patch` on `apps/deployments/scale` grants the replica count and
+nothing else. An attempt to change an image with this credential is refused by
+the API server, not by a file in this repository.
+
+What it still permits is `--replicas=0`, which is an outage. The grant does not
+distinguish that from any other number, so the things that do are the connector's
+allowlist, its `K8S_SCALE_MAX_REPLICAS` ceiling, and the gate.
+
+### Capability surface
+
+`replicas` is a caller parameter here, which entry 1 deliberately does not have.
+That is safe for the reason above and only for that reason: the parameter is the
+verb's argument, not a channel into an arbitrary patch body, because the
+subresource cannot carry one.
+
+### Authorization decision
+
+The gate `mcp__k8s-scale__scale_deployment`, on the same route as entry 1.
+
+### Reversible, and it says what to put back
+
+Unlike a restart, a scale can be undone: the replica count in force immediately
+before the patch is enough to restore it. The tool reads that count on the way
+past and returns it, and **refuses to write if it cannot read one** -- an action
+that happened without a recorded prior state leaves the platform holding a record
+it cannot act on (ADR-0117). This is why the reply is JSON rather than prose.
+
+### Deliberately not granted
+
+`patch` on `deployments` itself. Granting it to this identity "for tidiness"
+would throw away the subresource ceiling that is this entry's whole argument.
+
+---
+
+## 3. `upgrade_self` — starting this bot's own version upgrade
+
+| | |
+|---|---|
+| Tool | `mcp__self-upgrade__upgrade_self()` — no arguments |
+| Kubernetes verbs | `get` on `batch/cronjobs`; `create`, `list` on `batch/jobs` |
+| Scoped by | `resourceNames` on the CronJob; **nothing scopes the create** — see below |
+| Authorization | `approvalPolicy` gate — a human approves each call |
+| Status | Implemented, ships with its credential absent. Proven end to end on a live cluster 2026-08-28 |
+
+This upgrades the **bot's own bundle version** -- a new agent version built from
+the repository. It is not entry 4, which upgrades the Curie release underneath
+it. They are different operations with different blast radii, and the shared word
+"upgrade" is the only thing they have in common.
+
+### The grant RBAC cannot narrow
+
+`create` on `jobs` is namespace-wide and cannot be otherwise. `resourceNames`
+matches against the name of an existing object, and a create has no name yet, so
+there is no RBAC expression for "may create only this Job". A credential with
+this Role can in principle create a Job running any image with any command in the
+release's namespace -- the namespace holding the platform's API key.
+
+That is the same shape as entry 1's `patch` on `deployments`, and it gets the
+same answer: the ceiling is enforced in the connector, which exposes one tool
+that **takes no arguments at all** and posts the named CronJob's
+`jobTemplate.spec` verbatim. There is no field a caller can reach, so there is
+nothing to validate and nothing to escape.
+
+Read honestly, what remains is a credential whose blast radius is the release
+namespace if the token escapes the connector pod. It does not leave the pod, for
+the same reason the read connector drops `configuration_view`: the sandbox learns
+a URL and never holds a credential.
+
+### Why this is not the abstraction entry 4 rejects
+
+Entry 4 rejects `upgrade_release(target_version)` -- a connector validating a
+version against a list it holds itself -- because that makes the connector the
+policy holder, in a process the builder cannot edit or inspect per-agent.
+
+This tool holds no policy. It has no version list, no sequencing, and no
+decision: which repository, which branch, which image and which command all come
+from a CronJob an operator wrote and can read. The connector's entire
+contribution is "start that, now, if nothing like it is already running". Move
+any of those choices into the connector and entry 4's objection would apply here
+too.
+
+### Why the bot does not simply do the upgrade
+
+Creating an agent version needs the platform API key, and every `/agents/**`
+route requires it. The sandbox holds a per-turn `state`-scoped token and nothing
+else, deliberately. Handing the sandbox the platform key so that "upgrade
+yourself" could work in one step would trade that property for a convenience, and
+the property is what makes a successful prompt injection unable to walk away with
+a credential. So the key stays in the Job and the bot only presses the button.
+
+### Not reversible, and the reply says so
+
+There is no undo tool. `prior` is null on every path including the successful
+one, so the platform never records a snapshot it cannot act on. Restoring the
+previous version is an operator action with the platform API key, named in the
+reply rather than implied.
+
+Starting the Job is also not finishing it. The reply carries the Job's name and
+says so in as many words, because the agent reports from that text and "started"
+read as "succeeded" is the failure this wording exists to prevent.
+
+### Deliberately not granted
+
+`delete` on `jobs`. Cleaning up finished Jobs is the CronJob's
+`successfulJobsHistoryLimit`, and `delete` would let a prompt-injected agent
+erase the evidence of what it started.
+
+---
+
+## 4. Upgrading Curie's own release — a workflow, not a tool
 
 **PROPOSED. Not implemented.** Superseded as a weekly requirement — issue #1857
 asks for "rollback or recovery behavior", not a named-version upgrade — so this
