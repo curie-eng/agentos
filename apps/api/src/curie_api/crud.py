@@ -38,6 +38,7 @@ from .schemas import (
     ChannelBindingPatch,
     ChannelBindingWrite,
     DeploymentCreate,
+    HookPartitionConfig,
     PublicationCreate,
     VersionCreate,
 )
@@ -175,6 +176,7 @@ async def create_agent(session: AsyncSession, data: AgentCreate) -> Agent:
             if data.approval_routes is not None
             else None
         ),
+        hook_partitions=_stored_hook_partitions(data.hook_partitions),
         secrets=data.secrets,
         memory=data.memory,
     )
@@ -394,6 +396,35 @@ async def update_agent_approval_routes(
     resolution surface)."""
 
     agent.approval_routes = routes or None
+    await session.commit()
+    await session.refresh(agent)
+    return agent
+
+
+def _stored_hook_partitions(
+    partitions: dict[str, HookPartitionConfig] | None,
+) -> dict[str, Any] | None:
+    """The column value for a hook-partition map (ADR-0134).
+
+    One definition for both write paths, because create and PATCH must not
+    disagree about what "no configuration" looks like in the column: an empty
+    map is stored as NULL, the same "every hook returns to one thread per hook"
+    posture as an omitted map, which is what an operator turning the feature
+    off is asking for.
+    """
+
+    if not partitions:
+        return None
+    return {name: c.model_dump() for name, c in partitions.items()}
+
+
+async def update_agent_hook_partitions(
+    session: AsyncSession, agent: Agent, partitions: dict[str, HookPartitionConfig]
+) -> Agent:
+    """Set which of the agent's hooks fan out (ADR-0134). An empty dict clears
+    them (stored as NULL)."""
+
+    agent.hook_partitions = _stored_hook_partitions(partitions)
     await session.commit()
     await session.refresh(agent)
     return agent

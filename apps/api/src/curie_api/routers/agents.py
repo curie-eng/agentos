@@ -192,6 +192,12 @@ async def update_agent(agent_id: uuid.UUID, data: AgentUpdate, session: SessionD
     if data.secrets is not None:
         # Omitted leaves the secrets unchanged; an explicit {} clears them (#429).
         agent = await crud.update_agent_secrets(session, agent, data.secrets)
+    if data.hook_partitions is not None:
+        # Omitted leaves the partitions unchanged; an explicit {} clears them
+        # (ADR-0134). Plain `is not None` like the siblings above rather than
+        # `model_fields_set`: there is no platform default a null would clear
+        # back to, which is the distinction `memory` already draws.
+        agent = await crud.update_agent_hook_partitions(session, agent, data.hook_partitions)
     return AgentOut.model_validate(agent)
 
 

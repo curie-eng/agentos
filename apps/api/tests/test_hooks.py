@@ -15,9 +15,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
-import os
 import uuid
-from collections.abc import Iterator
 from typing import Any
 
 import pytest
@@ -25,8 +23,6 @@ import redis
 from aci_protocol import QueuedTurn, TurnSource
 from curie_api.config import get_settings
 from curie_api.hook_signing import derive
-from curie_api.main import create_app
-from curie_test_support.valkey import connect_or_skip
 from fastapi.testclient import TestClient
 from sqlalchemy import text as sql_text
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -36,30 +32,9 @@ EMAIL_ADAPTER = "agentmail-sandbox"
 
 
 # --- fixtures -----------------------------------------------------------------
-
-
-@pytest.fixture
-def runs_stream() -> Iterator[str]:
-    name = f"test:curie:runs:{uuid.uuid4().hex}"
-    os.environ["RUNS_STREAM"] = name
-    get_settings.cache_clear()
-    yield name
-    os.environ.pop("RUNS_STREAM", None)
-    get_settings.cache_clear()
-
-
-@pytest.fixture
-def valkey(runs_stream: str) -> Iterator[redis.Redis]:
-    client = connect_or_skip(decode_responses=True)
-    yield client
-    client.delete(runs_stream)
-    client.close()
-
-
-@pytest.fixture
-def hooks_client(_disposable_db: Any, runs_stream: str) -> Iterator[TestClient]:
-    with TestClient(create_app()) as test_client:
-        yield test_client
+#
+# `runs_stream`, `valkey` and `hooks_client` live in conftest.py, shared with
+# test_hook_partition.py.
 
 
 @pytest.fixture
@@ -200,6 +175,11 @@ def test_every_firing_of_one_hook_shares_a_thread(
     A fresh thread per delivery would claim a sandbox per event and let two
     firings run concurrently with no ordering; sharing one means the second
     defers behind the first. Two hooks on one agent stay separate.
+
+    This is also the explicit UNPARTITIONED control for the opt-in delivery
+    partitioning in `test_hook_partition.py`: an agent that never configured
+    `hook_partitions` mints a THREE-segment id, so a change that made every hook
+    fan out by default fails here rather than only there.
     """
 
     agent_id = _bind(hooks_client, auth_headers, name="threadagent")
@@ -212,6 +192,7 @@ def test_every_firing_of_one_hook_shares_a_thread(
     threads = [t.conversation_id for t in _queued(valkey, runs_stream)]
     assert threads[0] == threads[1], threads
     assert threads[2] != threads[0], threads
+    assert all(t.count(":") == 2 for t in threads), threads
 
 
 # --- refusals -----------------------------------------------------------------
