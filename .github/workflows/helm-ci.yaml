@@ -142,6 +142,17 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/clickhouse-logging-assertions.sh
 
+      # Prove Langfuse honors valkey.existingSecret on a BYO valkey install
+      # (#2052). A supported BYO install (valkey.deploy=false + host +
+      # existingSecret) had every component read the operator's Secret except
+      # Langfuse, which stayed pinned to the chart-managed Secret -- so trace
+      # ingestion died alone while the rest of the release stayed healthy,
+      # which is why nothing pointed at the cause.
+      - name: helm render assertions (langfuse valkey existingSecret)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/valkey-existing-secret-assertions.sh
+
       # Prove the tenant capacity ceiling actually binds the pods it is meant to.
       # The quota is PriorityClass-scoped, so if its scope is not the name the
       # sandbox pods carry it matches nothing and enforces nothing -- silently,
