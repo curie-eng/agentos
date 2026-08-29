@@ -541,6 +541,20 @@
           "channel": {
             "$ref": "#/components/schemas/ChannelBindingWrite"
           },
+          "hook_partitions": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/HookPartitionConfig"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Hook Partitions"
+          },
           "memory": {
             "default": false,
             "title": "Memory",
@@ -662,6 +676,20 @@
             "title": "Created At",
             "type": "string"
           },
+          "hook_partitions": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/HookPartitionConfig"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Hook Partitions"
+          },
           "id": {
             "format": "uuid",
             "title": "Id",
@@ -733,6 +761,7 @@
           "thinking",
           "approval_required_tools",
           "approval_routes",
+          "hook_partitions",
           "secrets",
           "memory",
           "created_at"
@@ -770,6 +799,20 @@
               }
             ],
             "title": "Approval Routes"
+          },
+          "hook_partitions": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/HookPartitionConfig"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Hook Partitions"
           },
           "memory": {
             "anyOf": [
@@ -2663,8 +2706,19 @@
         "type": "object"
       },
       "HookAccepted": {
-        "description": "The hook receipt. ``duplicate`` says whether THIS request enqueued.\n\n``stream_id`` is None only while another request holds the claim and has not\nenqueued yet (the 202 case).",
+        "description": "The hook receipt. ``duplicate`` says whether THIS request enqueued.\n\n``stream_id`` is None only while another request holds the claim and has not\nenqueued yet (the 202 case).\n\n``conversation_id`` is the thread this delivery ACTUALLY landed on. A\npartitioned hook (ADR-0134) mints one id per partition value, and the caller\nhas no other way to learn which of them it got -- it is the last segment of\nthe thread key that ``POST /agents/{agent_id}/threads/{thread_key}/reset``\ntakes, and it is also what the\n``GET /approvals?conversation_id=`` filter takes directly.\n\nOn a DUPLICATE it is read back from the queued turn, never re-derived from\nthis request's body: a retry of the same delivery id may carry a different\npartition value, or the operator may have changed the pointer since, and\neither would name a thread the queued turn never landed on.\n\nIt is None when the landing thread is not knowable from this request: a\npending twin still mid-flight, a stream an operator has trimmed, or the 202\nno-claim case where this request enqueued nothing and nothing is yet known.",
         "properties": {
+          "conversation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Conversation Id"
+          },
           "duplicate": {
             "title": "Duplicate",
             "type": "boolean"
@@ -2688,9 +2742,25 @@
         "required": [
           "event_id",
           "stream_id",
-          "duplicate"
+          "duplicate",
+          "conversation_id"
         ],
         "title": "HookAccepted",
+        "type": "object"
+      },
+      "HookPartitionConfig": {
+        "additionalProperties": false,
+        "description": "How one hook names the thing each delivery is about (ADR-0134).\n\nOne model serves ``AgentCreate``, ``AgentUpdate`` AND ``AgentOut``, which the\n``_StoredWithoutNulls`` tripwire above would otherwise argue against: that\nsplit only happens for models carrying the wrap serializer, and this one has\nneither it nor an optional field, so the dumped and validated shapes are the\nsame and no ``-Input``/``-Output`` pair is generated. Do not add a separate\n``...Out`` variant.",
+        "properties": {
+          "pointer": {
+            "title": "Pointer",
+            "type": "string"
+          }
+        },
+        "required": [
+          "pointer"
+        ],
+        "title": "HookPartitionConfig",
         "type": "object"
       },
       "KillState": {
@@ -8797,7 +8867,7 @@
     },
     "/hooks/{agent_id}/{hook}": {
       "post": {
-        "description": "Verify one hook delivery and enqueue it as a turn.\n\nOrder, and why each step sits where it does:\n\n1. the hook NAME, validated before anything else, because it is about to be\n   used to build key names;\n2. the size bound, before the signature is computed, so an oversized body is\n   refused without the server ever HMAC-ing it;\n3. the agent row, which unavoidably precedes authentication here (see the\n   module docstring);\n4. the SIGNATURE over the raw body;\n5. the delivery id, checked after authentication so an unsigned caller learns\n   nothing about what this route wants;\n6. routability, then the claim, quota and enqueue.",
+        "description": "Verify one hook delivery and enqueue it as a turn.\n\nOrder, and why each step sits where it does:\n\n1. the hook NAME, validated before anything else, because it is about to be\n   used to build key names -- with ``fullmatch``, since the pattern's ``$``\n   matches before a trailing newline and would let one into those keys;\n2. the size bound, before the signature is computed, so an oversized body is\n   refused without the server ever HMAC-ing it;\n3. the agent row, which unavoidably precedes authentication here (see the\n   module docstring);\n4. the SIGNATURE over the raw body;\n5. the delivery id, checked after authentication so an unsigned caller learns\n   nothing about what this route wants;\n6. the PARTITION this delivery belongs to, if the hook has one (ADR-0134),\n   after both of those and before anything is claimed;\n7. routability, then the claim, quota and enqueue.",
         "operationId": "ingest_hook_hooks__agent_id___hook__post",
         "parameters": [
           {

@@ -135,6 +135,20 @@ class Agent(Base):
     # sitting in plaintext in the control plane, and rotating it any other way
     # means rotating the platform key for every agent at once.
     hook_generation: Mapped[int] = mapped_column(default=0, server_default="0")
+    # Which of this agent's hooks fan out, and by what (ADR-0134, amending
+    # ADR-0079): hook name -> ``{"pointer": <RFC 6901 pointer>}``, the pointer
+    # naming the field of a delivery body that identifies the thing the delivery
+    # is about. NULL means no hook on this agent partitions, which is the
+    # behavior every hook had before the column existed: one thread per hook.
+    #
+    # The pointer must name a STABLE identity of that thing -- a pull request
+    # number, a ticket key, a thread ts -- and never a run id or a timestamp. A
+    # partition IS a thread and owns a transcript, so an identity that changes
+    # per delivery makes every transcript single-use and grows the state store
+    # without bound. Nothing secret belongs here either (the neighbouring
+    # `hook_generation` comment's discipline): a pointer is configuration, and it
+    # must not be extended into anything carrying a VALUE from the payload.
+    hook_partitions: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
     # Whether this agent's bindings share one workflow-state namespace or each
     # get their own (#1525 follow-up). Cardinality alone (ADR-0118 decision 2)
     # governs routing and agent-scoped controls (budget, kill state, bundle

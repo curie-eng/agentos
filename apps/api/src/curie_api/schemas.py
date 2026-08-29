@@ -30,6 +30,7 @@ from pydantic import (
 )
 
 from .config import get_settings
+from .hook_partition import HOOK_NAME, validate_pointer_syntax
 from .models import GIT_FLOW_CREATED_BY, Environment
 from .repo_full_name import RepoFullName
 from .workspace_policy import REPOSITORY_FULL_NAME_PATTERN, valid_repository_name
@@ -514,6 +515,56 @@ class ApprovalApprovers(_StoredWithoutNulls):
         return self
 
 
+class HookPartitionConfig(BaseModel):
+    """How one hook names the thing each delivery is about (ADR-0134).
+
+    One model serves ``AgentCreate``, ``AgentUpdate`` AND ``AgentOut``, which the
+    ``_StoredWithoutNulls`` tripwire above would otherwise argue against: that
+    split only happens for models carrying the wrap serializer, and this one has
+    neither it nor an optional field, so the dumped and validated shapes are the
+    same and no ``-Input``/``-Output`` pair is generated. Do not add a separate
+    ``...Out`` variant.
+    """
+
+    # A typo'd key must not be silently dropped: here the dropped key would be
+    # the whole partition, and the hook would run unpartitioned while its config
+    # still looked right in a GET. Same reason as `ApprovalApprovers`.
+    model_config = ConfigDict(extra="forbid")
+
+    # An RFC 6901 pointer into the delivery body.
+    pointer: str
+
+    @field_validator("pointer")
+    @classmethod
+    def _check_pointer(cls, value: str) -> str:
+        # The ingress's own syntax rule, imported rather than restated, so a
+        # pointer the write surface accepts is exactly one the resolver can read.
+        return validate_pointer_syntax(value)
+
+
+def _validate_hook_partitions(
+    value: "dict[str, HookPartitionConfig] | None",
+) -> "dict[str, HookPartitionConfig] | None":
+    """Partition keys are hook NAMES, checked against the shape the ingress
+    enforces.
+
+    A key outside that shape can never match a firing, so it configures nothing
+    while looking configured -- the operator sees a partition map and gets
+    unpartitioned threads.
+    """
+
+    if value is None:
+        return value
+    for name in value:
+        if not HOOK_NAME.fullmatch(name):
+            raise ValueError(
+                f"hook_partitions key {name!r} is not a hook name: 1-63 "
+                "characters of lowercase letters, digits, dot, dash or "
+                "underscore, beginning with a letter or a digit"
+            )
+    return value
+
+
 def _validate_route_names(
     value: "dict[str, ApprovalRouteBinding] | None",
 ) -> "dict[str, ApprovalRouteBinding] | None":
@@ -888,6 +939,10 @@ class AgentCreate(BaseModel):
     # secret. Stored on the agent row for the local tier and forwarded into the
     # sandbox by the worker binding. None means no connector secrets.
     secrets: dict[str, str] | None = None
+    # Per-hook delivery partitioning (ADR-0134): hook name -> the JSON Pointer
+    # into the delivery body that names the thing each delivery is about. None
+    # (the default) is the unpartitioned behavior: one thread per hook.
+    hook_partitions: dict[str, HookPartitionConfig] | None = None
     # Whether this agent's bindings share one workflow-state namespace (#1525
     # follow-up). False (the default) matches a single-binding agent's existing
     # behavior exactly, since there is nothing yet to share with.
@@ -898,6 +953,7 @@ class AgentCreate(BaseModel):
     _check_approval_tools = field_validator("approval_required_tools")(_validate_tool_names)
     _check_approval_routes = field_validator("approval_routes")(_validate_route_names)
     _check_secrets = field_validator("secrets")(_validate_secret_map)
+    _check_hook_partitions = field_validator("hook_partitions")(_validate_hook_partitions)
     _reject_retired_channel_keys = model_validator(mode="before")(_reject_retired_binding_keys)
 
 
@@ -936,6 +992,13 @@ class AgentUpdate(BaseModel):
     # New connector secrets (#429). Omitted (None) leaves current secrets
     # unchanged; an explicit empty dict clears them.
     secrets: dict[str, str] | None = None
+    # New per-hook delivery partitioning (ADR-0134). Omitted (None) leaves the
+    # partitions unchanged; an explicit empty dict clears them, returning every
+    # hook on this agent to one thread per hook. Deliberately `approval_routes`'
+    # semantics and NOT the `model`/`thinking` `model_fields_set` three-way:
+    # there is no platform default for this field to be cleared back TO, so
+    # reading None as "omitted" conflates nothing.
+    hook_partitions: dict[str, HookPartitionConfig] | None = None
     # Which repository's pushes deploy this agent (ADR-0091). PATCHable because
     # an agent created before its repo existed -- or, until migration 0018, the
     # SECOND agent of a repo, which the unique index forbade from carrying it --
@@ -950,6 +1013,7 @@ class AgentUpdate(BaseModel):
     _check_approval_tools = field_validator("approval_required_tools")(_validate_tool_names)
     _check_approval_routes = field_validator("approval_routes")(_validate_route_names)
     _check_secrets = field_validator("secrets")(_validate_secret_map)
+    _check_hook_partitions = field_validator("hook_partitions")(_validate_hook_partitions)
     _reject_retired_channel_keys = model_validator(mode="before")(_reject_retired_binding_keys)
     # The update-only half: a withdrawn `channel` here is refused, while the
     # same key stays required on `AgentCreate`.
@@ -976,6 +1040,9 @@ class AgentOut(BaseModel):
     thinking: str | None
     approval_required_tools: list[str] | None
     approval_routes: dict[str, ApprovalRouteBindingOut] | None
+    # Which hooks fan out, and by what (ADR-0134). Null is the unpartitioned
+    # posture and the value every pre-existing agent row carries.
+    hook_partitions: dict[str, HookPartitionConfig] | None
     # Connector secret NAMES only (#429) -- values are never returned. The stored
     # column is a name->value map; expose just the sorted names so an operator can
     # see which secrets an agent has bound without the material leaving the API.
