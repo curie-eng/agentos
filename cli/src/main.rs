@@ -1243,8 +1243,11 @@ enum SkillAction {
         commands::OBSERVABILITY_REASON, commands::OBSERVABILITY_ALT,
     ))]
     Observability {
+        /// Optional so the bare form (no leaf) reaches the exit-4 capability
+        /// refusal below instead of dying as a clap usage error (issue
+        /// #1955, ADR-0041).
         #[command(subcommand)]
-        _query: SkillObservabilityQuery,
+        _query: Option<SkillObservabilityQuery>,
     },
     /// Stop and remove the local runner container.
     Down {
