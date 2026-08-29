@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/soak/v1.json",
+  "title": "curie dev soak --json",
+  "description": "The agent-facing result of `curie dev soak`. One family covers all three outcomes: the scenario passed, the scenario failed, and the scenario was SKIPPED because no cluster was reachable (`status: \"skipped\"`, exit 0, with `reason` naming the concrete context, namespace or warm pool that was absent). The failure result -- the scenario failing, or `uv run pytest` failing to launch -- rides the error path via `exit::with_json_payload`, so a non-zero `curie dev soak --json` emits THIS schema on stdout rather than error.schema.json.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "status": {
+      "description": "The scenario outcome.",
+      "enum": [
+        "passed",
+        "failed",
+        "skipped"
+      ]
+    },
+    "reason": {
+      "description": "A complete sentence naming why the run skipped or failed, including the concrete context/namespace/pool values. Null on a pass.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "context": {
+      "description": "The kube context the scenario targeted. Null when no kubeconfig current-context is set.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "namespace": {
+      "type": "string"
+    },
+    "pool": {
+      "type": "string"
+    },
+    "runs": {
+      "description": "Consecutive scenario runs requested in this invocation.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "exit_code": {
+      "description": "The pytest process exit code. Null when no pytest process produced one -- a preflight skip before pytest ran, or a `uv run pytest` that could not be launched at all.",
+      "type": [
+        "integer",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "status",
+    "reason",
+    "context",
+    "namespace",
+    "pool",
+    "runs",
+    "exit_code"
+  ]
+}
