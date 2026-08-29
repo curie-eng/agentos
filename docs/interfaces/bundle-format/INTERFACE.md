@@ -106,6 +106,40 @@ promotes unknown-field warnings to errors, and the five Curie authoring extensio
 unknown-to-Claude-Code by design, so warnings are the expected steady state and only a non-zero
 exit is a failure.
 
+Outbound compatibility and **spec conformance** are different contracts, and the second needs its
+own gate: Claude Code accepting our bundles does not establish that the skills inside them satisfy
+the published Agent Skills spec, which is stricter about what a `SKILL.md` frontmatter may contain.
+`scripts/check-agent-skills.sh` (run it as `curie dev agent-skills`) defends that direction, and CI
+runs the same script from `.github/workflows/agent-skills.yaml`. Determinism here takes three pins
+working together, not one: `SKILLS_REF_VERSION` fixes the reference validator at
+`skills-ref==0.1.1`, `SKILLS_REF_EXCLUDE_NEWER` is threaded through every `uvx` invocation as a
+resolution cutoff that freezes the transitive dependency set, and the workflow pins the uv version
+on its `setup-uv` step because uv's resolver is what picks those transitive deps. The transitive
+set matters because it decides verdicts — `skills-ref` declares floating dependencies, and
+strictyaml's refusal of JSON-style flow collections is precisely what makes `allowed-tools: []`
+fail, so a strictyaml release could flip the gate with no change of ours. Given those three pins
+and a reachable PyPI the gate is deterministic, which is why this workflow has no nightly
+`schedule` trigger while plugin-compat does, since a pinned validator cannot drift between runs and
+adopting a newer spec revision is a reviewed edit. The check runs over an explicit allowlist rather
+than pure discovery, and a discovery drift check asserts that allowlist covers exactly the skills
+found under the Curie-owned roots, so a newly added skill cannot silently escape the gate by being
+unlisted. The script also preflights the validator and refuses to emit any verdict when it cannot
+be resolved or launched, so a network failure reds the gate rather than being mistaken for a skill
+being invalid — which is what lets the next claim be trusted. The fixture
+`packages/plugin-format/tests/fixtures/bad_skill/skills/broken` is carried as an **asserted
+negative**: the gate requires the reference validator to keep rejecting it, which makes
+the deliberately malformed fixture proof that the gate is not vacuous rather than an unexplained
+exclusion. Note that this constrains Curie's OWN skills only — the `plugin_format` loader stays
+deliberately lenient and keeps accepting Claude-Code-shaped bundles carrying keys the spec does not
+know about, and the two bars are intentionally different.
+
+Conforming had one real cost, paid once. `.claude/skills/implement` is the single skill the gate
+forced a migration on: its top-level `disable-model-invocation: true` is not one of the fixed
+fields the spec allows, so it moved under `metadata`, the spec's designated slot for vendor
+extensions. That keeps the declaration but drops its effect — Claude Code reads the key only at the
+top level, so it no longer enforces slash-command-only invocation for that skill. Nothing in this
+repo reads the key, and the trade is accepted deliberately.
+
 ## Implementations today
 
 One: the `plugin_format` package. **Unlike `aci-protocol`, it is NOT tri-language with generated
