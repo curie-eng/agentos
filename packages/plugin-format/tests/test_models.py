@@ -1,5 +1,12 @@
 import pytest
-from plugin_format import ApprovalGate, McpServer, PluginManifest, SkillFrontmatter
+from plugin_format import (
+    TOOL_POLICY_ENFORCEMENT,
+    ApprovalGate,
+    McpServer,
+    PluginManifest,
+    SkillFrontmatter,
+    ToolPolicy,
+)
 from pydantic import ValidationError
 
 
@@ -104,3 +111,99 @@ def test_approval_gate_grantable_via_policy_field() -> None:
     dumped = gate.model_dump()
     assert dumped["grantableViaPolicy"] is True
     assert ApprovalGate.model_validate(dumped).grantableViaPolicy is True
+
+
+def test_tool_policy_parses_a_full_declaration_and_defaults_its_collections() -> None:
+    """The ``toolPolicy`` model round-trips, and its three collections default to empty.
+
+    Empty is the coherent default for a DECLARED policy: unmatched means deny, so a
+    policy that lists nothing refuses everything. The alternative -- ``None`` for an
+    omitted collection -- would invite a "None means unrestricted" reading, which is
+    the fail-open the policy exists to prevent.
+    """
+
+    policy = ToolPolicy.model_validate(
+        {
+            "enforcement": TOOL_POLICY_ENFORCEMENT,
+            "allow": ["grafana/list_datasources"],
+            "approvalRequired": ["kubernetes/pods_*"],
+            "deny": ["kubernetes/resources_delete"],
+        }
+    )
+    assert policy.enforcement == TOOL_POLICY_ENFORCEMENT
+    assert policy.allow == ["grafana/list_datasources"]
+    assert policy.approvalRequired == ["kubernetes/pods_*"]
+    assert policy.deny == ["kubernetes/resources_delete"]
+    # Serializes back under the verbatim camelCase key.
+    assert policy.model_dump()["approvalRequired"] == ["kubernetes/pods_*"]
+
+    bare = ToolPolicy.model_validate({"enforcement": TOOL_POLICY_ENFORCEMENT})
+    assert bare.allow == []
+    assert bare.approvalRequired == []
+    assert bare.deny == []
+
+
+def test_tool_policy_rejects_an_unknown_key() -> None:
+    """ToolPolicy is STRICT: an unknown key is a typo, and a typo here widens permissions.
+
+    The concrete failure a lenient model would ship: an author writes ``denny``
+    for ``deny``, pydantic accepts and discards it, the real deny list is empty,
+    and every tool the author believed blocked falls through to their ``allow``
+    glob. Forward-compatibility leniency is right for shapes with an EXTERNAL
+    producer (PluginManifest mirrors Claude Code's evolving format); a
+    Curie-owned policy object has no such producer, so ``extra="forbid"`` --
+    the same reasoning ConnectorSpec, ConnectorLockEntry and DeployTarget encode.
+    """
+
+    with pytest.raises(ValidationError):
+        ToolPolicy.model_validate({"enforcement": TOOL_POLICY_ENFORCEMENT, "futureField": 42})
+
+    # The realistic case, stated as itself: a misspelled collection name.
+    with pytest.raises(ValidationError):
+        ToolPolicy.model_validate(
+            {
+                "enforcement": TOOL_POLICY_ENFORCEMENT,
+                "allow": ["k8s/*"],
+                "denny": ["k8s/delete_namespace"],
+            }
+        )
+
+
+def test_manifest_stays_lenient_even_though_tool_policy_is_strict() -> None:
+    """Strictness is scoped to ToolPolicy; PluginManifest keeps accepting unknown keys.
+
+    Tightening the manifest would reject real Claude Code bundles carrying fields
+    this package does not model, which is the compatibility wedge.
+    """
+
+    manifest = PluginManifest.model_validate(
+        {
+            "name": "demo",
+            "futureField": 42,
+            "toolPolicy": {"enforcement": TOOL_POLICY_ENFORCEMENT, "allow": ["grafana/*"]},
+        }
+    )
+    assert manifest.model_dump().get("futureField") == 42
+    assert manifest.toolPolicy is not None
+
+
+def test_manifest_tool_policy_field() -> None:
+    """The Curie ``toolPolicy`` authoring extension round-trips on the manifest.
+
+    Absent -> ``None``, which is the backward-compatibility guarantee: every bundle
+    shipped before this feature keeps validating and keeps its behavior. The one
+    visible change for an existing bundle is that ``model_dump()`` now carries
+    ``toolPolicy: None`` -- the ordinary new-optional-field patch behaviour, which
+    is why the round-trip below dumps with ``exclude_none``.
+    """
+
+    declared = {
+        "enforcement": TOOL_POLICY_ENFORCEMENT,
+        "allow": ["grafana/*"],
+        "deny": ["grafana/delete_*"],
+    }
+    manifest = PluginManifest.model_validate({"name": "demo", "toolPolicy": declared})
+    assert manifest.toolPolicy == declared
+    assert manifest.model_dump(exclude_none=True)["toolPolicy"] == declared
+
+    assert PluginManifest.model_validate({"name": "demo"}).toolPolicy is None

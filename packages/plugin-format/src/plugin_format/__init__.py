@@ -33,9 +33,23 @@ from .models import (
     McpServer,
     PluginManifest,
     SkillFrontmatter,
+    ToolPolicy,
     TriggerDeclaration,
 )
 from .reserved_env import RESERVED_BOOT_ENV, is_reserved_boot_env_name
+from .tool_policy import (
+    TOOL_POLICY_ENFORCEMENT,
+    ToolPolicyDecision,
+    ToolPolicyInvalid,
+    ToolPolicyPatternIssue,
+    ToolPolicyUnenforceable,
+    check_policy_patterns,
+    classify_tool,
+    literal_server_segment,
+    load_tool_policy,
+    policy_patterns,
+    validate_pattern,
+)
 from .validate import ValidationIssue, ValidationResult, validate_bundle
 
 __version__ = "0.0.0"
@@ -56,11 +70,23 @@ __all__ = [
     "TriggerDeclaration",
     "ApprovalPolicy",
     "ApprovalGate",
+    "ToolPolicy",
     "grantable_routes",
     "declared_mcp_server_names",
     "connector_server_names",
     "connector_tool_prefix",
     "effective_operator_gates",
+    "TOOL_POLICY_ENFORCEMENT",
+    "ToolPolicyDecision",
+    "ToolPolicyInvalid",
+    "ToolPolicyPatternIssue",
+    "ToolPolicyUnenforceable",
+    "validate_pattern",
+    "literal_server_segment",
+    "policy_patterns",
+    "check_policy_patterns",
+    "classify_tool",
+    "load_tool_policy",
     "validate_bundle",
     "ValidationResult",
     "ValidationIssue",
