@@ -256,6 +256,26 @@ def _known_placeholders() -> frozenset[str]:
     return frozenset(PLACEHOLDERS)
 
 
+def _forges_the_render_join(name: str) -> bool:
+    """Whether this connector name would forge a second ``-mcp-`` in the object name.
+
+    Imported lazily for exactly the reason ``_known_placeholders`` above is:
+    ``connector_render`` imports THIS module at top level, so importing it back
+    at top level is a circular import.
+
+    The rule is deliberately not restated here. The renderer owns it, so the
+    name this validator refuses and the name the renderer refuses cannot drift
+    -- and the drift would be silent in both directions: a name the validator
+    accepts but the renderer refuses turns a friendly bundle error into a crash
+    at deploy time, and a name the validator refuses but the renderer accepts
+    blocks a bundle that was fine (#1446).
+    """
+
+    from .connector_render import connector_forges_join
+
+    return connector_forges_join(name)
+
+
 def _is_valid_name(name: str) -> bool:
     """RFC 1123 label, capped: the name becomes a k8s object and a DNS label."""
 
@@ -302,6 +322,25 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
                     "(the approval server / the durable state server), so a connector "
                     "declaring it would replace that server in the agent's session and "
                     f"the agent would lose {lost} -- rename the connector",
+                )
+            )
+        # A separate `if`, never an `elif` on the shape check above: a name can
+        # be both badly shaped and forging, and this validator's convention is
+        # to report every applicable code so the author fixes the whole file in
+        # one pass instead of discovering the next problem after each rename.
+        if _forges_the_render_join(name):
+            errors.append(
+                (
+                    "connectors.ambiguous_name",
+                    f"{where}: `{name}` would forge a second `-mcp-` in the object name "
+                    "Curie derives for this connector (`<release>-<agent>-mcp-"
+                    "<connector>`), so it is no longer recoverable where the agent ends "
+                    "and the connector begins -- a DIFFERENT agent/connector pair would "
+                    "render the same Service, Deployment, both NetworkPolicies and the "
+                    "same `app.kubernetes.io/name` pod selector, handing one agent's "
+                    "sandbox the other's connector and the credential bound to it "
+                    "(the connector is deliberately unauthenticated, ADR-0086) -- rename "
+                    "the connector so it does not start with `mcp-` or contain `-mcp-`",
                 )
             )
         if spec.image and spec.url:

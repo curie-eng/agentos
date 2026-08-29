@@ -66,7 +66,9 @@ files**, both optional, both invisible to Claude Code:
   value. Validated by `packages/plugin-format/src/plugin_format/validate.py::_validate_connectors`,
   which emits `connectors.*` codes (`connectors.not_object`, `connectors.ambiguous`,
   `connectors.underspecified`, `connectors.reserved_name`, `connectors.duplicate_connector`,
-  `connectors.duplicate_server`, and others). Authored mapping keys are checked for
+  `connectors.duplicate_server`, `connectors.ambiguous_name` (a connector name that forges the
+  `-mcp-` join used to render the connector's object name, so two different (agent, connector)
+  pairs would render byte-identical objects), and others). Authored mapping keys are checked for
   duplicates before validation, so a repeated connector name is rejected rather than
   silently replaced by the last YAML value.
 - `deploy.yaml` (ADR-0089, `packages/plugin-format/src/plugin_format/deploy_targets.py::DeployTargetsFile`)
@@ -76,7 +78,10 @@ files**, both optional, both invisible to Claude Code:
   `packages/plugin-format/src/plugin_format/validate.py::_validate_deploy_targets`, which emits
   `deploy.*` codes (`deploy.not_object`, `deploy.duplicate_target`, `deploy.bad_target_name`,
   `deploy.bad_env`, `deploy.missing_agent` (a declared target must name its agent; the error names
-  the target key), `deploy.bad_agent_name`, `deploy.bad_slack_channel`). Authored mapping keys are
+  the target key), `deploy.bad_agent_name`, `deploy.ambiguous_agent_name` (the agent, not the
+  connector, must not END in `-mcp`, since the agent sits immediately left of the `-mcp-` join —
+  same collision as `connectors.ambiguous_name`, viewed from the other side of the join),
+  `deploy.bad_slack_channel`). Authored mapping keys are
   checked for duplicates before validation, so a repeated target name fails closed instead of
   silently selecting the last YAML value.
 

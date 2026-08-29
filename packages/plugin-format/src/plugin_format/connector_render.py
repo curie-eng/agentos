@@ -44,6 +44,86 @@ from .connectors import ConnectorSpec
 _DNS_LABEL_MAX = 63
 _DIGEST_LEN = 8
 
+# The literal that joins the agent to the connector in `object_name` (#1116).
+# It is a bare substring INSIDE one DNS label, not a structural separator: the
+# rendered name has no field boundary, so the join point cannot be recovered
+# from the result. `curie-a-mcp-b-mcp-c` reads equally well as
+# (agent=`a-mcp-b`, connector=`c`) and (agent=`a`, connector=`b-mcp-c`), and
+# both render byte-identical objects. Defined once so the rule below and the
+# concatenation it guards cannot drift apart -- a second copy of this literal
+# is how the guard silently stops matching what is actually rendered (#1446).
+_JOIN = "-mcp-"
+
+
+class AmbiguousObjectName(ValueError):
+    """A name would make the rendered object name ambiguous (#1446).
+
+    A named subclass rather than a bare ``ValueError`` on purpose. The two
+    consumers that contain this failure -- the API's connector-manifest render
+    and the runner's ``.mcp.json`` derivation -- have to catch exactly this
+    condition and nothing else. Catching bare ``ValueError`` there would also
+    swallow ordinary programming errors and degrade them into "mounted no
+    connectors", which is the same silent, unlogged wrong-credential outcome
+    this exception exists to prevent.
+    """
+
+
+def agent_forges_join(agent: str) -> bool:
+    """Whether this agent name would forge a second ``-mcp-`` in the object name.
+
+    The rule is NOT "the name contains ``-mcp-``", which is the fix the issue
+    itself proposed and which does not close the hole: agent ``x-mcp`` with
+    connector ``c`` and agent ``x`` with connector ``mcp-c`` both render
+    ``curie-x-mcp-mcp-c``, while neither ``x-mcp`` nor ``mcp-c`` contains the
+    delimiter as a substring at all. The property that matters is whether
+    the name FORGES a second occurrence of the delimiter once the concatenation
+    happens, so each side is tested against the half of the delimiter it abuts.
+
+    The agent is immediately FOLLOWED by the join, so appending the join's
+    leading dash is exactly what it will sit against. A trailing ``-mcp`` is
+    therefore fatal here (``grafana-mcp`` + ``-mcp-c...`` completes a second
+    join) while a LEADING ``mcp-`` is harmless (an alternative split of
+    ``curie-mcp-x-mcp-c`` would leave an EMPTY agent, which no bundle can
+    declare). That is the mirror image of ``connector_forges_join`` below, and
+    the asymmetry reads like a bug until the derivation is done -- a symmetric
+    rule would be wrong in both directions, over-refusing agent ``mcp-x`` and
+    connector ``c-mcp`` and breaking working installs for no security gain.
+
+    The RELEASE is deliberately not guarded by any equivalent predicate. A
+    ``-mcp-`` on the release side cannot create an (agent, connector)
+    ambiguity: every alternative split of ``grafana-mcp-acme-mcp-grafana``
+    either leaves an empty agent or stops preserving the release prefix. The
+    obvious-looking whole-string guard, ``base.count(_JOIN) == 1``, would refuse
+    every deploy of a release literally named ``grafana-mcp``.
+
+    The rule is SOUND, not exact. It never MISSES a collision -- that is the
+    security property -- but under the validators' 40-character name cap it can
+    refuse a name whose only alternative split would need a partner longer than
+    the cap, i.e. a name for which no valid colliding partner exists. Refusing
+    loudly at validation time is the correct direction of error for a name that
+    is the sole binding between a sandbox and a credential.
+    """
+
+    return _JOIN in f"{agent}-"
+
+
+def connector_forges_join(connector: str) -> bool:
+    """Whether this connector name would forge a second ``-mcp-`` in the object name.
+
+    The mirror of ``agent_forges_join``: the connector is PRECEDED by the join,
+    so prepending the join's trailing dash is what it will sit against. A
+    LEADING ``mcp-`` is fatal here, while a trailing ``-mcp`` is harmless --
+    nothing follows the connector, so ``c-mcp`` has nothing to complete a second
+    join with. ``kubernetes``, ``netpol-probe`` and ``grafana-mcp`` therefore
+    stay renderable, which matters because the first two are the connector names
+    this repo's own example bundles ship.
+
+    See ``agent_forges_join`` for why the release is not guarded and why the
+    rule is sound rather than exact.
+    """
+
+    return _JOIN in f"-{connector}"
+
 
 def sandbox_selector(release: str, app_name: str) -> dict[str, str]:
     """The pods Rail 1's default-deny egress selects, exactly.
@@ -82,9 +162,51 @@ def object_name(release: str, agent: str, connector: str) -> str:
     It also makes pruning safe. Objects are pruned by an owner label; with
     colliding names, ownership silently transfers to whoever deployed last, and
     one agent removing a connector deletes another agent's running server.
+
+    Fails closed on a name that forges a second ``-mcp-`` (#1446). #1116 made
+    names distinct per (release, agent, connector) but the join it introduced is
+    a bare substring, so two DIFFERENT tuples could still render one Service,
+    one Deployment, both NetworkPolicies and -- worst -- one
+    ``app.kubernetes.io/name``, which IS the pod selector. The connector is
+    deliberately unauthenticated (ADR-0086: the network is not one layer of the
+    access control, it is the whole of it), so this name is the only thing
+    binding a sandbox to a credential and a collision hands one agent another
+    agent's production token with nothing logged.
+
+    Raising, rather than quietly deriving some other unique name, is what keeps
+    the other half of this function's contract intact. "Stable and derivable"
+    means every name that renders today renders byte-identically tomorrow; a
+    disambiguating rename would orphan every live Service, Deployment and
+    NetworkPolicy under a name nothing reconciles any more -- still running,
+    still holding its credential -- while a fresh set came up beside it.
     """
 
-    base = f"{release}-{agent}-mcp-{connector}"
+    # BEFORE `base` is built, and before the length check below, deliberately.
+    # The truncate-with-digest branch looks like it would disambiguate these and
+    # cannot: the digest is taken over `base`, and a forging pair produces the
+    # SAME `base` from both tuples, hence the same sha256 and the same
+    # truncation. It reproduces the collision byte for byte rather than breaking
+    # it. The agent is checked FIRST so a name offending on both sides reports
+    # the agent deterministically, instead of an incidentally ordered message.
+    if agent_forges_join(agent):
+        raise AmbiguousObjectName(
+            f"agent `{agent}` would forge a second `{_JOIN}` in the connector object "
+            f"name `<release>-<agent>{_JOIN}<connector>`, so a different "
+            "agent/connector pair would render the same Service, Deployment, both "
+            "NetworkPolicies and the same `app.kubernetes.io/name` pod selector -- "
+            "one agent's sandbox would reach the other's connector and the credential "
+            "bound to it (ADR-0086). Rename the agent."
+        )
+    if connector_forges_join(connector):
+        raise AmbiguousObjectName(
+            f"connector `{connector}` would forge a second `{_JOIN}` in the connector "
+            f"object name `<release>-<agent>{_JOIN}<connector>`, so a different "
+            "agent/connector pair would render the same Service, Deployment, both "
+            "NetworkPolicies and the same `app.kubernetes.io/name` pod selector -- "
+            "one agent's sandbox would reach the other's connector and the credential "
+            "bound to it (ADR-0086). Rename the connector."
+        )
+    base = f"{release}-{agent}{_JOIN}{connector}"
     if len(base) <= _DNS_LABEL_MAX:
         return base
     # Truncate WITH a digest of the full name: clipping alone would map two long
