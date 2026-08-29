@@ -503,6 +503,29 @@ class WorkerConfig(BaseSettings):
             )
         return self
 
+    @model_validator(mode="after")
+    def _quiesce_outlives_the_drain_wait(self) -> WorkerConfig:
+        """Fail at construction if the quiesce flag can lapse mid-drain.
+
+        The gate sets the flag once and then waits up to
+        ``upgrade_drain_timeout_s`` for the in-flight deliveries to settle. A
+        TTL at or below that wait expires the flag while the gate is still
+        waiting, so the replicas resume claiming into an upgrade that is about
+        to roll them -- re-creating the very interruption the gate exists to
+        prevent, and doing it silently (the gate would still report a clean
+        drain). Strictly greater, so there is real headroom.
+        """
+        if self.upgrade_quiesce_ttl_s <= self.upgrade_drain_timeout_s:
+            raise ValueError(
+                "CURIE_UPGRADE_QUIESCE_TTL_S "
+                f"({self.upgrade_quiesce_ttl_s!r}) must be strictly greater than "
+                "CURIE_UPGRADE_DRAIN_TIMEOUT_S "
+                f"({self.upgrade_drain_timeout_s!r}): a flag that lapses mid-drain "
+                "lets the replicas resume claiming into a roll that is about to "
+                "interrupt them"
+            )
+        return self
+
     # Read loop
     read_count: int = 16
     read_block_ms: int = 5000
@@ -611,6 +634,35 @@ class WorkerConfig(BaseSettings):
     delivery_shutdown_reserve_s: float = Field(
         default=60.0, ge=0, validation_alias="CURIE_DELIVERY_SHUTDOWN_RESERVE_S"
     )
+    # ---- Upgrade drain gate (issue #2010) --------------------------------
+    #
+    # ADR-0131 made ONE worker's own shutdown safe: grace covers budget +
+    # reserve, so a SIGTERMed replica can settle the delivery it owns. It says
+    # nothing about the PLATFORM roll around it. A `helm upgrade` rolls the
+    # worker and its backing services together, and an already-accepted
+    # side-effecting turn whose owner dies mid-flight is reclaimed by the
+    # replacement, which correctly refuses to re-run the action and escalates to
+    # a human. Duplicate effects are prevented and the requested task still does
+    # not complete -- the failure #2010 reports.
+    #
+    # These three knobs drive the pre-upgrade gate (``upgrade_drain.py``), which
+    # quiesces new claims and waits for every live-leased delivery to reach its
+    # terminal outcome BEFORE the roll begins, and refuses the upgrade when they
+    # do not.
+    upgrade_drain_timeout_s: float = Field(
+        default=900.0, gt=0, validation_alias="CURIE_UPGRADE_DRAIN_TIMEOUT_S"
+    )
+    upgrade_drain_poll_interval_s: float = Field(
+        default=5.0, gt=0, validation_alias="CURIE_UPGRADE_DRAIN_POLL_INTERVAL_S"
+    )
+    # How long the quiesce flag lives. FINITE on purpose: an upgrade that is
+    # killed between the gate and the post-upgrade release must not leave the
+    # fleet permanently unable to claim, so the flag lapses on its own. It must
+    # also outlast the drain wait, which is what the validator below enforces.
+    upgrade_quiesce_ttl_s: float = Field(
+        default=1200.0, gt=0, validation_alias="CURIE_UPGRADE_QUIESCE_TTL_S"
+    )
+
     # The platform's voluntary termination grace, injected by the chart from
     # the SAME value it renders onto the Pod's ``terminationGracePeriodSeconds``
     # so the app's validator and the platform can never drift apart. ``None``
@@ -961,6 +1013,14 @@ class WorkerConfig(BaseSettings):
         # loop must not scan a production Valkey, and a redelivery-only sweep
         # would never reach a turn whose stream entry was already acked.
         return f"{self.key_prefix}:completions:pending"
+
+    def upgrade_quiesce_key(self) -> str:
+        # The fleet-wide "stop taking new work" flag the pre-upgrade gate sets
+        # (issue #2010). One key for the whole release, not one per replica: the
+        # gate runs as a Job that knows nothing about how many replicas exist,
+        # and every consumer reads the same flag. Always written with a TTL --
+        # see ``upgrade_quiesce_ttl_s`` for why it must never be permanent.
+        return f"{self.key_prefix}:upgrade:quiesce"
 
     def lock_key(self, thread_key: str) -> str:
         return f"{self.key_prefix}:lock:{thread_key}"

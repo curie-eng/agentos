@@ -1336,6 +1336,56 @@ worker:
   # clear) after the runner work is done. `terminationGracePeriodSeconds`
   # above must be at least deliveryBudgetSeconds + this value.
   deliveryShutdownReserveSeconds: 60
+  # Pre-upgrade drain gate (issue #2010). ADR-0131 made one worker's own
+  # shutdown safe; it says nothing about the roll happening around it. A
+  # `helm upgrade` applies the worker AND its backing services in one pass, so
+  # an already-accepted, side-effecting turn whose owner is interrupted is
+  # reclaimed by the replacement, which correctly refuses to re-run the action
+  # and escalates to a human. No duplicate effect, no silent loss -- and the
+  # requested task does not complete.
+  #
+  # When enabled, a `pre-upgrade` hook Job quiesces new claims across the
+  # release and waits for every delivery that currently holds a live ownership
+  # lease to reach its terminal outcome. If they all settle, the roll proceeds
+  # and each of those turns completed exactly once. If they do not, the hook
+  # fails, `helm upgrade` fails with it, and NOTHING is rolled -- the upgrade is
+  # postponed rather than converting accepted work into an escalation. A
+  # `post-upgrade` hook clears the flag once the roll is done.
+  #
+  # Disable it for a release where an interrupted turn is acceptable (a dev
+  # cluster, a fake-model install). The chart's behavior without it is exactly
+  # what it was before the gate existed.
+  upgradeDrain:
+    enabled: true
+    # How long to wait for the in-flight deliveries before refusing. A FLOOR,
+    # not a ceiling: the effective wait is raised to at least
+    # deliveryBudgetSeconds + deliveryShutdownReserveSeconds, because a gate
+    # that gives up while a turn is still inside the budget ADR-0131 already
+    # promised it would postpone upgrades during ordinary traffic. Raising the
+    # delivery budget therefore raises this automatically rather than breaking
+    # the render for a value you never touched.
+    timeoutSeconds: 900
+    # How often the gate re-reads the in-flight set while waiting.
+    pollIntervalSeconds: 5
+    # How long the quiesce flag lives. Also a floor: it is derived above the
+    # EFFECTIVE wait above, because the worker refuses a TTL that does not
+    # outlast the drain at boot, and a render the app rejects is a green
+    # `helm upgrade` followed by a CrashLoopBackOff. Finite by construction, so
+    # an upgrade killed between the two hooks cannot leave the fleet
+    # permanently unable to claim. Size it to span the expected rollout: the
+    # flag is what keeps replacement Pods from reclaiming mid-roll.
+    #
+    # Setting it at or below timeoutSeconds IS refused at render time -- that
+    # pair is written together, so contradicting yourself there is a stated
+    # intent worth surfacing rather than silently raising.
+    quiesceTtlSeconds: 1800
+    resources:
+      requests:
+        cpu: 10m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 128Mi
   # The Slack assistant-thread "shimmer" (#1182): the animated caption Slack
   # shows next to the app's name while a turn runs. On by default -- the
   # placeholder message only changes when the model emits text, so a model that
