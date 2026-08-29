@@ -15,6 +15,7 @@ import sys
 import anyio
 from aci_protocol import BootEnv
 from aiohttp import web
+from claude_agent_sdk import HookMatcher
 
 from .adapter import ClaudeAgentSession, ModelSession, build_options
 from .approval import (
@@ -22,6 +23,7 @@ from .approval import (
     ApprovalPolicyError,
     assert_gates_not_shadowed,
     build_approval_gate,
+    build_approval_hook,
     build_approval_server,
     build_can_use_tool,
     resolve_approval_policy,
@@ -104,6 +106,35 @@ def _compose_system_prompt(
     model_preamble = f"Configured model: {model}" if model else None
     parts = [p for p in (memory_preamble, conversation_preamble, base, model_preamble) if p]
     return "\n\n".join(parts) if parts else None
+
+
+def _merge_pre_tool_use_hooks(
+    approval_hooks: dict[str, list[HookMatcher]] | None,
+    bundle_hooks: dict[str, list[HookMatcher]] | None,
+) -> dict[str, list[HookMatcher]] | None:
+    """Merge the approval gate's PreToolUse matcher with the bundle's own (#1852).
+
+    Merge, never replace: dropping the bundle's declared PreToolUse guardrails
+    (#272) would silently disarm them, and dropping the approval matcher leaves
+    the gate bypassable by any permission rule -- the #1852 defect itself. The
+    approval matcher is placed first for determinism of our own construction;
+    the CLI dispatches matchers on one event CONCURRENTLY
+    (claude_agent_sdk/types.py:1956-1961), so list position is not a runtime
+    precedence guarantee and nothing here relies on it.
+
+    Returns None when neither side contributes anything: ``ClaudeAgentOptions``
+    takes ``hooks=None`` to mean "no hooks declared", which is not the same as
+    an empty matcher list, and ``load_bundle_hooks`` returning None for a bundle
+    with no hooks is the common case rather than an error.
+    """
+
+    merged: dict[str, list[HookMatcher]] = {}
+    for source in (approval_hooks, bundle_hooks):
+        if not source:
+            continue
+        for event, matchers in source.items():
+            merged.setdefault(event, []).extend(matchers)
+    return merged or None
 
 
 def build_runner(
@@ -198,6 +229,16 @@ def build_runner(
         logger.error("approval policy unusable error_class=%s: %s", type(exc).__name__, exc)
         raise
 
+    # The gate's own PreToolUse matcher (#1852), MERGED with the bundle's rather
+    # than replacing it. Built here, after the boot refusal above has passed, so
+    # a bundle Curie is about to refuse never gets a hook registered against it.
+    # No gate -> no hook, which is what keeps an unconfigured agent's wiring
+    # byte-identical to before.
+    session_hooks = _merge_pre_tool_use_hooks(
+        build_approval_hook(approval_gate) if approval_gate is not None else None,
+        bundle_hooks,
+    )
+
     # The durable state store exposed to bundle code (#249): when the worker
     # forwarded CURIE_STATE_URL, mount the platform ``curie-state`` MCP
     # server so a skill can read/write suspend/resume-surviving state without the
@@ -238,7 +279,12 @@ def build_runner(
             thinking=config.thinking,
             task_budget_hint=config.session.budget.task_budget_hint,
             env=sdk_env or {},
-            hooks=bundle_hooks,
+            # The approval gate's PreToolUse matcher rides here alongside the
+            # bundle's own (#1852): can_use_tool is skipped by any permission
+            # rule that already allows the call (claude_agent_sdk/types.py:
+            # 1932-1948), and a skill's allowed-tools frontmatter is exactly
+            # such a rule, so the hook is the only layer that sees every call.
+            hooks=session_hooks,
             # Every session carries the in-process approval-request tool, so a
             # skill can raise a policy gate (ADR-0010) without the bundle
             # shipping its own MCP server for it. The ``curie-state`` server

@@ -80,6 +80,15 @@ class TurnState:
     # reply recorded into the conversation transcript (#20); left None on a
     # failure/budget/auth final so those turns are not persisted as history.
     final_text: str | None = None
+    # Runner-internal, NOT a wire field (#1852): set by
+    # ``SessionRunner._merge_gate_block`` when the runner's OWN approval gate
+    # asked the CLI to stop the turn. A gated deny now carries the SDK's
+    # turn-stopping flags, so the CLI aborts and its terminal result arrives
+    # is_error-shaped -- which ``_translate_result`` classifies as a failure.
+    # This flag is what lets ``_apply_approval_override`` flip a turn the CLI
+    # reported as errored *because we interrupted it*, instead of reporting a
+    # failure with nothing to approve.
+    approval_halt_requested: bool = False
 
 
 def translate_message(
