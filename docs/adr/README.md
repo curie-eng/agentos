@@ -145,4 +145,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0114 | [Cluster up infers detected install facts](0114-cluster-up-infers-detected-install-facts.md) | Accepted |
 | 0115 | [Agents call each other directly, with no third party in the path](0115-agents-call-each-other-with-no-third-party.md) | Draft |
 | 0123 | [A pending approval's approver set does not follow its route binding](0123-a-pending-approvals-approver-set-does-not-follow-its-route-binding.md) | Accepted |
+| 0135 | [Langfuse stays the shipped trace store; the cost, and what would reopen it](0135-langfuse-stays-the-shipped-trace-store.md) | Draft |
 <!-- END GENERATED: adr-index -->
