@@ -38,7 +38,14 @@ const RELEASE: &str = "platform";
 
 /// Components whose names the CLI derives from the release name. `dispatcher`
 /// renders only when Slack is configured, which the default values do not do.
-const COMPONENTS: [&str; 6] = ["api", "ui", "langfuse-web", "valkey", "dispatcher", "worker"];
+const COMPONENTS: [&str; 6] = [
+    "api",
+    "ui",
+    "langfuse-web",
+    "valkey",
+    "dispatcher",
+    "worker",
+];
 
 fn chart() -> PathBuf {
     PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../charts/curie"))
@@ -189,8 +196,7 @@ fn cli_naming_rule_matches_the_charts_own_render() {
 
     for component in COMPONENTS {
         let suffix = format!("-{component}");
-        let candidates: Vec<&String> =
-            names.iter().filter(|n| n.ends_with(&suffix)).collect();
+        let candidates: Vec<&String> = names.iter().filter(|n| n.ends_with(&suffix)).collect();
 
         if candidates.is_empty() {
             // Only the dispatcher is allowed to be absent: it renders solely
@@ -201,9 +207,7 @@ fn cli_naming_rule_matches_the_charts_own_render() {
                 "the chart renders no object for `{component}`; either the chart \
                  changed or the manifest read is broken"
             );
-            eprintln!(
-                "skipping dispatcher: the chart renders it only when Slack is configured"
-            );
+            eprintln!("skipping dispatcher: the chart renders it only when Slack is configured");
             continue;
         }
 

@@ -382,10 +382,16 @@ fn persist_and_hint(opts: &MessageOpts, verb: TurnVerb, channel: &str, thread_ts
 // Pure command builders (unit-tested below)
 // ---------------------------------------------------------------------------
 
-/// `kubectl -n <ns> port-forward svc/<release>-<suffix> <local>:<remote>`.
+/// `kubectl -n <ns> port-forward svc/<fullname>-<suffix> <local>:<remote>`.
+///
+/// Takes a RESOLVED `ReleaseFullname` (#1533). Every component this tunnels to
+/// (`api`, `valkey`) is rendered by the chart as
+/// `{{ include "curie.fullname" . }}-<suffix>`, which is NOT `{release}-<suffix>`
+/// unless the release name already contains the chart name. A raw release name
+/// cannot reach this builder, which is the point of the newtype.
 pub fn port_forward_command(
     namespace: &str,
-    release: &str,
+    fullname: &crate::ops::ReleaseFullname,
     suffix: &str,
     local_port: u16,
     remote_port: u16,
@@ -396,7 +402,7 @@ pub fn port_forward_command(
             plain("-n"),
             plain(namespace),
             plain("port-forward"),
-            plain(format!("svc/{release}-{suffix}")),
+            plain(format!("svc/{}", fullname.resource(suffix))),
             plain(format!("{local_port}:{remote_port}")),
         ],
     )
@@ -463,37 +469,73 @@ static CLUSTER_TRUST_SIGNAL_STATE: std::sync::LazyLock<std::sync::Mutex<Option<T
 static CLUSTER_TRUST_SIGNAL_HANDLER: std::sync::OnceLock<std::result::Result<(), String>> =
     std::sync::OnceLock::new();
 
-/// Probe the connected transport without collapsing a kubectl/RBAC failure into
-/// "dispatcher absent". Trust may only be widened after absence is positively
-/// observed; an indeterminate probe therefore refuses before any mutation.
-async fn dispatcher_connected_strict(namespace: &str, release: &str) -> Result<bool> {
-    let command = OpsCommand::new(
+/// The kubectl read behind `dispatcher_connected_strict`, extracted pure so the
+/// Deployment NAME is unit-testable without a cluster (#1533).
+///
+/// `--ignore-not-found` is what makes a wrong name dangerous here: a Deployment
+/// that does not exist returns success with EMPTY output, which the caller
+/// reads as "Slack is disconnected" and acts on by widening worker Slack trust.
+/// That is a silent wrong-direction mutation, not a visible failure, so the
+/// name must be the chart-rendered one.
+fn dispatcher_probe_command(namespace: &str, fullname: &crate::ops::ReleaseFullname) -> OpsCommand {
+    OpsCommand::new(
         "kubectl",
         vec![
             plain("-n"),
             plain(namespace),
             plain("get"),
             plain("deployment"),
-            plain(format!("{release}-dispatcher")),
+            plain(fullname.resource("dispatcher")),
             plain("--ignore-not-found"),
             plain("-o"),
             plain("name"),
         ],
-    );
+    )
+}
+
+/// Probe the connected transport without collapsing a kubectl/RBAC failure into
+/// "dispatcher absent". Trust may only be widened after absence is positively
+/// observed; an indeterminate probe therefore refuses before any mutation.
+async fn dispatcher_connected_strict(
+    namespace: &str,
+    fullname: &crate::ops::ReleaseFullname,
+) -> Result<bool> {
+    let command = dispatcher_probe_command(namespace, fullname);
     let (ok, out, err) = run_capture(&command).await?;
     if !ok {
         bail!(
-            "could not prove that Slack is disconnected for release {release} in namespace \
+            "could not prove that Slack is disconnected for {} in namespace \
              {namespace}; refusing to widen worker Slack trust: {}",
+            fullname.resource("dispatcher"),
             err.trim().lines().next().unwrap_or("kubectl probe failed")
         );
     }
     Ok(!out.trim().is_empty())
 }
 
+/// The worker Deployment the temporary trust widening (#1812) patches.
+///
+/// Extracted so the NAME is unit-testable without a cluster (#1533). The chart
+/// renders `{{ include "curie.fullname" . }}-worker`; a `{release}-worker` guess
+/// patches nothing, so the stub reply never arrives and the guard's ownership
+/// annotation lands on no object.
+fn stub_trust_deployment(fullname: &crate::ops::ReleaseFullname) -> String {
+    fullname.resource("worker")
+}
+
 impl ClusterStubTrust {
-    async fn install(namespace: &str, release: &str, advertise_host: &str) -> Result<Self> {
-        let deployment = format!("{release}-worker");
+    /// `release` is still needed alongside `fullname`: the post-rollout wait
+    /// selects pods by `app.kubernetes.io/instance=<release>`, which is the raw
+    /// Helm release name and NOT the rendered fullname (`curie.selectorLabels`,
+    /// `charts/curie/templates/_helpers.tpl:40-44`). Only the Deployment NAME
+    /// follows `curie.fullname` (#1533).
+    async fn install(
+        namespace: &str,
+        release: &str,
+        fullname: &crate::ops::ReleaseFullname,
+        advertise_host: &str,
+    ) -> Result<Self> {
+        let deployment = stub_trust_deployment(fullname);
         let view = read_worker_trust(namespace, &deployment).await?;
         let host = if advertise_host.contains(':') && !advertise_host.starts_with('[') {
             format!("[{advertise_host}]")
@@ -504,7 +546,7 @@ impl ClusterStubTrust {
         if let Some(holder) = view.holder.as_deref() {
             bail!(
                 "another cluster message command ({holder}) is temporarily managing worker Slack \
-                 trust for release {release}; retry after it exits"
+                 trust on {deployment}; retry after it exits"
             );
         }
         if view
@@ -1177,9 +1219,14 @@ pub fn server_host_and_port(server: &str) -> Option<(String, u16)> {
 /// The reply routes back to the stub via the per-turn endpoint on the queue
 /// payload (issue #19), so there is no worker-global `helm upgrade` to render.
 pub fn dry_run_lines(opts: &MessageOpts, advertise_host: &str) -> Vec<String> {
+    // Offline by contract: a dry run contacts no cluster, so it renders the
+    // chart's no-override `curie.fullname` rule rather than discovering the
+    // rendered name (#1533). Under `nameOverride`/`fullnameOverride` the printed
+    // service names are therefore the chart-default ones, not this install's.
+    let fullname = crate::ops::chart_fullname(&opts.release);
     let mut cmds: Vec<OpsCommand> = vec![port_forward_command(
         &opts.namespace,
-        &opts.release,
+        &fullname,
         "valkey",
         opts.valkey_local_port,
         VALKEY_REMOTE_PORT,
@@ -1187,7 +1234,7 @@ pub fn dry_run_lines(opts: &MessageOpts, advertise_host: &str) -> Vec<String> {
     if opts.channel.is_none() {
         cmds.push(port_forward_command(
             &opts.namespace,
-            &opts.release,
+            &fullname,
             "api",
             opts.api_local_port,
             API_REMOTE_PORT,
@@ -2797,14 +2844,17 @@ fn connected_turn(
 /// a cluster turn: an explicit `--channel`, else the sole bound Slack pair via a
 /// short-lived API port-forward (dropped once the lookup returns). Shared by the
 /// stub path and the connected-transport path.
-async fn resolve_cluster_channel(opts: &MessageOpts) -> Result<(String, Option<String>)> {
+async fn resolve_cluster_channel(
+    opts: &MessageOpts,
+    fullname: &crate::ops::ReleaseFullname,
+) -> Result<(String, Option<String>)> {
     match opts.channel.as_deref() {
         Some(channel) => Ok((channel.to_string(), None)),
         None => {
             let (_api_pf, api_local_port) = start_port_forward(
                 &port_forward_command(
                     &opts.namespace,
-                    &opts.release,
+                    fullname,
                     "api",
                     opts.api_local_port,
                     API_REMOTE_PORT,
@@ -2832,14 +2882,17 @@ async fn resolve_cluster_channel(opts: &MessageOpts) -> Result<(String, Option<S
 /// resumed reply ride the connected transport. The CLI cannot observe a reply
 /// that lands in Slack, so it enqueues and points the operator there rather than
 /// waiting on a (nonexistent) stub.
-async fn message_connected(opts: MessageOpts) -> Result<()> {
+async fn message_connected(
+    opts: MessageOpts,
+    fullname: &crate::ops::ReleaseFullname,
+) -> Result<()> {
     let ui = crate::ui::ui();
 
     // Valkey port-forward for the enqueue (killed on drop at fn end).
     let (_valkey_pf, valkey_local_port) = start_port_forward(
         &port_forward_command(
             &opts.namespace,
-            &opts.release,
+            fullname,
             "valkey",
             opts.valkey_local_port,
             VALKEY_REMOTE_PORT,
@@ -2849,7 +2902,7 @@ async fn message_connected(opts: MessageOpts) -> Result<()> {
     )
     .await?;
 
-    let (channel, _agent_hint) = resolve_cluster_channel(&opts).await?;
+    let (channel, _agent_hint) = resolve_cluster_channel(&opts, fullname).await?;
     ui.plumbing(&format!(
         "routing to channel {channel} over the connected Slack transport"
     ));
@@ -2953,13 +3006,18 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
 
     require_on_path("kubectl")?;
 
+    // Resolve the release's rendered fullname once, here: every kubectl target
+    // below is a chart resource, and `--dry-run` returned above without ever
+    // reaching a cluster (#1533).
+    let fullname = crate::ops::release_fullname(&opts.namespace, &opts.release).await;
+
     // Connected-transport path (#770/ADR-0078): when a real workspace is
     // connected (a running dispatcher), post a real placeholder and enqueue
     // against its ts with no per-turn endpoint, so the approval card and any
     // resumed reply ride the connected transport -- no throwaway stub. A kubectl
     // failure reads as NOT connected, so this falls through to the stub path.
-    if dispatcher_connected_strict(&opts.namespace, &opts.release).await? {
-        return message_connected(opts).await;
+    if dispatcher_connected_strict(&opts.namespace, &fullname).await? {
+        return message_connected(opts, &fullname).await;
     }
 
     // Advertise a host the in-cluster worker can reach, then bind the stub on
@@ -2977,13 +3035,14 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
     // Slack-connected release. The guard restores the default closed posture on
     // every normal/error return and is moved into non-unwinding exits below.
     let mut stub_trust =
-        ClusterStubTrust::install(&opts.namespace, &opts.release, &advertise_host).await?;
+        ClusterStubTrust::install(&opts.namespace, &opts.release, &fullname, &advertise_host)
+            .await?;
 
     // Valkey port-forward for the enqueue (killed on drop at fn end).
     let (_valkey_pf, valkey_local_port) = start_port_forward(
         &port_forward_command(
             &opts.namespace,
-            &opts.release,
+            &fullname,
             "valkey",
             opts.valkey_local_port,
             VALKEY_REMOTE_PORT,
@@ -2995,7 +3054,7 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
 
     // Channel: explicit --channel, else the sole deployed agent via a
     // short-lived API port-forward (#766). Shared with the connected path.
-    let (channel, agent_hint) = resolve_cluster_channel(&opts).await?;
+    let (channel, agent_hint) = resolve_cluster_channel(&opts, &fullname).await?;
     ui.plumbing(&format!("routing to channel {channel}"));
 
     // Enqueue the exact event the dispatcher would produce and wait for the ack.
@@ -3370,10 +3429,14 @@ pub fn eval_dry_run_lines(opts: &EvalOpts, suite_name: &str, case_count: usize) 
             .listen_host
             .clone()
             .unwrap_or_else(|| "<auto-detected-local-ip>".to_string());
+        // Offline by contract: a dry run contacts no cluster, so it renders the
+        // chart's no-override `curie.fullname` rule rather than discovering the
+        // rendered name (#1533).
+        let fullname = crate::ops::chart_fullname(&opts.release);
         lines.push(
             port_forward_command(
                 &opts.namespace,
-                &opts.release,
+                &fullname,
                 "valkey",
                 opts.valkey_local_port,
                 VALKEY_REMOTE_PORT,
@@ -3384,7 +3447,7 @@ pub fn eval_dry_run_lines(opts: &EvalOpts, suite_name: &str, case_count: usize) 
             lines.push(
                 port_forward_command(
                     &opts.namespace,
-                    &opts.release,
+                    &fullname,
                     "api",
                     opts.api_local_port,
                     API_REMOTE_PORT,
@@ -3709,6 +3772,34 @@ pub fn guard_fake_sweep(fake: bool, models: &[String], local: bool) -> Result<()
     ))
 }
 
+/// The resource ref the fake-model probe reads, named in ONE place so the argv
+/// and the failure diagnostic can never name different Deployments (#1533).
+fn fake_model_probe_target(fullname: &crate::ops::ReleaseFullname) -> String {
+    format!("deployment/{}", fullname.resource("worker"))
+}
+
+/// The kubectl read behind the cluster branch of `probe_fake_model`, extracted
+/// pure so the Deployment NAME is unit-testable without a cluster (#1533).
+///
+/// The chart renders `{{ include "curie.fullname" . }}-worker`; the old
+/// `{release}-worker` guess made `cluster eval --release platform` fail before a
+/// single eval case ran.
+fn fake_model_probe_command(namespace: &str, fullname: &crate::ops::ReleaseFullname) -> OpsCommand {
+    OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("-n"),
+            plain(namespace),
+            plain("get"),
+            plain(fake_model_probe_target(fullname)),
+            plain("-o"),
+            plain(
+                "jsonpath={.spec.template.spec.containers[*].env[?(@.name==\"CURIE_FAKE_MODEL\")].value}",
+            ),
+        ],
+    )
+}
+
 /// Read the fake-ness of the tier's DEPLOYED worker: the already-composed value
 /// of `CURIE_FAKE_MODEL` on the artifact that is actually running.
 ///
@@ -3719,7 +3810,16 @@ pub fn guard_fake_sweep(fake: bool, models: &[String], local: bool) -> Result<()
 /// `inference.deploy` + `fakeModel=true` install is a REAL install, and shell
 /// env is not what the running container was booted with). A probe failure is
 /// reported as itself; it never falls back to a default guess.
-async fn probe_fake_model(opts: &EvalOpts) -> Result<bool> {
+///
+/// `fullname` is the CALLER's already-resolved release name, threaded in rather
+/// than resolved here: the sweep needs the same name for its api port-forward,
+/// and resolving twice costs a second kubectl discovery round-trip per
+/// invocation (#1533). It is `None` on the `--local` path, which reaches no
+/// cluster and must make zero kubectl calls.
+async fn probe_fake_model(
+    opts: &EvalOpts,
+    fullname: Option<&crate::ops::ReleaseFullname>,
+) -> Result<bool> {
     let env = if opts.local {
         let worker = local_worker_container().await?;
         let cmd = OpsCommand::new(
@@ -3744,20 +3844,11 @@ async fn probe_fake_model(opts: &EvalOpts) -> Result<bool> {
             .map(str::to_string)
     } else {
         require_on_path("kubectl")?;
-        let deployment = format!("deployment/{}-worker", opts.release);
-        let cmd = OpsCommand::new(
-            "kubectl",
-            vec![
-                plain("-n"),
-                plain(&opts.namespace),
-                plain("get"),
-                plain(&deployment),
-                plain("-o"),
-                plain(
-                    "jsonpath={.spec.template.spec.containers[*].env[?(@.name==\"CURIE_FAKE_MODEL\")].value}",
-                ),
-            ],
-        );
+        let fullname = fullname.context(
+            "internal: the cluster fake-model probe needs the release fullname its caller resolved",
+        )?;
+        let deployment = fake_model_probe_target(fullname);
+        let cmd = fake_model_probe_command(&opts.namespace, fullname);
         let (ok, stdout, stderr) = run_capture(&cmd).await?;
         if !ok {
             bail!(
@@ -3856,7 +3947,22 @@ async fn eval_sweep(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
         });
         return Ok(());
     }
-    guard_fake_sweep(probe_fake_model(&opts).await?, &opts.models, opts.local)?;
+    // Resolved ONCE for the whole sweep and threaded into both consumers (the
+    // fake-model probe below and the api port-forward further down), so a
+    // `cluster eval --model` pays exactly one discovery round-trip rather than
+    // one per consumer. `--local` reaches no cluster, so it resolves nothing and
+    // makes zero kubectl calls (#1533).
+    let fullname = if opts.local {
+        None
+    } else {
+        require_on_path("kubectl")?;
+        Some(crate::ops::release_fullname(&opts.namespace, &opts.release).await)
+    };
+    guard_fake_sweep(
+        probe_fake_model(&opts, fullname.as_ref()).await?,
+        &opts.models,
+        opts.local,
+    )?;
 
     // The trigger + matrix reads go over the platform API. Local reaches it
     // directly; cluster tunnels an api port-forward kept alive for the whole poll.
@@ -3865,10 +3971,13 @@ async fn eval_sweep(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
         (ApiClient::new(&base, &opts.api_key)?, None)
     } else {
         require_on_path("kubectl")?;
+        let fullname = fullname.as_ref().context(
+            "internal: the cluster api tunnel needs the release fullname resolved above",
+        )?;
         let (pf, api_local_port) = start_port_forward(
             &port_forward_command(
                 &opts.namespace,
-                &opts.release,
+                fullname,
                 "api",
                 opts.api_local_port,
                 API_REMOTE_PORT,
@@ -4011,10 +4120,13 @@ async fn eval_trajectory_platform(opts: EvalOpts, suite: EvalSuite) -> Result<()
         (ApiClient::new(&api_base, &opts.api_key)?, None)
     } else {
         require_on_path("kubectl")?;
+        // Cluster-only branch, so the discovery round-trip never fires for
+        // `--local` (#1533).
+        let fullname = crate::ops::release_fullname(&opts.namespace, &opts.release).await;
         let (pf, api_local_port) = start_port_forward(
             &port_forward_command(
                 &opts.namespace,
-                &opts.release,
+                &fullname,
                 "api",
                 opts.api_local_port,
                 API_REMOTE_PORT,
@@ -4332,6 +4444,10 @@ async fn eval_cluster(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
 
     require_on_path("kubectl")?;
 
+    // Resolved once here: `--dry-run` returned above without contacting a
+    // cluster, and every kubectl target below is a chart resource (#1533).
+    let fullname = crate::ops::release_fullname(&opts.namespace, &opts.release).await;
+
     let advertise_host = resolve_advertise_host(opts.listen_host.as_deref()).await?;
     let mut stub = SlackStub::start("0.0.0.0", opts.listen_port, &advertise_host).await?;
     ui.note(&format!(
@@ -4343,7 +4459,7 @@ async fn eval_cluster(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
     let (_valkey_pf, valkey_local_port) = start_port_forward(
         &port_forward_command(
             &opts.namespace,
-            &opts.release,
+            &fullname,
             "valkey",
             opts.valkey_local_port,
             VALKEY_REMOTE_PORT,
@@ -4359,7 +4475,7 @@ async fn eval_cluster(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
             let (_api_pf, api_local_port) = start_port_forward(
                 &port_forward_command(
                     &opts.namespace,
-                    &opts.release,
+                    &fullname,
                     "api",
                     opts.api_local_port,
                     API_REMOTE_PORT,
@@ -4969,7 +5085,13 @@ mod tests {
 
     #[test]
     fn port_forward_command_renders_svc_and_ports() {
-        let cmd = port_forward_command("curie", "curie", "valkey", 56381, 6379);
+        let cmd = port_forward_command(
+            "curie",
+            &crate::ops::chart_fullname("curie"),
+            "valkey",
+            56381,
+            6379,
+        );
         assert_eq!(
             cmd.display(),
             "kubectl -n curie port-forward svc/curie-valkey 56381:6379"
@@ -5055,8 +5177,8 @@ mod tests {
     /// `deployment/platform-worker` and fail before a single eval case ran.
     #[test]
     fn probe_fake_model_targets_the_chart_rendered_worker() {
-        let argv = fake_model_probe_command("acme-system", &crate::ops::chart_fullname("platform"))
-            .argv();
+        let argv =
+            fake_model_probe_command("acme-system", &crate::ops::chart_fullname("platform")).argv();
         assert!(
             argv.iter().any(|a| a == "deployment/platform-curie-worker"),
             "the fake-model probe must read the chart-rendered worker: {argv:?}"
@@ -5067,7 +5189,8 @@ mod tests {
         );
 
         // Negative control.
-        let control = fake_model_probe_command("curie", &crate::ops::chart_fullname("curie")).argv();
+        let control =
+            fake_model_probe_command("curie", &crate::ops::chart_fullname("curie")).argv();
         assert!(
             control.iter().any(|a| a == "deployment/curie-worker"),
             "the default release must be unchanged: {control:?}"

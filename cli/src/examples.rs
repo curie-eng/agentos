@@ -1310,14 +1310,16 @@ async fn resolve_embedded_cluster_connection(
         .ok()
         .filter(|value| !value.trim().is_empty());
     let local_port = crate::message::DEFAULT_API_LOCAL_PORT;
-    let (api_url, port_forward) = match commands::deploy_port_forward(
+    let tunnel = commands::deploy_api_tunnel(
         explicit_api_url.as_deref(),
         &identity.namespace,
         &identity.release,
         local_port,
         crate::message::API_REMOTE_PORT,
-    ) {
-        Some(command) => {
+    )
+    .await;
+    let (api_url, port_forward) = match tunnel {
+        Some((_fullname, command)) => {
             let (child, effective_port) =
                 crate::message::start_port_forward(&command, local_port, "SRE bot deploy API")
                     .await?;

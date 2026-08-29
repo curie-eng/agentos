@@ -904,6 +904,12 @@ fn observability_api_errors_keep_specific_recovery_guidance() {
 fn cluster_query_parent_namespace_and_release_drive_discovery_for_every_leaf() {
     const NAMESPACE: &str = "observability-parent-ns";
     const RELEASE: &str = "observability-parent-release";
+    // The chart names every resource `{{ include "curie.fullname" . }}-<component>`,
+    // and `curie.fullname` is the release name only when it already contains
+    // "curie", else `<release>-curie`. This release does not contain it, so the
+    // rendered Service names carry the suffix (#1533). The CLI discovers this
+    // name by label selector rather than computing it.
+    const FULLNAME: &str = "observability-parent-release-curie";
     const DISCOVERED_SECRET: &str = "observability-parent-release-secrets";
 
     let run = trace_tree();
@@ -975,7 +981,10 @@ case "$*" in
   *"config view --minify"*)
     printf '%s' 'https://127.0.0.1:6443'
     ;;
-  *"get svc observability-parent-release-ui -n observability-parent-ns"*)
+  *"-n observability-parent-ns get svc -l app.kubernetes.io/instance=observability-parent-release,app.kubernetes.io/component=api"*)
+    printf '%s' 'observability-parent-release-curie-api'
+    ;;
+  *"get svc observability-parent-release-curie-ui -n observability-parent-ns"*)
     printf '{"spec":{"type":"NodePort","ports":[{"port":80,"nodePort":%s}]}}' "$CURIE_TEST_OBSERVABILITY_NODE_PORT"
     ;;
   *"-n observability-parent-ns get secret -l app.kubernetes.io/instance=observability-parent-release"*)
@@ -984,7 +993,7 @@ case "$*" in
   *"-n observability-parent-ns get secret observability-parent-release-secrets"*"apiKey"*)
     printf '%s' "$CURIE_TEST_OBSERVABILITY_API_KEY"
     ;;
-  *"-n observability-parent-ns port-forward svc/observability-parent-release-api 0:8000"*)
+  *"-n observability-parent-ns port-forward svc/observability-parent-release-curie-api 0:8000"*)
     exec python3 "$CURIE_TEST_OBSERVABILITY_PROXY_SCRIPT" 0
     ;;
   *)
@@ -1074,7 +1083,18 @@ esac
         discovery
             .lines()
             .filter(|line| line.contains(&format!(
-                "-n {NAMESPACE} port-forward svc/{RELEASE}-api 0:8000"
+                "-n {NAMESPACE} get svc -l app.kubernetes.io/instance={RELEASE},app.kubernetes.io/component=api"
+            )))
+            .count(),
+        3,
+        "every query must resolve the rendered api Service name by label, not by \
+         string-building it from the release name: {discovery}"
+    );
+    assert_eq!(
+        discovery
+            .lines()
+            .filter(|line| line.contains(&format!(
+                "-n {NAMESPACE} port-forward svc/{FULLNAME}-api 0:8000"
             )))
             .count(),
         3,

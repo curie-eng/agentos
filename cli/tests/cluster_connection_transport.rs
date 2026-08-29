@@ -327,9 +327,7 @@ impl Fixture {
     /// The same fixture with a caller-supplied service at the far end of the
     /// tunnel. `cluster deploy` verification (#1533) turns on what that service
     /// answers, so each case needs its own responder.
-    fn with_backend(
-        handler: impl Fn(&Request) -> Response + Send + Sync + 'static,
-    ) -> Self {
+    fn with_backend(handler: impl Fn(&Request) -> Response + Send + Sync + 'static) -> Self {
         let tools = tempfile::tempdir().expect("create fake tool directory");
         write_kubectl_stub(tools.path());
         let kubectl_path = stub_path(tools.path());

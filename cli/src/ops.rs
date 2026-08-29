@@ -2363,10 +2363,7 @@ mod chart_fullname_tests {
 
         // helm rendered `<61 a's>--api`: the retained dash plus the template's
         // own `-api`. A `trim_end_matches` implementation gives `<61 a's>-api`.
-        assert_eq!(
-            fullname.resource("api"),
-            format!("{}--api", "a".repeat(61))
-        );
+        assert_eq!(fullname.resource("api"), format!("{}--api", "a".repeat(61)));
         assert_eq!(fullname.resource("api").len(), 66);
     }
     /// Helm's `printf "%s-%s" "" "curie"` is `-curie`. Kubernetes rejects that
@@ -4347,12 +4344,16 @@ pub fn up_commands(o: &UpOpts) -> Vec<OpsCommand> {
 }
 
 /// The read-only commands `curie cluster status` runs (and prints under `--dry-run`).
-pub fn status_commands(o: &CommonOpts) -> Vec<OpsCommand> {
+///
+/// Pure: the caller resolves the release's [`ReleaseFullname`] and passes it in
+/// (live for a real run, [`chart_fullname`] under `--dry-run`), so this builder
+/// still makes no cluster call of its own.
+pub fn status_commands(o: &CommonOpts, fullname: &ReleaseFullname) -> Vec<OpsCommand> {
     vec![
         helm_status_cmd(o),
         pods_cmd(o),
-        svc_cmd(o, "ui"),
-        svc_cmd(o, "langfuse-web"),
+        svc_cmd(o, fullname, "ui"),
+        svc_cmd(o, fullname, "langfuse-web"),
         kubeconfig_host_cmd(),
     ]
 }
@@ -4383,13 +4384,20 @@ fn pods_cmd(o: &CommonOpts) -> OpsCommand {
     )
 }
 
-fn svc_cmd(o: &CommonOpts, suffix: &str) -> OpsCommand {
+/// `kubectl get svc <fullname>-<suffix> -n <ns> -o json`.
+///
+/// The choke point for every release Service the CLI reads. It takes a resolved
+/// [`ReleaseFullname`], never the release name: the chart names each Service
+/// `{{ include "curie.fullname" . }}-<component>`, which equals
+/// `<release>-<component>` only when the release name happens to contain the
+/// chart name (#1533).
+fn svc_cmd(o: &CommonOpts, fullname: &ReleaseFullname, suffix: &str) -> OpsCommand {
     OpsCommand::new(
         "kubectl",
         vec![
             plain("get"),
             plain("svc"),
-            plain(format!("{}-{}", o.release, suffix)),
+            plain(fullname.resource(suffix)),
             plain("-n"),
             plain(&o.namespace),
             plain("-o"),
@@ -5591,8 +5599,9 @@ async fn run_prepared_up(
     // label match the Deployment's own `selectorLabels` regardless of any
     // `nameOverride`/`fullnameOverride`, so this is correct in every case.
     let restart_hint = format!(
-        "kubectl -n {} rollout restart deployment -l app.kubernetes.io/instance={},app.kubernetes.io/component=api",
-        opts.common.namespace, opts.common.release
+        "kubectl -n {} rollout restart deployment -l {}",
+        opts.common.namespace,
+        component_selector(&opts.common.release, "api")
     );
     // An explicit but EMPTY `--github-token` / `CURIE_GITHUB_TOKEN`: a routine
     // shell accident that preserves rather than clears (`resolve_github_token`),
@@ -5938,8 +5947,12 @@ impl crate::ui::CliOutput for ClusterStatusOutput {
 
 pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
     if opts.dry_run {
+        // A dry run makes no cluster call, so the release's fullname cannot be
+        // discovered and the chart's no-override rule is the honest best guess.
+        // `dry_run_fullname` computes it and emits the caveat that says so.
+        let fullname = dry_run_fullname(&opts.release);
         return Ok(ClusterStatusOutput::DryRun(crate::ui::DryRunPlan {
-            lines: status_commands(&opts)
+            lines: status_commands(&opts, &fullname)
                 .iter()
                 .map(|cmd| cmd.display())
                 .collect(),
@@ -5983,11 +5996,18 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
         (Vec::new(), 0, 0, Vec::new())
     };
 
-    // (c) URL discovery.
-    let host = discover_host().await;
+    // (c) URL discovery. Resolve the release's rendered fullname once, here on
+    // the live branch -- `--dry-run` returned above without touching kubectl.
+    // The host lookup does not depend on the fullname, so the two run
+    // concurrently rather than paying for each other's round-trip; the service
+    // reads below need both and fan out after.
+    let (fullname, host) = tokio::join!(
+        release_fullname(&opts.namespace, &opts.release),
+        discover_host(),
+    );
     let urls = vec![
-        resolve_service_url(&opts, "ui", "UI", &host, true).await,
-        resolve_service_url(&opts, "langfuse-web", "Langfuse", &host, false).await,
+        resolve_service_url(&opts, &fullname, "ui", "UI", &host, true).await,
+        resolve_service_url(&opts, &fullname, "langfuse-web", "Langfuse", &host, false).await,
     ];
 
     Ok(ClusterStatusOutput::Status(Box::new(ClusterStatus {
@@ -6570,7 +6590,24 @@ pub enum SlackApiBase {
 /// defect `release_secret_name` already avoids by selecting on labels, and this
 /// selects the same way for the same reason.
 fn worker_deployment_selector(release: &str) -> String {
-    format!("app.kubernetes.io/instance={release},app.kubernetes.io/component=worker")
+    component_selector(release, "worker")
+}
+
+/// The label pair that finds one component of a release whatever it is named.
+///
+/// `curie.selectorLabels` (`charts/curie/templates/_helpers.tpl:40-44`) emits
+/// `app.kubernetes.io/instance: {{ .Release.Name }}` and
+/// `app.kubernetes.io/component: {{ .component }}` and reads NEITHER
+/// `nameOverride` nor `fullnameOverride`, so these labels are stable on exactly
+/// the installs whose rendered NAMES are not. One spelling, because three
+/// hand-built copies of the same pair is three places for it to drift from the
+/// chart.
+///
+/// Not the shape [`release_secret_name`] uses: that one deliberately selects on
+/// `instance` alone and filters by name suffix, because the chart Secret
+/// carries no component label.
+fn component_selector(release: &str, component: &str) -> String {
+    format!("app.kubernetes.io/instance={release},app.kubernetes.io/component={component}")
 }
 
 /// Parse `kubectl get deployment -o jsonpath=...` output into an outcome.
@@ -6624,7 +6661,7 @@ pub async fn discover_slack_api_base_url(namespace: &str, release: &str) -> Slac
     }
 }
 
-/// Whether a `<release>-dispatcher` Deployment exists in `namespace` -- i.e. a
+/// Whether the release's dispatcher Deployment exists in `namespace` -- i.e. a
 /// real Slack workspace is connected (via `curie cluster comms --slack`). In
 /// that case `cluster message` posts a real placeholder and routes the approval
 /// card + resumed reply over that connected transport rather than a throwaway
@@ -6634,6 +6671,12 @@ pub async fn discover_slack_api_base_url(namespace: &str, release: &str) -> Slac
 /// absent Deployment an empty success, so "connected" is exactly "non-empty
 /// output on a zero exit".
 pub async fn dispatcher_connected(namespace: &str, release: &str) -> bool {
+    // The chart renders `{{ curie.fullname }}-dispatcher`, so the name must be
+    // resolved and not computed from the release. `--ignore-not-found` turns a
+    // wrong name into a confident empty success, which reads as "no workspace
+    // connected" -- a silent wrong answer rather than a visible failure (#1533).
+    let fullname = release_fullname(namespace, release).await;
+    let dispatcher = fullname.resource("dispatcher");
     let cmd = OpsCommand::new(
         "kubectl",
         vec![
@@ -6641,7 +6684,7 @@ pub async fn dispatcher_connected(namespace: &str, release: &str) -> bool {
             plain(namespace),
             plain("get"),
             plain("deployment"),
-            plain(format!("{release}-dispatcher")),
+            plain(&dispatcher),
             plain("--ignore-not-found"),
             plain("-o"),
             plain("name"),
@@ -6657,7 +6700,7 @@ pub async fn dispatcher_connected(namespace: &str, release: &str) -> bool {
         Ok((false, _, err)) => {
             crate::ui::ui().warn(&format!(
                 "could not determine whether a Slack workspace is connected \
-                 (kubectl probe for {release}-dispatcher failed: {}); assuming \
+                 (kubectl probe for {dispatcher} failed: {}); assuming \
                  NOT connected and using the local reply stub",
                 err.trim().lines().next().unwrap_or("no stderr")
             ));
@@ -6735,6 +6778,183 @@ pub async fn release_secret_name_or_default(namespace: &str, release: &str) -> S
     release_secret_name(namespace, release)
         .await
         .unwrap_or_else(|| format!("{release}-secrets"))
+}
+
+/// A release's rendered `curie.fullname` -- the prefix every Curie-owned object
+/// in the chart is named from.
+///
+/// A newtype rather than a bare `String` on purpose. Every affected call site
+/// used to build `format!("{release}-{component}")` from a raw release name, so
+/// a `&str` parameter merely RENAMED to `fullname` would still compile when a
+/// caller passed the release name -- the original defect, type-checked as
+/// correct. This value is constructible only by [`chart_fullname`] and
+/// [`release_fullname`], so a raw release name cannot reach a resource name at
+/// all, and the compiler finds every site that has not been routed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseFullname(String);
+
+impl ReleaseFullname {
+    /// The chart's name for one of the release's components:
+    /// `{{ include "curie.fullname" . }}-<component>`
+    /// (`charts/curie/templates/_helpers.tpl:16-26`).
+    ///
+    /// The suffix is appended AFTER the fullname's own `trunc 63`, exactly as
+    /// the chart templates do, so a rendered object name can legitimately
+    /// exceed 63 characters. Truncating the joined string instead would name an
+    /// object helm never created; `truncation_happens_before_the_component_suffix`
+    /// pins the ordering.
+    pub fn resource(&self, component: &str) -> String {
+        format!("{}-{component}", self.0)
+    }
+
+    /// The fullname itself, for a caller that needs the prefix rather than a
+    /// component's name.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The chart's `curie.fullname` computed from the release name alone.
+///
+/// **Offline fallback only.** This is the chart's NO-OVERRIDE path
+/// (`charts/curie/templates/_helpers.tpl:16-26`):
+///
+/// ```text
+/// fullnameOverride                 if set
+/// .Release.Name                    if it contains the chart name
+/// "{.Release.Name}-curie"          otherwise
+///                                  ... then | trunc 63 | trimSuffix "-"
+/// ```
+///
+/// It cannot see `nameOverride` or `fullnameOverride`, and both move the
+/// rendered name somewhere this rule computes WRONGLY: `helm template platform
+/// charts/curie --set fullnameOverride=platform` renders `platform-api` while
+/// this rule says `platform-curie-api`. So a live path calls
+/// [`release_fullname`], which asks the cluster and only falls back here when
+/// the cluster cannot answer (`--dry-run`, no kubectl, no release yet).
+/// `cli/tests/chart_fullname_parity.rs` pins both the rule and its limit
+/// against the chart's own render.
+pub fn chart_fullname(release: &str) -> ReleaseFullname {
+    const CHART_NAME: &str = "curie";
+
+    let fullname = if release.contains(CHART_NAME) {
+        release.to_string()
+    } else {
+        format!("{release}-{CHART_NAME}")
+    };
+    // `trunc 63` first, then `trimSuffix "-"`, with sprig's exact semantics:
+    // `trimSuffix` removes EXACTLY ONE trailing dash where
+    // `str::trim_end_matches('-')` removes all of them. Confirmed against the
+    // chart rather than against a reading of sprig -- `--set
+    // fullnameOverride=<61 a's>--<10 z's>` renders the api Service as
+    // `<61 a's>--api`, so one dash survives for the component suffix to join to.
+    let truncated: String = fullname.chars().take(63).collect();
+    let trimmed = truncated.strip_suffix('-').unwrap_or(truncated.as_str());
+    ReleaseFullname(trimmed.to_string())
+}
+
+/// The fullname a `--dry-run` plan prints, plus the caveat that goes with it.
+///
+/// A dry run makes no cluster call, so the release's rendered name cannot be
+/// discovered and [`chart_fullname`]'s no-override rule is the honest best
+/// guess. Every dry-run branch owes the reader the same caveat, so the note
+/// lives with the value rather than being restated at each verb.
+fn dry_run_fullname(release: &str) -> ReleaseFullname {
+    let fullname = chart_fullname(release);
+    crate::ui::ui().note(&format!(
+        "dry run: service names assume the chart's default naming ({}); an install \
+         using nameOverride/fullnameOverride renders them differently",
+        fullname.resource("<component>")
+    ));
+    fullname
+}
+
+/// The fullname implied by a discovered object name, or `None` when that name
+/// does not carry the component suffix we selected on.
+///
+/// Pure, extracted for the same reason [`pick_release_secret`] is: the part
+/// that can be wrong is the selection rule, and it has to be testable with no
+/// cluster. Rejecting rather than blind-stripping is load-bearing -- a name
+/// that does not end in `-<component>` is not ours to truncate, and a
+/// confidently wrong fullname is worse than falling through to the chart rule.
+pub fn fullname_from_resource_name(name: &str, component: &str) -> Option<String> {
+    let fullname = name.trim().strip_suffix(&format!("-{component}"))?;
+    if fullname.is_empty() {
+        return None;
+    }
+    Some(fullname.to_string())
+}
+
+/// One discovery probe: select the release's `<component>` object by label and
+/// read its name back.
+async fn discover_component_fullname(
+    namespace: &str,
+    release: &str,
+    kind: &str,
+    component: &str,
+) -> Option<ReleaseFullname> {
+    let cmd = OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("-n"),
+            plain(namespace),
+            plain("get"),
+            plain(kind),
+            plain("-l"),
+            plain(component_selector(release, component)),
+            plain("-o"),
+            plain("jsonpath={.items[0].metadata.name}"),
+        ],
+    );
+    let (ok, out, _err) = run_capture(&cmd).await.ok()?;
+    if !ok {
+        return None;
+    }
+    fullname_from_resource_name(&out, component).map(ReleaseFullname)
+}
+
+/// The release's rendered fullname, read off the cluster.
+///
+/// Discovered rather than computed for the same reason [`release_secret_name`]
+/// is: `nameOverride` and `fullnameOverride` both change the rendered name and
+/// neither is visible from the release name alone. It works because
+/// `curie.selectorLabels` (`charts/curie/templates/_helpers.tpl:40-44`) emits
+/// `app.kubernetes.io/instance: {{ .Release.Name }}` and
+/// `app.kubernetes.io/component: {{ .component }}` and reads NEITHER override,
+/// so the labels stay stable on exactly the installs whose NAMES do not.
+/// Verified against both override renders, and pinned by
+/// `overrides_preserve_the_discovery_labels`.
+///
+/// Two probes, deliberately: the api Service first, then the worker Deployment.
+/// `api.deploy=false` is a supported install with no api Service, and the
+/// worker Deployment still carries the release labels.
+///
+/// `items[0]` is deterministic: `app.kubernetes.io/instance=<release>` is
+/// unique per release by construction, so there is no set to choose from.
+async fn discover_release_fullname(namespace: &str, release: &str) -> Option<ReleaseFullname> {
+    if let Some(fullname) = discover_component_fullname(namespace, release, "svc", "api").await {
+        return Some(fullname);
+    }
+    discover_component_fullname(namespace, release, "deployment", "worker").await
+}
+
+/// The release's fullname: discovered from the cluster, falling back to the
+/// chart's no-override rule.
+///
+/// THE live entry point. Every path that can reach a cluster resolves here, and
+/// [`chart_fullname`] is what it degrades to. Discovery finding nothing is
+/// normal rather than an error -- `doctor` and a not-yet-installed release must
+/// still work -- so this never fails.
+///
+/// Resolve LAZILY, on the branch that actually needs a cluster-derived name.
+/// Resolving at a verb's entry point fires kubectl on the explicit-`--api-url`
+/// and `--dry-run` paths, which are contractually cluster-offline
+/// (`cli/tests/cluster_connection_transport.rs`). Under `--dry-run`, call
+/// [`chart_fullname`] directly and make no cluster call at all.
+pub async fn release_fullname(namespace: &str, release: &str) -> ReleaseFullname {
+    discover_release_fullname(namespace, release)
+        .await
+        .unwrap_or_else(|| chart_fullname(release))
 }
 
 /// The release's sealing keys (ADR-0094): current first, then the previous one
@@ -6898,24 +7118,33 @@ pub async fn discover_api_url(namespace: &str, release: &str) -> Result<String> 
         release: release.to_string(),
         dry_run: false,
     };
+    // This function is only reached when no `--api-url` was supplied, so it is
+    // already a cluster path: resolving the fullname here keeps the explicit
+    // `--api-url` and `--dry-run` routes free of any kubectl call.
+    let fullname = release_fullname(namespace, release).await;
+    let ui_svc = fullname.resource("ui");
+    let api_svc = fullname.resource("api");
     let host = resolve_node_host().await;
 
-    if let Ok((true, ui_json, _)) = run_capture(&svc_cmd(&common, "ui")).await {
+    if let Ok((true, ui_json, _)) = run_capture(&svc_cmd(&common, &fullname, "ui")).await {
         return ui_api_url_from_parts(&ui_json, host.as_deref());
     }
 
     // No UI. The api service may still be reachable on its own NodePort.
-    if let Ok((true, api_json, _)) = run_capture(&svc_cmd(&common, "api")).await {
+    if let Ok((true, api_json, _)) = run_capture(&svc_cmd(&common, &fullname, "api")).await {
         if let Some(url) = api_url_from_parts(&api_json, host.as_deref()) {
             return Ok(url);
         }
+        // The port-forward hint names 8000:8000, not the old 8123: `cluster
+        // deploy` no longer binds 8123 for its own tunnel, and a hint naming
+        // that exact port would send the operator at the thing #1533 fixed.
         return Err(api_url_usage_err(format!(
-            "the {release}-ui service is absent (ui.deploy=false?) and {release}-api is not NodePort-exposed, so there is no reachable platform API URL; expose it with --set api.service.type=NodePort, or pass --api-url (e.g. via `kubectl port-forward svc/{release}-api 8123:8000`)"
+            "the {ui_svc} service is absent (ui.deploy=false?) and {api_svc} is not NodePort-exposed, so there is no reachable platform API URL; expose it with --set api.service.type=NodePort, or pass --api-url (e.g. via `kubectl port-forward svc/{api_svc} 8000:8000`)"
         )));
     }
 
     Err(api_url_usage_err(format!(
-        "could not read the {release}-ui or {release}-api service in namespace {namespace} to discover the platform API URL; pass --api-url to target the API directly"
+        "could not read the {ui_svc} or {api_svc} service in namespace {namespace} to discover the platform API URL; pass --api-url to target the API directly"
     )))
 }
 
@@ -7026,14 +7255,20 @@ impl ServiceUrl {
     }
 }
 
+/// One `cluster status` URL row.
+///
+/// The displayed `name` and the name `svc_cmd` QUERIES come from the same
+/// resolved fullname on purpose: they diverged before, so status could report a
+/// service it had never asked about.
 async fn resolve_service_url(
     o: &CommonOpts,
+    fullname: &ReleaseFullname,
     suffix: &str,
     label: &str,
     host: &str,
     api: bool,
 ) -> ServiceUrl {
-    let name = format!("{}-{}", o.release, suffix);
+    let name = fullname.resource(suffix);
     let mk = |kind| ServiceUrl {
         label: label.to_string(),
         name: name.clone(),
@@ -7041,7 +7276,7 @@ async fn resolve_service_url(
         api,
         kind,
     };
-    let (ok, out, _) = match run_capture(&svc_cmd(o, suffix)).await {
+    let (ok, out, _) = match run_capture(&svc_cmd(o, fullname, suffix)).await {
         Ok(res) => res,
         Err(_) => return mk(ServiceUrlKind::NotFound),
     };
@@ -7154,7 +7389,7 @@ fn port_forward_hint(ns: &str, name: &str, local: u16, port: u16, path: &str) ->
     )
 }
 
-/// The platform API service's port (`{release}-api`, `api.service.port` in the
+/// The platform API service's port (`<fullname>-api`, `api.service.port` in the
 /// chart). Owned here so the port-forward hint carries no bare literal.
 const API_SERVICE_PORT: u16 = 8000;
 
@@ -7170,6 +7405,7 @@ const API_SERVICE_PORT: u16 = 8000;
 /// service -- plain text, since `--json` serializes this note.
 fn api_base_endpoint(
     o: &CommonOpts,
+    fullname: &ReleaseFullname,
     ui_svc_json: Option<&str>,
     host: Option<&str>,
 ) -> crate::observability::Endpoint {
@@ -7180,19 +7416,23 @@ fn api_base_endpoint(
         browsable: false,
     };
     let Some(ui_svc_json) = ui_svc_json else {
-        return row(None, Some(format!("service {}-ui not found", o.release)));
+        return row(
+            None,
+            Some(format!("service {} not found", fullname.resource("ui"))),
+        );
     };
     match ui_api_url_from_parts(ui_svc_json, host) {
         Ok(url) => row(Some(url), None),
         // Any other failure -- ClusterIP / `--no-expose` (a supported install
         // mode), an unassigned nodePort, an unreadable service, or an
         // unresolvable host -- still leaves a way in: port-forward the API
-        // service directly.
+        // service directly. The operator copies and runs that line, so it must
+        // name the object the chart actually rendered.
         Err(_) => row(
             None,
             Some(port_forward_hint(
                 &o.namespace,
-                &format!("{}-api", o.release),
+                &fullname.resource("api"),
                 API_SERVICE_PORT,
                 API_SERVICE_PORT,
                 "",
@@ -7207,13 +7447,14 @@ fn api_base_endpoint(
 /// port-forward.
 fn service_surface(
     o: &CommonOpts,
+    fullname: &ReleaseFullname,
     suffix: &str,
     name: &str,
     svc_json: Option<&str>,
     host: Option<&str>,
     api: bool,
 ) -> crate::observability::Endpoint {
-    let svc_name = format!("{}-{}", o.release, suffix);
+    let svc_name = fullname.resource(suffix);
     let degraded = |note: String| crate::observability::Endpoint {
         name: name.to_string(),
         url: None,
@@ -7250,8 +7491,8 @@ fn service_surface(
 }
 
 /// Fetch one release service's JSON, or None when kubectl cannot read it.
-async fn fetch_service(o: &CommonOpts, suffix: &str) -> Option<String> {
-    match run_capture(&svc_cmd(o, suffix)).await {
+async fn fetch_service(o: &CommonOpts, fullname: &ReleaseFullname, suffix: &str) -> Option<String> {
+    match run_capture(&svc_cmd(o, fullname, suffix)).await {
         Ok((true, out, _)) => Some(out),
         _ => None,
     }
@@ -7273,14 +7514,24 @@ pub async fn cluster_observability_endpoints(
     // URL-producing path (`discover_api_url`) and the `api_base_endpoint`
     // row. `cluster status` stays human-facing and keeps its display
     // convenience.
-    let (host, ui_svc, langfuse_svc) = tokio::join!(
+    //
+    // Resolved once, before the fan-out: both service reads and all three rows
+    // must agree on the release's rendered name. This is a live path only --
+    // `observability`'s `--dry-run` branch returns before reaching here.
+    // `resolve_node_host()` needs no fullname, so it runs alongside the
+    // resolution instead of behind it; only the service reads have to wait.
+    let (fullname, host) = tokio::join!(
+        release_fullname(&opts.namespace, &opts.release),
         resolve_node_host(),
-        fetch_service(opts, "ui"),
-        fetch_service(opts, "langfuse-web"),
+    );
+    let (ui_svc, langfuse_svc) = tokio::join!(
+        fetch_service(opts, &fullname, "ui"),
+        fetch_service(opts, &fullname, "langfuse-web"),
     );
     vec![
         service_surface(
             opts,
+            &fullname,
             "ui",
             "Curie Console",
             ui_svc.as_deref(),
@@ -7289,13 +7540,14 @@ pub async fn cluster_observability_endpoints(
         ),
         service_surface(
             opts,
+            &fullname,
             "langfuse-web",
             "Langfuse UI (traces / cost / evals)",
             langfuse_svc.as_deref(),
             host.as_deref(),
             false,
         ),
-        api_base_endpoint(opts, ui_svc.as_deref(), host.as_deref()),
+        api_base_endpoint(opts, &fullname, ui_svc.as_deref(), host.as_deref()),
     ]
 }
 
@@ -7304,12 +7556,12 @@ pub async fn cluster_observability_endpoints(
 ///
 /// A superset of what actually runs, not a 1:1 trace: `resolve_node_host` only
 /// falls through to `nodes_cmd()` when `kubeconfig_host_cmd()` yields no host.
-pub fn observability_commands(o: &CommonOpts) -> Vec<OpsCommand> {
+pub fn observability_commands(o: &CommonOpts, fullname: &ReleaseFullname) -> Vec<OpsCommand> {
     vec![
         kubeconfig_host_cmd(),
         nodes_cmd(),
-        svc_cmd(o, "ui"),
-        svc_cmd(o, "langfuse-web"),
+        svc_cmd(o, fullname, "ui"),
+        svc_cmd(o, fullname, "langfuse-web"),
     ]
 }
 
@@ -7323,9 +7575,13 @@ pub async fn observability(
     open: bool,
 ) -> Result<crate::observability::ObservabilityOutput> {
     if opts.dry_run {
+        // No cluster call, so no discovery: the printed names follow the
+        // chart's no-override rule and an override install renders them
+        // differently. `dry_run_fullname` emits that caveat with the value.
+        let fullname = dry_run_fullname(&opts.release);
         return Ok(crate::observability::ObservabilityOutput::DryRun(
             crate::ui::DryRunPlan {
-                lines: observability_commands(&opts)
+                lines: observability_commands(&opts, &fullname)
                     .iter()
                     .map(|cmd| cmd.display())
                     .collect(),
@@ -7355,6 +7611,14 @@ mod tests {
             release: "curie".into(),
             dry_run: false,
         }
+    }
+
+    /// The default release's resolved fullname, for the builders that now take
+    /// one. `curie` contains the chart name, so this is byte-identical to the
+    /// names these tests have always asserted -- see
+    /// `chart_fullname_tests::the_default_release_is_a_byte_identical_no_op`.
+    fn fullname() -> ReleaseFullname {
+        chart_fullname("curie")
     }
 
     #[test]
@@ -9148,7 +9412,7 @@ mod tests {
 
     #[test]
     fn status_lists_the_readonly_commands() {
-        let cmds = status_commands(&common());
+        let cmds = status_commands(&common(), &fullname());
         let lines: Vec<String> = cmds.iter().map(OpsCommand::display).collect();
         assert_eq!(lines[0], "helm status curie -n curie");
         assert_eq!(lines[1], "kubectl get pods -n curie -o json");
@@ -10091,7 +10355,7 @@ mod tests {
     fn api_base_endpoint_maps_ui_service_to_a_non_browsable_api_endpoint() {
         // A NodePort ui service resolves to the UI /api proxy URL (#360) and is
         // NEVER browsable -- it is an agent target, not a webapp.
-        let ep = api_base_endpoint(&common(), Some(NODEPORT_SVC), Some("10.0.0.5"));
+        let ep = api_base_endpoint(&common(), &fullname(), Some(NODEPORT_SVC), Some("10.0.0.5"));
         assert_eq!(ep.name, "Curie API");
         assert_eq!(ep.url.as_deref(), Some("http://10.0.0.5:31234/api"));
         assert_eq!(ep.note, None);
@@ -10102,7 +10366,7 @@ mod tests {
     fn api_base_endpoint_degrades_to_a_note_when_the_ui_service_is_unreadable() {
         // Unreadable ui service: degrade to a note endpoint rather than failing
         // the whole command, and never smuggle the message into `url`.
-        let ep = api_base_endpoint(&common(), Some(""), Some("10.0.0.5"));
+        let ep = api_base_endpoint(&common(), &fullname(), Some(""), Some("10.0.0.5"));
         assert_eq!(ep.name, "Curie API");
         assert_eq!(ep.url, None, "a degraded endpoint must not carry a url");
         assert!(
@@ -10128,7 +10392,7 @@ mod tests {
         // Not "could not read" (the deploy-path wording): the true condition is
         // not-found, and this row must agree with the `ui` row from
         // `service_surface`.
-        let ep = api_base_endpoint(&common(), None, Some("10.0.0.5"));
+        let ep = api_base_endpoint(&common(), &fullname(), None, Some("10.0.0.5"));
         assert_eq!(ep.url, None);
         assert_eq!(ep.note.as_deref(), Some("service curie-ui not found"));
         assert!(!ep.browsable);
@@ -10140,7 +10404,12 @@ mod tests {
         // `--no-expose` is a supported install mode, so this is a real path,
         // not an error: hand back an actionable port-forward for the API
         // service instead of deploy's dead --api-url hint.
-        let ep = api_base_endpoint(&common(), Some(CLUSTERIP_SVC), Some("10.0.0.5"));
+        let ep = api_base_endpoint(
+            &common(),
+            &fullname(),
+            Some(CLUSTERIP_SVC),
+            Some("10.0.0.5"),
+        );
         assert_eq!(ep.url, None);
         assert_eq!(
             ep.note.as_deref(),
@@ -10156,10 +10425,15 @@ mod tests {
     fn api_base_endpoint_notes_stay_plain_for_the_json_payload() {
         // `Ui::emit_json` documents the payload as machine-consumed: no ANSI.
         for ep in [
-            api_base_endpoint(&common(), None, Some("10.0.0.5")),
-            api_base_endpoint(&common(), Some(CLUSTERIP_SVC), Some("10.0.0.5")),
-            api_base_endpoint(&common(), Some(""), Some("10.0.0.5")),
-            api_base_endpoint(&common(), Some(NODEPORT_SVC), None),
+            api_base_endpoint(&common(), &fullname(), None, Some("10.0.0.5")),
+            api_base_endpoint(
+                &common(),
+                &fullname(),
+                Some(CLUSTERIP_SVC),
+                Some("10.0.0.5"),
+            ),
+            api_base_endpoint(&common(), &fullname(), Some(""), Some("10.0.0.5")),
+            api_base_endpoint(&common(), &fullname(), Some(NODEPORT_SVC), None),
         ] {
             let note = ep.note.as_deref().unwrap_or("");
             assert!(
@@ -10172,7 +10446,7 @@ mod tests {
 
     #[test]
     fn api_base_endpoint_hints_a_port_forward_when_the_host_is_unresolvable() {
-        let ep = api_base_endpoint(&common(), Some(NODEPORT_SVC), None);
+        let ep = api_base_endpoint(&common(), &fullname(), Some(NODEPORT_SVC), None);
         assert_eq!(ep.url, None);
         assert_eq!(
             ep.note.as_deref(),
@@ -10191,6 +10465,7 @@ mod tests {
     fn service_surface_maps_a_nodeport_service_to_a_browsable_url_row() {
         let ep = service_surface(
             &common(),
+            &fullname(),
             "ui",
             "Curie Console",
             Some(NODEPORT_SVC),
@@ -10207,6 +10482,7 @@ mod tests {
     fn service_surface_degrades_when_the_service_is_not_found() {
         let ep = service_surface(
             &common(),
+            &fullname(),
             "ui",
             "Curie Console",
             None,
@@ -10225,6 +10501,7 @@ mod tests {
         // unresolvable host is an explicit note, never a fabricated URL.
         let ep = service_surface(
             &common(),
+            &fullname(),
             "ui",
             "Curie Console",
             Some(NODEPORT_SVC),
@@ -10244,6 +10521,7 @@ mod tests {
         let unassigned = r#"{"spec":{"type":"NodePort","ports":[{"port":80}]}}"#;
         let ep = service_surface(
             &common(),
+            &fullname(),
             "ui",
             "Curie Console",
             Some(unassigned),
@@ -10262,6 +10540,7 @@ mod tests {
     fn service_surface_maps_a_clusterip_service_to_a_plain_port_forward_note() {
         let ep = service_surface(
             &common(),
+            &fullname(),
             "langfuse-web",
             "Langfuse UI",
             Some(CLUSTERIP_SVC),
@@ -10286,6 +10565,7 @@ mod tests {
     fn service_surface_degrades_an_unreadable_service_to_a_note() {
         let ep = service_surface(
             &common(),
+            &fullname(),
             "ui",
             "Curie Console",
             Some("{not json"),
@@ -10299,7 +10579,7 @@ mod tests {
 
     #[test]
     fn observability_dry_run_plan_lists_the_read_only_lookups() {
-        let lines: Vec<String> = observability_commands(&common())
+        let lines: Vec<String> = observability_commands(&common(), &fullname())
             .iter()
             .map(|c| c.display())
             .collect();

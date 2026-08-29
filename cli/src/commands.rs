@@ -4362,6 +4362,17 @@ fn unbound_declared_secrets(declared: &[String], bound: &[String]) -> Vec<String
         .collect()
 }
 
+/// True when a cluster verb SELF-PLUMBS its API transport: no explicit
+/// `--api-url`/`CURIE_API_URL` was given, so the release's api Service is
+/// reached over a loopback kubectl port-forward rather than direct-dialed.
+///
+/// The single statement of that discriminant (#1533). [`deploy_port_forward`]
+/// and [`deploy_api_tunnel`] both key on this one predicate, so "is a tunnel in
+/// play?" cannot answer differently in the two places a call site consults it.
+pub fn deploy_self_plumbs(api_url: Option<&str>) -> bool {
+    api_url.is_none()
+}
+
 /// The kubectl port-forward the auto `cluster deploy` path opens to the
 /// release's api service (ADR-0057, superseding ADR-0024's deploy transport).
 /// When no `--api-url` is given, deploy self-plumbs this loopback tunnel and
@@ -4372,20 +4383,53 @@ fn unbound_declared_secrets(declared: &[String], bound: &[String]) -> Vec<String
 pub fn deploy_port_forward(
     api_url: Option<&str>,
     namespace: &str,
-    release: &str,
+    fullname: &crate::ops::ReleaseFullname,
     local_port: u16,
     remote_port: u16,
 ) -> Option<crate::ops::OpsCommand> {
-    match api_url {
-        Some(_) => None,
-        None => Some(crate::message::port_forward_command(
-            namespace,
-            release,
-            "api",
-            local_port,
-            remote_port,
-        )),
+    if !deploy_self_plumbs(api_url) {
+        return None;
     }
+    Some(crate::message::port_forward_command(
+        namespace,
+        fullname,
+        "api",
+        local_port,
+        remote_port,
+    ))
+}
+
+/// The self-plumbed API tunnel for a cluster verb: the release's RESOLVED
+/// [`crate::ops::ReleaseFullname`] and the port-forward command that reaches its
+/// api Service, returned TOGETHER. `None` when an explicit
+/// `--api-url`/`CURIE_API_URL` was given, since that path direct-dials the URL
+/// and builds no tunnel.
+///
+/// The fullname is resolved LAZILY, on the self-plumbed branch only: the
+/// explicit `--api-url` path names no Service, and
+/// `cli/tests/cluster_connection_transport.rs` pins a fully explicit connection
+/// as never invoking kubectl at all, so resolving eagerly would fire kubectl on
+/// a path proven not to.
+///
+/// Paired rather than handed back as two independent `Option`s (#1533): the
+/// fullname the tunnel forwards to is the same one the caller needs for its
+/// `svc/<name>` diagnostics and unreachable hints. Carrying them apart left
+/// every call site re-deriving the self-plumbed discriminant for itself and
+/// asserting at runtime that the two `Option`s agreed.
+pub async fn deploy_api_tunnel(
+    api_url: Option<&str>,
+    namespace: &str,
+    release: &str,
+    local_port: u16,
+    remote_port: u16,
+) -> Option<(crate::ops::ReleaseFullname, crate::ops::OpsCommand)> {
+    if !deploy_self_plumbs(api_url) {
+        return None;
+    }
+    let fullname = crate::ops::release_fullname(namespace, release).await;
+    let command =
+        crate::message::port_forward_command(namespace, &fullname, "api", local_port, remote_port);
+    Some((fullname, command))
 }
 
 /// True when `cluster deploy` must auto-discover the release Secret key: no
