@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from curie_worker import run
 from curie_worker.config import WorkerConfig
 from curie_worker.run import (
     _MAX_TUNABLE_SECONDS,
@@ -540,3 +541,193 @@ def test_crashing_supervised_task_does_not_cancel_its_siblings() -> None:
         assert sibling_ran["ok"] is True
 
     asyncio.run(go())
+
+
+# -- #1751: the boot rekey is CALLED by _run, once, before any consumer reads --
+#
+# Every other test of the legacy approval-card migration drives
+# ``ApprovalCardStore.migrate_legacy_thread_keyed_refs`` directly on the store,
+# so all of them would still pass with the boot call deleted from ``_run`` --
+# and the whole #1751 fix would be dead in production behind a green suite.
+# These four pin the call site itself: it happens, it happens BEFORE the
+# consumers start (a legacy ref must be rekeyed before any resume turn is
+# read), and neither a failure nor a budget overrun stops the worker booting.
+
+
+class _FakeCardStore:
+    """Records the boot rekey, and can fail or stall the way Valkey would.
+
+    ``events`` is the one ordering log shared with the fake consumers, so a
+    single list witnesses both that the migration ran and where it ran relative
+    to the reads it must precede.
+    """
+
+    def __init__(
+        self,
+        events: list[str],
+        *,
+        raises: BaseException | None = None,
+        stall_s: float = 0.0,
+    ) -> None:
+        self._events = events
+        self._raises = raises
+        self._stall_s = stall_s
+
+    async def migrate_legacy_thread_keyed_refs(self) -> None:
+        # Recorded before the stall so the ordering assertion still holds on the
+        # budget-overrun path, where the call is cancelled rather than returning.
+        self._events.append("migrate")
+        if self._stall_s:
+            await asyncio.sleep(self._stall_s)
+        if self._raises is not None:
+            raise self._raises
+
+
+class _FakeSupervisedTask:
+    """A consumer whose ``run`` records itself and returns immediately, so each
+    ``_supervise`` settles on a clean completion and the top-level gather
+    finishes without needing a signal to arrive."""
+
+    def __init__(self, events: list[str], name: str) -> None:
+        self._events = events
+        self._name = name
+
+    async def run(self) -> None:
+        self._events.append(self._name)
+
+    def request_stop(self) -> None:
+        # Only reachable through the signal handler, which these tests never fire.
+        pass
+
+
+class _FakeTransport:
+    """Stands in for every long-lived resource ``_run``'s finally block disposes;
+    one class covers all three disposal verbs the runtime's fields use."""
+
+    async def close(self) -> None:
+        pass
+
+    async def aclose(self) -> None:
+        pass
+
+    async def dispose(self) -> None:
+        pass
+
+
+class _FakeRuntime:
+    """Exactly the attributes ``_run`` touches -- deliberately not a real
+    ``Runtime``, so nothing here reaches Valkey, Postgres, or the substrate."""
+
+    def __init__(self, card_store: _FakeCardStore, events: list[str]) -> None:
+        self.card_store = card_store
+        self.consumer = _FakeSupervisedTask(events, "runs")
+        self.killswitch = _FakeSupervisedTask(events, "killswitch")
+        self.eval_consumer = _FakeSupervisedTask(events, "evals")
+        self.connector_loop = None
+        self.runner = _FakeTransport()
+        self.sink = _FakeTransport()
+        self.eval_http = _FakeTransport()
+        self.async_redis = _FakeTransport()
+        self.eval_redis = _FakeTransport()
+        self.engine = _FakeTransport()
+
+
+def _boot(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    raises: BaseException | None = None,
+    stall_s: float = 0.0,
+) -> list[str]:
+    """Drive one full ``_run`` boot against the fakes and return the event log.
+
+    The card store is built here rather than passed in, so it records into the
+    very list the fake consumers append to: one shared log is what makes the
+    ordering assertion meaningful, and a store built by the caller would write
+    its "migrate" marker into a list this function never returns.
+
+    ``build`` and ``run_heartbeat`` are the only two things stubbed: the first
+    because wiring the real runtime would open sockets, the second because the
+    real heartbeat never returns and would hang the gather. The migration call
+    site under test is untouched.
+    """
+    events: list[str] = []
+    card_store = _FakeCardStore(events, raises=raises, stall_s=stall_s)
+
+    def fake_build(config: WorkerConfig, env: Any) -> _FakeRuntime:
+        return _FakeRuntime(card_store, events)
+
+    async def fake_heartbeat(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(run, "build", fake_build)
+    monkeypatch.setattr(run, "run_heartbeat", fake_heartbeat)
+    # The outer wait_for is a deadlock guard, not the behaviour under test: a
+    # regression that leaves _run blocked must fail this suite, not hang CI.
+    asyncio.run(asyncio.wait_for(run._run(WorkerConfig(), {}), timeout=10))
+    return events
+
+
+def test_run_migrates_legacy_card_refs_once_at_boot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events = _boot(monkeypatch)
+    # Exactly once: it is a boot migration, not something supervised or retried,
+    # and a second pass would re-walk the keyspace on every restart for nothing.
+    assert events.count("migrate") == 1
+
+
+def test_run_migrates_legacy_card_refs_before_the_consumers_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The ordering the whole fix rests on. A ref still under the pre-#1723 thread
+    # key must be rekeyed onto its approval id BEFORE the runs consumer can read
+    # a resume turn for it -- otherwise the card the turn settles is the one the
+    # migration has not reached yet, which is the stranding #1751 exists to end.
+    events = _boot(monkeypatch)
+    assert events[0] == "migrate"
+    assert "runs" in events
+
+
+def test_run_boots_the_consumers_when_the_migration_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A Valkey blip during a best-effort boot migration must degrade to "those
+    # cards stay live until their TTL", never to a worker that will not start.
+    with caplog.at_level(logging.WARNING, logger="curie_worker.run"):
+        events = _boot(monkeypatch, raises=RuntimeError("valkey down"))
+
+    assert events.count("migrate") == 1
+    assert "runs" in events  # boot continued past the failure
+    failures = [
+        r
+        for r in caplog.records
+        if r.name == "curie_worker.run" and "migration failed" in r.getMessage()
+    ]
+    assert len(failures) == 1
+    assert failures[0].levelno == logging.ERROR
+
+
+def test_run_boots_the_consumers_when_the_migration_exceeds_its_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The bound exists because this pass runs BEFORE the liveness heartbeat
+    # starts: unbounded, a degraded Valkey stalls readiness until the exec probe
+    # kills the pod, and a best-effort migration becomes a restart loop. The
+    # budget is monkeypatched rather than waited out, so the test neither takes
+    # 30 seconds nor hard-codes the production number.
+    monkeypatch.setattr(run, "_CARD_MIGRATION_BUDGET_S", 0.01)
+    with caplog.at_level(logging.WARNING, logger="curie_worker.run"):
+        # Far past the patched budget; wait_for cancels it, so nothing waits 30s.
+        events = _boot(monkeypatch, stall_s=30.0)
+
+    assert events.count("migrate") == 1
+    assert "runs" in events  # boot continued past the cut-short migration
+    cut_short = [
+        r
+        for r in caplog.records
+        if r.name == "curie_worker.run" and "cut short" in r.getMessage()
+    ]
+    assert len(cut_short) == 1
+    assert cut_short[0].levelno == logging.WARNING

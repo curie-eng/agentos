@@ -556,6 +556,39 @@ previous chart. Deleting a StatefulSet does not delete the PVCs its
 `volumeClaimTemplates` created, so the old store's volume survives the upgrade
 and the rollback re-attaches it with the data intact. Keep the export anyway.
 
+### Approvals pending across a worker roll
+
+An upgrade restarts the worker, and an approval can easily be pending for hours
+or days -- so approvals routinely straddle a roll. The worker remembers where it
+posted each Slack approval card so it can settle that card (strip the
+Approve/Reject buttons) when the approval is resolved out of band or EXPIRES.
+That memory used to be keyed by conversation and is now keyed by approval id.
+
+A resolution through the buttons carries its own card location, so it settles
+either way. An **expiry** carries no click: if the worker cannot find the
+remembered card, the expired approval keeps buttons that answer every later
+click with an error.
+
+**No operator action is required.** On startup the worker moves any remaining
+conversation-keyed entries onto their approval id once, so those approvals
+settle normally. The pass is best-effort and cannot fail startup; if Valkey is
+unreachable at that moment the affected cards simply stay live until their
+memory lapses (14 days).
+
+One narrow window stays open while the roll is in progress. The startup pass
+runs once, so it cannot see an entry written after it finished -- and a replica
+still on the old build keeps serving, and keeps recording cards the old way,
+until it is replaced. An approval created by such a replica after the new one
+started can therefore still keep live buttons if it later expires. The window
+closes on its own once the roll completes and every replica is on the new
+build; anything missed lapses with its existing 14 day memory.
+
+One residual case is not recoverable: a card remembered by a build old enough
+that the entry did not record which approval it belonged to cannot be paired
+with anything. If such an approval expires, its message keeps its buttons.
+Edit or delete that Slack message by hand, or ignore it -- the approval itself
+is expired in the API either way, so a click on it cannot approve anything.
+
 ## Known gotchas
 
 Notes from the first installs of the chart on fresh clusters, kept for the
