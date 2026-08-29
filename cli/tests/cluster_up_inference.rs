@@ -148,6 +148,10 @@ exit 64
             TARGET_NAMESPACE,
             "--release",
             TARGET_RELEASE,
+            // This harness only ever installs with `--dev`, so every non-empty
+            // existing-values document it simulates must also record
+            // `security.allowDevDefaults=true`. Without it `guard_dev_defaults_flip`
+            // (#1145) correctly refuses the run; do not drop the flag to make a test pass.
             "--dev",
             "--no-expose",
         ];
@@ -258,10 +262,13 @@ fn inferred_provider_refresh_preserves_recorded_web_egress() {
     let fixture = Fixture::new(
         r#"{
           "agentSandbox":{"runner":{"credentials":"sk-or-v1-PLACEHOLDER"}},
-          "security":{"networkPolicy":{"allowedEgress":[{
-            "cidr":"203.0.113.0/24",
-            "ports":[{"protocol":"TCP","port":443}]
-          }]}}
+          "security":{
+            "allowDevDefaults":true,
+            "networkPolicy":{"allowedEgress":[{
+              "cidr":"203.0.113.0/24",
+              "ports":[{"protocol":"TCP","port":443}]
+            }]}
+          }
         }"#,
     );
     let output = fixture.run(&[], VALID_RESOLVER, &[]);
@@ -292,10 +299,13 @@ fn repeated_bare_up_does_not_duplicate_the_recorded_inferred_provider_route() {
     let fixture = Fixture::new(
         r#"{
           "agentSandbox":{"runner":{"credentials":"sk-or-v1-PLACEHOLDER"}},
-          "security":{"networkPolicy":{"allowedEgress":[
-            {"cidr":"1.1.1.1/32","ports":[{"protocol":"TCP","port":443}]},
-            {"cidr":"203.0.113.0/24","ports":[{"protocol":"TCP","port":443}]}
-          ]}}
+          "security":{
+            "allowDevDefaults":true,
+            "networkPolicy":{"allowedEgress":[
+              {"cidr":"1.1.1.1/32","ports":[{"protocol":"TCP","port":443}]},
+              {"cidr":"203.0.113.0/24","ports":[{"protocol":"TCP","port":443}]}
+            ]}
+          }
         }"#,
     );
     let output = fixture.run(&[], VALID_RESOLVER, &[]);
@@ -327,7 +337,7 @@ fn repeated_bare_up_preserves_the_inferred_gvisor_off_posture() {
     // The successful recovery retry from the first install records this value.
     // A second bare up must pass it to Helm before rendering the preflight, or
     // the chart's default `auto` posture will recreate the rejected Job.
-    let fixture = Fixture::new(r#"{"security":{"gvisor":{"mode":"off"}}}"#);
+    let fixture = Fixture::new(r#"{"security":{"gvisor":{"mode":"off"},"allowDevDefaults":true}}"#);
     let output = fixture.run(&[], VALID_RESOLVER, &[]);
     assert_success(&fixture, &output);
 
@@ -345,7 +355,7 @@ fn repeated_bare_up_preserves_the_inferred_gvisor_off_posture() {
 
 #[test]
 fn explicit_gvisor_mode_replaces_the_recorded_inferred_posture() {
-    let fixture = Fixture::new(r#"{"security":{"gvisor":{"mode":"off"}}}"#);
+    let fixture = Fixture::new(r#"{"security":{"gvisor":{"mode":"off"},"allowDevDefaults":true}}"#);
     let output = fixture.run(
         &[],
         VALID_RESOLVER,
@@ -391,8 +401,12 @@ fn explicit_provider_list_containing_the_detected_provider_wins_silently() {
 
 #[test]
 fn preserved_credential_contradiction_fails_after_the_values_read() {
-    let fixture =
-        Fixture::new(r#"{"agentSandbox":{"runner":{"credentials":"sk-or-v1-PLACEHOLDER"}}}"#);
+    let fixture = Fixture::new(
+        r#"{
+          "agentSandbox":{"runner":{"credentials":"sk-or-v1-PLACEHOLDER"}},
+          "security":{"allowDevDefaults":true}
+        }"#,
+    );
     let output = fixture.run(
         &[],
         "not resolver JSON",
@@ -509,10 +523,62 @@ fn inference_uses_the_effective_credential_precedence() {
     assert!(final_helm_value.upgrade_log().contains("8.8.8.8/32"));
     assert!(!final_helm_value.upgrade_log().contains("1.1.1.1/32"));
 
-    let preserved =
-        Fixture::new(r#"{"agentSandbox":{"runner":{"credentials":"sk-or-v1-PLACEHOLDER"}}}"#);
+    let preserved = Fixture::new(
+        r#"{
+          "agentSandbox":{"runner":{"credentials":"sk-or-v1-PLACEHOLDER"}},
+          "security":{"allowDevDefaults":true}
+        }"#,
+    );
     let output = preserved.run(&[], VALID_RESOLVER, &[]);
     assert_success(&preserved, &output);
     assert!(preserved.upgrade_log().contains("1.1.1.1/32"));
     assert_inference_once(&stderr(&output), "--allow-egress-host openrouter");
+}
+
+/// #1145, through the real consumer path: `curie cluster up --dev` against a
+/// release that is NOT already on dev defaults refuses before Helm is ever
+/// invoked to mutate anything.
+///
+/// `AGENTS.md`, "Guards are outcome-tested", requires that a gate's regression
+/// test assert the outcome through the real consumer path. Every other
+/// `guard_dev_defaults_flip` test calls the pure function directly, so deleting
+/// its call site in `run_prepared_up` -- or moving it to AFTER the helm upgrade,
+/// which is the damaging half of the same mistake -- leaves them all green.
+/// This is the test that fails if the guard is ever disconnected from
+/// `cluster up`, and `upgrade_count() == 0` is the assertion that proves it
+/// still runs BEFORE any mutation.
+///
+/// The existing-values document is non-empty and records no
+/// `security.allowDevDefaults`, so it is a SEALED release and distinguishable
+/// from "no existing release" (which is the supported fresh-install case).
+#[test]
+fn dev_over_a_sealed_release_is_refused_before_helm_mutates_anything() {
+    let fixture = Fixture::new(r#"{"security":{"gvisor":{"mode":"off"}}}"#);
+    let output = fixture.run(&[], VALID_RESOLVER, &[]);
+    let shown = all_output(&output);
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a refused `--dev` is a usage error (exit 2), not a runtime failure: {shown}"
+    );
+    assert_eq!(
+        fixture.upgrade_count(),
+        0,
+        "the guard must refuse BEFORE any helm mutation: {}",
+        fixture.upgrade_log()
+    );
+    assert!(
+        fixture.helm_log().contains("get values"),
+        "the refusal must follow the live values read, not precede it: {}",
+        fixture.helm_log()
+    );
+
+    let refusal = stderr(&output).to_lowercase();
+    for token in ["--dev", "refused", "pvc"] {
+        assert!(
+            refusal.contains(token),
+            "the refusal must reach stderr and say why (missing {token:?}): {refusal}"
+        );
+    }
 }
