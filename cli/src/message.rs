@@ -2909,6 +2909,10 @@ pub struct EvalOpts {
     /// Explicit eval-case file; `None` resolves `evals/cases.json` like
     /// `skill eval` (cwd, then the recorded bundle dir).
     pub cases: Option<PathBuf>,
+    /// Case selector (`--case-id`, repeatable). Empty runs the whole suite.
+    /// A value matching no case in the suite exits 2 (Usage) rather than
+    /// silently narrowing to nothing -- a mistyped selector fails the gate.
+    pub case_ids: Vec<String>,
     pub channel: Option<String>,
     pub namespace: String,
     pub release: String,
@@ -3275,6 +3279,56 @@ pub fn validate_eval_models(models: &[String]) -> Result<()> {
 /// target tier's message enqueue+await path and grade with the shared grader,
 /// so a suite that passes at `skill` can be re-asserted verbatim at `local` and
 /// `cluster` (issue #344, the per-tier parity gate).
+/// Refuse a `--case-id` selector on a `--model` sweep (exit 4, ADR-0041).
+///
+/// A sweep is the platform eval plane: it sends only the suite NAME to
+/// `POST /evals/trigger` and the worker reloads the DEPLOYED suite server-side,
+/// then reports a per-model pass-rate over all of it. A locally chosen subset is
+/// never read, so honoring the flag is impossible -- silently sweeping the whole
+/// deployed suite while displaying a narrowed selection is the failure this
+/// prevents, exactly as the sibling `--cases` refusal does (#608). Unsupported
+/// rather than Usage: no input and no retry makes the selector apply here.
+///
+/// Pure so the class and the wording are testable with no stack.
+pub fn guard_sweep_case_ids(case_ids: &[String]) -> Result<()> {
+    if case_ids.is_empty() {
+        return Ok(());
+    }
+    Err(anyhow::Error::from(
+        crate::exit::CliError::unsupported(
+            "--case-id has no effect on a --model sweep: the sweep runs a platform eval that \
+             reloads the deployed bundle's evals/cases.json server-side and reports a per-model \
+             pass-rate over the whole suite, so a local case selection is never applied",
+        )
+        .with_fix(
+            "drop --case-id to sweep the whole deployed suite, or omit --model to grade selected \
+             cases in-CLI with `curie <skill|local|cluster> eval --case-id <ID>`",
+        ),
+    ))
+}
+
+/// Refuse a `--case-id` selector on the local/cluster trajectory eval (exit 4).
+///
+/// Trajectory scoring at these tiers runs on the worker eval plane against the
+/// deployed bundle's suite, the same construction that refuses `--cases` here,
+/// so a locally chosen subset never reaches the scorer. Pure for the same reason
+/// as [`guard_sweep_case_ids`].
+pub fn guard_trajectory_case_ids(case_ids: &[String]) -> Result<()> {
+    if case_ids.is_empty() {
+        return Ok(());
+    }
+    Err(anyhow::Error::from(
+        crate::exit::CliError::unsupported(
+            "--case-id cannot narrow a local/cluster trajectory eval because trajectory scoring \
+             runs on the worker eval plane against the deployed bundle's suite",
+        )
+        .with_fix(
+            "drop --case-id to grade the whole deployed trajectory suite, or use \
+             `curie skill eval --case-id <ID>` to grade selected local cases",
+        ),
+    ))
+}
+
 pub async fn eval(opts: EvalOpts) -> Result<()> {
     validate_eval_models(&opts.models)?;
     // Refuse `--concurrency > 1` before any enqueue or work (#706): the CLI eval
@@ -3320,6 +3374,7 @@ pub async fn eval(opts: EvalOpts) -> Result<()> {
                 ),
             ));
         }
+        guard_sweep_case_ids(&opts.case_ids)?;
         let loaded = resolve_eval(opts.cases.clone())?;
         return eval_sweep(opts, loaded.suite).await;
     }
@@ -3347,12 +3402,21 @@ pub async fn eval(opts: EvalOpts) -> Result<()> {
                 ),
             ));
         }
+        guard_trajectory_case_ids(&opts.case_ids)?;
         return eval_trajectory_platform(opts, loaded.suite).await;
     }
+    let total_cases = loaded.suite.cases.len();
+    // Exit 2 before any stack contact when a --case-id matches nothing: a
+    // mistyped selector fails the gate instead of greening an empty run.
+    let suite = crate::evals::select_cases(loaded.suite, &opts.case_ids)?;
+    if let Some(note) = crate::evals::selection_note(&opts.case_ids, suite.cases.len(), total_cases)
+    {
+        crate::ui::ui().note(&note);
+    }
     if opts.local {
-        eval_local(opts, loaded.suite).await
+        eval_local(opts, suite).await
     } else {
-        eval_cluster(opts, loaded.suite).await
+        eval_cluster(opts, suite).await
     }
 }
 
@@ -5212,6 +5276,7 @@ mod tests {
             models: Vec::new(),
             concurrency: 1,
             sampling: crate::eval_sampling::SampleConfig::default(),
+            case_ids: Vec::new(),
         }
     }
 
@@ -5699,5 +5764,103 @@ mod tests {
             fix.contains("--cases") && fix.contains("--model"),
             "the fix points at both the drop-flag and the in-CLI path: {fix}"
         );
+    }
+
+    // --- --case-id selector (#2007) -----------------------------------------
+
+    fn selector_suite() -> EvalSuite {
+        EvalSuite {
+            name: "smoke".into(),
+            cases: ["greets-the-user", "looks-up-the-order"]
+                .iter()
+                .map(|id| {
+                    let mut case = eval_case(GraderKind::Contains, "hi");
+                    case.id = (*id).into();
+                    case
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn an_unmatched_case_id_selector_is_a_usage_error_at_local_and_cluster() {
+        // The headline of #2007 on the parity tiers: a mistyped selector fails
+        // the gate (exit 2) rather than greening an empty run.
+        let err = crate::evals::select_cases(
+            selector_suite(),
+            std::slice::from_ref(&"greets-the-usr".to_string()),
+        )
+        .expect_err("a mistyped --case-id must fail");
+        assert_eq!(
+            crate::exit::classify(&err).0,
+            crate::exit::ExitClass::Usage,
+            "{err:#}"
+        );
+        assert!(format!("{err:#}").contains("greets-the-usr"), "{err:#}");
+    }
+
+    #[test]
+    fn a_case_id_selector_on_a_model_sweep_is_unsupported() {
+        assert!(guard_sweep_case_ids(&[]).is_ok(), "no selector, no refusal");
+        let err = guard_sweep_case_ids(std::slice::from_ref(&"greets-the-user".to_string()))
+            .expect_err("--case-id + --model must be refused");
+        let (class, fix) = crate::exit::classify(&err);
+        assert_eq!(
+            class,
+            crate::exit::ExitClass::Unsupported,
+            "the refusal is ADR-0041 Unsupported (exit 4): {err:#}"
+        );
+        assert!(format!("{err:#}").contains("--case-id"), "{err:#}");
+        assert!(
+            fix.expect("the refusal names the honest alternative")
+                .contains("--case-id"),
+            "the fix names the in-CLI path that honors a selector",
+        );
+    }
+
+    #[test]
+    fn a_case_id_selector_on_the_trajectory_platform_path_is_unsupported() {
+        assert!(
+            guard_trajectory_case_ids(&[]).is_ok(),
+            "no selector, no refusal"
+        );
+        let err = guard_trajectory_case_ids(std::slice::from_ref(&"greets-the-user".to_string()))
+            .expect_err("--case-id on a trajectory eval must be refused");
+        let (class, fix) = crate::exit::classify(&err);
+        assert_eq!(class, crate::exit::ExitClass::Unsupported, "{err:#}");
+        assert!(
+            format!("{err:#}").contains("trajectory"),
+            "the message names the plane that cannot honor it: {err:#}"
+        );
+        assert!(
+            fix.expect("the refusal names the honest alternative")
+                .contains("skill eval --case-id"),
+            "the fix names the tier that does honor a selector",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mistyped_case_id_fails_a_local_eval_dry_run_rather_than_greening_it() {
+        // End of the wire at this tier: even a --dry-run refuses, so a mistyped
+        // selector cannot be discovered only after a full stack run.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cases = dir.path().join("cases.json");
+        std::fs::write(
+            &cases,
+            r#"{"name":"smoke","cases":[{"id":"greets-the-user","input":"hi","grader":{"kind":"contains","expected":"hi"}}]}"#,
+        )
+        .expect("write suite");
+        let mut opts = eval_opts(true, Some("C7"));
+        opts.cases = Some(cases);
+        opts.case_ids = vec!["greets-the-usr".to_string()];
+        let err = eval(opts)
+            .await
+            .expect_err("a mistyped --case-id must fail the run");
+        assert_eq!(
+            crate::exit::classify(&err).0,
+            crate::exit::ExitClass::Usage,
+            "{err:#}"
+        );
+        assert!(format!("{err:#}").contains("greets-the-usr"), "{err:#}");
     }
 }

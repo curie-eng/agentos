@@ -925,6 +925,12 @@ enum SkillAction {
         /// bundle's).
         #[arg(long)]
         cases: Option<PathBuf>,
+        /// Run only the case(s) with these ids; repeat to select several.
+        /// Omit to run the whole suite. A value that matches no case in the
+        /// suite exits 2 (usage), so a mistyped selector fails the gate instead
+        /// of greening an empty run.
+        #[arg(long = "case-id", value_name = "ID")]
+        case_id: Vec<String>,
         /// Runner base URL (defaults to the started runner, then localhost).
         #[arg(long)]
         url: Option<String>,
@@ -1158,6 +1164,12 @@ enum LocalAction {
         /// bundle's).
         #[arg(long)]
         cases: Option<PathBuf>,
+        /// Run only the case(s) with these ids; repeat to select several.
+        /// Omit to run the whole suite. A value that matches no case in the
+        /// suite exits 2 (usage), so a mistyped selector fails the gate instead
+        /// of greening an empty run.
+        #[arg(long = "case-id", value_name = "ID")]
+        case_id: Vec<String>,
         /// Slack channel id to send as; must match the target agent's
         /// channel. Omit to use the sole deployed agent's channel.
         #[arg(long)]
@@ -1818,6 +1830,12 @@ enum ClusterAction {
         /// bundle's).
         #[arg(long)]
         cases: Option<PathBuf>,
+        /// Run only the case(s) with these ids; repeat to select several.
+        /// Omit to run the whole suite. A value that matches no case in the
+        /// suite exits 2 (usage), so a mistyped selector fails the gate instead
+        /// of greening an empty run.
+        #[arg(long = "case-id", value_name = "ID")]
+        case_id: Vec<String>,
         /// Slack channel id to send as; must match the target agent's
         /// channel. Omit to use the sole deployed agent's channel.
         #[arg(long)]
@@ -2408,6 +2426,7 @@ async fn run(command: Option<Command>) -> Result<()> {
             } => commands::send(&text, &user, event_type.into(), url).await,
             SkillAction::Eval {
                 cases,
+                case_id,
                 url,
                 model,
                 secret,
@@ -2419,7 +2438,16 @@ async fn run(command: Option<Command>) -> Result<()> {
                     artifacts::Channel::current(),
                     artifacts::version(),
                 );
-                commands::eval(cases, url, model, secret, image, sampling.config()?).await
+                commands::eval(
+                    cases,
+                    case_id,
+                    url,
+                    model,
+                    secret,
+                    image,
+                    sampling.config()?,
+                )
+                .await
             }
             SkillAction::EvalInit { out, force } => {
                 curie::eval_init::run(curie::eval_init::EvalInitOpts { out, force })
@@ -2617,6 +2645,7 @@ async fn run(command: Option<Command>) -> Result<()> {
             }
             LocalAction::Eval {
                 cases,
+                case_id,
                 channel,
                 valkey_password,
                 api_url,
@@ -2631,6 +2660,7 @@ async fn run(command: Option<Command>) -> Result<()> {
             } => {
                 message::eval(message::EvalOpts {
                     cases,
+                    case_ids: case_id,
                     channel,
                     namespace: "curie".into(),
                     release: "curie".into(),
@@ -3166,6 +3196,7 @@ async fn run(command: Option<Command>) -> Result<()> {
             }
             ClusterAction::Eval {
                 cases,
+                case_id,
                 channel,
                 namespace,
                 release,
@@ -3205,6 +3236,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 .await?;
                 message::eval(message::EvalOpts {
                     cases,
+                    case_ids: case_id,
                     channel,
                     namespace,
                     release,
@@ -4223,6 +4255,91 @@ mod tests {
                 action: ClusterAction::Eval { model, .. },
             }) => assert_eq!(model, vec!["opus"]),
             _ => panic!("expected cluster eval sweep"),
+        }
+    }
+
+    #[test]
+    fn eval_case_id_is_repeatable_at_every_tier_and_empty_when_absent() {
+        // #2007: `--case-id` is the eval case SELECTOR (distinct from `--cases`,
+        // the suite FILE). Absent means the whole suite; repeated means a subset,
+        // and a value matching nothing exits 2 rather than greening an empty run.
+        match Cli::try_parse_from([
+            "curie",
+            "skill",
+            "eval",
+            "--case-id",
+            "greets-the-user",
+            "--case-id",
+            "escalates",
+        ])
+        .expect("skill eval --case-id should parse")
+        .command
+        {
+            Some(Command::Skill {
+                action: SkillAction::Eval { case_id, .. },
+            }) => assert_eq!(case_id, vec!["greets-the-user", "escalates"]),
+            _ => panic!("expected skill eval with a selector"),
+        }
+        match Cli::try_parse_from(["curie", "skill", "eval"])
+            .expect("skill eval should parse")
+            .command
+        {
+            Some(Command::Skill {
+                action: SkillAction::Eval { case_id, .. },
+            }) => assert!(case_id.is_empty(), "no selector -> the whole suite"),
+            _ => panic!("expected skill eval"),
+        }
+        match Cli::try_parse_from([
+            "curie",
+            "local",
+            "eval",
+            "--case-id",
+            "greets-the-user",
+            "--case-id",
+            "escalates",
+        ])
+        .expect("local eval --case-id should parse")
+        .command
+        {
+            Some(Command::Local {
+                action: LocalAction::Eval { case_id, .. },
+            }) => assert_eq!(case_id, vec!["greets-the-user", "escalates"]),
+            _ => panic!("expected local eval with a selector"),
+        }
+        match Cli::try_parse_from(["curie", "local", "eval"])
+            .expect("local eval should parse")
+            .command
+        {
+            Some(Command::Local {
+                action: LocalAction::Eval { case_id, .. },
+            }) => assert!(case_id.is_empty()),
+            _ => panic!("expected local eval"),
+        }
+        match Cli::try_parse_from([
+            "curie",
+            "cluster",
+            "eval",
+            "--case-id",
+            "greets-the-user",
+            "--case-id",
+            "escalates",
+        ])
+        .expect("cluster eval --case-id should parse")
+        .command
+        {
+            Some(Command::Cluster {
+                action: ClusterAction::Eval { case_id, .. },
+            }) => assert_eq!(case_id, vec!["greets-the-user", "escalates"]),
+            _ => panic!("expected cluster eval with a selector"),
+        }
+        match Cli::try_parse_from(["curie", "cluster", "eval"])
+            .expect("cluster eval should parse")
+            .command
+        {
+            Some(Command::Cluster {
+                action: ClusterAction::Eval { case_id, .. },
+            }) => assert!(case_id.is_empty()),
+            _ => panic!("expected cluster eval"),
         }
     }
 
