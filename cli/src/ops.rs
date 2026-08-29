@@ -2428,6 +2428,190 @@ mod chart_fullname_tests {
         assert_eq!(fullname_from_resource_name("platform-api", "worker"), None);
     }
 
+    // --- discovery cardinality ------------------------------------------------
+
+    /// The ordinary case: one labelled object, one answer.
+    #[test]
+    fn exactly_one_match_yields_the_fullname() {
+        assert_eq!(
+            component_discovery("platform-curie-api\n", "api"),
+            ComponentDiscovery::Found(chart_fullname("platform"))
+        );
+        assert_eq!(
+            component_discovery("platform-api", "api"),
+            ComponentDiscovery::Found(ReleaseFullname("platform".to_string()))
+        );
+    }
+
+    /// Zero matches is absence, not failure: the caller falls through to the
+    /// worker probe and then to the chart rule, and says nothing, because a
+    /// not-yet-installed release is a supported state.
+    #[test]
+    fn zero_matches_is_not_present() {
+        assert_eq!(
+            component_discovery("", "api"),
+            ComponentDiscovery::NotPresent
+        );
+        assert_eq!(
+            component_discovery("\n  \n", "api"),
+            ComponentDiscovery::NotPresent
+        );
+
+        let absent = ComponentDiscovery::NotPresent;
+        let fallback = chart_fullname("platform");
+        assert_eq!(
+            absent.fallback_warning("platform-ns", "platform", &fallback),
+            None,
+            "an absent release must degrade quietly; only a FAILED probe warns"
+        );
+    }
+
+    /// THE finding. Kubernetes does not enforce label uniqueness, so `items[0]`
+    /// could name a workload that is not ours -- a stray `unexpected-api`
+    /// carrying the release labels would resolve the fullname to `unexpected`
+    /// and point `cluster message`/`comms`/`eval` at it. Two matches are
+    /// refused, never resolved to the first.
+    #[test]
+    fn two_matches_are_refused_not_resolved_to_the_first() {
+        let outcome = component_discovery("platform-curie-api\nunexpected-api\n", "api");
+        match &outcome {
+            ComponentDiscovery::Ambiguous { component, names } => {
+                let listed: Vec<&str> = names.iter().map(String::as_str).collect();
+                assert_eq!(component.as_str(), "api");
+                assert_eq!(listed, ["platform-curie-api", "unexpected-api"]);
+            }
+            other => panic!("two matches must be refused, not resolved: {other:?}"),
+        }
+    }
+
+    /// A single match that does not carry the component suffix is rejected, not
+    /// blind-stripped -- the rule `fullname_from_resource_name` pins, asserted
+    /// here at the level that actually decides what discovery returns.
+    #[test]
+    fn a_single_match_without_the_suffix_is_rejected_not_stripped() {
+        assert_eq!(
+            component_discovery("platform-ui\n", "api"),
+            ComponentDiscovery::NotPresent
+        );
+        assert_eq!(
+            component_discovery("api\n", "api"),
+            ComponentDiscovery::NotPresent,
+            "stripping `-api` off `api` leaves an empty fullname"
+        );
+    }
+
+    /// A FAILED probe is not an absent release. It must warn, say why, and say
+    /// that the name in use is a guess -- otherwise `cluster status` reports
+    /// the Service as "not found" and masks an RBAC denial.
+    #[test]
+    fn a_failed_probe_warns_that_the_name_is_a_guess() {
+        let denied = ComponentDiscovery::ProbeFailed {
+            component: "api".to_string(),
+            detail: "Error from server (Forbidden): services is forbidden".to_string(),
+        };
+        let fallback = chart_fullname("platform");
+        let warning = denied
+            .fallback_warning("platform-ns", "platform", &fallback)
+            .expect("a failed probe must warn");
+
+        assert!(warning.contains("FAILED"), "{warning}");
+        assert!(warning.contains("Forbidden"), "{warning}");
+        assert!(warning.contains("platform-ns"), "the namespace: {warning}");
+        assert!(warning.contains("COMPUTED GUESS"), "{warning}");
+        assert!(warning.contains("platform-curie-<component>"), "{warning}");
+        assert!(
+            warning.contains("nameOverride/fullnameOverride"),
+            "{warning}"
+        );
+    }
+
+    /// The ambiguity warning has to be actionable: the namespace, the selector,
+    /// and every candidate name, so the operator can see the collision it has
+    /// to resolve.
+    #[test]
+    fn the_ambiguity_warning_names_the_selector_and_the_candidates() {
+        let ambiguous = ComponentDiscovery::Ambiguous {
+            component: "api".to_string(),
+            names: vec![
+                "platform-curie-api".to_string(),
+                "unexpected-api".to_string(),
+            ],
+        };
+        let fallback = chart_fullname("platform");
+        let warning = ambiguous
+            .fallback_warning("platform-ns", "platform", &fallback)
+            .expect("an ambiguous match must warn");
+
+        assert!(warning.contains("platform-ns"), "{warning}");
+        assert!(
+            warning.contains(&component_selector("platform", "api")),
+            "{warning}"
+        );
+        assert!(warning.contains("platform-curie-api"), "{warning}");
+        assert!(warning.contains("unexpected-api"), "{warning}");
+        assert!(warning.contains("COMPUTED GUESS"), "{warning}");
+    }
+
+    /// A resolved name wins from either probe; otherwise a PROBLEM outranks
+    /// absence, so a denied api probe is not buried by an absent worker.
+    #[test]
+    fn a_probe_problem_outranks_an_absent_second_probe() {
+        let denied = ComponentDiscovery::ProbeFailed {
+            component: "api".to_string(),
+            detail: "forbidden".to_string(),
+        };
+        let absent = ComponentDiscovery::NotPresent;
+        let found = ComponentDiscovery::Found(chart_fullname("platform"));
+
+        assert_eq!(
+            preferred_probe_outcome(denied.clone(), absent.clone()),
+            denied
+        );
+        assert_eq!(
+            preferred_probe_outcome(absent.clone(), denied.clone()),
+            denied
+        );
+        // A real answer from either probe still wins.
+        assert_eq!(preferred_probe_outcome(denied, found.clone()), found);
+        assert_eq!(
+            preferred_probe_outcome(absent.clone(), absent.clone()),
+            absent
+        );
+    }
+
+    // --- the chart Secret's offline name --------------------------------------
+
+    /// `release_secret_name_or_default` fell back to `format!("{release}-secrets")`,
+    /// the raw chart-resource form #1533 names explicitly. A `platform` install
+    /// renders `platform-curie-secrets`, so the old fallback had `migrate-store`
+    /// stage a pod against a Secret that does not exist. The fallback is now the
+    /// `secrets` resource of `chart_fullname`, pinned here as a literal rather
+    /// than by re-deriving it.
+    #[test]
+    fn the_secret_fallback_uses_the_chart_rule_for_a_non_default_release() {
+        assert_eq!(
+            chart_fullname("platform").resource("secrets"),
+            "platform-curie-secrets"
+        );
+        assert_eq!(
+            chart_fullname("acme-prod").resource("secrets"),
+            "acme-prod-curie-secrets"
+        );
+    }
+
+    /// The negative control for that change: `"curie".contains("curie")`, so
+    /// the default release's Secret name is byte-identical to the computed
+    /// `format!("{release}-secrets")` it replaced. Every local, CI, and
+    /// parity-ladder install uses `--release curie`.
+    #[test]
+    fn the_secret_fallback_is_byte_identical_for_the_default_release() {
+        assert_eq!(chart_fullname("curie").resource("secrets"), "curie-secrets");
+        assert_eq!(
+            chart_fullname("my-curie-prod").resource("secrets"),
+            "my-curie-prod-secrets"
+        );
+    }
+
     // --- rendered argv for a non-default release ------------------------------
 
     /// `cluster status` under a release that does not contain the chart name.
@@ -6767,17 +6951,24 @@ pub fn pick_release_secret(names: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The chart Secret's name, falling back to the historical guess.
+/// The chart Secret's name, falling back to the chart's own naming rule.
 ///
 /// A caller that must NAME the Secret (rather than read through it) still needs
 /// a string when the cluster is unreachable -- a `--dry-run` plan, for
-/// instance. The fallback is the old computed form, which is right for the
-/// installs that set `nameOverride` and wrong in exactly the way this function
-/// exists to fix, so it is a last resort and never silent in a live run.
+/// instance. That fallback used to be `format!("{release}-secrets")`, the raw
+/// chart-resource form this sweep exists to delete: for an ordinary `platform`
+/// install the chart renders `platform-curie-secrets`, so a transient discovery
+/// failure had `migrate-store` stage a pod against a Secret that does not
+/// exist. It now goes through [`chart_fullname`], which is the chart's
+/// no-override rule and byte-identical for the default `curie` release.
+///
+/// Only the FALLBACK changed. Live discovery still selects on the instance
+/// label alone and filters by suffix afterwards ([`pick_release_secret`]),
+/// which is what makes it correct under `nameOverride`/`fullnameOverride`.
 pub async fn release_secret_name_or_default(namespace: &str, release: &str) -> String {
     release_secret_name(namespace, release)
         .await
-        .unwrap_or_else(|| format!("{release}-secrets"))
+        .unwrap_or_else(|| chart_fullname(release).resource("secrets"))
 }
 
 /// A release's rendered `curie.fullname` -- the prefix every Curie-owned object
@@ -6885,14 +7076,127 @@ pub fn fullname_from_resource_name(name: &str, component: &str) -> Option<String
     Some(fullname.to_string())
 }
 
-/// One discovery probe: select the release's `<component>` object by label and
-/// read its name back.
+/// The outcome of one discovery probe, kept as four distinct cases on purpose.
+///
+/// The probe used to collapse "this release is not installed", "kubectl is not
+/// on PATH", "RBAC denied the read" and "two objects matched" into a single
+/// `None`, and the caller then silently computed a name. The distinction that
+/// matters: falling back for a genuinely ABSENT or not-yet-installed release is
+/// defensible -- `doctor` and a fresh namespace must still work -- while
+/// falling back because the probe FAILED is a guess dressed as an answer, and
+/// doing it silently is the defect. Each case is its own variant so
+/// [`release_fullname`] can say which one happened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComponentDiscovery {
+    /// Exactly one labelled object matched and its name carries the component
+    /// suffix: the release's rendered fullname, read off the cluster.
+    Found(ReleaseFullname),
+    /// The probe ran and answered: this release has no such object.
+    NotPresent,
+    /// The probe did not answer -- kubectl missing, unreachable API server,
+    /// RBAC denial, malformed request. Carries the first line of stderr.
+    ProbeFailed { component: String, detail: String },
+    /// More than one object carried the release's labels for this component.
+    /// Kubernetes does not enforce label uniqueness, so this is reachable with
+    /// a hand-applied or copy-pasted object, and taking `items[0]` would
+    /// silently point every downstream verb at a workload that is not ours.
+    Ambiguous {
+        component: String,
+        names: Vec<String>,
+    },
+}
+
+impl ComponentDiscovery {
+    /// The warning an operator must see before this outcome degrades into a
+    /// COMPUTED name, or `None` when degrading is the honest, normal thing.
+    ///
+    /// Pure, so the wording -- the part that has to be actionable -- is
+    /// testable with no cluster.
+    pub fn fallback_warning(
+        &self,
+        namespace: &str,
+        release: &str,
+        fallback: &ReleaseFullname,
+    ) -> Option<String> {
+        let guess = format!(
+            "the name being used, `{}`, is a COMPUTED GUESS from the chart's default \
+             naming and is WRONG on an install using nameOverride/fullnameOverride",
+            fallback.resource("<component>")
+        );
+        match self {
+            // A real answer needs no caveat, and an absent release is the
+            // documented reason this path has a fallback at all.
+            Self::Found(_) | Self::NotPresent => None,
+            Self::ProbeFailed { component, detail } => Some(format!(
+                "could not discover release `{release}` resource names in namespace \
+                 `{namespace}`: the kubectl probe for the `{component}` object FAILED \
+                 ({detail}). Continuing, but {guess}. Check kubectl access and RBAC \
+                 (get/list on services and deployments in `{namespace}`)."
+            )),
+            Self::Ambiguous { component, names } => Some(format!(
+                "refusing to choose: {} objects in namespace `{namespace}` match \
+                 `{}` ({}). Curie cannot tell which one belongs to release `{release}`, \
+                 so it targets NONE of them. Continuing, but {guess}. Relabel or remove \
+                 the objects that are not part of release `{release}`.",
+                names.len(),
+                component_selector(release, component),
+                names.join(", ")
+            )),
+        }
+    }
+}
+
+/// The outcome implied by the names a probe matched.
+///
+/// Pure, extracted for the same reason [`fullname_from_resource_name`] is: the
+/// cardinality rule is the part that can be wrong, and it has to be testable
+/// with no cluster.
+///
+/// EXACTLY ONE match resolves. Zero is absence. Two or more is
+/// [`ComponentDiscovery::Ambiguous`] and never `names[0]`: those labels are not
+/// unique by construction, so a stray Service named `unexpected-api` carrying
+/// the release's labels would otherwise resolve the fullname to `unexpected`
+/// and send `cluster message`/`comms`/`eval` at an unrelated workload.
+///
+/// Two legitimate releases are NOT this case: the selector pins
+/// `app.kubernetes.io/instance=<release>`, so another release's objects never
+/// match in the first place.
+pub fn component_discovery(names: &str, component: &str) -> ComponentDiscovery {
+    let matched: Vec<String> = names
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect();
+
+    match matched.len() {
+        0 => ComponentDiscovery::NotPresent,
+        1 => match fullname_from_resource_name(&matched[0], component) {
+            Some(fullname) => ComponentDiscovery::Found(ReleaseFullname(fullname)),
+            // Labelled for the component but not NAMED for it: not ours to
+            // truncate. Fall through to the next probe rather than mint a
+            // confidently wrong fullname.
+            None => ComponentDiscovery::NotPresent,
+        },
+        _ => ComponentDiscovery::Ambiguous {
+            component: component.to_string(),
+            names: matched,
+        },
+    }
+}
+
+/// One discovery probe: select the release's `<component>` objects by label and
+/// read their names back.
+///
+/// The jsonpath ranges over ALL matches rather than reading `.items[0]`, so
+/// cardinality is observable at all -- a single-item jsonpath cannot tell one
+/// match from three.
 async fn discover_component_fullname(
     namespace: &str,
     release: &str,
     kind: &str,
     component: &str,
-) -> Option<ReleaseFullname> {
+) -> ComponentDiscovery {
     let cmd = OpsCommand::new(
         "kubectl",
         vec![
@@ -6903,14 +7207,44 @@ async fn discover_component_fullname(
             plain("-l"),
             plain(component_selector(release, component)),
             plain("-o"),
-            plain("jsonpath={.items[0].metadata.name}"),
+            plain("jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{end}"),
         ],
     );
-    let (ok, out, _err) = run_capture(&cmd).await.ok()?;
-    if !ok {
-        return None;
+    match run_capture(&cmd).await {
+        Ok((true, out, _err)) => component_discovery(&out, component),
+        Ok((false, _out, err)) => {
+            let detail = err.trim().lines().next().unwrap_or("no stderr");
+            ComponentDiscovery::ProbeFailed {
+                component: component.to_string(),
+                detail: detail.to_string(),
+            }
+        }
+        Err(exc) => ComponentDiscovery::ProbeFailed {
+            component: component.to_string(),
+            detail: exc.to_string(),
+        },
     }
-    fullname_from_resource_name(&out, component).map(ReleaseFullname)
+}
+
+/// Which of the two probes' outcomes to report.
+///
+/// A resolved name wins from either probe. Otherwise a PROBLEM (a failed probe,
+/// an ambiguous match) outranks absence, because absence is the one case that
+/// degrades silently and it must not mask the other two.
+fn preferred_probe_outcome(
+    api: ComponentDiscovery,
+    worker: ComponentDiscovery,
+) -> ComponentDiscovery {
+    if matches!(api, ComponentDiscovery::Found(_)) {
+        return api;
+    }
+    if matches!(worker, ComponentDiscovery::Found(_)) {
+        return worker;
+    }
+    if matches!(api, ComponentDiscovery::NotPresent) {
+        return worker;
+    }
+    api
 }
 
 /// The release's rendered fullname, read off the cluster.
@@ -6929,13 +7263,17 @@ async fn discover_component_fullname(
 /// `api.deploy=false` is a supported install with no api Service, and the
 /// worker Deployment still carries the release labels.
 ///
-/// `items[0]` is deterministic: `app.kubernetes.io/instance=<release>` is
-/// unique per release by construction, so there is no set to choose from.
-async fn discover_release_fullname(namespace: &str, release: &str) -> Option<ReleaseFullname> {
-    if let Some(fullname) = discover_component_fullname(namespace, release, "svc", "api").await {
-        return Some(fullname);
+/// Neither probe picks among matches. `app.kubernetes.io/instance=<release>`
+/// separates two legitimate releases, but nothing in Kubernetes stops a stray
+/// object from carrying the same pair of labels, so a set of size two or more
+/// is refused rather than resolved -- see [`component_discovery`].
+async fn discover_release_fullname(namespace: &str, release: &str) -> ComponentDiscovery {
+    let api = discover_component_fullname(namespace, release, "svc", "api").await;
+    if matches!(api, ComponentDiscovery::Found(_)) {
+        return api;
     }
-    discover_component_fullname(namespace, release, "deployment", "worker").await
+    let worker = discover_component_fullname(namespace, release, "deployment", "worker").await;
+    preferred_probe_outcome(api, worker)
 }
 
 /// The release's fullname: discovered from the cluster, falling back to the
@@ -6946,15 +7284,32 @@ async fn discover_release_fullname(namespace: &str, release: &str) -> Option<Rel
 /// normal rather than an error -- `doctor` and a not-yet-installed release must
 /// still work -- so this never fails.
 ///
+/// It is not, however, silent about WHY it degraded. A failed probe (RBAC
+/// denial, no kubectl, unreachable API server) and an ambiguous match both warn
+/// before the computed name is used, because on an install using
+/// `nameOverride`/`fullnameOverride` that name is known to be wrong: without
+/// the warning `cluster status` reports "not found" for a Service that exists
+/// and a self-plumbed deploy fails against a name helm never rendered. Control
+/// flow is deliberately unchanged -- the fallback still happens, loudly.
+/// Failing mutating verbs closed on a failed probe is the stronger fix and is
+/// left as a follow-up policy decision.
+///
 /// Resolve LAZILY, on the branch that actually needs a cluster-derived name.
 /// Resolving at a verb's entry point fires kubectl on the explicit-`--api-url`
 /// and `--dry-run` paths, which are contractually cluster-offline
 /// (`cli/tests/cluster_connection_transport.rs`). Under `--dry-run`, call
 /// [`chart_fullname`] directly and make no cluster call at all.
 pub async fn release_fullname(namespace: &str, release: &str) -> ReleaseFullname {
-    discover_release_fullname(namespace, release)
-        .await
-        .unwrap_or_else(|| chart_fullname(release))
+    match discover_release_fullname(namespace, release).await {
+        ComponentDiscovery::Found(fullname) => fullname,
+        outcome => {
+            let fallback = chart_fullname(release);
+            if let Some(warning) = outcome.fallback_warning(namespace, release, &fallback) {
+                crate::ui::ui().warn(&warning);
+            }
+            fallback
+        }
+    }
 }
 
 /// The release's sealing keys (ADR-0094): current first, then the previous one
