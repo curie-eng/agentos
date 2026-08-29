@@ -4340,6 +4340,11 @@ export const commandManifest = {
           "name": "plugin-compat"
         },
         {
+          "about": "Validate every Curie-owned skill against the Agent Skills reference validator, pinned to `skills-ref==0.1.1` so the gate is deterministic (`bash scripts/check-agent-skills.sh`). The inbound spec-conformance twin of `plugin-compat`: that one proves our bundles are accepted by Claude Code, this one proves our skills satisfy the published spec",
+          "hidden": false,
+          "name": "agent-skills"
+        },
+        {
           "about": "Run the committed eval suites through the fake model and assert every case goes RED -- the falsifiability gate's real-path negative control (#619, `bash cli/scripts/eval-falsifiability.sh`). Offline, no credential",
           "hidden": false,
           "name": "eval-falsifiability"

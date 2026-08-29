@@ -633,6 +633,12 @@ enum DevAction {
     DocsLint,
     /// Validate every `examples/` bundle against Claude Code (`bash scripts/check-plugin-compat.sh`).
     PluginCompat,
+    /// Validate every Curie-owned skill against the Agent Skills reference
+    /// validator, pinned to `skills-ref==0.1.1` so the gate is deterministic
+    /// (`bash scripts/check-agent-skills.sh`). The inbound spec-conformance twin
+    /// of `plugin-compat`: that one proves our bundles are accepted by Claude
+    /// Code, this one proves our skills satisfy the published spec.
+    AgentSkills,
     /// Run the committed eval suites through the fake model and assert every case
     /// goes RED -- the falsifiability gate's real-path negative control (#619,
     /// `bash cli/scripts/eval-falsifiability.sh`). Offline, no credential.
@@ -2299,6 +2305,9 @@ async fn run(command: Option<Command>) -> Result<()> {
             DevAction::DocsLint => commands::dev_script("scripts/check-docs.sh", &[]).await,
             DevAction::PluginCompat => {
                 commands::dev_script("scripts/check-plugin-compat.sh", &[]).await
+            }
+            DevAction::AgentSkills => {
+                commands::dev_script("scripts/check-agent-skills.sh", &[]).await
             }
             DevAction::EvalFalsifiability => {
                 commands::dev_script("cli/scripts/eval-falsifiability.sh", &[]).await
@@ -4472,6 +4481,14 @@ mod tests {
             cli.command,
             Some(Command::Dev {
                 action: DevAction::DocsLint
+            })
+        ));
+        let cli = Cli::try_parse_from(["curie", "dev", "agent-skills"])
+            .expect("dev agent-skills should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Dev {
+                action: DevAction::AgentSkills
             })
         ));
         let cli = Cli::try_parse_from(["curie", "dev", "eval-falsifiability"])
