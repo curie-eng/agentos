@@ -35,8 +35,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::api::{Agent, ApiClient};
 use crate::chat::{
-    await_reply, await_resume, continue_hint_line, continue_hint_long_line, parse_approval_id,
-    resolve_targets, Outcome, SlackStub,
+    await_reply, await_resume, capped, continue_hint_line, continue_hint_long_line,
+    parse_approval_id, resolve_targets, Outcome, SlackStub,
 };
 use crate::evals::{EvalCase, EvalSuite, ExpectedStatus, LoadedEval};
 use crate::ops::{plain, require_on_path, run_capture, OpsCommand};
@@ -447,6 +447,11 @@ struct TrustCleanupSpec {
 
 struct ClusterStubTrust {
     cleanup: TrustCleanupSpec,
+    /// The temporary-trust rollout can leave the prior worker in its graceful
+    /// drain period.  This is deliberately derived from the selected
+    /// Deployment rather than from `--timeout-secs`: the latter starts only
+    /// after the eventual queue entry is enqueued.
+    prevention_wait_budget: Duration,
     armed: bool,
 }
 
@@ -459,6 +464,7 @@ struct WorkerTrustView {
     env_present: bool,
     env: Vec<serde_json::Value>,
     trust: Option<String>,
+    termination_grace_period: Duration,
 }
 
 #[cfg(unix)]
@@ -537,6 +543,7 @@ impl ClusterStubTrust {
     ) -> Result<Self> {
         let deployment = stub_trust_deployment(fullname);
         let view = read_worker_trust(namespace, &deployment).await?;
+        let prevention_wait_budget = worker_prevention_wait_budget(&view);
         let host = if advertise_host.contains(':') && !advertise_host.starts_with('[') {
             format!("[{advertise_host}]")
         } else {
@@ -562,6 +569,7 @@ impl ClusterStubTrust {
                     original: view.trust,
                     mode: TrustMutationMode::Legacy,
                 },
+                prevention_wait_budget,
                 armed: false,
             });
         }
@@ -599,8 +607,13 @@ impl ClusterStubTrust {
         // API accepted the mutation must run restoration.
         let guard = Self {
             cleanup,
+            prevention_wait_budget,
             armed: true,
         };
+        crate::ui::ui().note(&format!(
+            "temporarily updating worker reply trust; allowing up to {}s for the worker rollout and prior worker drain before enqueue (separate from --timeout-secs)",
+            guard.prevention_wait_budget.as_secs()
+        ));
         let (ok, _, err) = run_capture(&apply).await?;
         if !ok {
             bail!(
@@ -609,9 +622,16 @@ impl ClusterStubTrust {
             );
         }
 
-        let rollout = guard.rollout_command();
+        let rollout = guard.prevention_rollout_command();
         let (ok, _, err) = run_capture(&rollout).await?;
         if !ok {
+            if rollout_timed_out(&err) {
+                return Err(worker_prevention_timeout_error(
+                    release,
+                    namespace,
+                    guard.prevention_wait_budget,
+                ));
+            }
             bail!(
                 "waiting for the worker to trust cluster-message stub origin {origin}: {}",
                 err.trim()
@@ -620,7 +640,11 @@ impl ClusterStubTrust {
         // rollout status returns once the new replica is Ready. The outgoing
         // pod can still be Terminating and still blocked in XREADGROUP, which
         // is how the first cluster message strands its own turn (#1532).
-        wait_for_worker_pods_to_release_claimers(namespace, release).await?;
+        crate::ui::ui().note(
+            "worker replacement is ready; waiting for every prior worker to stop claiming before enqueue",
+        );
+        wait_for_worker_pods_to_release_claimers(namespace, release, guard.prevention_wait_budget)
+            .await?;
         Ok(guard)
     }
 
@@ -629,7 +653,7 @@ impl ClusterStubTrust {
             return Ok(());
         }
         restore_cluster_trust(&self.cleanup).await?;
-        let (ok, _, err) = run_capture(&self.rollout_command()).await?;
+        let (ok, _, err) = run_capture(&self.restore_rollout_command()).await?;
         if !ok {
             bail!(
                 "waiting for the worker to restore its prior Slack trust: {}",
@@ -641,23 +665,76 @@ impl ClusterStubTrust {
         Ok(())
     }
 
-    fn rollout_command(&self) -> OpsCommand {
-        OpsCommand::new(
-            "kubectl",
-            vec![
-                plain("-n"),
-                plain(&self.cleanup.namespace),
-                plain("rollout"),
-                plain("status"),
-                plain(format!("deployment/{}", self.cleanup.deployment)),
-                plain("--timeout=120s"),
-            ],
+    fn prevention_rollout_command(&self) -> OpsCommand {
+        worker_rollout_command(
+            &self.cleanup.namespace,
+            &self.cleanup.deployment,
+            self.prevention_wait_budget,
+        )
+    }
+
+    /// Restoring operator state is cleanup, not part of the no-lost-turn gate.
+    /// Keep it short so a completed message never blocks for a full graceful
+    /// drain interval while the deployment rolls back its temporary trust.
+    fn restore_rollout_command(&self) -> OpsCommand {
+        worker_rollout_command(
+            &self.cleanup.namespace,
+            &self.cleanup.deployment,
+            WORKER_TRUST_RESTORE_ROLLOUT_TIMEOUT,
         )
     }
 }
 
-const WORKER_POD_SETTLE_TIMEOUT: Duration = Duration::from_secs(120);
+const DEFAULT_WORKER_TERMINATION_GRACE_PERIOD: Duration = Duration::from_secs(30);
+const WORKER_PREVENTION_MARGIN: Duration = Duration::from_secs(30);
+const WORKER_TRUST_RESTORE_ROLLOUT_TIMEOUT: Duration = Duration::from_secs(120);
 const WORKER_POD_SETTLE_POLL: Duration = Duration::from_millis(500);
+
+/// The safe pre-enqueue budget covers the Deployment's own configured drain
+/// window plus scheduling/control-plane slack. Kubernetes defaults an omitted
+/// `terminationGracePeriodSeconds` to 30 seconds, but a chart/operator value
+/// (notably Curie's 1800 second default) wins when present.
+fn worker_prevention_wait_budget(view: &WorkerTrustView) -> Duration {
+    view.termination_grace_period
+        .saturating_add(WORKER_PREVENTION_MARGIN)
+}
+
+fn worker_rollout_command(namespace: &str, deployment: &str, timeout: Duration) -> OpsCommand {
+    let timeout_secs = timeout.as_secs().max(1);
+    OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("-n"),
+            plain(namespace),
+            plain("rollout"),
+            plain("status"),
+            plain(format!("deployment/{deployment}")),
+            plain(format!("--timeout={timeout_secs}s")),
+        ],
+    )
+}
+
+fn rollout_timed_out(stderr: &str) -> bool {
+    stderr
+        .to_ascii_lowercase()
+        .contains("timed out waiting for the condition")
+}
+
+fn worker_prevention_timeout_error(
+    release: &str,
+    namespace: &str,
+    budget: Duration,
+) -> anyhow::Error {
+    anyhow::Error::from(
+        crate::exit::CliError::transient(format!(
+            "worker rollout or prior worker drain for release {release} in namespace {namespace} did not settle within {}s; no turn was enqueued, so retry is safe",
+            budget.as_secs()
+        ))
+        .with_fix(format!(
+            "wait for `kubectl -n {namespace} get pods -l app.kubernetes.io/instance={release},app.kubernetes.io/component=worker` to show only Ready, non-terminating pods, then retry `curie cluster message`"
+        )),
+    )
+}
 
 fn worker_pods_command(namespace: &str, release: &str) -> OpsCommand {
     OpsCommand::new(
@@ -719,8 +796,12 @@ fn worker_pods_allow_enqueue(pods_json: &str) -> Result<bool> {
     Ok(true)
 }
 
-async fn wait_for_worker_pods_to_release_claimers(namespace: &str, release: &str) -> Result<()> {
-    let deadline = Instant::now() + WORKER_POD_SETTLE_TIMEOUT;
+async fn wait_for_worker_pods_to_release_claimers(
+    namespace: &str,
+    release: &str,
+    budget: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + budget;
     loop {
         let (ok, out, err) = run_capture(&worker_pods_command(namespace, release)).await?;
         if !ok {
@@ -733,11 +814,7 @@ async fn wait_for_worker_pods_to_release_claimers(namespace: &str, release: &str
             return Ok(());
         }
         if Instant::now() >= deadline {
-            bail!(
-                "the previous worker pod for release {release} was still terminating after \
-                 {WORKER_POD_SETTLE_TIMEOUT:?}; retry cluster message once that pod is gone so \
-                 it cannot claim the turn"
-            );
+            return Err(worker_prevention_timeout_error(release, namespace, budget));
         }
         tokio::time::sleep(WORKER_POD_SETTLE_POLL).await;
     }
@@ -752,7 +829,7 @@ impl Drop for ClusterStubTrust {
             crate::ui::ui().warn("could not restore the worker's prior Slack trust");
             return;
         }
-        let rollout = self.rollout_command();
+        let rollout = self.restore_rollout_command();
         let rollout = std::process::Command::new(&rollout.program)
             .args(rollout.argv())
             .output();
@@ -797,6 +874,11 @@ fn worker_trust_view(deployment_json: &str) -> Result<WorkerTrustView> {
         None => None,
     };
     let annotations = deployment.pointer("/metadata/annotations");
+    let termination_grace_period = deployment
+        .pointer("/spec/template/spec/terminationGracePeriodSeconds")
+        .and_then(serde_json::Value::as_u64)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_WORKER_TERMINATION_GRACE_PERIOD);
     Ok(WorkerTrustView {
         resource_version: deployment
             .pointer("/metadata/resourceVersion")
@@ -811,6 +893,7 @@ fn worker_trust_view(deployment_json: &str) -> Result<WorkerTrustView> {
         env_present,
         env,
         trust,
+        termination_grace_period,
     })
 }
 
@@ -2388,6 +2471,161 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
     }
 }
 
+/// The whole budget for one advisory hint-channel lookup, port-forward startup
+/// included (#1531 finding 3).
+///
+/// Modeled on [`ApiClient::check_git_flow_routing`], which is this crate's
+/// established shape for an advisory read that must never become a hang: 10s is
+/// far past a healthy answer and far short of an operator's patience. The bound
+/// is applied ONCE around the entire lookup rather than per request, because the
+/// cluster arm spends most of its time in `start_port_forward` and a per-request
+/// deadline would leave that unbounded. `ApiClient::new` sets only
+/// `connect_timeout`, so a peer that accepts the connection and then never sends
+/// headers would otherwise wait forever -- and this runs INSIDE the resume wait,
+/// where forever means a frozen terminal on a turn whose durable approval is
+/// already fine.
+///
+/// A CEILING, not the effective budget. Because this runs inside the resume
+/// wait, spending it on top of the turn's own deadline would make
+/// `--timeout-secs 1` take about eleven seconds, and every nested gate would add
+/// another ten. [`hint_channel`] therefore caps it with
+/// [`crate::chat::capped`] against the turn deadline, which is the invariant
+/// `cli/src/chat.rs:497-499` already states for the resume scan: "Every per-op
+/// budget is capped by what is LEFT of the overall deadline, so the advertised
+/// `--timeout-secs` is a hard bound on this path too rather than being overrun
+/// by up to one fixed scan budget" (#1531).
+const HINT_CHANNEL_LOOKUP_BUDGET: Duration = Duration::from_secs(10);
+
+/// The channel the pre-wait resolve hint should name for approval `id`: the
+/// approval's own `card_channel` when a route binding placed the card somewhere
+/// other than where this turn spoke, else `turn_channel` (#1531 finding 3).
+///
+/// ADVISORY, and deliberately incapable of failing or delaying the turn. Every
+/// non-answer -- an unreachable API, a 404 because another operator resolved the
+/// approval first, a 5xx, a body that does not decode, an expired budget, a null
+/// or empty `card_channel` -- returns `turn_channel`, which is byte-for-byte what the
+/// hint printed before this change. The worst case is therefore the status quo,
+/// never a regression. Nothing here propagates: no `?` and no `unwrap` escapes
+/// the wrapper, since the caller is mid-wait on a durable approval and has
+/// nothing useful to do with an error.
+///
+/// A null `card_channel` means "an older row or a direct API write, so the
+/// requesting channel applies" (#1431), and the requesting channel IS the turn
+/// channel -- so it takes the same fallback rather than printing an empty or
+/// literal-null `--actor-channel`.
+///
+/// An EMPTY (or whitespace-only) `card_channel` takes that same fallback, and
+/// the reason is the server, not caution. The wire model admits
+/// `card_channel: ""` (`packages/aci-protocol/src/aci_protocol/wire.py`), and
+/// the authorizer selects the approver set as
+/// `approval.card_channel or approval.reply_channel`
+/// (`apps/api/src/curie_api/slack_approvers.py`). An empty string is FALSY in
+/// Python, so the server itself reads it as absent and falls back to
+/// `reply_channel` -- which is the turn channel. Echoing the empty value back
+/// would render `--actor-channel ''`, which that same membership check refuses
+/// 403 with "resolve this from the approval's channel": the exact failure #1531
+/// exists to remove. "Empty string is not the same as absent" is true in Rust
+/// and false on this wire, so do not collapse this arm back into a plain
+/// `Some(_)` match.
+///
+/// `deadline` is the TURN's overall deadline, not this lookup's. The effective
+/// bound is `capped(HINT_CHANNEL_LOOKUP_BUDGET, deadline)`, so a short
+/// `--timeout-secs` shortens the lookup instead of being overrun by it
+/// (`cli/src/chat.rs:497-499`, #1531).
+///
+/// Tier dispatch mirrors how each tier already reaches the API for the
+/// default-channel lookup: local talks straight to the compose API at
+/// [`local_api_base`], cluster opens a short-lived `kubectl port-forward` the way
+/// [`resolve_cluster_channel`] does. The cluster guard is created and dropped
+/// entirely INSIDE this function, so no forward is ever held across
+/// [`await_resume`] and the (possibly full `--timeout-secs`) wait. Because the
+/// budget wraps the port-forward startup too, an expiry drops the in-flight
+/// future, whose `kill_on_drop` Drop reaps the child: there is no path where the
+/// deadline fires and leaves a `kubectl port-forward` orphaned to init, which is
+/// the tracked regression class from #751/#766.
+async fn hint_channel(
+    opts: &MessageOpts,
+    verb: TurnVerb,
+    turn_channel: &str,
+    id: &str,
+    deadline: Instant,
+) -> String {
+    let lookup = async {
+        // The port-forward guard is bound HERE, in the enclosing async block,
+        // and deliberately NOT inside the cluster match arm. `start_port_forward`
+        // returns the `kubectl port-forward` child with `kill_on_drop(true)`, so
+        // the binding's scope IS the forward's lifetime. An arm-scoped binding
+        // ends when the arm yields its value, which is one line BEFORE
+        // `get_approval` runs: the child is reaped, the local port goes dead, the
+        // request fails, and the advisory wrapper silently degrades to the turn
+        // channel, so the cluster tier could never resolve a card channel. That
+        // was observed against a live cluster, where the approval row held the
+        // route's channel and `approvals --list` read it correctly through its
+        // own forward while this hint still printed the turn channel (#1531).
+        // Do not "tidy" this back into the arm.
+        //
+        // Binding it here still keeps the guard entirely inside this helper: it
+        // drops at the end of this async block, after `get_approval` has
+        // resolved, so no forward is held across `await_resume`, and a timeout
+        // drops this future part way through and runs the same Drop, which is
+        // what keeps an expiry from orphaning a `kubectl port-forward` to init
+        // (the tracked leak class from #751/#766).
+        let (_api_pf, api_base) = match verb {
+            TurnVerb::Local => (
+                // No forward on the local tier: compose publishes the API, so the
+                // guard slot stays empty and this arm behaves exactly as before.
+                None,
+                local_api_base(opts.api_url.as_deref()),
+            ),
+            TurnVerb::Cluster => {
+                let fullname = crate::ops::release_fullname(&opts.namespace, &opts.release).await;
+                let (api_pf, api_local_port) = start_port_forward(
+                    &port_forward_command(
+                        &opts.namespace,
+                        &fullname,
+                        "api",
+                        opts.api_local_port,
+                        API_REMOTE_PORT,
+                    ),
+                    opts.api_local_port,
+                    "api",
+                )
+                .await
+                .ok()?;
+                (Some(api_pf), format!("http://127.0.0.1:{api_local_port}"))
+            }
+        };
+        let api = ApiClient::new(&api_base, &opts.api_key).ok()?;
+        api.get_approval(id).await.ok()?.card_channel
+    };
+    // Capped, never fixed: the lookup may spend the advisory budget or what is
+    // LEFT of the turn, whichever is smaller, so it can never outlive the turn
+    // it is decorating (#1531; `cli/src/chat.rs:497-499`). Reuses the same
+    // `capped` helper the resume scan uses rather than a second copy of the
+    // bound.
+    match tokio::time::timeout(capped(HINT_CHANNEL_LOOKUP_BUDGET, deadline), lookup).await {
+        // A present, non-empty card channel is the only real answer. The
+        // emptiness guard is load-bearing, not defensive: the server reads
+        // `approval.card_channel or approval.reply_channel`, and in Python
+        // that `or` treats ONLY the empty string as falsy. A whitespace-only
+        // value such as a single space is truthy there, so the authorizer
+        // treats it as a real card channel and compares `--actor-channel`
+        // against it byte for byte. This arm must mirror that exactly and
+        // print a whitespace-only channel verbatim rather than trimming it
+        // away (#1531, see the doc comment above). Do not add `.trim()` back:
+        // a trimmed whitespace-only channel would degrade to the turn
+        // channel, and the printed command would then name a channel the
+        // server does not accept for this approval, drawing exactly the 403
+        // that #1531 exists to remove.
+        Ok(Some(card_channel)) if !card_channel.is_empty() => card_channel,
+        // Every remaining arm is the same answer: "no answer". An expired budget
+        // is indistinguishable from a 500 here, and a null or empty
+        // `card_channel` means the requesting channel applies -- all of them
+        // print what the hint printed before this change.
+        Ok(_) | Err(_) => turn_channel.to_string(),
+    }
+}
+
 /// The one runnable `approvals --resolve` command shape, shared by the pre-wait
 /// hint and the terminal wording so the two cannot drift (#766).
 ///
@@ -2406,9 +2644,18 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
 ///   is refused 403 ("resolve this from the approval's channel"). The channel this
 ///   turn routed to IS `reply_channel`, so it is the correct value in the common
 ///   case; a route binding that placed the card elsewhere carries a different
-///   `card_channel`, which `approvals --list` reports. (Route bindings that
-///   declare `approvers.users`/`approvers.group` ignore the channel entirely, so
-///   passing it is harmless there.)
+///   `card_channel`. The pre-wait hint now resolves that `card_channel` itself
+///   whenever it has an approval id in hand ([`hint_channel`], #1531), so the
+///   caller hands this formatter the corrected value; `approvals --list` remains
+///   the fallback for the terminal arms that carry no parseable id and so print
+///   the literal `<id>`. (Route bindings that declare
+///   `approvers.users`/`approvers.group` ignore the channel entirely, so passing
+///   it is harmless there.)
+///
+/// This stays a PURE formatter: it renders the channel it is GIVEN, verbatim,
+/// and does no I/O. The lookup lives in the caller precisely so a string helper
+/// shared by an async wait and a terminal print does not acquire a network
+/// dependency.
 fn approval_resolve_command(tier: &str, agent: Option<&str>, channel: &str, id: &str) -> String {
     let agent = agent.unwrap_or("<AGENT>");
     format!("curie {tier} approvals {agent} --resolve {id} --as <user> --actor-channel '{channel}'")
@@ -2509,14 +2756,57 @@ async fn resume_after_approval(
     const MAX_NESTED_GATES: usize = 64;
     let mut current_id = id.to_string();
     let mut last_reply = awaiting_reply;
+    // The channel the most recent pre-wait hint was resolved for, hoisted out of
+    // the loop the same way `last_reply` is and for the same reason: the POST-loop
+    // terminal has to report what the last iteration observed. The terminal line
+    // is the one an operator actually copies once the wait gives up, so it must
+    // not restate the turn channel the pre-wait hint just corrected (#1531).
+    // Invariant: this is the channel resolved for the CURRENT `current_id`, or the
+    // turn channel when nothing has been resolved for that id yet -- never a value
+    // resolved for a different approval.
+    let mut last_hint_channel = channel.to_string();
     for _ in 0..MAX_NESTED_GATES {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             break;
         }
+        // Resolve the hint's channel PER ITERATION, against `current_id`. A
+        // nested gate advances `current_id` to a different approval that may be
+        // bound to a different route, and reusing the first approval's channel
+        // for the second would be a confidently wrong value -- strictly worse
+        // than the turn channel, because the operator has no signal it is wrong
+        // (#1531). Skipped under `--json`, where `ui.note` prints nothing and
+        // the lookup would be a pure cost, the same way the timeout terminal
+        // skips its diagnostics read on that path.
+        // Assigned rather than re-bound per iteration so the post-loop terminal
+        // reads the SAME resolved value the hint printed. Under `--json` this is
+        // the turn channel with no lookup, exactly as before, so that path stays
+        // byte-identical.
+        last_hint_channel = if ui.json() {
+            channel.to_string()
+        } else {
+            hint_channel(opts, verb, channel, &current_id, deadline).await
+        };
+        // Recompute AFTER the lookup, because the lookup itself consumes turn
+        // time. The pre-lookup value is stale by up to the whole lookup budget,
+        // and `await_resume` starts a FRESH deadline from whatever it is handed
+        // -- so passing the stale value made `--timeout-secs 1` take about
+        // eleven seconds and let every nested gate add another lookup on top
+        // (#1531). Capping the lookup alone does not fix this half: the lookup
+        // is bounded either way, but the wait must be told what is actually
+        // left, or the advertised `--timeout-secs` stops being the hard bound
+        // `cli/src/chat.rs:497-499` promises.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            // The lookup consumed the remainder. Exit exactly as the top-of-loop
+            // check would on any other exhausted deadline -- the approval stays
+            // durable and resolvable -- rather than entering the wait with a
+            // zero budget, which would print "waiting..." and return instantly.
+            break;
+        }
         ui.note(&format!(
             "resolve it with: {}",
-            approval_resolve_command(tier, agent, channel, &current_id)
+            approval_resolve_command(tier, agent, &last_hint_channel, &current_id)
         ));
         ui.note(
             "waiting for the approval to be resolved; the resumed reply lands here if it is \
@@ -2571,6 +2861,13 @@ async fn resume_after_approval(
                     Some(new_id) => {
                         current_id = new_id;
                         last_reply = new_reply;
+                        // The hoisted hint belonged to the PREVIOUS approval, which
+                        // may be bound to a different route. Drop it back to the
+                        // turn channel so a break at the next loop boundary reports
+                        // a merely-imprecise channel rather than a confidently wrong
+                        // one the operator has no signal about (#1531); the next
+                        // iteration's lookup replaces it before any wait.
+                        last_hint_channel = channel.to_string();
                         // Loop: wait on the nested approval's resume entry.
                         continue;
                     }
@@ -2606,13 +2903,18 @@ async fn resume_after_approval(
                 return ResumeExit::Transient;
             }
             Outcome::TimedOut => {
-                // Never resolved: the durable approval is still pending.
+                // Never resolved: the durable approval is still pending. Report the
+                // channel the pre-wait hint just resolved for THIS `current_id`,
+                // not the turn channel: this terminal is the last line printed and
+                // the one the operator copies after the wait gives up, so restating
+                // the already-corrected channel here would undo the fix on the very
+                // path that needs it (#1531).
                 ui.emit(&MessageOutcomeOutput::AwaitingApproval {
                     thread: thread_ts.to_string(),
                     reply: last_reply,
                     tier,
                     agent: agent.map(str::to_string),
-                    channel: channel.to_string(),
+                    channel: last_hint_channel,
                 });
                 // Persist the turn context even on the transient exit so a follow-up
                 // `--continue` still has the thread to resume against.
@@ -2622,13 +2924,18 @@ async fn resume_after_approval(
         }
     }
     // The deadline elapsed at a loop boundary, or the nested-gate cap was hit. The
-    // current approval is still pending and resolvable later.
+    // current approval is still pending and resolvable later. Same reason as the
+    // in-loop timeout terminal: this is the last line the operator sees and copies,
+    // so it reports the hoisted hint rather than re-stating the turn channel
+    // (#1531). No lookup happens here -- if no iteration ever ran (the deadline was
+    // already spent on entry), the hoisted value is still the turn channel, exactly
+    // as this emit read before.
     ui.emit(&MessageOutcomeOutput::AwaitingApproval {
         thread: thread_ts.to_string(),
         reply: last_reply,
         tier,
         agent: agent.map(str::to_string),
-        channel: channel.to_string(),
+        channel: last_hint_channel,
     });
     persist_and_hint(opts, verb, channel, thread_ts);
     ResumeExit::Transient
@@ -2643,9 +2950,6 @@ const LOCAL_STUB_BOT_TOKEN: &str = "xoxb-dev";
 /// The host in `comms::LOCAL_SLACK_STUB_URL`. A worker whose `SLACK_API_BASE_URL`
 /// points here talks to the in-compose stub, never to Slack.
 const LOCAL_SLACK_STUB_HOST: &str = "localhost:8155";
-
-/// The compose service (and container) that holds the worker's Slack transport.
-const LOCAL_WORKER_CONTAINER: &str = "curie-worker";
 
 /// The Slack transport the RUNNING compose worker is actually configured with:
 /// `(SLACK_API_BASE_URL, SLACK_BOT_TOKEN)` as the container holds them.
@@ -2671,6 +2975,19 @@ type WorkerTransport = (Option<String>, Option<String>);
 ///    definitive signal: it is literally the transport the worker will use to
 ///    edit the placeholder, so if it is the stub, no real post can ever be
 ///    updated, whatever any token says.
+///
+///    An **empty** value is the CONNECTED signal here, not the disconnected one,
+///    and reading it the other way is what made this whole path unreachable
+///    (#1031). `local comms --connect` un-wires the stub by setting
+///    `SLACK_API_BASE_URL` to the empty string (`comms::local_connect_commands`),
+///    compose's single-dash `${SLACK_API_BASE_URL-http://localhost:8155/api/}`
+///    preserves an explicitly empty value rather than re-defaulting it, and
+///    `docs/slack-local-runbook.md` documents the convention; the cluster tier
+///    says the same thing with `worker.slackApiBaseUrl=`. Empty therefore means
+///    "no override -> real slack.com", which is exactly what
+///    `SlackTransport::new(None, ..)` resolves to. What genuinely carries no
+///    information is an ABSENT value (`None`): the probe could not read the
+///    container at all, and that stays the stub path.
 /// 2. the token must be a real one, not the `xoxb-dev` sentinel.
 ///
 /// Returning the worker's OWN token (rather than one the CLI resolved) also
@@ -2688,44 +3005,121 @@ type WorkerTransport = (Option<String>, Option<String>);
 /// Pure, so both conditions are unit-testable without Docker.
 fn connected_worker_transport(transport: WorkerTransport) -> Option<crate::slack::SlackTransport> {
     let (api_base, token) = transport;
-    let api_base = api_base.unwrap_or_default();
-    // Wired to the stub (or to nothing resolvable) means not connected.
-    if api_base.is_empty() || api_base.contains(LOCAL_SLACK_STUB_HOST) {
+    // Absent, not empty. `None` means the value was never read off the container
+    // -- there is no worker transport to trust, so take the stub path (#1031).
+    let api_base = api_base?;
+    // Wired to the stub is not connected: the stub is literally the transport the
+    // worker will edit the placeholder over, so no real post can ever be updated.
+    if api_base.contains(LOCAL_SLACK_STUB_HOST) {
         return None;
     }
     let token = token?.trim().to_string();
+    // An EMPTY base is carried through as "the source named no base", which
+    // `SlackTransport::new` resolves to real Slack -- the same answer the worker
+    // itself reaches. See the empty-is-connected paragraph above (#1031).
     (!token.is_empty() && token != LOCAL_STUB_BOT_TOKEN)
         .then(|| crate::slack::SlackTransport::new(Some(api_base), token))
 }
 
+/// How long the whole worker-transport probe (resolve the container, then read
+/// its env) may take before `local message` gives up on it.
+///
+/// A wedged docker daemon accepts the request and then never answers, so an
+/// unbounded probe hangs `curie local message` forever -- which also makes the
+/// "a probe failure falls back to the safe stub path" claim vacuous, since
+/// nothing ever fails. Two local `docker` reads have no business taking longer
+/// than this (#1031).
+const WORKER_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Read the running compose worker's Slack transport out of the container.
 ///
 /// `docker inspect` on the worker container, so what we act on is what the worker
-/// holds -- the reconciliation #957 asks for. Any failure (no stack up, docker
-/// absent, container renamed) reads as "no transport", which falls back to the
-/// stub path: the safe direction, since the stub path never posts to real Slack.
-async fn running_worker_transport() -> WorkerTransport {
-    let out = match crate::docker::docker_capture(&[
-        "inspect".to_string(),
-        "--format".to_string(),
-        "{{range .Config.Env}}{{println .}}{{end}}".to_string(),
-        LOCAL_WORKER_CONTAINER.to_string(),
-    ])
-    .await
-    {
-        Ok((status, stdout, _)) if status.success() => stdout,
-        _ => return (None, None),
-    };
+/// holds -- the reconciliation #957 asks for.
+///
+/// The container is resolved through the compose SERVICE LABEL
+/// ([`local_worker_container`] / [`COMPOSE_WORKER_SERVICE`]), never by a
+/// hardcoded name. Container names carry the compose project
+/// (`<project>-curie-worker-1`, and the CLI pins `COMPOSE_PROJECT_NAME=curie`),
+/// so inspecting a bare `curie-worker` matched nothing on a default stack and
+/// silently classified every stack as disconnected (#1031). The selector also
+/// closes the inverse hazard: an unrelated container that merely happens to be
+/// NAMED `curie-worker` carries no compose service label, so it can no longer
+/// impersonate the worker and hand this probe a real token the actual worker
+/// does not hold.
+///
+/// Failures are returned rather than swallowed, so the caller can say that the
+/// probe could not run instead of asserting a disconnected stack it never saw.
+async fn running_worker_transport() -> Result<WorkerTransport> {
+    let worker = local_worker_container().await?;
+    let cmd = OpsCommand::new(
+        "docker",
+        vec![
+            plain("inspect"),
+            plain(&worker),
+            plain("--format"),
+            plain("{{range .Config.Env}}{{println .}}{{end}}"),
+        ],
+    );
+    let (ok, stdout, stderr) = run_capture(&cmd).await?;
+    if !ok {
+        bail!(
+            "inspecting the local worker container {worker}: {}",
+            stderr.trim()
+        );
+    }
     let find = |key: &str| -> Option<String> {
-        out.lines()
+        stdout
+            .lines()
             .find_map(|l| l.strip_prefix(key).map(|v| v.to_string()))
     };
-    (find("SLACK_API_BASE_URL="), find("SLACK_BOT_TOKEN="))
+    Ok((find("SLACK_API_BASE_URL="), find("SLACK_BOT_TOKEN=")))
+}
+
+/// Bound `probe` by `budget`, flattening both a probe error and a timeout into
+/// one operator-facing reason string. Generic over the future purely so the
+/// timeout itself is testable without a wedged daemon.
+async fn bounded_worker_probe<F>(
+    probe: F,
+    budget: Duration,
+) -> std::result::Result<WorkerTransport, String>
+where
+    F: std::future::Future<Output = Result<WorkerTransport>>,
+{
+    match tokio::time::timeout(budget, probe).await {
+        Ok(Ok(transport)) => Ok(transport),
+        Ok(Err(err)) => Err(format!("{err:#}")),
+        Err(_) => Err(format!("the docker probe did not answer within {budget:?}")),
+    }
+}
+
+/// The warning a probe that could not RUN emits, mirroring the cluster sibling
+/// (`ops::dispatcher_connected`, #957 mode C) that the same diff introduced this
+/// path alongside. A probe that could not run is not evidence that no workspace
+/// is connected: silently downgrading to the stub path means the operator asked
+/// for the connected mode, got the other one, and was told nothing. Still fall
+/// back -- the stub path never posts to real Slack, and failing the whole command
+/// on a flaky docker would be worse -- but say so (#1031).
+fn worker_probe_warning(reason: &str) -> String {
+    format!(
+        "could not determine whether a Slack workspace is connected (the local worker \
+         transport probe failed: {}); assuming NOT connected and using the local reply stub",
+        reason.trim().lines().next().unwrap_or("no detail")
+    )
 }
 
 /// Process-level wrapper: the transport to post over, or `None` for the stub path.
-async fn local_connected_transport() -> Option<crate::slack::SlackTransport> {
-    connected_worker_transport(running_worker_transport().await)
+///
+/// `pub` so `cli/tests/local_connectedness_probe.rs` can drive the whole probe
+/// (resolve by label -> inspect -> classify) against a `docker` shim; the pure
+/// predicate alone cannot see the wiring both #1031 defects lived in.
+pub async fn local_connected_transport() -> Option<crate::slack::SlackTransport> {
+    match bounded_worker_probe(running_worker_transport(), WORKER_PROBE_TIMEOUT).await {
+        Ok(transport) => connected_worker_transport(transport),
+        Err(reason) => {
+            crate::ui::ui().warn(&worker_probe_warning(&reason));
+            None
+        }
+    }
 }
 
 /// The human dry-run line noting that a connected workspace changes the plan
@@ -3137,9 +3531,13 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
             // the identical context and print the continue hint once.
             persist_turn_quietly(&opts, TurnVerb::Cluster, &channel, &thread_ts);
             // Keep the stub alive and wait for the resumed reply instead of
-            // exiting and stranding it (#766). The wait observes the resume turn
-            // on the runs stream over the Valkey connection already open for the
-            // enqueue, so no API port-forward is needed for it. If we cannot parse
+            // exiting and stranding it (#766). The resume scan itself observes
+            // the resume turn on the runs stream over the Valkey connection
+            // already open for the enqueue, so it needs no API port-forward. The
+            // per-id resolve-hint channel lookup DOES open one (`hint_channel`,
+            // #1531), but it is short-lived: bounded by
+            // `HINT_CHANNEL_LOOKUP_BUDGET` and dropped before the wait is
+            // entered, so no forward child is held across it. If we cannot parse
             // an approval id, fall back to the awaiting-approval terminal rather
             // than hanging.
             match parse_approval_id(reply.as_deref().unwrap_or_default()) {
@@ -3249,6 +3647,10 @@ pub struct EvalOpts {
     /// Explicit eval-case file; `None` resolves `evals/cases.json` like
     /// `skill eval` (cwd, then the recorded bundle dir).
     pub cases: Option<PathBuf>,
+    /// Case selector (`--case-id`, repeatable). Empty runs the whole suite.
+    /// A value matching no case in the suite exits 2 (Usage) rather than
+    /// silently narrowing to nothing -- a mistyped selector fails the gate.
+    pub case_ids: Vec<String>,
     pub channel: Option<String>,
     pub namespace: String,
     pub release: String,
@@ -3603,11 +4005,76 @@ async fn run_eval_turns(
     result
 }
 
+/// Reject blank model entries before a target performs environment discovery.
+/// The shared eval handler calls this again so direct callers remain safe.
+pub fn validate_eval_models(models: &[String]) -> Result<()> {
+    if models.iter().any(|model| model.trim().is_empty()) {
+        return Err(anyhow::Error::from(
+            crate::exit::CliError::usage("--model cannot be empty or whitespace-only").with_fix(
+                "pass a non-empty model identifier to --model, or omit --model to run the \
+                 deployed/default model",
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// The shared `eval` handler: run the bundle's `evals/cases.json` through the
 /// target tier's message enqueue+await path and grade with the shared grader,
 /// so a suite that passes at `skill` can be re-asserted verbatim at `local` and
 /// `cluster` (issue #344, the per-tier parity gate).
+/// Refuse a `--case-id` selector on a `--model` sweep (exit 4, ADR-0041).
+///
+/// A sweep is the platform eval plane: it sends only the suite NAME to
+/// `POST /evals/trigger` and the worker reloads the DEPLOYED suite server-side,
+/// then reports a per-model pass-rate over all of it. A locally chosen subset is
+/// never read, so honoring the flag is impossible -- silently sweeping the whole
+/// deployed suite while displaying a narrowed selection is the failure this
+/// prevents, exactly as the sibling `--cases` refusal does (#608). Unsupported
+/// rather than Usage: no input and no retry makes the selector apply here.
+///
+/// Pure so the class and the wording are testable with no stack.
+pub fn guard_sweep_case_ids(case_ids: &[String]) -> Result<()> {
+    if case_ids.is_empty() {
+        return Ok(());
+    }
+    Err(anyhow::Error::from(
+        crate::exit::CliError::unsupported(
+            "--case-id has no effect on a --model sweep: the sweep runs a platform eval that \
+             reloads the deployed bundle's evals/cases.json server-side and reports a per-model \
+             pass-rate over the whole suite, so a local case selection is never applied",
+        )
+        .with_fix(
+            "drop --case-id to sweep the whole deployed suite, or omit --model to grade selected \
+             cases in-CLI with `curie <skill|local|cluster> eval --case-id <ID>`",
+        ),
+    ))
+}
+
+/// Refuse a `--case-id` selector on the local/cluster trajectory eval (exit 4).
+///
+/// Trajectory scoring at these tiers runs on the worker eval plane against the
+/// deployed bundle's suite, the same construction that refuses `--cases` here,
+/// so a locally chosen subset never reaches the scorer. Pure for the same reason
+/// as [`guard_sweep_case_ids`].
+pub fn guard_trajectory_case_ids(case_ids: &[String]) -> Result<()> {
+    if case_ids.is_empty() {
+        return Ok(());
+    }
+    Err(anyhow::Error::from(
+        crate::exit::CliError::unsupported(
+            "--case-id cannot narrow a local/cluster trajectory eval because trajectory scoring \
+             runs on the worker eval plane against the deployed bundle's suite",
+        )
+        .with_fix(
+            "drop --case-id to grade the whole deployed trajectory suite, or use \
+             `curie skill eval --case-id <ID>` to grade selected local cases",
+        ),
+    ))
+}
+
 pub async fn eval(opts: EvalOpts) -> Result<()> {
+    validate_eval_models(&opts.models)?;
     // Refuse `--concurrency > 1` before any enqueue or work (#706): the CLI eval
     // loop is sequential and real parallel dispatch is tracked in #709, so a
     // request above 1 fails fast rather than silently running sequentially.
@@ -3651,6 +4118,7 @@ pub async fn eval(opts: EvalOpts) -> Result<()> {
                 ),
             ));
         }
+        guard_sweep_case_ids(&opts.case_ids)?;
         let loaded = resolve_eval(opts.cases.clone())?;
         return eval_sweep(opts, loaded.suite).await;
     }
@@ -3678,12 +4146,21 @@ pub async fn eval(opts: EvalOpts) -> Result<()> {
                 ),
             ));
         }
+        guard_trajectory_case_ids(&opts.case_ids)?;
         return eval_trajectory_platform(opts, loaded.suite).await;
     }
+    let total_cases = loaded.suite.cases.len();
+    // Exit 2 before any stack contact when a --case-id matches nothing: a
+    // mistyped selector fails the gate instead of greening an empty run.
+    let suite = crate::evals::select_cases(loaded.suite, &opts.case_ids)?;
+    if let Some(note) = crate::evals::selection_note(&opts.case_ids, suite.cases.len(), total_cases)
+    {
+        crate::ui::ui().note(&note);
+    }
     if opts.local {
-        eval_local(opts, loaded.suite).await
+        eval_local(opts, suite).await
     } else {
-        eval_cluster(opts, loaded.suite).await
+        eval_cluster(opts, suite).await
     }
 }
 
@@ -3871,9 +4348,9 @@ async fn probe_fake_model(
 
 /// The compose service the worker runs as, per `compose.dev.yaml`. Container
 /// NAMES vary with the compose project (`<project>-curie-worker-1`), so the
-/// service label is the only stable selector; `cli/tests/fake_tier_plumbing.rs`
-/// pins this against the compose file so a service rename cannot silently
-/// blind the probe again.
+/// service label is the only stable selector; the unit test
+/// `the_probe_matches_the_worker_service_compose_declares` pins this against the
+/// compose file so a service rename cannot silently blind the probe again.
 pub(crate) const COMPOSE_WORKER_SERVICE: &str = "curie-worker";
 
 /// The label selector the probe matches on, quoted into diagnostics so an
@@ -3896,10 +4373,13 @@ fn worker_ps_command() -> OpsCommand {
 }
 
 /// Pick the one running compose worker from `docker ps` output. Zero or many is
-/// an explicit diagnostic: guessing which stack the sweep would hit is exactly
+/// an explicit diagnostic: guessing which stack the caller would hit is exactly
 /// the fabrication this probe exists to prevent. Both diagnostics name the
 /// selector rather than asserting a stack-wide fact the probe did not check --
 /// "no container matched X" is verifiable; "there is no stack" is not.
+///
+/// Shared by the `--model` sweep and the `local message` connectedness probe
+/// (#1031), so the wording names the worker rather than either caller's verb.
 fn select_worker_container(stdout: &str) -> Result<String> {
     let names: Vec<&str> = stdout
         .lines()
@@ -3909,13 +4389,13 @@ fn select_worker_container(stdout: &str) -> Result<String> {
     match names.as_slice() {
         [only] => Ok((*only).to_string()),
         [] => bail!(
-            "no running container matches `{}`, so the sweep cannot read which model the local \
-             stack is running. Start a stack with `curie local up`.",
+            "no running container matches `{}`, so the local worker's own configuration \
+             cannot be read. Start a stack with `curie local up`.",
             worker_label_selector()
         ),
         many => bail!(
-            "{} running containers match `{}` ({}); a sweep cannot tell which stack it would \
-             measure. Stop the extras with `curie local down`.",
+            "{} running containers match `{}` ({}); the local worker cannot be identified \
+             unambiguously. Stop the extras with `curie local down`.",
             many.len(),
             worker_label_selector(),
             many.join(", ")
@@ -4855,6 +5335,768 @@ mod tests {
         assert!(line.contains("approvals <AGENT> --resolve"), "{line}");
         assert!(line.contains("--actor-channel 'C-SIM-xyz'"), "{line}");
         assert!(line.starts_with("curie cluster approvals"), "{line}");
+
+        // #1531: the fix for the wrong-channel hint resolves the approval's
+        // `card_channel` in the CALLER and hands it down. This helper must stay
+        // a pure formatter that renders the channel it is GIVEN, verbatim, on
+        // both tiers -- no lookup, no substitution, no I/O. A route-bound
+        // channel is used here precisely because it is NOT the turn channel:
+        // if the formatter ever substituted a value of its own, this is where
+        // that would show up.
+        for tier in ["local", "cluster"] {
+            let line = approval_resolve_command(tier, Some("weather-bot"), "C-SIM-route", id);
+            assert!(
+                line.contains("--actor-channel 'C-SIM-route'"),
+                "the formatter must echo the channel it was handed, not one it \
+                 sourced itself ({tier}): {line}"
+            );
+            assert!(
+                !line.contains("C-SIM-abc") && !line.contains("C-SIM-xyz"),
+                "no channel from an earlier call may leak into this one \
+                 ({tier}): {line}"
+            );
+        }
+    }
+
+    // ─── #1531 finding 3: the advisory hint-channel lookup ───────────────────
+    //
+    // RED CONTRACT: the tests below call a private helper that does not exist
+    // yet, so this crate fails to COMPILE until it is added -- the intended RED
+    // signal, matching the idiom at
+    // `cli/tests/approvals_resolve_actor_channel.rs:14-24`. Intended shape:
+    //
+    //     async fn hint_channel(
+    //         opts: &MessageOpts,
+    //         verb: TurnVerb,
+    //         turn_channel: &str,
+    //         id: &str,
+    //         deadline: Instant,
+    //     ) -> String
+    //
+    // The `deadline` parameter is the turn's overall deadline, NOT this
+    // lookup's own: the effective bound is
+    // `capped(HINT_CHANNEL_LOOKUP_BUDGET, deadline)` (`cli/src/chat.rs:86`), so
+    // a short `--timeout-secs` shortens the lookup rather than being overrun by
+    // it. See `the_lookup_budget_is_capped_by_what_is_left_of_the_turns_deadline`.
+    //
+    // and, as part of the same contract, the bound it is capped against:
+    //
+    //     const HINT_CHANNEL_LOOKUP_BUDGET: Duration = Duration::from_secs(10);
+    //
+    // also private in `cli/src/message.rs`. It is named rather than inlined so
+    // the stalling-peer tests below track the budget if it is ever retuned.
+    //
+    // ADVISORY: every failure -- unreachable API, 404, 5xx, decode error,
+    // deadline expiry, an absent or empty `card_channel` -- collapses to
+    // `turn_channel`,
+    // which is byte-for-byte what the hint prints today. The worst case is
+    // therefore the status quo, never a regression, and never a failed turn.
+    //
+    // These live HERE rather than in `cli/tests/approval_hint_channel.rs`
+    // because `hint_channel` is private: an integration test cannot reach it,
+    // and making it `pub` would widen the crate's public API for a test. The
+    // wire-level half of the contract (`ApiClient::get_approval`) is in that
+    // file, where the shared `support` harness lives.
+
+    /// The record a route binding produces: the card landed in a channel other
+    /// than the one the requester spoke in. The two must stay distinct or the
+    /// positive assertion below cannot tell a correct value from a lucky one.
+    const HINT_ROUTE_BOUND_APPROVAL: &str = r#"{"id":"3f2504e0-4f89-41d3-9a0c-0305e82c3301","author":"U-REQUESTER","route":"finance","gate_kind":"policy","granted_tool":null,"status":"pending","conversation_id":"thread-1","summary":"approve invoice","expires_at":null,"resolved_by":null,"card_channel":"C-SIM-card","reply_channel":"C-SIM-turn"}"#;
+
+    /// The same approval on a row that predates route bindings, or written
+    /// directly through the API: `card_channel` is null, which means "the
+    /// requesting channel applies" (#1431), not "no channel".
+    const HINT_UNROUTED_APPROVAL: &str = r#"{"id":"3f2504e0-4f89-41d3-9a0c-0305e82c3301","author":"U-REQUESTER","route":null,"gate_kind":"policy","granted_tool":null,"status":"pending","conversation_id":"thread-1","summary":"approve invoice","expires_at":null,"resolved_by":null,"card_channel":null,"reply_channel":"C-SIM-turn"}"#;
+
+    /// The same approval with an EMPTY card channel rather than a null one. The
+    /// wire model admits it, and the server treats it as absent (see the test
+    /// below), so the CLI must too.
+    const HINT_EMPTY_CARD_APPROVAL: &str = r#"{"id":"3f2504e0-4f89-41d3-9a0c-0305e82c3301","author":"U-REQUESTER","route":"finance","gate_kind":"policy","granted_tool":null,"status":"pending","conversation_id":"thread-1","summary":"approve invoice","expires_at":null,"resolved_by":null,"card_channel":"","reply_channel":"C-SIM-turn"}"#;
+
+    /// The same approval with a WHITESPACE-ONLY card channel. Distinct from the
+    /// empty one above on purpose: the two fixtures pin the two sides of the
+    /// absent/present boundary the server draws, and neither covers the other.
+    const HINT_BLANK_CARD_APPROVAL: &str = r#"{"id":"3f2504e0-4f89-41d3-9a0c-0305e82c3301","author":"U-REQUESTER","route":"finance","gate_kind":"policy","granted_tool":null,"status":"pending","conversation_id":"thread-1","summary":"approve invoice","expires_at":null,"resolved_by":null,"card_channel":" ","reply_channel":"C-SIM-turn"}"#;
+
+    /// The whitespace-only channel `HINT_BLANK_CARD_APPROVAL` carries, spelled
+    /// out so the assertion below compares against the exact wire value rather
+    /// than a re-typed literal.
+    const HINT_BLANK_CARD_CHANNEL: &str = " ";
+
+    /// A well-formed UUID, because `parse_approval_id` (`cli/src/chat.rs:400`)
+    /// validates the id as one before `resume_after_approval` is ever entered,
+    /// and the endpoint types its path param as `uuid.UUID`.
+    const HINT_APPROVAL_ID: &str = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
+    /// What this turn routed to: the value the hint prints today, and the value
+    /// every degraded path must keep printing.
+    const HINT_TURN_CHANNEL: &str = "C-SIM-turn";
+    /// Where the route binding actually put the card: the value the server's
+    /// authorizer compares `--actor-channel` against.
+    const HINT_CARD_CHANNEL: &str = "C-SIM-card";
+    /// Placeholder platform API key for the hint lookup tests. Held in a const
+    /// rather than written inline so the commit-time secret scan does not read
+    /// an `api_key: "..."` assignment as a real credential; the same shape is
+    /// already proven safe at
+    /// `cli/tests/approvals_resolve_actor_channel.rs:30`.
+    const HINT_API_KEY: &str = "test-key";
+
+    /// A one-endpoint stand-in for the platform API on an ephemeral port,
+    /// answering every request with the same canned status and body.
+    ///
+    /// A raw accept loop rather than a router: it is the shape the port-forward
+    /// tests further down this same module already use
+    /// (`tokio::net::TcpListener::bind(("127.0.0.1", 0))`), and one canned
+    /// response is the whole surface these tests need. Returns the base URL.
+    async fn hint_stub_api(status: u16, body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                // Drain the request head first so the client sees a complete
+                // exchange rather than a reset part way through its write.
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let head = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        base
+    }
+
+    /// A turn deadline far enough out that it never binds, for the tests whose
+    /// subject is something other than the deadline cap. Every call site passes
+    /// one, because the turn's deadline is what bounds the lookup.
+    fn hint_far_deadline() -> Instant {
+        Instant::now() + HINT_CHANNEL_LOOKUP_BUDGET * 10
+    }
+
+    /// A peer that ACCEPTS the connection and then never answers: the stall
+    /// shape `ApiClient`'s connect-only timeout cannot see. Every accepted
+    /// socket is parked in `open` and never written to and never dropped, so
+    /// the client's connect succeeds and its read never completes. Returns the
+    /// base URL and the accept task, which the caller aborts once it has made
+    /// its assertions.
+    async fn hint_stalling_peer() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let accepting = tokio::spawn(async move {
+            let mut open = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                open.push(sock);
+            }
+        });
+        (base, accepting)
+    }
+
+    /// A local-tier turn pointed at the given API base. `api_url` is what
+    /// `local_api_base` reads, so this is the whole tier dispatch for
+    /// `TurnVerb::Local`.
+    fn hint_opts(api_url: &str) -> MessageOpts {
+        MessageOpts {
+            api_url: Some(api_url.to_string()),
+            api_key: HINT_API_KEY.to_string(),
+            local: true,
+            ..MessageOpts::default()
+        }
+    }
+
+    /// The defect itself (#1531 finding 3): a route binding put the card in a
+    /// different channel, and the hint must name THAT channel.
+    ///
+    /// The hint is a command a human copy-pastes. With the turn channel on it,
+    /// the default approver set -- `SlackChannelMembers(card_channel or
+    /// reply_channel)` in `apps/api/.../slack_approvers.py` -- refuses the
+    /// resolve 403 with "resolve this from the approval's channel", and the
+    /// operator has no way to derive the right value from what was printed.
+    ///
+    /// Mutation it catches: keeping `channel` at the call site, i.e. never
+    /// performing the lookup at all -- which is the pre-change behavior and is
+    /// exactly what every degraded path below must still produce.
+    #[tokio::test]
+    async fn the_hint_names_the_approvals_card_channel_when_a_route_bound_one() {
+        let base = hint_stub_api(200, HINT_ROUTE_BOUND_APPROVAL).await;
+        let opts = hint_opts(&base);
+
+        let resolved = hint_channel(
+            &opts,
+            TurnVerb::Local,
+            HINT_TURN_CHANNEL,
+            HINT_APPROVAL_ID,
+            hint_far_deadline(),
+        )
+        .await;
+
+        assert_eq!(
+            resolved, HINT_CARD_CHANNEL,
+            "the hint must name the channel the card was posted to, which is \
+             what the server-side authorizer compares --actor-channel against"
+        );
+        assert_ne!(
+            resolved, HINT_TURN_CHANNEL,
+            "the fixture keeps the card and turn channels distinct on purpose; \
+             if they matched, this test could not tell a real lookup from the \
+             unchanged fallback"
+        );
+    }
+
+    /// A-T4a. The API is unreachable, so the hint degrades to the turn channel
+    /// and does it promptly.
+    ///
+    /// This is the single most important test of the change: it is the guard on
+    /// the "never fail the turn, never hang" property. The lookup runs INSIDE
+    /// the resume wait, which can legitimately run for the full
+    /// `--timeout-secs`, so a lookup that propagated its error would turn an
+    /// unreachable API into a failed turn, and one that blocked would extend a
+    /// wait the operator is already watching.
+    ///
+    /// The port is learned by binding and then dropped, so nothing is listening
+    /// on it and the connect is refused rather than left hanging.
+    ///
+    /// Mutation it catches: writing the lookup with `?` or `unwrap` instead of
+    /// absorbing, or dropping the bound that keeps it off the wait's clock.
+    #[tokio::test]
+    async fn the_hint_names_the_turn_channel_when_the_lookup_cannot_answer() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let opts = hint_opts(&format!("http://127.0.0.1:{port}"));
+
+        let started = Instant::now();
+        let resolved = hint_channel(
+            &opts,
+            TurnVerb::Local,
+            HINT_TURN_CHANNEL,
+            HINT_APPROVAL_ID,
+            hint_far_deadline(),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            resolved, HINT_TURN_CHANNEL,
+            "an unreachable API is 'no answer', and no answer means the hint \
+             prints exactly what it printed before this change"
+        );
+        // The declared bound is 10s for the WHOLE lookup, port-forward startup
+        // included. A refused connection on loopback answers immediately, so
+        // anything near the budget here means the failure is being retried or
+        // waited on rather than absorbed.
+        assert!(
+            elapsed < HINT_CHANNEL_LOOKUP_BUDGET,
+            "the lookup must stay inside its budget so it can never extend the \
+             resume wait; took {elapsed:?}"
+        );
+    }
+
+    /// The guard on the highest-severity failure mode in this change: a peer
+    /// that ACCEPTS the connection and then never answers.
+    ///
+    /// `ApiClient::new` (`cli/src/api.rs:670`) sets only `connect_timeout(5s)`
+    /// and no read timeout, so a completed connect followed by silence leaves
+    /// the caller waiting forever. This lookup runs INSIDE `resume_after_approval`
+    /// while an operator watches a `message` turn, so "forever" means a frozen
+    /// terminal on a turn whose durable approval is already fine. The only thing
+    /// standing between that peer and the frozen turn is the single wrapping
+    /// `tokio::time::timeout(HINT_CHANNEL_LOOKUP_BUDGET, ...)`.
+    ///
+    /// This test costs roughly one budget of wall clock, and that cost is the
+    /// point: it is the ONLY test that can tell "bounded" from "hangs forever".
+    /// The refusal case above returns instantly and therefore proves nothing
+    /// about the bound, and reading the code for a `timeout` call is not a
+    /// demonstration that the guard rejects a violating input (AGENTS.md,
+    /// "Guards are outcome-tested").
+    ///
+    /// Mutation it catches: deleting the wrapping `tokio::time::timeout`, or
+    /// narrowing it to cover only part of the lookup.
+    #[tokio::test]
+    async fn a_stalled_api_is_cut_off_at_the_budget_rather_than_hanging_the_turn() {
+        let (base, stall) = hint_stalling_peer().await;
+        let opts = hint_opts(&base);
+
+        let started = Instant::now();
+        // The outer bound is the test harness's own safety net, deliberately
+        // wider than the budget under test: without it, an implementation that
+        // forgot the inner timeout would hang this test forever and block CI
+        // instead of failing it. Its expiry IS the failure signal.
+        let resolved = tokio::time::timeout(
+            HINT_CHANNEL_LOOKUP_BUDGET * 3,
+            hint_channel(
+                &opts,
+                TurnVerb::Local,
+                HINT_TURN_CHANNEL,
+                HINT_APPROVAL_ID,
+                hint_far_deadline(),
+            ),
+        )
+        .await
+        .expect(
+            "the lookup never returned within three budgets against a stalled peer, so nothing \
+             is bounding it: a real turn would sit here forever",
+        );
+        let elapsed = started.elapsed();
+        stall.abort();
+
+        assert_eq!(
+            resolved, HINT_TURN_CHANNEL,
+            "the degradation contract must hold under a HANG, not only under a \
+             refusal: an expired budget is 'no answer' like any other, so the \
+             hint prints exactly what it printed before this change"
+        );
+        // Lower bound: proves the budget is what returned, not some earlier
+        // error path that happened to answer quickly and would leave the real
+        // stall unbounded. Upper bound: proves the budget actually fired.
+        assert!(
+            elapsed >= HINT_CHANNEL_LOOKUP_BUDGET,
+            "returning before the budget means the stall was not reached and \
+             this test proved nothing about the bound; took {elapsed:?}"
+        );
+        assert!(
+            elapsed < HINT_CHANNEL_LOOKUP_BUDGET * 3,
+            "the lookup must be cut off at its own budget, not left to some \
+             wider deadline; took {elapsed:?}"
+        );
+    }
+
+    /// P1. The lookup's budget must be CAPPED by what is left of the turn's
+    /// deadline, never spent on top of it.
+    ///
+    /// `resume_after_approval` computes `remaining` and hands it to
+    /// `await_resume`. If the lookup can first burn its own fixed budget, an
+    /// operator who asked for `--timeout-secs 1` waits about eleven seconds,
+    /// and every nested gate in the loop adds another budget on top of that.
+    /// This repo states the opposite invariant explicitly at
+    /// `cli/src/chat.rs:497-499`: "Every per-op budget is capped by what is LEFT
+    /// of the overall deadline, so the advertised `--timeout-secs` is a hard
+    /// bound on this path too rather than being overrun by up to one fixed scan
+    /// budget." `capped(budget, deadline)` (`cli/src/chat.rs:86`) is the helper
+    /// that already expresses it, and the effective bound here must be
+    /// `capped(HINT_CHANNEL_LOOKUP_BUDGET, deadline)`.
+    ///
+    /// The peer is the same stall as the test above, so the lookup would run to
+    /// its full budget if nothing else stopped it: only the deadline can end it
+    /// early, which is what makes the timing assertion attributable.
+    ///
+    /// Mutation it catches: ignoring the `deadline` parameter (the current
+    /// implementation has none, so this fails to compile), or applying it as a
+    /// floor rather than a cap.
+    #[tokio::test]
+    async fn the_lookup_budget_is_capped_by_what_is_left_of_the_turns_deadline() {
+        let (base, stall) = hint_stalling_peer().await;
+        let opts = hint_opts(&base);
+        // A turn with one second left, against a peer that never answers.
+        let deadline = Instant::now() + Duration::from_secs(1);
+
+        let started = Instant::now();
+        // Same harness safety net as above: an implementation that ignored the
+        // deadline would otherwise hang CI instead of failing it.
+        let resolved = tokio::time::timeout(
+            HINT_CHANNEL_LOOKUP_BUDGET * 3,
+            hint_channel(
+                &opts,
+                TurnVerb::Local,
+                HINT_TURN_CHANNEL,
+                HINT_APPROVAL_ID,
+                deadline,
+            ),
+        )
+        .await
+        .expect(
+            "the lookup never returned within three budgets against a stalled peer, so neither \
+             its own bound nor the turn deadline is holding it",
+        );
+        let elapsed = started.elapsed();
+        stall.abort();
+
+        assert_eq!(
+            resolved, HINT_TURN_CHANNEL,
+            "a deadline that expires mid-lookup is 'no answer' like any other, \
+             so the hint still degrades to the turn channel"
+        );
+        // Half a budget, not the one second itself: the deadline is what must
+        // end this, and anything at or near the full budget means the turn's
+        // remaining time was ignored. The slack is deliberately wide so a loaded
+        // machine cannot flake it, while still being far below the value a
+        // deadline-blind implementation would produce.
+        assert!(
+            elapsed < HINT_CHANNEL_LOOKUP_BUDGET / 2,
+            "with one second left on the turn, the lookup must end in about one \
+             second, not run its full budget: a `--timeout-secs 1` turn would \
+             otherwise take about eleven seconds and break the hard bound \
+             `cli/src/chat.rs:497-499` promises. Took {elapsed:?}"
+        );
+    }
+
+    /// A-T4b. The lookup succeeds but the record carries no card channel, so
+    /// there is nothing to override with.
+    ///
+    /// A null `card_channel` is an older row or a direct API write, which means
+    /// the REQUESTING channel applies (#1431) -- and the requesting channel is
+    /// the turn channel. Substituting an empty string or the literal "null"
+    /// here would print an unrunnable command.
+    ///
+    /// Mutation it catches: `unwrap_or_default()` on the option, which yields
+    /// `--actor-channel ''`.
+    #[tokio::test]
+    async fn the_hint_names_the_turn_channel_when_the_record_binds_no_route() {
+        let base = hint_stub_api(200, HINT_UNROUTED_APPROVAL).await;
+        let opts = hint_opts(&base);
+
+        let resolved = hint_channel(
+            &opts,
+            TurnVerb::Local,
+            HINT_TURN_CHANNEL,
+            HINT_APPROVAL_ID,
+            hint_far_deadline(),
+        )
+        .await;
+
+        assert_eq!(
+            resolved, HINT_TURN_CHANNEL,
+            "a null card_channel means the requesting channel applies, not that \
+             the hint should print an empty or literal-null channel"
+        );
+    }
+
+    /// P2. An EMPTY `card_channel` is not a channel, and must degrade exactly
+    /// like a null one.
+    ///
+    /// The wire model admits `"card_channel": ""`, and the SERVER already reads
+    /// it as absent: the authorizer resolves the approver set as
+    /// `approval.card_channel or approval.reply_channel`
+    /// (`apps/api/src/curie_api/slack_approvers.py:174`), and an empty string is
+    /// falsy in Python, so the members of the REPLY channel are the approver
+    /// set. A CLI that echoed the empty value would print `--actor-channel ''`,
+    /// which that same membership check refuses 403 with "resolve this from the
+    /// approval's channel" -- the exact failure #1531 exists to remove,
+    /// reintroduced by the fix for it and on a record shape nothing else in the
+    /// suite covers.
+    ///
+    /// The turn channel is the right answer rather than merely a safe one: it
+    /// IS the reply channel, which is what the server falls back to.
+    ///
+    /// Mutation it catches: `Ok(Some(card_channel)) => card_channel` with no
+    /// emptiness check, which is what the current implementation does.
+    #[tokio::test]
+    async fn the_hint_names_the_turn_channel_when_the_card_channel_is_empty() {
+        let base = hint_stub_api(200, HINT_EMPTY_CARD_APPROVAL).await;
+        let opts = hint_opts(&base);
+
+        let resolved = hint_channel(
+            &opts,
+            TurnVerb::Local,
+            HINT_TURN_CHANNEL,
+            HINT_APPROVAL_ID,
+            hint_far_deadline(),
+        )
+        .await;
+
+        assert!(
+            !resolved.is_empty(),
+            "the hint must never render `--actor-channel ''`; an empty channel \
+             is a guaranteed 403 on the default approver set"
+        );
+        assert_eq!(
+            resolved, HINT_TURN_CHANNEL,
+            "an empty card_channel is what the server itself treats as absent, \
+             so the hint must name the reply channel the server falls back to, \
+             which is the turn channel"
+        );
+    }
+
+    /// The other side of that boundary: a WHITESPACE-ONLY `card_channel` is a
+    /// real channel to the server, so the hint must print it VERBATIM.
+    ///
+    /// This test and
+    /// `the_hint_names_the_turn_channel_when_the_card_channel_is_empty` are
+    /// deliberately a PAIR, and the pair is the point. The server picks the
+    /// approver set with `approval.card_channel or approval.reply_channel`
+    /// (`apps/api/src/curie_api/slack_approvers.py:174`), and in Python ONLY the
+    /// empty string is falsy. `" "` is truthy, so the authorizer takes that
+    /// exact whitespace value as the card channel and compares
+    /// `--actor-channel` against it. A CLI that trimmed before testing for
+    /// emptiness would degrade to the turn channel and hand the operator a
+    /// command the server refuses 403 -- which is the very failure #1531 exists
+    /// to remove, so a guard meant to prevent it would be causing it.
+    ///
+    /// The CLI's job here is to mirror Python falsiness exactly, not to improve
+    /// on it: only `""` is absent, and everything else is printed as-is. A later
+    /// reader must not "simplify" these two tests into one with a `trim()`; the
+    /// two fixtures differ by a single space precisely so that collapse fails.
+    ///
+    /// Mutation it catches: `!card_channel.trim().is_empty()` in place of
+    /// `!card_channel.is_empty()`, which is what the current implementation
+    /// does.
+    #[tokio::test]
+    async fn a_whitespace_only_card_channel_is_a_channel_and_prints_verbatim() {
+        let base = hint_stub_api(200, HINT_BLANK_CARD_APPROVAL).await;
+        let opts = hint_opts(&base);
+
+        let resolved = hint_channel(
+            &opts,
+            TurnVerb::Local,
+            HINT_TURN_CHANNEL,
+            HINT_APPROVAL_ID,
+            hint_far_deadline(),
+        )
+        .await;
+
+        assert_eq!(
+            resolved, HINT_BLANK_CARD_CHANNEL,
+            "a whitespace-only card_channel is TRUTHY in Python, so the server \
+             authorizes against that exact value; the hint must reproduce it \
+             byte for byte rather than trimming it away"
+        );
+        assert_ne!(
+            resolved, HINT_TURN_CHANNEL,
+            "degrading here prints a channel the server will not accept, which \
+             is the 403 this whole change exists to remove"
+        );
+    }
+
+    /// A 404 is absorbed by the advisory wrapper, not surfaced.
+    ///
+    /// Real rather than theoretical: another operator can resolve or expire the
+    /// approval between the pending notice and the hint. The client method
+    /// propagates the 404 (see `cli/tests/approval_hint_channel.rs`), and this
+    /// is the layer that turns it into today's behavior. The operator then
+    /// discovers the resolution through the wait itself.
+    ///
+    /// Mutation it catches: bubbling the client error out of the wrapper, which
+    /// would make a race between two operators fail the turn.
+    #[tokio::test]
+    async fn the_hint_names_the_turn_channel_when_the_approval_is_already_gone() {
+        let base = hint_stub_api(404, r#"{"detail":"approval not found"}"#).await;
+        let opts = hint_opts(&base);
+
+        let resolved = hint_channel(
+            &opts,
+            TurnVerb::Local,
+            HINT_TURN_CHANNEL,
+            HINT_APPROVAL_ID,
+            hint_far_deadline(),
+        )
+        .await;
+
+        assert_eq!(
+            resolved, HINT_TURN_CHANNEL,
+            "an approval resolved out from under the wait is 'no answer'; the \
+             hint degrades rather than the turn failing"
+        );
+    }
+
+    // ─── #1531 finding 3, cluster arm: degradation without a leaked child ────
+    //
+    // Everything above drives `TurnVerb::Local`, whose tier dispatch is a plain
+    // base URL. The CLUSTER arm reaches the API through a short-lived
+    // `kubectl port-forward` child instead, and until now no automated test
+    // entered it at all. The test below covers its FAILURE path only: the
+    // forward cannot start, so the lookup has no answer. The SUCCESS path,
+    // where the forward binds and the GET returns a card channel, needs a live
+    // cluster with a real release in it and is therefore recorded separately as
+    // tier evidence rather than asserted here.
+
+    /// The namespace and release this test's cluster-tier `MessageOpts` name.
+    ///
+    /// Deliberately values no real deployment would ever use, because the leak
+    /// assertion counts processes by these strings. A developer running an
+    /// unrelated `kubectl port-forward` against a real release on the same box
+    /// must not be counted by that scan, must not be killed, and must not be
+    /// able to fail this test.
+    const HINT_CLUSTER_NAMESPACE: &str = "curie-hint-1531-absent-namespace";
+    const HINT_CLUSTER_RELEASE: &str = "curie-hint-1531-absent-release";
+
+    /// A cluster-tier turn. There is no `api_url` to point anywhere, unlike
+    /// [`hint_opts`]: on this tier the namespace and release ARE the dispatch,
+    /// since they are what [`port_forward_command`] renders into the child's
+    /// argv. The local port is likewise a value nothing else on the box is
+    /// expected to hold, so a real forward is never disturbed.
+    fn hint_cluster_opts() -> MessageOpts {
+        MessageOpts {
+            api_key: HINT_API_KEY.to_string(),
+            namespace: HINT_CLUSTER_NAMESPACE.to_string(),
+            release: HINT_CLUSTER_RELEASE.to_string(),
+            api_local_port: 18531,
+            local: false,
+            ..MessageOpts::default()
+        }
+    }
+
+    /// The `svc/<release>-api` argument [`port_forward_command`] builds for
+    /// [`hint_cluster_opts`]: the token that identifies a child THIS test
+    /// caused, and nothing else.
+    fn hint_cluster_forward_target() -> String {
+        format!("svc/{HINT_CLUSTER_RELEASE}-api")
+    }
+
+    /// How many live processes carry both this test's namespace and its
+    /// `svc/<release>-api` target on their command line.
+    ///
+    /// A count, never a kill: the assertion compares this before and after, so
+    /// an unrelated pre existing forward cancels out instead of failing the
+    /// test, and no process this test did not start is ever signalled.
+    ///
+    /// A zombie has an EMPTY `cmdline` in `/proc`, so a child that has already
+    /// exited but is still awaiting reap is not counted. That is what keeps the
+    /// assertion free of reap timing flake: the question is whether a forward is
+    /// still RUNNING, not whether its slot is cleared.
+    #[cfg(target_os = "linux")]
+    fn hint_cluster_port_forwards() -> usize {
+        let target = hint_cluster_forward_target();
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return 0;
+        };
+        entries
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                let Ok(raw) = std::fs::read(entry.path().join("cmdline")) else {
+                    return false;
+                };
+                // `/proc` separates argv with NUL; joining on spaces makes the
+                // needles read like the argv `port_forward_command` renders.
+                let argv = String::from_utf8_lossy(&raw).replace('\0', " ");
+                argv.contains(HINT_CLUSTER_NAMESPACE) && argv.contains(&target)
+            })
+            .count()
+    }
+
+    /// The same count where there is no `/proc` to walk. `pgrep -f` matches the
+    /// same space joined argv, and a box with neither `/proc` nor `pgrep`
+    /// answers zero on both sides of the call, which leaves the delta assertion
+    /// true rather than falsely red.
+    #[cfg(not(target_os = "linux"))]
+    fn hint_cluster_port_forwards() -> usize {
+        let Ok(out) = std::process::Command::new("pgrep")
+            .arg("-f")
+            .arg(hint_cluster_forward_target())
+            .output()
+        else {
+            return 0;
+        };
+        out.stdout
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .count()
+    }
+
+    /// The cluster arm degrades to the turn channel when the port forward cannot
+    /// start, stays inside its budget, and leaves no `kubectl port-forward`
+    /// child behind ON THAT PATH.
+    ///
+    /// The input is always "the forward did not bind", in every environment this
+    /// test can run in, and the contract is identical in each, so none of them
+    /// is skipped: a developer box whose `kubectl` has no current context errors
+    /// out at once, CI where `kubectl` is not on PATH fails the spawn, and a box
+    /// with a live cluster still has no such namespace as
+    /// [`HINT_CLUSTER_NAMESPACE`].
+    ///
+    /// What it covers:
+    ///
+    /// 1. DEGRADATION (#1531 finding 3). The hint is a command a human copy
+    ///    pastes, and the default approver set compares `--actor-channel`
+    ///    against the approval's channel. A cluster whose API cannot be reached
+    ///    knows nothing about the card, so it must print exactly what the hint
+    ///    printed before this change. A wrong or empty channel is a guaranteed
+    ///    403, which is the failure #1531 exists to remove.
+    /// 2. BOUND. The lookup runs INSIDE the resume wait, so a cluster arm that
+    ///    sat on `start_port_forward` would freeze a terminal on a turn whose
+    ///    durable approval is already fine.
+    /// 3. NO CHILD LEFT BEHIND on the failed-bind path: a spawn that somehow
+    ///    outlives a bind that failed would show up as a nonzero delta.
+    ///
+    /// What it does NOT cover, said plainly so no reader takes more from it than
+    /// it gives. Because `start_port_forward` always ERRORS here, no guard is
+    /// ever constructed, and the child count is zero on both sides of the call.
+    /// The guard's drop on the SUCCESS path -- which is the #751/#766 regression
+    /// class proper -- is therefore untested by this test: hoisting the guard out
+    /// of the lookup, leaking it with `std::mem::forget`, or dropping
+    /// `kill_on_drop` would all still pass here, because none of them can run.
+    /// That property rests on the live cluster verification this ticket requires
+    /// (`pgrep -f "kubectl port-forward"` empty after a turn that actually bound
+    /// one), and nothing in `cargo test` can stand in for it.
+    ///
+    /// Mutations it does catch: replacing the degraded arm with the card channel
+    /// unwrapped, or with an empty string, fails assertion 1; deleting the
+    /// wrapping `tokio::time::timeout` so `start_port_forward`'s own 15 second
+    /// readiness deadline governs fails assertion 2, and a lookup that hangs
+    /// outright is caught by the outer harness timeout.
+    #[tokio::test]
+    async fn the_cluster_arm_degrades_without_leaking_a_port_forward() {
+        let opts = hint_cluster_opts();
+        let before = hint_cluster_port_forwards();
+
+        let started = Instant::now();
+        // The same harness safety net the local stall tests use, and wider than
+        // the budget under test on purpose: an implementation that lost its
+        // bound would otherwise hang CI instead of failing it.
+        let resolved = tokio::time::timeout(
+            HINT_CHANNEL_LOOKUP_BUDGET * 3,
+            hint_channel(
+                &opts,
+                TurnVerb::Cluster,
+                HINT_TURN_CHANNEL,
+                HINT_APPROVAL_ID,
+                hint_far_deadline(),
+            ),
+        )
+        .await
+        .expect(
+            "the cluster lookup never returned within three budgets against a cluster it cannot \
+             reach, so nothing is bounding it: a real turn would sit here forever",
+        );
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            resolved, HINT_TURN_CHANNEL,
+            "a cluster whose API cannot be reached is 'no answer', and no answer \
+             means the hint prints exactly what it printed before this change"
+        );
+        assert!(
+            !resolved.is_empty(),
+            "the hint must never render `--actor-channel ''` on the cluster arm \
+             either; an empty channel is a guaranteed 403"
+        );
+        // A forward that cannot bind fails at once on every environment listed
+        // above, so anything near the budget means the failure is being waited
+        // on rather than absorbed, and the bound is named rather than a literal
+        // so it tracks the constant if that is ever retuned.
+        assert!(
+            elapsed < HINT_CHANNEL_LOOKUP_BUDGET,
+            "the cluster lookup must stay inside its budget so it can never \
+             extend the resume wait; took {elapsed:?}"
+        );
+
+        // The kill is delivered on drop, so give the kernel a moment to land it
+        // before concluding a child survived (the same poll the abandoned docker
+        // child test uses).
+        let mut after = hint_cluster_port_forwards();
+        for _ in 0..100 {
+            if after <= before {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            after = hint_cluster_port_forwards();
+        }
+        assert!(
+            after <= before,
+            "the cluster lookup leaked a `kubectl port-forward` for \
+             {} (before {before}, after {after}); an orphaned forward is the \
+             #751/#766 regression class, and this lookup runs once per gate",
+            hint_cluster_forward_target()
+        );
     }
 
     /// The probe is only honest if it filters on the service compose actually
@@ -4888,6 +6130,13 @@ mod tests {
         assert_eq!(
             select_worker_container("curie-curie-worker-1\n").unwrap(),
             "curie-curie-worker-1"
+        );
+        // #1031(a): container NAMES carry the compose project, so a non-default
+        // `COMPOSE_PROJECT_NAME` renames the container out from under any
+        // hardcoded name. The label selector is what still resolves it.
+        assert_eq!(
+            select_worker_container("acme-staging-curie-worker-1\n").unwrap(),
+            "acme-staging-curie-worker-1"
         );
     }
 
@@ -5503,9 +6752,22 @@ mod tests {
             connected_worker_transport((t("https://slack.com/api/"), t(LOCAL_STUB_BOT_TOKEN))),
             None
         );
-        // No stack running / nothing resolvable -> stub path, never a real post.
+        // #1031: an EMPTY `SLACK_API_BASE_URL` is this repo's "talk to real Slack"
+        // signal, not its "nothing configured" one. `local comms --connect` sets
+        // exactly that (`comms::local_connect_commands`), compose's single-dash
+        // `${SLACK_API_BASE_URL-...}` preserves it, and the runbook documents it.
+        // Reading it as disconnected made the connected local transport
+        // unreachable. Connected, over real Slack's own base.
+        let empty_base = connected_worker_transport((t(""), t("xoxb-real")))
+            .expect("an empty SLACK_API_BASE_URL is the connected signal, not the stub one");
+        assert_eq!(empty_base.api_base, crate::slack::DEFAULT_API_BASE);
+        assert_eq!(empty_base.bot_token, "xoxb-real");
+
+        // Absent is NOT empty. `None` means the value was never read off the
+        // container (no stack, docker down, container renamed), so there is no
+        // worker transport to trust -> stub path, never a real post.
         assert_eq!(connected_worker_transport((None, None)), None);
-        assert_eq!(connected_worker_transport((t(""), t("xoxb-real"))), None);
+        assert_eq!(connected_worker_transport((None, t("xoxb-real"))), None);
         assert_eq!(
             connected_worker_transport((t("https://slack.com/api/"), None)),
             None
@@ -5513,6 +6775,194 @@ mod tests {
         assert_eq!(
             connected_worker_transport((t("https://slack.com/api/"), t("  "))),
             None
+        );
+    }
+
+    fn local_comms_opts(disconnect: bool) -> crate::comms::LocalCommsOpts {
+        crate::comms::LocalCommsOpts {
+            file: "compose.dev.yaml".to_string(),
+            dry_run: false,
+            app_token: "xapp-real-workspace".to_string(),
+            bot_token: "xoxb-real-workspace".to_string(),
+            disconnect,
+            model_mode: crate::local::ModelMode::DefaultFake,
+            model_credentials: Vec::new(),
+            model: None,
+            minimal: false,
+            stack_image_env: Vec::new(),
+        }
+    }
+
+    /// The worker Slack env a `local comms` command actually applies, read back
+    /// out of the built `OpsCommand`s the same way compose would.
+    fn worker_slack_env(commands: &[crate::ops::OpsCommand]) -> WorkerTransport {
+        let get = |key: &str| -> Option<String> {
+            commands
+                .iter()
+                .flat_map(|cmd| cmd.env.iter().chain(cmd.secret_env.iter()))
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.clone())
+        };
+        (get("SLACK_API_BASE_URL"), get("SLACK_BOT_TOKEN"))
+    }
+
+    /// #1031 end to end across the two modules: the env `curie local comms
+    /// --connect` really applies to the worker must classify as CONNECTED, and
+    /// `--disconnect`'s must classify as NOT connected. Both halves are read from
+    /// the command builder rather than restated here, so inverting either the
+    /// predicate or the builder fails this test instead of silently stranding the
+    /// connected path (which is exactly how the defect shipped).
+    #[test]
+    fn local_comms_connect_and_disconnect_round_trip_through_the_probe() {
+        let connect = crate::comms::local_connect_commands(&local_comms_opts(false));
+        let connected_env = worker_slack_env(&connect);
+        assert_eq!(
+            connected_env.0,
+            Some(String::new()),
+            "`local comms --connect` un-wires the stub by setting an EMPTY base; if that \
+             ever changes, the probe's reading of empty must change with it"
+        );
+
+        let transport = connected_worker_transport(connected_env)
+            .expect("`local comms --connect` must leave the worker classified as connected");
+        assert_eq!(transport.api_base, crate::slack::DEFAULT_API_BASE);
+        assert_eq!(transport.bot_token, "xoxb-real-workspace");
+
+        // Negative control on the same seam: --disconnect restores the stub, which
+        // must stay classified as not connected however real the token looks.
+        let disconnect = crate::comms::local_disconnect_commands(&local_comms_opts(true));
+        let disconnected_env = worker_slack_env(&disconnect);
+        assert!(
+            disconnected_env
+                .0
+                .as_deref()
+                .is_some_and(|base| base.contains(LOCAL_SLACK_STUB_HOST)),
+            "`local comms --disconnect` must point the worker back at the stub: {:?}",
+            disconnected_env.0
+        );
+        assert_eq!(connected_worker_transport(disconnected_env), None);
+    }
+
+    /// #1031 mode C at the local tier: a probe that could not RUN is not evidence
+    /// that no workspace is connected, so it says so rather than silently taking
+    /// the stub path (the asymmetry `ops::dispatcher_connected` already closed).
+    #[test]
+    fn a_probe_that_could_not_run_warns_rather_than_claiming_disconnected() {
+        let warning = worker_probe_warning("no running container matches `label=x`");
+        assert!(
+            warning.contains("could not determine")
+                && warning.contains("no running container matches `label=x`")
+                && warning.contains("NOT connected"),
+            "{warning}"
+        );
+        // Only the first line of a multi-line failure, so a docker stack trace
+        // cannot swamp the operator's terminal.
+        let multi = worker_probe_warning("first line\nsecond line");
+        assert!(
+            multi.contains("first line") && !multi.contains("second line"),
+            "{multi}"
+        );
+    }
+
+    /// #1031(d): a wedged docker daemon accepts the request and never answers.
+    /// Without a bound, `curie local message` hangs forever -- which contradicts
+    /// the "probe failure is the safe direction" claim, because it never fails.
+    /// `std::future::pending()` is that daemon; the assertion is that the probe
+    /// RETURNS at all.
+    #[tokio::test]
+    async fn a_wedged_docker_daemon_times_the_probe_out_instead_of_hanging() {
+        let budget = Duration::from_millis(20);
+        // The outer bound is the test harness's own safety net: without the guard
+        // under test this call never returns, and a CI job that HANGS is a worse
+        // signal than one that fails. Five seconds is 250x the budget, so it can
+        // only fire when the budget is not being applied at all.
+        let reason = tokio::time::timeout(
+            Duration::from_secs(5),
+            bounded_worker_probe(std::future::pending(), budget),
+        )
+        .await
+        .expect("the probe must be bounded; it never returned")
+        .expect_err("a probe that never answers must time out, not hang");
+        assert!(
+            reason.contains("did not answer within"),
+            "the timeout must be reported as a timeout: {reason}"
+        );
+    }
+
+    /// The `/proc` state letter for `pid`: `None` once the entry is gone, `Some('Z')`
+    /// while it is a reaped-pending zombie, `Some('S')` while it is still sleeping.
+    #[cfg(target_os = "linux")]
+    fn proc_state(pid: u32) -> Option<char> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // comm can contain spaces and parens, so the fields start after the LAST ')'.
+        let rest = stat.rsplit_once(')')?.1;
+        rest.split_whitespace().next()?.chars().next()
+    }
+
+    /// #1031(d), second half: bounding the WAIT is not bounding the WORK. A
+    /// timeout that only drops the future leaves the `docker` client running
+    /// against the wedged daemon, so every timed-out `local message` strands
+    /// another one -- the leak is worst in exactly the scenario the timeout
+    /// exists for. `run_capture` sets `kill_on_drop`, so abandoning the probe
+    /// takes the child with it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_timed_out_probe_kills_the_docker_child_it_abandoned() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let pidfile = temp.path().join("pid");
+        let script = temp.path().join("wedged-docker");
+        std::fs::write(&script, "#!/bin/sh\necho $$ > \"$1\"\nexec sleep 60\n")
+            .expect("write wedged docker shim");
+        let mut permissions = std::fs::metadata(&script)
+            .expect("shim metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).expect("make shim executable");
+
+        let cmd = OpsCommand::new(
+            script.to_str().expect("shim path is UTF 8"),
+            vec![plain(pidfile.to_str().expect("pidfile path is UTF 8"))],
+        );
+        let reason = bounded_worker_probe(
+            async {
+                let (_ok, _out, _err) = run_capture(&cmd).await?;
+                Ok((None, None))
+            },
+            Duration::from_millis(300),
+        )
+        .await
+        .expect_err("a shim that never answers must time out");
+        assert!(reason.contains("did not answer within"), "{reason}");
+
+        let pid: u32 = std::fs::read_to_string(&pidfile)
+            .expect("the shim recorded its pid before sleeping")
+            .trim()
+            .parse()
+            .expect("the recorded pid is a number");
+
+        // The kill is delivered on drop; give the kernel a moment to land it.
+        let mut state = proc_state(pid);
+        for _ in 0..100 {
+            if !matches!(state, Some('S') | Some('R') | Some('D')) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            state = proc_state(pid);
+        }
+        assert!(
+            !matches!(state, Some('S') | Some('R') | Some('D')),
+            "the abandoned child is still running (pid {pid}, state {state:?})"
+        );
+    }
+
+    #[test]
+    fn the_probe_budget_is_bounded_and_usable() {
+        assert!(
+            WORKER_PROBE_TIMEOUT > Duration::ZERO
+                && WORKER_PROBE_TIMEOUT <= Duration::from_secs(30),
+            "{WORKER_PROBE_TIMEOUT:?}"
         );
     }
 
@@ -5839,6 +7289,26 @@ mod tests {
     }
 
     #[test]
+    fn worker_pod_settle_budget_covers_chart_default_termination_grace() {
+        let chart_grace = Duration::from_secs(1800);
+        let view = WorkerTrustView {
+            resource_version: None,
+            annotations_present: false,
+            holder: None,
+            worker_index: 0,
+            env_present: false,
+            env: Vec::new(),
+            trust: None,
+            termination_grace_period: chart_grace,
+        };
+        assert_eq!(
+            worker_prevention_wait_budget(&view),
+            chart_grace + WORKER_PREVENTION_MARGIN,
+            "the CLI settle wait must cover worker.terminationGracePeriodSeconds=1800"
+        );
+    }
+
+    #[test]
     fn message_dry_run_json_carries_the_planned_action() {
         // Explicit channel passes through verbatim.
         let v = message_dry_run_json(
@@ -5886,6 +7356,7 @@ mod tests {
             models: Vec::new(),
             concurrency: 1,
             sampling: crate::eval_sampling::SampleConfig::default(),
+            case_ids: Vec::new(),
         }
     }
 
@@ -6421,5 +7892,103 @@ mod tests {
         );
 
         assert!(!cmd.env.iter().any(|(k, _)| k == "CURIE_DISPATCHER_IMAGE"));
+    }
+
+    // --- --case-id selector (#2007) -----------------------------------------
+
+    fn selector_suite() -> EvalSuite {
+        EvalSuite {
+            name: "smoke".into(),
+            cases: ["greets-the-user", "looks-up-the-order"]
+                .iter()
+                .map(|id| {
+                    let mut case = eval_case(GraderKind::Contains, "hi");
+                    case.id = (*id).into();
+                    case
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn an_unmatched_case_id_selector_is_a_usage_error_at_local_and_cluster() {
+        // The headline of #2007 on the parity tiers: a mistyped selector fails
+        // the gate (exit 2) rather than greening an empty run.
+        let err = crate::evals::select_cases(
+            selector_suite(),
+            std::slice::from_ref(&"greets-the-usr".to_string()),
+        )
+        .expect_err("a mistyped --case-id must fail");
+        assert_eq!(
+            crate::exit::classify(&err).0,
+            crate::exit::ExitClass::Usage,
+            "{err:#}"
+        );
+        assert!(format!("{err:#}").contains("greets-the-usr"), "{err:#}");
+    }
+
+    #[test]
+    fn a_case_id_selector_on_a_model_sweep_is_unsupported() {
+        assert!(guard_sweep_case_ids(&[]).is_ok(), "no selector, no refusal");
+        let err = guard_sweep_case_ids(std::slice::from_ref(&"greets-the-user".to_string()))
+            .expect_err("--case-id + --model must be refused");
+        let (class, fix) = crate::exit::classify(&err);
+        assert_eq!(
+            class,
+            crate::exit::ExitClass::Unsupported,
+            "the refusal is ADR-0041 Unsupported (exit 4): {err:#}"
+        );
+        assert!(format!("{err:#}").contains("--case-id"), "{err:#}");
+        assert!(
+            fix.expect("the refusal names the honest alternative")
+                .contains("--case-id"),
+            "the fix names the in-CLI path that honors a selector",
+        );
+    }
+
+    #[test]
+    fn a_case_id_selector_on_the_trajectory_platform_path_is_unsupported() {
+        assert!(
+            guard_trajectory_case_ids(&[]).is_ok(),
+            "no selector, no refusal"
+        );
+        let err = guard_trajectory_case_ids(std::slice::from_ref(&"greets-the-user".to_string()))
+            .expect_err("--case-id on a trajectory eval must be refused");
+        let (class, fix) = crate::exit::classify(&err);
+        assert_eq!(class, crate::exit::ExitClass::Unsupported, "{err:#}");
+        assert!(
+            format!("{err:#}").contains("trajectory"),
+            "the message names the plane that cannot honor it: {err:#}"
+        );
+        assert!(
+            fix.expect("the refusal names the honest alternative")
+                .contains("skill eval --case-id"),
+            "the fix names the tier that does honor a selector",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mistyped_case_id_fails_a_local_eval_dry_run_rather_than_greening_it() {
+        // End of the wire at this tier: even a --dry-run refuses, so a mistyped
+        // selector cannot be discovered only after a full stack run.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cases = dir.path().join("cases.json");
+        std::fs::write(
+            &cases,
+            r#"{"name":"smoke","cases":[{"id":"greets-the-user","input":"hi","grader":{"kind":"contains","expected":"hi"}}]}"#,
+        )
+        .expect("write suite");
+        let mut opts = eval_opts(true, Some("C7"));
+        opts.cases = Some(cases);
+        opts.case_ids = vec!["greets-the-usr".to_string()];
+        let err = eval(opts)
+            .await
+            .expect_err("a mistyped --case-id must fail the run");
+        assert_eq!(
+            crate::exit::classify(&err).0,
+            crate::exit::ExitClass::Usage,
+            "{err:#}"
+        );
+        assert!(format!("{err:#}").contains("greets-the-usr"), "{err:#}");
     }
 }

@@ -658,6 +658,14 @@
             },
             {
               "global": false,
+              "help": "Run only the case(s) with these ids; repeat to select several. Omit to run the whole suite. A value that matches no case in the suite exits 2 (usage), so a mistyped selector fails the gate instead of greening an empty run",
+              "id": "case_id",
+              "long": "case-id",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Runner base URL (defaults to the started runner, then localhost)",
               "id": "url",
               "long": "url",
@@ -1264,6 +1272,14 @@
               "help": "Eval case file (default: `evals/cases.json` here, then the recorded bundle's)",
               "id": "cases",
               "long": "cases",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Run only the case(s) with these ids; repeat to select several. Omit to run the whole suite. A value that matches no case in the suite exits 2 (usage), so a mistyped selector fails the gate instead of greening an empty run",
+              "id": "case_id",
+              "long": "case-id",
               "positional": false,
               "required": false
             },
@@ -2603,7 +2619,7 @@
             },
             {
               "global": false,
-              "help": "Install with the chart's built-in dev-default secrets instead of generating strong per-release randoms. Deterministic, for local dev and CI only -- these defaults are published in the public repo",
+              "help": "Install with the chart's built-in dev-default secrets instead of generating strong per-release randoms. Deterministic, for local dev and CI only -- these defaults are published in the public repo. Applies to a fresh install or a release already on dev defaults; it is refused against a release installed without it, since switching an existing release onto the published defaults breaks authentication against the credentials its PVCs still hold",
               "id": "dev",
               "long": "dev",
               "positional": false,
@@ -2682,6 +2698,81 @@
           ],
           "hidden": false,
           "name": "down"
+        },
+        {
+          "about": "Roll the release back to the newest revision that is actually known good",
+          "args": [
+            {
+              "global": false,
+              "help": "Roll back to this exact revision instead of the newest safe one. A revision that is not `deployed` or `superseded` is refused unless --allow-failed-revision is also passed",
+              "id": "revision",
+              "long": "revision",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Permit --revision to name a revision helm never finished applying (`failed`, `pending-*`, `uninstalling`). Off by default. Requires --revision -- auto-select never chooses an ineligible revision, so this flag alone would otherwise be a silent no-op",
+              "id": "allow_failed_revision",
+              "long": "allow-failed-revision",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "env": "CURIE_NAMESPACE",
+              "global": false,
+              "help": "Kubernetes namespace",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": false,
+              "help": "Helm release name",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Skip the interactive confirmation prompt",
+              "id": "yes",
+              "long": "yes",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Print the commands that would run and exit without executing",
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "long_about": "Roll the release back to the newest revision that is actually known good.\n\nA bare `helm rollback` targets the immediately preceding revision. On a cluster with no `runsc` RuntimeClass that is the wrong one: `cluster up` records a FAILED revision before its successful gVisor-off retry, so the history alternates failed/superseded and the preceding revision is a failed one -- a manifest helm never finished applying.\n\nThis verb skips every revision whose status is not `deployed` or `superseded` and rolls back to the newest one below the current revision that is, printing which revisions it passed over. See issue #1899.",
+          "name": "rollback"
         },
         {
           "about": "Carry bundle objects across a chart upgrade that renames the object store (issue #1324)",
@@ -3153,6 +3244,28 @@
             },
             {
               "default_values": [
+                ""
+              ],
+              "global": false,
+              "help": "Name of a Secret you manage that holds the App's PEM. The chart only references it, so the key never enters helm release history. The recommended path; mutually exclusive with --private-key",
+              "id": "existing_secret",
+              "long": "existing-secret",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "privateKey"
+              ],
+              "global": false,
+              "help": "Data key inside --existing-secret holding the PEM",
+              "id": "existing_secret_key",
+              "long": "existing-secret-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
                 "https://github.com"
               ],
               "global": false,
@@ -3398,6 +3511,14 @@
               "help": "Eval case file (default: `evals/cases.json` here, then the recorded bundle's)",
               "id": "cases",
               "long": "cases",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Run only the case(s) with these ids; repeat to select several. Omit to run the whole suite. A value that matches no case in the suite exits 2 (usage), so a mistyped selector fails the gate instead of greening an empty run",
+              "id": "case_id",
+              "long": "case-id",
               "positional": false,
               "required": false
             },
@@ -5010,6 +5131,38 @@
               "long": "from-env",
               "positional": false,
               "required": false
+            },
+            {
+              "global": false,
+              "help": "Cluster identity fingerprint from `kubectl config view`. Required with --release and --namespace to scope a connector secret to one cluster",
+              "id": "cluster_identity",
+              "long": "cluster-identity",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Helm release the secret may be injected into",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Kubernetes namespace the secret may be injected into",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Compare-and-set version from `curie secrets list --json`. Required to replace an existing cluster-scoped secret",
+              "id": "expected_version",
+              "long": "expected-version",
+              "positional": false,
+              "required": false
             }
           ],
           "hidden": false,
@@ -5029,6 +5182,30 @@
               "id": "name",
               "positional": true,
               "required": true
+            },
+            {
+              "global": false,
+              "help": "Cluster identity fingerprint. Required with --release and --namespace to remove one scoped entry without deleting the unscoped value",
+              "id": "cluster_identity",
+              "long": "cluster-identity",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Helm release of the scoped entry to remove",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Kubernetes namespace of the scoped entry to remove",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
             }
           ],
           "hidden": false,
@@ -5154,6 +5331,11 @@
           "about": "Validate every `examples/` bundle against Claude Code (`bash scripts/check-plugin-compat.sh`)",
           "hidden": false,
           "name": "plugin-compat"
+        },
+        {
+          "about": "Validate every Curie-owned skill against the Agent Skills reference validator, pinned to `skills-ref==0.1.1` so the gate is deterministic (`bash scripts/check-agent-skills.sh`). The inbound spec-conformance twin of `plugin-compat`: that one proves our bundles are accepted by Claude Code, this one proves our skills satisfy the published spec",
+          "hidden": false,
+          "name": "agent-skills"
         },
         {
           "about": "Run the committed eval suites through the fake model and assert every case goes RED -- the falsifiability gate's real-path negative control (#619, `bash cli/scripts/eval-falsifiability.sh`). Offline, no credential",
@@ -5336,6 +5518,7 @@
           "default_values": [
             "curie"
           ],
+          "env": "CURIE_NAMESPACE",
           "global": false,
           "id": "namespace",
           "long": "namespace",
@@ -5435,6 +5618,14 @@
           "positional": false,
           "required": false,
           "short": "f"
+        },
+        {
+          "global": false,
+          "help": "Chart reference override, as `cluster up` takes. Diff RENDERS this chart to detect stateful components the apply would delete, so point it at the same chart `curie apply --chart` would use",
+          "id": "chart",
+          "long": "chart",
+          "positional": false,
+          "required": false
         }
       ],
       "hidden": false,

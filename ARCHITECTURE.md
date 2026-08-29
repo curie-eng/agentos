@@ -315,7 +315,14 @@ Each has an integration test under `apps/worker/tests/`:
 1. **One live session per thread.** A Valkey thread lock (`SET NX PX`) is the routing CAS (compare-and-swap) ([`apps/worker/src/curie_worker/threadlock.py::ThreadLock`](apps/worker/src/curie_worker/threadlock.py)).
 2. **The finish race.** A follow-up during a live turn is a steer; if the turn finished first, the runner returns 409 and the kernel opens a fresh turn on the same idle sandbox ([`apps/worker/src/curie_worker/kernel.py::Kernel._route_and_start`](apps/worker/src/curie_worker/kernel.py)).
 3. **No auto-retry after a side-effectful failure.** If a prior attempt flagged a side effect, the kernel escalates to a human instead of retrying ([`apps/worker/src/curie_worker/kernel.py::Kernel.process_event`](apps/worker/src/curie_worker/kernel.py)).
-4. **Crash recovery.** Pending stream entries are reclaimed with `XAUTOCLAIM` ([`apps/worker/src/curie_worker/stream_consumer.py::StreamConsumer._reclaim_once`](apps/worker/src/curie_worker/stream_consumer.py)). The runs consumer group is created at `$`, so a cold worker never replays ancient backlog ([`apps/worker/src/curie_worker/consumer.py::Consumer.ensure_group`](apps/worker/src/curie_worker/consumer.py)).
+4. **Crash recovery.** A capable dead consumer's pending entries are transferred
+   after sustained renewable-lease absence, with one Valkey arbitration lease
+   preventing replacement replicas from racing through the delivery budget;
+   unknown older consumers retain `XAUTOCLAIM` as the compatibility backstop
+   ([`apps/worker/src/curie_worker/stream_consumer.py::StreamConsumer._reclaim_once`](apps/worker/src/curie_worker/stream_consumer.py)).
+   A restarted generation first recovers rows under its own stable consumer name.
+   The runs consumer group is created at `$`, so a cold worker never replays ancient
+   backlog ([`apps/worker/src/curie_worker/consumer.py::Consumer.ensure_group`](apps/worker/src/curie_worker/consumer.py)).
 
 Beyond these four invariants, a **kill switch** — a Valkey pub/sub channel
 `curie:kill-events` plus per-agent kill keys — gates and interrupts live runs
@@ -371,10 +378,17 @@ Three properties keep an approval from becoming a standing permission:
 ## Pushing agent versions with git (deploy flow)
 
 A push is verified with an HMAC (Hash-based Message Authentication Code)
-signature, archived, validated, and stored as an immutable versioned bundle.
-A **dev-branch** push builds the artifact and fans out its eval suite as a CI
-check. A **prod-branch** push promotes that same artifact without rebuilding.
-One diagram, both branches:
+signature. The delivery that **builds** the bundle -- archiving, validating,
+and storing it as an immutable versioned bundle -- is a **dev-branch** push,
+which then fans out its eval suite as a CI check. A **prod-branch** push
+promotes that same artifact without rebuilding: if the pushed sha already has
+a stored bundle for this repository, the promote fetches its bytes straight
+from the object store and skips both the clone and the re-validation, which is
+why a prod promote does not need access to the git remote (#1211). Either way
+the deployed artifact is still the exact object that was validated when it was
+first built; the promote only re-checks its bounds against current caps
+(`deploy.revalidate_stored_bundle`, ADR-0059 decision 3). One diagram, both
+branches:
 
 There are **two ways a push reaches this flow**, and they converge immediately.
 The webhook below is the fast path. The second is a timer: `CommitPoller` in the

@@ -449,8 +449,8 @@ fn run_tui_action(
             if confirm != name {
                 return Ok("Remove secret canceled.".to_string());
             }
-            crate::secrets::remove_value(&name)?;
-            Ok(format!("Removed {name}."))
+            crate::secrets::remove_all_values(&name)?;
+            Ok(format!("Removed all stored entries for {name}."))
         }
     }
 }

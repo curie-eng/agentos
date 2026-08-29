@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import subprocess
 from datetime import datetime, timedelta
 
 import httpx
@@ -26,6 +27,11 @@ from fastapi.testclient import TestClient
 
 REPO = "octo/agent-bot"
 CLONE = "https://github.com/octo/agent-bot.git"
+# A sha the real `process_push` will accept: it rejects anything that is not
+# 40/64 lowercase hex as "ignored" before it ever reaches the clone (#1309's
+# end-to-end tests drive the real deploy path, so "abc123" would never get
+# there).
+REAL_SHA = "a" * 40
 
 
 class Tips:
@@ -45,6 +51,57 @@ class Tips:
 
 def target(*branches: str, repo: str = REPO) -> PollTarget:
     return PollTarget(repo_full_name=repo, clone_url=CLONE, branches=branches)
+
+
+def _poller_with_clock(
+    *,
+    tips,
+    bindings_for_pass=lambda: [(REPO, "agent")],
+    deployments_for_pass=lambda: [],
+):
+    """The poller plus the mutable clock both harnesses drive it with.
+
+    Returns `(poller, now)`, where `now` is the `{"v": seconds}` dict the
+    injected clock reads: advancing it is how a test crosses a backoff window
+    without sleeping for five minutes.
+
+    The two row sources are callables evaluated per query rather than fixed
+    rows, so the harness that varies its answers between passes (`_run_passes`)
+    and the one that answers identically for forty passes (the end-to-end
+    timeout test, which needs the REAL `process_push` and so cannot use
+    `_run_passes`) share one Session, factory and clock.
+    """
+
+    from contextlib import asynccontextmanager
+
+    from curie_api.commitpoller import CommitPoller
+    from curie_api.config import Settings
+
+    now = {"v": 0.0}
+
+    class Session:
+        async def execute(self, stmt):
+            if "FROM curie.agents" in str(stmt):
+                return bindings_for_pass()
+            # Everything else is the deployments query: its SQL reads
+            # `FROM curie.deployments d JOIN curie.agents a`, so it does not
+            # match the substring above.
+            return deployments_for_pass()
+
+    @asynccontextmanager
+    async def factory():
+        yield Session()
+
+    poller = CommitPoller(
+        session_factory=factory,
+        store=object(),
+        settings=Settings(github_clone_base="https://github.com"),
+        eval_queue=object(),
+        tips=tips,
+        interval_seconds=60,
+        clock=lambda: now["v"],
+    )
+    return poller, now
 
 
 # --------------------------------------------------------------------------- #
@@ -929,56 +986,84 @@ def test_invalid_repo_full_name_is_rejected_before_commit_poll_http(monkeypatch)
 
 # Not re-cloning a commit that already settled (#1267)
 # --------------------------------------------------------------------------- #
-async def _passes(
+async def _run_passes(
     monkeypatch,
-    result,
+    outcomes,
     n: int = 2,
     binding_snapshots: list[tuple[str, ...]] | None = None,
-) -> int:
-    """Run n consecutive poll_once passes; return how many reached the deploy path.
+    seconds_per_pass: float = 0.0,
+    tips=None,
+    after_pass=None,
+    deployments: list[list[tuple[str, str, str]]] | None = None,
+):
+    """Run n consecutive poll_once passes; return (deploy-path calls, poller).
 
     Reaching the deploy path is what costs a full mirror clone -- the clone
-    lives inside process_push -- so this counts exactly the thing #1267 is
-    about.
+    lives inside process_push -- so the count is exactly the thing #1267 and
+    #1309 are about.
+
+    `seconds_per_pass` advances the poller's injected clock between passes, so a
+    backoff window can be crossed (or deliberately not crossed) without a test
+    that sleeps for five minutes. The default of 0.0 keeps every earlier
+    caller's timing semantics: passes back to back, no time elapsing.
+
+    `outcomes` is what the stubbed deploy path returns: one WebhookResult for
+    every call, or a list giving a different outcome per call -- which is what
+    lets a test prove a retry actually reached process_push and what it returned
+    when it did. The last entry of a list repeats once the list runs out.
+
+    `deployments` supplies the rows the deployments query returns on each pass,
+    as `(repo_full_name, environment, commit_sha)`. It defaults to no rows on
+    every pass, which is what every earlier caller already got. Supplying rows is
+    how a test stands in for the OTHER lane -- a webhook deploy the poller never
+    saw -- since that query is the only place its result is visible here.
     """
-    from contextlib import asynccontextmanager
-
     from curie_api import gitflow
-    from curie_api.commitpoller import CommitPoller
-    from curie_api.config import Settings
 
+    per_call = list(outcomes) if isinstance(outcomes, list) else [outcomes]
     calls = {"n": 0}
 
     async def counting(session, store, settings, eval_queue, payload):
+        outcome = per_call[min(calls["n"], len(per_call) - 1)]
         calls["n"] += 1
-        return result
+        return outcome
 
     snapshots = binding_snapshots or [("agent",)] * n
+    deployment_rows = deployments if deployments is not None else [[]] * n
     pass_index = {"value": 0}
 
-    class Session:
-        async def execute(self, stmt):
-            if "FROM curie.agents" in str(stmt):
-                return [(REPO, name) for name in snapshots[pass_index["value"]]]
-            return []
-
-    @asynccontextmanager
-    async def factory():
-        yield Session()
-
     monkeypatch.setattr(gitflow, "process_push", counting)
-    poller = CommitPoller(
-        session_factory=factory,
-        store=object(),
-        settings=Settings(github_clone_base="https://github.com"),
-        eval_queue=object(),
-        tips=Tips({(REPO, "dev"): "abc123", (REPO, "main"): None}),
-        interval_seconds=60,
+    poller, now = _poller_with_clock(
+        tips=tips or Tips({(REPO, "dev"): "abc123", (REPO, "main"): None}),
+        bindings_for_pass=lambda: [(REPO, name) for name in snapshots[pass_index["value"]]],
+        deployments_for_pass=lambda: deployment_rows[pass_index["value"]],
     )
     for _ in range(n):
         await poller.poll_once()
+        if after_pass is not None:
+            after_pass(poller, now["v"])
         pass_index["value"] += 1
-    return calls["n"]
+        now["v"] += seconds_per_pass
+    return calls["n"], poller
+
+
+async def _passes(
+    monkeypatch,
+    outcomes,
+    n: int = 2,
+    binding_snapshots: list[tuple[str, ...]] | None = None,
+    seconds_per_pass: float = 0.0,
+) -> int:
+    """How many of n passes reached the deploy path. See `_run_passes`."""
+
+    calls, _ = await _run_passes(
+        monkeypatch,
+        outcomes,
+        n=n,
+        binding_snapshots=binding_snapshots,
+        seconds_per_pass=seconds_per_pass,
+    )
+    return calls
 
 
 @pytest.mark.anyio
@@ -1036,19 +1121,483 @@ async def test_a_topology_rejection_waits_for_a_binding_change(monkeypatch, code
     ) == 2
 
 
+def _archive_failure(*extra_codes: str):
+    """A rejection carrying `git.archive_failed` plus any extra codes."""
+    from curie_api.schemas import WebhookResult
+
+    codes = ["git.archive_failed", *extra_codes]
+    return WebhookResult(status="rejected", errors=[{"code": code} for code in codes])
+
+
 @pytest.mark.anyio
 async def test_a_transient_clone_failure_IS_retried(monkeypatch) -> None:
     """The other side: remembering must not make a network blip permanent.
 
     An unreachable remote is the one rejection that says nothing about the
     commit, so suppressing its retry would strand a repository until the API
-    restarted.
+    restarted. #1309 bounds the RATE of those retries; it must not quietly turn
+    them into the terminal state #1267 gives every other rejection. With enough
+    time elapsing to clear even the hourly ceiling, every pass tries again.
+    """
+
+    assert await _passes(monkeypatch, _archive_failure(), n=4, seconds_per_pass=3600.0) == 4
+
+
+@pytest.mark.anyio
+async def test_a_repeatedly_failing_clone_is_not_recloned_every_pass(monkeypatch) -> None:
+    """AC2 of #1309. The regression: ~1,440 full clones a day for one sha.
+
+    Before this, `git.archive_failed` was retried on the very next pass and then
+    settled -- two clones, then silence. The suppression half of the fix is that
+    a second pass arriving before the backoff window has elapsed must not reach
+    process_push at all, because the mirror clone lives inside it.
+    """
+
+    assert await _passes(monkeypatch, _archive_failure(), n=4, seconds_per_pass=0.0) == 1
+
+
+@pytest.mark.anyio
+async def test_an_archive_failure_recovers_once_the_backoff_has_elapsed(monkeypatch) -> None:
+    """AC1 of #1309: one real timeout must stay recoverable.
+
+    The second pass runs exactly at `next_attempt_at`, reaches process_push, and
+    deploys. `_archive_backoff` being empty afterwards is the assertion that
+    matters: only the deployed branch pops the record, so a run that never got
+    past the filter -- or that got a second rejection -- would leave one behind.
     """
 
     from curie_api.schemas import WebhookResult
 
-    transient = WebhookResult(status="rejected", errors=[{"code": "git.archive_failed"}])
-    assert await _passes(monkeypatch, transient, n=4) == 2
+    calls, poller = await _run_passes(
+        monkeypatch,
+        [_archive_failure(), WebhookResult(status="deployed")],
+        n=2,
+        # Exactly _RETRY_BASE_DELAY_S: the window is "not before", so landing on
+        # the boundary is a retry, not a skip.
+        seconds_per_pass=300.0,
+    )
+    assert calls == 2, "the repaired repository never got its second clone"
+    assert poller._archive_backoff == {}, "a successful deploy left failure state behind"
+    assert poller._settled == {}, "a successful deploy must leave the database in charge"
+
+
+@pytest.mark.anyio
+async def test_the_backoff_window_holds_until_it_elapses(monkeypatch) -> None:
+    """AC1 of #1309, negative control: 299s is still inside the window.
+
+    299 and 300 seconds are the two sides of the same window, and asserting
+    both -- through the real filter, with no private state read -- is what pins
+    the boundary rather than merely the record's contents.
+    """
+
+    assert await _passes(monkeypatch, _archive_failure(), n=2, seconds_per_pass=299.0) == 1
+
+
+@pytest.mark.anyio
+async def test_the_retry_delay_grows_geometrically_and_is_capped(monkeypatch) -> None:
+    """AC2 of #1309: increasing, capped delay -- asserted in seconds.
+
+    The numbers are the point, so they are literals rather than recomputed from
+    the module's constants: 5m, 10m, 20m, 40m, then an hour that does NOT keep
+    doubling. The cap is what keeps a repository repaired later self-healing --
+    an uncapped schedule reaches days and is terminal in all but name.
+    """
+
+    delays: list[float] = []
+
+    def record(poller, now: float) -> None:
+        delays.append(poller._archive_backoff[(REPO, "dev")].next_attempt_at - now)
+
+    calls, _ = await _run_passes(
+        monkeypatch,
+        _archive_failure(),
+        n=6,
+        # Two hours clears every window, so all six passes really attempt.
+        seconds_per_pass=7200.0,
+        after_pass=record,
+    )
+    assert calls == 6
+    assert delays == [300.0, 600.0, 1200.0, 2400.0, 3600.0, 3600.0]
+
+
+@pytest.mark.anyio
+async def test_a_changed_failure_class_restarts_the_backoff(monkeypatch) -> None:
+    """AC2 of #1309: the count continues only for the SAME failure.
+
+    A rejection whose codes changed is a different failure -- the repository
+    moved from one problem to another -- and has not earned the accumulated
+    delay of the previous one. Without the codes in the record, the second
+    failure below would wait 600s on the strength of an unrelated first.
+    """
+
+    delays: list[float] = []
+
+    def record(poller, now: float) -> None:
+        delays.append(poller._archive_backoff[(REPO, "dev")].next_attempt_at - now)
+
+    await _run_passes(
+        monkeypatch,
+        [_archive_failure(), _archive_failure("deploy.ambiguous_env")],
+        n=2,
+        seconds_per_pass=7200.0,
+        after_pass=record,
+    )
+    assert delays == [300.0, 300.0], f"a different failure class inherited a delay: {delays}"
+
+
+@pytest.mark.anyio
+async def test_a_sustained_clone_failure_reports_the_lane_as_stalled(
+    monkeypatch, caplog
+) -> None:
+    """AC3 of #1309: an Error record after a defined consecutive threshold.
+
+    Two properties, and the second is the one that gets lost: nothing at ERROR
+    for the first two attempts (a blip must not page anyone), and the error
+    REPEATS on every attempt after the threshold. A lane parked at the hourly
+    ceiling that reported itself once, hours ago, is back to being silent --
+    which is the #1309 failure, not the fix for it.
+    """
+
+    seen: list[int] = []
+
+    def count_errors(poller, now: float) -> None:
+        seen.append(len([r for r in caplog.records if r.levelno >= logging.ERROR]))
+
+    with caplog.at_level(logging.ERROR, logger="curie_api.commitpoller"):
+        await _run_passes(
+            monkeypatch,
+            _archive_failure(),
+            n=4,
+            seconds_per_pass=7200.0,
+            after_pass=count_errors,
+        )
+
+    assert seen == [0, 0, 1, 2], f"errors after each attempt: {seen}"
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    text = errors[0].getMessage()
+    assert REPO in text, f"the stalled repository must be named: {text}"
+    assert "NOT happening" in text, f"the record must say deploys have stopped: {text}"
+    assert "credential" in text, f"the record must point at the likely causes: {text}"
+
+
+@pytest.mark.anyio
+async def test_a_new_commit_is_attempted_while_the_old_backoff_is_open(monkeypatch) -> None:
+    """AC4 of #1309: failure state is per sha, and a new sha clears it.
+
+    The backoff is a statement about one commit, not about the repository
+    forever. Suppressing a NEW commit -- which may be the very push that fixes
+    the repository -- would be a worse outage than the one #1309 is about. The
+    negative control is `..._is_not_recloned_every_pass` above: same sha, same
+    zero elapsed time, one clone.
+    """
+
+    class MovingTip:
+        """A dev branch whose tip the test moves between passes."""
+
+        def __init__(self, sha: str) -> None:
+            self.sha = sha
+
+        def sha_for(self, repo_full_name: str, branch: str) -> str | None:
+            return self.sha if branch == "dev" else None
+
+    tips = MovingTip("abc123")
+
+    def push_a_new_commit(poller, now: float) -> None:
+        tips.sha = "def456"
+
+    calls, _ = await _run_passes(
+        monkeypatch,
+        _archive_failure(),
+        n=2,
+        # No time passes at all: the first sha's window is still wide open.
+        seconds_per_pass=0.0,
+        tips=tips,
+        after_pass=push_a_new_commit,
+    )
+    assert calls == 2, "a new commit was suppressed by the previous commit's backoff"
+
+
+@pytest.mark.anyio
+async def test_a_successful_deploy_resets_the_attempt_count(monkeypatch) -> None:
+    """AC4 of #1309: a deploy clears the record, it does not just pause it.
+
+    If the record survived a success, the next unrelated failure would inherit
+    the old attempt count -- backing off for 10 minutes on a first blip and
+    reporting a stalled lane one failure early.
+    """
+
+    from curie_api.schemas import WebhookResult
+
+    calls, poller = await _run_passes(
+        monkeypatch,
+        [_archive_failure(), WebhookResult(status="deployed"), _archive_failure()],
+        n=3,
+        seconds_per_pass=7200.0,
+    )
+    assert calls == 3
+    assert poller._archive_backoff[(REPO, "dev")].attempts == 1, (
+        "the failure after a successful deploy continued the old count"
+    )
+
+
+@pytest.mark.anyio
+async def test_a_lane_failing_for_weeks_keeps_retrying_instead_of_crashing(
+    monkeypatch,
+) -> None:
+    """AC2 of #1309: the hourly ceiling must be a ceiling, not a crash loop.
+
+    `_RETRY_BASE_DELAY_S * 2 ** (attempts - 1)` evaluates the exponent in full
+    before `min` clamps anything, and at attempt 1,025 that float multiplication
+    raises OverflowError. A repository that fails every attempt reaches 1,025 in
+    roughly 43 days at the hourly ceiling -- well inside the life of an API pod.
+    The exception escapes poll_once before the new record is stored, so the
+    already-expired record survives and the lane clones again on every single
+    interval: exactly the ~1,440-clones-a-day regression #1309 exists to end,
+    now permanent instead of transient.
+
+    Driven through the real poll_once with no private state seeded, so on the
+    unfixed code pass 1,025 raises out of poll_once and this errors -- there is
+    no run_forever here to swallow it.
+    """
+
+    calls, _ = await _run_passes(
+        monkeypatch,
+        _archive_failure(),
+        n=1026,
+        # Two hours clears even the hourly ceiling, so every pass really
+        # attempts and the attempt count really reaches 1,026.
+        seconds_per_pass=7200.0,
+    )
+    assert calls == 1026, f"the poll pass stopped attempting after {calls}"
+
+
+@pytest.mark.anyio
+async def test_a_deploy_from_the_webhook_lane_clears_the_backoff(monkeypatch) -> None:
+    """AC4 of #1309: a successful deploy is a successful deploy, either lane.
+
+    The backoff record was cleared only when the POLLER itself saw a deploy. The
+    webhook lane runs the same process_push without going near the poller, so:
+    the poller fails on sha A and writes a 5-minute record; the webhook deploys
+    sha B on that branch; the branch is rolled back to A. A is a move again, the
+    stale record still matches it, its window is still open -- and the rollback
+    is suppressed, even though the deploy of B is direct evidence the repository
+    is clonable again. The poller must not sit on a stale failure for a branch
+    the platform has since deployed.
+
+    The negative control is `..._is_not_recloned_every_pass` above: same sha, no
+    time elapsed, NO deployment change, one clone.
+    """
+
+    # Two more shas of the same shape as REAL_SHA, because this scenario needs
+    # three distinct commits at once -- reusing REAL_SHA for both sides of a
+    # rollback would prove nothing.
+    polled_sha = "b" * 40
+    webhook_sha = "c" * 40
+
+    calls, _ = await _run_passes(
+        monkeypatch,
+        _archive_failure(),
+        n=2,
+        # No time passes at all: A's window is still wide open on pass 2, so the
+        # only thing that can let it through is the deployment of B.
+        seconds_per_pass=0.0,
+        tips=Tips({(REPO, "dev"): polled_sha, (REPO, "main"): None}),
+        deployments=[[], [(REPO, "dev", webhook_sha)]],
+    )
+    assert calls == 2, "a rollback was suppressed by a failure the other lane already fixed"
+
+
+@pytest.mark.anyio
+async def test_each_deploy_branch_backs_off_on_its_own_schedule(monkeypatch) -> None:
+    """AC2 of #1309: "the same failure" includes the BRANCH, not just the repo.
+
+    Every other test here exercises one branch, because the shared fixture
+    gives `main` no tip and so only `dev` ever moves. That leaves the branch
+    dimension of the key unpinned: a record keyed on the repository alone would
+    have both deploy branches sharing one backoff, and each branch's failure
+    would evict the other's record on every single pass -- so neither window
+    would ever suppress anything and the repository would be back to a full
+    mirror clone per branch per interval, which is the #1309 regression itself.
+
+    Both branches are given a real, distinct tip so both move on every pass,
+    and both fail the same way. What proves the isolation is that the third
+    pass clones NOTHING: two independent windows, each opened by that branch's
+    own second failure, are both still shut.
+    """
+
+    dev_sha = "d" * 40
+    main_sha = "e" * 40
+
+    attempts: dict[tuple[str, str], list[int]] = {}
+
+    def record(poller, now: float) -> None:
+        for key, backoff in poller._archive_backoff.items():
+            attempts.setdefault(key, []).append(backoff.attempts)
+
+    calls, poller = await _run_passes(
+        monkeypatch,
+        _archive_failure(),
+        n=3,
+        # One base window per pass: pass 2 lands exactly on `next_attempt_at`
+        # and retries, and pass 3 lands inside the 600s that second failure
+        # earned -- for BOTH branches, if each really has its own record.
+        seconds_per_pass=300.0,
+        tips=Tips({(REPO, "dev"): dev_sha, (REPO, "main"): main_sha}),
+        after_pass=record,
+    )
+
+    assert calls == 4, (
+        "two branches over three passes should clone twice each and then be "
+        f"suppressed together, not {calls} times"
+    )
+    assert set(poller._archive_backoff) == {(REPO, "dev"), (REPO, "main")}, (
+        f"the two deploy branches did not get their own records: {poller._archive_backoff}"
+    )
+    assert poller._archive_backoff[(REPO, "dev")].sha == dev_sha
+    assert poller._archive_backoff[(REPO, "main")].sha == main_sha
+    # Each branch failed twice, at t=0 and t=300, so each has earned 600s from
+    # its own second failure -- a shared counter would read 1 or 4, never 2 on
+    # both.
+    assert attempts == {
+        (REPO, "dev"): [1, 2, 2],
+        (REPO, "main"): [1, 2, 2],
+    }, f"the two branches did not count their failures separately: {attempts}"
+    assert poller._archive_backoff[(REPO, "dev")].next_attempt_at == 900.0
+    assert poller._archive_backoff[(REPO, "main")].next_attempt_at == 900.0
+
+
+# --------------------------------------------------------------------------- #
+# Driving a real subprocess timeout through the whole lane (#1309, AC5)
+# --------------------------------------------------------------------------- #
+def _timing_out_git(calls: list[list[str]]):
+    """A `subprocess.run` that always times out, recording each invocation.
+
+    120s is the timeout `clone_and_archive` actually passes, and both the clone
+    and the archive use it. A repository too large to clone inside it fails this
+    way on every attempt, forever -- which is the case #1309 exists for, and the
+    one PR #1289 classified as transient.
+
+    The received `timeout` keyword is recorded too, on the returned callable's
+    `.timeouts` attribute, so a caller that wants to pin the bound (rather than
+    just observe argv) can without changing the `calls` list every existing
+    caller already asserts on.
+    """
+    timeouts: list[object] = []
+
+    def run(*args, **kwargs):
+        calls.append(list(args[0]) if args else [])
+        timeouts.append(kwargs.get("timeout"))
+        raise subprocess.TimeoutExpired(cmd=args[0] if args else ["git"], timeout=120)
+
+    run.timeouts = timeouts
+    return run
+
+
+def test_a_clone_timeout_becomes_a_gitflow_error(monkeypatch) -> None:
+    """AC5 of #1309, layer one: TimeoutExpired through `clone_and_archive`.
+
+    `clone_and_archive` catches TimeoutExpired alongside CalledProcessError and
+    re-raises GitFlowError. That conversion is the reason a timeout arrives at
+    the poller as a rejection rather than as a crashed poll pass. The 120s bound
+    itself is pinned here too: an unbounded git clone is a poll pass that never
+    returns, and the bound is what makes the failure a rejection the backoff can
+    classify rather than a hang.
+    """
+
+    from curie_api import gitflow
+    from curie_api.config import Settings
+
+    calls: list[list[str]] = []
+    fake_run = _timing_out_git(calls)
+    monkeypatch.setattr("curie_api.gitflow.subprocess.run", fake_run)
+
+    with pytest.raises(gitflow.GitFlowError):
+        gitflow.clone_and_archive(
+            CLONE,
+            REAL_SHA,
+            Settings(github_clone_base="https://github.com"),
+            repo_full_name=REPO,
+            ref="refs/heads/dev",
+        )
+    assert calls and calls[0][:1] == ["git"], "the timeout must come from the git clone"
+    assert fake_run.timeouts[0] == 120, "clone_and_archive must bound the clone at 120s"
+
+
+@pytest.mark.anyio
+async def test_process_push_reports_a_clone_timeout_as_archive_failed(monkeypatch) -> None:
+    """AC5 of #1309, layer two: TimeoutExpired through `process_push`.
+
+    This pins the code the poller classifies on. If a timeout ever stopped
+    mapping to `git.archive_failed`, the backoff would never engage and the
+    rejection would settle terminally instead -- silently, on the lane with no
+    GitHub delivery UI. No database: `process_push` reaches the clone after only
+    `crud.get_agents_by_repo`.
+    """
+
+    from curie_api import crud, gitflow
+    from curie_api.config import Settings
+
+    class StubAgent:
+        repo_full_name = REPO
+        name = "agent"
+
+    async def one_agent(session, full_name):
+        return [StubAgent()]
+
+    monkeypatch.setattr(crud, "get_agents_by_repo", one_agent)
+    monkeypatch.setattr("curie_api.gitflow.subprocess.run", _timing_out_git([]))
+
+    result = await gitflow.process_push(
+        object(),
+        object(),
+        Settings(github_clone_base="https://github.com"),
+        object(),
+        Move(REPO, CLONE, "dev", REAL_SHA).as_push_payload(),
+    )
+    assert result.status == "rejected"
+    assert [e.get("code") for e in (result.errors or [])] == ["git.archive_failed"]
+
+
+@pytest.mark.anyio
+async def test_a_permanently_timing_out_repository_stops_being_recloned(
+    monkeypatch, caplog
+) -> None:
+    """AC5 of #1309, layer three: repeated poll_once over the REAL deploy path.
+
+    The end-to-end proof, and the only test here that counts actual git
+    invocations rather than a fake's calls. Forty passes at the recommended 60s
+    interval is forty full mirror clones today; under the backoff the same forty
+    passes clone at t=0, 300, 900 and 2100 seconds -- four attempts -- and the
+    lane reports itself stalled instead of going quiet.
+    """
+
+    from curie_api import crud
+
+    class StubAgent:
+        repo_full_name = REPO
+        name = "agent"
+
+    async def one_agent(session, full_name):
+        return [StubAgent()]
+
+    clones: list[list[str]] = []
+    monkeypatch.setattr(crud, "get_agents_by_repo", one_agent)
+    monkeypatch.setattr("curie_api.gitflow.subprocess.run", _timing_out_git(clones))
+
+    # The same plumbing `_run_passes` builds, minus its counting stub: this test
+    # drives the REAL `process_push`, so the clones it counts are real git
+    # invocations. The default row sources are exactly what it needs -- one
+    # binding, no deployments, on every pass.
+    poller, now = _poller_with_clock(tips=Tips({(REPO, "dev"): REAL_SHA, (REPO, "main"): None}))
+    with caplog.at_level(logging.ERROR, logger="curie_api.commitpoller"):
+        for _ in range(40):
+            await poller.poll_once()
+            now["v"] += 60.0
+
+    assert len(clones) == 4, f"40 polls produced {len(clones)} clone attempts"
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert errors, "a repository failing every attempt must report the lane as stalled"
+    assert "NOT happening" in errors[0].getMessage()
 
 
 @pytest.mark.anyio

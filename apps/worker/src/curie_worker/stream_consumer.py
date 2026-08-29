@@ -15,11 +15,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from collections.abc import AsyncIterator, Awaitable, Callable
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import cast
+from typing import Any, cast
 
 from curie_telemetry import operation_span, record_metric
 from opentelemetry.trace import SpanKind, StatusCode
@@ -34,6 +35,7 @@ from redis.exceptions import (
 )
 
 from .broker import StreamBroker
+from .consumer_liveness import ConsumerLivenessStore
 from .delivery_lease import (
     DeliveryLease,
     DeliveryLeaseStore,
@@ -91,6 +93,8 @@ class DeliverySpec:
     dead_letter_maxlen: int
     reclaim_min_idle_ms: int
     dead_consumer_idle_ms: int
+    heartbeat_ttl_ms: int
+    capability_ttl_ms: int
     read_count: int
     cap_scan_page: int
     telemetry_source: str
@@ -98,6 +102,10 @@ class DeliverySpec:
     logger: logging.Logger
     dead_letter_log: str
     dead_letter_fail_log: str
+
+
+class ConsumerLivenessExpired(RuntimeError):
+    """The local consumer could no longer renew its alive lease safely."""
 
 
 class StreamConsumer:
@@ -118,13 +126,19 @@ class StreamConsumer:
         leases: DeliveryLeaseStore | None = None,
         on_lease_lost: LeaseLostHandler | None = None,
         drain: UpgradeDrainGate | None = None,
+        liveness_store: ConsumerLivenessStore | None = None,
     ) -> None:
         # The stream broker behind the port (#284). ``redis.asyncio.Redis`` is the
         # one backing today and structurally satisfies ``StreamBroker``; a second
         # broker is a drop-in. Named ``_redis`` still so the sacred consumer.py
         # subclass (which reads ``self._redis`` for XAUTOCLAIM) is untouched.
         self._redis: StreamBroker = redis
+        # Process stop is permanent (SIGTERM/operator shutdown). Generation stop
+        # is replaced for every supervised ``run()`` so a terminal lease failure
+        # can tear one generation down and restart cleanly without making the
+        # process look gracefully stopped.
         self._stop = asyncio.Event()
+        self._generation_stop = asyncio.Event()
         # Entry ids currently being handled by THIS consumer. XAUTOCLAIM would
         # otherwise reclaim our own long-running (still-pending) entries and
         # re-dispatch a duplicate handler that steers the same prompt into its
@@ -173,6 +187,14 @@ class StreamConsumer:
         # replacement pods that come up mid-roll do not reclaim them out from
         # under a replica that is still draining.
         self._drain: UpgradeDrainGate | None = drain
+        self._liveness_store = liveness_store
+        # The first absent observation for each capable peer. It is scoped to a
+        # run generation and cleared on restoration/disappearance/restart.
+        self._peer_absent_since: dict[str, float] = {}
+        # Prompt and 15-minute recovery both select PEL ownership through this
+        # lock. It never covers handler execution or a capacity-semaphore wait.
+        self._reclaim_lock = asyncio.Lock()
+        self._last_liveness_renewal: float | None = None
 
     @property
     def _spec(self) -> DeliverySpec:
@@ -209,6 +231,9 @@ class StreamConsumer:
             )
             return False
 
+    def _should_stop(self) -> bool:
+        return self._stop.is_set() or self._generation_stop.is_set()
+
     async def _ensure_group(self, stream: str, group: str, *, start_id: str) -> None:
         """Create the consumer group (and the stream) if it does not exist.
 
@@ -225,7 +250,7 @@ class StreamConsumer:
     async def _consume(self, spec: ReadLoopSpec, handler: EntryHandler) -> None:
         """Blocking-read loop: read the group, dispatch each entry to ``handler``,
         and survive transient transport faults until stop is requested."""
-        while not self._stop.is_set():
+        while not self._should_stop():
             if await self._claims_paused():
                 # Take nothing new while an upgrade drains. The in-flight
                 # handlers this consumer already owns keep running under their
@@ -284,10 +309,247 @@ class StreamConsumer:
                         )
 
     async def _sleep_or_stop(self, seconds: float) -> None:
+        """Sleep until the process/generation stops or the timeout elapses."""
+
+        process_stop = asyncio.create_task(self._stop.wait())
+        generation_stop = asyncio.create_task(self._generation_stop.wait())
         try:
-            await asyncio.wait_for(self._stop.wait(), timeout=seconds)
+            await asyncio.wait(
+                {process_stop, generation_stop},
+                timeout=seconds,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for task in (process_stop, generation_stop):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(process_stop, generation_stop, return_exceptions=True)
+
+    async def _sleep_generation(self, seconds: float) -> None:
+        """Sleep for a lease cadence, ignoring process stop during drain."""
+
+        try:
+            await asyncio.wait_for(self._generation_stop.wait(), timeout=seconds)
         except TimeoutError:
             pass
+
+    # -- consumer liveness + structured run generations ---------------------
+
+    def _generation_inflight_tasks(self) -> set[asyncio.Task[None]]:
+        """Tasks whose handlers own PEL entries in this generation."""
+
+        return set()
+
+    def _reset_generation_resources(self) -> None:
+        """Subclass hook for semaphore/accounting reset after forced teardown."""
+
+    def _reset_generation(self) -> None:
+        self._generation_stop = asyncio.Event()
+        self._peer_absent_since.clear()
+        self._inflight_ids.clear()
+        self._last_liveness_renewal = None
+
+    def _liveness_timeout_s(self) -> float:
+        # One renewal attempt may consume at most one sixth of the lease, so a
+        # timed-out attempt plus a retry still fit before the pre-expiry guard.
+        # The
+        # 1ms floor keeps deliberately tiny integration-test leases usable.
+        return max(0.001, self._spec.heartbeat_ttl_ms / 6000)
+
+    async def _publish_liveness(self) -> None:
+        if self._liveness_store is None:
+            raise RuntimeError("consumer generation has no liveness store")
+        async with asyncio.timeout(self._liveness_timeout_s()):
+            await self._liveness_store.publish(
+                stream=self._spec.stream,
+                group=self._spec.group,
+                consumer=self._spec.consumer,
+                heartbeat_ttl_ms=self._spec.heartbeat_ttl_ms,
+                capability_ttl_ms=self._spec.capability_ttl_ms,
+            )
+        self._last_liveness_renewal = time.monotonic()
+
+    async def _liveness_refresh_loop(self) -> None:
+        """Renew alive/capability until this run generation ends.
+
+        One transient failure is not terminal. What matters is monotonic time
+        since the last confirmed renewal: before the alive lease can silently
+        expire, this task raises and structured teardown leaves owned entries in
+        the PEL for a replacement generation/process.
+        """
+
+        assert self._liveness_store is not None
+        ttl_s = self._spec.heartbeat_ttl_ms / 1000
+        refresh_s = ttl_s / 3
+        expiry_guard_s = max(0.001, ttl_s - refresh_s)
+        retry_s = max(0.001, min(refresh_s / 4, 0.25))
+
+        await self._sleep_generation(refresh_s)
+        while not self._generation_stop.is_set():
+            try:
+                async with asyncio.timeout(self._liveness_timeout_s()):
+                    await self._liveness_store.renew(
+                        stream=self._spec.stream,
+                        group=self._spec.group,
+                        consumer=self._spec.consumer,
+                        heartbeat_ttl_ms=self._spec.heartbeat_ttl_ms,
+                        capability_ttl_ms=self._spec.capability_ttl_ms,
+                    )
+            except Exception as exc:
+                # ``CancelledError`` remains a BaseException and propagates.
+                last = self._last_liveness_renewal
+                elapsed = float("inf") if last is None else time.monotonic() - last
+                if elapsed >= expiry_guard_s:
+                    raise ConsumerLivenessExpired(
+                        "consumer liveness renewal could not be confirmed before "
+                        f"lease expiry for {self._spec.consumer}"
+                    ) from exc
+                self._spec.logger.warning(
+                    "consumer liveness renewal failed transiently for %s; retrying",
+                    self._spec.consumer,
+                    exc_info=True,
+                )
+                await self._sleep_generation(retry_s)
+                continue
+            self._last_liveness_renewal = time.monotonic()
+            await self._sleep_generation(refresh_s)
+
+    async def _cleanup_alive(self) -> None:
+        if self._liveness_store is None:
+            return
+        try:
+            await self._liveness_store.cleanup_alive(
+                stream=self._spec.stream,
+                group=self._spec.group,
+                consumer=self._spec.consumer,
+                timeout_s=self._liveness_timeout_s(),
+            )
+        except Exception:
+            # Cleanup is best effort. The short TTL remains the authoritative
+            # bound if Valkey is unavailable while this generation terminates.
+            self._spec.logger.warning(
+                "consumer alive-lease cleanup failed for %s; awaiting TTL",
+                self._spec.consumer,
+                exc_info=True,
+            )
+
+    async def _cancel_and_join(self, tasks: set[asyncio.Task[None]]) -> None:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _run_consumer_generation(
+        self,
+        factories: dict[str, Callable[[], Coroutine[Any, Any, None]]],
+        *,
+        may_complete: frozenset[str] = frozenset(),
+    ) -> None:
+        """Run one supervised consumer generation with structured teardown.
+
+        ``request_stop`` is graceful: stop/cancel new-work loops, drain existing
+        handlers while the lease refresher stays alive, then remove the alive
+        lease. A child/refresher failure is terminal: cancel and join every loop
+        and handler, reset generation-local ownership/accounting, and re-raise so
+        the process supervisor starts exactly one clean generation.
+        """
+
+        self._reset_generation()
+        reserved = factories.keys() & {"bootstrap", "liveness"}
+        if reserved:
+            raise ValueError(f"consumer generation factories use reserved names: {reserved}")
+        await self._publish_liveness()  # ordered publication precedes every read
+
+        # A prior generation in this same pod can have been canceled after its
+        # alive lease became unverifiable. Recover rows still owned by this
+        # stable consumer name before reading new work. The refresher is already
+        # running while eval's inline handler drains this bootstrap.
+        tasks: dict[str, asyncio.Task[None]] = {}
+        tasks["liveness"] = asyncio.create_task(
+            self._liveness_refresh_loop(), name="consumer:liveness"
+        )
+        tasks["bootstrap"] = asyncio.create_task(
+            self._recover_local_pending_once(), name="consumer:bootstrap"
+        )
+        stop_waiter = asyncio.create_task(self._stop.wait(), name="consumer:process-stop")
+
+        failure: BaseException | None = None
+        graceful = False
+        try:
+            while tasks:
+                done, _pending = await asyncio.wait(
+                    {*tasks.values(), stop_waiter},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if stop_waiter in done:
+                    graceful = True
+                    break
+                for name, task in list(tasks.items()):
+                    if task not in done:
+                        continue
+                    del tasks[name]
+                    try:
+                        task.result()
+                    except BaseException as exc:
+                        failure = exc
+                        break
+                    if name == "bootstrap":
+                        tasks.update(
+                            {
+                                child_name: asyncio.create_task(
+                                    factory(), name=f"consumer:{child_name}"
+                                )
+                                for child_name, factory in factories.items()
+                            }
+                        )
+                        continue
+                    if name not in may_complete:
+                        failure = RuntimeError(
+                            f"consumer generation task {name!r} exited unexpectedly"
+                        )
+                        break
+                if failure is not None:
+                    break
+
+            if graceful:
+                # No new ownership after this point. Eval dispatch shields its
+                # inline handler; runs handlers already live in the in-flight set.
+                background = {
+                    task for name, task in tasks.items() if name != "liveness"
+                }
+                await self._cancel_and_join(background)
+
+                # Snapshot after producer loops are joined, so no new handler can
+                # appear while graceful drain is in progress.
+                inflight = self._generation_inflight_tasks()
+                if inflight:
+                    await asyncio.gather(*inflight, return_exceptions=True)
+
+                self._generation_stop.set()
+                liveness = tasks.get("liveness")
+                if liveness is not None:
+                    await asyncio.gather(liveness, return_exceptions=True)
+                return
+
+            # A terminal liveness or child failure must leave no zombie loop or
+            # handler that could race the replacement generation.
+            self._generation_stop.set()
+            await self._cancel_and_join(set(tasks.values()))
+            await self._cancel_and_join(self._generation_inflight_tasks())
+            self._reset_generation_resources()
+            # All old-generation work is joined. Replace the event and clear
+            # ownership/absence state before the supervisor's restart backoff so
+            # the next ``run()`` cannot inherit a terminal generation.
+            self._reset_generation()
+            if failure is None:
+                failure = RuntimeError("consumer generation exited without a terminal cause")
+            raise failure
+        finally:
+            if not stop_waiter.done():
+                stop_waiter.cancel()
+            await asyncio.gather(stop_waiter, return_exceptions=True)
+            await self._cleanup_alive()
 
     async def _xack(self, stream: str, group: str, entry_id: str) -> None:
         await self._redis.xack(stream, group, entry_id)
@@ -807,55 +1069,190 @@ class StreamConsumer:
             cursor = f"({pending[-1]['message_id']}"
         return over_cap
 
-    async def _reclaim_dead_consumers(self, over_cap: set[str]) -> int:
-        """Claim pending entries from consumers that have gone quiet.
+    async def _select_dead_consumer_entries(
+        self, over_cap: set[str]
+    ) -> list[StreamEntry]:
+        """Select/transfer entries only after sustained lease absence.
 
-        ``reclaim_min_idle_ms`` is an *entry* idle and must stay long enough
-        that a healthy in-flight turn is not stolen from a live replica.
-        Consumer idle is independent: a live worker keeps issuing XREADGROUP
-        every ``read_block_ms`` while its handler runs, so a peer whose last
-        group interaction is older than ``dead_consumer_idle_ms`` is gone, and
-        its PEL can be taken without waiting the 15-minute entry window
-        (#1532).
-
-        Since ADR-0131 this discovery is CANDIDATE DISCOVERY ONLY and is not
-        authority to steal a delivery. The ADR rejected process discovery as the
-        sole authority "because process discovery and retained runner lifetime
-        can diverge. Dead-consumer state remains a useful candidate signal
-        behind the lease fence." The fence itself is applied one level down, in
-        ``_claim_consumer_pending``.
+        Caller holds ``_reclaim_lock``. Consumer idle is merely a cheap
+        candidate threshold. A peer is proven dead only when it advertised the
+        liveness protocol and its alive lease is absent on two observations at
+        least one full heartbeat TTL apart. Unknown/pre-marker peers remain on
+        the unchanged XAUTOCLAIM backstop. Even after that proof, ADR-0131's
+        delivery lease remains authoritative: a live delivery fence is skipped
+        before cap evaluation and again after transfer.
         """
+
+        if self._liveness_store is None:
+            return []
         try:
-            consumers = await self._redis.xinfo_consumers(self._spec.stream, self._spec.group)
+            consumers = await self._redis.xinfo_consumers(
+                self._spec.stream, self._spec.group
+            )
         except ResponseError:
-            return 0
-        reclaimed = 0
+            self._peer_absent_since.clear()
+            return []
+
+        current_names = {str(info["name"]) for info in consumers}
+        for missing in self._peer_absent_since.keys() - current_names:
+            self._peer_absent_since.pop(missing, None)
+
+        now = time.monotonic()
+        required_absence_s = self._spec.heartbeat_ttl_ms / 1000
+        selected: list[StreamEntry] = []
         for info in consumers:
-            if self._stop.is_set():
+            if self._should_stop():
                 break
             name = str(info["name"])
-            if name == self._spec.consumer:
+            if (
+                name == self._spec.consumer
+                or int(info.get("pending") or 0) <= 0
+                or int(info.get("idle") or 0) < self._spec.dead_consumer_idle_ms
+            ):
+                self._peer_absent_since.pop(name, None)
                 continue
-            if int(info.get("pending") or 0) <= 0:
-                continue
-            if int(info.get("idle") or 0) < self._spec.dead_consumer_idle_ms:
-                continue
+
             try:
-                reclaimed += await self._claim_consumer_pending(name, over_cap)
+                capable = await self._liveness_store.is_capable(
+                    stream=self._spec.stream,
+                    group=self._spec.group,
+                    consumer=name,
+                )
+                if not capable:
+                    self._peer_absent_since.pop(name, None)
+                    continue
+                alive = await self._liveness_store.is_alive(
+                    stream=self._spec.stream,
+                    group=self._spec.group,
+                    consumer=name,
+                )
+            except Exception:
+                # An uncertain observation cannot contribute to proof of death.
+                self._peer_absent_since.pop(name, None)
+                self._spec.logger.warning(
+                    "consumer liveness observation failed for %s; prompt reclaim skipped",
+                    name,
+                    exc_info=True,
+                )
+                continue
+
+            if alive:
+                self._peer_absent_since.pop(name, None)
+                continue
+            first_absent = self._peer_absent_since.setdefault(name, now)
+            if now - first_absent < required_absence_s:
+                continue
+            token: str | None = None
+            try:
+                # Every surviving replica reaches this proof point at roughly
+                # the same time. A Valkey NX lease chooses one transfer owner so
+                # racing XCLAIM calls cannot burn several delivery attempts.
+                token = await self._liveness_store.try_acquire_reclaim(
+                    stream=self._spec.stream,
+                    group=self._spec.group,
+                    consumer=name,
+                    ttl_ms=max(self._spec.heartbeat_ttl_ms * 2, 60_000),
+                )
+                if token is None:
+                    continue
+                # The alive lease can be republished between the observation
+                # above and winning arbitration. Re-check inside the lease so a
+                # stale absence never transfers work from a restarted owner.
+                if await self._liveness_store.is_alive(
+                    stream=self._spec.stream,
+                    group=self._spec.group,
+                    consumer=name,
+                ):
+                    self._peer_absent_since.pop(name, None)
+                    continue
+                selected.extend(
+                    await self._claim_consumer_pending_locked(name, over_cap)
+                )
             except Exception:
                 self._spec.logger.exception(
                     "dead-consumer reclaim failed for %s on stream %s; left pending",
                     name,
                     self._spec.stream,
                 )
-        return reclaimed
+            finally:
+                if token is not None:
+                    try:
+                        await self._liveness_store.release_reclaim(
+                            stream=self._spec.stream,
+                            group=self._spec.group,
+                            consumer=name,
+                            token=token,
+                        )
+                    except Exception:
+                        # The lease TTL is authoritative. Never discard entries
+                        # already transferred merely because release failed.
+                        self._spec.logger.warning(
+                            "dead-consumer reclaim lease release failed for %s",
+                            name,
+                            exc_info=True,
+                        )
+        return selected
 
-    async def _claim_consumer_pending(self, name: str, over_cap: set[str]) -> int:
-        """XCLAIM one dead consumer's pending page and dispatch each entry."""
-        reclaimed = 0
+    async def _recover_local_pending_once(self) -> None:
+        """Recover rows canceled by an earlier generation with this same name."""
+
+        if self._liveness_store is None:
+            raise RuntimeError("consumer liveness store is required")
+        retry_s = min(max(0.001, self._spec.heartbeat_ttl_ms / 3000), 1.0)
+        while not self._should_stop():
+            token: str | None = None
+            entries: list[StreamEntry] = []
+            async with self._reclaim_lock:
+                try:
+                    # A peer can begin transferring this stable consumer name
+                    # while the local supervisor is between generations.
+                    # Bootstrap must contend on the same distributed lease or
+                    # both XCLAIM calls can dispatch the row and spend two
+                    # delivery attempts.
+                    token = await self._liveness_store.try_acquire_reclaim(
+                        stream=self._spec.stream,
+                        group=self._spec.group,
+                        consumer=self._spec.consumer,
+                        ttl_ms=max(self._spec.heartbeat_ttl_ms * 2, 60_000),
+                    )
+                    if token is not None:
+                        entries = await self._claim_consumer_pending_locked(
+                            self._spec.consumer, set()
+                        )
+                finally:
+                    if token is not None:
+                        try:
+                            await self._liveness_store.release_reclaim(
+                                stream=self._spec.stream,
+                                group=self._spec.group,
+                                consumer=self._spec.consumer,
+                                token=token,
+                            )
+                        except Exception:
+                            self._spec.logger.warning(
+                                "local pending recovery lease release failed for %s",
+                                self._spec.consumer,
+                                exc_info=True,
+                            )
+            if token is not None:
+                await self._dispatch_reclaimed(entries)
+                return
+            await self._sleep_generation(retry_s)
+
+    async def _claim_consumer_pending_locked(
+        self, name: str, over_cap: set[str]
+    ) -> list[StreamEntry]:
+        """Transfer one proven-dead peer's PEL, enforcing cap before XCLAIM.
+
+        Caller holds ``_reclaim_lock``. At/over-cap entries are dead-lettered
+        directly without XCLAIM's delivery-count increment. Handler dispatch is
+        returned to the caller and always occurs after the lock is released.
+        """
+
+        selected: list[StreamEntry] = []
         cursor = "-"
         page_size = self._spec.read_count
-        while not self._stop.is_set():
+        while not self._should_stop():
             rows = await self._redis.xpending_range(
                 self._spec.stream,
                 self._spec.group,
@@ -866,25 +1263,38 @@ class StreamConsumer:
             )
             if not rows:
                 break
-            ids: list[str] = []
+            claim_ids: list[str] = []
             for row in rows:
-                candidate = str(row["message_id"])
-                if candidate in self._inflight_ids or candidate in over_cap:
+                entry_id = str(row["message_id"])
+                if entry_id in self._inflight_ids or entry_id in over_cap:
                     continue
-                # The dead peer's process may be gone while its delivery's lease
-                # is still live -- a replacement that already took it, or the
-                # peer's own last renewal not yet expired. A dead consumer is a
-                # candidate, never authority (see the docstring above).
-                if await self._lease_is_live(candidate):
+                if await self._lease_is_live(entry_id):
                     continue
-                ids.append(candidate)
-            if ids:
+                delivered = int(row["times_delivered"])
+                if delivered >= self._spec.max_delivery:
+                    over_cap.add(entry_id)
+                    try:
+                        await self._dead_letter(
+                            entry_id,
+                            await self._entry_fields(entry_id),
+                            reason=self._spec.over_cap_reason,
+                            delivery_count=delivered,
+                        )
+                    except Exception:
+                        self._spec.logger.exception(
+                            self._spec.dead_letter_fail_log,
+                            entry_id,
+                        )
+                    continue
+                claim_ids.append(entry_id)
+
+            if claim_ids:
                 claimed = await self._redis.xclaim(
                     self._spec.stream,
                     self._spec.group,
                     self._spec.consumer,
                     0,
-                    ids,
+                    claim_ids,
                 )
                 for entry_id, fields in cast("list[StreamEntry]", claimed or []):
                     if entry_id in self._inflight_ids or entry_id in over_cap:
@@ -894,12 +1304,56 @@ class StreamConsumer:
                     # replacement to acquire the lease.
                     if await self._lease_is_live(entry_id):
                         continue
-                    reclaimed += 1
-                    await self._spec.handler(entry_id, dict(fields))
+                    selected.append((entry_id, dict(fields)))
             if len(rows) < page_size:
                 break
             cursor = f"({rows[-1]['message_id']}"
-        return reclaimed
+        return selected
+
+    async def _dispatch_reclaimed(self, entries: list[StreamEntry]) -> int:
+        dispatched = 0
+        for entry_id, fields in entries:
+            if self._should_stop():
+                break
+            if entry_id in self._inflight_ids:
+                continue
+            record_metric(
+                "curie.queue.retry",
+                attributes={
+                    "service.name": "curie-worker",
+                    "source": self._spec.telemetry_source,
+                    "retry_class": "redelivery",
+                },
+            )
+            await self._spec.handler(entry_id, fields)
+            dispatched += 1
+        return dispatched
+
+    async def _reclaim_dead_consumers(self) -> int:
+        """Prompt-only compatible-peer reclaim, with dispatch outside lock."""
+
+        async with self._reclaim_lock:
+            entries = await self._select_dead_consumer_entries(set())
+        return await self._dispatch_reclaimed(entries)
+
+    async def _prompt_reclaim_once(self) -> int:
+        """Observe capable peers and promptly recover only proven-dead owners."""
+
+        return await self._reclaim_dead_consumers()
+
+    async def _prompt_reclaim_loop(self) -> None:
+        """Dedicated lease-observation cadence, isolated from heavy maintenance."""
+
+        interval_s = self._spec.heartbeat_ttl_ms / 3000
+        while not self._should_stop():
+            try:
+                await self._prompt_reclaim_once()
+            except Exception:
+                self._spec.logger.exception(
+                    "prompt consumer reclaim tick failed on stream %s",
+                    self._spec.stream,
+                )
+            await self._sleep_or_stop(interval_s)
 
     async def _reclaim_once(self) -> int:
         """Reclaim entries pending too long from any (dead) consumer and retry.
@@ -910,62 +1364,33 @@ class StreamConsumer:
         still pending), so the ids it reports are skipped rather than dispatched:
         the cap binds even when the graveyard is unwritable.
 
-        Dead consumers are claimed by consumer idle first so a rollout that
-        strands a PEL does not wait ``reclaim_min_idle_ms``.
+        The prompt capable-peer path shares this selection lock, while unknown
+        peers retain this 15-minute compatibility backstop unchanged.
         """
-        over_cap = await self._dead_letter_over_cap()
-        reclaimed = await self._reclaim_dead_consumers(over_cap)
-        cursor: str = "0-0"
-        while not self._stop.is_set():
-            raw = await self._redis.xautoclaim(
-                self._spec.stream,
-                self._spec.group,
-                self._spec.consumer,
-                min_idle_time=self._spec.reclaim_min_idle_ms,
-                start_id=cursor,
-                count=self._spec.read_count,
-            )
-            cursor = str(raw[0])
-            entries = cast("list[StreamEntry]", raw[1])
-            for entry_id, fields in entries:
-                if entry_id in self._inflight_ids:
-                    continue  # still being processed here; not an orphan
-                if entry_id in over_cap:
-                    continue  # budget spent; never dispatch it again
-                # A live lease elsewhere: another owner is working it (ADR-0131).
-                # Note the ordering consequence -- XAUTOCLAIM has ALREADY claimed
-                # the entry to us by the time we see it here, which bumps the
-                # healthy peer's PEL delivery count. That is why the pre-cap
-                # check in ``_dead_letter_over_cap`` matters more than this one:
-                # this guard prevents the DISPATCH, that one prevents the
-                # DEAD-LETTER.
-                #
-                # The owner does NOT get the PEL row back. ``_HEARTBEAT_LUA``
-                # fails CLOSED: its guards run before any write, and a row that
-                # has moved to another consumer returns ``not-owner``, which the
-                # heartbeat loop reads as lease-lost. Its ``XCLAIM ... JUSTID``
-                # sits BEHIND that guard and only resets idle on a row the owner
-                # still holds; it is not a re-claim arm, and there must not be
-                # one -- an owner that stole its row back
-                # would be un-fencing itself against a replacement Valkey has
-                # legitimately handed the delivery to, which is the exact split
-                # brain ADR-0131 exists to prevent. So the cost of this
-                # XAUTOCLAIM is a bumped delivery count and, if the reclaimer is
-                # a different process, the healthy owner discovering on its next
-                # renewal that it has been fenced out. That is why the count is
-                # cap-checked BEFORE the claim rather than after.
-                if await self._lease_is_live(entry_id):
-                    continue
-                reclaimed += 1
-                record_metric(
-                    "curie.queue.retry",
-                    attributes={
-                        "service.name": "curie-worker",
-                        "source": self._spec.telemetry_source,
-                        "retry_class": "redelivery",
-                    },
+        selected: list[StreamEntry] = []
+        async with self._reclaim_lock:
+            over_cap = await self._dead_letter_over_cap()
+            selected.extend(await self._select_dead_consumer_entries(over_cap))
+            cursor: str = "0-0"
+            while not self._should_stop():
+                raw = await self._redis.xautoclaim(
+                    self._spec.stream,
+                    self._spec.group,
+                    self._spec.consumer,
+                    min_idle_time=self._spec.reclaim_min_idle_ms,
+                    start_id=cursor,
+                    count=self._spec.read_count,
                 )
-                await self._spec.handler(entry_id, fields)
-            if cursor in ("0-0", "0"):
-                break
-        return reclaimed
+                cursor = str(raw[0])
+                entries = cast("list[StreamEntry]", raw[1])
+                for entry_id, fields in entries:
+                    if entry_id in self._inflight_ids:
+                        continue  # still being processed here; not an orphan
+                    if entry_id in over_cap:
+                        continue  # budget spent; never dispatch it again
+                    if await self._lease_is_live(entry_id):
+                        continue  # another delivery owner is still active
+                    selected.append((entry_id, fields))
+                if cursor in ("0-0", "0"):
+                    break
+        return await self._dispatch_reclaimed(selected)

@@ -20,11 +20,64 @@ const VAULT_ACCOUNT: &str = "curie:global:vault";
 pub struct SetSecretOpts {
     pub name: String,
     pub from_env: Option<String>,
+    pub cluster_identity: Option<String>,
+    pub namespace: Option<String>,
+    pub release: Option<String>,
+    pub expected_version: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
 pub struct UnsetSecretOpts {
     pub name: String,
+    pub cluster_identity: Option<String>,
+    pub namespace: Option<String>,
+    pub release: Option<String>,
+}
+
+/// The cluster target a stored connector secret is allowed to be injected into.
+///
+/// Issue #1913: name-only storage lets `curie cluster deploy` reuse cluster A's
+/// credential on cluster B. Identity is a fingerprint of the kube-apiserver URL
+/// plus CA material, not a human cluster name.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SecretScope {
+    pub cluster_identity: String,
+    pub release: String,
+    pub namespace: String,
+}
+
+impl SecretScope {
+    pub fn describe(&self) -> String {
+        format!(
+            "cluster {} release {} namespace {}",
+            self.cluster_identity, self.release, self.namespace
+        )
+    }
+}
+
+/// How a cluster-deploy secret was resolved. Never carries the value in
+/// operator-facing descriptions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClusterSecretSource {
+    Scoped { version: u64 },
+    Environment,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedClusterSecret {
+    pub value: String,
+    pub source: ClusterSecretSource,
+}
+
+impl ResolvedClusterSecret {
+    pub fn source_label(&self) -> String {
+        match self.source {
+            ClusterSecretSource::Scoped { version } => {
+                format!("scoped stored secret (version {version})")
+            }
+            ClusterSecretSource::Environment => "process environment".to_string(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -39,8 +92,29 @@ struct SecretIndex {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct ScopedSecret {
+    cluster_identity: String,
+    release: String,
+    namespace: String,
+    value: String,
+    version: u64,
+}
+
+impl ScopedSecret {
+    fn scope(&self) -> SecretScope {
+        SecretScope {
+            cluster_identity: self.cluster_identity.clone(),
+            release: self.release.clone(),
+            namespace: self.namespace.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
 struct SecretVault {
     values: BTreeMap<String, String>,
+    #[serde(default)]
+    scoped: BTreeMap<String, Vec<ScopedSecret>>,
 }
 
 #[derive(Default)]
@@ -58,44 +132,144 @@ pub fn set(opts: SetSecretOpts) -> Result<()> {
             .with_context(|| format!("{var} is not set; cannot save {}", opts.name))?,
         None => prompt_secret(&opts.name)?,
     };
-    save_value(&opts.name, &value)?;
-    crate::ui::ui().success(&format!("saved {} in Curie private storage", opts.name));
+    match optional_scope(
+        opts.cluster_identity,
+        opts.release,
+        opts.namespace,
+        "secrets set",
+    )? {
+        Some(scope) => {
+            let version = save_scoped_value(&opts.name, &scope, &value, opts.expected_version)?;
+            crate::ui::ui().success(&format!(
+                "saved {} for {} (version {version})",
+                opts.name,
+                scope.describe()
+            ));
+        }
+        None => {
+            if opts.expected_version.is_some() {
+                return Err(crate::exit::usage(
+                    "--expected-version applies to cluster-scoped secrets; pass --cluster-identity, --release, and --namespace",
+                ));
+            }
+            save_value(&opts.name, &value)?;
+            crate::ui::ui().success(&format!("saved {} in Curie private storage", opts.name));
+        }
+    }
     Ok(())
 }
 
 pub fn list() -> Result<()> {
-    crate::ui::ui().emit(&SecretsListOutput {
-        names: list_names()?,
-    });
+    crate::ui::ui().emit(&list_output()?);
     Ok(())
 }
 
-/// Output of `secrets list` (#474): the saved secret NAMEs. Routes through the
-/// one `Ui::emit` point rather than an inline `if json()` branch. Public so the
-/// schema contract test (#634) can build one and validate `to_json` against
-/// `cli/schema/secrets.schema.json`.
+/// Output of `secrets list` (#474): the saved secret NAMEs plus cluster scope
+/// metadata. Values are never emitted. Routes through the one `Ui::emit` point.
 pub struct SecretsListOutput {
     pub names: Vec<String>,
+    pub entries: Vec<SecretListEntry>,
+}
+
+/// One stored secret listing. `scope` is absent for install-global (skill/local)
+/// values; cluster-scoped entries carry identity/release/namespace and version.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SecretListEntry {
+    pub name: String,
+    pub scope: Option<SecretScope>,
+    pub version: Option<u64>,
 }
 
 impl crate::ui::CliOutput for SecretsListOutput {
     fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({ "secrets": self.names })
+        serde_json::json!({
+            "secrets": self.names,
+            "entries": self.entries.iter().map(|entry| {
+                match &entry.scope {
+                    Some(scope) => serde_json::json!({
+                        "name": entry.name,
+                        "scope": {
+                            "cluster_identity": scope.cluster_identity,
+                            "release": scope.release,
+                            "namespace": scope.namespace,
+                        },
+                        "version": entry.version,
+                    }),
+                    None => serde_json::json!({
+                        "name": entry.name,
+                        "scope": null,
+                        "version": null,
+                    }),
+                }
+            }).collect::<Vec<_>>(),
+        })
     }
 
     fn render(&self, ui: &crate::ui::Ui) {
-        if self.names.is_empty() {
+        if self.entries.is_empty() {
             ui.note("no Curie secrets saved");
-        } else {
-            ui.payload_plain(&self.names.join("\n"));
+            return;
         }
+        let lines: Vec<String> = self
+            .entries
+            .iter()
+            .map(|entry| match &entry.scope {
+                Some(scope) => format!(
+                    "{}  {}  version {}",
+                    entry.name,
+                    scope.describe(),
+                    entry.version.unwrap_or(0)
+                ),
+                None => format!("{}  (unscoped)", entry.name),
+            })
+            .collect();
+        ui.payload_plain(&lines.join("\n"));
     }
 }
 
 pub fn unset(opts: UnsetSecretOpts) -> Result<()> {
-    remove_value(&opts.name)?;
-    crate::ui::ui().success(&format!("removed {}", opts.name));
+    match optional_scope(
+        opts.cluster_identity,
+        opts.release,
+        opts.namespace,
+        "secrets unset",
+    )? {
+        Some(scope) => {
+            remove_scoped_value(&opts.name, &scope)?;
+            crate::ui::ui().success(&format!("removed {} for {}", opts.name, scope.describe()));
+        }
+        None => {
+            remove_value(&opts.name)?;
+            crate::ui::ui().success(&format!("removed {}", opts.name));
+        }
+    }
     Ok(())
+}
+
+fn optional_scope(
+    cluster_identity: Option<String>,
+    release: Option<String>,
+    namespace: Option<String>,
+    verb: &str,
+) -> Result<Option<SecretScope>> {
+    match (cluster_identity, release, namespace) {
+        (None, None, None) => Ok(None),
+        (Some(cluster_identity), Some(release), Some(namespace)) => {
+            if cluster_identity.is_empty() || release.is_empty() || namespace.is_empty() {
+                return Err(crate::exit::usage(format!(
+                    "{verb} cluster scope requires non-empty --cluster-identity, --release, and --namespace"
+                )));
+            }
+            Ok(Some(SecretScope {
+                cluster_identity,
+                release,
+                namespace,
+            }))
+        }
+        _ => Err(crate::exit::usage(format!(
+            "{verb} cluster scope requires --cluster-identity, --release, and --namespace together"
+        ))),
+    }
 }
 
 pub fn get_value(name: &str) -> Result<Option<String>> {
@@ -201,6 +375,272 @@ pub fn save_value(name: &str, value: &str) -> Result<()> {
     add_to_index(name)
 }
 
+pub fn save_scoped_value(
+    name: &str,
+    scope: &SecretScope,
+    value: &str,
+    expected_version: Option<u64>,
+) -> Result<u64> {
+    validate_name(name)?;
+    if value.is_empty() {
+        bail!("refusing to store an empty secret for {name}");
+    }
+    let mut credentials = read_credentials()?;
+    let version = credentials.save_scoped(name, scope, value, expected_version)?;
+    write_credentials(&credentials)?;
+    add_to_index(name)?;
+    Ok(version)
+}
+
+pub fn remove_scoped_value(name: &str, scope: &SecretScope) -> Result<()> {
+    validate_name(name)?;
+    let mut credentials = read_credentials()?;
+    credentials.remove_scoped(name, scope);
+    write_credentials(&credentials)?;
+    if !credentials.has_name(name) {
+        remove_from_index(name)?;
+    }
+    Ok(())
+}
+
+/// Resolve a connector secret for a cluster deploy target.
+///
+/// A matching scoped store entry wins. A stored entry for this name that does
+/// not match the target (including an unscoped value) is a refusal, not a
+/// fallback. Process environment is used only when the store has no entry for
+/// the name at all, and the caller must surface that source.
+pub fn resolve_cluster_secret(
+    name: &str,
+    target: &SecretScope,
+) -> Result<Option<ResolvedClusterSecret>> {
+    validate_name(name)?;
+    let credentials = match config_dir() {
+        Ok(_) => read_credentials()?,
+        // A deploy with only process-environment values (CI, HOME unset) has no
+        // host vault to consult. An absent config dir is an empty store, not a
+        // failure to resolve the env fallback.
+        Err(_) => SecretVault::default(),
+    };
+    match credentials.resolve_cluster(name, target)? {
+        Some(resolved) => Ok(Some(resolved)),
+        None => Ok(std::env::var(name)
+            .ok()
+            .filter(|value| !value.is_empty())
+            .map(|value| ResolvedClusterSecret {
+                value,
+                source: ClusterSecretSource::Environment,
+            })),
+    }
+}
+
+pub fn list_output() -> Result<SecretsListOutput> {
+    let credentials = read_credentials()?;
+    Ok(credentials.list_output())
+}
+
+fn conflict(message: String, fix: &str) -> anyhow::Error {
+    anyhow::Error::from(crate::exit::CliError::failure(message).with_fix(fix.to_string()))
+}
+
+impl SecretVault {
+    fn remove_all(&mut self, name: &str) {
+        self.values.remove(name);
+        self.scoped.remove(name);
+    }
+
+    fn has_name(&self, name: &str) -> bool {
+        self.values.contains_key(name)
+            || self
+                .scoped
+                .get(name)
+                .is_some_and(|entries| !entries.is_empty())
+    }
+
+    fn scoped_entries(&self, name: &str) -> &[ScopedSecret] {
+        self.scoped.get(name).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    fn lookup_scoped(&self, name: &str, target: &SecretScope) -> Option<&ScopedSecret> {
+        self.scoped_entries(name)
+            .iter()
+            .find(|entry| entry.scope() == *target)
+    }
+
+    fn other_scopes(&self, name: &str, target: &SecretScope) -> Vec<SecretScope> {
+        self.scoped_entries(name)
+            .iter()
+            .map(ScopedSecret::scope)
+            .filter(|scope| scope != target)
+            .collect()
+    }
+
+    fn resolve_cluster(
+        &self,
+        name: &str,
+        target: &SecretScope,
+    ) -> Result<Option<ResolvedClusterSecret>> {
+        if let Some(entry) = self.lookup_scoped(name, target) {
+            return Ok(Some(ResolvedClusterSecret {
+                value: entry.value.clone(),
+                source: ClusterSecretSource::Scoped {
+                    version: entry.version,
+                },
+            }));
+        }
+        let others = self.other_scopes(name, target);
+        if !others.is_empty() {
+            return Err(mismatch_error(name, target, &others));
+        }
+        if self.values.contains_key(name) {
+            return Err(unscoped_error(name, target));
+        }
+        Ok(None)
+    }
+
+    fn save_scoped(
+        &mut self,
+        name: &str,
+        scope: &SecretScope,
+        value: &str,
+        expected_version: Option<u64>,
+    ) -> Result<u64> {
+        let entries = self.scoped.entry(name.to_string()).or_default();
+        let existing = entries.iter().position(|entry| entry.scope() == *scope);
+        match existing {
+            Some(index) => {
+                let stored = entries[index].version;
+                if expected_version != Some(stored) {
+                    return Err(conflict(
+                        format!(
+                            "version mismatch: expected {}, stored {stored}",
+                            expected_version
+                                .map(|v| v.to_string())
+                                .unwrap_or_else(|| "none".to_string())
+                        ),
+                        "re-run `curie secrets list --json` and pass the stored version as --expected-version",
+                    ));
+                }
+                entries[index].value = value.to_string();
+                entries[index].version = stored + 1;
+                Ok(entries[index].version)
+            }
+            None => {
+                if expected_version.is_some() {
+                    return Err(conflict(
+                        "version mismatch: entry does not exist yet".to_string(),
+                        "omit --expected-version when saving a secret for a new cluster target",
+                    ));
+                }
+                entries.push(ScopedSecret {
+                    cluster_identity: scope.cluster_identity.clone(),
+                    release: scope.release.clone(),
+                    namespace: scope.namespace.clone(),
+                    value: value.to_string(),
+                    version: 1,
+                });
+                Ok(1)
+            }
+        }
+    }
+
+    fn remove_scoped(&mut self, name: &str, scope: &SecretScope) {
+        if let Some(entries) = self.scoped.get_mut(name) {
+            entries.retain(|entry| entry.scope() != *scope);
+            if entries.is_empty() {
+                self.scoped.remove(name);
+            }
+        }
+    }
+
+    fn list_output(&self) -> SecretsListOutput {
+        let mut names = BTreeSet::new();
+        let mut entries = Vec::new();
+        for name in self.values.keys() {
+            names.insert(name.clone());
+            entries.push(SecretListEntry {
+                name: name.clone(),
+                scope: None,
+                version: None,
+            });
+        }
+        for (name, scoped) in &self.scoped {
+            names.insert(name.clone());
+            for entry in scoped {
+                entries.push(SecretListEntry {
+                    name: name.clone(),
+                    scope: Some(entry.scope()),
+                    version: Some(entry.version),
+                });
+            }
+        }
+        entries.sort_by(|a, b| {
+            a.name.cmp(&b.name).then_with(|| {
+                a.scope
+                    .as_ref()
+                    .map(SecretScope::describe)
+                    .cmp(&b.scope.as_ref().map(SecretScope::describe))
+            })
+        });
+        SecretsListOutput {
+            names: names.into_iter().collect(),
+            entries,
+        }
+    }
+}
+
+pub fn mismatch_error(name: &str, target: &SecretScope, existing: &[SecretScope]) -> anyhow::Error {
+    let recorded = existing
+        .iter()
+        .map(SecretScope::describe)
+        .collect::<Vec<_>>()
+        .join("; ");
+    crate::exit::usage(format!(
+        "stored secret {name} is scoped to {recorded}; refusing to inject it into {}. Save a value for this target with `curie secrets set {name} --from-env {name} --cluster-identity {} --release {} --namespace {}`",
+        target.describe(),
+        target.cluster_identity,
+        target.release,
+        target.namespace
+    ))
+}
+
+pub fn unscoped_error(name: &str, target: &SecretScope) -> anyhow::Error {
+    crate::exit::usage(format!(
+        "stored secret {name} has no cluster scope; refusing to inject it into {}. Re-save it with --cluster-identity {} --release {} --namespace {}",
+        target.describe(),
+        target.cluster_identity,
+        target.release,
+        target.namespace
+    ))
+}
+
+/// Names of incoming keys that already exist on the live connector Secret.
+/// Values are never inspected; presence of the key is the replacement signal.
+pub fn keys_being_replaced(
+    existing_keys: &BTreeSet<String>,
+    incoming_keys: &[String],
+) -> Vec<String> {
+    incoming_keys
+        .iter()
+        .filter(|key| existing_keys.contains(*key))
+        .cloned()
+        .collect()
+}
+
+pub fn write_intent_line(secret_name: &str, keys: &[String], target: &SecretScope) -> String {
+    format!(
+        "writing stored connector secrets into {secret_name} for {}: {}",
+        target.describe(),
+        keys.join(", ")
+    )
+}
+
+pub fn replacement_warning_line(secret_name: &str, keys: &[String]) -> String {
+    format!(
+        "replacing non-empty connector secret keys in {secret_name}: {} (values not shown)",
+        keys.join(", ")
+    )
+}
+
 pub fn delete_value(name: &str) -> Result<()> {
     validate_name(name)?;
     let mut credentials = read_credentials()?;
@@ -216,16 +656,28 @@ pub fn remove_value(name: &str) -> Result<()> {
     remove_from_index(name)
 }
 
+/// Remove every scope for a name. The interactive TUI has no scope picker, so
+/// it must remove all matching entries rather than claim a partial success.
+pub fn remove_all_values(name: &str) -> Result<()> {
+    validate_name(name)?;
+    let mut credentials = read_credentials()?;
+    credentials.remove_all(name);
+    write_credentials(&credentials)?;
+    remove_from_index(name)
+}
+
 pub fn list_names() -> Result<Vec<String>> {
     let index = read_index()?;
-    Ok(index
+    let mut names = index
         .names
         .into_iter()
         .chain(index.legacy_names)
         .chain(index.file_names)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect())
+        .collect::<BTreeSet<_>>();
+    for name in read_credentials()?.list_output().names {
+        names.insert(name);
+    }
+    Ok(names.into_iter().collect())
 }
 
 pub fn validate_name(name: &str) -> Result<()> {
@@ -401,6 +853,7 @@ fn config_dir() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::CliOutput;
 
     #[test]
     fn validates_env_like_names() {
@@ -474,12 +927,224 @@ mod tests {
                     "github-secret".to_string(),
                 ),
             ]),
+            scoped: BTreeMap::new(),
         };
         let raw = serde_json::to_string(&vault).unwrap();
         let decoded: SecretVault = serde_json::from_str(&raw).unwrap();
 
         assert_eq!(decoded.values, vault.values);
         assert_eq!(VAULT_ACCOUNT, "curie:global:vault");
+    }
+
+    #[test]
+    fn same_name_secrets_are_distinct_across_cluster_identities() {
+        let mut vault = SecretVault::default();
+        let a = SecretScope {
+            cluster_identity: "ca:a".into(),
+            release: "curie".into(),
+            namespace: "curie-test".into(),
+        };
+        let b = SecretScope {
+            cluster_identity: "ca:b".into(),
+            release: "curie".into(),
+            namespace: "curie".into(),
+        };
+        vault
+            .save_scoped("K8S_WRITE_KUBECONFIG", &a, "token-a", None)
+            .unwrap();
+        vault
+            .save_scoped("K8S_WRITE_KUBECONFIG", &b, "token-b", None)
+            .unwrap();
+
+        let resolved_a = vault
+            .resolve_cluster("K8S_WRITE_KUBECONFIG", &a)
+            .unwrap()
+            .unwrap();
+        let resolved_b = vault
+            .resolve_cluster("K8S_WRITE_KUBECONFIG", &b)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved_a.value, "token-a");
+        assert_eq!(resolved_b.value, "token-b");
+        assert_ne!(resolved_a.value, resolved_b.value);
+    }
+
+    #[test]
+    fn cluster_deploy_refuses_a_mismatched_scope() {
+        let mut vault = SecretVault::default();
+        let a = SecretScope {
+            cluster_identity: "ca:a".into(),
+            release: "curie".into(),
+            namespace: "curie-test".into(),
+        };
+        let b = SecretScope {
+            cluster_identity: "ca:b".into(),
+            release: "curie".into(),
+            namespace: "curie".into(),
+        };
+        vault
+            .save_scoped("K8S_WRITE_KUBECONFIG", &a, "token-a", None)
+            .unwrap();
+
+        let err = vault
+            .resolve_cluster("K8S_WRITE_KUBECONFIG", &b)
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("refusing to inject"),
+            "mismatch must refuse, got {message}"
+        );
+        assert!(message.contains("ca:a"), "must name the stored scope");
+        assert!(message.contains("ca:b"), "must name the requested scope");
+        assert!(
+            !message.contains("token-a"),
+            "refusal must not leak the stored value"
+        );
+    }
+
+    #[test]
+    fn cluster_deploy_refuses_unscoped_reuse() {
+        let mut vault = SecretVault::default();
+        vault
+            .values
+            .insert("K8S_WRITE_KUBECONFIG".into(), "token-unscoped".into());
+        let target = SecretScope {
+            cluster_identity: "ca:b".into(),
+            release: "curie".into(),
+            namespace: "curie".into(),
+        };
+        let err = vault
+            .resolve_cluster("K8S_WRITE_KUBECONFIG", &target)
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("no cluster scope"));
+        assert!(
+            !message.contains("token-unscoped"),
+            "refusal must not leak the stored value"
+        );
+    }
+
+    #[test]
+    fn replacing_a_scoped_secret_requires_the_stored_version() {
+        let mut vault = SecretVault::default();
+        let target = SecretScope {
+            cluster_identity: "ca:a".into(),
+            release: "curie".into(),
+            namespace: "curie-test".into(),
+        };
+        assert_eq!(
+            vault
+                .save_scoped("K8S_WRITE_KUBECONFIG", &target, "token-1", None)
+                .unwrap(),
+            1
+        );
+        let stale = vault
+            .save_scoped("K8S_WRITE_KUBECONFIG", &target, "token-2", None)
+            .unwrap_err()
+            .to_string();
+        assert!(stale.contains("version mismatch"));
+        assert!(
+            !stale.contains("token-1") && !stale.contains("token-2"),
+            "conflict must not leak secret values"
+        );
+        assert_eq!(
+            vault
+                .save_scoped("K8S_WRITE_KUBECONFIG", &target, "token-2", Some(1))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            vault
+                .resolve_cluster("K8S_WRITE_KUBECONFIG", &target)
+                .unwrap()
+                .unwrap()
+                .value,
+            "token-2"
+        );
+    }
+
+    #[test]
+    fn expected_version_cannot_create_a_missing_scoped_entry() {
+        let mut vault = SecretVault::default();
+        let target = SecretScope {
+            cluster_identity: "ca:a".into(),
+            release: "curie".into(),
+            namespace: "curie-test".into(),
+        };
+        let err = vault
+            .save_scoped("K8S_WRITE_KUBECONFIG", &target, "token", Some(1))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not exist yet"));
+    }
+
+    #[test]
+    fn list_output_exposes_scope_and_version_never_values() {
+        let mut vault = SecretVault::default();
+        vault
+            .values
+            .insert("ANTHROPIC_API_KEY".into(), "sk-ant-never-print".into());
+        let target = SecretScope {
+            cluster_identity: "ca:a".into(),
+            release: "curie".into(),
+            namespace: "curie-test".into(),
+        };
+        vault
+            .save_scoped("K8S_WRITE_KUBECONFIG", &target, "token-a", None)
+            .unwrap();
+        let out = vault.list_output();
+        let json = out.to_json().to_string();
+        assert!(json.contains("K8S_WRITE_KUBECONFIG"));
+        assert!(json.contains("ca:a"));
+        assert!(json.contains("\"version\":1"));
+        assert!(!json.contains("token-a"));
+        assert!(!json.contains("sk-ant-never-print"));
+    }
+
+    #[test]
+    fn replacement_visibility_names_keys_not_values() {
+        let existing = BTreeSet::from(["K8S_WRITE_KUBECONFIG".to_string()]);
+        let incoming = vec!["K8S_WRITE_KUBECONFIG".to_string(), "OTHER".to_string()];
+        let replaced = keys_being_replaced(&existing, &incoming);
+        assert_eq!(replaced, vec!["K8S_WRITE_KUBECONFIG".to_string()]);
+        let warning = replacement_warning_line("acme-bot-connector-secrets", &replaced);
+        assert!(warning.contains("K8S_WRITE_KUBECONFIG"));
+        assert!(warning.contains("values not shown"));
+        let intent = write_intent_line(
+            "acme-bot-connector-secrets",
+            &incoming,
+            &SecretScope {
+                cluster_identity: "ca:a".into(),
+                release: "curie".into(),
+                namespace: "curie-test".into(),
+            },
+        );
+        assert!(intent.contains("K8S_WRITE_KUBECONFIG"));
+        assert!(!intent.contains("token"));
+    }
+
+    #[test]
+    fn legacy_credentials_json_without_scoped_still_parses() {
+        let decoded: SecretVault =
+            serde_json::from_str(r#"{"values":{"ANTHROPIC_API_KEY":"x"}}"#).unwrap();
+        assert_eq!(decoded.values.get("ANTHROPIC_API_KEY").unwrap(), "x");
+        assert!(decoded.scoped.is_empty());
+    }
+
+    #[test]
+    fn tui_all_scope_removal_cannot_leave_a_scoped_entry() {
+        let mut vault = SecretVault::default();
+        let scope = SecretScope {
+            cluster_identity: "ca:a".into(),
+            release: "curie".into(),
+            namespace: "curie-test".into(),
+        };
+        vault
+            .save_scoped("K8S_WRITE_KUBECONFIG", &scope, "token-a", None)
+            .unwrap();
+        vault.remove_all("K8S_WRITE_KUBECONFIG");
+        assert!(!vault.has_name("K8S_WRITE_KUBECONFIG"));
+        assert!(vault.scoped_entries("K8S_WRITE_KUBECONFIG").is_empty());
     }
 
     #[cfg(unix)]

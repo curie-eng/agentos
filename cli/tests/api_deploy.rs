@@ -1276,3 +1276,95 @@ async fn surfaces_api_errors_with_status_and_body() {
     assert!(text.contains("401"), "unexpected error: {text}");
     assert!(text.contains("invalid API key"), "unexpected error: {text}");
 }
+
+// --------------------------------------------------------------------------- #
+// The advisory git-flow routing check (#1221)
+//
+// Binding a SECOND agent to a repository is legal since migration 0018
+// (ADR-0091) and silently stops every push for the agent that was already
+// bound. The CLI asks the API about it AFTER the deploy has landed, so the
+// check must be incapable of turning a successful deploy into a failure: every
+// answer that is not a decodable success is `Ok(None)`, which prints nothing.
+// --------------------------------------------------------------------------- #
+
+const UNROUTABLE: &str = r#"{
+  "repo_full_name": "octo/shared-repo",
+  "agent_count": 2,
+  "agents": ["acme-bot", "acme-dev"],
+  "resolvable": false,
+  "unresolvable": [
+    {"environment": "dev", "code": "deploy.no_targets", "message": "2 agents are built from this repository but the bundle has no deploy.yaml, so there is nothing to say which one this branch deploys to. Declare a target (ADR-0089)."},
+    {"environment": "prod", "code": "deploy.no_targets", "message": "2 agents are built from this repository but the bundle has no deploy.yaml, so there is nothing to say which one this branch deploys to. Declare a target (ADR-0089)."}
+  ]
+}"#;
+
+#[tokio::test]
+async fn routing_check_decodes_an_unresolvable_repository() {
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("POST", "/git-flow/routing-check") => Response::json(200, UNROUTABLE),
+        other => panic!("unexpected request: {other:?}"),
+    });
+    let client = ApiClient::new(&server.base_url, "k").unwrap();
+
+    let check = client
+        .check_git_flow_routing("octo/shared-repo", None)
+        .await
+        .unwrap()
+        .expect("a successful body must decode");
+
+    assert!(!check.resolvable);
+    assert_eq!(check.agent_count, 2);
+    assert_eq!(check.agents, vec!["acme-bot", "acme-dev"]);
+    // The resolver's problems survive the hop intact: the CLI prints its
+    // `message` verbatim rather than restating the rule (#1212).
+    assert_eq!(check.unresolvable.len(), 2);
+    assert_eq!(check.unresolvable[0].environment, "dev");
+    assert_eq!(check.unresolvable[0].code, "deploy.no_targets");
+    assert!(check.unresolvable[0].message.contains("Declare a target"));
+
+    // The repository and the bundle's deploy.yaml text both travel to the API,
+    // which owns the parser and the resolver (ADR-0089).
+    let body: serde_json::Value = serde_json::from_slice(&server.recorded()[0].body).unwrap();
+    assert_eq!(body["repo_full_name"], "octo/shared-repo");
+    assert!(body["content"].is_null());
+}
+
+#[tokio::test]
+async fn routing_check_is_silent_against_a_platform_that_predates_it() {
+    // FastAPI's bare not-found body: the CLI is newer than the platform. That
+    // operator is not doing anything wrong, and an advisory check must not tell
+    // them their deploy failed.
+    let server = serve(|_req| Response::json(404, r#"{"detail":"Not Found"}"#));
+    let client = ApiClient::new(&server.base_url, "k").unwrap();
+    assert!(client
+        .check_git_flow_routing("octo/shared-repo", Some("targets: {}\n"))
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn routing_check_never_fails_a_deploy_on_a_server_error() {
+    // The deploy already succeeded by the time this runs; a 500 here says
+    // nothing about it, so it degrades to "no answer" rather than an error.
+    let server = serve(|_req| Response::json(500, r#"{"detail":"boom"}"#));
+    let client = ApiClient::new(&server.base_url, "k").unwrap();
+    assert!(client
+        .check_git_flow_routing("octo/shared-repo", None)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn routing_check_swallows_a_body_it_cannot_decode() {
+    // Platform skew can answer 200 with a shape this CLI does not model. A
+    // decode failure is still "no answer", never a failed deploy.
+    let server = serve(|_req| Response::json(200, r#"["not", "an", "object"]"#));
+    let client = ApiClient::new(&server.base_url, "k").unwrap();
+    assert!(client
+        .check_git_flow_routing("octo/shared-repo", None)
+        .await
+        .unwrap()
+        .is_none());
+}

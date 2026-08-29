@@ -1,6 +1,6 @@
 [package]
 name = "curie"
-version = "0.7.2"
+version = "0.7.3"
 edition = "2021"
 description = "Curie CLI: init/start/send/eval a plugin against a local runner (task I1)"
 
@@ -49,6 +49,7 @@ serde_urlencoded = "0.7"
 sha2 = "0.11"
 signal-hook = "0.4"
 tar = "0.4"
+tempfile = "3"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 uuid = { version = "1", features = ["v4"] }
 # OS CSPRNG for generating strong per-release chart secrets (cluster up). Same
@@ -80,7 +81,6 @@ crypto_box = { version = "0.9.1", features = ["seal", "std"] }
 base64 = "0.23.1"
 
 [dev-dependencies]
-tempfile = "3"
 # The frozen ACI types are a normal dependency of the lib, but integration test
 # crates need them by name to build a SessionStatus for the status_json contract.
 curie-aci-protocol = { path = "../packages/aci-protocol/generated/rust" }

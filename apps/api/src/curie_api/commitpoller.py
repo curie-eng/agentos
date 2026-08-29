@@ -22,7 +22,7 @@ deploy paths that could disagree about what a push means would be worse than
 one path that sometimes runs late -- and the webhook remains the fast path
 wherever it can reach.
 
-Three properties worth stating, because each is a way this could go wrong:
+Four properties worth stating, because each is a way this could go wrong:
 
 - **It polls per REPOSITORY, not per agent.** Several agents share one
   repository (ADR-0091), so per-agent polling would make N identical API calls
@@ -33,14 +33,21 @@ Three properties worth stating, because each is a way this could go wrong:
 - **One failing repository does not stop the others.** A repo whose credential
   has been revoked, or that has been deleted, must not silently halt polling
   for every other agent on the cluster.
+- **A clone that keeps failing backs off instead of retrying every interval.**
+  A repository that is unreachable, unauthorized, or too large to clone inside
+  the 120s timeout fails identically on every pass, so retrying at the interval
+  is roughly 1,440 full clones a day for one unchanged sha. Repeated failures
+  of the same class for the same sha wait geometrically longer, to an hourly
+  ceiling, and the stalled lane is reported rather than left silent (#1309).
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -273,8 +280,11 @@ WHERE a.repo_full_name IS NOT NULL
 ORDER BY a.repo_full_name, d.environment, d.deployed_at DESC
 """
 
-# These rejections depend on which agents are bound to the repository. They
-# settle against that binding snapshot, then get one new attempt when an
+# A rejection lands in one of three tiers, and the tier is what decides whether
+# the next pass pays for another full mirror clone.
+#
+# Tier one, TOPOLOGY: these depend on which agents are bound to the repository.
+# They settle against that binding snapshot, then get one new attempt when an
 # operator changes it without pushing a new commit (#1307).
 _TOPOLOGY_REJECTIONS = frozenset(
     {
@@ -284,6 +294,65 @@ _TOPOLOGY_REJECTIONS = frozenset(
     }
 )
 _ARCHIVE_FAILURE = "git.archive_failed"
+# Tier two, RETRYABLE: this one says nothing about the commit. The same code
+# covers a subprocess error and both 120s timeouts, so it means anything from a
+# network blip to a repository that is permanently unreachable, unauthorized,
+# missing its clone credential, or too large to clone inside the timeout. It
+# must not be terminal, and it must not be retried every interval either -- it
+# earns another clone on a capped geometric backoff (#1309).
+_RETRYABLE_REJECTIONS = frozenset({_ARCHIVE_FAILURE})
+#
+# Tier three, EVERYTHING ELSE: an ambiguous environment or an invalid bundle is
+# fixed only by pushing a new commit, so those settle for the sha and re-cloning
+# would prove nothing.
+
+# The first wait after a retryable failure. Five minutes turns the worst case --
+# a repository broken all day on a 60s interval -- from ~1,440 clone attempts
+# into 24, while still recovering from a genuine blip inside one pass of an
+# operator's attention (#1309).
+_RETRY_BASE_DELAY_S = 300.0
+# The ceiling on that geometric growth: 5m, 10m, 20m, 40m, then an hour
+# forever. Capping rather than settling is deliberate. A private repository
+# whose clone credential arrives an hour after the binding was made is exactly
+# the shape `docs/operations.md` documents, and a terminal state would strand it
+# until someone pushed a new commit or restarted the API. The bound here is on
+# the RATE of clones; the stalled lane is made findable by the error below
+# instead of by silence.
+_RETRY_MAX_DELAY_S = 3600.0
+# The same ceiling, expressed as a bound on the EXPONENT, because clamping only
+# the product is too late. `2 ** (attempts - 1)` is evaluated in full before
+# `min` ever sees it, and at attempt 1,025 that float multiplication raises
+# OverflowError -- a repository failing every attempt reaches 1,025 in roughly
+# 43 days at the hourly ceiling, well inside the life of an API pod. The
+# exception would escape `poll_once` BEFORE the new record is stored, so the
+# already-expired record survives and every following pass clones again and
+# crashes again: #1309 restored, on exactly the repository this feature exists
+# for. Derived from the two delays rather than written down, so it cannot
+# silently drift if they change (4 for the current constants -- 300s doubled
+# four times is 4,800s, already past the ceiling).
+_RETRY_MAX_DOUBLINGS = math.ceil(math.log2(_RETRY_MAX_DELAY_S / _RETRY_BASE_DELAY_S))
+# How many consecutive failures before this stops reading like a blip -- the
+# same judgement as _SUSTAINED_THROTTLE_ROUNDS above. By the third identical
+# failure the deploy lane has stopped, and an operator needs to find it as that
+# rather than as one more per-pass INFO line (#1309).
+_RETRY_ERROR_ROUNDS = 3
+
+
+@dataclass(frozen=True)
+class ArchiveBackoff:
+    """A retryable rejection that has not yet earned another clone."""
+
+    sha: str
+    # The failure class: the rejection's sorted error codes. A different class
+    # is a different failure, so it restarts the schedule rather than inheriting
+    # the previous one's delay.
+    codes: tuple[str, ...]
+    attempts: int
+    next_attempt_at: float  # monotonic seconds
+    # What the deployments query reported for this branch when the failure was
+    # recorded. A CHANGE in it means a deploy landed since -- from either lane
+    # -- and this record is stale (see the prune in `poll_once`).
+    deployed_sha: str | None
 
 
 # Every repository binding. Grouping these rows produces both the unique poll
@@ -321,6 +390,7 @@ class CommitPoller:
         eval_queue: Any,
         tips: BranchTip,
         interval_seconds: float,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._session_factory = session_factory
         self._store = store
@@ -328,14 +398,19 @@ class CommitPoller:
         self._eval_queue = eval_queue
         self._tips = tips
         self._interval = interval_seconds
+        # Monotonic, not wall clock: a backoff window must not be skipped or
+        # extended by an NTP correction. Injectable so the schedule can be
+        # asserted without a test that sleeps for an hour.
+        self._clock = clock
         # The database records successes only. Intrinsic failures settle for
         # the sha, while routing failures settle until the repository binding
         # snapshot changes. In memory only, so restart can retry once.
         self._settled: dict[tuple[str, str], Settled] = {}
-        # Archive failure gets one retry on the next pass, then settles. This
-        # bounds network failure clones without making a single blip terminal.
-        self._archive_retry: dict[tuple[str, str], str] = {}
         self._last_success_monotonic: float | None = None
+        # A retryable rejection is neither forgotten nor terminal: it waits a
+        # geometrically growing, capped delay before earning another clone
+        # (#1309). Keyed the same way as _settled, per (repository, branch).
+        self._archive_backoff: dict[tuple[str, str], ArchiveBackoff] = {}
 
     async def run_forever(self) -> None:
         logger.info("commit poller started interval=%ss", self._interval)
@@ -429,6 +504,23 @@ class CommitPoller:
 
         binding_snapshots = {repo: tuple(names) for repo, names in bindings.items()}
 
+        # A deployment on the branch retires the failure record, whichever lane
+        # produced it. The webhook lane deploys through the same `process_push`
+        # without going near the poller, so the success-clearing branch below
+        # never runs for a commit it handled -- and the stale record would then
+        # survive a rollback to the failed sha and suppress redeploying it, even
+        # though the successful deploy is direct evidence the repository is
+        # clonable again (AC4 of #1309).
+        #
+        # The comparison is against the sha captured AT RECORD TIME, not against
+        # `move.sha`: a branch normally has an older deployed sha than its tip,
+        # so comparing to the tip would prune on the very first failure and
+        # disable the backoff entirely. It is the change in the branch's last
+        # successful deploy that means one landed since.
+        for key, record in list(self._archive_backoff.items()):
+            if deployed.get(key) != record.deployed_sha:
+                del self._archive_backoff[key]
+
         targets: list[PollTarget] = []
         for repo in bindings:
             try:
@@ -455,8 +547,26 @@ class CommitPoller:
         # inside it -- at the recommended 60s interval an unchanged
         # non-deploying branch is roughly 1,440 full clones a day (#1267).
         unsettled: list[Move] = []
+        now = self._clock()
         for move in moves:
-            settled = self._settled.get((move.repo_full_name, move.branch))
+            key = (move.repo_full_name, move.branch)
+            backoff = self._archive_backoff.get(key)
+            if backoff is not None:
+                if backoff.sha != move.sha:
+                    # A record for a different sha suppresses nothing -- a new
+                    # commit is a new chance, and may be the fix -- and it is
+                    # dropped rather than merely ignored, because it is state
+                    # about a commit that is no longer the branch tip (AC4 of
+                    # #1309).
+                    del self._archive_backoff[key]
+                elif now < backoff.next_attempt_at:
+                    # Still inside the window this repository's last failure
+                    # earned. It has to be checked HERE for the same reason the
+                    # settled check is: the mirror clone lives inside
+                    # process_push, so a skip decided any later has already paid
+                    # for it (#1309).
+                    continue
+            settled = self._settled.get(key)
             if settled is None or settled.sha != move.sha:
                 unsettled.append(move)
                 continue
@@ -483,28 +593,24 @@ class CommitPoller:
                 # and this must not keep a second copy that a rollback would
                 # not clear.
                 self._settled.pop(key, None)
-                self._archive_retry.pop(key, None)
+                self._archive_backoff.pop(key, None)
             elif result.status == "rejected":
                 codes = {(error.get("code") or "") for error in (result.errors or [])}
                 if codes & _TOPOLOGY_REJECTIONS:
-                    self._settled[key] = Settled(move.sha, binding_snapshots[move.repo_full_name])
-                    self._archive_retry.pop(key, None)
-                elif _ARCHIVE_FAILURE in codes and self._archive_retry.get(key) != move.sha:
-                    self._archive_retry[key] = move.sha
-                    logger.info(
-                        "commit poll will retry repo=%s branch=%s sha=%s (transient)",
-                        move.repo_full_name,
-                        move.branch,
-                        move.sha[:8],
+                    self._settled[key] = Settled(
+                        move.sha, binding_snapshots[move.repo_full_name]
                     )
+                    self._archive_backoff.pop(key, None)
+                elif codes & _RETRYABLE_REJECTIONS:
+                    self._record_retryable_failure(move, codes, deployed.get(key))
                 else:
                     self._settled[key] = Settled(move.sha, None)
-                    self._archive_retry.pop(key, None)
+                    self._archive_backoff.pop(key, None)
             else:
                 # An ignored outcome will keep repeating for this commit.
                 # Remember it, or the next pass clones again (#1267).
                 self._settled[key] = Settled(move.sha, None)
-                self._archive_retry.pop(key, None)
+                self._archive_backoff.pop(key, None)
 
             if result.status != "rejected":
                 logger.info(
@@ -515,3 +621,73 @@ class CommitPoller:
                     result.status,
                 )
         return moves
+
+    def _record_retryable_failure(
+        self,
+        move: Move,
+        codes: set[str],
+        deployed_sha: str | None,
+    ) -> None:
+        """Make this repository wait longer before it costs another clone.
+
+        The attempt count continues only while the sha AND the failure class
+        both hold. A new commit may be the fix, and a rejection that changed
+        codes is a different failure -- neither has earned the previous
+        failure's accumulated delay (#1309).
+
+        `deployed_sha` is what the deployments query reported for this branch on
+        this pass, passed in rather than recomputed. It is the baseline the
+        prune in `poll_once` compares against to notice a deploy from the other
+        lane.
+        """
+
+        key = (move.repo_full_name, move.branch)
+        failure = tuple(sorted(codes))
+        previous = self._archive_backoff.get(key)
+        if previous is not None and previous.sha == move.sha and previous.codes == failure:
+            attempts = previous.attempts + 1
+        else:
+            attempts = 1
+        # The exponent is clamped as well as the product: see
+        # `_RETRY_MAX_DOUBLINGS`. The outer `min` still earns its place -- four
+        # doublings gives 4,800s, and the ceiling is 3,600s. `attempts` itself
+        # is deliberately NOT capped: the count is real information, and it is
+        # what the stalled-lane error below reports.
+        delay = min(
+            _RETRY_BASE_DELAY_S * 2 ** min(attempts - 1, _RETRY_MAX_DOUBLINGS),
+            _RETRY_MAX_DELAY_S,
+        )
+        self._archive_backoff[key] = ArchiveBackoff(
+            sha=move.sha,
+            codes=failure,
+            attempts=attempts,
+            next_attempt_at=self._clock() + delay,
+            deployed_sha=deployed_sha,
+        )
+        if attempts >= _RETRY_ERROR_ROUNDS:
+            # Re-emitted on EVERY subsequent attempt, not once at the
+            # threshold: a lane parked at the hourly ceiling would otherwise go
+            # quiet again, which is the silence this was meant to end (#1309).
+            logger.error(
+                "commit poll clone failed %d consecutive times repo=%s branch=%s sha=%s "
+                "codes=%s; deploys from this repository are NOT happening. Retrying in "
+                "%.0fs. The repository may be unreachable, unauthorized, missing a clone "
+                "credential, or too large to clone inside the 120s timeout.",
+                attempts,
+                move.repo_full_name,
+                move.branch,
+                move.sha[:8],
+                ",".join(failure),
+                delay,
+            )
+        else:
+            logger.info(
+                "commit poll will retry repo=%s branch=%s sha=%s codes=%s "
+                "attempt=%d in %.0fs",
+                move.repo_full_name,
+                move.branch,
+                move.sha[:8],
+                ",".join(failure),
+                attempts,
+                delay,
+            )

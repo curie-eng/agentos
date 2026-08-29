@@ -8,43 +8,17 @@ backwards -- the caller uses this BEFORE an agent exists, to find out which
 agent to create.
 """
 
-import yaml
 from fastapi import APIRouter, Depends, HTTPException, status
-from plugin_format.deploy_targets import DeployTargetsFile, validate_deploy_targets
-from plugin_format.yaml_loader import DuplicateKeyError, safe_load_unique
 
 from ..auth import require_api_key
+from ..deploy_target_parsing import parse_deploy_targets as _parse
 from ..schemas import ListedTargets, NamedTarget, ResolvedTarget, ResolveTargetRequest
 
 router = APIRouter(tags=["deploy-targets"], dependencies=[Depends(require_api_key)])
 
-
-def _parse(content: str) -> DeployTargetsFile:
-    """Parse and validate ``deploy.yaml``, or raise the operator-facing 400.
-
-    Shared by both endpoints so `list` and `resolve` cannot disagree about
-    whether a file is valid -- which would be a second parser by the back door,
-    the exact thing ADR-0089 put this in the API to prevent.
-    """
-
-    try:
-        data = safe_load_unique(content)
-    except DuplicateKeyError as exc:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            f"deploy.duplicate_target: deploy.yaml contains duplicate key {exc.key!r}",
-        ) from exc
-    except yaml.YAMLError as exc:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST, f"deploy.yaml is unparseable: {exc}"
-        ) from exc
-
-    parsed, errors = validate_deploy_targets(data)
-    if errors:
-        detail = "; ".join(f"{code}: {message}" for code, message in errors)
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail)
-    assert parsed is not None
-    return parsed
+# `_parse` is imported rather than defined here: the git-flow routing check
+# (#1221) needs the same parser, and a second copy of it would be the second
+# parser ADR-0089 exists to prevent. See `deploy_target_parsing`.
 
 
 @router.post("/deploy-targets/resolve", response_model=ResolvedTarget)

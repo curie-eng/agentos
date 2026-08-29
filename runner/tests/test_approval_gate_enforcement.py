@@ -1,0 +1,917 @@
+"""The approval gate is ENFORCED, not merely armed (#1852).
+
+PR #1875 landed only the boot-time refusal (``assert_gates_not_shadowed``, tested
+in ``test_gate_shadowing.py``). That closes the case where the bundle itself
+preauthorizes a gated tool, but it cannot close the two halves this file covers:
+
+1. **The gate has to run at a layer permission rules cannot skip.** The SDK
+   documents on ``ClaudeAgentOptions.can_use_tool`` (see
+   ``.venv/lib/python3.14/site-packages/claude_agent_sdk/types.py``, the
+   ``can_use_tool`` field docstring) that the callback is "*not* invoked for tool
+   calls already permitted by ``allowed_tools`` ... or ``permissions.allow`` rules
+   in settings", and that "To observe or gate *every* tool call regardless of
+   permission rules, use a ``PreToolUse`` hook via ``hooks`` instead -- but note
+   that a ``PreToolUse`` hook returning an *allow* decision also skips this
+   callback." So the gate's DECIDING layer must be the PreToolUse hook.
+
+   Observed live (2026-08-29, claude-agent-sdk 0.2.135 + OpenRouter
+   anthropic/claude-sonnet-4.5) with
+   ``ClaudeAgentOptions(allowed_tools=["Bash"], permission_mode="default",
+   can_use_tool=<cb>)``:
+     - no PreToolUse hook              -> ``can_use_tool`` NEVER invoked, Bash EXECUTED;
+     - hook returns deny + continue False -> hook invoked, ``can_use_tool`` never
+       invoked, Bash NOT executed, and the turn ended promptly with a terminal
+       ``ResultMessage``;
+     - hook returns allow              -> hook invoked, ``can_use_tool`` NOT invoked,
+       Bash executed.
+   That third line is why the hook -- not ``can_use_tool`` -- has to be what spends
+   the one-shot post-approval grant: a hook allow means the callback never runs.
+
+2. **Stopping the turn must still produce an approval record.** A hook deny that
+   stops the turn, and a ``PermissionResultDeny(interrupt=True)``, both end the
+   turn in a shape the session previously read as a plain failure, so the run
+   ended ``classified-failure`` with no ``approval_summary`` and nothing to
+   approve -- the "denied live tool call left the turn hanging" half of the issue.
+   ``_apply_approval_override`` only flipped a DONE final, so a runner-requested
+   halt has to be carried on its own flag.
+
+Everything here runs offline: no network, no credential, no mocked
+Postgres/Valkey/Langfuse. The model session is replaced at the ``ModelSession``
+adapter seam (``FakeModelSession``), which is the repo's sanctioned mock point.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import json
+import typing
+from pathlib import Path
+from typing import Any
+
+import anyio
+import pytest
+from aci_protocol import Event, SessionStatus, parse_ndjson
+from claude_agent_sdk import (
+    AssistantMessage,
+    HookMatcher,
+    ResultMessage,
+    TextBlock,
+    ToolUseBlock,
+)
+from claude_agent_sdk.types import (
+    PermissionResultAllow,
+    PermissionResultDeny,
+    PreToolUseHookSpecificOutput,
+    SyncHookJSONOutput,
+    ToolPermissionContext,
+)
+from curie_runner import __main__ as boot
+from curie_runner.__main__ import build_runner
+from curie_runner.approval import (
+    _DENY_MESSAGE,
+    APPROVAL_SUMMARY_PREFIX,
+    ApprovalGate,
+    ApprovalPolicyError,
+    build_approval_hook,
+    build_can_use_tool,
+)
+from curie_runner.config import RunnerConfig
+from curie_runner.fake import FakeModelSession
+from curie_runner.otel import RunTracer
+from curie_runner.session import SessionRunner
+from curie_runner.side_effects import SideEffectClassifier
+
+_BUDGET = '{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}'
+
+
+# --- fixtures: a realistic plugin bundle, not a stub ----------------------------
+
+
+def _bundle(
+    root: Path,
+    *,
+    gates: list[str] | None = None,
+    skill_allowed_tools: list[str] | None = None,
+    manifest_hooks: dict[str, Any] | None = None,
+) -> str:
+    """Write a real bundle dir: manifest + (optionally) a skill with frontmatter.
+
+    Mirrors the ``_bundle`` idiom in ``test_gate_shadowing.py`` but adds the
+    manifest ``hooks`` field, because the merge under test (#1852) is between the
+    bundle's own PreToolUse matchers and the approval matcher.
+    """
+
+    (root / ".claude-plugin").mkdir(parents=True, exist_ok=True)
+    manifest: dict[str, Any] = {
+        "name": "approval-demo",
+        "version": "0.1.0",
+        "description": "A bundle for the gate-enforcement tests.",
+    }
+    if gates:
+        manifest["approvalPolicy"] = {"gates": [{"gate": g, "route": "ops"} for g in gates]}
+    if manifest_hooks is not None:
+        manifest["hooks"] = manifest_hooks
+    (root / ".claude-plugin" / "plugin.json").write_text(json.dumps(manifest), encoding="utf-8")
+    if skill_allowed_tools is not None:
+        skill_dir = root / "skills" / "approval-demo"
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        lines = [
+            "---",
+            "name: approval-demo",
+            "description: Demonstrates the approval gate.",
+            "allowed-tools:",
+            *(f"  - {entry}" for entry in skill_allowed_tools),
+            "---",
+            "",
+            "# approval-demo",
+            "",
+        ]
+        (skill_dir / "SKILL.md").write_text("\n".join(lines), encoding="utf-8")
+    return str(root)
+
+
+def _config(plugin_dir: str, **extra: str) -> RunnerConfig:
+    return RunnerConfig.from_env(
+        {
+            "CURIE_PLUGIN_DIR": plugin_dir,
+            "CURIE_SESSION_ID": "s-1852",
+            "CURIE_SANDBOX_ID": "b-1852",
+            "CURIE_BUDGET": _BUDGET,
+            **extra,
+        }
+    )
+
+
+def _hook_callback(gate: ApprovalGate):
+    """The single PreToolUse callback ``build_approval_hook`` contributes."""
+
+    hooks = build_approval_hook(gate)
+    assert set(hooks) == {"PreToolUse"}, "the approval hook registers PreToolUse only"
+    matchers = hooks["PreToolUse"]
+    assert len(matchers) == 1
+    matcher = matchers[0]
+    assert isinstance(matcher, HookMatcher)
+    # matcher=None means "every tool call". A tool-name matcher string would let
+    # the CLI's own matching decide which calls reach us, and the gate's whole
+    # claim is that it sees every one.
+    assert matcher.matcher is None
+    assert len(matcher.hooks) == 1
+    return matcher.hooks[0]
+
+
+def _run_hook(gate: ApprovalGate, tool: str, tool_input: dict[str, Any]) -> dict[str, Any]:
+    callback = _hook_callback(gate)
+
+    async def go() -> dict[str, Any]:
+        return await callback(
+            {"tool_name": tool, "tool_input": tool_input}, "tuid-1", {"signal": None}
+        )
+
+    return anyio.run(go)
+
+
+def _decision(output: dict[str, Any]) -> dict[str, Any]:
+    assert "hookSpecificOutput" in output, f"no hook decision in {output!r}"
+    return output["hookSpecificOutput"]
+
+
+def _runner_over(script: list[Any], *, gate: ApprovalGate, ceiling: int = 10_000, **kw):
+    session = FakeModelSession(lambda: script, **kw)
+    runner = SessionRunner(
+        session_factory=lambda: session,
+        ceiling=ceiling,
+        tracer=RunTracer(None),
+        classifier=SideEffectClassifier(),
+        trace_name="t",
+        approval_gate=gate,
+    )
+    return runner, session
+
+
+def _recording_deny(gate: ApprovalGate, *, interrupt: bool):
+    """A permission callback that records the block exactly as the hook does.
+
+    The fake tier deliberately does not run PreToolUse hooks (they shell out and
+    would break its offline no-op guarantee -- see ``FakeModelSession``), so a
+    session-level test drives the same state transition through the permission
+    callback seam the fake DOES honor. ``interrupt`` is a parameter because the
+    two turn-ending shapes under test differ: ``True`` is the SDK aborting the
+    turn immediately, ``False`` lets the scripted terminal result be delivered so
+    the error-result shape itself can be asserted on.
+    """
+
+    async def callback(
+        tool_name: str, tool_input: dict[str, Any], _ctx: ToolPermissionContext
+    ) -> PermissionResultAllow | PermissionResultDeny:
+        if tool_name in gate.required:
+            gate.block(tool_name, tool_input)
+            return PermissionResultDeny(message=_DENY_MESSAGE, interrupt=interrupt)
+        return PermissionResultAllow()
+
+    return callback
+
+
+def _gated_bash_then_error_result() -> list[Any]:
+    """A gated Bash call followed by an interrupt-shaped terminal ERROR result.
+
+    This is the shape a CLI-side stop produces: the model's tool call is emitted,
+    the call never executes, and the turn terminates on an error-subtype
+    ``ResultMessage`` rather than a clean success.
+    """
+
+    return [
+        AssistantMessage(content=[TextBlock(text="I'll run that")], model="m"),
+        AssistantMessage(
+            content=[ToolUseBlock(id="t1", name="Bash", input={"command": "rm -rf /tmp/x"})],
+            model="m",
+        ),
+        ResultMessage(
+            subtype="error_during_execution",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=True,
+            num_turns=1,
+            session_id="s",
+            result="aborted",
+        ),
+    ]
+
+
+# --- A. the exact issue repro, through the real boot path (AC1/AC2) -------------
+
+
+def test_boot_refuses_the_issue_repro_bundle(tmp_path: Path) -> None:
+    # revert: drop the assert_gates_not_shadowed call from build_runner -> this fails.
+    # The verbatim #1852 repro: a manifest that gates Bash shipped alongside a
+    # skill whose frontmatter declares `allowed-tools: [Bash]`. Driven through
+    # build_runner (not the validator in isolation) because boot is the only
+    # scope that holds both the assembled gate and the bundle directory.
+    plugin_dir = _bundle(tmp_path, gates=["Bash"], skill_allowed_tools=["Bash"])
+
+    with pytest.raises(ApprovalPolicyError) as exc:
+        build_runner(_config(plugin_dir), fake_model=True)
+
+    message = str(exc.value)
+    assert "skills/approval-demo/SKILL.md" in message  # the file to edit
+    assert "'Bash'" in message  # the entry, and the gated tool
+    assert "before the approval callback runs" in message  # why it is fatal
+
+
+def test_boot_accepts_the_same_bundle_once_the_entry_is_removed(tmp_path: Path) -> None:
+    # revert/negative control: if assert_gates_not_shadowed over-matched, a
+    # legitimately gated bundle would refuse to boot and operators would remove
+    # the gate to get running again.
+    plugin_dir = _bundle(tmp_path, gates=["Bash"], skill_allowed_tools=["Read"])
+    runner = build_runner(_config(plugin_dir), fake_model=True)
+    assert runner is not None
+
+
+# --- B. an operator gate armed AFTER deployment (AC6) ---------------------------
+
+
+def test_hook_denies_a_gate_the_operator_armed_after_the_bundle_shipped() -> None:
+    # revert: hook returns {} (or an "ask") for a gated tool -> this fails, and the
+    # tool runs unapproved.
+    # The bundle ships no approvalPolicy and no allowed-tools entry, so nothing at
+    # deploy time has anything to check; the gate exists only because an operator
+    # set CURIE_APPROVAL_REQUIRED_TOOLS=Bash afterwards. The hook must still deny.
+    gate = ApprovalGate(required=frozenset({"Bash"}))
+
+    output = _run_hook(gate, "Bash", {"command": "rm -rf /tmp/x"})
+
+    decision = _decision(output)
+    assert decision["hookEventName"] == "PreToolUse"
+    assert decision["permissionDecision"] == "deny"
+    assert decision["permissionDecisionReason"] == _DENY_MESSAGE
+
+    # The turn-stopping half. `continue_` is the Python-side spelling; the SDK
+    # rewrites it to the wire's "continue" in
+    # claude_agent_sdk/_internal/query.py::_convert_hook_output_for_cli, so a
+    # callback that emitted the wire name would be silently ignored and the turn
+    # would keep running after the deny.
+    assert output["continue_"] is False
+    assert "continue" not in output, "emit continue_, not the wire name; the SDK converts"
+    assert isinstance(output.get("stopReason"), str) and output["stopReason"]
+
+    # And the approval record the platform suspends on.
+    assert gate.pending_summary is not None
+    assert gate.pending_summary.startswith(APPROVAL_SUMMARY_PREFIX)
+    assert "rm -rf /tmp/x" in gate.pending_summary
+    assert gate.pending_gate_kind == "permission"
+    assert gate.pending_granted_tool == "Bash"
+    # The runner asked for the stop, so an interrupt-shaped turn end is still an
+    # approval pause rather than a failure (see test F).
+    assert gate.pending_halt is True
+
+
+def test_reset_clears_the_halt_marker() -> None:
+    # revert: reset() leaves pending_halt set -> the NEXT turn's unrelated failure
+    # is reported as awaiting-approval on a stale flag.
+    gate = ApprovalGate(required=frozenset({"Bash"}))
+    gate.block("Bash", {"command": "x"})
+    assert gate.pending_halt is True
+    gate.reset()
+    assert gate.pending_halt is False
+
+
+# --- C. a non-gated tool falls through to the existing callback -----------------
+
+
+def test_hook_returns_no_decision_for_an_ungated_tool() -> None:
+    # revert: hook returns an explicit "allow" for every tool -> this fails.
+    # An explicit allow would be a behavior change well beyond the gate: the SDK
+    # documents that a PreToolUse allow SKIPS can_use_tool entirely, so allowing
+    # Read here would silently disable the approval callback for every other tool.
+    gate = ApprovalGate(required=frozenset({"Bash"}))
+
+    output = _run_hook(gate, "Read", {"file_path": "/etc/hosts"})
+
+    assert output == {}
+    assert gate.pending_summary is None
+    assert gate.pending_halt is False
+
+
+@pytest.mark.parametrize(
+    "hook_input",
+    [None, {}, {"tool_name": None}, {"tool_input": {"command": "x"}}, "not-a-mapping", []],
+)
+def test_hook_tolerates_a_missing_or_odd_shaped_input(hook_input: object) -> None:
+    # revert: index hook_input["tool_name"] directly -> a KeyError/TypeError inside
+    # a permission hook, which the CLI reports as a hook error and then lets the
+    # call PROCEED. A crash in the gate must never become a fail-open.
+    gate = ApprovalGate(required=frozenset({"Bash"}))
+    callback = _hook_callback(gate)
+
+    async def go() -> Any:
+        return await callback(hook_input, None, {"signal": None})
+
+    assert anyio.run(go) == {}
+    assert gate.pending_summary is None
+
+
+# --- D. the one-shot grant is spent by the HOOK, not by can_use_tool (AC4) ------
+
+
+def test_hook_spends_the_one_shot_grant_and_re_arms() -> None:
+    # revert: hook returns {} when a grant is available (leaving the allow to
+    # can_use_tool) -> the SDK never reaches can_use_tool for a hook-gated call, so
+    # the approved action is denied a second time and the resume deadlocks.
+    gate = ApprovalGate(required=frozenset({"Bash"}), grant_tool="Bash")
+
+    first = _run_hook(gate, "Bash", {"command": "the approved action"})
+    assert _decision(first)["permissionDecision"] == "allow"
+    assert "continue_" not in first, "an allow must not stop the turn"
+    assert gate.pending_summary is None  # the approved call records no block
+    assert gate.pending_halt is False
+
+    second = _run_hook(gate, "Bash", {"command": "sneak a retry"})
+    assert _decision(second)["permissionDecision"] == "deny"
+    assert gate.pending_summary is not None
+    assert "sneak a retry" in gate.pending_summary
+
+
+def test_can_use_tool_is_not_what_consumed_the_grant() -> None:
+    # revert: leave consume_grant in build_can_use_tool only -> this fails.
+    # Observed live: a PreToolUse hook returning "allow" SKIPS can_use_tool, so if
+    # the hook allowed while can_use_tool still owned the grant, the grant would
+    # never be spent and the very next gated call would be allowed too -- one
+    # approval buying unlimited executions.
+    gate = ApprovalGate(required=frozenset({"Bash"}), grant_tool="Bash")
+    callback = build_can_use_tool(gate)
+
+    allowed = _run_hook(gate, "Bash", {"command": "the approved action"})
+    assert _decision(allowed)["permissionDecision"] == "allow"
+
+    async def go() -> None:
+        # The hook spent it: the callback now denies.
+        result = await callback("Bash", {"command": "again"}, ToolPermissionContext())
+        assert isinstance(result, PermissionResultDeny)
+
+    anyio.run(go)
+
+
+# --- E. the callback's deny interrupts the turn ---------------------------------
+
+
+def test_can_use_tool_deny_carries_interrupt_true() -> None:
+    # revert: PermissionResultDeny(message=...) without interrupt=True -> the SDK
+    # default is interrupt=False (see PermissionResultDeny in
+    # claude_agent_sdk/types.py), so the model keeps its turn open after the deny
+    # and the run hangs instead of pausing for approval -- the live-OpenRouter half
+    # of the issue.
+    async def go() -> None:
+        gate = ApprovalGate(required=frozenset({"Bash"}))
+        callback = build_can_use_tool(gate)
+        result = await callback("Bash", {"command": "x"}, ToolPermissionContext())
+        assert isinstance(result, PermissionResultDeny)
+        assert result.message == _DENY_MESSAGE
+        assert result.interrupt is True
+
+    anyio.run(go)
+
+
+def test_can_use_tool_allow_is_unchanged_for_ungated_tools() -> None:
+    # negative control: interrupt=True must ride the DENY only. An allow that
+    # somehow carried a stop would kill every ungated tool call.
+    async def go() -> None:
+        gate = ApprovalGate(required=frozenset({"Bash"}))
+        callback = build_can_use_tool(gate)
+        result = await callback("Read", {"file_path": "/x"}, ToolPermissionContext())
+        assert isinstance(result, PermissionResultAllow)
+
+    anyio.run(go)
+
+
+# --- F. the headline regression: a stopped turn still finalizes as an approval ---
+
+
+def test_gated_turn_ending_in_an_error_result_finalizes_awaiting_approval() -> None:
+    # revert: _apply_approval_override flips only a DONE final -> this fails with
+    # status == classified-failure and no approval_summary, which is exactly the
+    # "denied tool call left the turn hanging with no approval record" defect.
+    # Stopping the turn is what the gate ASKED for, so the interrupt-shaped
+    # terminal result it produces must not be read as the run failing.
+    gate = ApprovalGate(required=frozenset({"Bash"}), route_by_tool={"Bash": "ops"})
+    runner, _session = _runner_over(
+        _gated_bash_then_error_result(),
+        gate=gate,
+        # interrupt=False so the scripted terminal ERROR result is actually
+        # delivered; that result is the shape under test.
+        can_use_tool=_recording_deny(gate, interrupt=False),
+        truncate_on_interrupt=False,
+    )
+
+    lines: list[str] = []
+
+    async def go() -> None:
+        await runner.start()
+        async for line in runner.run_turn(Event(type="message", text="go", user="U", ts="1")):
+            lines.append(line)
+
+    anyio.run(go)
+    events = parse_ndjson("".join(lines))
+
+    final = events[-1]
+    assert final.type == "final"
+    assert final.status == SessionStatus.AWAITING_APPROVAL
+    assert final.status != SessionStatus.CLASSIFIED_FAILURE
+    assert final.approval_summary
+    assert final.approval_summary.startswith(APPROVAL_SUMMARY_PREFIX)
+    assert final.approval_gate_kind == "permission"
+    assert final.approval_granted_tool == "Bash"
+    assert final.approval_route == "ops"
+    assert runner.status == SessionStatus.AWAITING_APPROVAL
+
+
+def test_ungated_error_result_still_ends_classified_failure() -> None:
+    # negative control for F: the halt flag must be the ONLY thing that rescues an
+    # error result. revert: flip any error final to awaiting-approval -> this fails,
+    # and every genuine crash would be parked behind a human decision forever.
+    gate = ApprovalGate(required=frozenset({"Bash"}))
+    runner, _session = _runner_over(
+        [
+            AssistantMessage(content=[TextBlock(text="working")], model="m"),
+            ResultMessage(
+                subtype="error_during_execution",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=True,
+                num_turns=1,
+                session_id="s",
+                result="boom",
+            ),
+        ],
+        gate=gate,
+    )
+
+    lines: list[str] = []
+
+    async def go() -> None:
+        await runner.start()
+        async for line in runner.run_turn(Event(type="message", text="go", user="U", ts="1")):
+            lines.append(line)
+
+    anyio.run(go)
+    events = parse_ndjson("".join(lines))
+    assert events[-1].status == SessionStatus.CLASSIFIED_FAILURE
+    assert not events[-1].approval_summary
+
+
+
+def _gated_bash_then_model_error_result() -> list[Any]:
+    """A gated Bash call, then a REAL model failure, then the error result.
+
+    Same shape as ``_gated_bash_then_error_result`` except the provider reported
+    a failure of its own (``AssistantMessage.error``) before the turn ended --
+    which is what ``translate.py`` records on ``TurnState.error_classification``.
+    ``server_error`` is deliberately not ``authentication_failed``: the auth code
+    fast-fails earlier in ``_drive_turn`` and would never reach the override.
+    """
+
+    return [
+        AssistantMessage(content=[TextBlock(text="I'll run that")], model="m"),
+        AssistantMessage(
+            content=[ToolUseBlock(id="t1", name="Bash", input={"command": "rm -rf /tmp/x"})],
+            model="m",
+        ),
+        AssistantMessage(content=[], model="m", error="server_error"),
+        ResultMessage(
+            subtype="error_during_execution",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=True,
+            num_turns=1,
+            session_id="s",
+            result="provider unavailable",
+        ),
+    ]
+
+
+def test_gated_turn_that_also_hit_a_model_error_ends_classified_failure() -> None:
+    # revert (the mutation this kills): drop `state.error_classification is None`
+    # from the halt branch of _apply_approval_override, i.e. flip ANY non-DONE
+    # final whenever the halt marker is set -> this fails with
+    # status == awaiting-approval.
+    #
+    # The halt marker is written by ApprovalGate.block at DENY time, before the
+    # turn's terminal cause is known, so it alone cannot distinguish "the CLI
+    # aborted because we asked it to" (test F) from "the provider fell over".
+    # Relabelling a provider outage as awaiting-approval hides a real failure
+    # behind a human decision that cannot fix it, and an approver resuming it
+    # lands straight back in the same failure.
+    gate = ApprovalGate(required=frozenset({"Bash"}), route_by_tool={"Bash": "ops"})
+    runner, _session = _runner_over(
+        _gated_bash_then_model_error_result(),
+        gate=gate,
+        can_use_tool=_recording_deny(gate, interrupt=False),
+        truncate_on_interrupt=False,
+    )
+
+    lines: list[str] = []
+
+    async def go() -> None:
+        await runner.start()
+        async for line in runner.run_turn(Event(type="message", text="go", user="U", ts="1")):
+            lines.append(line)
+
+    anyio.run(go)
+    events = parse_ndjson("".join(lines))
+
+    # Not vacuous: the gate really did fire and really did ask for the halt, so
+    # the ONLY thing keeping this out of awaiting-approval is the model error.
+    assert gate.pending_summary is not None
+    assert gate.pending_halt is True
+
+    final = events[-1]
+    assert final.type == "final"
+    assert final.status == SessionStatus.CLASSIFIED_FAILURE
+    assert final.status != SessionStatus.AWAITING_APPROVAL
+    assert not final.approval_summary
+    # And the failure is still reported as itself, not swallowed.
+    assert any(
+        e.type == "error" and e.classification == "server_error" for e in events
+    ), "the model's own error frame must survive"
+
+
+def test_a_done_gated_turn_still_flips_even_after_a_model_error_frame() -> None:
+    # negative control for the guard above: the new error_classification check
+    # must ride the HALT branch only. revert: apply it to the DONE branch too ->
+    # this fails, and a turn the model finished cleanly after a recovered
+    # (non-terminal) error would lose its approval record entirely.
+    gate = ApprovalGate(required=frozenset({"Bash"}), route_by_tool={"Bash": "ops"})
+    script = [
+        AssistantMessage(content=[], model="m", error="server_error"),
+        AssistantMessage(
+            content=[ToolUseBlock(id="t1", name="Bash", input={"command": "rm -rf /tmp/x"})],
+            model="m",
+        ),
+        ResultMessage(
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=False,
+            num_turns=1,
+            session_id="s",
+            result="recovered and finished",
+        ),
+    ]
+    runner, _session = _runner_over(
+        script,
+        gate=gate,
+        can_use_tool=_recording_deny(gate, interrupt=False),
+        truncate_on_interrupt=False,
+    )
+
+    lines: list[str] = []
+
+    async def go() -> None:
+        await runner.start()
+        async for line in runner.run_turn(Event(type="message", text="go", user="U", ts="1")):
+            lines.append(line)
+
+    anyio.run(go)
+    events = parse_ndjson("".join(lines))
+
+    final = events[-1]
+    assert final.type == "final"
+    assert final.status == SessionStatus.AWAITING_APPROVAL
+    assert final.approval_summary
+    assert final.approval_gate_kind == "permission"
+
+
+# --- G. negative control: an operator interrupt outranks the gate ---------------
+
+
+def test_operator_interrupt_on_a_gated_turn_still_ends_idle() -> None:
+    # revert: copy the gate's halt marker onto the turn state unconditionally ->
+    # this fails. A human pressing stop is an intentional stop, not an approval
+    # request; reporting it as awaiting-approval would suspend the thread behind a
+    # decision nobody asked for and no approver would recognize.
+    gate = ApprovalGate(required=frozenset({"Bash"}))
+    runner, session = _runner_over(
+        _gated_bash_then_error_result(),
+        gate=gate,
+        can_use_tool=_recording_deny(gate, interrupt=False),
+        truncate_on_interrupt=False,
+    )
+
+    lines: list[str] = []
+
+    async def go() -> None:
+        await runner.start()
+        gen = runner.run_turn(Event(type="message", text="go", user="U", ts="1"))
+        lines.append(await gen.__anext__())  # first frame; the turn is live
+        await runner.interrupt("user stop")  # the operator's own stop
+        async for line in gen:
+            lines.append(line)
+
+    anyio.run(go)
+    events = parse_ndjson("".join(lines))
+
+    # The gate really did block this turn -- otherwise the control is vacuous.
+    assert gate.pending_summary is not None
+    assert session.interrupts >= 1
+    assert events[-1].type == "final"
+    assert events[-1].status == SessionStatus.IDLE_AWAITING_INPUT
+
+
+# --- H. negative control: a budget halt still outranks a pending approval --------
+
+
+def test_budget_halt_still_outranks_a_pending_approval() -> None:
+    # revert: evaluate the approval override before the budget halt -> this fails.
+    # A run that blew its token ceiling has not completed cleanly; suspending it
+    # behind a human decision strands a broken run, and approving it would resume
+    # straight back into the same halt.
+    gate = ApprovalGate(required=frozenset({"Bash"}))
+    script = [
+        AssistantMessage(
+            content=[ToolUseBlock(id="t1", name="Bash", input={"command": "x"})],
+            model="m",
+            usage={"output_tokens": 500},
+        ),
+        ResultMessage(
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=False,
+            num_turns=1,
+            session_id="s",
+            result="done",
+            usage={"output_tokens": 500},
+        ),
+    ]
+    runner, _session = _runner_over(
+        script,
+        gate=gate,
+        ceiling=10,
+        can_use_tool=_recording_deny(gate, interrupt=False),
+        truncate_on_interrupt=False,
+    )
+
+    lines: list[str] = []
+
+    async def go() -> None:
+        await runner.start()
+        async for line in runner.run_turn(Event(type="message", text="go", user="U", ts="1")):
+            lines.append(line)
+
+    anyio.run(go)
+    events = parse_ndjson("".join(lines))
+
+    assert gate.pending_summary is not None  # the gate did fire this turn
+    assert events[-1].type == "final"
+    assert events[-1].status == SessionStatus.CLASSIFIED_FAILURE
+    assert "budget" in events[-1].text
+
+
+# --- I. boot merges the approval matcher WITH the bundle's own hooks -------------
+
+
+class _CapturedSession:
+    """Stands in for ClaudeAgentSession so the built options can be inspected.
+
+    The real class constructs a ClaudeSDKClient; the assertion here is about what
+    ``build_runner`` PUT in the options, so the transport is not needed.
+    """
+
+    def __init__(self, options: Any) -> None:
+        self.options = options
+
+
+def _options_from_boot(monkeypatch: pytest.MonkeyPatch, config: RunnerConfig) -> Any:
+    monkeypatch.setattr(boot, "ClaudeAgentSession", _CapturedSession)
+    runner = build_runner(config)
+    session = runner._factory()
+    assert isinstance(session, _CapturedSession)
+    return session.options
+
+
+_BUNDLE_HOOKS = {
+    "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "true"}]}]
+}
+
+
+def test_boot_merges_the_approval_matcher_ahead_of_bundle_hooks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # revert: pass hooks=bundle_hooks unchanged -> the gate never runs as a hook and
+    # a skill/settings permission rule silently bypasses it (the #1852 defect).
+    # revert: pass hooks=approval_hook only -> the bundle's declared PreToolUse
+    # guardrails (#272) are silently dropped.
+    plugin_dir = _bundle(tmp_path, manifest_hooks=_BUNDLE_HOOKS)
+    config = _config(plugin_dir, CURIE_APPROVAL_REQUIRED_TOOLS="Bash")
+
+    options = _options_from_boot(monkeypatch, config)
+
+    matchers = options.hooks["PreToolUse"]
+    assert len(matchers) == 2
+    # The approval matcher is first and unscoped; the bundle's keeps its own
+    # matcher string, proving it was preserved rather than rebuilt.
+    assert matchers[0].matcher is None
+    assert matchers[1].matcher == "Bash"
+    # Defense in depth: the callback stays wired too, so an ungated tool that
+    # falls through the hook is still decided by the approval callback.
+    assert options.can_use_tool is not None
+
+
+def test_boot_wires_the_approval_matcher_when_the_bundle_declares_no_hooks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # revert: only merge when bundle hooks exist -> the common case (a gated bundle
+    # with no hooks of its own) boots with no hook at all and stays bypassable.
+    plugin_dir = _bundle(tmp_path)
+    config = _config(plugin_dir, CURIE_APPROVAL_REQUIRED_TOOLS="Bash")
+
+    options = _options_from_boot(monkeypatch, config)
+
+    assert options.hooks is not None
+    assert [m.matcher for m in options.hooks["PreToolUse"]] == [None]
+
+
+def test_boot_adds_no_approval_matcher_when_nothing_is_gated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # negative control: an unconfigured agent must see zero behavior change --
+    # no gate, no approval hook, and the bundle's own hooks untouched.
+    plugin_dir = _bundle(tmp_path, manifest_hooks=_BUNDLE_HOOKS)
+    config = _config(plugin_dir)
+
+    options = _options_from_boot(monkeypatch, config)
+
+    assert [m.matcher for m in options.hooks["PreToolUse"]] == ["Bash"]
+    assert options.can_use_tool is None
+
+
+# --- J. fake-tier parity: a deny with interrupt=True stops the replay ------------
+
+
+def _collect(session: FakeModelSession) -> list[Any]:
+    async def go() -> list[Any]:
+        await session.connect()
+        await session.query("go")
+        return [message async for message in session.receive_turn()]
+
+    return anyio.run(go)
+
+
+def test_fake_session_stops_replaying_after_an_interrupting_deny() -> None:
+    # revert: FakeModelSession._apply_gate ignores the PermissionResultDeny result
+    # -> the offline tier keeps replaying past a call the real SDK would have
+    # aborted, so the fake/CI/chart-default path stops modelling the gate it is
+    # supposed to prove (the tier-parity rule).
+    sentinel = "MUST-NOT-REPLAY-AFTER-INTERRUPTING-DENY"
+    gate = ApprovalGate(required=frozenset({"Bash"}))
+    script = [
+        AssistantMessage(
+            content=[ToolUseBlock(id="t1", name="Bash", input={"command": "x"})], model="m"
+        ),
+        AssistantMessage(content=[TextBlock(text=sentinel)], model="m"),
+        ResultMessage(
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=False,
+            num_turns=1,
+            session_id="s",
+            result=sentinel,
+        ),
+    ]
+
+    session = FakeModelSession(lambda: script, can_use_tool=_recording_deny(gate, interrupt=True))
+    messages = _collect(session)
+
+    texts = [
+        block.text
+        for message in messages
+        if isinstance(message, AssistantMessage)
+        for block in message.content
+        if isinstance(block, TextBlock)
+    ]
+    assert sentinel not in texts
+    assert not any(isinstance(m, ResultMessage) for m in messages)
+    assert gate.pending_summary is not None
+
+
+def test_fake_session_keeps_replaying_after_a_non_interrupting_deny() -> None:
+    # negative control for J: only interrupt=True truncates. Without this, an
+    # implementation that truncates on ANY deny would pass J while breaking every
+    # existing gated-turn test that expects the terminal result to arrive.
+    gate = ApprovalGate(required=frozenset({"Bash"}))
+    script = [
+        AssistantMessage(
+            content=[ToolUseBlock(id="t1", name="Bash", input={"command": "x"})], model="m"
+        ),
+        ResultMessage(
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=False,
+            num_turns=1,
+            session_id="s",
+            result="done",
+        ),
+    ]
+
+    session = FakeModelSession(lambda: script, can_use_tool=_recording_deny(gate, interrupt=False))
+    messages = _collect(session)
+
+    assert any(isinstance(m, ResultMessage) for m in messages)
+
+
+# --- K. pin the SDK's decision-key names ----------------------------------------
+#
+# Source of truth: .venv/lib/python3.14/site-packages/claude_agent_sdk/types.py
+# (SyncHookJSONOutput, PreToolUseHookSpecificOutput, PermissionResultDeny) and
+# claude_agent_sdk/_internal/query.py::_convert_hook_output_for_cli. These are
+# TypedDicts, so a rename upstream is invisible at runtime -- the hook would keep
+# returning keys the CLI ignores and the gate would silently stop gating, which is
+# the exact failure mode #1852 is about. Assert against the pinned SDK's own
+# declarations rather than a hand-copied table.
+
+
+def test_hook_output_keys_are_declared_by_the_pinned_sdk() -> None:
+    # revert: rename any emitted key (continue_ -> continue, permissionDecision ->
+    # decision, hookSpecificOutput -> hookOutput) -> this fails instead of the gate
+    # silently ceasing to enforce.
+    gate = ApprovalGate(required=frozenset({"Bash"}))
+    output = _run_hook(gate, "Bash", {"command": "x"})
+
+    top_level = set(SyncHookJSONOutput.__annotations__)
+    assert set(output) <= top_level, f"undeclared top-level key(s): {set(output) - top_level}"
+    assert {"continue_", "stopReason", "hookSpecificOutput"} <= set(output)
+
+    specific = set(PreToolUseHookSpecificOutput.__annotations__)
+    decision = _decision(output)
+    assert set(decision) <= specific, f"undeclared decision key(s): {set(decision) - specific}"
+    assert {"hookEventName", "permissionDecision", "permissionDecisionReason"} <= set(decision)
+
+
+def test_the_decision_values_are_declared_by_the_pinned_sdk() -> None:
+    # revert: emit "block"/"reject" instead of "deny", or "PreToolUseHook" as the
+    # event name -> the CLI silently ignores an unrecognized value and the call
+    # proceeds.
+    annotation = PreToolUseHookSpecificOutput.__annotations__["permissionDecision"]
+    literal = typing.get_args(annotation)[0]  # unwrap NotRequired[...]
+    allowed = set(typing.get_args(literal))
+    assert {"allow", "deny"} <= allowed
+
+    gate = ApprovalGate(required=frozenset({"Bash"}))
+    denied = _decision(_run_hook(gate, "Bash", {"command": "x"}))
+    assert denied["permissionDecision"] in allowed
+
+    granted = ApprovalGate(required=frozenset({"Bash"}), grant_tool="Bash")
+    allowed_out = _decision(_run_hook(granted, "Bash", {"command": "x"}))
+    assert allowed_out["permissionDecision"] in allowed
+
+    event_literal = typing.get_args(PreToolUseHookSpecificOutput.__annotations__["hookEventName"])
+    assert denied["hookEventName"] in set(event_literal)
+
+
+def test_permission_result_deny_still_carries_an_interrupt_field() -> None:
+    # revert / upstream drift: if the SDK drops or renames `interrupt`, the deny in
+    # build_can_use_tool stops stopping the turn and the run hangs again. Fail here
+    # rather than in production.
+    fields = {f.name for f in dataclasses.fields(PermissionResultDeny)}
+    assert {"message", "interrupt"} <= fields
+    assert PermissionResultDeny().interrupt is False  # the default we must override

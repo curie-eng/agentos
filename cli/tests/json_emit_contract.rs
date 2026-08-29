@@ -352,6 +352,7 @@ const TEST_API_KEY: &str = "curie-dev-key";
 fn eval_dry_run_plan_names_sequential_concurrency() {
     let opts = EvalOpts {
         cases: None,
+        case_ids: Vec::new(),
         channel: None,
         namespace: "curie".into(),
         release: "curie".into(),
@@ -1561,6 +1562,13 @@ fn write_kubectl_stub(dir: &Path) -> PathBuf {
         &path,
         r#"#!/bin/sh
 case "$*" in
+  *"config view"*)
+    printf '%s' '{"clusters":[{"cluster":{"server":"https://cluster-a.example.com","certificate-authority-data":"Y2EtYQ=="}}]}'
+    ;;
+  *"get secret"*)
+    printf '%s\n' 'Error from server (NotFound): secrets "missing" not found' >&2
+    exit 1
+    ;;
   *"get deployment"*)
     if [ "${CURIE_TEST_KUBECTL_FAILURE:-}" = discovery ]; then
       printf '%s\n' 'app discovery exploded' >&2

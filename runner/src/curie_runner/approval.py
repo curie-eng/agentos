@@ -32,13 +32,13 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, NamedTuple
 
 import yaml
-from claude_agent_sdk import create_sdk_mcp_server, tool
+from claude_agent_sdk import HookMatcher, create_sdk_mcp_server, tool
 from claude_agent_sdk.types import (
     CanUseTool,
     McpSdkServerConfig,
@@ -509,7 +509,11 @@ class ApprovalGate:
     ``pending_summary``/``pending_route`` are set by the callback when it
     blocks a call and consumed by the session at turn end to flip the final
     to awaiting-approval; ``reset()`` clears them at each turn start so one
-    turn's block never leaks into the next.
+    turn's block never leaks into the next. ``pending_halt`` records that the
+    runner's own gate asked the CLI to stop the turn (#1852) -- it is
+    runner-internal state, never a wire field, and the session reads it to tell
+    "the turn ended badly because we stopped it for approval" apart from "the
+    turn ended badly".
 
     The first blocked call of a turn wins: a model that retries the denied
     tool (against the deny message's instruction) does not overwrite the
@@ -558,6 +562,12 @@ class ApprovalGate:
     grantable_by_route: dict[str, str] = field(default_factory=dict)
     publication_title: str | None = None
     publication_body: str | None = None
+    # Set by ``block()`` whenever the gate refuses a call (#1852). Since the
+    # refusal now carries the SDK's turn-stopping flags, the CLI aborts the turn
+    # and its terminal result arrives shaped like a failure; this marker is how
+    # ``SessionRunner`` knows the runner itself requested that stop. It is
+    # runner-internal and is NEVER serialized onto the wire.
+    pending_halt: bool = False
     _boot_turn_seen: bool = False
 
     def grantable_tool_for_route(self, route: str | None) -> str | None:
@@ -582,6 +592,10 @@ class ApprovalGate:
         self.policy_route = None
         self.publication_title = None
         self.publication_body = None
+        # Strictly per-turn, and cleared with the other pending state rather
+        # than with the boot-turn grant below: a halt that leaked forward would
+        # make every later errored turn finalize as awaiting-approval (#1852).
+        self.pending_halt = False
         # Boot-turn-only grant: keep it on the first reset (the boot turn),
         # expire any unspent grant on the second and later resets so it never
         # leaks into a subsequent turn.
@@ -598,6 +612,11 @@ class ApprovalGate:
         return False
 
     def block(self, tool_name: str, tool_input: dict[str, Any]) -> None:
+        # Outside the first-block guard on purpose (#1852): the FIRST blocked
+        # call still wins the summary the human resolves against, but a second
+        # blocked call in the same turn must still assert that the runner asked
+        # for a stop. Do not tidy this back inside the guard below.
+        self.pending_halt = True
         if self.pending_summary is None:
             if tool_name == PUBLISH_TOOL_NAME:
                 title = tool_input.get("title")
@@ -617,6 +636,50 @@ class ApprovalGate:
             self.pending_granted_tool = tool_name
 
 
+class _GateDecision(NamedTuple):
+    """The three-way approval-gate outcome shared by both interception points.
+
+    ``build_can_use_tool`` (the SDK permission callback, backstop) and
+    ``build_approval_hook`` (the PreToolUse hook, #1852, first line of
+    defense) each apply the identical ungated/granted/blocked rule to a
+    candidate tool call before rendering it into their own callback's return
+    shape (an SDK ``PermissionResult`` vs a hook-output dict). ``_decide_gate``
+    below is that one rule, so a future change to it lands in both call sites
+    at once instead of risking the two drifting apart -- exactly the defect
+    class #1852 closed for the two independent invocation contexts, applied
+    here to the decision they share.
+
+    ``blocked`` is the only field a caller branches on today; ``ungated`` is
+    carried so a caller that wants to distinguish "nothing to do" from
+    "allowed via grant" can, without re-deriving it from ``gate.required``.
+    """
+
+    blocked: bool
+    ungated: bool
+
+
+def _decide_gate(gate: ApprovalGate, tool_name: str, tool_input: dict[str, Any]) -> _GateDecision:
+    """Apply the gate rule to one candidate call, mutating ``gate`` as needed.
+
+    Mirrors the pre-extraction ``can_use_tool`` logic verbatim: a tool outside
+    ``gate.required`` is ungated (no state change, allow); a gated tool with an
+    unspent one-shot grant is granted (the grant is spent here, allow); anything
+    else is blocked (``gate.block`` records it, deny). The caller still owns
+    rendering the outcome into its own return shape and any outcome-specific
+    side effects (the hook's grant-spend log line, the SDK deny's ``interrupt``
+    flag) -- this function decides, it does not render.
+    """
+
+    if tool_name not in gate.required:
+        return _GateDecision(blocked=False, ungated=True)
+    # Publication is completed outside the sandbox after approval, so an
+    # injected or stale grant must never let the in-sandbox tool execute.
+    if tool_name != PUBLISH_TOOL_NAME and gate.consume_grant(tool_name):
+        return _GateDecision(blocked=False, ungated=False)
+    gate.block(tool_name, tool_input)
+    return _GateDecision(blocked=True, ungated=False)
+
+
 def build_can_use_tool(gate: ApprovalGate) -> CanUseTool:
     """The SDK permission callback replacing the hardcoded bypass (#245).
 
@@ -625,6 +688,18 @@ def build_can_use_tool(gate: ApprovalGate) -> CanUseTool:
     for unconfigured tools. The decision is proactive -- the call is blocked
     before execution -- unlike the reactive ``side_effect_flag`` classifier,
     which only reports after the fact.
+
+    Since #1852 this is the **second** line of defense, not the first.
+    ``build_approval_hook`` decides first on the real path, because the SDK
+    documents on ``ClaudeAgentOptions.can_use_tool``
+    (``claude_agent_sdk/types.py:1932-1948``) that this callback is *not*
+    invoked for a call already permitted by ``allowed_tools``, ``permission_mode``
+    or a settings ``permissions.allow`` rule -- and a skill's ``allowed-tools``
+    frontmatter is exactly such a rule. Confirmed live (2026-08-29,
+    claude-agent-sdk 0.2.135 + OpenRouter anthropic/claude-sonnet-4.5): with
+    ``allowed_tools=["Bash"]`` and no PreToolUse hook, this callback was never
+    invoked and Bash executed. It remains the decision on the fake tier, and the
+    backstop for every tool the hook abstains on or if no hook is registered.
     """
 
     async def can_use_tool(
@@ -632,25 +707,193 @@ def build_can_use_tool(gate: ApprovalGate) -> CanUseTool:
         tool_input: dict[str, Any],
         _context: ToolPermissionContext,
     ) -> PermissionResultAllow | PermissionResultDeny:
-        if tool_name in gate.required:
-            # The one-shot post-approval allowance (#430): a resume-boot grant
-            # for exactly this tool lets one call through (no block recorded, the
-            # approved action completes) and re-arms the gate.
-            # Publication never resumes into the sandbox and is therefore not
-            # grantable.  An injected/stale grant naming it is discarded by the
-            # gate builder and this explicit branch keeps future callers safe.
-            if tool_name != PUBLISH_TOOL_NAME and gate.consume_grant(tool_name):
-                return PermissionResultAllow()
-            try:
-                gate.block(tool_name, tool_input)
-            except ValueError as exc:
-                return PermissionResultDeny(
-                    message=f"Publication request was not recorded: {exc}. Correct it and retry."
-                )
-            return PermissionResultDeny(message=_DENY_MESSAGE)
+        # The one-shot post-approval allowance (#430): a resume-boot grant for
+        # exactly this tool lets one call through (no block recorded, the
+        # approved action completes) and re-arms the gate. ``_decide_gate``
+        # applies this rule (shared with the hook below).
+        try:
+            decision = _decide_gate(gate, tool_name, tool_input)
+        except ValueError as exc:
+            return PermissionResultDeny(
+                message=f"Publication request was not recorded: {exc}. Correct it and retry.",
+                interrupt=True,
+            )
+        if decision.blocked:
+            # ``interrupt`` is the SDK-native "deny AND stop the turn" flag
+            # (``PermissionResultDeny.interrupt``, claude_agent_sdk/types.py:247-252),
+            # forwarded to the CLI as ``response_data["interrupt"]`` in
+            # claude_agent_sdk/_internal/query.py:474-477. Before #1852 only
+            # ``_DENY_MESSAGE``'s prose asked the model to end its turn, and
+            # against a real OpenRouter-backed model it simply spun until the
+            # caller timed out -- with the stream entry pending and no approval
+            # record. Prose is not a halt mechanism; this flag is. It rides the
+            # DENY only: an allow that carried it would kill every ungated call.
+            return PermissionResultDeny(message=_DENY_MESSAGE, interrupt=True)
         return PermissionResultAllow()
 
     return can_use_tool
+
+
+# What the operator sees when the hook stops the turn. Short by design: it is
+# surfaced as the CLI's stop reason, not as the approval summary (which is
+# ``pending_summary``, built by ``summarize_tool_call``).
+_HOOK_STOP_REASON = "Paused for human approval: an approval-required tool call was denied."
+
+# Why the hook allows a call outright. Only ever emitted after the one-shot
+# post-approval grant (#430) has actually been spent, so it can state that.
+_HOOK_GRANT_REASON = (
+    "Approved by a human: the one-shot post-approval grant for this tool was spent"
+    " on this call, and the gate is re-armed for any further call."
+)
+
+
+def _hook_field(hook_input: Any, key: str) -> Any:
+    """Read one field from a hook input that may be a mapping or a dataclass.
+
+    The SDK types the callback's first argument as ``HookInput`` (a union of
+    TypedDicts, so a dict at runtime), but the CLI is the thing that actually
+    constructs it and a future shape change must not turn the gate into a
+    raising hook. Missing/odd shapes resolve to None and the caller abstains.
+    """
+
+    if isinstance(hook_input, Mapping):
+        return hook_input.get(key)
+    return getattr(hook_input, key, None)
+
+
+def build_approval_hook(gate: ApprovalGate) -> dict[str, list[HookMatcher]]:
+    """The ``PreToolUse`` hook that no permission rule can shadow (#1852).
+
+    ``can_use_tool`` (#245) arms the gate but is skipped whenever some other
+    permission rule already allows the call, and a skill's ``allowed-tools``
+    frontmatter is such a rule -- so a bundle could arm a gate and then walk
+    straight through it. The SDK names the fix on that very field: "To observe
+    or gate *every* tool call regardless of permission rules, use a
+    ``PreToolUse`` hook via ``hooks`` instead"
+    (``claude_agent_sdk/types.py:1945-1947``). ``matcher=None`` matches every
+    tool call, which is the whole claim.
+
+    Returns the ``{"PreToolUse": [HookMatcher]}`` mapping ``__main__`` MERGES
+    into the bundle's own hooks (#272). Note that the CLI dispatches every
+    matcher on one event **concurrently** (``types.py:1956-1961``), so this hook
+    must not assume it runs before a bundle's hook, and its position in the
+    merged list is construction order, not precedence.
+
+    Three outcomes, keyed on gate membership:
+
+    - **Ungated tool** -> ``{}``. No decision, so the call falls through the
+      CLI's normal precedence and on to ``can_use_tool``, preserving today's
+      posture exactly. An ``allow`` here would silently widen authority for
+      every non-gated tool AND skip the callback the policy lane (#544/#558)
+      still relies on.
+    - **Gated, with the one-shot grant available** -> an EXPLICIT ``allow``,
+      after spending the grant here. This is load-bearing, not stylistic: the
+      SDK documents (and it was observed live on 2026-08-29 against OpenRouter
+      anthropic/claude-sonnet-4.5) that a hook ``allow`` also skips
+      ``can_use_tool``. So the hook must be the thing that spends the grant --
+      if it returned ``{}`` instead, ``can_use_tool`` would run, find the grant
+      unspent, and either block the approved call or (if the hook had spent it
+      and still returned ``{}``) let one approval buy unlimited executions.
+      Either way #430's one-shot allowance breaks. Do not "simplify" this to a
+      bare ``{}``.
+    - **Gated, no grant** -> record the block and ``deny``, plus the
+      turn-stopping control fields, so the run pauses rather than spinning.
+
+    A bundle's own PreToolUse guardrail can still veto an approved call
+    (#1852, accepted rather than fixed). The grant above is spent AT DECISION
+    TIME -- before this hook returns -- but every matcher on one ``PreToolUse``
+    event is dispatched CONCURRENTLY by the CLI (``claude_agent_sdk/types.py``,
+    the ``ClaudeAgentOptions.hooks`` docstring), so a bundle's own hook for the
+    same tool (see ``hooks.py``) resolves independently and can return
+    ``deny`` even though this hook already returned ``allow`` and spent the
+    grant. When that happens the approved call does not execute, but the
+    one-shot grant is already gone, so recovery is a fresh approval -- there is
+    no way to detect a concurrently-dispatched hook's outcome from inside this
+    callback, so this cannot be fixed from here. This is deliberate defense in
+    depth, not a bug: a bundle's own guardrail vetoing an approved call is a
+    legitimate second opinion, and failing toward "did not run, needs
+    re-approval" is the safe direction -- the alternative (letting a
+    bundle-denied call through because it was separately approved) would be a
+    real hole. ``consume_grant`` is called here anyway (see the WARNING log at
+    the call site) precisely because NOT spending it would let ``can_use_tool``
+    re-block the approved call, which is the #430 regression this explicit
+    ``allow`` exists to prevent.
+    """
+
+    async def approval_hook(
+        hook_input: Any,
+        _tool_use_id: str | None,
+        _context: Any,
+    ) -> dict[str, Any]:
+        tool_name = _hook_field(hook_input, "tool_name")
+        if not isinstance(tool_name, str) or not tool_name:
+            # Abstain rather than raise. A hook that raises is reported by the
+            # CLI as a hook error and the call then PROCEEDS -- a crash in the
+            # gate would become a fail-open. Abstaining leaves ``can_use_tool``
+            # as the backstop, which is strictly the pre-#1852 posture.
+            return {}
+        if tool_name not in gate.required:
+            return {}
+
+        raw_input = _hook_field(hook_input, "tool_input")
+        tool_input: dict[str, Any] = raw_input if isinstance(raw_input, dict) else {}
+
+        # ``_decide_gate`` applies the shared ungated/granted/blocked rule (also
+        # used by ``build_can_use_tool`` above); the grant, if any, is spent as
+        # a side effect of this call.
+        try:
+            decision = _decide_gate(gate, tool_name, tool_input)
+        except ValueError as exc:
+            reason = f"Publication request was not recorded: {exc}. Correct it and retry."
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": reason,
+                },
+                "continue_": False,
+                "stopReason": reason,
+            }
+        if not decision.blocked:
+            # Observability for #1852 (accepted, not fixed): the grant is spent
+            # HERE, before the concurrently-dispatched bundle PreToolUse hook's
+            # own outcome is known (see the docstring above). If a bundle hook
+            # independently denies this same call, the call never executes but
+            # the grant is already gone -- silently, from an operator's view.
+            # This WARNING is the only way to correlate "approval granted" with
+            # "the call may not have actually run" from pod logs.
+            logger.warning("approval one-shot grant spent tool=%s", tool_name)
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "allow",
+                    "permissionDecisionReason": _HOOK_GRANT_REASON,
+                }
+            }
+
+        # ``continue_`` and ``stopReason`` are ``SyncHookJSONOutput`` common
+        # control fields (claude_agent_sdk/types.py:520-561): "Whether Claude
+        # should proceed after hook execution" and "Message shown when continue
+        # is False". Emit the Python spelling ``continue_`` -- the SDK rewrites
+        # it to the wire's "continue" in
+        # claude_agent_sdk/_internal/query.py::_convert_hook_output_for_cli, so
+        # emitting the wire name directly would be passed through untouched and
+        # silently ignored, and the turn would keep running after the deny.
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": _DENY_MESSAGE,
+            },
+            "continue_": False,
+            "stopReason": _HOOK_STOP_REASON,
+        }
+
+    # ``Any`` for the same reason ``hooks.py::_make_callback`` uses it: the SDK's
+    # ``HookCallback`` alias is typed against its TypedDict union, and a plain
+    # ``dict[str, Any]`` return is not assignable to it.
+    callback: Any = approval_hook
+    return {"PreToolUse": [HookMatcher(matcher=None, hooks=[callback])]}
 
 
 # --- The manifest approval policy (#247): gates shipped in the bundle -----------

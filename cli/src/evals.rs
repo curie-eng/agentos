@@ -370,6 +370,72 @@ pub fn validate_suite(name: &str, cases: &[EvalCase]) -> Result<()> {
     Ok(())
 }
 
+/// Narrow `suite` to the cases named by `selector` (`--case-id`, repeatable).
+///
+/// An empty `selector` is the unfiltered run and returns the suite untouched, so
+/// every pre-existing invocation is byte-identical. Otherwise the suite is
+/// filtered in SUITE order (not selector order), so a filtered run reports its
+/// cases in the same order a full run would.
+///
+/// A selector value that matches no case in the suite is a `Usage` error (exit
+/// 2, ADR-0021): a mistyped `--case-id` must FAIL the gate rather than green it
+/// on an empty run. This is checked per value, not only when the whole selection
+/// is empty -- `--case-id good --case-id typo` silently dropping the typo is the
+/// same silent-gate failure, one case quieter. The message names the unmatched
+/// value(s) verbatim and lists the suite's available ids so the operator can
+/// self-correct without opening the file.
+pub fn select_cases(suite: EvalSuite, selector: &[String]) -> Result<EvalSuite> {
+    if selector.is_empty() {
+        return Ok(suite);
+    }
+    let available = suite
+        .cases
+        .iter()
+        .map(|case| case.id.clone())
+        .collect::<Vec<_>>();
+    let mut unmatched: Vec<&str> = Vec::new();
+    for want in selector {
+        if !available.iter().any(|id| id == want) && !unmatched.contains(&want.as_str()) {
+            unmatched.push(want.as_str());
+        }
+    }
+    if !unmatched.is_empty() {
+        let missing = unmatched.join(", ");
+        let known = available.join(", ");
+        return Err(anyhow::Error::from(
+            crate::exit::CliError::usage(format!(
+                "--case-id matched no case in suite {:?}: {missing}. A selector that matches \
+                 nothing fails the eval gate instead of greening an empty run; the suite defines: \
+                 {known}",
+                suite.name,
+            ))
+            .with_fix(format!(
+                "correct the --case-id value(s) ({missing}); the suite defines: {known}"
+            )),
+        ));
+    }
+    let mut suite = suite;
+    suite
+        .cases
+        .retain(|case| selector.iter().any(|want| want == &case.id));
+    Ok(suite)
+}
+
+/// The one-line human note for an active selector, or `None` for an unfiltered
+/// run. A filtered run must not be mistakable for a full one when someone reads
+/// the terminal, so the note names the ids and the narrowed count. Pure and
+/// separate from [`select_cases`] so the wording is testable without a suite,
+/// and so the `--json` payload is untouched (notes go to stderr).
+pub fn selection_note(selector: &[String], selected: usize, total: usize) -> Option<String> {
+    if selector.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "selector: --case-id {} ({selected} of {total} cases)",
+        selector.join(", ")
+    ))
+}
+
 fn parse_suite(path: &Path, body: &[u8]) -> Result<EvalSuite> {
     let value: serde_json::Value = serde_json::from_slice(body)
         .with_context(|| format!("{} is not valid JSON", path.display()))?;
@@ -1057,5 +1123,127 @@ mod tests {
         assert_eq!(case_line("approver", true, 1.24), "\u{2713} approver  1.2s");
         assert_eq!(case_line("crm", false, 0.9), "\u{2717} crm  0.9s");
         assert_eq!(summary_line(34, 36), "34/36 passed");
+    }
+
+    // --- case selector (#2007) ---------------------------------------------
+
+    fn selector_suite() -> EvalSuite {
+        let ids = ["greets-the-user", "looks-up-the-order", "escalates"];
+        EvalSuite {
+            name: "smoke".into(),
+            cases: ids
+                .iter()
+                .map(|id| EvalCase {
+                    id: (*id).into(),
+                    input: "hi".into(),
+                    grader: grader(GraderKind::Contains, "hi", false),
+                    shared_history: false,
+                    expect_status: ExpectedStatus::Done,
+                })
+                .collect(),
+        }
+    }
+
+    fn ids(selector: &[&str]) -> Vec<String> {
+        selector.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn an_empty_selector_returns_the_suite_untouched() {
+        // The unfiltered run must be byte-identical to today's behaviour.
+        let selected = select_cases(selector_suite(), &[]).expect("no selector is not an error");
+        assert_eq!(selected.name, "smoke");
+        assert_eq!(
+            selected
+                .cases
+                .iter()
+                .map(|c| c.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["greets-the-user", "looks-up-the-order", "escalates"],
+        );
+        assert_eq!(selection_note(&[], 3, 3), None, "no note on a full run");
+    }
+
+    #[test]
+    fn a_mistyped_case_id_selector_is_a_usage_error_naming_the_typo() {
+        // THE headline of #2007: a selector that matches nothing must FAIL the
+        // gate (exit 2), never green an empty run. `greets-the-usr` is one
+        // dropped character from a real case id -- exactly the CI typo this
+        // guards against.
+        let err = select_cases(selector_suite(), &ids(&["greets-the-usr"]))
+            .expect_err("a selector matching nothing must fail");
+        let (class, fix) = crate::exit::classify(&err);
+        assert_eq!(
+            class,
+            crate::exit::ExitClass::Usage,
+            "an unmatched selector exits 2, not 0: {err:#}"
+        );
+        let shown = format!("{err:#}");
+        assert!(
+            shown.contains("greets-the-usr"),
+            "the message names the mistyped value verbatim: {shown}"
+        );
+        assert!(
+            shown.contains("greets-the-user"),
+            "the message lists the suite's real ids so the operator can self-correct: {shown}"
+        );
+        let fix = fix.expect("an unmatched selector carries a fix");
+        assert!(
+            fix.contains("greets-the-usr") && fix.contains("greets-the-user"),
+            "the fix names the typo and the available ids: {fix}"
+        );
+    }
+
+    #[test]
+    fn a_partially_mistyped_selector_fails_and_names_only_the_typo() {
+        // One good id plus one typo must not quietly run the good one: that is
+        // the same silent-gate failure, one case quieter.
+        let err = select_cases(selector_suite(), &ids(&["escalates", "escalatez"]))
+            .expect_err("a partially unmatched selector must fail");
+        assert_eq!(
+            crate::exit::classify(&err).0,
+            crate::exit::ExitClass::Usage,
+            "{err:#}"
+        );
+        let shown = format!("{err:#}");
+        assert!(shown.contains("escalatez"), "{shown}");
+        assert!(
+            !shown.contains("matched no case in suite \"smoke\": escalates,"),
+            "only the unmatched value is reported as unmatched: {shown}"
+        );
+    }
+
+    #[test]
+    fn a_matching_selector_narrows_the_suite_in_suite_order() {
+        // Selector order is deliberately NOT the run order: a filtered run
+        // reports its cases in the same order a full run would.
+        let selected = select_cases(selector_suite(), &ids(&["escalates", "greets-the-user"]))
+            .expect("both ids exist");
+        assert_eq!(
+            selected
+                .cases
+                .iter()
+                .map(|c| c.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["greets-the-user", "escalates"],
+        );
+        assert_eq!(selected.name, "smoke", "the suite name is preserved");
+    }
+
+    #[test]
+    fn an_active_selector_notes_the_ids_and_the_narrowed_count() {
+        assert_eq!(
+            selection_note(&ids(&["a", "b"]), 2, 7).as_deref(),
+            Some("selector: --case-id a, b (2 of 7 cases)"),
+        );
+    }
+
+    #[test]
+    fn a_selected_suite_still_passes_validate_suite() {
+        // The narrowed suite is a real suite: it never trips the empty-cases
+        // rule, because every selector value matched at least one case.
+        let selected = select_cases(selector_suite(), &ids(&["escalates"])).expect("the id exists");
+        validate_suite(&selected.name, &selected.cases).expect("a narrowed suite is valid");
+        assert_eq!(selected.cases.len(), 1);
     }
 }

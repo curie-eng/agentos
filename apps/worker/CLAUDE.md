@@ -58,6 +58,13 @@ simplification.
   claim; the pre-claim value is the budget already spent. Cap at `>=`. Keep the
   `IDLE` filter equal to `XAUTOCLAIM`'s `min_idle_time`, and keep the
   `_inflight_ids` skip ahead of the cap check.
+- **Narrow prompt-reclaim exception:** the normal heavy-maintenance pass keeps
+  that equal-`IDLE` rule. A younger at/over-cap row may instead be
+  dead-lettered directly only after the owning consumer has advertised
+  capability *and* its independent alive lease has remained absent for the
+  sustained-absence proof. That path still reads pre-claim `XPENDING` metadata
+  and applies the local `_inflight_ids` skip before either a direct
+  dead-letter or an `XCLAIM`; it never charges a live peer another delivery.
 - **`XADD` before `XACK`, never the reverse.** A crash between them costs a
   duplicate graveyard row; the reverse costs the entry.
 - **`max_delivery` is not `max_attempts`.** The latter is the kernel's
@@ -86,6 +93,49 @@ simplification.
   validation.** `XADD` precedes `XACK`, so a self-targeting graveyard re-queues
   failures onto the stream they came from and hot-loops. Do not soften that
   validator into a warning.
+
+## Consumer liveness and prompt recovery (#1532)
+
+`XINFO CONSUMERS` idle is an observation filter, not a process-health signal:
+it grows while a worker drains an in-flight turn or waits on a saturated local
+semaphore. Runs and eval consumers therefore use the same
+`ConsumerLivenessStore`
+(`apps/worker/src/curie_worker/consumer_liveness.py::ConsumerLivenessStore`)
+beside the stream broker, rather than widening `StreamBroker` with generic
+string-key verbs.
+
+- **Publish before reading.** A generation writes its renewable short `alive`
+  lease before its renewable `capability` marker, and does not issue
+  `XREADGROUP` until that ordered publication succeeds. Both markers refresh
+  for the consumer lifetime, including graceful in-flight drain. On graceful
+  exit only the short alive lease is removed; the longer capability marker
+  remains long enough for a replacement to recognize a departed capable peer.
+- **Prompt reclaim needs positive proof of death.** The dedicated liveness
+  cadence considers only a consumer that is idle enough to be a candidate,
+  has a capability marker, and has an absent alive lease on two observations
+  separated by at least one heartbeat TTL. A restored lease, a missing
+  consumer, a liveness-store error, or a generation restart clears that proof.
+  This protects live, draining, and saturated peers from duplicate dispatch.
+- **One replacement owns the transfer.** After the death proof, a short Valkey
+  `SET NX PX` arbitration lease per dead consumer selects one replacement. That
+  prevents replicas crossing the proof threshold together from issuing racing
+  `XCLAIM`s and consuming several delivery attempts. A generation restarted
+  under the same stable consumer name first recovers its own canceled PEL rows
+  through the same pre-claim cap path before it reads new entries.
+- **Terminal teardown is joined, not instantaneous.** A renewal timeout that can
+  no longer be retried safely stops new reads and joins canceled handlers before
+  resetting generation state. Thread-backed work may delay that join; peers
+  still require the full sustained-absence proof and arbitration before transfer.
+- **Mixed-version compatibility is intentional.** An unknown or pre-marker
+  consumer is not guessed dead by the prompt path; its PEL entries stay on the
+  existing 900-second `XAUTOCLAIM` backstop. The prompt path is additional
+  recovery for a proven-dead capable peer, not a shorter global idle timeout.
+- **Runs/eval parity is mandatory.** Both
+  `apps/worker/src/curie_worker/consumer.py::Consumer` and
+  `apps/worker/src/curie_worker/eval/stream.py::EvalStreamConsumer` use the shared
+  `apps/worker/src/curie_worker/stream_consumer.py::StreamConsumer` lifecycle, selection,
+  cap, and sustained-absence rules. Do not give either lane a private reclaim
+  shortcut.
 
 ## The sandbox substrate (`curie_worker.sandbox`)
 

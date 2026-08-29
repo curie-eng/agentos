@@ -234,6 +234,8 @@ def test_defaults_parity_with_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert config.reclaim_min_idle_ms == 900000
     assert config.reclaim_interval_s == 30.0
     assert config.dead_consumer_idle_ms == 15000
+    assert config.consumer_heartbeat_ttl_ms == 15000
+    assert config.consumer_capability_ttl_ms == 1800000
     # Slack edit throttle
     assert config.slack_edit_min_interval_s == 0.7
     # Runner HTTP timeouts
@@ -270,6 +272,44 @@ def test_defaults_parity_with_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     expected_consumer = f"{socket.gethostname()}-{os.getpid()}"
     assert config.consumer_name == expected_consumer
     assert config.eval_consumer_name == expected_consumer
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"consumer_heartbeat_ttl_ms": 0},
+        {"consumer_capability_ttl_ms": 0},
+    ],
+)
+def test_consumer_liveness_ttls_must_be_positive(
+    overrides: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError):
+        WorkerConfig.model_validate(overrides)
+
+
+def test_consumer_capability_ttl_must_outlive_reclaim_backstop() -> None:
+    with pytest.raises(ValueError, match="must be greater than reclaim_min_idle_ms"):
+        WorkerConfig(reclaim_min_idle_ms=50, consumer_capability_ttl_ms=50)
+
+    config = WorkerConfig(reclaim_min_idle_ms=50, consumer_capability_ttl_ms=51)
+    assert config.consumer_capability_ttl_ms == 51
+
+
+def test_consumer_liveness_ttls_read_only_their_curie_aliases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CONSUMER_HEARTBEAT_TTL_MS", "999")
+    monkeypatch.setenv("CONSUMER_CAPABILITY_TTL_MS", "999999")
+    monkeypatch.setenv("CURIE_CONSUMER_HEARTBEAT_TTL_MS", "25")
+    monkeypatch.setenv("CURIE_CONSUMER_CAPABILITY_TTL_MS", "5001")
+    monkeypatch.setenv("RECLAIM_MIN_IDLE_MS", "5000")
+
+    config = WorkerConfig()
+
+    assert config.consumer_heartbeat_ttl_ms == 25
+    assert config.consumer_capability_ttl_ms == 5001
 
 
 def test_overrides_parity_with_from_env(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -81,6 +81,17 @@ pub fn detect_store(components: &[String]) -> Option<StoreKind> {
         .find(|kind| components.iter().any(|c| c == kind.suffix()))
 }
 
+/// Is this stateful COMPONENT something `--migrate-store` can carry?
+///
+/// The guard's bypass has to ask this question, and it has to ask it HERE: the
+/// migration can carry exactly the stores `StoreKind` knows, so a second list
+/// of names living in the caller would go stale the moment a chart renames a
+/// store again -- and the failure mode of a stale copy is that apply DELETES a
+/// component it believed it was migrating (#1501).
+pub(crate) fn is_object_store_component(component: &str) -> bool {
+    StoreKind::from_suffix(component).is_some()
+}
+
 /// What a migration would do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MigrationPlan {
@@ -887,13 +898,41 @@ fn standalone_import_dry_run_plan(
 }
 
 /// Phase one: stage every object while the old store is still up.
+///
+/// The standalone `curie cluster migrate-store --phase export` verb has no
+/// installation file behind it, so it renders the chart with no values -- which
+/// is exactly what this wrapper passes. `apply` must NOT reuse that: see
+/// [`run_export_with_values`].
 pub async fn run_export(o: &CommonOpts, chart: &str, bucket: &str) -> Result<MigrateStoreOutput> {
-    let (from, to) = resolve_store_migration(o, chart).await?;
+    run_export_with_values(o, chart, bucket, &crate::ops::UpValuePlan::default()).await
+}
+
+/// Phase one, rendering the target chart with the SAME values the caller's
+/// upgrade will apply.
+///
+/// The value plan is threaded rather than defaulted because the two halves of
+/// one `apply` disagreeing about what the chart renders is not a cosmetic
+/// difference: the guard rendered with the effective values and saw the store
+/// gone, the export rendered with none and saw a store to migrate INTO, so the
+/// migration staged, the irreversible upgrade ran, and only then did the run
+/// fail -- telling the operator to re-run the upgrade that had already deleted
+/// the source store (#1501). Same values, one answer, before the mutation.
+pub(crate) async fn run_export_with_values(
+    o: &CommonOpts,
+    chart: &str,
+    bucket: &str,
+    value_plan: &crate::ops::UpValuePlan,
+) -> Result<MigrateStoreOutput> {
+    let (from, to) = resolve_store_migration(o, chart, value_plan).await?;
 
     run_export_with_plan(o, from, to, bucket).await
 }
 
-async fn resolve_store_migration(o: &CommonOpts, chart: &str) -> Result<(StoreKind, StoreKind)> {
+async fn resolve_store_migration(
+    o: &CommonOpts,
+    chart: &str,
+    value_plan: &crate::ops::UpValuePlan,
+) -> Result<(StoreKind, StoreKind)> {
     let live: Vec<String> = crate::ops::live_stateful_components(o)
         .await?
         .into_iter()
@@ -901,12 +940,11 @@ async fn resolve_store_migration(o: &CommonOpts, chart: &str) -> Result<(StoreKi
         .collect();
     // migrate_store reasons about COMPONENTS only (which store is which); the
     // resource names the guard also needs are irrelevant here.
-    let rendered: Vec<String> =
-        crate::ops::chart_stateful_components(chart, o, &crate::ops::UpValuePlan::default())
-            .await?
-            .into_iter()
-            .map(|(component, _)| component)
-            .collect();
+    let rendered: Vec<String> = crate::ops::chart_stateful_components(chart, o, value_plan)
+        .await?
+        .into_iter()
+        .map(|(component, _)| component)
+        .collect();
     let (from, to) = ensure_migratable(&plan(&live, &rendered)?)?;
 
     Ok((from, to))
@@ -1217,7 +1255,10 @@ impl Drop for ValuesFileCleanup {
 /// staged it itself moments earlier. Making an operator bypass a safety check
 /// as a routine step teaches them to bypass it.
 pub async fn run_auto(o: &CommonOpts, chart: &str, bucket: &str) -> Result<MigrateStoreOutput> {
-    let (from, to) = resolve_store_migration(o, chart).await?;
+    // The standalone verb carries no installation file, so there is no value
+    // plan to render with -- unchanged behaviour, stated explicitly rather than
+    // defaulted somewhere deeper where `apply` could inherit it again (#1501).
+    let (from, to) = resolve_store_migration(o, chart, &crate::ops::UpValuePlan::default()).await?;
 
     let image = "amazon/aws-cli:2.32.6";
     let secret = crate::ops::release_secret_name_or_default(&o.namespace, &o.release).await;

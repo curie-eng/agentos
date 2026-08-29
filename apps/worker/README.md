@@ -120,8 +120,11 @@ Runtime rules (each has a provoking integration test in `tests/eval/test_stream.
   down in a `finally`. A provisioning failure is a failed run reported and acked.
 - **XACK only after the report POST attempt completes** (success, or terminally failed
   after bounded retries and logged). A worker crash before that leaves the entry
-  pending; a background reclaim loop (`XAUTOCLAIM` past an idle timeout, mirroring the
-  runs consumer) re-runs it, so delivery is **at-least-once** with a best-effort
+  pending. The shared runs/eval liveness path promptly transfers a capable dead
+  consumer's PEL after two lease-absence observations; unknown older consumers
+  retain the 15-minute `XAUTOCLAIM` fallback. A restarted generation first
+  recovers rows under its own stable consumer name. The entry is re-run, so
+  delivery is **at-least-once** with a best-effort
   report. A malformed payload cannot be processed on any redelivery, so it is logged
   and acked (a poison-pill drop). A failing eval case is a failed COUNT in the report,
   not a consumer crash.
@@ -196,8 +199,12 @@ Rules (detailed-architecture 2b), each with an integration test that provokes it
   answers the user, and logs at INFO instead.
 - **Idempotency + crash recovery.** The Slack event id gates a `done` marker, so
   a redelivered or reclaimed entry that already finished is skipped.
-  `XAUTOCLAIM` reclaims entries a dead consumer took but never acked and
-  reprocesses them; the markers make that safe.
+  A renewable worker lease distinguishes process death from ordinary consumer
+  idle. After two absent observations, one replacement wins a Valkey arbitration
+  lease and transfers the dead consumer's pending entries without racing other
+  replicas through the delivery budget. Unknown older consumers retain the
+  15-minute `XAUTOCLAIM` fallback; a restarted generation also recovers pending
+  rows left under its own stable consumer name. The markers make reprocessing safe.
 - **Bounded delivery + a dead-letter graveyard** (ADR-0039, an Architecture
   Decision Record; #505). Reclaim is
   capped, not infinite. An entry already delivered `max_delivery` times

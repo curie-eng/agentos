@@ -674,6 +674,165 @@ def test_clone_failure_reports_git_stderr_not_the_exit_code() -> None:
     assert "Repository not found" in str(err.value)
 
 
+# --------------------------------------------------------------------------- #
+# The network-free half of the clone's authorization, on its own (#1211)
+# --------------------------------------------------------------------------- #
+# A promote of an already-stored bundle no longer clones, so every check that
+# used to live inside `clone_and_archive` and cost nothing -- the payload scheme
+# allowlist, the sha format gate, the `repo_full_name` derivation, the derived
+# URL's own scheme allowlist, and whole-key origin equality -- has to run
+# somewhere both paths reach. `verify_push_origin` is that somewhere, and the
+# tests below call it DIRECTLY: exercising it only through `clone_and_archive`
+# would test it exclusively on the path that no longer always runs.
+#
+# The exhaustive fourteen-case mismatch battery stays where it is, still driven
+# through `clone_and_archive`; what is repeated here is a representative subset,
+# because two copies of fourteen cases rot into two different fourteen cases.
+#
+# Note what is absent: no `subprocess.run` patch anywhere below. That is not an
+# omission, it is the property -- this function starts no process at all, which
+# is what lets it be hoisted in front of the branch and run on a delivery that
+# will never touch the network. A version of it that needed a mock would have
+# smuggled the clone back in.
+_MISMATCH_SUBSET = [
+    # Userinfo of any kind: a credential in the payload URL is never honored.
+    f"https://x-access-token:t@github.com/{_REPO}.git",
+    # Hostname is evil.example; the "github.com" is the username.
+    f"https://github.com@evil.example/{_REPO}.git",
+    # A non-default port reaches a different service on the same host.
+    f"https://github.com:8443/{_REPO}.git",
+    # Scheme downgrade.
+    f"http://github.com/{_REPO}.git",
+    # Path prefix. Whole-key equality, never startswith.
+    "https://github.com/octo/demo-agent-evil.git",
+    # Unparseable port: urlsplit().port raises ValueError, which must read as a
+    # mismatch rather than escaping as a 500.
+    f"https://github.com:notaport/{_REPO}.git",
+    # Malformed IPv6 literal: urlsplit itself raises ValueError.
+    f"https://[::1/{_REPO}.git",
+]
+
+
+@pytest.mark.parametrize("payload_url", _MISMATCH_SUBSET)
+def test_verify_push_origin_rejects_a_mismatched_origin(payload_url: str) -> None:
+    from curie_api.gitflow import verify_push_origin
+
+    settings = Settings(github_token="ghs-secret-token")
+    with pytest.raises(CloneOriginMismatch):
+        verify_push_origin(payload_url, _VALID_SHA1, settings, repo_full_name=_REPO)
+
+
+@pytest.mark.parametrize(
+    "payload_url",
+    [
+        # GitHub sets clone_url with .git and url without it.
+        f"https://github.com/{_REPO}.git",
+        f"https://github.com/{_REPO}",
+        # Trailing slash, with and without .git before it.
+        f"https://github.com/{_REPO}.git/",
+        f"https://github.com/{_REPO}/",
+        # An explicit default port is the same origin.
+        f"https://github.com:443/{_REPO}.git",
+        # urlsplit().hostname lowercases ASCII hosts.
+        f"https://GitHub.com/{_REPO}.git",
+    ],
+)
+def test_verify_push_origin_returns_the_derived_url_for_every_accepted_form(
+    payload_url: str,
+) -> None:
+    # Asserting the RETURN VALUE, not merely "it did not raise". The derived URL
+    # is the only string that may ever reach git, and a function that accepted
+    # the payload and handed its caller the payload back would satisfy a
+    # does-not-raise assertion while re-opening #1122 for whoever uses it next.
+    from curie_api.gitflow import verify_push_origin
+
+    assert (
+        verify_push_origin(payload_url, _VALID_SHA1, Settings(), repo_full_name=_REPO)
+        == _GITHUB_URL
+    )
+
+
+def test_verify_push_origin_refuses_a_mixed_case_scheme_as_a_config_error() -> None:
+    # `HTTPS://` is refused by the case-sensitive PAYLOAD scheme allowlist, which
+    # runs BEFORE the origin comparator. The error TYPE is the assertion: a
+    # scheme refusal is not a forged-push report, and the two produce different
+    # operator-facing codes (`git.archive_failed` vs `git.origin_mismatch`).
+    # Case-folding that allowlist to turn this into an accept would be widening a
+    # security gate to pass a test. Nobody may do that.
+    from curie_api.gitflow import verify_push_origin
+
+    with pytest.raises(GitFlowError) as err:
+        verify_push_origin(
+            f"HTTPS://github.com/{_REPO}.git", _VALID_SHA1, Settings(), repo_full_name=_REPO
+        )
+    assert not isinstance(err.value, CloneOriginMismatch)
+
+
+@pytest.mark.parametrize("clone_base", ["github.com", "ssh://git@github.com"])
+def test_verify_push_origin_refuses_a_configured_base_outside_the_allowlist(
+    clone_base: str,
+) -> None:
+    # The DERIVED url gets its own scheme check, because it -- not the payload --
+    # is what git would be handed. A misconfigured `github_clone_base` must fail
+    # as a deployment configuration error, never be reported as a forged push,
+    # so again the assertion that carries the meaning is the error type.
+    from curie_api.gitflow import verify_push_origin
+
+    settings = Settings(github_token="ghs-secret-token", github_clone_base=clone_base)
+    with pytest.raises(GitFlowError) as err:
+        verify_push_origin(_GITHUB_URL, _VALID_SHA1, settings, repo_full_name=_REPO)
+    assert not isinstance(err.value, CloneOriginMismatch)
+
+
+def test_verify_push_origin_propagates_an_invalid_repo_full_name() -> None:
+    # #1140. `InvalidRepoFullName` is a distinct exception rather than a
+    # GitFlowError precisely so `process_push` can map it to
+    # `git.invalid_repository`, and it must escape this function unwrapped or the
+    # code changes shape depending on whether the delivery cloned. This is why
+    # `git.invalid_repository` needs no duplicate integration test per path: one
+    # function raises it for both.
+    from curie_api.gitflow import verify_push_origin
+    from curie_api.repo_full_name import InvalidRepoFullName
+
+    with pytest.raises(InvalidRepoFullName):
+        verify_push_origin(_ALLOWED_URL, _VALID_SHA1, _local_settings(), repo_full_name="octo/..")
+
+
+@pytest.mark.parametrize(
+    "bad_sha",
+    [
+        "--upload-pack=touch /tmp/pwned",  # a real option-injection payload
+        "deadbeef",  # too short
+        "A" * 40,  # uppercase hex is rejected
+        "a" * 40 + "\n--foo",  # embedded newline smuggling a git option
+        "",  # empty
+    ],
+)
+def test_verify_push_origin_rejects_a_malformed_sha(bad_sha: str) -> None:
+    # #65's option-injection gate. It travels with the origin check rather than
+    # staying behind in the clone, so a delivery that never runs `git archive`
+    # still refuses a sha that is not a full lowercase-hex object id -- and the
+    # refusal is a plain GitFlowError, not a mismatch report.
+    from curie_api.gitflow import verify_push_origin
+
+    with pytest.raises(GitFlowError) as err:
+        verify_push_origin(_ALLOWED_URL, bad_sha, _local_settings(), repo_full_name=_REPO)
+    assert not isinstance(err.value, CloneOriginMismatch)
+
+
+def test_verify_push_origin_accepts_a_local_file_origin() -> None:
+    # The control on every rejection above: a function that refused everything
+    # would satisfy them all and break every real deploy. `file://` is the shape
+    # the integration suite's bare repositories use, so this is also the form the
+    # end-to-end tests depend on.
+    from curie_api.gitflow import verify_push_origin
+
+    assert (
+        verify_push_origin(_ALLOWED_URL, _VALID_SHA1, _local_settings(), repo_full_name=_REPO)
+        == _ALLOWED_URL
+    )
+
+
 def test_rejected_push_is_logged_loudly() -> None:
     # A rejected push still returns 200 -- GitHub would retry a non-2xx and the
     # push will not succeed on a retry. The cost is that every dashboard reports

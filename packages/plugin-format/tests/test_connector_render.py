@@ -7,9 +7,11 @@ refactor cannot quietly reintroduce them.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -319,6 +321,381 @@ def test_over_long_names_that_share_a_prefix_still_differ() -> None:
     b = r.object_name("release", "agent-with-a-very-long-name-number-two", "grafana")
     assert len(a) <= 63 and len(b) <= 63
     assert a != b
+
+
+# --------------------------------------------------------------------------- #
+# Forged join -- #1446
+#
+# #1116 made the object name agent-scoped by joining the two names with the
+# literal `-mcp-`. That literal is a bare substring INSIDE a single DNS label,
+# not a structural separator, so the join point is not recoverable from the
+# rendered string: `curie-a-mcp-b-mcp-c` reads equally well as
+# (agent=`a-mcp-b`, connector=`c`) and (agent=`a`, connector=`b-mcp-c`). Two
+# different agents therefore render byte-identical Services, Deployments,
+# NetworkPolicies AND `app.kubernetes.io/name` pod selectors.
+#
+# The connector is deliberately unauthenticated (ADR-0086: "the network is not
+# one layer of the access control here, it is the whole of it"), so the object
+# name is the ONLY thing binding a sandbox to a credential. A collision hands
+# one agent another agent's production token with nothing logged and nothing
+# failing. These tests pin the refusal.
+# --------------------------------------------------------------------------- #
+
+
+def _render_connector(agent: str, connector: str, release: str = "curie") -> list[dict]:
+    """Render one connector's objects, holding everything but the names fixed.
+
+    The one render call both the refusal tests and their controls go through.
+    The namespace, app name, spec and secret name are incidental to #1446, and
+    pinning them in a single place is what lets a refusal and the control it is
+    paired with differ in nothing but the agent and connector names -- which is
+    the entire claim those pairs make.
+    """
+
+    return r.render(
+        release=release,
+        agent=agent,
+        namespace="ns",
+        app_name="curie",
+        connector=connector,
+        spec=DEV,
+        secret_name="s",
+    )
+
+
+def _rendered_names(release: str, agent: str, connector: str) -> dict[str, str]:
+    """The four object names one connector renders, keyed by what they are.
+
+    Used as the CONTROL for the refusal tests below. A test that only asserts
+    `render()` raises passes vacuously if a future change stops rendering an
+    object at all, so every refusal test is paired with a render of a
+    non-forging name that proves all four kinds are still produced -- and that
+    all four take their name from `object_name`, which is where the guard lives.
+    """
+
+    objs = _render_connector(agent, connector, release)
+    # Select the policies by direction, never by kind: two NetworkPolicies ship
+    # per connector, so `kind == "NetworkPolicy"` silently picks whichever is
+    # first and tests the wrong object.
+    return {
+        "Service": next(o for o in objs if o["kind"] == "Service")["metadata"]["name"],
+        "Deployment": next(o for o in objs if o["kind"] == "Deployment")["metadata"]["name"],
+        "egress": _egress_np(objs)["metadata"]["name"],
+        "ingress": _ingress_np(objs)["metadata"]["name"],
+    }
+
+
+def test_the_issue_pair_cannot_render_the_same_objects() -> None:
+    # The exact pair from #1446. Both tuples build the identical base string
+    # `curie-a-mcp-b-mcp-c`, so before this guard the DEV agent `a` declaring a
+    # connector `b-mcp-c` and the PROD agent `a-mcp-b` declaring a connector `c`
+    # rendered the same Service, the same Deployment, both the same
+    # NetworkPolicies and the same pod selector. Whichever deployed last owned
+    # every object, and the other agent's sandbox reached a connector holding a
+    # credential that was never issued to it. Nothing errored -- that silence is
+    # the whole defect, and it is why the refusal is fail-closed rather than a
+    # warning.
+    assert f"curie-{'a-mcp-b'}-mcp-{'c'}" == f"curie-{'a'}-mcp-{'b-mcp-c'}", (
+        "if this ever stops holding the pair below is no longer the issue's pair"
+    )
+
+    with pytest.raises(r.AmbiguousObjectName) as first:
+        _render_connector(agent="a-mcp-b", connector="c")
+    with pytest.raises(r.AmbiguousObjectName) as second:
+        _render_connector(agent="a", connector="b-mcp-c")
+
+    assert "a-mcp-b" in str(first.value), "the error must name the offending agent"
+    assert "b-mcp-c" in str(second.value), "the error must name the offending connector"
+
+
+def test_every_rendered_object_kind_is_refused() -> None:
+    # AC3: the check covers all FOUR rendered objects, not just the Deployment.
+    # The guard sits in `object_name`, so `render()` refuses before it produces
+    # any of them -- but "raises" alone would still pass if `render` quietly
+    # stopped emitting the ingress policy #1443 added. The control below pins
+    # the full set and its names, so dropping an object fails here too.
+    with pytest.raises(r.AmbiguousObjectName):
+        _render_connector(agent="a-mcp-b", connector="c")
+
+    control = _rendered_names("curie", "acme-dev", "grafana")
+    assert control == {
+        "Service": "curie-acme-dev-mcp-grafana",
+        "Deployment": "curie-acme-dev-mcp-grafana",
+        "egress": "curie-acme-dev-mcp-grafana-allow",
+        "ingress": "curie-acme-dev-mcp-grafana-allow-ingress",
+    }
+
+
+def test_a_substring_ban_would_miss_this_pair() -> None:
+    # This is the test that separates the shipped rule from the fix the issue
+    # itself suggested. `-mcp-` is NOT a substring of either offending name:
+    #
+    #     "-mcp-" in "x-mcp"  ->  False
+    #     "-mcp-" in "mcp-c"  ->  False
+    #
+    # yet agent `x-mcp` + connector `c` and agent `x` + connector `mcp-c` both
+    # render `curie-x-mcp-mcp-c`. A ban on the literal substring therefore
+    # leaves this collision fully live while looking like a fix. The rule has to
+    # be "would this name FORGE a second join once the concatenation happens",
+    # which is `-mcp-` in f"{agent}-" on the left and in f"-{connector}" on the
+    # right -- each side tested against the half of the delimiter it abuts.
+    assert "-mcp-" not in "x-mcp"
+    assert "-mcp-" not in "mcp-c"
+    assert f"curie-{'x-mcp'}-mcp-{'c'}" == f"curie-{'x'}-mcp-{'mcp-c'}"
+
+    with pytest.raises(r.AmbiguousObjectName):
+        _render_connector(agent="x-mcp", connector="c")
+    with pytest.raises(r.AmbiguousObjectName):
+        _render_connector(agent="x", connector="mcp-c")
+
+
+def test_a_forging_pair_is_refused_even_past_the_digest_boundary() -> None:
+    # The truncate-with-digest branch does NOT close this hole on its own, and
+    # believing it does is the easy wrong conclusion: it looks like a
+    # disambiguator because it exists to stop two long names clipping together.
+    # It cannot help here. The digest is taken over `base`, and a forging pair
+    # produces the SAME `base` from both tuples -- so it produces the same
+    # sha256, the same truncation, and reproduces the collision byte for byte.
+    # The guard has to run BEFORE the length check; this test fails if someone
+    # moves it after.
+    long_agent = "a" * 25 + "-mcp-" + "b" * 25
+    short_connector = "c" * 10
+    short_agent = "a" * 25
+    long_connector = "b" * 25 + "-mcp-" + "c" * 10
+
+    left = f"curie-{long_agent}-mcp-{short_connector}"
+    right = f"curie-{short_agent}-mcp-{long_connector}"
+    assert left == right, "the two tuples must build one base for this test to mean anything"
+    assert len(left) > 63, "this pair must reach the truncate-with-digest branch"
+
+    with pytest.raises(r.AmbiguousObjectName):
+        _render_connector(agent=long_agent, connector=short_connector)
+    with pytest.raises(r.AmbiguousObjectName):
+        _render_connector(agent=short_agent, connector=long_connector)
+
+
+_FORGING_AGENT = "a-mcp-b"
+
+# Every accessor that derives anything from the object name. They all funnel
+# through `object_name` today, which is why one guard is enough -- but that is a
+# property of the current code, not a guarantee. If a refactor gives any of
+# these its own copy of the `-mcp-` concatenation, the guard stops covering it
+# and the collision comes back through that one path alone, silently. This list
+# is the pin, and it includes `_labels` deliberately: those labels ARE the
+# Service selector, the Deployment matchLabels and both policies' podSelectors,
+# so a collision there cross-wires traffic even when the object names differ.
+_DERIVATIONS: list[tuple[str, Callable[[], object]]] = [
+    ("object_name", lambda: r.object_name("curie", _FORGING_AGENT, "c")),
+    ("service_dns", lambda: r.service_dns("curie", _FORGING_AGENT, "c", "ns")),
+    ("host_aliases", lambda: r.host_aliases("curie", _FORGING_AGENT, "c", "ns", 8000)),
+    ("substitutions", lambda: r.substitutions("curie", _FORGING_AGENT, "c", "ns", 8000)),
+    ("mcp_entry", lambda: r.mcp_entry("curie", _FORGING_AGENT, "ns", "c", DEV)),
+    ("_labels", lambda: r._labels("curie", _FORGING_AGENT, "c")),
+    ("render_service", lambda: r.render_service("curie", _FORGING_AGENT, "c", DEV)),
+    (
+        "render_deployment",
+        lambda: r.render_deployment("curie", _FORGING_AGENT, "ns", "c", DEV, "s"),
+    ),
+    (
+        "render_networkpolicy",
+        lambda: r.render_networkpolicy("curie", _FORGING_AGENT, "curie", "c", DEV),
+    ),
+    (
+        "render_ingress_networkpolicy",
+        lambda: r.render_ingress_networkpolicy("curie", _FORGING_AGENT, "curie", "c", DEV),
+    ),
+    ("render", lambda: _render_connector(agent=_FORGING_AGENT, connector="c")),
+]
+
+
+@pytest.mark.parametrize("call", [pytest.param(fn, id=name) for name, fn in _DERIVATIONS])
+def test_the_refusal_reaches_every_derivation(call: Callable[[], object]) -> None:
+    # A guard that only covers `render()` leaves `mcp_entry` handing the sandbox
+    # a URL for the OTHER agent's connector, and `substitutions` baking that
+    # same host into CURIE_ALLOWED_HOSTS -- both without rendering a single
+    # object. Every derivation has to refuse, or the credential still leaks
+    # through the path that skipped the renderer.
+    with pytest.raises(r.AmbiguousObjectName):
+        call()
+
+
+def test_the_error_names_the_offending_side() -> None:
+    # An operator hits this on an install that worked yesterday (an agent named
+    # `grafana-mcp` was legal before this fix). "invalid name" would send them
+    # into the source; the message has to say WHICH of the two names offends and
+    # WHAT ITS VALUE IS, because the agent comes from deploy.yaml and the
+    # connector from connectors.yaml -- two different files to go edit.
+    with pytest.raises(r.AmbiguousObjectName) as agent_side:
+        r.object_name("curie", "aa-mcp-bb", "grafana")
+    assert "aa-mcp-bb" in str(agent_side.value)
+
+    with pytest.raises(r.AmbiguousObjectName) as connector_side:
+        r.object_name("curie", "acme", "mcp-zzqq")
+    assert "mcp-zzqq" in str(connector_side.value)
+
+    # Both sides offending reports the AGENT, deterministically -- the guard
+    # checks the agent first. Pinned so the message is reproducible rather than
+    # incidentally ordered.
+    with pytest.raises(r.AmbiguousObjectName) as both:
+        r.object_name("curie", "aa-mcp-bb", "mcp-zzqq")
+    assert "aa-mcp-bb" in str(both.value)
+    assert "mcp-zzqq" not in str(both.value)
+
+
+# The asymmetry below looks like a bug until the derivation is done, so it is
+# stated here once rather than in each case:
+#
+#   agent     is followed by the join  ->  refused iff `-mcp-` in f"{agent}-"
+#   connector is preceded by the join  ->  refused iff `-mcp-` in f"-{connector}"
+#
+# So a TRAILING `-mcp` is fatal on the agent side (`grafana-mcp` + `-mcp-c...`
+# completes a second join) but harmless on the connector side (nothing follows
+# the connector, so `c-mcp` cannot complete anything). A LEADING `mcp-` is the
+# mirror: fatal on the connector side, harmless on the agent side (an
+# alternative split of `curie-mcp-x-mcp-c` would leave an EMPTY agent, which is
+# not a name any bundle can declare). Each side sits against a different half of
+# the delimiter, so a symmetric rule would be wrong in both directions -- it
+# would over-reject `c-mcp` and `mcp-x`, breaking installs for no security gain.
+_REFUSED_AGENTS = ["a-mcp-b", "grafana-mcp", "x-mcp"]
+_ALLOWED_AGENTS = ["mcp-x", "mcp", "acme-dev", "kubernetes"]
+_REFUSED_CONNECTORS = ["b-mcp-c", "mcp-c"]
+_ALLOWED_CONNECTORS = ["c-mcp", "grafana-mcp", "mcp", "grafana", "kubernetes", "netpol-probe"]
+
+
+@pytest.mark.parametrize("agent", _REFUSED_AGENTS)
+def test_agent_forges_join_is_true_for_a_name_that_completes_the_delimiter(agent: str) -> None:
+    assert r.agent_forges_join(agent) is True
+
+
+@pytest.mark.parametrize("agent", _ALLOWED_AGENTS)
+def test_agent_forges_join_is_false_for_a_name_that_only_looks_like_it(agent: str) -> None:
+    # Over-rejection is not the safe direction here. Every name refused is an
+    # install that must be renamed before its next deploy, so a rule that is
+    # merely conservative breaks working agents for nothing.
+    assert r.agent_forges_join(agent) is False
+
+
+@pytest.mark.parametrize("connector", _REFUSED_CONNECTORS)
+def test_connector_forges_join_is_true_for_a_name_that_completes_the_delimiter(
+    connector: str,
+) -> None:
+    assert r.connector_forges_join(connector) is True
+
+
+@pytest.mark.parametrize("connector", _ALLOWED_CONNECTORS)
+def test_connector_forges_join_is_false_for_a_name_that_only_looks_like_it(
+    connector: str,
+) -> None:
+    # `kubernetes` and `netpol-probe` are the connector names actually shipped
+    # in examples/, and `grafana-mcp` is the shape an author reaches for first.
+    # If any of these start being refused, this fix has broken the repo's own
+    # bundles.
+    assert r.connector_forges_join(connector) is False
+
+
+@pytest.mark.parametrize(
+    ("release", "agent", "connector", "expected"),
+    [
+        ("curie", "acme-dev", "grafana-mcp", "curie-acme-dev-mcp-grafana-mcp"),
+        ("curie", "acme-dev", "c-mcp", "curie-acme-dev-mcp-c-mcp"),
+        ("curie", "acme-dev", "mcp", "curie-acme-dev-mcp-mcp"),
+        ("curie", "mcp-x", "grafana", "curie-mcp-x-mcp-grafana"),
+        ("curie", "mcp", "grafana", "curie-mcp-mcp-grafana"),
+        ("grafana-mcp", "acme", "grafana", "grafana-mcp-acme-mcp-grafana"),
+    ],
+    ids=[
+        "connector_grafana_mcp",
+        "connector_c_mcp",
+        "connector_mcp",
+        "agent_mcp_x",
+        "agent_mcp",
+        "release_grafana_mcp",
+    ],
+)
+def test_names_that_only_look_like_the_join_still_render(
+    release: str, agent: str, connector: str, expected: str
+) -> None:
+    # The over-rejection guard, and the test that fails if someone "simplifies"
+    # the rule to a substring ban or to `base.count("-mcp-") == 1`. Each of
+    # these renders an UNAMBIGUOUS name: no other valid (agent, connector) split
+    # of the result exists, because the alternative split either leaves one side
+    # empty or fails to preserve the release prefix.
+    assert r.object_name(release, agent, connector) == expected
+    names = _rendered_names(release, agent, connector)
+    assert names == {
+        "Service": expected,
+        "Deployment": expected,
+        "egress": f"{expected}-allow",
+        "ingress": f"{expected}-allow-ingress",
+    }
+
+
+def test_the_release_is_deliberately_not_guarded() -> None:
+    # The release side is NOT checked, and that is a decision rather than an
+    # oversight. A `-mcp-` inside the release cannot create an
+    # (agent, connector) ambiguity: any alternative split of
+    # `grafana-mcp-acme-mcp-grafana` either leaves an empty agent or stops
+    # preserving the release prefix. Guarding the whole rendered base -- the
+    # obvious-looking `base.count("-mcp-") == 1` -- would refuse every deploy of
+    # a release literally named `grafana-mcp`, which is a real break of working
+    # installs in exchange for no security gain at all.
+    assert r.object_name("grafana-mcp", "acme", "grafana") == "grafana-mcp-acme-mcp-grafana"
+    assert r.agent_forges_join("acme") is False
+    assert r.connector_forges_join("grafana") is False
+
+
+def _name_as_it_rendered_before_1446(release: str, agent: str, connector: str) -> str:
+    """The pre-#1446 derivation, restated so the pin is independent of the code.
+
+    Deliberately a second copy of the formula: a pin that called `object_name`
+    to compute its own expectation could not detect a rename at all.
+    """
+
+    base = f"{release}-{agent}-mcp-{connector}"
+    if len(base) <= 63:
+        return base
+    digest = hashlib.sha256(base.encode()).hexdigest()[:8]
+    return f"{base[: 63 - 8 - 1].rstrip('-')}-{digest}"
+
+
+@pytest.mark.parametrize(
+    ("release", "agent", "connector"),
+    [
+        ("curie", "acme-dev", "grafana"),
+        ("curie", "acme-bot", "kubernetes"),
+        ("curie", "sre-prod", "netpol-probe"),
+        ("acme-bot", "driftcheck", "grafana"),
+        # Over the 63-character ceiling, so this one pins the
+        # truncate-with-digest branch as well as the plain concatenation.
+        ("release-with-a-long-name", "agent-with-a-very-long-name-number-one", "grafana"),
+    ],
+)
+def test_allowed_names_render_exactly_the_name_they_render_today(
+    release: str, agent: str, connector: str
+) -> None:
+    # #1116's contract has two halves and this fix may only touch one. Names
+    # must be DISTINCT per (release, agent, connector) -- that is what the guard
+    # above buys -- and they must stay "stable and derivable", which means every
+    # name that deploys today must render byte-identically tomorrow. A rename
+    # would not fail loudly: it would leave every live Service, Deployment and
+    # NetworkPolicy orphaned under a name nothing reconciles any more, still
+    # running, still holding its credential, while a fresh set comes up beside
+    # it. This test is the churn pin.
+    assert r.object_name(release, agent, connector) == _name_as_it_rendered_before_1446(
+        release, agent, connector
+    )
+
+
+def test_an_unhosted_connector_still_derives_nothing() -> None:
+    # `unhosted_mcp_entry` calls `mcp_entry("", "", "", "", spec)` with four
+    # empty strings for a remote connector. Empty names must not trip the new
+    # guard -- for two independent reasons: the spec is not hosted so
+    # `service_dns` is never reached, and `-mcp-` is not in `"-"` on either side
+    # anyway. If this starts raising, every remote connector in every bundle
+    # stops resolving.
+    entry = r.unhosted_mcp_entry(REMOTE)
+    assert entry is not None
+    assert entry["url"] == "https://mcp.internal/mcp"
 
 
 # --------------------------------------------------------------------------- #
@@ -723,6 +1100,58 @@ def test_connector_accepts_traffic_only_from_the_sandbox() -> None:
     }
     assert set(src[0]) == {"podSelector"}
     assert src[0]["podSelector"]["matchLabels"] == r.sandbox_selector("release-r", "app-name")
+
+
+# This sits BESIDE the test above, which already goes red on the same mutation
+# via its `set(src[0]) == {"podSelector"}` line. That coverage is incidental:
+# it lives inside a test named for pod-scope narrowness, and its failure points
+# a reader at label identity, not at namespace scope. A future edit could
+# reasonably relax or split it without any signal that one line of it was the
+# only thing standing between the repo and the #1502 widening. This test's
+# whole stated purpose IS the namespace axis, so it cannot be relaxed by
+# accident. Keep both; they are complements, not duplicates (#1450, #1502).
+def test_ingress_source_peer_is_namespace_scoped_by_omission() -> None:
+    """The ingress `from` peer must stay a BARE podSelector -- no namespaceSelector.
+
+    The widening this exists to catch is `namespaceSelector: {}` merged INTO
+    the existing peer, rather than added as a second peer:
+
+        from:
+          - podSelector: {matchLabels: {...sandbox labels...}}
+            namespaceSelector: {}            # <-- the mutation
+
+    A bare podSelector peer is implicitly scoped to the policy's own namespace,
+    so this merge relaxes the NAMESPACE axis while leaving the pod axis exactly
+    as narrow as it was: every sandbox-labelled pod in EVERY namespace is then
+    admitted to a connector that holds a production credential and
+    authenticates nobody.
+
+    The cluster gate cannot see it. `scripts/check-netpol-enforcement.sh`'s
+    deny prober `netpol-probe-outside` is unlabelled and lives in the
+    connectors' own namespace, so it differs from a sandbox on the POD axis
+    only -- the merged peer still denies it and the gate stays green while the
+    boundary is gone. That script's `netpol-probe-foreign` (sandbox labels,
+    different namespace) is the cluster-side complement; this test needs no
+    cluster at all.
+    """
+    src = _ingress_np(_objs(release="release-r", app="app-name"))["spec"]["ingress"][0]["from"]
+    assert len(src) == 1, (
+        "exactly one source peer; a second peer widens the source set as surely "
+        "as widening this one does"
+    )
+    assert set(src[0]) == {"podSelector"}, (
+        "the peer must carry podSelector and NOTHING else: a bare podSelector peer is "
+        "namespace-local, and any sibling key here widens the source beyond this namespace"
+    )
+    assert "namespaceSelector" not in src[0], (
+        "a bare podSelector peer is namespace-local; a namespaceSelector here would admit "
+        "sandbox-labelled pods in EVERY namespace, which the unlabelled same-namespace "
+        "cluster probe cannot observe (#1502)"
+    )
+    assert src[0]["podSelector"]["matchLabels"] == r.sandbox_selector("release-r", "app-name"), (
+        "the peer must still name exactly this release's sandbox on the pod axis; "
+        "the namespace axis is held closed by omission, not by these labels"
+    )
 
 
 def test_ingress_policy_selects_the_connector_not_the_sandbox() -> None:

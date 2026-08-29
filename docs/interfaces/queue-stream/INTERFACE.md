@@ -69,6 +69,31 @@ A second broker must honor the stream key, the payload encoding, and the Stream 
   the group. The target stream is `WorkerConfig.dead_letter_stream`
   (`apps/worker/src/curie_worker/config.py::WorkerConfig`), defaulting to
   `"<stream>:dead"`.
+- **Consumer liveness and prompt reclaim** (#1532) — `XINFO CONSUMERS` idle is
+  only a cheap candidate filter: it rises while a worker drains a turn or waits
+  at its local concurrency limit. Before either lane reads, the narrow
+  `ConsumerLivenessStore`
+  (`apps/worker/src/curie_worker/consumer_liveness.py::ConsumerLivenessStore`)
+  writes a renewable alive lease, then a renewable capability marker, and
+  refreshes both throughout its lifetime, including graceful handler drain.
+  The prompt path may transfer a pending entry only after a peer's capability
+  marker is present and its alive lease is absent on two observations separated
+  by a full heartbeat TTL. Alive restoration, missing peers, store errors, and
+  a new consumer generation reset that proof. A live, draining, or saturated
+  peer is consequently not reclaimed merely because its stream-consumer idle
+  value is high.
+- **Recovery ownership** — a short per-dead-consumer `SET NX PX` lease in the
+  adjacent liveness store selects one replacement before `XCLAIM`, preventing
+  replicas from racing through the delivery budget. A restarted generation
+  also recovers rows under its own stable consumer name through the same
+  pre-claim cap check before it reads new entries.
+- **Compatibility and the prompt cap rule** — an unknown/pre-marker peer keeps
+  the unchanged 900-second `XAUTOCLAIM` backstop. For a proven-dead capable
+  peer, the prompt path first reads `XPENDING` metadata and skips local
+  in-flight IDs; it directly dead-letters an at/over-cap row before `XCLAIM`,
+  even when the row is younger than the heavy reclaim window. A below-cap row
+  is claimed only after the same proof. This narrow exception preserves the
+  delivery bound without treating idle alone as liveness.
 
 Idempotency lives beside the stream, not in it: `claim_event` does a
 `SET <dedupe_key> 1 NX EX <ttl>` before `XADD` (`apps/dispatcher/src/curie_dispatcher/queue.py::claim_event`).
@@ -78,9 +103,13 @@ Idempotency lives beside the stream, not in it: `claim_event` does a
 One, redis-py against Valkey. The dispatcher `XADD`s
 (`apps/dispatcher/src/curie_dispatcher/queue.py::enqueue`); the worker runs
 a consumer group with `XREADGROUP`/`XACK`, crash-recovery `XAUTOCLAIM`,
-dead-consumer prompt reclaim `XINFO CONSUMERS`/`XCLAIM` (#1532), and the
-delivery-cap dead-letter path's `XPENDING`/`XRANGE`/`XADD`. All of those verbs are
-issued from the shared base (`apps/worker/src/curie_worker/stream_consumer.py::StreamConsumer`);
+capable-peer prompt reclaim `XINFO CONSUMERS`/`XCLAIM` (#1532), and the
+delivery-cap dead-letter path's `XPENDING`/`XRANGE`/`XADD`. The runs and eval
+lanes share the ordered liveness publication, sustained-absence proof, and cap
+enforcement in `apps/worker/src/curie_worker/stream_consumer.py::StreamConsumer`;
+an unmarked peer remains on the 900-second `XAUTOCLAIM` fallback. All stream
+verbs are issued from that shared base
+(`apps/worker/src/curie_worker/stream_consumer.py::StreamConsumer`);
 the sacred `apps/worker/src/curie_worker/consumer.py::Consumer` subclass supplies the
 specs and handlers and issues only its own pre-claim `xpending_range`
 (`apps/worker/src/curie_worker/consumer.py::Consumer._pending_delivery_count`). A second, sibling stream
@@ -103,6 +132,14 @@ is not touched:
   dead-consumer prompt reclaim (#1532) — `xinfo_consumers`/`xclaim`. The non-sacred `StreamConsumer`
   base (`apps/worker/src/curie_worker/stream_consumer.py`) holds a `StreamBroker`; the sacred `consumer.py` subclass
   inherits it unchanged (its `XAUTOCLAIM` reclaim now targets the port by inheritance).
+- **Consumer liveness store** — `ConsumerLivenessStore`
+  (`apps/worker/src/curie_worker/consumer_liveness.py::ConsumerLivenessStore`)
+  is deliberately a separate, narrow Redis string-key adapter for ordered
+  alive/capability publication, renewal, observation, alive-lease cleanup, and
+  token-checked prompt-reclaim arbitration.
+  It is not an expansion of the stream-only `StreamBroker`: a different stream
+  broker must either supply this limited liveness boundary or explicitly retain
+  the long `XAUTOCLAIM` compatibility behavior.
 
 The verbs return a bare `Awaitable`/value matching redis-py's own typing, so
 `redis.asyncio.Redis` / `redis.Redis` satisfy the ports structurally with no adapter.
@@ -127,6 +164,13 @@ The verbs return a bare `Awaitable`/value matching redis-py's own typing, so
   `apps/api/src/curie_api/threadreset.py::ThreadResetRequests`. A second broker that
   implements only the two stream Protocols would leave this feature unbacked; it is a
   Valkey dependency, not a stream-contract one, and no port names it today.
+- **Liveness string keys are another intentionally narrow adjacent dependency.**
+  `ConsumerLivenessStore` uses the worker's concrete async Redis client for its
+  renewable alive/capability markers and short token-checked arbitration lease;
+  generic `SET`/`EXISTS`/`DELETE` were
+  not added to `StreamBroker`. The independent marker protocol is what lets
+  prompt recovery protect a live consumer whose `XINFO` idle time is high while
+  retaining a 900-second fallback for a pre-marker peer.
 - **The API both writes the runs stream and reads the graveyard outside the ports.**
   Correcting an earlier claim that the API's redis only backs the kill-switch /
   eval-queue: the approval-resume path enqueues resume turns directly onto the same

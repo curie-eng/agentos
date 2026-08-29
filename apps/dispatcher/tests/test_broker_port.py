@@ -24,4 +24,7 @@ def test_minimal_second_broker_satisfies_port() -> None:
         def set(self, name: object, value: object, *, nx: bool = False, ex: object = None) -> bool:
             return True
 
+        def delete(self, *names: object) -> int:
+            return 1
+
     assert isinstance(FakeBroker(), StreamPublisher)

@@ -193,7 +193,16 @@ contexts: [{name: prod, context: {cluster: prod, user: sre-bot-reader}}]
 current-context: prod
 YAML
 )"
-curie secrets set K8S_READONLY_KUBECONFIG --from-env K8S_READONLY_KUBECONFIG
+CURIE_CLUSTER_ID="ca:$(kubectl config view --minify --raw -o json | jq -r '.clusters[0].cluster | ((.server // "") + "\\n" + (."certificate-authority-data" // ."certificate-authority" // ""))' | sha256sum | awk '{print $1}')"
+curie secrets set K8S_READONLY_KUBECONFIG --from-env K8S_READONLY_KUBECONFIG \
+  --cluster-identity "$CURIE_CLUSTER_ID" --release curie --namespace curie
+
+# 4. Deploy the bundle. This is also what provisions the secret from step 3
+#    into the namespace; nothing else does.
+curie cluster deploy --plugin-dir examples/sre-bot
+
+# 5. Ask it something.
+curie cluster message "Is any pod crashlooping right now?"
 ```
 
 4. **Complete the gated write prerequisites.** Follow

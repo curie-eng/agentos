@@ -686,3 +686,146 @@ def test_connector_declaration_field_names_match_the_frozen_vector() -> None:
     fields = _vector_file("connector-fields.json")["models"]
     assert set(ConnectorSpec.model_fields) == set(fields["ConnectorSpec"])
     assert set(ConnectorBuild.model_fields) == set(fields["ConnectorBuild"])
+
+
+# --------------------------------------------------------------------------- #
+# Names that forge the renderer's `-mcp-` join -- #1446
+#
+# The renderer joins the agent and the connector with the literal `-mcp-`
+# (`{release}-{agent}-mcp-{connector}`). That literal is a bare substring inside
+# one DNS label, not a structural separator, so a connector whose name starts
+# with `mcp-` or contains `-mcp-` makes the rendered name ambiguous about where
+# the agent ends and the connector begins: a DIFFERENT agent/connector pair then
+# renders the same Service, the same Deployment, both the same NetworkPolicies
+# and the same `app.kubernetes.io/name` pod selector. The connector is
+# deliberately unauthenticated (ADR-0086), so the object name is the only thing
+# binding a sandbox to a credential -- a collision quietly hands one agent
+# another agent's production token.
+#
+# The renderer refuses too, as a backstop. This validator is the primary gate,
+# because it is the one that reaches the author with a name and a fix instead of
+# a 500 at deploy time.
+# --------------------------------------------------------------------------- #
+FORGING_CONNECTOR_NAMES = ["mcp-c", "b-mcp-c", "mcp-grafana"]
+SAFE_CONNECTOR_NAMES = ["grafana-mcp", "c-mcp", "mcp", "grafana", "kubernetes", "netpol-probe"]
+
+
+@pytest.mark.parametrize("name", FORGING_CONNECTOR_NAMES)
+def test_a_connector_name_that_forges_the_render_join_is_rejected(name: str) -> None:
+    # The spec here is otherwise perfectly valid -- a plain hosted image, a
+    # well-formed RFC 1123 name, nothing reserved. So this can only pass if the
+    # new check fires on its own; it cannot be masked by `connectors.bad_name`
+    # or `connectors.underspecified` standing in for it.
+    assert _codes({"connectors": {name: {"image": "x:1"}}}) == ["connectors.ambiguous_name"]
+
+
+@pytest.mark.parametrize("name", SAFE_CONNECTOR_NAMES)
+def test_a_connector_name_that_merely_ends_in_mcp_is_accepted(name: str) -> None:
+    # The asymmetry that looks like a bug: a TRAILING `-mcp` is fine on the
+    # connector, because nothing follows the connector to complete a second
+    # join, while it is fatal on the agent, which the join follows directly.
+    # Refusing these would be an over-rejection with a real cost -- `kubernetes`
+    # and `netpol-probe` are the connector names shipped in examples/, and every
+    # install declaring one would stop deploying for no security gain.
+    assert "connectors.ambiguous_name" not in _codes({"connectors": {name: {"image": "x:1"}}})
+
+
+def test_the_ambiguous_name_error_says_what_to_do() -> None:
+    # An author reads this message and has to fix it without opening the
+    # renderer's source: it must name the connector, say that the name forges a
+    # second `-mcp-` in the object name Curie derives, and say to rename.
+    _, errors = validate_connectors({"connectors": {"mcp-grafana": {"image": "x:1"}}})
+    message = next(m for c, m in errors if c == "connectors.ambiguous_name")
+    assert "mcp-grafana" in message
+    assert "-mcp-" in message
+    assert "rename" in message.lower()
+
+
+def test_the_validator_and_the_renderer_share_one_join_rule() -> None:
+    # Two copies of the rule would drift, and the drift is silent in the worst
+    # direction: a name the validator accepts and the renderer refuses turns a
+    # friendly bundle error into a 500 at deploy time, and a name the validator
+    # refuses but the renderer accepts blocks a bundle that would have been
+    # fine. Modelled on the placeholder-list pin above -- the renderer owns the
+    # rule, the validator only asks.
+    from plugin_format.connector_render import connector_forges_join
+
+    for name in FORGING_CONNECTOR_NAMES + SAFE_CONNECTOR_NAMES:
+        rejected = "connectors.ambiguous_name" in _codes({"connectors": {name: {"image": "x:1"}}})
+        assert rejected is connector_forges_join(name), name
+
+
+def test_a_forging_name_and_a_bad_shape_report_both() -> None:
+    # Same accumulation convention as the reserved-name check above: the author
+    # sees every problem in the file in one pass, rather than discovering the
+    # next one only after renaming to fix the first. This fails if the new check
+    # lands as an `elif` on the shape check. Paired against `image` + `url`
+    # rather than the underspecified shape below -- that shape is hosted
+    # (`image` is set), so the ambiguous-name guard is live for it too.
+    codes = _codes({"connectors": {"mcp-c": {"image": "x:1", "url": "https://y/mcp"}}})
+    assert "connectors.ambiguous_name" in codes
+    assert "connectors.ambiguous" in codes
+
+
+def test_a_forging_name_on_an_underspecified_connector_is_not_yet_judged() -> None:
+    # Neither `image:` nor `url:` is set, so `is_hosted` is False and the
+    # ambiguous-name guard does not fire -- not because the name is safe, but
+    # because we do not yet know it will ever reach `object_name`. If the
+    # author resolves `connectors.underspecified` by adding `url:`, this exact
+    # name is perfectly legal. Reporting `connectors.ambiguous_name` here would
+    # be a spurious error chasing a shape the author hasn't chosen yet.
+    assert _codes({"connectors": {"mcp-c": {"secrets": ["T"]}}}) == ["connectors.underspecified"]
+
+
+def test_a_forging_remote_connector_name_is_accepted() -> None:
+    # `render()` emits zero objects for a `url` connector and `mcp_entry()`
+    # returns the authored URL verbatim, so `object_name` is never called on
+    # this name -- it cannot collide with anything. Refusing it anyway would
+    # break a previously valid bundle for a collision it cannot cause.
+    assert "connectors.ambiguous_name" not in _codes(
+        {"connectors": {"mcp-internal": {"url": "https://mcp.internal/mcp"}}}
+    )
+    assert "connectors.ambiguous_name" not in _codes(
+        {"connectors": {"x-mcp-y": {"url": "https://mcp.internal/mcp"}}}
+    )
+
+
+@pytest.mark.parametrize("name", ["mcp-internal", "x-mcp-y"])
+def test_the_same_forging_name_is_refused_only_when_hosted(name: str) -> None:
+    # The important half of the boundary: the exact same name that is safe as
+    # `url` (above) is still refused once it is `image` -- a hosted connector
+    # renders real Kubernetes objects through `object_name`, so the collision
+    # this check exists to prevent is live again. Pinning both outcomes side
+    # by side is what stops a future widening of the remote exemption from
+    # quietly disabling the hosted guard too.
+    remote_codes = _codes({"connectors": {name: {"url": "https://mcp.internal/mcp"}}})
+    hosted_codes = _codes({"connectors": {name: {"image": "x:1"}}})
+    assert "connectors.ambiguous_name" not in remote_codes
+    assert hosted_codes == ["connectors.ambiguous_name"]
+
+
+def test_a_forging_hosted_connector_with_an_unhosted_url_stays_refused() -> None:
+    # `unhosted_url` is the tier-3 fallback address, not a substitute for
+    # `image` -- the connector is still hosted (`is_hosted` reads `image`) and
+    # still renders real objects on any tier that can host it. This is the
+    # shape most likely to be mis-gated by a later edit that broadens the
+    # `url`-only exemption to "anything with a URL on it."
+    assert _codes(
+        {
+            "connectors": {
+                "mcp-grafana": {"image": "x:1", "unhosted_url": "${GRAFANA_MCP_URL}"}
+            }
+        }
+    ) == ["connectors.ambiguous_name"]
+
+
+def test_bundle_surfaces_an_ambiguous_connector_name(tmp_path: Path) -> None:
+    # Through the real entry point. `validate.py` forwards validator codes
+    # verbatim with no allowlist, and this is what proves it -- a new code that
+    # never reaches `validate_bundle` never reaches an author either.
+    root = _bundle(tmp_path, "connectors:\n  mcp-grafana:\n    image: x:1\n")
+    result = validate_bundle(str(root))
+    assert not result.valid
+    offending = [e for e in result.errors if e.code == "connectors.ambiguous_name"]
+    assert offending, [e.code for e in result.errors]
+    assert "mcp-grafana" in offending[0].message

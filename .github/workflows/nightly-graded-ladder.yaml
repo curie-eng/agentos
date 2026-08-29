@@ -247,10 +247,27 @@ jobs:
           load: true
           cache-from: type=gha,scope=ladder-worker
           cache-to: type=gha,mode=max,scope=ladder-worker
+      # Mirrors ci.yaml's e2e-ladder-release step of the same name. The ladder
+      # selects compose's `full` profile whenever the bundle carries
+      # evals/trajectory.json, which the weather bundle this rung runs does, and
+      # that profile pins the ui image too (#2005). The ui image is not a FROM
+      # consumer, so it builds on the named cache-only builder like api/worker.
+      - name: Build the ui image locally (satisfies the generated release compose, no registry auth)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: apps/ui/Dockerfile
+          builder: ${{ steps.releasecache.outputs.name }}
+          tags: ghcr.io/curie-eng/curie-ui:latest
+          push: false
+          load: true
+          cache-from: type=gha,scope=ladder-ui
+          cache-to: type=gha,mode=max,scope=ladder-ui
       # The generated release compose pins `:latest` images and carries no build
-      # directive, so satisfy those refs here: retag the api build, and build the
-      # worker-local overlay with plain `docker build` (it is the FROM consumer,
-      # so it must stay on the default plain-docker builder, #803).
+      # directive, so satisfy those refs here: the ui build above, plus retag the
+      # api build, and build the worker-local overlay with plain `docker build`
+      # (it is the FROM consumer, so it must stay on the default plain-docker
+      # builder, #803).
       - name: Tag the api image for the generated release compose (ghcr.io/curie-eng/curie-api:latest, no registry auth)
         run: docker tag ghcr.io/curie-eng/curie-api:ci-local ghcr.io/curie-eng/curie-api:latest
       - name: Build the worker-local overlay for the generated release compose (ghcr.io/curie-eng/curie-worker-local:latest, no registry auth)

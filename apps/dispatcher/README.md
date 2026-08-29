@@ -9,6 +9,44 @@ All of this runs under reconnect supervision with graceful shutdown.
 It does exactly that and no more: routing, the finish-race, steer/interrupt, and
 run orchestration are the worker's job, not the dispatcher's.
 
+## What is ingested, and what is refused
+
+Ingest admits more than it used to (#2006). A message whose body lives in Block Kit
+`blocks` or legacy `attachments` — an alert app's post, typically — is normalized by
+`inbound_text.derive_text` instead of being read off an empty top-level `text`, so it
+reaches the model with its content instead of minting an empty turn. What that walker
+leaves out is a closed denylist of keys, not a judgement about which strings are prose: it
+refuses to descend into an `accessory`, `confirm`, `options`, `option_groups`, `placeholder`
+or `hint` subtree, and into an `actions` block's `elements`, so button labels,
+confirmation-dialog copy, select placeholders and option lists stay out of the turn. It is
+not a complete exclusion of interface chrome, and should not be read as one — an input
+block's `label` is not on that denylist, so its text does reach the derived turn. Message
+subtypes are
+now an open world: only the closed `relevance.NON_CONTENT_SUBTYPES` denylist (edits,
+deletes, tombstones, EKM-redacted bodies, assistant thread-start markers) is refused, so
+`file_share`, `thread_broadcast` and any subtype Slack ships in future are ingested. And a
+bot-authored `app_mention` posted at the root of a channel is ingested, so an alert bot can
+@-mention the agent; the DM lane does not inspect bot authorship at all (Bolt's own
+`IgnoringSelfEvents` middleware drops the bot's own posts before any listener runs).
+
+Still refused: a bot-authored `app_mention` that carries a `thread_ts`, as a loop guard
+between two Curie installations in one workspace — the cost is that an alert bot replying
+*inside* a thread is not ingested; a `message` event outside the DM lane, which the app
+never subscribed to; a redelivery whose dedupe key is already claimed; and a button click
+with nowhere to reply — an App Home or modal click, which carries no channel and no
+message.
+
+Every refusal these handlers make on the message lanes is logged at INFO with its
+enumerated reason and rationale (the full list is `relevance.DROP_RATIONALES`), so an
+operator chasing a message that produced no turn can grep the dispatcher log for
+`dropped inbound slack delivery` and read why. The click lane logs the same way for the
+refusal it can make; two further reasons in that list, `no_action_in_payload` and
+`empty_action_command`, are defensive guards Bolt's catch-all action matcher does not
+currently deliver, so they are not dispositions to expect in production logs — they are
+kept on purpose, and `docs/interfaces/channel-ingress/INTERFACE.md` says why. If the grep
+finds nothing, the refusal was Bolt's, above these handlers — that same document is the
+system of record for this contract.
+
 ## The queue seam (what the worker consumes)
 
 The dispatcher `XADD`s onto a Valkey Stream (`CURIE_STREAM`, default
