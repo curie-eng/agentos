@@ -2206,6 +2206,312 @@ mod release_secret_name_tests {
 }
 
 #[cfg(test)]
+mod chart_fullname_tests {
+    use super::*;
+
+    /// Every component the CLI derives from a release name. The chart names
+    /// each one `{{ include "curie.fullname" . }}-<component>`
+    /// (`charts/curie/templates/_helpers.tpl:16-26`), so this is the full set
+    /// the sweep has to keep byte-identical for the default release.
+    const COMPONENTS: [&str; 7] = [
+        "api",
+        "ui",
+        "langfuse-web",
+        "valkey",
+        "dispatcher",
+        "worker",
+        "secrets",
+    ];
+
+    fn opts(release: &str, namespace: &str) -> CommonOpts {
+        CommonOpts {
+            namespace: namespace.into(),
+            release: release.into(),
+            dry_run: false,
+        }
+    }
+
+    // --- the negative control -------------------------------------------------
+
+    /// THE regression guard for the whole sweep.
+    ///
+    /// `"curie".contains("curie")` is true, so the chart's fullname for the
+    /// default release is the release name itself and every derived resource
+    /// name is exactly what the CLI built before this change. Every install
+    /// anyone runs locally, in CI, and on the parity ladder uses `--release
+    /// curie`; if this goes red the fix broke all of them.
+    ///
+    /// The expectation is a literal, never a second call to the rule under
+    /// test -- comparing the rule against itself would pass whatever the rule
+    /// happened to be.
+    #[test]
+    fn the_default_release_is_a_byte_identical_no_op() {
+        for component in COMPONENTS {
+            assert_eq!(
+                chart_fullname("curie").resource(component),
+                format!("curie-{component}"),
+                "the default release must derive the same name it always did"
+            );
+        }
+    }
+
+    // --- the chart's naming rule ----------------------------------------------
+
+    /// `contains`, not `starts_with` and not an exact match: the chart tests
+    /// `contains $name .Release.Name`, so a release that merely embeds the
+    /// chart name anywhere takes no suffix. A "stricter" reading here would
+    /// diverge from what helm actually renders.
+    #[test]
+    fn a_release_containing_curie_takes_no_suffix() {
+        assert_eq!(chart_fullname("curie").as_str(), "curie");
+        assert_eq!(chart_fullname("curieish").as_str(), "curieish");
+        assert_eq!(chart_fullname("my-curie-prod").as_str(), "my-curie-prod");
+        assert_eq!(chart_fullname("curieish").resource("api"), "curieish-api");
+    }
+
+    /// The reported bug: `helm template platform charts/curie` renders
+    /// `platform-curie-api`, and the CLI used to ask for `platform-api`.
+    #[test]
+    fn a_release_not_containing_curie_takes_the_chart_suffix() {
+        assert_eq!(chart_fullname("platform").as_str(), "platform-curie");
+        assert_eq!(chart_fullname("acme-prod").as_str(), "acme-prod-curie");
+        assert_eq!(
+            chart_fullname("platform").resource("api"),
+            "platform-curie-api"
+        );
+        assert_eq!(
+            chart_fullname("acme-prod").resource("worker"),
+            "acme-prod-curie-worker"
+        );
+    }
+
+    /// Helm applies `trunc 63` to the FULLNAME -- `printf "%s-%s" .Release.Name
+    /// $name | trunc 63` -- and the template appends `-<component>` after that,
+    /// so a rendered object name can exceed 63 characters. Truncating the
+    /// joined string instead yields 63 and names an object the chart never
+    /// created. This test is what pins that ordering.
+    #[test]
+    fn truncation_happens_before_the_component_suffix() {
+        let release = "a".repeat(70);
+        let fullname = chart_fullname(&release);
+
+        assert_eq!(fullname.as_str(), "a".repeat(63));
+        assert_eq!(fullname.as_str().len(), 63);
+
+        let resource = fullname.resource("api");
+        assert_eq!(resource, format!("{}-api", "a".repeat(63)));
+        assert_eq!(
+            resource.len(),
+            67,
+            "the component suffix is appended after truncation, so 63 + \"-api\""
+        );
+    }
+
+    /// `trimSuffix "-"` runs after `trunc`, so a cut that lands on a dash
+    /// leaves the object named `<...>-api`, never `<...>--api`.
+    #[test]
+    fn a_trailing_dash_after_truncation_is_trimmed() {
+        // 62 `a`s and a dash: the fullname is `<62 a>--curie`, and the 63rd
+        // character is the release's own trailing dash.
+        let release = format!("{}-", "a".repeat(62));
+        let fullname = chart_fullname(&release);
+
+        assert_eq!(fullname.as_str(), "a".repeat(62));
+        assert_eq!(fullname.resource("api"), format!("{}-api", "a".repeat(62)));
+        assert!(
+            !fullname.resource("api").contains("--"),
+            "a doubled dash means the trim ran before the truncation"
+        );
+    }
+
+    /// Sprig's `trimSuffix "-"` removes exactly ONE trailing dash;
+    /// `str::trim_end_matches('-')` removes all of them. A release whose
+    /// truncation boundary lands after a `--` is where the two diverge, and the
+    /// CLI must follow the chart.
+    ///
+    /// Confirmed against helm rather than against a reading of Sprig. The
+    /// release-name path cannot be rendered directly: helm rejects any release
+    /// name longer than 53 characters, so no release can reach the 63-character
+    /// cut. The `fullnameOverride` branch runs the byte-identical
+    /// `| trunc 63 | trimSuffix "-"` pipeline and has no such limit, so
+    ///
+    ///   helm template platform charts/curie \
+    ///     --set fullnameOverride=<61 a's>--<10 z's>
+    ///
+    /// renders the api Service as `<61 a's>--api` (66 characters): the cut left
+    /// `<61 a's>--`, and exactly one dash was removed, leaving one behind for
+    /// the component suffix to join to. That is the behavior pinned here.
+    #[test]
+    fn only_one_trailing_dash_is_trimmed_matching_helms_trimsuffix() {
+        // 61 `a`s, then `--`, then filler so the fullname overruns 63. The
+        // release does not contain "curie", so the chart appends the suffix and
+        // the cut lands exactly on the second of the two dashes.
+        let release = format!("{}--{}", "a".repeat(61), "z".repeat(10));
+        let fullname = chart_fullname(&release);
+
+        assert_eq!(
+            fullname.as_str(),
+            format!("{}-", "a".repeat(61)),
+            "one dash is trimmed, not both: trimming both would name an object \
+             the chart never rendered"
+        );
+        assert_eq!(fullname.as_str().len(), 62);
+        assert!(
+            !fullname.as_str().ends_with("--"),
+            "the truncation must still have trimmed one dash"
+        );
+
+        // helm rendered `<61 a's>--api`: the retained dash plus the template's
+        // own `-api`. A `trim_end_matches` implementation gives `<61 a's>-api`.
+        assert_eq!(
+            fullname.resource("api"),
+            format!("{}--api", "a".repeat(61))
+        );
+        assert_eq!(fullname.resource("api").len(), 66);
+    }
+    /// Helm's `printf "%s-%s" "" "curie"` is `-curie`. Kubernetes rejects that
+    /// name, which is the right place for the failure -- pin what the chart
+    /// does rather than "improving" it here and diverging from the render.
+    #[test]
+    fn an_empty_release_still_produces_the_chart_name() {
+        assert_eq!(chart_fullname("").as_str(), "-curie");
+        assert_eq!(chart_fullname("").resource("api"), "-curie-api");
+    }
+
+    // --- the discovery parse --------------------------------------------------
+
+    /// Discovery reads back the name of a Service selected by label, so the
+    /// fullname is whatever precedes the component suffix. Both shapes are
+    /// real: `platform-api` is an override install, `platform-curie-api` is
+    /// the no-override chart rule.
+    #[test]
+    fn a_discovered_api_service_name_yields_the_fullname() {
+        assert_eq!(
+            fullname_from_resource_name("platform-api", "api"),
+            Some("platform".to_string())
+        );
+        assert_eq!(
+            fullname_from_resource_name("platform-curie-api", "api"),
+            Some("platform-curie".to_string())
+        );
+    }
+
+    /// A name that does not carry the suffix we asked for is not ours to
+    /// truncate. Blind stripping would mint a confidently wrong fullname,
+    /// which is worse than falling through to the chart rule.
+    #[test]
+    fn a_name_without_the_expected_suffix_is_rejected_not_stripped() {
+        assert_eq!(fullname_from_resource_name("platform-ui", "api"), None);
+        assert_eq!(fullname_from_resource_name("platformapi", "api"), None);
+        assert_eq!(fullname_from_resource_name("api", "api"), None);
+    }
+
+    /// The jsonpath yields an empty string when the selector matches nothing.
+    /// That must be `None` so the caller falls through to the worker probe and
+    /// then to `chart_fullname`, rather than resolving to the empty fullname.
+    #[test]
+    fn empty_discovery_output_yields_none() {
+        assert_eq!(fullname_from_resource_name("", "api"), None);
+        assert_eq!(fullname_from_resource_name("", "worker"), None);
+    }
+
+    /// Step 2 of discovery: with `api.deploy=false` there is no api Service,
+    /// but the worker Deployment still carries the release labels. It strips
+    /// its OWN suffix, and must not accept a name carrying another one.
+    #[test]
+    fn the_worker_fallback_strips_its_own_suffix() {
+        assert_eq!(
+            fullname_from_resource_name("platform-worker", "worker"),
+            Some("platform".to_string())
+        );
+        assert_eq!(
+            fullname_from_resource_name("platform-curie-worker", "worker"),
+            Some("platform-curie".to_string())
+        );
+        assert_eq!(fullname_from_resource_name("platform-api", "worker"), None);
+    }
+
+    // --- rendered argv for a non-default release ------------------------------
+
+    /// `cluster status` under a release that does not contain the chart name.
+    /// The literals are what `helm template platform charts/curie` actually
+    /// renders; before this change the CLI asked for `platform-ui` and
+    /// `platform-langfuse-web`, which do not exist.
+    #[test]
+    fn status_queries_the_chart_rendered_services_for_a_non_default_release() {
+        let o = opts("platform", "platform-ns");
+        let lines: Vec<String> = status_commands(&o, &chart_fullname("platform"))
+            .iter()
+            .map(OpsCommand::display)
+            .collect();
+
+        assert!(
+            lines.contains(&"kubectl get svc platform-curie-ui -n platform-ns -o json".to_string()),
+            "status must query the chart-rendered ui Service: {lines:#?}"
+        );
+        assert!(
+            lines.contains(
+                &"kubectl get svc platform-curie-langfuse-web -n platform-ns -o json".to_string()
+            ),
+            "status must query the chart-rendered langfuse Service: {lines:#?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("svc platform-ui ")
+                || line.contains("svc platform-langfuse-web ")),
+            "the raw release name must not reach a service query: {lines:#?}"
+        );
+    }
+
+    /// `cluster observability` resolves the same two Services and had the same
+    /// defect.
+    #[test]
+    fn observability_queries_the_chart_rendered_services_for_a_non_default_release() {
+        let o = opts("platform", "platform-ns");
+        let lines: Vec<String> = observability_commands(&o, &chart_fullname("platform"))
+            .iter()
+            .map(OpsCommand::display)
+            .collect();
+
+        assert!(
+            lines.contains(&"kubectl get svc platform-curie-ui -n platform-ns -o json".to_string()),
+            "observability must query the chart-rendered ui Service: {lines:#?}"
+        );
+        assert!(
+            lines.contains(
+                &"kubectl get svc platform-curie-langfuse-web -n platform-ns -o json".to_string()
+            ),
+            "observability must query the chart-rendered langfuse Service: {lines:#?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("svc platform-ui ")
+                || line.contains("svc platform-langfuse-web ")),
+            "the raw release name must not reach a service query: {lines:#?}"
+        );
+    }
+
+    /// The default release renders the same argv it always has. The sibling
+    /// `status_lists_the_readonly_commands` pins this at the argv level too;
+    /// this is the observability half of that control.
+    #[test]
+    fn the_default_release_renders_the_same_service_argv_it_always_did() {
+        let o = opts("curie", "curie");
+        let lines: Vec<String> = observability_commands(&o, &chart_fullname("curie"))
+            .iter()
+            .map(OpsCommand::display)
+            .collect();
+
+        assert!(
+            lines.contains(&"kubectl get svc curie-ui -n curie -o json".to_string()),
+            "{lines:#?}"
+        );
+        assert!(
+            lines.contains(&"kubectl get svc curie-langfuse-web -n curie -o json".to_string()),
+            "{lines:#?}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod api_key_discovery_tests {
 
     // --- #1030: the worker Deployment lookup ---------------------------------

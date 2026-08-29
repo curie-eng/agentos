@@ -27,6 +27,11 @@ const RELEASE: &str = "acme-release";
 const DISCOVERED_KEY: &str = "fixture-release-platform-key";
 const EXPLICIT_KEY: &str = "fixture-operator-platform-key";
 const API_TUNNEL_PORT: u16 = 8123;
+/// What the fake cluster's chart renders for `RELEASE` on a plain install:
+/// `acme-release` does not contain the chart name, so `curie.fullname` is
+/// `acme-release-curie` and every resource is `acme-release-curie-<component>`.
+/// The CLI used to ask for `acme-release-<component>` (#1533).
+const DISCOVERED_FULLNAME: &str = "acme-release-curie";
 
 static TUNNEL_LOCK: Mutex<()> = Mutex::new(());
 
@@ -127,6 +132,33 @@ if "get" in args and "nodes" in args:
             }
         }]
     }), end="")
+    sys.exit(0)
+
+# Live `curie.fullname` discovery (#1533): the CLI selects the release's own
+# api Service (then, as a fallback, its worker Deployment) by the chart's
+# instance/component labels, which neither `nameOverride` nor
+# `fullnameOverride` touches, and strips the component suffix back off.
+#
+# `CURIE_TEST_DISCOVERED_FULLNAME` is what this cluster "renders":
+#   acme-release-curie  -- a plain `helm install acme-release` (the default)
+#   acme-release        -- an override install, which the chart rule gets WRONG
+#   ""                  -- nothing matches, so the CLI must fall back
+#
+# Keyed on the component label rather than the resource kind, so the api probe
+# and the worker fallback are both answered whatever order they are tried in.
+# The release Secret selector carries no component label, so it still falls
+# through to its own branch below.
+if "get" in args and "-l" in args and any("app.kubernetes.io/component=" in a for a in args):
+    fullname = os.environ.get("CURIE_TEST_DISCOVERED_FULLNAME", "")
+    if not fullname:
+        print("", end="")
+        sys.exit(0)
+    selector = next(a for a in args if "app.kubernetes.io/component=" in a)
+    component = ""
+    for part in selector.split(","):
+        if part.startswith("app.kubernetes.io/component="):
+            component = part.split("=", 1)[1]
+    print(f"{fullname}-{component}", end="")
     sys.exit(0)
 
 if "get" in args and "svc" in args:
@@ -289,11 +321,20 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_backend(|_| Response::json(200, "[]"))
+    }
+
+    /// The same fixture with a caller-supplied service at the far end of the
+    /// tunnel. `cluster deploy` verification (#1533) turns on what that service
+    /// answers, so each case needs its own responder.
+    fn with_backend(
+        handler: impl Fn(&Request) -> Response + Send + Sync + 'static,
+    ) -> Self {
         let tools = tempfile::tempdir().expect("create fake tool directory");
         write_kubectl_stub(tools.path());
         let kubectl_path = stub_path(tools.path());
         let kubectl_log = tools.path().join("kubectl.log");
-        let tunnel_backend = serve(|_| Response::json(200, "[]"));
+        let tunnel_backend = serve(handler);
         let nodeport_decoy = WideServer::start();
         let proxy_decoy = serve(versions_api);
         Self {
@@ -321,6 +362,7 @@ impl Fixture {
             .env("CURIE_TEST_NODEPORT", self.nodeport_decoy.port.to_string())
             .env("CURIE_TEST_NODE_HOST", self.nodeport_decoy.host.to_string())
             .env("CURIE_TEST_DISCOVERED_KEY", DISCOVERED_KEY)
+            .env("CURIE_TEST_DISCOVERED_FULLNAME", DISCOVERED_FULLNAME)
             .env("HTTP_PROXY", &self.proxy_decoy.base_url)
             .env("http_proxy", &self.proxy_decoy.base_url)
             .env("ALL_PROXY", &self.proxy_decoy.base_url)
@@ -709,6 +751,340 @@ fn fully_explicit_https_connection_never_invokes_kubectl() {
     assert!(
         fixture.kubectl_log().is_empty(),
         "fully explicit connection must skip every discovery call: {}",
+        fixture.kubectl_log()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `cluster deploy`: the self-plumbed tunnel's target, and the verification that
+// what answers on it is actually the Curie API (#1533 symptoms 1 and 2).
+//
+// These are consumer-path tests on purpose. A unit test of the `/health` probe
+// proves the probe works; it does NOT prove `cluster deploy` calls it -- delete
+// the call and every unit test in this change still passes. What dies under
+// that mutation is `deploy_refuses_and_posts_nothing_when_the_tunnel_reaches_a
+// _non_curie_service`, because the bundle POST it forbids then happens.
+// ---------------------------------------------------------------------------
+
+/// A bundle real enough for `cluster deploy` to pack and post.
+fn deploy_bundle() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("create deploy bundle directory");
+    curie::scaffold::scaffold(dir.path(), AGENT).expect("scaffold the deploy bundle");
+    dir
+}
+
+/// The real API's `/health`: 200, JSON, `{"status":"ok"}`
+/// (`apps/api/src/curie_api/main.py`), plus enough of the agent surface for the
+/// deploy to reach its first write.
+fn curie_api(request: &Request) -> Response {
+    if request.path == "/health" {
+        Response::json(200, r#"{"status":"ok","service":"curie-api"}"#)
+    } else if request.method == "GET" && request.path.ends_with("/agents") {
+        Response::json(200, "[]")
+    } else {
+        Response::json(500, r#"{"detail":"unexpected fixture path"}"#)
+    }
+}
+
+/// The squatted-port case: something is listening and answering 200, but it is
+/// a dev server, not the platform API. This is the shape the issue reported --
+/// the bundle was posted at the stranger and its 404 was reported as the deploy
+/// result.
+fn html_squatter(_request: &Request) -> Response {
+    Response {
+        status: 200,
+        content_type: "text/html".into(),
+        body: b"<html><body>vite dev server</body></html>".to_vec(),
+    }
+}
+
+/// A different service that routes nothing at `/health`.
+fn wrong_service(_request: &Request) -> Response {
+    Response::json(404, r#"{"detail":"Not Found"}"#)
+}
+
+/// THE consumer-path test (#1533 DW-15). Deleting the verification call from
+/// `cluster deploy` makes this fail: the deploy would proceed, and the bundle
+/// POST this asserts never happens would appear in the recording.
+///
+/// Asserted on the stub's request log rather than an error variant, because
+/// "posted nothing at the stranger" is the property that matters and only the
+/// wire can show it.
+#[test]
+fn deploy_refuses_and_posts_nothing_when_the_tunnel_reaches_a_non_curie_service() {
+    for (name, fixture) in [
+        ("200 text/html", Fixture::with_backend(html_squatter)),
+        ("404", Fixture::with_backend(wrong_service)),
+    ] {
+        let bundle = deploy_bundle();
+        let output = fixture.run(&[
+            "cluster",
+            "deploy",
+            "--plugin-dir",
+            bundle.path().to_str().expect("bundle path"),
+        ]);
+
+        assert!(
+            !output.status.success(),
+            "{name}: deploy must refuse a tunnel that does not reach the Curie API\n{}\nkubectl:\n{}",
+            describe(&output),
+            fixture.kubectl_log()
+        );
+
+        let requests = fixture.tunnel_backend.recorded();
+        assert_eq!(
+            requests.len(),
+            1,
+            "{name}: the ONLY request may be the health probe; anything else means the \
+             bundle was posted at the stranger: {requests:?}\n{}",
+            describe(&output)
+        );
+        assert_eq!(requests[0].method, "GET", "{name}");
+        assert_eq!(requests[0].path, "/health", "{name}");
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.header("x-api-key").is_none()),
+            "{name}: no request may carry the release key before the endpoint is proven \
+             to be Curie (#705): {requests:?}"
+        );
+        assert!(
+            fixture.proxy_decoy.recorded().is_empty(),
+            "{name}: the loopback probe must bypass the system HTTP proxy: {:?}",
+            fixture.proxy_decoy.recorded()
+        );
+
+        // #1400's honesty standard: the refusal names what it looked at and
+        // both ways out of it.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("acme-release-curie-api"),
+            "{name}: the refusal must name the resolved service: {stderr}"
+        );
+        for recovery in ["--api-local-port", "--api-url"] {
+            assert!(
+                stderr.contains(recovery),
+                "{name}: the refusal must name recovery {recovery:?}: {stderr}"
+            );
+        }
+    }
+}
+
+/// #705 / DW-16. At the moment of the probe the auto-discovered strong release
+/// key is already in hand, and the endpoint is not yet known to be Curie.
+/// Sending the key there is exactly the egress the cleartext guard exists to
+/// prevent, so the probe must be unauthenticated -- and must stay so even
+/// against an endpoint that answers correctly.
+#[test]
+fn the_health_probe_is_unauthenticated() {
+    let fixture = Fixture::with_backend(curie_api);
+    let bundle = deploy_bundle();
+    let output = fixture.run(&[
+        "cluster",
+        "deploy",
+        "--plugin-dir",
+        bundle.path().to_str().expect("bundle path"),
+    ]);
+
+    let requests = fixture.tunnel_backend.recorded();
+    let health = requests
+        .iter()
+        .find(|request| request.path == "/health")
+        .unwrap_or_else(|| {
+            panic!(
+                "the self-plumbed deploy must verify the endpoint: {requests:?}\n{}",
+                describe(&output)
+            )
+        });
+    assert_eq!(
+        health.header("x-api-key"),
+        None,
+        "the health probe must not carry the auto-discovered release key (#705)"
+    );
+    assert!(
+        fixture.kubectl_log().contains("apiKey"),
+        "the key really was discovered before the probe, so this is not vacuous: {}",
+        fixture.kubectl_log()
+    );
+}
+
+/// The positive control that stops the refusal from being unconditional: a real
+/// Curie API answers `{"status":"ok"}` and the deploy goes on to write, with the
+/// discovered key, over the same tunnel.
+#[test]
+fn deploy_proceeds_when_health_reports_ok() {
+    let fixture = Fixture::with_backend(curie_api);
+    let bundle = deploy_bundle();
+    let output = fixture.run(&[
+        "cluster",
+        "deploy",
+        "--plugin-dir",
+        bundle.path().to_str().expect("bundle path"),
+    ]);
+
+    let requests = fixture.tunnel_backend.recorded();
+    assert_eq!(
+        requests.first().map(|request| request.path.as_str()),
+        Some("/health"),
+        "verification must come first, before any target is posted (#1279): \
+         {requests:?}\n{}",
+        describe(&output)
+    );
+    assert!(
+        requests.len() > 1,
+        "a healthy endpoint must not be refused: {requests:?}\n{}",
+        describe(&output)
+    );
+    assert!(
+        requests[1..]
+            .iter()
+            .all(|request| request.header("x-api-key") == Some(DISCOVERED_KEY)),
+        "every request after verification must authenticate with the discovered key: \
+         {requests:?}"
+    );
+    assert!(
+        requests[1..].iter().any(|request| request.method == "POST"),
+        "the deploy must reach its first write over the verified tunnel: {requests:?}\n{}",
+        describe(&output)
+    );
+    assert!(
+        fixture.nodeport_decoy.recorded().is_empty(),
+        "deploy must not touch the cleartext NodePort: {:?}",
+        fixture.nodeport_decoy.recorded()
+    );
+    assert!(
+        fixture.proxy_decoy.recorded().is_empty(),
+        "deploy must bypass the system HTTP proxy: {:?}",
+        fixture.proxy_decoy.recorded()
+    );
+}
+
+/// #1533 symptom 1, through the real binary. `acme-release` does not contain
+/// the chart name, so the chart renders `acme-release-curie-api` and the CLI
+/// used to port-forward `svc/acme-release-api` -- a Service that does not
+/// exist. Every other naming test in this change is a unit test of a pure
+/// builder; this is the one that proves the resolved name reaches kubectl.
+#[test]
+fn the_self_plumbed_tunnel_targets_the_chart_rendered_service() {
+    let fixture = Fixture::with_backend(curie_api);
+    let bundle = deploy_bundle();
+    let output = fixture.run(&[
+        "cluster",
+        "deploy",
+        "--plugin-dir",
+        bundle.path().to_str().expect("bundle path"),
+    ]);
+    let log = fixture.kubectl_log();
+
+    assert!(
+        log.contains("svc/acme-release-curie-api"),
+        "the tunnel must target the chart-rendered Service: {log}\n{}",
+        describe(&output)
+    );
+    assert!(
+        !log.contains("svc/acme-release-api"),
+        "the tunnel must not compute `{{release}}-api`: {log}"
+    );
+}
+
+/// The Finding 1 reversal, proved end to end. Under `nameOverride` or
+/// `fullnameOverride` the chart renders `acme-release-api` while still carrying
+/// `instance=acme-release,component=api`, so LIVE discovery gets it right and
+/// the pure chart rule gets it wrong. An implementation that computes the name
+/// instead of discovering it passes every other test here and fails this one.
+#[test]
+fn an_override_install_is_discovered_rather_than_computed() {
+    let fixture = Fixture::with_backend(curie_api);
+    let bundle = deploy_bundle();
+    let output = fixture.run_with_env(
+        &[
+            "cluster",
+            "deploy",
+            "--plugin-dir",
+            bundle.path().to_str().expect("bundle path"),
+        ],
+        &[("CURIE_TEST_DISCOVERED_FULLNAME", RELEASE)],
+    );
+    let log = fixture.kubectl_log();
+
+    assert!(
+        log.contains("svc/acme-release-api"),
+        "an override install renders `acme-release-api`; discovery must follow the \
+         cluster, not the chart rule: {log}\n{}",
+        describe(&output)
+    );
+    assert!(
+        !log.contains("svc/acme-release-curie-api"),
+        "the computed chart-rule name must not win over what the cluster reports: {log}"
+    );
+}
+
+/// The offline fallback is wired, not merely written: with nothing matching the
+/// discovery selectors the CLI must still name a Service and proceed, using the
+/// chart's own no-override rule.
+#[test]
+fn discovery_failure_falls_back_to_the_chart_rule() {
+    let fixture = Fixture::with_backend(curie_api);
+    let bundle = deploy_bundle();
+    let output = fixture.run_with_env(
+        &[
+            "cluster",
+            "deploy",
+            "--plugin-dir",
+            bundle.path().to_str().expect("bundle path"),
+        ],
+        &[("CURIE_TEST_DISCOVERED_FULLNAME", "")],
+    );
+    let log = fixture.kubectl_log();
+
+    assert!(
+        log.contains("app.kubernetes.io/component=api"),
+        "discovery must have been ATTEMPTED, else the fallback is untested: {log}"
+    );
+    assert!(
+        log.contains("svc/acme-release-curie-api"),
+        "an unanswerable cluster must fall back to the chart rule, never hard-fail: \
+         {log}\n{}",
+        describe(&output)
+    );
+    assert!(
+        fixture
+            .tunnel_backend
+            .recorded()
+            .iter()
+            .any(|request| request.path == "/health"),
+        "the deploy must proceed to verification after falling back: {}",
+        describe(&output)
+    );
+}
+
+/// Decision 2's deliberate asymmetry: an explicit `--api-url` is the operator's
+/// own choice of endpoint, possibly a gateway that exposes no `/health`. Adding
+/// a hard failure there would break a path that works today, so it is not
+/// probed at all -- one path, one behavior, no warning either.
+#[test]
+fn an_explicit_api_url_is_not_health_probed() {
+    let fixture = Fixture::with_backend(curie_api);
+    let bundle = deploy_bundle();
+    let api_url = fixture.tunnel_backend.base_url.clone();
+    let output = fixture.run(&[
+        "cluster",
+        "deploy",
+        "--plugin-dir",
+        bundle.path().to_str().expect("bundle path"),
+        "--api-url",
+        &api_url,
+    ]);
+
+    let requests = fixture.tunnel_backend.recorded();
+    assert!(
+        !requests.iter().any(|request| request.path == "/health"),
+        "an explicit --api-url must not be health-probed: {requests:?}\n{}",
+        describe(&output)
+    );
+    assert!(
+        !fixture.kubectl_log().contains("port-forward"),
+        "an explicit --api-url must direct-dial with no tunnel: {}",
         fixture.kubectl_log()
     );
 }

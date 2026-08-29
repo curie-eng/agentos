@@ -5166,6 +5166,41 @@ mod tests {
         }
     }
 
+    /// #1533 symptom 2: `cluster deploy` hardcoded `DEFAULT_API_LOCAL_PORT`
+    /// (8123) for its self-plumbed tunnel, so two concurrent deploys collided
+    /// and anything already holding 8123 broke the deploy. `cluster message`
+    /// and `cluster eval` were fixed by #1740 / #1652; deploy was the verb that
+    /// PR did not reach. An omitted flag must request a kernel-assigned port.
+    #[test]
+    fn cluster_deploy_defaults_api_local_port_to_zero() {
+        let cli = Cli::try_parse_from(["curie", "cluster", "deploy"])
+            .expect("cluster deploy should parse");
+        match cli.command {
+            Some(Command::Cluster {
+                action: ClusterAction::Deploy { api_local_port, .. },
+            }) => assert_eq!(
+                api_local_port, 0,
+                "an omitted --api-local-port must request a kernel-assigned port"
+            ),
+            _ => panic!("expected cluster deploy command"),
+        }
+    }
+
+    /// The escape hatch stays exact: an explicit port is an override, not a
+    /// hint, so an operator can still pin a tunnel port (and get the #1739
+    /// occupied-port refusal when it is squatted).
+    #[test]
+    fn an_explicit_api_local_port_is_honoured() {
+        let cli = Cli::try_parse_from(["curie", "cluster", "deploy", "--api-local-port", "18123"])
+            .expect("cluster deploy with an explicit port should parse");
+        match cli.command {
+            Some(Command::Cluster {
+                action: ClusterAction::Deploy { api_local_port, .. },
+            }) => assert_eq!(api_local_port, 18123),
+            _ => panic!("expected cluster deploy command"),
+        }
+    }
+
     #[test]
     fn cluster_eval_preserves_explicit_port_overrides() {
         let cli = Cli::try_parse_from([

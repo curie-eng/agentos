@@ -437,6 +437,74 @@ mod tests {
         assert!(err.contains("specify a chat surface"), "{err}");
     }
 
+    /// #1533 (S19 + S20): after a `cluster comms --slack` upgrade the pods must
+    /// be rolled so the Secret-backed tokens go live. Under a release name that
+    /// does not contain the chart name the CLI asked for
+    /// `deployment/platform-worker`, which the chart never rendered: the
+    /// rollout failed to reach anything and the operator was left with stale
+    /// Slack tokens after a "connected" report.
+    #[test]
+    fn rollout_restart_targets_the_chart_rendered_deployment() {
+        let fullname = crate::ops::chart_fullname("platform");
+        assert_eq!(
+            rollout_restart_command("acme-system", &fullname, "worker").display(),
+            "kubectl -n acme-system rollout restart deployment/platform-curie-worker"
+        );
+        assert_eq!(
+            rollout_restart_command("acme-system", &fullname, "dispatcher").display(),
+            "kubectl -n acme-system rollout restart deployment/platform-curie-dispatcher"
+        );
+
+        // Negative control: byte-identical for the default release.
+        let default = crate::ops::chart_fullname("curie");
+        assert_eq!(
+            rollout_restart_command("curie", &default, "worker").display(),
+            "kubectl -n curie rollout restart deployment/curie-worker"
+        );
+    }
+
+    /// The status wait must name the same Deployment the restart named --
+    /// otherwise `cluster comms` waits on a rollout that is not happening (or,
+    /// with `--ignore-not-found` semantics absent here, fails confusingly).
+    #[test]
+    fn rollout_status_targets_the_chart_rendered_deployment() {
+        let fullname = crate::ops::chart_fullname("platform");
+        assert_eq!(
+            rollout_status_command("acme-system", &fullname, "worker").display(),
+            "kubectl -n acme-system rollout status deployment/platform-curie-worker \
+             --timeout=120s"
+        );
+
+        // Negative control.
+        let default = crate::ops::chart_fullname("curie");
+        assert_eq!(
+            rollout_status_command("curie", &default, "worker").display(),
+            "kubectl -n curie rollout status deployment/curie-worker --timeout=120s"
+        );
+    }
+
+    /// The public entry point, so the fix is pinned where `comms` actually
+    /// calls it and not only on the two private builders.
+    #[test]
+    fn connect_rolls_both_chart_rendered_deployments() {
+        let rendered: Vec<String> =
+            rollout_commands(false, "acme-system", &crate::ops::chart_fullname("platform"))
+                .iter()
+                .map(super::OpsCommand::display)
+                .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "kubectl -n acme-system rollout restart deployment/platform-curie-worker",
+                "kubectl -n acme-system rollout restart deployment/platform-curie-dispatcher",
+                "kubectl -n acme-system rollout status deployment/platform-curie-worker \
+                 --timeout=120s",
+                "kubectl -n acme-system rollout status deployment/platform-curie-dispatcher \
+                 --timeout=120s",
+            ]
+        );
+    }
+
     /// #749 token resolution precedence: the clap-merged `--flag`/env value wins;
     /// only when it is empty does the saved vault value apply; empty + no saved
     /// value yields the empty string (which `require_connect_tokens` rejects on

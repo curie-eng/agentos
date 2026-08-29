@@ -4976,6 +4976,104 @@ mod tests {
         );
     }
 
+    /// #1533 (S14): a release name that does not contain the chart name renders
+    /// `{release}-curie-{component}` in the chart, so the tunnel must ask for
+    /// that. `platform` renders `platform-curie`, never `platform`.
+    ///
+    /// The Implementer builds this against a RESOLVED `ReleaseFullname`; a raw
+    /// release name cannot reach the builder, which is the point of the newtype.
+    #[test]
+    fn port_forward_command_uses_the_resolved_fullname() {
+        let fullname = crate::ops::chart_fullname("platform");
+        assert_eq!(
+            port_forward_command("curie", &fullname, "api", 18000, 8000).display(),
+            "kubectl -n curie port-forward svc/platform-curie-api 18000:8000"
+        );
+        assert_eq!(
+            port_forward_command("curie", &fullname, "valkey", 56381, 6379).display(),
+            "kubectl -n curie port-forward svc/platform-curie-valkey 56381:6379"
+        );
+
+        // Negative control: the default release must stay byte-identical to
+        // what shipped before this change.
+        let default = crate::ops::chart_fullname("curie");
+        assert_eq!(
+            port_forward_command("curie", &default, "api", 18000, 8000).display(),
+            "kubectl -n curie port-forward svc/curie-api 18000:8000"
+        );
+        assert_eq!(
+            port_forward_command("curie", &default, "valkey", 56381, 6379).display(),
+            "kubectl -n curie port-forward svc/curie-valkey 56381:6379"
+        );
+    }
+
+    /// #1533 (S15), the highest-consequence site. `dispatcher_connected_strict`
+    /// probes with `--ignore-not-found`, so a Deployment name that does not
+    /// exist returns success with EMPTY output -- which the caller reads as
+    /// "Slack is disconnected" and acts on by widening worker Slack trust.
+    /// That collapses the disconnected-vs-unprobeable distinction PR #1839 /
+    /// issue #1812 exists to preserve, silently and in the wrong direction.
+    ///
+    /// Asserted on the whole rendered argv rather than the name alone: the
+    /// `--ignore-not-found` and `-o name` flags are what make a wrong name
+    /// silent, so they are pinned here too.
+    #[test]
+    fn dispatcher_probe_names_the_chart_rendered_deployment() {
+        assert_eq!(
+            dispatcher_probe_command("acme-system", &crate::ops::chart_fullname("platform"))
+                .display(),
+            "kubectl -n acme-system get deployment platform-curie-dispatcher \
+             --ignore-not-found -o name"
+        );
+
+        // Negative control: unchanged for the default release.
+        assert_eq!(
+            dispatcher_probe_command("curie", &crate::ops::chart_fullname("curie")).display(),
+            "kubectl -n curie get deployment curie-dispatcher --ignore-not-found -o name"
+        );
+    }
+
+    /// #1533 (S16): the temporary trust widening (#1812) patches the release's
+    /// worker Deployment. A wrong name means the patch targets nothing, the
+    /// stub reply never arrives, and the guard's ownership annotation lands on
+    /// no object.
+    #[test]
+    fn stub_trust_targets_the_chart_rendered_worker() {
+        assert_eq!(
+            stub_trust_deployment(&crate::ops::chart_fullname("platform")),
+            "platform-curie-worker"
+        );
+
+        // Negative control.
+        assert_eq!(
+            stub_trust_deployment(&crate::ops::chart_fullname("curie")),
+            "curie-worker"
+        );
+    }
+
+    /// #1533 (S34): `cluster eval --release platform` used to read
+    /// `deployment/platform-worker` and fail before a single eval case ran.
+    #[test]
+    fn probe_fake_model_targets_the_chart_rendered_worker() {
+        let argv = fake_model_probe_command("acme-system", &crate::ops::chart_fullname("platform"))
+            .argv();
+        assert!(
+            argv.iter().any(|a| a == "deployment/platform-curie-worker"),
+            "the fake-model probe must read the chart-rendered worker: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a == "deployment/platform-worker"),
+            "the fake-model probe must not compute `{{release}}-worker`: {argv:?}"
+        );
+
+        // Negative control.
+        let control = fake_model_probe_command("curie", &crate::ops::chart_fullname("curie")).argv();
+        assert!(
+            control.iter().any(|a| a == "deployment/curie-worker"),
+            "the default release must be unchanged: {control:?}"
+        );
+    }
+
     #[tokio::test]
     async fn port_forward_rejects_an_occupied_port_without_owned_readiness() {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))

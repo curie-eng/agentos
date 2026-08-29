@@ -252,6 +252,41 @@ mod tests {
         );
     }
 
+    /// #1533 (S18): the rollout is what makes a `cluster github-app` connect
+    /// take effect. Its own doc comment names the failure a wrong target
+    /// reintroduces -- "the operator sees 'configured' and pushes still fail to
+    /// clone" -- which is exactly the symptom PR #1223 was filed to eliminate.
+    /// Under `--release platform` the chart renders `platform-curie-api` and the
+    /// CLI asked for `platform-api`.
+    #[test]
+    fn rollout_commands_target_the_chart_rendered_api_deployment() {
+        let cmds = rollout_commands("acme-system", &crate::ops::chart_fullname("platform"));
+        let rendered: Vec<String> = cmds.iter().map(OpsCommand::display).collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "kubectl -n acme-system rollout restart deployment/platform-curie-api",
+                "kubectl -n acme-system rollout status deployment/platform-curie-api \
+                 --timeout=180s",
+            ]
+        );
+    }
+
+    /// Negative control: the default release renders byte-identically to what
+    /// shipped before #1533.
+    #[test]
+    fn the_default_release_rollout_is_unchanged() {
+        let cmds = rollout_commands("curie", &crate::ops::chart_fullname("curie"));
+        let rendered: Vec<String> = cmds.iter().map(OpsCommand::display).collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "kubectl -n curie rollout restart deployment/curie-api",
+                "kubectl -n curie rollout status deployment/curie-api --timeout=180s",
+            ]
+        );
+    }
+
     /// A real file holding a PEM-shaped body, so "the contents never reach
     /// argv" is checked against contents that exist.
     ///

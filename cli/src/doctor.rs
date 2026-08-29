@@ -441,6 +441,52 @@ mod tests {
         assert_eq!(guidance(&checks_with(1)), None);
     }
 
+    /// #1533 (S17). `api_nodeport` reads the API Service to report how the API
+    /// is exposed. It spawns kubectl, so the NAME it asks for is extracted into
+    /// a pure command builder and asserted here -- no cluster, no child
+    /// process.
+    ///
+    /// A wrong name makes the read return nothing, which `cluster_facts`
+    /// renders as "API not exposed": a FALSE readiness verdict, the precise
+    /// failure mode PR #1348 built `curie doctor` to prevent.
+    ///
+    /// Required signature (`cli/src/doctor.rs`):
+    ///   fn api_nodeport_command(
+    ///       namespace: &str,
+    ///       fullname: &crate::ops::ReleaseFullname,
+    ///   ) -> crate::ops::OpsCommand
+    /// with `api_nodeport` calling it and running it through
+    /// `crate::ops::run_capture`.
+    #[test]
+    fn api_nodeport_reads_the_chart_rendered_service() {
+        let argv =
+            api_nodeport_command("acme-system", &crate::ops::chart_fullname("platform")).argv();
+        assert!(
+            argv.iter().any(|a| a == "platform-curie-api"),
+            "doctor must read the chart-rendered API service: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a == "platform-api"),
+            "doctor must not compute `{{release}}-api`: {argv:?}"
+        );
+        assert!(
+            argv.iter().any(|a| a == "acme-system"),
+            "the namespace must still be passed through: {argv:?}"
+        );
+        assert!(
+            argv.iter()
+                .any(|a| a.contains("jsonpath={.spec.ports[?(@.nodePort)].nodePort}")),
+            "the nodePort jsonpath must be preserved: {argv:?}"
+        );
+
+        // Negative control: byte-identical for the default release.
+        let control = api_nodeport_command("curie", &crate::ops::chart_fullname("curie")).argv();
+        assert!(
+            control.iter().any(|a| a == "curie-api"),
+            "the default release must be unchanged: {control:?}"
+        );
+    }
+
     /// Several gaps have an ORDER and depend on values not yet collected, which
     /// is the work the guided workflow exists to do.
     #[test]
