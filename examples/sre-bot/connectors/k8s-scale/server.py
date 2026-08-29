@@ -260,7 +260,23 @@ def scale_deployment(namespace: str, name: str, replicas: int) -> str:
                     "scale without a prior state to restore",
                 )
 
-            patched = client.patch(path, {"spec": {"replicas": replicas}})
+            # KEYWORD arguments. `httpx.Client.patch` is
+            # `patch(url, *, content=..., json=..., headers=...)` -- everything
+            # after the URL is keyword only, so passing the body positionally
+            # raised TypeError on every call and this verb could never scale
+            # anything (#1947). The `except httpx.HTTPError` below does not
+            # catch TypeError, so it propagated out of the tool after a human
+            # had already approved the write.
+            #
+            # merge-patch rather than the sibling connector's strategic-merge:
+            # `spec.replicas` is a scalar on a flat object, where the two are
+            # equivalent, and merge-patch is the one the scale subresource
+            # documents.
+            patched = client.patch(
+                path,
+                content=json.dumps({"spec": {"replicas": replicas}}),
+                headers={"Content-Type": "application/merge-patch+json"},
+            )
             if patched.status_code in (401, 403):
                 return _reply(
                     False,

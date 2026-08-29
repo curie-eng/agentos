@@ -99,7 +99,11 @@ class _FakeClient:
     def __exit__(self, *exc):
         return False
 
-    def get(self, path, params=None):
+    # These signatures MIRROR httpx.Client, keyword-only marker included. The
+    # sibling scale connector shipped a verb that could never run because its
+    # fake took the body positionally while the real client does not (#1947);
+    # a fake looser than the thing it stands in for tests the fake.
+    def get(self, path, *, params=None):
         if "/cronjobs/" in path:
             self.seen["cronjob_path"] = path
             return _Response(*self._cronjob)
@@ -107,7 +111,7 @@ class _FakeClient:
         self.seen["jobs_params"] = params
         return _Response(*self._jobs)
 
-    def post(self, path, json=None):
+    def post(self, path, *, json=None, content=None, headers=None):
         self.seen["post_path"] = path
         self.seen["post_body"] = json
         return _Response(*self._create)
@@ -264,3 +268,25 @@ def test_the_token_never_appears_in_a_returned_message(tmp_path, monkeypatch):
     srv = _load(tmp_path)
     monkeypatch.setattr(srv, "_client", lambda: _FakeClient({}, cronjob=(500, {})))
     assert "upgrade-token" not in srv.upgrade_self()
+
+
+def test_the_fake_client_cannot_accept_a_call_the_real_one_rejects():
+    """Pinned for the reason the sibling connector had to learn (#1947).
+
+    `k8s-scale` passed its patch body positionally and every one of its tests
+    passed, because its fake accepted it positionally too while the real
+    `httpx.Client` takes everything after the URL keyword-only. The verb could
+    never run. This connector's calls are already keyword, and this keeps the
+    fake from quietly drifting looser than the client it stands in for.
+    """
+
+    import httpx
+
+    for method in ("get", "post"):
+        real = inspect.signature(getattr(httpx.Client, method)).parameters
+        fake = inspect.signature(getattr(_FakeClient, method)).parameters
+        # [0] is self, [1] is the URL; both are positional in httpx too.
+        for name, param in list(fake.items())[2:]:
+            assert name in real, f"_FakeClient.{method} accepts {name!r}, httpx does not"
+            assert param.kind is inspect.Parameter.KEYWORD_ONLY
+            assert real[name].kind is inspect.Parameter.KEYWORD_ONLY
