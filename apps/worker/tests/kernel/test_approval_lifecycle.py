@@ -1633,3 +1633,73 @@ def test_normal_turn_reply_stays_loud_when_endpoint_is_dead(make_harness) -> Non
             assert not await h.async_redis.exists(h.config.done_key(ev.event_id))
 
     asyncio.run(go())
+
+
+def test_a_legacy_thread_keyed_card_is_settled_after_the_boot_migration(
+    make_harness,
+) -> None:
+    """#1751: the stranding a worker roll used to create is gone.
+
+    #1723 rekeyed the card pointer from the thread to the approval id with no
+    dual read, so an approval that was ALREADY PENDING when the workers rolled
+    left its ref under the old thread key where ``_finalize_settled_card``
+    could never see it. A resolve click still healed such a card from its
+    interaction payload; an EXPIRY has no click, so the buttons stayed live for
+    the rest of the 14 day TTL.
+
+    This is the end-to-end shape of the fix: seed the pre-#1723 entry exactly
+    as the old worker wrote it (thread-keyed, ``approval_id`` in the payload),
+    run the one-shot boot migration, then drive the expiry resume turn the #412
+    sweeper enqueues and assert the card is actually settled in place.
+    """
+
+    async def go() -> None:
+        thread = "th-legacy-roll"
+        async with make_harness(approvals=RecordingApprovals()) as h:
+            # Written by the PREVIOUS worker version: keyed by thread, with the
+            # approval id inline (#1199) -- the only reason it is recoverable.
+            legacy_key = f"{h.config.key_prefix}:approval-card:{thread}"
+            await h.async_redis.set(
+                legacy_key,
+                json.dumps(
+                    {
+                        "channel": "C1",
+                        "ts": "posted-legacy",
+                        "summary": "Give ACME a 20% discount",
+                        "endpoint": None,
+                        "requested_by": "U1",
+                        "kind": "slack",
+                        "adapter": None,
+                        "approval_id": "appr-1",
+                    }
+                ),
+                ex=3600,
+            )
+            # Boot: the one-shot pass ``run._run`` makes before any consumer reads.
+            assert (await h.card_store.migrate_legacy_thread_keyed_refs()).migrated == 1
+            assert not await h.async_redis.exists(legacy_key)
+
+            h.runner.default_script = [Final(text="Acknowledged the expiry.", status=DONE)]
+            await h.kernel.process_event(
+                _resume_turn(
+                    "[approval expired] not approved in time",
+                    thread=thread,
+                    approval_id="appr-1",
+                    author="system",
+                )
+            )
+
+            # The buttons are gone: the card was edited in place at the address
+            # the LEGACY entry remembered, with its remembered summary.
+            assert len(h.sink.card_updates) == 1
+            channel, ts, message, endpoint, settled = h.sink.card_updates[0]
+            assert (channel, ts) == ("C1", "posted-legacy")
+            assert endpoint is None
+            assert message.text == "Give ACME a 20% discount"
+            assert settled is not None and settled.decision is None
+            assert settled.requested_by == "U1"
+
+            # And the migrated memory was consumed, so a redelivery no-ops.
+            assert not await h.async_redis.exists(h.config.approval_card_key("appr-1"))
+
+    asyncio.run(go())
