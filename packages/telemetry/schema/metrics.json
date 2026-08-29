@@ -195,10 +195,11 @@
           "redelivery",
           "rate-limit",
           "runner-error",
-          "runner-timeout"
+          "runner-timeout",
+          "workspace-error"
         ]
       },
-      "cardinality_bound": 8
+      "cardinality_bound": 10
     },
     "curie.queue.dead_letter": {
       "type": "counter",

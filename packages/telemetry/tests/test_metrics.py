@@ -135,9 +135,15 @@ def test_retry_metrics_separate_bounded_retry_causes() -> None:
     assert queue["attributes"] == {
         "service.name": ["curie-worker"],
         "source": ["worker", "eval"],
-        "retry_class": ["redelivery", "rate-limit", "runner-error", "runner-timeout"],
+        "retry_class": [
+            "redelivery",
+            "rate-limit",
+            "runner-error",
+            "runner-timeout",
+            "workspace-error",
+        ],
     }
-    assert queue["cardinality_bound"] == 8
+    assert queue["cardinality_bound"] == 10
     reply = manifest["curie.reply.retry"]
     assert reply["attributes"] == {
         "service.name": ["curie-worker"],
