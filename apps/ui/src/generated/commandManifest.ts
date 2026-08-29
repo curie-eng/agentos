@@ -3761,6 +3761,17 @@ export const commandManifest = {
               "long": "secret",
               "positional": false,
               "required": false
+            },
+            {
+              "default_values": [
+                "0"
+              ],
+              "global": false,
+              "help": "Local port the self-plumbed API port-forward binds. Default 0 lets the kernel assign an ephemeral port, matching `cluster message` and `cluster eval` (#1652 / #1740), so concurrent deploys cannot collide and a squatted port cannot be inherited",
+              "id": "api_local_port",
+              "long": "api-local-port",
+              "positional": false,
+              "required": false
             }
           ],
           "hidden": false,

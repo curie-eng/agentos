@@ -224,6 +224,7 @@ curie cluster deploy --plugin-dir <bundle-dir>
 | `--repo <owner/name>` | Bind this agent to a GitHub repo so pushes deploy it; set only on the deploy that creates the agent and unchangeable after. Omit it and the agent can never use git-flow. |
 | `--api-url <url>` / `CURIE_API_URL` | Direct-dial this URL instead of self-plumbing a loopback tunnel. |
 | `--api-key <key>` / `CURIE_API_KEY` | Override the auto-discovered API key. |
+| `--api-local-port <port>` | Local end of the self-plumbed tunnel. Default `0` lets the kernel assign an ephemeral port, so two deploys never fight over the same one. |
 
 Beyond pointing it at your bundle, `cluster deploy` needs no `--api-url` or
 `--api-key` by default: it automatically finds a way to reach the Curie API
@@ -235,7 +236,13 @@ you do need is `--repo`, and only if you want git-flow -- see
 Under the hood, it opens a secure local tunnel to the Curie API (so
 nothing needs to be exposed publicly) and reads the API key straight out
 of the release's own Kubernetes Secret -- the key is never printed or
-stored anywhere in your shell history.
+stored anywhere in your shell history. Before posting the bundle, it
+also checks the tunnel's unauthenticated `/health` to confirm it really
+reaches the Curie API -- a squatted local port or a tunnel that resolved
+to the wrong workload both look reachable, so a 404, an HTML response, a
+non-`ok` JSON body, or a redirect is refused rather than posted to. This
+check only runs on the self-plumbed tunnel; an explicit `--api-url` is
+not probed.
 
 Override this only for a non-default setup: `--api-url` to talk to a
 specific address instead of tunneling, or `--api-key` to use a specific key

@@ -432,14 +432,16 @@ async fn resolve_cluster_conn(
         Some(key) => key,
         None => ops::discover_api_key(&namespace, &release).await?,
     };
-    let (api_url, port_forward) = match commands::deploy_port_forward(
+    let tunnel = commands::deploy_api_tunnel(
         api_url.as_deref(),
         &namespace,
         &release,
         local_port,
         message::API_REMOTE_PORT,
-    ) {
-        Some(pf_cmd) => {
+    )
+    .await;
+    let (api_url, port_forward) = match tunnel {
+        Some((_fullname, pf_cmd)) => {
             let (child, effective_port) =
                 message::start_port_forward(&pf_cmd, local_port, "cluster api").await?;
             (format!("http://127.0.0.1:{effective_port}"), Some(child))
@@ -519,14 +521,16 @@ async fn run_cluster_observability_query(
     };
     let local_port = 0;
     let _port_forward;
-    let api_url = match commands::deploy_port_forward(
+    let tunnel = commands::deploy_api_tunnel(
         conn.api_url.as_deref(),
         &namespace,
         &release,
         local_port,
         message::API_REMOTE_PORT,
-    ) {
-        Some(command) => {
+    )
+    .await;
+    let api_url = match tunnel {
+        Some((_fullname, command)) => {
             let (child, effective_port) =
                 message::start_port_forward(&command, local_port, "observability api").await?;
             _port_forward = Some(child);
@@ -2390,6 +2394,12 @@ enum ClusterAction {
         /// stays names-only. See ADR-0009 / #1488.
         #[arg(long = "secret")]
         secret: Vec<String>,
+        /// Local port the self-plumbed API port-forward binds.
+        /// Default 0 lets the kernel assign an ephemeral port, matching
+        /// `cluster message` and `cluster eval` (#1652 / #1740), so concurrent
+        /// deploys cannot collide and a squatted port cannot be inherited.
+        #[arg(long, default_value_t = 0)]
+        api_local_port: u16,
     },
     // Agent-lifecycle verbs (kill/resume/budget/delete) speak the platform API
     // like `deploy` does. Design decision (#149): extend the existing `cluster`
@@ -3877,6 +3887,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 env,
                 label,
                 secret,
+                api_local_port,
             } => {
                 let api_key = commands::normalize_deploy_api_key(api_key);
                 // ADR-0057 (supersedes ADR-0024's deploy transport): with no
@@ -3894,29 +3905,76 @@ async fn run(command: Option<Command>) -> Result<()> {
                 // over the loopback tunnel, never over the cleartext UI /api
                 // NodePort proxy. Hold the child until after deploy returns;
                 // kill_on_drop tears it down on every exit path.
-                let local_port = message::DEFAULT_API_LOCAL_PORT;
+                // 0 (the clap default) requests a kernel-assigned port, so a
+                // squatted 8123 and two concurrent deploys are both structurally
+                // impossible; an explicit --api-local-port stays an exact
+                // override and still gets #1739's occupied-port refusal (#1533
+                // symptom 2, the verb #1740 did not reach).
+                let local_port = api_local_port;
                 let _deploy_pf;
-                // Tracks which transport produced `api_url`, so the unreachable
-                // hint below describes the RIGHT recovery: the auto path really
-                // self-plumbed a tunnel; the explicit path direct-dialed and did
-                // not. Mirrors the same `Some`/`None` discriminant
-                // `deploy_port_forward` keys on below.
-                let self_plumbed = api_url.is_none();
-                let api_url = match commands::deploy_port_forward(
+                // `Some` iff this deploy self-plumbed, carrying the fullname the
+                // tunnel actually forwards to. That one value decides the
+                // transport, names the Service in the diagnostics below, and
+                // tells the unreachable hint which recovery to describe: the
+                // auto path really opened a tunnel; the explicit path
+                // direct-dialed and did not.
+                let tunnel = commands::deploy_api_tunnel(
                     api_url.as_deref(),
                     &namespace,
                     &release,
                     local_port,
                     message::API_REMOTE_PORT,
-                ) {
-                    Some(pf_cmd) => {
+                )
+                .await;
+                let api_url = match &tunnel {
+                    Some((fullname, pf_cmd)) => {
                         let (deploy_pf, effective_port) =
-                            message::start_port_forward(&pf_cmd, local_port, "deploy api").await?;
+                            message::start_port_forward(pf_cmd, local_port, "deploy api").await?;
                         _deploy_pf = Some(deploy_pf);
                         // svc/<release>-api serves the platform API at ROOT, so the
                         // base URL has NO /api suffix (the /api in ADR-0024 was only
                         // because the request went through the UI pod).
-                        format!("http://127.0.0.1:{effective_port}")
+                        let base_url = format!("http://127.0.0.1:{effective_port}");
+                        // The tunnel is TCP-alive, but a squatted local port and a
+                        // Service name that resolved to the wrong workload are both
+                        // TCP-alive too -- `start_port_forward`'s bind and readiness
+                        // checks cannot tell them from the real API. Reading the
+                        // UNAUTHENTICATED /health is the only check that can, and it
+                        // is the compensating control for name resolution falling
+                        // back to the chart rule.
+                        //
+                        // Placed here, at tunnel setup, deliberately: `--all-targets`
+                        // posts several bundles over this one tunnel dev-before-prod
+                        // (#1279), so verifying once BEFORE the target loop is what
+                        // keeps a refusal a clean refusal instead of a half-deployed
+                        // repository.
+                        //
+                        // #705: the auto-discovered strong release key is already in
+                        // hand and this endpoint is not yet proven to be Curie, so the
+                        // probe carries no key and a 401/403 is never retried with one.
+                        //
+                        // #1908: this returns `Err` rather than exiting, so the scope
+                        // unwinds, `_deploy_pf` drops, and `kill_on_drop` reaps the
+                        // kubectl child instead of orphaning it with its port held.
+                        if let Err(observed) = api::verify_is_curie_api(&base_url).await {
+                            let api_svc = fullname.resource("api");
+                            return Err(anyhow::Error::from(
+                                curie::exit::CliError::failure(format!(
+                                    "refusing to deploy: the endpoint behind the self-plumbed \
+                                     tunnel is not the Curie API. {observed}. `cluster deploy` \
+                                     forwarded svc/{api_svc} in namespace {namespace} to \
+                                     127.0.0.1:{effective_port} and posted nothing. Re-run with \
+                                     --api-local-port <port> to bind a different local port, or \
+                                     pass --api-url <url> to dial the API directly without a \
+                                     tunnel."
+                                ))
+                                .with_fix(
+                                    "re-run with --api-local-port <port>, or pass --api-url <url> \
+                                     to dial the platform API directly",
+                                ),
+                            ));
+                        }
+                        base_url
                     }
                     None => {
                         _deploy_pf = None;
@@ -3937,14 +3995,28 @@ async fn run(command: Option<Command>) -> Result<()> {
                         url
                     }
                 };
-                let connect_hint = if self_plumbed {
-                    format!(
-                        "the platform API at {api_url} is unreachable. `cluster deploy` self-plumbs a kubectl port-forward to svc/{release}-api; confirm the release is healthy with `curie cluster status`, or pass --api-url to dial the API directly."
-                    )
-                } else {
-                    format!(
-                        "the platform API at {api_url} (from --api-url/CURIE_API_URL) is unreachable. `cluster deploy` dialed it directly with no port-forward; confirm that URL is reachable and the release is healthy with `curie cluster status`, or omit --api-url to self-plumb a loopback port-forward to svc/{release}-api."
-                    )
+                let connect_hint = match tunnel.as_ref() {
+                    // Self-plumbed: name the Service the tunnel ACTUALLY used,
+                    // as resolved from the cluster, so the operator can look up
+                    // the same object the CLI did.
+                    Some((fullname, _)) => {
+                        let api_svc = fullname.resource("api");
+                        format!(
+                            "the platform API at {api_url} is unreachable. `cluster deploy` self-plumbs a kubectl port-forward to svc/{api_svc}; confirm the release is healthy with `curie cluster status`, or pass --api-url to dial the API directly."
+                        )
+                    }
+                    // Explicit --api-url: no Service was contacted and none was
+                    // resolved, so this hint names the chart's no-override rule
+                    // rather than triggering a discovery round-trip on a path
+                    // that is pinned cluster-offline. Under an override install
+                    // the printed name may differ from the rendered one; the
+                    // recovery it suggests (omit --api-url) resolves it live.
+                    None => {
+                        let api_svc = ops::chart_fullname(&release).resource("api");
+                        format!(
+                            "the platform API at {api_url} (from --api-url/CURIE_API_URL) is unreachable. `cluster deploy` dialed it directly with no port-forward; confirm that URL is reachable and the release is healthy with `curie cluster status`, or omit --api-url to self-plumb a loopback port-forward to svc/{api_svc}."
+                        )
+                    }
                 };
                 // --all-targets onboards a repository in one invocation.
                 // The list comes from the API, not a Rust YAML parse: ADR-0089
@@ -5166,6 +5238,41 @@ mod tests {
                 );
             }
             _ => panic!("expected cluster eval command"),
+        }
+    }
+
+    /// #1533 symptom 2: `cluster deploy` hardcoded `DEFAULT_API_LOCAL_PORT`
+    /// (8123) for its self-plumbed tunnel, so two concurrent deploys collided
+    /// and anything already holding 8123 broke the deploy. `cluster message`
+    /// and `cluster eval` were fixed by #1740 / #1652; deploy was the verb that
+    /// PR did not reach. An omitted flag must request a kernel-assigned port.
+    #[test]
+    fn cluster_deploy_defaults_api_local_port_to_zero() {
+        let cli = Cli::try_parse_from(["curie", "cluster", "deploy"])
+            .expect("cluster deploy should parse");
+        match cli.command {
+            Some(Command::Cluster {
+                action: ClusterAction::Deploy { api_local_port, .. },
+            }) => assert_eq!(
+                api_local_port, 0,
+                "an omitted --api-local-port must request a kernel-assigned port"
+            ),
+            _ => panic!("expected cluster deploy command"),
+        }
+    }
+
+    /// The escape hatch stays exact: an explicit port is an override, not a
+    /// hint, so an operator can still pin a tunnel port (and get the #1739
+    /// occupied-port refusal when it is squatted).
+    #[test]
+    fn an_explicit_api_local_port_is_honoured() {
+        let cli = Cli::try_parse_from(["curie", "cluster", "deploy", "--api-local-port", "18123"])
+            .expect("cluster deploy with an explicit port should parse");
+        match cli.command {
+            Some(Command::Cluster {
+                action: ClusterAction::Deploy { api_local_port, .. },
+            }) => assert_eq!(api_local_port, 18123),
+            _ => panic!("expected cluster deploy command"),
         }
     }
 

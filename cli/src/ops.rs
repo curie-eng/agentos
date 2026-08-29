@@ -2206,6 +2206,493 @@ mod release_secret_name_tests {
 }
 
 #[cfg(test)]
+mod chart_fullname_tests {
+    use super::*;
+
+    /// Every component the CLI derives from a release name. The chart names
+    /// each one `{{ include "curie.fullname" . }}-<component>`
+    /// (`charts/curie/templates/_helpers.tpl:16-26`), so this is the full set
+    /// the sweep has to keep byte-identical for the default release.
+    const COMPONENTS: [&str; 7] = [
+        "api",
+        "ui",
+        "langfuse-web",
+        "valkey",
+        "dispatcher",
+        "worker",
+        "secrets",
+    ];
+
+    fn opts(release: &str, namespace: &str) -> CommonOpts {
+        CommonOpts {
+            namespace: namespace.into(),
+            release: release.into(),
+            dry_run: false,
+        }
+    }
+
+    // --- the negative control -------------------------------------------------
+
+    /// THE regression guard for the whole sweep.
+    ///
+    /// `"curie".contains("curie")` is true, so the chart's fullname for the
+    /// default release is the release name itself and every derived resource
+    /// name is exactly what the CLI built before this change. Every install
+    /// anyone runs locally, in CI, and on the parity ladder uses `--release
+    /// curie`; if this goes red the fix broke all of them.
+    ///
+    /// The expectation is a literal, never a second call to the rule under
+    /// test -- comparing the rule against itself would pass whatever the rule
+    /// happened to be.
+    #[test]
+    fn the_default_release_is_a_byte_identical_no_op() {
+        for component in COMPONENTS {
+            assert_eq!(
+                chart_fullname("curie").resource(component),
+                format!("curie-{component}"),
+                "the default release must derive the same name it always did"
+            );
+        }
+    }
+
+    // --- the chart's naming rule ----------------------------------------------
+
+    /// `contains`, not `starts_with` and not an exact match: the chart tests
+    /// `contains $name .Release.Name`, so a release that merely embeds the
+    /// chart name anywhere takes no suffix. A "stricter" reading here would
+    /// diverge from what helm actually renders.
+    #[test]
+    fn a_release_containing_curie_takes_no_suffix() {
+        assert_eq!(chart_fullname("curie").as_str(), "curie");
+        assert_eq!(chart_fullname("curieish").as_str(), "curieish");
+        assert_eq!(chart_fullname("my-curie-prod").as_str(), "my-curie-prod");
+        assert_eq!(chart_fullname("curieish").resource("api"), "curieish-api");
+    }
+
+    /// The reported bug: `helm template platform charts/curie` renders
+    /// `platform-curie-api`, and the CLI used to ask for `platform-api`.
+    #[test]
+    fn a_release_not_containing_curie_takes_the_chart_suffix() {
+        assert_eq!(chart_fullname("platform").as_str(), "platform-curie");
+        assert_eq!(chart_fullname("acme-prod").as_str(), "acme-prod-curie");
+        assert_eq!(
+            chart_fullname("platform").resource("api"),
+            "platform-curie-api"
+        );
+        assert_eq!(
+            chart_fullname("acme-prod").resource("worker"),
+            "acme-prod-curie-worker"
+        );
+    }
+
+    /// Helm applies `trunc 63` to the FULLNAME -- `printf "%s-%s" .Release.Name
+    /// $name | trunc 63` -- and the template appends `-<component>` after that,
+    /// so a rendered object name can exceed 63 characters. Truncating the
+    /// joined string instead yields 63 and names an object the chart never
+    /// created. This test is what pins that ordering.
+    #[test]
+    fn truncation_happens_before_the_component_suffix() {
+        let release = "a".repeat(70);
+        let fullname = chart_fullname(&release);
+
+        assert_eq!(fullname.as_str(), "a".repeat(63));
+        assert_eq!(fullname.as_str().len(), 63);
+
+        let resource = fullname.resource("api");
+        assert_eq!(resource, format!("{}-api", "a".repeat(63)));
+        assert_eq!(
+            resource.len(),
+            67,
+            "the component suffix is appended after truncation, so 63 + \"-api\""
+        );
+    }
+
+    /// `trimSuffix "-"` runs after `trunc`, so a cut that lands on a dash
+    /// leaves the object named `<...>-api`, never `<...>--api`.
+    #[test]
+    fn a_trailing_dash_after_truncation_is_trimmed() {
+        // 62 `a`s and a dash: the fullname is `<62 a>--curie`, and the 63rd
+        // character is the release's own trailing dash.
+        let release = format!("{}-", "a".repeat(62));
+        let fullname = chart_fullname(&release);
+
+        assert_eq!(fullname.as_str(), "a".repeat(62));
+        assert_eq!(fullname.resource("api"), format!("{}-api", "a".repeat(62)));
+        assert!(
+            !fullname.resource("api").contains("--"),
+            "a doubled dash means the trim ran before the truncation"
+        );
+    }
+
+    /// Sprig's `trimSuffix "-"` removes exactly ONE trailing dash;
+    /// `str::trim_end_matches('-')` removes all of them. A release whose
+    /// truncation boundary lands after a `--` is where the two diverge, and the
+    /// CLI must follow the chart.
+    ///
+    /// Confirmed against helm rather than against a reading of Sprig. The
+    /// release-name path cannot be rendered directly: helm rejects any release
+    /// name longer than 53 characters, so no release can reach the 63-character
+    /// cut. The `fullnameOverride` branch runs the byte-identical
+    /// `| trunc 63 | trimSuffix "-"` pipeline and has no such limit, so
+    ///
+    ///   helm template platform charts/curie \
+    ///     --set fullnameOverride=<61 a's>--<10 z's>
+    ///
+    /// renders the api Service as `<61 a's>--api` (66 characters): the cut left
+    /// `<61 a's>--`, and exactly one dash was removed, leaving one behind for
+    /// the component suffix to join to. That is the behavior pinned here.
+    #[test]
+    fn only_one_trailing_dash_is_trimmed_matching_helms_trimsuffix() {
+        // 61 `a`s, then `--`, then filler so the fullname overruns 63. The
+        // release does not contain "curie", so the chart appends the suffix and
+        // the cut lands exactly on the second of the two dashes.
+        let release = format!("{}--{}", "a".repeat(61), "z".repeat(10));
+        let fullname = chart_fullname(&release);
+
+        assert_eq!(
+            fullname.as_str(),
+            format!("{}-", "a".repeat(61)),
+            "one dash is trimmed, not both: trimming both would name an object \
+             the chart never rendered"
+        );
+        assert_eq!(fullname.as_str().len(), 62);
+        assert!(
+            !fullname.as_str().ends_with("--"),
+            "the truncation must still have trimmed one dash"
+        );
+
+        // helm rendered `<61 a's>--api`: the retained dash plus the template's
+        // own `-api`. A `trim_end_matches` implementation gives `<61 a's>-api`.
+        assert_eq!(fullname.resource("api"), format!("{}--api", "a".repeat(61)));
+        assert_eq!(fullname.resource("api").len(), 66);
+    }
+    /// Helm's `printf "%s-%s" "" "curie"` is `-curie`. Kubernetes rejects that
+    /// name, which is the right place for the failure -- pin what the chart
+    /// does rather than "improving" it here and diverging from the render.
+    #[test]
+    fn an_empty_release_still_produces_the_chart_name() {
+        assert_eq!(chart_fullname("").as_str(), "-curie");
+        assert_eq!(chart_fullname("").resource("api"), "-curie-api");
+    }
+
+    // --- the discovery parse --------------------------------------------------
+
+    /// Discovery reads back the name of a Service selected by label, so the
+    /// fullname is whatever precedes the component suffix. Both shapes are
+    /// real: `platform-api` is an override install, `platform-curie-api` is
+    /// the no-override chart rule.
+    #[test]
+    fn a_discovered_api_service_name_yields_the_fullname() {
+        assert_eq!(
+            fullname_from_resource_name("platform-api", "api"),
+            Some("platform".to_string())
+        );
+        assert_eq!(
+            fullname_from_resource_name("platform-curie-api", "api"),
+            Some("platform-curie".to_string())
+        );
+    }
+
+    /// A name that does not carry the suffix we asked for is not ours to
+    /// truncate. Blind stripping would mint a confidently wrong fullname,
+    /// which is worse than falling through to the chart rule.
+    #[test]
+    fn a_name_without_the_expected_suffix_is_rejected_not_stripped() {
+        assert_eq!(fullname_from_resource_name("platform-ui", "api"), None);
+        assert_eq!(fullname_from_resource_name("platformapi", "api"), None);
+        assert_eq!(fullname_from_resource_name("api", "api"), None);
+    }
+
+    /// The jsonpath yields an empty string when the selector matches nothing.
+    /// That must be `None` so the caller falls through to the worker probe and
+    /// then to `chart_fullname`, rather than resolving to the empty fullname.
+    #[test]
+    fn empty_discovery_output_yields_none() {
+        assert_eq!(fullname_from_resource_name("", "api"), None);
+        assert_eq!(fullname_from_resource_name("", "worker"), None);
+    }
+
+    /// Step 2 of discovery: with `api.deploy=false` there is no api Service,
+    /// but the worker Deployment still carries the release labels. It strips
+    /// its OWN suffix, and must not accept a name carrying another one.
+    #[test]
+    fn the_worker_fallback_strips_its_own_suffix() {
+        assert_eq!(
+            fullname_from_resource_name("platform-worker", "worker"),
+            Some("platform".to_string())
+        );
+        assert_eq!(
+            fullname_from_resource_name("platform-curie-worker", "worker"),
+            Some("platform-curie".to_string())
+        );
+        assert_eq!(fullname_from_resource_name("platform-api", "worker"), None);
+    }
+
+    // --- discovery cardinality ------------------------------------------------
+
+    /// The ordinary case: one labelled object, one answer.
+    #[test]
+    fn exactly_one_match_yields_the_fullname() {
+        assert_eq!(
+            component_discovery("platform-curie-api\n", "api"),
+            ComponentDiscovery::Found(chart_fullname("platform"))
+        );
+        assert_eq!(
+            component_discovery("platform-api", "api"),
+            ComponentDiscovery::Found(ReleaseFullname("platform".to_string()))
+        );
+    }
+
+    /// Zero matches is absence, not failure: the caller falls through to the
+    /// worker probe and then to the chart rule, and says nothing, because a
+    /// not-yet-installed release is a supported state.
+    #[test]
+    fn zero_matches_is_not_present() {
+        assert_eq!(
+            component_discovery("", "api"),
+            ComponentDiscovery::NotPresent
+        );
+        assert_eq!(
+            component_discovery("\n  \n", "api"),
+            ComponentDiscovery::NotPresent
+        );
+
+        let absent = ComponentDiscovery::NotPresent;
+        let fallback = chart_fullname("platform");
+        assert_eq!(
+            absent.fallback_warning("platform-ns", "platform", &fallback),
+            None,
+            "an absent release must degrade quietly; only a FAILED probe warns"
+        );
+    }
+
+    /// THE finding. Kubernetes does not enforce label uniqueness, so `items[0]`
+    /// could name a workload that is not ours -- a stray `unexpected-api`
+    /// carrying the release labels would resolve the fullname to `unexpected`
+    /// and point `cluster message`/`comms`/`eval` at it. Two matches are
+    /// refused, never resolved to the first.
+    #[test]
+    fn two_matches_are_refused_not_resolved_to_the_first() {
+        let outcome = component_discovery("platform-curie-api\nunexpected-api\n", "api");
+        match &outcome {
+            ComponentDiscovery::Ambiguous { component, names } => {
+                let listed: Vec<&str> = names.iter().map(String::as_str).collect();
+                assert_eq!(component.as_str(), "api");
+                assert_eq!(listed, ["platform-curie-api", "unexpected-api"]);
+            }
+            other => panic!("two matches must be refused, not resolved: {other:?}"),
+        }
+    }
+
+    /// A single match that does not carry the component suffix is rejected, not
+    /// blind-stripped -- the rule `fullname_from_resource_name` pins, asserted
+    /// here at the level that actually decides what discovery returns.
+    #[test]
+    fn a_single_match_without_the_suffix_is_rejected_not_stripped() {
+        assert_eq!(
+            component_discovery("platform-ui\n", "api"),
+            ComponentDiscovery::NotPresent
+        );
+        assert_eq!(
+            component_discovery("api\n", "api"),
+            ComponentDiscovery::NotPresent,
+            "stripping `-api` off `api` leaves an empty fullname"
+        );
+    }
+
+    /// A FAILED probe is not an absent release. It must warn, say why, and say
+    /// that the name in use is a guess -- otherwise `cluster status` reports
+    /// the Service as "not found" and masks an RBAC denial.
+    #[test]
+    fn a_failed_probe_warns_that_the_name_is_a_guess() {
+        let denied = ComponentDiscovery::ProbeFailed {
+            component: "api".to_string(),
+            detail: "Error from server (Forbidden): services is forbidden".to_string(),
+        };
+        let fallback = chart_fullname("platform");
+        let warning = denied
+            .fallback_warning("platform-ns", "platform", &fallback)
+            .expect("a failed probe must warn");
+
+        assert!(warning.contains("FAILED"), "{warning}");
+        assert!(warning.contains("Forbidden"), "{warning}");
+        assert!(warning.contains("platform-ns"), "the namespace: {warning}");
+        assert!(warning.contains("COMPUTED GUESS"), "{warning}");
+        assert!(warning.contains("platform-curie-<component>"), "{warning}");
+        assert!(
+            warning.contains("nameOverride/fullnameOverride"),
+            "{warning}"
+        );
+    }
+
+    /// The ambiguity warning has to be actionable: the namespace, the selector,
+    /// and every candidate name, so the operator can see the collision it has
+    /// to resolve.
+    #[test]
+    fn the_ambiguity_warning_names_the_selector_and_the_candidates() {
+        let ambiguous = ComponentDiscovery::Ambiguous {
+            component: "api".to_string(),
+            names: vec![
+                "platform-curie-api".to_string(),
+                "unexpected-api".to_string(),
+            ],
+        };
+        let fallback = chart_fullname("platform");
+        let warning = ambiguous
+            .fallback_warning("platform-ns", "platform", &fallback)
+            .expect("an ambiguous match must warn");
+
+        assert!(warning.contains("platform-ns"), "{warning}");
+        assert!(
+            warning.contains(&component_selector("platform", "api")),
+            "{warning}"
+        );
+        assert!(warning.contains("platform-curie-api"), "{warning}");
+        assert!(warning.contains("unexpected-api"), "{warning}");
+        assert!(warning.contains("COMPUTED GUESS"), "{warning}");
+    }
+
+    /// A resolved name wins from either probe; otherwise a PROBLEM outranks
+    /// absence, so a denied api probe is not buried by an absent worker.
+    #[test]
+    fn a_probe_problem_outranks_an_absent_second_probe() {
+        let denied = ComponentDiscovery::ProbeFailed {
+            component: "api".to_string(),
+            detail: "forbidden".to_string(),
+        };
+        let absent = ComponentDiscovery::NotPresent;
+        let found = ComponentDiscovery::Found(chart_fullname("platform"));
+
+        assert_eq!(
+            preferred_probe_outcome(denied.clone(), absent.clone()),
+            denied
+        );
+        assert_eq!(
+            preferred_probe_outcome(absent.clone(), denied.clone()),
+            denied
+        );
+        // A real answer from either probe still wins.
+        assert_eq!(preferred_probe_outcome(denied, found.clone()), found);
+        assert_eq!(
+            preferred_probe_outcome(absent.clone(), absent.clone()),
+            absent
+        );
+    }
+
+    // --- the chart Secret's offline name --------------------------------------
+
+    /// `release_secret_name_or_default` fell back to `format!("{release}-secrets")`,
+    /// the raw chart-resource form #1533 names explicitly. A `platform` install
+    /// renders `platform-curie-secrets`, so the old fallback had `migrate-store`
+    /// stage a pod against a Secret that does not exist. The fallback is now the
+    /// `secrets` resource of `chart_fullname`, pinned here as a literal rather
+    /// than by re-deriving it.
+    #[test]
+    fn the_secret_fallback_uses_the_chart_rule_for_a_non_default_release() {
+        assert_eq!(
+            chart_fullname("platform").resource("secrets"),
+            "platform-curie-secrets"
+        );
+        assert_eq!(
+            chart_fullname("acme-prod").resource("secrets"),
+            "acme-prod-curie-secrets"
+        );
+    }
+
+    /// The negative control for that change: `"curie".contains("curie")`, so
+    /// the default release's Secret name is byte-identical to the computed
+    /// `format!("{release}-secrets")` it replaced. Every local, CI, and
+    /// parity-ladder install uses `--release curie`.
+    #[test]
+    fn the_secret_fallback_is_byte_identical_for_the_default_release() {
+        assert_eq!(chart_fullname("curie").resource("secrets"), "curie-secrets");
+        assert_eq!(
+            chart_fullname("my-curie-prod").resource("secrets"),
+            "my-curie-prod-secrets"
+        );
+    }
+
+    // --- rendered argv for a non-default release ------------------------------
+
+    /// `cluster status` under a release that does not contain the chart name.
+    /// The literals are what `helm template platform charts/curie` actually
+    /// renders; before this change the CLI asked for `platform-ui` and
+    /// `platform-langfuse-web`, which do not exist.
+    #[test]
+    fn status_queries_the_chart_rendered_services_for_a_non_default_release() {
+        let o = opts("platform", "platform-ns");
+        let lines: Vec<String> = status_commands(&o, &chart_fullname("platform"))
+            .iter()
+            .map(OpsCommand::display)
+            .collect();
+
+        assert!(
+            lines.contains(&"kubectl get svc platform-curie-ui -n platform-ns -o json".to_string()),
+            "status must query the chart-rendered ui Service: {lines:#?}"
+        );
+        assert!(
+            lines.contains(
+                &"kubectl get svc platform-curie-langfuse-web -n platform-ns -o json".to_string()
+            ),
+            "status must query the chart-rendered langfuse Service: {lines:#?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("svc platform-ui ")
+                || line.contains("svc platform-langfuse-web ")),
+            "the raw release name must not reach a service query: {lines:#?}"
+        );
+    }
+
+    /// `cluster observability` resolves the same two Services and had the same
+    /// defect.
+    #[test]
+    fn observability_queries_the_chart_rendered_services_for_a_non_default_release() {
+        let o = opts("platform", "platform-ns");
+        let lines: Vec<String> = observability_commands(&o, &chart_fullname("platform"))
+            .iter()
+            .map(OpsCommand::display)
+            .collect();
+
+        assert!(
+            lines.contains(&"kubectl get svc platform-curie-ui -n platform-ns -o json".to_string()),
+            "observability must query the chart-rendered ui Service: {lines:#?}"
+        );
+        assert!(
+            lines.contains(
+                &"kubectl get svc platform-curie-langfuse-web -n platform-ns -o json".to_string()
+            ),
+            "observability must query the chart-rendered langfuse Service: {lines:#?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("svc platform-ui ")
+                || line.contains("svc platform-langfuse-web ")),
+            "the raw release name must not reach a service query: {lines:#?}"
+        );
+    }
+
+    /// The default release renders the same argv it always has. The sibling
+    /// `status_lists_the_readonly_commands` pins this at the argv level too;
+    /// this is the observability half of that control.
+    #[test]
+    fn the_default_release_renders_the_same_service_argv_it_always_did() {
+        let o = opts("curie", "curie");
+        let lines: Vec<String> = observability_commands(&o, &chart_fullname("curie"))
+            .iter()
+            .map(OpsCommand::display)
+            .collect();
+
+        assert!(
+            lines.contains(&"kubectl get svc curie-ui -n curie -o json".to_string()),
+            "{lines:#?}"
+        );
+        assert!(
+            lines.contains(&"kubectl get svc curie-langfuse-web -n curie -o json".to_string()),
+            "{lines:#?}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod api_key_discovery_tests {
 
     // --- #1030: the worker Deployment lookup ---------------------------------
@@ -4041,12 +4528,16 @@ pub fn up_commands(o: &UpOpts) -> Vec<OpsCommand> {
 }
 
 /// The read-only commands `curie cluster status` runs (and prints under `--dry-run`).
-pub fn status_commands(o: &CommonOpts) -> Vec<OpsCommand> {
+///
+/// Pure: the caller resolves the release's [`ReleaseFullname`] and passes it in
+/// (live for a real run, [`chart_fullname`] under `--dry-run`), so this builder
+/// still makes no cluster call of its own.
+pub fn status_commands(o: &CommonOpts, fullname: &ReleaseFullname) -> Vec<OpsCommand> {
     vec![
         helm_status_cmd(o),
         pods_cmd(o),
-        svc_cmd(o, "ui"),
-        svc_cmd(o, "langfuse-web"),
+        svc_cmd(o, fullname, "ui"),
+        svc_cmd(o, fullname, "langfuse-web"),
         kubeconfig_host_cmd(),
     ]
 }
@@ -4077,13 +4568,20 @@ fn pods_cmd(o: &CommonOpts) -> OpsCommand {
     )
 }
 
-fn svc_cmd(o: &CommonOpts, suffix: &str) -> OpsCommand {
+/// `kubectl get svc <fullname>-<suffix> -n <ns> -o json`.
+///
+/// The choke point for every release Service the CLI reads. It takes a resolved
+/// [`ReleaseFullname`], never the release name: the chart names each Service
+/// `{{ include "curie.fullname" . }}-<component>`, which equals
+/// `<release>-<component>` only when the release name happens to contain the
+/// chart name (#1533).
+fn svc_cmd(o: &CommonOpts, fullname: &ReleaseFullname, suffix: &str) -> OpsCommand {
     OpsCommand::new(
         "kubectl",
         vec![
             plain("get"),
             plain("svc"),
-            plain(format!("{}-{}", o.release, suffix)),
+            plain(fullname.resource(suffix)),
             plain("-n"),
             plain(&o.namespace),
             plain("-o"),
@@ -5285,8 +5783,9 @@ async fn run_prepared_up(
     // label match the Deployment's own `selectorLabels` regardless of any
     // `nameOverride`/`fullnameOverride`, so this is correct in every case.
     let restart_hint = format!(
-        "kubectl -n {} rollout restart deployment -l app.kubernetes.io/instance={},app.kubernetes.io/component=api",
-        opts.common.namespace, opts.common.release
+        "kubectl -n {} rollout restart deployment -l {}",
+        opts.common.namespace,
+        component_selector(&opts.common.release, "api")
     );
     // An explicit but EMPTY `--github-token` / `CURIE_GITHUB_TOKEN`: a routine
     // shell accident that preserves rather than clears (`resolve_github_token`),
@@ -5632,8 +6131,12 @@ impl crate::ui::CliOutput for ClusterStatusOutput {
 
 pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
     if opts.dry_run {
+        // A dry run makes no cluster call, so the release's fullname cannot be
+        // discovered and the chart's no-override rule is the honest best guess.
+        // `dry_run_fullname` computes it and emits the caveat that says so.
+        let fullname = dry_run_fullname(&opts.release);
         return Ok(ClusterStatusOutput::DryRun(crate::ui::DryRunPlan {
-            lines: status_commands(&opts)
+            lines: status_commands(&opts, &fullname)
                 .iter()
                 .map(|cmd| cmd.display())
                 .collect(),
@@ -5677,11 +6180,18 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
         (Vec::new(), 0, 0, Vec::new())
     };
 
-    // (c) URL discovery.
-    let host = discover_host().await;
+    // (c) URL discovery. Resolve the release's rendered fullname once, here on
+    // the live branch -- `--dry-run` returned above without touching kubectl.
+    // The host lookup does not depend on the fullname, so the two run
+    // concurrently rather than paying for each other's round-trip; the service
+    // reads below need both and fan out after.
+    let (fullname, host) = tokio::join!(
+        release_fullname(&opts.namespace, &opts.release),
+        discover_host(),
+    );
     let urls = vec![
-        resolve_service_url(&opts, "ui", "UI", &host, true).await,
-        resolve_service_url(&opts, "langfuse-web", "Langfuse", &host, false).await,
+        resolve_service_url(&opts, &fullname, "ui", "UI", &host, true).await,
+        resolve_service_url(&opts, &fullname, "langfuse-web", "Langfuse", &host, false).await,
     ];
 
     Ok(ClusterStatusOutput::Status(Box::new(ClusterStatus {
@@ -6065,8 +6575,9 @@ fn deployed_release_namespace(
 }
 
 /// Discover a Helm release's platform API key by reading it out of the chart
-/// Secret (`<release>-secrets`, data key `apiKey`), decoded server-side by
-/// kubectl's `base64decode` so the plaintext never lands in argv (#524). The
+/// Secret (data key `apiKey`), whose name is discovered by label selector
+/// rather than computed -- see [`release_secret_name`] -- decoded server-side
+/// by kubectl's `base64decode` so the plaintext never lands in argv (#524). The
 /// governance verbs use this so they authenticate against a REAL release whose
 /// `api.apiKey` was randomized at `cluster up`, instead of silently sending the
 /// dev sentinel `curie-dev-key` and 401-ing. An explicit `--api-key`/env still
@@ -6183,7 +6694,8 @@ fn valkey_password_usage_err(msg: impl Into<String>) -> anyhow::Error {
 }
 
 /// Discover a Helm release's Valkey password from the same chart Secret
-/// (`<release>-secrets`, data key `valkeyPassword`). `cluster message` enqueues
+/// (name discovered by label selector -- see [`release_secret_name`] -- data
+/// key `valkeyPassword`). `cluster message` enqueues
 /// onto the release's Valkey, whose password `cluster up` randomizes, so without
 /// this the dev sentinel `valkeypass` reaches a strong-secrets install and the
 /// connection fails authentication (#786). An explicit
@@ -6209,12 +6721,13 @@ fn slack_bot_token_usage_err(msg: impl Into<String>) -> anyhow::Error {
 }
 
 /// Discover a Helm release's Slack bot token from the chart Secret
-/// (`<release>-secrets`, data key `slackBotToken`), or from the operator's own
+/// (name discovered by label selector -- see [`release_secret_name`] -- data
+/// key `slackBotToken`), or from the operator's own
 /// `dispatcher.slack.botTokenExistingSecret` when one is configured (#1759).
 /// In connected mode `cluster message` posts a real placeholder to the
 /// workspace with this token so the approval card and resumed reply ride the
 /// connected transport, instead of the throwaway stub (#770/ADR-0078). Only
-/// reached when a `<release>-dispatcher` is present (a workspace IS
+/// reached when the release's dispatcher Deployment is present (a workspace IS
 /// connected), so the token is expected to be set; an empty or unreadable
 /// value is an actionable error. The value is never printed -- it flows only
 /// into the `chat.postMessage` auth header.
@@ -6264,7 +6777,24 @@ pub enum SlackApiBase {
 /// defect `release_secret_name` already avoids by selecting on labels, and this
 /// selects the same way for the same reason.
 fn worker_deployment_selector(release: &str) -> String {
-    format!("app.kubernetes.io/instance={release},app.kubernetes.io/component=worker")
+    component_selector(release, "worker")
+}
+
+/// The label pair that finds one component of a release whatever it is named.
+///
+/// `curie.selectorLabels` (`charts/curie/templates/_helpers.tpl:40-44`) emits
+/// `app.kubernetes.io/instance: {{ .Release.Name }}` and
+/// `app.kubernetes.io/component: {{ .component }}` and reads NEITHER
+/// `nameOverride` nor `fullnameOverride`, so these labels are stable on exactly
+/// the installs whose rendered NAMES are not. One spelling, because three
+/// hand-built copies of the same pair is three places for it to drift from the
+/// chart.
+///
+/// Not the shape [`release_secret_name`] uses: that one deliberately selects on
+/// `instance` alone and filters by name suffix, because the chart Secret
+/// carries no component label.
+fn component_selector(release: &str, component: &str) -> String {
+    format!("app.kubernetes.io/instance={release},app.kubernetes.io/component={component}")
 }
 
 /// Parse `kubectl get deployment -o jsonpath=...` output into an outcome.
@@ -6318,7 +6848,7 @@ pub async fn discover_slack_api_base_url(namespace: &str, release: &str) -> Slac
     }
 }
 
-/// Whether a `<release>-dispatcher` Deployment exists in `namespace` -- i.e. a
+/// Whether the release's dispatcher Deployment exists in `namespace` -- i.e. a
 /// real Slack workspace is connected (via `curie cluster comms --slack`). In
 /// that case `cluster message` posts a real placeholder and routes the approval
 /// card + resumed reply over that connected transport rather than a throwaway
@@ -6328,6 +6858,12 @@ pub async fn discover_slack_api_base_url(namespace: &str, release: &str) -> Slac
 /// absent Deployment an empty success, so "connected" is exactly "non-empty
 /// output on a zero exit".
 pub async fn dispatcher_connected(namespace: &str, release: &str) -> bool {
+    // The chart renders `{{ curie.fullname }}-dispatcher`, so the name must be
+    // resolved and not computed from the release. `--ignore-not-found` turns a
+    // wrong name into a confident empty success, which reads as "no workspace
+    // connected" -- a silent wrong answer rather than a visible failure (#1533).
+    let fullname = release_fullname(namespace, release).await;
+    let dispatcher = fullname.resource("dispatcher");
     let cmd = OpsCommand::new(
         "kubectl",
         vec![
@@ -6335,7 +6871,7 @@ pub async fn dispatcher_connected(namespace: &str, release: &str) -> bool {
             plain(namespace),
             plain("get"),
             plain("deployment"),
-            plain(format!("{release}-dispatcher")),
+            plain(&dispatcher),
             plain("--ignore-not-found"),
             plain("-o"),
             plain("name"),
@@ -6351,7 +6887,7 @@ pub async fn dispatcher_connected(namespace: &str, release: &str) -> bool {
         Ok((false, _, err)) => {
             crate::ui::ui().warn(&format!(
                 "could not determine whether a Slack workspace is connected \
-                 (kubectl probe for {release}-dispatcher failed: {}); assuming \
+                 (kubectl probe for {dispatcher} failed: {}); assuming \
                  NOT connected and using the local reply stub",
                 err.trim().lines().next().unwrap_or("no stderr")
             ));
@@ -6418,17 +6954,365 @@ pub fn pick_release_secret(names: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The chart Secret's name, falling back to the historical guess.
+/// The chart Secret's name, falling back to the chart's own naming rule.
 ///
 /// A caller that must NAME the Secret (rather than read through it) still needs
 /// a string when the cluster is unreachable -- a `--dry-run` plan, for
-/// instance. The fallback is the old computed form, which is right for the
-/// installs that set `nameOverride` and wrong in exactly the way this function
-/// exists to fix, so it is a last resort and never silent in a live run.
+/// instance. That fallback used to be `format!("{release}-secrets")`, the raw
+/// chart-resource form this sweep exists to delete: for an ordinary `platform`
+/// install the chart renders `platform-curie-secrets`, so a transient discovery
+/// failure had `migrate-store` stage a pod against a Secret that does not
+/// exist. It now goes through [`chart_fullname`], which is the chart's
+/// no-override rule and byte-identical for the default `curie` release.
+///
+/// Only the FALLBACK changed. Live discovery still selects on the instance
+/// label alone and filters by suffix afterwards ([`pick_release_secret`]),
+/// which is what makes it correct under `nameOverride`/`fullnameOverride`.
 pub async fn release_secret_name_or_default(namespace: &str, release: &str) -> String {
     release_secret_name(namespace, release)
         .await
-        .unwrap_or_else(|| format!("{release}-secrets"))
+        .unwrap_or_else(|| chart_fullname(release).resource("secrets"))
+}
+
+/// A release's rendered `curie.fullname` -- the prefix every Curie-owned object
+/// in the chart is named from.
+///
+/// A newtype rather than a bare `String` on purpose. Every affected call site
+/// used to build `format!("{release}-{component}")` from a raw release name, so
+/// a `&str` parameter merely RENAMED to `fullname` would still compile when a
+/// caller passed the release name -- the original defect, type-checked as
+/// correct. This value is constructible only by [`chart_fullname`] and
+/// [`release_fullname`], so a raw release name cannot reach a resource name at
+/// all, and the compiler finds every site that has not been routed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseFullname(String);
+
+impl ReleaseFullname {
+    /// The chart's name for one of the release's components:
+    /// `{{ include "curie.fullname" . }}-<component>`
+    /// (`charts/curie/templates/_helpers.tpl:16-26`).
+    ///
+    /// The suffix is appended AFTER the fullname's own `trunc 63`, exactly as
+    /// the chart templates do, so a rendered object name can legitimately
+    /// exceed 63 characters. Truncating the joined string instead would name an
+    /// object helm never created; `truncation_happens_before_the_component_suffix`
+    /// pins the ordering.
+    pub fn resource(&self, component: &str) -> String {
+        format!("{}-{component}", self.0)
+    }
+
+    /// The fullname itself, for a caller that needs the prefix rather than a
+    /// component's name.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The chart's `curie.fullname` computed from the release name alone.
+///
+/// **Offline fallback only.** This is the chart's NO-OVERRIDE path
+/// (`charts/curie/templates/_helpers.tpl:16-26`):
+///
+/// ```text
+/// fullnameOverride                 if set
+/// .Release.Name                    if it contains the chart name
+/// "{.Release.Name}-curie"          otherwise
+///                                  ... then | trunc 63 | trimSuffix "-"
+/// ```
+///
+/// It cannot see `nameOverride` or `fullnameOverride`, and both move the
+/// rendered name somewhere this rule computes WRONGLY: `helm template platform
+/// charts/curie --set fullnameOverride=platform` renders `platform-api` while
+/// this rule says `platform-curie-api`. So a live path calls
+/// [`release_fullname`], which asks the cluster and only falls back here when
+/// the cluster cannot answer (`--dry-run`, no kubectl, no release yet).
+/// `cli/tests/chart_fullname_parity.rs` pins both the rule and its limit
+/// against the chart's own render.
+pub fn chart_fullname(release: &str) -> ReleaseFullname {
+    const CHART_NAME: &str = "curie";
+
+    let fullname = if release.contains(CHART_NAME) {
+        release.to_string()
+    } else {
+        format!("{release}-{CHART_NAME}")
+    };
+    // `trunc 63` first, then `trimSuffix "-"`, with sprig's exact semantics:
+    // `trimSuffix` removes EXACTLY ONE trailing dash where
+    // `str::trim_end_matches('-')` removes all of them. Confirmed against the
+    // chart rather than against a reading of sprig -- `--set
+    // fullnameOverride=<61 a's>--<10 z's>` renders the api Service as
+    // `<61 a's>--api`, so one dash survives for the component suffix to join to.
+    let truncated: String = fullname.chars().take(63).collect();
+    let trimmed = truncated.strip_suffix('-').unwrap_or(truncated.as_str());
+    ReleaseFullname(trimmed.to_string())
+}
+
+/// The fullname a `--dry-run` plan prints, plus the caveat that goes with it.
+///
+/// A dry run makes no cluster call, so the release's rendered name cannot be
+/// discovered and [`chart_fullname`]'s no-override rule is the honest best
+/// guess. Every dry-run branch owes the reader the same caveat, so the note
+/// lives with the value rather than being restated at each verb.
+fn dry_run_fullname(release: &str) -> ReleaseFullname {
+    let fullname = chart_fullname(release);
+    crate::ui::ui().note(&format!(
+        "dry run: service names assume the chart's default naming ({}); an install \
+         using nameOverride/fullnameOverride renders them differently",
+        fullname.resource("<component>")
+    ));
+    fullname
+}
+
+/// The fullname implied by a discovered object name, or `None` when that name
+/// does not carry the component suffix we selected on.
+///
+/// Pure, extracted for the same reason [`pick_release_secret`] is: the part
+/// that can be wrong is the selection rule, and it has to be testable with no
+/// cluster. Rejecting rather than blind-stripping is load-bearing -- a name
+/// that does not end in `-<component>` is not ours to truncate, and a
+/// confidently wrong fullname is worse than falling through to the chart rule.
+pub fn fullname_from_resource_name(name: &str, component: &str) -> Option<String> {
+    let fullname = name.trim().strip_suffix(&format!("-{component}"))?;
+    if fullname.is_empty() {
+        return None;
+    }
+    Some(fullname.to_string())
+}
+
+/// The outcome of one discovery probe, kept as four distinct cases on purpose.
+///
+/// The probe used to collapse "this release is not installed", "kubectl is not
+/// on PATH", "RBAC denied the read" and "two objects matched" into a single
+/// `None`, and the caller then silently computed a name. The distinction that
+/// matters: falling back for a genuinely ABSENT or not-yet-installed release is
+/// defensible -- `doctor` and a fresh namespace must still work -- while
+/// falling back because the probe FAILED is a guess dressed as an answer, and
+/// doing it silently is the defect. Each case is its own variant so
+/// [`release_fullname`] can say which one happened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComponentDiscovery {
+    /// Exactly one labelled object matched and its name carries the component
+    /// suffix: the release's rendered fullname, read off the cluster.
+    Found(ReleaseFullname),
+    /// The probe ran and answered: this release has no such object.
+    NotPresent,
+    /// The probe did not answer -- kubectl missing, unreachable API server,
+    /// RBAC denial, malformed request. Carries the first line of stderr.
+    ProbeFailed { component: String, detail: String },
+    /// More than one object carried the release's labels for this component.
+    /// Kubernetes does not enforce label uniqueness, so this is reachable with
+    /// a hand-applied or copy-pasted object, and taking `items[0]` would
+    /// silently point every downstream verb at a workload that is not ours.
+    Ambiguous {
+        component: String,
+        names: Vec<String>,
+    },
+}
+
+impl ComponentDiscovery {
+    /// The warning an operator must see before this outcome degrades into a
+    /// COMPUTED name, or `None` when degrading is the honest, normal thing.
+    ///
+    /// Pure, so the wording -- the part that has to be actionable -- is
+    /// testable with no cluster.
+    pub fn fallback_warning(
+        &self,
+        namespace: &str,
+        release: &str,
+        fallback: &ReleaseFullname,
+    ) -> Option<String> {
+        let guess = format!(
+            "the name being used, `{}`, is a COMPUTED GUESS from the chart's default \
+             naming and is WRONG on an install using nameOverride/fullnameOverride",
+            fallback.resource("<component>")
+        );
+        match self {
+            // A real answer needs no caveat, and an absent release is the
+            // documented reason this path has a fallback at all.
+            Self::Found(_) | Self::NotPresent => None,
+            Self::ProbeFailed { component, detail } => Some(format!(
+                "could not discover release `{release}` resource names in namespace \
+                 `{namespace}`: the kubectl probe for the `{component}` object FAILED \
+                 ({detail}). Continuing, but {guess}. Check kubectl access and RBAC \
+                 (get/list on services and deployments in `{namespace}`)."
+            )),
+            Self::Ambiguous { component, names } => Some(format!(
+                "refusing to choose: {} objects in namespace `{namespace}` match \
+                 `{}` ({}). Curie cannot tell which one belongs to release `{release}`, \
+                 so it targets NONE of them. Continuing, but {guess}. Relabel or remove \
+                 the objects that are not part of release `{release}`.",
+                names.len(),
+                component_selector(release, component),
+                names.join(", ")
+            )),
+        }
+    }
+}
+
+/// The outcome implied by the names a probe matched.
+///
+/// Pure, extracted for the same reason [`fullname_from_resource_name`] is: the
+/// cardinality rule is the part that can be wrong, and it has to be testable
+/// with no cluster.
+///
+/// EXACTLY ONE match resolves. Zero is absence. Two or more is
+/// [`ComponentDiscovery::Ambiguous`] and never `names[0]`: those labels are not
+/// unique by construction, so a stray Service named `unexpected-api` carrying
+/// the release's labels would otherwise resolve the fullname to `unexpected`
+/// and send `cluster message`/`comms`/`eval` at an unrelated workload.
+///
+/// Two legitimate releases are NOT this case: the selector pins
+/// `app.kubernetes.io/instance=<release>`, so another release's objects never
+/// match in the first place.
+pub fn component_discovery(names: &str, component: &str) -> ComponentDiscovery {
+    let matched: Vec<String> = names
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect();
+
+    match matched.len() {
+        0 => ComponentDiscovery::NotPresent,
+        1 => match fullname_from_resource_name(&matched[0], component) {
+            Some(fullname) => ComponentDiscovery::Found(ReleaseFullname(fullname)),
+            // Labelled for the component but not NAMED for it: not ours to
+            // truncate. Fall through to the next probe rather than mint a
+            // confidently wrong fullname.
+            None => ComponentDiscovery::NotPresent,
+        },
+        _ => ComponentDiscovery::Ambiguous {
+            component: component.to_string(),
+            names: matched,
+        },
+    }
+}
+
+/// One discovery probe: select the release's `<component>` objects by label and
+/// read their names back.
+///
+/// The jsonpath ranges over ALL matches rather than reading `.items[0]`, so
+/// cardinality is observable at all -- a single-item jsonpath cannot tell one
+/// match from three.
+async fn discover_component_fullname(
+    namespace: &str,
+    release: &str,
+    kind: &str,
+    component: &str,
+) -> ComponentDiscovery {
+    let cmd = OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("-n"),
+            plain(namespace),
+            plain("get"),
+            plain(kind),
+            plain("-l"),
+            plain(component_selector(release, component)),
+            plain("-o"),
+            plain("jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{end}"),
+        ],
+    );
+    match run_capture(&cmd).await {
+        Ok((true, out, _err)) => component_discovery(&out, component),
+        Ok((false, _out, err)) => {
+            let detail = err.trim().lines().next().unwrap_or("no stderr");
+            ComponentDiscovery::ProbeFailed {
+                component: component.to_string(),
+                detail: detail.to_string(),
+            }
+        }
+        Err(exc) => ComponentDiscovery::ProbeFailed {
+            component: component.to_string(),
+            detail: exc.to_string(),
+        },
+    }
+}
+
+/// Which of the two probes' outcomes to report.
+///
+/// A resolved name wins from either probe. Otherwise a PROBLEM (a failed probe,
+/// an ambiguous match) outranks absence, because absence is the one case that
+/// degrades silently and it must not mask the other two.
+fn preferred_probe_outcome(
+    api: ComponentDiscovery,
+    worker: ComponentDiscovery,
+) -> ComponentDiscovery {
+    if matches!(api, ComponentDiscovery::Found(_)) {
+        return api;
+    }
+    if matches!(worker, ComponentDiscovery::Found(_)) {
+        return worker;
+    }
+    if matches!(api, ComponentDiscovery::NotPresent) {
+        return worker;
+    }
+    api
+}
+
+/// The release's rendered fullname, read off the cluster.
+///
+/// Discovered rather than computed for the same reason [`release_secret_name`]
+/// is: `nameOverride` and `fullnameOverride` both change the rendered name and
+/// neither is visible from the release name alone. It works because
+/// `curie.selectorLabels` (`charts/curie/templates/_helpers.tpl:40-44`) emits
+/// `app.kubernetes.io/instance: {{ .Release.Name }}` and
+/// `app.kubernetes.io/component: {{ .component }}` and reads NEITHER override,
+/// so the labels stay stable on exactly the installs whose NAMES do not.
+/// Verified against both override renders, and pinned by
+/// `overrides_preserve_the_discovery_labels`.
+///
+/// Two probes, deliberately: the api Service first, then the worker Deployment.
+/// `api.deploy=false` is a supported install with no api Service, and the
+/// worker Deployment still carries the release labels.
+///
+/// Neither probe picks among matches. `app.kubernetes.io/instance=<release>`
+/// separates two legitimate releases, but nothing in Kubernetes stops a stray
+/// object from carrying the same pair of labels, so a set of size two or more
+/// is refused rather than resolved -- see [`component_discovery`].
+async fn discover_release_fullname(namespace: &str, release: &str) -> ComponentDiscovery {
+    let api = discover_component_fullname(namespace, release, "svc", "api").await;
+    if matches!(api, ComponentDiscovery::Found(_)) {
+        return api;
+    }
+    let worker = discover_component_fullname(namespace, release, "deployment", "worker").await;
+    preferred_probe_outcome(api, worker)
+}
+
+/// The release's fullname: discovered from the cluster, falling back to the
+/// chart's no-override rule.
+///
+/// THE live entry point. Every path that can reach a cluster resolves here, and
+/// [`chart_fullname`] is what it degrades to. Discovery finding nothing is
+/// normal rather than an error -- `doctor` and a not-yet-installed release must
+/// still work -- so this never fails.
+///
+/// It is not, however, silent about WHY it degraded. A failed probe (RBAC
+/// denial, no kubectl, unreachable API server) and an ambiguous match both warn
+/// before the computed name is used, because on an install using
+/// `nameOverride`/`fullnameOverride` that name is known to be wrong: without
+/// the warning `cluster status` reports "not found" for a Service that exists
+/// and a self-plumbed deploy fails against a name helm never rendered. Control
+/// flow is deliberately unchanged -- the fallback still happens, loudly.
+/// Failing mutating verbs closed on a failed probe is the stronger fix and is
+/// left as a follow-up policy decision.
+///
+/// Resolve LAZILY, on the branch that actually needs a cluster-derived name.
+/// Resolving at a verb's entry point fires kubectl on the explicit-`--api-url`
+/// and `--dry-run` paths, which are contractually cluster-offline
+/// (`cli/tests/cluster_connection_transport.rs`). Under `--dry-run`, call
+/// [`chart_fullname`] directly and make no cluster call at all.
+pub async fn release_fullname(namespace: &str, release: &str) -> ReleaseFullname {
+    match discover_release_fullname(namespace, release).await {
+        ComponentDiscovery::Found(fullname) => fullname,
+        outcome => {
+            let fallback = chart_fullname(release);
+            if let Some(warning) = outcome.fallback_warning(namespace, release, &fallback) {
+                crate::ui::ui().warn(&warning);
+            }
+            fallback
+        }
+    }
 }
 
 /// The release's sealing keys (ADR-0094): current first, then the previous one
@@ -6592,24 +7476,33 @@ pub async fn discover_api_url(namespace: &str, release: &str) -> Result<String> 
         release: release.to_string(),
         dry_run: false,
     };
+    // This function is only reached when no `--api-url` was supplied, so it is
+    // already a cluster path: resolving the fullname here keeps the explicit
+    // `--api-url` and `--dry-run` routes free of any kubectl call.
+    let fullname = release_fullname(namespace, release).await;
+    let ui_svc = fullname.resource("ui");
+    let api_svc = fullname.resource("api");
     let host = resolve_node_host().await;
 
-    if let Ok((true, ui_json, _)) = run_capture(&svc_cmd(&common, "ui")).await {
+    if let Ok((true, ui_json, _)) = run_capture(&svc_cmd(&common, &fullname, "ui")).await {
         return ui_api_url_from_parts(&ui_json, host.as_deref());
     }
 
     // No UI. The api service may still be reachable on its own NodePort.
-    if let Ok((true, api_json, _)) = run_capture(&svc_cmd(&common, "api")).await {
+    if let Ok((true, api_json, _)) = run_capture(&svc_cmd(&common, &fullname, "api")).await {
         if let Some(url) = api_url_from_parts(&api_json, host.as_deref()) {
             return Ok(url);
         }
+        // The port-forward hint names 8000:8000, not the old 8123: `cluster
+        // deploy` no longer binds 8123 for its own tunnel, and a hint naming
+        // that exact port would send the operator at the thing #1533 fixed.
         return Err(api_url_usage_err(format!(
-            "the {release}-ui service is absent (ui.deploy=false?) and {release}-api is not NodePort-exposed, so there is no reachable platform API URL; expose it with --set api.service.type=NodePort, or pass --api-url (e.g. via `kubectl port-forward svc/{release}-api 8123:8000`)"
+            "the {ui_svc} service is absent (ui.deploy=false?) and {api_svc} is not NodePort-exposed, so there is no reachable platform API URL; expose it with --set api.service.type=NodePort, or pass --api-url (e.g. via `kubectl port-forward svc/{api_svc} 8000:8000`)"
         )));
     }
 
     Err(api_url_usage_err(format!(
-        "could not read the {release}-ui or {release}-api service in namespace {namespace} to discover the platform API URL; pass --api-url to target the API directly"
+        "could not read the {ui_svc} or {api_svc} service in namespace {namespace} to discover the platform API URL; pass --api-url to target the API directly"
     )))
 }
 
@@ -6720,14 +7613,20 @@ impl ServiceUrl {
     }
 }
 
+/// One `cluster status` URL row.
+///
+/// The displayed `name` and the name `svc_cmd` QUERIES come from the same
+/// resolved fullname on purpose: they diverged before, so status could report a
+/// service it had never asked about.
 async fn resolve_service_url(
     o: &CommonOpts,
+    fullname: &ReleaseFullname,
     suffix: &str,
     label: &str,
     host: &str,
     api: bool,
 ) -> ServiceUrl {
-    let name = format!("{}-{}", o.release, suffix);
+    let name = fullname.resource(suffix);
     let mk = |kind| ServiceUrl {
         label: label.to_string(),
         name: name.clone(),
@@ -6735,7 +7634,7 @@ async fn resolve_service_url(
         api,
         kind,
     };
-    let (ok, out, _) = match run_capture(&svc_cmd(o, suffix)).await {
+    let (ok, out, _) = match run_capture(&svc_cmd(o, fullname, suffix)).await {
         Ok(res) => res,
         Err(_) => return mk(ServiceUrlKind::NotFound),
     };
@@ -6848,7 +7747,7 @@ fn port_forward_hint(ns: &str, name: &str, local: u16, port: u16, path: &str) ->
     )
 }
 
-/// The platform API service's port (`{release}-api`, `api.service.port` in the
+/// The platform API service's port (`<fullname>-api`, `api.service.port` in the
 /// chart). Owned here so the port-forward hint carries no bare literal.
 const API_SERVICE_PORT: u16 = 8000;
 
@@ -6864,6 +7763,7 @@ const API_SERVICE_PORT: u16 = 8000;
 /// service -- plain text, since `--json` serializes this note.
 fn api_base_endpoint(
     o: &CommonOpts,
+    fullname: &ReleaseFullname,
     ui_svc_json: Option<&str>,
     host: Option<&str>,
 ) -> crate::observability::Endpoint {
@@ -6874,19 +7774,23 @@ fn api_base_endpoint(
         browsable: false,
     };
     let Some(ui_svc_json) = ui_svc_json else {
-        return row(None, Some(format!("service {}-ui not found", o.release)));
+        return row(
+            None,
+            Some(format!("service {} not found", fullname.resource("ui"))),
+        );
     };
     match ui_api_url_from_parts(ui_svc_json, host) {
         Ok(url) => row(Some(url), None),
         // Any other failure -- ClusterIP / `--no-expose` (a supported install
         // mode), an unassigned nodePort, an unreadable service, or an
         // unresolvable host -- still leaves a way in: port-forward the API
-        // service directly.
+        // service directly. The operator copies and runs that line, so it must
+        // name the object the chart actually rendered.
         Err(_) => row(
             None,
             Some(port_forward_hint(
                 &o.namespace,
-                &format!("{}-api", o.release),
+                &fullname.resource("api"),
                 API_SERVICE_PORT,
                 API_SERVICE_PORT,
                 "",
@@ -6901,13 +7805,14 @@ fn api_base_endpoint(
 /// port-forward.
 fn service_surface(
     o: &CommonOpts,
+    fullname: &ReleaseFullname,
     suffix: &str,
     name: &str,
     svc_json: Option<&str>,
     host: Option<&str>,
     api: bool,
 ) -> crate::observability::Endpoint {
-    let svc_name = format!("{}-{}", o.release, suffix);
+    let svc_name = fullname.resource(suffix);
     let degraded = |note: String| crate::observability::Endpoint {
         name: name.to_string(),
         url: None,
@@ -6944,8 +7849,8 @@ fn service_surface(
 }
 
 /// Fetch one release service's JSON, or None when kubectl cannot read it.
-async fn fetch_service(o: &CommonOpts, suffix: &str) -> Option<String> {
-    match run_capture(&svc_cmd(o, suffix)).await {
+async fn fetch_service(o: &CommonOpts, fullname: &ReleaseFullname, suffix: &str) -> Option<String> {
+    match run_capture(&svc_cmd(o, fullname, suffix)).await {
         Ok((true, out, _)) => Some(out),
         _ => None,
     }
@@ -6967,14 +7872,24 @@ pub async fn cluster_observability_endpoints(
     // URL-producing path (`discover_api_url`) and the `api_base_endpoint`
     // row. `cluster status` stays human-facing and keeps its display
     // convenience.
-    let (host, ui_svc, langfuse_svc) = tokio::join!(
+    //
+    // Resolved once, before the fan-out: both service reads and all three rows
+    // must agree on the release's rendered name. This is a live path only --
+    // `observability`'s `--dry-run` branch returns before reaching here.
+    // `resolve_node_host()` needs no fullname, so it runs alongside the
+    // resolution instead of behind it; only the service reads have to wait.
+    let (fullname, host) = tokio::join!(
+        release_fullname(&opts.namespace, &opts.release),
         resolve_node_host(),
-        fetch_service(opts, "ui"),
-        fetch_service(opts, "langfuse-web"),
+    );
+    let (ui_svc, langfuse_svc) = tokio::join!(
+        fetch_service(opts, &fullname, "ui"),
+        fetch_service(opts, &fullname, "langfuse-web"),
     );
     vec![
         service_surface(
             opts,
+            &fullname,
             "ui",
             "Curie Console",
             ui_svc.as_deref(),
@@ -6983,13 +7898,14 @@ pub async fn cluster_observability_endpoints(
         ),
         service_surface(
             opts,
+            &fullname,
             "langfuse-web",
             "Langfuse UI (traces / cost / evals)",
             langfuse_svc.as_deref(),
             host.as_deref(),
             false,
         ),
-        api_base_endpoint(opts, ui_svc.as_deref(), host.as_deref()),
+        api_base_endpoint(opts, &fullname, ui_svc.as_deref(), host.as_deref()),
     ]
 }
 
@@ -6998,12 +7914,12 @@ pub async fn cluster_observability_endpoints(
 ///
 /// A superset of what actually runs, not a 1:1 trace: `resolve_node_host` only
 /// falls through to `nodes_cmd()` when `kubeconfig_host_cmd()` yields no host.
-pub fn observability_commands(o: &CommonOpts) -> Vec<OpsCommand> {
+pub fn observability_commands(o: &CommonOpts, fullname: &ReleaseFullname) -> Vec<OpsCommand> {
     vec![
         kubeconfig_host_cmd(),
         nodes_cmd(),
-        svc_cmd(o, "ui"),
-        svc_cmd(o, "langfuse-web"),
+        svc_cmd(o, fullname, "ui"),
+        svc_cmd(o, fullname, "langfuse-web"),
     ]
 }
 
@@ -7017,9 +7933,13 @@ pub async fn observability(
     open: bool,
 ) -> Result<crate::observability::ObservabilityOutput> {
     if opts.dry_run {
+        // No cluster call, so no discovery: the printed names follow the
+        // chart's no-override rule and an override install renders them
+        // differently. `dry_run_fullname` emits that caveat with the value.
+        let fullname = dry_run_fullname(&opts.release);
         return Ok(crate::observability::ObservabilityOutput::DryRun(
             crate::ui::DryRunPlan {
-                lines: observability_commands(&opts)
+                lines: observability_commands(&opts, &fullname)
                     .iter()
                     .map(|cmd| cmd.display())
                     .collect(),
@@ -7049,6 +7969,14 @@ mod tests {
             release: "curie".into(),
             dry_run: false,
         }
+    }
+
+    /// The default release's resolved fullname, for the builders that now take
+    /// one. `curie` contains the chart name, so this is byte-identical to the
+    /// names these tests have always asserted -- see
+    /// `chart_fullname_tests::the_default_release_is_a_byte_identical_no_op`.
+    fn fullname() -> ReleaseFullname {
+        chart_fullname("curie")
     }
 
     #[test]
@@ -8842,7 +9770,7 @@ mod tests {
 
     #[test]
     fn status_lists_the_readonly_commands() {
-        let cmds = status_commands(&common());
+        let cmds = status_commands(&common(), &fullname());
         let lines: Vec<String> = cmds.iter().map(OpsCommand::display).collect();
         assert_eq!(lines[0], "helm status curie -n curie");
         assert_eq!(lines[1], "kubectl get pods -n curie -o json");
@@ -9785,7 +10713,7 @@ mod tests {
     fn api_base_endpoint_maps_ui_service_to_a_non_browsable_api_endpoint() {
         // A NodePort ui service resolves to the UI /api proxy URL (#360) and is
         // NEVER browsable -- it is an agent target, not a webapp.
-        let ep = api_base_endpoint(&common(), Some(NODEPORT_SVC), Some("10.0.0.5"));
+        let ep = api_base_endpoint(&common(), &fullname(), Some(NODEPORT_SVC), Some("10.0.0.5"));
         assert_eq!(ep.name, "Curie API");
         assert_eq!(ep.url.as_deref(), Some("http://10.0.0.5:31234/api"));
         assert_eq!(ep.note, None);
@@ -9796,7 +10724,7 @@ mod tests {
     fn api_base_endpoint_degrades_to_a_note_when_the_ui_service_is_unreadable() {
         // Unreadable ui service: degrade to a note endpoint rather than failing
         // the whole command, and never smuggle the message into `url`.
-        let ep = api_base_endpoint(&common(), Some(""), Some("10.0.0.5"));
+        let ep = api_base_endpoint(&common(), &fullname(), Some(""), Some("10.0.0.5"));
         assert_eq!(ep.name, "Curie API");
         assert_eq!(ep.url, None, "a degraded endpoint must not carry a url");
         assert!(
@@ -9822,7 +10750,7 @@ mod tests {
         // Not "could not read" (the deploy-path wording): the true condition is
         // not-found, and this row must agree with the `ui` row from
         // `service_surface`.
-        let ep = api_base_endpoint(&common(), None, Some("10.0.0.5"));
+        let ep = api_base_endpoint(&common(), &fullname(), None, Some("10.0.0.5"));
         assert_eq!(ep.url, None);
         assert_eq!(ep.note.as_deref(), Some("service curie-ui not found"));
         assert!(!ep.browsable);
@@ -9834,7 +10762,12 @@ mod tests {
         // `--no-expose` is a supported install mode, so this is a real path,
         // not an error: hand back an actionable port-forward for the API
         // service instead of deploy's dead --api-url hint.
-        let ep = api_base_endpoint(&common(), Some(CLUSTERIP_SVC), Some("10.0.0.5"));
+        let ep = api_base_endpoint(
+            &common(),
+            &fullname(),
+            Some(CLUSTERIP_SVC),
+            Some("10.0.0.5"),
+        );
         assert_eq!(ep.url, None);
         assert_eq!(
             ep.note.as_deref(),
@@ -9850,10 +10783,15 @@ mod tests {
     fn api_base_endpoint_notes_stay_plain_for_the_json_payload() {
         // `Ui::emit_json` documents the payload as machine-consumed: no ANSI.
         for ep in [
-            api_base_endpoint(&common(), None, Some("10.0.0.5")),
-            api_base_endpoint(&common(), Some(CLUSTERIP_SVC), Some("10.0.0.5")),
-            api_base_endpoint(&common(), Some(""), Some("10.0.0.5")),
-            api_base_endpoint(&common(), Some(NODEPORT_SVC), None),
+            api_base_endpoint(&common(), &fullname(), None, Some("10.0.0.5")),
+            api_base_endpoint(
+                &common(),
+                &fullname(),
+                Some(CLUSTERIP_SVC),
+                Some("10.0.0.5"),
+            ),
+            api_base_endpoint(&common(), &fullname(), Some(""), Some("10.0.0.5")),
+            api_base_endpoint(&common(), &fullname(), Some(NODEPORT_SVC), None),
         ] {
             let note = ep.note.as_deref().unwrap_or("");
             assert!(
@@ -9866,7 +10804,7 @@ mod tests {
 
     #[test]
     fn api_base_endpoint_hints_a_port_forward_when_the_host_is_unresolvable() {
-        let ep = api_base_endpoint(&common(), Some(NODEPORT_SVC), None);
+        let ep = api_base_endpoint(&common(), &fullname(), Some(NODEPORT_SVC), None);
         assert_eq!(ep.url, None);
         assert_eq!(
             ep.note.as_deref(),
@@ -9885,6 +10823,7 @@ mod tests {
     fn service_surface_maps_a_nodeport_service_to_a_browsable_url_row() {
         let ep = service_surface(
             &common(),
+            &fullname(),
             "ui",
             "Curie Console",
             Some(NODEPORT_SVC),
@@ -9901,6 +10840,7 @@ mod tests {
     fn service_surface_degrades_when_the_service_is_not_found() {
         let ep = service_surface(
             &common(),
+            &fullname(),
             "ui",
             "Curie Console",
             None,
@@ -9919,6 +10859,7 @@ mod tests {
         // unresolvable host is an explicit note, never a fabricated URL.
         let ep = service_surface(
             &common(),
+            &fullname(),
             "ui",
             "Curie Console",
             Some(NODEPORT_SVC),
@@ -9938,6 +10879,7 @@ mod tests {
         let unassigned = r#"{"spec":{"type":"NodePort","ports":[{"port":80}]}}"#;
         let ep = service_surface(
             &common(),
+            &fullname(),
             "ui",
             "Curie Console",
             Some(unassigned),
@@ -9956,6 +10898,7 @@ mod tests {
     fn service_surface_maps_a_clusterip_service_to_a_plain_port_forward_note() {
         let ep = service_surface(
             &common(),
+            &fullname(),
             "langfuse-web",
             "Langfuse UI",
             Some(CLUSTERIP_SVC),
@@ -9980,6 +10923,7 @@ mod tests {
     fn service_surface_degrades_an_unreadable_service_to_a_note() {
         let ep = service_surface(
             &common(),
+            &fullname(),
             "ui",
             "Curie Console",
             Some("{not json"),
@@ -9993,7 +10937,7 @@ mod tests {
 
     #[test]
     fn observability_dry_run_plan_lists_the_read_only_lookups() {
-        let lines: Vec<String> = observability_commands(&common())
+        let lines: Vec<String> = observability_commands(&common(), &fullname())
             .iter()
             .map(|c| c.display())
             .collect();

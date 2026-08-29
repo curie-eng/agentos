@@ -699,6 +699,222 @@ fn has_local_host(endpoint: &reqwest::Url) -> bool {
     }
 }
 
+/// Build the one kind of HTTP client this CLI makes requests with.
+///
+/// The loopback `no_proxy` rule is a SECURITY property, not a convenience: a
+/// system HTTP proxy must never see traffic on a tunnel that exists precisely to
+/// keep that traffic on the loopback. Both the authenticated [`ApiClient`] and
+/// the unauthenticated `/health` probe need it, so it has exactly one
+/// implementation here rather than two copies that have to be kept in step.
+///
+/// Redirects are NOT followed, and that is a SECURITY property too. reqwest
+/// strips `Authorization`, cookies, and `Proxy-Authorization` when a redirect
+/// crosses to another host (`reqwest/src/redirect.rs`), but it does NOT strip
+/// custom headers -- and this CLI authenticates with the custom `X-API-Key`
+/// header. Under reqwest's default policy (follow up to 10 hops) an endpoint
+/// that answers `307`/`308 Location: http://attacker.example/...` would be
+/// handed the release's auto-discovered strong key, with method and body
+/// preserved. It would also defeat #705's cleartext refusal, which classifies
+/// only the INITIAL `--api-url`: an `https://` URL that redirects to `http://`
+/// would sail past it. And it would weaken the `/health` verification below,
+/// which exists to certify THIS listener -- a redirect would let a wrong
+/// listener point the probe at something that does answer `{"status": "ok"}`.
+///
+/// Nothing should depend on a silent redirect here: the platform API is a
+/// direct JSON API reached over a loopback tunnel or an operator-supplied URL.
+/// Do not "helpfully" restore following; a 3xx is surfaced to the operator as
+/// its own diagnosis instead (see `verify_is_curie_api` and `ApiClient::expect_ok`).
+///
+/// `connect_timeout` is optional because a caller that bounds the WHOLE request
+/// (`RequestBuilder::timeout`) has already bounded the connect inside it; a
+/// second, equal bound would only be a second number to keep in step.
+///
+/// Returns reqwest's own error so each caller keeps its own `.context`.
+fn http_client(
+    base_url: &str,
+    connect_timeout: Option<std::time::Duration>,
+) -> std::result::Result<reqwest::Client, reqwest::Error> {
+    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+    if let Some(connect_timeout) = connect_timeout {
+        builder = builder.connect_timeout(connect_timeout);
+    }
+    if reqwest::Url::parse(base_url.trim()).is_ok_and(|endpoint| {
+        matches!(endpoint.scheme(), "http" | "https") && has_local_host(&endpoint)
+    }) {
+        builder = builder.no_proxy();
+    }
+    builder.build()
+}
+
+/// Render a 3xx response's `Location` for an operator-facing message.
+///
+/// A redirect is never followed by this CLI (see [`http_client`]), so where it
+/// pointed is the whole diagnosis: it names what the endpoint wanted to hand the
+/// request -- and, under a following client, the `X-API-Key` header -- to.
+/// A 3xx with no `Location` is legal, hence the fallback rather than an unwrap.
+fn redirect_target(headers: &reqwest::header::HeaderMap) -> String {
+    headers
+        .get(reqwest::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| format!("`{}`", value.trim()))
+        .unwrap_or_else(|| "an unstated location (no `Location` header)".to_string())
+}
+
+/// The operator-facing diagnosis for a 3xx on a KEY-CARRYING request, or `None`
+/// when the status is not a redirect.
+///
+/// Every authenticated path shares it, because redirects are never followed (see
+/// [`http_client`]) and so a 3xx reaches all of them as an ordinary response
+/// rather than as a transport error.
+fn redirect_refusal(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+) -> Option<String> {
+    status.is_redirection().then(|| {
+        format!(
+            "the endpoint answered {status} redirecting to {}. This CLI never follows \
+             redirects, because a redirect would carry the API key's `X-API-Key` header to \
+             the host it names, including a downgrade from https to cleartext http (#705). \
+             Point --api-url at the platform API's own address.",
+            redirect_target(headers)
+        )
+    })
+}
+
+/// How long the `/health` probe waits. Deliberately short: `start_port_forward`
+/// has already waited for kubectl's readiness line and TCP-proved the local
+/// port, so by the time this runs a slow answer is a real signal about what is
+/// listening, not a cold start.
+const HEALTH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Prove that whatever answers on `base_url` really is the Curie platform API,
+/// by reading its `GET /health` (`apps/api/src/curie_api/main.py`: HTTP 200 with
+/// a JSON body whose `status` is `"ok"`; the route is unauthenticated, per
+/// `apps/api/tests/test_channels.py`).
+///
+/// **Unauthenticated by construction, and that is the whole point (#705).** The
+/// caller (`cluster deploy`) is already holding the release's auto-discovered
+/// strong key when it calls this, and the endpoint is not yet known to be Curie.
+/// Sending the key to an unproven listener is exactly the egress the cleartext
+/// refusal exists to prevent. So this is a FREE function, not an [`ApiClient`]
+/// method: no key needs to exist for it to run, and a 401/403 is a refusal, never
+/// a prompt to retry with the key. A committed test asserts the request carries no
+/// `x-api-key`.
+///
+/// Why it is needed at all: a squatted local port and a port-forward pointed at
+/// the wrong workload are both TCP-alive and readable, so the bind and readiness
+/// checks in `start_port_forward` cannot see either. This is the only check that
+/// can, and it is the compensating control for release-name resolution falling
+/// back to the chart rule.
+///
+/// The error's `Display` is the class-specific OBSERVATION ("what answered, and
+/// how it differed"), with no recovery text: only the caller knows which Service
+/// it forwarded and on which local port, so the caller composes the recovery
+/// around this sentence.
+pub async fn verify_is_curie_api(base_url: &str) -> Result<()> {
+    let url = format!("{}/health", base_url.trim().trim_end_matches('/'));
+    // No connect timeout: the per-request `.timeout` below bounds the whole
+    // request, the connect included, at the same `HEALTH_PROBE_TIMEOUT`.
+    let http = http_client(base_url, None).context("building the health-probe HTTP client")?;
+
+    // No `X-API-Key` header. See the #705 note above.
+    let response = match http.get(&url).timeout(HEALTH_PROBE_TIMEOUT).send().await {
+        Ok(response) => response,
+        Err(err) if err.is_timeout() => bail!(
+            "GET {url} did not answer within {}s, and the local port had already been \
+             TCP-proved, so something is holding it without serving the API",
+            HEALTH_PROBE_TIMEOUT.as_secs()
+        ),
+        Err(err) if err.is_connect() => bail!(
+            "GET {url} could not connect, even though the port-forward reported the port \
+             ready, so the tunnel died between readiness and this check"
+        ),
+        Err(err) => bail!("GET {url} failed before any response arrived: {err}"),
+    };
+
+    let status = response.status();
+    // Redirects are not followed (see `http_client`), so a 3xx reaches here as an
+    // ordinary response. It is one of the answers this probe exists to catch: the
+    // thing on the port is not the Curie API, it is something pointing elsewhere,
+    // and following it would have certified the redirect target instead of the
+    // tunnel endpoint.
+    if status.is_redirection() {
+        bail!(
+            "GET {url} answered {status} redirecting to {}, and redirects are never followed, \
+             so the port is held by something that forwards elsewhere rather than by the \
+             Curie API, whose /health answers 200 in place",
+            redirect_target(response.headers())
+        );
+    }
+    if matches!(
+        status,
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+    ) {
+        bail!(
+            "GET {url} answered {status}, but the Curie API serves /health unauthenticated, \
+             so an auth challenge means a different service holds the port (the release key \
+             was not sent, and is not retried)"
+        );
+    }
+    if status == reqwest::StatusCode::NOT_FOUND {
+        bail!(
+            "GET {url} answered 404, so something is listening there but it does not route \
+             the Curie API's /health"
+        );
+    }
+    if status != reqwest::StatusCode::OK {
+        bail!("GET {url} answered {status}, not the 200 the Curie API's /health returns");
+    }
+
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let is_json = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .eq_ignore_ascii_case("application/json");
+    let body = response.text().await.unwrap_or_default();
+
+    // Deliberately NOT parsed as JSON first: a dev server answering 200 with
+    // HTML is the squatted-port case the issue reported, and surfacing a serde
+    // decode error for it would read as a Curie bug rather than as the
+    // wrong-listener fact it is.
+    if !is_json {
+        bail!(
+            "GET {url} answered 200 with {} content rather than JSON, so a different service \
+             is holding the port",
+            if content_type.trim().is_empty() {
+                "untyped".to_string()
+            } else {
+                content_type
+            }
+        );
+    }
+    let Ok(payload) = serde_json::from_str::<serde_json::Value>(&body) else {
+        bail!(
+            "GET {url} answered 200 and claimed JSON, but the body does not parse as JSON, \
+             so it is not the Curie API's /health"
+        );
+    };
+    match payload.get("status").and_then(|status| status.as_str()) {
+        Some("ok") => Ok(()),
+        Some(other) => bail!(
+            "GET {url} answered 200 with JSON status {other:?} rather than \"ok\", so either \
+             this is not the Curie API or the release is unhealthy"
+        ),
+        None => bail!(
+            "GET {url} answered 200 with JSON carrying no `status` field, while the Curie \
+             API's /health answers {{\"status\": \"ok\"}}"
+        ),
+    }
+}
+
 /// Warn (to stderr) when the endpoint would leak the API key over cleartext
 /// HTTP. See [`is_insecure_endpoint`].
 fn warn_if_insecure(base_url: &str) {
@@ -844,15 +1060,8 @@ impl ApiClient {
 
     pub fn new(base_url: &str, api_key: &str) -> Result<Self> {
         warn_if_insecure(base_url);
-        let endpoint = reqwest::Url::parse(base_url.trim()).ok();
-        let mut builder =
-            reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(5));
-        if endpoint.as_ref().is_some_and(|endpoint| {
-            matches!(endpoint.scheme(), "http" | "https") && has_local_host(endpoint)
-        }) {
-            builder = builder.no_proxy();
-        }
-        let http = builder.build().context("building HTTP client")?;
+        let http = http_client(base_url, Some(std::time::Duration::from_secs(5)))
+            .context("building HTTP client")?;
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),
@@ -865,6 +1074,14 @@ impl ApiClient {
             return Ok(resp);
         }
         let status = resp.status();
+        // Redirects are never followed, because a followed one would carry the
+        // `X-API-Key` header to whatever host it named (see [`http_client`]), so a
+        // 3xx lands here as an ordinary response. Say what it is: the configured
+        // endpoint is not the platform API itself but something in front of it,
+        // which is an operator configuration fact, not an API failure.
+        if let Some(refusal) = redirect_refusal(status, resp.headers()) {
+            bail!("{what} failed: {refusal}");
+        }
         let body = resp.text().await.unwrap_or_default();
         // An unrouted path means the platform is older than this CLI, which is
         // a different problem from a missing resource and has a different fix.
@@ -1745,6 +1962,9 @@ impl ApiClient {
             )
             .await?;
         let status = resp.status();
+        if let Some(refusal) = redirect_refusal(status, resp.headers()) {
+            anyhow::bail!("resolving target `{target}` failed: {refusal}");
+        }
         let body = resp.text().await.unwrap_or_default();
         if is_unrouted(status, &body) {
             anyhow::bail!(
@@ -1776,6 +1996,9 @@ impl ApiClient {
             )
             .await?;
         let status = resp.status();
+        if let Some(refusal) = redirect_refusal(status, resp.headers()) {
+            anyhow::bail!("listing the deploy targets failed: {refusal}");
+        }
         let body = resp.text().await.unwrap_or_default();
         // Same skew guard as `resolve_deploy_target`: a platform predating this
         // endpoint answers with FastAPI's bare 404 body, which is otherwise
