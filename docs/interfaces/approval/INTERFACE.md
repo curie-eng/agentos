@@ -157,7 +157,14 @@ in code now:
   human saw. ADR-0035 named a durable structured-provenance follow-up for this; that
   provenance has now LANDED as ADR-0046 (the `gate_kind`/`granted_tool` columns above), but it
   discriminates *which* gate may grant rather than binding the granted *arguments*, so
-  argument-scoping remains open (deferred to #558's operator-gated grantability).
+  argument-scoping remains open (deferred to #558's operator-gated grantability). Among gates
+  that set `grantableViaPolicy`, deploy validation also requires a route be claimed by only one
+  distinct tool: two grantable gates on the same route naming the same tool are a duplicate and
+  validate fine, but naming different tools is rejected as `approval_policy.grant_route_ambiguous`,
+  because the shared normalizer `grantable_routes` (the same helper the runner's loader calls)
+  excludes an ambiguous route and would otherwise let the policy validate green while arming no
+  grant. See the [bundle format seam](../bundle-format/INTERFACE.md) for the deploy-time
+  enforcement detail.
 - **Observe-only resume reconciliation (landed, #544, ADR-0046, Decision A2).** To make the
   residual "approved, then the model never re-called the tool" case observable, the worker
   injects an **authority-free** marker `CURIE_APPROVAL_RESUMED_KIND=policy` (`RESUMED_KIND_ENV`,
@@ -220,8 +227,12 @@ in code now:
   loudly and creates no approval**
   (#544, ADR-0046, AC2), reversing #247's earlier warn-and-route-to-requesting-channel
   fallback — authority must never silently widen. This is distinct from genuinely
-  agent-less generic approvals, which are unchanged. The card's transport follows the same
-  split (#451): a bound resolution channel that differs from the
+  agent-less generic approvals. ADR-0123 brings resolve time into line
+  with that creation-time rule: the API's `get_approval_route_binding` channel fallback
+  (`apps/api/src/curie_api/crud.py`) now applies only to a **routeless** approval, so a
+  routed approval with no binding is refused at BOTH ends of the lifecycle — no approval is
+  created for it, and one already pending stops being resolvable. The
+  card's transport follows the same split (#451): a bound channel that differs from the
   requesting channel is deployment policy, not part of the triggering conversation, so the
   card posts top-level over the worker's default Slack transport rather than the trigger's
   per-turn endpoint (this is what lets a non-Slack-triggered turn, e.g. CLI or API, still
@@ -400,15 +411,21 @@ non-approver.
 approval's `agent_id` and `route`; nothing is snapshotted onto the record at creation. That
 is the correct TOCTOU direction for authorization: revocation takes effect at the decision
 point, and a user removed from the approver group yesterday cannot resolve a stale pending
-approval today. The accepted consequence: deleting or renaming a binding that carried
-`approvers` while an approval pends WIDENS authority from the declared group or list to
-card-channel membership, because the resolver cannot distinguish "never bound" from "was
-bound, now unbound" without the rejected snapshot. It is accepted because mutating
-`approval_routes` requires the agent PATCH endpoint (the same platform key that can already
-resolve any approval directly, so no new escalation path), because fail-closing unbound
-routes would reject approvals that resolve fine today, and because the audit row records
-the widened basis actually used. An approval with a NULL `agent_id`, or one naming a route
-absent from the map, likewise has no binding to read and keeps channel membership.
+approval today. That direction is unchanged, and revocation still takes effect on the next
+click. What ADR-0123 changes is the ABSENT binding: deleting or renaming a binding while an
+approval pends no longer WIDENS that approval to card-channel membership — it makes the
+approval **unresolvable**. A pending approval that named a route is resolvable only through
+that route's binding, so with the binding gone the selector returns `UnboundRoute`, which
+admits nobody and reports `undetermined`; the resolve attempt is a 403 and the audit row
+records `UnboundRouteBinding` with the missing route in its evidence. ADR-0123 supersedes
+exactly this one consequence of ADR-0034; ADR-0034's AC4 zero-setup default stands, so a
+binding that is PRESENT and declares no `approvers` still means card-channel membership.
+An approval with a NULL `agent_id` that nonetheless names a route falls under the same
+rule and is refused too — `get_approval_route_binding` returns a bare None for every miss,
+and the split is on whether the approval named a route, not on why the binding is missing.
+An approval that names NO route never had a narrower set to lose and keeps channel
+membership. The recovery from a stuck approval is to restore the binding, after which it
+resolves normally; nothing is lost.
 
 ### The three ports
 

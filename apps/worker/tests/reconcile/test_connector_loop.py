@@ -459,3 +459,109 @@ def test_the_http_source_defaults_are_safe_when_the_api_omits_fields() -> None:
     rendered = RenderedConnectors()
     assert rendered.manifests == []
     assert not rendered.needs_operator_credentials
+
+
+# --------------------------------------------------------------------------- #
+# The in-force version has no bundle (#1216)
+# --------------------------------------------------------------------------- #
+# These exercise the REAL `_reconcile_one`, so only `targets()` is replaced.
+# The fake client and its manifest helper are the ones
+# `tests/reconcile/test_connector_agent.py` already established -- imported
+# rather than re-declared, so a second, subtly different notion of "what the
+# cluster returns" cannot drift away from the first.
+from .test_connector_agent import FakeClient, live_copy, manifest  # noqa: E402
+
+
+class ExplodingSource:
+    """A ManifestSource that must never be asked for anything.
+
+    The #1216 bug is invisible to a source that answers: the loop happily
+    rendered SOMETHING, just from the wrong version. Making the render itself
+    the failure is what turns "did not render" into an assertion.
+    """
+
+    def rendered(self, *, agent_id: str, version_id: str) -> Any:
+        raise AssertionError(
+            f"rendered a bundleless version: agent={agent_id} version={version_id}"
+        )
+
+
+class StubTargetsLoop(ConnectorReconcileLoop):
+    """The loop with only the database swapped out.
+
+    Unlike `Loop` above, `_reconcile_one` is the real one -- the branch under
+    test lives there, so faking it would test nothing.
+    """
+
+    def __init__(self, targets: list[AgentTarget], **kw: Any) -> None:
+        super().__init__(namespace="curie", db_schema="curie", **kw)
+        self._targets = targets
+
+    async def targets(self) -> list[AgentTarget]:  # type: ignore[override]
+        return list(self._targets)
+
+
+def bundleless(name: str) -> AgentTarget:
+    import uuid
+
+    return AgentTarget(
+        agent_id=uuid.uuid4(), agent_name=name, version_id=uuid.uuid4(), has_bundle=False
+    )
+
+
+async def test_a_bundleless_target_never_renders_and_prunes_what_it_owns() -> None:
+    # The render endpoint 404s for a version with no stored bundle, so asking
+    # would fail this agent every pass forever. The objects it owns belong to a
+    # declaration nothing can produce, so they are pruned instead.
+    agent = bundleless("a")
+    client = FakeClient(
+        [
+            live_copy(manifest("Service", "grafana"), agent="a"),
+            live_copy(manifest("Deployment", "grafana"), agent="a"),
+        ]
+    )
+    loop = StubTargetsLoop([agent], engine=None, source=ExplodingSource(), client=client)
+
+    summary = await loop.one_pass()
+
+    assert client.applied == [], "a bundleless version must not apply anything"
+    assert sorted(client.deleted) == [("Deployment", "grafana"), ("Service", "grafana")]
+    assert summary.skipped == 1
+    assert summary.deleted == 2
+    assert summary.failed == 0
+
+
+async def test_a_bundleless_target_never_deletes_an_owned_secret() -> None:
+    # Without a render we do not know which Secret name is ours, and the one
+    # live here is the operator's credential (ADR-0086) -- unrecoverable, and
+    # its removal breaks every connector pod on its next restart. So no Secret
+    # of any name is manageable on this path, exactly as on the unprovisioned
+    # branch.
+    agent = bundleless("a")
+    client = FakeClient(
+        [
+            live_copy(manifest("Service", "grafana"), agent="a"),
+            live_copy(manifest("Secret", "curie-a-connector-secrets"), agent="a"),
+        ]
+    )
+    loop = StubTargetsLoop([agent], engine=None, source=ExplodingSource(), client=client)
+
+    await loop.one_pass()
+
+    assert client.deleted == [("Service", "grafana")]
+    assert all(kind != "Secret" for kind, _ in client.deleted)
+
+
+async def test_a_converged_bundleless_target_touches_the_cluster_only_to_look() -> None:
+    # Nothing owned means nothing to remove. The steady state of an agent parked
+    # on a bundleless version must not re-issue deletes every minute.
+    agent = bundleless("a")
+    client = FakeClient([])
+    loop = StubTargetsLoop([agent], engine=None, source=ExplodingSource(), client=client)
+
+    summary = await loop.one_pass()
+
+    assert client.applied == []
+    assert client.deleted == []
+    assert summary.skipped == 1
+    assert summary.deleted == 0

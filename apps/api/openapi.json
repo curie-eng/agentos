@@ -3615,6 +3615,93 @@
         "title": "ResolvedTarget",
         "type": "object"
       },
+      "RoutingCheck": {
+        "description": "Whether pushes to a repository still resolve to an agent (#1221).\n\n``resolvable`` is false only when the real resolver raised: a branch with no\nmatching target resolves to \"ignore\", which is intended behaviour, not a\nproblem. An unbound repository (``agent_count`` 0) stays resolvable too --\nthis reports ROUTING, not whether anything is bound.",
+        "properties": {
+          "agent_count": {
+            "default": 0,
+            "title": "Agent Count",
+            "type": "integer"
+          },
+          "agents": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Agents",
+            "type": "array"
+          },
+          "repo_full_name": {
+            "title": "Repo Full Name",
+            "type": "string"
+          },
+          "resolvable": {
+            "default": true,
+            "title": "Resolvable",
+            "type": "boolean"
+          },
+          "unresolvable": {
+            "items": {
+              "$ref": "#/components/schemas/RoutingCheckProblem"
+            },
+            "title": "Unresolvable",
+            "type": "array"
+          }
+        },
+        "required": [
+          "repo_full_name"
+        ],
+        "title": "RoutingCheck",
+        "type": "object"
+      },
+      "RoutingCheckProblem": {
+        "description": "One environment whose pushes this repository can no longer route.\n\n``message`` is the resolver's OWN text, carried verbatim so the CLI can\nprint it without paraphrasing the rule.",
+        "properties": {
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "environment": {
+            "title": "Environment",
+            "type": "string"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "environment",
+          "code",
+          "message"
+        ],
+        "title": "RoutingCheckProblem",
+        "type": "object"
+      },
+      "RoutingCheckRequest": {
+        "description": "Ask whether a repository's pushes can still be routed to an agent (#1221).\n\nMigration 0018 (ADR-0091) dropped the unique index on ``repo_full_name``, so\nbinding a SECOND agent to a repository is legal -- and silently flips every\nfuture push for the agent that was already bound from \"deploys\" to\n\"rejected\", because nothing says which of the two a branch belongs to. The\ncaller sends the bundle's ``deploy.yaml`` TEXT for the same reason\n``ResolveTargetRequest`` does: the API owns the resolver rule, so a client\nrestating it here would drift from the rule actually enforced on a push.",
+        "properties": {
+          "content": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Content"
+          },
+          "repo_full_name": {
+            "title": "Repo Full Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repo_full_name"
+        ],
+        "title": "RoutingCheckRequest",
+        "type": "object"
+      },
       "RunnerPods": {
         "description": "The runner sandbox pods in a namespace (populates the Logs pod dropdown).",
         "properties": {
@@ -8778,6 +8865,66 @@
         "summary": "Trigger Eval",
         "tags": [
           "evals"
+        ]
+      }
+    },
+    "/git-flow/routing-check": {
+      "post": {
+        "description": "Report whether pushes to this repository still resolve to an agent.\n\nThe arguments handed to the resolver are built exactly the way\n``gitflow.process_push`` builds them, so the routing rule applied here is\nidentical to a real push's and cannot drift. It is not an unconditional\nprophecy of the next push's outcome, though: this endpoint resolves\nagainst the caller's local ``deploy.yaml``, while a real push resolves\nagainst the pushed commit's -- a dirty working tree or a HEAD that has\nsince moved can make the two disagree.\n\nA repository with several agents AND declared targets is the intended\nADR-0091 configuration and reports resolvable; warning on it would be noise\non exactly the shape the ADR asks operators to adopt.",
+        "operationId": "check_git_flow_routing_git_flow_routing_check_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RoutingCheckRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RoutingCheck"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Check Git Flow Routing",
+        "tags": [
+          "git-flow"
         ]
       }
     },

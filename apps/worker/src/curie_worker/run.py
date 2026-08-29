@@ -95,6 +95,10 @@ class Runtime:
     eval_redis: AsyncRedis
     eval_http: httpx.AsyncClient
     engine: AsyncEngine
+    # The SAME store the kernel settles cards through, exposed so ``_run`` can
+    # drive its one-shot legacy rekey at boot (#1751) without constructing a
+    # second client-and-config pair that could drift from the kernel's.
+    card_store: ApprovalCardStore
     # None unless the connector reconciler is enabled (ADR-0090, #1184). Held
     # here so `_run` supervises it beside the consumers rather than letting it
     # run unsupervised.
@@ -114,6 +118,20 @@ class Runtime:
 # keys off, so a year-long route already means "never reaped by TTL" and
 # anything longer is definitionally a leak.
 _MAX_TUNABLE_SECONDS = 31_536_000
+
+
+# How long the one-shot legacy approval-card rekey (#1751) may hold up boot.
+# Not an operator knob: the number that matters is not "how big is the keyspace"
+# but "how long may readiness stall", and that answer is the same everywhere.
+# WHY a bound exists at all: this pass is awaited BEFORE the asyncio.gather that
+# starts the liveness heartbeat, so nothing is touching the heartbeat file while
+# it runs. Per-entry errors are swallowed and the loop continues, which means a
+# degraded Valkey costs roughly one socket timeout per entry with nothing
+# capping the total -- and the k8s exec probe, finding a stale heartbeat, kills
+# the pod. Unbounded, a best-effort migration becomes a restart loop that never
+# reaches the consumers. Cutting it short only leaves some legacy refs behind,
+# and those lapse with their own TTL.
+_CARD_MIGRATION_BUDGET_S = 30.0
 
 
 def _bounded_seconds(
@@ -459,6 +477,7 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         eval_redis=eval_redis,
         eval_http=eval_http,
         engine=engine,
+        card_store=card_store,
         connector_loop=_build_connector_loop(config, engine),
         publication_loop=publication_loop,
     )
@@ -627,6 +646,28 @@ async def _run(config: WorkerConfig, env: Mapping[str, str]) -> None:
         loop.add_signal_handler(sig, _stop)
 
     logging.getLogger("curie_worker").info("worker starting")
+    # One-shot, before any consumer reads: rekey approval-card refs left under
+    # the pre-#1723 thread key onto their approval id, so an approval that was
+    # already pending when this worker rolled can still have its card settled
+    # (#1751). It is deliberately NOT supervised or repeated -- it is a boot
+    # migration that no-ops once the old key space is empty -- and it is
+    # deliberately swallowed: a Valkey blip here must degrade to "those cards
+    # stay live until TTL", never to a worker that will not start.
+    # It is bounded because the heartbeat has not started yet -- see
+    # _CARD_MIGRATION_BUDGET_S.
+    try:
+        await asyncio.wait_for(
+            rt.card_store.migrate_legacy_thread_keyed_refs(),
+            timeout=_CARD_MIGRATION_BUDGET_S,
+        )
+    except TimeoutError:
+        logger.warning(
+            "legacy approval card migration exceeded its %.0fs boot budget and was "
+            "cut short; any legacy ref it did not reach simply lapses with its TTL",
+            _CARD_MIGRATION_BUDGET_S,
+        )
+    except Exception:
+        logger.exception("legacy approval card migration failed; continuing boot")
     try:
         # return_exceptions=True + per-task restart: a crash in one consumer must
         # not cancel its siblings (#673). Supervisors only return on shutdown.
@@ -658,7 +699,7 @@ async def _run(config: WorkerConfig, env: Mapping[str, str]) -> None:
                         shutdown,
                     )
                 ]
-                if rt.publication_loop is not None
+                    if getattr(rt, "publication_loop", None) is not None
                 else []
             ),
             return_exceptions=True,

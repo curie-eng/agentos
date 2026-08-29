@@ -9,6 +9,7 @@ every push or a dead token served until restart.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -445,3 +446,304 @@ def test_the_startup_line_carries_no_secret(private_key: str, caplog) -> None:
     text = " ".join(r.getMessage() for r in caplog.records)
     assert "PRIVATE KEY" not in text
     assert "ghp_supersecret" not in text
+
+
+# --------------------------------------------------------------------------- #
+# The installation-id cache -- reinstalling the App used to need a restart (#1257)
+# --------------------------------------------------------------------------- #
+class ReinstallRecorder:
+    """GitHub across an App reinstall: discovery moves, the retired id 404s.
+
+    `installation_id` is what discovery reports; `valid_ids` is what
+    `/access_tokens` will still mint for. Setting the two to different values is
+    exactly the state an operator lands in the moment they reinstall the App.
+    """
+
+    def __init__(self, installation_id: int = 4242, valid_ids: set[int] | None = None):
+        self.minted = 0
+        self.discoveries = 0
+        self.installation_id = installation_id
+        self.valid_ids = {installation_id} if valid_ids is None else valid_ids
+
+    def handle(self, request: httpx.Request) -> httpx.Response:
+        parts = request.url.path.strip("/").split("/")
+        if parts[-1] == "installation":
+            self.discoveries += 1
+            return httpx.Response(200, json={"id": self.installation_id})
+        if parts[-1] == "access_tokens":
+            requested = int(parts[-2])
+            if requested not in self.valid_ids:
+                # What GitHub answers for an installation that no longer exists.
+                return httpx.Response(404, json={"message": "Not Found"})
+            self.minted += 1
+            return httpx.Response(
+                201,
+                json={"token": f"ghs_from_{requested}", "expires_at": "2999-01-01T00:00:00Z"},
+            )
+        return httpx.Response(404, json={"message": "Not Found"})
+
+
+def _expire_cached_token(creds: GitHubCredentials, repo: str) -> None:
+    """Age out the token cache so the next call actually mints.
+
+    The token cache is the thing that hid this bug in production for an hour at
+    a time; forcing it stale is setup, not the assertion.
+    """
+
+    creds._tokens[repo].expires_at = time.time() - 1
+
+
+def test_a_reinstalled_app_recovers_without_restarting_the_api(private_key, monkeypatch) -> None:
+    """AC1. `_installations` had no invalidation of any kind (#1257).
+
+    Reinstalling the App retires the installation id. Every later mint POSTed to
+    the retired id, took a 404, and never re-ran discovery -- so the only
+    recovery was restarting the API, and the 404 told the operator to install an
+    App they had just installed. Deleting the eviction turns this red: the
+    second `token_for` raises instead of returning a token from 8484.
+    """
+
+    recorder = ReinstallRecorder()
+    monkeypatch.setattr("curie_api.github_app.httpx.Client", serve(recorder.handle))
+    creds = GitHubCredentials(settings=app_settings(private_key))
+
+    assert creds.token_for(REPO) == "ghs_from_4242"
+    discoveries_before = recorder.discoveries
+
+    # The operator reinstalls the App.
+    recorder.installation_id = 8484
+    recorder.valid_ids = {8484}
+    _expire_cached_token(creds, REPO)
+
+    assert creds.token_for(REPO) == "ghs_from_8484", "a reinstall must not need a restart"
+    assert recorder.discoveries == discoveries_before + 1, "the stale id must be re-discovered"
+
+
+def test_the_re_discovered_installation_is_cached_again(private_key, monkeypatch) -> None:
+    # Otherwise "always re-discover" also passes the test above and the
+    # installation cache stops being a cache.
+    recorder = ReinstallRecorder()
+    monkeypatch.setattr("curie_api.github_app.httpx.Client", serve(recorder.handle))
+    creds = GitHubCredentials(settings=app_settings(private_key))
+
+    creds.token_for(REPO)
+    recorder.installation_id = 8484
+    recorder.valid_ids = {8484}
+    _expire_cached_token(creds, REPO)
+    creds.token_for(REPO)
+
+    discoveries_after_recovery = recorder.discoveries
+    _expire_cached_token(creds, REPO)
+    assert creds.token_for(REPO) == "ghs_from_8484"
+    assert recorder.discoveries == discoveries_after_recovery, "recovery must not disable the cache"
+
+
+def test_a_freshly_discovered_installation_is_not_re_discovered(private_key, monkeypatch) -> None:
+    """Exactly one retry, and only when the id came from the cache.
+
+    If discovery just produced the id, re-running discovery can only produce the
+    same id and the same 404 -- a second round trip on every genuine failure,
+    and one 404 away from a retry loop.
+    """
+
+    recorder = ReinstallRecorder(valid_ids=set())
+    monkeypatch.setattr("curie_api.github_app.httpx.Client", serve(recorder.handle))
+    creds = GitHubCredentials(settings=app_settings(private_key))
+
+    with pytest.raises(GitHubAppError):
+        creds.token_for(REPO)
+
+    assert recorder.discoveries == 1, "a fresh id that 404s must surface, not be re-discovered"
+    assert recorder.minted == 0
+
+
+def test_a_fresh_installation_404_never_tells_the_operator_to_install_the_app(
+    private_key, monkeypatch
+) -> None:
+    """AC3, the no-cache half. Nothing was cached, so nothing may be called stale.
+
+    Discovery 404 means "install the App" (asserted by
+    `test_a_repository_the_app_cannot_see_says_so`). A mint 404 on an id
+    discovery just resolved means the App IS installed -- repeating the install
+    advice is what sent operators round the loop after a reinstall. But this
+    path evicted nothing and re-discovered nothing, so the reinstall wording is
+    simply false here and points at a cache bug that does not exist (#1257).
+    """
+
+    recorder = ReinstallRecorder(valid_ids=set())
+    monkeypatch.setattr("curie_api.github_app.httpx.Client", serve(recorder.handle))
+    creds = GitHubCredentials(settings=app_settings(private_key))
+
+    with pytest.raises(GitHubAppError) as raised:
+        creds.token_for(REPO)
+
+    message = str(raised.value)
+    assert "4242" in message, "the operator has to be told which installation failed"
+    assert "not installed on that repository" not in message
+    assert "install it" not in message
+    assert "stale" not in message, "nothing was cached here, so nothing went stale"
+
+
+def test_a_stale_installation_404_says_the_cached_one_was_re_discovered(
+    private_key, monkeypatch
+) -> None:
+    """AC3, the eviction half. The reinstall recovery ran and still failed.
+
+    The operator reinstalled, we evicted the retired id and re-discovered a new
+    one, and that one cannot mint either. This is the one state where naming the
+    stale cache is true -- and the id quoted has to be the RE-DISCOVERED one, or
+    the operator goes and inspects an installation GitHub already retired.
+    """
+
+    recorder = ReinstallRecorder()
+    monkeypatch.setattr("curie_api.github_app.httpx.Client", serve(recorder.handle))
+    creds = GitHubCredentials(settings=app_settings(private_key))
+
+    creds.token_for(REPO)  # caches installation 4242
+
+    # The operator reinstalls, and the new installation is broken too.
+    recorder.installation_id = 8484
+    recorder.valid_ids = set()
+    _expire_cached_token(creds, REPO)
+
+    with pytest.raises(GitHubAppError) as raised:
+        creds.token_for(REPO)
+
+    message = str(raised.value)
+    assert "8484" in message, "the re-discovered installation is the one to go and look at"
+    assert "stale" in message
+    assert "not installed on that repository" not in message
+    assert "install it" not in message
+
+
+# --------------------------------------------------------------------------- #
+# Single-flight -- `clone_and_archive` runs under `run_in_threadpool`
+# --------------------------------------------------------------------------- #
+def test_concurrent_pushes_to_one_repo_mint_exactly_one_token(private_key, monkeypatch) -> None:
+    """`token_for` was a check-then-act on a plain dict (#1257).
+
+    Concurrent webhook pushes are real OS threads, so eight of them produced
+    five distinct tokens from five mints. Every token was valid, so this is
+    redundant token exchanges and rate-limit pressure rather than a correctness
+    bug -- but the fix is a per-repo lock and a re-read of the cache.
+    """
+
+    workers = 8
+    recorder = Recorder()
+    barrier = threading.Barrier(workers)
+    inner = recorder.handle
+
+    def slow(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/access_tokens"):
+            time.sleep(0.05)  # a real window for the losers to pile into
+        return inner(request)
+
+    monkeypatch.setattr("curie_api.github_app.httpx.Client", serve(slow))
+    creds = GitHubCredentials(settings=app_settings(private_key))
+
+    seen: list[str] = []
+    guard = threading.Lock()
+
+    def push() -> None:
+        barrier.wait(timeout=10)
+        token = creds.token_for(REPO)
+        with guard:
+            seen.append(token)
+
+    threads = [threading.Thread(target=push) for _ in range(workers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert len(seen) == workers
+    assert recorder.minted == 1, f"{workers} concurrent pushes cost {recorder.minted} exchanges"
+    assert set(seen) == {"ghs_minted_1"}, "every caller must get the one minted token"
+
+
+def test_two_repositories_do_not_serialize_on_one_lock(private_key, monkeypatch) -> None:
+    """One slow repository must not stall a mint for a different repository.
+
+    A single global lock also passes the single-flight test above, at the cost
+    of holding it across the HTTP call: one slow repo would then stall every
+    other push. Asserting only that `_mint_lock_for` hands back distinct objects
+    does not catch that -- per-repo lock objects plus a separate global lock
+    around `token_for` would pass while serializing every repository. So this
+    overlaps two real mints and asserts the second one finished while the first
+    was still in flight.
+    """
+
+    other = "octo/other-bot"
+    recorder = Recorder()
+    inner = recorder.handle
+    slow_mint_started = threading.Event()
+    release_slow_mint = threading.Event()
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        import json
+
+        body = json.loads(request.content) if request.content else None
+        blocks = request.url.path.endswith("/access_tokens") and (
+            isinstance(body, dict) and body.get("repositories") == ["agent-bot"]
+        )
+        if blocks:
+            slow_mint_started.set()
+            # Bounded, and released by the main thread below: a regression has to
+            # FAIL on the assertions, never hang the suite waiting for a deadlock.
+            release_slow_mint.wait(timeout=30)
+        return inner(request)
+
+    monkeypatch.setattr("curie_api.github_app.httpx.Client", serve(handle))
+    creds = GitHubCredentials(settings=app_settings(private_key))
+
+    fast_finished = threading.Event()
+
+    def fast_push() -> None:
+        creds.token_for(other)
+        fast_finished.set()
+
+    slow = threading.Thread(target=creds.token_for, args=(REPO,))
+    fast = threading.Thread(target=fast_push)
+    overtook = False
+    slow_still_in_flight = False
+    slow.start()
+    try:
+        reached_mint = slow_mint_started.wait(timeout=10)
+        if reached_mint:
+            fast.start()
+            overtook = fast_finished.wait(timeout=10)
+            slow_still_in_flight = slow.is_alive()
+    finally:
+        release_slow_mint.set()
+        slow.join(timeout=30)
+        if fast.ident is not None:
+            fast.join(timeout=30)
+
+    assert reached_mint, "the slow repository never reached its own mint"
+    assert overtook, f"{other} serialized behind {REPO}'s in-flight mint"
+    assert slow_still_in_flight, "the slow mint had already finished; the overlap proved nothing"
+    assert creds._mint_lock_for(REPO) is not creds._mint_lock_for(other)
+    assert creds._mint_lock_for(REPO) is creds._mint_lock_for(REPO)
+
+
+# --------------------------------------------------------------------------- #
+# Expiry timezone -- latent, but the fallout is a seven-hour outage
+# --------------------------------------------------------------------------- #
+def test_a_naive_expiry_is_read_as_utc() -> None:
+    """An expiry without `Z` must not be read in the container's local zone.
+
+    `.timestamp()` on a naive datetime applies local time: under
+    TZ=America/Los_Angeles a 3600s token caches as 28800s and every clone 401s
+    for about seven hours, with the log saying "authentication". Asserting the
+    naive and `Z` forms agree keeps this independent of the machine's own TZ.
+    """
+
+    naive = GitHubCredentials._expiry_seconds("2026-01-01T00:00:00")
+    zulu = GitHubCredentials._expiry_seconds("2026-01-01T00:00:00Z")
+    assert naive == zulu
+
+
+def test_an_explicit_offset_expiry_is_still_honoured() -> None:
+    # The UTC default must apply only when the value carries no zone at all.
+    offset = GitHubCredentials._expiry_seconds("2026-01-01T00:00:00+02:00")
+    assert offset == GitHubCredentials._expiry_seconds("2025-12-31T22:00:00Z")

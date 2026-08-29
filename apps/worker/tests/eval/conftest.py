@@ -71,6 +71,10 @@ class FakeEvalRunner:
             ]
         )
         self.responses: dict[str, str] = {}
+        # Inputs held in-flight until the test releases the event. This drives
+        # lifecycle assertions across a real inline eval handler without
+        # replacing the runner HTTP path.
+        self.hold_inputs: dict[str, asyncio.Event] = {}
         self.fail_inputs: set[str] = set()
         # Inputs whose turn ends with a classified-failure final (budget/model
         # error) while still carrying text in responses[input].
@@ -128,6 +132,9 @@ class FakeEvalRunner:
         body = await request.json()
         self.seen.append(body)
         text = body["text"]
+        hold = self.hold_inputs.get(text)
+        if hold is not None:
+            await hold.wait()
         if text in self.fail_inputs:
             return web.json_response({"error": "boom"}, status=500)
         # A recall input answers from the conversation so far (the history that a

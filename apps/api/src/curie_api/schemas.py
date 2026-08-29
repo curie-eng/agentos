@@ -19,6 +19,7 @@ from aci_protocol import ApprovalRequest as ApprovalRequest
 from aci_protocol import EvalReport as EvalReport
 from fastapi import HTTPException
 from plugin_format import is_reserved_boot_env_name
+from plugin_format.connector_render import agent_forges_join
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -423,6 +424,59 @@ def _validate_secret_map(value: dict[str, str] | None) -> dict[str, str] | None:
             )
         if not secret:
             raise ValueError(f"secret {name!r} has an empty value")
+    return value
+
+
+def _validate_agent_name(value: str) -> str:
+    """Reject an agent name that would forge the connector object-name join.
+
+    A connector's Kubernetes objects are named
+    ``{release}-{agent}-mcp-{connector}``
+    (``plugin_format.connector_render.object_name``). The ``-mcp-`` is a bare
+    substring inside one DNS label rather than a structural separator, so the
+    join point is not recoverable from the rendered string: agent ``a-mcp-b``
+    with connector ``c`` and agent ``a`` with connector ``b-mcp-c`` render
+    byte-identical objects AND the identical ``app.kubernetes.io/name`` pod
+    selector. The connector is deliberately unauthenticated (ADR-0086 -- the
+    sandbox holds no credential to authenticate WITH, so the network is the
+    whole of the access control), which makes that name the only thing binding
+    a sandbox to a credential: one agent's sandbox reaches another agent's
+    connector holding another agent's production token, and nothing errors
+    anywhere (#1446).
+
+    ``connectors.yaml`` names and ``deploy.yaml``'s ``target.agent`` are both
+    gated by bundle validation. ``POST /agents`` is the hole -- the stored
+    ``Agent.name`` reaches the renderer with no field validator in between --
+    and it is the path the CLI's ``resolve_agent`` and the UI's create modal
+    both take. Refusing on write keeps the forging name out of the database
+    entirely; the render-time 422 in ``routers/agents.py`` only covers rows
+    created before this validator existed.
+
+    Deliberately ONLY the delimiter-forging shape. ``AgentCreate.name`` accepts
+    spaces, uppercase, and 200-character names today; that is a real but
+    SEPARATE pre-existing gap, and tightening it here would refuse names live
+    installs already hold. Do not "helpfully" widen this into general
+    name-shape validation -- that is its own change, with its own migration
+    story.
+
+    The rule itself is imported, never restated: ``agent_forges_join`` asks
+    whether ``-mcp-`` appears in ``f"{name}-"``, which catches a TRAILING
+    ``-mcp`` (the join supplies the dash that completes it) as surely as an
+    outright ``-mcp-``, while leaving a LEADING ``mcp-`` alone -- its only
+    alternative split leaves an empty agent, so nothing is ambiguous. A second
+    copy of that asymmetry here would be free to drift from the renderer it
+    exists to protect.
+    """
+
+    if agent_forges_join(value):
+        raise ValueError(
+            f"agent name {value!r} collides with the connector object-name "
+            "delimiter '-mcp-': a connector's Kubernetes objects are named "
+            "'{release}-{agent}-mcp-{connector}', so a name that contains "
+            "'-mcp-' or ends in '-mcp' makes two different agents render the "
+            "same objects and share one connector's credential (#1446). Pick a "
+            "name that neither contains '-mcp-' nor ends in '-mcp'."
+        )
     return value
 
 
@@ -948,6 +1002,7 @@ class AgentCreate(BaseModel):
     # behavior exactly, since there is nothing yet to share with.
     memory: bool = False
 
+    _check_name = field_validator("name")(_validate_agent_name)
     _check_model = field_validator("model")(_validate_model_override)
     _check_thinking = field_validator("thinking")(_validate_thinking_override)
     _check_approval_tools = field_validator("approval_required_tools")(_validate_tool_names)
@@ -1178,6 +1233,53 @@ class ListedTargets(BaseModel):
     """
 
     targets: list[NamedTarget] = []
+
+
+class RoutingCheckRequest(BaseModel):
+    """Ask whether a repository's pushes can still be routed to an agent (#1221).
+
+    Migration 0018 (ADR-0091) dropped the unique index on ``repo_full_name``, so
+    binding a SECOND agent to a repository is legal -- and silently flips every
+    future push for the agent that was already bound from "deploys" to
+    "rejected", because nothing says which of the two a branch belongs to. The
+    caller sends the bundle's ``deploy.yaml`` TEXT for the same reason
+    ``ResolveTargetRequest`` does: the API owns the resolver rule, so a client
+    restating it here would drift from the rule actually enforced on a push.
+    """
+
+    repo_full_name: str
+    # The bundle's deploy.yaml TEXT, or None when the bundle has no such file.
+    # None and an empty `targets:` map say the same thing about routing (#1210),
+    # and the resolver already treats them identically.
+    content: str | None = None
+
+
+class RoutingCheckProblem(BaseModel):
+    """One environment whose pushes this repository can no longer route.
+
+    ``message`` is the resolver's OWN text, carried verbatim so the CLI can
+    print it without paraphrasing the rule.
+    """
+
+    environment: str
+    code: str
+    message: str
+
+
+class RoutingCheck(BaseModel):
+    """Whether pushes to a repository still resolve to an agent (#1221).
+
+    ``resolvable`` is false only when the real resolver raised: a branch with no
+    matching target resolves to "ignore", which is intended behaviour, not a
+    problem. An unbound repository (``agent_count`` 0) stays resolvable too --
+    this reports ROUTING, not whether anything is bound.
+    """
+
+    repo_full_name: str
+    agent_count: int = 0
+    agents: list[str] = Field(default_factory=list)
+    resolvable: bool = True
+    unresolvable: list[RoutingCheckProblem] = Field(default_factory=list)
 
 
 class ConnectorManifests(BaseModel):

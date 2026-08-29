@@ -2691,9 +2691,14 @@ class Kernel:
         value. Sequential redelivery finds no ref after successful cleanup. If a
         newer ref replaces the value during delivery, comparison preserves it.
 
-        This remains fully best effort and never fails the resume. There is no
-        dual read for refs keyed by thread before the approval id layout. Those
-        refs are not automatically settled and remain until their TTL expires.
+        This remains fully best effort and never fails the resume. There is
+        still no RUNTIME dual read: this path reads exactly one key, the
+        approval id's. Refs keyed by thread before the approval id layout are
+        instead rekeyed onto their approval id by a one-shot boot migration
+        (``ApprovalCardStore.migrate_legacy_thread_keyed_refs``, #1751), so by
+        the time a resume arrives they are ordinary entries this read finds. A
+        pre-#1199 ref that never recorded its approval id is not migratable and
+        still lapses with its TTL.
         """
 
         if self._card_store is None or not self._is_approval_resume(qevent.event_id):

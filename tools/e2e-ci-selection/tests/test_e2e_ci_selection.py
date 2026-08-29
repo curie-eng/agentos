@@ -546,3 +546,22 @@ def test_negative_control_rejects_selected_skipped_outcome_when_validator_mutate
     output = completed.stdout + completed.stderr
     assert completed.returncode != 0, output
     assert "Selected and skipped negative control failed" in output
+
+
+def test_selector_directory_has_no_stdlib_shadowing_modules() -> None:
+    # Structural, not behavioral: on Linux `select` is a builtin module (its
+    # __file__ is None), so a directly-executed script's own directory on
+    # sys.path never wins and the shadow bug cannot be reproduced here. On
+    # macOS `select` is a dynamic extension in lib-dynload, which loses to
+    # sys.path[0] and crashes. See issue #1878.
+    selector_dir = SELECTOR.parent
+    for candidate in selector_dir.glob("*.py"):
+        assert candidate.stem not in sys.stdlib_module_names, (
+            f"{candidate.name} shadows the stdlib module '{candidate.stem}': "
+            "Python puts a directly-executed script's own directory first on "
+            "sys.path, so this basename shadows the stdlib module for every "
+            "import in this process. That's harmless on platforms where the "
+            "shadowed module is a builtin (e.g. Linux's `select`), but breaks "
+            "the script on platforms where it's a dynamic extension instead "
+            "(e.g. macOS's `select`), per issue #1878."
+        )

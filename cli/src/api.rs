@@ -34,6 +34,46 @@ pub struct ResolvedTarget {
     pub slack_channel: Option<String>,
 }
 
+/// One environment whose pushes a repository can no longer route (#1221).
+///
+/// `message` is the platform resolver's OWN text. The CLI prints it verbatim
+/// and never paraphrases it: the routing rule lives in `gitflow.py`, and a
+/// restatement here would be free to drift from the rule a push enforces.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RoutingCheckProblem {
+    #[serde(default)]
+    pub environment: String,
+    #[serde(default)]
+    pub code: String,
+    #[serde(default)]
+    pub message: String,
+}
+
+/// Whether git-flow pushes to a repository still resolve to an agent (#1221).
+///
+/// Every field carries `serde(default)`: this decode is advisory, and a
+/// platform that answers with a narrower shape must degrade to "nothing to
+/// warn about" rather than panic a deploy that otherwise succeeded.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RoutingCheck {
+    #[serde(default)]
+    pub repo_full_name: String,
+    #[serde(default)]
+    pub agent_count: u32,
+    #[serde(default)]
+    pub agents: Vec<String>,
+    #[serde(default = "yes")]
+    pub resolvable: bool,
+    #[serde(default)]
+    pub unresolvable: Vec<RoutingCheckProblem>,
+}
+
+/// `resolvable` defaults to TRUE when absent: silence must mean "no problem
+/// reported", never a warning invented from a field the platform never sent.
+fn yes() -> bool {
+    true
+}
+
 /// One target plus the name it is declared under (ADR-0089).
 #[derive(Debug, Clone, Deserialize)]
 pub struct NamedTarget {
@@ -2016,6 +2056,70 @@ impl ApiClient {
         serde_json::from_str(&body).context("decoding the deploy target list")
     }
 
+    /// Ask the API whether this repository's pushes still route (#1221).
+    ///
+    /// ADVISORY, and deliberately incapable of failing a deploy: binding an
+    /// agent to a repository already succeeded by the time this is called, so
+    /// an error here would report failure for work that landed. Every
+    /// non-success -- an older platform with no such route, a 500, a body that
+    /// does not decode -- returns `Ok(None)`, meaning "no answer", which the
+    /// caller renders as no output at all.
+    ///
+    /// The `deploy.yaml` text goes over the wire unparsed for the same reason
+    /// `resolve_deploy_target` sends it: ADR-0089 keeps exactly one parser for
+    /// this format, and the resolver rule the answer depends on is the
+    /// platform's, not a copy of it living here.
+    ///
+    /// This is the ONE call with a per-request deadline, and it is set here
+    /// rather than on the shared client on purpose. `ApiClient::new` bounds
+    /// only `connect_timeout`, so a peer that accepts the TCP connection and
+    /// then stalls before sending headers leaves the caller waiting forever --
+    /// and because this runs AFTER the deploy has already landed, that
+    /// unbounded wait turns a successful deploy into an apparent hang, which is
+    /// exactly the failure this check promises never to cause. A GLOBAL timeout
+    /// is the wrong fix: bundle upload, deploy activation, and the streaming
+    /// reads legitimately run longer than any bound this call wants, and
+    /// capping them would break work that must not be interrupted. 10s is far
+    /// past a healthy answer and far short of an operator's patience; expiry
+    /// lands in the non-success path below as `Ok(None)` -- a timeout is "no
+    /// answer", indistinguishable from a 500, and prints nothing.
+    pub async fn check_git_flow_routing(
+        &self,
+        repo_full_name: &str,
+        content: Option<&str>,
+    ) -> Result<Option<RoutingCheck>> {
+        let sent = self
+            .send_request(
+                self.http
+                    .post(format!("{}/git-flow/routing-check", self.base_url))
+                    .header("X-API-Key", &self.api_key)
+                    .json(&serde_json::json!({
+                        "repo_full_name": repo_full_name,
+                        "content": content,
+                    }))
+                    .timeout(std::time::Duration::from_secs(10)),
+                "checking git-flow routing",
+            )
+            .await;
+        // A send that never completed -- the 10s deadline above, or an
+        // unreachable API -- is "no answer" like any other, so it is absorbed
+        // here rather than bubbled with `?`. Propagating would make the
+        // function's advisory contract depend on every caller remembering to
+        // discard the error.
+        let Ok(resp) = sent else {
+            return Ok(None);
+        };
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        // A platform predating this endpoint answers FastAPI's bare 404. That is
+        // skew, not a fault: an operator on an older release is not doing
+        // anything wrong and must not be told to upgrade by an advisory check.
+        if is_unrouted(status, &body) || !status.is_success() {
+            return Ok(None);
+        }
+        Ok(serde_json::from_str(&body).ok())
+    }
+
     pub async fn version_connectors(
         &self,
         agent_id: &str,
@@ -2124,6 +2228,40 @@ impl ApiClient {
             .json()
             .await
             .context("decoding approvals")
+    }
+
+    /// One approval by id: `GET /approvals/{approval_id}`, mirroring the
+    /// endpoint at `apps/api/src/curie_api/routers/approvals.py:92-98`. Answers
+    /// 404 when the id names no approval, which a resolve or an expiry by
+    /// another operator makes a real answer rather than a theoretical one.
+    ///
+    /// The CLI reads this for `card_channel` (#1531 finding 3): a route binding
+    /// can put the card in a channel other than the one the turn spoke in, and
+    /// the printed resolve hint has to name the channel the server's authorizer
+    /// actually compares `--actor-channel` against. The single-record read is
+    /// what the hint needs rather than [`Self::list_pending_approvals`], whose
+    /// page is capped at the server max and can simply not contain the approval
+    /// being waited on (#670).
+    ///
+    /// Deliberately UNBOUNDED here, unlike [`Self::check_git_flow_routing`]:
+    /// this stays a plain mirror of the endpoint like every other method, so a
+    /// future non-advisory caller is not silently capped. The deadline belongs
+    /// to the advisory caller, which is where the reasoning for a specific
+    /// budget lives (`message::hint_channel`).
+    pub async fn get_approval(&self, approval_id: &str) -> Result<ApprovalRecord> {
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!("{}/approvals/{approval_id}", self.base_url))
+                    .header("X-API-Key", &self.api_key),
+                "GET /approvals/{id}",
+            )
+            .await?;
+        Self::expect_ok(resp, "reading an approval")
+            .await?
+            .json()
+            .await
+            .context("decoding the approval")
     }
 
     /// Resolve one approval as a chosen actor: `POST /approvals/{id}/resolve`.

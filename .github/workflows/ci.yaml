@@ -1056,8 +1056,9 @@ jobs:
       # GHA-layer-cached builds via a named buildx builder that is NOT made the
       # default (`use: false`), same mechanism the `e2e-ladder` job documents.
       # `load: true` exports each image into the local daemon store so `kind
-      # load` picks it up with no registry round trip. Only the four images the
-      # cluster round trip actually needs; the dispatcher is not deployed.
+      # load` picks it up with no registry round trip. The four product images
+      # drive the cluster round trip; a fifth fixture image delays Postgres for
+      # the Langfuse startup regression. The dispatcher is not deployed.
       - name: Set up a cache-only buildx builder (named, NOT the default)
         id: clustercache
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
@@ -1107,6 +1108,17 @@ jobs:
           load: true
           cache-from: type=gha,scope=ladder-runner
           cache-to: type=gha,mode=max,scope=ladder-runner
+      - name: Build the delayed Postgres readiness fixture locally
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: charts/curie/ci
+          file: charts/curie/ci/postgres-readiness-delay.Dockerfile
+          builder: ${{ steps.clustercache.outputs.name }}
+          tags: curie-postgres-readiness:${{ github.sha }}
+          push: false
+          load: true
+          cache-from: type=gha,scope=langfuse-postgres-readiness
+          cache-to: type=gha,mode=max,scope=langfuse-postgres-readiness
       # kind config: map the UI NodePort (chart default 30080) to the host so
       # `cluster deploy`'s UI `/api` NodePort discovery -- which resolves the
       # loopback kubeconfig host (127.0.0.1) -- reaches the in-cluster API.
@@ -1176,14 +1188,30 @@ jobs:
           kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/calico.yaml
           kubectl -n kube-system rollout status daemonset/calico-node --timeout=300s
           kubectl wait --for=condition=Ready node --all --timeout=300s
-      # Load the four locally-built images into the node store so the install's
-      # pullPolicy Never overrides bind them with no registry pull.
+      # Load the locally-built product images and uniquely tagged Postgres delay
+      # fixture into the node store with no registry round trip.
       - name: Load images into the kind cluster
         run: |
           set -euo pipefail
-          for img in curie-api:local curie-worker:local curie-ui:local curie-runner:latest; do
+          for img in \
+            curie-api:local \
+            curie-worker:local \
+            curie-ui:local \
+            curie-runner:latest \
+            "curie-postgres-readiness:${GITHUB_SHA}"; do
             kind load docker-image "$img" --name curie-e2e
           done
+      - name: Langfuse web waits for delayed Postgres without restarting
+        env:
+          READINESS_NAMESPACE: curie-1853-${{ github.run_id }}-${{ github.run_attempt }}
+          READINESS_RELEASE: curie-1853-${{ github.run_id }}-${{ github.run_attempt }}
+          READINESS_POSTGRES_IMAGE: curie-postgres-readiness:${{ github.sha }}
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/runtime/langfuse-postgres-readiness-runtime.sh \
+            --namespace "$READINESS_NAMESPACE" \
+            --release "$READINESS_RELEASE" \
+            --postgres-image "$READINESS_POSTGRES_IMAGE"
       # The pod-reachable host for the reply stub: the kind Docker network
       # gateway. Every node container sits on this bridge, so a pod egressing
       # through its node reaches the host here; the stub binds 0.0.0.0 and answers
@@ -1225,11 +1253,10 @@ jobs:
       # overrides repoint every first-party image at the just-loaded local tags
       # with pullPolicy Never (the runner AND its prewarm DaemonSet), force gVisor
       # off (no runsc on kind nodes), and drop the dispatcher (no Slack; its
-      # presence would trip the `cluster message` reply-hijack guard).
-      # worker.slackTrustedOrigins is a CI only widening that lets the worker
-      # answer the host side reply stub on any kernel assigned port on this
-      # host. The portless origin is intentional because `cluster message`
-      # requests an ephemeral port; the chart default stays empty and fail closed.
+      # presence would trip the `cluster message` reply-hijack guard). The worker
+      # is deliberately installed with the chart's empty/default trusted-origin
+      # posture: the rollout-recovery regression below must exercise the first
+      # `cluster message` command's temporary trust rollout from that cold state.
       - name: Install the platform (curie cluster up)
         env:
           CURIE_BIN: cli/target/release/curie
@@ -1241,7 +1268,6 @@ jobs:
             --fake-model \
             --set security.gvisor.mode=off \
             --set dispatcher.deploy=false \
-            --set worker.slackTrustedOrigins="http://${CURIE_E2E_LISTEN_HOST}" \
             --set api.image.repository=curie-api --set api.image.tag=local --set api.image.pullPolicy=Never \
             --set worker.image.repository=curie-worker --set worker.image.tag=local --set worker.image.pullPolicy=Never \
             --set ui.image.repository=curie-ui --set ui.image.tag=local --set ui.image.pullPolicy=Never \
@@ -1260,6 +1286,18 @@ jobs:
           kubectl rollout status deploy/curie-worker -n curie --timeout=300s
           kubectl rollout status deploy/curie-ui -n curie --timeout=300s
           kubectl rollout status daemonset/curie-runner-prewarm -n curie --timeout=300s
+      # QA4-02: drive the first no-Slack invocation from the default/untrusted
+      # install through its real Deployment rollout and prove the outgoing
+      # worker never claims it. Then kill a real PEL owner while its sandbox
+      # is held Pending by a namespaced, sandbox-only node selector and require
+      # the same CLI process to transfer the PEL entry and recover its reply in
+      # under three minutes. The shared agent-sandbox controller stays Ready and
+      # untouched throughout. Red-on-revert binaries/images are opt-in harness
+      # knobs; CI deliberately exercises only the current branch.
+      - name: First invocation rollout and dead-consumer recovery
+        env:
+          CURIE_BIN: cli/target/release/curie
+        run: bash cli/scripts/e2e-cluster-rollout-recovery.sh
       # The cluster rung only: `cluster status` gate -> `cluster deploy` ->
       # `cluster message` (reply asserted). Fake model, credential-free.
       - name: Parity ladder (cluster rung, fake model, credential-free)
@@ -1286,6 +1324,14 @@ jobs:
           kubectl get events -n curie --sort-by=.lastTimestamp | tail -50 || true
           kubectl describe pods -n curie -l app.kubernetes.io/component=runner-sandbox || true
           kubectl logs -n curie -l app.kubernetes.io/component=worker --tail=100 || true
+      # Delete only this job's namespaced release resources. Do not uninstall or
+      # delete the shared controller namespace: the pinned kind action owns final
+      # disposal of the whole single-use cluster. This still runs after failure.
+      - name: Tear down the disposable cluster release
+        if: always()
+        run: |
+          kubectl delete namespace curie \
+            --ignore-not-found --wait=false 2>/dev/null || true
 
   e2e-required:
     name: E2E required

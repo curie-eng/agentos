@@ -12,8 +12,11 @@ import os
 import sys
 from pathlib import Path
 
+import anyio
 import httpx
 import pytest
+from mcp.server.fastmcp.exceptions import ToolError
+from mcp.shared.memory import create_connected_server_and_client_session as _connect
 
 # Load server.py BY PATH under a unique module name, rather than putting this
 # directory on sys.path and importing `server`.
@@ -125,10 +128,10 @@ def test_zero_or_duplicate_tempo_datasources_refuse_before_proxy(monkeypatch, da
         return httpx.Response(200, json=datasources)
 
     monkeypatch.setattr(srv.httpx, "get", fake_get)
-    result = srv.list_trace_tags()
-    assert isinstance(result, str)
-    assert "exactly one" in result
-    assert "Tempo" in result
+    with pytest.raises(ToolError) as excinfo:
+        srv.list_trace_tags()
+    assert "exactly one" in str(excinfo.value)
+    assert "Tempo" in str(excinfo.value)
     assert seen == ["https://grafana.example.com/api/datasources"]
 
 
@@ -150,8 +153,13 @@ def test_limit_is_clamped(monkeypatch, asked, expected):
 
 
 # --------------------------------------------------------------------------- #
-# Errors. Every one is returned as a SENTENCE, because a raised exception
-# reaches the model as a stack trace -- which it pastes into Slack or retries.
+# Errors. Every one is a ToolError carrying a SENTENCE. The sentence is what
+# stops the model pasting a traceback into Slack or retrying something that will
+# refuse again -- FastMCP puts the message on the wire behind a fixed
+# `Error executing tool <tool_name>: ` prefix and adds nothing else, no
+# traceback (the wire test below pins that shape exactly).
+# Raising rather than returning is what makes the result `isError: true`, so a
+# refusal is not the same wire value as an answer (see the wire test below).
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize(
     "status,must_contain",
@@ -162,16 +170,16 @@ def test_limit_is_clamped(monkeypatch, asked, expected):
         (500, "500"),
     ],
 )
-def test_http_errors_become_readable_strings(monkeypatch, status, must_contain):
+def test_http_errors_become_readable_tool_errors(monkeypatch, status, must_contain):
     srv = _load()
     _with_one_tempo(
         monkeypatch,
         srv,
         lambda *a, **kw: httpx.Response(status, text="boom"),
     )
-    out = srv.search_traces("{}")
-    assert isinstance(out, str)
-    assert must_contain in out
+    with pytest.raises(ToolError) as excinfo:
+        srv.search_traces("{}")
+    assert must_contain in str(excinfo.value)
 
 
 # --------------------------------------------------------------------------- #
@@ -196,13 +204,14 @@ def test_oversized_body_is_refused_by_content_length(monkeypatch):
             200, json={"ok": True}, headers={"content-length": oversized}
         ),
     )
-    out = srv.get_trace("abc123")
-    assert isinstance(out, str)
-    assert "cap" in out
+    with pytest.raises(ToolError) as excinfo:
+        srv.get_trace("abc123")
+    message = str(excinfo.value)
+    assert "cap" in message
     # Actionable, and explicitly not retryable -- otherwise the agent tries
     # three times and reports a timeout.
-    assert "Narrow the query" in out
-    assert "refused again" in out
+    assert "Narrow the query" in message
+    assert "refused again" in message
 
 
 def test_oversized_body_is_refused_when_content_length_is_absent(monkeypatch):
@@ -213,9 +222,9 @@ def test_oversized_body_is_refused_when_content_length_is_absent(monkeypatch):
     resp = httpx.Response(200, json=big)
     del resp.headers["content-length"]
     _with_one_tempo(monkeypatch, srv, lambda *a, **kw: resp)
-    out = srv.get_trace("abc123")
-    assert isinstance(out, str)
-    assert "cap" in out
+    with pytest.raises(ToolError) as excinfo:
+        srv.get_trace("abc123")
+    assert "cap" in str(excinfo.value)
 
 
 def test_a_normal_sized_trace_is_still_returned(monkeypatch):
@@ -239,25 +248,36 @@ def test_search_results_are_capped_too(monkeypatch):
             200, json={"traces": []}, headers={"content-length": oversized}
         ),
     )
-    assert "cap" in srv.search_traces("{}")
+    with pytest.raises(ToolError) as excinfo:
+        srv.search_traces("{}")
+    assert "cap" in str(excinfo.value)
 
 
 def test_auth_failure_says_it_will_not_fix_itself(monkeypatch):
     # Without this the agent retries a 403 three times and reports a timeout.
     srv = _load()
     _with_one_tempo(monkeypatch, srv, lambda *a, **kw: httpx.Response(403))
-    assert "not fix itself" in srv.search_traces("{}")
+    with pytest.raises(ToolError) as excinfo:
+        srv.search_traces("{}")
+    assert "not fix itself" in str(excinfo.value)
 
 
-def test_timeout_is_not_an_exception(monkeypatch):
+def test_timeout_is_a_sentence_not_a_traceback(monkeypatch):
+    # It IS an exception now -- a ToolError -- but that is not the property that
+    # matters here. What matters is that the httpx traceback never reaches the
+    # model: it gets one sentence naming the timeout and what to narrow, which
+    # is what stops the retry loop.
     srv = _load()
 
     def boom(*a, **kw):
         raise httpx.TimeoutException("too slow")
 
     _with_one_tempo(monkeypatch, srv, boom)
-    out = srv.search_traces("{}")
-    assert isinstance(out, str) and "did not respond" in out
+    with pytest.raises(ToolError) as excinfo:
+        srv.search_traces("{}")
+    message = str(excinfo.value)
+    assert "did not respond" in message
+    assert "too slow" not in message
 
 
 def test_transport_error_does_not_leak_the_token(monkeypatch):
@@ -267,8 +287,9 @@ def test_transport_error_does_not_leak_the_token(monkeypatch):
         raise httpx.ConnectError("connection refused")
 
     _with_one_tempo(monkeypatch, srv, boom)
-    out = srv.search_traces("{}")
-    assert "glsa_test" not in out
+    with pytest.raises(ToolError) as excinfo:
+        srv.search_traces("{}")
+    assert "glsa_test" not in str(excinfo.value)
 
 
 # --------------------------------------------------------------------------- #
@@ -281,8 +302,81 @@ def test_empty_trace_id_is_rejected_before_a_request(monkeypatch):
         raise AssertionError("should not have called Grafana")
 
     monkeypatch.setattr(srv.httpx, "get", explode)
-    assert "required" in srv.get_trace("   ")
-    assert "required" in srv.list_trace_tag_values("")
+    with pytest.raises(ToolError) as excinfo:
+        srv.get_trace("   ")
+    assert "required" in str(excinfo.value)
+    with pytest.raises(ToolError) as excinfo:
+        srv.list_trace_tag_values("")
+    assert "required" in str(excinfo.value)
+
+
+# --------------------------------------------------------------------------- #
+# The wire. Every case above calls the tool function directly, and none of them
+# can see the field the connector is actually judged by. FastMCP marks a result
+# `isError: true` only when the call RAISED; a refusal that is `return`ed is a
+# string like any other, so it goes out as `isError: false` and reads as an
+# answer to anything consuming the protocol rather than the prose -- an eval
+# grader, a ledger, a retry policy. "Grafana refused the request" and "no traces
+# matched" were the same wire result, and the difference between them is the
+# whole reason to ask Tempo anything.
+#
+# So this one goes through the real MCP request path, in process.
+# --------------------------------------------------------------------------- #
+def _call_tool(srv, name, args):
+    """Call one tool through the real MCP request path and return the CallToolResult."""
+
+    async def go():
+        async with _connect(srv.mcp._mcp_server) as client:
+            return await client.call_tool(name, args)
+
+    return anyio.run(go)
+
+
+def test_a_refused_read_and_an_answered_one_carry_different_is_error_flags(monkeypatch):
+    srv = _load()
+
+    _with_one_tempo(monkeypatch, srv, lambda *a, **kw: httpx.Response(403))
+    refused = _call_tool(srv, "get_trace", {"trace_id": "abc123"})
+    assert refused.isError is True
+    # The sentence survives the trip behind a fixed SDK prefix: FastMCP puts our
+    # message text on the wire, never a traceback, so raising costs nothing the
+    # prose was doing.
+    assert "not fix itself" in refused.content[0].text
+
+    # The prefix, pinned. OBSERVED against the pinned mcp==1.28.1, which builds
+    # it at mcp/server/fastmcp/tools/base.py:117
+    # (`raise ToolError(f"Error executing tool {self.name}: {e}") from e`) and
+    # puts str(e) in as the only text content. Pinned rather than
+    # substring-matched so a version bump that reshapes or drops the prefix
+    # fails here instead of quietly changing what an operator reads in Slack.
+    prefix = "Error executing tool get_trace: "
+    refusal_text = refused.content[0].text
+    assert refusal_text.startswith(prefix)
+    # ...and what follows it is _proxy's sentence verbatim, so rewording the
+    # refusal fails here too, not just changing the prefix.
+    assert refusal_text[len(prefix):] == (
+        "Grafana refused the request (403). The service account token is "
+        "missing or lacks access to the Tempo datasource. This will not fix "
+        "itself on retry."
+    )
+
+    payload = {"batches": [{"spans": [{"name": "GET /health"}]}]}
+    _with_one_tempo(
+        monkeypatch,
+        srv,
+        lambda *a, **kw: httpx.Response(200, json=payload),
+    )
+    answered = _call_tool(srv, "get_trace", {"trace_id": "abc123"})
+    assert answered.isError is False
+    assert "GET /health" in answered.content[0].text
+    # The contrast in the OTHER direction: an answered read carries no prefix at
+    # all, so the two results differ in text shape as well as in the flag.
+    assert not answered.content[0].text.startswith("Error executing tool")
+
+    # THE contrast, stated outright: this is the whole property. While both were
+    # returned strings these two results had the same shape, and a program
+    # reading them could not tell a refusal from a trace.
+    assert refused.isError != answered.isError
 
 
 def test_every_tool_is_annotated_read_only():

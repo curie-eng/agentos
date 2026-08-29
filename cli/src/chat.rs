@@ -83,7 +83,7 @@ const SCAN_ERROR_WARN_THRESHOLD: u32 = 5;
 
 /// Caps a per-call timeout budget at the time remaining before `deadline`, so
 /// a fixed per-call timeout can never overrun the caller's overall deadline.
-fn capped(budget: Duration, deadline: Instant) -> Duration {
+pub(crate) fn capped(budget: Duration, deadline: Instant) -> Duration {
     budget.min(deadline.saturating_duration_since(Instant::now()))
 }
 

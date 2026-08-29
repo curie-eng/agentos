@@ -189,6 +189,7 @@ _HTTP_OPERATIONS = [
     "/evals/matrix",
     "/evals/report",
     "/evals/trigger",
+    "/git-flow/routing-check",
     "/github/webhook",
     "/health",
     "/hooks/{agent_id}/{hook}",

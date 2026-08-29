@@ -153,7 +153,8 @@ precedence is fixed: `users` beats `group` beats channel membership.
 
 | Declared | Set | Lookup | Does the click channel matter? |
 |---|---|---|---|
-| nothing | `SlackChannelMembers` | none, the click's channel is the proof | yes, it is the only test |
+| nothing, and the route is bound (or the approval has no route at all) | `SlackChannelMembers` | none, the click's channel is the proof | yes, it is the only test |
+| nothing, and the approval names a route that is **not** bound | `UnboundRoute` — refuses everyone | none, there is no set to resolve | no, nobody is admitted |
 | `approvers.group: S...` | `SlackUserGroupMembers` | Slack `usergroups.users.list` | no |
 | `approvers.users: [U...]` | `ExplicitUsers` | none, pure config | no |
 
@@ -274,6 +275,7 @@ entirely, so passing it there is harmless.
 | `403 self-approval is blocked` | You are the author of the turn that raised it. Resolve as a different actor. |
 | `403 you are not an approver` | The route's set does not admit that actor from that channel. Pass the record's `card_channel` as `--actor-channel` (`--list --json` reports it since #1078), or check the `approvers` block. A null `card_channel` is from an older row or a direct API write that omitted the field, so use the requesting channel. |
 | `403 could not verify approvers` | The declared `approvers` block is malformed and cannot be evaluated. Correct its `users` or `group` value, then replace the complete route map. |
+| `403 could not verify approvers: ... route is no longer bound` | The approval named a route whose binding was cleared or rewritten while it was pending — `--clear-routes`, a `--routes-from` file that omits the route, or any `--route` write, since a write is a full replacement. A pending approval is resolvable only through its own route's binding (ADR-0123), so it fails closed rather than widening to card-channel membership. Restore the binding and the approval resolves normally; it is not lost. |
 | `403 could not verify approver group membership` | Slack group membership could not be verified. This fails closed and does not name its cause. Check the API `SLACK_BOT_TOKEN`, its `usergroups:read` scope and reinstallation, and Slack availability. It never falls back to channel membership. |
 | `409 already resolved by ...` | Someone else won the claim. The decision stands. |
 | `410 expired` | The record passed its deadline. The session was already woken down its timeout branch. |

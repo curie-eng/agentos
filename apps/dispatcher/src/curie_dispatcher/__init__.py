@@ -16,7 +16,7 @@ from .app import (
     build_web_client,
 )
 from .config import DispatcherConfig
-from .handlers import is_actionable, process_event, register_handlers
+from .handlers import process_event, register_handlers
 from .queue import (
     claim_event,
     enqueue,
@@ -41,7 +41,6 @@ __all__ = [
     "claim_event",
     "enqueue",
     "from_stream_fields",
-    "is_actionable",
     "process_event",
     "register_handlers",
     "to_stream_fields",

@@ -1540,3 +1540,80 @@ def test_agent_legitimate_secret_name_still_creates(
     )
     assert ok.status_code == 201, ok.text
     assert ok.json()["secrets"] == ["GITHUB_PERSONAL_ACCESS_TOKEN"]
+
+
+# --- an agent name that forges the connector object-name join -- #1446 -------
+#
+# A connector's Kubernetes objects are named `{release}-{agent}-mcp-{connector}`
+# (`plugin_format.connector_render.object_name`). The `-mcp-` is a bare
+# substring inside one DNS label, not a structural separator, so the join point
+# is not recoverable from the rendered string: `agent='a-mcp-b'/connector='c'`
+# and `agent='a'/connector='b-mcp-c'` render the SAME Service, Deployment, both
+# NetworkPolicies, and -- worse -- the same `app.kubernetes.io/name` pod
+# selector. The connector is deliberately unauthenticated (ADR-0086: "the
+# network is not one layer of the access control here, it is the whole of it"),
+# so the object name is the ONLY thing binding a sandbox to a credential. One
+# agent's sandbox then reaches another agent's connector holding another
+# agent's production token, and nothing errors anywhere.
+#
+# `connectors.yaml` names and `deploy.yaml`'s `target.agent` are both gated by
+# bundle validation. `POST /agents` is the hole: `AgentCreate.name` reaches
+# `render_connector_manifests` (routers/agents.py, via the stored `Agent.name`)
+# with no field validator between, and this is the path the CLI's
+# `resolve_agent` and the UI's create modal both take. These tests close it at
+# the write seam, so the forging name can never enter the database at all.
+#
+# Deliberately NOT asserted here: general name shape (spaces, uppercase, length).
+# `AgentCreate.name` accepts those today and that is a separate, pre-existing
+# gap -- pinning it here would make this fence look like something it is not.
+_FORGING_AGENT_NAMES = [
+    # The pair from the issue: contains the join outright.
+    "a-mcp-b",
+    # The one a naive `'-mcp-' in name` ban MISSES: `'-mcp-' in 'x-mcp'` is
+    # False, yet `x-mcp` + connector `c` and `x` + connector `mcp-c` both render
+    # `<release>-x-mcp-mcp-c`. The trailing dash of the join is supplied by the
+    # join itself, so ending in `-mcp` forges it just as surely.
+    "x-mcp",
+    # The realistic one an operator actually types, and the reason the error
+    # message has to be actionable: `grafana-mcp` is a natural agent name.
+    "grafana-mcp",
+]
+
+
+@pytest.mark.parametrize("name", _FORGING_AGENT_NAMES)
+def test_agent_name_forging_the_connector_join_is_422(
+    client: Any, auth_headers: dict[str, str], clean_db: None, name: str
+) -> None:
+    bad = _create(client, auth_headers, name=name, channel=_slack("C0EXAMPLE1"))
+    assert bad.status_code == 422, bad.text
+    # The body must name the FIELD, or an operator staring at a 422 from a
+    # create call carrying a channel, a repo and a secrets map has no way to
+    # know which of them was refused.
+    assert any("name" in err["loc"] for err in bad.json()["detail"]), bad.text
+    # ...and the REASON, in the operator's own vocabulary. A bare "invalid
+    # name" sends them hunting for a character they typed wrong; the mechanism
+    # is that the name collides with the connector object-name delimiter, and
+    # the only fix is to rename the agent.
+    assert "-mcp-" in bad.text, bad.text
+
+
+_SAFE_AGENT_NAMES = [
+    # The shipped fixture names, which must keep working.
+    "acme-dev",
+    # LEADING `mcp-` on the agent side is fine and must stay fine: the only
+    # alternative split of `<release>-mcp-x-mcp-<connector>` leaves an empty
+    # agent, so nothing is ambiguous. A rule that over-rejects here would break
+    # live installs for no security gain, which is why the negative corpus is
+    # asserted and not assumed.
+    "mcp-x",
+    "mcp",
+]
+
+
+@pytest.mark.parametrize("name", _SAFE_AGENT_NAMES)
+def test_an_agent_name_that_only_looks_like_the_join_still_creates(
+    client: Any, auth_headers: dict[str, str], clean_db: None, name: str
+) -> None:
+    ok = _create(client, auth_headers, name=name, channel=_slack("C0EXAMPLE2"))
+    assert ok.status_code == 201, ok.text
+    assert ok.json()["name"] == name

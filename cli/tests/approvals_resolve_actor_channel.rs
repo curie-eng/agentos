@@ -255,3 +255,175 @@ async fn list_json_reports_the_card_channel_the_recipe_promises() {
          cannot tell a correct value from a lucky one"
     );
 }
+
+// ─── #1531 finding 3 (companion): the HUMAN --list render owes the same field ──
+//
+// `note_approval_pending` (`cli/src/message.rs:2033-2034`) tells an operator
+// that `approvals <AGENT> --list` "also reports the approval's channel if its
+// route binds one". On the human path that promise is false: #1078 fixed the
+// `--json` projection above and left the `ApprovalsOutput::Pending` render
+// printing only summary, conversation_id, tool, route and by. That render is the
+// fallback for exactly the terminals that cannot look the channel up themselves
+// (the arms with no parseable approval id), so it is the one surface that closes
+// the loop for them.
+//
+// These two drive the REAL binary. `cli/src/ui.rs` exposes only
+// `pub fn ui() -> &'static Ui` over a `OnceLock`, and `kv`/`payload` write
+// straight to `anstream::stdout()`, so there is no in-process capture seam and
+// a hand-built `ApprovalsOutput` would walk past the render under test. The
+// subprocess precedent is `cli/tests/chart_check.rs:53` and
+// `cli/tests/cluster_rollback.rs:638`.
+
+/// Run `curie local approvals weather --list` against a stub API and hand back
+/// its stdout. `NO_COLOR` keeps the assertions matching plain text rather than
+/// ANSI-wrapped fragments.
+fn list_stdout(server: &MockServer) -> String {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_curie"))
+        .args(["local", "approvals", "weather", "--list"])
+        .args(["--api-url", server.base_url.as_str()])
+        .args(["--api-key", TEST_API_KEY])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("run curie local approvals --list");
+    let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
+    let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
+    assert!(
+        output.status.success(),
+        "--list against a well-formed stub must succeed; stdout: {stdout:?} stderr: {stderr:?}"
+    );
+    stdout
+}
+
+/// A stub serving the agent lookup plus one pending approval, with the given
+/// `card_channel` JSON literal spliced in (`"CFINANCE01"`, `null`, or `""`).
+fn pending_list_server(card_channel: &'static str) -> MockServer {
+    serve(move |req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => Response::json(
+            200,
+            r##"[{"id":"11111111-1111-1111-1111-111111111111","name":"weather","channels":[{"kind":"slack","address":"CREQUEST01"}],"created_at":"2026-07-05T00:00:00Z","memory":false}]"##,
+        ),
+        ("GET", p) if p.starts_with("/approvals") => Response::json(
+            200,
+            &format!(
+                r##"[{{"id":"22222222-2222-2222-2222-222222222222","agent_id":"11111111-1111-1111-1111-111111111111","author":"U-REQUESTER","route":"finance","gate_kind":"policy","granted_tool":null,"status":"pending","conversation_id":"thread-1","summary":"approve invoice","expires_at":null,"resolved_by":null,"card_channel":{card_channel},"reply_channel":"CREQUEST01"}}]"##
+            ),
+        ),
+        other => panic!("unexpected request: {other:?}"),
+    })
+}
+
+/// B-T1. The human render must name the card channel, making
+/// `note_approval_pending`'s printed promise true.
+///
+/// The requesting channel is a DIFFERENT channel here on purpose: an operator
+/// who assumed the two were the same would pass the wrong `--actor-channel` and
+/// read the resulting 403 as an authorization problem rather than a typo.
+///
+/// Mutation it catches: deleting the `card` local or its field from the format
+/// string in `ApprovalsOutput::Pending`'s render arm.
+#[test]
+fn list_human_render_reports_the_card_channel_the_hint_promises() {
+    let server = pending_list_server(r#""CFINANCE01""#);
+    let stdout = list_stdout(&server);
+
+    assert!(
+        stdout.contains("CFINANCE01"),
+        "the human --list output must report the approval's card channel; \
+         without it the operator has no way to derive --actor-channel from the \
+         human path. stdout: {stdout:?}"
+    );
+}
+
+/// B-T2 (negative). A null `card_channel` must render its real MEANING.
+///
+/// #1431 settled what a null means: an older row or a direct API write, so the
+/// REQUESTING channel applies -- not "the record names no route". Printing
+/// `null`, `none` or `-` states the wrong fact, and an operator acting on it
+/// would conclude no channel is required and omit `--actor-channel` entirely.
+/// `cli/tests/guide.rs:288-315` already holds this meaning on the guide surface;
+/// this extends the same invariant to the list render.
+///
+/// `route` is a non-null `"finance"` in the fixture so the expected
+/// `(requesting channel)` placeholder can only have come from `card_channel`.
+///
+/// Mutation it catches: `unwrap_or("null")`, `unwrap_or("none")`, or
+/// `unwrap_or("-")` on the card channel.
+#[test]
+fn a_null_card_channel_renders_the_requesting_channel_meaning() {
+    let server = pending_list_server("null");
+    let stdout = list_stdout(&server);
+
+    let record_line = stdout
+        .lines()
+        .find(|line| line.contains("22222222-2222-2222-2222-222222222222"))
+        .unwrap_or_else(|| panic!("the pending record must be listed; stdout: {stdout:?}"))
+        .to_string();
+
+    assert!(
+        record_line.contains("(requesting channel)"),
+        "a null card_channel means the requesting channel applies; the render \
+         must say so. line: {record_line:?}"
+    );
+    for wrong in ["channel: null", "channel: none", "channel: -"] {
+        assert!(
+            !record_line.contains(wrong),
+            "rendering a null card_channel as {wrong:?} states the wrong fact \
+             (#1431): it reads as 'no channel is needed'. line: {record_line:?}"
+        );
+    }
+}
+
+/// B-T2's pair: an EMPTY `card_channel` is the server's own spelling of absent,
+/// so the list must say the requesting channel applies too.
+///
+/// The server selects the approver set with
+/// `approval.card_channel or approval.reply_channel`
+/// (`apps/api/src/curie_api/slack_approvers.py:174`), and in Python only the
+/// empty string is falsy, so `""` on the wire means "fall back to the reply
+/// channel" exactly as a null does. The resolve hint already mirrors that: it
+/// degrades to the turn channel for this same input
+/// (`the_hint_names_the_turn_channel_when_the_card_channel_is_empty` in
+/// `cli/src/message.rs`). The list render keys on `None` alone
+/// (`cli/src/commands.rs:5246`), so it prints `channel: ` with NOTHING after it,
+/// which is both a disagreement between the two surfaces about one wire value
+/// and a line that tells the operator nothing at all.
+///
+/// This test and `a_null_card_channel_renders_the_requesting_channel_meaning`
+/// are a PAIR covering both spellings of absent. Neither covers the other:
+/// `None` and `Some("")` are different values reaching different branches.
+///
+/// `route` is a non-null `"finance"` in the fixture so the expected
+/// `(requesting channel)` placeholder can only have come from `card_channel`.
+///
+/// Mutation it catches: keying the placeholder on `as_deref()` alone rather than
+/// also on emptiness, which is what the render does today.
+#[test]
+fn an_empty_card_channel_renders_the_requesting_channel_meaning() {
+    let server = pending_list_server(r#""""#);
+    let stdout = list_stdout(&server);
+
+    let record_line = stdout
+        .lines()
+        .find(|line| line.contains("22222222-2222-2222-2222-222222222222"))
+        .unwrap_or_else(|| panic!("the pending record must be listed; stdout: {stdout:?}"))
+        .to_string();
+
+    assert!(
+        record_line.contains("(requesting channel)"),
+        "an empty card_channel is what the server itself treats as absent, so \
+         the list must say the requesting channel applies, exactly as the \
+         resolve hint already degrades to the turn channel for this same \
+         value. line: {record_line:?}"
+    );
+    // A blank field is the specific defect: `channel: ` followed straight by the
+    // next field renders nothing at all where a meaning belongs. The other three
+    // are the #1431 wrong-fact spellings the null case already forbids.
+    for wrong in ["channel: ,", "channel: null", "channel: none", "channel: -"] {
+        assert!(
+            !record_line.contains(wrong),
+            "rendering an empty card_channel as {wrong:?} either states the \
+             wrong fact or states nothing; the operator cannot derive \
+             --actor-channel from it either way. line: {record_line:?}"
+        );
+    }
+}

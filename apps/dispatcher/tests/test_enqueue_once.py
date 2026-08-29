@@ -69,10 +69,12 @@ def test_enqueue_payload_uses_dispatcher_carrier_beside_unchanged_payload(
     assert len(entries) == 1
     assert entries[0][0] == stream_id
     fields = entries[0][1]
-    assert fields == {
-        "payload": turn.model_dump_json(),
-        TRACEPARENT_STREAM_FIELD: _TRACEPARENT,
-    }
+    assert fields["payload"] == turn.model_dump_json()
+    carrier = fields[TRACEPARENT_STREAM_FIELD]
+    _, trace_id, span_id, flags = carrier.split("-")
+    assert trace_id == _TRACEPARENT.split("-")[1]
+    assert len(span_id) == 16
+    assert flags == "01"
     assert from_stream_fields(fields) == turn
 
 

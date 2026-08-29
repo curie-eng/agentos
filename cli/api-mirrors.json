@@ -272,6 +272,16 @@
       "struct": "MetricSeries",
       "schema": "MetricSeries",
       "omissions": []
+    },
+    {
+      "struct": "RoutingCheckProblem",
+      "schema": "RoutingCheckProblem",
+      "omissions": []
+    },
+    {
+      "struct": "RoutingCheck",
+      "schema": "RoutingCheck",
+      "omissions": []
     }
   ],
   "non_mirrors": [

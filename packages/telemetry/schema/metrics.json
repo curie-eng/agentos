@@ -937,6 +937,7 @@
           "/evals/matrix",
           "/evals/report",
           "/evals/trigger",
+          "/git-flow/routing-check",
           "/github/webhook",
           "/health",
           "/hooks/{agent_id}/{hook}",
@@ -980,7 +981,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 2640
+      "cardinality_bound": 2680
     },
     "curie.http.server.request.duration": {
       "type": "histogram",
@@ -1037,6 +1038,7 @@
           "/evals/matrix",
           "/evals/report",
           "/evals/trigger",
+          "/git-flow/routing-check",
           "/github/webhook",
           "/health",
           "/hooks/{agent_id}/{hook}",
@@ -1080,7 +1082,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 2640
+      "cardinality_bound": 2680
     },
     "curie.http.server.active": {
       "type": "up_down_counter",
@@ -1137,6 +1139,7 @@
           "/evals/matrix",
           "/evals/report",
           "/evals/trigger",
+          "/git-flow/routing-check",
           "/github/webhook",
           "/health",
           "/hooks/{agent_id}/{hook}",
@@ -1173,7 +1176,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 528
+      "cardinality_bound": 536
     },
     "curie.background.loop": {
       "type": "counter",

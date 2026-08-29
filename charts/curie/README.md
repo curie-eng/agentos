@@ -406,6 +406,24 @@ Flipping any to `false` removes its resources from the render; consumers
 fields on the same block (`host`/`port` for stores, `otelCollector.endpoint`
 for an external collector).
 
+### Langfuse Postgres startup readiness
+
+`langfuse.web.postgresReadiness` is enabled by default. Before Langfuse web
+starts, its `wait-for-postgres` init container makes a credential-free
+`pg_isready` protocol-readiness check only; it does not validate authentication
+or run migrations. Its `image` is empty by default and falls back to
+`postgres.image`; override it for a BYO Postgres/private registry when the
+default image is unavailable there.
+
+Defaults are `attempts: 60`, `intervalSeconds: 2`, and
+`probeTimeoutSeconds: 2`: the wait is bounded to approximately 2--4 minutes,
+depending on how quickly each probe fails. While the Pod remains in `Init`, use
+`kubectl logs <langfuse-web-pod> -c wait-for-postgres` and check the Postgres
+endpoint, DNS, and network path. Exhaustion fails the init container so
+Kubernetes restarts it. After a successful protocol check, Langfuse web owns
+authentication and migrations: bad credentials and permanent migration failures
+are terminal there and are not retried by this gate.
+
 Secrets: all credentials are written to one `<release>-secrets` Secret. A sealed
 `helm install` (the default) generates strong random values for all eleven
 chart owned credentials: the backing store passwords, Langfuse
@@ -1082,9 +1100,23 @@ Create that Secret however you like — `kubectl create secret generic`, Externa
 Secrets Operator against AWS Secrets Manager or Vault, or Sealed Secrets. This
 is the same bring-your-own idiom every backing store in this chart uses.
 
+The CLI can point a release at it instead of a values file:
+
+```bash
+curie cluster github-app --app-id 1234567 --existing-secret my-github-app
+```
+
+`--existing-secret-key` defaults to `privateKey`, the same default as the
+chart — pass it explicitly if your Secret uses a different key, since the CLI
+always sets this field. The command also rolls the API deployment onto the
+referenced Secret, so there is nothing further to restart.
+
 **Quick trial — let the chart hold it.** `curie cluster github-app --app-id …
 --private-key …` puts the PEM in the chart's own Secret. Fine to prove the flow
-works; move to `githubAppExistingSecret` before you rely on it.
+works; move to `githubAppExistingSecret` before you rely on it. Once a release
+has `githubAppExistingSecret` set, `--private-key` is refused rather than
+silently ignored — run `--existing-secret` again to adopt a (possibly new)
+BYO Secret, or `--disconnect` first to go back to the chart-held path.
 
 ### Rotating the key
 
@@ -1092,12 +1124,29 @@ A GitHub App can hold several private keys at once, so rotation has no downtime
 and needs no coordination with any repository:
 
 1. Generate a second private key on the App's settings page — both are now valid
-2. Deploy the new one (update your Secret, or re-run `curie cluster github-app`)
+2. Deploy the new one, and roll the API onto it:
+   - **BYO Secret**: update the Secret, then run
+     `curie cluster github-app --app-id <id> --existing-secret <name>
+     --existing-secret-key <key>` — it performs the rollout for you. Pass
+     `--existing-secret-key` whenever the Secret uses a non-default key: the
+     CLI always sets this field, so omitting it resets the reference to
+     `privateKey`. Updating the Secret alone is not enough.
+   - **Chart-held**: re-run
+     `curie cluster github-app --app-id <id> --private-key <path>` — same
+     rollout.
+   - If you update the Secret by hand and skip the CLI, you must run
+     `kubectl -n <ns> rollout restart deployment/<release>-api` yourself
+     before the next step.
 3. Delete the first key on GitHub
 
 Installations, permissions, and the App ID are untouched. This is a real
 advantage over a personal access token, where rotation means re-issuing the
 credential *and* re-authorizing what it could reach.
+
+Step 2 needs an explicit rollout because `GITHUB_APP_PRIVATE_KEY` reaches the
+api pod as a `secretKeyRef` environment variable, and Kubernetes resolves that
+exactly once, at pod start — nothing re-reads the Secret until the pod
+restarts.
 
 ### The other direct-passthrough credentials
 
