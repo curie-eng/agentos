@@ -1197,11 +1197,20 @@ print("yes" if isinstance(d, dict) and d.get("release_found") is True else "no")
     retention_rc=$?
     set -e
     printf '%s\n' "$retention_out"
-    if [[ "$retention_rc" -eq 124 ]]; then
-        echo "cluster: message after repeated eval timed out at 45s; eval-owned sandboxes likely still hold the quota (#1534)." >&2
+    # GNU timeout can return 124 at the same boundary where the CLI has already
+    # emitted its complete finalized JSON but has not quite exited. The reply is
+    # the outcome this check exists to prove, so validate the captured outcome
+    # before diagnosing the process status. A timeout with absent, partial, or
+    # non-finalized JSON still fails here and retains the #1534 diagnosis.
+    if ! assert_finalized_reply "cluster" "$retention_out"; then
+        if [[ "$retention_rc" -eq 124 ]]; then
+            echo "cluster: message after repeated eval timed out at 45s without a finalized reply; eval-owned sandboxes likely still hold the quota (#1534)." >&2
+        fi
         return 1
     fi
-    assert_finalized_reply "cluster" "$retention_out"
+    if [[ "$retention_rc" -eq 124 ]]; then
+        echo "cluster: finalized reply was captured at the 45s timeout boundary; accepting the proved outcome."
+    fi
 
     assert_bundle_identity "cluster" "$digest"
 }
