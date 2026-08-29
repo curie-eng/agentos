@@ -2573,7 +2573,12 @@ def test_clearing_a_bound_route_makes_a_pending_approval_unresolvable_not_wider(
     agent_id = _agent_with_routes(
         approvals_client,
         auth_headers,
-        {"managers": {"channel": _BROAD, "approvers": {"group": _GROUP}}},
+        {
+            "managers": {
+                "resolution": _slack_resolution(_BROAD),
+                "approvers": {"group": _GROUP},
+            }
+        },
     )
     created = approvals_client.post(
         "/approvals", json=_routed_payload(agent_id), headers=auth_headers
@@ -2588,7 +2593,11 @@ def test_clearing_a_bound_route_makes_a_pending_approval_unresolvable_not_wider(
     # Step 2: the route map is rewritten without `managers`.
     rewritten = approvals_client.patch(
         f"/agents/{agent_id}",
-        json={"approval_routes": {"legal": {"channel": _ELSEWHERE}}},
+        json={
+            "approval_routes": {
+                "legal": {"resolution": _slack_resolution(_ELSEWHERE)}
+            }
+        },
         headers=auth_headers,
     )
     assert rewritten.status_code == 200, rewritten.text
@@ -2618,7 +2627,10 @@ def test_clearing_a_bound_route_makes_a_pending_approval_unresolvable_not_wider(
         f"/agents/{agent_id}",
         json={
             "approval_routes": {
-                "managers": {"channel": _BROAD, "approvers": {"group": _GROUP}}
+                "managers": {
+                    "resolution": _slack_resolution(_BROAD),
+                    "approvers": {"group": _GROUP},
+                }
             }
         },
         headers=auth_headers,
