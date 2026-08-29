@@ -446,11 +446,21 @@ async def get_approval_route_binding(session: AsyncSession, approval: Approval) 
     approver group revokes them immediately instead of leaving them able to
     resolve yesterday's stale request.
 
-    None covers every legitimate miss -- a generic approval with no agent
+    None still covers every legitimate miss -- a generic approval with no agent
     (``agent_id`` is nullable by design), an approval with no route, an agent
-    with no bindings, a route the map does not bind -- and each of them means
-    "no approvers declared", which is channel membership by design (AC4), not a
-    failure.
+    with no bindings, a route the map does not bind -- but it no longer means
+    one thing. ADR-0123 makes the selector split a None on whether the approval
+    NAMED a route: a routeless approval keeps the AC4 zero-setup channel
+    membership, while a routed approval with no binding is refused outright,
+    because a route the operator narrowed must not be readable as one they never
+    narrowed.
+
+    This function deliberately still returns a bare None and does not say which
+    of the four misses happened. The selector needs only ``approval.route`` to
+    make that split, and a richer return type is not something ADR-0123 asks
+    for. Note the guard below is ``not approval.route``, so a ``route=""``
+    approval is routeless here; the selector keys on the same truthiness so the
+    two files cannot disagree about what "named a route" means.
 
     A present-but-non-dict value is NOT one of those misses, so it is returned
     raw (the JSONB value can be anything) rather than coerced to None: the
