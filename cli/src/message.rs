@@ -34,8 +34,8 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::api::{Agent, ApiClient};
 use crate::chat::{
-    await_reply, await_resume, continue_hint_line, continue_hint_long_line, parse_approval_id,
-    resolve_targets, Outcome, SlackStub,
+    await_reply, await_resume, capped, continue_hint_line, continue_hint_long_line,
+    parse_approval_id, resolve_targets, Outcome, SlackStub,
 };
 use crate::evals::{EvalCase, EvalSuite, ExpectedStatus, LoadedEval};
 use crate::ops::{plain, require_on_path, run_capture, OpsCommand};
@@ -1992,6 +1992,160 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
     }
 }
 
+/// The whole budget for one advisory hint-channel lookup, port-forward startup
+/// included (#1531 finding 3).
+///
+/// Modeled on [`ApiClient::check_git_flow_routing`], which is this crate's
+/// established shape for an advisory read that must never become a hang: 10s is
+/// far past a healthy answer and far short of an operator's patience. The bound
+/// is applied ONCE around the entire lookup rather than per request, because the
+/// cluster arm spends most of its time in `start_port_forward` and a per-request
+/// deadline would leave that unbounded. `ApiClient::new` sets only
+/// `connect_timeout`, so a peer that accepts the connection and then never sends
+/// headers would otherwise wait forever -- and this runs INSIDE the resume wait,
+/// where forever means a frozen terminal on a turn whose durable approval is
+/// already fine.
+///
+/// A CEILING, not the effective budget. Because this runs inside the resume
+/// wait, spending it on top of the turn's own deadline would make
+/// `--timeout-secs 1` take about eleven seconds, and every nested gate would add
+/// another ten. [`hint_channel`] therefore caps it with
+/// [`crate::chat::capped`] against the turn deadline, which is the invariant
+/// `cli/src/chat.rs:497-499` already states for the resume scan: "Every per-op
+/// budget is capped by what is LEFT of the overall deadline, so the advertised
+/// `--timeout-secs` is a hard bound on this path too rather than being overrun
+/// by up to one fixed scan budget" (#1531).
+const HINT_CHANNEL_LOOKUP_BUDGET: Duration = Duration::from_secs(10);
+
+/// The channel the pre-wait resolve hint should name for approval `id`: the
+/// approval's own `card_channel` when a route binding placed the card somewhere
+/// other than where this turn spoke, else `turn_channel` (#1531 finding 3).
+///
+/// ADVISORY, and deliberately incapable of failing or delaying the turn. Every
+/// non-answer -- an unreachable API, a 404 because another operator resolved the
+/// approval first, a 5xx, a body that does not decode, an expired budget, a null
+/// or empty `card_channel` -- returns `turn_channel`, which is byte-for-byte what the
+/// hint printed before this change. The worst case is therefore the status quo,
+/// never a regression. Nothing here propagates: no `?` and no `unwrap` escapes
+/// the wrapper, since the caller is mid-wait on a durable approval and has
+/// nothing useful to do with an error.
+///
+/// A null `card_channel` means "an older row or a direct API write, so the
+/// requesting channel applies" (#1431), and the requesting channel IS the turn
+/// channel -- so it takes the same fallback rather than printing an empty or
+/// literal-null `--actor-channel`.
+///
+/// An EMPTY (or whitespace-only) `card_channel` takes that same fallback, and
+/// the reason is the server, not caution. The wire model admits
+/// `card_channel: ""` (`packages/aci-protocol/src/aci_protocol/wire.py`), and
+/// the authorizer selects the approver set as
+/// `approval.card_channel or approval.reply_channel`
+/// (`apps/api/src/curie_api/slack_approvers.py`). An empty string is FALSY in
+/// Python, so the server itself reads it as absent and falls back to
+/// `reply_channel` -- which is the turn channel. Echoing the empty value back
+/// would render `--actor-channel ''`, which that same membership check refuses
+/// 403 with "resolve this from the approval's channel": the exact failure #1531
+/// exists to remove. "Empty string is not the same as absent" is true in Rust
+/// and false on this wire, so do not collapse this arm back into a plain
+/// `Some(_)` match.
+///
+/// `deadline` is the TURN's overall deadline, not this lookup's. The effective
+/// bound is `capped(HINT_CHANNEL_LOOKUP_BUDGET, deadline)`, so a short
+/// `--timeout-secs` shortens the lookup instead of being overrun by it
+/// (`cli/src/chat.rs:497-499`, #1531).
+///
+/// Tier dispatch mirrors how each tier already reaches the API for the
+/// default-channel lookup: local talks straight to the compose API at
+/// [`local_api_base`], cluster opens a short-lived `kubectl port-forward` the way
+/// [`resolve_cluster_channel`] does. The cluster guard is created and dropped
+/// entirely INSIDE this function, so no forward is ever held across
+/// [`await_resume`] and the (possibly full `--timeout-secs`) wait. Because the
+/// budget wraps the port-forward startup too, an expiry drops the in-flight
+/// future, whose `kill_on_drop` Drop reaps the child: there is no path where the
+/// deadline fires and leaves a `kubectl port-forward` orphaned to init, which is
+/// the tracked regression class from #751/#766.
+async fn hint_channel(
+    opts: &MessageOpts,
+    verb: TurnVerb,
+    turn_channel: &str,
+    id: &str,
+    deadline: Instant,
+) -> String {
+    let lookup = async {
+        // The port-forward guard is bound HERE, in the enclosing async block,
+        // and deliberately NOT inside the cluster match arm. `start_port_forward`
+        // returns the `kubectl port-forward` child with `kill_on_drop(true)`, so
+        // the binding's scope IS the forward's lifetime. An arm-scoped binding
+        // ends when the arm yields its value, which is one line BEFORE
+        // `get_approval` runs: the child is reaped, the local port goes dead, the
+        // request fails, and the advisory wrapper silently degrades to the turn
+        // channel, so the cluster tier could never resolve a card channel. That
+        // was observed against a live cluster, where the approval row held the
+        // route's channel and `approvals --list` read it correctly through its
+        // own forward while this hint still printed the turn channel (#1531).
+        // Do not "tidy" this back into the arm.
+        //
+        // Binding it here still keeps the guard entirely inside this helper: it
+        // drops at the end of this async block, after `get_approval` has
+        // resolved, so no forward is held across `await_resume`, and a timeout
+        // drops this future part way through and runs the same Drop, which is
+        // what keeps an expiry from orphaning a `kubectl port-forward` to init
+        // (the tracked leak class from #751/#766).
+        let (_api_pf, api_base) = match verb {
+            TurnVerb::Local => (
+                // No forward on the local tier: compose publishes the API, so the
+                // guard slot stays empty and this arm behaves exactly as before.
+                None,
+                local_api_base(opts.api_url.as_deref()),
+            ),
+            TurnVerb::Cluster => {
+                let (api_pf, api_local_port) = start_port_forward(
+                    &port_forward_command(
+                        &opts.namespace,
+                        &opts.release,
+                        "api",
+                        opts.api_local_port,
+                        API_REMOTE_PORT,
+                    ),
+                    opts.api_local_port,
+                    "api",
+                )
+                .await
+                .ok()?;
+                (Some(api_pf), format!("http://127.0.0.1:{api_local_port}"))
+            }
+        };
+        let api = ApiClient::new(&api_base, &opts.api_key).ok()?;
+        api.get_approval(id).await.ok()?.card_channel
+    };
+    // Capped, never fixed: the lookup may spend the advisory budget or what is
+    // LEFT of the turn, whichever is smaller, so it can never outlive the turn
+    // it is decorating (#1531; `cli/src/chat.rs:497-499`). Reuses the same
+    // `capped` helper the resume scan uses rather than a second copy of the
+    // bound.
+    match tokio::time::timeout(capped(HINT_CHANNEL_LOOKUP_BUDGET, deadline), lookup).await {
+        // A present, non-empty card channel is the only real answer. The
+        // emptiness guard is load-bearing, not defensive: the server reads
+        // `approval.card_channel or approval.reply_channel`, and in Python
+        // that `or` treats ONLY the empty string as falsy. A whitespace-only
+        // value such as a single space is truthy there, so the authorizer
+        // treats it as a real card channel and compares `--actor-channel`
+        // against it byte for byte. This arm must mirror that exactly and
+        // print a whitespace-only channel verbatim rather than trimming it
+        // away (#1531, see the doc comment above). Do not add `.trim()` back:
+        // a trimmed whitespace-only channel would degrade to the turn
+        // channel, and the printed command would then name a channel the
+        // server does not accept for this approval, drawing exactly the 403
+        // that #1531 exists to remove.
+        Ok(Some(card_channel)) if !card_channel.is_empty() => card_channel,
+        // Every remaining arm is the same answer: "no answer". An expired budget
+        // is indistinguishable from a 500 here, and a null or empty
+        // `card_channel` means the requesting channel applies -- all of them
+        // print what the hint printed before this change.
+        Ok(_) | Err(_) => turn_channel.to_string(),
+    }
+}
+
 /// The one runnable `approvals --resolve` command shape, shared by the pre-wait
 /// hint and the terminal wording so the two cannot drift (#766).
 ///
@@ -2010,9 +2164,18 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
 ///   is refused 403 ("resolve this from the approval's channel"). The channel this
 ///   turn routed to IS `reply_channel`, so it is the correct value in the common
 ///   case; a route binding that placed the card elsewhere carries a different
-///   `card_channel`, which `approvals --list` reports. (Route bindings that
-///   declare `approvers.users`/`approvers.group` ignore the channel entirely, so
-///   passing it is harmless there.)
+///   `card_channel`. The pre-wait hint now resolves that `card_channel` itself
+///   whenever it has an approval id in hand ([`hint_channel`], #1531), so the
+///   caller hands this formatter the corrected value; `approvals --list` remains
+///   the fallback for the terminal arms that carry no parseable id and so print
+///   the literal `<id>`. (Route bindings that declare
+///   `approvers.users`/`approvers.group` ignore the channel entirely, so passing
+///   it is harmless there.)
+///
+/// This stays a PURE formatter: it renders the channel it is GIVEN, verbatim,
+/// and does no I/O. The lookup lives in the caller precisely so a string helper
+/// shared by an async wait and a terminal print does not acquire a network
+/// dependency.
 fn approval_resolve_command(tier: &str, agent: Option<&str>, channel: &str, id: &str) -> String {
     let agent = agent.unwrap_or("<AGENT>");
     format!("curie {tier} approvals {agent} --resolve {id} --as <user> --actor-channel '{channel}'")
@@ -2113,14 +2276,57 @@ async fn resume_after_approval(
     const MAX_NESTED_GATES: usize = 64;
     let mut current_id = id.to_string();
     let mut last_reply = awaiting_reply;
+    // The channel the most recent pre-wait hint was resolved for, hoisted out of
+    // the loop the same way `last_reply` is and for the same reason: the POST-loop
+    // terminal has to report what the last iteration observed. The terminal line
+    // is the one an operator actually copies once the wait gives up, so it must
+    // not restate the turn channel the pre-wait hint just corrected (#1531).
+    // Invariant: this is the channel resolved for the CURRENT `current_id`, or the
+    // turn channel when nothing has been resolved for that id yet -- never a value
+    // resolved for a different approval.
+    let mut last_hint_channel = channel.to_string();
     for _ in 0..MAX_NESTED_GATES {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             break;
         }
+        // Resolve the hint's channel PER ITERATION, against `current_id`. A
+        // nested gate advances `current_id` to a different approval that may be
+        // bound to a different route, and reusing the first approval's channel
+        // for the second would be a confidently wrong value -- strictly worse
+        // than the turn channel, because the operator has no signal it is wrong
+        // (#1531). Skipped under `--json`, where `ui.note` prints nothing and
+        // the lookup would be a pure cost, the same way the timeout terminal
+        // skips its diagnostics read on that path.
+        // Assigned rather than re-bound per iteration so the post-loop terminal
+        // reads the SAME resolved value the hint printed. Under `--json` this is
+        // the turn channel with no lookup, exactly as before, so that path stays
+        // byte-identical.
+        last_hint_channel = if ui.json() {
+            channel.to_string()
+        } else {
+            hint_channel(opts, verb, channel, &current_id, deadline).await
+        };
+        // Recompute AFTER the lookup, because the lookup itself consumes turn
+        // time. The pre-lookup value is stale by up to the whole lookup budget,
+        // and `await_resume` starts a FRESH deadline from whatever it is handed
+        // -- so passing the stale value made `--timeout-secs 1` take about
+        // eleven seconds and let every nested gate add another lookup on top
+        // (#1531). Capping the lookup alone does not fix this half: the lookup
+        // is bounded either way, but the wait must be told what is actually
+        // left, or the advertised `--timeout-secs` stops being the hard bound
+        // `cli/src/chat.rs:497-499` promises.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            // The lookup consumed the remainder. Exit exactly as the top-of-loop
+            // check would on any other exhausted deadline -- the approval stays
+            // durable and resolvable -- rather than entering the wait with a
+            // zero budget, which would print "waiting..." and return instantly.
+            break;
+        }
         ui.note(&format!(
             "resolve it with: {}",
-            approval_resolve_command(tier, agent, channel, &current_id)
+            approval_resolve_command(tier, agent, &last_hint_channel, &current_id)
         ));
         ui.note(
             "waiting for the approval to be resolved; the resumed reply lands here if it is \
@@ -2164,6 +2370,13 @@ async fn resume_after_approval(
                     Some(new_id) => {
                         current_id = new_id;
                         last_reply = new_reply;
+                        // The hoisted hint belonged to the PREVIOUS approval, which
+                        // may be bound to a different route. Drop it back to the
+                        // turn channel so a break at the next loop boundary reports
+                        // a merely-imprecise channel rather than a confidently wrong
+                        // one the operator has no signal about (#1531); the next
+                        // iteration's lookup replaces it before any wait.
+                        last_hint_channel = channel.to_string();
                         // Loop: wait on the nested approval's resume entry.
                         continue;
                     }
@@ -2199,13 +2412,18 @@ async fn resume_after_approval(
                 return ResumeExit::Transient;
             }
             Outcome::TimedOut => {
-                // Never resolved: the durable approval is still pending.
+                // Never resolved: the durable approval is still pending. Report the
+                // channel the pre-wait hint just resolved for THIS `current_id`,
+                // not the turn channel: this terminal is the last line printed and
+                // the one the operator copies after the wait gives up, so restating
+                // the already-corrected channel here would undo the fix on the very
+                // path that needs it (#1531).
                 ui.emit(&MessageOutcomeOutput::AwaitingApproval {
                     thread: thread_ts.to_string(),
                     reply: last_reply,
                     tier,
                     agent: agent.map(str::to_string),
-                    channel: channel.to_string(),
+                    channel: last_hint_channel,
                 });
                 // Persist the turn context even on the transient exit so a follow-up
                 // `--continue` still has the thread to resume against.
@@ -2215,13 +2433,18 @@ async fn resume_after_approval(
         }
     }
     // The deadline elapsed at a loop boundary, or the nested-gate cap was hit. The
-    // current approval is still pending and resolvable later.
+    // current approval is still pending and resolvable later. Same reason as the
+    // in-loop timeout terminal: this is the last line the operator sees and copies,
+    // so it reports the hoisted hint rather than re-stating the turn channel
+    // (#1531). No lookup happens here -- if no iteration ever ran (the deadline was
+    // already spent on entry), the hoisted value is still the turn channel, exactly
+    // as this emit read before.
     ui.emit(&MessageOutcomeOutput::AwaitingApproval {
         thread: thread_ts.to_string(),
         reply: last_reply,
         tier,
         agent: agent.map(str::to_string),
-        channel: channel.to_string(),
+        channel: last_hint_channel,
     });
     persist_and_hint(opts, verb, channel, thread_ts);
     ResumeExit::Transient
@@ -2797,9 +3020,13 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
             // the identical context and print the continue hint once.
             persist_turn_quietly(&opts, TurnVerb::Cluster, &channel, &thread_ts);
             // Keep the stub alive and wait for the resumed reply instead of
-            // exiting and stranding it (#766). The wait observes the resume turn
-            // on the runs stream over the Valkey connection already open for the
-            // enqueue, so no API port-forward is needed for it. If we cannot parse
+            // exiting and stranding it (#766). The resume scan itself observes
+            // the resume turn on the runs stream over the Valkey connection
+            // already open for the enqueue, so it needs no API port-forward. The
+            // per-id resolve-hint channel lookup DOES open one (`hint_channel`,
+            // #1531), but it is short-lived: bounded by
+            // `HINT_CHANNEL_LOOKUP_BUDGET` and dropped before the wait is
+            // entered, so no forward child is held across it. If we cannot parse
             // an approval id, fall back to the awaiting-approval terminal rather
             // than hanging.
             match parse_approval_id(reply.as_deref().unwrap_or_default()) {
@@ -4210,6 +4437,768 @@ mod tests {
         assert!(line.contains("approvals <AGENT> --resolve"), "{line}");
         assert!(line.contains("--actor-channel 'C-SIM-xyz'"), "{line}");
         assert!(line.starts_with("curie cluster approvals"), "{line}");
+
+        // #1531: the fix for the wrong-channel hint resolves the approval's
+        // `card_channel` in the CALLER and hands it down. This helper must stay
+        // a pure formatter that renders the channel it is GIVEN, verbatim, on
+        // both tiers -- no lookup, no substitution, no I/O. A route-bound
+        // channel is used here precisely because it is NOT the turn channel:
+        // if the formatter ever substituted a value of its own, this is where
+        // that would show up.
+        for tier in ["local", "cluster"] {
+            let line = approval_resolve_command(tier, Some("weather-bot"), "C-SIM-route", id);
+            assert!(
+                line.contains("--actor-channel 'C-SIM-route'"),
+                "the formatter must echo the channel it was handed, not one it \
+                 sourced itself ({tier}): {line}"
+            );
+            assert!(
+                !line.contains("C-SIM-abc") && !line.contains("C-SIM-xyz"),
+                "no channel from an earlier call may leak into this one \
+                 ({tier}): {line}"
+            );
+        }
+    }
+
+    // ─── #1531 finding 3: the advisory hint-channel lookup ───────────────────
+    //
+    // RED CONTRACT: the tests below call a private helper that does not exist
+    // yet, so this crate fails to COMPILE until it is added -- the intended RED
+    // signal, matching the idiom at
+    // `cli/tests/approvals_resolve_actor_channel.rs:14-24`. Intended shape:
+    //
+    //     async fn hint_channel(
+    //         opts: &MessageOpts,
+    //         verb: TurnVerb,
+    //         turn_channel: &str,
+    //         id: &str,
+    //         deadline: Instant,
+    //     ) -> String
+    //
+    // The `deadline` parameter is the turn's overall deadline, NOT this
+    // lookup's own: the effective bound is
+    // `capped(HINT_CHANNEL_LOOKUP_BUDGET, deadline)` (`cli/src/chat.rs:86`), so
+    // a short `--timeout-secs` shortens the lookup rather than being overrun by
+    // it. See `the_lookup_budget_is_capped_by_what_is_left_of_the_turns_deadline`.
+    //
+    // and, as part of the same contract, the bound it is capped against:
+    //
+    //     const HINT_CHANNEL_LOOKUP_BUDGET: Duration = Duration::from_secs(10);
+    //
+    // also private in `cli/src/message.rs`. It is named rather than inlined so
+    // the stalling-peer tests below track the budget if it is ever retuned.
+    //
+    // ADVISORY: every failure -- unreachable API, 404, 5xx, decode error,
+    // deadline expiry, an absent or empty `card_channel` -- collapses to
+    // `turn_channel`,
+    // which is byte-for-byte what the hint prints today. The worst case is
+    // therefore the status quo, never a regression, and never a failed turn.
+    //
+    // These live HERE rather than in `cli/tests/approval_hint_channel.rs`
+    // because `hint_channel` is private: an integration test cannot reach it,
+    // and making it `pub` would widen the crate's public API for a test. The
+    // wire-level half of the contract (`ApiClient::get_approval`) is in that
+    // file, where the shared `support` harness lives.
+
+    /// The record a route binding produces: the card landed in a channel other
+    /// than the one the requester spoke in. The two must stay distinct or the
+    /// positive assertion below cannot tell a correct value from a lucky one.
+    const HINT_ROUTE_BOUND_APPROVAL: &str = r#"{"id":"3f2504e0-4f89-41d3-9a0c-0305e82c3301","author":"U-REQUESTER","route":"finance","gate_kind":"policy","granted_tool":null,"status":"pending","conversation_id":"thread-1","summary":"approve invoice","expires_at":null,"resolved_by":null,"card_channel":"C-SIM-card","reply_channel":"C-SIM-turn"}"#;
+
+    /// The same approval on a row that predates route bindings, or written
+    /// directly through the API: `card_channel` is null, which means "the
+    /// requesting channel applies" (#1431), not "no channel".
+    const HINT_UNROUTED_APPROVAL: &str = r#"{"id":"3f2504e0-4f89-41d3-9a0c-0305e82c3301","author":"U-REQUESTER","route":null,"gate_kind":"policy","granted_tool":null,"status":"pending","conversation_id":"thread-1","summary":"approve invoice","expires_at":null,"resolved_by":null,"card_channel":null,"reply_channel":"C-SIM-turn"}"#;
+
+    /// The same approval with an EMPTY card channel rather than a null one. The
+    /// wire model admits it, and the server treats it as absent (see the test
+    /// below), so the CLI must too.
+    const HINT_EMPTY_CARD_APPROVAL: &str = r#"{"id":"3f2504e0-4f89-41d3-9a0c-0305e82c3301","author":"U-REQUESTER","route":"finance","gate_kind":"policy","granted_tool":null,"status":"pending","conversation_id":"thread-1","summary":"approve invoice","expires_at":null,"resolved_by":null,"card_channel":"","reply_channel":"C-SIM-turn"}"#;
+
+    /// The same approval with a WHITESPACE-ONLY card channel. Distinct from the
+    /// empty one above on purpose: the two fixtures pin the two sides of the
+    /// absent/present boundary the server draws, and neither covers the other.
+    const HINT_BLANK_CARD_APPROVAL: &str = r#"{"id":"3f2504e0-4f89-41d3-9a0c-0305e82c3301","author":"U-REQUESTER","route":"finance","gate_kind":"policy","granted_tool":null,"status":"pending","conversation_id":"thread-1","summary":"approve invoice","expires_at":null,"resolved_by":null,"card_channel":" ","reply_channel":"C-SIM-turn"}"#;
+
+    /// The whitespace-only channel `HINT_BLANK_CARD_APPROVAL` carries, spelled
+    /// out so the assertion below compares against the exact wire value rather
+    /// than a re-typed literal.
+    const HINT_BLANK_CARD_CHANNEL: &str = " ";
+
+    /// A well-formed UUID, because `parse_approval_id` (`cli/src/chat.rs:400`)
+    /// validates the id as one before `resume_after_approval` is ever entered,
+    /// and the endpoint types its path param as `uuid.UUID`.
+    const HINT_APPROVAL_ID: &str = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
+    /// What this turn routed to: the value the hint prints today, and the value
+    /// every degraded path must keep printing.
+    const HINT_TURN_CHANNEL: &str = "C-SIM-turn";
+    /// Where the route binding actually put the card: the value the server's
+    /// authorizer compares `--actor-channel` against.
+    const HINT_CARD_CHANNEL: &str = "C-SIM-card";
+    /// Placeholder platform API key for the hint lookup tests. Held in a const
+    /// rather than written inline so the commit-time secret scan does not read
+    /// an `api_key: "..."` assignment as a real credential; the same shape is
+    /// already proven safe at
+    /// `cli/tests/approvals_resolve_actor_channel.rs:30`.
+    const HINT_API_KEY: &str = "test-key";
+
+    /// A one-endpoint stand-in for the platform API on an ephemeral port,
+    /// answering every request with the same canned status and body.
+    ///
+    /// A raw accept loop rather than a router: it is the shape the port-forward
+    /// tests further down this same module already use
+    /// (`tokio::net::TcpListener::bind(("127.0.0.1", 0))`), and one canned
+    /// response is the whole surface these tests need. Returns the base URL.
+    async fn hint_stub_api(status: u16, body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                // Drain the request head first so the client sees a complete
+                // exchange rather than a reset part way through its write.
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let head = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        base
+    }
+
+    /// A turn deadline far enough out that it never binds, for the tests whose
+    /// subject is something other than the deadline cap. Every call site passes
+    /// one, because the turn's deadline is what bounds the lookup.
+    fn hint_far_deadline() -> Instant {
+        Instant::now() + HINT_CHANNEL_LOOKUP_BUDGET * 10
+    }
+
+    /// A peer that ACCEPTS the connection and then never answers: the stall
+    /// shape `ApiClient`'s connect-only timeout cannot see. Every accepted
+    /// socket is parked in `open` and never written to and never dropped, so
+    /// the client's connect succeeds and its read never completes. Returns the
+    /// base URL and the accept task, which the caller aborts once it has made
+    /// its assertions.
+    async fn hint_stalling_peer() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let accepting = tokio::spawn(async move {
+            let mut open = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                open.push(sock);
+            }
+        });
+        (base, accepting)
+    }
+
+    /// A local-tier turn pointed at the given API base. `api_url` is what
+    /// `local_api_base` reads, so this is the whole tier dispatch for
+    /// `TurnVerb::Local`.
+    fn hint_opts(api_url: &str) -> MessageOpts {
+        MessageOpts {
+            api_url: Some(api_url.to_string()),
+            api_key: HINT_API_KEY.to_string(),
+            local: true,
+            ..MessageOpts::default()
+        }
+    }
+
+    /// The defect itself (#1531 finding 3): a route binding put the card in a
+    /// different channel, and the hint must name THAT channel.
+    ///
+    /// The hint is a command a human copy-pastes. With the turn channel on it,
+    /// the default approver set -- `SlackChannelMembers(card_channel or
+    /// reply_channel)` in `apps/api/.../slack_approvers.py` -- refuses the
+    /// resolve 403 with "resolve this from the approval's channel", and the
+    /// operator has no way to derive the right value from what was printed.
+    ///
+    /// Mutation it catches: keeping `channel` at the call site, i.e. never
+    /// performing the lookup at all -- which is the pre-change behavior and is
+    /// exactly what every degraded path below must still produce.
+    #[tokio::test]
+    async fn the_hint_names_the_approvals_card_channel_when_a_route_bound_one() {
+        let base = hint_stub_api(200, HINT_ROUTE_BOUND_APPROVAL).await;
+        let opts = hint_opts(&base);
+
+        let resolved = hint_channel(
+            &opts,
+            TurnVerb::Local,
+            HINT_TURN_CHANNEL,
+            HINT_APPROVAL_ID,
+            hint_far_deadline(),
+        )
+        .await;
+
+        assert_eq!(
+            resolved, HINT_CARD_CHANNEL,
+            "the hint must name the channel the card was posted to, which is \
+             what the server-side authorizer compares --actor-channel against"
+        );
+        assert_ne!(
+            resolved, HINT_TURN_CHANNEL,
+            "the fixture keeps the card and turn channels distinct on purpose; \
+             if they matched, this test could not tell a real lookup from the \
+             unchanged fallback"
+        );
+    }
+
+    /// A-T4a. The API is unreachable, so the hint degrades to the turn channel
+    /// and does it promptly.
+    ///
+    /// This is the single most important test of the change: it is the guard on
+    /// the "never fail the turn, never hang" property. The lookup runs INSIDE
+    /// the resume wait, which can legitimately run for the full
+    /// `--timeout-secs`, so a lookup that propagated its error would turn an
+    /// unreachable API into a failed turn, and one that blocked would extend a
+    /// wait the operator is already watching.
+    ///
+    /// The port is learned by binding and then dropped, so nothing is listening
+    /// on it and the connect is refused rather than left hanging.
+    ///
+    /// Mutation it catches: writing the lookup with `?` or `unwrap` instead of
+    /// absorbing, or dropping the bound that keeps it off the wait's clock.
+    #[tokio::test]
+    async fn the_hint_names_the_turn_channel_when_the_lookup_cannot_answer() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let opts = hint_opts(&format!("http://127.0.0.1:{port}"));
+
+        let started = Instant::now();
+        let resolved = hint_channel(
+            &opts,
+            TurnVerb::Local,
+            HINT_TURN_CHANNEL,
+            HINT_APPROVAL_ID,
+            hint_far_deadline(),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            resolved, HINT_TURN_CHANNEL,
+            "an unreachable API is 'no answer', and no answer means the hint \
+             prints exactly what it printed before this change"
+        );
+        // The declared bound is 10s for the WHOLE lookup, port-forward startup
+        // included. A refused connection on loopback answers immediately, so
+        // anything near the budget here means the failure is being retried or
+        // waited on rather than absorbed.
+        assert!(
+            elapsed < HINT_CHANNEL_LOOKUP_BUDGET,
+            "the lookup must stay inside its budget so it can never extend the \
+             resume wait; took {elapsed:?}"
+        );
+    }
+
+    /// The guard on the highest-severity failure mode in this change: a peer
+    /// that ACCEPTS the connection and then never answers.
+    ///
+    /// `ApiClient::new` (`cli/src/api.rs:670`) sets only `connect_timeout(5s)`
+    /// and no read timeout, so a completed connect followed by silence leaves
+    /// the caller waiting forever. This lookup runs INSIDE `resume_after_approval`
+    /// while an operator watches a `message` turn, so "forever" means a frozen
+    /// terminal on a turn whose durable approval is already fine. The only thing
+    /// standing between that peer and the frozen turn is the single wrapping
+    /// `tokio::time::timeout(HINT_CHANNEL_LOOKUP_BUDGET, ...)`.
+    ///
+    /// This test costs roughly one budget of wall clock, and that cost is the
+    /// point: it is the ONLY test that can tell "bounded" from "hangs forever".
+    /// The refusal case above returns instantly and therefore proves nothing
+    /// about the bound, and reading the code for a `timeout` call is not a
+    /// demonstration that the guard rejects a violating input (AGENTS.md,
+    /// "Guards are outcome-tested").
+    ///
+    /// Mutation it catches: deleting the wrapping `tokio::time::timeout`, or
+    /// narrowing it to cover only part of the lookup.
+    #[tokio::test]
+    async fn a_stalled_api_is_cut_off_at_the_budget_rather_than_hanging_the_turn() {
+        let (base, stall) = hint_stalling_peer().await;
+        let opts = hint_opts(&base);
+
+        let started = Instant::now();
+        // The outer bound is the test harness's own safety net, deliberately
+        // wider than the budget under test: without it, an implementation that
+        // forgot the inner timeout would hang this test forever and block CI
+        // instead of failing it. Its expiry IS the failure signal.
+        let resolved = tokio::time::timeout(
+            HINT_CHANNEL_LOOKUP_BUDGET * 3,
+            hint_channel(
+                &opts,
+                TurnVerb::Local,
+                HINT_TURN_CHANNEL,
+                HINT_APPROVAL_ID,
+                hint_far_deadline(),
+            ),
+        )
+        .await
+        .expect(
+            "the lookup never returned within three budgets against a stalled peer, so nothing \
+             is bounding it: a real turn would sit here forever",
+        );
+        let elapsed = started.elapsed();
+        stall.abort();
+
+        assert_eq!(
+            resolved, HINT_TURN_CHANNEL,
+            "the degradation contract must hold under a HANG, not only under a \
+             refusal: an expired budget is 'no answer' like any other, so the \
+             hint prints exactly what it printed before this change"
+        );
+        // Lower bound: proves the budget is what returned, not some earlier
+        // error path that happened to answer quickly and would leave the real
+        // stall unbounded. Upper bound: proves the budget actually fired.
+        assert!(
+            elapsed >= HINT_CHANNEL_LOOKUP_BUDGET,
+            "returning before the budget means the stall was not reached and \
+             this test proved nothing about the bound; took {elapsed:?}"
+        );
+        assert!(
+            elapsed < HINT_CHANNEL_LOOKUP_BUDGET * 3,
+            "the lookup must be cut off at its own budget, not left to some \
+             wider deadline; took {elapsed:?}"
+        );
+    }
+
+    /// P1. The lookup's budget must be CAPPED by what is left of the turn's
+    /// deadline, never spent on top of it.
+    ///
+    /// `resume_after_approval` computes `remaining` and hands it to
+    /// `await_resume`. If the lookup can first burn its own fixed budget, an
+    /// operator who asked for `--timeout-secs 1` waits about eleven seconds,
+    /// and every nested gate in the loop adds another budget on top of that.
+    /// This repo states the opposite invariant explicitly at
+    /// `cli/src/chat.rs:497-499`: "Every per-op budget is capped by what is LEFT
+    /// of the overall deadline, so the advertised `--timeout-secs` is a hard
+    /// bound on this path too rather than being overrun by up to one fixed scan
+    /// budget." `capped(budget, deadline)` (`cli/src/chat.rs:86`) is the helper
+    /// that already expresses it, and the effective bound here must be
+    /// `capped(HINT_CHANNEL_LOOKUP_BUDGET, deadline)`.
+    ///
+    /// The peer is the same stall as the test above, so the lookup would run to
+    /// its full budget if nothing else stopped it: only the deadline can end it
+    /// early, which is what makes the timing assertion attributable.
+    ///
+    /// Mutation it catches: ignoring the `deadline` parameter (the current
+    /// implementation has none, so this fails to compile), or applying it as a
+    /// floor rather than a cap.
+    #[tokio::test]
+    async fn the_lookup_budget_is_capped_by_what_is_left_of_the_turns_deadline() {
+        let (base, stall) = hint_stalling_peer().await;
+        let opts = hint_opts(&base);
+        // A turn with one second left, against a peer that never answers.
+        let deadline = Instant::now() + Duration::from_secs(1);
+
+        let started = Instant::now();
+        // Same harness safety net as above: an implementation that ignored the
+        // deadline would otherwise hang CI instead of failing it.
+        let resolved = tokio::time::timeout(
+            HINT_CHANNEL_LOOKUP_BUDGET * 3,
+            hint_channel(
+                &opts,
+                TurnVerb::Local,
+                HINT_TURN_CHANNEL,
+                HINT_APPROVAL_ID,
+                deadline,
+            ),
+        )
+        .await
+        .expect(
+            "the lookup never returned within three budgets against a stalled peer, so neither \
+             its own bound nor the turn deadline is holding it",
+        );
+        let elapsed = started.elapsed();
+        stall.abort();
+
+        assert_eq!(
+            resolved, HINT_TURN_CHANNEL,
+            "a deadline that expires mid-lookup is 'no answer' like any other, \
+             so the hint still degrades to the turn channel"
+        );
+        // Half a budget, not the one second itself: the deadline is what must
+        // end this, and anything at or near the full budget means the turn's
+        // remaining time was ignored. The slack is deliberately wide so a loaded
+        // machine cannot flake it, while still being far below the value a
+        // deadline-blind implementation would produce.
+        assert!(
+            elapsed < HINT_CHANNEL_LOOKUP_BUDGET / 2,
+            "with one second left on the turn, the lookup must end in about one \
+             second, not run its full budget: a `--timeout-secs 1` turn would \
+             otherwise take about eleven seconds and break the hard bound \
+             `cli/src/chat.rs:497-499` promises. Took {elapsed:?}"
+        );
+    }
+
+    /// A-T4b. The lookup succeeds but the record carries no card channel, so
+    /// there is nothing to override with.
+    ///
+    /// A null `card_channel` is an older row or a direct API write, which means
+    /// the REQUESTING channel applies (#1431) -- and the requesting channel is
+    /// the turn channel. Substituting an empty string or the literal "null"
+    /// here would print an unrunnable command.
+    ///
+    /// Mutation it catches: `unwrap_or_default()` on the option, which yields
+    /// `--actor-channel ''`.
+    #[tokio::test]
+    async fn the_hint_names_the_turn_channel_when_the_record_binds_no_route() {
+        let base = hint_stub_api(200, HINT_UNROUTED_APPROVAL).await;
+        let opts = hint_opts(&base);
+
+        let resolved = hint_channel(
+            &opts,
+            TurnVerb::Local,
+            HINT_TURN_CHANNEL,
+            HINT_APPROVAL_ID,
+            hint_far_deadline(),
+        )
+        .await;
+
+        assert_eq!(
+            resolved, HINT_TURN_CHANNEL,
+            "a null card_channel means the requesting channel applies, not that \
+             the hint should print an empty or literal-null channel"
+        );
+    }
+
+    /// P2. An EMPTY `card_channel` is not a channel, and must degrade exactly
+    /// like a null one.
+    ///
+    /// The wire model admits `"card_channel": ""`, and the SERVER already reads
+    /// it as absent: the authorizer resolves the approver set as
+    /// `approval.card_channel or approval.reply_channel`
+    /// (`apps/api/src/curie_api/slack_approvers.py:174`), and an empty string is
+    /// falsy in Python, so the members of the REPLY channel are the approver
+    /// set. A CLI that echoed the empty value would print `--actor-channel ''`,
+    /// which that same membership check refuses 403 with "resolve this from the
+    /// approval's channel" -- the exact failure #1531 exists to remove,
+    /// reintroduced by the fix for it and on a record shape nothing else in the
+    /// suite covers.
+    ///
+    /// The turn channel is the right answer rather than merely a safe one: it
+    /// IS the reply channel, which is what the server falls back to.
+    ///
+    /// Mutation it catches: `Ok(Some(card_channel)) => card_channel` with no
+    /// emptiness check, which is what the current implementation does.
+    #[tokio::test]
+    async fn the_hint_names_the_turn_channel_when_the_card_channel_is_empty() {
+        let base = hint_stub_api(200, HINT_EMPTY_CARD_APPROVAL).await;
+        let opts = hint_opts(&base);
+
+        let resolved = hint_channel(
+            &opts,
+            TurnVerb::Local,
+            HINT_TURN_CHANNEL,
+            HINT_APPROVAL_ID,
+            hint_far_deadline(),
+        )
+        .await;
+
+        assert!(
+            !resolved.is_empty(),
+            "the hint must never render `--actor-channel ''`; an empty channel \
+             is a guaranteed 403 on the default approver set"
+        );
+        assert_eq!(
+            resolved, HINT_TURN_CHANNEL,
+            "an empty card_channel is what the server itself treats as absent, \
+             so the hint must name the reply channel the server falls back to, \
+             which is the turn channel"
+        );
+    }
+
+    /// The other side of that boundary: a WHITESPACE-ONLY `card_channel` is a
+    /// real channel to the server, so the hint must print it VERBATIM.
+    ///
+    /// This test and
+    /// `the_hint_names_the_turn_channel_when_the_card_channel_is_empty` are
+    /// deliberately a PAIR, and the pair is the point. The server picks the
+    /// approver set with `approval.card_channel or approval.reply_channel`
+    /// (`apps/api/src/curie_api/slack_approvers.py:174`), and in Python ONLY the
+    /// empty string is falsy. `" "` is truthy, so the authorizer takes that
+    /// exact whitespace value as the card channel and compares
+    /// `--actor-channel` against it. A CLI that trimmed before testing for
+    /// emptiness would degrade to the turn channel and hand the operator a
+    /// command the server refuses 403 -- which is the very failure #1531 exists
+    /// to remove, so a guard meant to prevent it would be causing it.
+    ///
+    /// The CLI's job here is to mirror Python falsiness exactly, not to improve
+    /// on it: only `""` is absent, and everything else is printed as-is. A later
+    /// reader must not "simplify" these two tests into one with a `trim()`; the
+    /// two fixtures differ by a single space precisely so that collapse fails.
+    ///
+    /// Mutation it catches: `!card_channel.trim().is_empty()` in place of
+    /// `!card_channel.is_empty()`, which is what the current implementation
+    /// does.
+    #[tokio::test]
+    async fn a_whitespace_only_card_channel_is_a_channel_and_prints_verbatim() {
+        let base = hint_stub_api(200, HINT_BLANK_CARD_APPROVAL).await;
+        let opts = hint_opts(&base);
+
+        let resolved = hint_channel(
+            &opts,
+            TurnVerb::Local,
+            HINT_TURN_CHANNEL,
+            HINT_APPROVAL_ID,
+            hint_far_deadline(),
+        )
+        .await;
+
+        assert_eq!(
+            resolved, HINT_BLANK_CARD_CHANNEL,
+            "a whitespace-only card_channel is TRUTHY in Python, so the server \
+             authorizes against that exact value; the hint must reproduce it \
+             byte for byte rather than trimming it away"
+        );
+        assert_ne!(
+            resolved, HINT_TURN_CHANNEL,
+            "degrading here prints a channel the server will not accept, which \
+             is the 403 this whole change exists to remove"
+        );
+    }
+
+    /// A 404 is absorbed by the advisory wrapper, not surfaced.
+    ///
+    /// Real rather than theoretical: another operator can resolve or expire the
+    /// approval between the pending notice and the hint. The client method
+    /// propagates the 404 (see `cli/tests/approval_hint_channel.rs`), and this
+    /// is the layer that turns it into today's behavior. The operator then
+    /// discovers the resolution through the wait itself.
+    ///
+    /// Mutation it catches: bubbling the client error out of the wrapper, which
+    /// would make a race between two operators fail the turn.
+    #[tokio::test]
+    async fn the_hint_names_the_turn_channel_when_the_approval_is_already_gone() {
+        let base = hint_stub_api(404, r#"{"detail":"approval not found"}"#).await;
+        let opts = hint_opts(&base);
+
+        let resolved = hint_channel(
+            &opts,
+            TurnVerb::Local,
+            HINT_TURN_CHANNEL,
+            HINT_APPROVAL_ID,
+            hint_far_deadline(),
+        )
+        .await;
+
+        assert_eq!(
+            resolved, HINT_TURN_CHANNEL,
+            "an approval resolved out from under the wait is 'no answer'; the \
+             hint degrades rather than the turn failing"
+        );
+    }
+
+    // ─── #1531 finding 3, cluster arm: degradation without a leaked child ────
+    //
+    // Everything above drives `TurnVerb::Local`, whose tier dispatch is a plain
+    // base URL. The CLUSTER arm reaches the API through a short-lived
+    // `kubectl port-forward` child instead, and until now no automated test
+    // entered it at all. The test below covers its FAILURE path only: the
+    // forward cannot start, so the lookup has no answer. The SUCCESS path,
+    // where the forward binds and the GET returns a card channel, needs a live
+    // cluster with a real release in it and is therefore recorded separately as
+    // tier evidence rather than asserted here.
+
+    /// The namespace and release this test's cluster-tier `MessageOpts` name.
+    ///
+    /// Deliberately values no real deployment would ever use, because the leak
+    /// assertion counts processes by these strings. A developer running an
+    /// unrelated `kubectl port-forward` against a real release on the same box
+    /// must not be counted by that scan, must not be killed, and must not be
+    /// able to fail this test.
+    const HINT_CLUSTER_NAMESPACE: &str = "curie-hint-1531-absent-namespace";
+    const HINT_CLUSTER_RELEASE: &str = "curie-hint-1531-absent-release";
+
+    /// A cluster-tier turn. There is no `api_url` to point anywhere, unlike
+    /// [`hint_opts`]: on this tier the namespace and release ARE the dispatch,
+    /// since they are what [`port_forward_command`] renders into the child's
+    /// argv. The local port is likewise a value nothing else on the box is
+    /// expected to hold, so a real forward is never disturbed.
+    fn hint_cluster_opts() -> MessageOpts {
+        MessageOpts {
+            api_key: HINT_API_KEY.to_string(),
+            namespace: HINT_CLUSTER_NAMESPACE.to_string(),
+            release: HINT_CLUSTER_RELEASE.to_string(),
+            api_local_port: 18531,
+            local: false,
+            ..MessageOpts::default()
+        }
+    }
+
+    /// The `svc/<release>-api` argument [`port_forward_command`] builds for
+    /// [`hint_cluster_opts`]: the token that identifies a child THIS test
+    /// caused, and nothing else.
+    fn hint_cluster_forward_target() -> String {
+        format!("svc/{HINT_CLUSTER_RELEASE}-api")
+    }
+
+    /// How many live processes carry both this test's namespace and its
+    /// `svc/<release>-api` target on their command line.
+    ///
+    /// A count, never a kill: the assertion compares this before and after, so
+    /// an unrelated pre existing forward cancels out instead of failing the
+    /// test, and no process this test did not start is ever signalled.
+    ///
+    /// A zombie has an EMPTY `cmdline` in `/proc`, so a child that has already
+    /// exited but is still awaiting reap is not counted. That is what keeps the
+    /// assertion free of reap timing flake: the question is whether a forward is
+    /// still RUNNING, not whether its slot is cleared.
+    #[cfg(target_os = "linux")]
+    fn hint_cluster_port_forwards() -> usize {
+        let target = hint_cluster_forward_target();
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return 0;
+        };
+        entries
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                let Ok(raw) = std::fs::read(entry.path().join("cmdline")) else {
+                    return false;
+                };
+                // `/proc` separates argv with NUL; joining on spaces makes the
+                // needles read like the argv `port_forward_command` renders.
+                let argv = String::from_utf8_lossy(&raw).replace('\0', " ");
+                argv.contains(HINT_CLUSTER_NAMESPACE) && argv.contains(&target)
+            })
+            .count()
+    }
+
+    /// The same count where there is no `/proc` to walk. `pgrep -f` matches the
+    /// same space joined argv, and a box with neither `/proc` nor `pgrep`
+    /// answers zero on both sides of the call, which leaves the delta assertion
+    /// true rather than falsely red.
+    #[cfg(not(target_os = "linux"))]
+    fn hint_cluster_port_forwards() -> usize {
+        let Ok(out) = std::process::Command::new("pgrep")
+            .arg("-f")
+            .arg(hint_cluster_forward_target())
+            .output()
+        else {
+            return 0;
+        };
+        out.stdout
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .count()
+    }
+
+    /// The cluster arm degrades to the turn channel when the port forward cannot
+    /// start, stays inside its budget, and leaves no `kubectl port-forward`
+    /// child behind ON THAT PATH.
+    ///
+    /// The input is always "the forward did not bind", in every environment this
+    /// test can run in, and the contract is identical in each, so none of them
+    /// is skipped: a developer box whose `kubectl` has no current context errors
+    /// out at once, CI where `kubectl` is not on PATH fails the spawn, and a box
+    /// with a live cluster still has no such namespace as
+    /// [`HINT_CLUSTER_NAMESPACE`].
+    ///
+    /// What it covers:
+    ///
+    /// 1. DEGRADATION (#1531 finding 3). The hint is a command a human copy
+    ///    pastes, and the default approver set compares `--actor-channel`
+    ///    against the approval's channel. A cluster whose API cannot be reached
+    ///    knows nothing about the card, so it must print exactly what the hint
+    ///    printed before this change. A wrong or empty channel is a guaranteed
+    ///    403, which is the failure #1531 exists to remove.
+    /// 2. BOUND. The lookup runs INSIDE the resume wait, so a cluster arm that
+    ///    sat on `start_port_forward` would freeze a terminal on a turn whose
+    ///    durable approval is already fine.
+    /// 3. NO CHILD LEFT BEHIND on the failed-bind path: a spawn that somehow
+    ///    outlives a bind that failed would show up as a nonzero delta.
+    ///
+    /// What it does NOT cover, said plainly so no reader takes more from it than
+    /// it gives. Because `start_port_forward` always ERRORS here, no guard is
+    /// ever constructed, and the child count is zero on both sides of the call.
+    /// The guard's drop on the SUCCESS path -- which is the #751/#766 regression
+    /// class proper -- is therefore untested by this test: hoisting the guard out
+    /// of the lookup, leaking it with `std::mem::forget`, or dropping
+    /// `kill_on_drop` would all still pass here, because none of them can run.
+    /// That property rests on the live cluster verification this ticket requires
+    /// (`pgrep -f "kubectl port-forward"` empty after a turn that actually bound
+    /// one), and nothing in `cargo test` can stand in for it.
+    ///
+    /// Mutations it does catch: replacing the degraded arm with the card channel
+    /// unwrapped, or with an empty string, fails assertion 1; deleting the
+    /// wrapping `tokio::time::timeout` so `start_port_forward`'s own 15 second
+    /// readiness deadline governs fails assertion 2, and a lookup that hangs
+    /// outright is caught by the outer harness timeout.
+    #[tokio::test]
+    async fn the_cluster_arm_degrades_without_leaking_a_port_forward() {
+        let opts = hint_cluster_opts();
+        let before = hint_cluster_port_forwards();
+
+        let started = Instant::now();
+        // The same harness safety net the local stall tests use, and wider than
+        // the budget under test on purpose: an implementation that lost its
+        // bound would otherwise hang CI instead of failing it.
+        let resolved = tokio::time::timeout(
+            HINT_CHANNEL_LOOKUP_BUDGET * 3,
+            hint_channel(
+                &opts,
+                TurnVerb::Cluster,
+                HINT_TURN_CHANNEL,
+                HINT_APPROVAL_ID,
+                hint_far_deadline(),
+            ),
+        )
+        .await
+        .expect(
+            "the cluster lookup never returned within three budgets against a cluster it cannot \
+             reach, so nothing is bounding it: a real turn would sit here forever",
+        );
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            resolved, HINT_TURN_CHANNEL,
+            "a cluster whose API cannot be reached is 'no answer', and no answer \
+             means the hint prints exactly what it printed before this change"
+        );
+        assert!(
+            !resolved.is_empty(),
+            "the hint must never render `--actor-channel ''` on the cluster arm \
+             either; an empty channel is a guaranteed 403"
+        );
+        // A forward that cannot bind fails at once on every environment listed
+        // above, so anything near the budget means the failure is being waited
+        // on rather than absorbed, and the bound is named rather than a literal
+        // so it tracks the constant if that is ever retuned.
+        assert!(
+            elapsed < HINT_CHANNEL_LOOKUP_BUDGET,
+            "the cluster lookup must stay inside its budget so it can never \
+             extend the resume wait; took {elapsed:?}"
+        );
+
+        // The kill is delivered on drop, so give the kernel a moment to land it
+        // before concluding a child survived (the same poll the abandoned docker
+        // child test uses).
+        let mut after = hint_cluster_port_forwards();
+        for _ in 0..100 {
+            if after <= before {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            after = hint_cluster_port_forwards();
+        }
+        assert!(
+            after <= before,
+            "the cluster lookup leaked a `kubectl port-forward` for \
+             {} (before {before}, after {after}); an orphaned forward is the \
+             #751/#766 regression class, and this lookup runs once per gate",
+            hint_cluster_forward_target()
+        );
     }
 
     /// The probe is only honest if it filters on the service compose actually

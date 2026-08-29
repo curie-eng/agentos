@@ -148,7 +148,14 @@ in code now:
   human saw. ADR-0035 named a durable structured-provenance follow-up for this; that
   provenance has now LANDED as ADR-0046 (the `gate_kind`/`granted_tool` columns above), but it
   discriminates *which* gate may grant rather than binding the granted *arguments*, so
-  argument-scoping remains open (deferred to #558's operator-gated grantability).
+  argument-scoping remains open (deferred to #558's operator-gated grantability). Among gates
+  that set `grantableViaPolicy`, deploy validation also requires a route be claimed by only one
+  distinct tool: two grantable gates on the same route naming the same tool are a duplicate and
+  validate fine, but naming different tools is rejected as `approval_policy.grant_route_ambiguous`,
+  because the shared normalizer `grantable_routes` (the same helper the runner's loader calls)
+  excludes an ambiguous route and would otherwise let the policy validate green while arming no
+  grant. See the [bundle format seam](../bundle-format/INTERFACE.md) for the deploy-time
+  enforcement detail.
 - **Observe-only resume reconciliation (landed, #544, ADR-0046, Decision A2).** To make the
   residual "approved, then the model never re-called the tool" case observable, the worker
   injects an **authority-free** marker `CURIE_APPROVAL_RESUMED_KIND=policy` (`RESUMED_KIND_ENV`,

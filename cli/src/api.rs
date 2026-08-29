@@ -1452,6 +1452,40 @@ impl ApiClient {
             .context("decoding approvals")
     }
 
+    /// One approval by id: `GET /approvals/{approval_id}`, mirroring the
+    /// endpoint at `apps/api/src/curie_api/routers/approvals.py:92-98`. Answers
+    /// 404 when the id names no approval, which a resolve or an expiry by
+    /// another operator makes a real answer rather than a theoretical one.
+    ///
+    /// The CLI reads this for `card_channel` (#1531 finding 3): a route binding
+    /// can put the card in a channel other than the one the turn spoke in, and
+    /// the printed resolve hint has to name the channel the server's authorizer
+    /// actually compares `--actor-channel` against. The single-record read is
+    /// what the hint needs rather than [`Self::list_pending_approvals`], whose
+    /// page is capped at the server max and can simply not contain the approval
+    /// being waited on (#670).
+    ///
+    /// Deliberately UNBOUNDED here, unlike [`Self::check_git_flow_routing`]:
+    /// this stays a plain mirror of the endpoint like every other method, so a
+    /// future non-advisory caller is not silently capped. The deadline belongs
+    /// to the advisory caller, which is where the reasoning for a specific
+    /// budget lives (`message::hint_channel`).
+    pub async fn get_approval(&self, approval_id: &str) -> Result<ApprovalRecord> {
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!("{}/approvals/{approval_id}", self.base_url))
+                    .header("X-API-Key", &self.api_key),
+                "GET /approvals/{id}",
+            )
+            .await?;
+        Self::expect_ok(resp, "reading an approval")
+            .await?
+            .json()
+            .await
+            .context("decoding the approval")
+    }
+
     /// Resolve one approval as a chosen actor: `POST /approvals/{id}/resolve`.
     /// The server owns the resolve-once CAS, the authorizer (self-approval block,
     /// route approvers), and the resume-turn enqueue; `resolved_by` is the acting

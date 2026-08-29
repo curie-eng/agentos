@@ -5239,10 +5239,26 @@ impl crate::ui::CliOutput for ApprovalsOutput {
                     for r in records {
                         let tool = r.granted_tool.as_deref().unwrap_or("-");
                         let route = r.route.as_deref().unwrap_or("(requesting channel)");
+                        // A null card_channel means an older row or a direct API
+                        // write that omitted the field, for which the requesting
+                        // channel applies (#1431); it must NOT render as "null",
+                        // "none" or "-", which would state the wrong fact.
+                        // The server picks approvers from `card_channel or
+                        // reply_channel`, and in Python only the empty string
+                        // is falsy, so an empty card_channel is absent too and
+                        // must show the same requesting-channel meaning as the
+                        // resolve hint in message.rs. A whitespace-only channel
+                        // is truthy in Python and is NOT absent, so it is still
+                        // printed verbatim here; do not trim it.
+                        let card = r
+                            .card_channel
+                            .as_deref()
+                            .filter(|c| !c.is_empty())
+                            .unwrap_or("(requesting channel)");
                         ui.kv(
                             &r.id,
                             &format!(
-                                "{} — {} [tool: {tool}, route: {route}, by: {}]",
+                                "{} — {} [tool: {tool}, route: {route}, channel: {card}, by: {}]",
                                 r.summary, r.conversation_id, r.author
                             ),
                         );
