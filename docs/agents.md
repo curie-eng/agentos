@@ -125,6 +125,24 @@ majority aggregation; `curie skill eval --samples 3 --json`,
 `curie cluster eval --samples 3 --json` raise N on the in-CLI path. A run
 that is all `plumbing_ok` is not a pass, it is an ungraded run.
 
+**An eval's exit code is the gate: 1 at least one selected case failed, 2 the
+selector matched no cases, 3 the runner or platform API was unreachable or
+timed out (transient, retryable), 4 the selector does not apply to this eval
+plane, 0 no case failed.** Exit 0 is not the same as success -- an all
+`plumbing_ok` run also has `failed` equal to 0 and so also exits 0; apply the
+`failed` equal to 0 AND `plumbing_ok` equal to 0 rule above before reading an
+exit code as a pass. `--case-id <ID>` (repeatable, at `skill`, `local`, and `cluster`)
+selects which cases run; omitting it runs the whole suite. A value that matches
+no case in the suite exits 2 and names the unmatched value, so a mistyped
+`--case-id` fails the gate instead of greening an empty run -- including when
+only one of several values is mistyped, which would otherwise drop a case
+silently. Exit 4 is the honest refusal where a local selection cannot reach the
+work: a `local`/`cluster` `--model` sweep and the `local`/`cluster` trajectory
+eval both grade the deployed suite server-side from a suite NAME alone, so
+`--case-id` is declined there rather than ignored. `curie skill eval --case-id`
+IS honored on a `--model` sweep, because that sweep boots a transient local
+runner per model and grades in-CLI, so a local selection reaches the run.
+
 **When a command is uncertain, `curie schema` is the authority.** Do not invoke
 a command you have not seen resolve there.
 

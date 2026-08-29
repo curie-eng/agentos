@@ -341,6 +341,7 @@ const TEST_API_KEY: &str = "curie-dev-key";
 fn eval_dry_run_plan_names_sequential_concurrency() {
     let opts = EvalOpts {
         cases: None,
+        case_ids: Vec::new(),
         channel: None,
         namespace: "curie".into(),
         release: "curie".into(),

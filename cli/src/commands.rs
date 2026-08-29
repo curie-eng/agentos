@@ -2685,6 +2685,7 @@ impl crate::ui::CliOutput for SkillMessageOutput {
 
 pub async fn eval(
     cases_path: Option<PathBuf>,
+    case_ids: Vec<String>,
     url: Option<String>,
     models: Vec<String>,
     secrets: Vec<String>,
@@ -2708,9 +2709,22 @@ pub async fn eval(
             state_plugin_dir.as_deref(),
         )?;
         let loaded = load_eval(&cases_path)?;
+        let total_cases = loaded.suite.cases.len();
+        let trajectory = loaded.trajectory;
+        // Unlike the local/cluster sweep -- the platform eval plane, which
+        // `POST /evals/trigger`s a suite NAME and lets the worker reload the
+        // deployed suite server-side, so a local selection can never reach it --
+        // the skill-tier sweep boots a transient LOCAL runner per model and runs
+        // the suite in-CLI via `run_suite_cases`. A selection made here DOES
+        // reach the run, so it is honored rather than refused.
+        let suite = crate::evals::select_cases(loaded.suite, &case_ids)?;
+        if let Some(note) = crate::evals::selection_note(&case_ids, suite.cases.len(), total_cases)
+        {
+            crate::ui::ui().note(&note);
+        }
         return eval_sweep(
-            &loaded.suite,
-            loaded.trajectory.as_ref(),
+            &suite,
+            trajectory.as_ref(),
             &models,
             &secrets,
             &image,
@@ -2735,6 +2749,11 @@ pub async fn eval(
         state_plugin_dir.as_deref(),
     )?;
     let loaded = load_eval(&cases_path)?;
+    let total_cases = loaded.suite.cases.len();
+    let trajectory = loaded.trajectory;
+    // A selector that matches nothing exits 2 before any runner contact, so a
+    // mistyped --case-id fails the gate rather than greening an empty run.
+    let suite = crate::evals::select_cases(loaded.suite, &case_ids)?;
     // #1087 AC2: the bundle this eval graded, on the machine surface, so an
     // agent can confirm it is the SAME digest `skill status`/`skill message`
     // report without reading a human note off stderr (docs/agents.md bans
@@ -2743,22 +2762,21 @@ pub async fn eval(
     let bundle_digest = recorded_bundle_digest(saved.as_ref(), &url);
     let client = RunnerClient::new(&url)?;
     let ui = crate::ui::ui();
+    if let Some(note) = crate::evals::selection_note(&case_ids, suite.cases.len(), total_cases) {
+        ui.note(&note);
+    }
     // `run_suite_cases` also tallies completion for the `--model` sweep path;
     // the single-runner report doesn't need the count (it already reports the
     // per-case `Fail` either way and exits on any of them), so it is discarded.
     let bar = ui.progress_bar(
-        (loaded.suite.cases.len() as u64).saturating_mul(u64::from(sampling.n)),
+        (suite.cases.len() as u64).saturating_mul(u64::from(sampling.n)),
         "running evals",
     );
-    let (results, _completed) = run_suite_cases(
-        &client,
-        &loaded.suite,
-        fake,
-        loaded.trajectory.as_ref(),
-        sampling,
-        |_| bar.inc(1),
-    )
-    .await?;
+    let (results, _completed) =
+        run_suite_cases(&client, &suite, fake, trajectory.as_ref(), sampling, |_| {
+            bar.inc(1)
+        })
+        .await?;
     bar.finish();
 
     report_eval(&results, bundle_digest.as_deref(), ())
@@ -6290,6 +6308,49 @@ mod tests {
     };
     use serde::Deserialize;
     use std::path::{Path, PathBuf};
+
+    // --- the eval exit-code contract (#2007) --------------------------------
+    //
+    // The exit-0/exit-1 halves of the contract are proven end-to-end in
+    // `cli/tests/eval_case_selector.rs`, against the real binary's process exit
+    // code and the requests the runner actually received. A unit test here
+    // could only re-derive the verdict rule from a row vector, which stays
+    // green under a mutation that runs the UNFILTERED suite.
+
+    #[tokio::test]
+    async fn a_mistyped_case_id_fails_a_skill_eval_model_sweep_rather_than_greening_it() {
+        // #2007: the skill-tier `--model` sweep boots a transient LOCAL runner
+        // per model and grades in-CLI via `run_suite_cases`, so a `--case-id`
+        // selection reaches it (unlike the local/cluster sweep, which is the
+        // platform plane and only ever sees a suite NAME). `select_cases` runs
+        // before `eval_sweep` boots anything, and an explicit --cases path
+        // skips cwd-dependent resolution, so this reaches the exit-2 gate with
+        // no Docker daemon and no `.curie/runner.json` needed.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cases = dir.path().join("cases.json");
+        std::fs::write(
+            &cases,
+            r#"{"name":"smoke","cases":[{"id":"greets-the-user","input":"hi","grader":{"kind":"contains","expected":"hi"}}]}"#,
+        )
+        .expect("write suite");
+        let err = super::eval(
+            Some(cases),
+            vec!["greets-the-usr".to_string()],
+            None,
+            vec!["opus".to_string()],
+            Vec::new(),
+            "curie-runner:test".to_string(),
+            crate::eval_sampling::SampleConfig::default(),
+        )
+        .await
+        .expect_err("a mistyped --case-id must fail the sweep, not silently sweep everything");
+        assert_eq!(
+            crate::exit::classify(&err).0,
+            crate::exit::ExitClass::Usage,
+            "{err:#}"
+        );
+        assert!(format!("{err:#}").contains("greets-the-usr"), "{err:#}");
+    }
 
     /// The platform's answer for a repository two agents bind with no declared
     /// targets -- built by deserializing the WIRE shape, so the test cannot

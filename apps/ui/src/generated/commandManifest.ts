@@ -516,6 +516,14 @@ export const commandManifest = {
             },
             {
               "global": false,
+              "help": "Run only the case(s) with these ids; repeat to select several. Omit to run the whole suite. A value that matches no case in the suite exits 2 (usage), so a mistyped selector fails the gate instead of greening an empty run",
+              "id": "case_id",
+              "long": "case-id",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Runner base URL (defaults to the started runner, then localhost)",
               "id": "url",
               "long": "url",
@@ -1085,6 +1093,14 @@ export const commandManifest = {
               "help": "Eval case file (default: `evals/cases.json` here, then the recorded bundle's)",
               "id": "cases",
               "long": "cases",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Run only the case(s) with these ids; repeat to select several. Omit to run the whole suite. A value that matches no case in the suite exits 2 (usage), so a mistyped selector fails the gate instead of greening an empty run",
+              "id": "case_id",
+              "long": "case-id",
               "positional": false,
               "required": false
             },
@@ -2791,6 +2807,14 @@ export const commandManifest = {
               "help": "Eval case file (default: `evals/cases.json` here, then the recorded bundle's)",
               "id": "cases",
               "long": "cases",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Run only the case(s) with these ids; repeat to select several. Omit to run the whole suite. A value that matches no case in the suite exits 2 (usage), so a mistyped selector fails the gate instead of greening an empty run",
+              "id": "case_id",
+              "long": "case-id",
               "positional": false,
               "required": false
             },
