@@ -17,6 +17,7 @@ from aci_protocol import ApprovalRequest as ApprovalRequest
 from aci_protocol import EvalReport as EvalReport
 from fastapi import HTTPException
 from plugin_format import is_reserved_boot_env_name
+from plugin_format.connector_render import agent_forges_join
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -433,6 +434,59 @@ def _validate_secret_map(value: dict[str, str] | None) -> dict[str, str] | None:
     return value
 
 
+def _validate_agent_name(value: str) -> str:
+    """Reject an agent name that would forge the connector object-name join.
+
+    A connector's Kubernetes objects are named
+    ``{release}-{agent}-mcp-{connector}``
+    (``plugin_format.connector_render.object_name``). The ``-mcp-`` is a bare
+    substring inside one DNS label rather than a structural separator, so the
+    join point is not recoverable from the rendered string: agent ``a-mcp-b``
+    with connector ``c`` and agent ``a`` with connector ``b-mcp-c`` render
+    byte-identical objects AND the identical ``app.kubernetes.io/name`` pod
+    selector. The connector is deliberately unauthenticated (ADR-0086 -- the
+    sandbox holds no credential to authenticate WITH, so the network is the
+    whole of the access control), which makes that name the only thing binding
+    a sandbox to a credential: one agent's sandbox reaches another agent's
+    connector holding another agent's production token, and nothing errors
+    anywhere (#1446).
+
+    ``connectors.yaml`` names and ``deploy.yaml``'s ``target.agent`` are both
+    gated by bundle validation. ``POST /agents`` is the hole -- the stored
+    ``Agent.name`` reaches the renderer with no field validator in between --
+    and it is the path the CLI's ``resolve_agent`` and the UI's create modal
+    both take. Refusing on write keeps the forging name out of the database
+    entirely; the render-time 422 in ``routers/agents.py`` only covers rows
+    created before this validator existed.
+
+    Deliberately ONLY the delimiter-forging shape. ``AgentCreate.name`` accepts
+    spaces, uppercase, and 200-character names today; that is a real but
+    SEPARATE pre-existing gap, and tightening it here would refuse names live
+    installs already hold. Do not "helpfully" widen this into general
+    name-shape validation -- that is its own change, with its own migration
+    story.
+
+    The rule itself is imported, never restated: ``agent_forges_join`` asks
+    whether ``-mcp-`` appears in ``f"{name}-"``, which catches a TRAILING
+    ``-mcp`` (the join supplies the dash that completes it) as surely as an
+    outright ``-mcp-``, while leaving a LEADING ``mcp-`` alone -- its only
+    alternative split leaves an empty agent, so nothing is ambiguous. A second
+    copy of that asymmetry here would be free to drift from the renderer it
+    exists to protect.
+    """
+
+    if agent_forges_join(value):
+        raise ValueError(
+            f"agent name {value!r} collides with the connector object-name "
+            "delimiter '-mcp-': a connector's Kubernetes objects are named "
+            "'{release}-{agent}-mcp-{connector}', so a name that contains "
+            "'-mcp-' or ends in '-mcp' makes two different agents render the "
+            "same objects and share one connector's credential (#1446). Pick a "
+            "name that neither contains '-mcp-' nor ends in '-mcp'."
+        )
+    return value
+
+
 class _StoredWithoutNulls(BaseModel):
     """Serializes to the stored-JSONB shape: unset keys are absent, not null.
 
@@ -750,6 +804,7 @@ class AgentCreate(BaseModel):
     # sandbox by the worker binding. None means no connector secrets.
     secrets: dict[str, str] | None = None
 
+    _check_name = field_validator("name")(_validate_agent_name)
     _check_model = field_validator("model")(_validate_model_override)
     _check_thinking = field_validator("thinking")(_validate_thinking_override)
     _check_approval_tools = field_validator("approval_required_tools")(_validate_tool_names)

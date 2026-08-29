@@ -9,11 +9,18 @@ CLI, under the operator's own kubectl credentials.
 
 from __future__ import annotations
 
+import asyncio
+import io
 import json
+import tarfile
 from pathlib import Path
+from typing import Any
 
 import pytest
 from curie_api import bundles
+from curie_api.config import get_settings
+from curie_api.models import Agent, AgentChannel
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 
 def _bundle(root: Path, connectors_yaml: str | None = None) -> Path:
@@ -270,3 +277,154 @@ def test_a_referenced_secret_points_outside_curies_own_secret(tmp_path: Path) ->
     ref = next(e for e in env if e["name"] == "GRAFANA_TOKEN")["valueFrom"]["secretKeyRef"]
     assert ref["name"] == "grafana-mcp"
     assert "value" not in next(e for e in env if e["name"] == "GRAFANA_TOKEN")
+
+
+# --------------------------------------------------------------------------- #
+# A stored agent name that forges the object-name join -- #1446
+#
+# `object_name` builds `{release}-{agent}-mcp-{connector}`, and the `-mcp-` is a
+# bare substring of one DNS label rather than a structural separator. So
+# `agent='a-mcp-b'/connector='c'` and `agent='a'/connector='b-mcp-c'` render
+# byte-identical objects AND the identical `app.kubernetes.io/name` pod
+# selector. Because the connector is deliberately unauthenticated (ADR-0086 --
+# the sandbox holds no credential to authenticate WITH, so the network is the
+# whole of the access control), that name is the only thing binding a sandbox
+# to a credential: one agent's sandbox reaches another agent's connector
+# holding another agent's production token, silently.
+#
+# Once the renderer fails closed on such a name, THIS endpoint is where the
+# refusal surfaces, because `read_version_connectors` reads the stored
+# `Agent.name` straight into `render_connector_manifests` inside a
+# `run_in_threadpool` with no `except` around it. Unhandled, that is a 500: an
+# opaque server error on a read-only endpoint the CLI calls during every
+# `cluster deploy`, with nothing in the response saying which name is at fault
+# or that renaming the agent is the fix. A 422 naming the agent is what makes
+# it diagnosable without reading source or pulling API logs.
+#
+# The row is written straight through the ORM rather than through `POST
+# /agents`, deliberately: the create path now refuses this name, so the only
+# way an install still has one is a row created before that validator existed.
+# That is the case this endpoint has to survive, and it is not reachable
+# through the API by construction.
+# --------------------------------------------------------------------------- #
+
+ENDPOINT_RELEASE = "curie"
+ENDPOINT_NAMESPACE = "curie-prod"
+ENDPOINT_APP_NAME = "curie"
+
+
+def _archive(connectors_yaml: str) -> bytes:
+    """The smallest bundle that validates AND declares a hosted connector.
+
+    A bundle declaring no connector renders an empty list without ever reaching
+    `object_name`, so the connector is what makes this test bite at all.
+    """
+
+    files = {
+        ".claude-plugin/plugin.json": json.dumps(
+            {"name": "acme-bot", "version": "0.1.0", "description": "t"}
+        ),
+        "skills/acme-bot/SKILL.md": "---\nname: acme-bot\ndescription: t\n---\nhi\n",
+        "connectors.yaml": connectors_yaml,
+    }
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        for rel, content in files.items():
+            data = content.encode("utf-8")
+            info = tarfile.TarInfo(f"acme-bot/{rel}")
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+def _agent_row(name: str) -> str:
+    """Insert the agent row directly, the way a pre-validator install holds one.
+
+    Mirrors `crud.create_agent`'s shape (the agent and its binding in one
+    transaction) but goes around `AgentCreate`, because the write-seam validator
+    is precisely what this row is meant to predate. Fresh engine per call, the
+    pattern `test_crud.py` and `test_evals_trigger_integration.py` use to keep
+    the query off the TestClient's portal loop.
+    """
+
+    async def run() -> str:
+        engine = create_async_engine(get_settings().database_url)
+        sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with sessionmaker() as session:
+                agent = Agent(
+                    name=name,
+                    channel=AgentChannel(kind="slack", address="C0EXAMPLE4"),
+                )
+                session.add(agent)
+                await session.commit()
+                return str(agent.id)
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(run())
+
+
+def _version_with_bundle(client: Any, headers: dict[str, str], agent_id: str) -> str:
+    version = client.post(
+        f"/agents/{agent_id}/versions",
+        json={"version_label": "v1", "created_by": "test"},
+        headers=headers,
+    )
+    assert version.status_code == 201, version.text
+    version_id = version.json()["id"]
+    stored = client.put(
+        f"/agents/{agent_id}/versions/{version_id}/bundle",
+        files={"file": ("b.tar.gz", _archive(HOSTED))},
+        headers=headers,
+    )
+    assert stored.status_code == 201, stored.text
+    return str(version_id)
+
+
+def _read_connectors(client: Any, headers: dict[str, str], agent_id: str, version_id: str) -> Any:
+    return client.get(
+        f"/agents/{agent_id}/versions/{version_id}/connectors",
+        params={
+            "release": ENDPOINT_RELEASE,
+            "namespace": ENDPOINT_NAMESPACE,
+            "app_name": ENDPOINT_APP_NAME,
+        },
+        headers=headers,
+    )
+
+
+def test_a_stored_forging_agent_name_is_a_422_not_a_500(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    agent_id = _agent_row("a-mcp-b")
+    version_id = _version_with_bundle(client, auth_headers, agent_id)
+
+    resp = _read_connectors(client, auth_headers, agent_id, version_id)
+    assert resp.status_code == 422, resp.text
+    # Naming the agent is the whole point: `cluster deploy` renders manifests
+    # for whichever agent the bundle's deploy.yaml selected, so an operator
+    # reading this response is not necessarily holding the name that caused it.
+    assert "a-mcp-b" in resp.text, resp.text
+
+
+def test_the_same_bundle_still_renders_for_an_unambiguous_agent(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    # The control, and it is not optional: without it the 422 test above passes
+    # just as happily if the endpoint, the bundle fixture, or the upload broke
+    # for some reason having nothing to do with #1446. Same bundle, same
+    # release, same namespace -- only the agent name differs.
+    agent_id = _agent_row("acme-dev")
+    version_id = _version_with_bundle(client, auth_headers, agent_id)
+
+    resp = _read_connectors(client, auth_headers, agent_id, version_id)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    name = f"{ENDPOINT_RELEASE}-acme-dev-mcp-grafana"
+    assert {o["metadata"]["name"] for o in body["manifests"]} == {
+        name,
+        f"{name}-allow",
+        f"{name}-allow-ingress",
+    }
+    assert name in body["mcp_entries"]["grafana"]["url"]
