@@ -1233,3 +1233,95 @@ fn skill_observability_queries_are_answered_as_unavailable_with_cross_tier_guida
         );
     }
 }
+
+/// ADR-0041 parity means the **bare** form (no leaf) is answered at every
+/// tier, not just the query leaves covered above: the skill tier answers with
+/// the capability refusal (exit 4, `{error, fix}`), while local and cluster
+/// answer with their surface/plan payloads (exit 0). Before #1955 the skill
+/// tier alone declared its subcommand field non-optional, so clap's
+/// `subcommand_required` kicked in and `curie skill observability` with no
+/// leaf died as a clap usage error -- exit 2, help on stderr, empty stdout --
+/// instead of ever reaching `commands::skill_observability_unavailable()`.
+#[test]
+fn bare_observability_is_answered_at_every_tier_and_refused_at_skill() {
+    // skill: the bare form must reach the exit-4 capability refusal, not
+    // clap's subcommand-required usage error.
+    let output = Command::new(bin())
+        .args(["--json", "skill", "observability"])
+        .stdin(Stdio::null())
+        .env_remove("CURIE_API_URL")
+        .env_remove("CURIE_API_KEY")
+        .output()
+        .unwrap_or_else(|error| panic!("run skill observability: {error}"));
+
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "bare skill observability must exit 4, not clap's usage exit 2\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("Usage: curie skill observability"),
+        "bare skill observability must not fall back to clap's subcommand-required usage help \
+         (the #1955 regression): stderr: {stderr}"
+    );
+
+    let value = one_stdout_object(&output);
+    assert_only_error_fix(&value);
+
+    let error = value["error"].as_str().unwrap().to_ascii_lowercase();
+    assert!(
+        error.contains("not available at this tier") && error.contains("skill"),
+        "the error must identify skill-tier capability absence: {value}"
+    );
+
+    let fix = value["fix"].as_str().unwrap().to_ascii_lowercase();
+    assert!(
+        fix.contains("curie local observability") || fix.contains("curie cluster observability"),
+        "the fix must point to a platform query tier: {value}"
+    );
+    assert!(
+        !fix.contains("retry"),
+        "an unsupported skill-tier query must not masquerade as transient: {value}"
+    );
+
+    // local: the parity control -- the sibling tier answers the same bare
+    // verb with its surface report, not a refusal. `commands::observability`
+    // is a pure URL printer, so this needs no running stack.
+    let output = Command::new(bin())
+        .args(["--json", "local", "observability"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap_or_else(|error| panic!("run local observability: {error}"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("Usage: curie local observability"),
+        "bare local observability must not fall back to clap usage help: stderr: {stderr}"
+    );
+    let value = assert_success(&output, "bare local observability");
+    assert!(
+        value["surfaces"].as_array().is_some(),
+        "bare local observability must report its surfaces array: {value}"
+    );
+
+    // cluster: same parity control, via --dry-run so no kubectl/helm is
+    // shelled out -- the plan payload is returned before
+    // `require_on_path("kubectl")` runs.
+    let output = Command::new(bin())
+        .args(["--json", "cluster", "observability", "--dry-run"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap_or_else(|error| panic!("run cluster observability --dry-run: {error}"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("Usage: curie cluster observability"),
+        "bare cluster observability --dry-run must not fall back to clap usage help: stderr: {stderr}"
+    );
+    let value = assert_success(&output, "bare cluster observability --dry-run");
+    assert!(
+        value.as_object().is_some_and(|object| !object.is_empty()),
+        "bare cluster observability --dry-run must report a non-empty plan payload: {value}"
+    );
+}
