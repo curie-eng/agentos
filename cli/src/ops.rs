@@ -6575,8 +6575,9 @@ fn deployed_release_namespace(
 }
 
 /// Discover a Helm release's platform API key by reading it out of the chart
-/// Secret (`<release>-secrets`, data key `apiKey`), decoded server-side by
-/// kubectl's `base64decode` so the plaintext never lands in argv (#524). The
+/// Secret (data key `apiKey`), whose name is discovered by label selector
+/// rather than computed -- see [`release_secret_name`] -- decoded server-side
+/// by kubectl's `base64decode` so the plaintext never lands in argv (#524). The
 /// governance verbs use this so they authenticate against a REAL release whose
 /// `api.apiKey` was randomized at `cluster up`, instead of silently sending the
 /// dev sentinel `curie-dev-key` and 401-ing. An explicit `--api-key`/env still
@@ -6693,7 +6694,8 @@ fn valkey_password_usage_err(msg: impl Into<String>) -> anyhow::Error {
 }
 
 /// Discover a Helm release's Valkey password from the same chart Secret
-/// (`<release>-secrets`, data key `valkeyPassword`). `cluster message` enqueues
+/// (name discovered by label selector -- see [`release_secret_name`] -- data
+/// key `valkeyPassword`). `cluster message` enqueues
 /// onto the release's Valkey, whose password `cluster up` randomizes, so without
 /// this the dev sentinel `valkeypass` reaches a strong-secrets install and the
 /// connection fails authentication (#786). An explicit
@@ -6719,12 +6721,13 @@ fn slack_bot_token_usage_err(msg: impl Into<String>) -> anyhow::Error {
 }
 
 /// Discover a Helm release's Slack bot token from the chart Secret
-/// (`<release>-secrets`, data key `slackBotToken`), or from the operator's own
+/// (name discovered by label selector -- see [`release_secret_name`] -- data
+/// key `slackBotToken`), or from the operator's own
 /// `dispatcher.slack.botTokenExistingSecret` when one is configured (#1759).
 /// In connected mode `cluster message` posts a real placeholder to the
 /// workspace with this token so the approval card and resumed reply ride the
 /// connected transport, instead of the throwaway stub (#770/ADR-0078). Only
-/// reached when a `<release>-dispatcher` is present (a workspace IS
+/// reached when the release's dispatcher Deployment is present (a workspace IS
 /// connected), so the token is expected to be set; an empty or unreadable
 /// value is an actionable error. The value is never printed -- it flows only
 /// into the `chat.postMessage` auth header.
