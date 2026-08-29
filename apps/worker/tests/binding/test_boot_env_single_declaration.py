@@ -283,6 +283,21 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # validator and the platform can never drift apart. Read from the
         # WORKER's env by WorkerConfig; the sandbox never sees it.
         "CURIE_TERMINATION_GRACE_PERIOD_S",
+        # The pre-upgrade drain gate (issue #2010), read from the env of the
+        # WORKER IMAGE by WorkerConfig -- both by every worker replica (which
+        # only ever reads the quiesce flag) and by the chart's pre-upgrade and
+        # post-upgrade hook Jobs, which run `python -m curie_worker.upgrade_drain`
+        # out of that same image. Nothing here is injected into a runner claim,
+        # and the gate runs before any sandbox for this release exists.
+        # - CURIE_UPGRADE_DRAIN_TIMEOUT_S: how long the gate waits for accepted
+        #   in-flight deliveries to settle before it refuses the upgrade.
+        # - CURIE_UPGRADE_DRAIN_POLL_INTERVAL_S: how often it re-reads the
+        #   in-flight set while waiting.
+        # - CURIE_UPGRADE_QUIESCE_TTL_S: lifetime of the fleet-wide quiesce
+        #   flag, which must outlast that wait and must never be permanent.
+        "CURIE_UPGRADE_DRAIN_TIMEOUT_S",
+        "CURIE_UPGRADE_DRAIN_POLL_INTERVAL_S",
+        "CURIE_UPGRADE_QUIESCE_TTL_S",
     }
 )
 

@@ -40,6 +40,12 @@ from .delivery_lease import (
     LeaseRefused,
     unfenced_lease,
 )
+from .upgrade_drain import UpgradeDrainGate
+
+# How often a paused read loop re-checks the upgrade quiesce flag (#2010). Short
+# relative to any rollout, so a released fleet resumes claiming promptly, and far
+# longer than one EXISTS, so the poll costs nothing measurable while idle.
+_QUIESCE_POLL_S = 1.0
 
 # One stream entry as redis returns it with decode_responses=True.
 StreamEntry = tuple[str, dict[str, str]]
@@ -111,6 +117,7 @@ class StreamConsumer:
         *,
         leases: DeliveryLeaseStore | None = None,
         on_lease_lost: LeaseLostHandler | None = None,
+        drain: UpgradeDrainGate | None = None,
     ) -> None:
         # The stream broker behind the port (#284). ``redis.asyncio.Redis`` is the
         # one backing today and structurally satisfies ``StreamBroker``; a second
@@ -158,6 +165,14 @@ class StreamConsumer:
         # cancels a handler task itself: a bare cancel skips the runner-side
         # stop and leaves a turn producing effects on a sandbox we no longer own.
         self._on_lease_lost: LeaseLostHandler | None = on_lease_lost
+        # The pre-upgrade drain gate (#2010), or None for a consumer that has no
+        # platform to be rolled by (compose, the base-only unit tests). While it
+        # reports a drain in progress this consumer takes NO new work -- neither
+        # a fresh read nor a reclaim -- so the deliveries already accepted can
+        # reach their terminal outcome before the roll interrupts them, and the
+        # replacement pods that come up mid-roll do not reclaim them out from
+        # under a replica that is still draining.
+        self._drain: UpgradeDrainGate | None = drain
 
     @property
     def _spec(self) -> DeliverySpec:
@@ -168,6 +183,31 @@ class StreamConsumer:
 
     def request_stop(self) -> None:
         self._stop.set()
+
+    async def _claims_paused(self) -> bool:
+        """Is the fleet quiesced for an upgrade drain (#2010)?
+
+        Checked before every new claim -- a blocking read and a reclaim alike.
+        Deliveries already in flight are untouched: pausing is about not taking
+        on MORE work, and cutting a live turn short is the failure the drain
+        exists to prevent.
+
+        Fails OPEN. An unreadable flag degrades to the behavior this consumer
+        had before the gate existed, which is a working worker. Failing closed
+        would idle every replica in the release on a transient Valkey blip --
+        turning the one read that is supposed to make upgrades safer into a
+        fleet-wide stall, and doing it at exactly the moment Valkey is least
+        healthy.
+        """
+        if self._drain is None:
+            return False
+        try:
+            return await self._drain.is_quiescing()
+        except Exception:
+            logging.getLogger(__name__).debug(
+                "quiesce flag read failed; claiming normally", exc_info=True
+            )
+            return False
 
     async def _ensure_group(self, stream: str, group: str, *, start_id: str) -> None:
         """Create the consumer group (and the stream) if it does not exist.
@@ -186,6 +226,12 @@ class StreamConsumer:
         """Blocking-read loop: read the group, dispatch each entry to ``handler``,
         and survive transient transport faults until stop is requested."""
         while not self._stop.is_set():
+            if await self._claims_paused():
+                # Take nothing new while an upgrade drains. The in-flight
+                # handlers this consumer already owns keep running under their
+                # own leases and settle normally; only the read is held back.
+                await self._sleep_or_stop(_QUIESCE_POLL_S)
+                continue
             try:
                 resp = await self._redis.xreadgroup(
                     spec.group,

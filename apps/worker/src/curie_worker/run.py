@@ -65,6 +65,7 @@ from .sandbox import (
     SuspendedThreadError,
 )
 from .threadlock import ThreadLock
+from .upgrade_drain import UpgradeDrainGate
 from .workspace import (
     SubprocessCommands,
     WorkspaceClaimCoordinator,
@@ -393,11 +394,17 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
     # server ``TIME``, which the ``StreamBroker`` port deliberately does not
     # carry. Each lane gets its own store bound to its own connection, so the
     # eval lane's blocking read can never stall a runs-lane heartbeat.
+
+    # The pre-upgrade drain gate (#2010). ONE gate object shared by both
+    # delivery lanes: the quiesce flag is release-wide, and two gates reading
+    # the same key would only be two ways to answer the same question.
+    drain_gate = UpgradeDrainGate(async_redis, config)
     consumer = Consumer(
         redis=async_redis,
         kernel=kernel,
         config=config,
         leases=DeliveryLeaseStore(async_redis, config),
+        drain=drain_gate,
     )
 
     # The eval lane (F3): a second consumer group on curie:evals, on its own
@@ -416,6 +423,7 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         redis=eval_redis,
         config=config,
         leases=DeliveryLeaseStore(eval_redis, config),
+        drain=drain_gate,
         bundle_store=BundleStore(config),
         substrate=substrate,
         reporter=EvalReporter(

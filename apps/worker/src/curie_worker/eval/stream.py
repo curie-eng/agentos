@@ -74,6 +74,7 @@ from ..delivery_lease import DeliveryLeaseStore, LeaseLostError
 from ..sandbox import SandboxSubstrate
 from ..sandbox.types import SandboxError
 from ..stream_consumer import DeliverySpec, ReadLoopSpec, StreamConsumer
+from ..upgrade_drain import UpgradeDrainGate
 from .models import EvalCaseResult, EvalOutcome, EvalRunResult, EvalScorer, EvalSuite
 from .recorder import LangfuseEvalRecorder
 from .run import run_eval_suite, sample_config_from_env
@@ -262,6 +263,7 @@ class EvalStreamConsumer(StreamConsumer):
         recorder: LangfuseEvalRecorder,
         repo_lookup: Any,
         leases: DeliveryLeaseStore | None = None,
+        drain: UpgradeDrainGate | None = None,
     ) -> None:
         # ADR-0131: "runs and evals must share the lease implementation by
         # construction. A fix on only one consumer lane is incomplete." The whole
@@ -272,7 +274,11 @@ class EvalStreamConsumer(StreamConsumer):
         # there is nothing for the callback to stop. Active cancellation on lease
         # loss is the named follow-up (F2), and the residual is documented at
         # ``_report`` below -- not papered over with a second interrupt mechanism.
-        super().__init__(redis, leases=leases)
+        # ``drain`` is the same pre-upgrade quiesce gate the runs lane takes
+        # (#2010), and for the same construction reason ADR-0131 gives above: a
+        # gate wired on only one lane is incomplete. An eval delivery holds a
+        # sandbox and a lease exactly as a turn does.
+        super().__init__(redis, leases=leases, drain=drain)
         self._config = config
         self._bundles = bundle_store
         self._substrate = substrate

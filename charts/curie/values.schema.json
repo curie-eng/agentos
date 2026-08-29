@@ -66,6 +66,27 @@
           "maximum": 86400,
           "description": "Voluntary Pod termination grace before SIGKILL. Must be at least deliveryBudgetSeconds + deliveryShutdownReserveSeconds (ADR-0131, #1971), or a worker draining a maximum-budget turn is killed at the exact moment it would settle; below 60s not even a fast drain reliably completes."
         },
+        "upgradeDrain": {
+          "type": "object",
+          "description": "Pre-upgrade drain gate (issue #2010): quiesce new claims and drain already-accepted deliveries to their terminal outcome before the roll, or refuse the upgrade while unsafe in-flight work exists.",
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "timeoutSeconds": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 7200,
+              "description": "Floor for how long the gate waits for in-flight deliveries before refusing the upgrade. The effective wait is raised to at least deliveryBudgetSeconds + deliveryShutdownReserveSeconds so the gate never gives up on a delivery still inside the budget ADR-0131 promised it."
+            },
+            "pollIntervalSeconds": {"type": "integer", "exclusiveMinimum": 0, "maximum": 3600},
+            "quiesceTtlSeconds": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 86400,
+              "description": "Floor for the lifetime of the fleet-wide quiesce flag, derived above the effective drain wait so it cannot lapse mid-drain. Setting it at or below timeoutSeconds is refused at render time. Finite by construction, so an upgrade killed between the two hooks cannot leave the fleet permanently unable to claim."
+            },
+            "resources": {"type": "object"}
+          }
+        },
         "workspace": {
           "type": "object",
           "properties": {

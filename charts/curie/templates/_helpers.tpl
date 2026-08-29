@@ -1148,6 +1148,48 @@ securityContext:
 {{- end -}}
 {{- end -}}
 
+{{/* ---- Upgrade drain gate arithmetic (issue #2010) ----
+     The gate's two clocks are DERIVED, with the values as floors, and only a
+     self-contradictory pair is refused outright. The split is deliberate.
+
+     `timeoutSeconds` vs the delivery budget is a CROSS-FAMILY relationship an
+     operator does not author together: raising `deliveryBudgetSeconds` is a
+     decision about how long a turn may run, made for reasons that have nothing
+     to do with upgrades. Refusing that render would break configurations that
+     are valid today, on a chart upgrade, for a value the operator never touched
+     -- so the effective wait is raised to cover the budget instead. The gate
+     must never give up on a delivery that is still inside the budget ADR-0131
+     already promised it; a gate that refuses upgrades during ordinary traffic
+     is a gate that gets switched off in its first week.
+
+     The quiesce TTL is then derived above that, because the worker's OWN boot
+     validator refuses a TTL that does not outlast the wait -- so a rendered
+     pair the app would reject is a green `helm upgrade` followed by a
+     CrashLoopBackOff, the same failure `validateDrainBudget` above exists to
+     prevent.
+
+     What IS refused is the one pair an operator writes together and can only
+     get wrong by contradicting themselves: a `quiesceTtlSeconds` at or below
+     the `timeoutSeconds` they set beside it. Silently raising that one would
+     hide a stated intent rather than an unrelated default. */}}
+{{- define "curie.worker.upgradeDrain.timeout" -}}
+{{- max (int64 .Values.worker.upgradeDrain.timeoutSeconds) (add (int64 .Values.worker.deliveryBudgetSeconds) (int64 .Values.worker.deliveryShutdownReserveSeconds)) -}}
+{{- end -}}
+
+{{/* Headroom over the effective wait, so the flag cannot lapse in the moments
+     between the gate's last poll and the roll it clears the way for. */}}
+{{- define "curie.worker.upgradeDrain.quiesceTtl" -}}
+{{- max (int64 .Values.worker.upgradeDrain.quiesceTtlSeconds) (add (int64 (include "curie.worker.upgradeDrain.timeout" .)) 60) -}}
+{{- end -}}
+
+{{- define "curie.worker.validateUpgradeDrain" -}}
+{{- $timeout := int64 .Values.worker.upgradeDrain.timeoutSeconds -}}
+{{- $quiesce := int64 .Values.worker.upgradeDrain.quiesceTtlSeconds -}}
+{{- if le $quiesce $timeout -}}
+{{- fail (printf "worker.upgradeDrain.quiesceTtlSeconds (%d) must be strictly greater than worker.upgradeDrain.timeoutSeconds (%d) (issue #2010). As set, the fleet-wide quiesce flag lapses while the gate is still waiting, so the replicas resume claiming into a roll that is about to interrupt them -- and the gate would still report a clean drain. Fix: raise worker.upgradeDrain.quiesceTtlSeconds above %d, or lower worker.upgradeDrain.timeoutSeconds below %d." $quiesce $timeout $timeout $quiesce) -}}
+{{- end -}}
+{{- end -}}
+
 {{/* ---- Langfuse ClickHouse startup gate (issue #2009) ----
      Both Langfuse deployments run their ClickHouse migrations during boot, so a
      Helm upgrade that recreates the ClickHouse Service can start them before the

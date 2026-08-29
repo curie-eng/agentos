@@ -56,6 +56,7 @@ from .config import WorkerConfig
 from .delivery_lease import DeliveryLeaseStore, LeaseLostError
 from .kernel import Kernel, _thread_key_for
 from .stream_consumer import DeliverySpec, ReadLoopSpec, StreamConsumer
+from .upgrade_drain import UpgradeDrainGate
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +120,7 @@ class Consumer(StreamConsumer):
         config: WorkerConfig,
         max_concurrency: int = 16,
         leases: DeliveryLeaseStore | None = None,
+        drain: UpgradeDrainGate | None = None,
     ) -> None:
         # The delivery-ownership fence (ADR-0131) lives entirely in the shared
         # base: acquisition, the background heartbeat, release, and the reclaim
@@ -127,7 +129,10 @@ class Consumer(StreamConsumer):
         # implementation by construction. ``leases=None`` keeps every pre-ADR-0131
         # construction (and the tests that use it) behaving exactly as before.
         super().__init__(
-            redis, leases=leases, on_lease_lost=self._interrupt_on_lease_lost
+            redis,
+            leases=leases,
+            on_lease_lost=self._interrupt_on_lease_lost,
+            drain=drain,
         )
         # The base class narrows self._redis to the StreamBroker port (stream
         # verbs only, by design -- a second broker implementation need not
@@ -506,7 +511,17 @@ class Consumer(StreamConsumer):
     async def _maintenance_loop(self) -> None:
         while not self._stop.is_set():
             try:
-                await self._reclaim_once()
+                # A reclaim is a NEW claim: it moves a peer's pending entry into
+                # this consumer and dispatches it. During an upgrade drain
+                # (#2010) that is exactly the theft the gate exists to stop --
+                # a replacement pod coming up mid-roll would otherwise take the
+                # delivery a still-draining replica is settling, see the
+                # side-effect marker, and escalate work that was about to
+                # complete. The rest of the tick is unaffected: reaping orphans
+                # and sweeping owed completions create no claims and stay
+                # useful while a drain is in progress.
+                if not await self._claims_paused():
+                    await self._reclaim_once()
                 await self._kernel.reap_orphans()
                 await self._kernel.sweep_pending_completions()
                 await self._drain_thread_reset_requests()

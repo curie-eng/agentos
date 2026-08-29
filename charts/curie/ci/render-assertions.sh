@@ -929,6 +929,9 @@ expected = {
     ("Job", f"{prefix}-netpol-probe"): "hooks",
     ("Job", f"{prefix}-security-probe"): "hooks",
     ("Job", f"{prefix}-langfuse-model-pricing"): "hooks",
+    # The pre-upgrade drain gate and its post-upgrade release (issue #2010).
+    ("Job", f"{prefix}-upgrade-drain"): "hooks",
+    ("Job", f"{prefix}-upgrade-drain-release"): "hooks",
     ("Pod", f"{prefix}-security-probe-hardening"): "hooks",
     ("Deployment", "agent-sandbox-controller"): "controller",
 }
