@@ -20,6 +20,15 @@ EX <ttl>`` before enqueuing: the first delivery claims the key and enqueues; a
 retry finds the key present and is dropped. This is chosen over stream-side
 dedupe because it is O(1), TTL-bounded (no unbounded dedupe set to prune), and
 does not require scanning the Stream.
+
+The claim also has a release path, ``release_event`` (``DEL <dedupe_key>``,
+#2006), and it is deliberately asymmetric. A failure between claiming and
+posting the placeholder has produced no user-visible side effect yet, so
+releasing is safe and lets a genuine Slack redelivery retry cleanly. A failure
+between a *successful* placeholder post and the ``XADD``, by contrast, must
+NOT release: the placeholder is already visible in the channel, and a
+redelivery that re-claims would post a second one. The asymmetry is the point,
+not an inconsistency to "clean up" later.
 """
 
 from typing import Any, Protocol, cast, runtime_checkable
@@ -33,13 +42,15 @@ from .config import DispatcherConfig
 class StreamPublisher(Protocol):
     """The stream-broker port (producer side): append an entry + dedupe-claim.
 
-    Issue #284 / ADR-0027. The producer's whole coupling to the broker is these
-    two verbs: ``xadd`` (append the one-``payload`` entry to the stream) and a
-    ``SET NX EX`` dedupe-claim (``set``). Typing the producer against this
-    Protocol makes a future non-redis broker a drop-in on the write side. The
-    consumer side has its own port (``StreamBroker`` in the worker). ``redis.Redis``
-    structurally satisfies this, so it is the one backing today with no adapter.
-    The verbs are typed permissively to match redis-py's signatures.
+    Issue #284 / ADR-0027, widened by #2006. The producer's whole coupling to
+    the broker is these three verbs: ``xadd`` (append the one-``payload`` entry
+    to the stream), a ``SET NX EX`` dedupe-claim (``set``), and its release
+    (``delete``). Typing the producer against this Protocol makes a future
+    non-redis broker a drop-in on the write side. The consumer side has its own
+    port (``StreamBroker`` in the worker). ``redis.Redis`` already has
+    ``delete``, so it structurally satisfies this widened port too, same as
+    before -- the one backing today with no adapter. The verbs are typed
+    permissively to match redis-py's signatures.
     """
 
     def xadd(self, name: Any, fields: Any) -> Any:
@@ -48,6 +59,10 @@ class StreamPublisher(Protocol):
 
     def set(self, name: Any, value: Any, *, nx: bool = ..., ex: Any = ...) -> Any:
         """``SET`` with ``NX``/``EX`` — the dedupe-claim beside the stream."""
+        ...
+
+    def delete(self, *names: Any) -> Any:
+        """``DEL`` — releases a dedupe claim (see ``release_event``)."""
         ...
 
 
@@ -75,6 +90,26 @@ def claim_event(redis_client: "StreamPublisher", config: "DispatcherConfig", eve
         ex=config.dedupe_ttl_seconds,
     )
     return bool(claimed)
+
+
+def release_event(
+    redis_client: "StreamPublisher", config: "DispatcherConfig", event_id: str
+) -> None:
+    """Release the dedupe claim on ``event_id`` so a Slack redelivery can retry.
+
+    Legitimate to call only when nothing user-visible has happened yet -- i.e.
+    before the placeholder post has succeeded. Once a placeholder has been
+    posted, do NOT call this: a redelivery would re-claim and post a second
+    placeholder (see the module docstring's Dedupe paragraph and #2006).
+
+    Caveat: under Socket Mode, Bolt acks the envelope before running the
+    listener body, so a Slack redelivery triggered by a failure inside the
+    listener is rare -- there is often no retry for the release to enable.
+    Calling this restores idempotency *correctness* (the claim no longer lies
+    about an event having gone through) rather than guaranteeing recovery of
+    every failure.
+    """
+    redis_client.delete(config.dedupe_key(event_id))
 
 
 def enqueue(redis_client: "StreamPublisher", config: "DispatcherConfig", turn: QueuedTurn) -> str:

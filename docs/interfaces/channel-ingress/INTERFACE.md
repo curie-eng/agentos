@@ -109,6 +109,119 @@ the Rust CLI mints the exact
 (`cli/src/queue.rs`) and drives the whole deployed system with zero Slack contact
 via `curie local message` / `cluster message` (`cli/src/chat.rs`, `cli/src/message.rs`).
 
+## Adapter admission and the drop contract (Slack)
+
+This clarifies *this* seam's ingress contract for the one adapter that exists (#2006). It
+is a Slack-adapter statement, not a vocabulary other adapters are asked to adopt.
+
+**The rule.** The adapter normalizes what it receives; routing decides what is relevant.
+Anything decidable from the routed payload belongs at the routing seam
+(`BindingResolver.resolve` above), so what stays in `apps/dispatcher` is normalization plus
+the few refusals that seam structurally cannot make. Every drop the adapter's own code
+makes is an enumerated member of
+`apps/dispatcher/src/curie_dispatcher/relevance.py::DropReason`, carries a documented
+rationale in `apps/dispatcher/src/curie_dispatcher/relevance.py::DROP_RATIONALES`, and is
+emitted as exactly one INFO record by
+`apps/dispatcher/src/curie_dispatcher/relevance.py::drop`. There are no silent drops inside
+the adapter: a bare `return None` on the ingest path is the defect #2006 closed, not a
+style preference. The module is the system of record for this table, and the dispatcher's
+tests assert the two sets equal in both directions.
+
+| `DropReason` | Documented rationale |
+|---|---|
+| `UNSUBSCRIBED_LANE` | The delivered envelope is outside the adapter's declared subscription surface — `apps/dispatcher/slack-app-manifest.yaml` subscribes to `app_mention` and `message.im` only, so a message event on any other channel type cannot legitimately arrive, and refusing it is envelope validation rather than a relevance judgement. |
+| `BOT_AUTHORED_THREAD_REPLY` | Loop guard across installations: Curie's own replies and placeholders are always threaded, so admitting a bot-authored mention that carries a thread timestamp would let two Curie installations in one workspace mention-loop each other indefinitely, which Bolt's self filter cannot stop because the two bot identities differ. |
+| `NON_CONTENT_SUBTYPE` | The subtype marks something other than new user content: an edit, a delete, a tombstone, a body redacted by Enterprise Key Management, or an assistant thread-start marker. |
+| `DUPLICATE_DELIVERY` | Slack redelivered a delivery whose idempotency key was already claimed, so processing it again would post a second placeholder and mint a second turn for one message. |
+| `NO_ACTION_IN_PAYLOAD` | A block-action payload carrying no actions names no command and addresses nothing, so there is no turn to mint from it. |
+| `EMPTY_ACTION_COMMAND` | A clicked button carrying neither a value nor a usable action id names no command, so the turn text would be empty. |
+| `UNADDRESSABLE_ACTION` | An App Home or modal click carries no channel and no message, so there is no thread in which a reply could be delivered. |
+
+The last three sit on the Block Kit click lane, which is a real ingest lane:
+`apps/dispatcher/src/curie_dispatcher/handlers.py::process_action` mints a `QueuedTurn`
+exactly as `apps/dispatcher/src/curie_dispatcher/handlers.py::process_event` does, so a
+dropped click is inbound loss of the same class. Of the three, only `UNADDRESSABLE_ACTION`
+is a disposition Bolt actually delivers today: an App Home or modal click really does
+arrive with no channel and no message. `NO_ACTION_IN_PAYLOAD` and `EMPTY_ACTION_COMMAND`
+are **defensive guards on that lane that the current matcher does not reach**. The
+catch-all registration in
+`apps/dispatcher/src/curie_dispatcher/handlers.py::register_handlers` is
+`@app.action(re.compile(r".+"))`, and `slack_bolt` resolves the clicked action inside its
+own matcher before invoking the listener: a payload with an empty `actions` list raises
+there rather than arriving at `process_action`, and an empty `action_id` never matches
+`.+` at all. The dispatcher's tests therefore exercise those two rows directly instead of
+through Bolt. They are kept, not deleted, for three reasons: they are one comparison each;
+the matcher's payload handling is a `slack_bolt` implementation detail rather than a
+contract this seam holds, so a release that starts delivering either shape must meet a
+logged refusal; and a silent `return None` on that path is the defect #2006 removes, which
+is exactly what a deleted guard would restore. An approval-card click is deliberately
+absent — it is *handled* by the dedicated approval listener, not dropped.
+
+- **The framework's admission boundary sits above the adapter, and is documented rather
+  than re-implemented.** Three of Bolt's own mechanisms admit or refuse an event before any
+  listener in `apps/dispatcher/src/curie_dispatcher/handlers.py` runs, so none of them can
+  be a `DropReason`. `slack_bolt`'s built-in `IgnoringSelfEvents` middleware compares the
+  incoming identity against the authorized bot identity and acks a self-authored event
+  without invoking a listener, logging only at DEBUG — so at production log levels that
+  drop is invisible. Bolt's authorization middleware refuses an event whose token or team
+  does not authorize. Bolt's listener matchers match on event *type* only and are
+  subtype-blind, so an unregistered type is acked and dropped, and every `message.im`
+  subtype does reach the adapter's listener. These are Bolt's decisions on Bolt's terms and
+  the dispatcher deliberately does not duplicate them. `IgnoringSelfEvents` is the real
+  self-event loop guard, which is why the adapter no longer carries a blanket
+  bot-authorship filter of its own: that filter was redundant with the middleware *and*
+  harmful, discarding legitimate incoming-webhook, Workflow Builder and other-app posts.
+- **`UNSUBSCRIBED_LANE` is envelope validation, not a relevance decision.** The Slack app
+  subscribes to exactly `app_mention` and `message.im`
+  (`apps/dispatcher/slack-app-manifest.yaml`), so refusing another lane is the adapter
+  asserting that the delivered envelope matches its declared subscription — the same family
+  as refusing a payload with no event id, not a judgement that channel chatter is
+  uninteresting. It also could not move downstream even if we wanted it to: `QueuedTurn`
+  carries no Slack lane and no subtype, and `BindingResolver.resolve` receives only the
+  `(kind, channel)` pair, so the routing seam has no field on which to tell a mention from
+  ordinary chatter and would simply mint a turn.
+- **Subtype handling is open-world.**
+  `apps/dispatcher/src/curie_dispatcher/relevance.py::NON_CONTENT_SUBTYPES` is a small
+  closed denylist of things that are structurally not new user content; everything else,
+  including subtypes Slack ships after this was written, is admitted and left to routing.
+  The inverse rule this replaced — refuse *any* subtype — swallowed `file_share` (a person
+  uploading a file with a comment) and `thread_broadcast` (a person's thread reply), both
+  real user content. The open default is bounded by the manifest: with only `app_mention`
+  and `message.im` subscribed, channel-lane noise (joins, leaves, topic and purpose
+  changes, pins) cannot reach these lanes in production, so the denylist stays small rather
+  than becoming a speculative catalogue of every subtype Slack documents.
+- **Bot authorship is a mention-lane rule, and its cost is accepted.** A foreign bot's
+  *root* `@`-mention is admitted — the alert-app case this work exists for, whose body
+  typically arrives as Block Kit and is normalized by
+  `apps/dispatcher/src/curie_dispatcher/inbound_text.py::derive_text` rather than read off
+  an empty top-level `text`. A bot-authored mention carrying `thread_ts` is refused as
+  `BOT_AUTHORED_THREAD_REPLY` for the cross-installation loop above; on the DM lane bot
+  authorship is not consulted at all. The accepted cost, stated rather than discovered
+  later: an alert bot that replies *inside* a thread with a mention is not ingested.
+  Root-only admission is what separates the ticket's case from the loop without a new
+  `QueuedTurn` field or a bot allowlist.
+
+  Its known consequence, stated here rather than left to be found: a bot-authored event
+  normally carries no human `user`, so the turn is queued with an empty `author` while its
+  text becomes a model turn like any other. That is not a new prompt-injection primitive —
+  the same text was already reachable from any member of the workspace — but it does widen
+  the set of *automated* principals that can drive the model, a compromised third-party app
+  or the holder of an incoming-webhook URL among them, and routing cannot tell one from a
+  person afterwards because the adapter carries neither `bot_id` nor the message subtype
+  onto the queue. Carrying machine provenance onto the turn is deliberately deferred, not
+  overlooked: `QueuedTurn`
+  (`packages/aci-protocol/src/aci_protocol/turn.py::QueuedTurn`) cannot gain a field
+  without a protocol-version bump
+  (`packages/aci-protocol/src/aci_protocol/version.py::PROTOCOL_VERSION`) and the matching
+  `packages/aci-protocol/schema/wire.lock` regeneration, which is a change to the frozen
+  package rather than to this adapter.
+- **Sibling ingress paths — audited, unchanged.** The first-party HTTP ingress paths
+  (`apps/api/src/curie_api/routers/hooks.py`,
+  `apps/api/src/curie_api/routers/channels.py`) already refuse explicitly: every refusal is
+  an HTTP status returned to the caller and every duplicate is a flagged response, so they
+  need no equivalent vocabulary today, and extending the enumerated reasons to them if they
+  ever grow relevance logic is deliberately deferred.
+
 ## Known leakage
 
 Two ends and the binding surface were cleaned; what remains is egress semantics and
