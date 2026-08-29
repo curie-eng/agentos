@@ -184,17 +184,19 @@ def check_ref(aid, manifest, container, env_name, expected_secret, expected_key,
                         f"{ref.get('key')!r}, expected {expected_key!r}")
 
 
-LANGFUSE_CONTAINERS = ["langfuse-web", "langfuse-worker"]
+# Paired with a literal id suffix so every per-container assertion id follows the
+# same a/b convention as the single-container ones (3a/3b) in this file.
+LANGFUSE_CONTAINERS = [("a", "langfuse-web"), ("b", "langfuse-worker")]
 
 # ---- 1: default render still resolves to the chart's own Secret. ----
-for i, c in enumerate(LANGFUSE_CONTAINERS):
-    check_ref(f"1{chr(ord('a') + i)}", f"{DEFAULT_DIR}/langfuse.yaml", c,
+for suffix, c in LANGFUSE_CONTAINERS:
+    check_ref(f"1{suffix}", f"{DEFAULT_DIR}/langfuse.yaml", c,
               "REDIS_AUTH", CHART_SECRET_NAME, "valkeyPassword",
               f"default render, {c}")
 
 # ---- 2: valkey.existingSecret reaches BOTH langfuse containers. ----
-for i, c in enumerate(LANGFUSE_CONTAINERS):
-    check_ref(f"2{chr(ord('a') + i)}", f"{BYO_DIR}/langfuse.yaml", c,
+for suffix, c in LANGFUSE_CONTAINERS:
+    check_ref(f"2{suffix}", f"{BYO_DIR}/langfuse.yaml", c,
               "REDIS_AUTH", BYO_SECRET_NAME, "valkeyPassword",
               f"valkey.existingSecret set, {c}")
 
@@ -207,8 +209,8 @@ check_ref("3b", f"{BYO_DIR}/worker.yaml", "worker", "VALKEY_PASSWORD",
 
 # ---- 4b: the realistic full BYO shape (deploy=false + host + existingSecret)
 #          -- the exact supported configuration the bug broke. ----
-for i, c in enumerate(LANGFUSE_CONTAINERS):
-    check_ref(f"4b{chr(ord('i') + i)}", f"{BYO_FULL_DIR}/langfuse.yaml", c,
+for suffix, c in LANGFUSE_CONTAINERS:
+    check_ref(f"4b{suffix}", f"{BYO_FULL_DIR}/langfuse.yaml", c,
               "REDIS_AUTH", BYO_SECRET_NAME, "valkeyPassword",
               f"valkey.deploy=false + host + existingSecret, {c}")
 
@@ -216,7 +218,7 @@ for i, c in enumerate(LANGFUSE_CONTAINERS):
 #         than passing vacuously: under both BYO renders the chart Secret must
 #         not back REDIS_AUTH on either langfuse container. ----
 for label, d in (("byo", BYO_DIR), ("byo-full", BYO_FULL_DIR)):
-    for c in LANGFUSE_CONTAINERS:
+    for _suffix, c in LANGFUSE_CONTAINERS:
         ref, n = find_env(f"{d}/langfuse.yaml", c, "REDIS_AUTH")
         if n == 1 and ref and ref.get("name") == CHART_SECRET_NAME:
             failures.append(
