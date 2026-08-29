@@ -179,11 +179,21 @@ Rules (detailed-architecture 2b), each with an integration test that provokes it
   instead of retrying. The flag is persisted to Valkey the instant it is seen, so
   a worker crash mid-side-effect still escalates on reclaim rather than re-running
   a non-idempotent action. Flag-clean failures retry by classification:
-  `rate-limit`, `runner-error` and `runner-timeout` are transient (bounded
-  exponential backoff); `budget-exceeded` and everything else escalate.
+  `rate-limit`, `runner-error`, `runner-timeout` and `workspace-error` are
+  transient (bounded exponential backoff); `budget-exceeded` and everything else
+  escalate.
   `runner-timeout` is the runner's streaming budget expiring mid-turn (#2011),
   told apart from `runner-error` -- the sandbox or the transport dying -- so an
   operator can see which one happened.
+  `workspace-error` is a managed-workspace preparation FAULT before the turn was
+  ever accepted (#2004): the clone, the archive, the upload, or a missing
+  workspace coordinator. It is told apart from `runner-error` for the same
+  reason, and it always carries a `workspace start failed` WARNING naming the
+  agent, the deployment, the repository the turn asked for and the stage that
+  failed -- such a turn used to ack, create no sandbox and log nothing at all.
+  A deliberate repository-selection refusal is the other half of that split and
+  is NOT this: it is a decision rather than a fault, so it stays terminal,
+  answers the user, and logs at INFO instead.
 - **Idempotency + crash recovery.** The Slack event id gates a `done` marker, so
   a redelivered or reclaimed entry that already finished is skipped.
   `XAUTOCLAIM` reclaims entries a dead consumer took but never acked and

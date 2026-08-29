@@ -71,7 +71,16 @@ _QUEUE_RETRY_ATTRIBUTES = {
     # here -- ``record_metric`` raises on an out-of-domain attribute value, so a
     # retryable classification missing from this allowlist crashes the worker on
     # the retry emission rather than silently dropping a point.
-    "retry_class": ["redelivery", "rate-limit", "runner-error", "runner-timeout"],
+    # "workspace-error" (#2004): a managed-workspace preparation failure before
+    # the turn was ever accepted, named apart from "runner-error" for the same
+    # reason -- and, being retryable, subject to the same crash-on-omission.
+    "retry_class": [
+        "redelivery",
+        "rate-limit",
+        "runner-error",
+        "runner-timeout",
+        "workspace-error",
+    ],
 }
 _THREAD_ATTRIBUTES = {
     "service.name": ["curie-worker"],

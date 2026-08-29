@@ -15,7 +15,8 @@ Rules implemented here (detailed-architecture section 2b):
    escalates to a human instead of retrying; the flag is persisted the instant it
    is seen so a crash mid-side-effect still escalates on reclaim. Flag-clean
    failures retry by error classification (rate-limit / runner-error /
-   runner-timeout are transient; budget-exceeded and everything else escalate).
+   runner-timeout / workspace-error are transient; budget-exceeded and
+   everything else escalate).
 
 Idempotency: the Slack event id gates a ``done`` marker so a redelivered or
 reclaimed event that already finished is skipped.
@@ -298,7 +299,19 @@ def _exception_reason(exc: BaseException) -> str:
 # before it had a name and still is. The side-effect check in ``_attempt`` runs
 # BEFORE retryability is consulted (ADR-0013), so a timeout that arrives after a
 # side-effect frame still escalates and is never retried.
-RETRYABLE_CLASSIFICATIONS = frozenset({"rate-limit", "runner-error", "runner-timeout"})
+# ``workspace-error`` (#2004) is a managed-workspace preparation failure -- a
+# clone, an archive, an upload, or a missing coordinator -- raised before the
+# turn was ever accepted. It is named separately from ``runner-error`` for the
+# same reason ``runner-timeout`` is: an operator reading the escalation must be
+# able to tell "this thread's repository could not be prepared" from "the
+# sandbox died", and previously the two were indistinguishable. It stays HERE
+# because naming it changes nothing about retryability: a clone or internal-API
+# blip was transient before it had a name and still is, and the side-effect
+# check above still runs first, so a workspace failure that somehow arrives
+# after a side-effect frame escalates rather than replaying it.
+RETRYABLE_CLASSIFICATIONS = frozenset(
+    {"rate-limit", "runner-error", "runner-timeout", "workspace-error"}
+)
 
 # The floor of remaining DELIVERY budget below which a fresh attempt is not
 # started (ADR-0131). The runner cannot claim a sandbox, open a turn and stream a
@@ -1149,9 +1162,27 @@ class Kernel:
                 if getattr(resolved, "workspace_enabled", False):
                     workspace_deployment_id = getattr(resolved, "deployment_id", None)
                     if workspace_deployment_id is None:
-                        raise WorkspacePreparationError(
+                        # Outside _attempt's handlers, so this one has to name
+                        # itself: deployment_id is legitimately optional on a
+                        # resolved binding, making this a reachable
+                        # misconfiguration that would otherwise reach the
+                        # consumer as an anonymous processing exception (#2004).
+                        # Log first so the failure names the agent, then let the
+                        # raise stand unchanged: it leaves the stream entry
+                        # pending for reclaim rather than settling it -- only
+                        # the visibility changed here.
+                        binding_failure = WorkspacePreparationError(
                             "binding", "workspace-enabled deployment has no deployment id"
                         )
+                        self._log_workspace_start_failure(
+                            qevent,
+                            qevent.text,
+                            binding_failure,
+                            agent_id=agent_id,
+                            agent_name=agent_name,
+                            workspace_deployment_id=None,
+                        )
+                        raise binding_failure
                 # One-shot post-approval allowance (#430, ADR-0035): when THIS turn is the
                 # resume of a genuinely-approved permission-gate approval, deliver a single
                 # gated-tool grant so the approved action completes once; the gate re-arms
@@ -2071,6 +2102,70 @@ class Kernel:
 
     # -- internals ------------------------------------------------------------
 
+    def _log_workspace_start_failure(
+        self,
+        qevent: QueuedTurn,
+        turn_text: str,
+        exc: WorkspacePreparationError,
+        *,
+        agent_id: uuid.UUID | None,
+        agent_name: str | None,
+        workspace_deployment_id: uuid.UUID | None,
+    ) -> None:
+        """Name the deployment behind a workspace PREPARATION failure (#2004).
+
+        The refusal branch below already covers its own half: it answers the
+        requester with ``exc.public_detail`` and tells the operator over its own
+        INFO line. This complements that rather than replacing it. Every OTHER
+        workspace start failure -- a clone, an archive, an upload, a missing
+        coordinator -- falls into ``_attempt``'s broad start-failure clause,
+        which used to log an event id and an anonymous ``repr``: naming neither
+        the agent, nor the deployment, nor the repository. A binding carrying no
+        deployment id is different again: it never reaches that clause at all,
+        because it is raised earlier, in ``_process_event``, before ``_attempt``
+        runs -- and had no log of its own before this ticket. The reported
+        symptom is what both cost -- the turn acks, creates no sandbox, and an
+        operator has nothing to search on.
+
+        So this emits one WARNING carrying everything needed to find the
+        deployment from the outside: the event, the agent, the deployment, the
+        repository the turn asked for (``<none named>`` when the message named
+        none -- that absence is itself the usual cause), the preparation stage
+        that failed, and a never-empty reason. WARNING rather than the refusal's
+        INFO because the two are different kinds of event: a refusal is a
+        decision the feature made on purpose, a preparation failure is a fault
+        nobody chose.
+
+        It takes the turn TEXT rather than an ``Event`` because the earliest
+        workspace failure -- a workspace-enabled deployment carrying no
+        deployment id -- is raised before ``_attempt`` has built one, and a
+        failure this helper cannot be called from is exactly the silence #2004
+        is about.
+        """
+        # Total by construction: parse_github_repo_fact RAISES
+        # WorkspaceSelectionRefused on a multi-repository message. That refusal
+        # is incidental here -- a second failure raised by the reparse, not the
+        # one being reported -- and letting it escape would replace the caller's
+        # fault with it, losing the outcome the caller is about to return and
+        # leaving the entry pending until dead-letter. Naming one of the two
+        # repositories instead would be a lie, so the ambiguity is reported as
+        # itself. Narrow on purpose -- a genuine bug here should still surface.
+        try:
+            repository = parse_github_repo_fact(turn_text) or "<none named>"
+        except WorkspacePreparationError:
+            repository = "<ambiguous>"
+        logger.warning(
+            "workspace start failed for %s: agent=%s agent_id=%s deployment=%s "
+            "repo=%s stage=%s reason=%s",
+            qevent.event_id,
+            agent_name or "<unknown>",
+            agent_id if agent_id is not None else "<unknown>",
+            workspace_deployment_id if workspace_deployment_id is not None else "<unknown>",
+            repository,
+            exc.stage,
+            _exception_reason(exc),
+        )
+
     async def _attempt(
         self,
         qevent: QueuedTurn,
@@ -2193,13 +2288,32 @@ class Kernel:
             )
             await self._reply_for(qevent, route, exc.public_detail)
             return TurnOutcome(terminal_ok=True)
+        except WorkspacePreparationError as exc:
+            # AFTER the refusal branch above, and it has to stay after it:
+            # `WorkspaceSelectionRefused` subclasses this, so ordering these two
+            # the other way round would swallow a deliberate policy answer and
+            # retry it. What reaches HERE is infrastructure, not policy -- the
+            # clone, the archive, the upload, the coordinator wiring. It used to
+            # fall into the clause below and answer to the name "runner-error",
+            # pointing an operator at a runner that never saw the fault. Retry
+            # behavior is deliberately identical (`workspace-error` is
+            # retryable); only the name and the log line change.
+            release_order()
+            self._log_workspace_start_failure(
+                qevent,
+                event.text,
+                exc,
+                agent_id=agent_id,
+                agent_name=agent_name,
+                workspace_deployment_id=workspace_deployment_id,
+            )
+            return TurnOutcome(terminal_ok=False, classification="workspace-error")
         except (
             RunnerError,
             aiohttp.ClientError,
             TimeoutError,
             OSError,
             SandboxError,
-            WorkspacePreparationError,
         ) as exc:
             # The turn was never accepted (transient runner 5xx, runner not ready,
             # claim timeout, route-lock acquire timeout). Convert to a retryable

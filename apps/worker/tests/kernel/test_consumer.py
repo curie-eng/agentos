@@ -15,12 +15,14 @@ from aci_protocol import Final, QueuedTurn, ReplyHandle, SessionStatus, TextDelt
 from curie_dispatcher.queue import to_stream_fields
 from curie_worker import consumer as consumer_module
 from curie_worker import kernel as kernel_module
+from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.consumer import (
     THREAD_RESET_INFLIGHT_SET,
     THREAD_RESET_SET,
     Consumer,
 )
 from curie_worker.sandbox import QuotaRejection
+from curie_worker.workspace import WorkspacePreparationError
 
 DONE = SessionStatus.DONE
 
@@ -673,5 +675,163 @@ def test_maintenance_tick_thread_reset_is_not_stalled_by_a_hanging_substrate_rel
 
             # The request was popped either way; a fresh reset is needed to retry.
             assert await h.async_redis.scard(THREAD_RESET_SET) == 0
+
+    asyncio.run(go())
+
+
+# --- An acked entry must never be a silent one (#2004) -----------------------
+# The kernel-level regressions call ``process_event`` directly, so they can only
+# see the silence. The ack is a CONSUMER fact -- a normal return from
+# ``process_event`` is what makes ``Consumer`` XACK -- so the pairing the ticket
+# actually reports is only observable here, against the real stream and group.
+
+
+def _workspace_binding(deployment_id: uuid.UUID) -> object:
+    """A workspace-enabled binding carrying a FIXED deployment id.
+
+    Fixed on purpose: the id is what an operator greps the worker log for, so
+    the assertion below checks the real value rather than that some uuid landed.
+    Defined locally rather than imported from ``test_kernel``; importlib mode
+    makes cross-test-module imports fragile.
+    """
+
+    class WorkspaceResolved:
+        def __init__(self) -> None:
+            self.agent_id = uuid.uuid4()
+            self.agent_name = "test-agent"
+            self.endpoint: str | None = None
+            self.adapter: str | None = None
+            self.deployment_id = deployment_id
+            self.workspace_enabled = True
+
+    class WorkspaceBinding:
+        async def resolve(self, _kind: str, _channel: str) -> WorkspaceResolved:
+            return WorkspaceResolved()
+
+        def boot_env(
+            self,
+            _resolved: object,
+            _thread_key: str,
+            *,
+            kind: str | None = None,
+            address: str | None = None,
+        ) -> dict[str, str]:
+            return {}
+
+        def packs_for(self, _resolved: object) -> BehaviorPacks:
+            return BehaviorPacks()
+
+    return WorkspaceBinding()
+
+
+def test_failed_workspace_preparation_acks_the_entry_and_is_not_silent(
+    make_harness, caplog
+) -> None:
+    """#2004 end to end: the reported evidence was a group at ``pending 0`` with
+    ``last-delivered-id`` equal to the turn's stream id -- yet no sandbox and an
+    empty worker log.
+
+    The refusal half of that symptom is already covered on ``next`` by the INFO
+    line the refusal branch emits; this pins the PREPARATION half, which is the
+    one still silent here. Selection succeeds and the clone fails, so the turn
+    retries to its escalation and the entry is acked -- and only the ack makes
+    the silence undiagnosable. An entry left pending is at least visible in
+    XPENDING; an acked entry with nothing in the log is indistinguishable from a
+    bot that was never mentioned. Driven through the real ``Consumer`` and the
+    real stream so the ack is the production one, not an assertion about
+    ``process_event``'s return value.
+    """
+
+    caplog.set_level(logging.WARNING, logger="curie_worker.kernel")
+    deployment_id = uuid.uuid4()
+
+    async def go() -> None:
+        async with make_harness(binding=_workspace_binding(deployment_id)) as h:
+            # Selection SUCCEEDS -- this is a fault, not a policy refusal -- and
+            # the workspace then fails to materialize, which is the path that
+            # still ends the turn without naming anything.
+            class WorkspaceProbe:
+                def select_repository(
+                    self,
+                    *,
+                    thread_key: str,
+                    deployment_id: uuid.UUID,
+                    author: str,
+                    repo_full_name: str | None,
+                ) -> str:
+                    assert repo_full_name is not None
+                    return repo_full_name
+
+                def claim_or_resume_with_handle(self, **kwargs: object) -> object:
+                    raise WorkspacePreparationError(
+                        "clone", "git clone exited 128: repository not found"
+                    )
+
+                def touch(self, thread_key: str, *, ttl_seconds: int) -> bool:
+                    return True
+
+                def enumerate_expired(self) -> list[object]:
+                    # The consumer's maintenance loop polls this every tick;
+                    # without it the loop logs a repeated AttributeError
+                    # traceback that pollutes this test's caplog capture.
+                    return []
+
+            h.kernel._workspace = WorkspaceProbe()  # type: ignore[assignment]
+
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            await consumer.ensure_group()
+
+            qe = _qevent(
+                "Fix https://github.com/acme-corp/acme-bot",
+                thread="tAckSilent",
+                event_id="ws-ack-1",
+            )
+            await h.async_redis.xadd(h.config.stream, to_stream_fields(qe))
+
+            task = asyncio.create_task(consumer.run())
+            # Wait for the escalation itself, not its classification string --
+            # the turn exhausts its retries and escalates on both the pre-fix
+            # and post-fix source, and only the classification name
+            # ("runner-error" vs "workspace-error") differs between them.
+            # Gating on the new name would time out pre-fix and never reach
+            # the assertions below, which is the thing this test exists to
+            # pin.
+            await _wait_until(
+                lambda: h.sink.last_text is not None
+                and "Flagging for a human" in h.sink.last_text
+            )
+            consumer.request_stop()
+            await task
+
+            # Half one of the ticket's evidence: the entry really was consumed
+            # and acked off the group -- nothing is left for an operator to find.
+            summary = await h.async_redis.xpending(h.config.stream, h.config.consumer_group)
+            assert summary["pending"] == 0
+            assert h.fake_k8s.claim_envs == []  # ...and no sandbox was ever created
+            assert h.runner.opened == []  # ...and the runner never saw a turn
+
+            # Half two, asserted second so the pairing is explicit: an acked,
+            # sandbox-less turn is only a bug because the worker said nothing
+            # about it. This is the assertion that fails on the current base.
+            failures = [
+                r
+                for r in caplog.records
+                if r.name == "curie_worker.kernel" and "workspace start failed" in r.getMessage()
+            ]
+            assert failures, (
+                "the entry was acked with no sandbox and no line naming the agent -- "
+                f"exactly what #2004 reports: {caplog.text!r}"
+            )
+            assert all(r.levelno == logging.WARNING for r in failures)
+            message = failures[-1].getMessage()
+            assert "agent=test-agent" in message, message
+            assert f"deployment={deployment_id}" in message, message
+            assert "stage=clone" in message, message
+
+            # Last: the escalation is correctly classified post-fix. Placed
+            # after the silence assertion above so a pre-fix failure reports
+            # the meaningful thing (no warning line) rather than this one.
+            assert h.sink.last_text is not None
+            assert "workspace-error" in h.sink.last_text
 
     asyncio.run(go())

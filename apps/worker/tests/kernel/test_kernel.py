@@ -35,7 +35,10 @@ from curie_worker.kernel import ThreadBusyError
 from curie_worker.reply_sink import TargetRoute
 from curie_worker.runner_client import RunnerError, TurnStream
 from curie_worker.sandbox import QuotaRejection
-from curie_worker.workspace import WorkspaceSelectionRefused
+from curie_worker.workspace import (
+    WorkspacePreparationError,
+    WorkspaceSelectionRefused,
+)
 
 DONE = SessionStatus.DONE
 IDLE = SessionStatus.IDLE_AWAITING_INPUT
@@ -466,6 +469,215 @@ def test_a_selection_refusal_is_logged_so_an_operator_can_find_it(
             )
 
     asyncio.run(go())
+
+
+# --- A workspace PREPARATION failure must never be anonymous (#2004) ----------
+# The refusal half of this ticket is already covered above, by the INFO line the
+# refusal branch emits. These pin the other half: a clone, an upload, or a
+# binding carrying no deployment id used to be swallowed by the broad
+# start-failure clause, which names an event id and an anonymous repr -- so a
+# workspace-enabled turn acked, created no sandbox, and left the operator with
+# nothing to search on. They assert the log line, not the reply; the reply was
+# never the missing half.
+
+
+def _workspace_binding(deployment_id: uuid.UUID | None) -> object:
+    """A binding for a workspace-enabled deployment with a FIXED deployment id.
+
+    Fixed on purpose: the id is what an operator greps for, so the tests assert
+    the exact value reaches the log rather than that some uuid did. ``None`` is
+    admitted because it is a real resolved shape -- deployment_id is optional on
+    the binding row -- and the misconfiguration it produces is its own test."""
+
+    class WorkspaceResolved(_FakeResolved):
+        def __init__(self) -> None:
+            super().__init__(uuid.uuid4())
+            self.deployment_id = deployment_id
+            self.workspace_enabled = True
+
+    class WorkspaceBinding:
+        async def resolve(self, _kind: str, _channel: str) -> WorkspaceResolved:
+            return WorkspaceResolved()
+
+        def boot_env(
+            self,
+            _resolved: object,
+            _thread_key: str,
+            *,
+            kind: str | None = None,
+            address: str | None = None,
+        ) -> dict[str, str]:
+            return {}
+
+        def packs_for(self, _resolved: object) -> BehaviorPacks:
+            return BehaviorPacks()
+
+    return WorkspaceBinding()
+
+
+def _workspace_start_failures(caplog: Any) -> list[str]:
+    return [r.getMessage() for r in caplog.records if "workspace start failed" in r.getMessage()]
+
+
+def _workspace_start_failure_records(caplog: Any) -> list[logging.LogRecord]:
+    # Companion to _workspace_start_failures: keeps the record itself so a
+    # test can assert on level, not just message text.
+    return [r for r in caplog.records if "workspace start failed" in r.getMessage()]
+
+
+def test_workspace_preparation_failure_escalates_by_its_own_name(make_harness, caplog) -> None:
+    """#2004: a workspace that cannot be prepared fails LOUDLY and by name.
+
+    Selection succeeds, then the clone fails -- so this is a fault, not the
+    deliberate refusal the branch above handles. Pre-fix it fell into the broad
+    start-failure clause: the only trace was ``turn start failed for <event id>``
+    with an anonymous repr -- naming neither the agent, the deployment, the
+    repository, nor the stage -- and it escalated as the generic
+    ``runner-error``, indistinguishable from a runner 5xx. This pins both halves:
+    the operator line, and the classification the user-visible escalation
+    carries. Retry behavior is unchanged, which the escalation-after-3-attempts
+    shape (and the real, unprobed ``retry_class`` metric this path emits) still
+    proves."""
+
+    caplog.set_level(logging.WARNING, logger="curie_worker.kernel")
+    deployment_id = uuid.uuid4()
+
+    async def go() -> None:
+        async with make_harness(binding=_workspace_binding(deployment_id), max_attempts=3) as h:
+            class WorkspaceProbe:
+                def select_repository(
+                    self,
+                    *,
+                    thread_key: str,
+                    deployment_id: uuid.UUID,
+                    author: str,
+                    repo_full_name: str | None,
+                ) -> str:
+                    assert repo_full_name is not None
+                    return repo_full_name
+
+                def claim_or_resume_with_handle(self, **kwargs: object) -> object:
+                    raise WorkspacePreparationError(
+                        "clone", "git clone exited 128: repository not found"
+                    )
+
+                def touch(self, thread_key: str, *, ttl_seconds: int) -> bool:
+                    return True
+
+            h.kernel._workspace = WorkspaceProbe()  # type: ignore[assignment]
+            await h.kernel.process_event(
+                _qevent("Fix https://github.com/acme-corp/acme-bot", thread="tWorkspaceClone")
+            )
+
+            # The turn was never accepted: nothing was claimed and no turn opened.
+            assert h.fake_k8s.claim_envs == []
+            assert h.runner.opened == []
+
+            # Visible terminal failure, under the workspace's own name. Pre-fix
+            # this said "runner-error" and pointed operators at the runner.
+            assert h.sink.last_text is not None
+            assert "workspace-error" in h.sink.last_text, h.sink.last_text
+            assert "human" in h.sink.last_text.lower()
+
+            failures = _workspace_start_failures(caplog)
+            assert failures, f"the preparation failure was unnamed: {caplog.text!r}"
+            message = failures[-1]
+            assert "agent=test-agent" in message, message
+            assert f"deployment={deployment_id}" in message, message
+            assert "acme-corp/acme-bot" in message, message
+            assert "stage=clone" in message, message
+            assert "repository not found" in message, message
+
+    asyncio.run(go())
+
+
+def test_workspace_enabled_binding_without_deployment_id_is_named(make_harness, caplog) -> None:
+    """#2004: the binding-stage misconfiguration logs before it raises.
+
+    ``deployment_id`` is optional on a resolved binding, so a workspace-enabled
+    deployment carrying none is reachable config drift. It is raised outside
+    ``_attempt``'s handlers, so it never reached the visibility helper and the
+    consumer saw only an anonymous processing exception. The raise is deliberate
+    and unchanged -- leaving the entry pending is the right terminal answer for a
+    config error -- so it is asserted here, not softened."""
+
+    caplog.set_level(logging.WARNING, logger="curie_worker.kernel")
+
+    async def go() -> None:
+        async with make_harness(binding=_workspace_binding(None)) as h:
+            with pytest.raises(WorkspacePreparationError):
+                await h.kernel.process_event(_qevent("do the thing", thread="tNoDeploymentId"))
+
+            assert h.fake_k8s.claim_envs == []
+            assert h.runner.opened == []
+
+            failures = _workspace_start_failures(caplog)
+            assert failures, f"the binding misconfiguration was unnamed: {caplog.text!r}"
+            message = failures[-1]
+            assert "agent=test-agent" in message, message
+            assert "stage=binding" in message, message
+            assert "has no deployment id" in message, message
+            # The whole point of this failure: no deployment id ever reached
+            # the log call, and no repository was selected either.
+            assert "deployment=<unknown>" in message, message
+            assert "repo=<none named>" in message, message
+            record = _workspace_start_failure_records(caplog)[-1]
+            assert record.levelno == logging.WARNING, record
+
+    asyncio.run(go())
+
+
+def test_binding_failure_on_an_ambiguous_message_logs_without_re_raising(
+    make_harness, caplog
+) -> None:
+    """#2004: the visibility helper must not raise the refusal it trips over.
+
+    The helper reparses the turn text to name the repository, and
+    ``parse_github_repo_fact`` itself RAISES ``WorkspaceSelectionRefused`` on a
+    message naming two repositories. That refusal is incidental -- the failure
+    being reported is the binding one -- so a naive helper would replace the
+    caller's fault with it, and the missing-deployment-id raise below would reach
+    the consumer as a refusal instead.
+
+    This is the one reachable path where the guard still bites: the
+    ``deployment_id is None`` raise in ``_process_event`` calls the helper with
+    the raw turn text, before any selection is attempted. It pins that the
+    ambiguity is reported as itself (neither repository can be named without
+    lying about which one won) and that the binding failure is still what
+    escapes."""
+
+    caplog.set_level(logging.WARNING, logger="curie_worker.kernel")
+
+    async def go() -> None:
+        async with make_harness(binding=_workspace_binding(None)) as h:
+            with pytest.raises(WorkspacePreparationError) as raised:
+                await h.kernel.process_event(
+                    _qevent(
+                        "Port https://github.com/acme-corp/acme-bot to "
+                        "https://github.com/acme-corp/acme-api",
+                        thread="tAmbiguousRepo",
+                    )
+                )
+
+            # The helper swallowed the reparse's refusal instead of letting it
+            # stand in for the fault the caller is reporting.
+            assert not isinstance(raised.value, WorkspaceSelectionRefused), raised.value
+            assert raised.value.stage == "binding", raised.value
+
+            assert h.fake_k8s.claim_envs == []
+            assert h.runner.opened == []
+
+            failures = _workspace_start_failures(caplog)
+            assert failures, f"the binding misconfiguration was unnamed: {caplog.text!r}"
+            message = failures[-1]
+            assert "agent=test-agent" in message, message
+            assert "repo=<ambiguous>" in message, message
+            assert "stage=binding" in message, message
+            record = _workspace_start_failure_records(caplog)[-1]
+            assert record.levelno == logging.WARNING, record
+
+    asyncio.run(go())
+
 
 
 def test_tool_notes_are_consumed_without_reaching_user_facing_updates(
