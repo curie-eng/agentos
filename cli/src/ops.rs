@@ -2998,6 +2998,21 @@ pub async fn fetch_release_values(o: &CommonOpts) -> Result<Option<serde_json::V
     fetch_existing_values(o).await
 }
 
+/// The **computed** values of an existing release: the chart's own defaults
+/// merged with whatever the operator overrode.
+///
+/// That merge is the whole difference from [`fetch_release_values`], which
+/// reports only what the operator supplied. An operator who ran `curie cluster
+/// up` and never set a model supplied nothing, so helm recorded nothing, and
+/// the user-supplied read cannot see the chart default the sandboxes actually
+/// boot. `--all` is the only way to observe a default nobody supplied (#1950).
+///
+/// `None` only when Helm positively reports the release does not exist; read
+/// failures, malformed JSON, and non-object/non-null shapes fail closed.
+pub async fn fetch_release_computed_values(o: &CommonOpts) -> Result<Option<serde_json::Value>> {
+    fetch_helm_values(o, helm_get_all_values_cmd(o), "computed Helm values").await
+}
+
 /// Resolve [`GITHUB_TOKEN_KEY`] for this run.
 ///
 /// - `flag` is the `--github-token` value: `None` when the flag and
@@ -3143,22 +3158,38 @@ fn resolve_generated_secrets(
     Ok(resolved)
 }
 
+/// `helm get values <release> -n <ns> [--all] -o json`. `all` is the only
+/// difference between the two wrappers below, and it is load bearing rather
+/// than stylistic: without it helm reports only what the operator supplied.
+fn helm_get_values_cmd_with(o: &CommonOpts, all: bool) -> OpsCommand {
+    let mut args = vec![
+        plain("get"),
+        plain("values"),
+        plain(&o.release),
+        plain("-n"),
+        plain(&o.namespace),
+    ];
+    if all {
+        args.push(plain("--all"));
+    }
+    args.push(plain("-o"));
+    args.push(plain("json"));
+    OpsCommand::new("helm", args)
+}
+
 /// `helm get values <release> -n <ns> -o json`: helm's record of the values a
 /// prior install supplied. `cluster up` reads it back so an upgrade re-supplies
 /// the same generated secrets instead of rotating them.
 fn helm_get_values_cmd(o: &CommonOpts) -> OpsCommand {
-    OpsCommand::new(
-        "helm",
-        vec![
-            plain("get"),
-            plain("values"),
-            plain(&o.release),
-            plain("-n"),
-            plain(&o.namespace),
-            plain("-o"),
-            plain("json"),
-        ],
-    )
+    helm_get_values_cmd_with(o, false)
+}
+
+/// `helm get values <release> -n <ns> --all -o json`: the COMPUTED values --
+/// chart defaults merged with the operator's overrides. The sibling above
+/// reports only what the operator supplied, which is why `--all` is load
+/// bearing here and not a stylistic difference.
+fn helm_get_all_values_cmd(o: &CommonOpts) -> OpsCommand {
+    helm_get_values_cmd_with(o, true)
 }
 
 /// Whether Helm positively reported that the requested release does not exist.
@@ -3173,7 +3204,20 @@ fn helm_release_is_absent(stderr: &str) -> bool {
 /// shapes fail closed. Helm prints `null` for an existing release with no user
 /// supplied values.
 async fn fetch_existing_values(o: &CommonOpts) -> Result<Option<serde_json::Value>> {
-    let (ok, out, err) = run_capture(&helm_get_values_cmd(o)).await?;
+    fetch_helm_values(o, helm_get_values_cmd(o), "Helm values").await
+}
+
+/// The shared read for both `helm get values` shapes. `what` names the read in
+/// the operator facing message ("Helm values" or "computed Helm values") and is
+/// the only thing that varies between callers; the absent-release, connectivity
+/// vs failure, malformed-JSON and non-object ladders are deliberately single
+/// sourced so the fail-closed contract cannot drift between them.
+async fn fetch_helm_values(
+    o: &CommonOpts,
+    cmd: OpsCommand,
+    what: &str,
+) -> Result<Option<serde_json::Value>> {
+    let (ok, out, err) = run_capture(&cmd).await?;
     let fix = format!(
         "verify the release and cluster access with `helm status {} -n {}`, then retry",
         o.release, o.namespace
@@ -3184,7 +3228,7 @@ async fn fetch_existing_values(o: &CommonOpts) -> Result<Option<serde_json::Valu
         }
         let reason = failure_reason(&err);
         let message = format!(
-            "could not read Helm values for release {} in namespace {}: {reason}",
+            "could not read {what} for release {} in namespace {}: {reason}",
             o.release, o.namespace
         );
         let error = if is_connectivity_failure(&err) {
@@ -3197,14 +3241,14 @@ async fn fetch_existing_values(o: &CommonOpts) -> Result<Option<serde_json::Valu
 
     let values: serde_json::Value = serde_json::from_str(out.trim()).map_err(|error| {
         crate::exit::CliError::failure(format!(
-            "could not read Helm values for release {} in namespace {}: malformed Helm values JSON ({error})",
+            "could not read {what} for release {} in namespace {}: malformed Helm values JSON ({error})",
             o.release, o.namespace
         ))
         .with_fix(fix.clone())
     })?;
     if !values.is_object() && !values.is_null() {
         return Err(crate::exit::CliError::failure(format!(
-            "could not read Helm values for release {} in namespace {}: malformed Helm values JSON, expected an object or null",
+            "could not read {what} for release {} in namespace {}: malformed Helm values JSON, expected an object or null",
             o.release, o.namespace
         ))
         .with_fix(fix)
@@ -10365,6 +10409,22 @@ mod tests {
     fn helm_get_values_reads_user_supplied_values_as_json() {
         let cmd = helm_get_values_cmd(&common());
         assert_eq!(cmd.display(), "helm get values curie -n curie -o json");
+    }
+
+    /// `--all` is the entire point of this helper, and its absence is invisible
+    /// at runtime: helm answers happily either way, just without the chart
+    /// defaults. That is exactly the bug #1950 reports -- an operator who never
+    /// supplied a model has no user-supplied value to read, so the sibling
+    /// command above returns nothing and `doctor` reports the floating chart
+    /// default as "not applicable". A test that does not pin `--all` lets a
+    /// refactor reintroduce that silently.
+    #[test]
+    fn helm_get_all_values_reads_computed_values_as_json() {
+        let cmd = helm_get_all_values_cmd(&common());
+        assert_eq!(
+            cmd.display(),
+            "helm get values curie -n curie --all -o json"
+        );
     }
 
     #[test]

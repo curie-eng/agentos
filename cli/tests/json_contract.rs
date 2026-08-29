@@ -1584,8 +1584,17 @@ fn doctor_output_validates() {
         model_credential: Some("CURIE_CREDENTIALS".to_string()),
         model_credential_source: Some("environment".to_string()),
         // A dated snapshot, so the schema is validated against the pinned
-        // branch of the model-pin check rather than its advisory branch.
-        model_pin: Some("claude-haiku-4-5-20251001".to_string()),
+        // branch of the model-pin check rather than its advisory branch. It
+        // arrives from the RELEASE DEFAULT rather than the invoking shell,
+        // which is the state #1950 is about: the release is what the sandboxes
+        // actually boot, and the shell is not a declared producer of the value
+        // at all.
+        model_shell: None,
+        model_release_default: Some("claude-haiku-4-5-20251001".to_string()),
+        model_release_key: Some(curie::doctor::ReleaseModelKey::Runner),
+        model_release_fake: false,
+        model_agent_overrides: vec![],
+        target: Some(("curie".to_string(), "curie".to_string())),
         model_credential_provider: None,
         docker_ok: true,
         bundle_name: Some("my-agent".to_string()),

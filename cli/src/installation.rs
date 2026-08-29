@@ -2072,8 +2072,11 @@ mod stateful_guard_message_tests {
 #[cfg(test)]
 mod diff_tests {
     use super::*;
-
-    static CREDENTIAL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // Env mutation is process-global: there must be exactly one lock domain
+    // guarding it, so this reuses the crate-wide lock (also taken by
+    // `doctor.rs`'s model-env test) instead of a lock private to this file.
+    // Named at every use site rather than aliased, so the single domain stays
+    // visible to whoever next reaches for a second one.
 
     struct CredentialEnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
 
@@ -2107,7 +2110,7 @@ mod diff_tests {
 
     #[test]
     fn shipped_curie_yaml_example_plans_for_apply() {
-        let _lock = CREDENTIAL_ENV_LOCK
+        let _lock = crate::PROCESS_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let names = ["ANTHROPIC_API_KEY", "SLACK_APP_TOKEN", "SLACK_BOT_TOKEN"];
@@ -2271,7 +2274,7 @@ mod diff_tests {
 
     #[test]
     fn every_lenient_desired_map_difference_is_disclosed_as_unknown() {
-        let _lock = CREDENTIAL_ENV_LOCK
+        let _lock = crate::PROCESS_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let names = [
@@ -2367,7 +2370,7 @@ mod diff_tests {
 
     #[tokio::test]
     async fn explicit_model_credential_set_survives_the_environment() {
-        let _lock = CREDENTIAL_ENV_LOCK
+        let _lock = crate::PROCESS_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let env = CredentialEnvRestore::clear(&["CURIE_MODEL_CREDENTIALS"]);
@@ -2405,7 +2408,7 @@ mod diff_tests {
 
     #[test]
     fn an_unresolved_declared_github_change_never_reports_zero_changes() {
-        let _lock = CREDENTIAL_ENV_LOCK
+        let _lock = crate::PROCESS_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let env = CredentialEnvRestore::clear(&["CURIE_1426_GITHUB_CREDENTIAL"]);
