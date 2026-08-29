@@ -142,9 +142,36 @@ fn guide_prints_primer_to_stdout() {
     // "Roughly 100 lines": a real primer, neither a stub nor a sprawling manual.
     let lines = text.lines().count();
     assert!(
-        (60..=160).contains(&lines),
+        (60..=170).contains(&lines),
         "primer is {lines} lines, expected roughly 100"
     );
+}
+
+#[test]
+fn guide_distinguishes_skill_tier_from_bundle_artifact() {
+    let markdown = run(&["guide"]);
+    assert!(
+        markdown.status.success(),
+        "curie guide failed:\n{}",
+        err_str(&markdown)
+    );
+    let json = run(&["guide", "--json"]);
+    assert!(
+        json.status.success(),
+        "curie guide --json failed:\n{}",
+        err_str(&json)
+    );
+
+    let markdown = out_str(&markdown);
+    let json = out_str(&json);
+    for (surface, text) in [("markdown", &markdown), ("json", &json)] {
+        for fact in ["runner only tier", "skills/<name>/SKILL.md"] {
+            assert!(
+                text.contains(fact),
+                "{surface} guide must distinguish its runner tier from the bundle artifact with `{fact}`\n{text}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -227,7 +254,17 @@ fn guide_documents_the_approval_plane() {
         for needle in [
             "mcp__curie__request_approval",
             "approval_routes",
+            "--route-resolution",
+            "--routes-from",
             "approvers.group",
+            "text-only",
+            "interaction=None",
+            "configured approval channel",
+            "without disclosing its identifier",
+            "endpoint",
+            "adapter",
+            "verified Slack",
+            "scoped credential",
             "self-approval",
             "[approval resolved]",
             // #1086. Each is a fact an agent cannot derive from the command

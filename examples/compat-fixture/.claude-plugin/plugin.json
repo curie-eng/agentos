@@ -1,7 +1,7 @@
 {
   "name": "compat-fixture",
   "version": "0.1.0",
-  "description": "Not a runnable agent: a plugin-compat gate fixture that carries all five Curie authoring extensions (systemPrompt, starterPrompts, secrets, triggers, approvalPolicy) so `claude plugin validate` exercises the warn-and-ignore degradation contract for every one of them (#538). A dedicated fixture keeps these fields off the real example bundles, where approvalPolicy and systemPrompt would change runtime behavior for no functional benefit.",
+  "description": "Not a runnable agent: a plugin-compat gate fixture that carries all six Curie authoring extensions (systemPrompt, starterPrompts, secrets, triggers, approvalPolicy, toolPolicy) so `claude plugin validate` exercises the warn-and-ignore degradation contract for every one of them (#538). A dedicated fixture keeps these fields off the real example bundles, where approvalPolicy and systemPrompt would change runtime behavior for no functional benefit. Its toolPolicy is NOT an adoption example: the patterns use wildcard server segments only (the fixture declares no MCP servers and no connectors.yaml), and no runtime enforces a toolPolicy yet.",
   "author": { "name": "CurieTech" },
   "keywords": ["fixture", "plugin-compat", "extensions"],
   "systemPrompt": "You are a compatibility fixture; you are never actually run.",
@@ -17,5 +17,11 @@
     "gates": [
       { "gate": "Bash", "route": "fixture-route" }
     ]
+  },
+  "toolPolicy": {
+    "enforcement": "curie/mcp-tool-policy@1",
+    "allow": ["*/search_*"],
+    "approvalRequired": ["*/pods_*"],
+    "deny": ["*/resources_create_or_update"]
   }
 }

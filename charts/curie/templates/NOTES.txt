@@ -25,7 +25,13 @@ Components deployed:
   - S3: BYO at {{ .Values.rustfs.host }}:{{ .Values.rustfs.port }}
 {{- end }}
 {{- if .Values.otelCollector.deploy }}
-  - OTel Collector ({{ .Values.otelCollector.image }})
+  - OTel Collector ({{ .Values.otelCollector.image }}) at http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.service.httpPort }}
+{{- else if .Values.otelCollector.telemetryDisabled }}
+  - OTel: telemetry explicitly disabled (no OTLP endpoint on instrumented workloads)
+{{- else if .Values.otelCollector.endpoint }}
+  - OTel: external collector at {{ .Values.otelCollector.endpoint }} ({{ .Values.otelCollector.protocol }})
+{{- else }}
+  - OTel: no endpoint (SDK export inert; stderr diagnostics remain)
 {{- end }}
 
 App services:
@@ -55,6 +61,11 @@ App services:
 {{- end }}
 {{- if .Values.worker.deploy }}
   - worker ({{ .Values.worker.image.repository }}:{{ .Values.worker.image.tag }})
+{{- end }}
+{{- if and .Values.worker.deploy .Values.worker.publication.enabled }}
+  - managed publication Jobs: namespace {{ include "curie.publicationNamespace" . }}
+    GitHub App permissions: Contents read/write and Pull requests read/write.
+    App installation tokens are preferred; api.githubToken is the fallback.
 {{- end }}
 {{- if .Values.ui.deploy }}
   - ui ({{ .Values.ui.image.repository }}:{{ .Values.ui.image.tag }}) on Service {{ include "curie.fullname" . }}-ui:{{ .Values.ui.service.port }}
@@ -191,8 +202,8 @@ Curie cannot detect this from inside the cluster -- please verify it yourself:
            Cloud KMS key is separate and OFF unless you enabled it:
              gcloud container clusters describe <c> --format='value(databaseEncryption)'
 
-For the most sensitive value -- the GitHub App private key, which can mint read
-tokens for every repository the App is installed on -- prefer a Secret you
+For the most sensitive value -- the GitHub App private key, which can mint
+tokens carrying the App's configured repository permissions -- prefer a Secret you
 manage yourself, so it never passes through helm values or release history:
 
   api.githubAppExistingSecret: my-github-app

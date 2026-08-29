@@ -13,15 +13,17 @@ sync fixtures.
 from __future__ import annotations
 
 import contextlib
-import uuid
-from collections.abc import AsyncIterator, Callable, Iterator
+import socket
+import threading
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from typing import Any
 
 import aiohttp
 import pytest
 import redis
-from aci_protocol import Final, OutboundEvent, SessionStatus
+from aci_protocol import Final, OutboundEvent, QueuedTurn, SessionStatus
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 from channel_protocol import OutboundMessage
@@ -44,9 +46,6 @@ from curie_test_support.valkey import (
 from curie_test_support.valkey import (
     VALKEY_PW as _VALKEY_PW,
 )
-from curie_test_support.valkey import (
-    connect_or_skip,
-)
 from curie_worker.approval_cards import ApprovalCardStore
 from curie_worker.config import WorkerConfig
 from curie_worker.kernel import Kernel
@@ -63,29 +62,10 @@ from curie_worker.sandbox.types import ClaimView, SandboxView
 from curie_worker.threadlock import ThreadLock
 from redis.asyncio import Redis as AsyncRedis
 
-
-@pytest.fixture
-def sync_redis() -> Iterator[redis.Redis]:
-    client = connect_or_skip(decode_responses=True)
-    yield client
-    client.close()
-
-
-@pytest.fixture
-def names(sync_redis: redis.Redis) -> Iterator[dict[str, str]]:
-    """Per-test-unique stream / group / key prefixes on the shared Valkey."""
-    token = uuid.uuid4().hex
-    ns = {
-        "stream": f"test:curie:runs:{token}",
-        "group": f"g-{token}",
-        "prefix": f"test:curie:worker:{token}",
-        "sandbox_prefix": f"test:curie:sandbox:{token}",
-    }
-    yield ns
-    for pat in (f"{ns['prefix']}*", f"{ns['sandbox_prefix']}*", ns["stream"]):
-        keys = list(sync_redis.scan_iter(match=pat))
-        if keys:
-            sync_redis.delete(*keys)
+# ``sync_redis`` and ``names`` (the per-test-unique stream / group / key
+# prefixes on the shared Valkey) live in ``tests/conftest.py``: they are used
+# here AND by ``tests/test_delivery_lease.py``, which drives the lease store
+# directly against the same real Valkey without a full kernel harness.
 
 
 def make_config(names: dict[str, str], **overrides: object) -> WorkerConfig:
@@ -317,6 +297,11 @@ class _FakeClaim:
 class _FakeSandbox:
     name: str
     operating_mode: str = "Running"
+    # The sandbox-specific dial port, or None for the fleet-wide fallback.
+    # ``None`` is what every existing test gets, and it makes the substrate use
+    # ``SubstrateConfig.runner_port`` exactly as before (``substrate.py``:
+    # ``port=bound.port if bound.port is not None else config.runner_port``).
+    port: int | None = None
 
 
 @dataclass
@@ -331,6 +316,40 @@ class FakeK8s:
     quota_rejection: QuotaRejection | None = None
     ready_reason: str | None = None
     ready_message: str | None = None
+    # OPT-IN per-sandbox runner ports, pre-started by the harness fixture (see
+    # ``per_sandbox_runners``). Empty (the default) is the shared-runner world
+    # every existing test lives in: every sandbox gets ``port=None`` and dials
+    # the one fleet-wide runner.
+    #
+    # The pool cannot be created here: ``create_claim`` is sync -- the substrate
+    # calls it through ``asyncio.to_thread`` -- so it can neither start an
+    # aiohttp ``TestServer`` nor await one.
+    runner_ports: list[int] = field(default_factory=list)
+    # sandbox name -> the port it was handed, so a fan-out test can assert the
+    # partitions resolved to DISTINCT runners rather than to one shared fake.
+    assigned_ports: dict[str, int] = field(default_factory=dict)
+    _next_port: int = 0
+    # ``create_claim`` runs on a worker thread, and a fan-out test creates
+    # several claims concurrently, so handing out the next port is a real race.
+    _port_lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def _take_port(self, sandbox_name: str) -> int | None:
+        """The next pooled port for a new sandbox, or None when unpooled."""
+        with self._port_lock:
+            if not self.runner_ports:
+                return None
+            if self._next_port >= len(self.runner_ports):
+                # Refuse rather than wrap. Recycling a port would hand two
+                # sandboxes ONE fake runner with ONE ``turn_active`` flag, which
+                # is the exact false-pass this pool exists to eliminate.
+                raise AssertionError(
+                    f"per-sandbox runner pool exhausted after "
+                    f"{len(self.runner_ports)} sandboxes; raise per_sandbox_runners"
+                )
+            port = self.runner_ports[self._next_port]
+            self._next_port += 1
+            self.assigned_ports[sandbox_name] = port
+            return port
 
     def create_claim(
         self,
@@ -351,7 +370,9 @@ class FakeK8s:
             ready_reason=self.ready_reason,
             ready_message=self.ready_message,
         )
-        self.sandboxes[sandbox_name] = _FakeSandbox(name=sandbox_name)
+        self.sandboxes[sandbox_name] = _FakeSandbox(
+            name=sandbox_name, port=self._take_port(sandbox_name)
+        )
 
     def get_claim(self, name: str) -> ClaimView | None:
         claim = self.claims.get(name)
@@ -388,11 +409,18 @@ class FakeK8s:
         if sandbox is None:
             return None
         # 127.0.0.1 so RunnerClient reaches the in-process fake runner.
+        #
+        # ``port=None`` keeps the fleet-wide fallback (every existing test: one
+        # shared fake runner on ``SubstrateConfig.runner_port``). A per-sandbox
+        # port is how a fan-out test gives each partition its OWN runner, so
+        # each has its own ``turn_active`` flag and the kernel's liveness read
+        # answers per thread instead of fleet-wide.
         return SandboxView(
             name=sandbox.name,
             ready=True,
             service_fqdn="127.0.0.1",
             operating_mode=sandbox.operating_mode,
+            port=sandbox.port,
         )
 
     def set_sandbox_mode(self, name: str, mode: str) -> None:
@@ -466,13 +494,26 @@ class FakeRunner:
         resp = web.StreamResponse(status=200, headers={"Content-Type": "application/x-ndjson"})
         await resp.prepare(request)
         self.turn_active = True
-        for frame in script:
-            await resp.write((frame.model_dump_json() + "\n").encode("utf-8"))
-        if self.hold is not None:
-            await self.hold.wait()  # type: ignore[attr-defined]
-            for frame in self.tail:
+        # Cleared on EVERY exit path, not just the normal one. A client that
+        # gives up mid-stream (its total/sock-read budget expiring, #2011)
+        # releases the response, and aiohttp then CANCELS this handler while it
+        # is parked on ``hold`` -- so a fake that only cleared the flag on its
+        # way out would stay "busy" forever, and every later turn on the thread
+        # would be answered by a 200 from /v1/steer and folded into the dead
+        # turn instead of opening a fresh one. The real runner's session ends
+        # with the process/turn that died, so idle-after-a-drop is the faithful
+        # model, and it is what makes the timeout retry path testable at all.
+        try:
+            for frame in script:
                 await resp.write((frame.model_dump_json() + "\n").encode("utf-8"))
-        self.turn_active = False
+            if self.hold is not None:
+                await self.hold.wait()  # type: ignore[attr-defined]
+                for frame in self.tail:
+                    await resp.write((frame.model_dump_json() + "\n").encode("utf-8"))
+        finally:
+            self.turn_active = False
+        # Normal path only: on a dead transport this raises, and there is no
+        # eof to send to a client that already went away.
         await resp.write_eof()
         return resp
 
@@ -492,6 +533,67 @@ class FakeRunner:
         return web.json_response({"ok": True})
 
 
+# --- Delivery-lease test helpers (ADR-0131, #1971) -----------------------------
+#
+# Shared by ``test_delivery_ownership.py`` and ``test_long_turn_evidence.py``,
+# which both drive real ``Consumer``/``Kernel`` pairs against the delivery
+# lease. Living here rather than duplicated in each file keeps them from
+# quietly diverging on the ``lease is None`` forwarding branch, which encodes
+# the kernel's optional-lease call contract: a signature change to
+# ``Kernel.process_event`` breaks both call sites identically.
+
+
+class _ProcessEventSpy:
+    """Wraps ``kernel.process_event``, recording each call and its lease.
+
+    The lease is what the whole feature threads through the sacred handler, so
+    recording it (rather than only counting calls) is what lets a test assert on
+    the generation and the inherited deadline the kernel actually received. The
+    ``lease is None`` branch forwards the ORIGINAL one-argument call so that,
+    before the feature lands, these tests fail on a missing lease rather than on
+    a ``TypeError`` from a keyword the signature does not have yet.
+    """
+
+    def __init__(self, kernel: Any) -> None:
+        self._inner = kernel.process_event
+        self.calls: list[tuple[str, Any]] = []
+        kernel.process_event = self
+
+    async def __call__(self, qevent: QueuedTurn, *, lease: Any = None) -> None:
+        self.calls.append((qevent.event_id, lease))
+        if lease is None:
+            await self._inner(qevent)
+        else:
+            await self._inner(qevent, lease=lease)
+
+    def leases_for(self, event_id: str) -> list[Any]:
+        return [lease for eid, lease in self.calls if eid == event_id]
+
+    def entries_for(self, event_id: str) -> int:
+        return sum(1 for eid, _ in self.calls if eid == event_id)
+
+
+async def _pending_rows(h: Any) -> dict[str, int]:
+    """Every pending entry id -> its current ``times_delivered``."""
+    rows = await h.async_redis.xpending_range(
+        h.config.stream, h.config.consumer_group, min="-", max="+", count=50
+    )
+    return {row["message_id"]: int(row["times_delivered"]) for row in rows}
+
+
+def _closed_port() -> int:
+    """A loopback port nothing is listening on.
+
+    Bind to port 0, read what the OS handed out, close it again. Used as the
+    fleet-wide ``runner_port`` trap described in ``kernel_harness``: dialling it
+    must fail, so a lost per-sandbox port is a loud test failure rather than a
+    silent fall-back onto the one shared fake runner.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
 @dataclass
 class Harness:
     substrate: SandboxSubstrate
@@ -503,6 +605,12 @@ class Harness:
     fake_k8s: FakeK8s
     card_store: ApprovalCardStore
     killswitch: object | None = None
+    # The opt-in per-sandbox fake runners, keyed by the port each is serving on,
+    # so a test can map an asserted ``fake_k8s.assigned_ports`` value back to the
+    # runner that answered for that sandbox. Empty unless ``per_sandbox_runners``
+    # was passed; ``runner`` above stays the shared one either way. Appended LAST
+    # and defaulted so the existing 9-positional construction below stays valid.
+    runners: dict[int, FakeRunner] = field(default_factory=dict)
 
 
 @pytest.fixture
@@ -513,10 +621,23 @@ def make_harness(
 
     Closes over the per-test names and the sync Valkey client so tests need no
     conftest import (which importlib mode makes fragile). Optional kwargs:
-    ``binding`` (a resolver injected into the kernel), ``with_killswitch``
+    ``binding`` (a resolver injected into the kernel), ``actions`` (an action
+    ledger recorder), ``with_killswitch``
     (build a real KillSwitch wired to the kernel) and ``sink`` (any ``ReplySink``
     -- a real ``ReplySinkRouter`` for the adapter-selection tests, T-B3/T-B4);
-    the rest are config overrides."""
+    the rest are config overrides. ``runner_total_timeout_s`` is an ordinary
+    config override: it drives BOTH the ``WorkerConfig`` and the
+    ``RunnerClient``'s streaming budget (mirroring ``run.py``), so a test that
+    expires the stream mid-flight (#2011) passes a fractional value and the
+    config's own ``runner_total_timeout_s <= delivery_budget_s`` validator still
+    judges what the client actually does.
+
+    ``per_sandbox_runners`` (default 0, meaning "unchanged") starts N ADDITIONAL
+    fake runners, one per sandbox, and exposes them as ``Harness.runners``. Pass
+    it when the test is about several threads running AT ONCE: with the shared
+    single runner, every sandbox dials one fake with one ``turn_active`` flag, so
+    the kernel reads every thread as busy and a fan-out test would "prove" that
+    independent threads serialize."""
 
     def factory(**overrides: object) -> contextlib.AbstractAsyncContextManager[Harness]:
         return kernel_harness(names, sync_redis, **overrides)
@@ -533,8 +654,11 @@ async def kernel_harness(
     with_killswitch: bool = False,
     approvals: object | None = None,
     approval_reader: object | None = None,
+    actions: object | None = None,
+    publication_creator: object | None = None,
     sink: object | None = None,
     claim_timeout_seconds: float = 3.0,
+    per_sandbox_runners: int = 0,
     **config_overrides: object,
 ) -> AsyncIterator[Harness]:
     """Assemble a live kernel wired to a fake runner and real Valkey."""
@@ -545,14 +669,37 @@ async def kernel_harness(
     port = server.port
     assert port is not None
 
-    fake_k8s = FakeK8s()
+    # Opt-in per-sandbox runners. Started HERE, before any claim: the substrate
+    # calls ``FakeK8s.create_claim`` synchronously on a worker thread, which can
+    # neither start an aiohttp server nor await one.
+    extra_servers: list[TestServer] = []
+    runners: dict[int, FakeRunner] = {}
+    for _ in range(per_sandbox_runners):
+        extra_runner = FakeRunner()
+        extra_server = TestServer(extra_runner.app)
+        await extra_server.start_server()
+        assert extra_server.port is not None
+        extra_servers.append(extra_server)
+        runners[extra_server.port] = extra_runner
+
+    # The fleet-wide fallback port. With per-sandbox runners in play it is set to
+    # a deliberately CLOSED port, and that is the negative control that keeps
+    # this harness honest: if a future change stops honouring ``SandboxView.port``
+    # (``substrate.py``'s ``port=bound.port if bound.port is not None else
+    # config.runner_port``), every sandbox falls back to a dead port,
+    # ``Kernel._turn_active`` fails CLOSED and reports every thread busy, and the
+    # fan-out test fails LOUDLY -- instead of silently sharing one runner, one
+    # ``turn_active`` flag, and passing for the wrong reason.
+    fleet_port = _closed_port() if per_sandbox_runners else port
+
+    fake_k8s = FakeK8s(runner_ports=list(runners))
     substrate = SandboxSubstrate(
         fake_k8s,  # type: ignore[arg-type]
         AffinityStore(sync_redis, key_prefix=names["sandbox_prefix"]),
         SubstrateConfig(
             namespace="test-ns",
             warm_pool="test-pool",
-            runner_port=port,
+            runner_port=fleet_port,
             route_ttl_seconds=60,
             claim_timeout_seconds=claim_timeout_seconds,
             poll_interval_seconds=0.005,
@@ -563,7 +710,14 @@ async def kernel_harness(
         host=_VALKEY_HOST, port=_VALKEY_PORT, password=_VALKEY_PW or None, decode_responses=True
     )
     reply_sink = FakeSink() if sink is None else sink
-    runner_client = RunnerClient(total_timeout_s=30.0)
+    # One source of truth, exactly as production does it (``run.py`` builds the
+    # real client with ``total_timeout_s=config.runner_total_timeout_s``):
+    # ``runner_total_timeout_s`` flows through ``**config_overrides`` into the
+    # ``WorkerConfig`` and the client is built from the resulting config. A
+    # harness whose client budget could silently disagree with its own config
+    # would slip past the config's ``runner_total_timeout_s <=
+    # delivery_budget_s`` validator, which now couples the two.
+    runner_client = RunnerClient(total_timeout_s=config.runner_total_timeout_s)
     card_store = ApprovalCardStore(async_redis, config)
     kernel = Kernel(
         substrate=substrate,
@@ -580,6 +734,8 @@ async def kernel_harness(
         binding=binding,  # type: ignore[arg-type]
         approvals=approvals,  # type: ignore[arg-type]
         approval_reader=approval_reader,  # type: ignore[arg-type]
+        actions=actions,  # type: ignore[arg-type]
+        publication_creator=publication_creator,  # type: ignore[arg-type]
         card_store=card_store,
     )
     killswitch = None
@@ -599,6 +755,7 @@ async def kernel_harness(
             fake_k8s,
             card_store,
             killswitch,
+            runners,
         )
     finally:
         with contextlib.suppress(Exception):
@@ -607,3 +764,8 @@ async def kernel_harness(
             await async_redis.aclose()
         with contextlib.suppress(Exception):
             await server.close()
+        # Every per-sandbox server too: a missed close leaks an aiohttp site for
+        # the rest of the pytest session and surfaces as unrelated flakes.
+        for extra_server in extra_servers:
+            with contextlib.suppress(Exception):
+                await extra_server.close()

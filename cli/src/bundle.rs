@@ -101,10 +101,37 @@ impl Exclusions {
     }
 
     fn is_excluded(&self, rel: &Path) -> bool {
-        let name = rel.file_name().unwrap_or_default();
-        self.names.iter().any(|n| name == std::ffi::OsStr::new(n))
-            || self.paths.iter().any(|p| rel == p)
+        rel.components().any(|component| match component {
+            Component::Normal(name) => self
+                .names
+                .iter()
+                .any(|excluded| name == std::ffi::OsStr::new(excluded)),
+            _ => false,
+        }) || self.paths.iter().any(|path| rel.starts_with(path))
     }
+}
+
+/// Whether porcelain v1 `-z` output contains no change that can affect the
+/// packed bundle. Changes under excluded workstation directories are harmless;
+/// the exclusion file itself is not, because changing it changes what is packed.
+pub(crate) fn git_status_is_clean_for_pack(root: &Path, repo_prefix: &Path, status: &[u8]) -> bool {
+    let Ok(exclusions) = Exclusions::load(root) else {
+        return false;
+    };
+    status
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .all(|entry| {
+            let Some(path) = entry
+                .get(3..)
+                .and_then(|path| std::str::from_utf8(path).ok())
+                .map(Path::new)
+                .and_then(|path| path.strip_prefix(repo_prefix).ok())
+            else {
+                return false;
+            };
+            path != Path::new(IGNORE_FILE) && exclusions.is_excluded(path)
+        })
 }
 
 fn append_dir(
@@ -494,6 +521,26 @@ mod tests {
             "bare-name pattern did not match at depth: {names:?}"
         );
         assert!(!names.contains(&".curieignore".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn pack_cleanliness_ignores_excluded_descendants_but_not_the_exclusion_file() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::scaffold::scaffold(dir.path(), "deal-desk").unwrap();
+        std::fs::write(dir.path().join(".curieignore"), "generated-output/\n").unwrap();
+        std::fs::create_dir(dir.path().join("generated-output")).unwrap();
+        std::fs::write(dir.path().join("generated-output/file.txt"), "generated\n").unwrap();
+
+        assert!(git_status_is_clean_for_pack(
+            dir.path(),
+            Path::new(""),
+            b"!! generated-output/file.txt\0",
+        ));
+        assert!(!git_status_is_clean_for_pack(
+            dir.path(),
+            Path::new(""),
+            b" M .curieignore\0",
+        ));
     }
 
     #[test]

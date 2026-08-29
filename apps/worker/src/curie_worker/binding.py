@@ -7,8 +7,10 @@ read-only query layer over the same tables via a SQLAlchemy async engine: one
 parameterized SELECT joining agents -> agent_channels -> deployments ->
 agent_versions.
 
-Resolution rule: an agent is bound to a channel via a row in ``agent_channels``
-(ADR-0096, #1459), one binding per agent. The run uses that agent's active
+Resolution rule: an agent holds one or more rows in ``agent_channels``
+(ADR-0096, #1459; ADR-0118). Resolution is from the ``(kind, address)`` pair to
+the agent, so the count of bindings per agent never affects the predicate. The
+run uses that agent's active
 deployment (deployments.status = 'active'); when both a prod and a dev
 deployment are active, prod wins, then the most recent. An address with no
 agent, or an agent with no active deployment, resolves to None -- the kernel
@@ -118,7 +120,7 @@ RUNNER_TOKEN_ENV = BootEnv.env_key("runner_token")
 APPROVAL_REQUIRED_ENV = BootEnv.env_key("approval_required_tools")
 # Marks which boot-env keys are per-agent connector secrets (ADR-0009, #429).
 # The k8s substrate reads it to strip those plaintext values off the value-only
-# SandboxClaim CR (their secretKeyRef delivery is #440); the docker substrate
+# SandboxClaim CR (their secretKeyRef delivery is #1488); the docker substrate
 # forwards them directly. The marker and the keys it names are both kept off the
 # k8s claim, so a connector secret is never persisted in etcd.
 CONNECTOR_SECRET_KEYS_ENV = BootEnv.env_key("connector_secret_keys")
@@ -215,6 +217,9 @@ SELECT a.id AS agent_id,
        a.approval_required_tools AS approval_required_tools,
        a.approval_routes AS approval_routes,
        a.secrets AS secrets,
+       d.id AS deployment_id,
+       d.workspace_enabled AS workspace_enabled,
+       a.memory AS memory,
        v.id AS version_id,
        v.version_label AS version_label,
        v.bundle_ref AS bundle_ref,
@@ -237,6 +242,11 @@ class ResolvedDeployment(BaseModel):
     # (#1116) and use the name, so the runner needs it to derive a URL that
     # matches the Service that exists.
     agent_name: str
+    # The active deployment is the sole selector the trusted worker may redeem
+    # through the internal workspace credential endpoint.  Optional defaults
+    # keep old worker doubles and rolling-deploy rows source-compatible.
+    deployment_id: uuid.UUID | None = None
+    workspace_enabled: bool = False
     version_id: uuid.UUID
     version_label: str
     bundle_ref: str | None
@@ -256,8 +266,8 @@ class ResolvedDeployment(BaseModel):
     # forwarded as CURIE_APPROVAL_REQUIRED_TOOLS at boot. None means no gates.
     approval_required_tools: list[str] | None = None
     # The agent's approval route bindings (#247): manifest route name ->
-    # workspace binding ({"channel": "C..."}), resolved by the kernel when a
-    # raised approval names a route. None means no bindings.
+    # binding with one verified-card resolution target and an optional
+    # text-only notification target. None means no bindings.
     approval_routes: dict[str, Any] | None = None
     # The agent's connector secrets (ADR-0009, #429): env-var name -> secret
     # value, injected by name into the sandbox boot env so a bundle's authed MCP
@@ -272,6 +282,11 @@ class ResolvedDeployment(BaseModel):
     # together for any other kind (`agent_channels_route_pair_ck`).
     endpoint: str | None = None
     adapter: str | None = None
+    # Whether this agent's bindings share one general-state namespace, or each
+    # get their own (#1525 follow-up). Read fresh per resolve, so flipping it
+    # takes effect on the very next turn -- there is no cached copy anywhere
+    # to go stale.
+    memory: bool = False
 
 
 def warn_if_multiple_agents_bound(kind: str, address: str, rows: Sequence[Any]) -> None:
@@ -371,9 +386,7 @@ class BindingResolver:
         value: str | None = row[0]
         return value
 
-    async def approval_grant_tool(
-        self, event_id: str, agent_id: uuid.UUID
-    ) -> str | None:
+    async def approval_grant_tool(self, event_id: str, agent_id: uuid.UUID) -> str | None:
         """The one-shot post-approval grant for a resume turn (#430, ADR-0035).
 
         When ``event_id`` is the deterministic resume id of a genuinely
@@ -451,12 +464,10 @@ class BindingResolver:
         summary: str | None = row["summary"]
         if not summary or not summary.startswith(_PERMISSION_GATE_SUMMARY_PREFIX):
             return None
-        tool = summary[len(_PERMISSION_GATE_SUMMARY_PREFIX):].split(" ", 1)[0]
+        tool = summary[len(_PERMISSION_GATE_SUMMARY_PREFIX) :].split(" ", 1)[0]
         return tool or None
 
-    async def approval_resumed_kind(
-        self, event_id: str, agent_id: uuid.UUID
-    ) -> str | None:
+    async def approval_resumed_kind(self, event_id: str, agent_id: uuid.UUID) -> str | None:
         """The gate provenance of the approval a resume turn is resuming (#544,
         Decision A2), or None.
 
@@ -551,6 +562,17 @@ class BindingResolver:
             value = json.loads(value)
         return value if isinstance(value, dict) else None
 
+    async def name_for(self, agent_id: uuid.UUID) -> str | None:
+        """The agent's NAME for eval pool routing (#1488). None if unknown."""
+        sql = text(f"SELECT name FROM {self._config.db_schema}.agents WHERE id = :id")
+        async with self._engine.connect() as conn:
+            result = await conn.execute(sql, {"id": agent_id})
+            row = result.first()
+        if row is None:
+            return None
+        value: str | None = row[0]
+        return value
+
     async def thinking_for(self, agent_id: uuid.UUID) -> str | None:
         """The agent's thinking depth for eval sandbox boots."""
         sql = text(f"SELECT thinking FROM {self._config.db_schema}.agents WHERE id = :id")
@@ -585,7 +607,15 @@ class BindingResolver:
             ),
         )
 
-    def boot_env(self, resolved: ResolvedDeployment, thread_key: str) -> dict[str, str]:
+    def boot_env(
+        self,
+        resolved: ResolvedDeployment,
+        thread_key: str,
+        *,
+        kind: str | None = None,
+        address: str | None = None,
+        isolate_memory: bool = False,
+    ) -> dict[str, str]:
         """The env injected into the sandbox claim for a bound run.
 
         Rendered from the declared contract (``BootEnv``, #488/ADR-0049) rather
@@ -595,9 +625,12 @@ class BindingResolver:
         keys: it never writes CURIE_SANDBOX_ID or CURIE_RUNNER_PORT, which
         the substrate derives from the pod itself.
 
-        A ``thread_key`` starting with ``EVAL_ISOLATE_THREAD_PREFIX`` (#1909)
-        omits ``CURIE_MEMORY_REF`` / ``CURIE_MEMORY_TOKEN`` so default
-        local/cluster eval does not load ambient durable agent memory.
+        An eval-isolated turn (#1909) omits ``CURIE_MEMORY_REF`` /
+        ``CURIE_MEMORY_TOKEN`` so default local/cluster eval does not load
+        ambient durable agent memory. Direct callers may still express that
+        intent with the legacy eval-prefixed ``thread_key``; the kernel passes
+        ``isolate_memory`` explicitly because its internal key also includes
+        the channel kind and address.
         """
         # The memory ref (#264): the agent's scoped namespace on the durable
         # state store (#23/#248). The runner dereferences it at boot to load
@@ -625,7 +658,24 @@ class BindingResolver:
         # and any bundle script talking to the store directly compose
         # ``/<namespace>/<key>`` onto this. Memory and history are two reserved
         # namespaces UNDER it; a bundle skill gets the rest.
+        #
+        # Narrowed to THIS binding's own path segment, unless the agent has
+        # opted every binding into one shared namespace, or this caller has no
+        # binding to name (#1525 follow-up): a memory=False agent's bundle
+        # composes ``/<namespace>/<key>`` onto whichever base it was handed
+        # here, unaware which shape it got -- the scoping decision lives
+        # entirely in which URL the worker minted, never in a credential claim
+        # (rejected alternative: widening ``sandbox_token`` -- it authenticates
+        # WHICH agent, and a partition key within that agent's own,
+        # already-fully-accessible store has no privilege to carry, so the API
+        # verifies it against ``agent_channels`` directly instead of trusting
+        # an opaque claim). memory and history stay agent-wide either way.
         state_url = f"{base}/agents/{resolved.agent_id}/state"
+        if not resolved.memory and kind is not None and address is not None:
+            state_url = (
+                f"{base}/agents/{resolved.agent_id}/state/bindings/"
+                f"{quote(kind, safe='')}/{quote(address, safe='')}"
+            )
         # Mint scoped tokens (ADR-0033, #410) for this agent. Two scopes, because
         # the memory/history loaders and the bundle reach DIFFERENT namespaces:
         #  - the broad ``state`` token backs the memory and history tokens, whose
@@ -682,9 +732,7 @@ class BindingResolver:
             # Same precedence as the model above (#1182): the agent's value wins,
             # then the platform default, then nothing at all -- and "nothing at
             # all" is what makes an unconfigured install behave as it always has.
-            thinking=(
-                resolved.thinking if resolved.thinking is not None else self._config.thinking
-            )
+            thinking=(resolved.thinking if resolved.thinking is not None else self._config.thinking)
             or None,
             fake_model=self._config.fake_model,
             credentials_ref=self._config.credentials,
@@ -718,7 +766,7 @@ class BindingResolver:
         # `.mcp.json` `${VAR}` expansion consumes them. Injected by value; the
         # docker substrate forwards them as `-e KEY=VALUE`, while the k8s
         # substrate strips them off its plaintext claim CR by the marker
-        # CURIE_CONNECTOR_SECRET_KEYS (their secretKeyRef delivery is #440).
+        # CURIE_CONNECTOR_SECRET_KEYS (their secretKeyRef delivery is #1488).
         # Runs AFTER the render so the reserved-name filter sees the rendered
         # keys, and stays the marker's sole writer -- see the
         # inject_connector_secrets docstring for the #457/#429 rationale.
@@ -730,8 +778,9 @@ class BindingResolver:
         # it and could change a committed case. The CLI marks those turns with
         # EVAL_ISOLATE_THREAD_PREFIX; drop the memory ref/token so the runner
         # boots NullMemoryStore. History stays: each case already has a unique
-        # empty thread (#550 / ADR-0051). Kernel.py is not edited (sacred).
-        if is_eval_isolate_thread(thread_key):
+        # empty thread (#550 / ADR-0051). The kernel carries this intent
+        # explicitly once it scopes the internal key by channel.
+        if isolate_memory or is_eval_isolate_thread(thread_key):
             env.pop(MEMORY_REF_ENV, None)
             env.pop(MEMORY_TOKEN_ENV, None)
             logger.info("eval isolate: omitted memory_ref for thread %s", thread_key)

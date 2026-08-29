@@ -19,6 +19,7 @@ from curie_dispatcher.queue import to_stream_fields
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from curie_worker import consumer as consumer_module
 from curie_worker import kernel as kernel_module
+from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.consumer import (
     THREAD_RESET_INFLIGHT_SET,
     THREAD_RESET_SET,
@@ -31,6 +32,7 @@ from curie_worker.consumer_liveness import (
 )
 from curie_worker.sandbox import QuotaRejection
 from curie_worker.stream_consumer import ConsumerLivenessExpired
+from curie_worker.workspace import WorkspacePreparationError
 from redis.asyncio import Redis as AsyncRedis
 
 DONE = SessionStatus.DONE
@@ -129,6 +131,10 @@ def _qevent(text: str, *, thread: str = "th-1", event_id: str | None = None) -> 
     )
 
 
+def _thread_key(thread: str) -> str:
+    return f"slack:C1:{thread}"
+
+
 async def _wait_until(pred: Callable[[], bool], timeout: float = 5.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -217,6 +223,76 @@ def test_dispatch_applies_backpressure_at_capacity(make_harness) -> None:
             hold.set()  # first turn finishes, frees the slot
             await second  # second dispatch now proceeds
             await asyncio.gather(*list(consumer._inflight))
+
+    asyncio.run(go())
+
+
+def test_message_settlement_does_not_sample_queue_inventory(make_harness) -> None:
+    """Queue gauge reads cannot retain the per-message semaphore slot."""
+
+    async def go() -> None:
+        async with make_harness() as h:
+            h.runner.default_script = [Final(text="answer", status=DONE)]
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            await consumer.ensure_group()
+
+            observations = 0
+
+            async def observe() -> None:
+                nonlocal observations
+                observations += 1
+
+            consumer._observe_queue_state = observe  # type: ignore[method-assign]
+            await h.async_redis.xadd(
+                h.config.stream,
+                to_stream_fields(_qevent("hot path", thread="t-hot", event_id="hot-1")),
+            )
+            rows = await h.async_redis.xreadgroup(
+                h.config.consumer_group,
+                h.config.consumer_name,
+                {h.config.stream: ">"},
+                count=1,
+            )
+            entry_id, fields = rows[0][1][0]
+            await consumer._dispatch(entry_id, fields)
+            await asyncio.gather(*list(consumer._inflight))
+
+            assert observations == 0
+            # Every configured slot is immediately acquirable again. If the
+            # handler were still awaiting queue observation in its finally, the
+            # last acquire would time out.
+            for _ in range(16):
+                await asyncio.wait_for(consumer._sem.acquire(), timeout=0.1)
+            for _ in range(16):
+                consumer._sem.release()
+
+    asyncio.run(go())
+
+
+def test_maintenance_tick_samples_queue_inventory_once(make_harness) -> None:
+    """The maintenance cadence owns queue inventory observation."""
+
+    async def go() -> None:
+        async with make_harness() as h:
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            calls: list[str] = []
+
+            async def step(name: str) -> None:
+                calls.append(name)
+
+            async def observe() -> None:
+                calls.append("observe")
+                consumer.request_stop()
+
+            consumer._reclaim_once = lambda: step("reclaim")  # type: ignore[method-assign]
+            h.kernel.reap_orphans = lambda: step("reap")  # type: ignore[method-assign]
+            h.kernel.sweep_pending_completions = lambda: step("sweep")  # type: ignore[method-assign]
+            consumer._drain_thread_reset_requests = lambda: step("reset")  # type: ignore[method-assign]
+            consumer._observe_queue_state = observe  # type: ignore[method-assign]
+
+            await consumer._maintenance_loop()
+
+            assert calls == ["reclaim", "reap", "sweep", "reset", "observe"]
 
     asyncio.run(go())
 
@@ -1323,9 +1399,11 @@ def test_next_turn_drains_queued_eval_reset_before_claiming(make_harness) -> Non
         async with make_harness() as h:
             h.runner.default_script = [Final(text="hi", status=DONE)]
             await h.kernel.process_event(_qevent("eval-case-1", thread="tEval1"))
-            assert h.substrate.lookup("tEval1") is not None
+            first_thread_key = _thread_key("tEval1")
+            second_thread_key = _thread_key("tEval2")
+            assert h.substrate.lookup(first_thread_key) is not None
 
-            await h.async_redis.sadd(THREAD_RESET_SET, "tEval1")
+            await h.async_redis.sadd(THREAD_RESET_SET, first_thread_key)
             consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
             await consumer.ensure_group()
             nxt = _qevent("eval-case-2", thread="tEval2", event_id="eval-2")
@@ -1333,10 +1411,12 @@ def test_next_turn_drains_queued_eval_reset_before_claiming(make_harness) -> Non
             await consumer._sem.acquire()
             await consumer._handle(entry_id, to_stream_fields(nxt))
 
-            assert h.substrate.lookup("tEval1") is None
-            assert h.substrate.lookup("tEval2") is not None
+            assert h.substrate.lookup(first_thread_key) is None
+            assert h.substrate.lookup(second_thread_key) is not None
             assert await h.async_redis.scard(THREAD_RESET_SET) == 0
-            assert not await h.async_redis.sismember(THREAD_RESET_INFLIGHT_SET, "tEval1")
+            assert not await h.async_redis.sismember(
+                THREAD_RESET_INFLIGHT_SET, first_thread_key
+            )
 
     asyncio.run(go())
 
@@ -1351,7 +1431,9 @@ def test_next_turn_drains_reset_before_claiming_when_quota_is_full(make_harness)
         async with make_harness(claim_timeout_seconds=0.2) as h:
             h.runner.default_script = [Final(text="hi", status=DONE)]
             await h.kernel.process_event(_qevent("eval-case-1", thread="tEval1"))
-            assert h.substrate.lookup("tEval1") is not None
+            first_thread_key = _thread_key("tEval1")
+            second_thread_key = _thread_key("tEval2")
+            assert h.substrate.lookup(first_thread_key) is not None
 
             h.fake_k8s.quota_rejection = QuotaRejection(
                 quota_name="curie-sandbox-quota",
@@ -1368,7 +1450,7 @@ def test_next_turn_drains_reset_before_claiming_when_quota_is_full(make_harness)
 
             h.fake_k8s.delete_claim = delete_and_free  # type: ignore[method-assign]
 
-            await h.async_redis.sadd(THREAD_RESET_SET, "tEval1")
+            await h.async_redis.sadd(THREAD_RESET_SET, first_thread_key)
             consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
             await consumer.ensure_group()
             nxt = _qevent("eval-case-2", thread="tEval2", event_id="eval-2-quota")
@@ -1376,8 +1458,8 @@ def test_next_turn_drains_reset_before_claiming_when_quota_is_full(make_harness)
             await consumer._sem.acquire()
             await consumer._handle(entry_id, to_stream_fields(nxt))
 
-            assert h.substrate.lookup("tEval1") is None
-            assert h.substrate.lookup("tEval2") is not None
+            assert h.substrate.lookup(first_thread_key) is None
+            assert h.substrate.lookup(second_thread_key) is not None
 
     asyncio.run(go())
 
@@ -1391,18 +1473,19 @@ def test_maintenance_tick_drains_pending_thread_reset_requests(make_harness) -> 
         async with make_harness() as h:
             h.runner.default_script = [Final(text="hi", status=DONE)]
             await h.kernel.process_event(_qevent("hi", thread="tDrain"))
-            assert h.substrate.lookup("tDrain") is not None
+            thread_key = _thread_key("tDrain")
+            assert h.substrate.lookup(thread_key) is not None
 
             consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
-            await h.async_redis.sadd(THREAD_RESET_SET, "tDrain")
+            await h.async_redis.sadd(THREAD_RESET_SET, thread_key)
 
             await consumer._drain_thread_reset_requests()
 
-            assert h.substrate.lookup("tDrain") is None  # released
+            assert h.substrate.lookup(thread_key) is None  # released
             assert await h.async_redis.scard(THREAD_RESET_SET) == 0  # popped, not left behind
             # #812: the in-progress marker is cleared only after the release
             # actually lands, so a successful drain leaves nothing pending.
-            assert not await h.async_redis.sismember(THREAD_RESET_INFLIGHT_SET, "tDrain")
+            assert not await h.async_redis.sismember(THREAD_RESET_INFLIGHT_SET, thread_key)
 
     asyncio.run(go())
 
@@ -1456,7 +1539,8 @@ def test_maintenance_tick_thread_reset_is_not_stalled_by_a_wedged_runner(
         async with make_harness() as h:
             h.runner.default_script = [Final(text="hi", status=DONE)]
             await h.kernel.process_event(_qevent("hi", thread="tWedgedDrain"))
-            assert h.substrate.lookup("tWedgedDrain") is not None
+            thread_key = _thread_key("tWedgedDrain")
+            assert h.substrate.lookup(thread_key) is not None
 
             monkeypatch.setattr(kernel_module, "_RESET_INTERRUPT_TIMEOUT_S", 0.2)
 
@@ -1468,11 +1552,11 @@ def test_maintenance_tick_thread_reset_is_not_stalled_by_a_wedged_runner(
             monkeypatch.setattr(h.kernel._runner, "interrupt", never_answers)
 
             consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
-            await h.async_redis.sadd(THREAD_RESET_SET, "tWedgedDrain")
+            await h.async_redis.sadd(THREAD_RESET_SET, thread_key)
 
             await asyncio.wait_for(consumer._drain_thread_reset_requests(), timeout=2.0)
 
-            assert h.substrate.lookup("tWedgedDrain") is None  # the reset was not lost
+            assert h.substrate.lookup(thread_key) is None  # the reset was not lost
 
     asyncio.run(go())
 
@@ -1586,7 +1670,8 @@ def test_maintenance_tick_thread_reset_is_not_stalled_by_a_hanging_substrate_rel
         async with make_harness() as h:
             h.runner.default_script = [Final(text="hi", status=DONE)]
             await h.kernel.process_event(_qevent("hi", thread="tHangRelease"))
-            assert h.substrate.lookup("tHangRelease") is not None
+            thread_key = _thread_key("tHangRelease")
+            assert h.substrate.lookup(thread_key) is not None
 
             monkeypatch.setattr(kernel_module, "_RESET_RELEASE_TIMEOUT_S", 0.2)
 
@@ -1597,7 +1682,7 @@ def test_maintenance_tick_thread_reset_is_not_stalled_by_a_hanging_substrate_rel
             monkeypatch.setattr(h.substrate, "release", hanging_release)
 
             consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
-            await h.async_redis.sadd(THREAD_RESET_SET, "tHangRelease")
+            await h.async_redis.sadd(THREAD_RESET_SET, thread_key)
 
             # Must finish well under the 5s hang, bounded instead by the
             # (monkeypatched) release timeout.
@@ -1605,6 +1690,164 @@ def test_maintenance_tick_thread_reset_is_not_stalled_by_a_hanging_substrate_rel
 
             # The request was popped either way; a fresh reset is needed to retry.
             assert await h.async_redis.scard(THREAD_RESET_SET) == 0
+
+    asyncio.run(go())
+
+
+# --- An acked entry must never be a silent one (#2004) -----------------------
+# The kernel-level regressions call ``process_event`` directly, so they can only
+# see the silence. The ack is a CONSUMER fact -- a normal return from
+# ``process_event`` is what makes ``Consumer`` XACK -- so the pairing the ticket
+# actually reports is only observable here, against the real stream and group.
+
+
+def _workspace_binding(deployment_id: uuid.UUID) -> object:
+    """A workspace-enabled binding carrying a FIXED deployment id.
+
+    Fixed on purpose: the id is what an operator greps the worker log for, so
+    the assertion below checks the real value rather than that some uuid landed.
+    Defined locally rather than imported from ``test_kernel``; importlib mode
+    makes cross-test-module imports fragile.
+    """
+
+    class WorkspaceResolved:
+        def __init__(self) -> None:
+            self.agent_id = uuid.uuid4()
+            self.agent_name = "test-agent"
+            self.endpoint: str | None = None
+            self.adapter: str | None = None
+            self.deployment_id = deployment_id
+            self.workspace_enabled = True
+
+    class WorkspaceBinding:
+        async def resolve(self, _kind: str, _channel: str) -> WorkspaceResolved:
+            return WorkspaceResolved()
+
+        def boot_env(
+            self,
+            _resolved: object,
+            _thread_key: str,
+            *,
+            kind: str | None = None,
+            address: str | None = None,
+        ) -> dict[str, str]:
+            return {}
+
+        def packs_for(self, _resolved: object) -> BehaviorPacks:
+            return BehaviorPacks()
+
+    return WorkspaceBinding()
+
+
+def test_failed_workspace_preparation_acks_the_entry_and_is_not_silent(
+    make_harness, caplog
+) -> None:
+    """#2004 end to end: the reported evidence was a group at ``pending 0`` with
+    ``last-delivered-id`` equal to the turn's stream id -- yet no sandbox and an
+    empty worker log.
+
+    The refusal half of that symptom is already covered on ``next`` by the INFO
+    line the refusal branch emits; this pins the PREPARATION half, which is the
+    one still silent here. Selection succeeds and the clone fails, so the turn
+    retries to its escalation and the entry is acked -- and only the ack makes
+    the silence undiagnosable. An entry left pending is at least visible in
+    XPENDING; an acked entry with nothing in the log is indistinguishable from a
+    bot that was never mentioned. Driven through the real ``Consumer`` and the
+    real stream so the ack is the production one, not an assertion about
+    ``process_event``'s return value.
+    """
+
+    caplog.set_level(logging.WARNING, logger="curie_worker.kernel")
+    deployment_id = uuid.uuid4()
+
+    async def go() -> None:
+        async with make_harness(binding=_workspace_binding(deployment_id)) as h:
+            # Selection SUCCEEDS -- this is a fault, not a policy refusal -- and
+            # the workspace then fails to materialize, which is the path that
+            # still ends the turn without naming anything.
+            class WorkspaceProbe:
+                def select_repository(
+                    self,
+                    *,
+                    thread_key: str,
+                    deployment_id: uuid.UUID,
+                    author: str,
+                    repo_full_name: str | None,
+                ) -> str:
+                    assert repo_full_name is not None
+                    return repo_full_name
+
+                def claim_or_resume_with_handle(self, **kwargs: object) -> object:
+                    raise WorkspacePreparationError(
+                        "clone", "git clone exited 128: repository not found"
+                    )
+
+                def touch(self, thread_key: str, *, ttl_seconds: int) -> bool:
+                    return True
+
+                def enumerate_expired(self) -> list[object]:
+                    # The consumer's maintenance loop polls this every tick;
+                    # without it the loop logs a repeated AttributeError
+                    # traceback that pollutes this test's caplog capture.
+                    return []
+
+            h.kernel._workspace = WorkspaceProbe()  # type: ignore[assignment]
+
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            await consumer.ensure_group()
+
+            qe = _qevent(
+                "Fix https://github.com/acme-corp/acme-bot",
+                thread="tAckSilent",
+                event_id="ws-ack-1",
+            )
+            await h.async_redis.xadd(h.config.stream, to_stream_fields(qe))
+
+            task = asyncio.create_task(consumer.run())
+            # Wait for the escalation itself, not its classification string --
+            # the turn exhausts its retries and escalates on both the pre-fix
+            # and post-fix source, and only the classification name
+            # ("runner-error" vs "workspace-error") differs between them.
+            # Gating on the new name would time out pre-fix and never reach
+            # the assertions below, which is the thing this test exists to
+            # pin.
+            await _wait_until(
+                lambda: h.sink.last_text is not None
+                and "Flagging for a human" in h.sink.last_text
+            )
+            consumer.request_stop()
+            await task
+
+            # Half one of the ticket's evidence: the entry really was consumed
+            # and acked off the group -- nothing is left for an operator to find.
+            summary = await h.async_redis.xpending(h.config.stream, h.config.consumer_group)
+            assert summary["pending"] == 0
+            assert h.fake_k8s.claim_envs == []  # ...and no sandbox was ever created
+            assert h.runner.opened == []  # ...and the runner never saw a turn
+
+            # Half two, asserted second so the pairing is explicit: an acked,
+            # sandbox-less turn is only a bug because the worker said nothing
+            # about it. This is the assertion that fails on the current base.
+            failures = [
+                r
+                for r in caplog.records
+                if r.name == "curie_worker.kernel" and "workspace start failed" in r.getMessage()
+            ]
+            assert failures, (
+                "the entry was acked with no sandbox and no line naming the agent -- "
+                f"exactly what #2004 reports: {caplog.text!r}"
+            )
+            assert all(r.levelno == logging.WARNING for r in failures)
+            message = failures[-1].getMessage()
+            assert "agent=test-agent" in message, message
+            assert f"deployment={deployment_id}" in message, message
+            assert "stage=clone" in message, message
+
+            # Last: the escalation is correctly classified post-fix. Placed
+            # after the silence assertion above so a pre-fix failure reports
+            # the meaningful thing (no warning line) rather than this one.
+            assert h.sink.last_text is not None
+            assert "workspace-error" in h.sink.last_text
 
     asyncio.run(go())
 
@@ -1643,7 +1886,8 @@ def test_maintenance_tick_thread_reset_claim_and_mark_is_atomic(make_harness) ->
         async with make_harness() as h:
             h.runner.default_script = [Final(text="hi", status=DONE)]
             await h.kernel.process_event(_qevent("hi", thread="tAtomicClaim"))
-            assert h.substrate.lookup("tAtomicClaim") is not None
+            thread_key = _thread_key("tAtomicClaim")
+            assert h.substrate.lookup(thread_key) is not None
 
             violations: list[str] = []
             observed: list[str] = []
@@ -1695,10 +1939,10 @@ def test_maintenance_tick_thread_reset_claim_and_mark_is_atomic(make_harness) ->
                     observed.append(name)
                     try:
                         in_requests = await observer_redis.sismember(
-                            THREAD_RESET_SET, "tAtomicClaim"
+                            THREAD_RESET_SET, thread_key
                         )
                         in_flight = await observer_redis.sismember(
-                            THREAD_RESET_INFLIGHT_SET, "tAtomicClaim"
+                            THREAD_RESET_INFLIGHT_SET, thread_key
                         )
                         if not in_requests and not in_flight:
                             violations.append(name)
@@ -1723,16 +1967,16 @@ def test_maintenance_tick_thread_reset_claim_and_mark_is_atomic(make_harness) ->
                 # These writes happen before the spy is installed (and, in the
                 # `finally`, after it is restored), so they can never be counted
                 # as violations or as inflight_marks.
-                await original_srem(THREAD_RESET_SET, "tAtomicClaim")
-                await original_srem(THREAD_RESET_INFLIGHT_SET, "tAtomicClaim")
+                await original_srem(THREAD_RESET_SET, thread_key)
+                await original_srem(THREAD_RESET_INFLIGHT_SET, thread_key)
                 assert not await observer_redis.sismember(
-                    THREAD_RESET_SET, "tAtomicClaim"
+                    THREAD_RESET_SET, thread_key
                 )
                 assert not await observer_redis.sismember(
-                    THREAD_RESET_INFLIGHT_SET, "tAtomicClaim"
+                    THREAD_RESET_INFLIGHT_SET, thread_key
                 ), "stale in-progress residue would make arm (a) vacuous"
 
-                await original_sadd(THREAD_RESET_SET, "tAtomicClaim")
+                await original_sadd(THREAD_RESET_SET, thread_key)
                 # The live request now exists; install the spy before the drain
                 # can issue its first command. The spy is only ever installed
                 # between here and the `finally` below, so its own presence is
@@ -1750,7 +1994,7 @@ def test_maintenance_tick_thread_reset_claim_and_mark_is_atomic(make_harness) ->
                 # (b) The mark landed -- the pending signal is still True while
                 # the release runs...
                 assert await observer_redis.sismember(
-                    THREAD_RESET_INFLIGHT_SET, "tAtomicClaim"
+                    THREAD_RESET_INFLIGHT_SET, thread_key
                 )
                 # ...and it came from the atomic claim, not a second round trip
                 # through the command boundary.
@@ -1777,7 +2021,7 @@ def test_maintenance_tick_thread_reset_claim_and_mark_is_atomic(make_harness) ->
                 # that brought us here.
                 for _set in (THREAD_RESET_SET, THREAD_RESET_INFLIGHT_SET):
                     with contextlib.suppress(Exception):
-                        await original_srem(_set, "tAtomicClaim")
+                        await original_srem(_set, thread_key)
                 with contextlib.suppress(Exception):
                     await observer_redis.aclose()
 
@@ -1800,10 +2044,10 @@ def test_maintenance_tick_thread_reset_claim_and_mark_is_atomic(make_harness) ->
             )
 
             # End state is clean: released, and nothing left pending.
-            assert h.substrate.lookup("tAtomicClaim") is None
-            assert not await h.async_redis.sismember(THREAD_RESET_SET, "tAtomicClaim")
+            assert h.substrate.lookup(thread_key) is None
+            assert not await h.async_redis.sismember(THREAD_RESET_SET, thread_key)
             assert not await h.async_redis.sismember(
-                THREAD_RESET_INFLIGHT_SET, "tAtomicClaim"
+                THREAD_RESET_INFLIGHT_SET, thread_key
             )
 
     asyncio.run(go())

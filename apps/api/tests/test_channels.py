@@ -27,6 +27,7 @@ import re
 import uuid
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from typing import Any
 
 import pytest
@@ -36,9 +37,13 @@ from curie_api.channel_token import CHANNEL_ENQUEUE_SCOPE, mint
 from curie_api.config import Settings, get_settings
 from curie_api.main import create_app
 from curie_api.routers import channels as channels_router
+from curie_telemetry import TRACEPARENT_STREAM_FIELD, extract_trace_context
 from curie_test_support.valkey import connect_or_skip
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
+from opentelemetry import context as otel_context
+from opentelemetry import trace
+from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags, TraceState
 from sqlalchemy import text as sql_text
 from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -49,6 +54,24 @@ EMAIL_ENDPOINT = "http://curie-mail-adapter:8080/"
 EMAIL_ADAPTER = "agentmail-sandbox"
 PAST = 1000000000  # 2001, comfortably expired
 FAR_FUTURE = 4102444800  # 2100-01-01
+_TRACE_ID = int("1123456789abcdef0123456789abcdef", 16)
+_SPAN_ID = int("1123456789abcdef", 16)
+
+
+@contextmanager
+def _remote_parent() -> Iterator[None]:
+    parent = SpanContext(
+        trace_id=_TRACE_ID,
+        span_id=_SPAN_ID,
+        is_remote=True,
+        trace_flags=TraceFlags.SAMPLED,
+        trace_state=TraceState(),
+    )
+    token = otel_context.attach(trace.set_span_in_context(NonRecordingSpan(parent)))
+    try:
+        yield
+    finally:
+        otel_context.detach(token)
 
 # The one detail string every ingress auth failure returns. Identical for
 # "no credential" and "wrong credential" so a caller cannot probe the
@@ -388,6 +411,16 @@ def test_the_ingress_refuses_an_unroutable_binding_for_the_platform_key_too(
     assert refused.status_code == 409, refused.text
     assert "no reply route" in refused.text, refused.text
     assert "endpoint" in refused.text and "adapter" in refused.text, refused.text
+    # The recovery instruction has to name a request the API still accepts: the
+    # binding subresource with its (kind, address) selector. It used to say
+    # "PATCH the agent's channel", and `AgentUpdate` now 422s that field, so a
+    # caller following the 409 got a second refusal and no way out.
+    for expected in (
+        "/agents/{agent_id}/channels",
+        "kind=email",
+        "address=unroutable@example.test",
+    ):
+        assert expected in refused.text, refused.text
     assert _turns_on(valkey, runs_stream) == []
 
     slack = _post_turn(
@@ -558,6 +591,49 @@ def test_the_enqueued_handle_takes_kind_endpoint_and_adapter_from_the_row(
     assert turn.reply_handle.placeholder == body["reply_ref"]
     assert turn.reply_handle.endpoint == EMAIL_ENDPOINT == row["endpoint"]
     assert turn.reply_handle.adapter == EMAIL_ADAPTER == row["adapter"]
+
+
+def test_channel_ingress_injects_traceparent_adjacent_to_unchanged_payload(
+    channels_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+) -> None:
+    """The API channel producer preserves QueuedTurn and adds transport context."""
+
+    _bind(
+        channels_client,
+        auth_headers,
+        name="traced-ingress-agent",
+        channel=_email_channel("trace@example.test"),
+    )
+    token = _mint(
+        channels_client,
+        auth_headers,
+        kind="email",
+        address="trace@example.test",
+    )
+
+    with _remote_parent():
+        response = _post_turn(
+            channels_client,
+            token,
+            _turn("email", "trace@example.test"),
+        )
+    assert response.status_code == 200, response.text
+
+    entries = valkey.xrange(runs_stream)
+    assert len(entries) == 1
+    _entry_id, fields = entries[0]
+    assert set(fields) == {"payload", TRACEPARENT_STREAM_FIELD}
+    raw_payload = fields["payload"]
+    assert QueuedTurn.model_validate_json(raw_payload).model_dump_json() == raw_payload
+
+    parent = trace.get_current_span(extract_trace_context(fields)).get_span_context()
+    assert parent.is_valid is True
+    assert parent.is_remote is True
+    assert parent.trace_id == _TRACE_ID
 
 
 def test_a_slack_binding_enqueues_with_neither_endpoint_nor_adapter(
@@ -1036,7 +1112,7 @@ def test_a_token_is_dead_after_the_binding_is_repointed(
 ) -> None:
     """T-C8 (finding 10). The generation half of D5.
 
-    `update_agent_binding` mutates the row IN PLACE, so without the generation a
+    `update_channel_binding` mutates the row IN PLACE, so without the generation a
     token minted before a rebind stays valid against the row's NEW owner. Both
     rebinds are asserted: a MOVE to another address, and a no-op PATCH that
     re-asserts the same values -- because an operator re-asserting a binding is
@@ -1067,8 +1143,9 @@ def test_a_token_is_dead_after_the_binding_is_repointed(
     noop_token = _mint(channels_client, auth_headers, kind="email", address="noop@example.test")
 
     patched = channels_client.patch(
-        f"/agents/{agent_id}",
-        json={"channel": _email_channel("noop@example.test")},
+        f"/agents/{agent_id}/channels",
+        params={"kind": "email", "address": "noop@example.test"},
+        json=_email_channel("noop@example.test"),
         headers=auth_headers,
     )
     assert patched.status_code == 200, patched.text
@@ -1161,19 +1238,17 @@ def test_a_half_configured_route_is_rejected_on_create_and_on_patch(
         assert created.status_code == 422, created.text
         assert missing in created.text, created.text
 
+        whole = f"whole-{uuid.uuid4().hex[:6]}@example.test"
         agent_id = _bind(
             channels_client,
             auth_headers,
             name=f"whole-{uuid.uuid4().hex[:6]}",
-            channel=_email_channel(f"whole-{uuid.uuid4().hex[:6]}@example.test"),
+            channel=_email_channel(whole),
         )
         patched = channels_client.patch(
-            f"/agents/{agent_id}",
-            json={
-                "channel": _channel(
-                    "email", f"moved-{uuid.uuid4().hex[:6]}@example.test", **route
-                )
-            },
+            f"/agents/{agent_id}/channels",
+            params={"kind": "email", "address": whole},
+            json=_channel("email", f"moved-{uuid.uuid4().hex[:6]}@example.test", **route),
             headers=auth_headers,
         )
         assert patched.status_code == 422, patched.text
@@ -1215,7 +1290,7 @@ def test_a_route_less_binding_is_legal_at_rest_and_unmintable(
             channel=_channel(kind, address),
         )
         assert created.status_code == 201, created.text
-        assert created.json()["channel"] == {"kind": kind, "address": address}
+        assert created.json()["channels"] == [{"kind": kind, "address": address}]
 
         row = _binding_row(created.json()["id"])
         assert row["endpoint"] is None and row["adapter"] is None
@@ -1257,8 +1332,9 @@ def test_a_route_added_by_patch_makes_the_binding_mintable(
     assert unroutable.status_code == 409, unroutable.text
 
     patched = channels_client.patch(
-        f"/agents/{agent_id}",
-        json={"channel": _email_channel("late@example.test")},
+        f"/agents/{agent_id}/channels",
+        params={"kind": "email", "address": "late@example.test"},
+        json=_email_channel("late@example.test"),
         headers=auth_headers,
     )
     assert patched.status_code == 200, patched.text
@@ -1320,7 +1396,7 @@ def test_a_valid_route_is_stored_and_never_leaks_into_the_response(
 
     fetched = channels_client.get(f"/agents/{agent_id}", headers=auth_headers)
     assert fetched.status_code == 200, fetched.text
-    assert fetched.json()["channel"] == {"kind": "email", "address": "routed@example.test"}
+    assert fetched.json()["channels"] == [{"kind": "email", "address": "routed@example.test"}]
 
     row = _binding_row(agent_id)
     assert row["endpoint"] == EMAIL_ENDPOINT

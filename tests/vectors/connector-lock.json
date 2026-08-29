@@ -1,0 +1,345 @@
+{
+  "comment": "Single source of truth for connectors.lock.yaml, the per install record of what a bundle's declared connector source resolved to (ADR 0113). Python owns ConnectorLockFile / ConnectorLockEntry, validate_connector_lock and apply_lock in packages/plugin-format/src/plugin_format/connector_lock.py; the Rust CLI owns hand mirrors in cli/src/connector_build.rs because `curie build` writes the file and `curie cluster deploy` preflights it, both before the platform ever sees the bundle. plugin-format.schema.json carries no Connector* $defs, so the schema driven field-parity gate compares nothing here and this file is the seam instead. Read by packages/plugin-format/tests/test_connector_lock.py and by cli/tests/connector_build_decl_vectors.rs.\n\napply_lock is the SINGLE enforcement point for \"the resolved digest is the only identity rendered into a Deployment or used to start the local connector\" (ADR 0113). It returns a derived ConnectorsFile in which each build: connector's image is the locked digest and its build is cleared, so every downstream reader (render, mcp_entry, is_hosted, the worker reconciler's plan) works unchanged against an ordinary image: spec.\n\nAn image reference is well formed in exactly two shapes and nothing else: `<repo>@sha256:<64 lowercase hex>` for delivery `registry`, which is the OCI content-addressable manifest digest form documented at https://github.com/opencontainers/distribution-spec/blob/main/spec.md#pulling-manifests, and a bare `sha256:<64 lowercase hex>` for delivery `local-daemon`, which is the image ID `docker image inspect --format {{.Id}}` reports for a locally built image. Anything else, a tag included, is refused: a tag can be repointed after review, which is the mutable-tag failure this platform has already hit.\n\nEach vector carries: `name`, `why`, `connectors` (the connectors.yaml content), `lock` (the connectors.lock.yaml content), `portable` (the apply_lock keyword; only the cluster deploy preflight passes true), `expect` (\"apply\", \"raise\" or \"invalid\"), and on \"apply\" a `resolved` map of connector name to the image every downstream reader must then see. \"raise\" means validate_connector_lock accepts the document but apply_lock refuses it. \"invalid\" means the document does not survive validate_connector_lock at all, so it is rejected at bundle intake rather than at render time; `codes` names the reported error codes, all of which are namespaced under `connectors.lock`. Both lanes reject unknown keys inside a vector.",
+  "vectors": [
+    {
+      "name": "a_registry_entry_resolves_the_declaration_to_its_digest",
+      "why": "The ordinary cluster path. After apply_lock the spec is indistinguishable from a hand authored image: connector, which is what lets render, mcp_entry and the reconciler stay unchanged.",
+      "connectors": {
+        "connectors": {
+          "k8s-write": {
+            "build": {
+              "context": "connectors/k8s-write",
+              "platforms": ["linux/amd64", "linux/arm64"]
+            },
+            "env": { "K8S_WRITE_ALLOWLIST": "acme-ns/acme-api" }
+          }
+        }
+      },
+      "lock": {
+        "version": 1,
+        "connectors": {
+          "k8s-write": {
+            "image": "ghcr.io/acme-corp/acme-bot-k8s-write-mcp@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "delivery": "registry",
+            "platforms": ["linux/amd64", "linux/arm64"],
+            "source_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+          }
+        }
+      },
+      "portable": true,
+      "expect": "apply",
+      "resolved": {
+        "k8s-write": "ghcr.io/acme-corp/acme-bot-k8s-write-mcp@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    {
+      "name": "a_local_daemon_entry_applies_when_portability_is_not_required",
+      "why": "The dev fast path. A local tier version is a legitimate stored artifact and rendering its manifests is harmless because nothing applies them at local tier, so the API render path passes portable=false. Refusing here is what broke every `curie local deploy` in an earlier draft.",
+      "connectors": {
+        "connectors": {
+          "tempo": {
+            "build": { "context": "connectors/tempo", "platforms": ["linux/amd64"] }
+          }
+        }
+      },
+      "lock": {
+        "version": 1,
+        "connectors": {
+          "tempo": {
+            "image": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            "delivery": "local-daemon",
+            "platforms": ["linux/amd64"],
+            "source_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+          }
+        }
+      },
+      "portable": false,
+      "expect": "apply",
+      "resolved": {
+        "tempo": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+      }
+    },
+    {
+      "name": "a_local_daemon_entry_is_refused_where_portability_is_required",
+      "why": "A local image id names nothing a Kubernetes node can pull. Applying it produces an ImagePullBackOff on every node, long after the deploy reported success. The refusal belongs to the cluster path only, which is the sole caller passing portable=true.",
+      "connectors": {
+        "connectors": {
+          "tempo": {
+            "build": { "context": "connectors/tempo", "platforms": ["linux/amd64"] }
+          }
+        }
+      },
+      "lock": {
+        "version": 1,
+        "connectors": {
+          "tempo": {
+            "image": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            "delivery": "local-daemon",
+            "platforms": ["linux/amd64"],
+            "source_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+          }
+        }
+      },
+      "portable": true,
+      "expect": "raise"
+    },
+    {
+      "name": "a_tag_shaped_image_is_refused",
+      "why": "The mutable-tag failure mode ADR 0113 exists to close: a tag can be repointed at a different artifact after review and between tier runs. This is the outcome test for \"the renderer and applier never deploy a mutable connector tag\", and it must refuse even though the reference is otherwise perfectly well formed.",
+      "connectors": {
+        "connectors": {
+          "k8s-write": {
+            "build": {
+              "context": "connectors/k8s-write",
+              "platforms": ["linux/amd64"]
+            }
+          }
+        }
+      },
+      "lock": {
+        "version": 1,
+        "connectors": {
+          "k8s-write": {
+            "image": "ghcr.io/acme-corp/acme-bot-k8s-write-mcp:v1",
+            "delivery": "registry",
+            "platforms": ["linux/amd64"],
+            "source_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+          }
+        }
+      },
+      "portable": true,
+      "expect": "raise"
+    },
+    {
+      "name": "a_truncated_digest_is_refused",
+      "why": "A digest that is the right shape but the wrong length resolves to nothing. Accepting it means the refusal is a substring check for `@sha256:` rather than a check of the digest itself, which a hand edited lock trips immediately.",
+      "connectors": {
+        "connectors": {
+          "k8s-write": {
+            "build": {
+              "context": "connectors/k8s-write",
+              "platforms": ["linux/amd64"]
+            }
+          }
+        }
+      },
+      "lock": {
+        "version": 1,
+        "connectors": {
+          "k8s-write": {
+            "image": "ghcr.io/acme-corp/acme-bot-k8s-write-mcp@sha256:0000",
+            "delivery": "registry",
+            "platforms": ["linux/amd64"],
+            "source_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+          }
+        }
+      },
+      "portable": true,
+      "expect": "raise"
+    },
+    {
+      "name": "an_uppercase_digest_is_refused",
+      "why": "An OCI digest is lowercase hex by specification, and two spellings of one digest would compare unequal everywhere the lock is checked for staleness or matched against a registry manifest.",
+      "connectors": {
+        "connectors": {
+          "k8s-write": {
+            "build": {
+              "context": "connectors/k8s-write",
+              "platforms": ["linux/amd64"]
+            }
+          }
+        }
+      },
+      "lock": {
+        "version": 1,
+        "connectors": {
+          "k8s-write": {
+            "image": "ghcr.io/acme-corp/acme-bot-k8s-write-mcp@sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "delivery": "registry",
+            "platforms": ["linux/amd64"],
+            "source_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+          }
+        }
+      },
+      "portable": true,
+      "expect": "raise"
+    },
+    {
+      "name": "a_bare_digest_is_refused_for_registry_delivery",
+      "why": "A local image id carries no repository, so nothing can pull it. Delivery and image shape must agree or the two fields are decoration.",
+      "connectors": {
+        "connectors": {
+          "k8s-write": {
+            "build": {
+              "context": "connectors/k8s-write",
+              "platforms": ["linux/amd64"]
+            }
+          }
+        }
+      },
+      "lock": {
+        "version": 1,
+        "connectors": {
+          "k8s-write": {
+            "image": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            "delivery": "registry",
+            "platforms": ["linux/amd64"],
+            "source_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+          }
+        }
+      },
+      "portable": true,
+      "expect": "raise"
+    },
+    {
+      "name": "a_declared_build_connector_with_no_lock_entry_is_refused",
+      "why": "Without this the derived spec keeps image None and render_deployment emits `image: null`, which applies as an invalid Deployment and surfaces as an opaque Kubernetes error far from the cause.",
+      "connectors": {
+        "connectors": {
+          "k8s-write": {
+            "build": {
+              "context": "connectors/k8s-write",
+              "platforms": ["linux/amd64"]
+            }
+          },
+          "tempo": {
+            "build": { "context": "connectors/tempo", "platforms": ["linux/amd64"] }
+          }
+        }
+      },
+      "lock": {
+        "version": 1,
+        "connectors": {
+          "k8s-write": {
+            "image": "ghcr.io/acme-corp/acme-bot-k8s-write-mcp@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "delivery": "registry",
+            "platforms": ["linux/amd64"],
+            "source_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+          }
+        }
+      },
+      "portable": true,
+      "expect": "raise"
+    },
+    {
+      "name": "an_image_connector_is_carried_through_untouched",
+      "why": "REGRESSION. apply_lock runs on every version the API renders, including the bundles in the wild that declare no build at all. A lock entry is not required for them and their image must survive byte identical.",
+      "connectors": {
+        "connectors": {
+          "grafana": {
+            "image": "ghcr.io/acme-corp/mcp-grafana:0.17.2",
+            "args": ["-t", "streamable-http", "-disable-write"]
+          }
+        }
+      },
+      "lock": null,
+      "portable": true,
+      "expect": "apply",
+      "resolved": { "grafana": "ghcr.io/acme-corp/mcp-grafana:0.17.2" }
+    },
+    {
+      "name": "a_url_connector_survives_a_lock_that_does_not_mention_it",
+      "why": "REGRESSION for the remote form. A bundle mixing a built connector and a provider owned endpoint must keep the endpoint exactly as declared; only the built one is rewritten.",
+      "connectors": {
+        "connectors": {
+          "internal": { "url": "https://mcp.acme.example.com/mcp" },
+          "tempo": {
+            "build": { "context": "connectors/tempo", "platforms": ["linux/amd64"] }
+          }
+        }
+      },
+      "lock": {
+        "version": 1,
+        "connectors": {
+          "tempo": {
+            "image": "ghcr.io/acme-corp/acme-bot-tempo-mcp@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "delivery": "registry",
+            "platforms": ["linux/amd64"],
+            "source_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+          }
+        }
+      },
+      "portable": true,
+      "expect": "apply",
+      "resolved": {
+        "tempo": "ghcr.io/acme-corp/acme-bot-tempo-mcp@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    {
+      "name": "an_unknown_key_in_a_lock_entry_is_rejected_at_intake",
+      "why": "The deny_unknown_fields proof for the lock. `digest:` is a plausible thing to reach for beside `image:`; silently dropping it means an operator believes they pinned something they did not. Rejected by validate_connector_lock, so a malformed lock never reaches apply_lock.",
+      "connectors": {
+        "connectors": {
+          "tempo": {
+            "build": { "context": "connectors/tempo", "platforms": ["linux/amd64"] }
+          }
+        }
+      },
+      "lock": {
+        "version": 1,
+        "connectors": {
+          "tempo": {
+            "image": "ghcr.io/acme-corp/acme-bot-tempo-mcp@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "delivery": "registry",
+            "platforms": ["linux/amd64"],
+            "source_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+            "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+          }
+        }
+      },
+      "portable": true,
+      "expect": "invalid",
+      "codes": ["connectors.lock_invalid"]
+    },
+    {
+      "name": "an_unknown_delivery_is_rejected_at_intake",
+      "why": "Delivery is control bearing: it decides whether the cluster preflight refuses. An unmodelled value must be refused loudly rather than degraded to a default, the same rule ADR 0036 sets for control bearing enums.",
+      "connectors": {
+        "connectors": {
+          "tempo": {
+            "build": { "context": "connectors/tempo", "platforms": ["linux/amd64"] }
+          }
+        }
+      },
+      "lock": {
+        "version": 1,
+        "connectors": {
+          "tempo": {
+            "image": "ghcr.io/acme-corp/acme-bot-tempo-mcp@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "delivery": "node-import",
+            "platforms": ["linux/amd64"],
+            "source_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+          }
+        }
+      },
+      "portable": true,
+      "expect": "invalid",
+      "codes": ["connectors.lock_invalid"]
+    },
+    {
+      "name": "an_unknown_lock_version_is_rejected_at_intake",
+      "why": "The version field is the only thing that lets a future shape change be refused by an older reader instead of silently misread. A reader that ignores it makes the field decoration.",
+      "connectors": {
+        "connectors": {
+          "tempo": {
+            "build": { "context": "connectors/tempo", "platforms": ["linux/amd64"] }
+          }
+        }
+      },
+      "lock": {
+        "version": 2,
+        "connectors": {
+          "tempo": {
+            "image": "ghcr.io/acme-corp/acme-bot-tempo-mcp@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "delivery": "registry",
+            "platforms": ["linux/amd64"],
+            "source_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+          }
+        }
+      },
+      "portable": true,
+      "expect": "invalid",
+      "codes": ["connectors.lock_unsupported_version"]
+    }
+  ]
+}

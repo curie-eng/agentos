@@ -3,7 +3,7 @@
 #
 # BUILD FROM THE REPO ROOT, not from runner/, because the runner compiles against
 # the frozen workspace packages (packages/aci-protocol, packages/plugin-format)
-# and shared telemetry schema (packages/telemetry-schema):
+# and shared telemetry packages (packages/telemetry and telemetry-schema):
 #
 #   docker build -f runner/Dockerfile -t curie-runner .
 #
@@ -32,7 +32,7 @@ COPY --from=node /usr/local/lib/node_modules /usr/local/lib/node_modules
 RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
     && ln -s /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
     && apt-get update \
-    && apt-get install -y --no-install-recommends curl ca-certificates \
+    && apt-get install -y --no-install-recommends curl ca-certificates git \
     && rm -rf /var/lib/apt/lists/*
 
 # Off-the-shelf MCP servers pre-installed at build time so a bundle that
@@ -45,13 +45,14 @@ RUN npm install -g @modelcontextprotocol/server-github@2025.4.8
 
 WORKDIR /app
 
-# The four source trees the runner needs: the two frozen workspace packages, the
-# shared telemetry schema, and the runner itself. Copied by path so the image is
+# The five source trees the runner needs: the two frozen workspace packages, the
+# shared telemetry implementation and schema, and the runner itself. Copied by path so the image is
 # reproducible from the lockfile above them (root pyproject/uv.lock are the
 # workspace source of truth).
 COPY uv.lock ./uv.lock
 COPY packages/aci-protocol ./packages/aci-protocol
 COPY packages/plugin-format ./packages/plugin-format
+COPY packages/telemetry ./packages/telemetry
 COPY packages/telemetry-schema ./packages/telemetry-schema
 COPY runner ./runner
 
@@ -65,6 +66,7 @@ RUN python3 -m venv /app/.venv \
     && /app/.venv/bin/pip install --no-cache-dir --no-deps \
         ./packages/aci-protocol \
         ./packages/plugin-format \
+        ./packages/telemetry \
         ./packages/telemetry-schema \
     && /app/.venv/bin/pip install --no-cache-dir --no-deps ./runner \
     && python3 runner/export_dependency_pins.py < uv.lock > /tmp/runner-dependency-pins.txt \

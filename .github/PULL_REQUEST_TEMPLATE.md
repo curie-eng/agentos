@@ -8,6 +8,24 @@
 
 Closes #
 
+## Fix pin verification
+
+<!-- Verification is required for declared fixes. For a fix pull request,
+     replace this comment with exactly one selector changed by this pull request:
+Fix pin: <supported selector>
+
+     Supported selector forms:
+     apps/*/tests/*.py::test
+     packages/*/tests/*.py::test
+     cli/tests/name.rs::test
+     charts/curie/ci/name.sh
+
+     The declaration must be present before opening the pull request. If it is
+     added or corrected later, the body edit automatically revalidates the
+     required gate.
+
+     For a non fix pull request, leave this section empty. -->
+
 ## End-to-end verification
 
 <!-- Behavior-bearing changes only. Classify every tier required or n/a with a

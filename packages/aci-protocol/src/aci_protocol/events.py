@@ -192,11 +192,36 @@ class SideEffectFlag(_OutboundBase):
 
     Its presence gates the no-retry-after-side-effects rule (section 2b): a
     failed run carrying this flag escalates to a human instead of retrying.
+
+    It also reports WHAT the call did (ADR-0117). The information was already in
+    hand where the frame is built and was being replaced by a constant ``detail``
+    string, so a consumer could know that something mutated and never what. Every
+    field below is optional with a ``None`` default, which is why carrying them
+    is a patch under ADR-0036: a reader that predates them decodes the frame
+    unchanged.
+
+    One CALL produces two frames -- an opening one when the call is made, so the
+    no-retry rule latches even if the turn dies mid-call, and a closing one
+    carrying what came back. ``call_id`` is what joins them into one record; a
+    turn that calls the same tool twice is otherwise indistinguishable from one
+    that called it once.
     """
 
     type: Literal["side_effect_flag"] = "side_effect_flag"
     tool: str | None = None
     detail: str | None = None
+    # The harness's own id for the call. The join key, not a display value.
+    call_id: str | None = None
+    # What the call was made with, and what it answered. ``result`` is present
+    # only for a structured reply: a connector that answers in prose has none,
+    # deliberately, because guessing structure out of a sentence is how something
+    # downstream restores a guess.
+    arguments: dict[str, Any] | None = None
+    result: dict[str, Any] | None = None
+    # Whether the tool reported failure. ``None`` means unknown (an opening
+    # frame, or a producer that predates this). A record is undoable only on a
+    # successful outcome, so the outcome has to travel with the result.
+    failed: bool | None = None
 
 
 OutboundEvent = Annotated[

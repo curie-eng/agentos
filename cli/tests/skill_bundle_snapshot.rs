@@ -62,6 +62,8 @@ fn recorded_runner(base_url: &str, dir: &Path) -> RunnerState {
         model_base_url: None,
         bundle_digest: None,
         bundle_snapshot_dir: None,
+        connector_containers: Vec::new(),
+        connector_network: None,
     }
 }
 
@@ -109,6 +111,7 @@ fn eval_cases(input: &str) -> String {
 fn skill_message_warns_when_the_editable_bundle_differs_from_the_running_snapshot() {
     let server = serve(
         |request| match (request.method.as_str(), request.path.as_str()) {
+            ("POST", "/v1/reset") => Response::json(200, "{}"),
             ("POST", "/v1/event") => done_turn("snapshot reply"),
             _ => Response::json(404, r#"{"error":"unexpected request"}"#),
         },
@@ -158,6 +161,7 @@ fn skill_message_warns_when_the_editable_bundle_differs_from_the_running_snapsho
 fn skill_message_does_not_warn_when_the_editable_bundle_matches_the_running_snapshot() {
     let server = serve(
         |request| match (request.method.as_str(), request.path.as_str()) {
+            ("POST", "/v1/reset") => Response::json(200, "{}"),
             ("POST", "/v1/event") => done_turn("snapshot reply"),
             _ => Response::json(404, r#"{"error":"unexpected request"}"#),
         },

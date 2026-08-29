@@ -2110,9 +2110,7 @@ mod diff_tests {
 
     #[test]
     fn shipped_curie_yaml_example_plans_for_apply() {
-        let _lock = crate::PROCESS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _lock = crate::PROCESS_ENV_LOCK.blocking_lock();
         let names = ["ANTHROPIC_API_KEY", "SLACK_APP_TOKEN", "SLACK_BOT_TOKEN"];
         let env = CredentialEnvRestore::clear(&names);
         for name in names {
@@ -2274,9 +2272,7 @@ mod diff_tests {
 
     #[test]
     fn every_lenient_desired_map_difference_is_disclosed_as_unknown() {
-        let _lock = crate::PROCESS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _lock = crate::PROCESS_ENV_LOCK.blocking_lock();
         let names = [
             "CURIE_1426_MODEL_CREDENTIAL",
             "CURIE_1426_GITHUB_CREDENTIAL",
@@ -2370,26 +2366,26 @@ mod diff_tests {
 
     #[tokio::test]
     async fn explicit_model_credential_set_survives_the_environment() {
-        let _lock = crate::PROCESS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let env = CredentialEnvRestore::clear(&["CURIE_MODEL_CREDENTIALS"]);
-        env.set(
-            "CURIE_MODEL_CREDENTIALS",
-            "model credential from environment",
-        );
-        let cfg = Installation::parse(concat!(
-            "version: 1\n",
-            "install:\n",
-            "  namespace: acme\n",
-            "  release: acme\n",
-            "credentials:\n",
-            "  model: CURIE_MODEL_CREDENTIALS\n",
-            "set:\n",
-            "  agentSandbox.runner.credentials: model credential from set\n",
-        ))
-        .expect("configuration parses");
-        let local = plan_installation(cfg, true).expect("installation plans");
+        let local = {
+            let _lock = crate::PROCESS_ENV_LOCK.lock().await;
+            let env = CredentialEnvRestore::clear(&["CURIE_MODEL_CREDENTIALS"]);
+            env.set(
+                "CURIE_MODEL_CREDENTIALS",
+                "model credential from environment",
+            );
+            let cfg = Installation::parse(concat!(
+                "version: 1\n",
+                "install:\n",
+                "  namespace: acme\n",
+                "  release: acme\n",
+                "credentials:\n",
+                "  model: CURIE_MODEL_CREDENTIALS\n",
+                "set:\n",
+                "  agentSandbox.runner.credentials: model credential from set\n",
+            ))
+            .expect("configuration parses");
+            plan_installation(cfg, true).expect("installation plans")
+        };
 
         // `Skip`: this fixture's `up.chart` is empty, so a probe would shell out
         // to a real `kubectl` and `helm template ""`.
@@ -2408,9 +2404,7 @@ mod diff_tests {
 
     #[test]
     fn an_unresolved_declared_github_change_never_reports_zero_changes() {
-        let _lock = crate::PROCESS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _lock = crate::PROCESS_ENV_LOCK.blocking_lock();
         let env = CredentialEnvRestore::clear(&["CURIE_1426_GITHUB_CREDENTIAL"]);
         let cfg = Installation::parse(concat!(
             "version: 1\n",

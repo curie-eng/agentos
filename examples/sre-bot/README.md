@@ -16,21 +16,22 @@ What you get back: a one-line verdict first ("Nothing looks broken." / "Yes --
 `api` is throwing 500s"), then the evidence, then a link so you can look
 yourself.
 
-**Out of the box it cannot change anything.** Every shipped tool is
-`readOnlyHint`, and the credential behind them is a ServiceAccount that cannot
-read Secrets and cannot delete anything. There is no write tool, so there is
-nothing to gate, so no approval policy is declared at all -- the safest
-configuration is the absence of configuration.
+**Read-only operation remains the default.** The Kubernetes read connector is
+on. The one write connector and its exact approval gate ship declared together,
+so the tool cannot be enabled without its gate. On a genuinely untouched
+bring-up, `cluster deploy` refuses on the unbuilt `connectors.lock.yaml` before
+it ever reaches the secret check; once built, the still-missing separate
+`K8S_WRITE_KUBECONFIG` refuses just as cleanly before any connector starts,
+instead of silently acquiring write access.
 
-**One write verb ships in the box, switched off.** Enabling it takes a few
-deliberate steps and gives the bot exactly one thing it can change: rolling a
-single named Deployment, behind a human approval card. See
+Completing the deliberate setup gives the bot exactly one thing it can change:
+rolling one allowlisted Deployment behind a human approval card. See
 [Level up: the gated write path](#level-up-the-gated-write-path).
 
 This is the repo's most complete example bundle. It is a real bot, generalised:
-a skill, four connectors (one on, three off), the RBAC to stand it up, a
-purpose-built write connector with its source and tests, deploy targets, and a
-falsifiable eval suite.
+a skill, four declared connectors (Kubernetes read, gated write, Grafana and
+Tempo), the RBAC to stand it up, connector source and tests, deploy targets, and
+a falsifiable eval suite.
 
 ---
 
@@ -81,102 +82,32 @@ code execution across it.
 
 ## Quick deploy
 
-Needs a Kubernetes cluster, `kubectl` pointed at it, and this repo checked out.
-The short version lives in
-[QUICKSTART.md](../../QUICKSTART.md#deploy-your-own-sre-bot); this is the same
-path with the reasoning attached.
-
-**1. Bring up the platform.**
+On a clean Kubernetes cluster, run one command:
 
 ```bash
-export CURIE_CREDENTIALS=sk-ant-...
-curie cluster up --allow-egress-host anthropic --set security.gvisor.mode=off
+curie example sre-bot install --observability
 ```
 
-`--allow-egress-host` opens the model call: the cluster sandbox is fail-closed by
-default, so a credential alone is not enough. Drop
-`--set security.gvisor.mode=off` on a cluster that has `runsc` installed.
-
-**This step is first because it creates the `curie` namespace**, and step 2
-installs a ServiceAccount and a token Secret into it. Run step 2 on a fresh
-cluster and the apply PARTIALLY fails in a way that reads like success: the
-cluster-scoped ClusterRole and ClusterRoleBinding are created and print
-`created`, the two namespaced objects are not, and `kubectl` exits 1.
-
-**2. Create the read-only identity.**
+This installs the bot and its self referential observability stack with no
+values files. With no targeting flags, Curie lands as release `curie` in
+namespace `curie`, and the retained Grafana/Loki/Alloy/Tempo/Prometheus stack
+lands in namespace `observability`. To install beside an existing release, pass
+the same identity the rest of the cluster CLI uses:
 
 ```bash
-kubectl apply -f examples/sre-bot/manifests/read-access.yaml
+curie example sre-bot install --observability \
+  --namespace soak \
+  --release soak \
+  --observability-namespace soak-obs
 ```
 
-Read that file before you apply it -- it explains why it enumerates permissions
-instead of binding the built-in `view` role, and why `configmaps` is in the list
-and `secrets` is not. Then prove it is genuinely read-only:
-
-```bash
-kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-reader list pods -A       # yes
-kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-reader get secrets -A     # NO
-kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-reader delete pods -A     # NO
-kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-reader create pods/exec -A  # NO
-```
-
-**Three `no`s are the passing result.** A `yes` on secrets means the binding
-picked up something broader -- fix the role, not the connector flags.
-
-**3. Assemble the kubeconfig and store it.**
-
-The connector authenticates from a kubeconfig FILE (`secret_files:` in
-`connectors.yaml`), not an env var, so it needs a complete config -- server URL,
-CA, token. Inside the cluster the API server is always reachable at
-`https://kubernetes.default.svc`:
-
-```bash
-kubectl -n curie get secret sre-bot-reader-token \
-  -o jsonpath='{.data.token}' | base64 -d > /tmp/sre-token
-CA=$(kubectl -n curie get secret sre-bot-reader-token -o jsonpath='{.data.ca\.crt}')
-
-cat > /tmp/sre-bot.kubeconfig <<YAML
-apiVersion: v1
-kind: Config
-clusters: [{name: prod, cluster: {server: https://kubernetes.default.svc, certificate-authority-data: $CA}}]
-users: [{name: sre-bot-reader, user: {token: $(cat /tmp/sre-token)}}]
-contexts: [{name: prod, context: {cluster: prod, user: sre-bot-reader}}]
-current-context: prod
-YAML
-
-export K8S_READONLY_KUBECONFIG="$(cat /tmp/sre-bot.kubeconfig)"
-CURIE_CLUSTER_ID="ca:$(kubectl config view --minify --raw -o json | jq -r '.clusters[0].cluster | ((.server // "") + "\\n" + (."certificate-authority-data" // ."certificate-authority" // ""))' | sha256sum | awk '{print $1}')"
-curie secrets set K8S_READONLY_KUBECONFIG --from-env K8S_READONLY_KUBECONFIG \
-  --cluster-identity "$CURIE_CLUSTER_ID" --release curie --namespace curie
-shred -u /tmp/sre-bot.kubeconfig /tmp/sre-token 2>/dev/null || rm -f /tmp/sre-bot.kubeconfig /tmp/sre-token
-```
-
-`curie secrets set` has no stdin form -- `--from-env` is how a multi-line value
-gets in. It writes to Curie's own storage on this machine; the value never
-enters this repository, and it does NOT yet exist in the cluster (step 4 puts it
-there).
-
-Reaching a DIFFERENT cluster from the one Curie runs on? Use that cluster's
-external API endpoint and its CA instead of `kubernetes.default.svc`, and check
-the sandbox egress allowlist can express the route before minting anything.
-
-**4. Deploy the bundle.**
-
-```bash
-curie cluster deploy --plugin-dir examples/sre-bot
-```
-
-This is the step that provisions the secret from step 3 into the namespace.
-Nothing else does -- not `curie secrets set`, and not a git-flow push. **The
-connector CrashLoops with `references non-existent secret key` if you skip it**,
-and the worker logs the reason plainly: `connector credentials are
-operator-supplied and not yet provisioned in this namespace`.
-
-**5. Ask it something.**
-
-```bash
-curie cluster message "Is any pod crashlooping right now?"
-```
+`--namespace` also reads `CURIE_NAMESPACE`. The installer threads those three
+values through every Helm, kubectl, manifest, secret-discovery, connector, and
+deploy step, including the embedded `read-access.yaml` and observability
+service DNS. The installer makes a read only runtime copy of the checked in
+bundle by removing the write connector and its matching approval gate together.
+The declared write path remains in the source bundle for the explicit Level up
+build and deploy flow below.
 
 ---
 
@@ -190,7 +121,7 @@ export SLACK_APP_TOKEN=xapp-...
 export SLACK_BOT_TOKEN=xoxb-...
 curie cluster comms --slack
 
-curie cluster deploy --plugin-dir examples/sre-bot --slack-channel C0EXAMPLE1
+curie example sre-bot install --observability --slack-channel C0EXAMPLE1
 ```
 
 Then invite the bot to the channel and `@mention` it.
@@ -199,26 +130,6 @@ Then invite the bot to the channel and `@mention` it.
 binds nothing and the deploy still reports success -- the bot simply goes silent
 with nothing in any log to explain it. Right-click the channel in Slack -> View
 channel details -> the ID is at the bottom, starting with `C`.
-
-`deploy.yaml` is the better home for that ID once you have more than one
-environment. It declares named targets -- a dev agent in a dev channel, a prod
-agent in a prod channel -- so the routing is a reviewable diff rather than a flag
-somebody typed:
-
-```bash
-curie cluster deploy --plugin-dir examples/sre-bot --target prod
-curie cluster deploy --plugin-dir examples/sre-bot --all-targets
-```
-
-The bundle is IDENTICAL across targets; only the binding differs. That is what
-lets prod promote the exact artifact dev validated.
-
-**[`deploy.yaml`](deploy.yaml) is read only when you pass `--target` or
-`--all-targets`.** A plain `curie cluster deploy --plugin-dir examples/sre-bot`
-ignores it: the agent name comes from `plugin.json` and the binding is the CLI's
-own stub channel. So the documentation IDs shipped in that file are inert on the
-golden path, and you replace them at the point you start naming targets, not
-before.
 
 ---
 
@@ -229,39 +140,47 @@ Every call pauses the turn and posts an approval card, **and the person who
 asked can never be the person who approves** -- the platform blocks
 self-approval.
 
+The connector source declaration and the exact
+`mcp__k8s-write__restart_deployment` gate already ship together. There is no
+connector block to uncomment and no gate snippet to add. The remaining work is
+to scope the identity and allowlist, store the separate credential, then build
+and deploy from the declaration.
+
 Read the four-layer table above before starting, and
 [`manifests/write-role.yaml`](manifests/write-role.yaml) before applying it.
 
-**1. Build and push the connector image.**
+**Prerequisite: both kubeconfigs must be available to a manual `cluster
+deploy`.** `cluster deploy` refuses unless BOTH `K8S_READONLY_KUBECONFIG` and
+`K8S_WRITE_KUBECONFIG` are available -- exported in the environment or stored
+with `curie secrets set` -- the bundle declares both `secret_files` entries
+regardless of which path you're bringing up. This holds even on an
+install where `curie example sre-bot install` already ran: Quick-deploy mints
+the read-only kubeconfig and passes it to its own deploy as a one-off secret
+override, but never persists it to the host vault, so a later manual `cluster
+deploy` still needs `K8S_READONLY_KUBECONFIG` supplied in the environment or
+stored yourself. Apply
+[`manifests/read-access.yaml`](manifests/read-access.yaml) if it isn't already
+applied, then assemble and store `K8S_READONLY_KUBECONFIG` from its
+`sre-bot-reader-token` Secret the same way step 2 below builds the write
+kubeconfig from `sre-bot-writer-token`.
 
-There is no public image on purpose: the allowlist and the credential are yours,
-and so is the artifact. Build multi-arch -- a single-arch image passes CI and
-then fails to pull on a node of the other architecture with "no matching
-manifest", which reads as a registry problem.
-
-```bash
-docker buildx build --platform linux/amd64,linux/arm64 \
-  -t <your-registry>/sre-bot-k8s-write-mcp:v1 --push \
-  examples/sre-bot/connectors/k8s-write
-```
-
-If your registry defaults new packages to private, flip this one to public or
-give the cluster a pull secret. An anonymous pull otherwise 403s and surfaces as
-`ImagePullBackOff`.
-
-**2. Create the write identity.**
+**1. Scope and create the write identity.**
 
 Edit the namespace and the `resourceNames` list in
 [`manifests/write-role.yaml`](manifests/write-role.yaml) first -- one Deployment,
-not a list, unless someone has actually asked for the second one. Then:
+not a list, unless someone has actually asked for the second one. Replace
+`<namespace>/<deployment>` under `K8S_WRITE_ALLOWLIST` in
+[`connectors.yaml`](connectors.yaml) with the same pair. Stating the ceiling in
+two places is deliberate: a ceiling stated once is a ceiling that moves when
+someone edits the other place. Then:
 
 ```bash
 kubectl apply -f examples/sre-bot/manifests/write-role.yaml
 ```
 
-**3. Assemble and store the write kubeconfig.**
+**2. Assemble and store the write kubeconfig.**
 
-Same shape as the read-only one, from the `sre-bot-writer-token` Secret step 2
+Same shape as the read-only one, from the `sre-bot-writer-token` Secret step 1
 minted. This must be a SEPARATE credential -- never the read-only connector's,
 which is deliberately unable to write. Use the namespace you set in
 `write-role.yaml`:
@@ -280,9 +199,7 @@ contexts: [{name: prod, context: {cluster: prod, user: sre-bot-writer}}]
 current-context: prod
 YAML
 )"
-CURIE_CLUSTER_ID="ca:$(kubectl config view --minify --raw -o json | jq -r '.clusters[0].cluster | ((.server // "") + "\\n" + (."certificate-authority-data" // ."certificate-authority" // ""))' | sha256sum | awk '{print $1}')"
-curie secrets set K8S_WRITE_KUBECONFIG --from-env K8S_WRITE_KUBECONFIG \
-  --cluster-identity "$CURIE_CLUSTER_ID" --release curie --namespace curie
+curie secrets set K8S_WRITE_KUBECONFIG --from-env K8S_WRITE_KUBECONFIG
 ```
 
 Prove the ceiling before wiring it up. The second and third must fail:
@@ -296,49 +213,45 @@ kubectl auth can-i --as=system:serviceaccount:"$NS":sre-bot-writer \
   delete deployments -n "$NS"                                 # NO
 ```
 
-**4. Turn the connector on.**
+**The credential comes before bring-up, and that order is load-bearing.** The
+declared `secret_files` entry has no bundled value. On a genuinely untouched
+bring-up -- before `curie build` has ever run -- `cluster deploy` refuses on
+the unbuilt `connectors.lock.yaml` before it reaches the secret check at all.
+Once built (next step) with `K8S_WRITE_KUBECONFIG` still unstored, the bundle
+publishes to the API first and only then does deploy refuse cleanly on the
+missing secret, before any connector object is applied. The writer can never
+fall back to the read-only connector's credential.
 
-Uncomment the `k8s-write:` block in [`connectors.yaml`](connectors.yaml), set
-`image:` to what you pushed, and set `K8S_WRITE_ALLOWLIST` to
-`<namespace>/<deployment>` -- the same pair you put in `resourceNames`. Stating
-the ceiling in two places is deliberate: a ceiling stated once is a ceiling that
-moves when someone edits the other place.
+**3. Build the connector image.**
 
-**5. Declare the approval gate.**
+**Needs a buildx driver that supports multi-platform builds.** The declaration
+builds both `linux/amd64` and `linux/arm64`, and the stock `docker` driver
+refuses that with `Multi-platform build is not supported for the docker
+driver`. Unblock it once with `docker buildx create --driver docker-container
+--use` (or enable the containerd image store).
 
-Add this to `.claude-plugin/plugin.json`. It is not shipped, because bundle
-validation rejects a gate naming an undeclared connector -- so a gate for a
-commented-out connector would fail the build for everyone who never enables it.
-
-```json
-  "approvalPolicy": {
-    "gates": [
-      {
-        "gate": "mcp__k8s-write__restart_deployment",
-        "route": "sre-approvals"
-      }
-    ]
-  }
+```bash
+curie build --plugin-dir examples/sre-bot --registry <registry-reference>
 ```
 
-**THE TOOL NAME IS NOT WHAT THE ERROR MESSAGE TELLS YOU.** It is
-`mcp__k8s-write__restart_deployment`, NOT
-`mcp__plugin_sre-bot_k8s-write__restart_deployment`. Curie connectors are
-platform-supplied servers, named like `mcp__curie__request_approval` with no
-plugin infix; only bundle-loaded MCP servers take the `plugin_<bundle>_` form.
-The deploy error advises the prefixed form. Following it yields a gate that
-validates, deploys, and never fires.
+The declaration builds `connectors/k8s-write` for `linux/amd64` and
+`linux/arm64` and writes its resolved digest to `connectors.lock.yaml`. This one
+command replaces the old manual image build and push ceremony. The exact
+approval gate is already versioned in the plugin manifest. There is no image
+line, connector uncomment, or gate edit in the bring-up path.
 
-**6. Redeploy.**
+**4. Deploy the bundle.**
 
 ```bash
 curie cluster deploy --plugin-dir examples/sre-bot
 ```
 
-**7. Bind the route, or the card has nowhere to post.**
+The deploy renders only the digest from `connectors.lock.yaml`.
+
+**5. Bind the route, or the card has nowhere to post.**
 
 ```bash
-curie cluster approvals sre-bot --route sre-approvals=C0EXAMPLE1
+curie cluster approvals sre-bot --route-resolution sre-approvals=C0EXAMPLE1
 curie cluster approvals sre-bot --list-routes
 ```
 
@@ -346,11 +259,13 @@ An unbound route fails SAFE -- it escalates to a human rather than executing --
 but you will see `approval route 'sre-approvals' is not bound for agent ...;
 escalating rather than routing the card` and no card will appear.
 
-**`--route` and `--gate` are FULL REPLACEMENTS, not additive.** A write replaces
-the whole map, so name every route you want on every invocation. Passing one
+**Route-binding writes and `--gate` are FULL REPLACEMENTS, not additive.** A
+write using `--route-resolution`, `--route-approvers`, or `--routes-from`
+replaces the whole route map, so name every route you want on every invocation.
+Notifications are declared only in the complete `--routes-from` map. Passing one
 route to add it silently drops the others.
 
-**8. Approve one.**
+**6. Request one restart, approve it as a second actor, and verify the rollout.**
 
 In Slack, someone other than the requester clicks the card. Self-approval is
 blocked by the platform, which in a one-person workspace is a dead end for a
@@ -381,6 +296,27 @@ curie cluster approvals sre-bot --resolve <approval-id> --as <someone-else> --ac
 `--as` must not name the requester. Raise `--timeout-secs` further if a human is
 doing the deciding rather than you in the next terminal.
 
+To reject instead, add `--reject`:
+
+```bash
+curie cluster approvals sre-bot --resolve <approval-id> --as <someone-else> \
+  --actor-channel C0EXAMPLE1 --reject
+```
+
+Shell 1's requester gets a no-action reply ("I won't retry it -- no rollout was
+triggered, and the deployment is unchanged") and nothing rolls.
+
+The resumed reply must verify with Kubernetes reads: new pods, their ages, and
+relevant events. A successful write response proves only that the patch was
+accepted. Independently wait for the rollout before calling the exercise done:
+
+```bash
+kubectl rollout status deployment/<deployment> -n "$NS"
+```
+
+Also request a restart for a different Deployment. The connector must reject it
+as outside `K8S_WRITE_ALLOWLIST`; no approval can widen that ceiling.
+
 ### Turning it off in a hurry
 
 **Kill the credential, not the pod.** The RoleBinding is the one thing Curie
@@ -395,9 +331,11 @@ still call it, but the API server refuses every patch with a 403 -- so the
 failure lands where you want it, at the credential, and the connector reports it
 honestly rather than pretending to have rolled something.
 
-Then remove it properly: comment the `k8s-write` block in
-[`connectors.yaml`](connectors.yaml) and redeploy. The connector disappears and
-so does the tool.
+Then remove it properly: remove the `k8s-write` declaration in
+[`connectors.yaml`](connectors.yaml) and its exact gate in
+`.claude-plugin/plugin.json` in the same change, then redeploy. The connector and
+tool disappear, while the bundle stays valid because no gate names an absent
+connector.
 
 ```bash
 curie cluster deploy --plugin-dir examples/sre-bot
@@ -430,37 +368,55 @@ you wanted.
 
 ---
 
-## Optional: Grafana and traces
+## Level up: upgrading itself on request
 
-Both ship commented out in [`connectors.yaml`](connectors.yaml).
+`self-upgrade/cronjob.yaml` already knew how to redeploy this bot from its
+repository. What it could not do was happen because someone asked -- it ran on a
+schedule, so the answer to "upgrade yourself" was "wait until :17".
 
-**Grafana** adds logs, metrics, alerts, on-call schedules, profiles, and the
-ability to run the query behind a dashboard panel. It costs one credential: a
-service account with the **Viewer** role, which is the real read-only
-enforcement -- the `-disable-*` flags are defense in depth.
+The `self-upgrade` connector is the button. One gated tool, `upgrade_self`,
+taking **no arguments**: it creates a Job from that CronJob's template, and the
+approval card goes to the same channel as every other write.
+
+**The bot does not perform the upgrade, and that is the point.** Creating an
+agent version needs the platform API key, and every `/agents/**` route requires
+it. The sandbox holds a per-turn `state`-scoped token and nothing else, so a
+successful prompt injection cannot walk away with a credential. Handing the
+sandbox the platform key to make this feature work would trade that property for
+a convenience. The key stays in the Job; the bot only presses the button and
+reads the Job's name.
+
+**Read [`manifests/upgrade-role.yaml`](manifests/upgrade-role.yaml) before you
+install this.** Its grant is the widest in the bundle: `create` on `jobs` cannot
+be narrowed with `resourceNames`, because a create has no name to match. The
+ceiling is the connector -- one tool, no arguments, posting the named CronJob's
+template verbatim -- not RBAC. That file says so plainly and explains what is
+left.
+
+To install it:
+
+1. Apply `manifests/upgrade-role.yaml` (edit its namespace to the one the Curie
+   release runs in) and store the resulting kubeconfig as
+   `SELF_UPGRADE_KUBECONFIG`.
+2. Install the CronJob it starts, following the header of
+   [`self-upgrade/cronjob.yaml`](self-upgrade/cronjob.yaml). It ships
+   `suspend: true`: the template exists to be started on request. Set
+   `suspend: false` to *also* run it on the schedule -- the two are not
+   exclusive.
+
+Then ask it in Slack. The bot investigates, calls the tool, says it is
+requesting approval, and stops. A human approves; the Job runs; the bot watches
+it with the read-only tools and reports what happened.
+
+**There is no undo.** Putting the previous version back is an operator action
+with the platform API key, and `SKILL.md` tells the agent to say so rather than
+offer a rollback it cannot perform.
+
+**Turning it off in a hurry** works the same way as the write path:
 
 ```bash
-export GRAFANA_TOKEN=glsa_...
-curie secrets set GRAFANA_SERVICE_ACCOUNT_TOKEN --from-env GRAFANA_TOKEN
+kubectl delete rolebinding sre-bot-upgrader -n <namespace>
 ```
-
-Then uncomment the block and set `GRAFANA_URL`. **That is the one line to edit
-per install**, and it cannot be a placeholder: Curie substitutes exactly four
-`${CURIE_*}` names in connector `args`/`env`, all derived from the Service it
-creates, and rejects any other `${...}` at validation. None of them carries
-per-environment configuration, so a second environment must edit that line. A
-platform-side per-target override is the proper fix and does not exist yet.
-
-**Tempo** adds distributed traces. `mcp-grafana` has no tool that speaks Tempo,
-so without this connector the bot can see the datasource and never read a span.
-It needs the Grafana connector on (it reuses the same token, reaching an endpoint
-mcp-grafana has no tool for) and an image you build from
-[`connectors/tempo/`](connectors/tempo/) -- same `docker buildx` shape as the
-write connector.
-
-Three off-the-shelf routes were measured and rejected before this connector was
-written; [`connectors/tempo/server.py`](connectors/tempo/server.py) records what
-each one actually returned, including `run_panel_query` refusing tempo outright.
 
 ---
 
@@ -554,13 +510,30 @@ failure than the one you were fixing.
 
 **`curie cluster message` hangs for the whole timeout, and the worker log says
 `UntrustedSlackEndpointError: refusing to send the Slack bot token to
-http://...`.** A previous `curie cluster comms --slack` recorded a bot token in
-the release, and `cluster up` preserves it across upgrades. `cluster message`
-serves its reply through a per-turn stub on your machine, and the worker will
-not hand a Slack bot token to an endpoint that is not Slack, so it refuses to
-deliver and the CLI waits forever. This is a platform bug rather than anything in
-this bundle, and it bites anyone who tries Slack first and the CLI second. Clear
-the recorded tokens:
+http://...`.** `cluster message` serves its reply through a per-turn stub on
+your machine, and the worker refuses to hand the Slack bot token to *any*
+reply endpoint whose origin is not in `CURIE_SLACK_TRUSTED_ORIGINS` -- it does
+not matter whether a token is even recorded. The guard fires on the endpoint
+origin, not on token presence. Diagnose by reading the origin the worker log
+names and comparing it against the configured list:
+
+```bash
+kubectl -n curie logs deployment/curie-worker --tail=60 | grep UntrustedSlackEndpointError
+kubectl -n curie exec deployment/curie-worker -- printenv CURIE_SLACK_TRUSTED_ORIGINS
+```
+
+The usual cause on a multi-interface box: `cluster message` auto-detects a
+local IP for its stub -- e.g. a Tailscale address -- that isn't in the
+trusted-origins list. Pin the stub to an address that is:
+
+```bash
+curie cluster message --listen-host <ip-in-CURIE_SLACK_TRUSTED_ORIGINS> ...
+```
+
+`curie cluster comms --slack --disconnect` is not a fix for this error -- the
+guard fires purely on the reply endpoint's origin, never on whether a token is
+stale or even present, so disconnecting cannot clear the refusal. It remains
+useful only for removing Slack comms from the install entirely:
 
 ```bash
 curie cluster comms --slack --disconnect
@@ -571,10 +544,15 @@ deployment/curie-worker`, then waits on the rollout), so the running pod picks
 up the cleared tokens. If you cleared them some other way, run that restart by
 hand or the pod keeps serving the stale Secret.
 
+A timed-out turn's entry on the `curie:runs` valkey stream is reclaimed by the
+platform's bounded-delivery/dead-letter backstop -- no manual XACK or other
+stream surgery is needed.
+
 **The bot says it escalated and no approval card appeared.** The route named in
 `approvalPolicy` is not bound for that agent. Bind it with
-`curie cluster approvals <agent> --route <name>=<channel>` and confirm with
-`--list-routes`. This fails safe -- an unbound route escalates, it never executes.
+`curie cluster approvals <agent> --route-resolution <name>=<channel>` and
+confirm with `--list-routes`. This fails safe -- an unbound route escalates, it
+never executes.
 
 **The write fails AFTER a human approved it.** The worst shape: the approval is
 spent, nothing rolled, and the operator's attention is gone. Both instances of
@@ -610,15 +588,20 @@ in the environment section so the bot can say which one it hit.
 
 | Path | What it is |
 |---|---|
-| `.claude-plugin/plugin.json` | Identity, starter prompts. No `approvalPolicy` -- see step 5 above |
+| `.claude-plugin/plugin.json` | Identity, starter prompts, and the exact write approval gate |
 | `skills/sre-bot/SKILL.md` | The persona and answering rules -- **the main thing to edit** |
-| `connectors.yaml` | What the bot needs running; Curie derives the Kubernetes |
+| `connectors.yaml` | Kubernetes read, gated write, Grafana and Tempo declarations |
 | `deploy.yaml` | Named deploy targets: which agent, which environment, which channel |
 | `evals/cases.json` | The falsifiable test suite / promotion gate |
 | `manifests/read-access.yaml` | The read-only ServiceAccount, ClusterRole and token |
-| `manifests/write-role.yaml` | The write identity, for the optional write path |
+| `manifests/write-role.yaml` | The write identity, for the gated write path |
+| `manifests/scale-role.yaml` | The scale identity, scoped to the `deployments/scale` subresource |
+| `manifests/upgrade-role.yaml` | The upgrade identity -- **the widest grant here; read it first** |
 | `connectors/k8s-write/` | Source, Dockerfile and tests for the one-tool write connector |
+| `connectors/k8s-scale/` | Source, Dockerfile and tests for the one-tool scale connector |
+| `connectors/self-upgrade/` | Source, Dockerfile and tests for the one-tool upgrade connector |
 | `connectors/tempo/` | Source, Dockerfile and tests for the traces connector |
+| `self-upgrade/` | The Job that redeploys this bot, and the CronJob template it runs from |
 
 To change how the bot *behaves*, edit `SKILL.md`. To change what it can *reach*,
 edit `connectors.yaml`.

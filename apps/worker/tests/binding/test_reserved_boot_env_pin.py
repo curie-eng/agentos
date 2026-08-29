@@ -1,6 +1,6 @@
 """Completeness + cross-language drift pin for the reserved boot-env policy (#457).
 
-Three guards, all checked at import time (no Postgres, no fixtures):
+Four guards, all checked at import time (no Postgres, no fixtures):
 
 (a) Every credential-key literal the runner's ``sdk_auth`` owns is caught by
     ``is_reserved_boot_env_name``. If a new model credential is added to
@@ -20,6 +20,12 @@ Three guards, all checked at import time (no Postgres, no fixtures):
     ``curie.reservedConnectorSecretNames`` define MUST list exactly the
     non-``CURIE_`` members of ``RESERVED_BOOT_ENV`` (the prefix rule covers
     ``CURIE_*`` on both sides). Fails CI if the two lists drift.
+(d) The same parity for the CLI's Rust copy
+    (``cli/src/connector_build.rs``'s ``RESERVED_CONNECTOR_SECRET_NAMES``). It
+    is a third language for the same reason Helm is a second: the skill and
+    local tiers resolve a connector's declared secret from the operator's
+    environment or vault before any Python sees the bundle, so the refusal has
+    to exist client-side.
 """
 
 from __future__ import annotations
@@ -176,3 +182,34 @@ def _reserved_names_from_helpers() -> set[str]:
 def test_helm_reserved_list_matches_non_prefixed_members() -> None:
     expected = {n for n in RESERVED_BOOT_ENV if not n.startswith("CURIE_")}
     assert _reserved_names_from_helpers() == expected
+
+
+# --- (d) Rust cross-language drift gate --------------------------------------
+
+# The CLI's copy, and the second unavoidable one (Rust cannot import Python
+# either). It exists because the skill and local tiers resolve a connector's
+# declared secret from the operator's own environment or vault BEFORE any
+# Python validates the bundle, so the client has to refuse a reserved name on
+# its own. Same rule as the Helm gate: list parity on the non-``CURIE_``
+# members, with the prefix rule covering ``CURIE_*`` on both sides.
+_CONNECTOR_BUILD_RS = Path(__file__).resolve().parents[4] / "cli" / "src" / "connector_build.rs"
+
+
+def _reserved_names_from_rust() -> set[str]:
+    text = _CONNECTOR_BUILD_RS.read_text(encoding="utf-8")
+    match = re.search(
+        r"RESERVED_CONNECTOR_SECRET_NAMES[^=]*=\s*\[(?P<body>.*?)\]",
+        text,
+        re.DOTALL,
+    )
+    assert match, (
+        "no `RESERVED_CONNECTOR_SECRET_NAMES` array found in "
+        f"{_CONNECTOR_BUILD_RS} -- the Rust reserved-name drift gate has no source"
+    )
+    tokens = set(_ENV_NAME_RE.findall(match.group("body")))
+    return {t for t in tokens if not t.startswith("CURIE_")}
+
+
+def test_rust_reserved_list_matches_non_prefixed_members() -> None:
+    expected = {n for n in RESERVED_BOOT_ENV if not n.startswith("CURIE_")}
+    assert _reserved_names_from_rust() == expected

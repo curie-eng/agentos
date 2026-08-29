@@ -4,6 +4,10 @@ Date: 2026-08-04
 
 Status: Draft
 
+Partially superseded by [ADR-0111](0111-the-default-memory-compaction-algorithm.md)
+for the incremental compaction mechanism only. This ADR remains current for
+durable storage and session injection.
+
 Supersedes [ADR-0025](0025-memory-port-and-first-loader.md) (the per-agent
 memory port and first loader) **upon acceptance**: agent memory becomes one
 tier of the lifecycle defined here rather than a separate system, and
@@ -19,6 +23,13 @@ new event kind), whose `source` field and placeholder-less output path this
 lifecycle builds on. Distinct from [ADR-0030](0030-proactive-within-episode-memory-agent.md)
 (within-episode memory), which addresses behavioral decay inside one run; this
 ADR addresses context continuity across runs.
+
+## Narrowing recorded 2026 08 17
+
+The 2026 08 17 architecture review narrowed this ADR to durable storage and
+session injection. [ADR-0111](0111-the-default-memory-compaction-algorithm.md)
+supersedes the incremental compaction mechanism described below. The storage
+and injection decisions in this ADR remain current.
 
 ## Context
 
@@ -298,6 +309,9 @@ The lifecycle is a hybrid, matching the convergent industry pattern:
   session the moment they land. Every write passes the budget gate above.
   The channel tier is the default destination; the agent tier is for lessons
   that should travel across channels.
+- **Supersession note.** [ADR-0111](0111-the-default-memory-compaction-algorithm.md)
+  supersedes the incremental compaction mechanism described in the following
+  historical paragraph.
 - **Compaction is a scheduled background turn, not new infrastructure.** An
   API-side scheduler loop (the expiry sweeper's wait-first template,
   including its multi-replica single-writer guard so two API replicas cannot

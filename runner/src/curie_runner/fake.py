@@ -9,6 +9,7 @@ spawns the CLI or touches the network. ``aci-protocol`` is never mocked.
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import AsyncIterator, Callable
 from typing import Any
@@ -17,7 +18,9 @@ from claude_agent_sdk import (
     AssistantMessage,
     ResultMessage,
     TextBlock,
+    ToolResultBlock,
     ToolUseBlock,
+    UserMessage,
 )
 from claude_agent_sdk.types import CanUseTool, PermissionResultDeny, ToolPermissionContext
 
@@ -47,14 +50,76 @@ def _result(
     )
 
 
+def _tool_result(tool_use_id: str, content: Any, *, is_error: bool = False) -> UserMessage:
+    """A tool's answer, on the message the SDK actually delivers it on.
+
+    Tool results arrive on a ``UserMessage``, not on the assistant turn, which is
+    why forwarding them is a separate branch in translation. A fake that skips
+    this message leaves that branch unreachable offline.
+    """
+
+    return UserMessage(
+        content=[ToolResultBlock(tool_use_id=tool_use_id, content=content, is_error=is_error)]
+    )
+
+
 def default_turn() -> list[Any]:
-    """A representative successful turn: text, a side-effecting tool, then done."""
+    """A representative successful turn: text, a side-effecting tool, then done.
+
+    The tool answers in prose, because ``echo hi`` has nothing else to say. That
+    is the honest default and it is also the not-undoable path: no structured
+    reply means no prior state, so a recorded action reports that it cannot be
+    put back rather than claiming it can.
+    """
 
     return [
         _assistant(TextBlock(text="Looking into it")),
         _assistant(ToolUseBlock(id="t1", name="Bash", input={"command": "echo hi"})),
+        _tool_result("t1", "hi\n"),
         _assistant(TextBlock(text="all done"), usage={"input_tokens": 20, "output_tokens": 8}),
         _result(text="all done", usage={"input_tokens": 20, "output_tokens": 8}),
+    ]
+
+
+# The other half of a write connector's contract: a reply that reports what it
+# read and what it left, so an offline run can exercise a reversible action end
+# to end (ADR-0117). Selected by marker like the approval turn below, because the
+# default turn's honest answer is prose and both paths need to exist offline.
+REVERSIBLE_MARKER = "[fake:reversible-tool]"
+
+_REVERSIBLE_REPLY = {
+    "ok": True,
+    "summary": "scaled public/api from 3 to 10",
+    # What a restore puts back, and what it is checked against. Not
+    # interchangeable: comparing the live resource to ``prior`` would refuse
+    # every safe undo and permit the one that is not.
+    "prior": {"spec": {"replicas": 3}},
+    "post": {"spec": {"replicas": 10}},
+    "target": {"kind": "Deployment", "namespace": "public", "name": "api"},
+}
+
+
+def reversible_turn() -> list[Any]:
+    """A turn whose side-effecting call reports a state that can be restored."""
+
+    return [
+        _assistant(TextBlock(text="Scaling it")),
+        _assistant(
+            ToolUseBlock(
+                id="t1",
+                name="scale_deployment",
+                input={"namespace": "public", "name": "api", "replicas": 10},
+            )
+        ),
+        _tool_result("t1", json.dumps(_REVERSIBLE_REPLY)),
+        _assistant(
+            TextBlock(text="scaled public/api from 3 to 10"),
+            usage={"input_tokens": 20, "output_tokens": 8},
+        ),
+        _result(
+            text="scaled public/api from 3 to 10",
+            usage={"input_tokens": 20, "output_tokens": 8},
+        ),
     ]
 
 
@@ -153,6 +218,8 @@ class FakeModelSession:
         if match:
             summary = last[match.end() :].strip() or "unspecified request"
             return approval_turn(summary, route=match.group(1))
+        if REVERSIBLE_MARKER in last:
+            return reversible_turn()
         return default_turn()
 
     async def connect(self) -> None:

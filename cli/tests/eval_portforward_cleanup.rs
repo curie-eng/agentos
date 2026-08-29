@@ -90,7 +90,8 @@ fn wait_until_dead(pid: u32) {
 async fn run_red_eval_child() {
     let kubectl = PathBuf::from(std::env::var(KUBECTL_FLAG).expect("child kubectl path"));
     let meta = PathBuf::from(std::env::var(META_FLAG).expect("child meta path"));
-    let mut cmd = port_forward_command("acme-system", "acme-release", "valkey", 0, 6379);
+    let fullname = curie::ops::chart_fullname("acme-release");
+    let mut cmd = port_forward_command("acme-system", &fullname, "valkey", 0, 6379);
     cmd.program = kubectl.to_string_lossy().into_owned();
     let (child, port) = start_port_forward(&cmd, 0, "valkey")
         .await

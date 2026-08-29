@@ -41,7 +41,15 @@ class StubBinding:
     async def resolve(self, kind: str, address: str) -> ResolvedDeployment | None:
         return self._by_route.get((kind, address))
 
-    def boot_env(self, resolved: ResolvedDeployment, thread_key: str) -> dict[str, str]:
+    def boot_env(
+        self,
+        resolved: ResolvedDeployment,
+        thread_key: str,
+        *,
+        kind: str | None = None,
+        address: str | None = None,
+        isolate_memory: bool = False,
+    ) -> dict[str, str]:
         env = {
             BUDGET_ENV: '{"max_output_tokens_per_run":100000,"max_usd_per_day":10.0}',
             PLUGIN_DIR_ENV: "/bundles/current",
@@ -63,10 +71,24 @@ class RealBootEnvBinding(StubBinding):
     enqueue -> claim path without touching sacred ``kernel.py``.
     """
 
-    def boot_env(self, resolved: ResolvedDeployment, thread_key: str) -> dict[str, str]:
+    def boot_env(
+        self,
+        resolved: ResolvedDeployment,
+        thread_key: str,
+        *,
+        kind: str | None = None,
+        address: str | None = None,
+        isolate_memory: bool = False,
+    ) -> dict[str, str]:
         resolver = BindingResolver.__new__(BindingResolver)
         resolver._config = WorkerConfig()
-        return resolver.boot_env(resolved, thread_key)
+        return resolver.boot_env(
+            resolved,
+            thread_key,
+            kind=kind,
+            address=address,
+            isolate_memory=isolate_memory,
+        )
 
 
 def _resolved(agent_id: uuid.UUID, *, bundle: str | None = "bundles/x.zip") -> ResolvedDeployment:

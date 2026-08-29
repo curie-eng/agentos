@@ -110,6 +110,59 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # and consumed by ``build_reply_sink``. It is an egress-trust decision
         # made on the worker; nothing about it reaches a sandbox.
         "CURIE_SLACK_TRUSTED_ORIGINS",
+        # Managed-workspace operator settings, read from the WORKER's env by
+        # WorkerConfig and consumed by WorkspacePreparer, WorkspaceObjectStore,
+        # and the internal credential client. They govern worker-side clone,
+        # archive, upload, and capability-minting policy; none is runner boot
+        # configuration.
+        "CURIE_INTERNAL_WORKER_TOKEN",
+        "CURIE_WORKSPACE_ENABLED",
+        "CURIE_WORKSPACE_BUCKET",
+        "CURIE_WORKSPACE_OBJECT_PREFIX",
+        "CURIE_WORKSPACE_SCRATCH_ROOT",
+        "CURIE_WORKSPACE_CLONE_TIMEOUT_SECONDS",
+        "CURIE_WORKSPACE_ARCHIVE_TIMEOUT_SECONDS",
+        "CURIE_WORKSPACE_UPLOAD_TIMEOUT_SECONDS",
+        "CURIE_WORKSPACE_TOTAL_TIMEOUT_SECONDS",
+        "CURIE_WORKSPACE_MAX_CHECKOUT_BYTES",
+        "CURIE_WORKSPACE_MAX_ARCHIVE_BYTES",
+        "CURIE_WORKSPACE_MAX_MEMBERS",
+        "CURIE_WORKSPACE_MAX_COMPRESSION_RATIO",
+        "CURIE_WORKSPACE_REFERENCE_TTL_SECONDS",
+        "CURIE_WORKSPACE_MAX_CONCURRENT_CLONES",
+        # WorkspaceClaimCoordinator injects these exact-object handoff values
+        # into a claim for the workspace-init container
+        # to consume. They are substrate-local delivery inputs, not fields read
+        # by the sandbox runner and therefore not part of frozen BootEnv.
+        "CURIE_WORKSPACE_REF",
+        "CURIE_WORKSPACE_SHA256",
+        # Publication-Job operator settings, read from the WORKER's env by
+        # WorkerConfig and consumed by PublicationReconcileLoop and its
+        # Kubernetes Job builder. They configure the platform-side publisher,
+        # never a runner sandbox boot.
+        "CURIE_PUBLICATION_ENABLED",
+        "CURIE_PUBLICATION_NAMESPACE",
+        "CURIE_PUBLICATION_PATCH_MAX_BYTES",
+        "CURIE_PUBLICATION_RESULT_MAX_ATTEMPTS",
+        "CURIE_PUBLICATION_RECONCILE_MAX_ATTEMPTS",
+        "CURIE_PUBLICATION_JOB_ACTIVE_DEADLINE_SECONDS",
+        "CURIE_PUBLICATION_GIT_COMMAND_TIMEOUT_SECONDS",
+        "CURIE_PUBLICATION_GITHUB_API_URL",
+        "CURIE_PUBLICATION_RECONCILE_INTERVAL_SECONDS",
+        "CURIE_PUBLICATION_LEASE_SECONDS",
+        "CURIE_PUBLICATION_IMAGE_PULL_POLICY",
+        "CURIE_PUBLICATION_IMAGE_PULL_SECRETS",
+        "CURIE_PUBLICATION_PRIORITY_CLASS_NAME",
+        "CURIE_PUBLICATION_SERVICE_ACCOUNT_NAME",
+        "CURIE_PUBLICATION_OWNER_NAME",
+        "CURIE_PUBLICATION_GIT_USER_NAME",
+        "CURIE_PUBLICATION_GIT_USER_EMAIL",
+        "CURIE_PUBLICATION_CPU_REQUEST",
+        "CURIE_PUBLICATION_CPU_LIMIT",
+        "CURIE_PUBLICATION_MEMORY_REQUEST",
+        "CURIE_PUBLICATION_MEMORY_LIMIT",
+        "CURIE_PUBLICATION_EPHEMERAL_REQUEST",
+        "CURIE_PUBLICATION_EPHEMERAL_LIMIT",
         # The Slack shimmer caption. Read from the WORKER's env since #1312 moved
         # the whole shimmer to this side; it reaches Slack, never a sandbox.
         "CURIE_STATUS_TEXT",
@@ -191,6 +244,13 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_RUNNER_NO_NEW_PRIVILEGES",
         "CURIE_RUNNER_MEMORY_LIMIT",
         "CURIE_RUNNER_CPU_LIMIT",
+        # Standard signal-specific OTel variables are operator-owned process
+        # configuration read directly by the SDK exporter. They are not boot
+        # keys injected by the worker; the three general fallback keys above
+        # remain derived from BootEnv.
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+        "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
         # runner-local false-completion knob; read by the runner from its own env,
         # not a boot contract key.
         "CURIE_FALSE_COMPLETION_CHECK",
@@ -198,6 +258,48 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # its own env to pick the active harness, unset selects the built-in
         # Claude. Not a boot contract key.
         "CURIE_HARNESS",
+        # Delivery budget and ownership lease (ADR-0131, #1971), read from the
+        # WORKER's env by WorkerConfig. Never a sandbox boot key: they govern
+        # how the worker paces and reclaims its own delivery loop, not
+        # anything injected into a runner claim.
+        # - CURIE_DELIVERY_BUDGET_S: the overall wall-clock deadline for one
+        #   delivery (claim, every runner request, retries, reclaim, cleanup).
+        # - CURIE_DELIVERY_LEASE_TTL_S: how long the fenced ownership lease on
+        #   an in-flight delivery is valid before it is reclaimable.
+        # - CURIE_DELIVERY_LEASE_HEARTBEAT_S: how often the owner renews that
+        #   lease while the delivery is still healthy.
+        # - CURIE_DELIVERY_SHUTDOWN_RESERVE_S: time reserved near the budget's
+        #   end for terminal cleanup instead of another runner attempt.
+        # - CURIE_RECLAIM_INTERVAL_S: the maintenance-tick cadence that scans
+        #   for expired leases to reclaim; same reclaim family as
+        #   CURIE_RECLAIM_MIN_IDLE_MS in the code above, worker-side policy
+        #   decided before any sandbox exists.
+        "CURIE_DELIVERY_BUDGET_S",
+        "CURIE_DELIVERY_LEASE_TTL_S",
+        "CURIE_DELIVERY_LEASE_HEARTBEAT_S",
+        "CURIE_DELIVERY_SHUTDOWN_RESERVE_S",
+        "CURIE_RECLAIM_INTERVAL_S",
+        # The platform's voluntary termination grace (ADR-0131, #1971),
+        # injected by the chart from the SAME value it renders onto the Pod's
+        # ``terminationGracePeriodSeconds`` so the worker's own shutdown
+        # validator and the platform can never drift apart. Read from the
+        # WORKER's env by WorkerConfig; the sandbox never sees it.
+        "CURIE_TERMINATION_GRACE_PERIOD_S",
+        # The pre-upgrade drain gate (issue #2010), read from the env of the
+        # WORKER IMAGE by WorkerConfig -- both by every worker replica (which
+        # only ever reads the quiesce flag) and by the chart's pre-upgrade and
+        # post-upgrade hook Jobs, which run `python -m curie_worker.upgrade_drain`
+        # out of that same image. Nothing here is injected into a runner claim,
+        # and the gate runs before any sandbox for this release exists.
+        # - CURIE_UPGRADE_DRAIN_TIMEOUT_S: how long the gate waits for accepted
+        #   in-flight deliveries to settle before it refuses the upgrade.
+        # - CURIE_UPGRADE_DRAIN_POLL_INTERVAL_S: how often it re-reads the
+        #   in-flight set while waiting.
+        # - CURIE_UPGRADE_QUIESCE_TTL_S: lifetime of the fleet-wide quiesce
+        #   flag, which must outlast that wait and must never be permanent.
+        "CURIE_UPGRADE_DRAIN_TIMEOUT_S",
+        "CURIE_UPGRADE_DRAIN_POLL_INTERVAL_S",
+        "CURIE_UPGRADE_QUIESCE_TTL_S",
     }
 )
 

@@ -168,6 +168,7 @@ exit 64
             .env("CURIE_TEST_UPGRADE_LOG", &self.upgrade_log)
             .env("CURIE_TEST_EXISTING_VALUES", &self.existing_values)
             .env("CURIE_TEST_PROVIDER_EGRESS_JSON", resolver)
+            .env("CURIE_CONFIG_DIR", self._temp.path().join("config"))
             .env_remove("CURIE_CREDENTIALS")
             .env_remove("CURIE_MODEL_CREDENTIALS")
             .env_remove("CURIE_GITHUB_TOKEN")

@@ -38,11 +38,13 @@ the substrate's resume path retires the paused container and claims a fresh one.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import shutil
 import subprocess
+import tarfile
 import tempfile
 import urllib.error
 import urllib.request
@@ -66,6 +68,15 @@ from ..binding import (
     PLUGIN_DIR_ENV,
 )
 from ..bundle_store import BundleReader, extract_bundle
+from ..workspace import (
+    WORKSPACE_MOUNT_PATH,
+    WORKSPACE_REF_ENV,
+    WORKSPACE_SHA256_ENV,
+    WorkspaceLimits,
+    WorkspacePreparationError,
+    WorkspaceRef,
+    validate_workspace_archive,
+)
 from .types import (
     MANAGED_BY_LABEL,
     MANAGED_BY_VALUE,
@@ -73,6 +84,7 @@ from .types import (
     OperatingMode,
     SandboxError,
     SandboxView,
+    filter_agent_child_env,
 )
 
 logger = logging.getLogger(__name__)
@@ -111,9 +123,7 @@ _OAUTH_TOKEN_PREFIX = "sk-ant-oat"
 # explicitly, the bundle ref named a RustFS object the worker already fetched
 # (the runner never fetches), and the credential is forwarded by name (never as
 # a value in the argv).
-_WORKER_OWNED_ENV = frozenset(
-    {BUNDLE_REF_ENV, PLUGIN_DIR_ENV, "CURIE_SANDBOX_ID", CREDENTIALS_ENV}
-)
+_WORKER_OWNED_ENV = frozenset({BUNDLE_REF_ENV, PLUGIN_DIR_ENV, "CURIE_SANDBOX_ID", CREDENTIALS_ENV})
 
 
 def _parse_created(raw: str) -> datetime | None:
@@ -263,6 +273,7 @@ class DockerSandboxClient:
         bundle_max_uncompressed_bytes: int = DEFAULT_MAX_UNCOMPRESSED_BYTES,
         bundle_max_compression_ratio: float = DEFAULT_MAX_COMPRESSION_RATIO,
         bundle_max_members: int = DEFAULT_MAX_MEMBERS,
+        workspace_limits: WorkspaceLimits | None = None,
     ) -> None:
         self._image = image
         self._bundles = bundle_store
@@ -287,6 +298,8 @@ class DockerSandboxClient:
         self._environ = environ if environ is not None else os.environ
         # Per-container host dir holding the extracted bundle, cleaned on delete.
         self._bundle_dirs: dict[str, str] = {}
+        self._workspace_dirs: dict[str, str] = {}
+        self._workspace_limits = workspace_limits or WorkspaceLimits()
 
     # -- claim lifecycle ------------------------------------------------------
 
@@ -298,7 +311,7 @@ class DockerSandboxClient:
         env: dict[str, str] | None = None,
         labels: dict[str, str] | None = None,
     ) -> None:
-        env = dict(env or {})
+        env = filter_agent_child_env(env)
         plugin_dir = env.get(PLUGIN_DIR_ENV, self._default_plugin_dir)
         args = [
             "run",
@@ -328,6 +341,17 @@ class DockerSandboxClient:
         if env.get(BUNDLE_REF_ENV):
             root = self._prepare_bundle(name, env[BUNDLE_REF_ENV])
             args += ["-v", f"{root}:{plugin_dir}:ro"]
+        if env.get(WORKSPACE_REF_ENV):
+            try:
+                root = self._prepare_workspace(
+                    name,
+                    env[WORKSPACE_REF_ENV],
+                    env.get(WORKSPACE_SHA256_ENV, ""),
+                )
+            except Exception:
+                self._cleanup_bundle(name)
+                raise
+            args += ["-v", f"{root}:{WORKSPACE_MOUNT_PATH}:rw"]
 
         args += [
             "-e",
@@ -375,9 +399,7 @@ class DockerSandboxClient:
         if not fake_model:
             byo = self._environ.get(CREDENTIALS_ENV)
             drop_oauth_byo = (
-                base_url_override
-                and byo is not None
-                and byo.startswith(_OAUTH_TOKEN_PREFIX)
+                base_url_override and byo is not None and byo.startswith(_OAUTH_TOKEN_PREFIX)
             )
             if byo and not drop_oauth_byo:
                 args += ["-e", CREDENTIALS_ENV]
@@ -390,8 +412,9 @@ class DockerSandboxClient:
         try:
             self._docker(args)
         except DockerError:
-            # A failed boot must not leak the bundle dir we just staged.
+            # A failed boot must not leak staged claim data.
             self._cleanup_bundle(name)
+            self._cleanup_workspace(name)
             raise
 
     def get_claim(self, name: str) -> ClaimView | None:
@@ -419,6 +442,7 @@ class DockerSandboxClient:
         # -f removes a running/paused container too; ignore "no such container".
         self._docker(["rm", "-f", name], check=False)
         self._cleanup_bundle(name)
+        self._cleanup_workspace(name)
 
     def list_claims(self, *, label_selector: str) -> list[ClaimView]:
         out = self._docker(
@@ -506,6 +530,72 @@ class DockerSandboxClient:
 
     def _cleanup_bundle(self, name: str) -> None:
         tmp = self._bundle_dirs.pop(name, None)
+        if tmp is not None:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def _prepare_workspace(self, name: str, encoded_ref: str, expected_sha256: str) -> str:
+        """Fetch one signed object, verify it, and safely materialize /workspace."""
+
+        reference = WorkspaceRef.decode(encoded_ref)
+        if reference.expires_in_seconds <= 0:
+            raise WorkspacePreparationError("workspace-fetch", "workspace reference expired")
+        if expected_sha256 != reference.sha256:
+            raise WorkspacePreparationError(
+                "workspace-fetch", "claim digest disagrees with signed workspace reference"
+            )
+        tmp = tempfile.mkdtemp(prefix="curie-workspace-")
+        archive_path = Path(tmp) / ".workspace-archive"
+        root = Path(tmp) / "checkout"
+        root.mkdir(mode=0o700)
+        digest = hashlib.sha256()
+        total = 0
+        request = urllib.request.Request(reference.url, method="GET")
+        try:
+            with (
+                urllib.request.urlopen(
+                    request, timeout=self._workspace_limits.clone_timeout_seconds
+                ) as response,
+                archive_path.open("wb") as output,
+            ):
+                while chunk := response.read(1024 * 1024):
+                    total += len(chunk)
+                    if total > self._workspace_limits.max_archive_bytes:
+                        raise WorkspacePreparationError(
+                            "workspace-fetch", "workspace archive exceeds compressed-size limit"
+                        )
+                    digest.update(chunk)
+                    output.write(chunk)
+            if digest.hexdigest() != reference.sha256:
+                raise WorkspacePreparationError(
+                    "workspace-fetch", "workspace archive digest mismatch"
+                )
+            with archive_path.open("rb") as source:
+                validate_workspace_archive(
+                    iter(lambda: source.read(1024 * 1024), b""),
+                    limits=self._workspace_limits,
+                )
+            with tarfile.open(archive_path, mode="r:*") as archive:
+                archive.extractall(root, filter="data")
+            archive_path.unlink(missing_ok=True)
+
+            # Local Docker may run under a host uid different from the runner's
+            # fixed uid 1000. The workspace is deliberately writable, so make
+            # the bind mount writable independent of that host uid.
+            os.chmod(root, 0o777)
+            for dirpath, dirnames, filenames in os.walk(root):
+                for dirname in dirnames:
+                    os.chmod(os.path.join(dirpath, dirname), 0o777)
+                for filename in filenames:
+                    path = os.path.join(dirpath, filename)
+                    os.chmod(path, os.stat(path).st_mode | 0o666)
+        except Exception:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise
+        self._workspace_dirs[name] = tmp
+        return str(root)
+
+    def _cleanup_workspace(self, name: str) -> None:
+        tmp = self._workspace_dirs.pop(name, None)
         if tmp is not None:
             shutil.rmtree(tmp, ignore_errors=True)
 

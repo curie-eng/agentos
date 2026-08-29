@@ -1,7 +1,9 @@
+import json
+import shutil
 from pathlib import Path
 
 import pytest
-from plugin_format import validate_bundle
+from plugin_format import TOOL_POLICY_ENFORCEMENT, validate_bundle, validate_pattern
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -839,3 +841,869 @@ def test_gate_check_stays_silent_when_connectors_yaml_is_unreadable(tmp_path: Pa
     codes = _codes(bundle)
     assert "connectors.unreadable" in codes
     assert _GATE_CODE not in codes
+
+
+# --------------------------------------------------------------------------- #
+# Bundle intake for a source-built connector -- ADR 0113
+#
+# `validate_bundle` is the ONE gate a bundle passes through whatever entry point
+# it arrives by (apps/api/CLAUDE.md): the CLI upload, the console's create-agent
+# modal, and the git push path all route through it. That is why these rules
+# live here rather than in the API router, and why every assertion below goes
+# through `validate_bundle` rather than through the lock model directly.
+# --------------------------------------------------------------------------- #
+_REGISTRY_IMAGE = (
+    "ghcr.io/acme-corp/acme-bot-k8s-write-mcp@sha256:"
+    "0000000000000000000000000000000000000000000000000000000000000000"
+)
+_LOCAL_IMAGE = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+
+_BUILT_CONNECTORS = (
+    "connectors:\n"
+    "  k8s-write:\n"
+    "    build:\n"
+    "      context: connectors/k8s-write\n"
+    "      platforms: [linux/amd64, linux/arm64]\n"
+)
+
+
+def _built_bundle(tmp_path: Path, connectors_yaml: str = _BUILT_CONNECTORS) -> Path:
+    """A minimal bundle whose only connector is declared as source."""
+
+    root = _bundle(
+        tmp_path, '{"name": "acme-bot", "version": "0.1.0", "description": "t"}'
+    )
+    (root / "skills" / "acme-bot").mkdir(parents=True, exist_ok=True)
+    (root / "skills" / "acme-bot" / "SKILL.md").write_text(
+        "---\nname: acme-bot\ndescription: t\n---\nhi\n", encoding="utf-8"
+    )
+    (root / "connectors.yaml").write_text(connectors_yaml, encoding="utf-8")
+    context = root / "connectors" / "k8s-write"
+    context.mkdir(parents=True, exist_ok=True)
+    (context / "Dockerfile").write_text(
+        "FROM scratch\nCOPY server.py /server.py\n", encoding="utf-8"
+    )
+    (context / "server.py").write_text("print('acme')\n", encoding="utf-8")
+    return root
+
+
+def _write_lock(
+    root: Path,
+    *,
+    image: str = _REGISTRY_IMAGE,
+    delivery: str = "registry",
+    source_digest: str | None = None,
+) -> None:
+    """Write a well-formed lock for the bundle's one built connector."""
+
+    from plugin_format import connector_lock
+    from plugin_format.connectors import ConnectorBuild
+
+    build = ConnectorBuild.model_validate(
+        {"context": "connectors/k8s-write", "platforms": ["linux/amd64", "linux/arm64"]}
+    )
+    digest = source_digest or connector_lock.source_digest_of(
+        root / "connectors" / "k8s-write", build
+    )
+    (root / connector_lock.CONNECTOR_LOCK_FILE).write_text(
+        "version: 1\n"
+        "connectors:\n"
+        "  k8s-write:\n"
+        f"    image: {image}\n"
+        f"    delivery: {delivery}\n"
+        "    platforms: [linux/amd64, linux/arm64]\n"
+        f"    source_digest: {digest}\n",
+        encoding="utf-8",
+    )
+
+
+def test_a_locked_build_bundle_validates(tmp_path: Path) -> None:
+    # The control for every negative below. Without it a rule that rejected
+    # every build: bundle outright would pass all of them.
+    root = _built_bundle(tmp_path)
+    _write_lock(root)
+    result = validate_bundle(root)
+    assert result.valid, [e.code for e in result.errors]
+
+
+def test_a_build_bundle_with_no_lock_is_refused(tmp_path: Path) -> None:
+    # gitflow.py creates the Version and stores the bundle only AFTER validation
+    # passes, so this is what stops a lockless build: version from ever
+    # existing. Without it the deployment goes active, the runner still derives
+    # a hosted URL for the connector, and the reconciler retries forever against
+    # something that was never built.
+    root = _built_bundle(tmp_path)
+    result = validate_bundle(root)
+    assert not result.valid
+    issue = next(i for i in result.errors if i.code == "connectors.lock_missing")
+    assert "k8s-write" in issue.message
+
+
+def test_an_image_bundle_with_no_lock_still_validates(tmp_path: Path) -> None:
+    # Every rule this ticket adds is conditioned on a build: declaration, and no
+    # bundle in the wild has one. A lock requirement that fired on the image:
+    # form would reject every hosted-connector bundle that exists.
+    root = _built_bundle(
+        tmp_path,
+        "connectors:\n  grafana:\n    image: ghcr.io/acme-corp/mcp-grafana:0.17.2\n",
+    )
+    assert validate_bundle(root).valid
+
+
+def test_a_lock_missing_only_one_of_two_built_connectors_is_refused(tmp_path: Path) -> None:
+    # Per connector, not per file. A lock that covers the first connector and
+    # not the second would otherwise satisfy a file-level presence check while
+    # the second renders `image: null`.
+    root = _built_bundle(
+        tmp_path,
+        _BUILT_CONNECTORS
+        + "  tempo:\n    build:\n      context: connectors/tempo\n      platforms: [linux/amd64]\n",
+    )
+    (root / "connectors" / "tempo").mkdir(parents=True, exist_ok=True)
+    (root / "connectors" / "tempo" / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    _write_lock(root)
+    result = validate_bundle(root)
+    assert not result.valid
+    issue = next(i for i in result.errors if i.code == "connectors.lock_missing")
+    assert "tempo" in issue.message
+
+
+def test_a_stale_lock_is_refused_when_the_source_changed(tmp_path: Path) -> None:
+    # Without it, a git push after a source edit activates the PREVIOUS digest
+    # and the deployed connector silently stops matching the reviewed source.
+    # The recomputation is pure hashing over the already extracted tree -- no
+    # docker, no registry, no network -- so the API stays a pure renderer.
+    root = _built_bundle(tmp_path)
+    _write_lock(root)
+    assert validate_bundle(root).valid, "the control: unchanged source validates"
+
+    (root / "connectors" / "k8s-write" / "server.py").write_text(
+        "print('acme, but different')\n", encoding="utf-8"
+    )
+    result = validate_bundle(root)
+    assert not result.valid
+    issue = next(i for i in result.errors if i.code == "connectors.lock_stale")
+    assert "k8s-write" in issue.message
+
+
+def test_a_stale_lock_is_refused_when_only_the_declaration_changed(tmp_path: Path) -> None:
+    # The second, independent path: not one byte of the build context changed,
+    # only `platforms` in connectors.yaml. The previous lock names a
+    # single-arch artifact that cannot run on half the nodes. A digest computed
+    # over the tree alone would report this bundle as fresh.
+    root = _built_bundle(tmp_path)
+    _write_lock(root)
+    (root / "connectors.yaml").write_text(
+        _BUILT_CONNECTORS.replace("[linux/amd64, linux/arm64]", "[linux/amd64]"), encoding="utf-8"
+    )
+    result = validate_bundle(root)
+    assert not result.valid
+    assert "connectors.lock_stale" in {i.code for i in result.errors}
+
+
+def test_a_valid_local_daemon_lock_passes_intake(tmp_path: Path) -> None:
+    # The regression pin for review round 2 finding r2-3, and it is a pin
+    # against a rule being ADDED rather than removed. `curie local deploy`
+    # legitimately uploads a bundle carrying a local-daemon lock; the
+    # registry-only rule belongs to the cluster deploy preflight, which is the
+    # only path that needs an artifact a Kubernetes node can pull. Making
+    # intake refuse local-daemon turns this test red, which is the point.
+    root = _built_bundle(tmp_path)
+    _write_lock(root, image=_LOCAL_IMAGE, delivery="local-daemon")
+    result = validate_bundle(root)
+    assert result.valid, [e.code for e in result.errors]
+
+
+def test_a_lock_carrying_a_tag_is_refused_at_intake(tmp_path: Path) -> None:
+    # A hand-edited lock reaches intake exactly as a generated one does. The
+    # mutable-tag refusal has to fire here too, not only at render time, or a
+    # version whose connector can never be rendered is stored and activated.
+    root = _built_bundle(tmp_path)
+    _write_lock(root, image="ghcr.io/acme-corp/acme-bot-k8s-write-mcp:v1")
+    result = validate_bundle(root)
+    assert not result.valid
+    assert any(i.code.startswith("connectors.lock") for i in result.errors)
+
+
+def test_a_malformed_lock_is_refused_at_intake(tmp_path: Path) -> None:
+    # Rejected here rather than stored and hit at render time, where the failure
+    # is an opaque parse error inside the API on a version that already looks
+    # deployed.
+    root = _built_bundle(tmp_path)
+    (root / "connectors.lock.yaml").write_text(
+        "version: 1\nconnectors:\n  k8s-write:\n    image: [unclosed\n", encoding="utf-8"
+    )
+    result = validate_bundle(root)
+    assert not result.valid
+    assert any(i.code.startswith("connectors.lock") for i in result.errors)
+
+
+def test_a_lock_beside_no_connectors_file_is_still_validated(tmp_path: Path) -> None:
+    # A leftover lock with no connectors.yaml at all is a bundle that lost its
+    # declaration. Ignoring the file entirely would let a malformed one ride
+    # along into the stored artifact unread.
+    root = _bundle(tmp_path, '{"name": "acme-bot", "version": "0.1.0", "description": "t"}')
+    (root / "skills" / "acme-bot").mkdir(parents=True, exist_ok=True)
+    (root / "skills" / "acme-bot" / "SKILL.md").write_text(
+        "---\nname: acme-bot\ndescription: t\n---\nhi\n", encoding="utf-8"
+    )
+    (root / "connectors.lock.yaml").write_text("version: 1\nconnectors: nope\n", encoding="utf-8")
+    result = validate_bundle(root)
+    assert not result.valid
+    assert any(i.code.startswith("connectors.lock") for i in result.errors)
+
+
+def test_a_build_connector_with_a_missing_context_dir_is_refused(tmp_path: Path) -> None:
+    # A declared context that does not exist in the bundle is a malformed
+    # bundle, and it must be refused HERE rather than skipped. Skipping it makes
+    # the lock rules fail open: the staleness recomputation has no tree to hash,
+    # so the lockless and stale refusals silently do not apply, the version is
+    # created, the deployment goes active, and the first thing anyone learns is
+    # a render-time failure on a connector nobody could have built. Refusing at
+    # intake is the same reason every other rule in this file lives here.
+    root = _built_bundle(tmp_path)
+    _write_lock(root)
+    shutil.rmtree(root / "connectors" / "k8s-write")
+
+    result = validate_bundle(root)
+    assert not result.valid
+    issue = next(i for i in result.errors if i.code == "connectors.build_context_missing")
+    assert "k8s-write" in issue.message
+    assert "connectors/k8s-write" in issue.message, "name the path the author declared"
+
+
+def test_the_same_bundle_with_the_context_present_validates(tmp_path: Path) -> None:
+    # The sibling positive, and the thing that stops the refusal above from
+    # being satisfiable by rejecting every build: bundle outright. Identical in
+    # every respect except that the declared directory exists.
+    root = _built_bundle(tmp_path)
+    _write_lock(root)
+    assert (root / "connectors" / "k8s-write").is_dir()
+    result = validate_bundle(root)
+    assert result.valid, [e.code for e in result.errors]
+
+
+def test_a_build_context_symlinked_out_of_the_bundle_is_refused(tmp_path: Path) -> None:
+    # RED before the fix: `connectors.build_context_escapes` is absent from
+    # result.errors and the bundle validates, because intake joined the declared
+    # path onto the root and asked only `is_dir()`. The declaration is textually
+    # clean, so `_escapes` cannot see this, and `safe_extract` guards a different
+    # entry point (an uploaded archive) than the gitflow path, which hands
+    # validate_bundle a real tree.
+    #
+    # What that bought an author: `source_digest_of` hashes whatever tree the
+    # context names, so a symlink makes the pinned digest a function of bytes
+    # outside the bundle -- content no reviewer of this bundle ever saw, and
+    # content that can change under the lock without the lock going stale. The
+    # CLI's `resolve_context` has refused exactly this since day one, so intake
+    # was the more permissive of the two gates on the same rule.
+    root = _built_bundle(tmp_path)
+    _write_lock(root)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "Dockerfile").write_text("FROM scratch\nRUN whoami\n", encoding="utf-8")
+    shutil.rmtree(root / "connectors" / "k8s-write")
+    (root / "connectors" / "k8s-write").symlink_to(outside, target_is_directory=True)
+
+    result = validate_bundle(root)
+    assert not result.valid
+    issue = next(i for i in result.errors if i.code == "connectors.build_context_escapes")
+    assert "k8s-write" in issue.message
+
+
+# --- toolPolicy: the vanilla MCP tool policy, checked at deploy ----------------
+#
+# The policy classifies a canonical "<server>/<tool>" name as allow /
+# approval-required / deny, with DENY as the default for anything unmatched. Every
+# rule below exists because the failure it prevents is silent: a malformed pattern
+# never matches, so a bundle validates green while the rule its author wrote does
+# nothing at all. These go through the public validate_bundle, never a private
+# helper, because that is the one gate every intake path shares.
+#
+# validate_bundle carries an ENFORCEMENT HANDSHAKE: a caller states the tool-policy
+# contract it implements via `enforces_tool_policy`, and a bundle declaring a
+# toolPolicy is REFUSED (tool_policy.unenforced) by any caller that does not state
+# the supported id. That is the fail-closed property -- apps/api's bundles.py and
+# runner's plugin.py both call validate_bundle(root) with no argument today, so a
+# policy-carrying bundle is refused by both until their lane actually enforces it,
+# rather than being accepted and silently ignored.
+
+_TP_ENFORCEMENT = "curie/mcp-tool-policy@1"
+_UNENFORCED = "tool_policy.unenforced"
+
+
+def _tool_policy_bundle(tmp_path: Path, policy: str) -> Path:
+    """A minimal bundle whose manifest carries the given toolPolicy JSON object."""
+    return _bundle(tmp_path, '{"name": "demo", "toolPolicy": ' + policy + "}")
+
+
+def _tool_policy_codes(bundle: Path) -> list[str]:
+    """The tool_policy.* error codes seen by a caller that DOES enforce the contract.
+
+    Every declared-policy case below states enforcement, so each one proves its
+    OWN error code fires. Without that the blanket tool_policy.unenforced error
+    would mask every other check and the whole table would pass vacuously.
+    """
+    result = validate_bundle(bundle, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
+    return [i.code for i in result.errors if i.code.startswith("tool_policy.")]
+
+
+# --- the enforcement handshake: a declared policy nobody enforces is refused ---
+
+
+def test_bundle_without_a_tool_policy_validates_green_under_the_default_call(
+    tmp_path: Path,
+) -> None:
+    """BACKWARD COMPATIBILITY control: absence is never a tool_policy issue.
+
+    Every bundle in the wild today has no toolPolicy, and today's callers
+    (apps/api bundles.py, runner plugin.py) pass no enforcement argument. Such a
+    bundle must return the SAME valid/errors/warnings it did before the field
+    existed: green, with no tool_policy.* issue of any kind. The new optional
+    field does surface as ``toolPolicy: None`` in ``PluginManifest.model_dump()``
+    -- the ordinary new-optional-field patch behaviour, and not something the
+    validator's result reflects.
+    """
+
+    bundle = _bundle(tmp_path, '{"name": "demo"}')
+    _write_mcp(bundle, '{"mcpServers": {"grafana": {"command": "grafana-mcp"}}}')
+
+    result = validate_bundle(bundle)
+    assert result.valid, result.errors
+    assert not [i for i in result.errors if i.code.startswith("tool_policy.")]
+    assert not [i for i in result.warnings if i.code.startswith("tool_policy.")]
+
+
+def test_a_consumer_declaring_no_enforcement_refuses_a_declared_policy(tmp_path: Path) -> None:
+    """The default call REFUSES a bundle that ships a toolPolicy. This is the whole point.
+
+    A consumer that has not declared which tool-policy contract it implements
+    cannot silently accept a bundle carrying one: it would load the agent, ignore
+    the policy, and give the author a control that exists only on paper. Both
+    call sites in the tree (apps/api bundles.py:101, runner plugin.py:60) pass no
+    argument today, so both refuse such a bundle until their lane enforces it.
+    """
+
+    bundle = _tool_policy_bundle(
+        tmp_path,
+        '{"enforcement": "' + _TP_ENFORCEMENT + '", "allow": ["grafana/list_datasources"]}',
+    )
+    _write_mcp(bundle, '{"mcpServers": {"grafana": {"command": "grafana-mcp"}}}')
+
+    result = validate_bundle(bundle)
+    assert not result.valid
+    issue = next(i for i in result.errors if i.code == _UNENFORCED)
+    # Actionable: the caller must be told which contract id it has to implement.
+    assert _TP_ENFORCEMENT in issue.message
+
+
+def test_the_same_declared_policy_validates_once_enforcement_is_declared(tmp_path: Path) -> None:
+    """The positive half of the handshake: the identical bundle passes for a real enforcer.
+
+    Paired with the test above on purpose -- same bundle, only the caller's
+    declaration differs -- so the refusal is proven to come from the handshake and
+    not from anything wrong with the policy itself.
+    """
+
+    bundle = _tool_policy_bundle(
+        tmp_path,
+        '{"enforcement": "' + _TP_ENFORCEMENT + '", "allow": ["grafana/list_datasources"]}',
+    )
+    _write_mcp(bundle, '{"mcpServers": {"grafana": {"command": "grafana-mcp"}}}')
+
+    result = validate_bundle(bundle, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
+    assert result.valid, result.errors
+    assert not [i for i in result.errors if i.code.startswith("tool_policy.")]
+
+
+def test_a_consumer_enforcing_a_different_contract_refuses_a_declared_policy(
+    tmp_path: Path,
+) -> None:
+    """A caller implementing @2 cannot enforce an @1 policy, so the bundle is refused.
+
+    "Some enforcement" is not enforcement of THIS contract; accepting a near-miss
+    id would apply rules the author never wrote.
+    """
+
+    bundle = _tool_policy_bundle(
+        tmp_path,
+        '{"enforcement": "' + _TP_ENFORCEMENT + '", "allow": ["grafana/list_datasources"]}',
+    )
+    _write_mcp(bundle, '{"mcpServers": {"grafana": {"command": "grafana-mcp"}}}')
+
+    result = validate_bundle(bundle, enforces_tool_policy="curie/mcp-tool-policy@2")
+    assert not result.valid
+    assert _UNENFORCED in {i.code for i in result.errors}
+
+
+def test_the_handshake_error_is_the_declared_id_pinned_to_the_exported_constant() -> None:
+    """The id the validator demands is the one the module exports; not two literals."""
+
+    assert TOOL_POLICY_ENFORCEMENT == _TP_ENFORCEMENT
+
+
+# --- shape ---------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("literal", ['["grafana/*"]', '"allow everything"'], ids=["list", "string"])
+def test_tool_policy_that_is_not_an_object_is_rejected(tmp_path: Path, literal: str) -> None:
+    """A list or string toolPolicy carries no collections, so it can classify nothing.
+
+    It must be rejected rather than ignored: a manifest that "has a toolPolicy"
+    which the loader cannot read is the worst outcome -- the author sees the key
+    in their bundle and assumes it is in force.
+
+    ``PluginManifest.toolPolicy`` is typed ``dict[str, Any] | None``, the same as
+    ``approvalPolicy``, so a non-object value fails manifest model validation one
+    layer before ``_validate_tool_policy`` ever runs. The code is therefore
+    ``manifest.invalid``, not ``tool_policy.invalid`` -- but the property under
+    test, rejection, still holds, so this asserts the reported error names
+    ``toolPolicy`` rather than a specific error code.
+    """
+
+    bundle = _tool_policy_bundle(tmp_path, literal)
+
+    result = validate_bundle(bundle, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
+    assert not result.valid
+    assert any("toolPolicy" in issue.message for issue in result.errors), result.errors
+
+
+def test_tool_policy_collection_that_is_not_a_list_is_rejected(tmp_path: Path) -> None:
+    """``allow`` given as a bare string is a shape error, not a one-element list.
+
+    Coercing it would silently reinterpret the author's intent; a string is also
+    iterable, so a lenient implementation could end up matching per-character.
+    """
+
+    bundle = _tool_policy_bundle(
+        tmp_path,
+        '{"enforcement": "' + _TP_ENFORCEMENT + '", "allow": "grafana/*"}',
+    )
+
+    assert "tool_policy.invalid" in _tool_policy_codes(bundle)
+    assert not validate_bundle(bundle, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT).valid
+
+
+def test_a_misspelled_collection_key_is_rejected_not_silently_dropped(tmp_path: Path) -> None:
+    """``denny`` instead of ``deny`` is a DENY-BYPASS, so ToolPolicy forbids extra keys.
+
+    The attack this closes: with a lenient model the misspelled key is accepted
+    and discarded, the real ``deny`` list is empty, and ``k8s/delete_namespace``
+    -- which the author believes is blocked -- falls through to the ``allow`` glob
+    and becomes callable. A typo silently WIDENS permissions.
+
+    This is why ToolPolicy is strict where PluginManifest is lenient: the manifest
+    has an external producer (Claude Code) that legitimately adds keys; a
+    Curie-owned policy object has none, so an unknown key is always a mistake --
+    the same reasoning ConnectorSpec, ConnectorLockEntry and DeployTarget already
+    encode with ``extra="forbid"``.
+    """
+
+    bundle = _tool_policy_bundle(
+        tmp_path,
+        '{"enforcement": "' + _TP_ENFORCEMENT + '", '
+        '"allow": ["k8s/*"], "denny": ["k8s/delete_namespace"]}',
+    )
+    _write_mcp(bundle, '{"mcpServers": {"k8s": {"command": "k8s-mcp"}}}')
+
+    result = validate_bundle(bundle, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
+    assert not result.valid
+    issue = next(i for i in result.errors if i.code == "tool_policy.invalid")
+    assert "denny" in issue.message
+
+
+def test_manifest_stays_lenient_around_a_strict_tool_policy(tmp_path: Path) -> None:
+    """Strictness is scoped to the ToolPolicy object; the manifest keeps accepting extras.
+
+    Tightening the whole manifest would reject real Claude Code bundles carrying
+    fields this package does not model -- the compatibility wedge.
+    """
+
+    bundle = _bundle(
+        tmp_path,
+        '{"name": "demo", "futureField": 42, "toolPolicy": '
+        '{"enforcement": "' + _TP_ENFORCEMENT + '", "allow": ["grafana/*"]}}',
+    )
+    _write_mcp(bundle, '{"mcpServers": {"grafana": {"command": "grafana-mcp"}}}')
+
+    result = validate_bundle(bundle, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
+    assert result.valid, result.errors
+
+
+# --- the enforcement id the BUNDLE declares -----------------------------------
+
+
+def test_tool_policy_without_an_enforcement_id_is_rejected(tmp_path: Path) -> None:
+    """A policy that names no enforcement contract cannot be applied by any build."""
+
+    bundle = _tool_policy_bundle(tmp_path, '{"allow": ["grafana/*"]}')
+
+    result = validate_bundle(bundle, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
+    assert not result.valid
+    issue = next(i for i in result.errors if i.code == "tool_policy.enforcement_unsupported")
+    assert _TP_ENFORCEMENT in issue.message
+
+
+def test_tool_policy_with_a_blank_enforcement_id_is_rejected(tmp_path: Path) -> None:
+    """An empty string is not a contract id; it must not read as "unset, so fine"."""
+
+    bundle = _tool_policy_bundle(tmp_path, '{"enforcement": "", "allow": ["grafana/*"]}')
+
+    result = validate_bundle(bundle, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
+    assert not result.valid
+    issue = next(i for i in result.errors if i.code == "tool_policy.enforcement_unsupported")
+    assert _TP_ENFORCEMENT in issue.message
+
+
+@pytest.mark.parametrize(
+    "declared",
+    [
+        pytest.param(" curie/mcp-tool-policy@1", id="leading-space"),
+        pytest.param("curie/mcp-tool-policy@1 ", id="trailing-space"),
+        pytest.param("curie/mcp-tool-policy\t@1", id="internal-tab"),
+    ],
+)
+def test_a_whitespace_padded_enforcement_id_is_rejected(tmp_path: Path, declared: str) -> None:
+    """The id is compared BYTE-FOR-BYTE: padding makes it a different string, so it is refused.
+
+    Not stripping is the fail-CLOSED choice. Accepting " curie/mcp-tool-policy@1 "
+    as v1 would silently decide on the author's behalf that the padding meant
+    nothing -- and would put the deploy validator and any future runtime loader
+    one normalization apart, which is the #453/#544 drift. ``load_tool_policy``
+    refuses the same strings for the same reason.
+
+    Deliberately unlike the approval-gate check, which DOES strip gate names so
+    the validator and the loader agree on one tool name: a version discriminator
+    is not a tool name.
+    """
+
+    # json.dumps, not string concatenation: the tab case carries a real control
+    # character, which is illegal RAW inside a JSON string and would otherwise
+    # fail manifest parsing instead of reaching the enforcement check.
+    bundle = _tool_policy_bundle(
+        tmp_path,
+        json.dumps({"enforcement": declared, "allow": ["grafana/*"]}),
+    )
+    _write_mcp(bundle, '{"mcpServers": {"grafana": {"command": "grafana-mcp"}}}')
+
+    result = validate_bundle(bundle, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
+    assert not result.valid
+    issue = next(i for i in result.errors if i.code == "tool_policy.enforcement_unsupported")
+    # Both what was written and what this build implements, or the fix is a guess.
+    assert repr(declared) in issue.message
+    assert _TP_ENFORCEMENT in issue.message
+
+
+def test_tool_policy_with_a_future_enforcement_id_is_rejected(tmp_path: Path) -> None:
+    """A bundle asking for @2 semantics gets refused, not silently given @1 semantics.
+
+    Asserted with the caller passing the SUPPORTED id, so this is not the
+    handshake error in disguise: the bundle's own declaration is what fails. The
+    message must name BOTH ids -- what the author asked for and what this build
+    implements -- or the fix is a guess.
+    """
+
+    bundle = _tool_policy_bundle(
+        tmp_path,
+        '{"enforcement": "curie/mcp-tool-policy@2", "allow": ["grafana/*"]}',
+    )
+    _write_mcp(bundle, '{"mcpServers": {"grafana": {"command": "grafana-mcp"}}}')
+
+    result = validate_bundle(bundle, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
+    assert not result.valid
+    issue = next(i for i in result.errors if i.code == "tool_policy.enforcement_unsupported")
+    assert "curie/mcp-tool-policy@2" in issue.message
+    assert _TP_ENFORCEMENT in issue.message
+
+
+# --- pattern grammar ----------------------------------------------------------
+
+
+def test_valid_tool_policy_over_declared_servers_validates_green(tmp_path: Path) -> None:
+    """The happy path: well-formed patterns naming servers the bundle actually declares."""
+
+    bundle = _tool_policy_bundle(
+        tmp_path,
+        '{"enforcement": "' + _TP_ENFORCEMENT + '", '
+        '"allow": ["grafana/list_datasources", "grafana/query_*"], '
+        '"approvalRequired": ["kubernetes/pods_*"], '
+        '"deny": ["kubernetes/resources_delete"]}',
+    )
+    _write_mcp(
+        bundle,
+        '{"mcpServers": {"grafana": {"command": "grafana-mcp"}, '
+        '"kubernetes": {"command": "k8s-mcp"}}}',
+    )
+
+    result = validate_bundle(bundle, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
+    assert result.valid, result.errors
+    assert _tool_policy_codes(bundle) == []
+
+
+def test_malformed_patterns_are_reported_in_every_collection(tmp_path: Path) -> None:
+    """All THREE collections are pattern-checked, each at its own location.
+
+    The realistic defect is wiring the check into ``allow`` only: a malformed
+    pattern in ``deny`` never matches anything, so the bundle validates green while
+    the author believes a tool is blocked. One bad pattern per collection proves
+    each is walked.
+    """
+
+    bundle = _tool_policy_bundle(
+        tmp_path,
+        '{"enforcement": "' + _TP_ENFORCEMENT + '", '
+        '"allow": ["grafana/**"], '
+        '"approvalRequired": ["kubernetes/pods run"], '
+        '"deny": ["a/b/c"]}',
+    )
+    _write_mcp(
+        bundle,
+        '{"mcpServers": {"grafana": {"command": "grafana-mcp"}, '
+        '"kubernetes": {"command": "k8s-mcp"}}}',
+    )
+
+    result = validate_bundle(bundle, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
+    assert not result.valid
+    issues = [i for i in result.errors if i.code == "tool_policy.pattern_invalid"]
+    assert len(issues) == 3, result.errors
+    locations = [i.location for i in issues]
+    for collection in ("allow", "approvalRequired", "deny"):
+        assert any(collection in loc and "[0]" in loc for loc in locations), locations
+    # And each offending pattern is named, so the author can find it.
+    messages = " ".join(i.message for i in issues)
+    assert "grafana/**" in messages
+    assert "a/b/c" in messages
+
+
+def test_pattern_invalid_location_names_the_collection_and_index(tmp_path: Path) -> None:
+    """The second entry of a collection is reported at index 1, not 0.
+
+    A hardcoded index would send the author to the wrong line of a long list.
+    """
+
+    bundle = _tool_policy_bundle(
+        tmp_path,
+        '{"enforcement": "' + _TP_ENFORCEMENT + '", '
+        '"allow": ["grafana/list_datasources", "grafana/[abc]*"]}',
+    )
+    _write_mcp(bundle, '{"mcpServers": {"grafana": {"command": "grafana-mcp"}}}')
+
+    result = validate_bundle(bundle, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
+    issue = next(i for i in result.errors if i.code == "tool_policy.pattern_invalid")
+    assert "allow" in issue.location
+    assert "[1]" in issue.location
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    ["grafana/**", "grafana/[abc]*", "a/b/c", "grafana/tool!", "list_datasources"],
+)
+def test_the_validator_rejects_exactly_what_validate_pattern_rejects(
+    tmp_path: Path, pattern: str
+) -> None:
+    """ONE normalization path: the deploy gate applies the exported grammar, not its own.
+
+    The #453/#544 lesson -- a validator and a runtime loader that each normalize
+    separately drift apart silently and ship a fail-open. Both halves of this test
+    use the SAME pattern string, so a second, divergent grammar inside validate.py
+    fails here instead of at turn time.
+    """
+
+    assert validate_pattern(pattern) is not None, "fixture must be an invalid pattern"
+
+    bundle = _tool_policy_bundle(
+        tmp_path,
+        '{"enforcement": "' + _TP_ENFORCEMENT + '", "deny": ["' + pattern + '"]}',
+    )
+
+    codes = _tool_policy_codes(bundle)
+    assert "tool_policy.pattern_invalid" in codes
+
+
+def test_duplicate_pattern_within_one_collection_is_rejected(tmp_path: Path) -> None:
+    """The same pattern twice in one collection is a copy-paste artifact, not a rule.
+
+    It is rejected rather than deduped because the author almost certainly meant
+    to write two DIFFERENT patterns, and silently collapsing them hides the tool
+    they thought they had covered.
+    """
+
+    bundle = _tool_policy_bundle(
+        tmp_path,
+        '{"enforcement": "' + _TP_ENFORCEMENT + '", '
+        '"allow": ["grafana/query_*", "grafana/list_*", "grafana/query_*"]}',
+    )
+    _write_mcp(bundle, '{"mcpServers": {"grafana": {"command": "grafana-mcp"}}}')
+
+    result = validate_bundle(bundle, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
+    assert not result.valid
+    issue = next(i for i in result.errors if i.code == "tool_policy.pattern_duplicate")
+    assert "grafana/query_*" in issue.message
+
+
+def test_identical_pattern_in_allow_and_deny_is_rejected(tmp_path: Path) -> None:
+    """One pattern string in two collections is a contradiction the author must resolve.
+
+    Precedence would silently resolve it (deny wins), which is exactly why it must
+    be rejected: the author wrote both, so one of the two is a mistake, and the
+    validator cannot know which.
+    """
+
+    bundle = _tool_policy_bundle(
+        tmp_path,
+        '{"enforcement": "' + _TP_ENFORCEMENT + '", '
+        '"allow": ["kubernetes/resources_scale"], '
+        '"deny": ["kubernetes/resources_scale"]}',
+    )
+    _write_mcp(bundle, '{"mcpServers": {"kubernetes": {"command": "k8s-mcp"}}}')
+
+    result = validate_bundle(bundle, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
+    assert not result.valid
+    issue = next(i for i in result.errors if i.code == "tool_policy.pattern_conflict")
+    assert "kubernetes/resources_scale" in issue.message
+
+
+def test_overlapping_but_different_patterns_across_collections_validate_green(
+    tmp_path: Path,
+) -> None:
+    """OVERLAP is legal and deliberate; only exact duplication across collections is not.
+
+    ``deny: k8s/resources_*`` beside ``allow: k8s/resources_scale`` is the normal
+    way to carve an exception out of a broad rule, and precedence gives it a
+    well-defined answer. A conflict check that compared by MATCH rather than by
+    exact string would reject this idiom and make the policy unusable.
+    """
+
+    bundle = _tool_policy_bundle(
+        tmp_path,
+        '{"enforcement": "' + _TP_ENFORCEMENT + '", '
+        '"allow": ["k8s/resources_scale"], '
+        '"deny": ["k8s/resources_*"]}',
+    )
+    _write_mcp(bundle, '{"mcpServers": {"k8s": {"command": "k8s-mcp"}}}')
+
+    result = validate_bundle(bundle, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
+    assert result.valid, result.errors
+    assert _tool_policy_codes(bundle) == []
+
+
+# --- the declared-server cross-check ------------------------------------------
+
+
+def test_pattern_naming_an_undeclared_server_is_rejected(tmp_path: Path) -> None:
+    """A literal server segment the bundle never declares is a typo that gates nothing.
+
+    The pattern is syntactically fine, so nothing else catches it: the rule simply
+    never matches a live tool, and the author believes they wrote a control.
+    """
+
+    bundle = _tool_policy_bundle(
+        tmp_path,
+        '{"enforcement": "' + _TP_ENFORCEMENT + '", "deny": ["grafna/delete_dashboard"]}',
+    )
+    _write_mcp(bundle, '{"mcpServers": {"grafana": {"command": "grafana-mcp"}}}')
+
+    result = validate_bundle(bundle, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
+    assert not result.valid
+    issue = next(i for i in result.errors if i.code == "tool_policy.unknown_server")
+    assert "grafna" in issue.message
+
+
+def test_a_wildcard_server_segment_never_triggers_unknown_server(tmp_path: Path) -> None:
+    """``*/pods_run`` names no server, so there is nothing to cross-check.
+
+    Asserted on a bundle that declares NO servers at all, the case where a naive
+    implementation ("is the segment in the declared set?") would reject every
+    wildcard pattern.
+    """
+
+    bundle = _tool_policy_bundle(
+        tmp_path,
+        '{"enforcement": "' + _TP_ENFORCEMENT + '", '
+        '"approvalRequired": ["*/pods_run"], "allow": ["*/*"]}',
+    )
+
+    result = validate_bundle(bundle, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
+    assert result.valid, result.errors
+    assert "tool_policy.unknown_server" not in _tool_policy_codes(bundle)
+
+
+def test_a_literal_segment_naming_a_declared_server_does_not_trigger_unknown_server(
+    tmp_path: Path,
+) -> None:
+    """The positive control for the cross-check: a declared server is accepted."""
+
+    bundle = _tool_policy_bundle(
+        tmp_path,
+        '{"enforcement": "' + _TP_ENFORCEMENT + '", "allow": ["grafana/list_datasources"]}',
+    )
+    _write_mcp(bundle, '{"mcpServers": {"grafana": {"command": "grafana-mcp"}}}')
+
+    result = validate_bundle(bundle, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
+    assert result.valid, result.errors
+    assert "tool_policy.unknown_server" not in _tool_policy_codes(bundle)
+
+
+def test_a_connectors_yaml_server_satisfies_the_cross_check(tmp_path: Path) -> None:
+    """connectors.yaml is the bundle's OTHER tool surface, so its servers count too.
+
+    Without it, a bundle whose whole surface is connectors would have every literal
+    pattern rejected and could not write a policy at all.
+    """
+
+    bundle = _tool_policy_bundle(
+        tmp_path,
+        '{"enforcement": "' + _TP_ENFORCEMENT + '", '
+        '"approvalRequired": ["kubernetes-admin/resources_create_or_update"]}',
+    )
+    _write_connectors(
+        bundle,
+        "connectors:\n  kubernetes-admin:\n    image: ghcr.io/example/k8s-mcp:1.0.0\n",
+    )
+
+    result = validate_bundle(bundle, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
+    assert result.valid, result.errors
+    assert "tool_policy.unknown_server" not in _tool_policy_codes(bundle)
+
+
+def test_unknown_server_check_stays_silent_when_the_mcp_declaration_is_unreadable(
+    tmp_path: Path,
+) -> None:
+    """An unreadable .mcp.json makes the declared-server set UNKNOWABLE, not empty.
+
+    Treating it as empty would report every literal pattern as naming an undeclared
+    server, stacking a pile of misleading errors on top of the real JSON error and
+    sending the author to fix the wrong file. The MCP error must fire alone.
+    """
+
+    bundle = _tool_policy_bundle(
+        tmp_path,
+        '{"enforcement": "' + _TP_ENFORCEMENT + '", '
+        '"allow": ["grafana/list_datasources"], "deny": ["kubernetes/pods_run"]}',
+    )
+    _write_mcp(bundle, "{not json")
+
+    result = validate_bundle(bundle, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
+    codes = {i.code for i in result.errors}
+    assert "mcp.invalid_json" in codes
+    assert "tool_policy.unknown_server" not in codes
+
+
+def test_a_policy_denying_everything_warns_but_still_validates(tmp_path: Path) -> None:
+    """Three empty collections deny every tool: coherent, so a WARNING, not an error.
+
+    It is legal (a deliberate lockdown) but almost always a mistake, and the agent
+    that ships it will simply refuse every tool call with no explanation at turn
+    time. Warn loudly at deploy, where the author is still looking.
+    """
+
+    bundle = _tool_policy_bundle(
+        tmp_path,
+        '{"enforcement": "' + _TP_ENFORCEMENT + '", '
+        '"allow": [], "approvalRequired": [], "deny": []}',
+    )
+    _write_mcp(bundle, '{"mcpServers": {"grafana": {"command": "grafana-mcp"}}}')
+
+    result = validate_bundle(bundle, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
+    assert result.valid, result.errors
+    assert "tool_policy.denies_everything" in {i.code for i in result.warnings}

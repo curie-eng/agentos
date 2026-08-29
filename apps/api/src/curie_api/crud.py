@@ -7,43 +7,125 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import delete, func, select, update
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from .config import get_settings
 from .models import (
+    ActionAuditEntry,
+    ActionStatus,
     Agent,
+    AgentAction,
     AgentChannel,
     AgentVersion,
     Approval,
     ApprovalAuditEntry,
     ApprovalStatus,
     ConsoleSession,
+    CredentialRedemptionAuditEntry,
     Deployment,
     Environment,
+    Publication,
+    ThreadWorkspace,
 )
 from .schemas import (
+    ActionComplete,
+    ActionRecord,
     AgentCreate,
     ApprovalRequest,
+    ChannelBindingPatch,
     ChannelBindingWrite,
     DeploymentCreate,
+    HookPartitionConfig,
+    PublicationCreate,
     VersionCreate,
 )
+from .workspace_policy import repository_is_allowed
+
+_WORKSPACE_UNSET = object()
+
+
+class PublicationReplayConflict(RuntimeError):
+    """A publication dedupe key was replayed with different private facts."""
+
+
+async def _adopt_publication_replay(
+    session: AsyncSession,
+    data: PublicationCreate,
+    patch: bytes,
+    *,
+    agent_id: uuid.UUID,
+) -> Publication | None:
+    approval = await get_approval_by_dedupe_key(session, data.dedupe_key)
+    if approval is None:
+        return None
+    publication = await get_publication_by_approval(session, approval.id)
+    if publication is None:
+        raise PublicationReplayConflict(
+            "publication dedupe key belongs to a non-publication approval"
+        )
+    if (
+        approval.agent_id != agent_id
+        or approval.conversation_id != data.conversation_id
+        or publication.deployment_id != data.deployment_id
+        or publication.repo_full_name.casefold() != data.repo_full_name.casefold()
+        or publication.base_sha != data.base_sha
+        or publication.patch_bytes != patch
+        or publication.changed_paths != data.changed_paths
+        or publication.title != (data.title or data.summary)
+        or publication.body != (data.body or "Approved platform publication.")
+    ):
+        raise PublicationReplayConflict(
+            "publication dedupe key was replayed with different snapshot facts"
+        )
+    return publication
+
+
+async def _require_current_publication_workspace(
+    session: AsyncSession, data: PublicationCreate
+) -> tuple[Deployment, ThreadWorkspace]:
+    """Authorize the request against current deployment and thread policy."""
+
+    deployment = await get_deployment(session, data.deployment_id)
+    if deployment is None:
+        raise LookupError("deployment not found")
+    if not deployment.workspace_enabled:
+        raise ValueError("deployment does not declare a repository workspace")
+    thread_workspace = await get_thread_workspace(
+        session,
+        agent_id=deployment.agent_id,
+        conversation_id=data.conversation_id,
+    )
+    if thread_workspace is None:
+        raise ValueError("conversation has no selected repository workspace")
+    if thread_workspace.repo_full_name.casefold() != data.repo_full_name.casefold():
+        raise ValueError("publication repository differs from the thread workspace")
+    if not repository_is_allowed(
+        thread_workspace.repo_full_name, get_settings().github_repo_allowlist
+    ):
+        raise ValueError("thread workspace repository is no longer allowed")
+    return deployment, thread_workspace
 
 
 async def get_version(session: AsyncSession, version_id: uuid.UUID) -> AgentVersion | None:
     return await session.get(AgentVersion, version_id)
 
 
-async def _refresh_with_channel(session: AsyncSession, agent: Agent) -> Agent:
-    """Commit, then refresh the agent and name the `channel` relationship explicitly.
+async def refresh_with_channels(session: AsyncSession, agent: Agent) -> Agent:
+    """Commit, then refresh the agent and name the `channels` relationship explicitly.
 
-    The response model reads `agent.channel` after this session is done with, and
-    an unloaded relationship RAISES under asyncio rather than lazy-loading, so
-    the endpoint 500s where a crud-level test (holding a live session) passes.
+    The response model reads `agent.channels` after this session is done with,
+    and an unloaded relationship RAISES under asyncio rather than lazy-loading,
+    so the endpoint 500s where a crud-level test (holding a live session) passes.
+    Naming the collection also re-reads it from the database, so a binding
+    inserted or deleted around the relationship is reflected rather than served
+    from the stale loaded collection (`expire_on_commit=False`).
     """
     await session.commit()
     await session.refresh(agent)
-    await session.refresh(agent, ["channel"])
+    await session.refresh(agent, ["channels"])
     return agent
 
 
@@ -72,12 +154,16 @@ async def create_agent(session: AsyncSession, data: AgentCreate) -> Agent:
         # configured later, both set together otherwise. The write schema has
         # already refused a half-configured pair, and
         # `agent_channels_route_pair_ck` refuses one from an out-of-band writer.
-        channel=AgentChannel(
-            kind=data.channel.kind,
-            address=data.channel.address,
-            endpoint=data.channel.endpoint,
-            adapter=data.channel.adapter,
-        ),
+        # A create binds exactly ONE channel (ADR-0118 keeps the create
+        # singular); the rest arrive through `add_channel_binding`.
+        channels=[
+            AgentChannel(
+                kind=data.channel.kind,
+                address=data.channel.address,
+                endpoint=data.channel.endpoint,
+                adapter=data.channel.adapter,
+            )
+        ],
         repo_full_name=data.repo_full_name,
         model=data.model,
         thinking=data.thinking,
@@ -90,10 +176,12 @@ async def create_agent(session: AsyncSession, data: AgentCreate) -> Agent:
             if data.approval_routes is not None
             else None
         ),
+        hook_partitions=_stored_hook_partitions(data.hook_partitions),
         secrets=data.secrets,
+        memory=data.memory,
     )
     session.add(agent)
-    return await _refresh_with_channel(session, agent)
+    return await refresh_with_channels(session, agent)
 
 
 async def list_agents(session: AsyncSession) -> list[Agent]:
@@ -102,7 +190,7 @@ async def list_agents(session: AsyncSession) -> list[Agent]:
     # correct AND unboundedly slow, so a hundred-agent install would pay a
     # hundred round trips to render one page.
     result = await session.scalars(
-        select(Agent).options(selectinload(Agent.channel)).order_by(Agent.created_at)
+        select(Agent).options(selectinload(Agent.channels)).order_by(Agent.created_at)
     )
     return list(result)
 
@@ -132,15 +220,69 @@ async def delete_agent(session: AsyncSession, agent_id: uuid.UUID) -> None:
     await session.commit()
 
 
-async def update_agent_binding(
-    session: AsyncSession, agent: Agent, channel: ChannelBindingWrite
-) -> Agent:
-    """Move the agent's single binding to a new kind/address (ADR-0096, #1459).
+async def lock_agent_bindings(session: AsyncSession, agent_id: uuid.UUID) -> list[AgentChannel]:
+    """`SELECT ... FOR UPDATE` the agent's WHOLE binding set, ordered as it reads.
 
-    Mutated IN PLACE rather than replaced: an agent holds exactly one binding
-    (`agent_channels_agent_id_key`), and assigning a fresh row would make the
+    Every mutating binding handler opens with this, and then picks its target
+    out of the returned list rather than issuing a second, unlocked query --
+    which is what makes the lock load-bearing instead of decorative.
+
+    Without it the last-binding guard is unsound: an agent with two bindings and
+    two concurrent DELETEs of DIFFERENT pairs has both requests read count=2,
+    both pass the guard, and the agent lands at ZERO bindings -- deployed,
+    healthy-looking, answering nothing (#38). Under the lock the second delete
+    re-reads count=1 and conflicts. The lock also serializes `generation += 1`
+    into an increment instead of a lost update.
+
+    `populate_existing` is load-bearing: the handler has already loaded the
+    agent (for its 404), so its bindings are in the session's identity map, and
+    a plain locking SELECT would hand those STALE objects back -- the row would
+    be locked while the generation the caller compares against came from before
+    the winner's commit.
+
+    Known and accepted conservatism: `FOR UPDATE` locks rows that exist; it does
+    not block a concurrent INSERT. A DELETE racing an ADD may therefore 409 as
+    "last binding" even though a second binding commits moments later. That
+    direction is safe (a retry succeeds) and is cheaper than the predicate lock
+    that would close it -- it is accepted, not overlooked.
+    """
+
+    result = await session.scalars(
+        select(AgentChannel)
+        .where(AgentChannel.agent_id == agent_id)
+        .order_by(AgentChannel.kind, AgentChannel.address)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    return list(result)
+
+
+async def agent_id_for_pair(session: AsyncSession, kind: str, address: str) -> uuid.UUID | None:
+    """Which agent holds this `(kind, address)` pair, if any.
+
+    Named rather than inlined at its one call site: it answers the question a
+    binding write's 409 has to answer accurately -- is the duplicate THIS
+    agent's or another's -- and an inline `select` there reads as an incidental
+    query the next reader deletes.
+    """
+
+    owner: uuid.UUID | None = await session.scalar(
+        select(AgentChannel.agent_id).where(
+            AgentChannel.kind == kind, AgentChannel.address == address
+        )
+    )
+    return owner
+
+
+async def update_channel_binding(
+    session: AsyncSession, binding: AgentChannel, channel: ChannelBindingPatch
+) -> AgentChannel:
+    """Move ONE binding row to a new kind/address (ADR-0096, #1459; ADR-0118).
+
+    Mutated IN PLACE rather than replaced: assigning a fresh row would make the
     insert of the replacement race the delete of the original inside one flush,
-    tripping that constraint on a move that is perfectly legal.
+    tripping `agent_channels_kind_address_key` on a move that is perfectly
+    legal.
 
     That in-place mutation is exactly why `generation` exists (ADR-0096 D5): the
     row id is a stable identity, so a credential minted against this binding
@@ -151,18 +293,58 @@ async def update_agent_binding(
     think something is wrong with this route" gesture that should invalidate
     outstanding credentials, and guarding the bump on a value change would leave
     that case silently valid.
+
+    FLUSHES rather than commits, so the caller can run it inside a SAVEPOINT:
+    the unique violation this raises has to be recoverable without discarding
+    the outer transaction's `FOR UPDATE` locks.
     """
 
-    agent.channel.kind = channel.kind
-    agent.channel.address = channel.address
-    # The reply route moves WITH the binding (ADR-0096 phase 2): a PATCH that
+    binding.kind = channel.kind
+    binding.address = channel.address
+    # The reply route moves WITH the pair (ADR-0096 phase 2): a move that
     # re-points the pair and leaves the old endpoint/adapter behind would send
     # the new route's replies to the previous adapter, authenticated as it. This
-    # is also the cutover's step 10 -- bind first, PATCH the route in later.
-    agent.channel.endpoint = channel.endpoint
-    agent.channel.adapter = channel.adapter
-    agent.channel.generation += 1
-    return await _refresh_with_channel(session, agent)
+    # is also the cutover's step 10 -- bind first, move the route in later.
+    if "endpoint" in channel.model_fields_set:
+        binding.endpoint = channel.endpoint
+        binding.adapter = channel.adapter
+    binding.generation += 1
+    await session.flush()
+    return binding
+
+
+async def add_channel_binding(
+    session: AsyncSession, agent_id: uuid.UUID, channel: ChannelBindingWrite
+) -> AgentChannel:
+    """Append a binding to an agent (ADR-0118). Appends; never moves.
+
+    A new row, so its `generation` starts at 0 and no credential can exist for
+    it yet. Flushes for the same savepoint reason as `update_channel_binding`.
+    """
+
+    binding = AgentChannel(
+        agent_id=agent_id,
+        kind=channel.kind,
+        address=channel.address,
+        endpoint=channel.endpoint,
+        adapter=channel.adapter,
+    )
+    session.add(binding)
+    await session.flush()
+    return binding
+
+
+async def delete_channel_binding(session: AsyncSession, binding: AgentChannel) -> None:
+    """Remove one binding row, after the caller proved under the lock that it is
+    not the agent's last one.
+
+    Deleting the row invalidates its outstanding channel tokens by construction:
+    a `chn` claim names `channel_id`, and the id no longer resolves. The
+    siblings' tokens are untouched, because the counters and ids are per-row.
+    """
+
+    await session.delete(binding)
+    await session.flush()
 
 
 async def update_agent_model(session: AsyncSession, agent: Agent, model: str | None) -> Agent:
@@ -176,6 +358,19 @@ async def update_agent_thinking(
     session: AsyncSession, agent: Agent, thinking: str | None
 ) -> Agent:
     agent.thinking = thinking
+    await session.commit()
+    await session.refresh(agent)
+    return agent
+
+
+async def update_agent_memory(session: AsyncSession, agent: Agent, memory: bool) -> Agent:
+    """Set whether this agent's bindings share one workflow-state namespace
+    (#1525 follow-up). Flipping it changes nothing already stored -- a row
+    written under one scope is simply not the row a later request under the
+    other scope reads; it is a routing decision for FUTURE state calls, not a
+    migration of past ones."""
+
+    agent.memory = memory
     await session.commit()
     await session.refresh(agent)
     return agent
@@ -197,9 +392,39 @@ async def update_agent_approval_routes(
     session: AsyncSession, agent: Agent, routes: dict[str, Any]
 ) -> Agent:
     """Set the agent's approval route bindings (#247). An empty dict clears
-    them (stored as NULL: unbound routes fall back to the requesting channel)."""
+    them (stored as NULL: unbound routes escalate rather than inventing a
+    resolution surface)."""
 
     agent.approval_routes = routes or None
+    await session.commit()
+    await session.refresh(agent)
+    return agent
+
+
+def _stored_hook_partitions(
+    partitions: dict[str, HookPartitionConfig] | None,
+) -> dict[str, Any] | None:
+    """The column value for a hook-partition map (ADR-0134).
+
+    One definition for both write paths, because create and PATCH must not
+    disagree about what "no configuration" looks like in the column: an empty
+    map is stored as NULL, the same "every hook returns to one thread per hook"
+    posture as an omitted map, which is what an operator turning the feature
+    off is asking for.
+    """
+
+    if not partitions:
+        return None
+    return {name: c.model_dump() for name, c in partitions.items()}
+
+
+async def update_agent_hook_partitions(
+    session: AsyncSession, agent: Agent, partitions: dict[str, HookPartitionConfig]
+) -> Agent:
+    """Set which of the agent's hooks fan out (ADR-0134). An empty dict clears
+    them (stored as NULL)."""
+
+    agent.hook_partitions = _stored_hook_partitions(partitions)
     await session.commit()
     await session.refresh(agent)
     return agent
@@ -300,17 +525,19 @@ async def create_version(
         agent_id,
         version_label=data.version_label,
         created_by=data.created_by,
+        commit_sha=data.commit_sha,
         bundle_ref=data.bundle_ref,
     )
 
 
 async def get_version_by_commit(
-    session: AsyncSession, agent_id: uuid.UUID, commit_sha: str
+    session: AsyncSession, agent_id: uuid.UUID, commit_sha: str, created_by: str
 ) -> AgentVersion | None:
     version: AgentVersion | None = await session.scalar(
         select(AgentVersion).where(
             AgentVersion.agent_id == agent_id,
             AgentVersion.commit_sha == commit_sha,
+            AgentVersion.created_by == created_by,
         )
     )
     return version
@@ -332,12 +559,23 @@ async def create_deployment_row(
     environment: Environment,
     commit_sha: str | None = None,
     status: str = "active",
+    workspace_enabled: bool | object = _WORKSPACE_UNSET,
 ) -> Deployment:
+    resolved_workspace_enabled: bool
+    if workspace_enabled is _WORKSPACE_UNSET:
+        current = await get_active_deployment(session, agent_id, environment)
+        resolved_workspace_enabled = (
+            current.workspace_enabled if current is not None else False
+        )
+    else:
+        assert isinstance(workspace_enabled, bool)
+        resolved_workspace_enabled = workspace_enabled
     deployment = Deployment(
         agent_id=agent_id,
         version_id=version_id,
         environment=environment,
         commit_sha=commit_sha,
+        workspace_enabled=resolved_workspace_enabled,
         status=status,
     )
     session.add(deployment)
@@ -352,8 +590,61 @@ async def create_deployment(session: AsyncSession, data: DeploymentCreate) -> De
         agent_id=data.agent_id,
         version_id=data.version_id,
         environment=data.environment,
+        commit_sha=data.commit_sha,
         status=data.status,
+        workspace_enabled=(
+            data.workspace_enabled
+            if "workspace_enabled" in data.model_fields_set
+            else _WORKSPACE_UNSET
+        ),
     )
+
+
+async def get_thread_workspace(
+    session: AsyncSession, *, agent_id: uuid.UUID, conversation_id: str
+) -> ThreadWorkspace | None:
+    selected: ThreadWorkspace | None = await session.scalar(
+        select(ThreadWorkspace).where(
+            ThreadWorkspace.agent_id == agent_id,
+            ThreadWorkspace.conversation_id == conversation_id,
+        )
+    )
+    return selected
+
+
+async def select_thread_workspace(
+    session: AsyncSession,
+    *,
+    agent_id: uuid.UUID,
+    deployment_id: uuid.UUID,
+    conversation_id: str,
+    repo_full_name: str,
+    selected_by: str,
+) -> tuple[ThreadWorkspace, bool]:
+    """Insert the first selection or atomically adopt the concurrent winner."""
+
+    candidate_id = uuid.uuid4()
+    inserted = await session.scalar(
+        insert(ThreadWorkspace)
+        .values(
+            id=candidate_id,
+            agent_id=agent_id,
+            selected_by_deployment_id=deployment_id,
+            conversation_id=conversation_id,
+            repo_full_name=repo_full_name,
+            selected_by=selected_by,
+        )
+        .on_conflict_do_nothing(
+            constraint="thread_workspaces_agent_conversation_key"
+        )
+        .returning(ThreadWorkspace.id)
+    )
+    await session.commit()
+    selected = await get_thread_workspace(
+        session, agent_id=agent_id, conversation_id=conversation_id
+    )
+    assert selected is not None
+    return selected, inserted == candidate_id
 
 
 async def get_active_deployment(
@@ -392,7 +683,286 @@ async def get_deployment(session: AsyncSession, deployment_id: uuid.UUID) -> Dep
     return await session.get(Deployment, deployment_id)
 
 
+async def end_deployment(session: AsyncSession, deployment: Deployment) -> None:
+    deployment.status = "stopped"
+    await session.commit()
+
+
 # -- approvals (#244, ADR-0010) -------------------------------------------------
+
+
+async def create_publication(
+    session: AsyncSession,
+    data: PublicationCreate,
+    *,
+    patch: bytes,
+) -> tuple[Publication, bool]:
+    """Atomically create the durable approval and its private publication.
+
+    ``dedupe_key`` belongs to Approval, so the replay lookup starts there. An
+    exact replay adopts both rows; a changed patch or snapshot fact is a hard
+    conflict and can never replace bytes that were already approved.
+    """
+
+    deployment, thread_workspace = await _require_current_publication_workspace(
+        session, data
+    )
+    existing = await _adopt_publication_replay(
+        session, data, patch, agent_id=deployment.agent_id
+    )
+    if existing is not None:
+        return existing, False
+
+    expires_at = None
+    if data.expires_in_seconds is not None:
+        expires_at = datetime.now(UTC).replace(tzinfo=None) + timedelta(
+            seconds=data.expires_in_seconds
+        )
+    approval = Approval(
+        agent_id=deployment.agent_id,
+        conversation_id=data.conversation_id,
+        author=data.author,
+        summary=data.summary,
+        reply_kind=data.reply_kind,
+        reply_channel=data.reply_channel,
+        reply_placeholder=data.reply_placeholder,
+        reply_endpoint=data.reply_endpoint,
+        reply_adapter=data.reply_adapter,
+        dedupe_key=data.dedupe_key,
+        route=None,
+        card_channel=data.reply_channel,
+        gate_kind="permission",
+        granted_tool="mcp__curie__publish_changes",
+        purpose="publication",
+        expires_at=expires_at,
+    )
+    session.add(approval)
+    try:
+        await session.flush()
+    except IntegrityError:
+        await session.rollback()
+        deployment, _ = await _require_current_publication_workspace(session, data)
+        existing = await _adopt_publication_replay(
+            session, data, patch, agent_id=deployment.agent_id
+        )
+        if existing is None:
+            raise
+        return existing, False
+    publication = Publication(
+        approval_id=approval.id,
+        deployment_id=deployment.id,
+        repo_full_name=thread_workspace.repo_full_name,
+        status="pending",
+        version=1,
+        base_sha=data.base_sha,
+        patch_bytes=patch,
+        changed_paths=data.changed_paths,
+        title=data.title or data.summary,
+        body=data.body or "Approved platform publication.",
+        reply_kind=data.reply_kind,
+        reply_channel=data.reply_channel,
+        reply_placeholder=data.reply_placeholder,
+        reply_endpoint=data.reply_endpoint,
+        reply_adapter=data.reply_adapter,
+    )
+    session.add(publication)
+    try:
+        await session.commit()
+    except IntegrityError:
+        # Two reclaimed deliveries can both miss the optimistic pre-read. The
+        # unique approval dedupe key is the arbiter; after rolling back the
+        # losing INSERT, re-read and adopt only an exact private-fact replay.
+        await session.rollback()
+        deployment, _ = await _require_current_publication_workspace(session, data)
+        existing = await _adopt_publication_replay(
+            session, data, patch, agent_id=deployment.agent_id
+        )
+        if existing is None:
+            raise
+        return existing, False
+    await session.refresh(publication)
+    return publication, True
+
+
+async def get_publication(
+    session: AsyncSession, publication_id: uuid.UUID
+) -> Publication | None:
+    return await session.get(Publication, publication_id)
+
+
+async def get_publication_by_approval(
+    session: AsyncSession, approval_id: uuid.UUID
+) -> Publication | None:
+    publication: Publication | None = await session.scalar(
+        select(Publication).where(Publication.approval_id == approval_id)
+    )
+    return publication
+
+
+async def list_publications(
+    session: AsyncSession, *, limit: int = 100
+) -> list[Publication]:
+    result = await session.scalars(
+        select(Publication).order_by(Publication.created_at.desc()).limit(limit)
+    )
+    return list(result)
+
+
+async def append_credential_redemption_audit(
+    session: AsyncSession,
+    *,
+    purpose: str,
+    outcome: str,
+    deployment_id: uuid.UUID | None,
+    publication_id: uuid.UUID | None,
+    repo_full_name: str | None,
+    detail: str | None,
+) -> None:
+    session.add(
+        CredentialRedemptionAuditEntry(
+            purpose=purpose,
+            outcome=outcome,
+            deployment_id=deployment_id,
+            publication_id=publication_id,
+            repo_full_name=repo_full_name,
+            detail=detail,
+        )
+    )
+    await session.commit()
+
+
+async def reap_terminal_publication_patches(
+    session: AsyncSession, *, terminal_before: datetime, limit: int
+) -> int:
+    ids = list(
+        await session.scalars(
+            select(Publication.id)
+            .where(
+                Publication.status.in_(("denied", "expired", "succeeded", "failed")),
+                Publication.terminal_at.is_not(None),
+                Publication.terminal_at <= terminal_before,
+                Publication.patch_bytes.is_not(None),
+            )
+            .order_by(Publication.terminal_at)
+            .limit(limit)
+        )
+    )
+    if not ids:
+        return 0
+    await session.execute(
+        update(Publication)
+        .where(Publication.id.in_(ids))
+        .values(patch_bytes=None, updated_at=func.now())
+    )
+    await session.commit()
+    return len(ids)
+
+
+async def create_action(session: AsyncSession, data: ActionRecord) -> AgentAction:
+    """Insert a pending action record.
+
+    Raises IntegrityError on a ``dedupe_key`` replay; the router maps that to the
+    existing record, so a redelivered turn adopts what it already wrote.
+    """
+
+    action = AgentAction(
+        agent_id=data.agent_id,
+        conversation_id=data.conversation_id,
+        call_id=data.call_id,
+        tool=data.tool,
+        arguments=data.arguments,
+        detail=data.detail,
+        gate_approval_id=data.gate_approval_id,
+        dedupe_key=data.dedupe_key,
+        status=ActionStatus.pending,
+    )
+    session.add(action)
+    await session.commit()
+    await session.refresh(action)
+    return action
+
+
+async def get_action(session: AsyncSession, action_id: uuid.UUID) -> AgentAction | None:
+    return await session.get(AgentAction, action_id)
+
+
+async def get_action_by_dedupe_key(session: AsyncSession, key: str) -> AgentAction | None:
+    result = await session.execute(select(AgentAction).where(AgentAction.dedupe_key == key))
+    return result.scalar_one_or_none()
+
+
+async def list_actions(
+    session: AsyncSession,
+    *,
+    conversation_id: str | None = None,
+    agent_id: uuid.UUID | None = None,
+    limit: int = 50,
+) -> list[AgentAction]:
+    """A conversation's actions, oldest first -- the order a receipt lists them."""
+
+    query = select(AgentAction)
+    if conversation_id is not None:
+        query = query.where(AgentAction.conversation_id == conversation_id)
+    if agent_id is not None:
+        query = query.where(AgentAction.agent_id == agent_id)
+    query = query.order_by(AgentAction.created_at, AgentAction.call_id).limit(limit)
+    result = await session.execute(query)
+    return list(result.scalars().all())
+
+
+async def complete_action(
+    session: AsyncSession, action: AgentAction, data: ActionComplete
+) -> AgentAction:
+    """Record what came back, once.
+
+    A completion that arrives for an already-completed record is a redelivery,
+    not a correction: the first account of a call is the one that was true when
+    it happened, and overwriting it with a second would silently move a prior
+    state a restore is about to replay. Returned unchanged.
+    """
+
+    if action.status != ActionStatus.pending:
+        return action
+    action.status = ActionStatus.failed if data.failed else ActionStatus.succeeded
+    action.result = data.result
+    action.prior_state = data.prior_state
+    action.post_state = data.post_state
+    action.target = data.target
+    if data.detail is not None:
+        action.detail = data.detail
+    action.completed_at = datetime.now(UTC).replace(tzinfo=None)
+    await session.commit()
+    await session.refresh(action)
+    return action
+
+
+async def list_action_audit(
+    session: AsyncSession, action_id: uuid.UUID
+) -> list[ActionAuditEntry]:
+    result = await session.execute(
+        select(ActionAuditEntry)
+        .where(ActionAuditEntry.action_id == action_id)
+        .order_by(ActionAuditEntry.created_at)
+    )
+    return list(result.scalars().all())
+
+
+async def claim_action_undo(
+    session: AsyncSession, action: AgentAction, *, actor: str
+) -> AgentAction:
+    """Mark the undo claimed so a second ruling cannot authorize a second restore.
+
+    Claimed at ruling time rather than on completion, because nothing reports
+    completion yet: the executor ADR-0117 leaves undecided is what would. The
+    honest consequence is that a restore which never runs leaves a record saying
+    it was, and closing that is the executor's job -- authorizing two restores of
+    one action is the worse failure of the two.
+    """
+
+    action.undone_at = datetime.now(UTC).replace(tzinfo=None)
+    action.undone_by = actor
+    session.add(action)
+    return action
 
 
 async def create_approval(session: AsyncSession, data: "ApprovalRequest") -> Approval:
@@ -502,6 +1072,21 @@ async def list_approvals(
     return list(result)
 
 
+async def pending_approval_inventory(
+    session: AsyncSession,
+) -> tuple[int, datetime | None]:
+    """Fleet-wide pending count and oldest creation time, without pagination."""
+
+    count, oldest = (
+        await session.execute(
+            select(func.count(Approval.id), func.min(Approval.created_at)).where(
+                Approval.status == ApprovalStatus.pending
+            )
+        )
+    ).one()
+    return int(count), oldest
+
+
 async def claim_approval_resolution(
     session: AsyncSession,
     approval_id: uuid.UUID,
@@ -517,18 +1102,48 @@ async def claim_approval_resolution(
     tells them who won). This is the claim-race primitive of ADR-0010.
     """
 
+    values: dict[str, Any] = {
+        "status": decision,
+        "resolved_by": resolved_by,
+        "resolution_note": note,
+        "resolved_at": func.now(),
+    }
+    # Publication outcomes are reported by the platform worker, never by a
+    # resumed model turn. Mark the approval as owing no wake in the same CAS.
+    publication = await get_publication_by_approval(session, approval_id)
+    if publication is not None:
+        values["resumed_at"] = func.now()
+
     result = await session.execute(
         update(Approval)
         .where(Approval.id == approval_id, Approval.status == ApprovalStatus.pending)
-        .values(
-            status=decision,
-            resolved_by=resolved_by,
-            resolution_note=note,
-            resolved_at=func.now(),
-        )
+        .values(**values)
         .returning(Approval.id)
     )
     claimed = result.scalar_one_or_none()
+    if claimed is not None and publication is not None:
+        publication_status = "approved" if decision == ApprovalStatus.approved else "denied"
+        publication_values: dict[str, Any] = {
+            "status": publication_status,
+            "version": Publication.version + 1,
+            "updated_at": func.now(),
+        }
+        if publication_status == "denied":
+            publication_values["terminal_at"] = func.now()
+            publication_values["patch_bytes"] = None
+        changed = await session.execute(
+            update(Publication)
+            .where(
+                Publication.id == publication.id,
+                Publication.status == "pending",
+                Publication.version == publication.version,
+            )
+            .values(**publication_values)
+            .returning(Publication.id)
+        )
+        if changed.scalar_one_or_none() is None:
+            await session.rollback()
+            return None
     await session.commit()
     if claimed is None:
         return None
@@ -567,13 +1182,32 @@ async def expire_approval(session: AsyncSession, approval_id: uuid.UUID) -> Appr
     """Flip a pending approval past its SLA to expired (same CAS guard, so an
     in-flight resolution that already won is never overwritten)."""
 
+    publication = await get_publication_by_approval(session, approval_id)
+    approval_values: dict[str, Any] = {
+        "status": ApprovalStatus.expired,
+        "resolved_at": func.now(),
+    }
+    if publication is not None:
+        approval_values["resumed_at"] = func.now()
     result = await session.execute(
         update(Approval)
         .where(Approval.id == approval_id, Approval.status == ApprovalStatus.pending)
-        .values(status=ApprovalStatus.expired, resolved_at=func.now())
+        .values(**approval_values)
         .returning(Approval.id)
     )
     claimed = result.scalar_one_or_none()
+    if claimed is not None and publication is not None:
+        await session.execute(
+            update(Publication)
+            .where(Publication.id == publication.id, Publication.status == "pending")
+            .values(
+                status="expired",
+                patch_bytes=None,
+                version=Publication.version + 1,
+                updated_at=func.now(),
+                terminal_at=func.now(),
+            )
+        )
     await session.commit()
     if claimed is None:
         return None
@@ -629,6 +1263,7 @@ async def reopen_dead_lettered_resume(
         update(Approval)
         .where(
             Approval.id == approval_id,
+            Approval.purpose != "publication",
             Approval.status.in_(_RESUMABLE_STATUSES),
             Approval.resumed_at.is_not(None),
             Approval.resumed_at < dead_lettered_after,
@@ -672,6 +1307,7 @@ async def claim_resume_row(session: AsyncSession, approval_id: uuid.UUID) -> App
         select(Approval)
         .where(
             Approval.id == approval_id,
+            Approval.purpose != "publication",
             Approval.resumed_at.is_(None),
             Approval.status.in_(_RESUMABLE_STATUSES),
         )
@@ -704,6 +1340,7 @@ async def list_resolved_unresumed(
     result = await session.scalars(
         select(Approval.id)
         .where(
+            Approval.purpose != "publication",
             Approval.status.in_(_RESUMABLE_STATUSES),
             Approval.resolved_at.is_not(None),
             Approval.resumed_at.is_(None),
@@ -913,4 +1550,3 @@ async def revoke_console_session(
     await session.commit()
     await session.refresh(row)
     return row
-

@@ -44,7 +44,16 @@ server {
     root /usr/share/nginx/html;
     index index.html;
 
-    # Reverse-proxy API calls, stripping the /api prefix.
+    # Internal worker routes are never exposed through the browser-facing
+    # reverse proxy, even when a client knows their path.
+    location = /api/v1/internal {
+        return 404;
+    }
+    location ^~ /api/v1/internal/ {
+        return 404;
+    }
+
+    # Reverse-proxy operator API calls, stripping the /api prefix.
     location /api/ {
         proxy_pass ${CURIE_API_TARGET}/;
         proxy_set_header Host $host;

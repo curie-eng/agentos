@@ -76,6 +76,10 @@ always goes to **stdout**; every diagnostic (progress, spinners, helm/kubectl/
 compose chatter) always goes to **stderr** -- so piping or redirecting the
 payload never picks up progress noise.
 
+For `local message` and `cluster message`, interim answer text and tool context
+are transient progress on stderr. Only the finalized reply is the stdout
+result. In JSON mode, stdout remains exactly one JSON object.
+
 On an interactive terminal, progress renders as spinners and a live checklist;
 it degrades automatically to plain, colorless status lines on a non-TTY, in
 CI, or when `NO_COLOR`/`TERM=dumb` are set.
@@ -116,7 +120,7 @@ state on stdout --
 - `--json --dry-run` emits a planned-action descriptor `{"dry_run": true,
   "target": "local"|"cluster", "stream": ..., "channel": ...,
   "reply_endpoint": ...}` (`channel` is null when it would be resolved from
-  the sole deployed agent).
+  the sole bound `(agent, Slack channel)` pair).
 
 The five shapes are the `oneOf` in `cli/schema/message.schema.json`. Two
 exceptions still print human text instead of JSON on success (tracked in
@@ -237,7 +241,7 @@ disk and targets no environment.
 | Target | What runs | Slack | Kubernetes | Verbs | Reach for it to |
 |---|---|---|---|---|---|
 | `skill` | Just the runner container on the host Docker daemon. No platform, no queue, no API, no Slack. Fully offline. | none | none | `up` `check` `down` `status` `message` `eval` | Iterate a plugin/skill against a local runner, the fastest loop. |
-| `local` | The full platform via docker compose (Postgres + Valkey + Langfuse + API + worker). | stub by default, optional real Slack with `--slack` | none | `up` `down` `status` `comms` `message` `eval` `deploy` `overrides` `reset-thread` | Exercise the real queue -> worker -> sandbox -> reply product loop with zero Slack and zero Kubernetes. Its API is published on host port `28000`. |
+| `local` | The full platform via docker compose (Postgres + Valkey + Langfuse + API + worker). | stub by default, optional real Slack with `--slack` | none | `up` `down` `status` `comms` `message` `eval` `deploy` `overrides` `reset-thread` `delete` | Exercise the real queue -> worker -> sandbox -> reply product loop with zero Slack and zero Kubernetes. Its API is published on host port `28000`. |
 | `cluster` | The platform on Kubernetes (a Helm release). | optional | yes | `up` `down` `status` `comms` `message` `eval` `deploy` `kill` `resume` `budget` `overrides` `reset-thread` `delete` | Operate and drive a deployed cluster release, and control its agents' lifecycle. |
 
 `eval` is on all three, running the SAME `evals/cases.json` with the SAME
@@ -360,10 +364,13 @@ the optional Slack dispatcher.
 
 | Command | What it does |
 |---|---|
-| `curie local up` | Bring the compose stack up (`docker compose --profile full up -d --wait` by default, `docker compose --profile core up -d --wait` with `--minimal`) and print URLs.<br>• `--slack` appends `--profile slack`.<br>• `--local-model [<id>]` adds the `local-model` profile and routes runners at the compose Ollama (default `qwen3:4b`). Same pre-provisioning rule as `skill up`: the ~8.9 GB image and the model must already be cached or `up` refuses before starting anything; `--pull-model` accepts the download for that run (ADR 0093, #1183).<br>• `--env-file <PATH>` reads the model credential from a bundle `.env` as a last resort (precedence: shell env > file; only `CURIE_CREDENTIALS`/`CLAUDE_CODE_OAUTH_TOKEN`/`ANTHROPIC_API_KEY`, and the value never reaches argv or logs), so the stack boots live with no `set -a; source .env` step (#749). |
+| `curie local up` | Bring the compose stack up (`docker compose --profile full up -d --wait` by default, `docker compose --profile core up -d --wait` with `--minimal`) and print URLs.<br>• `--slack` appends `--profile slack`.<br>• `--build` builds the stack's images from the source checkout as `:dev` and runs those instead of the published ones; it needs a compose file that substitutes the image tags, so a release-channel `curie` must pass `-f compose.dev.yaml` or it refuses before building anything (#1926).<br>• `--local-model [<id>]` adds the `local-model` profile and routes runners at the compose Ollama (default `qwen3:4b`). Same pre-provisioning rule as `skill up`: the ~8.9 GB image and the model must already be cached or `up` refuses before starting anything; `--pull-model` accepts the download for that run (ADR 0093, #1183).<br>• `--env-file <PATH>` reads the model credential from a bundle `.env` as a last resort (precedence: shell env > file; only `CURIE_CREDENTIALS`/`CLAUDE_CODE_OAUTH_TOKEN`/`ANTHROPIC_API_KEY`, and the value never reaches argv or logs), so the stack boots live with no `set -a; source .env` step (#749). |
 | `curie local down` | Stop the compose stack (`docker compose down`), keeping volumes. |
 | `curie local status` | Show the compose stack's service status (`docker compose ps`). |
 | `curie local observability` | Print the local platform's observability surfaces: Curie Console, Langfuse UI (traces / cost / evals), and the Curie API base. URLs are printed only; pass `--open` to also open the browsable ones (Console, Langfuse) in a browser. `--json` never opens a browser. |
+| `curie local observability runs` | List newest-first trace rows through the local Curie API. `--limit` defaults to 20 and accepts 1 through 100; `--agent-id <id>` restricts the list. |
+| `curie local observability run <trace-id>` | Read one complete trace tree previously returned by `runs` (or reported by a completed turn). |
+| `curie local observability metrics` | Read the metrics summary, or a series with `--metric runs\|latency_p95_ms\|tokens\|cost_usd\|error_rate`. Series `--granularity hour\|day\|week` defaults to `day`; all metrics queries accept the API's independent `--start`, `--end`, `--environment`, and `--agent` filters. Series results are capped at 1,000 points. |
 | `curie local comms --slack` | Connect or disconnect a real Slack workspace for the compose stack.<br>• Resolves `SLACK_APP_TOKEN` and `SLACK_BOT_TOKEN` with precedence `--app-token`/`--bot-token` flag > env var > a value persisted with `curie secrets set` (so tokens saved once need no per-session re-export, #749).<br>• Masks them in dry run output.<br>• Starts or stops the dispatcher, and switches the worker between real Slack and the local stub. |
 | `curie local message "..."` | Drive the local compose stack end to end with zero Slack. Enqueues straight to the compose Valkey and lets the containerized worker answer. |
 | `curie local eval` | Run the deployed bundle's eval suite through the compose platform. Without a trajectory sidecar, it uses the enqueue, worker, sandbox, and reply path with the shared grader, isolating each case from ambient durable agent memory so the gate is the immutable bundle plus committed cases (#1909). With `evals/trajectory.json`, it triggers the worker eval plane and reads each structured trajectory verdict from the exact matrix stream. Prints the same per case table and rollup, with nonzero exit on failure.<br>• `--cases` overrides the file only for a text graded run. It is refused for a trajectory run because the platform grades the deployed bundle.<br>• `--case-id ID` (repeatable) selects which cases run; omit it for the whole suite. A value matching no case exits **2** (usage) naming the typo, so a mistyped selector fails the gate rather than greening an empty run. Refused with exit 4 on a `--model` sweep and on a trajectory run, both of which grade the deployed suite server-side.<br>• `--samples N` / `--aggregation` / `--pass-at-k` match `skill eval`. A `--model` sweep refuses `--samples > 1`.<br>• `--dry-run` prints the plan.<br>• `--concurrency` defaults to 1. Values above 1 are refused for now (#709). |
@@ -372,6 +379,7 @@ the optional Slack dispatcher.
 | `curie local memory <agent> --add <content>` | Append an operator-authored memory record (`POST /agents/{id}/memory`). The API stamps operator provenance. A fresh session is required before the entry is injected at boot. `--dry-run` prints the plan. |
 | `curie local overrides <agent> [--model V\|--clear-model] [--thinking V\|--clear-thinking]` | Read or change the agent's two nullable operator overrides via the compose platform API (`PATCH /agents/{id}`).<br>• With no change flags it INSPECTS and writes nothing.<br>• `--clear-<field>` sends explicit JSON null, restoring the platform default; an omitted field is left alone, which is a different request the API tells apart with `model_fields_set`.<br>• A blank value is refused rather than forwarded: an empty override skips the platform default instead of restoring it. |
 | `curie local reset-thread <agent> --thread-key <key> --yes` | Force a stuck thread's sandbox to be released via the compose platform API (`POST /agents/{id}/threads/{thread_key}/reset`, #737).<br>• The worker's next maintenance tick releases the thread's claim and route, so its next message cold-creates a fresh sandbox; conversation history is not deleted.<br>• Interrupts a live turn on the thread first, so it refuses without `--yes`. |
+| `curie local delete <agent> --yes` | End every active deployment, then delete the agent through the compose platform API. Destructive and irreversible: refuses without `--yes`.<br>• If the final agent deletion fails, the agent remains present but any deployments already ended stay ended. |
 
 ##### `curie local message`: the same roundtrip against the compose stack
 
@@ -424,16 +432,58 @@ Wraps the umbrella Helm chart and the deployed release, the way `linkerd` or
 | `curie cluster rollback` | Roll the release back to a prior Helm revision (`helm rollback`); prompts unless `--yes`.<br>• With no `--revision`, auto-selects the newest revision whose status is `deployed` or `superseded`, skipping any `failed`/`pending-*`/`uninstalling` revision in between.<br>• `--revision <n>` targets an exact revision instead; one that is not `deployed`/`superseded` is refused unless `--allow-failed-revision` is also passed (requires `--revision`). |
 | `curie cluster status` | Report release health, pod readiness, and access URLs (read-only). |
 | `curie cluster observability` | Report the release's observability surfaces (Curie Console, Langfuse UI, Curie API base), using the same NodePort discovery as `cluster status`.<br>• Degrades a missing, ClusterIP, or unresolvable surface to a note instead of failing.<br>• URLs are printed only; pass `--open` to also open the browsable ones (Console, Langfuse) in a browser. `--json` never opens a browser.<br>• `--dry-run` prints the read-only discovery commands. |
+| `curie cluster observability runs\|run\|metrics` | The same read-only query grammar and results as local observability. Omit `--api-url` to self-plumb a loopback port-forward to the API selected by `--namespace` / `--release` (both default to `curie`); omit `--api-key` there to read the release Secret. A direct `--api-url` requires its matching `--api-key`, so a discovered release key is never sent to an arbitrary endpoint. |
 | `curie cluster comms --slack` | Connect or disconnect a real Slack workspace with a thin `helm upgrade --reuse-values`; env-backed tokens are masked in dry-run output. |
 | `curie cluster message "..."` | Drive the deployed release end to end. With a connected dispatcher, it posts a placeholder and routes the reply to the agent's bound Slack channel. Without a dispatcher, it uses the terminal reply stub and waits for the reply.<br>• Auto-discovers the release-generated API key and Valkey password from `<release>-secrets` when `--api-key` / `--valkey-password` (or their env vars) are omitted, so a default strong-secrets install needs no hand-exported credentials (#786). |
 | `curie cluster eval` | Run the deployed bundle's eval suite through the Kubernetes platform. Without a trajectory sidecar, it uses the reply stub path with the shared grader, isolating each case from ambient durable agent memory so the gate is the immutable bundle plus committed cases (#1909). With `evals/trajectory.json`, it triggers the worker eval plane and reads each structured trajectory verdict from the exact matrix stream. Prints the same per case table and rollup, with nonzero exit on failure.<br>• `--cases` overrides the file only for a text graded run. It is refused for a trajectory run because the platform grades the deployed bundle.<br>• `--case-id ID` (repeatable) selects which cases run; omit it for the whole suite. A value matching no case exits **2** (usage) naming the typo, so a mistyped selector fails the gate rather than greening an empty run. Refused with exit 4 on a `--model` sweep and on a trajectory run, both of which grade the deployed suite server-side.<br>• `--samples N` / `--aggregation` / `--pass-at-k` match `skill eval`. A `--model` sweep refuses `--samples > 1`.<br>• `--dry-run` prints the plan.<br>• `--concurrency` defaults to 1. Values above 1 are refused for now (#709).<br>• Auto discovers the release generated API key and Valkey password from `<release>-secrets` when `--api-key` or `--valkey-password`, and their environment variables, are omitted. A default strong secrets install needs no hand exported credentials (#790). |
-| `curie cluster deploy` | Package the bundle as tar.gz and push it to the platform API.<br>• When `--api-url` is omitted, self-plumbs a `kubectl port-forward` (loopback tunnel) to the release API service and auto-discovers the release-generated key from `<release>-secrets`, so the strong key never crosses the cleartext UI proxy (ADR-0057).<br>• Pass `--api-url` / `CURIE_API_URL` to direct-dial a URL instead (no tunnel); an explicit `--api-key` / `CURIE_API_KEY` still wins over discovery. |
+| `curie cluster deploy` | Package the bundle as tar.gz and push it to the platform API.<br>• When `--api-url` is omitted, self-plumbs a `kubectl port-forward` (loopback tunnel) to the release API service and auto-discovers the release-generated key from `<release>-secrets`, so the strong key never crosses the cleartext UI proxy (ADR-0057). `--api-local-port` picks the local end of that tunnel; default `0` lets the kernel assign an ephemeral port, matching `cluster message` and `cluster eval`, so concurrent deploys cannot collide on a fixed port.<br>• Before posting, verifies the self-plumbed tunnel's unauthenticated `GET /health` really answers the Curie API (`{"status": "ok"}`); refuses a 404, an HTML 200, a non-`ok` JSON 200, or a redirect, since a squatted local port or a misresolved Service are both TCP-alive and would pass the port-forward's own readiness check. This verification does not run against an explicit `--api-url`.<br>• Pass `--api-url` / `CURIE_API_URL` to direct-dial a URL instead (no tunnel); an explicit `--api-key` / `CURIE_API_KEY` still wins over discovery. |
 | `curie cluster kill <agent> --yes` | Kill an agent (stop its runs) via the platform API (`POST /agents/{id}/kill`). Destructive: refuses without `--yes`. |
 | `curie cluster resume <agent>` | Resume a killed agent via the platform API (`POST /agents/{id}/resume`). |
 | `curie cluster budget <agent> --limit <n>` | Set the agent's daily spend cap in USD via the platform API (`PUT /agents/{id}/budget`, `BudgetConfig.max_usd_per_day`); the per-run token cap is left at the platform default. |
 | `curie cluster overrides <agent> [--model V\|--clear-model] [--thinking V\|--clear-thinking]` | Read or change the agent's two nullable operator overrides via the platform API (`PATCH /agents/{id}`).<br>• With no change flags it INSPECTS and writes nothing.<br>• `--clear-<field>` sends explicit JSON null, restoring the platform default; an omitted field is left alone, which is a different request the API tells apart with `model_fields_set`.<br>• A blank value is refused rather than forwarded: an empty override skips the platform default instead of restoring it. |
 | `curie cluster reset-thread <agent> --thread-key <key> --yes` | Force a stuck thread's sandbox to be released via the platform API (`POST /agents/{id}/threads/{thread_key}/reset`, #737).<br>• The worker's next maintenance tick releases the thread's claim and route, so its next message cold-creates a fresh sandbox; conversation history is not deleted.<br>• Interrupts a live turn on the thread first, so it refuses without `--yes`. |
-| `curie cluster delete <agent> --yes` | Delete an agent via the platform API (`DELETE /agents/{id}`). Destructive and irreversible: refuses without `--yes`. |
+| `curie cluster delete <agent> --yes` | End every active deployment, then delete the agent through the platform API. Destructive and irreversible: refuses without `--yes`.<br>• If the final agent deletion fails, the agent remains present but any deployments already ended stay ended. |
+
+##### `curie local|cluster observability`: API-backed queries
+
+The bare commands above remain URL/surface reports. Queries are read-only and
+non-interactive; they use only the Curie API proxy and its existing DTOs, never
+Langfuse or backend credentials. `--open` is available only on the bare surface
+report and is rejected with a query; `cluster observability --dry-run` likewise
+applies only to bare discovery. There is deliberately no `--latest`: use the
+trace id emitted by a completed turn, then inspect it with `run`.
+
+For either `<tier>` (`local` or `cluster`), the grammar is `curie <tier>
+observability runs [--limit 1..100] [--agent-id <id>]`, `curie <tier>
+observability run <trace-id>`, or `curie <tier> observability metrics
+[--metric <enum> [--granularity <enum>]] [--start <ISO-8601>] [--end
+<ISO-8601>] [--environment <name>] [--agent <name>]`.
+
+```bash
+curie --json local observability runs --limit 20 --agent-id acme-agent
+curie --json local observability run trace_abc
+curie --json local observability metrics --metric tokens --granularity hour \
+  --start 2026-08-23T00:00:00Z --end 2026-08-24T00:00:00Z \
+  --environment development --agent acme-bot
+curie --json cluster observability --namespace curie --release curie runs --limit 20
+```
+
+`runs` returns the bounded wrapper `{"limit", "count", "runs"}` (schema
+`https://schemas.curietech.ai/cli/observability-runs/v1.json`); `run` returns
+the complete `TraceTree` DTO (`trace`, `tree`, `sandbox_id`, and
+`approval_decision`; schema
+`https://schemas.curietech.ai/cli/observability-run/v1.json`). `metrics` returns
+the direct summary DTO when `--metric` is omitted, or the direct series DTO
+when it is present (schema
+`https://schemas.curietech.ai/cli/observability-metrics/v1.json`). The metrics
+filter is deliberately `--agent`, while the runs filter is `--agent-id`,
+matching their API routes.
+
+With `--json`, each successful query writes exactly one typed object to stdout;
+human guidance and progress stay on stderr (and respect `--quiet`). An unknown,
+well-formed trace id writes `{"error","fix"}` and exits 1; an unavailable API
+writes a distinct `{"error","fix"}` and exits 3. Invalid input, including a
+limit outside 1 through 100 or `--granularity` without `--metric`, exits 2.
 
 | `curie cluster memory <agent>` | List the agent's durable memory log (`GET /agents/{id}/memory`). Empty when none exist. |
 | `curie cluster memory <agent> --add <content>` | Append an operator-authored memory record (`POST /agents/{id}/memory`). The API stamps operator provenance. A fresh session is required before the entry is injected at boot. `--dry-run` prints the plan. |
@@ -682,21 +732,25 @@ these forms:
 3. `charts/curie/ci/name.sh` for a chart check script.
 
 The command runs the selector at the current `HEAD`, reverses only the change's
-non test files in a disposable worktree, then runs the selector again. `PINNED`
-is printed and exits successfully for any nonzero selector result after a clean
-reversal, including compile or import failures. `UNPINNED` is
-printed and exits nonzero when it remains green.
+non test files in a disposable worktree, then runs the selector again. It prints
+`PINNED` and exits successfully only when the changed selected test node owns the
+failure after a clean reversal. For Python, the selected pytest testcase must
+carry the sole JUnit failure element. For Rust, the exact selected test must fail
+at runtime, or a compile error must point inside the changed selected function.
+Chart checks must return nonzero. It prints `UNPINNED` and exits nonzero when the
+selector remains green.
 
 It refuses invalid commit or pull request references, root commits, changes
 without classified test files or product files, selectors outside the three
 forms or not changed by the reference, a red baseline, and reverse patch
-conflicts. Inline tests in product files are not inferred.
+conflicts. It also refuses unrelated collection, import, compile, setup, and
+teardown failures. Inline tests in product files are not inferred.
 
 ### Building the runner image from source
 
 | Command | What it does |
 |---|---|
-| `curie build` | Build the runner image locally: `docker build -f runner/Dockerfile -t curie-runner .` from the repo root (found by walking up to `runner/Dockerfile`). `--tag` overrides the tag. Prints a clear error if Docker is not installed or if run outside a source checkout -- a release binary pulls the pinned runner image from GHCR automatically and never needs to build. |
+| `curie build` | Build the runner image locally from `runner/Dockerfile` at the repo root. Default tag is `curie-runner`; the same image is also tagged `ghcr.io/curie-eng/curie-runner:dev` so a `curie local up --build` stack sees it. `--tag` overrides the primary tag (a custom tag is not also applied as `:dev`). Prints a clear error if Docker is not installed or if run outside a source checkout -- a release binary pulls the pinned runner image from GHCR automatically and never needs to build. |
 
 ### Prototyping agents in a source checkout
 
@@ -710,7 +764,7 @@ Two shortcuts for working with the repo's own `agents/` scratch directory:
 ### Verify
 
 ```bash
-cd cli && cargo fmt --check && cargo clippy -- -D warnings && cargo test
+cd cli && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 ```
 
 The scripted E2E (real runner container, fake model by default, offline):

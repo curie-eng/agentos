@@ -139,6 +139,8 @@ fn record_runner(bundle: &Path, base_url: &str) {
             model_base_url: None,
             bundle_digest: None,
             bundle_snapshot_dir: None,
+            connector_containers: Vec::new(),
+            connector_network: None,
         },
     )
     .expect("record runner state");

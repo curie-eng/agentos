@@ -103,6 +103,7 @@ async fn two_disposable_clusters_refuse_mismatch_and_warn_on_replace() {
         &["K8S_WRITE_KUBECONFIG".to_string()],
         &scope_b,
         "acme-bot",
+        &BTreeMap::new(),
     )
     .unwrap_err()
     .to_string();
@@ -116,6 +117,7 @@ async fn two_disposable_clusters_refuse_mismatch_and_warn_on_replace() {
         &["K8S_WRITE_KUBECONFIG".to_string()],
         &scope_a,
         "acme-bot",
+        &BTreeMap::new(),
     )
     .unwrap();
     let intent = prepared_a.write_intent().unwrap();
@@ -148,6 +150,7 @@ async fn two_disposable_clusters_refuse_mismatch_and_warn_on_replace() {
         &["K8S_WRITE_KUBECONFIG".to_string()],
         &scope_a,
         "acme-bot",
+        &BTreeMap::new(),
     )
     .unwrap()
     .bind_target(
@@ -170,6 +173,7 @@ async fn two_disposable_clusters_refuse_mismatch_and_warn_on_replace() {
         &["K8S_WRITE_KUBECONFIG".to_string()],
         &scope_a,
         "acme-bot",
+        &BTreeMap::new(),
     )
     .unwrap();
     let replaced = sync(

@@ -135,6 +135,8 @@ fn record_for(
         model_base_url: None,
         bundle_digest: digest,
         bundle_snapshot_dir: None,
+        connector_containers: Vec::new(),
+        connector_network: None,
     }
 }
 

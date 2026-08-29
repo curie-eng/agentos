@@ -18,6 +18,7 @@ from aci_protocol import BootEnv
 from kubernetes import client as k8s_client
 from kubernetes import config as k8s_config
 
+from ..workspace import WORKSPACE_REF_ENV, WORKSPACE_SHA256_ENV
 from .types import (
     MANAGED_BY_LABEL,
     MANAGED_BY_VALUE,
@@ -25,6 +26,7 @@ from .types import (
     OperatingMode,
     QuotaRejection,
     SandboxView,
+    filter_agent_child_env,
 )
 
 CORE_GROUP = "agents.x-k8s.io"
@@ -44,6 +46,7 @@ EXT_VERSION = "v1beta1"
 # and answer, with the bundle simply absent.
 BUNDLE_REF_ENV = BootEnv.env_key("bundle_ref")
 BUNDLE_INIT_CONTAINERS = ("bundle-fetch", "bundle-extract")
+WORKSPACE_INIT_CONTAINERS = ("workspace-init",)
 
 # The SandboxClaim env schema is value-only (no secretKeyRef), so anything put
 # here is stored in plain text on the claim object. The model credential must NOT
@@ -62,9 +65,8 @@ CREDENTIALS_ENV = BootEnv.env_key("credentials_ref")
 # plaintext in etcd -- the same leak the model-credential stripping above avoids.
 # The binding marks which keys are connector secrets in this env var
 # (comma-separated names); strip both the marker and every key it names off the
-# claim. Their secretKeyRef delivery via a per-agent Secret is #440; until then
-# an authed-MCP bundle simply is not delivered its secret on the cluster tier
-# rather than leaking it. Named from the BootEnv declaration like the two above:
+# claim. Their secretKeyRef delivery is the per-agent SandboxTemplate (#1488).
+# Named from the BootEnv declaration like the two above:
 # a local literal that drifted on a rename would stop matching the marker the
 # binding writes, and every connector secret would be persisted as plaintext.
 CONNECTOR_SECRET_KEYS_ENV = BootEnv.env_key("connector_secret_keys")
@@ -131,11 +133,7 @@ def _quota_rejection(status: dict[str, Any]) -> QuotaRejection | None:
         if not marker or "exceeded quota: " in details:
             continue
         quota_name, marker, details = details.partition(", requested: ")
-        if (
-            not marker
-            or not quota_name
-            or any(character.isspace() for character in quota_name)
-        ):
+        if not marker or not quota_name or any(character.isspace() for character in quota_name):
             continue
         requested_raw, marker, details = details.partition(", used: ")
         if not marker:
@@ -219,7 +217,12 @@ def _sandbox_view(obj: dict[str, Any]) -> SandboxView:
 class KubernetesSandboxClient:
     """SandboxClient against a real cluster (kubeconfig or in-cluster auth)."""
 
-    def __init__(self, namespace: str, *, kubeconfig: str | None = None) -> None:
+    def __init__(
+        self,
+        namespace: str,
+        *,
+        kubeconfig: str | None = None,
+    ) -> None:
         try:
             k8s_config.load_incluster_config()
         except k8s_config.ConfigException:
@@ -237,6 +240,7 @@ class KubernetesSandboxClient:
         env: dict[str, str] | None = None,
         labels: dict[str, str] | None = None,
     ) -> None:
+        env = filter_agent_child_env(env)
         body: dict[str, Any] = {
             "apiVersion": f"{EXT_GROUP}/{EXT_VERSION}",
             "kind": "SandboxClaim",
@@ -251,15 +255,19 @@ class KubernetesSandboxClient:
             # model credential and per-agent connector secrets are deliberately
             # excluded so no secret value is ever persisted in plain text on the
             # claim: the credential reaches the runner via the template's
-            # secretKeyRef, and connector-secret delivery is #440. The marker var
-            # naming the connector-secret keys is stripped too.
+            # secretKeyRef, and connector secrets are delivered the same way via
+            # the per-agent template (#1488). The marker var naming the
+            # connector-secret keys is stripped too.
             marker = env.get(CONNECTOR_SECRET_KEYS_ENV, "")
-            stripped = {CREDENTIALS_ENV, CONNECTOR_SECRET_KEYS_ENV}
+            stripped = {
+                CREDENTIALS_ENV,
+                CONNECTOR_SECRET_KEYS_ENV,
+                WORKSPACE_REF_ENV,
+                WORKSPACE_SHA256_ENV,
+            }
             stripped.update(k for k in marker.split(",") if k)
             entries: list[dict[str, str]] = [
-                {"name": k, "value": v}
-                for k, v in sorted(env.items())
-                if k not in stripped
+                {"name": k, "value": v} for k, v in sorted(env.items()) if k not in stripped
             ]
             # The bundle ref must also reach the init containers, which the
             # Overrides policy does not touch without an explicit containerName.
@@ -273,6 +281,28 @@ class KubernetesSandboxClient:
                             "value": bundle_ref,
                         }
                     )
+            # Workspace fetch/extract consumes only the short-lived exact-object
+            # reference and digest. It receives no worker-auth, object-store, or
+            # GitHub credential.
+            workspace_ref = env.get(WORKSPACE_REF_ENV)
+            workspace_sha256 = env.get(WORKSPACE_SHA256_ENV)
+            if workspace_ref is not None:
+                for container in WORKSPACE_INIT_CONTAINERS:
+                    entries.append(
+                        {
+                            "containerName": container,
+                            "name": WORKSPACE_REF_ENV,
+                            "value": workspace_ref,
+                        }
+                    )
+                    if workspace_sha256 is not None:
+                        entries.append(
+                            {
+                                "containerName": container,
+                                "name": WORKSPACE_SHA256_ENV,
+                                "value": workspace_sha256,
+                            }
+                        )
             body["spec"]["env"] = entries
         self._api.create_namespaced_custom_object(
             EXT_GROUP, EXT_VERSION, self._namespace, "sandboxclaims", body

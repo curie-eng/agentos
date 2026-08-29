@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/observability-runs/v1.json",
+  "title": "curie local|cluster observability runs --json",
+  "description": "A bounded newest-first list of trace rows read through the Curie API. `count` is the number of rows returned after defensive client-side truncation, not a backend total. The API intentionally exposes each trace as an open-ended object, so rows are preserved wholesale while the CLI-owned wrapper remains closed.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "limit",
+    "count",
+    "runs"
+  ],
+  "properties": {
+    "limit": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100
+    },
+    "count": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 100
+    },
+    "runs": {
+      "type": "array",
+      "maxItems": 100,
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": [
+          "id",
+          "name",
+          "timestamp"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "timestamp": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

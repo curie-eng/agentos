@@ -1,0 +1,548 @@
+{
+  "comment": "Single source of truth for source_digest, the content derived identity of a connector's build input (ADR 0113). Python owns it as connector_lock.source_digest_of, which the bundle validator calls to recompute the digest from an already extracted tree and refuse a stale lock; the Rust CLI ports it because `curie build` computes the same value before writing the lock. The two cannot share code, so the algorithm is frozen here as a corpus of small trees with their expected digests: a lane that computes anything else fails its own suite.\n\nTHE ALGORITHM, stated completely, because a vector corpus alone cannot say why two readers disagree.\n  stream = b\"\"\n  for each included file, ordered by the bytewise ascending order of its UTF-8 encoded POSIX relative path:\n      stream += relpath (UTF-8) + b\"\\0\" + lowercase hex sha256 of the file's bytes (ASCII) + b\"\\0\" + b\"1\" if the file is executable by its owner else b\"0\" + b\"\\n\"\n  stream += b\"build\\0\" + canonical JSON of the build block (UTF-8) + b\"\\n\"\n  source_digest = \"sha256:\" + lowercase hex sha256 of stream\nThe build block is {context, dockerfile, platforms} with dockerfile already defaulted to \"Dockerfile\" and platforms in DECLARED order, serialized with sorted keys, no whitespace between tokens, and no non-ASCII escaping.\n\nTHE EXECUTABLE BIT is the third field of every per-file record, and it is exactly one bit: is the file executable by its OWNER (POSIX mode & 0o100), written as ASCII 1 or 0. Docker's build context tar carries each file's mode and BuildKit keys its cache on it, so `chmod +x entrypoint.sh` with no byte changed is a different build input producing a different image. A digest blind to it leaves the lock looking fresh while a stale image deploys. Only the owner bit is read, not the group or other bits and not the rest of the mode: those do not survive uniformly into an image layer, and hashing them would report a source changed on a machine with a different umask. Off-unix, where there is no owner execute bit to read, every file hashes as 0 -- the same normalization docker itself applies on Windows.\n\nINCLUDED FILES are every regular file at any depth under the canonicalized context, EXCEPT the generated connectors.lock.yaml, and any path excluded by the context's own .dockerignore. The lock exclusion is exactly one path under exactly one condition: `connectors.lock.yaml` at the TOP of the context, and only when the declared `build.context` names the BUNDLE ROOT. That condition is decided from the declaration, never from the tree: normalize the declared context by stripping a trailing `/`, and it is the bundle root when what remains is `.` or the empty string. `curie build` writes the generated lock at the bundle root and nowhere else, so that is the only place a `connectors.lock.yaml` can be the file the digest is being recorded into; excluding it there is what stops writing the lock from invalidating the digest it records. Everywhere else a file of that name is ORDINARY BUILD INPUT and is hashed: at the top of a subdirectory context (the common case, `context: connectors/tempo`), because `curie build` never wrote it there and the daemon receives it like any other authored file; and nested deeper under any context, for the same reason. Excluding by basename at any depth, or excluding at the context root whatever the declared context is, both let an edit to real source leave the digest unmoved -- a stale lock passing review. A symlink is never followed and never hashed; the context resolver refuses one before hashing begins, on both sides (`connector_lock.resolve_context` and `cli/src/connector_build.rs`'s `resolve_context`), so a symlinked context cannot steer the digest with bytes outside the bundle.\n\n.dockerignore is Docker's own exclusion set, so honoring it means the digest covers exactly what the daemon receives (https://docs.docker.com/build/concepts/context/#dockerignore-files). .curieignore is a different question, governing bundle packing, and is NOT consulted. Blank lines and lines whose first non-space character is # are skipped; every other line is stripped and matched against the file's POSIX relative path and against each of its ancestor directory paths, segment by segment, so * and ? never cross a / and a pattern naming a directory excludes everything beneath it. That is Go filepath.Match, the matcher Docker's own client uses.\n\nTHE RULE SET IS ORDERED, and this is where a naive port goes wrong. A line beginning with ! is a re-include, its ! stripped and the remainder used verbatim (a bare ! names nothing and is skipped). EVERY rule is evaluated against every candidate path and the LAST one that matches decides: a later ! re-includes what an earlier pattern excluded, and a later pattern excludes what an earlier ! re-included. A reader that returns on the first matching exclusion, or that has no ! at all, breaks the digest's one property in both directions -- `*.log` plus `!keep.log` ships keep.log to the daemon while hashing nothing of it, so editing keep.log leaves a stale lock looking current; and `*` alone excludes the entire tree, so the digest is a constant and the lock can NEVER go stale. A directory is therefore never pruned during the walk either: a ! can re-include a file beneath an excluded directory, exactly as Docker descends whenever the ignore set carries any exclusion. Finally, two rules are appended after the file's own, mirroring the docker CLI's TrimBuildFilesFromExcludes: if the patterns would exclude `.dockerignore` or the declared dockerfile, `!` that path back in, because the daemon receives those two whatever the patterns say. .dockerignore itself IS hashed: changing the exclusion set changes what gets built.\n\nCONTENT AND ONE MODE BIT, NOTHING ELSE. No mtime, uid or gid, and of the mode only the owner execute bit above -- deliberately unlike cli/src/bundle.rs's archive digest, which documents at cli/src/bundle.rs:181-184 that it embeds all three because it identifies an ARCHIVE and not a source tree. Reusing that computation here would report every fresh checkout as a changed source. The two-directories-same-content-different-mtimes proof lives in the CLI suite, since a JSON corpus cannot express a timestamp.\n\nEach vector carries `name`, `why`, `tree` (POSIX relative path to file, materialized verbatim by both suites), `build` (the declared build block), and `source_digest`. A `tree` VALUE is either a string, which is the file's content with no execute bit, or an object {\"content\": \"...\", \"executable\": true}, which is the same content materialized with the owner execute bit set. Both suites' materializers honor the object form; a suite that read only the string form would materialize the executable vectors non-executable and compute a digest the corpus does not carry. `relations` then names the pairs whose digests must be equal and the pairs that must differ, which is where the exclusion and build-block rules are actually falsified: a reader that ignores .dockerignore still passes every single-vector assertion by recording whatever it computes, but cannot satisfy both halves of a relation. Read by packages/plugin-format/tests/test_connector_lock.py and by cli/tests/connector_build_decl_vectors.rs.",
+  "vectors": [
+    {
+      "name": "single_file_context",
+      "why": "The minimum tree. Pins the per file record layout (relative path, NUL, lowercase hex sha256 of the content, NUL, the ASCII owner-execute bit, newline) and the trailing build block record, with nothing else in the stream to hide an ordering mistake.",
+      "tree": {
+        "Dockerfile": "FROM scratch\nCOPY server.py /server.py\n"
+      },
+      "build": {
+        "context": "connectors/tempo",
+        "dockerfile": "Dockerfile",
+        "platforms": [
+          "linux/amd64"
+        ]
+      },
+      "source_digest": "sha256:b0d3efedb7c89e479095b9e9893b22f964f171f831e9b0813d1515a46a911f77"
+    },
+    {
+      "name": "nested_tree_is_walked_in_sorted_path_order",
+      "why": "Files at three depths whose sorted order differs from any natural filesystem walk order. A reader that walks directories depth first, or sorts basenames rather than full relative paths, produces a different stream and therefore a different digest on the same source.",
+      "tree": {
+        "Dockerfile": "FROM scratch\n",
+        "server.py": "print('acme')\n",
+        "lib/a.py": "A = 1\n",
+        "lib/inner/b.py": "B = 2\n",
+        "README.md": "acme tempo connector\n"
+      },
+      "build": {
+        "context": "connectors/tempo",
+        "dockerfile": "Dockerfile",
+        "platforms": [
+          "linux/amd64"
+        ]
+      },
+      "source_digest": "sha256:bed90b9da771703347cdd0f06f99174036045629886fdf63b54fe66170228790"
+    },
+    {
+      "name": "dockerignore_excludes_a_matching_file",
+      "why": "The context the daemon receives is the context minus what .dockerignore names, so the digest must cover exactly that. Hashing an ignored file makes every build report itself stale after a log rotates.",
+      "tree": {
+        "Dockerfile": "FROM scratch\n",
+        ".dockerignore": "# scratch output, never part of the image\n*.log\n",
+        "server.py": "print('acme')\n",
+        "debug.log": "first run\n"
+      },
+      "build": {
+        "context": "connectors/tempo",
+        "dockerfile": "Dockerfile",
+        "platforms": [
+          "linux/amd64"
+        ]
+      },
+      "source_digest": "sha256:b6a919e33ab673f96b7b7d88f0569d5d6f44024e2769d4d1c369ef632747f91b"
+    },
+    {
+      "name": "an_ignored_files_content_does_not_move_the_digest",
+      "why": "Same tree as dockerignore_excludes_a_matching_file with the ignored file's content changed. The digest must be identical: this is the pair that proves the exclusion is real rather than the pattern list merely being parsed.",
+      "tree": {
+        "Dockerfile": "FROM scratch\n",
+        ".dockerignore": "# scratch output, never part of the image\n*.log\n",
+        "server.py": "print('acme')\n",
+        "debug.log": "second run, different bytes entirely\n"
+      },
+      "build": {
+        "context": "connectors/tempo",
+        "dockerfile": "Dockerfile",
+        "platforms": [
+          "linux/amd64"
+        ]
+      },
+      "source_digest": "sha256:b6a919e33ab673f96b7b7d88f0569d5d6f44024e2769d4d1c369ef632747f91b"
+    },
+    {
+      "name": "editing_dockerignore_moves_the_digest",
+      "why": "Same files, one more exclusion pattern. .dockerignore is itself hashed, and it must be: adding a pattern changes what the daemon builds, so a digest that ignored the file would report an unchanged source for a materially different image.",
+      "tree": {
+        "Dockerfile": "FROM scratch\n",
+        ".dockerignore": "# scratch output, never part of the image\n*.log\nREADME.md\n",
+        "server.py": "print('acme')\n",
+        "debug.log": "first run\n"
+      },
+      "build": {
+        "context": "connectors/tempo",
+        "dockerfile": "Dockerfile",
+        "platforms": [
+          "linux/amd64"
+        ]
+      },
+      "source_digest": "sha256:0db7365347781cd8a32b3249e03fea8caf350ce21da83386d625c8e9a2db696f"
+    },
+    {
+      "name": "dockerignore_excludes_a_whole_directory",
+      "why": "A pattern naming a directory excludes everything beneath it, matched against each ancestor path. A reader that only compares the pattern against the full relative path leaves the directory's contents in the digest.",
+      "tree": {
+        "Dockerfile": "FROM scratch\n",
+        ".dockerignore": "scratch\n",
+        "server.py": "print('acme')\n",
+        "scratch/tmp.txt": "throwaway\n",
+        "scratch/deep/tmp2.txt": "throwaway\n"
+      },
+      "build": {
+        "context": "connectors/tempo",
+        "dockerfile": "Dockerfile",
+        "platforms": [
+          "linux/amd64"
+        ]
+      },
+      "source_digest": "sha256:c62eba33187d2ae6f11d7b790359c9237caaf65c1ab9ed973fbb304ffabf0c17"
+    },
+    {
+      "name": "a_negation_reincludes_what_an_earlier_pattern_excluded",
+      "why": "`*.log` then `!keep.log`, the ordering rule stated as a tree. Docker sends keep.log to the daemon because the LAST matching rule wins, so the digest must cover it. A reader that returns on the first matching exclusion, or that never implements `!`, drops keep.log and computes something else here.",
+      "tree": {
+        "Dockerfile": "FROM scratch\n",
+        ".dockerignore": "*.log\n!keep.log\n",
+        "server.py": "print('acme')\n",
+        "debug.log": "first run\n",
+        "keep.log": "kept\n"
+      },
+      "build": {
+        "context": "connectors/tempo",
+        "dockerfile": "Dockerfile",
+        "platforms": [
+          "linux/amd64"
+        ]
+      },
+      "source_digest": "sha256:18a8a5e047469e33dea44abe28b85fc4383c03adf0645893a37581dc446c523a"
+    },
+    {
+      "name": "editing_a_reincluded_file_moves_the_digest",
+      "why": "The same tree with the re-included keep.log edited. Its bytes are in the image, so the digest must move; a first-match-wins reader excludes the file and reports the source unchanged, which is a stale lock passing review.",
+      "tree": {
+        "Dockerfile": "FROM scratch\n",
+        ".dockerignore": "*.log\n!keep.log\n",
+        "server.py": "print('acme')\n",
+        "debug.log": "first run\n",
+        "keep.log": "kept, then edited\n"
+      },
+      "build": {
+        "context": "connectors/tempo",
+        "dockerfile": "Dockerfile",
+        "platforms": [
+          "linux/amd64"
+        ]
+      },
+      "source_digest": "sha256:758f094c3e477a83f1d1a3a36281d88a2685afddedaf7e94a41d0d07b79b084d"
+    },
+    {
+      "name": "a_still_ignored_file_beside_a_negation_does_not_move_the_digest",
+      "why": "The other half of the ordering rule: `!keep.log` re-includes exactly one path and leaves `*.log` governing every other log. debug.log's bytes must stay out. A reader that treats any `!` as switching the whole set off passes the pair above and fails here.",
+      "tree": {
+        "Dockerfile": "FROM scratch\n",
+        ".dockerignore": "*.log\n!keep.log\n",
+        "server.py": "print('acme')\n",
+        "debug.log": "second run, different bytes entirely\n",
+        "keep.log": "kept\n"
+      },
+      "build": {
+        "context": "connectors/tempo",
+        "dockerfile": "Dockerfile",
+        "platforms": [
+          "linux/amd64"
+        ]
+      },
+      "source_digest": "sha256:18a8a5e047469e33dea44abe28b85fc4383c03adf0645893a37581dc446c523a"
+    },
+    {
+      "name": "a_negation_reaches_beneath_an_excluded_directory",
+      "why": "`scratch` excludes the directory and `!scratch/keep.txt` puts one file back, which Docker honors by descending into an excluded directory whenever the ignore set carries any exclusion. A walk that PRUNES an excluded directory never sees keep.txt and cannot re-include it, which is the shape the Rust port had.",
+      "tree": {
+        "Dockerfile": "FROM scratch\nCOPY scratch/keep.txt /keep.txt\n",
+        ".dockerignore": "scratch\n!scratch/keep.txt\n",
+        "server.py": "print('acme')\n",
+        "scratch/keep.txt": "kept\n",
+        "scratch/tmp.txt": "throwaway\n"
+      },
+      "build": {
+        "context": "connectors/tempo",
+        "dockerfile": "Dockerfile",
+        "platforms": [
+          "linux/amd64"
+        ]
+      },
+      "source_digest": "sha256:9988fccabef3c1680c6a7a2e014785f271c7ee7622cb9c517dc163df33aac88b"
+    },
+    {
+      "name": "editing_a_file_reincluded_beneath_an_excluded_directory_moves_the_digest",
+      "why": "The same tree with the re-included file edited. Its bytes are copied into the image, so the digest must move; a pruning walk reports the source unchanged. scratch/tmp.txt stays excluded in both, so the pair isolates the re-inclusion.",
+      "tree": {
+        "Dockerfile": "FROM scratch\nCOPY scratch/keep.txt /keep.txt\n",
+        ".dockerignore": "scratch\n!scratch/keep.txt\n",
+        "server.py": "print('acme')\n",
+        "scratch/keep.txt": "kept, then edited\n",
+        "scratch/tmp.txt": "throwaway\n"
+      },
+      "build": {
+        "context": "connectors/tempo",
+        "dockerfile": "Dockerfile",
+        "platforms": [
+          "linux/amd64"
+        ]
+      },
+      "source_digest": "sha256:276b2417e9d1fea606bcfe7f0f3a5f2b565a9029f2bbbbf63106c73b94e2a5bd"
+    },
+    {
+      "name": "a_star_ignore_still_covers_the_build_files",
+      "why": "`*` excludes the whole tree, and the docker CLI puts the Dockerfile and .dockerignore back before sending the context, so those two are exactly what the digest covers. Without that rule the digest is a CONSTANT for every `*`-ignoring bundle: the lock can never go stale, and a Dockerfile rewrite deploys under the digest reviewers approved for the old one.",
+      "tree": {
+        "Dockerfile": "FROM scratch\nCOPY server.py /server.py\n",
+        ".dockerignore": "*\n",
+        "server.py": "print('acme')\n",
+        "notes.md": "scratch notes\n"
+      },
+      "build": {
+        "context": "connectors/tempo",
+        "dockerfile": "Dockerfile",
+        "platforms": [
+          "linux/amd64"
+        ]
+      },
+      "source_digest": "sha256:b2f97cb3fb2edb9f045b550a7ec630e312f1e4a511e3dbca4a33f1308b8d9640"
+    },
+    {
+      "name": "editing_the_dockerfile_under_a_star_ignore_moves_the_digest",
+      "why": "The same `*`-ignoring tree with the Dockerfile rewritten to run as a different user. That is a materially different image from the same declaration, so the digest must move.",
+      "tree": {
+        "Dockerfile": "FROM scratch\nUSER 65532\nCOPY server.py /server.py\n",
+        ".dockerignore": "*\n",
+        "server.py": "print('acme')\n",
+        "notes.md": "scratch notes\n"
+      },
+      "build": {
+        "context": "connectors/tempo",
+        "dockerfile": "Dockerfile",
+        "platforms": [
+          "linux/amd64"
+        ]
+      },
+      "source_digest": "sha256:e67fc21201027e29037fe591e748f98bf8d36783d41853ac1b9d06d354ebc978"
+    },
+    {
+      "name": "a_nested_lock_file_is_ordinary_build_input",
+      "why": "The bundle root carries the generated connectors.lock.yaml, excluded; fixtures/connectors.lock.yaml is a source file that happens to share the name, and the daemon receives it like any other. Excluding by BASENAME at any depth drops it from the digest.",
+      "tree": {
+        "Dockerfile": "FROM scratch\nCOPY fixtures /fixtures\n",
+        "server.py": "print('acme')\n",
+        "connectors.lock.yaml": "version: 1\nconnectors:\n  tempo:\n    image: sha256:1111111111111111111111111111111111111111111111111111111111111111\n",
+        "fixtures/connectors.lock.yaml": "version: 1\nconnectors: {}\n"
+      },
+      "build": {
+        "context": ".",
+        "dockerfile": "Dockerfile",
+        "platforms": [
+          "linux/amd64"
+        ]
+      },
+      "source_digest": "sha256:c0f1eed228d555f0bb223a6ba6c2527154b06f338add59113893806aa7830260"
+    },
+    {
+      "name": "editing_a_nested_lock_file_moves_the_digest",
+      "why": "The same tree with only the nested fixture edited. It is build input, so the digest must move; a basename exclusion reports the source unchanged and the lock stays green over a changed image.",
+      "tree": {
+        "Dockerfile": "FROM scratch\nCOPY fixtures /fixtures\n",
+        "server.py": "print('acme')\n",
+        "connectors.lock.yaml": "version: 1\nconnectors:\n  tempo:\n    image: sha256:1111111111111111111111111111111111111111111111111111111111111111\n",
+        "fixtures/connectors.lock.yaml": "version: 1\nconnectors:\n  tempo:\n    image: sha256:2222222222222222222222222222222222222222222222222222222222222222\n"
+      },
+      "build": {
+        "context": ".",
+        "dockerfile": "Dockerfile",
+        "platforms": [
+          "linux/amd64"
+        ]
+      },
+      "source_digest": "sha256:8849f554eb82ebdbd9b6a8c3e20294cf8393693d6de8dc07296be5cf73c3e06a"
+    },
+    {
+      "name": "a_bundle_root_context_carrying_the_lock",
+      "why": "The context is the bundle root, which is where connectors.lock.yaml is written. It is excluded by name at any depth.",
+      "tree": {
+        "Dockerfile": "FROM scratch\n",
+        "server.py": "print('acme')\n",
+        "connectors.yaml": "connectors:\n  tempo:\n    build:\n      context: .\n      platforms: [linux/amd64]\n",
+        "connectors.lock.yaml": "version: 1\nconnectors:\n  tempo:\n    image: sha256:1111111111111111111111111111111111111111111111111111111111111111\n"
+      },
+      "build": {
+        "context": ".",
+        "dockerfile": "Dockerfile",
+        "platforms": [
+          "linux/amd64"
+        ]
+      },
+      "source_digest": "sha256:7d85c20e48a0af27bedd4ee73a7f2ebefc739cfb4b83ad25bf41b01a313a52f6"
+    },
+    {
+      "name": "the_same_bundle_root_context_before_the_lock_was_written",
+      "why": "Same tree with connectors.lock.yaml absent. The digest must be identical to a_bundle_root_context_carrying_the_lock: without the exclusion, writing the lock changes the digest and the very next validation reports the lock stale against the source it was just built from.",
+      "tree": {
+        "Dockerfile": "FROM scratch\n",
+        "server.py": "print('acme')\n",
+        "connectors.yaml": "connectors:\n  tempo:\n    build:\n      context: .\n      platforms: [linux/amd64]\n"
+      },
+      "build": {
+        "context": ".",
+        "dockerfile": "Dockerfile",
+        "platforms": [
+          "linux/amd64"
+        ]
+      },
+      "source_digest": "sha256:7d85c20e48a0af27bedd4ee73a7f2ebefc739cfb4b83ad25bf41b01a313a52f6"
+    },
+    {
+      "name": "a_subdirectory_context_hashes_a_context_root_lock_file",
+      "why": "The declared context is a subdirectory, the common case, and it carries a connectors.lock.yaml at its own top. `curie build` writes the generated lock at the BUNDLE root, never here, so this file is authored input the daemon receives and the digest covers it. A reader that skips connectors.lock.yaml at the context root whatever the declared context is drops it.",
+      "tree": {
+        "Dockerfile": "FROM scratch\nCOPY connectors.lock.yaml /connectors.lock.yaml\n",
+        "server.py": "print('acme')\n",
+        "connectors.lock.yaml": "version: 1\nconnectors:\n  tempo:\n    image: sha256:1111111111111111111111111111111111111111111111111111111111111111\n"
+      },
+      "build": {
+        "context": "connectors/tempo",
+        "dockerfile": "Dockerfile",
+        "platforms": [
+          "linux/amd64"
+        ]
+      },
+      "source_digest": "sha256:302dd5e6ac8644ec090381a52195d1291a15b69c8cf463a85505dc5552fbf0ca"
+    },
+    {
+      "name": "editing_a_context_root_lock_file_under_a_subdirectory_context_moves_the_digest",
+      "why": "The same subdirectory context with only that file's content changed. It is build input, so the digest must move; an unconditional context-root exclusion reports the source unchanged and the lock stays green over a changed image. Held against the bundle-root pair above, this is what the unconditional rule cannot satisfy: the root pair must be equal AND this pair distinct.",
+      "tree": {
+        "Dockerfile": "FROM scratch\nCOPY connectors.lock.yaml /connectors.lock.yaml\n",
+        "server.py": "print('acme')\n",
+        "connectors.lock.yaml": "version: 1\nconnectors:\n  tempo:\n    image: sha256:2222222222222222222222222222222222222222222222222222222222222222\n"
+      },
+      "build": {
+        "context": "connectors/tempo",
+        "dockerfile": "Dockerfile",
+        "platforms": [
+          "linux/amd64"
+        ]
+      },
+      "source_digest": "sha256:2da2c41c4b5998a6ba5ab904d6dffd80e3bac9b223c0f8ac826a5e30db5e5aac"
+    },
+    {
+      "name": "an_entrypoint_without_the_executable_bit",
+      "why": "Baseline for the mode pair. Every byte here is identical to the vector below; the only difference on disk is that entrypoint.sh is not executable.",
+      "tree": {
+        "Dockerfile": "FROM scratch\nCOPY entrypoint.sh /entrypoint.sh\nENTRYPOINT [\"/entrypoint.sh\"]\n",
+        "entrypoint.sh": "#!/bin/sh\nexec python -m server\n",
+        "server.py": "print('acme')\n"
+      },
+      "build": {
+        "context": "connectors/tempo",
+        "dockerfile": "Dockerfile",
+        "platforms": [
+          "linux/amd64"
+        ]
+      },
+      "source_digest": "sha256:cbecbbee6a33b549a284b718bbb734c29284a3a3bd38494194b31cd6486b98dd"
+    },
+    {
+      "name": "chmod_plus_x_on_the_entrypoint_moves_the_digest",
+      "why": "The same bytes with entrypoint.sh made executable. Docker's context tar carries the mode and BuildKit keys its cache on it, so this is a materially different image built from the same declaration: an image whose ENTRYPOINT starts versus one that exits with permission denied. A digest that hashes content alone cannot tell the two apart, so the lock looks fresh and the stale image deploys.",
+      "tree": {
+        "Dockerfile": "FROM scratch\nCOPY entrypoint.sh /entrypoint.sh\nENTRYPOINT [\"/entrypoint.sh\"]\n",
+        "entrypoint.sh": {
+          "content": "#!/bin/sh\nexec python -m server\n",
+          "executable": true
+        },
+        "server.py": "print('acme')\n"
+      },
+      "build": {
+        "context": "connectors/tempo",
+        "dockerfile": "Dockerfile",
+        "platforms": [
+          "linux/amd64"
+        ]
+      },
+      "source_digest": "sha256:4b5130f3e6868bfb977593e2caf409e7a37b8a6f85443ebc6bd3ef2e9d51e09b"
+    },
+    {
+      "name": "two_dockerfiles_baseline",
+      "why": "Baseline for the two declaration-only edits below. The tree is held constant so the only thing that can move the digest is the build block.",
+      "tree": {
+        "Dockerfile": "FROM scratch\n",
+        "Dockerfile.alt": "FROM scratch\nUSER 65532\n",
+        "server.py": "print('acme')\n"
+      },
+      "build": {
+        "context": "connectors/tempo",
+        "dockerfile": "Dockerfile",
+        "platforms": [
+          "linux/amd64"
+        ]
+      },
+      "source_digest": "sha256:0836fa52dcd5c4fea1ad38d27a809ca9272a5f6c8f0ad0329d5531736672b4ac"
+    },
+    {
+      "name": "choosing_the_other_dockerfile_moves_the_digest",
+      "why": "Identical bytes on disk, a different Dockerfile selected. Without the build block in the stream this builds a different image and reports the same source digest, so the lock never looks stale and the deployed connector silently stops matching the reviewed declaration.",
+      "tree": {
+        "Dockerfile": "FROM scratch\n",
+        "Dockerfile.alt": "FROM scratch\nUSER 65532\n",
+        "server.py": "print('acme')\n"
+      },
+      "build": {
+        "context": "connectors/tempo",
+        "dockerfile": "Dockerfile.alt",
+        "platforms": [
+          "linux/amd64"
+        ]
+      },
+      "source_digest": "sha256:ad001bb5459689b1993118a70c1171dd8fb0224cb336e936ad902ed8d609142e"
+    },
+    {
+      "name": "adding_a_platform_moves_the_digest",
+      "why": "Identical bytes on disk, a second target architecture declared. The previous lock names a single-arch artifact that cannot run on half the nodes, so the digest must move or the staleness check never fires on a platforms edit.",
+      "tree": {
+        "Dockerfile": "FROM scratch\n",
+        "Dockerfile.alt": "FROM scratch\nUSER 65532\n",
+        "server.py": "print('acme')\n"
+      },
+      "build": {
+        "context": "connectors/tempo",
+        "dockerfile": "Dockerfile",
+        "platforms": [
+          "linux/amd64",
+          "linux/arm64"
+        ]
+      },
+      "source_digest": "sha256:2984ebbd27a5ae451b9892722b665e24c32b2626fe457854628de54dd4d155b9"
+    },
+    {
+      "name": "platform_order_is_significant",
+      "why": "The declared order is hashed as declared rather than sorted first. Stated as a pinned decision, not left to whichever side happened to sort: two readers disagreeing here disagree on every multi-arch lock.",
+      "tree": {
+        "Dockerfile": "FROM scratch\n",
+        "Dockerfile.alt": "FROM scratch\nUSER 65532\n",
+        "server.py": "print('acme')\n"
+      },
+      "build": {
+        "context": "connectors/tempo",
+        "dockerfile": "Dockerfile",
+        "platforms": [
+          "linux/arm64",
+          "linux/amd64"
+        ]
+      },
+      "source_digest": "sha256:837584781dd494634229dec09f47a9b73434445ccb25029ddd6f936a080bee1e"
+    }
+  ],
+  "relations": [
+    {
+      "same": [
+        "dockerignore_excludes_a_matching_file",
+        "an_ignored_files_content_does_not_move_the_digest"
+      ],
+      "why": "An excluded file's content is not in the digest, so a build that changes only ignored output is not stale."
+    },
+    {
+      "same": [
+        "a_bundle_root_context_carrying_the_lock",
+        "the_same_bundle_root_context_before_the_lock_was_written"
+      ],
+      "why": "The context's own root-level connectors.lock.yaml is excluded, so writing the lock does not invalidate the digest it records."
+    },
+    {
+      "distinct": [
+        "a_nested_lock_file_is_ordinary_build_input",
+        "editing_a_nested_lock_file_moves_the_digest"
+      ],
+      "why": "Only the generated lock at the context root is excluded. A file of that name nested inside the build context is source the daemon receives, so editing it must move the digest. Paired with the relation above, this is what a basename exclusion cannot satisfy: it needs the root pair equal AND the nested pair distinct."
+    },
+    {
+      "distinct": [
+        "a_subdirectory_context_hashes_a_context_root_lock_file",
+        "editing_a_context_root_lock_file_under_a_subdirectory_context_moves_the_digest"
+      ],
+      "why": "The generated lock is written at the BUNDLE root only, so under a subdirectory context a context-root connectors.lock.yaml is authored input and editing it must move the digest. Held against `a_bundle_root_context_carrying_the_lock` / `the_same_bundle_root_context_before_the_lock_was_written`, which must stay EQUAL, this is what an unconditional context-root exclusion cannot satisfy: the exclusion has to key on the declared context, not on the path."
+    },
+    {
+      "distinct": [
+        "an_entrypoint_without_the_executable_bit",
+        "chmod_plus_x_on_the_entrypoint_moves_the_digest"
+      ],
+      "why": "Byte-for-byte identical trees differing only in one file's owner execute bit. The context tar carries the mode and BuildKit keys its cache on it, so these build two different images and the digest must tell them apart. A content-only reader computes one value for both, which is a lock that stays green across `chmod +x`."
+    },
+    {
+      "distinct": [
+        "a_negation_reincludes_what_an_earlier_pattern_excluded",
+        "editing_a_reincluded_file_moves_the_digest"
+      ],
+      "why": "`!keep.log` puts keep.log back into the context, so its bytes are in the image and must be in the digest. A first-match-wins reader computes one value for both trees."
+    },
+    {
+      "same": [
+        "a_negation_reincludes_what_an_earlier_pattern_excluded",
+        "a_still_ignored_file_beside_a_negation_does_not_move_the_digest"
+      ],
+      "why": "A negation re-includes exactly what it names. debug.log stays excluded by `*.log`, so its bytes cannot move the digest. Held together with the distinct pair above, this pins last-match-wins rather than any-negation-disables-the-set."
+    },
+    {
+      "distinct": [
+        "a_negation_reaches_beneath_an_excluded_directory",
+        "editing_a_file_reincluded_beneath_an_excluded_directory_moves_the_digest"
+      ],
+      "why": "An excluded directory is descended, not pruned, so a `!` inside it re-includes the file it names and that file's bytes move the digest. A walk that prunes computes one value for both trees."
+    },
+    {
+      "distinct": [
+        "a_star_ignore_still_covers_the_build_files",
+        "editing_the_dockerfile_under_a_star_ignore_moves_the_digest"
+      ],
+      "why": "Under `*` the daemon still receives the Dockerfile and .dockerignore, so the digest still moves when the Dockerfile is rewritten. A reader that lets `*` empty the file list computes the same constant for both trees, which is a lock that can never go stale."
+    },
+    {
+      "distinct": [
+        "dockerignore_excludes_a_matching_file",
+        "editing_dockerignore_moves_the_digest"
+      ],
+      "why": ".dockerignore is hashed, so changing the exclusion set changes what is built and must change the digest."
+    },
+    {
+      "distinct": [
+        "two_dockerfiles_baseline",
+        "choosing_the_other_dockerfile_moves_the_digest"
+      ],
+      "why": "The build block is in the digest, so a dockerfile edit alone invalidates the lock."
+    },
+    {
+      "distinct": [
+        "two_dockerfiles_baseline",
+        "adding_a_platform_moves_the_digest"
+      ],
+      "why": "The build block is in the digest, so a platforms edit alone invalidates the lock."
+    },
+    {
+      "distinct": [
+        "adding_a_platform_moves_the_digest",
+        "platform_order_is_significant"
+      ],
+      "why": "Platform order is hashed as declared. Sorting on one side and not the other silently splits the two lanes."
+    }
+  ]
+}

@@ -8,6 +8,7 @@ refactor cannot quietly reintroduce them.
 from __future__ import annotations
 
 import hashlib
+import json
 import shutil
 import subprocess
 from collections.abc import Callable
@@ -1317,3 +1318,152 @@ def test_connector_env_port_placeholders_use_the_declared_port(port: int) -> Non
             f"http://acme-bot-acme-bot-mcp-grafana.acme-bot.svc.cluster.local:{port}"
         ),
     }
+
+
+# --------------------------------------------------------------------------- #
+# An unresolved `build:` connector never renders -- ADR 0113
+# --------------------------------------------------------------------------- #
+def _build_spec(**overrides: object) -> ConnectorSpec:
+    payload: dict = {
+        "build": {
+            "context": "connectors/k8s-write",
+            "platforms": ["linux/amd64", "linux/arm64"],
+        }
+    }
+    payload.update(overrides)
+    return ConnectorSpec.model_validate(payload)
+
+
+def test_rendering_an_unresolved_build_raises_instead_of_emitting_a_null_image() -> None:
+    # The alternative is render_deployment emitting `"image": None`, which
+    # applies as an invalid Deployment and surfaces as an opaque Kubernetes
+    # error a long way from its cause. The message must name the artifact that
+    # is missing, because the fix is to produce it, not to edit the bundle.
+    with pytest.raises(ValueError) as exc:
+        _objs(spec=_build_spec())
+    assert "connectors.lock.yaml" in str(exc.value)
+
+
+def test_the_guard_fires_before_any_object_is_produced() -> None:
+    # A guard that ran per-object would emit a Service and a NetworkPolicy for a
+    # connector that can never start, and a caller applying the partial list
+    # leaves them orphaned in the namespace.
+    with pytest.raises(ValueError):
+        r.render(
+            release="acme-rel",
+            agent="acme-bot",
+            namespace="acme-ns",
+            app_name="curie",
+            connector="k8s-write",
+            spec=_build_spec(),
+            secret_name="conn-secrets",
+        )
+
+
+def test_a_remote_connector_still_renders_nothing_rather_than_raising() -> None:
+    # The guard is scoped to hosted-ness. A `url` connector has no image by
+    # design and must keep returning an empty object list, not an error.
+    assert _objs(spec=REMOTE) == []
+
+
+# --------------------------------------------------------------------------- #
+# Hosted-ness is image-independent: the derivations a build connector inherits
+# --------------------------------------------------------------------------- #
+def test_a_build_connector_with_no_unhosted_url_is_declared_but_not_exercisable() -> None:
+    # Matching the `image:` form exactly. Reverting `is_hosted` to
+    # `self.image is not None` makes this return the REMOTE-form entry built
+    # from a `url` that is None, so the runner mounts an entry whose URL is
+    # null instead of reporting the connector as unavailable here (#1093).
+    assert r.unhosted_mcp_entry(_build_spec()) is None
+    assert r.unhosted_mcp_entry(HOSTED) is None
+
+
+def test_a_build_connector_may_declare_where_to_reach_it_when_unhosted() -> None:
+    spec = _build_spec(unhosted_url="http://127.0.0.1:8765/mcp")
+    assert r.unhosted_mcp_entry(spec) == {"type": "http", "url": "http://127.0.0.1:8765/mcp"}
+
+
+def test_the_mcp_entry_for_a_build_connector_is_the_service_derived_url() -> None:
+    # The URL derivation reads the Service name, never the image, so it is
+    # identical before and after the lock is applied. That is what lets the
+    # skill, local and cluster tiers mount one byte-identical entry.
+    entry = r.mcp_entry("acme-rel", "acme-bot", "acme-ns", "k8s-write", _build_spec())
+    assert entry == {
+        "type": "http",
+        "url": "http://acme-rel-acme-bot-mcp-k8s-write.acme-ns.svc.cluster.local:8000/mcp",
+    }
+    assert entry == r.mcp_entry(
+        "acme-rel",
+        "acme-bot",
+        "acme-ns",
+        "k8s-write",
+        ConnectorSpec(image="ghcr.io/acme-corp/acme-bot-k8s-write-mcp@sha256:" + "0" * 64),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# The frozen Python/Rust object-name and Service-DNS seam -- ADR 0113 Decision 2
+# --------------------------------------------------------------------------- #
+_DNS_VECTORS = json.loads(
+    (Path(__file__).parents[3] / "tests" / "vectors" / "connector-service-dns.json").read_text(
+        encoding="utf-8"
+    )
+)
+
+_DNS_VECTOR_KEYS = {
+    "name",
+    "why",
+    "release",
+    "agent",
+    "connector",
+    "namespace",
+    "object_name",
+    "service_dns",
+}
+
+
+def test_every_service_dns_vector_declares_only_modelled_keys() -> None:
+    for vector in _DNS_VECTORS["vectors"]:
+        extra = set(vector) - _DNS_VECTOR_KEYS
+        assert not extra, f"{vector['name']}: unmodelled vector keys {sorted(extra)}"
+
+
+@pytest.mark.parametrize("vector", _DNS_VECTORS["vectors"], ids=lambda v: v["name"])
+def test_service_dns_vectors(vector: dict) -> None:
+    # This string is the Docker network alias the CLI starts a skill-tier and
+    # local-tier connector container under, and the runner derives the URL it
+    # dials from THIS function. The two lanes cannot share code, so a change to
+    # either derivation that is not made to both has to fail both suites --
+    # otherwise the runner dials a DNS name no container owns and the failure is
+    # a bare connection timeout with nothing logged at either end. Same
+    # mechanism as tests/vectors/approval-action-ids.json.
+    assert (
+        r.object_name(vector["release"], vector["agent"], vector["connector"])
+        == vector["object_name"]
+    )
+    assert (
+        r.service_dns(
+            vector["release"], vector["agent"], vector["connector"], vector["namespace"]
+        )
+        == vector["service_dns"]
+    )
+
+
+def test_the_dns_corpus_covers_the_truncation_branch() -> None:
+    # Without an over-long name in the corpus the vectors freeze only the
+    # concatenation, and the truncation-with-digest branch -- the half a hand
+    # port gets wrong -- stays unpinned in both languages.
+    bases = [
+        f"{v['release']}-{v['agent']}-mcp-{v['connector']}" for v in _DNS_VECTORS["vectors"]
+    ]
+    assert any(len(base) > 63 for base in bases)
+    truncated = [
+        v
+        for v in _DNS_VECTORS["vectors"]
+        if len(f"{v['release']}-{v['agent']}-mcp-{v['connector']}") > 63
+    ]
+    # A truncated name must still be a legal DNS label, and two long names
+    # sharing a prefix must not collapse onto one object.
+    assert all(len(v["object_name"]) <= 63 for v in truncated)
+    assert all(not v["object_name"].endswith("-") for v in truncated)
+    assert len({v["object_name"] for v in truncated}) == len(truncated)

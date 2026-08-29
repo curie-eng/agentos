@@ -11,10 +11,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from enum import StrEnum
 from typing import Literal, Protocol
+
+from aci_protocol import BootEnv
+from aci_protocol.service_config import API_KEY_ENV
+from plugin_format import is_reserved_boot_env_name
 
 # Substrate-neutral labels: every backend tags its managed objects with these
 # (the Kubernetes adapter on claims, the Docker adapter on containers), so they
@@ -22,6 +27,76 @@ from typing import Literal, Protocol
 MANAGED_BY_LABEL = "curietech.ai/managed-by"
 MANAGED_BY_VALUE = "curie-sandbox-substrate"
 THREAD_HASH_LABEL = "curietech.ai/thread-hash"
+# Claim-object label (not spec.additionalPodMetadata). The adopted controller
+# rejects curietech.ai under additionalPodMetadata; template pod labels and
+# claim metadata labels are the supported paths (#1488).
+AGENT_LABEL = "curietech.ai/agent"
+
+_GENERIC_POOL_SUFFIX = "-runner-pool"
+
+
+def agent_warm_pool_name(base_pool: str, agent_name: str | None) -> str:
+    """Derive the per-agent pool name matching charts/curie/templates/agent-sandbox.yaml.
+
+    Generic pool: ``{fullname}-runner-pool``.
+    Per-agent pool: ``{fullname}-agent-{agent}-runner-pool``.
+    An operator override that does not use the chart suffix is left alone.
+    """
+
+    if not agent_name:
+        return base_pool
+    if not base_pool.endswith(_GENERIC_POOL_SUFFIX):
+        return base_pool
+    prefix = base_pool[: -len(_GENERIC_POOL_SUFFIX)]
+    return f"{prefix}-agent-{agent_name}{_GENERIC_POOL_SUFFIX}"
+
+
+def claim_warm_pool(
+    base_pool: str, env: Mapping[str, str] | None, agent_name: str | None
+) -> str:
+    """Route connector-secret claims to the per-agent pool, otherwise the generic pool."""
+
+    marker = (env or {}).get(BootEnv.env_key("connector_secret_keys"), "").strip()
+    if marker and agent_name:
+        return agent_warm_pool_name(base_pool, agent_name)
+    return base_pool
+
+HOST_APPLICATION_CREDENTIAL_ENV_NAMES: frozenset[str] = frozenset(
+    {
+        "POSTGRES_PASSWORD",
+        "DATABASE_URL",
+        "VALKEY_PASSWORD",
+        "SLACK_BOT_TOKEN",
+        "S3_ACCESS_KEY",
+        "S3_SECRET_KEY",
+        API_KEY_ENV,
+        "LANGFUSE_SECRET_KEY",
+        "CURIE_ADAPTER_CREDENTIALS",
+        "CURIE_SEALING_PRIVATE_KEY",
+        "CURIE_SEALING_PREVIOUS_PRIVATE_KEY",
+    }
+)
+
+
+def filter_agent_child_env(env: Mapping[str, str] | None) -> dict[str, str]:
+    """Return a copied child environment without host application credentials."""
+
+    if env is None:
+        return {}
+    declared_connector_secret_names = {
+        name
+        for name in env.get(BootEnv.env_key("connector_secret_keys"), "").split(",")
+        if name
+    }
+    return {
+        name: value
+        for name, value in env.items()
+        if name not in HOST_APPLICATION_CREDENTIAL_ENV_NAMES
+        or (
+            name in declared_connector_secret_names
+            and not is_reserved_boot_env_name(name)
+        )
+    }
 
 
 class RouteState(StrEnum):
@@ -195,7 +270,14 @@ class SandboxClient(Protocol):
         pool: str,
         env: dict[str, str] | None = None,
         labels: dict[str, str] | None = None,
-    ) -> None: ...
+    ) -> None:
+        """Create a claim after excluding host credentials from the child environment.
+
+        Implementations must apply ``filter_agent_child_env`` before constructing
+        any agent child environment.
+        """
+
+        ...
 
     def get_claim(self, name: str) -> ClaimView | None: ...
 

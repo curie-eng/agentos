@@ -34,7 +34,13 @@ stop -- that is scope creep on the sacred module.
    `side_effect_flag` escalates to a human instead of retrying; the flag is
    persisted to Valkey the instant it is seen so a crash mid-side-effect
    still escalates on reclaim. Flag-clean failures retry by classification
-   (`rate-limit`/`runner-error` transient, everything else escalates).
+   (`rate-limit`/`runner-error`/`runner-timeout`/`workspace-error` transient,
+   everything else escalates). `workspace-error` (#2004) is a workspace
+   preparation FAULT before the turn was accepted; it must log a WARNING naming
+   the agent, deployment, repository and stage, because a silent one acks the
+   turn and creates no sandbox with nothing in the log to find it by. A
+   deliberate selection refusal is the other half of that split: a decision, not
+   a fault, so it stays terminal, answers the user, and logs at INFO.
 
 ## Delivery is bounded (ADR-0039, #505)
 

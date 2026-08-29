@@ -14,7 +14,7 @@ use curie_aci_protocol::{Budget, EventType, OutboundEvent, SessionStatus};
 use serde::{Deserialize, Serialize};
 
 use crate::api::{ApiClient, BudgetConfig, ChannelOutcome, RoutingCheck};
-use crate::bundle::pack_tar_gz;
+use crate::bundle::{git_status_is_clean_for_pack, pack_tar_gz};
 use crate::docker::{self, CheckSpec, StartSpec};
 use crate::evals::{
     graded_answer, load_eval, outcome_label, rollup_line, score_turn, turn_completed, CaseOutcome,
@@ -431,11 +431,188 @@ impl crate::ui::CliOutput for InitOutput {
     }
 }
 
-/// `curie build`: build the runner image locally from the repo's Dockerfile.
-/// The one-command equivalent of `docker build -f runner/Dockerfile -t <tag> .`
-/// run from the repo root. Errors clearly when Docker is missing or when run
-/// outside a source checkout (a release binary pulls the image from GHCR).
-pub async fn build(tag: &str) -> Result<()> {
+/// Scaffold and drive the existing local skill path for one first reply.
+pub async fn try_first_run(keep: bool, image: String) -> Result<()> {
+    const DEMO_NAME: &str = "curie-demo";
+    const DEMO_PROMPT: &str = "hello, are you there?";
+
+    let ui = crate::ui::ui();
+    let dir = if keep {
+        PathBuf::from(DEMO_NAME)
+    } else {
+        std::env::temp_dir().join(format!("curie-try-{}", uuid::Uuid::new_v4()))
+    };
+
+    if let Err(err) = scaffold(&dir, DEMO_NAME) {
+        if !keep && dir.exists() {
+            if let Err(cleanup_err) = std::fs::remove_dir_all(&dir) {
+                ui.warn(&format!(
+                    "could not remove incomplete demo at {}: {cleanup_err}",
+                    dir.display()
+                ));
+            }
+        }
+        return Err(err);
+    }
+    ui.note(&format!("scaffolded demo at {}", dir.display()));
+
+    let mut credential_name = None;
+    let mut discovery_error = None;
+    for name in MODEL_CREDENTIAL_ENV_NAMES {
+        if env_credential_present(name) {
+            credential_name = Some(name);
+            break;
+        }
+        match crate::secrets::is_saved(name) {
+            Ok(true) => {
+                credential_name = Some(name);
+                break;
+            }
+            Ok(false) => {}
+            Err(err) => {
+                discovery_error = Some(err);
+                break;
+            }
+        }
+    }
+    if let Some(err) = discovery_error {
+        if !keep {
+            if let Err(cleanup_err) = std::fs::remove_dir_all(&dir) {
+                ui.warn(&format!(
+                    "could not remove temporary demo at {}: {cleanup_err}",
+                    dir.display()
+                ));
+            }
+        }
+        return Err(err);
+    }
+    let fake_model = credential_name.is_none();
+    if let Some(name) = credential_name {
+        ui.note(&format!("using discovered model credential {name}"));
+    } else {
+        ui.note("no model credential found; using the scripted fake model");
+    }
+
+    let started = start(StartOpts {
+        plugin_dir: dir.clone(),
+        image,
+        port: DEFAULT_PORT,
+        name: docker::RUNNER_CONTAINER_LOCAL.to_string(),
+        fake_model,
+        network: None,
+        otel_endpoint: None,
+        budget: DEFAULT_BUDGET.to_string(),
+        model: None,
+        local_model: None,
+        pull_model: false,
+        secret: Vec::new(),
+        env_file: None,
+        replace: false,
+    })
+    .await;
+    if let Err(err) = started {
+        if !keep {
+            if let Err(cleanup_err) = std::fs::remove_dir_all(&dir) {
+                ui.warn(&format!(
+                    "could not remove temporary demo at {}: {cleanup_err}",
+                    dir.display()
+                ));
+            }
+        }
+        return Err(err);
+    }
+
+    let message = send(
+        DEMO_PROMPT,
+        crate::message::DEFAULT_USER,
+        EventType::Message,
+        Some(format!("http://localhost:{DEFAULT_PORT}")),
+        true,
+    )
+    .await;
+    let teardown = stop(None, &dir).await;
+
+    let classified_failure = match message {
+        Ok(classified_failure) => classified_failure,
+        Err(message_err) => {
+            if let Err(cleanup_err) = &teardown {
+                ui.warn(&format!(
+                    "could not tear down the demo at {}: {cleanup_err}",
+                    dir.display()
+                ));
+            } else if !keep {
+                if let Err(cleanup_err) = std::fs::remove_dir_all(&dir) {
+                    ui.warn(&format!(
+                        "could not remove temporary demo at {}: {cleanup_err}",
+                        dir.display()
+                    ));
+                }
+            }
+            return Err(message_err);
+        }
+    };
+
+    if let Err(cleanup_err) = teardown {
+        ui.failure(&format!(
+            "could not tear down the demo at {}: {cleanup_err}",
+            dir.display()
+        ));
+        ui.note(&format!(
+            "recover with: cd {} && curie skill down",
+            dir.display()
+        ));
+        std::process::exit(1);
+    }
+
+    if keep {
+        let next = if fake_model {
+            "cd curie-demo && curie skill up --fake-model"
+        } else {
+            "cd curie-demo && curie skill up"
+        };
+        ui.note(&format!("kept ./curie-demo; next: {next}"));
+    } else if let Err(cleanup_err) = std::fs::remove_dir_all(&dir) {
+        ui.failure(&format!(
+            "could not remove temporary demo at {}: {cleanup_err}",
+            dir.display()
+        ));
+        std::process::exit(1);
+    } else {
+        ui.note(&format!("removed temporary demo at {}", dir.display()));
+    }
+
+    if classified_failure {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Tags `docker build` applies for one platform image.
+///
+/// The runner has two identities: the short name [`crate::docker::RUNNER_IMAGE`]
+/// (`curie skill up`, `curie update --image`) and the ghcr `:dev` ref a
+/// `--build` stack runs. Building either also tags the other, so the two
+/// paths share one image (#1931). A custom `curie build --tag` is left alone.
+pub(crate) fn platform_image_tags(dockerfile: &str, tag: &str) -> Vec<String> {
+    let mut tags = vec![tag.to_string()];
+    if dockerfile == "runner/Dockerfile" {
+        let short = crate::docker::RUNNER_IMAGE;
+        let qualified = crate::local::source_image_ref(short);
+        if tag == short || tag == qualified {
+            if tag != short {
+                tags.push(short.to_string());
+            }
+            if tag != qualified {
+                tags.push(qualified);
+            }
+        }
+    }
+    tags
+}
+
+/// Build one platform image. The single `docker build` invocation for Curie
+/// images: `curie build` and `curie local up --build` both route here (#1931).
+pub(crate) async fn build_image(dockerfile: &str, tag: &str) -> Result<()> {
     let ui = crate::ui::ui();
     if !on_path("docker") {
         bail!(
@@ -444,26 +621,90 @@ pub async fn build(tag: &str) -> Result<()> {
         );
     }
     let root = find_repo_root().context(
-        "runner/Dockerfile not found here or in any parent directory. Run `curie build` \
-         from a curie repo checkout -- a release binary pulls the runner image from GHCR \
-         automatically and never needs to build.",
+        "runner/Dockerfile not found here or in any parent directory. Run this from a \
+         curie repo checkout -- a release binary pulls published images and never needs to build.",
     )?;
+    let tags = platform_image_tags(dockerfile, tag);
+    let mut args = vec![
+        "build".to_string(),
+        "-f".to_string(),
+        dockerfile.to_string(),
+    ];
+    for image_tag in &tags {
+        args.push("-t".to_string());
+        args.push(image_tag.clone());
+    }
+    args.push(".".to_string());
+    let rendered = tags
+        .iter()
+        .map(|image_tag| format!("-t {image_tag}"))
+        .collect::<Vec<_>>()
+        .join(" ");
     ui.note(&format!(
-        "=== docker build -f runner/Dockerfile -t {tag} . (in {}) ===",
+        "=== docker build -f {dockerfile} {rendered} . (in {}) ===",
         root.display()
     ));
     // Inherit stdio so the build log streams to the terminal like a hand-run build.
     let status = tokio::process::Command::new("docker")
-        .args(["build", "-f", "runner/Dockerfile", "-t", tag, "."])
+        .args(&args)
         .current_dir(&root)
         .status()
         .await
         .context("failed to invoke docker")?;
     if !status.success() {
-        bail!("docker build failed ({status})");
+        bail!("docker build failed for {dockerfile} ({status})");
     }
+    Ok(())
+}
+
+/// `curie build`: build the runner image locally from the repo's Dockerfile.
+/// The one-command equivalent of `docker build -f runner/Dockerfile -t <tag> .`
+/// run from the repo root. Errors clearly when Docker is missing or when run
+/// outside a source checkout (a release binary pulls the image from GHCR).
+///
+/// When `tag` is the default short name, the same image is also tagged
+/// [`crate::local::source_image_ref`] so a `--build` stack sees it.
+pub async fn build(tag: &str) -> Result<()> {
+    let ui = crate::ui::ui();
+    build_image("runner/Dockerfile", tag).await?;
     ui.success(&format!("built runner image '{tag}'"));
     Ok(())
+}
+
+#[cfg(test)]
+mod platform_image_tags_tests {
+    use super::platform_image_tags;
+    use crate::docker::RUNNER_IMAGE;
+    use crate::local::source_image_ref;
+
+    #[test]
+    fn runner_short_name_also_tags_the_build_stack_ref() {
+        let tags = platform_image_tags("runner/Dockerfile", RUNNER_IMAGE);
+        assert_eq!(
+            tags,
+            vec![RUNNER_IMAGE.to_string(), source_image_ref(RUNNER_IMAGE),]
+        );
+    }
+
+    #[test]
+    fn runner_build_stack_ref_also_tags_the_short_name() {
+        let qualified = source_image_ref(RUNNER_IMAGE);
+        let tags = platform_image_tags("runner/Dockerfile", &qualified);
+        assert_eq!(tags, vec![qualified, RUNNER_IMAGE.to_string()]);
+    }
+
+    #[test]
+    fn custom_runner_tag_is_left_alone() {
+        let tags = platform_image_tags("runner/Dockerfile", "my-runner");
+        assert_eq!(tags, vec!["my-runner".to_string()]);
+    }
+
+    #[test]
+    fn non_runner_image_keeps_its_single_tag() {
+        let tag = source_image_ref("curie-api");
+        let tags = platform_image_tags("apps/api/Dockerfile", &tag);
+        assert_eq!(tags, vec![tag]);
+    }
 }
 
 /// `curie install`: from-a-checkout dev bootstrap/update -- install deps and
@@ -979,6 +1220,8 @@ pub async fn deploy_named(folder: &str, opts: DeployNamedOpts) -> Result<DeployO
         api_key: opts.api_key,
         slack_channel: opts.slack_channel,
         repo: opts.repo,
+        workspace: WorkspaceIntent::Preserve,
+        tier: DeployTier::Local,
         env: Some(opts.env),
         label: opts.label,
         secret: opts.secret,
@@ -1183,7 +1426,12 @@ fn on_path(bin: &str) -> bool {
 
 /// Walk up from the current directory to the repo root: the nearest ancestor
 /// that contains `runner/Dockerfile`.
-fn find_repo_root() -> Option<PathBuf> {
+///
+/// `pub(crate)` for `build_image` and `local::build_source_images` (#1915),
+/// which build the dev stack's images from the same root and want the same
+/// "are we in a checkout" answer rather than a second walk with its own
+/// anchor file.
+pub(crate) fn find_repo_root() -> Option<PathBuf> {
     let mut dir = std::env::current_dir().ok()?;
     loop {
         if dir.join("runner/Dockerfile").is_file() {
@@ -1318,7 +1566,7 @@ pub(crate) fn env_credential_present(name: &str) -> bool {
     std::env::var(name).is_ok_and(|value| !value.is_empty())
 }
 
-fn secret_store_env(name: &str) -> Result<Option<(String, String)>> {
+pub(crate) fn secret_store_env(name: &str) -> Result<Option<(String, String)>> {
     if env_credential_present(name) {
         return Ok(None);
     }
@@ -1346,9 +1594,12 @@ fn ambient_present_for(docker_env: &[(String, String)]) -> impl Fn(&str) -> bool
     move |name| std::env::var_os(name).is_some() || stored_env_contains(docker_env, name)
 }
 
-fn load_model_credentials_from_secret_store() -> Result<Vec<(String, String)>> {
+pub(crate) fn load_model_credentials_from_secret_store() -> Result<Vec<(String, String)>> {
     // Prefer an explicitly BYO Curie credential when saved, otherwise hydrate
     // the SDK credential names in the same order `select_passthrough_env` uses.
+    if env_credential_present("CURIE_CREDENTIALS") {
+        return Ok(Vec::new());
+    }
     if let Some(pair) = secret_store_env("CURIE_CREDENTIALS")? {
         return Ok(vec![pair]);
     }
@@ -1534,19 +1785,24 @@ fn short_digest(digest: &str) -> String {
 }
 
 /// Release everything a boot that has already packed its snapshot leaves behind
-/// when it aborts: the ollama sidecar, the network `start` owns, and the
-/// snapshot itself.
+/// when it aborts: the ollama sidecar, the hosted connectors, the network
+/// `start` owns, the credentials it staged, and the snapshot itself.
 ///
 /// One definition for all three abort arms between the pack and a recorded
 /// state, because nothing else will ever collect these: no state was saved, so
 /// no `skill down` can find them (#1087). A fourth abort path added later gets
 /// the whole sequence by calling this rather than by remembering three lines.
 ///
+/// Order is load bearing: the connectors are attached to the owned network, and
+/// `docker network rm` fails while any container is still on it, so every
+/// connector goes before the network does (ADR 0113).
+///
 /// Every release is best effort and deliberately swallows its error: these run
 /// while a command is already failing for its own reason, and must not change
 /// the error it reports or the code it exits with.
 async fn release_boot_scaffolding(
     ollama_container: Option<&String>,
+    connector_containers: &[String],
     owned_network: Option<&String>,
     snapshot_dir: &Path,
     plugin_dir: &Path,
@@ -1554,9 +1810,17 @@ async fn release_boot_scaffolding(
     if let Some(ollama) = ollama_container {
         let _ = docker::remove_container(ollama).await;
     }
+    for connector in connector_containers {
+        let _ = docker::remove_container(connector).await;
+    }
     if let Some(net) = owned_network {
         let _ = docker::remove_network(net).await;
     }
+    // After the connectors, never before: a tree still bind-mounted into a
+    // running container cannot be wiped cleanly, the same ordering
+    // `connector_teardown_plan` holds. Resolved credentials must not outlive a
+    // boot that no `skill down` can find.
+    let _ = crate::connector_build::wipe_connector_secrets(plugin_dir);
     let _ = crate::bundle::remove_snapshot(snapshot_dir, plugin_dir);
 }
 
@@ -1819,7 +2083,7 @@ pub async fn start(opts: StartOpts) -> Result<()> {
     // below reports the MODEL credential alone -- a `--secret` name riding in
     // `passthrough_env` is not one, and counting it would let the panel claim a
     // credential for a runner that has none.
-    let (model_cred_names, passthrough_env) = {
+    let (model_cred_names, mut passthrough_env) = {
         let ambient_present = ambient_present_for(&docker_env);
         let model_cred_names = select_passthrough_env(
             fake_model,
@@ -1831,12 +2095,79 @@ pub async fn start(opts: StartOpts) -> Result<()> {
         (model_cred_names, passthrough)
     };
 
+    // Hosted-connector preflights (ADR 0113) run BEFORE the snapshot is packed:
+    // the runner validates the packed snapshot, so a lock rewritten after
+    // packing would leave the runner refusing the stale copy it was handed
+    // while the source directory holds the fresh one.
+    let connector_decl = crate::connector_build::load(&plugin_dir)?;
+    let declares_hosted_connectors = connector_decl
+        .connectors
+        .values()
+        .any(|spec| spec.url.is_none() && spec.unhosted_url.is_none());
+    if declares_hosted_connectors {
+        // Fail closed on a missing credential BEFORE anything is created. It
+        // runs ahead of the rebuild below because there is no point spending
+        // minutes building images for a bring-up that will refuse, and ahead of
+        // the network and every container because a partial bring-up that then
+        // aborts leaks work this checks for up front instead.
+        if let Err(err) = refuse_missing_connector_secrets(&connector_decl) {
+            if let Some(ollama) = &ollama_container {
+                let _ = docker::remove_container(ollama).await;
+            }
+            if let Some(net) = &owned_network {
+                let _ = docker::remove_network(net).await;
+            }
+            return Err(err);
+        }
+        // ADR 0113's Decision 3, and its deliberate asymmetry: at the skill tier
+        // a missing or stale `connectors.lock.yaml` is REBUILT here, where the
+        // source and a Docker daemon are both within reach; at the cluster tier
+        // `lock_preflight` refuses instead. Without this, an edit to a connector's
+        // source silently brings up the previously locked image. A fresh lock
+        // computes no rebuild and issues no `docker build`, so the offline
+        // guarantee `cli/CLAUDE.md` makes for `skill up` still holds. It runs
+        // before the snapshot pack so the runner's copy carries the lock this
+        // writes, and before `start_skill_connectors`, which re-reads the lock
+        // from disk and so picks up whatever this wrote.
+        let stale = connectors_needing_rebuild(
+            &connector_decl,
+            crate::connector_build::load_lock(&plugin_dir)?.as_ref(),
+            &recompute_source_digests(&plugin_dir, &connector_decl)?,
+        );
+        if !stale.is_empty() {
+            // Not forced: a lock resolved to a pushed registry image is the
+            // operator's, and `write_lock` refuses to quietly downgrade it to a
+            // local-daemon one behind a `skill up`.
+            if let Err(err) = build_connectors(ConnectorBuildOpts {
+                plugin_dir: plugin_dir.clone(),
+                registry: None,
+                force: false,
+            })
+            .await
+            {
+                // A build is minutes long and fails for ordinary reasons (a bad
+                // Dockerfile, no daemon), so it releases what boot has created so
+                // far rather than leaving an ollama sidecar to collide with the
+                // operator's next attempt. No snapshot or connector container
+                // exists yet.
+                if let Some(ollama) = &ollama_container {
+                    let _ = docker::remove_container(ollama).await;
+                }
+                if let Some(net) = &owned_network {
+                    let _ = docker::remove_network(net).await;
+                }
+                return Err(err.context("rebuilding the bundle's connectors"));
+            }
+        }
+    }
+
     // #1087: the skill tier executes an immutable, content-addressed snapshot,
     // not the editable source -- matching what local and cluster already do. The
     // packer is the deploy path's packer, so the digest is the same one the API
     // records for this source. Placed AFTER the --replace teardown above so a
     // re-up of unchanged source (same digest, same directory) cannot have the
-    // snapshot it just created torn down again.
+    // snapshot it just created torn down again, and after the connector
+    // rebuild above so the packed bundle carries the lock the runner validates.
     let snapshot = match crate::bundle::snapshot(&plugin_dir) {
         Ok(snapshot) => snapshot,
         Err(err) => {
@@ -1851,6 +2182,55 @@ pub async fn start(opts: StartOpts) -> Result<()> {
             return Err(err.context("packaging the bundle snapshot for the runner"));
         }
     };
+
+    // Hosted connectors (ADR 0113). A bundle that declares none takes the
+    // existing hermetic path untouched; one that declares some gets a private
+    // network the runner and the connectors share, and the connector scope in
+    // the runner's boot env so `derive_mcp_servers` takes its normal path.
+    let mut connector_containers: Vec<String> = Vec::new();
+    let mut connector_network: Option<String> = None;
+    if declares_hosted_connectors {
+        let net = match &network {
+            Some(net) => net.clone(),
+            None => {
+                let net = format!("{}-net", opts.name);
+                if docker::create_network(&net).await? {
+                    owned_network = Some(net.clone());
+                }
+                net
+            }
+        };
+        let identity = crate::connector_build::ConnectorScope {
+            release: "curie".to_string(),
+            agent: plugin_name.clone(),
+            namespace: "default".to_string(),
+        };
+        match start_skill_connectors(&plugin_dir, &connector_decl, &identity, &net, &session_id)
+            .await
+        {
+            Ok(started) => connector_containers = started,
+            Err(err) => {
+                // Nothing is recorded yet, so this is the only chance to release
+                // whatever the partial bring-up created (#747).
+                let steps = docker::connector_teardown_plan(
+                    &session_id,
+                    owned_network.as_deref(),
+                    Some(&plugin_dir),
+                );
+                let _ = docker::run_connector_teardown(&steps).await;
+                if let Some(ollama) = &ollama_container {
+                    let _ = docker::remove_container(ollama).await;
+                }
+                return Err(err.context("starting the bundle's connectors"));
+            }
+        }
+        for (key, value) in crate::connector_build::connector_scope_env(&identity) {
+            passthrough_env.push(key.clone());
+            docker_env.push((key, value));
+        }
+        network = Some(net.clone());
+        connector_network = Some(net);
+    }
 
     let spec = StartSpec {
         image: opts.image.clone(),
@@ -1878,9 +2258,11 @@ pub async fn start(opts: StartOpts) -> Result<()> {
         Ok(id) => id,
         Err(err) => {
             // Nothing recorded the snapshot, so no teardown will ever find it
-            // (#1087); release it here alongside the sidecar and the network.
+            // (#1087); release it here alongside the sidecar, the connectors,
+            // and the network.
             release_boot_scaffolding(
                 ollama_container.as_ref(),
+                &connector_containers,
                 owned_network.as_ref(),
                 &snapshot.dir,
                 &plugin_dir,
@@ -1911,6 +2293,7 @@ pub async fn start(opts: StartOpts) -> Result<()> {
         // chance to release it (#1087).
         release_boot_scaffolding(
             ollama_container.as_ref(),
+            &connector_containers,
             owned_network.as_ref(),
             &snapshot.dir,
             &plugin_dir,
@@ -1941,6 +2324,8 @@ pub async fn start(opts: StartOpts) -> Result<()> {
             model_base_url: model_base_url.clone(),
             bundle_digest: Some(snapshot.digest.clone()),
             bundle_snapshot_dir: Some(snapshot.dir.display().to_string()),
+            connector_containers: connector_containers.clone(),
+            connector_network: connector_network.clone(),
         },
     ) {
         let _ = docker::remove_container(&opts.name).await;
@@ -1949,6 +2334,7 @@ pub async fn start(opts: StartOpts) -> Result<()> {
         // nothing behind (#1087).
         release_boot_scaffolding(
             ollama_container.as_ref(),
+            &connector_containers,
             owned_network.as_ref(),
             &snapshot.dir,
             &plugin_dir,
@@ -2177,8 +2563,7 @@ async fn remove_container_tolerating_absence(
     Ok(())
 }
 
-pub async fn stop(name: Option<String>) -> Result<()> {
-    let dir = Path::new(".");
+pub async fn stop(name: Option<String>, dir: &Path) -> Result<()> {
     let ui = crate::ui::ui();
     let saved = state::load(dir)?;
     let recorded = saved.as_ref().map(|s| s.container_name.clone());
@@ -2281,6 +2666,19 @@ async fn stop_recorded(
         ui.note(&format!(
             "kept model-cache volume '{volume}' for fast re-up; remove it with 'docker volume rm {volume}'"
         ));
+    }
+    // Connector containers, then the staged credential tree (ADR 0113,
+    // block B1-8). Label-scoped, so a connector this bundle started is reaped
+    // even if the record is incomplete; the network is left to the owned-network
+    // branch below, which alone knows whether this boot created it.
+    let connector_problems = docker::run_connector_teardown(&docker::connector_teardown_plan(
+        &saved.session_id,
+        None,
+        Some(dir),
+    ))
+    .await;
+    for problem in connector_problems {
+        ui.warn(&problem);
     }
     if let Some(net) = &saved.network {
         match docker::remove_network(net).await {
@@ -2513,12 +2911,338 @@ impl crate::ui::CliOutput for StatusOutput {
     }
 }
 
+/// What one `curie <tier> surfaces <agent>` invocation does to the agent's
+/// binding set: nothing (list), add one pair, or remove one pair.
+///
+/// Exactly one mutation per invocation, never a batch: the API has no batch
+/// endpoint, so a half-applied run would leave the operator guessing what took.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChannelChange {
+    /// No flags: read the agent's bindings and write nothing.
+    List,
+    Add {
+        kind: String,
+        address: String,
+        endpoint: Option<String>,
+        adapter: Option<String>,
+    },
+    Remove {
+        kind: String,
+        address: String,
+    },
+}
+
+impl ChannelChange {
+    /// Resolve the `--add` / `--remove` flag pair into one intent.
+    ///
+    /// clap already refuses the two together (`conflicts_with`), so this parses
+    /// whichever arrived. Usage errors are raised here, before any I/O, so a
+    /// mistyped pair costs no network round trip.
+    ///
+    /// Args:
+    ///   add: the `--add KIND=ADDRESS` value, if passed.
+    ///   remove: the `--remove KIND=ADDRESS` value, if passed.
+    ///
+    /// Returns:
+    ///   The intent, or a usage error when the pair is malformed.
+    pub fn resolve(
+        add: Option<String>,
+        remove: Option<String>,
+        endpoint: Option<String>,
+        adapter: Option<String>,
+    ) -> Result<Self> {
+        match (add, remove) {
+            (Some(spec), _) => {
+                let (kind, address) = parse_channel_pair(&spec)?;
+                Ok(ChannelChange::Add {
+                    kind,
+                    address,
+                    endpoint,
+                    adapter,
+                })
+            }
+            (None, Some(spec)) => {
+                let (kind, address) = parse_channel_pair(&spec)?;
+                Ok(ChannelChange::Remove { kind, address })
+            }
+            (None, None) => Ok(ChannelChange::List),
+        }
+    }
+}
+
+/// Split `KIND=ADDRESS` on the FIRST `=` only. A kind may not contain one; an
+/// address may (an email- or URL-shaped address for a non-Slack ingress is the
+/// whole reason bindings went channel-neutral), so everything after the first
+/// separator is the address, `=` included.
+fn parse_channel_pair(spec: &str) -> Result<(String, String)> {
+    let malformed = || {
+        crate::exit::usage(format!(
+            "--add/--remove takes KIND=ADDRESS (e.g. slack=C0EXAMPLE1), got {spec:?}. \
+             The kind is never inferred: a binding names the ingress explicitly"
+        ))
+    };
+    let (kind, address) = spec.split_once('=').ok_or_else(malformed)?;
+    if kind.is_empty() || address.is_empty() {
+        return Err(malformed());
+    }
+    Ok((kind.to_string(), address.to_string()))
+}
+
+/// Output of `<tier> surfaces <agent>`: the dry-run plan, or the agent's
+/// binding set as the API stored it. Owns its data so it outlives the
+/// `ApiClient`.
+///
+/// `channels` carries the PAIRS, not bare addresses, so an agent consumer reads
+/// the kind without guessing it. `changed` distinguishes a list from a
+/// mutation, so a consumer can tell "this is what it is" from "this is what it
+/// now is" without diffing.
+#[derive(Debug)]
+pub enum ChannelsOutput {
+    DryRun(crate::ui::DryRunPlan),
+    Done {
+        agent: String,
+        channels: Vec<crate::api::ChannelBinding>,
+        changed: bool,
+    },
+}
+
+impl crate::ui::CliOutput for ChannelsOutput {
+    fn to_json(&self) -> serde_json::Value {
+        match self {
+            ChannelsOutput::DryRun(plan) => plan.to_json(),
+            ChannelsOutput::Done {
+                agent,
+                channels,
+                changed,
+            } => serde_json::json!({
+                "agent": agent,
+                // Delegated to `Serialize` rather than hand-picked: a
+                // hand-projection could drop a field and would need its own
+                // `emits` declaration for the emit-parity gate (cli/CLAUDE.md).
+                "surfaces": serde_json::to_value(channels).unwrap_or(serde_json::Value::Null),
+                "changed": changed,
+            }),
+        }
+    }
+
+    fn render(&self, ui: &crate::ui::Ui) {
+        match self {
+            ChannelsOutput::DryRun(plan) => plan.render(ui),
+            ChannelsOutput::Done {
+                agent,
+                channels,
+                changed,
+            } => {
+                let verb = if *changed { " now" } else { "" };
+                let bound = if channels.is_empty() {
+                    "none".to_string()
+                } else {
+                    channels
+                        .iter()
+                        .map(|c| format!("{}:{}", c.kind, c.address))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                ui.payload(&format!("surfaces for {agent}{verb}: {bound}"));
+            }
+        }
+    }
+}
+
+/// `curie <tier> surfaces <agent> [--add KIND=ADDRESS | --remove KIND=ADDRESS]`.
+///
+/// With no flags this LISTS: one `GET`-resolved agent, no write. With one flag
+/// it adds or removes exactly that binding, then reports the set as the API
+/// holds it, so the operator sees what took rather than what was intended.
+///
+/// Args:
+///   opts: api url/key, the agent name or id, and the dry-run flag.
+///   change: the intent already parsed from the flag pair.
+///
+/// Returns:
+///   The agent's bindings, or the dry-run plan.
+///
+/// Named `channel_bindings` rather than `channels` after the verb: the
+/// emit-parity gate's reachability walk follows a `to_json` body's bare
+/// identifiers to same-named free functions (`cli/tests/support/emit_parity.rs`),
+/// and `channels` is now a field identifier several unrelated bodies mention,
+/// so a free fn by that name gets pulled into their keysets and reports
+/// omissions on other verbs as stale.
+pub async fn channel_bindings(
+    opts: AgentActionOpts,
+    change: ChannelChange,
+) -> Result<ChannelsOutput> {
+    let ui = crate::ui::ui();
+    if opts.dry_run {
+        let plan =
+            match &change {
+                ChannelChange::List => format!(
+                    "GET {}/agents  (read-only: would resolve agent {:?} and print its surfaces)",
+                    opts.api_url, opts.agent
+                ),
+                ChannelChange::Add {
+                    kind,
+                    address,
+                    endpoint,
+                    adapter,
+                } => format!(
+                "POST {}/agents/<id>/channels  {{\"kind\":\"{kind}\",\"address\":\"{address}\"}}  \
+                 (would resolve agent {:?} first; reply route: {})",
+                opts.api_url,
+                opts.agent,
+                if endpoint.is_some() && adapter.is_some() { "configured" } else { "implicit" }
+            ),
+                ChannelChange::Remove { kind, address } => format!(
+                    "DELETE {}/agents/<id>/channels?kind={kind}&address={address}  \
+                 (would resolve agent {:?} first)",
+                    opts.api_url, opts.agent
+                ),
+            };
+        return Ok(ChannelsOutput::DryRun(crate::ui::DryRunPlan {
+            lines: vec![plan],
+        }));
+    }
+    let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
+    let agent = client.find_agent(&opts.agent).await?;
+    let (kind, address, adding) = match &change {
+        ChannelChange::List => {
+            // find_agent already carries the bindings, so there is nothing
+            // further to fetch and nothing to write.
+            return Ok(ChannelsOutput::Done {
+                agent: agent.name,
+                channels: agent.channels,
+                changed: false,
+            });
+        }
+        ChannelChange::Add { kind, address, .. } => (kind, address, true),
+        ChannelChange::Remove { kind, address } => (kind, address, false),
+    };
+    let cl = ui.checklist();
+    let verb = if adding { "adding" } else { "removing" };
+    let step = cl.step(&format!(
+        "{verb} {kind}:{address} on {name}",
+        name = agent.name
+    ));
+    let saved = if adding {
+        let (endpoint, adapter) = match &change {
+            ChannelChange::Add {
+                endpoint, adapter, ..
+            } => (endpoint.as_deref(), adapter.as_deref()),
+            _ => (None, None),
+        };
+        client
+            .add_agent_channel(&agent.id, kind, address, endpoint, adapter)
+            .await
+    } else {
+        // The DELETE answers 204 with no body, so the remaining set comes from
+        // a fresh read rather than from locally subtracting the pair -- the CLI
+        // reports what the API holds, never what it assumes it holds.
+        match client.remove_agent_channel(&agent.id, kind, address).await {
+            Ok(()) => client.get_agent(&agent.id).await,
+            Err(err) => Err(err),
+        }
+    };
+    let saved = match saved {
+        Ok(saved) => {
+            step.done(if adding { "added" } else { "removed" });
+            saved
+        }
+        Err(err) => {
+            step.fail("failed");
+            return Err(err);
+        }
+    };
+    Ok(ChannelsOutput::Done {
+        agent: saved.name,
+        channels: saved.channels,
+        changed: true,
+    })
+}
+
+#[cfg(test)]
+mod channels_tests {
+    use super::ChannelChange;
+
+    #[test]
+    fn channel_change_parses_kind_and_address_on_first_equals() {
+        // KIND=ADDRESS splits on the FIRST `=` only. A kind may not contain
+        // one; an address may -- an email-shaped or URL-shaped address for a
+        // non-Slack ingress is the whole reason bindings went channel-neutral.
+        // Splitting on the last `=`, or rejecting the second one, would make
+        // those addresses unbindable through the CLI.
+        let change =
+            ChannelChange::resolve(Some("slack=C0EXAMPLE1".into()), None, None, None).unwrap();
+        assert_eq!(
+            change,
+            ChannelChange::Add {
+                kind: "slack".into(),
+                address: "C0EXAMPLE1".into(),
+                endpoint: None,
+                adapter: None,
+            }
+        );
+
+        let odd =
+            ChannelChange::resolve(Some("email=ops+a=b@example.com".into()), None, None, None)
+                .unwrap();
+        assert_eq!(
+            odd,
+            ChannelChange::Add {
+                kind: "email".into(),
+                address: "ops+a=b@example.com".into(),
+                endpoint: None,
+                adapter: None,
+            },
+            "everything after the first `=` is the address, `=` included"
+        );
+
+        // The same rule on the remove side: one parser, both flags.
+        let removed =
+            ChannelChange::resolve(None, Some("slack=C0EXAMPLE2".into()), None, None).unwrap();
+        assert_eq!(
+            removed,
+            ChannelChange::Remove {
+                kind: "slack".into(),
+                address: "C0EXAMPLE2".into(),
+            }
+        );
+
+        // Neither flag is an inspect, not an error: `channels <agent>` lists.
+        assert_eq!(
+            ChannelChange::resolve(None, None, None, None).unwrap(),
+            ChannelChange::List
+        );
+    }
+
+    #[test]
+    fn channel_change_rejects_a_bare_address_with_no_kind() {
+        // `--add C0EXAMPLE1` is the mistake this catches. Defaulting the kind
+        // to "slack" would be the silent-wrong-thing: the operator learns the
+        // kind is optional, and the first non-Slack ingress binds to the wrong
+        // one. The error must exit USAGE, before any network call.
+        let err = ChannelChange::resolve(Some("C0EXAMPLE1".into()), None, None, None).unwrap_err();
+        let (class, _fix) = crate::exit::classify(&err);
+        assert_eq!(class, crate::exit::ExitClass::Usage);
+        assert!(err.to_string().contains("KIND=ADDRESS"), "{err}");
+
+        // An empty kind or an empty address is the same mistake wearing a
+        // separator, and must not slip through as a half-empty pair.
+        for bad in ["=C0EXAMPLE1", "slack=", "="] {
+            assert!(
+                ChannelChange::resolve(Some(bad.into()), None, None, None).is_err(),
+                "{bad:?} must not resolve to a binding"
+            );
+        }
+    }
+}
+
 pub async fn send(
     text: &str,
     user: &str,
     event_type: EventType,
     url: Option<String>,
-) -> Result<()> {
+    r#continue: bool,
+) -> Result<bool> {
     let url = resolve_url(url)?;
     let saved = state::load(Path::new(".")).unwrap_or(None);
     let bundle_warning = editable_bundle_warning(saved.as_ref(), &url);
@@ -2528,6 +3252,13 @@ pub async fn send(
         ui.warn(&warning);
     }
     let mut printer = TurnPrinter::default();
+
+    if !r#continue {
+        client
+            .reset()
+            .await
+            .context("resetting the runner conversation before message")?;
+    }
 
     // Under `--json`, answer tokens are suppressed on stdout (they route through
     // `ui.answer`), so a streamed turn would exit 0 with empty stdout (#485).
@@ -2615,10 +3346,7 @@ pub async fn send(
                 status: status_str(status).to_string(),
                 finalized: true,
             });
-            if *status == SessionStatus::ClassifiedFailure {
-                std::process::exit(1);
-            }
-            return Ok(());
+            return Ok(*status == SessionStatus::ClassifiedFailure);
         }
         // Close the streamed answer on stdout only if the last thing written was
         // un-terminated token text; if a note already added its own newline (or
@@ -2628,11 +3356,9 @@ pub async fn send(
             ui.print_tokens("\n");
         }
         ui.note(&format!("-- final ({})", status_str(status)));
-        if *status == SessionStatus::ClassifiedFailure {
-            std::process::exit(1);
-        }
+        return Ok(*status == SessionStatus::ClassifiedFailure);
     }
-    Ok(())
+    Ok(false)
 }
 
 /// Output of `skill message` under `--json`: the full buffered reply plus the
@@ -3591,6 +4317,9 @@ pub struct DeployOpts {
     /// repository is left alone and warned about, because a deploy does not
     /// reroute an existing binding.
     pub repo: Option<String>,
+    /// Deployment-level managed workspace intent. Preserve deliberately omits
+    /// the workspace field so the server can carry the previous value forward.
+    pub workspace: WorkspaceIntent,
     /// None means the caller did not pass --env, so a declared target may
     /// supply it. An explicit flag still wins (ADR-0089).
     pub env: Option<DeployEnv>,
@@ -3601,18 +4330,32 @@ pub struct DeployOpts {
     /// forward into the sandbox. From `deploy --secret <NAME>`.
     pub secret: Vec<String>,
     /// Whether this tier offers `--secret` binding, gating the declared-secrets
-    /// policy check (#464): true for tiers that can bind a declared secret
-    /// (local), false where secret delivery is not yet wired (cluster, until
-    /// #440 flips it). When false the gate is skipped -- otherwise every
-    /// secrets-declaring bundle would hard-fail with a `--secret <NAME>`
-    /// remediation that does not exist on that tier.
+    /// policy check (#464): true when the tier can bind a declared secret
+    /// (local by value, cluster via the per-agent Helm Secret). When false the
+    /// gate is skipped.
     pub secret_binding_supported: bool,
     /// Actionable remediation line printed when the platform API connection
     /// fails (e.g. the kubectl port-forward command for cluster, or
     /// `curie local up` for local). Naming the fix turns a raw
     /// "Connection refused" into something the operator can act on.
     pub connect_hint: String,
+    /// Which tier this deploy targets. Explicit and without a `Default` impl on
+    /// purpose: `local deploy`, `cluster deploy` and `deploy_named` all reach
+    /// one `deploy()`, so the cluster-only connector checks have nothing to
+    /// select on without it, and a new caller must not silently inherit
+    /// `Local` and skip them.
+    pub tier: DeployTier,
 }
+
+/// The tier a deploy targets. Two variants, no default: the compiler enumerates
+/// every construction site when the field is added.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeployTier {
+    Local,
+    Cluster,
+}
+
+pub use crate::api::WorkspaceIntent;
 
 /// The declared connector-secret NAMES not present in the operator's bound
 /// `--secret` set (#464). A non-empty result is a deploy-time gap: the bundle
@@ -3637,6 +4380,17 @@ fn unbound_declared_secrets(declared: &[String], bound: &[String]) -> Vec<String
         .collect()
 }
 
+/// True when a cluster verb SELF-PLUMBS its API transport: no explicit
+/// `--api-url`/`CURIE_API_URL` was given, so the release's api Service is
+/// reached over a loopback kubectl port-forward rather than direct-dialed.
+///
+/// The single statement of that discriminant (#1533). [`deploy_port_forward`]
+/// and [`deploy_api_tunnel`] both key on this one predicate, so "is a tunnel in
+/// play?" cannot answer differently in the two places a call site consults it.
+pub fn deploy_self_plumbs(api_url: Option<&str>) -> bool {
+    api_url.is_none()
+}
+
 /// The kubectl port-forward the auto `cluster deploy` path opens to the
 /// release's api service (ADR-0057, superseding ADR-0024's deploy transport).
 /// When no `--api-url` is given, deploy self-plumbs this loopback tunnel and
@@ -3647,20 +4401,53 @@ fn unbound_declared_secrets(declared: &[String], bound: &[String]) -> Vec<String
 pub fn deploy_port_forward(
     api_url: Option<&str>,
     namespace: &str,
-    release: &str,
+    fullname: &crate::ops::ReleaseFullname,
     local_port: u16,
     remote_port: u16,
 ) -> Option<crate::ops::OpsCommand> {
-    match api_url {
-        Some(_) => None,
-        None => Some(crate::message::port_forward_command(
-            namespace,
-            release,
-            "api",
-            local_port,
-            remote_port,
-        )),
+    if !deploy_self_plumbs(api_url) {
+        return None;
     }
+    Some(crate::message::port_forward_command(
+        namespace,
+        fullname,
+        "api",
+        local_port,
+        remote_port,
+    ))
+}
+
+/// The self-plumbed API tunnel for a cluster verb: the release's RESOLVED
+/// [`crate::ops::ReleaseFullname`] and the port-forward command that reaches its
+/// api Service, returned TOGETHER. `None` when an explicit
+/// `--api-url`/`CURIE_API_URL` was given, since that path direct-dials the URL
+/// and builds no tunnel.
+///
+/// The fullname is resolved LAZILY, on the self-plumbed branch only: the
+/// explicit `--api-url` path names no Service, and
+/// `cli/tests/cluster_connection_transport.rs` pins a fully explicit connection
+/// as never invoking kubectl at all, so resolving eagerly would fire kubectl on
+/// a path proven not to.
+///
+/// Paired rather than handed back as two independent `Option`s (#1533): the
+/// fullname the tunnel forwards to is the same one the caller needs for its
+/// `svc/<name>` diagnostics and unreachable hints. Carrying them apart left
+/// every call site re-deriving the self-plumbed discriminant for itself and
+/// asserting at runtime that the two `Option`s agreed.
+pub async fn deploy_api_tunnel(
+    api_url: Option<&str>,
+    namespace: &str,
+    release: &str,
+    local_port: u16,
+    remote_port: u16,
+) -> Option<(crate::ops::ReleaseFullname, crate::ops::OpsCommand)> {
+    if !deploy_self_plumbs(api_url) {
+        return None;
+    }
+    let fullname = crate::ops::release_fullname(namespace, release).await;
+    let command =
+        crate::message::port_forward_command(namespace, &fullname, "api", local_port, remote_port);
+    Some((fullname, command))
 }
 
 /// True when `cluster deploy` must auto-discover the release Secret key: no
@@ -3693,6 +4480,8 @@ pub struct PreparedDeploy {
     deploy_targets_yaml: Option<String>,
     connect_hint: String,
     step: crate::ui::Step,
+    tier: DeployTier,
+    plugin_dir: PathBuf,
 }
 
 impl PreparedDeploy {
@@ -3715,6 +4504,32 @@ pub async fn prepare_deploy(opts: DeployOpts) -> Result<PreparedDeploy> {
         .canonicalize()
         .with_context(|| format!("plugin dir not found: {}", opts.plugin_dir.display()))?;
     let (plugin_name, manifest_version) = read_manifest(&plugin_dir)?;
+
+    // Connector lock preflight (ADR 0113), before the bundle is packed so the
+    // failure names the operator's own directory rather than a temp path, and
+    // long before anything is applied. `opts.plugin_dir` (not the canonicalized
+    // copy) is the path they typed.
+    {
+        let decl = crate::connector_build::load(&plugin_dir)?;
+        if decl.connectors.values().any(|spec| spec.build.is_some()) {
+            let recomputed = recompute_source_digests(&plugin_dir, &decl)?;
+            let lock = crate::connector_build::load_lock(&plugin_dir)?;
+            lock_preflight(
+                &opts.plugin_dir,
+                &decl,
+                lock.as_ref(),
+                &recomputed,
+                opts.tier,
+            )?;
+            // What the REGISTRY answers for the locked digest, not what the lock
+            // claims about it, is what a node has to pull (see
+            // `registry_preflight`). Cluster only: no local deploy pulls this.
+            if opts.tier == DeployTier::Cluster {
+                run_registry_preflight(&decl, lock.as_ref()).await?;
+            }
+        }
+    }
+
     let label = opts
         .label
         .unwrap_or_else(|| format!("{manifest_version}-{}", unix_now()));
@@ -3726,9 +4541,8 @@ pub async fn prepare_deploy(opts: DeployOpts) -> Result<PreparedDeploy> {
     // the ticket -- a missing binding otherwise surfaces later as a runtime auth
     // failure (#429). This runs in the shared deploy() path, pre-network, so it
     // covers BOTH `local deploy` and `cluster deploy`. It is gated on
-    // `secret_binding_supported` (AC2): cluster deploy cannot bind a `--secret`
-    // until #440 wires delivery, so enforcing there would hard-fail every
-    // secrets-declaring bundle with a remediation the tier cannot satisfy. It
+    // `secret_binding_supported` (AC2): skip only on a tier that still cannot
+    // bind. Cluster binding is #1488. It
     // runs first, before the archive is even packed: the check is a pure
     // name-set diff on `opts.secret` (the bound NAME set) and needs no packed
     // bundle or resolved values, so a declared-but-unbound policy fails fast
@@ -3751,6 +4565,54 @@ pub async fn prepare_deploy(opts: DeployOpts) -> Result<PreparedDeploy> {
         validate_channel_binding("slack", channel)?;
     }
     let archive = pack_tar_gz(&plugin_dir)?;
+    let git_prefix = tokio::process::Command::new("git")
+        .args(["rev-parse", "--show-prefix"])
+        .current_dir(&plugin_dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .output()
+        .await
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|prefix| PathBuf::from(prefix.trim_end_matches(['\r', '\n'])));
+    let git_status = tokio::process::Command::new("git")
+        .args([
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--no-renames",
+            "--untracked-files=all",
+            "--ignored=matching",
+            "--",
+            ".",
+        ])
+        .current_dir(&plugin_dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .output()
+        .await
+        .ok();
+    let commit_sha = match (git_prefix, git_status) {
+        (Some(prefix), Some(output))
+            if output.status.success()
+                && git_status_is_clean_for_pack(&plugin_dir, &prefix, &output.stdout) =>
+        {
+            tokio::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&plugin_dir)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .output()
+                .await
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .map(|sha| sha.trim().to_string())
+                .filter(|sha| !sha.is_empty())
+        }
+        _ => None,
+    };
     let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
     // Resolve a declared target, if one was named (ADR-0089). The file is sent
     // as TEXT and parsed server-side: one parser means the CLI and the
@@ -3836,8 +4698,13 @@ pub async fn prepare_deploy(opts: DeployOpts) -> Result<PreparedDeploy> {
             &label,
             &created_by,
             archive,
-            &secrets,
+            &match opts.tier {
+                DeployTier::Local => secrets.clone(),
+                DeployTier::Cluster => crate::cluster_secrets::agent_record_secrets(&secrets),
+            },
             opts.repo.as_deref(),
+            commit_sha.as_deref(),
+            opts.workspace,
         )
         .await
     {
@@ -3861,6 +4728,8 @@ pub async fn prepare_deploy(opts: DeployOpts) -> Result<PreparedDeploy> {
         deploy_targets_yaml,
         connect_hint: opts.connect_hint,
         step,
+        tier: opts.tier,
+        plugin_dir,
     })
 }
 
@@ -3943,6 +4812,8 @@ pub async fn deploy_prepared(prepared: PreparedDeploy) -> Result<DeployOutput> {
         deploy_targets_yaml,
         connect_hint,
         step,
+        tier,
+        plugin_dir,
     } = prepared;
     let outcome = match client.activate_deploy(outcome, &env).await {
         Ok(outcome) => {
@@ -4001,15 +4872,37 @@ pub async fn deploy_prepared(prepared: PreparedDeploy) -> Result<DeployOutput> {
 
     let channel = match &outcome.channel {
         ChannelOutcome::Created(channel) => channel.clone(),
-        ChannelOutcome::Updated { from, to } => format!("updated to {to} (was {from})"),
-        ChannelOutcome::Unchanged { channel, passed } => {
+        ChannelOutcome::Added { address } => format!("added {address}"),
+        ChannelOutcome::Unchanged { channels, passed } => {
+            let bound = channels.join(", ");
             if *passed {
-                format!("unchanged ({channel})")
+                format!("unchanged ({bound})")
             } else {
-                format!("unchanged ({channel}); pass --slack-channel to move it")
+                format!("unchanged ({bound}); pass --slack-channel to bind another")
             }
         }
     };
+    // The local tier runs the bundle's connectors itself (ADR 0113). Reached by
+    // both local callers -- `local deploy` and `deploy-local` -- because both
+    // arrive here, so the shorthand cannot upload a source-built bundle and
+    // start no connector. The identity is the one the deploy RESOLVED, never
+    // re-read from plugin.json: `--agent`/`--target` can override it, and an
+    // alias built from the manifest name is one the runner never dials.
+    if tier == DeployTier::Local {
+        let lock = crate::connector_build::load_lock(&plugin_dir)?.unwrap_or_else(|| {
+            crate::connector_build::ConnectorLockFileDecl {
+                version: crate::connector_build::LOCK_VERSION,
+                connectors: std::collections::BTreeMap::new(),
+            }
+        });
+        let identity = crate::connector_build::ConnectorScope {
+            release: "curie".to_string(),
+            agent: outcome.agent.name.clone(),
+            namespace: "default".to_string(),
+        };
+        bring_up_local(&plugin_dir, &lock, &identity, crate::local::COMPOSE_PROJECT).await?;
+    }
+
     Ok(DeployOutput {
         plugin_name,
         label,
@@ -4572,23 +5465,30 @@ impl crate::ui::CliOutput for DeleteOutput {
     }
 }
 
-/// `curie cluster delete <agent> --yes`: delete the agent
-/// (`DELETE /agents/{id}`). Destructive and irreversible, so it refuses without
-/// `--yes`, mirroring `cluster down`. `--dry-run` returns the plan and makes no
-/// request.
+/// `curie <tier> delete <agent> --yes`: end active deployments, then delete the
+/// agent. Destructive and irreversible, so it refuses without `--yes`.
+/// `--dry-run` returns the plan and makes no request.
 pub async fn delete(opts: AgentActionOpts, yes: bool) -> Result<DeleteOutput> {
     let ui = crate::ui::ui();
     if opts.dry_run {
         return Ok(DeleteOutput::DryRun(crate::ui::DryRunPlan {
-            lines: vec![format!(
-                "DELETE {}/agents/<id>  (would resolve agent {:?} first)",
-                opts.api_url, opts.agent
-            )],
+            lines: vec![
+                format!(
+                    "GET {}/agents  (would resolve agent {:?})",
+                    opts.api_url, opts.agent
+                ),
+                format!("GET {}/deployments?agent_id=<id>", opts.api_url),
+                format!(
+                    "DELETE {}/deployments/<id>  (for each active deployment)",
+                    opts.api_url
+                ),
+                format!("DELETE {}/agents/<id>", opts.api_url),
+            ],
         }));
     }
     if !yes {
         return Err(crate::exit::CliError::usage(format!(
-            "`curie cluster delete {}` permanently deletes the agent; re-run with --yes to confirm",
+            "`curie ... delete {}` permanently deletes the agent; re-run with --yes to confirm",
             opts.agent
         ))
         .with_fix("re-run with --yes")
@@ -4597,6 +5497,16 @@ pub async fn delete(opts: AgentActionOpts, yes: bool) -> Result<DeleteOutput> {
     let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
     let agent = client.find_agent(&opts.agent).await?;
     let cl = ui.checklist();
+    for deployment in client.list_deployments(&agent.id).await? {
+        if deployment.status == "active" {
+            let step = cl.step(&format!("ending deployment {}", deployment.id));
+            if let Err(err) = client.end_deployment(&deployment.id).await {
+                step.fail("failed");
+                return Err(err);
+            }
+            step.done("ended");
+        }
+    }
     let step = cl.step(&format!("deleting {}", agent.name));
     match client.delete_agent(&agent.id).await {
         Ok(()) => step.done("deleted"),
@@ -4854,8 +5764,8 @@ pub struct ApprovalCmd {
     pub reject: bool,
     pub note: Option<String>,
     pub actor_channel: Option<String>,
-    /// `--route NAME=CHANNEL`, repeatable.
-    pub route: Vec<String>,
+    /// `--route-resolution NAME=CHANNEL`, repeatable.
+    pub route_resolution: Vec<String>,
     /// `--route-approvers NAME=users:U1,U2` or `NAME=group:S1`, repeatable.
     pub route_approvers: Vec<String>,
     /// `--routes-from FILE`: the whole binding map as JSON.
@@ -4866,16 +5776,17 @@ pub struct ApprovalCmd {
 
 // --- Approval route bindings (#1052) -----------------------------------------
 //
-// Which channel an approval card posts to, and who may resolve it, live in the
-// agent's `approval_routes` map. Until this verb existed the only way to write
-// one was a hand-rolled `PATCH /agents/{id}`, against the repo's own "one entry
-// point: curie <command>" rule.
+// The verified resolution card, optional text-only notification, and who may
+// resolve live as separate fields in the agent's `approval_routes` map. Until
+// this verb existed the only way to write one was a hand-rolled
+// `PATCH /agents/{id}`, against the repo's own "one entry point: curie
+// <command>" rule.
 //
 // Two properties shape the code below.
 //
 // The write is a FULL REPLACEMENT, exactly as `--gate` already is for
 // `approval_required_tools`. That is the field's semantics on `AgentUpdate`, and
-// a merge would make `--route` unable to express removal.
+// a merge would make the route inputs unable to express removal.
 //
 // Every parse and shape error is collected BEFORE any HTTP call. A partial write
 // of a binding map is a silently widened (or silently narrowed) approver set,
@@ -4891,6 +5802,9 @@ static SLACK_USERGROUP_ID: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"^S[A-Z0-9]{7,}$").expect("usergroup id re"));
 static SLACK_USER_ID: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"^[UW][A-Z0-9]{7,}$").expect("user id re"));
+static CHANNEL_KIND: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"^[a-z0-9]+(?:[-_][a-z0-9]+)*$").expect("channel kind re")
+});
 
 /// Split `NAME=VALUE` once, rejecting an empty half.
 ///
@@ -4900,7 +5814,7 @@ static SLACK_USER_ID: std::sync::LazyLock<regex::Regex> =
 fn split_route_arg<'a>(flag: &str, raw: &'a str) -> Result<(&'a str, &'a str)> {
     let (name, value) = raw.split_once('=').ok_or_else(|| {
         crate::exit::usage(format!(
-            "{flag} {raw:?} is not NAME=VALUE; pass e.g. {flag} deal_desk=C0123ABCD"
+            "{flag} {raw:?} is not NAME=VALUE; pass e.g. {flag} deal_desk=C0EXAMPLE1"
         ))
     })?;
     let (name, value) = (name.trim(), value.trim());
@@ -4985,23 +5899,24 @@ fn parse_route_approvers(value: &str) -> Result<crate::api::ApprovalApprovers> {
     }
 }
 
-/// Build the binding map a write should send, from the three input forms.
+/// Build the binding map a write should send from a strict file plus overrides.
 ///
 /// `--routes-from` seeds the map and the repeatable flags apply on top, so a
 /// committed file can be spot-overridden on the command line. Every error is a
 /// usage error raised before the caller opens a connection.
 fn build_route_bindings(
-    route: &[String],
+    route_resolution: &[String],
     route_approvers: &[String],
     routes_from: Option<&PathBuf>,
-) -> Result<BTreeMap<String, crate::api::ApprovalRouteBinding>> {
-    let mut bindings: BTreeMap<String, crate::api::ApprovalRouteBinding> = BTreeMap::new();
+) -> Result<BTreeMap<String, crate::api::ApprovalRouteBindingWrite>> {
+    let mut bindings: BTreeMap<String, crate::api::ApprovalRouteBindingWrite> = BTreeMap::new();
 
     if let Some(path) = routes_from {
         let text = std::fs::read_to_string(path).map_err(|e| {
             crate::exit::usage(format!(
                 "--routes-from {}: {e}; the file must be JSON shaped \
-                 {{\"<route>\": {{\"channel\": \"C0123ABCD\"}}}}",
+                 {{\"<route>\": {{\"resolution\": \
+                 {{\"kind\": \"slack\", \"address\": \"C0EXAMPLE1\"}}}}}}",
                 path.display()
             ))
         })?;
@@ -5014,7 +5929,8 @@ fn build_route_bindings(
             serde_json::from_str(&text).map_err(|e| {
                 crate::exit::usage(format!(
                     "--routes-from {}: {e}; expected JSON shaped \
-                     {{\"<route>\": {{\"channel\": \"C0123ABCD\", \
+                     {{\"<route>\": {{\"resolution\": \
+                     {{\"kind\": \"slack\", \"address\": \"C0EXAMPLE1\"}}, \
                      \"approvers\": {{\"group\": \"S0123ABCD\"}}}}}}",
                     path.display()
                 ))
@@ -5022,8 +5938,8 @@ fn build_route_bindings(
         for (name, value) in raw {
             // RouteBindingInput is the strict, operator-file twin of the
             // response-side type: it refuses an unknown key instead of dropping
-            // it (#1072). A dropped `approver` would leave a channel-only
-            // binding, which widens the approver set to the whole card channel.
+            // it (#1072). A dropped `approver` would leave authority falling
+            // back to the whole resolution-card channel.
             let input: crate::api::RouteBindingInput =
                 serde_json::from_value(value).map_err(|e| {
                     anyhow::Error::from(
@@ -5032,15 +5948,14 @@ fn build_route_bindings(
                             path.display()
                         ))
                         .with_fix(
-                            "a route binding takes `channel` and an optional `approvers` \
-                             block of `group` or `users`, and nothing else. A dropped \
-                             sibling key would leave a channel-only binding, which makes \
-                             every member of that channel an approver",
+                            "a route binding requires `resolution: {kind: \"slack\", \
+                             address: \"C...\"}` and accepts optional `notification` and \
+                             `approvers` blocks, and nothing else. The retired `channel` key \
+                             is not accepted",
                         ),
                     )
                 })?;
-            validate_route_channel(&name, &input.channel)?;
-            let binding: crate::api::ApprovalRouteBinding = input.into();
+            let binding: crate::api::ApprovalRouteBindingWrite = input.into();
             if let Some(approvers) = &binding.approvers {
                 validate_parsed_approvers(&name, approvers)?;
             }
@@ -5048,14 +5963,22 @@ fn build_route_bindings(
         }
     }
 
-    for raw in route {
-        let (name, channel) = split_route_arg("--route", raw)?;
-        validate_route_channel(name, channel)?;
+    for raw in route_resolution {
+        let (name, channel) = split_route_arg("--route-resolution", raw)?;
         bindings
             .entry(name.to_string())
-            .and_modify(|b| b.channel = Some(channel.to_string()))
-            .or_insert_with(|| crate::api::ApprovalRouteBinding {
-                channel: Some(channel.to_string()),
+            .and_modify(|b| {
+                b.resolution = crate::api::ApprovalResolutionTargetWrite {
+                    kind: "slack".to_string(),
+                    address: channel.to_string(),
+                }
+            })
+            .or_insert_with(|| crate::api::ApprovalRouteBindingWrite {
+                resolution: crate::api::ApprovalResolutionTargetWrite {
+                    kind: "slack".to_string(),
+                    address: channel.to_string(),
+                },
+                notification: None,
                 approvers: None,
             });
     }
@@ -5063,17 +5986,15 @@ fn build_route_bindings(
     for raw in route_approvers {
         let (name, value) = split_route_arg("--route-approvers", raw)?;
         let approvers = parse_route_approvers(value)?;
-        // Approvers narrow an EXISTING binding; without a channel there is
-        // nowhere for the card to post, and the API's model requires one. Refuse
-        // rather than invent a channel.
+        // Approvers narrow an EXISTING binding; without a resolution there is
+        // no verified card surface. Refuse rather than invent one.
         let binding = bindings.get_mut(name).ok_or_else(|| {
             anyhow::Error::from(
                 crate::exit::CliError::usage(format!(
-                    "--route-approvers {name:?} names a route with no channel to post its \
-                     card in"
+                    "--route-approvers {name:?} names a route with no resolution"
                 ))
                 .with_fix(format!(
-                    "add --route {name}=<CHANNEL> to the same invocation (or name the \
+                    "add --route-resolution {name}=<CHANNEL> to the same invocation (or name the \
                      route in --routes-from): a write replaces the whole route map, so \
                      every route it should keep must be present"
                 )),
@@ -5082,7 +6003,136 @@ fn build_route_bindings(
         binding.approvers = Some(approvers);
     }
 
+    // Overrides can invalidate a previously valid file binding (for example,
+    // by moving resolution onto its notification target), so validate only the
+    // complete final map. Nothing reaches HTTP unless every binding survives.
+    for (name, binding) in &bindings {
+        validate_resolution_target(name, &binding.resolution)?;
+        if let Some(notification) = &binding.notification {
+            validate_notification_target(name, notification)?;
+            reject_identical_targets(name, &binding.resolution, notification)?;
+        }
+        if let Some(approvers) = &binding.approvers {
+            validate_parsed_approvers(name, approvers)?;
+        }
+    }
+
     Ok(bindings)
+}
+
+/// The interactive extension point is explicit but remains Slack-only until a
+/// second channel can mint a scoped, verified resolver credential.
+fn validate_resolution_target(
+    route: &str,
+    target: &crate::api::ApprovalResolutionTargetWrite,
+) -> Result<()> {
+    if target.kind != "slack" {
+        return Err(crate::exit::usage(format!(
+            "route {route:?}: resolution kind {:?} is unsupported; only slack can carry \
+             a verified resolver identity",
+            target.kind
+        )));
+    }
+    validate_route_channel(route, &target.address)
+}
+
+/// Validate the notification identity and its independent transport route.
+fn validate_notification_target(
+    route: &str,
+    target: &crate::api::NotificationTargetWrite,
+) -> Result<()> {
+    if !CHANNEL_KIND.is_match(&target.kind) {
+        return Err(crate::exit::usage(format!(
+            "route {route:?}: notification kind {:?} is not a lowercase channel-kind slug",
+            target.kind
+        )));
+    }
+    if target.kind == "slack" {
+        validate_route_channel(route, &target.address)?;
+    } else if target.address.is_empty() || target.address.chars().any(char::is_whitespace) {
+        return Err(crate::exit::usage(format!(
+            "route {route:?}: notification address must be non-empty and contain no whitespace"
+        )));
+    }
+    let complete_transport = target.endpoint.is_some() && target.adapter.is_some();
+    let empty_transport = target.endpoint.is_none() && target.adapter.is_none();
+    if !complete_transport && !empty_transport {
+        return Err(crate::exit::usage(format!(
+            "route {route:?}: notification endpoint and adapter must be supplied together"
+        )));
+    }
+    if target.kind != "slack" && !complete_transport {
+        return Err(crate::exit::CliError::usage(format!(
+            "route {route:?}: non-Slack notification kind {:?} requires both endpoint and adapter",
+            target.kind
+        ))
+        .with_fix(
+            "put the complete notification object in --routes-from, including an absolute \
+             endpoint URL and adapter name",
+        )
+        .into());
+    }
+    if let Some(adapter) = &target.adapter {
+        if !CHANNEL_KIND.is_match(adapter) {
+            return Err(crate::exit::usage(format!(
+                "route {route:?}: notification adapter is not a lowercase slug"
+            )));
+        }
+    }
+    if let Some(endpoint) = &target.endpoint {
+        let parsed = reqwest::Url::parse(endpoint).map_err(|_| {
+            crate::exit::usage(format!(
+                "route {route:?}: notification endpoint must be an absolute http(s) URL with a host"
+            ))
+        })?;
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+            return Err(crate::exit::usage(format!(
+                "route {route:?}: notification endpoint must be an absolute http(s) URL with a host"
+            )));
+        }
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(crate::exit::usage(format!(
+                "route {route:?}: notification endpoint must not contain userinfo; use adapter credentials"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn reject_identical_targets(
+    route: &str,
+    resolution: &crate::api::ApprovalResolutionTargetWrite,
+    notification: &crate::api::NotificationTargetWrite,
+) -> Result<()> {
+    if resolution.kind == notification.kind && resolution.address == notification.address {
+        return Err(crate::exit::usage(format!(
+            "route {route:?}: notification must differ from resolution; a duplicate target \
+             is not a second notification surface"
+        )));
+    }
+    Ok(())
+}
+
+/// Render route bindings for a dry-run without exposing credential-bearing
+/// adapter URL paths, queries, or fragments. The origin is enough to identify
+/// the transport destination; the real PATCH retains the complete endpoint.
+fn route_bindings_plan_json(
+    bindings: &BTreeMap<String, crate::api::ApprovalRouteBindingWrite>,
+) -> String {
+    let mut display = bindings.clone();
+    for binding in display.values_mut() {
+        let Some(endpoint) = binding
+            .notification
+            .as_mut()
+            .and_then(|target| target.endpoint.as_mut())
+        else {
+            continue;
+        };
+        *endpoint = reqwest::Url::parse(endpoint)
+            .map(|url| url.origin().ascii_serialization())
+            .unwrap_or_else(|_| "<redacted>".to_string());
+    }
+    serde_json::to_string(&display).unwrap_or_else(|_| "<unserializable>".to_string())
 }
 
 /// Channel-shape check for one route binding, with the route named in the error.
@@ -5094,8 +6144,8 @@ fn validate_route_channel(route: &str, channel: &str) -> Result<()> {
              receives messages"
         ))
         .with_fix(
-            "pass the channel ID (e.g. C0123ABCD): find it in the channel's About tab, \
-             or at the end of the channel URL (.../archives/C0123ABCD)",
+            "pass the channel ID (e.g. C0EXAMPLE1): find it in the channel's About tab, \
+             or at the end of the channel URL (.../archives/C0EXAMPLE1)",
         )
         .into());
     }
@@ -5172,7 +6222,7 @@ pub enum ApprovalsOutput {
     /// bundle names escalates to a human rather than posting a card.
     Routes {
         agent: String,
-        routes: BTreeMap<String, crate::api::ApprovalRouteBinding>,
+        routes: BTreeMap<String, crate::api::ApprovalRouteBindingResponse>,
     },
 }
 
@@ -5315,16 +6365,18 @@ impl crate::ui::CliOutput for ApprovalsOutput {
                         routes.len()
                     ));
                     for (name, binding) in routes {
-                        // Print WHERE and WHO as separate labelled facts: ADR-0034
-                        // unfused these two axes, and a single collapsed line would
-                        // re-fuse them in the operator's head.
+                        let resolution =
+                            format!("{}:{}", binding.resolution.kind, binding.resolution.address);
                         ui.kv(
                             name,
-                            &format!(
-                                "channel {}",
-                                binding.channel.as_deref().unwrap_or("(missing)")
-                            ),
+                            &format!("resolution {resolution} (verified interactive card)"),
                         );
+                        let notification = binding
+                            .notification
+                            .as_ref()
+                            .map(|target| format!("{}:{} (text-only)", target.kind, target.address))
+                            .unwrap_or_else(|| "(none)".to_string());
+                        ui.kv("", &format!("  notification: {notification}"));
                         ui.kv("", &format!("  approvers: {}", describe_approvers(binding)));
                     }
                 }
@@ -5334,14 +6386,12 @@ impl crate::ui::CliOutput for ApprovalsOutput {
 }
 
 /// One line naming who may resolve a route's approvals, including the default.
-fn describe_approvers(binding: &crate::api::ApprovalRouteBinding) -> String {
+fn describe_approvers(binding: &crate::api::ApprovalRouteBindingResponse) -> String {
     match &binding.approvers {
-        None => match binding.channel.as_deref() {
-            Some(channel) => {
-                format!("members of {channel} (the default: no approvers block declared)")
-            }
-            None => "unreadable: no channel or approvers block declared".to_string(),
-        },
+        None => format!(
+            "members of {}:{} (the default: no approvers block declared)",
+            binding.resolution.kind, binding.resolution.address
+        ),
         Some(a) => match (&a.users, &a.group) {
             // Mirror the API's precedence in the wording rather than hiding it:
             // `users` wins over `group`, so a binding carrying both must not read
@@ -5402,20 +6452,19 @@ pub async fn approvals(
 ) -> Result<ApprovalsOutput> {
     let gate_mode = clear || !gate.is_empty();
 
-    // --route/--route-approvers/--routes-from/--list-routes/--clear-routes (#1052):
-    // the agent's route bindings, which decide WHERE a card posts and WHO may
-    // resolve it. Handled ahead of every other branch because it is a distinct
+    // The split target/approver flags address the agent's approval route map.
+    // Handled ahead of every other branch because it is a distinct
     // object from both the tool gates and the pending records, and mixing it with
     // either in one invocation would make the write's replace-the-whole-map
     // semantics ambiguous.
-    let route_write = !cmd.route.is_empty()
+    let route_write = !cmd.route_resolution.is_empty()
         || !cmd.route_approvers.is_empty()
         || cmd.routes_from.is_some()
         || cmd.clear_routes;
     if route_write || cmd.list_routes {
         if gate_mode || cmd.list || cmd.resolve.is_some() {
             return Err(crate::exit::usage(
-                "the route-binding flags (--route/--route-approvers/--routes-from/\
+                "the route-binding flags (--route-resolution/--route-approvers/--routes-from/\
                  --list-routes/--clear-routes) address the agent's approval ROUTES; they \
                  cannot be combined with --gate/--clear (tool gates) or --list/--resolve \
                  (pending records). Run them as separate invocations",
@@ -5427,13 +6476,14 @@ pub async fn approvals(
             ));
         }
         if cmd.clear_routes
-            && (!cmd.route.is_empty()
+            && (!cmd.route_resolution.is_empty()
                 || !cmd.route_approvers.is_empty()
                 || cmd.routes_from.is_some())
         {
             return Err(crate::exit::usage(
-                "--clear-routes cannot be combined with --route/--route-approvers/\
-                 --routes-from (clear removes every binding)",
+                "--clear-routes cannot be combined with --route-resolution/\
+                 --route-approvers/--routes-from \
+                 (clear removes every binding)",
             ));
         }
 
@@ -5442,7 +6492,11 @@ pub async fn approvals(
         let bindings = if cmd.clear_routes {
             BTreeMap::new()
         } else {
-            build_route_bindings(&cmd.route, &cmd.route_approvers, cmd.routes_from.as_ref())?
+            build_route_bindings(
+                &cmd.route_resolution,
+                &cmd.route_approvers,
+                cmd.routes_from.as_ref(),
+            )?
         };
 
         if opts.dry_run {
@@ -5450,9 +6504,10 @@ pub async fn approvals(
                 format!(
                     "PATCH {}/agents/<id> approval_routes={} (a FULL REPLACEMENT of the map)",
                     opts.api_url,
-                    // Deliberately not valid JSON. "{}" is the real clear payload, so a
-                    // fallback that looked like "{}" would misreport a full revocation.
-                    serde_json::to_string(&bindings).unwrap_or_else(|_| "<unserializable>".into())
+                    // Deliberately not valid JSON on serialization failure. "{}" is the
+                    // real clear payload, so a fallback that looked like "{}" would
+                    // misreport a full revocation.
+                    route_bindings_plan_json(&bindings)
                 )
             } else {
                 format!(
@@ -5653,7 +6708,7 @@ pub async fn observability(open: bool) -> Result<crate::observability::Observabi
 /// answered authoritatively by the API.
 ///
 /// The `slack` arm rejects a `#name` rather than a channel ID: real Slack
-/// events carry the channel **ID** (e.g. `C0123ABCD`), and the worker's
+/// events carry the channel **ID** (e.g. `C0EXAMPLE1`), and the worker's
 /// binding resolver matches on that ID, so a `#name` value is stored verbatim
 /// and never routes -- a silently dead binding. Fail the deploy up front
 /// instead.
@@ -5661,9 +6716,9 @@ fn validate_channel_binding(kind: &str, address: &str) -> Result<()> {
     if kind == "slack" && address.trim_start().starts_with('#') {
         return Err(crate::exit::usage(format!(
             "slack channel {address:?} is a name, not an ID: real Slack events carry the \
-             channel ID (e.g. C0123ABCD) and the worker routes on it, so a #name binding \
+             channel ID (e.g. C0EXAMPLE1) and the worker routes on it, so a #name binding \
              never receives messages. Pass the channel ID instead -- find it in the \
-             channel's About tab, or the channel URL (.../archives/C0123ABCD)."
+             channel's About tab, or the channel URL (.../archives/C0EXAMPLE1)."
         )));
     }
     Ok(())
@@ -6233,6 +7288,12 @@ pub const MEMORY_REASON: &str =
 /// Where to run `memory` instead.
 pub const MEMORY_ALT: &str =
     "use `curie local memory <agent>` or `curie cluster memory <agent>` for a deployed agent";
+/// Why observability query verbs cannot be answered at this tier.
+pub const OBSERVABILITY_REASON: &str =
+    "the skill tier runs only a bundle runner and has no platform API or observability read service; `--otel-endpoint` can export telemetry but does not create a query API";
+/// Where to query observability, or how to export telemetry from a skill runner.
+pub const OBSERVABILITY_ALT: &str =
+    "use `curie local observability runs|run|metrics` or `curie cluster observability runs|run|metrics`; to export this skill runner's telemetry, restart it with `curie skill up --otel-endpoint <OTLP_URL>` and query through a platform API";
 
 /// `skill versions`: answered, but unavailable at this tier by construction.
 ///
@@ -6262,6 +7323,19 @@ pub fn skill_versions_unavailable() -> anyhow::Error {
 /// (issue #459, ADR-0041).
 pub fn skill_memory_unavailable() -> anyhow::Error {
     crate::exit::unsupported("memory", MEMORY_REASON, MEMORY_ALT)
+}
+
+/// `skill observability runs|run|metrics`: understood, but unavailable here.
+///
+/// A skill runner can emit OTLP when explicitly wired, but it does not host the
+/// API read models these query verbs intentionally use. Decline with ADR-0041's
+/// capability exit (4) rather than bypassing the API to query a backend.
+pub fn skill_observability_unavailable() -> anyhow::Error {
+    crate::exit::unsupported(
+        "observability runs|run|metrics",
+        OBSERVABILITY_REASON,
+        OBSERVABILITY_ALT,
+    )
 }
 
 /// Why `skill approvals --list`/`--resolve` cannot be answered at this tier.
@@ -6297,15 +7371,14 @@ pub const APPROVALS_ROUTES_REASON: &str =
     "an approval route binding is per-agent platform config (agents.approval_routes), and the skill tier runs a bare runner with no platform, no agent record, and therefore nothing to bind a route on";
 /// Where to bind approval routes instead.
 pub const APPROVALS_ROUTES_ALT: &str =
-    "use `curie local approvals <agent> --route <name>=<channel>` or `curie cluster approvals <agent> --route <name>=<channel>` for a deployed agent; the bundle-side half (which routes exist) is the manifest's approvalPolicy, which `curie skill approvals` does show";
+    "use `curie local approvals <agent> --route-resolution <name>=<channel>` or `curie cluster approvals <agent> --route-resolution <name>=<channel>` for a deployed agent; use `--routes-from <file>` to declare a complete route with a text-only notification; the bundle-side half (which routes exist) is the manifest's approvalPolicy, which `curie skill approvals` does show";
 
-/// `skill approvals --route`/`--route-approvers`/`--routes-from`/`--list-routes`/
-/// `--clear-routes`: answered, but unavailable at this tier by construction
-/// (ADR-0041). Accepted so the tier reports WHY (exit 4) rather than erroring
-/// like an unknown-flag typo, matching `--list`/`--resolve` above.
+/// The route-binding inputs are answered but unavailable at this tier by
+/// construction (ADR-0041). Accepted so the tier reports WHY (exit 4) rather
+/// than erroring like an unknown-flag typo, matching `--list`/`--resolve` above.
 pub fn skill_approval_routes_unavailable() -> anyhow::Error {
     crate::exit::unsupported(
-        "approvals --route/--route-approvers/--routes-from/--list-routes/--clear-routes",
+        "approvals --route-resolution/--route-approvers/--routes-from/--list-routes/--clear-routes",
         APPROVALS_ROUTES_REASON,
         APPROVALS_ROUTES_ALT,
     )
@@ -7406,6 +8479,8 @@ mod tests {
             api_key: "k".to_string(),
             slack_channel: None,
             repo: None,
+            workspace: super::WorkspaceIntent::Preserve,
+            tier: super::DeployTier::Local,
             env: Some(super::DeployEnv::Dev),
             label: Some("v0".to_string()),
             secret: vec![],
@@ -7486,11 +8561,13 @@ mod tests {
             api_key: "k".to_string(),
             slack_channel: None,
             repo: None,
+            workspace: super::WorkspaceIntent::Preserve,
             env: Some(super::DeployEnv::Dev),
             label: Some("v0".to_string()),
             secret: vec!["GH_TOKEN".to_string()],
             secret_binding_supported: true,
             connect_hint: "UNREACHABLE-HINT-SENTINEL".to_string(),
+            tier: super::DeployTier::Local,
         };
         let err = super::deploy(opts).await.unwrap_err();
         let rendered = format!("{err:#}");
@@ -7506,10 +8583,10 @@ mod tests {
 
     #[tokio::test]
     async fn deploy_skips_secrets_gate_when_binding_unsupported() {
-        // AC2: the cluster tier cannot bind a `--secret` until #440, so the
-        // declared-secrets gate is SKIPPED there. A secrets-declaring bundle must
-        // NOT be preempted by the gate; deploy proceeds to the network and fails
-        // on the connect path instead (naming the connect hint, never the secret).
+        // AC2: a tier that cannot bind `--secret` skips the declared-secrets
+        // gate so a secrets-declaring bundle is not preempted with a
+        // remediation that does not exist. Cluster now binds (#1488); this
+        // pin is the skip itself.
         let dir = tempfile::tempdir().unwrap();
         scaffold_with_secrets(dir.path(), "test-agent", &["GITHUB_PERSONAL_ACCESS_TOKEN"]);
 
@@ -7522,11 +8599,13 @@ mod tests {
             api_key: "k".to_string(),
             slack_channel: None,
             repo: None,
+            workspace: super::WorkspaceIntent::Preserve,
             env: Some(super::DeployEnv::Dev),
             label: Some("v0".to_string()),
             secret: vec![],
             secret_binding_supported: false,
             connect_hint: "UNREACHABLE-HINT-SENTINEL".to_string(),
+            tier: super::DeployTier::Cluster,
         };
         let err = super::deploy(opts).await.unwrap_err();
         let rendered = format!("{err:#}");
@@ -7590,6 +8669,7 @@ mod tests {
             status: status.into(),
             version_id: Some(version.into()),
             deployed_at: Some(ts.into()),
+            workspace_enabled: false,
         }
     }
 
@@ -8453,6 +9533,8 @@ mod tests {
             model_base_url: None,
             bundle_digest: digest.map(str::to_string),
             bundle_snapshot_dir: snapshot_dir.map(str::to_string),
+            connector_containers: Vec::new(),
+            connector_network: None,
         }
     }
 
@@ -8743,6 +9825,41 @@ mod tests {
         assert_eq!(
             eval_mounts(&bundle),
             vec![format!("{}:/plugin:ro", bundle.dir().display())]
+        );
+    }
+
+    /// An aborted boot releases the credentials it staged, not just the
+    /// containers. Deleting the wipe from `release_boot_scaffolding` fails here.
+    ///
+    /// Nothing else will ever collect them: no state was recorded, so no `skill
+    /// down` can find the bundle (#1087). Driven with no sidecar, no connector
+    /// and no network so it reaches no Docker daemon -- what is under test is
+    /// the release list, not the removals.
+    #[tokio::test]
+    async fn an_aborted_boot_releases_the_staged_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::connector_build::stage_secret_file(
+            dir.path(),
+            "kubernetes",
+            "/secrets/kubeconfig",
+            "creds",
+        )
+        .unwrap();
+        let root = crate::connector_build::connector_secrets_root(dir.path());
+        assert!(root.exists());
+
+        super::release_boot_scaffolding(
+            None,
+            &[],
+            None,
+            &dir.path().join(".curie/snapshots/never-packed"),
+            dir.path(),
+        )
+        .await;
+
+        assert!(
+            !root.exists(),
+            "a resolved credential must not outlive the boot that staged it"
         );
     }
 }
@@ -9140,4 +10257,760 @@ mod overrides_tests {
             OverrideChange::Set("m".into())
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Connector source builds (ADR 0113): `curie build --plugin-dir`
+// ---------------------------------------------------------------------------
+
+/// One connector's resolved identity, as `curie build --plugin-dir` reports it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ConnectorBuildRecord {
+    pub name: String,
+    pub image: String,
+    pub delivery: crate::connector_build::Delivery,
+    pub platforms: Vec<String>,
+    pub source_digest: String,
+}
+
+/// The `curie build --plugin-dir` receipt: one object, always, even when the
+/// bundle declares nothing to build. Empty stdout under `--json` is the #485
+/// failure -- an agent consumer cannot tell "nothing to build" from "the
+/// command produced nothing".
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ConnectorBuildOutput {
+    pub connectors: Vec<ConnectorBuildRecord>,
+}
+
+impl crate::ui::CliOutput for ConnectorBuildOutput {
+    fn to_json(&self) -> serde_json::Value {
+        // Delegated wholesale to the `Serialize` value rather than hand-picked
+        // field by field, so a record can never lose a field on the emit hop.
+        serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({ "connectors": [] }))
+    }
+
+    fn render(&self, ui: &crate::ui::Ui) {
+        if self.connectors.is_empty() {
+            ui.note("this bundle declares no connectors to build");
+            return;
+        }
+        for record in &self.connectors {
+            ui.payload_plain(&format!("{} -> {}", record.name, record.image));
+        }
+    }
+}
+
+/// The flags `curie build --plugin-dir` carries.
+pub struct ConnectorBuildOpts {
+    pub plugin_dir: PathBuf,
+    /// `Some(ref)` pushes a multi-platform index there; `None` builds the host
+    /// platform into the local Docker daemon.
+    pub registry: Option<String>,
+    /// Replace a registry lock with a local-daemon one deliberately.
+    pub force: bool,
+}
+
+/// `curie build --plugin-dir <dir>`: build every connector the bundle declares
+/// from source and write `connectors.lock.yaml`.
+///
+/// Deliberately does NOT look for a repo checkout the way `build` does: a
+/// released binary building a bundle's connectors has none, and requiring one
+/// would make the whole feature source-only.
+pub async fn build_connectors(opts: ConnectorBuildOpts) -> Result<ConnectorBuildOutput> {
+    use crate::connector_build as cb;
+
+    let plugin_dir = opts
+        .plugin_dir
+        .canonicalize()
+        .with_context(|| format!("plugin dir not found: {}", opts.plugin_dir.display()))?;
+    let decl = cb::load(&plugin_dir)?;
+    let buildable: Vec<(&String, &cb::ConnectorSpecDecl)> = decl
+        .connectors
+        .iter()
+        .filter(|(_, spec)| spec.build.is_some())
+        .collect();
+    if buildable.is_empty() {
+        return Ok(ConnectorBuildOutput {
+            connectors: Vec::new(),
+        });
+    }
+    if !on_path("docker") {
+        bail!(
+            "Docker is not installed or not on PATH. Install Docker \
+             (https://docs.docker.com/get-docker/) and retry."
+        );
+    }
+    let (bundle_name, _version) = read_manifest(&plugin_dir)?;
+
+    // buildx writes its build result here; a private per-run directory rather
+    // than the bundle, so a metadata file never rides the upload. The system
+    // temp dir is shared with every other user on the box, so the directory is
+    // the owner's alone rather than the 0755 a default umask would give it.
+    let metadata_dir = std::env::temp_dir().join(format!("curie-build-{}", uuid::Uuid::new_v4()));
+    create_private_dir(&metadata_dir)
+        .with_context(|| format!("create {}", metadata_dir.display()))?;
+
+    let ui = crate::ui::ui();
+    let host = cb::host_platform();
+    let mut records = Vec::new();
+    let mut entries = std::collections::BTreeMap::new();
+    let mut failure = None;
+    for (connector, spec) in buildable {
+        let plan = match cb::build_plan(
+            &plugin_dir,
+            &bundle_name,
+            connector,
+            spec,
+            opts.registry.as_deref(),
+            &host,
+            &metadata_dir,
+        ) {
+            Ok(plan) => plan,
+            Err(err) => {
+                failure = Some(err);
+                break;
+            }
+        };
+        match run_one_connector_build(&plan, ui).await {
+            Ok(image) => {
+                entries.insert(
+                    connector.clone(),
+                    cb::ConnectorLockEntryDecl {
+                        image: image.clone(),
+                        delivery: plan.delivery,
+                        platforms: plan.platforms.clone(),
+                        source_digest: plan.source_digest.clone(),
+                    },
+                );
+                records.push(ConnectorBuildRecord {
+                    name: connector.clone(),
+                    image,
+                    delivery: plan.delivery,
+                    platforms: plan.platforms.clone(),
+                    source_digest: plan.source_digest,
+                });
+            }
+            Err(err) => {
+                failure = Some(err);
+                break;
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&metadata_dir);
+    if let Some(err) = failure {
+        // A build that could not run writes no lock: a partial lock would claim
+        // a resolved image for a connector that has none.
+        return Err(err);
+    }
+
+    cb::write_lock(
+        &plugin_dir,
+        &cb::ConnectorLockFileDecl {
+            version: cb::LOCK_VERSION,
+            connectors: entries,
+        },
+        opts.force,
+    )?;
+    Ok(ConnectorBuildOutput {
+        connectors: records,
+    })
+}
+
+/// Create a directory only its owner can enter, in one step.
+///
+/// The mode rides the create rather than a `set_permissions` after it: in a
+/// shared `/tmp` the window between the two is a window in which anyone can
+/// read what lands there, and buildx starts writing as soon as it is handed the
+/// path. Non-unix keeps the platform default, as the other cfg splits here do.
+#[cfg(unix)]
+pub fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
+}
+
+#[cfg(not(unix))]
+pub fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)
+}
+
+/// Run one connector's build and read back the immutable reference it produced.
+async fn run_one_connector_build(
+    plan: &crate::connector_build::ConnectorBuildPlan,
+    ui: &crate::ui::Ui,
+) -> Result<String> {
+    use crate::connector_build as cb;
+
+    let command = cb::build_argv(plan);
+    ui.note(&format!("=== {} ===", command.display()));
+    // Inherit stdio so the build log streams like a hand-run build.
+    let status = tokio::process::Command::new(&command.program)
+        .args(command.argv())
+        .status()
+        .await
+        .context("failed to invoke docker")?;
+    if !status.success() {
+        bail!("building connector '{}' failed ({status})", plan.connector);
+    }
+    match plan.delivery {
+        cb::Delivery::Registry => {
+            let metadata_file = plan
+                .metadata_file
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("a registry build records no metadata file"))?;
+            let raw = std::fs::read_to_string(metadata_file)
+                .with_context(|| format!("read {}", metadata_file.display()))?;
+            Ok(cb::digest_pinned_ref(
+                &plan.image_ref,
+                &cb::digest_from_metadata(&raw)?,
+            ))
+        }
+        cb::Delivery::LocalDaemon => {
+            let inspect = cb::image_inspect_argv(&plan.image_ref);
+            crate::docker::docker(&inspect.argv()).await
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The deploy-time lock preflight (ADR 0113)
+// ---------------------------------------------------------------------------
+
+/// The command that clears a missing or stale lock, as the operator would type
+/// it against their own bundle directory.
+fn rebuild_hint(plugin_dir: &Path, registry: bool) -> String {
+    if registry {
+        format!(
+            "run `curie build --plugin-dir {} --registry <ref>` and redeploy",
+            plugin_dir.display()
+        )
+    } else {
+        format!(
+            "run `curie build --plugin-dir {}` and redeploy",
+            plugin_dir.display()
+        )
+    }
+}
+
+/// Refuse a deploy whose `build:` connectors have no usable lock.
+///
+/// The CLI mirror of the platform's intake rule, run before the bundle is even
+/// packed so the operator gets a local failure naming their own directory
+/// instead of an upload rejection about a file nobody told them to make. A
+/// bundle with no `build:` connector is untouched.
+pub fn lock_preflight(
+    plugin_dir: &Path,
+    decl: &crate::connector_build::ConnectorsFileDecl,
+    lock: Option<&crate::connector_build::ConnectorLockFileDecl>,
+    recomputed: &std::collections::BTreeMap<String, String>,
+    tier: DeployTier,
+) -> Result<()> {
+    use crate::connector_build::Delivery;
+
+    for (connector, spec) in &decl.connectors {
+        if spec.build.is_none() {
+            continue;
+        }
+        let Some(entry) = lock.and_then(|lock| lock.connectors.get(connector)) else {
+            return Err(anyhow::Error::from(
+                crate::exit::CliError::usage(format!(
+                    "connectors.{connector} builds from source, but {} records no image for it. \
+                     Build it before deploying.",
+                    crate::connector_build::CONNECTOR_LOCK_FILE
+                ))
+                .with_fix(rebuild_hint(plugin_dir, false)),
+            ));
+        };
+        if let Some(fresh) = recomputed.get(connector) {
+            if &entry.source_digest != fresh {
+                return Err(anyhow::Error::from(
+                    crate::exit::CliError::usage(format!(
+                        "connectors.{connector} has changed since {} was written, so the locked \
+                         image no longer matches this source.",
+                        crate::connector_build::CONNECTOR_LOCK_FILE
+                    ))
+                    .with_fix(rebuild_hint(plugin_dir, false)),
+                ));
+            }
+        }
+        if tier == DeployTier::Cluster && entry.delivery == Delivery::LocalDaemon {
+            return Err(anyhow::Error::from(
+                crate::exit::CliError::usage(format!(
+                    "connectors.{connector} is locked to an image in your local Docker daemon, \
+                     which no cluster node can pull. Push it to a registry first."
+                ))
+                .with_fix(rebuild_hint(plugin_dir, true)),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Ask the REGISTRY, by digest, for the raw manifest.
+///
+/// `--raw` matters: without it `imagetools inspect` pretty-prints, and a parser
+/// reading that output is reading a presentation format that has changed before.
+pub fn registry_manifest_argv(image: &str) -> crate::ops::OpsCommand {
+    crate::connector_build::plain_command(
+        "docker",
+        vec![
+            "buildx".into(),
+            "imagetools".into(),
+            "inspect".into(),
+            image.to_string(),
+            "--raw".into(),
+        ],
+    )
+}
+
+/// The architectures the cluster's own nodes report.
+pub fn node_architectures_argv() -> crate::ops::OpsCommand {
+    crate::connector_build::plain_command(
+        "kubectl",
+        vec![
+            "get".into(),
+            "nodes".into(),
+            "-o".into(),
+            "jsonpath={.items[*].status.nodeInfo.architecture}".into(),
+        ],
+    )
+}
+
+/// Parse that jsonpath's output: one space-separated word per node, duplicates
+/// being the common case.
+pub fn node_architectures(raw: &str) -> std::collections::BTreeSet<String> {
+    raw.split_whitespace().map(str::to_string).collect()
+}
+
+/// The platform set an OCI image index actually covers.
+///
+/// buildx's attestation manifests are `unknown/unknown` and are neither a
+/// platform the image covers nor a defect: a real multi-arch `--push` emits
+/// them alongside the real entries by default. A plain single-platform manifest
+/// has no `manifests` array at all and covers nothing the declaration promised.
+pub fn manifest_platforms(raw: &str) -> Result<std::collections::BTreeSet<String>> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(raw).context("parse the registry manifest")?;
+    let Some(manifests) = parsed.get("manifests").and_then(|m| m.as_array()) else {
+        return Ok(std::collections::BTreeSet::new());
+    };
+    Ok(manifests
+        .iter()
+        .filter_map(|entry| {
+            let platform = entry.get("platform")?;
+            let os = platform.get("os")?.as_str()?;
+            let arch = platform.get("architecture")?.as_str()?;
+            (os != "unknown" && arch != "unknown").then(|| format!("{os}/{arch}"))
+        })
+        .collect())
+}
+
+/// Refuse a cluster deploy whose locked image is gone from the registry, or
+/// whose resolved index cannot run on every node.
+///
+/// The comparison is against the REGISTRY's answer, never the lock's declared
+/// platforms: a lock declaring two platforms while the push went out single-arch
+/// passes a declaration check and fails after apply as `no matching manifest`.
+pub fn registry_preflight(
+    image: &str,
+    inspect: std::result::Result<&str, String>,
+    node_architectures: &std::collections::BTreeSet<String>,
+    declared_platforms: &[String],
+) -> Result<()> {
+    let raw = match inspect {
+        Ok(raw) => raw,
+        Err(stderr) => {
+            return Err(anyhow::Error::from(
+                crate::exit::CliError::usage(format!(
+                    "the registry could not resolve {image}: {}. The image the lock names is not \
+                     there, so no node could pull it.",
+                    stderr.trim()
+                ))
+                .with_fix(
+                    "rebuild and push it with `curie build --plugin-dir <dir> --registry <ref>`, \
+                     then redeploy",
+                ),
+            ));
+        }
+    };
+    let covered = manifest_platforms(raw).map_err(|err| {
+        anyhow::Error::from(
+            crate::exit::CliError::usage(format!(
+                "the registry's answer for {image} is not a manifest this build understands: {err}"
+            ))
+            .with_fix(
+                "rebuild and push it with `curie build --plugin-dir <dir> --registry <ref>`, \
+                 then redeploy",
+            ),
+        )
+    })?;
+    let missing: Vec<String> = node_architectures
+        .iter()
+        .filter(|arch| !covered.contains(&format!("linux/{arch}")))
+        .cloned()
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(anyhow::Error::from(
+        crate::exit::CliError::usage(format!(
+            "{image} covers [{}] in the registry, but this cluster's nodes report [{}], so [{}] \
+             has no image to run. The lock declares [{}].",
+            covered.iter().cloned().collect::<Vec<_>>().join(", "),
+            node_architectures
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", "),
+            missing.join(", "),
+            declared_platforms.join(", "),
+        ))
+        .with_fix(
+            "rebuild every architecture the nodes run with `curie build --plugin-dir <dir> \
+             --registry <ref>`, then redeploy",
+        ),
+    ))
+}
+
+/// The lock entries a cluster deploy has to ask the registry about: the entries
+/// of the `build:` connectors whose lock delivers through a registry.
+///
+/// Everything else is out of scope by construction -- an `image:` connector
+/// pulls a reference nobody here built, and a `local-daemon` build has already
+/// been refused by [`lock_preflight`] at this tier. An empty result is the
+/// common bundle, and it queries nothing.
+pub fn registry_preflight_targets<'a>(
+    decl: &crate::connector_build::ConnectorsFileDecl,
+    lock: Option<&'a crate::connector_build::ConnectorLockFileDecl>,
+) -> Vec<&'a crate::connector_build::ConnectorLockEntryDecl> {
+    decl.connectors
+        .iter()
+        .filter(|(_, spec)| spec.build.is_some())
+        .filter_map(|(connector, _)| lock.and_then(|lock| lock.connectors.get(connector)))
+        .filter(|entry| entry.delivery == crate::connector_build::Delivery::Registry)
+        .collect()
+}
+
+/// The impure half of [`registry_preflight`]: query the registry and the
+/// cluster, then hand both answers to the decision.
+///
+/// The node architectures are read ONCE and shared across every connector --
+/// they are a property of the cluster, not of the image, so one `kubectl get
+/// nodes` covers a bundle building any number of connectors.
+async fn run_registry_preflight(
+    decl: &crate::connector_build::ConnectorsFileDecl,
+    lock: Option<&crate::connector_build::ConnectorLockFileDecl>,
+) -> Result<()> {
+    let targets = registry_preflight_targets(decl, lock);
+    if targets.is_empty() {
+        return Ok(());
+    }
+
+    let (ok, out, err) = crate::ops::run_capture(&node_architectures_argv()).await?;
+    if !ok {
+        return Err(anyhow::anyhow!("{}", err.trim()))
+            .context("read the architectures this cluster's nodes report");
+    }
+    let node_archs = node_architectures(&out);
+
+    for entry in targets {
+        let (ok, raw, err) = crate::ops::run_capture(&registry_manifest_argv(&entry.image)).await?;
+        let inspect = if ok { Ok(raw.as_str()) } else { Err(err) };
+        registry_preflight(&entry.image, inspect, &node_archs, &entry.platforms)?;
+    }
+    Ok(())
+}
+
+/// The recomputed `source_digest` of every `build:` connector in a bundle, for
+/// the preflight to compare the lock against.
+pub fn recompute_source_digests(
+    plugin_dir: &Path,
+    decl: &crate::connector_build::ConnectorsFileDecl,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut digests = std::collections::BTreeMap::new();
+    for (connector, spec) in &decl.connectors {
+        let Some(build) = &spec.build else { continue };
+        let context = crate::connector_build::resolve_context(plugin_dir, &build.context)
+            .with_context(|| format!("connectors.{connector}"))?;
+        digests.insert(
+            connector.clone(),
+            crate::connector_build::source_digest_of(&context, build)
+                .with_context(|| format!("connectors.{connector}"))?,
+        );
+    }
+    Ok(digests)
+}
+
+/// The hosted `build:` connectors whose locked image no longer stands for this
+/// source: either the lock records nothing for them, or it records a different
+/// `source_digest` than the tree hashes to now.
+///
+/// The staleness test is `lock_preflight`'s, verbatim -- a missing lock entry
+/// and a digest mismatch are the two failures it refuses a deploy on, and a
+/// connector the recompute could not weigh in on is left alone by both. What
+/// differs is only what the caller does with the answer: the skill tier rebuilds
+/// (ADR 0113's Decision 3), the cluster tier refuses.
+///
+/// An `image:`-hosted connector has no source to be stale against, and one
+/// pointed at an already-running process with `unhosted_url` is not started
+/// here, so neither can put this bundle into a build.
+pub fn connectors_needing_rebuild(
+    decl: &crate::connector_build::ConnectorsFileDecl,
+    lock: Option<&crate::connector_build::ConnectorLockFileDecl>,
+    recomputed: &std::collections::BTreeMap<String, String>,
+) -> Vec<String> {
+    let mut stale = Vec::new();
+    for (connector, spec) in &decl.connectors {
+        if spec.build.is_none() || spec.url.is_some() || spec.unhosted_url.is_some() {
+            continue;
+        }
+        let Some(entry) = lock.and_then(|lock| lock.connectors.get(connector)) else {
+            stale.push(connector.clone());
+            continue;
+        };
+        if let Some(fresh) = recomputed.get(connector) {
+            if &entry.source_digest != fresh {
+                stale.push(connector.clone());
+            }
+        }
+    }
+    stale
+}
+
+// ---------------------------------------------------------------------------
+// The local tier's connector bring-up
+// ---------------------------------------------------------------------------
+
+/// Reconcile this agent's connector containers against the deployed bundle, then
+/// generate the connector compose overlay and bring the declared set up.
+///
+/// One helper, both local deploy callers (`local deploy` and `deploy-local`), so
+/// the shorthand cannot upload a source-built bundle and start no connector.
+/// The RESOLVED identity is passed in rather than re-derived from `plugin.json`:
+/// `--agent`/`--target` can override the manifest's name, and a helper that read
+/// it again would alias the connectors under one identity while the runner
+/// dialed another.
+pub async fn bring_up_local(
+    plugin_dir: &Path,
+    lock: &crate::connector_build::ConnectorLockFileDecl,
+    identity: &crate::connector_build::ConnectorScope,
+    project: &str,
+) -> Result<()> {
+    use crate::connector_build as cb;
+
+    let decl = cb::load(plugin_dir)?;
+    let hosted: Vec<(&String, &cb::ConnectorSpecDecl)> = decl
+        .connectors
+        .iter()
+        .filter(|(_, spec)| spec.url.is_none() && spec.unhosted_url.is_none())
+        .collect();
+
+    // Fail closed BEFORE anything is reaped, staged, written, or started -- the
+    // same refusal `skill up` performs, which this path used to skip. A declared
+    // secret with no value here would otherwise be written into the overlay as a
+    // `${NAME}` nothing populates: compose warns, expands it to empty, and the
+    // connector comes up authenticating with nothing. It runs above the reap so
+    // a bundle that cannot come up does not first tear down the connectors that
+    // are serving.
+    refuse_missing_connector_secrets(&decl)?;
+
+    // Reconcile before starting: compose only ADDS the services the overlay
+    // names, so a connector this bundle version dropped or renamed would keep
+    // running -- serving the runner an MCP endpoint the bundle no longer
+    // declares. It is deliberately NOT `--remove-orphans` and not a
+    // project-label sweep: this compose project holds the api/worker stack and
+    // every other locally deployed agent's connectors, so the reap is scoped to
+    // this agent's own containers and, within those, to the names the new
+    // desired set does not contain. A zero-connector bundle reaches this with an
+    // empty desired set, which is how the last one gets removed.
+    let desired: std::collections::BTreeSet<String> = hosted
+        .iter()
+        .map(|(connector, _)| {
+            cb::object_name(&identity.release, &identity.agent, connector.as_str())
+        })
+        .collect();
+    for problem in docker::reap_undesired_connectors(project, &identity.agent, &desired).await {
+        crate::ui::ui().warn(&problem);
+    }
+
+    if hosted.is_empty() {
+        return Ok(());
+    }
+
+    let mut secret_values = std::collections::BTreeMap::new();
+    for (connector, spec) in &hosted {
+        for name in cb::declared_secret_names(spec) {
+            // The refusal above already proved every one of these resolves, so a
+            // gap here is reported as the missing credential it is rather than
+            // silently skipped.
+            let value = resolve_connector_secret(&name)?
+                .ok_or_else(|| cb::missing_secrets_error(std::slice::from_ref(&name)))?;
+            secret_values.insert(name, value);
+        }
+        // Credential files are staged where both emitters expect them, so the
+        // container finds bytes rather than an empty mount.
+        for (key, declared_path) in &spec.secret_files {
+            let value = resolve_connector_secret(key)?
+                .ok_or_else(|| cb::missing_secrets_error(std::slice::from_ref(key)))?;
+            cb::stage_secret_file(plugin_dir, connector, declared_path, &value)?;
+        }
+    }
+
+    let overlay = cb::compose_overlay(lock, &decl, identity, project, plugin_dir)?;
+    let path = cb::compose_overlay_path(plugin_dir);
+    std::fs::create_dir_all(path.parent().expect("the overlay path has a parent"))?;
+    std::fs::write(
+        &path,
+        serde_norway::to_string(&overlay).context("serialize the connector compose overlay")?,
+    )
+    .with_context(|| format!("write {}", path.display()))?;
+
+    // The values reach the containers through the compose child's environment,
+    // where `${NAME}` in the file above expands from -- never through the file,
+    // never through argv, and masked in anything printed.
+    let command = cb::compose_up_command(&path, project, &secret_values);
+    let (ok, _out, err) = crate::ops::run_capture(&command)
+        .await
+        .context("starting the bundle's connectors")?;
+    if !ok {
+        bail!("starting the bundle's connectors failed: {}", err.trim());
+    }
+    Ok(())
+}
+
+/// Refuse the WHOLE bundle when a hosted connector declares a secret this box
+/// must not hand it, or has no value for -- before a network, a build, or a
+/// container exists. Both tiers' single pre-resolution gate, so a name the
+/// bundle must not own is refused here rather than at each caller.
+///
+/// Bring-up used to skip an unresolved secret silently: `skill up` reported
+/// success, the connector container exited 1 on its own missing-credential
+/// check, and the runner was left holding an MCP URL that connection-refused
+/// mid-turn. Between a silent connection-refused mid-turn and an actionable
+/// refusal at bring-up, the refusal is the correct behavior. Every gap across
+/// every hosted connector is collected first so one run names them all, and the
+/// check is resolve-only -- nothing is staged and no value is retained.
+fn refuse_missing_connector_secrets(
+    decl: &crate::connector_build::ConnectorsFileDecl,
+) -> Result<()> {
+    // Ahead of every resolve below: a name the bundle must not own is refused
+    // before a single value is read, because reading it IS the exfiltration --
+    // the sweep below would resolve the operator's own model credential and
+    // report the declaration as satisfied.
+    crate::connector_build::refuse_reserved_secret_names(decl)?;
+    // Then, so a `from_secret` reference keeps its own, more specific refusal
+    // (`refuse_out_of_band_secrets` names all three ways forward) instead of
+    // being reported as an ordinary unset name by the sweep below.
+    for (connector, spec) in &decl.connectors {
+        if spec.url.is_some() || spec.unhosted_url.is_some() {
+            continue;
+        }
+        crate::connector_build::refuse_out_of_band_secrets(connector, spec)?;
+    }
+    let mut missing = Vec::new();
+    for name in crate::connector_build::hosted_secret_names(decl) {
+        if resolve_connector_secret(&name)?.is_none() {
+            missing.push(name);
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(crate::connector_build::missing_secrets_error(&missing))
+}
+
+/// One connector credential, from the environment first and the host vault
+/// second. Never printed.
+fn resolve_connector_secret(name: &str) -> Result<Option<String>> {
+    if let Some(value) = std::env::var(name).ok().filter(|v| !v.is_empty()) {
+        return Ok(Some(value));
+    }
+    crate::secrets::get_value(name)
+}
+
+/// Which hosted connectors a skill-tier boot starts, each paired with the image
+/// it runs, in declaration order.
+///
+/// The selection is `connector_build::resolved_image`'s, which is also what the
+/// local tier's overlay emits -- one rule, so the two tiers cannot resolve the
+/// same declaration to two different images. Extracted as a pure seam for two
+/// reasons: it is decidable with no Docker daemon, and it leaves the starter
+/// below with no image of its own to compute. The inline lock-first copy it
+/// replaces is what let a stale lock entry hijack a connector whose declaration
+/// had since switched from `build:` to `image:`.
+///
+/// Every image is resolved before the first container starts, so a bundle
+/// missing one is refused whole rather than half-started.
+pub fn skill_connector_plan(
+    decl: &crate::connector_build::ConnectorsFileDecl,
+    lock: &crate::connector_build::ConnectorLockFileDecl,
+) -> Result<Vec<(String, String)>> {
+    let mut plan = Vec::new();
+    for (connector, spec) in &decl.connectors {
+        if spec.url.is_some() || spec.unhosted_url.is_some() {
+            continue;
+        }
+        plan.push((
+            connector.clone(),
+            crate::connector_build::resolved_image(connector, spec, lock)?,
+        ));
+    }
+    Ok(plan)
+}
+
+/// Start one container per hosted connector on the runner's private network.
+///
+/// Returns the container names so `skill down` reaps exactly what this boot
+/// created. Credentials are staged first, so each container finds bytes at its
+/// declared mount path rather than an empty file.
+async fn start_skill_connectors(
+    plugin_dir: &Path,
+    decl: &crate::connector_build::ConnectorsFileDecl,
+    identity: &crate::connector_build::ConnectorScope,
+    network: &str,
+    project: &str,
+) -> Result<Vec<String>> {
+    use crate::connector_build as cb;
+
+    let lock = cb::load_lock(plugin_dir)?.unwrap_or_else(|| cb::ConnectorLockFileDecl {
+        version: cb::LOCK_VERSION,
+        connectors: std::collections::BTreeMap::new(),
+    });
+    let mut started = Vec::new();
+    for (connector, image) in skill_connector_plan(decl, &lock)? {
+        let connector = connector.as_str();
+        let spec = decl
+            .connectors
+            .get(connector)
+            .expect("the plan names only this declaration's own connectors");
+        cb::refuse_out_of_band_secrets(connector, spec)?;
+        let mut secret_values = std::collections::BTreeMap::new();
+        for name in cb::declared_secret_names(spec) {
+            if let Some(value) = resolve_connector_secret(&name)? {
+                secret_values.insert(name, value);
+            }
+        }
+        for (key, declared_path) in &spec.secret_files {
+            if let Some(value) = resolve_connector_secret(key)? {
+                cb::stage_secret_file(plugin_dir, connector, declared_path, &value)?;
+            }
+        }
+        let start = docker::ConnectorStartSpec::from_declaration(
+            connector,
+            spec,
+            &image,
+            identity,
+            network,
+            project,
+            plugin_dir,
+            &secret_values,
+        )?;
+        docker::docker_with_env(&start.run_args(), &start.docker_env)
+            .await
+            .with_context(|| format!("starting connector '{connector}'"))?;
+        started.push(start.container_name);
+    }
+    Ok(started)
 }

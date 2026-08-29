@@ -16,6 +16,10 @@ it.
 
 New here? [`Quickstart`](#quickstart) gets you a first agent reply in a few minutes.
 
+Run `curie try` for a first reply without configured credentials or prompts. Run
+`curie try --keep` to retain the standard bundle at `./curie-demo` for normal
+`curie skill` commands. The [`Quickstart`](#quickstart) covers the full parity ladder.
+
 Join the [Curie Discord community](https://discord.gg/YZASub2d5B) to connect with other builders.
 
 ## Why your agent breaks when it leaves your laptop
@@ -29,6 +33,9 @@ the same plugin bundle climbs three tiers.
 - `local` runs it through the full platform via Docker Compose.
 
 - `cluster` runs it through that same full platform on Kubernetes.
+
+Here, `skill` names the runner only tier. An authored bundle skill is the
+artifact at `skills/<name>/SKILL.md`.
 
 An environment difference then shows up as a bug while progressing through these tiers, not a surprise
 your users hit - letting you iterate fast locally and ship with confidence.

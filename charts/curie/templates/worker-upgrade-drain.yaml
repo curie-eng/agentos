@@ -1,0 +1,183 @@
+{{- if and .Values.worker.deploy .Values.worker.upgradeDrain.enabled }}
+{{/*
+Pre-upgrade drain gate, and its post-upgrade release (issue #2010).
+
+ADR-0131 made one worker's OWN shutdown safe: `terminationGracePeriodSeconds`
+covers the delivery budget plus the shutdown reserve, so a SIGTERMed replica can
+settle the delivery it owns, and the fencing lease stops a replacement stealing
+a healthy long turn. None of that governs the roll happening around it. A
+`helm upgrade` applies the worker AND its backing services in one pass, and an
+already-accepted, side-effecting turn whose owner is interrupted mid-flight is
+reclaimed by the replacement, which correctly refuses to re-run the action and
+escalates to a human. No duplicate effect, no silent loss -- and the requested
+task does not complete. That is the failure #2010 reports, and it happened on a
+release whose grace was already 1800s.
+
+The gate closes it AHEAD of the roll rather than behind it:
+
+  pre-upgrade  -> quiesce new claims across the release, wait for every delivery
+                  holding a live ownership lease to settle. Exit 0 and the roll
+                  proceeds with each of those turns completed exactly once; exit
+                  1 and `helm upgrade` fails with the hook, so NOTHING is
+                  applied and the turn keeps running where it already is.
+  post-upgrade -> clear the flag so the new Pods start claiming.
+
+Three details are load-bearing.
+
+`pre-upgrade` and not `pre-upgrade,pre-install`: on a first install there is
+nothing in flight and no Valkey to ask, and a gate that has to reach a
+not-yet-existing dependency would fail every fresh install.
+
+`backoffLimit: 0` with `restartPolicy: Never`: a refusal is a DECISION, not a
+transient error. Retrying it would silently re-quiesce the fleet and wait the
+whole timeout again, turning one postponed upgrade into several minutes of a
+cluster that is not claiming.
+
+The failed Job is NOT auto-deleted (`hook-delete-policy` omits `hook-failed`):
+its log names the deliveries that held the upgrade back, which is the only place
+an operator can read why the upgrade was refused. `before-hook-creation` still
+clears it on the next attempt.
+*/}}
+{{- include "curie.worker.validateUpgradeDrain" . }}
+{{/* The EFFECTIVE clocks, not the raw values: `timeoutSeconds` is a floor and
+     the gate is raised to cover the delivery budget, with the quiesce TTL
+     derived above that. See `curie.worker.upgradeDrain.timeout` for why this is
+     derived rather than refused. */}}
+{{- $drainTimeout := include "curie.worker.upgradeDrain.timeout" . }}
+{{- $quiesceTtl := include "curie.worker.upgradeDrain.quiesceTtl" . }}
+{{- $image := include "curie.image" (dict "repository" .Values.worker.image.repository "tag" .Values.worker.image.tag "digest" .Values.worker.image.digest "defaultTag" .Chart.AppVersion) }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "curie.fullname" . }}-upgrade-drain
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: upgrade-drain
+  annotations:
+    "helm.sh/hook": pre-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 0
+  # A hard ceiling above the gate's own wait, so a Job wedged on an unreachable
+  # Valkey cannot hold `helm upgrade` open indefinitely. The gate returns on its
+  # own timeout well before this; reaching it means the container never got as
+  # far as waiting.
+  activeDeadlineSeconds: {{ add (int64 $drainTimeout) 120 }}
+  template:
+    metadata:
+      labels:
+        {{- with (include "curie.placement.labels" (dict "root" $ "class" "hooks")) }}
+        {{- . | nindent 8 }}
+        {{- end }}
+        {{- include "curie.selectorLabels" (dict "root" . "component" "upgrade-drain") | nindent 8 }}
+      {{- with (include "curie.placement.annotations" (dict "root" $ "class" "hooks")) }}
+      annotations:
+        {{- . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with (include "curie.placement.spec" (dict "root" $ "class" "hooks")) }}
+      {{- . | nindent 6 }}
+      {{- end }}
+      restartPolicy: Never
+      {{- with .Values.worker.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.worker.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: upgrade-drain
+          # The WORKER image, deliberately: the gate reads the worker's own key
+          # namespace, its lease keys, and its two delivery lanes, all through
+          # `curie_worker.config.WorkerConfig`. A separate image would be a
+          # second copy of that key layout, free to drift from the one the
+          # workers actually use.
+          image: {{ $image | quote }}
+          imagePullPolicy: {{ .Values.worker.image.pullPolicy }}
+          {{- with .Values.worker.containerSecurityContext }}
+          {{- include "curie.containerSecurityContext" . | nindent 10 }}
+          {{- end }}
+          command: ["python", "-m", "curie_worker.upgrade_drain", "--mode", "drain"]
+          env:
+            {{- include "curie.env.valkey" . | nindent 12 }}
+            # Valkey is the ONLY wiring the gate needs. Stream, group and key
+            # prefix are chart-invariant -- templates/worker.yaml overrides none
+            # of them -- so the gate reads the same namespace the workers write
+            # by using the very same WorkerConfig defaults they do. Rendering an
+            # override here would be a second, drift-prone declaration of a
+            # namespace this chart does not actually configure.
+            - name: CURIE_UPGRADE_DRAIN_TIMEOUT_S
+              value: {{ $drainTimeout | quote }}
+            - name: CURIE_UPGRADE_DRAIN_POLL_INTERVAL_S
+              value: {{ .Values.worker.upgradeDrain.pollIntervalSeconds | quote }}
+            - name: CURIE_UPGRADE_QUIESCE_TTL_S
+              value: {{ $quiesceTtl | quote }}
+          resources:
+            {{- toYaml .Values.worker.upgradeDrain.resources | nindent 12 }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "curie.fullname" . }}-upgrade-drain-release
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: upgrade-drain-release
+  annotations:
+    "helm.sh/hook": post-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  # Unlike the gate, this one SHOULD retry: clearing the flag is idempotent, and
+  # a release that never lands leaves the fleet waiting out `quiesceTtlSeconds`
+  # before it claims again. The TTL is the fail-safe behind these attempts, not
+  # a substitute for them.
+  backoffLimit: 3
+  activeDeadlineSeconds: 300
+  template:
+    metadata:
+      labels:
+        {{- with (include "curie.placement.labels" (dict "root" $ "class" "hooks")) }}
+        {{- . | nindent 8 }}
+        {{- end }}
+        {{- include "curie.selectorLabels" (dict "root" . "component" "upgrade-drain-release") | nindent 8 }}
+      {{- with (include "curie.placement.annotations" (dict "root" $ "class" "hooks")) }}
+      annotations:
+        {{- . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with (include "curie.placement.spec" (dict "root" $ "class" "hooks")) }}
+      {{- . | nindent 6 }}
+      {{- end }}
+      restartPolicy: Never
+      {{- with .Values.worker.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.worker.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: upgrade-drain-release
+          image: {{ $image | quote }}
+          imagePullPolicy: {{ .Values.worker.image.pullPolicy }}
+          {{- with .Values.worker.containerSecurityContext }}
+          {{- include "curie.containerSecurityContext" . | nindent 10 }}
+          {{- end }}
+          command: ["python", "-m", "curie_worker.upgrade_drain", "--mode", "release"]
+          env:
+            {{- include "curie.env.valkey" . | nindent 12 }}
+            # Present so the release Job builds the SAME WorkerConfig the gate
+            # does; the config's own validator refuses a quiesce TTL that does
+            # not outlast the drain wait, and a Job that omitted these would
+            # construct a config the gate could not.
+            - name: CURIE_UPGRADE_DRAIN_TIMEOUT_S
+              value: {{ $drainTimeout | quote }}
+            - name: CURIE_UPGRADE_QUIESCE_TTL_S
+              value: {{ $quiesceTtl | quote }}
+          resources:
+            {{- toYaml .Values.worker.upgradeDrain.resources | nindent 12 }}
+{{- end }}

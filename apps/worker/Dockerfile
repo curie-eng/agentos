@@ -17,7 +17,11 @@ COPY . .
 RUN uv sync --frozen --no-dev --no-editable --package curie-worker
 
 FROM python:3.13-slim
-RUN groupadd -g 1000 app && useradd -u 1000 -g app -m -d /home/app app
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd -g 1000 app \
+    && useradd -u 1000 -g app -m -d /home/app app
 WORKDIR /app
 COPY --from=builder --chown=app:app /app/.venv /app/.venv
 ENV PATH="/app/.venv/bin:$PATH"

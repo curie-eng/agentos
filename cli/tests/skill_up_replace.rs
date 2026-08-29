@@ -59,6 +59,8 @@ fn bundle_with_recorded_runner(with_local_model: bool) -> (tempfile::TempDir, Ru
         model_base_url: None,
         bundle_digest: None,
         bundle_snapshot_dir: None,
+        connector_containers: Vec::new(),
+        connector_network: None,
     };
     state::save(&dir.path().join("bundle"), &recorded).expect("save recorded runner");
     (dir, recorded)

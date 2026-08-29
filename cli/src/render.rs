@@ -218,6 +218,13 @@ mod tests {
             version: v(),
             tool: Some("Bash".into()),
             detail: None,
+            // Optional on the wire, but a Rust struct-variant literal has to
+            // name every field: "additive" describes the wire, not every
+            // language binding, and this constructor is what says so (ADR-0117).
+            call_id: None,
+            arguments: None,
+            result: None,
+            failed: None,
         };
         let error = OutboundEvent::ErrorEvent {
             version: v(),

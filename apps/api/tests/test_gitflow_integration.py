@@ -14,16 +14,20 @@ here is a test-only code branch.
 import asyncio
 import hashlib
 import hmac
+import io
 import json
 import os
 import shutil
 import subprocess
+import tarfile
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
+import redis
+from aci_protocol import STREAM_PAYLOAD_FIELD
 from curie_api import bundles, crud
 from curie_api.config import get_settings
 from curie_api.deps import get_eval_queue
@@ -438,9 +442,15 @@ def test_patch_omitting_repo_full_name_leaves_the_binding_intact(
 ) -> None:
     """A PATCH that omits repo_full_name must leave an existing binding alone.
 
-    This is the guarantee a channel-only redeploy PATCH depends on: the CLI
-    sends slack_channel by itself whenever --repo was not passed, and that
-    must never wipe the repository the agent is already bound to.
+    This is the guarantee a channel-only redeploy depends on: the CLI writes the
+    channel by itself whenever --repo was not passed, and that must never wipe
+    the repository the agent is already bound to.
+
+    Since ADR-0118 the channel write is a different REQUEST (the channels
+    subresource), so the sibling assertion needs two calls to say what one used
+    to: the channel write must take effect, and the repo binding must survive
+    it. Both are kept, because dropping either turns this into a test of one
+    endpoint rather than of the interaction between them.
     """
 
     created = client.post(
@@ -457,21 +467,22 @@ def test_patch_omitting_repo_full_name_leaves_the_binding_intact(
     assert created.json()["repo_full_name"] == REPO, "bound at creation"
 
     patched = client.patch(
-        f"/agents/{agent_id}",
-        json={"channel": {"kind": "slack", "address": "C0EXAMPLE4"}},
+        f"/agents/{agent_id}/channels",
+        params={"kind": "slack", "address": "C0EXAMPLE3"},
+        json={"kind": "slack", "address": "C0EXAMPLE4"},
         headers=auth_headers,
     )
     assert patched.status_code == 200, patched.text
 
     # Read back through a separate request, so the assertion cannot be
-    # satisfied by the PATCH response echoing stale input.
+    # satisfied by the write response echoing stale input.
     fetched = client.get(f"/agents/{agent_id}", headers=auth_headers)
     assert fetched.status_code == 200, fetched.text
     assert fetched.json()["repo_full_name"] == REPO, (
-        "omitting repo_full_name from the PATCH must leave the binding unchanged"
+        "a channel write must leave the repository binding unchanged"
     )
-    assert fetched.json()["channel"] == {"kind": "slack", "address": "C0EXAMPLE4"}, (
-        "the channel PATCH must still take effect"
+    assert fetched.json()["channels"] == [{"kind": "slack", "address": "C0EXAMPLE4"}], (
+        "the channel write must still take effect"
     )
 
 
@@ -520,6 +531,79 @@ def test_partial_version_is_rebuilt_not_reused(
     assert len(versions) == 1
     assert versions[0]["commit_sha"] == sha
     assert versions[0]["bundle_ref"] is not None
+
+
+def test_dev_push_does_not_reuse_a_cli_bundle_with_the_same_commit_sha(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    """A git push must build its own artifact and fan out its normal eval."""
+
+    agent_id = _register_agent(client, auth_headers)
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, VALID_FILES)
+
+    cli_version = client.post(
+        f"/agents/{agent_id}/versions",
+        json={
+            "version_label": "cli-working-tree",
+            "created_by": "cli",
+            "commit_sha": sha,
+        },
+        headers=auth_headers,
+    )
+    assert cli_version.status_code == 201, cli_version.text
+    cli_version_id = cli_version.json()["id"]
+
+    cli_files = {
+        **VALID_FILES,
+        "skills/alpha/SKILL.md": "---\nname: alpha\ndescription: cli working tree\n---\n",
+    }
+    cli_archive = io.BytesIO()
+    with tarfile.open(fileobj=cli_archive, mode="w:gz") as archive:
+        for rel, content in cli_files.items():
+            data = content.encode()
+            info = tarfile.TarInfo(f"cli-working-tree/{rel}")
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+    upload = client.put(
+        f"/agents/{agent_id}/versions/{cli_version_id}/bundle",
+        files={"file": ("cli-working-tree.tar.gz", cli_archive.getvalue())},
+        headers=auth_headers,
+    )
+    assert upload.status_code == 201, upload.text
+    cli_bundle_ref = upload.json()["bundle_ref"]
+
+    response = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url))
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "deployed"
+
+    versions = client.get(f"/agents/{agent_id}/versions", headers=auth_headers).json()
+    git_versions = [version for version in versions if version["created_by"] == "git-flow"]
+    assert len(git_versions) == 1, versions
+    git_version = git_versions[0]
+    assert git_version["id"] != cli_version_id
+    assert git_version["bundle_ref"] != cli_bundle_ref
+
+    stored = client.get(
+        f"/agents/{agent_id}/versions/{git_version['id']}/bundle", headers=auth_headers
+    )
+    assert stored.status_code == 200, stored.text
+    assert stored.content != cli_archive.getvalue()
+
+    stream = redis.from_url(get_settings().valkey_dsn())
+    try:
+        eval_jobs = [
+            json.loads(fields[STREAM_PAYLOAD_FIELD.encode()])
+            for _id, fields in stream.xrevrange("curie:evals", count=200)
+            if json.loads(fields[STREAM_PAYLOAD_FIELD.encode()]).get("agent_id") == agent_id
+        ]
+    finally:
+        stream.close()
+    assert len(eval_jobs) == 1, eval_jobs
+    assert eval_jobs[0]["version_id"] == git_version["id"]
+    assert eval_jobs[0]["sha"] == sha
 
 
 def test_invalid_signature_is_401(
@@ -1188,6 +1272,67 @@ def test_prod_promotes_the_exact_artifact_dev_validated(
     assert dev_version["commit_sha"] == prod_version["commit_sha"] == sha
 
 
+def test_dev_push_does_not_reuse_a_cli_bundle_from_a_sibling_agent(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    dev_id = _register(client, auth_headers, "two-agent-dev", "C000000D01")
+    prod_id = _register(client, auth_headers, "two-agent-prod", "C000000E01")
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, TWO_TARGET_FILES)
+
+    cli_version = client.post(
+        f"/agents/{prod_id}/versions",
+        json={
+            "version_label": "cli-sibling-working-tree",
+            "created_by": "cli",
+            "commit_sha": sha,
+        },
+        headers=auth_headers,
+    )
+    assert cli_version.status_code == 201, cli_version.text
+    cli_version_id = cli_version.json()["id"]
+
+    cli_files = {
+        **TWO_TARGET_FILES,
+        "skills/alpha/SKILL.md": "---\nname: alpha\ndescription: cli sibling tree\n---\n",
+    }
+    cli_archive = io.BytesIO()
+    with tarfile.open(fileobj=cli_archive, mode="w:gz") as archive:
+        for rel, content in cli_files.items():
+            data = content.encode()
+            info = tarfile.TarInfo(f"cli-sibling/{rel}")
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+    upload = client.put(
+        f"/agents/{prod_id}/versions/{cli_version_id}/bundle",
+        files={"file": ("cli-sibling.tar.gz", cli_archive.getvalue())},
+        headers=auth_headers,
+    )
+    assert upload.status_code == 201, upload.text
+    cli_bundle_ref = upload.json()["bundle_ref"]
+
+    response = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url))
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "deployed"
+
+    versions = client.get(f"/agents/{dev_id}/versions", headers=auth_headers).json()
+    assert len(versions) == 1, versions
+    git_version = versions[0]
+    assert git_version["created_by"] == "git-flow"
+    assert git_version["bundle_ref"] != cli_bundle_ref
+
+    stored = client.get(
+        f"/agents/{dev_id}/versions/{git_version['id']}/bundle", headers=auth_headers
+    )
+    assert stored.status_code == 200, stored.text
+    with tarfile.open(fileobj=io.BytesIO(stored.content), mode="r:*") as archive:
+        skill = archive.extractfile("skills/alpha/SKILL.md")
+        assert skill is not None
+        assert skill.read().decode() == VALID_FILES["skills/alpha/SKILL.md"]
+
+
 def test_prod_promote_to_a_sibling_agent_skips_the_clone(
     client: Any,
     auth_headers: dict[str, str],
@@ -1491,3 +1636,135 @@ def test_a_scaffolded_deploy_yaml_reads_back_as_an_empty_map(tmp_path: Path) -> 
     targets = bundles.read_deploy_targets(tmp_path)
     assert targets is not None, "a present deploy.yaml must not read back as absent"
     assert targets.targets == {}
+
+
+# --------------------------------------------------------------------------- #
+# A source-built connector arriving by git push (ADR 0113)
+#
+# VERIFY ONLY: nothing in gitflow.py changes. The push path routes through
+# `bundles.extract_and_validate`, so the intake rules added to
+# `plugin_format.validate.py` cover it with no second implementation -- which is
+# the whole reason they live in `validate_bundle` rather than in the CLI upload
+# router (apps/api/CLAUDE.md: the validator is the ONE gate a bundle passes
+# through, whatever entry point it arrives by). These tests prove that rather
+# than assuming it, and they assert on the ABSENCE of the Version row, not on a
+# log line: `gitflow.py` creates the Version and stores the bundle only after
+# validation passes, so a rule that fired but did not block would still leave a
+# row behind.
+# --------------------------------------------------------------------------- #
+BUILT_CONNECTORS = (
+    "connectors:\n"
+    "  k8s-write:\n"
+    "    build:\n"
+    "      context: connectors/k8s-write\n"
+    "      platforms: [linux/amd64, linux/arm64]\n"
+)
+
+_BUILT_FILES = {
+    **VALID_FILES,
+    "connectors.yaml": BUILT_CONNECTORS,
+    "connectors/k8s-write/Dockerfile": "FROM scratch\nCOPY server.py /server.py\n",
+    "connectors/k8s-write/server.py": "print('acme')\n",
+}
+
+_REGISTRY_IMAGE = (
+    "ghcr.io/acme-corp/acme-bot-k8s-write-mcp@sha256:"
+    "0000000000000000000000000000000000000000000000000000000000000000"
+)
+
+
+def _lock_text(source_digest: str) -> str:
+    return (
+        "version: 1\n"
+        "connectors:\n"
+        "  k8s-write:\n"
+        f"    image: {_REGISTRY_IMAGE}\n"
+        "    delivery: registry\n"
+        "    platforms: [linux/amd64, linux/arm64]\n"
+        f"    source_digest: {source_digest}\n"
+    )
+
+
+def _source_digest(tmp_path: Path, files: dict[str, str]) -> str:
+    """Hash the build context exactly as the validator will after extraction."""
+
+    from plugin_format import connector_lock
+    from plugin_format.connectors import ConnectorBuild
+
+    for rel, content in files.items():
+        path = tmp_path / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    build = ConnectorBuild.model_validate(
+        {"context": "connectors/k8s-write", "platforms": ["linux/amd64", "linux/arm64"]}
+    )
+    return connector_lock.source_digest_of(tmp_path / "connectors" / "k8s-write", build)
+
+
+def test_a_git_push_of_a_locked_build_bundle_deploys(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+    tmp_path: Path,
+) -> None:
+    # The control. Without it, a rule that rejected every build: bundle outright
+    # would pass both negatives below.
+    agent_id = _register_agent(client, auth_headers)
+    files = dict(_BUILT_FILES)
+    files["connectors.lock.yaml"] = _lock_text(_source_digest(tmp_path / "ctx", _BUILT_FILES))
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, files)
+
+    resp = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url))
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "deployed"
+    versions = client.get(f"/agents/{agent_id}/versions", headers=auth_headers).json()
+    assert [v["commit_sha"] for v in versions] == [sha]
+
+
+def test_a_git_push_of_a_lockless_build_bundle_creates_no_version(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    agent_id = _register_agent(client, auth_headers)
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, _BUILT_FILES)
+
+    resp = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url))
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "rejected"
+    assert "connectors.lock_missing" in {e["code"] for e in body["errors"]}
+
+    # The row itself, not the response: this is what stops the deployment going
+    # active while the runner derives a hosted URL for a connector nobody built.
+    assert client.get(f"/agents/{agent_id}/versions", headers=auth_headers).json() == []
+    assert (
+        client.get("/deployments", params={"agent_id": agent_id}, headers=auth_headers).json() == []
+    )
+
+
+def test_a_git_push_of_a_stale_build_bundle_creates_no_version(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+    tmp_path: Path,
+) -> None:
+    # The push path is the one an author uses without ever running `curie
+    # build`, so it is where a stale lock actually reaches production: the
+    # previous digest is activated and the deployed connector silently stops
+    # matching the reviewed source.
+    agent_id = _register_agent(client, auth_headers)
+    files = dict(_BUILT_FILES)
+    files["connectors.lock.yaml"] = _lock_text(_source_digest(tmp_path / "ctx", _BUILT_FILES))
+    files["connectors/k8s-write/server.py"] = "print('acme, but different')\n"
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, files)
+
+    resp = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url))
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "rejected"
+    assert "connectors.lock_stale" in {e["code"] for e in body["errors"]}
+    assert client.get(f"/agents/{agent_id}/versions", headers=auth_headers).json() == []

@@ -390,3 +390,484 @@ fn skill_up(fixture: &tempfile::TempDir, anthropic_key: Option<&str>) -> Output 
         .env_remove("CLAUDE_CODE_OAUTH_TOKEN");
     cmd.output().expect("run curie skill up")
 }
+
+const SAVED_CURIE_CREDENTIALS: &str = "vault-example-credential-sentinel";
+const SAVED_ANTHROPIC_CREDENTIALS: &str = "stored-anthropic-credential-sentinel";
+const SHELL_CURIE_CREDENTIALS: &str = "shell-example-credential-sentinel";
+const ENV_FILE_CURIE_CREDENTIALS: &str = "file-example-credential-sentinel";
+const EXPLICIT_MODEL: &str = "z-ai/glm-5.2";
+const CURIE_CREDENTIALS_VAULT_NOTE: &str =
+    "CURIE_CREDENTIALS: loaded from Curie private storage for this run";
+
+/// A private Curie config dir holding the provider neutral model credential.
+/// The fixture uses the public command, so the tests cover the same persisted
+/// shape a user creates rather than depending on vault internals.
+fn vault_with_saved_curie_credentials() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    save_model_credential(&dir, "CURIE_CREDENTIALS", SAVED_CURIE_CREDENTIALS);
+    dir
+}
+
+fn save_model_credential(fixture: &tempfile::TempDir, name: &str, value: &str) {
+    let seed = Command::new(bin())
+        .args(["secrets", "set", name, "--from-env", "SEED"])
+        .env("CURIE_CONFIG_DIR", fixture.path().join("cfg"))
+        .env("SEED", value)
+        .output()
+        .expect("run curie secrets set");
+    assert!(seed.status.success(), "seed vault: {}", err_str(&seed));
+}
+
+/// A saved credential whose index cannot be read. Credential-free modes must
+/// succeed against this fixture, which proves they never consult private
+/// storage rather than merely discarding a credential after loading it.
+fn unreadable_vault_with_saved_curie_credentials() -> tempfile::TempDir {
+    let dir = vault_with_saved_curie_credentials();
+    std::fs::write(dir.path().join("cfg/secrets.json"), "not valid json")
+        .expect("poison private store index");
+    dir
+}
+
+/// Start a real CLI process against the isolated credential store with every
+/// ambient model input removed. Individual tests can then add one explicit
+/// input without racing the test process environment.
+fn promotion_command(fixture: &tempfile::TempDir) -> Command {
+    let mut cmd = Command::new(bin());
+    cmd.env("CURIE_CONFIG_DIR", fixture.path().join("cfg"))
+        .env_remove("CURIE_CREDENTIALS")
+        .env_remove("CURIE_MODEL_CREDENTIALS")
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+        .env_remove("CURIE_MODEL")
+        .env_remove("CURIE_FAKE_MODEL");
+    cmd
+}
+
+fn repository_path(relative: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("cli package has repository parent")
+        .join(relative)
+}
+
+fn assert_secret_absent(out: &Output, secret: &str) {
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains(secret),
+        "raw credential must be absent from stdout"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains(secret),
+        "raw credential must be absent from stderr"
+    );
+}
+
+#[test]
+fn saved_curie_credentials_and_explicit_model_reach_local_up_dry_run() {
+    let fixture = vault_with_saved_curie_credentials();
+    let mut cmd = promotion_command(&fixture);
+    let out = cmd
+        .args([
+            "local",
+            "up",
+            "--dry-run",
+            "--model",
+            EXPLICIT_MODEL,
+            "--file",
+        ])
+        .arg(repository_path("compose.dev.yaml"))
+        .output()
+        .expect("run curie local up dry run");
+
+    assert!(out.status.success(), "local up dry run must succeed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(CURIE_CREDENTIALS_VAULT_NOTE));
+    assert!(stdout.contains("CURIE_FAKE_MODEL=0"));
+    assert!(stdout.contains("CURIE_MODEL=z-ai/glm-5.2"));
+    assert!(stdout.contains("CURIE_CREDENTIALS=vault-ex***"));
+    assert_secret_absent(&out, SAVED_CURIE_CREDENTIALS);
+}
+
+#[test]
+fn saved_curie_credentials_and_explicit_model_reach_local_rebuild_dry_run() {
+    let fixture = vault_with_saved_curie_credentials();
+    let mut cmd = promotion_command(&fixture);
+    let out = cmd
+        .args([
+            "local",
+            "rebuild",
+            "curie-worker",
+            "--dry-run",
+            "--model",
+            EXPLICIT_MODEL,
+            "--file",
+        ])
+        .arg(repository_path("compose.dev.yaml"))
+        .output()
+        .expect("run curie local rebuild dry run");
+
+    assert!(out.status.success(), "local rebuild dry run must succeed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(CURIE_CREDENTIALS_VAULT_NOTE));
+    assert!(stdout.contains("CURIE_FAKE_MODEL=0"));
+    assert!(stdout.contains("CURIE_MODEL=z-ai/glm-5.2"));
+    assert!(stdout.contains("CURIE_CREDENTIALS=vault-ex***"));
+    assert_secret_absent(&out, SAVED_CURIE_CREDENTIALS);
+}
+
+#[test]
+fn saved_curie_credentials_survive_local_comms_worker_recreation() {
+    let fixture = vault_with_saved_curie_credentials();
+    let mut cmd = promotion_command(&fixture);
+    let out = cmd
+        .args([
+            "local",
+            "comms",
+            "--slack",
+            "--dry-run",
+            "--model",
+            EXPLICIT_MODEL,
+            "--app-token",
+            "xapp-example",
+            "--bot-token",
+            "xoxb-example",
+            "--file",
+        ])
+        .arg(repository_path("compose.dev.yaml"))
+        .output()
+        .expect("run curie local comms dry run");
+
+    assert!(out.status.success(), "local comms dry run must succeed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(CURIE_CREDENTIALS_VAULT_NOTE));
+    assert!(stdout.contains("CURIE_FAKE_MODEL=0"));
+    assert!(stdout.contains("CURIE_MODEL=z-ai/glm-5.2"));
+    assert!(stdout.contains("CURIE_CREDENTIALS=vault-ex***"));
+    assert_secret_absent(&out, SAVED_CURIE_CREDENTIALS);
+}
+
+#[test]
+fn saved_curie_credentials_survive_local_comms_disconnect_worker_recreation() {
+    let fixture = vault_with_saved_curie_credentials();
+    let mut cmd = promotion_command(&fixture);
+    let out = cmd
+        .args([
+            "local",
+            "comms",
+            "--slack",
+            "--disconnect",
+            "--dry-run",
+            "--model",
+            EXPLICIT_MODEL,
+            "--file",
+        ])
+        .arg(repository_path("compose.dev.yaml"))
+        .output()
+        .expect("run curie local comms disconnect dry run");
+
+    assert!(out.status.success(), "local comms dry run must succeed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(CURIE_CREDENTIALS_VAULT_NOTE));
+    assert!(stdout.contains("CURIE_FAKE_MODEL=0"));
+    assert!(stdout.contains("CURIE_MODEL=z-ai/glm-5.2"));
+    assert!(stdout.contains("CURIE_CREDENTIALS=vault-ex***"));
+    assert_secret_absent(&out, SAVED_CURIE_CREDENTIALS);
+}
+
+#[test]
+fn shell_curie_credentials_take_priority_over_saved_credentials_for_local_up() {
+    let fixture = vault_with_saved_curie_credentials();
+    let mut cmd = promotion_command(&fixture);
+    let out = cmd
+        .args(["local", "up", "--dry-run", "--file"])
+        .arg(repository_path("compose.dev.yaml"))
+        .env("CURIE_CREDENTIALS", SHELL_CURIE_CREDENTIALS)
+        .output()
+        .expect("run curie local up dry run with shell credential");
+
+    assert!(out.status.success(), "local up dry run must succeed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains(CURIE_CREDENTIALS_VAULT_NOTE));
+    assert!(stdout.contains("CURIE_FAKE_MODEL=0"));
+    assert!(!stdout.contains("CURIE_CREDENTIALS=vault-ex***"));
+    assert_secret_absent(&out, SAVED_CURIE_CREDENTIALS);
+    assert_secret_absent(&out, SHELL_CURIE_CREDENTIALS);
+}
+
+#[test]
+fn shell_curie_credentials_do_not_hydrate_stored_sdk_credentials() {
+    let fixture = vault_with_saved_curie_credentials();
+    save_model_credential(&fixture, "ANTHROPIC_API_KEY", SAVED_ANTHROPIC_CREDENTIALS);
+    let mut cmd = promotion_command(&fixture);
+    let out = cmd
+        .args(["local", "up", "--dry-run", "--file"])
+        .arg(repository_path("compose.dev.yaml"))
+        .env("CURIE_CREDENTIALS", SHELL_CURIE_CREDENTIALS)
+        .output()
+        .expect("run curie local up with shell BYO credential");
+
+    assert!(out.status.success(), "local up dry run must succeed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("ANTHROPIC_API_KEY: loaded from Curie private storage"));
+    assert!(!stdout.contains("ANTHROPIC_API_KEY="));
+    assert_secret_absent(&out, SHELL_CURIE_CREDENTIALS);
+    assert_secret_absent(&out, SAVED_ANTHROPIC_CREDENTIALS);
+}
+
+#[test]
+fn saved_curie_credentials_take_priority_over_env_file_for_local_up() {
+    let fixture = vault_with_saved_curie_credentials();
+    let env_file = fixture.path().join("bundle.env");
+    std::fs::write(
+        &env_file,
+        format!("CURIE_CREDENTIALS={ENV_FILE_CURIE_CREDENTIALS}\n"),
+    )
+    .expect("write credential env file");
+    let mut cmd = promotion_command(&fixture);
+    let out = cmd
+        .args(["local", "up", "--dry-run", "--env-file"])
+        .arg(&env_file)
+        .args(["--file"])
+        .arg(repository_path("compose.dev.yaml"))
+        .output()
+        .expect("run curie local up dry run with saved and file credentials");
+
+    assert!(out.status.success(), "local up dry run must succeed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(CURIE_CREDENTIALS_VAULT_NOTE));
+    assert!(!stderr.contains("loaded from --env-file"));
+    assert!(stdout.contains("CURIE_CREDENTIALS=vault-ex***"));
+    assert!(!stdout.contains("CURIE_CREDENTIALS=file-ex***"));
+    assert_secret_absent(&out, SAVED_CURIE_CREDENTIALS);
+    assert_secret_absent(&out, ENV_FILE_CURIE_CREDENTIALS);
+}
+
+#[test]
+fn saved_curie_credentials_and_explicit_model_reach_cluster_up_dry_run() {
+    let fixture = vault_with_saved_curie_credentials();
+    let mut cmd = promotion_command(&fixture);
+    let out = cmd
+        .args([
+            "cluster",
+            "up",
+            "--dry-run",
+            "--dev",
+            "--model",
+            EXPLICIT_MODEL,
+            "--chart",
+        ])
+        .arg(repository_path("charts/curie"))
+        .output()
+        .expect("run curie cluster up dry run");
+
+    assert!(out.status.success(), "cluster up dry run must succeed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(CURIE_CREDENTIALS_VAULT_NOTE));
+    assert!(stdout.contains("<secret values file: agentSandbox.runner.credentials=vault-ex***>"));
+    assert!(stdout.contains("agentSandbox.runner.model=z-ai/glm-5.2"));
+    assert_secret_absent(&out, SAVED_CURIE_CREDENTIALS);
+}
+
+#[test]
+fn shell_curie_credentials_take_priority_over_saved_credentials_for_cluster_up() {
+    let fixture = vault_with_saved_curie_credentials();
+    let mut cmd = promotion_command(&fixture);
+    let out = cmd
+        .args([
+            "cluster",
+            "up",
+            "--dry-run",
+            "--dev",
+            "--model",
+            EXPLICIT_MODEL,
+            "--chart",
+        ])
+        .arg(repository_path("charts/curie"))
+        .env("CURIE_CREDENTIALS", SHELL_CURIE_CREDENTIALS)
+        .output()
+        .expect("run curie cluster up dry run with shell credential");
+
+    assert!(out.status.success(), "cluster up dry run must succeed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains(CURIE_CREDENTIALS_VAULT_NOTE));
+    assert!(stdout.contains("<secret values file: agentSandbox.runner.credentials=shell-ex***>"));
+    assert!(!stdout.contains("agentSandbox.runner.credentials=vault-ex***"));
+    assert_secret_absent(&out, SAVED_CURIE_CREDENTIALS);
+    assert_secret_absent(&out, SHELL_CURIE_CREDENTIALS);
+}
+
+#[test]
+fn cluster_fake_model_suppresses_the_saved_credential_but_keeps_explicit_model() {
+    let fixture = vault_with_saved_curie_credentials();
+    let mut cmd = promotion_command(&fixture);
+    let out = cmd
+        .args([
+            "cluster",
+            "up",
+            "--dry-run",
+            "--dev",
+            "--fake-model",
+            "--model",
+            EXPLICIT_MODEL,
+            "--chart",
+        ])
+        .arg(repository_path("charts/curie"))
+        .output()
+        .expect("run curie cluster up dry run with fake model");
+
+    assert!(out.status.success(), "cluster up dry run must succeed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains(CURIE_CREDENTIALS_VAULT_NOTE));
+    assert!(stdout.contains("agentSandbox.runner.model=z-ai/glm-5.2"));
+    assert!(!stdout.contains("agentSandbox.runner.credentials="));
+    assert!(!stdout.contains("agentSandbox.runner.credentials=vault-ex***"));
+    assert!(!stdout.contains("agentSandbox.runner.fakeModel=false"));
+    assert_secret_absent(&out, SAVED_CURIE_CREDENTIALS);
+}
+
+#[test]
+fn local_credential_free_modes_do_not_read_private_storage() {
+    for (label, extra_args, fake_env) in [
+        ("local model", vec!["--local-model", "qwen3:8b"], None),
+        ("explicit fake", Vec::new(), Some("1")),
+    ] {
+        let fixture = unreadable_vault_with_saved_curie_credentials();
+        let mut cmd = promotion_command(&fixture);
+        cmd.args(["local", "up", "--dry-run", "--file"])
+            .arg(repository_path("compose.dev.yaml"))
+            .args(extra_args);
+        if let Some(value) = fake_env {
+            cmd.env("CURIE_FAKE_MODEL", value);
+        }
+        let out = cmd.output().expect("run credential-free local up dry run");
+
+        assert!(
+            out.status.success(),
+            "{label} must not be blocked by private storage: {}",
+            err_str(&out)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!stderr.contains(CURIE_CREDENTIALS_VAULT_NOTE));
+        assert!(!stdout.contains("CURIE_CREDENTIALS="));
+        assert_secret_absent(&out, SAVED_CURIE_CREDENTIALS);
+    }
+}
+
+#[test]
+fn cluster_credential_free_modes_do_not_read_private_storage() {
+    for (label, mode_args) in [
+        ("fake model", vec!["--fake-model"]),
+        ("local model", vec!["--local-model", "qwen3:8b"]),
+    ] {
+        let fixture = unreadable_vault_with_saved_curie_credentials();
+        let mut cmd = promotion_command(&fixture);
+        let out = cmd
+            .args(["cluster", "up", "--dry-run", "--dev", "--chart"])
+            .arg(repository_path("charts/curie"))
+            .args(mode_args)
+            .output()
+            .expect("run credential-free cluster up dry run");
+
+        assert!(
+            out.status.success(),
+            "{label} must not be blocked by private storage: {}",
+            err_str(&out)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!stderr.contains(CURIE_CREDENTIALS_VAULT_NOTE));
+        assert!(!stdout.contains("agentSandbox.runner.credentials="));
+        assert_secret_absent(&out, SAVED_CURIE_CREDENTIALS);
+    }
+}
+
+#[test]
+fn corrupt_private_storage_does_not_block_default_up_modes() {
+    for tier in ["local", "cluster"] {
+        let fixture = unreadable_vault_with_saved_curie_credentials();
+        let mut cmd = promotion_command(&fixture);
+        cmd.args([tier, "up", "--dry-run"]);
+        if tier == "local" {
+            cmd.arg("--file").arg(repository_path("compose.dev.yaml"));
+        } else {
+            cmd.args(["--dev", "--chart"])
+                .arg(repository_path("charts/curie"));
+        }
+        let out = cmd.output().expect("run up with corrupt private storage");
+
+        assert!(
+            out.status.success(),
+            "{tier} up must fall back when private storage is corrupt: {}",
+            err_str(&out)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("Saved model credentials could not be read"));
+        if tier == "local" {
+            assert!(!stdout.contains("CURIE_FAKE_MODEL=0"));
+            assert!(!stdout.contains("CURIE_CREDENTIALS="));
+        } else {
+            assert!(!stdout.contains("agentSandbox.runner.credentials="));
+        }
+        assert_secret_absent(&out, SAVED_CURIE_CREDENTIALS);
+    }
+}
+
+#[test]
+fn model_and_local_model_are_rejected_together_for_each_up_tier() {
+    for tier in ["local", "cluster"] {
+        let out = Command::new(bin())
+            .args([
+                tier,
+                "up",
+                "--model",
+                EXPLICIT_MODEL,
+                "--local-model",
+                "qwen3:8b",
+            ])
+            .output()
+            .expect("run curie up with conflicting model flags");
+
+        assert_eq!(out.status.code(), Some(2), "{tier} up must report usage");
+        let stderr = err_str(&out);
+        assert!(stderr.contains("--model"), "{tier}: {stderr}");
+        assert!(stderr.contains("--local-model"), "{tier}: {stderr}");
+        assert!(stderr.contains("cannot be used with"), "{tier}: {stderr}");
+    }
+}
+
+#[test]
+fn model_and_local_model_are_rejected_together_for_local_rebuild() {
+    let out = Command::new(bin())
+        .args([
+            "local",
+            "rebuild",
+            "curie-worker",
+            "--model",
+            EXPLICIT_MODEL,
+            "--local-model",
+            "qwen3:8b",
+        ])
+        .output()
+        .expect("run curie local rebuild with conflicting model flags");
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "local rebuild must report usage"
+    );
+    let stderr = err_str(&out);
+    assert!(stderr.contains("--model"), "{stderr}");
+    assert!(stderr.contains("--local-model"), "{stderr}");
+    assert!(stderr.contains("cannot be used with"), "{stderr}");
+}

@@ -162,10 +162,10 @@ spec:
       ports:
         - { protocol: TCP, port: 8000 }
 {{- end }}
-{{- if and .Values.rustfs.deploy .Values.agentSandbox.runner.bundleFetch.enabled }}
+{{- if and .Values.rustfs.deploy (or .Values.agentSandbox.runner.bundleFetch.enabled .Values.agentSandbox.runner.workspace.enabled) }}
 ---
-{{/* Allow the runner's bundle-fetch init container to reach THIS release's
-     in-chart RustFS for the plugin bundle object. Mirrors the collector carve out
+{{/* Allow the runner's bundle-fetch or workspace-fetch init container to reach
+     THIS release's in-chart RustFS for its exact object. Mirrors the collector carve out
      above: without it, rail 1's default-deny blocks the S3 fetch and every bound
      sandbox fails closed. BYO S3 with rustfs.deploy=false is an external host, so it
      goes through the operator's allowedEgress list instead. */}}
@@ -262,6 +262,50 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     {{- end }}
+{{- end }}
+{{- $connectorEgress := .Values.agentSandbox.connectorEgress | default dict }}
+{{- range $agent := keys $connectorEgress | sortAlpha }}
+{{- if or (gt (len $agent) 40) (not (regexMatch "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$" $agent)) }}
+{{- fail (printf "agentSandbox.connectorEgress.%s has an invalid agent name" $agent) }}
+{{- end }}
+{{- $entries := index $connectorEgress $agent }}
+{{- if $entries }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "curie.fullname" $ }}-agent-{{ $agent }}-allow-egress
+  labels:
+    {{- include "curie.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: agent-sandbox
+    curietech.ai/agent: {{ $agent | quote }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "curie.selectorLabels" (dict "root" $ "component" "runner-sandbox") | nindent 6 }}
+      curietech.ai/agent: {{ $agent | quote }}
+  policyTypes: [Egress]
+  egress:
+    {{- range $entries }}
+    - to:
+        - ipBlock:
+            cidr: {{ .cidr }}
+            {{- if .except }}
+            except:
+              {{- toYaml .except | nindent 14 }}
+            {{- else }}
+            {{- $auto := include "curie.metadataExcept" .cidr | trim }}
+            {{- if $auto }}
+            except:
+              - {{ $auto }}
+            {{- end }}
+            {{- end }}
+      {{- with .ports }}
+      ports:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    {{- end }}
+{{- end }}
 {{- end }}
 {{- if $np.lockIngress }}
 ---

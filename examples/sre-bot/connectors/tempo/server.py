@@ -63,11 +63,6 @@ log = logging.getLogger("tempo-mcp")
 
 GRAFANA_URL = os.environ.get("GRAFANA_URL", "").rstrip("/")
 TOKEN = os.environ.get("GRAFANA_SERVICE_ACCOUNT_TOKEN", "")
-# `__Tempo__` is the uid a provisioned Tempo datasource commonly carries, and it
-# is stable once provisioned -- but it is an env var rather than a constant so a
-# second install does not need a code change. Find yours with the grafana
-# connector's `list_datasources` before assuming this default fits.
-DS_UID = os.environ.get("TEMPO_DATASOURCE_UID", "__Tempo__")
 TIMEOUT = float(os.environ.get("TEMPO_TIMEOUT_SECONDS", "30"))
 
 # Tempo will happily stream a very large trace. The sandbox pays for that in
@@ -97,15 +92,9 @@ mcp = FastMCP(
     "tempo",
     host=os.environ.get("BIND_ADDRESS", "0.0.0.0"),
     port=int(os.environ.get("PORT", "8000")),
-    # Mount at "/" so BOTH /mcp and /mcp/ are served.
-    #
-    # FastMCP's default mounts the handler at "/mcp", which makes Starlette
-    # 307-redirect a POST to "/mcp" over to "/mcp/". Curie builds the sandbox's
-    # URL as `http://<service>:8000/mcp` -- matching the other two connectors,
-    # which serve that path directly -- and an MCP client is not obliged to
-    # replay a POST body across a redirect. The symptom would be a connector
-    # that is up, healthy, answers curl, and registers zero tools.
-    streamable_http_path="/",
+    # Curie addresses hosted connectors at the exact, redirect-free /mcp path.
+    # MCP 1.28 mounts this value literally; "/" would leave /mcp returning 404.
+    streamable_http_path="/mcp",
 )
 
 READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=True)
@@ -132,12 +121,64 @@ def _proxy(path: str, params: dict[str, Any] | None = None) -> Any:
         raise ToolError(
             "not configured: GRAFANA_URL and GRAFANA_SERVICE_ACCOUNT_TOKEN must both be set"
         )
-    url = f"{GRAFANA_URL}/api/datasources/proxy/uid/{quote(DS_UID)}{path}"
+    headers = {"Authorization": f"Bearer {TOKEN}", "Accept": "application/json"}
+    try:
+        discovery = httpx.get(
+            f"{GRAFANA_URL}/api/datasources",
+            headers=headers,
+            timeout=TIMEOUT,
+        )
+    except httpx.TimeoutException as exc:
+        raise ToolError(
+            f"Grafana did not respond within {TIMEOUT:g}s while finding Tempo."
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise ToolError(f"could not reach Grafana while finding Tempo: {exc}") from exc
+
+    if discovery.status_code in (401, 403):
+        raise ToolError(
+            f"Grafana refused datasource discovery ({discovery.status_code}). The service "
+            "account token is missing or lacks datasource access. This will not fix itself "
+            "on retry."
+        )
+    if discovery.status_code >= 400:
+        raise ToolError(
+            f"Grafana datasource discovery returned {discovery.status_code}: "
+            f"{discovery.text[:300]}"
+        )
+
+    try:
+        datasources = discovery.json()
+    except ValueError as exc:
+        raise ToolError(
+            f"Grafana datasource discovery returned non JSON: {discovery.text[:300]}"
+        ) from exc
+    matches = [
+        datasource
+        for datasource in datasources
+        if isinstance(datasource, dict) and datasource.get("name") == "Tempo"
+    ]
+    if len(matches) != 1:
+        raise ToolError(
+            "expected exactly one Grafana datasource named Tempo, "
+            f"found {len(matches)}. Refusing to proxy the request."
+        )
+    datasource_uid = matches[0].get("uid")
+    if not isinstance(datasource_uid, str) or not datasource_uid:
+        raise ToolError(
+            "the Grafana datasource named Tempo has no usable uid. "
+            "Refusing to proxy the request."
+        )
+
+    url = (
+        f"{GRAFANA_URL}/api/datasources/proxy/uid/"
+        f"{quote(datasource_uid, safe='')}{path}"
+    )
     try:
         r = httpx.get(
             url,
             params=params or {},
-            headers={"Authorization": f"Bearer {TOKEN}", "Accept": "application/json"},
+            headers=headers,
             timeout=TIMEOUT,
         )
     except httpx.TimeoutException as exc:
@@ -155,8 +196,8 @@ def _proxy(path: str, params: dict[str, Any] | None = None) -> Any:
         )
     if r.status_code == 404:
         raise ToolError(
-            f"no such Tempo endpoint or datasource uid {DS_UID!r} ({r.status_code}). "
-            "Check TEMPO_DATASOURCE_UID."
+            f"Grafana could not proxy the Tempo request ({r.status_code}) through "
+            f"datasource uid {datasource_uid!r}."
         )
     if r.status_code >= 400:
         raise ToolError(f"Tempo returned {r.status_code}: {r.text[:300]}")
@@ -252,7 +293,7 @@ def get_trace(trace_id: str) -> Any:
     trace_id = trace_id.strip()
     if not trace_id:
         raise ToolError("trace_id is required -- get one from search_traces")
-    return _proxy(f"/api/traces/{quote(trace_id)}")
+    return _proxy(f"/api/traces/{quote(trace_id, safe='')}")
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -276,7 +317,7 @@ def list_trace_tag_values(tag: str) -> Any:
     tag = tag.strip()
     if not tag:
         raise ToolError("tag is required, e.g. resource.service.name")
-    return _proxy(f"/api/v2/search/tag/{quote(tag)}/values")
+    return _proxy(f"/api/v2/search/tag/{quote(tag, safe='')}/values")
 
 
 def main() -> int:
@@ -289,7 +330,7 @@ def main() -> int:
         # Kubernetes and is useless to the agent.
         log.error("refusing to start: missing %s", ", ".join(missing))
         return 1
-    log.info("tempo connector -> %s (datasource %s)", GRAFANA_URL, DS_UID)
+    log.info("tempo connector connected to %s", GRAFANA_URL)
     mcp.run(transport="streamable-http")
     return 0
 

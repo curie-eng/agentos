@@ -33,7 +33,8 @@
         { "field": "systemPrompt", "why": "no approvals-verb output surfaces the agent's system prompt." },
         { "field": "starterPrompts", "why": "no approvals-verb output surfaces starter prompts." },
         { "field": "secrets", "why": "declared secret NAMES are surfaced by other verbs (skill up --secret), not skill approvals." },
-        { "field": "triggers", "why": "no approvals-verb output surfaces the manifest's trigger declarations." }
+        { "field": "triggers", "why": "no approvals-verb output surfaces the manifest's trigger declarations." },
+        { "field": "toolPolicy", "why": "the vanilla MCP tool-policy declaration is a runtime-enforcement contract with no runtime enforcing it yet and no output surface on skill approvals; when a verb surfaces it, this omission becomes a carried field." }
       ]
     },
     {
@@ -50,6 +51,31 @@
     }
   ],
   "non_mirrors": [
+    {
+      "struct": "ConnectorsFileDecl",
+      "file": "cli/src/connector_build.rs",
+      "reason": "Mirrors plugin_format.connectors.ConnectorsFile, but plugin-format.schema.json carries no Connector* $defs (schema_export.py imports only from .models), so field-by-field comparison against the schema does not apply. The seam is frozen in tests/vectors/connector-build-decl.json and tests/vectors/connector-fields.json instead, read by both packages/plugin-format/tests/test_connectors.py and cli/tests/connector_build_decl_vectors.rs."
+    },
+    {
+      "struct": "ConnectorSpecDecl",
+      "file": "cli/src/connector_build.rs",
+      "reason": "Mirrors plugin_format.connectors.ConnectorSpec; same missing Connector* $defs, same vector-frozen seam (tests/vectors/connector-build-decl.json, tests/vectors/connector-fields.json)."
+    },
+    {
+      "struct": "ConnectorBuildDecl",
+      "file": "cli/src/connector_build.rs",
+      "reason": "Mirrors plugin_format.connectors.ConnectorBuild; same missing Connector* $defs, same vector-frozen seam (tests/vectors/connector-build-decl.json, tests/vectors/connector-fields.json)."
+    },
+    {
+      "struct": "ConnectorLockFileDecl",
+      "file": "cli/src/connector_build.rs",
+      "reason": "Mirrors plugin_format.connector_lock.ConnectorLockFile; same missing Connector* $defs, frozen in tests/vectors/connector-lock.json and tests/vectors/connector-fields.json."
+    },
+    {
+      "struct": "ConnectorLockEntryDecl",
+      "file": "cli/src/connector_build.rs",
+      "reason": "Mirrors plugin_format.connector_lock.ConnectorLockEntry; same missing Connector* $defs, frozen in tests/vectors/connector-lock.json and tests/vectors/connector-fields.json."
+    },
     {
       "struct": "CheckReport",
       "file": "cli/src/commands.rs",

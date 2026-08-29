@@ -243,6 +243,29 @@ def test_an_unparseable_expiry_is_not_treated_as_immortal(private_key: str, monk
     assert 3000 < assumed < 4200, f"expected the documented ~1h fallback, got {assumed:.0f}s"
 
 
+def test_repository_keyed_app_caches_are_bounded(
+    private_key: str, monkeypatch
+) -> None:
+    from curie_api.github_app import _REPOSITORY_CACHE_LIMIT
+
+    creds = GitHubCredentials(settings=app_settings(private_key))
+    monkeypatch.setattr(
+        creds,
+        "_mint_installation_token",
+        lambda repo: (f"token-{repo}", time.time() + 3600),
+    )
+    for index in range(_REPOSITORY_CACHE_LIMIT + 1):
+        creds.token_for(f"acme-corp/repo-{index}")
+    assert len(creds._tokens) == _REPOSITORY_CACHE_LIMIT
+    assert "acme-corp/repo-0" not in creds._tokens
+
+    monkeypatch.setattr(creds, "_get", lambda url: {"id": 42})
+    for index in range(_REPOSITORY_CACHE_LIMIT + 1):
+        creds._installation_id(f"acme-corp/install-{index}")
+    assert len(creds._installations) == _REPOSITORY_CACHE_LIMIT
+    assert "acme-corp/install-0" not in creds._installations
+
+
 # --------------------------------------------------------------------------- #
 # The JWT itself -- GitHub rejects a malformed one with a bare 401
 # --------------------------------------------------------------------------- #

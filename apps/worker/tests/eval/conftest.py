@@ -110,6 +110,13 @@ class FakeEvalRunner:
         # When True, /v1/reset answers 500 -- models a runner that could not
         # establish per-case isolation.
         self.fail_reset = False
+        # Inputs that keep the HTTP handler open after a valid Final. This is a
+        # real transport-boundary probe for consumers that naturally iterate to
+        # stream end instead of breaking at Final themselves.
+        self.post_final_stall_inputs: set[str] = set()
+        self.post_final_started = asyncio.Event()
+        self.post_final_unblock = asyncio.Event()
+        self.post_final_handler_done = asyncio.Event()
 
     async def _status(self, _request: web.Request) -> web.Response:
         return web.json_response({"status": "done", "turn_active": False})
@@ -164,6 +171,18 @@ class FakeEvalRunner:
             output_tokens=usage[1] if usage else None,
         )
         await resp.write((frame.model_dump_json() + "\n").encode("utf-8"))
+        if text in self.post_final_stall_inputs:
+            self.post_final_started.set()
+            try:
+                await self.post_final_unblock.wait()
+                await resp.write_eof()
+            except (ConnectionError, OSError):
+                # The client's bounded cleanup deliberately releases a peer
+                # that remains stalled after its terminal frame.
+                pass
+            finally:
+                self.post_final_handler_done.set()
+            return resp
         await resp.write_eof()
         return resp
 

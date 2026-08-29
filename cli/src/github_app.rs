@@ -163,8 +163,16 @@ pub fn disconnect_commands(opts: &GithubAppOpts) -> Vec<OpsCommand> {
 /// Roll the API so the Secret-backed key is actually read. Without this the
 /// upgrade succeeds and nothing changes until the next unrelated restart --
 /// the operator sees "configured" and pushes still fail to clone.
-pub fn rollout_commands(namespace: &str, release: &str) -> Vec<OpsCommand> {
-    let target = format!("deployment/{release}-api");
+///
+/// Takes a RESOLVED `ReleaseFullname` (#1533): the chart names the Deployment
+/// `{{ include "curie.fullname" . }}-api`, which is NOT `{release}-api` unless
+/// the release name already contains the chart name. A raw release name cannot
+/// reach this builder, which is the point of the newtype.
+pub fn rollout_commands(
+    namespace: &str,
+    fullname: &crate::ops::ReleaseFullname,
+) -> Vec<OpsCommand> {
+    let target = format!("deployment/{}", fullname.resource("api"));
     vec![
         OpsCommand::new(
             "kubectl",
@@ -461,9 +469,14 @@ pub async fn github_app(opts: GithubAppOpts, clone_base: &str) -> Result<GithubA
     } else {
         connect_commands(&opts, clone_base)
     };
-    let rollout = rollout_commands(&opts.common.namespace, &opts.common.release);
-
+    // `--dry-run` stays offline, so it renders the chart's no-override rule
+    // rather than asking the cluster (#1533). The live path below discovers the
+    // rendered fullname, which is override-proof.
     if opts.common.dry_run {
+        let rollout = rollout_commands(
+            &opts.common.namespace,
+            &crate::ops::chart_fullname(&opts.common.release),
+        );
         return Ok(GithubAppOutput::DryRun(crate::ui::DryRunPlan {
             lines: cmds
                 .iter()
@@ -496,6 +509,13 @@ pub async fn github_app(opts: GithubAppOpts, clone_base: &str) -> Result<GithubA
     }
     // A secretKeyRef env var is resolved once at pod start, so the Secret
     // change alone leaves the running API on the old credential.
+    //
+    // Resolved HERE rather than above: the rollout is the only consumer of the
+    // fullname, so a helm failure in the loop above no longer pays for a
+    // discovery round-trip whose answer nothing reads (#1533). The live path
+    // discovers the rendered name, which is override-proof.
+    let fullname = crate::ops::release_fullname(&opts.common.namespace, &opts.common.release).await;
+    let rollout = rollout_commands(&opts.common.namespace, &fullname);
     let roll_label = format!("rolling {} to pick up the credential", opts.common.release);
     for cmd in &rollout {
         run_step(&cl, &roll_label, "rolled", cmd).await?;
@@ -1031,6 +1051,41 @@ mod tests {
         );
     }
 
+    /// #1533 (S18): the rollout is what makes a `cluster github-app` connect
+    /// take effect. Its own doc comment names the failure a wrong target
+    /// reintroduces -- "the operator sees 'configured' and pushes still fail to
+    /// clone" -- which is exactly the symptom PR #1223 was filed to eliminate.
+    /// Under `--release platform` the chart renders `platform-curie-api` and the
+    /// CLI asked for `platform-api`.
+    #[test]
+    fn rollout_commands_target_the_chart_rendered_api_deployment() {
+        let cmds = rollout_commands("acme-system", &crate::ops::chart_fullname("platform"));
+        let rendered: Vec<String> = cmds.iter().map(OpsCommand::display).collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "kubectl -n acme-system rollout restart deployment/platform-curie-api",
+                "kubectl -n acme-system rollout status deployment/platform-curie-api \
+                 --timeout=180s",
+            ]
+        );
+    }
+
+    /// Negative control: the default release renders byte-identically to what
+    /// shipped before #1533.
+    #[test]
+    fn the_default_release_rollout_is_unchanged() {
+        let cmds = rollout_commands("curie", &crate::ops::chart_fullname("curie"));
+        let rendered: Vec<String> = cmds.iter().map(OpsCommand::display).collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "kubectl -n curie rollout restart deployment/curie-api",
+                "kubectl -n curie rollout status deployment/curie-api --timeout=180s",
+            ]
+        );
+    }
+
     /// A real file holding a PEM-shaped body, so "the contents never reach
     /// argv" is checked against contents that exist.
     ///
@@ -1135,7 +1190,7 @@ mod tests {
 
     #[test]
     fn the_api_is_rolled_so_the_new_key_is_actually_read() {
-        let cmds = rollout_commands("curie", "curie");
+        let cmds = rollout_commands("curie", &crate::ops::chart_fullname("curie"));
         let flat: Vec<String> = cmds.iter().map(|c| argv(c).join(" ")).collect();
         assert!(flat[0].contains("rollout restart deployment/curie-api"));
         assert!(flat[1].contains("rollout status deployment/curie-api"));

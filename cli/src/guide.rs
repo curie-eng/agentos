@@ -180,6 +180,11 @@ pub fn primer() -> Primer {
         ],
         decision_logic: vec![
             Decision {
+                question: "skill tier vs bundle skill artifact",
+                answer: "The `skill` command names the runner only tier. A bundle skill is an \
+                         artifact at `skills/<name>/SKILL.md`.",
+            },
+            Decision {
                 question: "skill vs local vs cluster",
                 answer: "skill is the runner only (offline, no platform, no Slack) -- the tightest \
                          loop. local puts the full platform in front of the identical runner via \
@@ -234,11 +239,18 @@ pub fn primer() -> Primer {
                     detail: "A bundle declares routes in .claude-plugin/plugin.json under \
                              approvalPolicy.gates[], each entry {gate: <tool name>, route: \
                              <route name>}. An operator then binds each route per agent with \
-                             `approvals <AGENT> --route <name>=<channel>` (and optionally \
-                             `--route-approvers <name>=users:U1,U2` or `<name>=group:S1`). \
-                             `channel` is WHERE the card posts; `approvers` is WHO may act \
-                             on it. A write REPLACES the whole route map, so name every \
-                             route it should keep.",
+                             `approvals <AGENT> --route-resolution <name>=<channel>` (and optionally \
+                             `--route-approvers <name>=users:U1,U2` or `<name>=group:S1`). Declare \
+                             a notification in the strict `--routes-from` JSON map. \
+                             `resolution` is the single verified Slack card where an identity \
+                             acts; `notification` is a text-only ping with interaction=None, \
+                             and `approvers` is WHO may act. A notification directs humans to \
+                             the configured approval channel without disclosing its identifier \
+                             and carries no resolving affordance. Slack uses \
+                             its configured transport; a non-Slack notification needs both \
+                             endpoint and adapter in --routes-from. Resolution on another \
+                             channel remains a future extension requiring a scoped credential. \
+                             A write REPLACES the whole route map, so name every route it should keep.",
                 },
                 ApprovalFact {
                     title: "Who may resolve is independent of where the card is",
@@ -290,7 +302,7 @@ pub fn primer() -> Primer {
             },
             Landmine {
                 title: "Silence after a request usually means an unbound route",
-                detail: "A route the bundle names but the agent's approval_routes never bound is escalated to a human rather than widened to the requesting channel, so no card appears anywhere and the turn still reports the request as pending. Bind the route with `--route <name>=<channel>` and re-run the turn; check that before suspecting the gate.",
+                detail: "A route the bundle names but the agent's approval_routes never bound is escalated to a human rather than widened to the requesting channel, so no card appears anywhere and the turn still reports the request as pending. Bind its verified Slack resolution with `--route-resolution <name>=<channel>` and re-run the turn; check that before suspecting the gate.",
             },
             Landmine {
                 title: "Fake vs live model is symmetric across skill and local",

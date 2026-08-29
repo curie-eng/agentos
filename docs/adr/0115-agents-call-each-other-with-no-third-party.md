@@ -49,11 +49,19 @@ bearing where they sit:
   `author=f"hook:{hook}"`, and the code says why: an upstream-supplied identity
   there "would let a hook impersonate one to anything downstream that reads the
   field". The reply route comes wholly from the target's binding row, so the
-  answer goes to the target's channel and a caller never sees it. And
-  `_conversation_id` is per hook, so two calls would share one thread and the
-  second would defer behind the first. A caller, a private answer, and
-  concurrency are the three things a call needs, and this surface refuses all
-  three on purpose.
+  answer goes to the target's channel and a caller never sees it. And by
+  default `_conversation_id` is per hook, so two calls would share one thread
+  and the second would defer behind the first. That is the unpartitioned
+  default: an operator can instead enable per-value partitioning for a hook
+  ([ADR-0134](0134-a-hook-shares-one-thread-per-partition.md), Draft), picking
+  which signed-body field names the partition. The operator only chooses that
+  pointer; the *values* come from whoever can sign a delivery, so a configured
+  hook gives a sender-driven number of concurrent threads. That does not
+  change the conclusion here, because concurrency was never the missing piece
+  -- a caller and a private reply route are, and this surface still has
+  neither: the author stays pinned to the hook regardless of partition, and
+  the reply still goes wherever the target's binding row says, never back to
+  whoever signed the delivery.
 - **The channel ingress is for adapters, not agents.** A `chn` token is scoped
   to a binding row so an ingress adapter can enqueue for that binding. It says
   nothing about who asked, and the same reply-routing property applies: the

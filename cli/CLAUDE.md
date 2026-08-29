@@ -115,7 +115,18 @@ Helm and the deployed release with `up`, `status`, `down`, `comms`, `message`,
   working with zero network access beyond the local Docker daemon and the local
   runner container. `skill up` stays offline once the runner image is present
   locally, or when `--image <local-tag>` names a local image. A release binary's
-  default runner image ref is pulled from GHCR on first run. `local deploy` and
+  default runner image ref is pulled from GHCR on first run. A bundle that
+  declares `build:` connectors moves that boundary by exactly one build: `skill
+  up` rebuilds a missing or stale `connectors.lock.yaml` before bring-up
+  (ADR 0113 Decision 3), and that is a `docker build` of the bundle's own
+  Dockerfiles, which reaches whatever they name -- a base image such as
+  `python:3.12-slim`, a `# syntax=` frontend if one is declared, and whatever
+  the Dockerfile's own steps fetch. So for those bundles the guarantee
+  is **offline after the first successful build, while the lock stays
+  current**: a lock whose `source_digest` still matches the tree computes no
+  rebuild and issues no `docker build`, so the verbs above again touch nothing
+  but the local daemon. A bundle that declares no `build:` connectors is
+  unaffected and keeps the zero-network guarantee as written above. `local deploy` and
   `cluster deploy` are the bundle shipping verbs that leave the machine: they
   package the bundle as
   tar.gz and push to the platform API (find-or-create agent, create version,
@@ -201,7 +212,7 @@ Helm and the deployed release with `up`, `status`, `down`, `comms`, `message`,
 ## Verify
 
 ```bash
-cd cli && cargo fmt --check && cargo clippy -- -D warnings && cargo test
+cd cli && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 ```
 The Rust CI job sets `CI_REQUIRE_VALKEY_TESTS` and starts Valkey, so Valkey-backed
 tests execute in CI. Contributors need a reachable Valkey, such as the compose

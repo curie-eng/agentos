@@ -31,19 +31,21 @@ spec:
   template:
     metadata:
       labels:
-        {{- with (include "curie.placement.labels" .Values.placement.platform) }}
+        {{- with (include "curie.placement.labels" (dict "root" $ "class" "platform")) }}
         {{- . | nindent 8 }}
         {{- end }}
         {{- include "curie.labels" . | nindent 8 }}
         {{- include "curie.selectorLabels" (dict "root" . "component" "langfuse-web") | nindent 8 }}
-      {{- with (include "curie.placement.annotations" .Values.placement.platform) }}
+      {{- with (include "curie.placement.annotations" (dict "root" $ "class" "platform")) }}
       annotations:
         {{- . | nindent 8 }}
       {{- end }}
     spec:
-      {{- with (include "curie.placement.spec" .Values.placement.platform) }}
+      {{- with (include "curie.placement.spec" (dict "root" $ "class" "platform")) }}
       {{- . | nindent 6 }}
       {{- end }}
+      {{- if or .Values.langfuse.clickhouseReadiness.enabled .Values.langfuse.web.postgresReadiness.enabled }}
+      initContainers:
       {{- if .Values.langfuse.web.postgresReadiness.enabled }}
       {{- $postgresReadiness := .Values.langfuse.web.postgresReadiness }}
       {{- $readinessSecurityContext := deepCopy (.Values.langfuse.web.containerSecurityContext | default dict) }}
@@ -60,7 +62,6 @@ spec:
       {{- fail (printf "langfuse.web.postgresReadiness.%s must be an integer >= 1" $field) }}
       {{- end }}
       {{- end }}
-      initContainers:
         - name: wait-for-postgres
           image: {{ $postgresReadiness.image | default .Values.postgres.image | quote }}
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
@@ -107,6 +108,14 @@ spec:
               value: {{ .Values.langfuse.web.postgresReadiness.intervalSeconds | quote }}
             - name: POSTGRES_READINESS_PROBE_TIMEOUT_SECONDS
               value: {{ .Values.langfuse.web.postgresReadiness.probeTimeoutSeconds | quote }}
+      {{- end }}
+      {{- if .Values.langfuse.clickhouseReadiness.enabled }}
+        {{- include "curie.langfuse.clickhouseGate" (dict
+             "root" .
+             "image" .Values.langfuse.image.web
+             "containerSecurityContext" .Values.langfuse.web.containerSecurityContext
+             "resources" .Values.langfuse.web.resources) | nindent 8 }}
+      {{- end }}
       {{- end }}
       containers:
         - name: langfuse-web
@@ -190,18 +199,26 @@ spec:
   template:
     metadata:
       labels:
-        {{- with (include "curie.placement.labels" .Values.placement.platform) }}
+        {{- with (include "curie.placement.labels" (dict "root" $ "class" "platform")) }}
         {{- . | nindent 8 }}
         {{- end }}
         {{- include "curie.labels" . | nindent 8 }}
         {{- include "curie.selectorLabels" (dict "root" . "component" "langfuse-worker") | nindent 8 }}
-      {{- with (include "curie.placement.annotations" .Values.placement.platform) }}
+      {{- with (include "curie.placement.annotations" (dict "root" $ "class" "platform")) }}
       annotations:
         {{- . | nindent 8 }}
       {{- end }}
     spec:
-      {{- with (include "curie.placement.spec" .Values.placement.platform) }}
+      {{- with (include "curie.placement.spec" (dict "root" $ "class" "platform")) }}
       {{- . | nindent 6 }}
+      {{- end }}
+      {{- if .Values.langfuse.clickhouseReadiness.enabled }}
+      initContainers:
+        {{- include "curie.langfuse.clickhouseGate" (dict
+             "root" .
+             "image" .Values.langfuse.image.worker
+             "containerSecurityContext" .Values.langfuse.worker.containerSecurityContext
+             "resources" .Values.langfuse.worker.resources) | nindent 8 }}
       {{- end }}
       containers:
         - name: langfuse-worker

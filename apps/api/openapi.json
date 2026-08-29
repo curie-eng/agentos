@@ -1,6 +1,503 @@
 {
   "components": {
     "schemas": {
+      "ActionAuditOut": {
+        "description": "One entry in an action's audit trail: an authorized undo, or a refused one.",
+        "properties": {
+          "action": {
+            "title": "Action",
+            "type": "string"
+          },
+          "action_id": {
+            "format": "uuid",
+            "title": "Action Id",
+            "type": "string"
+          },
+          "actor": {
+            "title": "Actor",
+            "type": "string"
+          },
+          "actor_channel": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actor Channel"
+          },
+          "authorized": {
+            "title": "Authorized",
+            "type": "boolean"
+          },
+          "authorizer": {
+            "title": "Authorizer",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "evidence": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Evidence"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          }
+        },
+        "required": [
+          "id",
+          "action_id",
+          "action",
+          "actor",
+          "actor_channel",
+          "authorizer",
+          "authorized",
+          "reason",
+          "evidence",
+          "created_at"
+        ],
+        "title": "ActionAuditOut",
+        "type": "object"
+      },
+      "ActionComplete": {
+        "description": "The closing frame: what came back, and what it takes to put it back.\n\n``prior_state`` and ``target`` are what a restore replays. Both are optional\nbecause a connector that answers in prose reports neither, and a record that\nholds neither is not undoable -- which is the honest answer rather than a\nmissing one.",
+        "properties": {
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail"
+          },
+          "failed": {
+            "default": false,
+            "title": "Failed",
+            "type": "boolean"
+          },
+          "post_state": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Post State"
+          },
+          "prior_state": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prior State"
+          },
+          "result": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Result"
+          },
+          "target": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target"
+          }
+        },
+        "title": "ActionComplete",
+        "type": "object"
+      },
+      "ActionOut": {
+        "properties": {
+          "agent_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Id"
+          },
+          "arguments": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Arguments"
+          },
+          "call_id": {
+            "title": "Call Id",
+            "type": "string"
+          },
+          "completed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completed At"
+          },
+          "conversation_id": {
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "dedupe_key": {
+            "title": "Dedupe Key",
+            "type": "string"
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail"
+          },
+          "gate_approval_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Gate Approval Id"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "post_state": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Post State"
+          },
+          "prior_state": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prior State"
+          },
+          "result": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Result"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "target": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target"
+          },
+          "tool": {
+            "title": "Tool",
+            "type": "string"
+          },
+          "undoable": {
+            "title": "Undoable",
+            "type": "boolean"
+          },
+          "undone_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Undone At"
+          },
+          "undone_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Undone By"
+          }
+        },
+        "required": [
+          "id",
+          "agent_id",
+          "conversation_id",
+          "call_id",
+          "tool",
+          "arguments",
+          "result",
+          "prior_state",
+          "post_state",
+          "target",
+          "detail",
+          "gate_approval_id",
+          "status",
+          "dedupe_key",
+          "created_at",
+          "completed_at",
+          "undone_at",
+          "undone_by",
+          "undoable"
+        ],
+        "title": "ActionOut",
+        "type": "object"
+      },
+      "ActionRecord": {
+        "description": "The opening frame of a side-effecting call, as the worker forwards it.\n\n``dedupe_key`` is the triggering event id and the call id. The worker\nredelivers at least once (ADR-0013), so a replayed turn must adopt the record\nit already wrote rather than mint a second account of one call.",
+        "properties": {
+          "agent_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Id"
+          },
+          "arguments": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Arguments"
+          },
+          "call_id": {
+            "title": "Call Id",
+            "type": "string"
+          },
+          "conversation_id": {
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "dedupe_key": {
+            "title": "Dedupe Key",
+            "type": "string"
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail"
+          },
+          "gate_approval_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Gate Approval Id"
+          },
+          "tool": {
+            "title": "Tool",
+            "type": "string"
+          }
+        },
+        "required": [
+          "conversation_id",
+          "call_id",
+          "tool",
+          "dedupe_key"
+        ],
+        "title": "ActionRecord",
+        "type": "object"
+      },
+      "ActionRestore": {
+        "description": "The call an authorized undo permits: put this state back on that target.",
+        "properties": {
+          "prior_state": {
+            "additionalProperties": true,
+            "title": "Prior State",
+            "type": "object"
+          },
+          "target": {
+            "additionalProperties": true,
+            "title": "Target",
+            "type": "object"
+          }
+        },
+        "required": [
+          "target",
+          "prior_state"
+        ],
+        "title": "ActionRestore",
+        "type": "object"
+      },
+      "ActionUndo": {
+        "description": "A request to put back what an action changed.\n\n``observed_state`` is the resource as it looks NOW, read by whoever will\nperform the restore. The platform cannot read it itself -- nothing here can\nreach a connector -- and it will not assume: an absent observation is refused\nrather than treated as \"unchanged\".",
+        "properties": {
+          "actor": {
+            "title": "Actor",
+            "type": "string"
+          },
+          "actor_channel": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actor Channel"
+          },
+          "observed_state": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observed State"
+          }
+        },
+        "required": [
+          "actor"
+        ],
+        "title": "ActionUndo",
+        "type": "object"
+      },
+      "ActionUndoOut": {
+        "description": "An authorization, not a receipt.\n\nThe API rules and returns; something else performs the restore (ADR-0117\nleaves where that executor lives undecided). So this names the call to make\nrather than claiming it was made.",
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/ActionOut"
+          },
+          "restore": {
+            "$ref": "#/components/schemas/ActionRestore"
+          }
+        },
+        "required": [
+          "action",
+          "restore"
+        ],
+        "title": "ActionUndoOut",
+        "type": "object"
+      },
       "AgentCreate": {
         "properties": {
           "approval_required_tools": {
@@ -43,6 +540,25 @@
           },
           "channel": {
             "$ref": "#/components/schemas/ChannelBindingWrite"
+          },
+          "hook_partitions": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/HookPartitionConfig"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Hook Partitions"
+          },
+          "memory": {
+            "default": false,
+            "title": "Memory",
+            "type": "boolean"
           },
           "model": {
             "anyOf": [
@@ -125,7 +641,9 @@
           "approval_routes": {
             "anyOf": [
               {
-                "additionalProperties": true,
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/ApprovalRouteBindingOut"
+                },
                 "type": "object"
               },
               {
@@ -146,18 +664,40 @@
             ],
             "title": "Behavior Packs"
           },
-          "channel": {
-            "$ref": "#/components/schemas/ChannelBinding"
+          "channels": {
+            "items": {
+              "$ref": "#/components/schemas/ChannelBindingOut"
+            },
+            "title": "Channels",
+            "type": "array"
           },
           "created_at": {
             "format": "date-time",
             "title": "Created At",
             "type": "string"
           },
+          "hook_partitions": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/HookPartitionConfig"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Hook Partitions"
+          },
           "id": {
             "format": "uuid",
             "title": "Id",
             "type": "string"
+          },
+          "memory": {
+            "title": "Memory",
+            "type": "boolean"
           },
           "model": {
             "anyOf": [
@@ -214,14 +754,16 @@
         "required": [
           "id",
           "name",
-          "channel",
+          "channels",
           "repo_full_name",
           "behavior_packs",
           "model",
           "thinking",
           "approval_required_tools",
           "approval_routes",
+          "hook_partitions",
           "secrets",
+          "memory",
           "created_at"
         ],
         "title": "AgentOut",
@@ -258,8 +800,30 @@
             ],
             "title": "Approval Routes"
           },
-          "channel": {
-            "$ref": "#/components/schemas/ChannelBindingWrite"
+          "hook_partitions": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/HookPartitionConfig"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Hook Partitions"
+          },
+          "memory": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memory"
           },
           "model": {
             "anyOf": [
@@ -331,7 +895,7 @@
       },
       "ApprovalApprovers": {
         "additionalProperties": false,
-        "description": "WHO may resolve a route's approvals (#420), as opposed to the binding's\n``channel``, which is only WHERE the card posts.\n\nDeclaring an approvers block is what lets a request sit in a broad channel\nwhere everyone can see it while only a narrow set may act on it. Omitting it\nkeeps the zero-setup default: the card channel's members are the approvers.",
+        "description": "WHO may resolve a route's approvals (#420), as opposed to the binding's\n``resolution``, which is only WHERE the interactive card posts.\n\nDeclaring an approvers block is what lets a request sit in a broad channel\nwhere everyone can see it while only a narrow set may act on it. Omitting it\nkeeps the zero-setup default: the resolution-card channel's members are the\napprovers. Notification recipients never enter this policy.",
         "properties": {
           "group": {
             "anyOf": [
@@ -360,6 +924,38 @@
           }
         },
         "title": "ApprovalApprovers",
+        "type": "object"
+      },
+      "ApprovalApproversOut": {
+        "description": "Repair-oriented read projection of the stored approver declaration.",
+        "properties": {
+          "group": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Group"
+          },
+          "users": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Users"
+          }
+        },
+        "title": "ApprovalApproversOut",
         "type": "object"
       },
       "ApprovalAuditOut": {
@@ -449,6 +1045,48 @@
           "created_at"
         ],
         "title": "ApprovalAuditOut",
+        "type": "object"
+      },
+      "ApprovalNotificationTarget": {
+        "additionalProperties": false,
+        "description": "A visibility-only approval ping target and its server-side transport.\n\nSlack may use the worker's configured default transport. Every other kind\nneeds the full endpoint/adapter pair at write time, so a declared\nnotification cannot persist as a permanently undeliverable best-effort\nbranch.",
+        "properties": {
+          "adapter": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Adapter"
+          },
+          "address": {
+            "title": "Address",
+            "type": "string"
+          },
+          "endpoint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Endpoint"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "address"
+        ],
+        "title": "ApprovalNotificationTarget",
         "type": "object"
       },
       "ApprovalOut": {
@@ -783,8 +1421,29 @@
         "title": "ApprovalRequest",
         "type": "object"
       },
+      "ApprovalResolutionTarget": {
+        "additionalProperties": false,
+        "description": "The one target permitted to carry an approval-resolving affordance.\n\n``kind`` is an explicit extension point, but it is intentionally Slack-only\nuntil a second adapter can present the scoped verified identity ADR-0096\nrequires. Merely teaching an adapter to render buttons cannot widen this\nauthority boundary.",
+        "properties": {
+          "address": {
+            "title": "Address",
+            "type": "string"
+          },
+          "kind": {
+            "const": "slack",
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "address"
+        ],
+        "title": "ApprovalResolutionTarget",
+        "type": "object"
+      },
       "ApprovalResolve": {
-        "description": "One resolution attempt. Exactly one attempt wins (compare-and-set), and\nthe server-side authorizer (#246) decides first whether this actor may\nresolve at all: self-approval is blocked, and channel membership is proven\nby ``actor_channel`` -- the channel the resolution attempt was made from\n(the card click's channel, relayed by the dispatcher; asserted explicitly\nby API-key operators).",
+        "description": "One resolution attempt. Exactly one attempt wins (compare-and-set), and\nthe server-side authorizer (#246) decides first whether this actor may\nresolve at all: ordinary self-approval is blocked, while a server-linked\npublication requester must still prove membership. ``actor_channel`` is the\nchannel the resolution attempt was made from (the card click's channel,\nrelayed by the dispatcher; asserted explicitly by API-key operators).",
         "properties": {
           "actor_channel": {
             "anyOf": [
@@ -831,7 +1490,7 @@
       },
       "ApprovalRouteBinding": {
         "additionalProperties": false,
-        "description": "One workspace binding for a manifest-declared approval route (#247):\nthe Slack channel whose members are that route's approvers (under the\nchannel-membership authorizer), and optionally the ``approvers`` block that\nnarrows WHO may act (#420), leaving ``channel`` to mean only WHERE the card\nposts.",
+        "description": "One strict workspace binding for a declared approval route (#1460).\n\n``resolution`` is the single verified-identity action surface.\n``notification`` may make the pending request visible elsewhere, but its\nmessage carries no interaction. ``approvers`` continues to narrow WHO may\nact through the resolution card path and is never inferred from notification\nrecipients.",
         "properties": {
           "approvers": {
             "anyOf": [
@@ -843,15 +1502,76 @@
               }
             ]
           },
-          "channel": {
-            "title": "Channel",
+          "notification": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ApprovalNotificationTarget"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "resolution": {
+            "$ref": "#/components/schemas/ApprovalResolutionTarget"
+          }
+        },
+        "required": [
+          "resolution"
+        ],
+        "title": "ApprovalRouteBinding",
+        "type": "object"
+      },
+      "ApprovalRouteBindingOut": {
+        "description": "The required resolution plus optional, redacted visibility policy.",
+        "properties": {
+          "approvers": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ApprovalApproversOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "notification": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ApprovalTargetOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "resolution": {
+            "$ref": "#/components/schemas/ApprovalTargetOut"
+          }
+        },
+        "required": [
+          "resolution"
+        ],
+        "title": "ApprovalRouteBindingOut",
+        "type": "object"
+      },
+      "ApprovalTargetOut": {
+        "description": "Display-safe target identity; stored transport is write-only.\n\nThis is deliberately a tolerant read projection. Write models validate the\nchannel kind/address pair before persistence, while reads must still expose\na malformed historical address so an operator can repair it.",
+        "properties": {
+          "address": {
+            "title": "Address",
+            "type": "string"
+          },
+          "kind": {
+            "title": "Kind",
             "type": "string"
           }
         },
         "required": [
-          "channel"
+          "kind",
+          "address"
         ],
-        "title": "ApprovalRouteBinding",
+        "title": "ApprovalTargetOut",
         "type": "object"
       },
       "BehaviorPacksConfig": {
@@ -1017,9 +1737,9 @@
         "title": "BundleOut",
         "type": "object"
       },
-      "ChannelBinding": {
+      "ChannelBindingOut": {
         "additionalProperties": false,
-        "description": "Where one agent listens: a channel KIND and an ADDRESS (ADR-0096, #1459).\n\nSingular wherever it appears -- one agent binds one channel (ADR-0089) --\nso `AgentCreate`, `AgentUpdate` and `AgentOut` all carry a `channel` OBJECT\nand there is no plural surface anywhere on this API.\n\n`kind` names the adapter that owns the binding, selects the address-shape\ncheck, AND routes: since ADR-0096 phase 2 the worker resolves on the\n`(kind, address)` PAIR, so the two together are the routing key the worker\nmatches on equality (a Slack channel id for `kind=\"slack\"`). One address can\ntherefore be bound twice under two different kinds.",
+        "description": "The READ side of a binding: the stored pair, serialized as it is stored.\n\nDeliberately NOT a subclass of `ChannelBinding`, and that is the whole point.\n`ChannelBinding` carries the address-shape rule three write paths inherit\n(`ChannelBindingWrite`, `ChannelTokenRequest`, `TurnIn`), and it used to be\nthe element type of `AgentOut.channels` as well -- so the rule that guards a\nBIND also ran when an existing row was READ, and one row it rejected failed\nthe whole response for every agent in it (#1914).\n\nAn install reaches that state by upgrading: migration 0021 backfills\n`agent_channels.address` from `agents.slack_channel` verbatim, and that column\nis exactly where a literal `#name` from before the validator lived. So an\ninstall that was merely mis-routed became one whose agent list was\nunavailable, reporting a Pydantic error instead of the bad value.\n\nSerializing a stored row must not re-litigate whether it should have been\nstored. Showing the bad address is also the more useful outcome: an operator\ncannot fix a value the API refuses to tell them.\n\nThe shape stays `{kind, address}`, identical to what `ChannelBinding`\nserialized, so this is not a wire change -- `ChannelBindingWrite`'s docstring\nalready describes that as the read contract.",
         "properties": {
           "address": {
             "title": "Address",
@@ -1034,12 +1754,54 @@
           "kind",
           "address"
         ],
-        "title": "ChannelBinding",
+        "title": "ChannelBindingOut",
+        "type": "object"
+      },
+      "ChannelBindingPatch": {
+        "additionalProperties": false,
+        "description": "A binding move with partial semantics for the write only reply route.\n\n`kind` and `address` always describe the replacement routing key. Omitting\nboth route fields preserves their stored values because callers cannot read\nthem back. Supplying both fields replaces them, including the explicit\n`null` pair that clears the route.",
+        "properties": {
+          "adapter": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Adapter"
+          },
+          "address": {
+            "title": "Address",
+            "type": "string"
+          },
+          "endpoint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Endpoint"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "address"
+        ],
+        "title": "ChannelBindingPatch",
         "type": "object"
       },
       "ChannelBindingWrite": {
         "additionalProperties": false,
-        "description": "The WRITE side of a binding: the public pair plus its reply ROUTE.\n\nA separate model from `ChannelBinding` because that one doubles as\n`AgentOut.channel` in RESPONSES, and the public read contract is exactly\n`{kind, address}` (ADR-0096 phase 2, EB-A18 as relocated). `endpoint` and\n`adapter` are server-controlled facts an operator configures at bind time --\nwhere this kind's replies go back through, and which egress credential\nauthenticates them -- so they are durable on the row and ABSENT from every\nread. A write-side policy on the shared model would 422 valid reads and\nleak a write rule into a read contract.\n\nThree rules, stated here because this is the write path every caller (UI,\nAPI, CLI) passes through; `agent_channels_route_pair_ck` states the first of\nthem at the database for out-of-band writers:\n\n- **Both or neither.** A half-configured route is an operator error that\n  would otherwise surface as a fail-closed escalation mid-turn, in the\n  worker, far from the request that caused it.\n- **Both absent is legal**, for every kind. The 0024 CHECK permits both-NULL,\n  migration 0024 backfills every existing row to exactly that, and the\n  cutover binds the agent first and PATCHes the route in later. The gate for\n  an unroutable binding is `POST /channels/token`, which refuses (409) to\n  mint for a non-`slack` binding with no route -- `slack`'s route is\n  legitimately implicit (the worker's configured Slack origin).\n- **`adapter` is a lowercase slug**, on the same pattern as `kind`, because\n  it is a CONFIG-MAP KEY on the worker\n  (`config.adapter_credentials[route.adapter]`): a value carrying a quote, a\n  space or a `:` is a config-injection shape, not a name.\n- **`endpoint` is an absolute http(s) URL with a host and NO userinfo.** The\n  worker POSTs the platform's AUTHENTICATED reply to this value, so an empty\n  string or a nonsense URL is a binding that mints tokens and passes ingress\n  and then fails closed mid-turn in the worker -- the same E17 failure the\n  route pair exists to foreclose, arriving one layer later. Userinfo\n  (`https://user:pass@host/`) is refused separately: a credential in the\n  stored URL is one git-grep, one log line and one error message away from\n  disclosure, and the `adapter` field is where a credential belongs.\n\nNeither the value nor any part of it appears in the messages below. An\nendpoint can carry a token in its path or query, so error text -- which is\nreturned to the caller and written to logs -- names the FIELD and states the\nrule instead of echoing what was sent.",
+        "description": "The WRITE side of a binding: the public pair plus its reply ROUTE.\n\nA separate model from `ChannelBinding` because that one doubles as the\nelement type of `AgentOut.channels` in RESPONSES, and the read contract is\nexactly\n`{kind, address}` (ADR-0096 phase 2, EB-A18 as relocated). `endpoint` and\n`adapter` are server-controlled facts an operator configures at bind time --\nwhere this kind's replies go back through, and which egress credential\nauthenticates them -- so they are durable on the row and ABSENT from every\nread. A write-side policy on the shared model would 422 valid reads and\nleak a write rule into a read contract.\n\nThree rules, stated here because this is the write path every caller (UI,\nAPI, CLI) passes through; `agent_channels_route_pair_ck` states the first of\nthem at the database for out-of-band writers:\n\n- **Both or neither.** A half-configured route is an operator error that\n  would otherwise surface as a fail-closed escalation mid-turn, in the\n  worker, far from the request that caused it.\n- **Both absent is legal**, for every kind. The 0024 CHECK permits both-NULL,\n  migration 0024 backfills every existing row to exactly that, and the\n  cutover binds the agent first and PATCHes the route in later. The gate for\n  an unroutable binding is `POST /channels/token`, which refuses (409) to\n  mint for a non-`slack` binding with no route -- `slack`'s route is\n  legitimately implicit (the worker's configured Slack origin).\n- **`adapter` is a lowercase slug**, on the same pattern as `kind`, because\n  it is a CONFIG-MAP KEY on the worker\n  (`config.adapter_credentials[route.adapter]`): a value carrying a quote, a\n  space or a `:` is a config-injection shape, not a name.\n- **`endpoint` is an absolute http(s) URL with a host and NO userinfo.** The\n  worker POSTs the platform's AUTHENTICATED reply to this value, so an empty\n  string or a nonsense URL is a binding that mints tokens and passes ingress\n  and then fails closed mid-turn in the worker -- the same E17 failure the\n  route pair exists to foreclose, arriving one layer later. Userinfo\n  (`https://user:pass@host/`) is refused separately: a credential in the\n  stored URL is one git-grep, one log line and one error message away from\n  disclosure, and the `adapter` field is where a credential belongs.\n\nNeither the value nor any part of it appears in the messages below. An\nendpoint can carry a token in its path or query, so error text -- which is\nreturned to the caller and written to logs -- names the FIELD and states the\nrule instead of echoing what was sent.",
         "properties": {
           "adapter": {
             "anyOf": [
@@ -1245,6 +2007,17 @@
             "title": "Agent Id",
             "type": "string"
           },
+          "commit_sha": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Commit Sha"
+          },
           "environment": {
             "$ref": "#/components/schemas/Environment"
           },
@@ -1257,6 +2030,17 @@
             "format": "uuid",
             "title": "Version Id",
             "type": "string"
+          },
+          "workspace_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workspace Enabled"
           }
         },
         "required": [
@@ -1306,6 +2090,10 @@
             "format": "uuid",
             "title": "Version Id",
             "type": "string"
+          },
+          "workspace_enabled": {
+            "title": "Workspace Enabled",
+            "type": "boolean"
           }
         },
         "required": [
@@ -1314,6 +2102,7 @@
           "version_id",
           "environment",
           "commit_sha",
+          "workspace_enabled",
           "status",
           "deployed_at"
         ],
@@ -1917,8 +2706,19 @@
         "type": "object"
       },
       "HookAccepted": {
-        "description": "The hook receipt. ``duplicate`` says whether THIS request enqueued.\n\n``stream_id`` is None only while another request holds the claim and has not\nenqueued yet (the 202 case).",
+        "description": "The hook receipt. ``duplicate`` says whether THIS request enqueued.\n\n``stream_id`` is None only while another request holds the claim and has not\nenqueued yet (the 202 case).\n\n``conversation_id`` is the thread this delivery ACTUALLY landed on. A\npartitioned hook (ADR-0134) mints one id per partition value, and the caller\nhas no other way to learn which of them it got -- it is the last segment of\nthe thread key that ``POST /agents/{agent_id}/threads/{thread_key}/reset``\ntakes, and it is also what the\n``GET /approvals?conversation_id=`` filter takes directly.\n\nOn a DUPLICATE it is read back from the queued turn, never re-derived from\nthis request's body: a retry of the same delivery id may carry a different\npartition value, or the operator may have changed the pointer since, and\neither would name a thread the queued turn never landed on.\n\nIt is None when the landing thread is not knowable from this request: a\npending twin still mid-flight, a stream an operator has trimmed, or the 202\nno-claim case where this request enqueued nothing and nothing is yet known.",
         "properties": {
+          "conversation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Conversation Id"
+          },
           "duplicate": {
             "title": "Duplicate",
             "type": "boolean"
@@ -1942,9 +2742,25 @@
         "required": [
           "event_id",
           "stream_id",
-          "duplicate"
+          "duplicate",
+          "conversation_id"
         ],
         "title": "HookAccepted",
+        "type": "object"
+      },
+      "HookPartitionConfig": {
+        "additionalProperties": false,
+        "description": "How one hook names the thing each delivery is about (ADR-0134).\n\nOne model serves ``AgentCreate``, ``AgentUpdate`` AND ``AgentOut``, which the\n``_StoredWithoutNulls`` tripwire above would otherwise argue against: that\nsplit only happens for models carrying the wrap serializer, and this one has\nneither it nor an optional field, so the dumped and validated shapes are the\nsame and no ``-Input``/``-Output`` pair is generated. Do not add a separate\n``...Out`` variant.",
+        "properties": {
+          "pointer": {
+            "title": "Pointer",
+            "type": "string"
+          }
+        },
+        "required": [
+          "pointer"
+        ],
+        "title": "HookPartitionConfig",
         "type": "object"
       },
       "KillState": {
@@ -2413,6 +3229,337 @@
           "logs"
         ],
         "title": "PodLogs",
+        "type": "object"
+      },
+      "PublicationCreate": {
+        "description": "Trusted snapshot facts used to atomically create approval + publication.",
+        "properties": {
+          "author": {
+            "minLength": 1,
+            "title": "Author",
+            "type": "string"
+          },
+          "base_sha": {
+            "title": "Base Sha",
+            "type": "string"
+          },
+          "body": {
+            "anyOf": [
+              {
+                "maxLength": 65536,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Body"
+          },
+          "changed_paths": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 4096,
+            "minItems": 1,
+            "title": "Changed Paths",
+            "type": "array"
+          },
+          "conversation_id": {
+            "minLength": 1,
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "dedupe_key": {
+            "minLength": 1,
+            "title": "Dedupe Key",
+            "type": "string"
+          },
+          "deployment_id": {
+            "format": "uuid",
+            "title": "Deployment Id",
+            "type": "string"
+          },
+          "expires_in_seconds": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires In Seconds"
+          },
+          "patch_b64": {
+            "minLength": 1,
+            "title": "Patch B64",
+            "type": "string"
+          },
+          "reply_adapter": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reply Adapter"
+          },
+          "reply_channel": {
+            "minLength": 1,
+            "title": "Reply Channel",
+            "type": "string"
+          },
+          "reply_endpoint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reply Endpoint"
+          },
+          "reply_kind": {
+            "minLength": 1,
+            "title": "Reply Kind",
+            "type": "string"
+          },
+          "reply_placeholder": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reply Placeholder"
+          },
+          "repo_full_name": {
+            "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9](?:[A-Za-z0-9._-]{0,98}[A-Za-z0-9_-])?$",
+            "title": "Repo Full Name",
+            "type": "string"
+          },
+          "summary": {
+            "minLength": 1,
+            "title": "Summary",
+            "type": "string"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          }
+        },
+        "required": [
+          "deployment_id",
+          "conversation_id",
+          "repo_full_name",
+          "author",
+          "summary",
+          "reply_kind",
+          "reply_channel",
+          "dedupe_key",
+          "base_sha",
+          "patch_b64",
+          "changed_paths"
+        ],
+        "title": "PublicationCreate",
+        "type": "object"
+      },
+      "PublicationOut": {
+        "description": "Patch-free publication metadata safe for operator and worker reads.",
+        "properties": {
+          "approval_id": {
+            "format": "uuid",
+            "title": "Approval Id",
+            "type": "string"
+          },
+          "base_sha": {
+            "title": "Base Sha",
+            "type": "string"
+          },
+          "body": {
+            "title": "Body",
+            "type": "string"
+          },
+          "changed_paths": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Changed Paths",
+            "type": "array"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "deployment_id": {
+            "format": "uuid",
+            "title": "Deployment Id",
+            "type": "string"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "reply_adapter": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reply Adapter"
+          },
+          "reply_channel": {
+            "title": "Reply Channel",
+            "type": "string"
+          },
+          "reply_endpoint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reply Endpoint"
+          },
+          "reply_kind": {
+            "title": "Reply Kind",
+            "type": "string"
+          },
+          "reply_placeholder": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reply Placeholder"
+          },
+          "repo_full_name": {
+            "title": "Repo Full Name",
+            "type": "string"
+          },
+          "result_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Result Url"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "terminal_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Terminal At"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "approval_id",
+          "deployment_id",
+          "repo_full_name",
+          "status",
+          "version",
+          "base_sha",
+          "changed_paths",
+          "title",
+          "body",
+          "reply_kind",
+          "reply_channel",
+          "reply_placeholder",
+          "reply_endpoint",
+          "reply_adapter",
+          "result_url",
+          "error",
+          "created_at",
+          "updated_at",
+          "terminal_at"
+        ],
+        "title": "PublicationOut",
+        "type": "object"
+      },
+      "RepositoryCredentialOut": {
+        "description": "One server-derived Git credential returned only to the trusted worker.",
+        "properties": {
+          "authorization_header": {
+            "title": "Authorization Header",
+            "type": "string"
+          },
+          "clone_url": {
+            "title": "Clone Url",
+            "type": "string"
+          },
+          "repo_full_name": {
+            "title": "Repo Full Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repo_full_name",
+          "clone_url",
+          "authorization_header"
+        ],
+        "title": "RepositoryCredentialOut",
         "type": "object"
       },
       "ResolveTargetRequest": {
@@ -2922,6 +4069,17 @@
             ],
             "title": "Bundle Ref"
           },
+          "commit_sha": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Commit Sha"
+          },
           "created_by": {
             "title": "Created By",
             "type": "string"
@@ -3097,6 +4255,64 @@
         ],
         "title": "WebhookResult",
         "type": "object"
+      },
+      "WorkspaceCredentialRequest": {
+        "properties": {
+          "conversation_id": {
+            "minLength": 1,
+            "title": "Conversation Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "conversation_id"
+        ],
+        "title": "WorkspaceCredentialRequest",
+        "type": "object"
+      },
+      "WorkspaceSelectionOut": {
+        "properties": {
+          "repo_full_name": {
+            "title": "Repo Full Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repo_full_name"
+        ],
+        "title": "WorkspaceSelectionOut",
+        "type": "object"
+      },
+      "WorkspaceSelectionRequest": {
+        "properties": {
+          "author": {
+            "minLength": 1,
+            "title": "Author",
+            "type": "string"
+          },
+          "conversation_id": {
+            "minLength": 1,
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "repo_full_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Repo Full Name"
+          }
+        },
+        "required": [
+          "conversation_id",
+          "author"
+        ],
+        "title": "WorkspaceSelectionRequest",
+        "type": "object"
       }
     }
   },
@@ -3106,6 +4322,424 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/actions": {
+      "get": {
+        "description": "A conversation's actions, oldest first -- the order a receipt lists them.",
+        "operationId": "list_actions_actions_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "conversation_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Conversation Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "agent_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Agent Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ActionOut"
+                  },
+                  "title": "Response List Actions Actions Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Actions",
+        "tags": [
+          "actions"
+        ]
+      },
+      "post": {
+        "description": "Record a side-effecting call; idempotent on ``dedupe_key``.\n\nCreated ``pending``: the call was made and nothing has come back to say what\nit did, which is also the state a turn that dies mid-call leaves behind.",
+        "operationId": "record_action_actions_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ActionRecord"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Record Action",
+        "tags": [
+          "actions"
+        ]
+      }
+    },
+    "/actions/{action_id}": {
+      "get": {
+        "operationId": "get_action_actions__action_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "action_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Action Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Action",
+        "tags": [
+          "actions"
+        ]
+      }
+    },
+    "/actions/{action_id}/audit": {
+      "get": {
+        "description": "The action's audit trail, oldest first.\n\nA refused undo leaves no trace anywhere else -- the world did not change and\nthe record did not move -- so this is the only place the reason survives.",
+        "operationId": "get_action_audit_actions__action_id__audit_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "action_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Action Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ActionAuditOut"
+                  },
+                  "title": "Response Get Action Audit Actions  Action Id  Audit Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Action Audit",
+        "tags": [
+          "actions"
+        ]
+      }
+    },
+    "/actions/{action_id}/complete": {
+      "post": {
+        "description": "Record what the tool answered.\n\n``prior_state`` and ``target`` are what a restore replays. A completion that\ncarries neither produces a record that is not undoable, which is the honest\nanswer for a connector that replied in prose -- nothing has to declare it.",
+        "operationId": "complete_action_actions__action_id__complete_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "action_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Action Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ActionComplete"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Complete Action",
+        "tags": [
+          "actions"
+        ]
+      }
+    },
+    "/actions/{action_id}/undo": {
+      "post": {
+        "description": "Rule on putting back what this action changed.\n\nA 200 authorizes a restore and names the call that performs it; every other\noutcome is a refusal that changed nothing. The refusals are ordered from the\nrecord's own state outward to the world, so the most specific true reason is\nthe one the operator is told.\n\nAuthorization runs first, before any of the record's own state is examined:\nwhether an actor may undo at all precedes whether this particular undo is\nsafe, and it keeps a refused actor from learning the resource's state through\na conflict message.",
+        "operationId": "undo_action_actions__action_id__undo_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "action_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Action Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ActionUndo"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionUndoOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Undo Action",
+        "tags": [
+          "actions"
+        ]
+      }
+    },
     "/agents": {
       "get": {
         "operationId": "list_agents_agents_get",
@@ -3641,6 +5275,247 @@
         "summary": "Put Budget",
         "tags": [
           "control"
+        ]
+      }
+    },
+    "/agents/{agent_id}/channels": {
+      "delete": {
+        "description": "Unbind the pair, unless it is this agent's last binding.\n\nThe last one is refused: an agent with zero bindings is deployed,\nhealthy-looking and unable to receive a turn -- #38's silent-shadow state,\nand the same reason `AgentCreate.channel` is required rather than optional.\nThe count comes from the locked set, so two concurrent deletes of different\npairs cannot both read \"two left\" and leave the agent at zero.",
+        "operationId": "remove_agent_channel_agents__agent_id__channels_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "kind",
+            "required": true,
+            "schema": {
+              "title": "Kind",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "address",
+            "required": true,
+            "schema": {
+              "title": "Address",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Remove Agent Channel",
+        "tags": [
+          "agents"
+        ]
+      },
+      "patch": {
+        "description": "Move (or re-assert) the binding the `(kind, address)` pair names.\n\n`expected_generation` is an OPTIONAL compare-and-set, in the shape\n`routers/state.py` uses for its versioned rows, so the two CAS surfaces read\nalike. Optional because an operator moving a binding from the CLI has no\ngeneration to quote; a channel adapter holding a token minted against\ngeneration N does, and it is exactly the caller that must not overwrite a\nrebind it never saw.",
+        "operationId": "move_agent_channel_agents__agent_id__channels_patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "kind",
+            "required": true,
+            "schema": {
+              "title": "Kind",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "address",
+            "required": true,
+            "schema": {
+              "title": "Address",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "expected_generation",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Expected Generation"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChannelBindingPatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Move Agent Channel",
+        "tags": [
+          "agents"
+        ]
+      },
+      "post": {
+        "description": "Bind this agent to one more channel. Appends; never moves.",
+        "operationId": "add_agent_channel_agents__agent_id__channels_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChannelBindingWrite"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Add Agent Channel",
+        "tags": [
+          "agents"
         ]
       }
     },
@@ -4263,7 +6138,6 @@
     },
     "/agents/{agent_id}/state": {
       "get": {
-        "description": "List the namespaces an agent has stored, each with its key count and the\nmost recent write time (#250). This is the enumeration the operator's\nread/inspect surface needs on top of get-by-key + list-by-namespace; it stays\nwithin the store's non-goals (no query language, just a grouped summary).\nNamespaces are returned most-recently-written first.\n\nThis route has no ``namespace`` path param, so ``forbid_reserved_namespace``\ncannot gate it; instead the reserved namespaces are filtered out for the\nnarrow app (bundle) token (#856), the enumeration equivalent of that guard.\nThe platform key (the UI inspector) and the broad ``state`` loaders keep full\nreach. ``require_state_access`` is a router-level dependency, so re-declaring\nit here only surfaces the already-resolved caller (FastAPI caches it).",
         "operationId": "list_namespaces_agents__agent_id__state_get",
         "parameters": [
           {
@@ -4320,6 +6194,566 @@
           }
         },
         "summary": "List Namespaces",
+        "tags": [
+          "state"
+        ]
+      }
+    },
+    "/agents/{agent_id}/state/bindings/{kind}/{address}": {
+      "get": {
+        "operationId": "list_namespaces_for_binding_agents__agent_id__state_bindings__kind___address__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "kind",
+            "required": true,
+            "schema": {
+              "title": "Kind",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "address",
+            "required": true,
+            "schema": {
+              "title": "Address",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/StateNamespaceOut"
+                  },
+                  "title": "Response List Namespaces For Binding Agents  Agent Id  State Bindings  Kind   Address  Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Namespaces For Binding",
+        "tags": [
+          "state"
+        ]
+      }
+    },
+    "/agents/{agent_id}/state/bindings/{kind}/{address}/{namespace}": {
+      "get": {
+        "operationId": "list_state_for_binding_agents__agent_id__state_bindings__kind___address___namespace__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "kind",
+            "required": true,
+            "schema": {
+              "title": "Kind",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "address",
+            "required": true,
+            "schema": {
+              "title": "Address",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "namespace",
+            "required": true,
+            "schema": {
+              "title": "Namespace",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/StateEntryOut"
+                  },
+                  "title": "Response List State For Binding Agents  Agent Id  State Bindings  Kind   Address   Namespace  Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List State For Binding",
+        "tags": [
+          "state"
+        ]
+      }
+    },
+    "/agents/{agent_id}/state/bindings/{kind}/{address}/{namespace}/{key}": {
+      "delete": {
+        "operationId": "delete_state_for_binding_agents__agent_id__state_bindings__kind___address___namespace___key__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "kind",
+            "required": true,
+            "schema": {
+              "title": "Kind",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "address",
+            "required": true,
+            "schema": {
+              "title": "Address",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "namespace",
+            "required": true,
+            "schema": {
+              "title": "Namespace",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "title": "Key",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete State For Binding",
+        "tags": [
+          "state"
+        ]
+      },
+      "get": {
+        "operationId": "get_state_for_binding_agents__agent_id__state_bindings__kind___address___namespace___key__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "kind",
+            "required": true,
+            "schema": {
+              "title": "Kind",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "address",
+            "required": true,
+            "schema": {
+              "title": "Address",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "namespace",
+            "required": true,
+            "schema": {
+              "title": "Namespace",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "title": "Key",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StateEntryOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get State For Binding",
+        "tags": [
+          "state"
+        ]
+      },
+      "put": {
+        "operationId": "put_state_for_binding_agents__agent_id__state_bindings__kind___address___namespace___key__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "kind",
+            "required": true,
+            "schema": {
+              "title": "Kind",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "address",
+            "required": true,
+            "schema": {
+              "title": "Address",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "namespace",
+            "required": true,
+            "schema": {
+              "title": "Namespace",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "title": "Key",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StateEntryPut"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StateEntryOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Put State For Binding",
+        "tags": [
+          "state"
+        ]
+      }
+    },
+    "/agents/{agent_id}/state/bindings/{kind}/{address}/{namespace}/{key}/append": {
+      "post": {
+        "operationId": "append_state_for_binding_agents__agent_id__state_bindings__kind___address___namespace___key__append_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "kind",
+            "required": true,
+            "schema": {
+              "title": "Kind",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "address",
+            "required": true,
+            "schema": {
+              "title": "Address",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "namespace",
+            "required": true,
+            "schema": {
+              "title": "Namespace",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "title": "Key",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StateAppendIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StateEntryOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Append State For Binding",
         "tags": [
           "state"
         ]
@@ -4629,7 +7063,6 @@
     },
     "/agents/{agent_id}/state/{namespace}/{key}/append": {
       "post": {
-        "description": "Append an item to a log-shaped (JSON array) entry (#248).\n\nCreates the entry as a single-element array if absent; otherwise the stored\nvalue must already be an array, else the append is a 409. Subject to the\nsame per-value and per-namespace size caps as a put.",
         "operationId": "append_state_agents__agent_id__state__namespace___key__append_post",
         "parameters": [
           {
@@ -6125,6 +8558,56 @@
       }
     },
     "/deployments/{deployment_id}": {
+      "delete": {
+        "operationId": "end_deployment_deployments__deployment_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "deployment_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Deployment Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "End Deployment",
+        "tags": [
+          "deployments"
+        ]
+      },
       "get": {
         "operationId": "get_deployment_deployments__deployment_id__get",
         "parameters": [
@@ -6531,7 +9014,7 @@
     },
     "/hooks/{agent_id}/{hook}": {
       "post": {
-        "description": "Verify one hook delivery and enqueue it as a turn.\n\nOrder, and why each step sits where it does:\n\n1. the hook NAME, validated before anything else, because it is about to be\n   used to build key names;\n2. the size bound, before the signature is computed, so an oversized body is\n   refused without the server ever HMAC-ing it;\n3. the agent row, which unavoidably precedes authentication here (see the\n   module docstring);\n4. the SIGNATURE over the raw body;\n5. the delivery id, checked after authentication so an unsigned caller learns\n   nothing about what this route wants;\n6. routability, then the claim, quota and enqueue.",
+        "description": "Verify one hook delivery and enqueue it as a turn.\n\nOrder, and why each step sits where it does:\n\n1. the hook NAME, validated before anything else, because it is about to be\n   used to build key names -- with ``fullmatch``, since the pattern's ``$``\n   matches before a trailing newline and would let one into those keys;\n2. the size bound, before the signature is computed, so an oversized body is\n   refused without the server ever HMAC-ing it;\n3. the agent row, which unavoidably precedes authentication here (see the\n   module docstring);\n4. the SIGNATURE over the raw body;\n5. the delivery id, checked after authentication so an unsigned caller learns\n   nothing about what this route wants;\n6. the PARTITION this delivery belongs to, if the hook has one (ADR-0134),\n   after both of those and before anything is claimed;\n7. routability, then the claim, quota and enqueue.",
         "operationId": "ingest_hook_hooks__agent_id___hook__post",
         "parameters": [
           {
@@ -6551,6 +9034,38 @@
             "schema": {
               "title": "Hook",
               "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "kind",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Kind"
+            }
+          },
+          {
+            "in": "query",
+            "name": "address",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Address"
             }
           },
           {
@@ -7227,6 +9742,385 @@
         "summary": "Runner Logs",
         "tags": [
           "observability"
+        ]
+      }
+    },
+    "/publications": {
+      "get": {
+        "operationId": "list_publications_publications_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/PublicationOut"
+                  },
+                  "title": "Response List Publications Publications Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Publications",
+        "tags": [
+          "publications"
+        ]
+      }
+    },
+    "/publications/{publication_id}": {
+      "get": {
+        "operationId": "get_publication_publications__publication_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "publication_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Publication Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicationOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Publication",
+        "tags": [
+          "publications"
+        ]
+      }
+    },
+    "/v1/internal/publications": {
+      "post": {
+        "operationId": "create_publication_v1_internal_publications_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PublicationCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicationOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Publication",
+        "tags": [
+          "internal-publications"
+        ]
+      }
+    },
+    "/v1/internal/publications/{publication_id}/credential": {
+      "post": {
+        "operationId": "redeem_publication_credential_v1_internal_publications__publication_id__credential_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "publication_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Publication Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryCredentialOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Redeem Publication Credential",
+        "tags": [
+          "internal-publications"
+        ]
+      }
+    },
+    "/v1/internal/workspaces/{deployment_id}/credential": {
+      "post": {
+        "operationId": "redeem_workspace_credential_v1_internal_workspaces__deployment_id__credential_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "deployment_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Deployment Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkspaceCredentialRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryCredentialOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Redeem Workspace Credential",
+        "tags": [
+          "internal-workspaces"
+        ]
+      }
+    },
+    "/v1/internal/workspaces/{deployment_id}/selection": {
+      "post": {
+        "description": "Select once per agent/thread, or validate and reuse the winner.",
+        "operationId": "select_workspace_repository_v1_internal_workspaces__deployment_id__selection_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "deployment_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Deployment Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkspaceSelectionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceSelectionOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Select Workspace Repository",
+        "tags": [
+          "internal-workspaces"
         ]
       }
     }

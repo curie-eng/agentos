@@ -29,17 +29,17 @@ spec:
   template:
     metadata:
       labels:
-        {{- with (include "curie.placement.labels" .Values.placement.data) }}
+        {{- with (include "curie.placement.labels" (dict "root" $ "class" "data")) }}
         {{- . | nindent 8 }}
         {{- end }}
         {{- include "curie.labels" . | nindent 8 }}
         {{- include "curie.selectorLabels" (dict "root" . "component" "valkey") | nindent 8 }}
-      {{- with (include "curie.placement.annotations" .Values.placement.data) }}
+      {{- with (include "curie.placement.annotations" (dict "root" $ "class" "data")) }}
       annotations:
         {{- . | nindent 8 }}
       {{- end }}
     spec:
-      {{- with (include "curie.placement.spec" .Values.placement.data) }}
+      {{- with (include "curie.placement.spec" (dict "root" $ "class" "data")) }}
       {{- . | nindent 6 }}
       {{- end }}
       {{- with .Values.priorityClasses.platform.name }}

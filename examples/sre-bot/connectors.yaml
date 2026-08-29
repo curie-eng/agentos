@@ -10,19 +10,29 @@
 # WHAT SHIPS ON, AND WHAT SHIPS OFF
 # ---------------------------------------------------------------------------
 #
-#   kubernetes    ON.  Read-only cluster access. The only connector you need to
-#                      make this bot useful, and the only one with no external
-#                      dependency beyond the cluster itself.
-#   k8s-write     OFF. One gated write verb. Needs an image you build, a second
-#                      credential, and an approval route. See README.md,
-#                      "Level up: the gated write path".
-#   grafana       OFF. Logs, metrics, alerts, profiles. Needs a Grafana and a
-#                      Viewer service-account token.
-#   tempo         OFF. Distributed traces. Needs Grafana plus an image you build.
+#   kubernetes    ON.       Read-only cluster access. The only connector you
+#                           need to make this bot useful, and the only one with
+#                           no external dependency beyond the cluster itself.
+#   k8s-write     DECLARED. One gated write verb. Its source build and exact
+#                           approval gate ship together, but its separate
+#                           K8S_WRITE_KUBECONFIG does not. Without that secret,
+#                           bring-up refuses cleanly before any connector starts,
+#                           so read-only operation remains the default. See
+#                           README.md, "Level up: the gated write path".
+#   k8s-scale     DECLARED. One gated, reversible scale verb, on its own
+#                           subresource-scoped identity. Same shape as
+#                           k8s-write: no K8S_SCALE_KUBECONFIG, no scale path.
+#   self-upgrade  DECLARED. One gated verb that starts this bot's own upgrade,
+#                           so it happens when asked rather than on a schedule.
+#                           Needs SELF_UPGRADE_KUBECONFIG and the CronJob it
+#                           starts. Read manifests/upgrade-role.yaml first: its
+#                           grant is the widest in this bundle.
+#   grafana       ON.       Logs, metrics, alerts and profiles from the bundled
+#                           observability stack.
+#   tempo         ON.       Distributed traces from the bundled stack.
 #
-# Turning one on is uncommenting its block and supplying its secret. Turning one
-# off is commenting it back out -- the connector disappears and so do its tools,
-# which is the fastest honest way to remove a capability.
+# Removing a declared connector removes its tools. Remove any matching approval
+# gate in the same change so the bundle remains valid.
 connectors:
   # Read-only Kubernetes: the questions metrics cannot answer. What the
   # scheduler actually said, what a crashed container logged, what a manifest
@@ -61,7 +71,7 @@ connectors:
     # v0.0.66 verified directly: carries --port/--bind-address/--read-only/
     # --disable-destructive/--disable-multi-cluster/--stateless/--kubeconfig,
     # and publishes both amd64 and arm64.
-    image: ghcr.io/containers/kubernetes-mcp-server:v0.0.66
+    image: ghcr.io/containers/kubernetes-mcp-server@sha256:6d650f4bd6ac303ad82713c997e73a2d001602f9bf17392c9b9a0e30e29c6423
     args:
       - --port
       - "8000"
@@ -122,7 +132,7 @@ connectors:
       K8S_READONLY_KUBECONFIG: /secrets/kubeconfig
 
 # ---------------------------------------------------------------------------
-# THE GATED WRITE CONNECTOR -- SHIPS OFF. Uncomment to enable.
+# THE GATED WRITE CONNECTOR -- DECLARED, WITH ITS CREDENTIAL ABSENT BY DEFAULT.
 #
 # What it is: a purpose-built server exposing exactly ONE tool,
 # `restart_deployment`, behind a Curie approval gate. Calling it pauses the
@@ -135,21 +145,29 @@ connectors:
 # exposes one tool, so there is no second thing for a gate to miss. Source and
 # full reasoning: connectors/k8s-write/server.py.
 #
-# ENABLING IT IS NOT JUST UNCOMMENTING. You must:
+# The connector declaration and its gate in `.claude-plugin/plugin.json` ship
+# together. That closes the unsafe intermediate state where the tool exists but
+# its gate does not. It does NOT grant a write path by itself. Before bring-up:
 #
-#   1. Build the image from `connectors/k8s-write/` and push it to a registry
-#      your cluster can pull from. There is no public image for this on purpose
-#      -- the allowlist and the credential are yours, and so is the artifact.
-#      Build it multi-arch; the Dockerfile says why.
-#   2. Apply `manifests/write-role.yaml` (after editing its namespace and
+#   1. Apply `manifests/write-role.yaml` (after editing its namespace and
 #      `resourceNames`) and store the resulting kubeconfig as
 #      K8S_WRITE_KUBECONFIG.
-#   3. Set `image:` below to what you pushed, and `K8S_WRITE_ALLOWLIST` to the
-#      one `namespace/deployment` this bot may roll.
-#   4. Add the approval gate to `.claude-plugin/plugin.json`. It is NOT shipped:
-#      bundle validation rejects a gate that names an undeclared connector, so a
-#      gate for a commented-out connector would fail the build for everyone who
-#      never enables this. README.md carries the exact JSON.
+#   2. Replace the K8S_WRITE_ALLOWLIST placeholder below with the one
+#      `namespace/deployment` this bot may roll.
+#   3. Build and deploy the declared source:
+#
+#          curie build --plugin-dir examples/sre-bot --registry <your-registry>
+#
+#      That builds every connector with a `build:` declaration for every named
+#      platform and records the resolved digests in `connectors.lock.yaml`.
+#      There is no `image:` line to edit: the digest lives in the lock.
+#
+# The missing separate kubeconfig is load-bearing -- but only once a lock file
+# exists. On a genuinely untouched bring-up, the unbuilt connectors.lock.yaml
+# refuses deploy before the secret check is ever reached; once built, the
+# still-missing kubeconfig refuses just as cleanly before either connector
+# starts, instead of silently running a writer with the read credential or an
+# unreviewed target.
 #
 # Full walkthrough: README.md, "Level up: the gated write path".
 #
@@ -161,149 +179,175 @@ connectors:
 # the prefixed form; following it yields a gate that validates, deploys, and
 # never fires.
 #
-#   k8s-write:
-#     # Whatever you built and pushed in step 1. Pinned by digest or an
-#     # immutable tag, never `:latest` -- see the pinning note on `kubernetes`
-#     # above, which is not theoretical.
-#     #
-#     # PACKAGE VISIBILITY, if you push to a registry that has the concept: a
-#     # newly published package is often PRIVATE by default, and an anonymous
-#     # node pull then gets a 403 that surfaces as ImagePullBackOff rather than
-#     # as a permissions error. Verify with an anonymous manifest fetch before
-#     # blaming the cluster.
-#     image: <your-registry>/sre-bot-k8s-write-mcp:v1
-#     unhosted_url: ${K8S_WRITE_MCP_URL}
-#     env:
-#       # Defence in depth alongside the Role's `resourceNames`. A ceiling
-#       # stated in one place only is a ceiling that moves when someone edits
-#       # the other place. Format is `namespace/deployment`, comma-separated.
-#       # EMPTY MEANS THE CONNECTOR REFUSES TO START, not that everything is
-#       # permitted -- a missing config fails closed.
-#       K8S_WRITE_ALLOWLIST: <namespace>/<deployment>
-#     # A SEPARATE kubeconfig from the read-only one, bound to the
-#     # ServiceAccount in manifests/write-role.yaml: one namespace, get+patch on
-#     # exactly the named Deployments. Never the read-only connector's
-#     # credential -- that one is deliberately unable to write, and reusing it
-#     # here would mean widening it.
-#     secret_files:
-#       K8S_WRITE_KUBECONFIG: /secrets/kubeconfig
-# ---------------------------------------------------------------------------
+  k8s-write:
+    # Where the image comes FROM, instead of what it is. `curie build` builds
+    # this context and records the digest it resolved in
+    # `connectors.lock.yaml`; the deploy renders that digest and nothing else,
+    # so the pinning note on `kubernetes` above, which is not theoretical, is
+    # satisfied by construction here rather than by remembering to type an
+    # immutable tag.
+    #
+    # `platforms` is required rather than defaulted, because a silently
+    # single-arch image builds clean, passes CI, and then fails to pull on a
+    # node of the other architecture as "no matching manifest".
+    build:
+      context: connectors/k8s-write
+      platforms: [linux/amd64, linux/arm64]
+    # Deliberately no `unhosted_url`: skill and local runs host this connector,
+    # so they exercise the separate secret requirement instead of silently
+    # dialing an operator-supplied copy. Re-run `curie build --plugin-dir`
+    # after source or declaration changes so the lock matches what is hosted.
+    env:
+      # Defence in depth alongside the Role's `resourceNames`. A ceiling
+      # stated in one place only is a ceiling that moves when someone edits
+      # the other place. Format is `namespace/deployment`, comma-separated.
+      # EMPTY MEANS THE CONNECTOR REFUSES TO START, not that everything is
+      # permitted -- a missing config fails closed.
+      K8S_WRITE_ALLOWLIST: <namespace>/<deployment>
+    # A SEPARATE kubeconfig from the read-only one, bound to the
+    # ServiceAccount in manifests/write-role.yaml: one namespace, get+patch on
+    # exactly the named Deployments. Never the read-only connector's
+    # credential -- that one is deliberately unable to write, and reusing it
+    # here would mean widening it.
+    secret_files:
+      K8S_WRITE_KUBECONFIG: /secrets/kubeconfig
 
 # ---------------------------------------------------------------------------
-# GRAFANA -- SHIPS OFF. Uncomment if you have a Grafana.
+# THE GATED SCALE CONNECTOR -- DECLARED, CREDENTIAL ABSENT BY DEFAULT, AND
+# REVERSIBLE.
 #
-# Adds logs (Loki), metrics (Prometheus), alerts, on-call schedules, profiles,
-# and the ability to run the query behind a dashboard panel. That is a large
-# capability jump and it costs exactly one credential: a service-account token
-# with the **Viewer** role.
+# A second one-tool server rather than a second tool on `k8s-write`, for the
+# reason that file's own docstring gives: it exposes ONE tool and takes no
+# parameter through which a caller could reach a replica count. Adding one there
+# would put caller input into a process whose whole argument is that no caller
+# input reaches the patch body.
 #
-# THE VIEWER ROLE IS THE REAL READ-ONLY ENFORCEMENT. The `-disable-*` flags
-# below are defense in depth: a write returns 403 server-side regardless. But
-# the agent is prompt-injectable, so write-shaped tools should never reach its
-# context at all -- it cannot be talked into calling a tool it cannot see.
+# It is also the NARROWER grant, and that is the interesting part. A rollout
+# restart is a PATCH of the pod template, so RBAC cannot separate it from `set
+# image`; scaling has `deployments/scale` as its own subresource, so
+# `manifests/scale-role.yaml` grants a ceiling Kubernetes itself enforces.
 #
-# Store the token before deploying:
+# REVERSIBLE, which is why it exists at all (ADR-0117). It reads the replica
+# count immediately before it patches and returns it, so the platform records
+# what to restore without asking a model what happened -- and REFUSES TO WRITE if
+# it cannot read one, because an action that happened without a recorded prior
+# state leaves the platform holding a record it cannot act on. A restart cannot
+# do this and says so in prose, which is how a receipt ends up honestly saying
+# "restarting pods cannot be undone" next to "scaled 3 to 10, undo".
 #
-#     curie secrets set GRAFANA_SERVICE_ACCOUNT_TOKEN
-#
-#   grafana:
-#     image: docker.io/grafana/mcp-grafana:1.0.0
-#     args:
-#       - -t
-#       - streamable-http
-#       - -address
-#       - 0.0.0.0:8000
-#       # Curie names the Service, so Curie supplies every name the sandbox may
-#       # dial. Hardcoding these was wrong the moment one bundle served both a
-#       # dev and a prod agent: the names are agent-scoped and differ per agent.
-#       - -allowed-hosts
-#       - ${CURIE_ALLOWED_HOSTS}
-#       # `-enabled-tools` REPLACES the default category list rather than
-#       # extending it, so the default list is repeated VERBATIM here and the
-#       # additions are appended. Naming only the categories you want silently
-#       # drops the rest -- that is how `suggest_loki_alloy_label_config`
-#       # vanished in a first attempt.
-#       #
-#       # `cloudwatch` is OFF in the upstream default list, so it has to be
-#       # named explicitly. Before enabling it, check what identity your
-#       # CloudWatch datasource authenticates as and confirm that identity is
-#       # strictly read-only: the Viewer role does NOT constrain what a
-#       # datasource query can do, because querying datasources is exactly what
-#       # Viewer is for.
-#       #
-#       # `runpanelquery` is the useful addition: it executes the query BEHIND a
-#       # dashboard panel, so "what does the API latency panel actually say
-#       # right now" stops requiring the agent to reconstruct a query it can
-#       # already see. `examples` returns Grafana's own sample queries. Both are
-#       # reads.
-#       - -enabled-tools
-#       - search,datasource,incident,prometheus,loki,alerting,dashboard,folder,oncall,asserts,sift,pyroscope,navigation,proxied,annotations,rendering,snapshot,plugin,api,config,provisioning,cloudwatch,runpanelquery,examples
-#       # The load-bearing one: removes create/update/delete across every group
-#       # in a single flag.
-#       - -disable-write
-#       # grafana_api_request is a generic passthrough to ANY Grafana API
-#       # endpoint. It defeats per-group tool scoping by construction, so it
-#       # goes even though the token would still reject a mutation.
-#       - -disable-api
-#       - -disable-plugin
-#       - -disable-provisioning
-#       - -disable-snapshot
-#       - -disable-admin
-#       - -disable-incident
-#       - -disable-proxied
-#       - -disable-rendering
-#     unhosted_url: ${GRAFANA_MCP_URL}
-#     env:
-#       # ***** THE ONE LINE TO EDIT PER INSTALL. *****
-#       #
-#       # This cannot be a placeholder today. Curie substitutes exactly four
-#       # names in `args`/`env` -- ${CURIE_ALLOWED_HOSTS}, ${CURIE_CONNECTOR_HOST},
-#       # ${CURIE_CONNECTOR_PORT}, ${CURIE_CONNECTOR_URL} -- all derived from the
-#       # Service Curie itself creates, and any other ${...} is rejected at
-#       # validation as `connectors.unknown_placeholder`. None of them carries
-#       # per-environment configuration, and `deploy.yaml` targets bind an agent
-#       # and a channel, not connector env.
-#       #
-#       # So the identical-bundle promise ("only the binding differs") does not
-#       # hold for this value: a second environment must edit this line. Fixing
-#       # it properly needs a platform-side per-target override (ADR-0089
-#       # shape); until that exists, treat this as the one line to change.
-#       GRAFANA_URL: https://grafana.example.com
-#     # NAME only. The value is resolved at deploy time and written to a
-#     # per-agent Kubernetes Secret; it never appears in this repository.
-#     secrets:
-#       - GRAFANA_SERVICE_ACCOUNT_TOKEN
-# ---------------------------------------------------------------------------
+# Before bring-up: apply `manifests/scale-role.yaml`, store the resulting
+# kubeconfig as K8S_SCALE_KUBECONFIG, and replace the allowlist placeholder.
+  k8s-scale:
+    build:
+      context: connectors/k8s-scale
+      platforms: [linux/amd64, linux/arm64]
+    env:
+      # Same ceiling discipline as the write connector, stated in two places on
+      # purpose. EMPTY MEANS EVERY CALL IS REFUSED.
+      K8S_SCALE_ALLOWLIST: <namespace>/<deployment>
+      # A scale is reversible; an outage caused by a typo'd zero is still an
+      # outage. This bounds the upper end; the allowlist bounds the target.
+      K8S_SCALE_MAX_REPLICAS: "50"
+    # A THIRD kubeconfig, bound to the ServiceAccount in
+    # manifests/scale-role.yaml. Never the write connector's -- that one holds
+    # `patch` on `deployments`, and reusing it here would throw away the
+    # subresource ceiling that is this connector's whole security argument.
+    secret_files:
+      K8S_SCALE_KUBECONFIG: /secrets/kubeconfig
 
 # ---------------------------------------------------------------------------
-# TEMPO (DISTRIBUTED TRACES) -- SHIPS OFF, and needs `grafana` on as well.
+# THE GATED SELF-UPGRADE CONNECTOR -- SO THE UPGRADE IS ASKED FOR, NOT SCHEDULED.
 #
-# `mcp-grafana` has no tool that speaks Tempo, so without this the bot can see
-# the datasource in `list_datasources` and never read a span. Three off-the-shelf
-# routes were measured and rejected first -- `proxied`, Sift, and
-# `run_panel_query`, the last of which refuses tempo outright. See
-# connectors/tempo/server.py for what each one actually returned.
+# `self-upgrade/cronjob.yaml` already knows how to redeploy this bot from its
+# repository. What it could not do is happen because someone asked: it ran on a
+# schedule, so the answer to "upgrade yourself" was "wait until :17".
 #
-# It holds the SAME Grafana token as the grafana connector and talks to the same
-# Grafana, just to an endpoint mcp-grafana has no tool for: the datasource
-# proxy. So this adds a capability without adding a credential.
+# This connector is the button. One tool, `upgrade_self`, taking NO ARGUMENTS at
+# all -- the repository, branch, image and command all come from the CronJob's
+# own template, read from the cluster at call time. It starts that Job and
+# returns its name; the bot then watches it with the read-only Kubernetes tools
+# and reports what happened.
 #
-# NO PUBLIC IMAGE. Build it from `connectors/tempo/` and push it to a registry
-# your cluster pulls from, then set `image:` to what you pushed. Pin it by
-# digest or an immutable tag -- a floating `:latest` already cost this connector
-# a CrashLoopBackOff once, when the flags verified at check time were not the
-# flags present at pull time.
+# WHY THE BOT DOES NOT JUST DO THE UPGRADE. Creating an agent version needs the
+# platform API key, and every `/agents/**` route requires it. The sandbox holds a
+# per-turn `state`-scoped token and nothing else, deliberately: that is what
+# makes a successful prompt injection unable to walk away with a credential.
+# Handing the sandbox the platform key to make this work would trade that
+# property for a convenience. So the key stays in the Job, and the bot only ever
+# presses the button.
 #
-#   tempo:
-#     image: <your-registry>/sre-bot-tempo-mcp:v1
-#     unhosted_url: ${TEMPO_MCP_URL}
-#     env:
-#       # Same install-specific line as the grafana block above, same reason.
-#       GRAFANA_URL: https://grafana.example.com
-#       # The Tempo datasource's uid. `__Tempo__` is the server's default and is
-#       # what a provisioned datasource commonly carries; confirm yours with the
-#       # grafana connector's `list_datasources` rather than assuming.
-#       TEMPO_DATASOURCE_UID: __Tempo__
-#     secrets:
-#       - GRAFANA_SERVICE_ACCOUNT_TOKEN
+# THE GRANT IS THE WIDEST IN THIS BUNDLE and manifests/upgrade-role.yaml says so
+# plainly: `create` on `jobs` cannot be narrowed with `resourceNames`, because a
+# create has no name to match. Read that file before installing this.
+#
+# Before bring-up: apply `manifests/upgrade-role.yaml`, store the resulting
+# kubeconfig as SELF_UPGRADE_KUBECONFIG, and install the CronJob (suspended --
+# see self-upgrade/cronjob.yaml) that this starts. Without the credential,
+# bring-up refuses cleanly, exactly like the other two write connectors.
+  self-upgrade:
+    build:
+      context: connectors/self-upgrade
+      platforms: [linux/amd64, linux/arm64]
+    env:
+      # Which upgrade this starts. Must agree with the `resourceNames` in
+      # manifests/upgrade-role.yaml. EMPTY MEANS EVERY CALL IS REFUSED.
+      SELF_UPGRADE_CRONJOB: sre-bot-self-upgrade
+      # The namespace the Curie release runs in. Left unset, the connector reads
+      # its own ServiceAccount namespace, which is the same place -- stated here
+      # so a cross-namespace install does not silently look in the wrong one.
+      SELF_UPGRADE_NAMESPACE: ""
+    # A FOURTH kubeconfig, bound to the ServiceAccount in
+    # manifests/upgrade-role.yaml. Never one of the other three: those are
+    # scoped to the workloads this bot may touch, and this one is scoped to the
+    # platform's own namespace. Reusing either direction would widen both.
+    secret_files:
+      SELF_UPGRADE_KUBECONFIG: /secrets/kubeconfig
 # ---------------------------------------------------------------------------
+
+  # Both grafana and tempo below read GRAFANA_SERVICE_ACCOUNT_TOKEN from the
+  # curie-grafana-connector Secret. Nothing in this bundle creates that
+  # Secret -- `curie example sre-bot install --observability` provisions the
+  # observability stack (see examples/sre-bot/observability/curie-values.yaml)
+  # and the chart mints it from there. A manual `cluster deploy` against a
+  # cluster that never ran that install leaves both connectors in
+  # CreateContainerConfigError with no matching Secret to mount -- and the
+  # deploy still exits 0, so "applied N object(s)" reads as success while
+  # these two are broken.
+  grafana:
+    image: docker.io/grafana/mcp-grafana@sha256:5efeafd01cd7e1aea9c4b0f03305951f2944db8f43e5ae290cce9578c977f241
+    args:
+      - -t
+      - streamable-http
+      - -address
+      - 0.0.0.0:8000
+      - -allowed-hosts
+      - ${CURIE_ALLOWED_HOSTS}
+      - -enabled-tools
+      - search,datasource,incident,prometheus,loki,alerting,dashboard,folder,oncall,asserts,sift,pyroscope,navigation,proxied,annotations,rendering,snapshot,plugin,api,config,provisioning,cloudwatch,runpanelquery,examples
+      - -disable-write
+      - -disable-api
+      - -disable-plugin
+      - -disable-provisioning
+      - -disable-snapshot
+      - -disable-admin
+      - -disable-incident
+      - -disable-proxied
+      - -disable-rendering
+    unhosted_url: ${GRAFANA_MCP_URL}
+    env:
+      GRAFANA_URL: http://grafana.observability.svc.cluster.local
+    secrets:
+      - name: GRAFANA_SERVICE_ACCOUNT_TOKEN
+        from_secret: curie-grafana-connector
+        key: GRAFANA_SERVICE_ACCOUNT_TOKEN
+  tempo:
+    build:
+      context: connectors/tempo
+      platforms: [linux/amd64, linux/arm64]
+    unhosted_url: ${TEMPO_MCP_URL}
+    env:
+      GRAFANA_URL: http://grafana.observability.svc.cluster.local
+    secrets:
+      - name: GRAFANA_SERVICE_ACCOUNT_TOKEN
+        from_secret: curie-grafana-connector
+        key: GRAFANA_SERVICE_ACCOUNT_TOKEN

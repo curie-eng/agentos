@@ -4,10 +4,11 @@
 //! platform API. Task I1; contracts are frozen in packages/aci-protocol and
 //! packages/plugin-format.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::{bail, Result};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use curie::api;
 use curie::artifacts;
 use curie::commands::{
@@ -79,11 +80,232 @@ struct ClusterConn {
     #[arg(long, env = "CURIE_API_KEY")]
     api_key: Option<String>,
     /// Kubernetes namespace of the release. Default: curie.
-    #[arg(long, default_value = "curie")]
+    #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
     namespace: String,
     /// Helm release name. Default: curie.
     #[arg(long, default_value = "curie")]
     release: String,
+}
+
+/// Local API connection flags shared by every observability query leaf. They
+/// intentionally live on the leaves: bare `local observability` remains the
+/// existing URL printer and does not grow a transport contract.
+#[derive(Args, Debug, Clone)]
+struct LocalObservabilityConn {
+    /// Platform API base URL.
+    #[arg(
+        long,
+        default_value = message::DEFAULT_LOCAL_API_URL,
+        env = "CURIE_API_URL"
+    )]
+    api_url: String,
+    /// Platform API key.
+    #[arg(long, default_value = message::DEFAULT_API_KEY, env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default)]
+    api_key: String,
+}
+
+/// Explicit cluster API overrides shared by every observability query leaf.
+/// Namespace and release stay on the parent `cluster observability` command so
+/// self-plumbing and the bare surface report always target the same release.
+#[derive(Args, Debug, Clone)]
+struct ClusterObservabilityConn {
+    /// Platform API base URL. Omit to self-plumb the release API over loopback.
+    #[arg(long, env = "CURIE_API_URL")]
+    api_url: Option<String>,
+    /// Platform API key. Required with --api-url; omit both for release discovery.
+    #[arg(long, env = "CURIE_API_KEY", hide_env_values = true)]
+    api_key: Option<String>,
+}
+
+fn parse_observability_limit(raw: &str) -> std::result::Result<usize, String> {
+    let limit = raw
+        .parse::<usize>()
+        .map_err(|_| "limit must be an integer from 1 through 100".to_string())?;
+    if (1..=100).contains(&limit) {
+        Ok(limit)
+    } else {
+        Err("limit must be from 1 through 100".to_string())
+    }
+}
+
+/// Shared list filters and defaults for the local and cluster sibling leaves.
+#[derive(Args, Debug, Clone)]
+struct ObservabilityRunsArgs {
+    /// Maximum newest-first trace rows to return (1-100).
+    #[arg(long, default_value = "20", value_parser = parse_observability_limit)]
+    limit: usize,
+    /// Restrict traces to one agent id.
+    #[arg(long)]
+    agent_id: Option<String>,
+}
+
+/// Shared detail selector for the local and cluster sibling leaves.
+#[derive(Args, Debug, Clone)]
+struct ObservabilityRunArgs {
+    /// Trace id previously returned by `observability runs` or a completed turn.
+    #[arg(value_parser = api::parse_trace_id)]
+    trace_id: String,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum ObservabilityMetric {
+    Runs,
+    #[value(name = "latency_p95_ms")]
+    LatencyP95Ms,
+    Tokens,
+    #[value(name = "cost_usd")]
+    CostUsd,
+    #[value(name = "error_rate")]
+    ErrorRate,
+}
+
+impl ObservabilityMetric {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Runs => "runs",
+            Self::LatencyP95Ms => "latency_p95_ms",
+            Self::Tokens => "tokens",
+            Self::CostUsd => "cost_usd",
+            Self::ErrorRate => "error_rate",
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum ObservabilityGranularity {
+    Hour,
+    Day,
+    Week,
+}
+
+impl ObservabilityGranularity {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Hour => "hour",
+            Self::Day => "day",
+            Self::Week => "week",
+        }
+    }
+}
+
+/// Shared metrics filters for both tiers. `--granularity` applies only to a
+/// series; omitting it with `--metric` resolves to `day` before the API call.
+#[derive(Args, Debug, Clone)]
+struct ObservabilityMetricsArgs {
+    /// Return a time series for this metric; omit for the scalar summary.
+    #[arg(long, value_enum)]
+    metric: Option<ObservabilityMetric>,
+    /// Series bucket size. Defaults to day when --metric is present.
+    #[arg(long, value_enum)]
+    granularity: Option<ObservabilityGranularity>,
+    /// Optional metrics-window start accepted by the platform API.
+    #[arg(long)]
+    start: Option<String>,
+    /// Optional metrics-window end accepted by the platform API.
+    #[arg(long)]
+    end: Option<String>,
+    /// Restrict metrics to one deployment environment.
+    #[arg(long)]
+    environment: Option<String>,
+    /// Restrict metrics to one agent name.
+    #[arg(long)]
+    agent: Option<String>,
+}
+
+impl ObservabilityMetricsArgs {
+    fn into_query(self) -> Result<curie::observability::ObservabilityQuery> {
+        if self.metric.is_none() && self.granularity.is_some() {
+            return Err(curie::exit::usage(
+                "--granularity requires --metric because summaries are not bucketed",
+            ));
+        }
+        let granularity = self.granularity.unwrap_or(ObservabilityGranularity::Day);
+        Ok(curie::observability::ObservabilityQuery::Metrics {
+            metric: self.metric.map(|metric| metric.as_str().to_string()),
+            granularity: granularity.as_str().to_string(),
+            start: self.start,
+            end: self.end,
+            environment: self.environment,
+            agent: self.agent,
+        })
+    }
+}
+
+/// Local query grammar. Only the connection block differs from the cluster
+/// enum below; every behavioral flag is one of the shared argument structs.
+#[derive(Subcommand, Debug, Clone)]
+enum LocalObservabilityQuery {
+    /// List recent runs, newest first.
+    Runs {
+        #[command(flatten)]
+        query: ObservabilityRunsArgs,
+        #[command(flatten)]
+        conn: LocalObservabilityConn,
+    },
+    /// Read one complete run by trace id.
+    Run {
+        #[command(flatten)]
+        query: ObservabilityRunArgs,
+        #[command(flatten)]
+        conn: LocalObservabilityConn,
+    },
+    /// Read the metrics summary or one bounded metric series.
+    Metrics {
+        #[command(flatten)]
+        query: ObservabilityMetricsArgs,
+        #[command(flatten)]
+        conn: LocalObservabilityConn,
+    },
+}
+
+/// Cluster query grammar. Explicit URL/key values bypass discovery; omitted
+/// values use the same namespace/release discovery as other cluster reads.
+#[derive(Subcommand, Debug, Clone)]
+enum ClusterObservabilityQuery {
+    /// List recent runs, newest first.
+    Runs {
+        #[command(flatten)]
+        query: ObservabilityRunsArgs,
+        #[command(flatten)]
+        conn: ClusterObservabilityConn,
+    },
+    /// Read one complete run by trace id.
+    Run {
+        #[command(flatten)]
+        query: ObservabilityRunArgs,
+        #[command(flatten)]
+        conn: ClusterObservabilityConn,
+    },
+    /// Read the metrics summary or one bounded metric series.
+    Metrics {
+        #[command(flatten)]
+        query: ObservabilityMetricsArgs,
+        #[command(flatten)]
+        conn: ClusterObservabilityConn,
+    },
+}
+
+/// Skill-tier query grammar. The leaves deliberately accept the same query
+/// selectors as the platform tiers so a caller gets the tier-capability answer
+/// (exit 4) instead of an "unknown command" usage error. They never execute a
+/// query: the skill tier has no platform API to read from.
+#[derive(Subcommand, Debug, Clone)]
+enum SkillObservabilityQuery {
+    /// Explain why recent runs cannot be queried at the skill tier.
+    Runs {
+        #[command(flatten)]
+        _query: ObservabilityRunsArgs,
+    },
+    /// Explain why a run cannot be queried by trace id at the skill tier.
+    Run {
+        #[command(flatten)]
+        _query: ObservabilityRunArgs,
+    },
+    /// Explain why metrics cannot be queried at the skill tier.
+    Metrics {
+        #[command(flatten)]
+        _query: ObservabilityMetricsArgs,
+    },
 }
 
 /// An agent-target cluster verb (`versions`/`memory`/`approvals`): the agent plus
@@ -171,6 +393,7 @@ async fn prepare_connectors(
         &rendered.owned_secret_keys,
         &target.scope,
         connector_version.agent_name,
+        &BTreeMap::new(),
     )?
     .bind_target(target)
 }
@@ -201,7 +424,7 @@ async fn resolve_cluster_conn(
     } = conn;
     let api_key = commands::normalize_deploy_api_key(api_key);
     let key_auto_discovered = api_key.is_none();
-    let local_port = message::DEFAULT_API_LOCAL_PORT;
+    let local_port = 0;
     if dry_run {
         return Ok((
             api_url.unwrap_or_else(|| format!("http://localhost:{local_port}")),
@@ -213,14 +436,16 @@ async fn resolve_cluster_conn(
         Some(key) => key,
         None => ops::discover_api_key(&namespace, &release).await?,
     };
-    let (api_url, port_forward) = match commands::deploy_port_forward(
+    let tunnel = commands::deploy_api_tunnel(
         api_url.as_deref(),
         &namespace,
         &release,
         local_port,
         message::API_REMOTE_PORT,
-    ) {
-        Some(pf_cmd) => {
+    )
+    .await;
+    let (api_url, port_forward) = match tunnel {
+        Some((_fullname, pf_cmd)) => {
             let (child, effective_port) =
                 message::start_port_forward(&pf_cmd, local_port, "cluster api").await?;
             (format!("http://127.0.0.1:{effective_port}"), Some(child))
@@ -239,6 +464,89 @@ async fn resolve_cluster_conn(
         }
     };
     Ok((api_url, api_key, port_forward))
+}
+
+async fn run_local_observability_query(
+    action: LocalObservabilityQuery,
+) -> Result<Box<dyn curie::ui::CliOutput>> {
+    let (conn, query) = match action {
+        LocalObservabilityQuery::Runs { query, conn } => (
+            conn,
+            curie::observability::ObservabilityQuery::Runs {
+                limit: query.limit,
+                agent_id: query.agent_id,
+            },
+        ),
+        LocalObservabilityQuery::Run { query, conn } => (
+            conn,
+            curie::observability::ObservabilityQuery::Run {
+                trace_id: query.trace_id,
+            },
+        ),
+        LocalObservabilityQuery::Metrics { query, conn } => (conn, query.into_query()?),
+    };
+    curie::observability::query("local", &conn.api_url, &conn.api_key, query).await
+}
+
+async fn run_cluster_observability_query(
+    action: ClusterObservabilityQuery,
+    namespace: String,
+    release: String,
+) -> Result<Box<dyn curie::ui::CliOutput>> {
+    let (conn, query) = match action {
+        ClusterObservabilityQuery::Runs { query, conn } => (
+            conn,
+            curie::observability::ObservabilityQuery::Runs {
+                limit: query.limit,
+                agent_id: query.agent_id,
+            },
+        ),
+        ClusterObservabilityQuery::Run { query, conn } => (
+            conn,
+            curie::observability::ObservabilityQuery::Run {
+                trace_id: query.trace_id,
+            },
+        ),
+        ClusterObservabilityQuery::Metrics { query, conn } => (conn, query.into_query()?),
+    };
+    if conn.api_url.is_some() && conn.api_key.is_none() {
+        return Err(anyhow::Error::from(
+            curie::exit::CliError::usage(
+                "--api-url requires --api-key for cluster observability queries",
+            )
+            .with_fix(
+                "pass the matching --api-key explicitly, or omit --api-url to use release discovery over a loopback port-forward",
+            ),
+        ));
+    }
+    let api_key = match conn.api_key {
+        Some(key) => key,
+        None => ops::discover_api_key(&namespace, &release).await?,
+    };
+    let local_port = 0;
+    let _port_forward;
+    let tunnel = commands::deploy_api_tunnel(
+        conn.api_url.as_deref(),
+        &namespace,
+        &release,
+        local_port,
+        message::API_REMOTE_PORT,
+    )
+    .await;
+    let api_url = match tunnel {
+        Some((_fullname, command)) => {
+            let (child, effective_port) =
+                message::start_port_forward(&command, local_port, "observability api").await?;
+            _port_forward = Some(child);
+            format!("http://127.0.0.1:{effective_port}")
+        }
+        None => {
+            _port_forward = None;
+            conn.api_url
+                .expect("explicit URL present when no port-forward is planned")
+        }
+    };
+    curie::observability::query("cluster", &api_url, &api_key, query).await
 }
 
 /// clap `value_parser` for every `--local-model` (#1254). All four sites carry the
@@ -293,6 +601,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Scaffold a keyless first reply, using a saved or environment model credential when available.
+    Try {
+        /// Keep the standard scaffold in ./curie-demo for normal skill commands.
+        #[arg(long)]
+        keep: bool,
+    },
     /// Scaffold a new plugin bundle (Claude Code plugin shape).
     Init {
         /// Kebab-case plugin name (e.g. deal-desk). Omit when using --from-spec.
@@ -312,7 +626,8 @@ enum Command {
         )]
         adopt: Option<PathBuf>,
     },
-    /// Work with a local runner session for a plugin bundle:
+    /// Work with the runner only tier for a plugin bundle. `skill` names that tier, not a
+    /// bundle skill artifact at `skills/<name>/SKILL.md`. Subcommands:
     /// `skill <up|down|status|message|eval|approvals>`. `versions` and `memory`
     /// are answered here too, reporting that this tier has neither.
     Skill {
@@ -328,6 +643,11 @@ enum Command {
     Cluster {
         #[command(subcommand)]
         action: ClusterAction,
+    },
+    /// Install a complete first party example workflow.
+    Example {
+        #[command(subcommand)]
+        action: ExampleAction,
     },
     /// List locally-authored agent bundles under `agents/` (source checkout
     /// only) -- a personal, gitignored directory (sibling of `examples/`) for
@@ -354,8 +674,9 @@ enum Command {
         #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", value_parser = message::api_key_or_default)]
         api_key: String,
         /// Slack channel to bind the agent to. On first create it defaults to
-        /// C0LOCALDEV; on redeploy it is only moved when you pass this flag, so
-        /// omitting it leaves the deployed agent's channel untouched.
+        /// C0LOCALDEV; on redeploy the channel is ADDED when the agent is not
+        /// already bound to it, never moved and never removed, so omitting the
+        /// flag leaves the deployed agent's binding set untouched.
         #[arg(long)]
         slack_channel: Option<String>,
         /// Bind this agent to a GitHub repository (`owner/name`) so pushes to
@@ -382,16 +703,32 @@ enum Command {
         #[arg(long = "secret", value_name = "NAME")]
         secret: Vec<String>,
     },
-    /// Build the runner image locally from `runner/Dockerfile` (source checkout only).
+    /// Build the runner image, or an agent bundle's declared connectors.
     ///
-    /// Runs `docker build -f runner/Dockerfile -t <tag> .` from the repo root. A
-    /// release binary pulls the pinned runner image from GHCR automatically and
-    /// never needs this; it errors clearly if Docker is missing or there is no
-    /// repo checkout.
+    /// With no flags it runs `docker build -f runner/Dockerfile -t <tag> .` from
+    /// the repo root (source checkout only; a release binary pulls the pinned
+    /// runner image from GHCR automatically and never needs this).
+    ///
+    /// With `--plugin-dir <PATH>` it builds every connector that bundle's
+    /// `connectors.yaml` declares from source and writes `connectors.lock.yaml`
+    /// beside it. With `--registry <REF>` it builds every declared platform,
+    /// pushes, and records the registry manifest digest, which is what a cluster
+    /// deploy requires. Without `--registry` it builds the host platform only
+    /// into the local Docker daemon and records the local image id, which is
+    /// usable at the skill and local tiers and refused at cluster.
     Build {
         /// Image tag to build.
-        #[arg(long, default_value = docker::RUNNER_IMAGE)]
+        #[arg(long, default_value = docker::RUNNER_IMAGE, conflicts_with = "plugin_dir")]
         tag: String,
+        /// Build the connectors this agent bundle declares.
+        #[arg(long, value_name = "PATH")]
+        plugin_dir: Option<PathBuf>,
+        /// Push a multi-platform index to this registry (e.g. ghcr.io/acme-corp).
+        #[arg(long, value_name = "REF", requires = "plugin_dir")]
+        registry: Option<String>,
+        /// Replace a registry lock with a local-daemon one deliberately.
+        #[arg(long, requires = "plugin_dir")]
+        force: bool,
     },
     /// Bootstrap or update a dev checkout: install deps and build, start nothing (source checkout only).
     ///
@@ -519,7 +856,7 @@ enum Command {
         connector: String,
         /// The environment variable name the connector reads it as.
         env_name: String,
-        #[arg(long, default_value = "curie")]
+        #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
         namespace: String,
         #[arg(long, default_value = "curie")]
         release: String,
@@ -571,6 +908,50 @@ enum Command {
         /// it at the same chart `curie apply --chart` would use.
         #[arg(long)]
         chart: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ExampleAction {
+    /// Install the self referential SRE bot example.
+    SreBot {
+        #[command(subcommand)]
+        action: SreBotAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum SreBotAction {
+    /// Install Curie, its observability stack, and the SRE bot bundle.
+    Install {
+        /// Install the fixed self referential Grafana, Loki, Alloy, Tempo, and Prometheus stack.
+        #[arg(long, required = true)]
+        observability: bool,
+        /// Print the ordered plan without mutating the cluster.
+        #[arg(long)]
+        dry_run: bool,
+        /// Bind the installed bot to this Slack channel.
+        #[arg(long, value_name = "CHANNEL")]
+        slack_channel: Option<String>,
+        /// Scope the approval-gated restart tool to these Deployments
+        /// (`namespace/name`, comma separated). One list renders BOTH ceilings:
+        /// the Role's resourceNames and the connector's K8S_WRITE_ALLOWLIST.
+        /// Omit and the connector is still installed, gated, with an empty
+        /// ceiling that refuses every call until targets are named.
+        #[arg(long, value_name = "NS/NAME[,NS/NAME]")]
+        write_allowlist: Option<String>,
+        /// Leave the gated write connector out of the install entirely.
+        #[arg(long)]
+        no_write: bool,
+        /// Kubernetes namespace of the Curie release. Default: curie.
+        #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
+        namespace: String,
+        /// Helm release name of the Curie install. Default: curie.
+        #[arg(long, default_value = "curie")]
+        release: String,
+        /// Kubernetes namespace of the retained observability stack. Default: observability.
+        #[arg(long, default_value = "observability")]
+        observability_namespace: String,
     },
 }
 
@@ -653,6 +1034,10 @@ enum DevAction {
     /// downstream of `field-parity`, `bash cli/scripts/check-emit-parity.sh`).
     /// Offline, no credential.
     EmitParity,
+    /// Assert sibling CLI verbs expose matching conversation controls across
+    /// the skill, local, and cluster tiers (#1666,
+    /// `bash cli/scripts/check-verb-parity.sh`). Offline, no credential.
+    VerbParity,
     /// Refresh the ADR-0101 schema compatibility baseline (cli/schema/baseline/).
     /// Refuses when a schema changed shape without a version bump.
     SchemaBaseline,
@@ -862,25 +1247,24 @@ enum SkillAction {
         /// declined cleanly at this tier.
         #[arg(long)]
         reject: bool,
-        /// Bind an approval route to a channel. Accepted so it can be DECLINED
-        /// with a reason rather than error like a typo: a route binding is
-        /// per-agent platform config, and the skill tier has no platform.
-        #[arg(long = "route", value_name = "NAME=CHANNEL")]
-        route: Vec<String>,
+        /// Bind a route's verified Slack resolution card. Accepted so it can be
+        /// DECLINED with a reason: the skill tier has no platform agent record.
+        #[arg(long = "route-resolution", value_name = "NAME=CHANNEL")]
+        route_resolution: Vec<String>,
         /// Narrow a route's approvers. Declined at this tier for the same reason
-        /// as --route.
+        /// as --route-resolution.
         #[arg(long = "route-approvers", value_name = "NAME=KIND:VALUES")]
         route_approvers: Vec<String>,
-        /// Read the route map from a JSON file. Declined at this tier for the
-        /// same reason as --route.
+        /// Read the complete route map, including optional notifications, from
+        /// JSON. Declined at this tier for the same reason as --route-resolution.
         #[arg(long = "routes-from", value_name = "FILE")]
         routes_from: Option<PathBuf>,
         /// Show the agent's route bindings. Declined at this tier for the same
-        /// reason as --route.
+        /// reason as --route-resolution.
         #[arg(long)]
         list_routes: bool,
         /// Remove every route binding. Declined at this tier for the same reason
-        /// as --route.
+        /// as --route-resolution.
         #[arg(long)]
         clear_routes: bool,
     },
@@ -897,6 +1281,17 @@ enum SkillAction {
         commands::MEMORY_REASON, commands::MEMORY_ALT,
     ))]
     Memory,
+    #[command(about = format!(
+        "Not available at this tier: {}; {}",
+        commands::OBSERVABILITY_REASON, commands::OBSERVABILITY_ALT,
+    ))]
+    Observability {
+        /// Optional so the bare form (no leaf) reaches the exit-4 capability
+        /// refusal below instead of dying as a clap usage error (issue
+        /// #1955, ADR-0041).
+        #[command(subcommand)]
+        _query: Option<SkillObservabilityQuery>,
+    },
     /// Stop and remove the local runner container.
     Down {
         /// Container name to remove. Defaults to the recorded runner, then to
@@ -924,6 +1319,9 @@ enum SkillAction {
         /// Runner base URL (defaults to the started runner, then localhost).
         #[arg(long)]
         url: Option<String>,
+        /// Reuse the runner's current conversation instead of starting fresh.
+        #[arg(long = "continue")]
+        r#continue: bool,
     },
     /// Run the bundle's eval cases through the local runner.
     Eval {
@@ -990,6 +1388,10 @@ enum LocalAction {
         /// Bring up only the 7 core services (skip Langfuse/ClickHouse/OTel/UI).
         #[arg(long)]
         minimal: bool,
+        /// Model id, forwarded as CURIE_MODEL. Omit for the SDK default.
+        /// Setting it makes token usage attributable in Langfuse traces.
+        #[arg(long, conflicts_with = "local_model")]
+        model: Option<String>,
         /// Run the named model through local Ollama.
         #[arg(
             long,
@@ -1015,6 +1417,25 @@ enum LocalAction {
         /// and the value never reaches argv or logs (#749).
         #[arg(long = "env-file", value_name = "PATH")]
         env_file: Option<PathBuf>,
+        /// Build the stack's images from THIS checkout instead of pulling the
+        /// published ones, and run them (#1915).
+        ///
+        /// `curie update` refreshes the CLI and the runner image; nothing
+        /// refreshed api, worker, ui or dispatcher, so a contributor on a feature
+        /// branch ran a source-built CLI against whatever the registry last
+        /// published. The skew does not announce itself: it surfaces as a serde
+        /// error about a field name, or `No module named` from inside a
+        /// container. Builds only what the selected profiles run.
+        ///
+        /// Requires a compose file that substitutes the image tags, so a
+        /// release-channel curie must pass `-f compose.dev.yaml` (#1926).
+        ///
+        /// The tag survives the command: `rebuild`, `comms` and a later plain
+        /// `up` read it back off the running api container, so they recreate
+        /// services onto what this built rather than silently re-resolving every
+        /// image to `:latest` (#1925).
+        #[arg(long)]
+        build: bool,
     },
     /// Rebuild + recreate ONE compose service (e.g. after a code change) without
     /// losing the stack's already-resolved credential/model-mode wiring.
@@ -1024,6 +1445,10 @@ enum LocalAction {
     /// `${VAR-default}` substitution reads THIS invocation's shell, not what the
     /// rest of the stack is running with -- export the same credential /
     /// CURIE_FAKE_MODEL you want, same as `local up`.
+    ///
+    /// The image tag is the exception: it is read back off the running api
+    /// container rather than the shell, so a service rebuilt against a stack
+    /// started with `local up --build` comes back on that build's tag (#1925).
     Rebuild {
         /// The compose service to rebuild, e.g. `curie-worker`.
         service: String,
@@ -1036,6 +1461,10 @@ enum LocalAction {
         /// Match how `local up` brought the stack up (core-only vs full).
         #[arg(long)]
         minimal: bool,
+        /// Model id, forwarded as CURIE_MODEL. Omit for the SDK default.
+        /// Match the explicit model used by `local up`.
+        #[arg(long, conflicts_with = "local_model")]
+        model: Option<String>,
         /// Match how `local up` brought the stack up (--local-model, if used).
         #[arg(
             long,
@@ -1092,6 +1521,9 @@ enum LocalAction {
         /// The stack runs only the 7 core services (skip Langfuse/ClickHouse/OTel/UI). Must match how `local up` brought it up.
         #[arg(long)]
         minimal: bool,
+        /// Match the explicit model used by `local up`. Defaults from CURIE_MODEL.
+        #[arg(long, env = "CURIE_MODEL")]
+        model: Option<String>,
         /// Slack app token. Defaults from SLACK_APP_TOKEN.
         #[arg(
             long,
@@ -1119,9 +1551,9 @@ enum LocalAction {
     Message {
         /// The user message text.
         text: String,
-        /// Slack channel id to send as; must match the target agent's
-        /// channel. Omit to use the sole deployed agent's channel (errors
-        /// if zero or multiple agents are deployed).
+        /// Slack channel id to send as; must match one of the target agent's
+        /// channels. Omit when exactly one channel is bound across all
+        /// deployed agents (errors on zero or several).
         #[arg(long)]
         channel: Option<String>,
         /// Existing thread ts to continue a conversation; omit to start a new
@@ -1176,8 +1608,9 @@ enum LocalAction {
         /// of greening an empty run.
         #[arg(long = "case-id", value_name = "ID")]
         case_id: Vec<String>,
-        /// Slack channel id to send as; must match the target agent's
-        /// channel. Omit to use the sole deployed agent's channel.
+        /// Slack channel id to send as; must match one of the target agent's
+        /// channels. Omit when exactly one channel is bound across all
+        /// deployed agents.
         #[arg(long)]
         channel: Option<String>,
         /// Valkey password (compose default `valkeypass`). Prefer the
@@ -1253,8 +1686,9 @@ enum LocalAction {
         #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", value_parser = message::api_key_or_default)]
         api_key: String,
         /// Slack channel to bind the agent to. On first create it defaults to
-        /// C0LOCALDEV; on redeploy it is only moved when you pass this flag, so
-        /// omitting it leaves the deployed agent's channel untouched.
+        /// C0LOCALDEV; on redeploy the channel is ADDED when the agent is not
+        /// already bound to it, never moved and never removed, so omitting the
+        /// flag leaves the deployed agent's binding set untouched.
         #[arg(long)]
         slack_channel: Option<String>,
         /// Bind this agent to a GitHub repository (`owner/name`) so pushes to
@@ -1268,6 +1702,13 @@ enum LocalAction {
         /// it; a warning names the binding it kept.
         #[arg(long = "repo", value_name = "OWNER/NAME")]
         repo: Option<String>,
+        /// Let each new session select an allowed GitHub repository from the
+        /// opening message and materialize it as managed /workspace.
+        #[arg(long, conflicts_with = "no_workspace")]
+        workspace: bool,
+        /// Explicitly disable a previously configured managed workspace.
+        #[arg(long, conflicts_with = "workspace")]
+        no_workspace: bool,
         /// Target environment. Defaults to dev; a `--target` supplies it
         /// instead, and an explicit value here still wins over the target.
         #[arg(long, value_enum)]
@@ -1331,19 +1772,20 @@ enum LocalAction {
         /// channel-authorized approval gates (with --resolve).
         #[arg(long)]
         actor_channel: Option<String>,
-        /// Bind a manifest approval route to the channel its card posts in, as
+        /// Bind a manifest route's verified Slack resolution card, as
         /// NAME=CHANNEL (e.g. deal_desk=C0123ABCD). Repeatable. A write REPLACES
         /// the whole route map, like --gate does for tool gates.
-        #[arg(long = "route", value_name = "NAME=CHANNEL")]
-        route: Vec<String>,
-        /// Narrow WHO may resolve a route, independently of where its card posts,
+        #[arg(long = "route-resolution", value_name = "NAME=CHANNEL")]
+        route_resolution: Vec<String>,
+        /// Narrow WHO may resolve a route, independently of its resolution target,
         /// as NAME=users:U1,U2 or NAME=group:S1. Repeatable. Omit to leave the
-        /// card channel's members as the approvers.
+        /// resolution card's channel members as the approvers.
         #[arg(long = "route-approvers", value_name = "NAME=KIND:VALUES")]
         route_approvers: Vec<String>,
         /// Read the whole route map from a JSON file, e.g.
-        /// {"deal_desk": {"channel": "C0123ABCD"}}. The repeatable flags apply on
-        /// top of it.
+        /// {"deal_desk":{"resolution":{"kind":"slack","address":"C0123ABCD"}}}.
+        /// Notifications, including endpoint+adapter transport, are declared in
+        /// this strict map. The repeatable override flags apply on top of it.
         #[arg(long = "routes-from", value_name = "FILE")]
         routes_from: Option<PathBuf>,
         /// Show the agent's approval route bindings instead of its tool gates.
@@ -1355,6 +1797,10 @@ enum LocalAction {
     },
     /// Show the local observability surfaces (Curie Console + Langfuse traces/cost + API base).
     Observability {
+        /// Query platform observability data through the Curie API. Omit to
+        /// preserve the existing URL/surface report.
+        #[command(subcommand)]
+        query: Option<LocalObservabilityQuery>,
         /// Also open the browsable surfaces in a browser. Off by default: the URLs
         /// are printed and nothing is opened unless --open is passed, and --json
         /// never opens a browser.
@@ -1388,6 +1834,30 @@ enum LocalAction {
         api_key: String,
         #[arg(long)]
         dry_run: bool,
+    },
+    /// List, add, or remove an agent's surfaces
+    /// (`/agents/{id}/channels`).
+    ///
+    /// With no flags this lists. An agent holds one or more bindings
+    /// (ADR-0118), so exactly one `--add` OR one `--remove` is applied per
+    /// invocation: the API has no batch endpoint, and a half-applied batch
+    /// would leave the operator guessing what took.
+    Surfaces {
+        #[command(flatten)]
+        target: AgentTarget<LocalTier>,
+        /// Add this surface, as KIND=ADDRESS (e.g. slack=C0EXAMPLE1).
+        #[arg(long, value_name = "KIND=ADDRESS")]
+        add: Option<String>,
+        /// Reply HTTP endpoint for a non-Slack adapter. Requires --adapter.
+        #[arg(long, requires_all = ["add", "adapter"])]
+        endpoint: Option<String>,
+        /// Worker credential selector for the reply adapter. Requires --endpoint.
+        #[arg(long, requires_all = ["add", "endpoint"])]
+        adapter: Option<String>,
+        /// Remove this surface, as KIND=ADDRESS. The API refuses to remove an
+        /// agent's final surface.
+        #[arg(long, value_name = "KIND=ADDRESS", conflicts_with = "add")]
+        remove: Option<String>,
     },
     /// Set an agent's daily budget (`PUT /agents/{id}/budget`).
     Budget {
@@ -1437,7 +1907,8 @@ enum LocalAction {
     ResetThread {
         /// Agent name or id (scopes the action; the release is thread-keyed).
         agent: String,
-        /// The thread key to reset (e.g. the Slack thread ts).
+        /// The worker's composed key: kind:channel:thread-ts (e.g.
+        /// slack:C0EXAMPLE1:1700000000.000100).
         #[arg(long, value_name = "THREAD_KEY")]
         thread_key: String,
         #[arg(long, default_value = "http://localhost:28000", env = "CURIE_API_URL")]
@@ -1447,6 +1918,25 @@ enum LocalAction {
         /// Confirm the action; it interrupts any live turn on the thread.
         #[arg(long)]
         yes: bool,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Delete an agent via the local platform API.
+    Delete {
+        /// Agent name or id to delete.
+        agent: String,
+        #[arg(
+            long,
+            default_value = message::DEFAULT_LOCAL_API_URL,
+            env = "CURIE_API_URL"
+        )]
+        api_url: String,
+        #[arg(long, default_value = message::DEFAULT_API_KEY, env = "CURIE_API_KEY", value_parser = message::api_key_or_default)]
+        api_key: String,
+        /// Confirm this destructive action.
+        #[arg(long)]
+        yes: bool,
+        /// Print what would be done and exit without making a request.
         #[arg(long)]
         dry_run: bool,
     },
@@ -1469,7 +1959,7 @@ enum ClusterAction {
     /// security.gvisor.mode=off and retries once. Every inferred value is printed.
     Up {
         /// Kubernetes namespace.
-        #[arg(long, default_value = "curie")]
+        #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
         namespace: String,
         /// Helm release name.
         #[arg(long, default_value = "curie")]
@@ -1484,6 +1974,10 @@ enum ClusterAction {
         /// is set (dev/CI escape hatch); suppresses the fake-model warning.
         #[arg(long)]
         fake_model: bool,
+        /// Model id, forwarded as CURIE_MODEL. Omit for the SDK default.
+        /// Setting it makes token usage attributable in Langfuse traces.
+        #[arg(long, conflicts_with = "local_model")]
+        model: Option<String>,
         /// Run the named model through the chart inference deployment.
         #[arg(
             long,
@@ -1553,7 +2047,7 @@ enum ClusterAction {
     /// the agents.x-k8s.io CRDs are left in place.
     Down {
         /// Kubernetes namespace.
-        #[arg(long, default_value = "curie")]
+        #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
         namespace: String,
         /// Helm release name.
         #[arg(long, default_value = "curie")]
@@ -1589,7 +2083,7 @@ enum ClusterAction {
         #[arg(long, requires = "revision")]
         allow_failed_revision: bool,
         /// Kubernetes namespace.
-        #[arg(long, default_value = "curie")]
+        #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
         namespace: String,
         /// Helm release name.
         #[arg(long, default_value = "curie")]
@@ -1635,7 +2129,7 @@ enum ClusterAction {
         #[arg(long, value_parser = ["export", "import"])]
         phase: Option<String>,
         /// Kubernetes namespace.
-        #[arg(long, default_value = "curie")]
+        #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
         namespace: String,
         /// Helm release name.
         #[arg(long, default_value = "curie")]
@@ -1659,7 +2153,7 @@ enum ClusterAction {
     /// Report release health and access URLs (read-only: helm status + kubectl).
     Status {
         /// Kubernetes namespace.
-        #[arg(long, default_value = "curie")]
+        #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
         namespace: String,
         /// Helm release name.
         #[arg(long, default_value = "curie")]
@@ -1670,11 +2164,15 @@ enum ClusterAction {
     },
     /// Show the release's observability surfaces (Curie Console + Langfuse traces/cost + API base).
     Observability {
+        /// Query platform observability data through the Curie API. Omit to
+        /// preserve the existing URL/surface report.
+        #[command(subcommand)]
+        query: Option<ClusterObservabilityQuery>,
         /// Kubernetes namespace.
-        #[arg(long, default_value = "curie")]
+        #[arg(long, global = true, default_value = "curie", env = "CURIE_NAMESPACE")]
         namespace: String,
         /// Helm release name.
-        #[arg(long, default_value = "curie")]
+        #[arg(long, global = true, default_value = "curie")]
         release: String,
         /// Print the read-only discovery commands that would run and exit.
         #[arg(long)]
@@ -1711,7 +2209,7 @@ enum ClusterAction {
         )]
         bot_token: String,
         /// Kubernetes namespace.
-        #[arg(long, default_value = "curie")]
+        #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
         namespace: String,
         /// Helm release name.
         #[arg(long, default_value = "curie")]
@@ -1747,7 +2245,7 @@ enum ClusterAction {
         #[arg(long)]
         disconnect: bool,
         /// Kubernetes namespace.
-        #[arg(long, default_value = "curie")]
+        #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
         namespace: String,
         /// Helm release name.
         #[arg(long, default_value = "curie")]
@@ -1763,9 +2261,9 @@ enum ClusterAction {
     Message {
         /// The user message text.
         text: String,
-        /// Slack channel id to send as; must match the target agent's
-        /// channel. Omit to use the sole deployed agent's channel (errors
-        /// if zero or multiple agents are deployed).
+        /// Slack channel id to send as; must match one of the target agent's
+        /// channels. Omit when exactly one channel is bound across all
+        /// deployed agents (errors on zero or several).
         #[arg(long)]
         channel: Option<String>,
         /// Existing thread ts to continue a conversation; omit to start a new
@@ -1778,7 +2276,7 @@ enum ClusterAction {
         #[arg(long = "continue")]
         r#continue: bool,
         /// Kubernetes namespace of the release. Default: curie.
-        #[arg(long)]
+        #[arg(long, env = "CURIE_NAMESPACE")]
         namespace: Option<String>,
         /// Helm release name. Default: curie.
         #[arg(long)]
@@ -1846,12 +2344,13 @@ enum ClusterAction {
         /// of greening an empty run.
         #[arg(long = "case-id", value_name = "ID")]
         case_id: Vec<String>,
-        /// Slack channel id to send as; must match the target agent's
-        /// channel. Omit to use the sole deployed agent's channel.
+        /// Slack channel id to send as; must match one of the target agent's
+        /// channels. Omit when exactly one channel is bound across all
+        /// deployed agents.
         #[arg(long)]
         channel: Option<String>,
         /// Kubernetes namespace of the release. Default: curie.
-        #[arg(long, default_value = "curie")]
+        #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
         namespace: String,
         /// Helm release name. Default: curie.
         #[arg(long, default_value = "curie")]
@@ -1948,11 +2447,16 @@ enum ClusterAction {
         #[arg(long, env = "CURIE_API_URL")]
         api_url: Option<String>,
         /// Kubernetes namespace of the release (for the port-forward + key discovery). Default: curie.
-        #[arg(long, default_value = "curie")]
+        #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
         namespace: String,
         /// Helm release name (for the port-forward + key discovery). Default: curie.
         #[arg(long, default_value = "curie")]
         release: String,
+        /// Helm chart used to write per-agent connector Secrets. Default: the
+        /// version-pinned chart release asset on release builds; local
+        /// `charts/curie` on dev builds.
+        #[arg(long)]
+        chart: Option<String>,
         /// Platform API key. Omit to auto-discover the release Secret key
         /// (`<release>-secrets`); the discovered key travels only in the
         /// X-API-Key header over the loopback tunnel, never over the cleartext
@@ -1960,8 +2464,9 @@ enum ClusterAction {
         #[arg(long, env = "CURIE_API_KEY", hide_env_values = true)]
         api_key: Option<String>,
         /// Slack channel to bind the agent to. On first create it defaults to
-        /// C0LOCALDEV; on redeploy it is only moved when you pass this flag, so
-        /// omitting it leaves the deployed agent's channel untouched.
+        /// C0LOCALDEV; on redeploy the channel is ADDED when the agent is not
+        /// already bound to it, never moved and never removed, so omitting the
+        /// flag leaves the deployed agent's binding set untouched.
         #[arg(long)]
         slack_channel: Option<String>,
         /// Bind this agent to a GitHub repository (`owner/name`) so pushes to
@@ -1975,6 +2480,13 @@ enum ClusterAction {
         /// it; a warning names the binding it kept.
         #[arg(long = "repo", value_name = "OWNER/NAME")]
         repo: Option<String>,
+        /// Let sessions on each deployment select an allowed GitHub repository
+        /// from the opening message and materialize it as managed /workspace.
+        #[arg(long, conflicts_with = "no_workspace")]
+        workspace: bool,
+        /// Explicitly disable a previously configured managed workspace.
+        #[arg(long, conflicts_with = "workspace")]
+        no_workspace: bool,
         /// Target environment. Defaults to dev; a `--target` supplies it
         /// instead, and an explicit value here still wins over the target.
         #[arg(long, value_enum)]
@@ -1982,14 +2494,17 @@ enum ClusterAction {
         /// Version label; defaults to <manifest version>-<unix time>.
         #[arg(long)]
         label: Option<String>,
-        /// Per-agent connector secrets are NOT yet delivered at the cluster tier
-        /// (#440): this flag is accepted only so it can be DECLINED with a reason
-        /// instead of erroring like a typo. Until per-agent K8s Secret +
-        /// secretKeyRef delivery lands, a value-only SandboxClaim CR would persist
-        /// the token in plaintext in etcd. Use `curie local deploy --secret`
-        /// today. See ADR-0009.
+        /// Per-agent connector secrets: values are written to the agent's Helm
+        /// Secret through a private values file (never argv). The SandboxClaim
+        /// stays names-only. See ADR-0009 / #1488.
         #[arg(long = "secret")]
         secret: Vec<String>,
+        /// Local port the self-plumbed API port-forward binds.
+        /// Default 0 lets the kernel assign an ephemeral port, matching
+        /// `cluster message` and `cluster eval` (#1652 / #1740), so concurrent
+        /// deploys cannot collide and a squatted port cannot be inherited.
+        #[arg(long, default_value_t = 0)]
+        api_local_port: u16,
     },
     // Agent-lifecycle verbs (kill/resume/budget/delete) speak the platform API
     // like `deploy` does. Design decision (#149): extend the existing `cluster`
@@ -2046,6 +2561,35 @@ enum ClusterAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// List, add, or remove an agent's surfaces
+    /// (`/agents/{id}/channels`).
+    ///
+    /// With no flags this lists. An agent holds one or more bindings
+    /// (ADR-0118), so exactly one `--add` OR one `--remove` is applied per
+    /// invocation: the API has no batch endpoint, and a half-applied batch
+    /// would leave the operator guessing what took.
+    Surfaces {
+        /// Agent name or id.
+        agent: String,
+        /// Add this surface, as KIND=ADDRESS (e.g. slack=C0EXAMPLE1).
+        #[arg(long, value_name = "KIND=ADDRESS")]
+        add: Option<String>,
+        /// Reply HTTP endpoint for a non-Slack adapter. Requires --adapter.
+        #[arg(long, requires_all = ["add", "adapter"])]
+        endpoint: Option<String>,
+        /// Worker credential selector for the reply adapter. Requires --endpoint.
+        #[arg(long, requires_all = ["add", "endpoint"])]
+        adapter: Option<String>,
+        /// Remove this surface, as KIND=ADDRESS. The API refuses to remove an
+        /// agent's final surface.
+        #[arg(long, value_name = "KIND=ADDRESS", conflicts_with = "add")]
+        remove: Option<String>,
+        #[command(flatten)]
+        conn: ClusterConn,
+        /// Print what would be done and exit without making a request.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Set an agent's budget via the platform API (`PUT /agents/{id}/budget`).
     Budget {
         /// Agent name or id.
@@ -2068,7 +2612,8 @@ enum ClusterAction {
     ResetThread {
         /// Agent name or id (scopes the action; the release is thread-keyed).
         agent: String,
-        /// The thread key to reset (e.g. the Slack thread ts).
+        /// The worker's composed key: kind:channel:thread-ts (e.g.
+        /// slack:C0EXAMPLE1:1700000000.000100).
         #[arg(long, value_name = "THREAD_KEY")]
         thread_key: String,
         #[command(flatten)]
@@ -2141,19 +2686,20 @@ enum ClusterAction {
         /// channel-authorized approval gates (with --resolve).
         #[arg(long)]
         actor_channel: Option<String>,
-        /// Bind a manifest approval route to the channel its card posts in, as
+        /// Bind a manifest route's verified Slack resolution card, as
         /// NAME=CHANNEL (e.g. deal_desk=C0123ABCD). Repeatable. A write REPLACES
         /// the whole route map, like --gate does for tool gates.
-        #[arg(long = "route", value_name = "NAME=CHANNEL")]
-        route: Vec<String>,
-        /// Narrow WHO may resolve a route, independently of where its card posts,
+        #[arg(long = "route-resolution", value_name = "NAME=CHANNEL")]
+        route_resolution: Vec<String>,
+        /// Narrow WHO may resolve a route, independently of its resolution target,
         /// as NAME=users:U1,U2 or NAME=group:S1. Repeatable. Omit to leave the
-        /// card channel's members as the approvers.
+        /// resolution card's channel members as the approvers.
         #[arg(long = "route-approvers", value_name = "NAME=KIND:VALUES")]
         route_approvers: Vec<String>,
         /// Read the whole route map from a JSON file, e.g.
-        /// {"deal_desk": {"channel": "C0123ABCD"}}. The repeatable flags apply on
-        /// top of it.
+        /// {"deal_desk":{"resolution":{"kind":"slack","address":"C0123ABCD"}}}.
+        /// Notifications, including endpoint+adapter transport, are declared in
+        /// this strict map. The repeatable override flags apply on top of it.
         #[arg(long = "routes-from", value_name = "FILE")]
         routes_from: Option<PathBuf>,
         /// Show the agent's approval route bindings instead of its tool gates.
@@ -2165,6 +2711,10 @@ enum ClusterAction {
     },
 }
 
+/// Resolve, and materialize, the compose file for a local verb.
+///
+/// `local up` does not call this: it inlines the same two steps so the
+/// `--build` channel guard can run between them (#1926).
 async fn resolve_compose_file(file: Option<String>, dry_run: bool) -> Result<String> {
     let resolved = artifacts::resolve_compose(
         file.as_deref(),
@@ -2174,6 +2724,38 @@ async fn resolve_compose_file(file: Option<String>, dry_run: bool) -> Result<Str
         std::path::Path::new(local::DEFAULT_COMPOSE_FILE).exists(),
     )?;
     materialize_artifact(resolved, dry_run, "compose").await
+}
+
+async fn bind_cluster_connector_secrets(
+    namespace: &str,
+    release: &str,
+    chart: Option<&str>,
+    agent_name: &str,
+    secret_names: &[String],
+) -> Result<()> {
+    let secrets = curie::cluster_secrets::resolve_named_secrets(secret_names)?;
+    if secrets.is_empty() {
+        return Ok(());
+    }
+    let resolved = artifacts::resolve_chart(
+        chart,
+        artifacts::Channel::current(),
+        artifacts::version(),
+        artifacts::cache_root,
+        std::path::Path::new("charts/curie").is_dir(),
+    )?;
+    let chart = materialize_artifact(resolved, false, "chart").await?;
+    curie::cluster_secrets::bind(curie::cluster_secrets::BindOpts {
+        common: CommonOpts {
+            namespace: namespace.to_string(),
+            release: release.to_string(),
+            dry_run: false,
+        },
+        chart,
+        agent: agent_name.to_string(),
+        secrets,
+    })
+    .await
 }
 
 async fn materialize_artifact(
@@ -2236,6 +2818,13 @@ fn emit<T: curie::ui::CliOutput>(out: T) -> Result<()> {
     Ok(())
 }
 
+/// Trait-object counterpart used by the shared observability query handler,
+/// whose three leaves intentionally return different concrete output types.
+fn emit_boxed(out: Box<dyn curie::ui::CliOutput>) -> Result<()> {
+    ui::ui().emit(out.as_ref());
+    Ok(())
+}
+
 /// Dispatch one parsed command. No subcommand opens the interactive terminal,
 /// matching `curie interactive` / `curie ui`. Returns the command's
 /// `Result`; `main`
@@ -2243,13 +2832,63 @@ fn emit<T: curie::ui::CliOutput>(out: T) -> Result<()> {
 async fn run(command: Option<Command>) -> Result<()> {
     match command {
         None => curie::interactive::run().await,
+        Some(Command::Try { keep }) => {
+            let image =
+                artifacts::resolve_image(None, artifacts::Channel::current(), artifacts::version());
+            commands::try_first_run(keep, image).await
+        }
         Some(Command::Init {
             name,
             dir,
             from_spec,
             adopt,
         }) => commands::init(name, dir, from_spec, adopt),
-        Some(Command::Build { tag }) => commands::build(&tag).await,
+        Some(Command::Example {
+            action:
+                ExampleAction::SreBot {
+                    action:
+                        SreBotAction::Install {
+                            observability,
+                            dry_run,
+                            slack_channel,
+                            write_allowlist,
+                            no_write,
+                            namespace,
+                            release,
+                            observability_namespace,
+                        },
+                },
+        }) => match curie::examples::install_sre_bot(curie::examples::SreBotInstallOpts {
+            observability,
+            dry_run,
+            slack_channel,
+            write_allowlist,
+            no_write,
+            namespace,
+            release,
+            observability_namespace,
+        })
+        .await?
+        {
+            curie::examples::SreBotInstallResult::DryRun(plan) => emit(plan),
+            curie::examples::SreBotInstallResult::Installed(deployed) => emit(*deployed),
+        },
+        Some(Command::Build {
+            tag,
+            plugin_dir,
+            registry,
+            force,
+        }) => match plugin_dir {
+            Some(plugin_dir) => emit(
+                commands::build_connectors(commands::ConnectorBuildOpts {
+                    plugin_dir,
+                    registry,
+                    force,
+                })
+                .await?,
+            ),
+            None => commands::build(&tag).await,
+        },
         Some(Command::Install { update }) => commands::install(update).await,
         Some(Command::Update { image }) => commands::update(image).await,
         Some(Command::Interactive) => curie::interactive::run().await,
@@ -2321,6 +2960,9 @@ async fn run(command: Option<Command>) -> Result<()> {
             }
             DevAction::EmitParity => {
                 commands::dev_script("cli/scripts/check-emit-parity.sh", &[]).await
+            }
+            DevAction::VerbParity => {
+                commands::dev_script("cli/scripts/check-verb-parity.sh", &[]).await
             }
             DevAction::SchemaBaseline => {
                 commands::dev_script("cli/scripts/refresh-schema-baseline.sh", &[]).await
@@ -2396,7 +3038,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 clear,
                 list,
                 resolve,
-                route,
+                route_resolution,
                 route_approvers,
                 routes_from,
                 list_routes,
@@ -2412,7 +3054,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 // record is absent because this tier keeps no durable store, but a
                 // route binding is absent because it is per-agent platform config
                 // and this tier has no agent. Same wrong answer, different fix.
-                let routes_asked = !route.is_empty()
+                let routes_asked = !route_resolution.is_empty()
                     || !route_approvers.is_empty()
                     || routes_from.is_some()
                     || list_routes
@@ -2429,14 +3071,23 @@ async fn run(command: Option<Command>) -> Result<()> {
             // the verb reports why and exits 4 (issue #459, ADR-0041).
             SkillAction::Versions => Err(commands::skill_versions_unavailable()),
             SkillAction::Memory => Err(commands::skill_memory_unavailable()),
-            SkillAction::Down { name } => commands::stop(name).await,
+            SkillAction::Observability { .. } => Err(commands::skill_observability_unavailable()),
+            SkillAction::Down { name } => commands::stop(name, std::path::Path::new(".")).await,
             SkillAction::Status { url } => commands::status(url).await,
             SkillAction::Message {
                 text,
                 user,
                 event_type,
                 url,
-            } => commands::send(&text, &user, event_type.into(), url).await,
+                r#continue,
+            } => {
+                let classified_failure =
+                    commands::send(&text, &user, event_type.into(), url, r#continue).await?;
+                if classified_failure {
+                    std::process::exit(1);
+                }
+                Ok(())
+            }
             SkillAction::Eval {
                 cases,
                 case_id,
@@ -2471,23 +3122,48 @@ async fn run(command: Option<Command>) -> Result<()> {
                 file,
                 dry_run,
                 minimal,
+                model,
                 local_model,
                 pull_model,
                 slack,
                 env_file,
+                build,
             } => {
-                let file = resolve_compose_file(file, dry_run).await?;
+                // The `--build` channel guard runs between the resolve and
+                // the materialize (#1926), so a refused run never downloads the
+                // release compose, never prints the compose-source note, and
+                // never emits a dry-run plan. That ordering is why these three
+                // steps are inlined here instead of going through
+                // `resolve_compose_file`.
+                let resolved = artifacts::resolve_compose(
+                    file.as_deref(),
+                    artifacts::Channel::current(),
+                    artifacts::version(),
+                    artifacts::cache_root,
+                    std::path::Path::new(local::DEFAULT_COMPOSE_FILE).exists(),
+                )?;
+                let build = if build {
+                    Some(local::ensure_build_reaches_the_stack(&resolved)?)
+                } else {
+                    None
+                };
+                let file = materialize_artifact(resolved, dry_run, "compose").await?;
                 emit(
-                    local::up(LocalOpts {
-                        file,
-                        dry_run,
-                        minimal,
-                        local_model,
-                        pull_model,
-                        slack,
-                        model_mode: local::model_mode_from_env(),
-                        env_file,
-                    })
+                    local::up(
+                        LocalOpts {
+                            file,
+                            dry_run,
+                            minimal,
+                            local_model,
+                            pull_model,
+                            slack,
+                            model_mode: local::model_mode_from_env(),
+                            env_file,
+                            build,
+                            stack_image_env: Vec::new(),
+                        },
+                        model,
+                    )
                     .await?,
                 )
             }
@@ -2496,6 +3172,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 file,
                 dry_run,
                 minimal,
+                model,
                 local_model,
                 slack,
                 env_file,
@@ -2512,8 +3189,16 @@ async fn run(command: Option<Command>) -> Result<()> {
                             slack,
                             model_mode: local::model_mode_from_env(),
                             env_file,
+                            // `local rebuild` recreates ONE service against the
+                            // stack already running; it never re-tags images.
+                            // The tag it recreates ONTO still has to match that
+                            // stack, which is `resolve_stack_image_env` below,
+                            // not this flag (#1925).
+                            build: None,
+                            stack_image_env: Vec::new(),
                         },
                         service,
+                        model,
                     })
                     .await?,
                 )
@@ -2536,6 +3221,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                             slack: false,
                             model_mode: local::ModelMode::DefaultFake,
                             env_file: None,
+                            build: None,
+                            stack_image_env: Vec::new(),
                         },
                         wipe,
                         yes,
@@ -2555,6 +3242,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                         slack: false,
                         model_mode: local::ModelMode::DefaultFake,
                         env_file: None,
+                        build: None,
+                        stack_image_env: Vec::new(),
                     })
                     .await?,
                 )
@@ -2563,6 +3252,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 slack,
                 disconnect,
                 minimal,
+                model,
                 app_token,
                 bot_token,
                 file,
@@ -2578,6 +3268,25 @@ async fn run(command: Option<Command>) -> Result<()> {
                     comms::resolve_local_slack_token("SLACK_APP_TOKEN", &app_token, disconnect)?;
                 let bot_token =
                     comms::resolve_local_slack_token("SLACK_BOT_TOKEN", &bot_token, disconnect)?;
+                let mut model_opts = LocalOpts {
+                    file: resolved_file.clone(),
+                    dry_run,
+                    minimal,
+                    local_model: None,
+                    pull_model: false,
+                    slack: true,
+                    model_mode: local::model_mode_from_env(),
+                    env_file: None,
+                    build: None,
+                    stack_image_env: Vec::new(),
+                };
+                let model_credentials =
+                    local::apply_credential_plan(&mut model_opts, crate::ui::ui())?;
+                // #1925: `comms connect` recreates the worker and dispatcher --
+                // and, via `depends_on`, the api and migrate behind them. Derive
+                // the running stack's tag here, alongside the credential plan
+                // this same throwaway `LocalOpts` already exists to resolve.
+                local::resolve_stack_image_env(&mut model_opts).await;
                 emit(
                     comms::local_comms(LocalCommsOpts {
                         file: resolved_file,
@@ -2585,8 +3294,11 @@ async fn run(command: Option<Command>) -> Result<()> {
                         app_token,
                         bot_token,
                         disconnect,
-                        model_mode: local::model_mode_from_env(),
+                        model_mode: model_opts.model_mode,
+                        model_credentials,
+                        model,
                         minimal,
+                        stack_image_env: model_opts.stack_image_env,
                     })
                     .await?,
                 )
@@ -2703,6 +3415,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                 api_key,
                 slack_channel,
                 repo,
+                workspace,
+                no_workspace,
                 env,
                 label,
                 secret,
@@ -2716,6 +3430,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                     api_key,
                     slack_channel,
                     repo,
+                    workspace: commands::WorkspaceIntent::from_flags(workspace, no_workspace),
+                    tier: commands::DeployTier::Local,
                     env,
                     label,
                     secret,
@@ -2742,7 +3458,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 reject,
                 note,
                 actor_channel,
-                route,
+                route_resolution,
                 route_approvers,
                 routes_from,
                 list_routes,
@@ -2759,7 +3475,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         reject,
                         note,
                         actor_channel,
-                        route,
+                        route_resolution,
                         route_approvers,
                         routes_from,
                         list_routes,
@@ -2768,7 +3484,13 @@ async fn run(command: Option<Command>) -> Result<()> {
                 )
                 .await?,
             ),
-            LocalAction::Observability { open } => emit(commands::observability(open).await?),
+            LocalAction::Observability { query, open } => match query {
+                None => emit(commands::observability(open).await?),
+                Some(_) if open => Err(curie::exit::usage(
+                    "--open cannot be combined with an observability query",
+                )),
+                Some(query) => emit_boxed(run_local_observability_query(query).await?),
+            },
             LocalAction::Overrides {
                 agent,
                 model,
@@ -2788,6 +3510,19 @@ async fn run(command: Option<Command>) -> Result<()> {
                     },
                     commands::OverrideChange::resolve("model", model, clear_model)?,
                     commands::OverrideChange::resolve("thinking", thinking, clear_thinking)?,
+                )
+                .await?,
+            ),
+            LocalAction::Surfaces {
+                target,
+                add,
+                endpoint,
+                adapter,
+                remove,
+            } => emit(
+                commands::channel_bindings(
+                    target.into(),
+                    commands::ChannelChange::resolve(add, remove, endpoint, adapter)?,
                 )
                 .await?,
             ),
@@ -2861,6 +3596,24 @@ async fn run(command: Option<Command>) -> Result<()> {
                 )
                 .await?,
             ),
+            LocalAction::Delete {
+                agent,
+                api_url,
+                api_key,
+                yes,
+                dry_run,
+            } => emit(
+                commands::delete(
+                    AgentActionOpts {
+                        api_url,
+                        api_key,
+                        agent,
+                        dry_run,
+                    },
+                    yes,
+                )
+                .await?,
+            ),
         },
         Some(Command::Cluster { action }) => match action {
             ClusterAction::Up {
@@ -2869,6 +3622,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 chart,
                 no_expose,
                 fake_model,
+                model,
                 local_model,
                 allow_egress_host,
                 allow_web_egress,
@@ -2886,10 +3640,10 @@ async fn run(command: Option<Command>) -> Result<()> {
                     std::path::Path::new("charts/curie").is_dir(),
                 )?;
                 let chart = materialize_artifact(resolved, dry_run, "chart").await?;
-                let credentials = if local_model.is_some() {
+                let credentials = if fake_model || local_model.is_some() {
                     None
                 } else {
-                    ops::resolve_up_credentials(fake_model, ops::model_credential_env())
+                    ops::resolve_up_credentials(fake_model, ops::model_credential_env()?)
                 };
                 emit(
                     ops::up(
@@ -2915,7 +3669,9 @@ async fn run(command: Option<Command>) -> Result<()> {
                             // Default `agentSandbox.runner.model` from the shell
                             // `CURIE_MODEL` (None when unset/empty) for cross-tier
                             // parity with `local up` (#361).
-                            model: std::env::var("CURIE_MODEL").ok().filter(|s| !s.is_empty()),
+                            model: model.or_else(|| {
+                                std::env::var("CURIE_MODEL").ok().filter(|s| !s.is_empty())
+                            }),
                             // Populated by ops::up (generate on fresh install / reuse on
                             // upgrade); empty here so the pure builder starts clean.
                             secrets: vec![],
@@ -2980,21 +3736,33 @@ async fn run(command: Option<Command>) -> Result<()> {
                 .await?,
             ),
             ClusterAction::Observability {
+                query,
                 namespace,
                 release,
                 dry_run,
                 open,
-            } => emit(
-                ops::observability(
-                    CommonOpts {
-                        namespace,
-                        release,
-                        dry_run,
-                    },
-                    open,
-                )
-                .await?,
-            ),
+            } => match query {
+                None => emit(
+                    ops::observability(
+                        CommonOpts {
+                            namespace,
+                            release,
+                            dry_run,
+                        },
+                        open,
+                    )
+                    .await?,
+                ),
+                Some(_) if open => Err(curie::exit::usage(
+                    "--open cannot be combined with an observability query",
+                )),
+                Some(_) if dry_run => Err(curie::exit::usage(
+                    "--dry-run applies to bare cluster observability discovery, not API queries",
+                )),
+                Some(query) => {
+                    emit_boxed(run_cluster_observability_query(query, namespace, release).await?)
+                }
+            },
             ClusterAction::MigrateStore {
                 phase,
                 namespace,
@@ -3279,26 +4047,17 @@ async fn run(command: Option<Command>) -> Result<()> {
                 api_url,
                 namespace,
                 release,
+                chart,
                 api_key,
                 slack_channel,
                 repo,
+                workspace,
+                no_workspace,
                 env,
                 label,
                 secret,
+                api_local_port,
             } => {
-                // Decline `--secret` at the cluster tier with a REASON, not a
-                // clap "unexpected argument" that reads like a typo (#551): the
-                // parity rule is every verb is either implemented or explicitly
-                // declined. Per-agent secret delivery to worker-spawned sandboxes
-                // is tracked in #440 (ADR-0009); `local deploy --secret` works today.
-                if !secret.is_empty() {
-                    bail!(
-                        "`cluster deploy --secret` is not supported at the cluster tier yet: \
-                         per-agent connector-secret delivery to worker-spawned sandboxes needs the \
-                         K8s Secret + secretKeyRef path tracked in #440 (ADR-0009). Deploy without \
-                         --secret, or use `curie local deploy --secret` for a local end-to-end run."
-                    );
-                }
                 let api_key = commands::normalize_deploy_api_key(api_key);
                 // ADR-0057 (supersedes ADR-0024's deploy transport): with no
                 // explicit --api-key, discover the release's strong Secret key;
@@ -3315,29 +4074,76 @@ async fn run(command: Option<Command>) -> Result<()> {
                 // over the loopback tunnel, never over the cleartext UI /api
                 // NodePort proxy. Hold the child until after deploy returns;
                 // kill_on_drop tears it down on every exit path.
-                let local_port = message::DEFAULT_API_LOCAL_PORT;
+                // 0 (the clap default) requests a kernel-assigned port, so a
+                // squatted 8123 and two concurrent deploys are both structurally
+                // impossible; an explicit --api-local-port stays an exact
+                // override and still gets #1739's occupied-port refusal (#1533
+                // symptom 2, the verb #1740 did not reach).
+                let local_port = api_local_port;
                 let _deploy_pf;
-                // Tracks which transport produced `api_url`, so the unreachable
-                // hint below describes the RIGHT recovery: the auto path really
-                // self-plumbed a tunnel; the explicit path direct-dialed and did
-                // not. Mirrors the same `Some`/`None` discriminant
-                // `deploy_port_forward` keys on below.
-                let self_plumbed = api_url.is_none();
-                let api_url = match commands::deploy_port_forward(
+                // `Some` iff this deploy self-plumbed, carrying the fullname the
+                // tunnel actually forwards to. That one value decides the
+                // transport, names the Service in the diagnostics below, and
+                // tells the unreachable hint which recovery to describe: the
+                // auto path really opened a tunnel; the explicit path
+                // direct-dialed and did not.
+                let tunnel = commands::deploy_api_tunnel(
                     api_url.as_deref(),
                     &namespace,
                     &release,
                     local_port,
                     message::API_REMOTE_PORT,
-                ) {
-                    Some(pf_cmd) => {
+                )
+                .await;
+                let api_url = match &tunnel {
+                    Some((fullname, pf_cmd)) => {
                         let (deploy_pf, effective_port) =
-                            message::start_port_forward(&pf_cmd, local_port, "deploy api").await?;
+                            message::start_port_forward(pf_cmd, local_port, "deploy api").await?;
                         _deploy_pf = Some(deploy_pf);
                         // svc/<release>-api serves the platform API at ROOT, so the
                         // base URL has NO /api suffix (the /api in ADR-0024 was only
                         // because the request went through the UI pod).
-                        format!("http://127.0.0.1:{effective_port}")
+                        let base_url = format!("http://127.0.0.1:{effective_port}");
+                        // The tunnel is TCP-alive, but a squatted local port and a
+                        // Service name that resolved to the wrong workload are both
+                        // TCP-alive too -- `start_port_forward`'s bind and readiness
+                        // checks cannot tell them from the real API. Reading the
+                        // UNAUTHENTICATED /health is the only check that can, and it
+                        // is the compensating control for name resolution falling
+                        // back to the chart rule.
+                        //
+                        // Placed here, at tunnel setup, deliberately: `--all-targets`
+                        // posts several bundles over this one tunnel dev-before-prod
+                        // (#1279), so verifying once BEFORE the target loop is what
+                        // keeps a refusal a clean refusal instead of a half-deployed
+                        // repository.
+                        //
+                        // #705: the auto-discovered strong release key is already in
+                        // hand and this endpoint is not yet proven to be Curie, so the
+                        // probe carries no key and a 401/403 is never retried with one.
+                        //
+                        // #1908: this returns `Err` rather than exiting, so the scope
+                        // unwinds, `_deploy_pf` drops, and `kill_on_drop` reaps the
+                        // kubectl child instead of orphaning it with its port held.
+                        if let Err(observed) = api::verify_is_curie_api(&base_url).await {
+                            let api_svc = fullname.resource("api");
+                            return Err(anyhow::Error::from(
+                                curie::exit::CliError::failure(format!(
+                                    "refusing to deploy: the endpoint behind the self-plumbed \
+                                     tunnel is not the Curie API. {observed}. `cluster deploy` \
+                                     forwarded svc/{api_svc} in namespace {namespace} to \
+                                     127.0.0.1:{effective_port} and posted nothing. Re-run with \
+                                     --api-local-port <port> to bind a different local port, or \
+                                     pass --api-url <url> to dial the API directly without a \
+                                     tunnel."
+                                ))
+                                .with_fix(
+                                    "re-run with --api-local-port <port>, or pass --api-url <url> \
+                                     to dial the platform API directly",
+                                ),
+                            ));
+                        }
+                        base_url
                     }
                     None => {
                         _deploy_pf = None;
@@ -3358,14 +4164,28 @@ async fn run(command: Option<Command>) -> Result<()> {
                         url
                     }
                 };
-                let connect_hint = if self_plumbed {
-                    format!(
-                        "the platform API at {api_url} is unreachable. `cluster deploy` self-plumbs a kubectl port-forward to svc/{release}-api; confirm the release is healthy with `curie cluster status`, or pass --api-url to dial the API directly."
-                    )
-                } else {
-                    format!(
-                        "the platform API at {api_url} (from --api-url/CURIE_API_URL) is unreachable. `cluster deploy` dialed it directly with no port-forward; confirm that URL is reachable and the release is healthy with `curie cluster status`, or omit --api-url to self-plumb a loopback port-forward to svc/{release}-api."
-                    )
+                let connect_hint = match tunnel.as_ref() {
+                    // Self-plumbed: name the Service the tunnel ACTUALLY used,
+                    // as resolved from the cluster, so the operator can look up
+                    // the same object the CLI did.
+                    Some((fullname, _)) => {
+                        let api_svc = fullname.resource("api");
+                        format!(
+                            "the platform API at {api_url} is unreachable. `cluster deploy` self-plumbs a kubectl port-forward to svc/{api_svc}; confirm the release is healthy with `curie cluster status`, or pass --api-url to dial the API directly."
+                        )
+                    }
+                    // Explicit --api-url: no Service was contacted and none was
+                    // resolved, so this hint names the chart's no-override rule
+                    // rather than triggering a discovery round-trip on a path
+                    // that is pinned cluster-offline. Under an override install
+                    // the printed name may differ from the rendered one; the
+                    // recovery it suggests (omit --api-url) resolves it live.
+                    None => {
+                        let api_svc = ops::chart_fullname(&release).resource("api");
+                        format!(
+                            "the platform API at {api_url} (from --api-url/CURIE_API_URL) is unreachable. `cluster deploy` dialed it directly with no port-forward; confirm that URL is reachable and the release is healthy with `curie cluster status`, or omit --api-url to self-plumb a loopback port-forward to svc/{api_svc}."
+                        )
+                    }
                 };
                 // --all-targets onboards a repository in one invocation.
                 // The list comes from the API, not a Rust YAML parse: ADR-0089
@@ -3452,6 +4272,11 @@ async fn run(command: Option<Command>) -> Result<()> {
                             api_key: api_key.clone(),
                             slack_channel: slack_channel.clone(),
                             repo: repo.clone(),
+                            workspace: commands::WorkspaceIntent::from_flags(
+                                workspace,
+                                no_workspace,
+                            ),
+                            tier: commands::DeployTier::Cluster,
                             env,
                             label: label.clone(),
                             secret: Vec::new(),
@@ -3514,6 +4339,26 @@ async fn run(command: Option<Command>) -> Result<()> {
                             }
                         };
 
+                        if !secret.is_empty() {
+                            if let Err(err) = bind_cluster_connector_secrets(
+                                &namespace,
+                                &release,
+                                chart.as_deref(),
+                                &deployed.agent_name,
+                                &secret,
+                            )
+                            .await
+                            {
+                                let payload = commands::all_targets_deploy_failure_json(
+                                    &target,
+                                    &completed,
+                                    Some(&deployed),
+                                    &err,
+                                );
+                                return Err(curie::exit::with_json_payload(err, payload));
+                            }
+                        }
+
                         if let Err(err) = apply_connectors(prepared_connectors).await {
                             let payload = commands::all_targets_deploy_failure_json(
                                 &target,
@@ -3542,19 +4387,26 @@ async fn run(command: Option<Command>) -> Result<()> {
                         api_key: api_key.clone(),
                         slack_channel: slack_channel.clone(),
                         repo: repo.clone(),
+                        workspace: commands::WorkspaceIntent::from_flags(workspace, no_workspace),
                         env,
                         label: label.clone(),
-                        // Cluster connector-secret delivery is deferred to #440; no
-                        // `--secret` flag on `cluster deploy` (see the note above).
-                        secret: Vec::new(),
-                        // Secret binding is not wired on cluster until #440, so the
-                        // declared-secrets policy gate (#464) is skipped here: it
-                        // would otherwise hard-fail every secrets-declaring bundle
-                        // with a `--secret <NAME>` remediation this tier lacks.
-                        secret_binding_supported: false,
+                        secret: secret.clone(),
+                        secret_binding_supported: true,
                         connect_hint: connect_hint.clone(),
+                        tier: commands::DeployTier::Cluster,
                     })
                     .await?;
+
+                    if !secret.is_empty() {
+                        bind_cluster_connector_secrets(
+                            &namespace,
+                            &release,
+                            chart.as_deref(),
+                            &deployed.agent_name,
+                            &secret,
+                        )
+                        .await?;
+                    }
 
                     // Stand up whatever the bundle's connectors.yaml declares
                     // (ADR-0086, #1063). After the deploy, so the objects exist
@@ -3641,6 +4493,34 @@ async fn run(command: Option<Command>) -> Result<()> {
                         },
                         model,
                         thinking,
+                    )
+                    .await?,
+                )
+            }
+            ClusterAction::Surfaces {
+                agent,
+                add,
+                endpoint,
+                adapter,
+                remove,
+                conn,
+                dry_run,
+            } => {
+                // Resolve the flag pair BEFORE discovering the connection, for
+                // the same reason `Overrides` does: a mistyped pair must not
+                // cost a cluster lookup, nor be reported as a connection
+                // failure instead of the usage error it is.
+                let change = commands::ChannelChange::resolve(add, remove, endpoint, adapter)?;
+                let (api_url, api_key, _port_forward) = resolve_cluster_conn(conn, dry_run).await?;
+                emit(
+                    commands::channel_bindings(
+                        AgentActionOpts {
+                            api_url,
+                            api_key,
+                            agent,
+                            dry_run,
+                        },
+                        change,
                     )
                     .await?,
                 )
@@ -3757,7 +4637,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 reject,
                 note,
                 actor_channel,
-                route,
+                route_resolution,
                 route_approvers,
                 routes_from,
                 list_routes,
@@ -3787,7 +4667,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                             reject,
                             note,
                             actor_channel,
-                            route,
+                            route_resolution,
                             route_approvers,
                             routes_from,
                             list_routes,
@@ -4142,13 +5022,13 @@ mod tests {
     fn build_defaults_tag_and_accepts_override() {
         let cli = Cli::try_parse_from(["curie", "build"]).expect("build should parse");
         match cli.command {
-            Some(Command::Build { tag }) => assert_eq!(tag, "curie-runner"),
+            Some(Command::Build { tag, .. }) => assert_eq!(tag, "curie-runner"),
             _ => panic!("expected build command"),
         }
         let cli = Cli::try_parse_from(["curie", "build", "--tag", "my-runner:dev"])
             .expect("build --tag should parse");
         match cli.command {
-            Some(Command::Build { tag }) => assert_eq!(tag, "my-runner:dev"),
+            Some(Command::Build { tag, .. }) => assert_eq!(tag, "my-runner:dev"),
             _ => panic!("expected build command"),
         }
     }
@@ -4695,6 +5575,41 @@ mod tests {
         }
     }
 
+    /// #1533 symptom 2: `cluster deploy` hardcoded `DEFAULT_API_LOCAL_PORT`
+    /// (8123) for its self-plumbed tunnel, so two concurrent deploys collided
+    /// and anything already holding 8123 broke the deploy. `cluster message`
+    /// and `cluster eval` were fixed by #1740 / #1652; deploy was the verb that
+    /// PR did not reach. An omitted flag must request a kernel-assigned port.
+    #[test]
+    fn cluster_deploy_defaults_api_local_port_to_zero() {
+        let cli = Cli::try_parse_from(["curie", "cluster", "deploy"])
+            .expect("cluster deploy should parse");
+        match cli.command {
+            Some(Command::Cluster {
+                action: ClusterAction::Deploy { api_local_port, .. },
+            }) => assert_eq!(
+                api_local_port, 0,
+                "an omitted --api-local-port must request a kernel-assigned port"
+            ),
+            _ => panic!("expected cluster deploy command"),
+        }
+    }
+
+    /// The escape hatch stays exact: an explicit port is an override, not a
+    /// hint, so an operator can still pin a tunnel port (and get the #1739
+    /// occupied-port refusal when it is squatted).
+    #[test]
+    fn an_explicit_api_local_port_is_honoured() {
+        let cli = Cli::try_parse_from(["curie", "cluster", "deploy", "--api-local-port", "18123"])
+            .expect("cluster deploy with an explicit port should parse");
+        match cli.command {
+            Some(Command::Cluster {
+                action: ClusterAction::Deploy { api_local_port, .. },
+            }) => assert_eq!(api_local_port, 18123),
+            _ => panic!("expected cluster deploy command"),
+        }
+    }
+
     #[test]
     fn cluster_eval_preserves_explicit_port_overrides() {
         let cli = Cli::try_parse_from([
@@ -5224,7 +6139,7 @@ mod tests {
             .command
         {
             Some(Command::Local {
-                action: LocalAction::Observability { open },
+                action: LocalAction::Observability { open, .. },
             }) => assert!(!open, "--open must default to false"),
             _ => panic!("expected local observability command"),
         }
@@ -5234,7 +6149,7 @@ mod tests {
             .command
         {
             Some(Command::Local {
-                action: LocalAction::Observability { open },
+                action: LocalAction::Observability { open, .. },
             }) => assert!(open, "--open must parse to true"),
             _ => panic!("expected local observability command"),
         }
@@ -5253,6 +6168,7 @@ mod tests {
                         release,
                         dry_run,
                         open,
+                        ..
                     },
             }) => {
                 assert_eq!(namespace, "curie");
@@ -5421,10 +6337,9 @@ mod tests {
     }
 
     #[test]
-    fn cluster_deploy_accepts_secret_so_it_can_decline_with_a_reason() {
-        // `--secret` must PARSE (not error like a typo) so the handler can decline
-        // it with an explicit #440 message (#551). The decline itself is a runtime
-        // bail; here we lock that the surface accepts the flag.
+    fn cluster_deploy_accepts_secret_flag() {
+        // `--secret` must PARSE (not error like a typo). Cluster delivery is
+        // implemented (#1488); this lock is the clap surface, not the helm path.
         match Cli::try_parse_from([
             "curie",
             "cluster",
@@ -5432,7 +6347,7 @@ mod tests {
             "--secret",
             "GITHUB_PERSONAL_ACCESS_TOKEN",
         ])
-        .expect("cluster deploy --secret should parse (then be declined at runtime)")
+        .expect("cluster deploy --secret should parse")
         .command
         {
             Some(Command::Cluster {

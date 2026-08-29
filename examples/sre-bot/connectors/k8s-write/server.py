@@ -79,11 +79,9 @@ mcp = FastMCP(
     "k8s-write",
     host=os.environ.get("BIND_ADDRESS", "0.0.0.0"),
     port=int(os.environ.get("PORT", "8000")),
-    # Mount at "/" so both /mcp and /mcp/ are served. FastMCP's default 307s a
-    # POST from /mcp to /mcp/, and an MCP client is not obliged to replay a POST
-    # body across a redirect -- the symptom is a connector that is up, healthy,
-    # answers curl, and registers zero tools.
-    streamable_http_path="/",
+    # Curie addresses hosted connectors at the exact, redirect-free /mcp path.
+    # MCP 1.28 mounts this value literally; "/" would leave /mcp returning 404.
+    streamable_http_path="/mcp",
 )
 
 # readOnlyHint=False is the honest value and the point of this server.

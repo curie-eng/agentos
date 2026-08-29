@@ -105,10 +105,15 @@ pub struct ConnectorManifests {
     pub mcp_entries: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
-/// One agent's channel binding (ADR-0096, #1459): `kind` names the ingress
-/// (`"slack"` today) and `address` is the kind-specific identifier the worker
-/// resolver matches turns against. Singular per ADR-0089's one-agent-one-channel
-/// rule, mirroring the committed `ChannelBinding`.
+/// One of an agent's channel bindings (ADR-0118, #1525): `kind` names the
+/// ingress (`"slack"` today) and `address` is the kind-specific identifier the
+/// worker resolver matches turns against. An agent holds one or more, so the
+/// pair -- never the address alone -- identifies a binding.
+///
+/// Mirrors the API's `ChannelBindingOut`, which is the READ shape and carries no
+/// address-shape rule (#1914): an upgraded install can hold an address the write
+/// path would now refuse, and the CLI has to be able to PRINT that value rather
+/// than fail to parse the agent it belongs to.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ChannelBinding {
     pub kind: String,
@@ -119,7 +124,10 @@ pub struct ChannelBinding {
 pub struct Agent {
     pub id: String,
     pub name: String,
-    pub channel: ChannelBinding,
+    /// Every channel this agent answers on, ordered by `(kind, address)`
+    /// server-side. One or more (ADR-0118): the API refuses to remove the last
+    /// one, because an agent bound to nothing is deployed and answers nowhere.
+    pub channels: Vec<ChannelBinding>,
     /// The repository whose pushes deploy this agent (ADR-0014). Set at
     /// creation via `--repo`, or bound later by PATCH since `AgentUpdate`
     /// carries the field (#1194). ADR-0091 dropped the unique index, so
@@ -130,12 +138,13 @@ pub struct Agent {
     /// `#[serde(default)]` keeps older/leaner responses parsing to None.
     #[serde(default)]
     pub approval_required_tools: Option<Vec<String>>,
-    /// Manifest route name -> workspace binding (#247, #420). Read back by
-    /// `approvals --list-routes` and written by `--route`/`--route-approvers`.
+    /// Manifest route name -> workspace binding (#247, #420, #1460). Read back
+    /// by `approvals --list-routes`; writes use a separate strict DTO so this
+    /// display-only, transport-redacted response can never become PATCH input.
     /// `#[serde(default)]` keeps a pre-#247 response parsing to None, which is
     /// the same fact as "no routes bound".
     #[serde(default)]
-    pub approval_routes: Option<std::collections::BTreeMap<String, ApprovalRouteBinding>>,
+    pub approval_routes: Option<std::collections::BTreeMap<String, ApprovalRouteBindingResponse>>,
     /// Per-agent model override, forwarded as `CURIE_MODEL` at sandbox boot
     /// (#254). `None` means no override: the platform default applies. Modeled
     /// since #1311 gave the CLI a verb that reads and writes it -- until then
@@ -149,27 +158,43 @@ pub struct Agent {
     /// explicit null clears it.
     #[serde(default)]
     pub thinking: Option<String>,
+    /// Whether this agent's bindings share one workflow-state namespace
+    /// (`true`) or each get their own (`false`, the default) (#1525 follow-up,
+    /// ADR-0118). Cardinality alone opts an agent into multiple surfaces; this
+    /// is the separate, explicit toggle for whether those surfaces share
+    /// cross-turn state.
+    pub memory: bool,
 }
 
-/// One route's workspace binding, mirroring the committed `ApprovalRouteBinding`.
+/// One route's display-only binding, mirroring `ApprovalRouteBindingOut`.
 ///
-/// The two fields are the axes ADR-0034 unfused and the CLI must keep visibly
-/// apart: `channel` is WHERE the card posts, `approvers` is WHO may act on it.
-/// Collapsing them in the output would re-fuse in presentation what the schema
-/// separates.
+/// `resolution` is the one interactive Slack card, `notification` is an
+/// optional text-only ping, and `approvers` is WHO may act. The response model
+/// intentionally has no transport fields and no conversion into the strict
+/// PATCH graph below.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-pub struct ApprovalRouteBinding {
-    // The deployed API can return a route binding with no `channel` after a
-    // live rebind. Preserve that absence so readers can distinguish it from an
-    // explicit empty string.
+pub struct ApprovalRouteBindingResponse {
+    pub resolution: ApprovalResolutionTargetResponse,
     #[serde(default)]
-    pub channel: Option<String>,
-    /// Absent means the card channel's members are the approvers, the zero-setup
-    /// default. Skipped on serialize so a channel-only write sends no `approvers`
-    /// key at all: the API models the block with `extra="forbid"`, and an explicit
-    /// null is a different statement from an omitted key.
+    pub notification: Option<ApprovalNotificationTargetResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approvers: Option<ApprovalApprovers>,
+}
+
+/// Interactive target returned by the API. The current resolver supports Slack
+/// only, but response decoding stays tolerant of a future server extension.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ApprovalResolutionTargetResponse {
+    pub kind: String,
+    pub address: String,
+}
+
+/// Text-only notification target returned by the API. Endpoint and adapter are
+/// deliberately absent: transport belongs to the write/stored model only.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ApprovalNotificationTargetResponse {
+    pub kind: String,
+    pub address: String,
 }
 
 /// Who may resolve a route's approvals, mirroring the committed
@@ -186,16 +211,15 @@ pub struct ApprovalApprovers {
 
 // --- The input side of the same contract (#1072) -------------------------------
 //
-// The two structs above decode API RESPONSES and must stay tolerant: a field a
-// newer server adds should not break an older CLI. The two below decode an
+// The structs above decode API RESPONSES and must stay tolerant: a field a newer
+// server adds should not break an older CLI. The graph below decodes an
 // OPERATOR-AUTHORED `--routes-from` file and must do the opposite.
 //
 // The asymmetry is the whole fix, so the pair lives here next to its lenient
 // twin rather than off in the command module. A typo'd key in a route file is
-// not a harmless unknown: dropping `approver` (for `approvers`) leaves a
-// channel-only binding, and a binding with no approvers block falls back to
-// card-channel membership, so the operator who meant to narrow authority to one
-// group has instead granted it to everyone in the channel.
+// not a harmless unknown: dropping `approver` (for `approvers`) leaves a route
+// whose authority falls back to resolution-card membership, so the operator who
+// meant to narrow authority to one group has widened it instead.
 //
 // The API already guards this with `extra="forbid"` on `ApprovalRouteBinding`,
 // on the stated premise that it is the binding's only writer. #1057 made the
@@ -205,11 +229,47 @@ pub struct ApprovalApprovers {
 // operator-authored files: an authoring typo fails loud rather than silently
 // dropping the intended field.
 
-/// One route binding as written in a `--routes-from` file. Strict by design.
+/// The only route shape accepted by `ApiClient::set_approval_routes`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalRouteBindingWrite {
+    pub resolution: ApprovalResolutionTargetWrite,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notification: Option<NotificationTargetWrite>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approvers: Option<ApprovalApprovers>,
+}
+
+/// Slack-only interactive resolution target. `kind` is kept explicit as the
+/// future extension point, while command validation currently refuses anything
+/// except `slack`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalResolutionTargetWrite {
+    pub kind: String,
+    pub address: String,
+}
+
+/// Optional notification target with write-only transport routing.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationTargetWrite {
+    pub kind: String,
+    pub address: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter: Option<String>,
+}
+
+/// One route binding as written in a `--routes-from` file. Strict by design and
+/// intentionally separate from both the tolerant response and the PATCH DTO.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteBindingInput {
-    pub channel: String,
+    pub resolution: ApprovalResolutionTargetWrite,
+    #[serde(default)]
+    pub notification: Option<NotificationTargetWrite>,
     #[serde(default)]
     pub approvers: Option<ApproversInput>,
 }
@@ -233,10 +293,11 @@ impl From<ApproversInput> for ApprovalApprovers {
     }
 }
 
-impl From<RouteBindingInput> for ApprovalRouteBinding {
+impl From<RouteBindingInput> for ApprovalRouteBindingWrite {
     fn from(input: RouteBindingInput) -> Self {
-        ApprovalRouteBinding {
-            channel: Some(input.channel),
+        ApprovalRouteBindingWrite {
+            resolution: input.resolution,
+            notification: input.notification,
             approvers: input.approvers.map(Into::into),
         }
     }
@@ -278,12 +339,15 @@ pub struct ApprovalRecord {
 pub enum ChannelOutcome {
     /// A new agent was created bound to this channel.
     Created(String),
-    /// An existing agent's channel was moved.
-    Updated { from: String, to: String },
-    /// An existing agent's channel was left as-is. `passed` records whether a
-    /// `--slack-channel` was supplied (and merely matched) so the caller can hint
-    /// how to move it when none was given.
-    Unchanged { channel: String, passed: bool },
+    /// An existing agent gained a binding it did not hold. Never a move: a
+    /// deploy only ever ADDS (ADR-0118), so the agent's other channels stay
+    /// routed.
+    Added { address: String },
+    /// An existing agent's binding set was left as-is, and carries every
+    /// address in it. `passed` records whether a `--slack-channel` was supplied
+    /// (and merely matched) so the caller can hint how to bind another when
+    /// none was given.
+    Unchanged { channels: Vec<String>, passed: bool },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -338,6 +402,109 @@ pub struct MemoryEntry {
     pub provenance: MemoryProvenance,
 }
 
+/// One row returned by `GET /langfuse/traces`.
+///
+/// That API route deliberately exposes Langfuse's open-ended trace object
+/// (`list[dict[str, object]]`) rather than a named OpenAPI DTO. Keep the row as
+/// a typed map wrapper so the CLI can bound the collection without projecting
+/// away trace/session/outcome fields a newer platform adds.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TraceListRow {
+    pub id: String,
+    pub name: Option<String>,
+    pub timestamp: String,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// One node in the existing API's reconstructed observation tree.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ObservationNode {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(rename = "startTime", default)]
+    pub start_time: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(rename = "usageDetails", default)]
+    pub usage_details: Option<serde_json::Map<String, serde_json::Value>>,
+    #[serde(default)]
+    pub children: Vec<ObservationNode>,
+}
+
+/// The complete existing `TraceTree` response from `GET
+/// /langfuse/traces/{trace_id}`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TraceTree {
+    pub trace: serde_json::Map<String, serde_json::Value>,
+    pub tree: Vec<ObservationNode>,
+    #[serde(default)]
+    pub sandbox_id: Option<String>,
+    #[serde(default)]
+    pub approval_decision: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Scalar totals returned by the existing observability summary route.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MetricsSummary {
+    pub start: String,
+    pub end: String,
+    pub runs: u64,
+    pub latency_p95_ms: f64,
+    pub tokens: u64,
+    pub cost_usd: f64,
+    #[serde(default = "default_true")]
+    pub cost_known: bool,
+    pub error_rate: f64,
+}
+
+/// One point in an existing observability metric series.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MetricPoint {
+    pub ts: String,
+    pub value: f64,
+}
+
+/// The existing observability metric-series DTO.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MetricSeries {
+    pub metric: String,
+    pub granularity: String,
+    pub start: String,
+    pub end: String,
+    pub points: Vec<MetricPoint>,
+}
+
+/// Maximum number of metric points a CLI result may carry. This defensive
+/// response check keeps a skewed backend from violating the public result bound.
+pub const MAX_OBSERVABILITY_METRIC_POINTS: usize = 1000;
+
+#[derive(Debug)]
+struct ObservabilityApiUnavailable(String);
+
+impl std::fmt::Display for ObservabilityApiUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ObservabilityApiUnavailable {}
+
+pub fn is_observability_api_unavailable(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<ObservabilityApiUnavailable>()
+            .is_some()
+    })
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Bundle {
     pub bundle_ref: String,
@@ -357,6 +524,28 @@ pub struct Deployment {
     pub version_id: Option<String>,
     #[serde(default)]
     pub deployed_at: Option<String>,
+    /// Deployment-level runtime workspace capability; absent defaults to disabled.
+    #[serde(default)]
+    pub workspace_enabled: bool,
+}
+
+/// Tri-state deployment intent. Preserve omits the request key, Disable sends
+/// `false`, and Enable sends `true`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceIntent {
+    Preserve,
+    Enable,
+    Disable,
+}
+
+impl WorkspaceIntent {
+    pub fn from_flags(workspace: bool, no_workspace: bool) -> Self {
+        match (workspace, no_workspace) {
+            (true, false) => Self::Enable,
+            (false, true) => Self::Disable,
+            _ => Self::Preserve,
+        }
+    }
 }
 
 /// One readable text file from a version's stored bundle (`BundleFile` in
@@ -497,6 +686,8 @@ pub struct PreparedDeployOutcome {
     pub(crate) bundle: Bundle,
     pub(crate) channel: ChannelOutcome,
     pub(crate) repo_note: Option<String>,
+    pub(crate) commit_sha: Option<String>,
+    pub(crate) workspace_enabled: Option<bool>,
 }
 
 /// The artifacts a deploy produces, for the summary printout.
@@ -545,6 +736,222 @@ fn has_local_host(endpoint: &reqwest::Url) -> bool {
     match host.parse::<std::net::IpAddr>() {
         Ok(address) => address.is_loopback() || address.is_unspecified(),
         Err(_) => host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost"),
+    }
+}
+
+/// Build the one kind of HTTP client this CLI makes requests with.
+///
+/// The loopback `no_proxy` rule is a SECURITY property, not a convenience: a
+/// system HTTP proxy must never see traffic on a tunnel that exists precisely to
+/// keep that traffic on the loopback. Both the authenticated [`ApiClient`] and
+/// the unauthenticated `/health` probe need it, so it has exactly one
+/// implementation here rather than two copies that have to be kept in step.
+///
+/// Redirects are NOT followed, and that is a SECURITY property too. reqwest
+/// strips `Authorization`, cookies, and `Proxy-Authorization` when a redirect
+/// crosses to another host (`reqwest/src/redirect.rs`), but it does NOT strip
+/// custom headers -- and this CLI authenticates with the custom `X-API-Key`
+/// header. Under reqwest's default policy (follow up to 10 hops) an endpoint
+/// that answers `307`/`308 Location: http://attacker.example/...` would be
+/// handed the release's auto-discovered strong key, with method and body
+/// preserved. It would also defeat #705's cleartext refusal, which classifies
+/// only the INITIAL `--api-url`: an `https://` URL that redirects to `http://`
+/// would sail past it. And it would weaken the `/health` verification below,
+/// which exists to certify THIS listener -- a redirect would let a wrong
+/// listener point the probe at something that does answer `{"status": "ok"}`.
+///
+/// Nothing should depend on a silent redirect here: the platform API is a
+/// direct JSON API reached over a loopback tunnel or an operator-supplied URL.
+/// Do not "helpfully" restore following; a 3xx is surfaced to the operator as
+/// its own diagnosis instead (see `verify_is_curie_api` and `ApiClient::expect_ok`).
+///
+/// `connect_timeout` is optional because a caller that bounds the WHOLE request
+/// (`RequestBuilder::timeout`) has already bounded the connect inside it; a
+/// second, equal bound would only be a second number to keep in step.
+///
+/// Returns reqwest's own error so each caller keeps its own `.context`.
+fn http_client(
+    base_url: &str,
+    connect_timeout: Option<std::time::Duration>,
+) -> std::result::Result<reqwest::Client, reqwest::Error> {
+    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+    if let Some(connect_timeout) = connect_timeout {
+        builder = builder.connect_timeout(connect_timeout);
+    }
+    if reqwest::Url::parse(base_url.trim()).is_ok_and(|endpoint| {
+        matches!(endpoint.scheme(), "http" | "https") && has_local_host(&endpoint)
+    }) {
+        builder = builder.no_proxy();
+    }
+    builder.build()
+}
+
+/// Render a 3xx response's `Location` for an operator-facing message.
+///
+/// A redirect is never followed by this CLI (see [`http_client`]), so where it
+/// pointed is the whole diagnosis: it names what the endpoint wanted to hand the
+/// request -- and, under a following client, the `X-API-Key` header -- to.
+/// A 3xx with no `Location` is legal, hence the fallback rather than an unwrap.
+fn redirect_target(headers: &reqwest::header::HeaderMap) -> String {
+    headers
+        .get(reqwest::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| format!("`{}`", value.trim()))
+        .unwrap_or_else(|| "an unstated location (no `Location` header)".to_string())
+}
+
+/// The operator-facing diagnosis for a 3xx on a KEY-CARRYING request, or `None`
+/// when the status is not a redirect.
+///
+/// Every authenticated path shares it, because redirects are never followed (see
+/// [`http_client`]) and so a 3xx reaches all of them as an ordinary response
+/// rather than as a transport error.
+fn redirect_refusal(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+) -> Option<String> {
+    status.is_redirection().then(|| {
+        format!(
+            "the endpoint answered {status} redirecting to {}. This CLI never follows \
+             redirects, because a redirect would carry the API key's `X-API-Key` header to \
+             the host it names, including a downgrade from https to cleartext http (#705). \
+             Point --api-url at the platform API's own address.",
+            redirect_target(headers)
+        )
+    })
+}
+
+/// How long the `/health` probe waits. Deliberately short: `start_port_forward`
+/// has already waited for kubectl's readiness line and TCP-proved the local
+/// port, so by the time this runs a slow answer is a real signal about what is
+/// listening, not a cold start.
+const HEALTH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Prove that whatever answers on `base_url` really is the Curie platform API,
+/// by reading its `GET /health` (`apps/api/src/curie_api/main.py`: HTTP 200 with
+/// a JSON body whose `status` is `"ok"`; the route is unauthenticated, per
+/// `apps/api/tests/test_channels.py`).
+///
+/// **Unauthenticated by construction, and that is the whole point (#705).** The
+/// caller (`cluster deploy`) is already holding the release's auto-discovered
+/// strong key when it calls this, and the endpoint is not yet known to be Curie.
+/// Sending the key to an unproven listener is exactly the egress the cleartext
+/// refusal exists to prevent. So this is a FREE function, not an [`ApiClient`]
+/// method: no key needs to exist for it to run, and a 401/403 is a refusal, never
+/// a prompt to retry with the key. A committed test asserts the request carries no
+/// `x-api-key`.
+///
+/// Why it is needed at all: a squatted local port and a port-forward pointed at
+/// the wrong workload are both TCP-alive and readable, so the bind and readiness
+/// checks in `start_port_forward` cannot see either. This is the only check that
+/// can, and it is the compensating control for release-name resolution falling
+/// back to the chart rule.
+///
+/// The error's `Display` is the class-specific OBSERVATION ("what answered, and
+/// how it differed"), with no recovery text: only the caller knows which Service
+/// it forwarded and on which local port, so the caller composes the recovery
+/// around this sentence.
+pub async fn verify_is_curie_api(base_url: &str) -> Result<()> {
+    let url = format!("{}/health", base_url.trim().trim_end_matches('/'));
+    // No connect timeout: the per-request `.timeout` below bounds the whole
+    // request, the connect included, at the same `HEALTH_PROBE_TIMEOUT`.
+    let http = http_client(base_url, None).context("building the health-probe HTTP client")?;
+
+    // No `X-API-Key` header. See the #705 note above.
+    let response = match http.get(&url).timeout(HEALTH_PROBE_TIMEOUT).send().await {
+        Ok(response) => response,
+        Err(err) if err.is_timeout() => bail!(
+            "GET {url} did not answer within {}s, and the local port had already been \
+             TCP-proved, so something is holding it without serving the API",
+            HEALTH_PROBE_TIMEOUT.as_secs()
+        ),
+        Err(err) if err.is_connect() => bail!(
+            "GET {url} could not connect, even though the port-forward reported the port \
+             ready, so the tunnel died between readiness and this check"
+        ),
+        Err(err) => bail!("GET {url} failed before any response arrived: {err}"),
+    };
+
+    let status = response.status();
+    // Redirects are not followed (see `http_client`), so a 3xx reaches here as an
+    // ordinary response. It is one of the answers this probe exists to catch: the
+    // thing on the port is not the Curie API, it is something pointing elsewhere,
+    // and following it would have certified the redirect target instead of the
+    // tunnel endpoint.
+    if status.is_redirection() {
+        bail!(
+            "GET {url} answered {status} redirecting to {}, and redirects are never followed, \
+             so the port is held by something that forwards elsewhere rather than by the \
+             Curie API, whose /health answers 200 in place",
+            redirect_target(response.headers())
+        );
+    }
+    if matches!(
+        status,
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+    ) {
+        bail!(
+            "GET {url} answered {status}, but the Curie API serves /health unauthenticated, \
+             so an auth challenge means a different service holds the port (the release key \
+             was not sent, and is not retried)"
+        );
+    }
+    if status == reqwest::StatusCode::NOT_FOUND {
+        bail!(
+            "GET {url} answered 404, so something is listening there but it does not route \
+             the Curie API's /health"
+        );
+    }
+    if status != reqwest::StatusCode::OK {
+        bail!("GET {url} answered {status}, not the 200 the Curie API's /health returns");
+    }
+
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let is_json = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .eq_ignore_ascii_case("application/json");
+    let body = response.text().await.unwrap_or_default();
+
+    // Deliberately NOT parsed as JSON first: a dev server answering 200 with
+    // HTML is the squatted-port case the issue reported, and surfacing a serde
+    // decode error for it would read as a Curie bug rather than as the
+    // wrong-listener fact it is.
+    if !is_json {
+        bail!(
+            "GET {url} answered 200 with {} content rather than JSON, so a different service \
+             is holding the port",
+            if content_type.trim().is_empty() {
+                "untyped".to_string()
+            } else {
+                content_type
+            }
+        );
+    }
+    let Ok(payload) = serde_json::from_str::<serde_json::Value>(&body) else {
+        bail!(
+            "GET {url} answered 200 and claimed JSON, but the body does not parse as JSON, \
+             so it is not the Curie API's /health"
+        );
+    };
+    match payload.get("status").and_then(|status| status.as_str()) {
+        Some("ok") => Ok(()),
+        Some(other) => bail!(
+            "GET {url} answered 200 with JSON status {other:?} rather than \"ok\", so either \
+             this is not the Curie API or the release is unhealthy"
+        ),
+        None => bail!(
+            "GET {url} answered 200 with JSON carrying no `status` field, while the Curie \
+             API's /health answers {{\"status\": \"ok\"}}"
+        ),
     }
 }
 
@@ -623,16 +1030,27 @@ fn agent_create_body(
 /// and Pydantic decodes a `null` and an absent key to the same `None`, so a
 /// `null` would read as "omitted" while looking on the wire like an intent to
 /// clear (#1071, the same trap documented on [`ApiClient::set_approval_routes`]).
-fn agent_update_body(
-    slack_channel: Option<&str>,
-    repo_full_name: Option<&str>,
-) -> serde_json::Value {
+fn agent_update_body(repo_full_name: Option<&str>) -> serde_json::Value {
     let mut body = json!({});
-    if let Some(channel) = slack_channel {
-        body["channel"] = json!({"kind": "slack", "address": channel});
-    }
     if let Some(repo) = repo_full_name {
         body["repo_full_name"] = json!(repo);
+    }
+    body
+}
+
+/// The `POST /agents/{id}/channels` body: the binding PAIR and nothing else.
+/// Pure so the shape is testable without a live API. The kind is never
+/// inferred -- a channel-neutral binding carries it explicitly.
+fn add_channel_body(
+    kind: &str,
+    address: &str,
+    endpoint: Option<&str>,
+    adapter: Option<&str>,
+) -> serde_json::Value {
+    let mut body = json!({"kind": kind, "address": address});
+    if let (Some(endpoint), Some(adapter)) = (endpoint, adapter) {
+        body["endpoint"] = json!(endpoint);
+        body["adapter"] = json!(adapter);
     }
     body
 }
@@ -656,6 +1074,23 @@ fn is_unrouted(status: reqwest::StatusCode, body: &str) -> bool {
             .is_some_and(|d| d == "Not Found")
 }
 
+/// Validate one trace id as the single safe path segment accepted by the API.
+///
+/// Keeping this byte-for-byte shape at the CLI boundary means a malformed id
+/// is a usage error before HTTP, while a well-formed id that the API does not
+/// know remains a distinct runtime failure.
+pub fn parse_trace_id(raw: &str) -> std::result::Result<String, String> {
+    if (1..=128).contains(&raw.len())
+        && raw
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        Ok(raw.to_string())
+    } else {
+        Err("trace id must be 1-128 ASCII letters, digits, underscores, or hyphens".to_string())
+    }
+}
+
 impl ApiClient {
     /// The server caps `/approvals` results at this many rows
     /// (`apps/api/.../routers/approvals.py`: `min(max(limit, 1), 200)`); the CLI
@@ -665,15 +1100,8 @@ impl ApiClient {
 
     pub fn new(base_url: &str, api_key: &str) -> Result<Self> {
         warn_if_insecure(base_url);
-        let endpoint = reqwest::Url::parse(base_url.trim()).ok();
-        let mut builder =
-            reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(5));
-        if endpoint.as_ref().is_some_and(|endpoint| {
-            matches!(endpoint.scheme(), "http" | "https") && has_local_host(endpoint)
-        }) {
-            builder = builder.no_proxy();
-        }
-        let http = builder.build().context("building HTTP client")?;
+        let http = http_client(base_url, Some(std::time::Duration::from_secs(5)))
+            .context("building HTTP client")?;
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),
@@ -686,6 +1114,14 @@ impl ApiClient {
             return Ok(resp);
         }
         let status = resp.status();
+        // Redirects are never followed, because a followed one would carry the
+        // `X-API-Key` header to whatever host it named (see [`http_client`]), so a
+        // 3xx lands here as an ordinary response. Say what it is: the configured
+        // endpoint is not the platform API itself but something in front of it,
+        // which is an operator configuration fact, not an API failure.
+        if let Some(refusal) = redirect_refusal(status, resp.headers()) {
+            bail!("{what} failed: {refusal}");
+        }
         let body = resp.text().await.unwrap_or_default();
         // An unrouted path means the platform is older than this CLI, which is
         // a different problem from a missing resource and has a different fix.
@@ -730,6 +1166,77 @@ impl ApiClient {
         }
     }
 
+    async fn expect_observability_ok(
+        resp: reqwest::Response,
+        what: &str,
+    ) -> Result<reqwest::Response> {
+        let status = resp.status();
+        if matches!(
+            status,
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+                | reqwest::StatusCode::BAD_GATEWAY
+                | reqwest::StatusCode::SERVICE_UNAVAILABLE
+                | reqwest::StatusCode::GATEWAY_TIMEOUT
+        ) {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ObservabilityApiUnavailable(format!(
+                "{what} failed with {status}: {}",
+                body.trim()
+            ))
+            .into());
+        }
+        if matches!(
+            status,
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ) {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow::Error::from(
+                crate::exit::CliError::failure(format!(
+                    "{what} failed with {status}: {}",
+                    body.trim()
+                ))
+                .with_fix("verify --api-key or CURIE_API_KEY matches the selected platform API"),
+            ));
+        }
+        if matches!(
+            status,
+            reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNPROCESSABLE_ENTITY
+        ) {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow::Error::from(
+                crate::exit::CliError::usage(format!(
+                    "{what} failed with {status}: {}",
+                    body.trim()
+                ))
+                .with_fix("review the observability query filters and retry with valid values"),
+            ));
+        }
+        Self::expect_ok(resp, what).await
+    }
+
+    async fn get_observability_json<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        query: &[(&str, String)],
+        what: &str,
+    ) -> Result<T> {
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!("{}{path}", self.base_url))
+                    .header("X-API-Key", &self.api_key)
+                    .query(query)
+                    .timeout(std::time::Duration::from_secs(30)),
+                "GET observability",
+            )
+            .await?;
+        Self::expect_observability_ok(resp, what)
+            .await?
+            .json()
+            .await
+            .with_context(|| format!("decoding {what}"))
+    }
+
     pub async fn list_agents(&self) -> Result<Vec<Agent>> {
         let resp = self
             .send_request(
@@ -744,6 +1251,128 @@ impl ApiClient {
             .json()
             .await
             .context("decoding agent list")
+    }
+
+    /// Read the newest trace rows through the platform API proxy. The caller
+    /// supplies the public bound and also truncates defensively after decoding;
+    /// the latter keeps a skewed or older server from violating the CLI result
+    /// contract even if it ignores `limit`.
+    pub async fn list_observability_runs(
+        &self,
+        limit: usize,
+        agent_id: Option<&str>,
+    ) -> Result<Vec<TraceListRow>> {
+        let mut query = vec![("limit", limit.to_string())];
+        if let Some(agent_id) = agent_id {
+            query.push(("agent_id", agent_id.to_string()));
+        }
+        self.get_observability_json("/langfuse/traces", &query, "listing observability runs")
+            .await
+    }
+
+    /// Read one complete trace tree through the platform API proxy. A handler
+    /// 404 is `Ok(None)` so the command can classify an unknown trace as exit
+    /// 1; FastAPI's generic unrouted 404 remains the existing stale-platform
+    /// error with its upgrade guidance.
+    pub async fn observability_run(&self, trace_id: &str) -> Result<Option<TraceTree>> {
+        parse_trace_id(trace_id).map_err(anyhow::Error::msg)?;
+        let resp = self
+            .http
+            .get(format!("{}/langfuse/traces/{trace_id}", self.base_url))
+            .header("X-API-Key", &self.api_key)
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await
+            .context("GET /langfuse/traces/{trace_id}")?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            let body = resp.text().await.unwrap_or_default();
+            if is_unrouted(reqwest::StatusCode::NOT_FOUND, &body) {
+                bail!(
+                    "reading observability run failed: this platform release does not have that \
+                     endpoint, so it is older than this CLI. Upgrade the release, or use a CLI \
+                     matching it."
+                );
+            }
+            return Ok(None);
+        }
+        let run = Self::expect_observability_ok(resp, "reading observability run")
+            .await?
+            .json()
+            .await
+            .context("decoding observability run")?;
+        Ok(Some(run))
+    }
+
+    /// Read the complete existing metrics-summary DTO through the platform API.
+    pub async fn observability_metrics_summary(
+        &self,
+        start: Option<&str>,
+        end: Option<&str>,
+        environment: Option<&str>,
+        agent: Option<&str>,
+    ) -> Result<MetricsSummary> {
+        let mut query = Vec::new();
+        for (key, value) in [
+            ("start", start),
+            ("end", end),
+            ("environment", environment),
+            ("agent", agent),
+        ] {
+            if let Some(value) = value {
+                query.push((key, value.to_string()));
+            }
+        }
+        self.get_observability_json(
+            "/observability/metrics/summary",
+            &query,
+            "reading observability metrics summary",
+        )
+        .await
+    }
+
+    /// Read the complete existing metric-series DTO through the platform API.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn observability_metric_series(
+        &self,
+        metric: &str,
+        granularity: &str,
+        start: Option<&str>,
+        end: Option<&str>,
+        environment: Option<&str>,
+        agent: Option<&str>,
+    ) -> Result<MetricSeries> {
+        let mut query = vec![
+            ("metric", metric.to_string()),
+            ("granularity", granularity.to_string()),
+        ];
+        for (key, value) in [
+            ("start", start),
+            ("end", end),
+            ("environment", environment),
+            ("agent", agent),
+        ] {
+            if let Some(value) = value {
+                query.push((key, value.to_string()));
+            }
+        }
+        let series: MetricSeries = self
+            .get_observability_json(
+                "/observability/metrics/series",
+                &query,
+                "reading observability metric series",
+            )
+            .await?;
+        if series.points.len() > MAX_OBSERVABILITY_METRIC_POINTS {
+            return Err(anyhow::Error::from(
+                crate::exit::CliError::failure(format!(
+                    "the API returned {} metric points, above the CLI maximum of {}",
+                    series.points.len(),
+                    MAX_OBSERVABILITY_METRIC_POINTS
+                ))
+                .with_fix("narrow --start/--end or choose a coarser --granularity"),
+            ));
+        }
+        Ok(series)
     }
 
     pub async fn create_agent(
@@ -799,6 +1428,94 @@ impl ApiClient {
             .json()
             .await
             .context("decoding updated agent")
+    }
+
+    /// `GET /agents/{id}`: the agent row as the API holds it right now. Used by
+    /// the ensure-bound recheck, which must read a FRESH row rather than the
+    /// one resolution already had.
+    pub async fn get_agent(&self, agent_id: &str) -> Result<Agent> {
+        let resp = self
+            .http
+            .get(format!("{}/agents/{agent_id}", self.base_url))
+            .header("X-API-Key", &self.api_key)
+            .send()
+            .await
+            .context("GET /agents/{id}")?;
+        Self::expect_ok(resp, "reading the agent")
+            .await?
+            .json()
+            .await
+            .context("decoding the agent")
+    }
+
+    /// Add one channel binding: `POST /agents/{id}/channels` (201 with the
+    /// agent as stored).
+    ///
+    /// A 409 is AMBIGUOUS: the pair's uniqueness is platform-wide, so the
+    /// conflict may be another agent holding it (a real error) or this very
+    /// agent, when a concurrent deploy won the race to add the same pair. This
+    /// is ensure-bound, a statement about the END STATE, so the conflict is
+    /// rechecked against a fresh read and answered as success only when this
+    /// agent now owns the pair.
+    pub async fn add_agent_channel(
+        &self,
+        agent_id: &str,
+        kind: &str,
+        address: &str,
+        endpoint: Option<&str>,
+        adapter: Option<&str>,
+    ) -> Result<Agent> {
+        let resp = self
+            .http
+            .post(format!("{}/agents/{agent_id}/channels", self.base_url))
+            .header("X-API-Key", &self.api_key)
+            .json(&add_channel_body(kind, address, endpoint, adapter))
+            .send()
+            .await
+            .context("POST /agents/{id}/channels")?;
+        if resp.status() == reqwest::StatusCode::CONFLICT {
+            let conflict = Self::expect_ok(resp, "adding the channel binding")
+                .await
+                .expect_err("a 409 is never a success");
+            let agent = self.get_agent(agent_id).await?;
+            if agent
+                .channels
+                .iter()
+                .any(|b| b.kind == kind && b.address == address)
+            {
+                return Ok(agent);
+            }
+            return Err(conflict);
+        }
+        Self::expect_ok(resp, "adding the channel binding")
+            .await?
+            .json()
+            .await
+            .context("decoding the agent after the channel add")
+    }
+
+    /// Remove one channel binding: `DELETE /agents/{id}/channels?kind=&address=`
+    /// (204, no body). The PAIR travels, never the address alone: on a
+    /// multi-binding agent an address-only removal would drop the wrong row.
+    ///
+    /// The API refuses to remove an agent's LAST binding with a 409, which
+    /// [`Self::expect_ok`] surfaces with the reason intact.
+    pub async fn remove_agent_channel(
+        &self,
+        agent_id: &str,
+        kind: &str,
+        address: &str,
+    ) -> Result<()> {
+        let resp = self
+            .http
+            .delete(format!("{}/agents/{agent_id}/channels", self.base_url))
+            .query(&[("kind", kind), ("address", address)])
+            .header("X-API-Key", &self.api_key)
+            .send()
+            .await
+            .context("DELETE /agents/{id}/channels")?;
+        Self::expect_ok(resp, "removing the channel binding").await?;
+        Ok(())
     }
 
     /// Bind the per-agent connector secrets (ADR-0009, #429). The values travel
@@ -857,7 +1574,16 @@ impl ApiClient {
                 // than sent away to be built again from scratch (#1212). An
                 // agent already bound elsewhere is NOT moved: a deploy must not
                 // silently reroute which repository's pushes reach it.
-                let channel_move = slack_channel.filter(|c| *c != agent.channel.address.as_str());
+                // ENSURE-BOUND (ADR-0118): `--slack-channel` states a binding
+                // the agent must HOLD, not the one binding it may have. An
+                // address it already answers on is nothing to do; anything else
+                // is added beside what is there, never on top of it.
+                let channel_add = slack_channel.filter(|c| {
+                    !agent
+                        .channels
+                        .iter()
+                        .any(|b| b.kind == "slack" && b.address == **c)
+                });
                 let current_repo = agent.repo_full_name.as_deref();
                 let (repo_bind, mut repo_note) = match (repo_full_name, current_repo) {
                     (Some(want), None) => (Some(want), None),
@@ -874,14 +1600,22 @@ impl ApiClient {
                     ),
                     _ => (None, None),
                 };
-                // One request rather than two removes the client-side window
-                // where the channel moved and a second call then failed, and
-                // the channel-uniqueness 409 aborts before repo_full_name is
-                // reached. The server still commits per field, so the two
-                // fields are not applied atomically.
-                let previous_channel = channel_move.map(|_| agent.channel.address.clone());
-                let agent = if channel_move.is_some() || repo_bind.is_some() {
-                    let body = agent_update_body(channel_move, repo_bind);
+                // TWO requests, not one: the binding lives on its own
+                // subresource now that `AgentUpdate.channel` is retired
+                // (ADR-0118), so the repo bind stays a separate PATCH. A
+                // failure between them therefore leaves the channel added and
+                // the repo unbound -- which is why the channel goes FIRST. A
+                // bound channel with no repo still answers a turn; a bound repo
+                // with no channel does not.
+                let agent = match channel_add {
+                    Some(address) => {
+                        self.add_agent_channel(&agent.id, "slack", address, None, None)
+                            .await?
+                    }
+                    None => agent,
+                };
+                let agent = if repo_bind.is_some() {
+                    let body = agent_update_body(repo_bind);
                     self.update_agent(&agent.id, &body).await?
                 } else {
                     agent
@@ -902,13 +1636,12 @@ impl ApiClient {
                         stored = bound.unwrap_or("no binding")
                     ));
                 }
-                let outcome = match previous_channel {
-                    Some(from) => ChannelOutcome::Updated {
-                        from,
-                        to: agent.channel.address.clone(),
+                let outcome = match channel_add {
+                    Some(address) => ChannelOutcome::Added {
+                        address: address.to_string(),
                     },
                     None => ChannelOutcome::Unchanged {
-                        channel: agent.channel.address.clone(),
+                        channels: agent.channels.iter().map(|b| b.address.clone()).collect(),
                         passed: slack_channel.is_some(),
                     },
                 };
@@ -917,7 +1650,14 @@ impl ApiClient {
             None => {
                 let channel = slack_channel.unwrap_or(DEFAULT_SLACK_CHANNEL);
                 let agent = self.create_agent(name, channel, repo_full_name).await?;
-                let outcome = ChannelOutcome::Created(agent.channel.address.clone());
+                // `AgentCreate` still carries the singular channel, so a created
+                // agent holds exactly the one binding it was created with.
+                let outcome = ChannelOutcome::Created(
+                    agent
+                        .channels
+                        .first()
+                        .map_or_else(|| channel.to_string(), |b| b.address.clone()),
+                );
                 Ok((agent, outcome, None))
             }
         }
@@ -928,13 +1668,18 @@ impl ApiClient {
         agent_id: &str,
         version_label: &str,
         created_by: &str,
+        commit_sha: Option<&str>,
     ) -> Result<Version> {
         let resp = self
             .send_request(
                 self.http
                     .post(format!("{}/agents/{agent_id}/versions", self.base_url))
                     .header("X-API-Key", &self.api_key)
-                    .json(&json!({"version_label": version_label, "created_by": created_by})),
+                    .json(&json!({
+                        "version_label": version_label,
+                        "created_by": created_by,
+                        "commit_sha": commit_sha,
+                    })),
                 "POST /agents/{id}/versions",
             )
             .await?;
@@ -980,17 +1725,24 @@ impl ApiClient {
         agent_id: &str,
         version_id: &str,
         environment: &str,
+        commit_sha: Option<&str>,
+        workspace_enabled: Option<bool>,
     ) -> Result<Deployment> {
+        let mut body = json!({
+            "agent_id": agent_id,
+            "version_id": version_id,
+            "environment": environment,
+            "commit_sha": commit_sha,
+        });
+        if let Some(enabled) = workspace_enabled {
+            body["workspace_enabled"] = json!(enabled);
+        }
         let resp = self
             .send_request(
                 self.http
                     .post(format!("{}/deployments", self.base_url))
                     .header("X-API-Key", &self.api_key)
-                    .json(&json!({
-                        "agent_id": agent_id,
-                        "version_id": version_id,
-                        "environment": environment,
-                    })),
+                    .json(&body),
                 "POST /deployments",
             )
             .await?;
@@ -1012,6 +1764,8 @@ impl ApiClient {
         archive: Vec<u8>,
         secrets: &std::collections::BTreeMap<String, String>,
         repo_full_name: Option<&str>,
+        commit_sha: Option<&str>,
+        workspace: WorkspaceIntent,
     ) -> Result<PreparedDeployOutcome> {
         let (agent, channel, repo_note) = self
             .resolve_agent(agent_name, slack_channel, repo_full_name)
@@ -1023,7 +1777,7 @@ impl ApiClient {
             self.update_agent_secrets(&agent.id, secrets).await?;
         }
         let version = self
-            .create_version(&agent.id, version_label, created_by)
+            .create_version(&agent.id, version_label, created_by, commit_sha)
             .await?;
         let bundle = self.upload_bundle(&agent.id, &version.id, archive).await?;
         Ok(PreparedDeployOutcome {
@@ -1032,6 +1786,12 @@ impl ApiClient {
             bundle,
             channel,
             repo_note,
+            commit_sha: commit_sha.map(str::to_string),
+            workspace_enabled: match workspace {
+                WorkspaceIntent::Preserve => None,
+                WorkspaceIntent::Disable => Some(false),
+                WorkspaceIntent::Enable => Some(true),
+            },
         })
     }
 
@@ -1040,8 +1800,16 @@ impl ApiClient {
         prepared: PreparedDeployOutcome,
         environment: &str,
     ) -> Result<DeployOutcome> {
+        let commit_sha = prepared.commit_sha.clone();
+        let workspace_enabled = prepared.workspace_enabled;
         let deployment = self
-            .create_deployment(&prepared.agent.id, &prepared.version.id, environment)
+            .create_deployment(
+                &prepared.agent.id,
+                &prepared.version.id,
+                environment,
+                commit_sha.as_deref(),
+                workspace_enabled,
+            )
             .await?;
         Ok(DeployOutcome {
             agent: prepared.agent,
@@ -1066,6 +1834,8 @@ impl ApiClient {
         archive: Vec<u8>,
         secrets: &std::collections::BTreeMap<String, String>,
         repo_full_name: Option<&str>,
+        commit_sha: Option<&str>,
+        workspace: WorkspaceIntent,
     ) -> Result<DeployOutcome> {
         let prepared = self
             .prepare_deploy(
@@ -1076,6 +1846,8 @@ impl ApiClient {
                 archive,
                 secrets,
                 repo_full_name,
+                commit_sha,
+                workspace,
             )
             .await?;
         self.activate_deploy(prepared, environment).await
@@ -1230,6 +2002,9 @@ impl ApiClient {
             )
             .await?;
         let status = resp.status();
+        if let Some(refusal) = redirect_refusal(status, resp.headers()) {
+            anyhow::bail!("resolving target `{target}` failed: {refusal}");
+        }
         let body = resp.text().await.unwrap_or_default();
         if is_unrouted(status, &body) {
             anyhow::bail!(
@@ -1261,6 +2036,9 @@ impl ApiClient {
             )
             .await?;
         let status = resp.status();
+        if let Some(refusal) = redirect_refusal(status, resp.headers()) {
+            anyhow::bail!("listing the deploy targets failed: {refusal}");
+        }
         let body = resp.text().await.unwrap_or_default();
         // Same skew guard as `resolve_deploy_target`: a platform predating this
         // endpoint answers with FastAPI's bare 404 body, which is otherwise
@@ -1555,7 +2333,7 @@ impl ApiClient {
     pub async fn set_approval_routes(
         &self,
         agent_id: &str,
-        routes: &std::collections::BTreeMap<String, ApprovalRouteBinding>,
+        routes: &std::collections::BTreeMap<String, ApprovalRouteBindingWrite>,
     ) -> Result<Agent> {
         let resp = self
             .send_request(
@@ -1656,6 +2434,19 @@ impl ApiClient {
             .context("decoding deployment list")
     }
 
+    /// End the deployment: `DELETE /deployments/{id}` (204 No Content on success).
+    pub async fn end_deployment(&self, deployment_id: &str) -> Result<()> {
+        let resp = self
+            .http
+            .delete(format!("{}/deployments/{deployment_id}", self.base_url))
+            .header("X-API-Key", &self.api_key)
+            .send()
+            .await
+            .context("DELETE /deployments/{id}")?;
+        Self::expect_ok(resp, "ending the deployment").await?;
+        Ok(())
+    }
+
     /// Read a version's authored text files (skills, manifest, eval cases):
     /// `GET /agents/{id}/versions/{version_id}/files`. The `approvals` read pulls
     /// the deployed bundle's manifest from here to recover its `approvalPolicy`
@@ -1701,7 +2492,7 @@ impl ApiClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{agent_create_body, agent_update_body, is_insecure_endpoint};
+    use super::{add_channel_body, agent_create_body, agent_update_body, is_insecure_endpoint};
 
     #[test]
     fn create_agent_body_omits_repo_unless_asked() {
@@ -1727,7 +2518,7 @@ mod tests {
     fn agent_update_body_omits_both_when_neither_is_asked() {
         // Omission is how the wire says "leave this alone", so a PATCH with
         // nothing to change carries nothing at all.
-        let body = agent_update_body(None, None);
+        let body = agent_update_body(None);
         assert!(
             body.as_object().expect("an object").is_empty(),
             "was {body}"
@@ -1740,19 +2531,47 @@ mod tests {
         // guards both fields behind `is not None`, and Pydantic decodes a null
         // and an omitted key identically, so a null would read as "omitted"
         // while looking on the wire like an intent to clear (#1071).
-        let channel = agent_update_body(Some("C123"), None);
-        assert_eq!(channel["channel"]["kind"], "slack");
-        assert_eq!(channel["channel"]["address"], "C123");
-        assert!(channel.get("repo_full_name").is_none(), "was {channel}");
-
-        let repo = agent_update_body(None, Some("acme/bundle"));
+        let repo = agent_update_body(Some("acme/bundle"));
         assert_eq!(repo["repo_full_name"], "acme/bundle");
-        assert!(repo.get("channel").is_none(), "was {repo}");
+    }
 
-        let both = agent_update_body(Some("C123"), Some("acme/bundle"));
-        assert_eq!(both["channel"]["kind"], "slack");
-        assert_eq!(both["channel"]["address"], "C123");
-        assert_eq!(both["repo_full_name"], "acme/bundle");
+    #[test]
+    fn agent_update_body_never_emits_channel() {
+        // `AgentUpdate.channel` is retired: bindings move through
+        // `POST /agents/{id}/channels`. A body that still carries the key does
+        // not merely send something unnecessary, it 422s the whole PATCH --
+        // taking the repo bind travelling beside it down with it.
+        for body in [
+            agent_update_body(None),
+            agent_update_body(Some("acme/bundle")),
+        ] {
+            assert!(
+                body.get("channel").is_none() && body.get("channels").is_none(),
+                "no binding key belongs in an AgentUpdate body: {body}"
+            );
+        }
+        assert_eq!(
+            agent_update_body(Some("acme/bundle")),
+            serde_json::json!({"repo_full_name": "acme/bundle"}),
+            "the repo bind is the only thing left in this body"
+        );
+    }
+
+    #[test]
+    fn add_channel_body_shape() {
+        // The subresource takes the PAIR and nothing else. Exact equality is
+        // the assertion, so a stray `agent_id` echoed back into the body, or a
+        // bare address string standing in for the pair, both fail.
+        assert_eq!(
+            add_channel_body("slack", "C0EXAMPLE1", None, None),
+            serde_json::json!({"kind": "slack", "address": "C0EXAMPLE1"})
+        );
+        // The kind is never inferred: a non-Slack ingress passes through
+        // verbatim, which is the whole point of a channel-neutral binding.
+        assert_eq!(
+            add_channel_body("email", "ops@example.com", None, None),
+            serde_json::json!({"kind": "email", "address": "ops@example.com"})
+        );
     }
 
     #[test]

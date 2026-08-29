@@ -25,12 +25,13 @@
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use curie_aci_protocol::QueuedTurn;
 use redis::aio::MultiplexedConnection;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::api::{Agent, ApiClient};
 use crate::chat::{
@@ -381,10 +382,16 @@ fn persist_and_hint(opts: &MessageOpts, verb: TurnVerb, channel: &str, thread_ts
 // Pure command builders (unit-tested below)
 // ---------------------------------------------------------------------------
 
-/// `kubectl -n <ns> port-forward svc/<release>-<suffix> <local>:<remote>`.
+/// `kubectl -n <ns> port-forward svc/<fullname>-<suffix> <local>:<remote>`.
+///
+/// Takes a RESOLVED `ReleaseFullname` (#1533). Every component this tunnels to
+/// (`api`, `valkey`) is rendered by the chart as
+/// `{{ include "curie.fullname" . }}-<suffix>`, which is NOT `{release}-<suffix>`
+/// unless the release name already contains the chart name. A raw release name
+/// cannot reach this builder, which is the point of the newtype.
 pub fn port_forward_command(
     namespace: &str,
-    release: &str,
+    fullname: &crate::ops::ReleaseFullname,
     suffix: &str,
     local_port: u16,
     remote_port: u16,
@@ -395,7 +402,7 @@ pub fn port_forward_command(
             plain("-n"),
             plain(namespace),
             plain("port-forward"),
-            plain(format!("svc/{release}-{suffix}")),
+            plain(format!("svc/{}", fullname.resource(suffix))),
             plain(format!("{local_port}:{remote_port}")),
         ],
     )
@@ -468,37 +475,73 @@ static CLUSTER_TRUST_SIGNAL_STATE: std::sync::LazyLock<std::sync::Mutex<Option<T
 static CLUSTER_TRUST_SIGNAL_HANDLER: std::sync::OnceLock<std::result::Result<(), String>> =
     std::sync::OnceLock::new();
 
-/// Probe the connected transport without collapsing a kubectl/RBAC failure into
-/// "dispatcher absent". Trust may only be widened after absence is positively
-/// observed; an indeterminate probe therefore refuses before any mutation.
-async fn dispatcher_connected_strict(namespace: &str, release: &str) -> Result<bool> {
-    let command = OpsCommand::new(
+/// The kubectl read behind `dispatcher_connected_strict`, extracted pure so the
+/// Deployment NAME is unit-testable without a cluster (#1533).
+///
+/// `--ignore-not-found` is what makes a wrong name dangerous here: a Deployment
+/// that does not exist returns success with EMPTY output, which the caller
+/// reads as "Slack is disconnected" and acts on by widening worker Slack trust.
+/// That is a silent wrong-direction mutation, not a visible failure, so the
+/// name must be the chart-rendered one.
+fn dispatcher_probe_command(namespace: &str, fullname: &crate::ops::ReleaseFullname) -> OpsCommand {
+    OpsCommand::new(
         "kubectl",
         vec![
             plain("-n"),
             plain(namespace),
             plain("get"),
             plain("deployment"),
-            plain(format!("{release}-dispatcher")),
+            plain(fullname.resource("dispatcher")),
             plain("--ignore-not-found"),
             plain("-o"),
             plain("name"),
         ],
-    );
+    )
+}
+
+/// Probe the connected transport without collapsing a kubectl/RBAC failure into
+/// "dispatcher absent". Trust may only be widened after absence is positively
+/// observed; an indeterminate probe therefore refuses before any mutation.
+async fn dispatcher_connected_strict(
+    namespace: &str,
+    fullname: &crate::ops::ReleaseFullname,
+) -> Result<bool> {
+    let command = dispatcher_probe_command(namespace, fullname);
     let (ok, out, err) = run_capture(&command).await?;
     if !ok {
         bail!(
-            "could not prove that Slack is disconnected for release {release} in namespace \
+            "could not prove that Slack is disconnected for {} in namespace \
              {namespace}; refusing to widen worker Slack trust: {}",
+            fullname.resource("dispatcher"),
             err.trim().lines().next().unwrap_or("kubectl probe failed")
         );
     }
     Ok(!out.trim().is_empty())
 }
 
+/// The worker Deployment the temporary trust widening (#1812) patches.
+///
+/// Extracted so the NAME is unit-testable without a cluster (#1533). The chart
+/// renders `{{ include "curie.fullname" . }}-worker`; a `{release}-worker` guess
+/// patches nothing, so the stub reply never arrives and the guard's ownership
+/// annotation lands on no object.
+fn stub_trust_deployment(fullname: &crate::ops::ReleaseFullname) -> String {
+    fullname.resource("worker")
+}
+
 impl ClusterStubTrust {
-    async fn install(namespace: &str, release: &str, advertise_host: &str) -> Result<Self> {
-        let deployment = format!("{release}-worker");
+    /// `release` is still needed alongside `fullname`: the post-rollout wait
+    /// selects pods by `app.kubernetes.io/instance=<release>`, which is the raw
+    /// Helm release name and NOT the rendered fullname (`curie.selectorLabels`,
+    /// `charts/curie/templates/_helpers.tpl:40-44`). Only the Deployment NAME
+    /// follows `curie.fullname` (#1533).
+    async fn install(
+        namespace: &str,
+        release: &str,
+        fullname: &crate::ops::ReleaseFullname,
+        advertise_host: &str,
+    ) -> Result<Self> {
+        let deployment = stub_trust_deployment(fullname);
         let view = read_worker_trust(namespace, &deployment).await?;
         let prevention_wait_budget = worker_prevention_wait_budget(&view);
         let host = if advertise_host.contains(':') && !advertise_host.starts_with('[') {
@@ -510,7 +553,7 @@ impl ClusterStubTrust {
         if let Some(holder) = view.holder.as_deref() {
             bail!(
                 "another cluster message command ({holder}) is temporarily managing worker Slack \
-                 trust for release {release}; retry after it exits"
+                 trust on {deployment}; retry after it exits"
             );
         }
         if view
@@ -1171,23 +1214,33 @@ pub fn local_api_base(api_url: Option<&str>) -> String {
 }
 
 /// Pick the channel to send as: an explicit `--channel` wins; otherwise the sole
-/// deployed agent's channel. Zero or multiple agents is an error naming
+/// deployed `(agent, channel)` PAIR. Selection counts pairs rather than agents
+/// (ADR-0118) because one agent may answer on several channels, and picking a
+/// channel is what this returns. Zero or multiple pairs is an error naming
 /// them and requiring `--channel`, because the worker binds a channel to an
 /// agent by exact equality -- guessing would silently route nowhere.
 pub fn select_channel(agents: &[Agent], explicit: Option<&str>) -> Result<String> {
     if let Some(channel) = explicit {
         return Ok(channel.to_string());
     }
-    match agents {
+    let pairs: Vec<(&str, &str)> = agents
+        .iter()
+        .flat_map(|a| {
+            a.channels
+                .iter()
+                .map(move |c| (a.name.as_str(), c.address.as_str()))
+        })
+        .collect();
+    match pairs.as_slice() {
         [] => bail!(
             "no agents are deployed on the platform API; deploy one with `curie local deploy` \
              or `curie cluster deploy`, or pass --channel <id>"
         ),
-        [only] => Ok(only.channel.address.clone()),
+        [(_, only)] => Ok((*only).to_string()),
         many => {
             let listed = many
                 .iter()
-                .map(|a| format!("{} -> {}", a.name, a.channel.address))
+                .map(|(name, address)| format!("{name} -> {address}"))
                 .collect::<Vec<_>>()
                 .join(", ");
             bail!("multiple agents are deployed; pass --channel <id> to pick one ({listed})")
@@ -1249,9 +1302,14 @@ pub fn server_host_and_port(server: &str) -> Option<(String, u16)> {
 /// The reply routes back to the stub via the per-turn endpoint on the queue
 /// payload (issue #19), so there is no worker-global `helm upgrade` to render.
 pub fn dry_run_lines(opts: &MessageOpts, advertise_host: &str) -> Vec<String> {
+    // Offline by contract: a dry run contacts no cluster, so it renders the
+    // chart's no-override `curie.fullname` rule rather than discovering the
+    // rendered name (#1533). Under `nameOverride`/`fullnameOverride` the printed
+    // service names are therefore the chart-default ones, not this install's.
+    let fullname = crate::ops::chart_fullname(&opts.release);
     let mut cmds: Vec<OpsCommand> = vec![port_forward_command(
         &opts.namespace,
-        &opts.release,
+        &fullname,
         "valkey",
         opts.valkey_local_port,
         VALKEY_REMOTE_PORT,
@@ -1259,7 +1317,7 @@ pub fn dry_run_lines(opts: &MessageOpts, advertise_host: &str) -> Vec<String> {
     if opts.channel.is_none() {
         cmds.push(port_forward_command(
             &opts.namespace,
-            &opts.release,
+            &fullname,
             "api",
             opts.api_local_port,
             API_REMOTE_PORT,
@@ -1271,7 +1329,7 @@ pub fn dry_run_lines(opts: &MessageOpts, advertise_host: &str) -> Vec<String> {
     let channel = opts
         .channel
         .clone()
-        .unwrap_or_else(|| "<the sole deployed agent's channel>".to_string());
+        .unwrap_or_else(|| "<the sole bound (agent, Slack channel) pair>".to_string());
     lines.push(format!(
         "enqueue a synthetic QueuedTurn (reply endpoint {url}) for channel {channel} \
          on stream {}",
@@ -1347,7 +1405,8 @@ pub fn message_enqueued_json(channel: &str, thread: &str) -> serde_json::Value {
 /// The machine-readable descriptor for `local`/`cluster message --json --dry-run`
 /// (issue #354): what a real run would enqueue, without touching the network.
 /// `target` is `"local"` or `"cluster"`, `channel` is null when it would be
-/// resolved from the sole deployed agent. Pure so it stays contract-testable
+/// resolved from the sole bound (agent, Slack channel) pair. Pure so it stays
+/// contract-testable
 /// against `cli/schema/message.schema.json`.
 pub fn message_dry_run_json(
     target: &str,
@@ -1735,13 +1794,423 @@ async fn bounded_diagnostics(
         })
 }
 
+const COMPOSE_CONFIG_FILES_LABEL: &str = "com.docker.compose.project.config_files";
+const COMPOSE_DISPATCHER_SERVICE: &str = "curie-dispatcher";
+const DISPATCHER_ENQUEUE_MODULE: &str = "curie_dispatcher.enqueue_once";
+const DISPATCHER_ENQUEUE_TIMEOUT: Duration = Duration::from_secs(30);
+const OTEL_EXPORTER_ENV_KEYS: [&str; 38] = [
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_PROTOCOL",
+    "OTEL_EXPORTER_OTLP_HEADERS",
+    "OTEL_EXPORTER_OTLP_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_CLIENT_KEY",
+    "OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_INSECURE",
+    "OTEL_EXPORTER_OTLP_COMPRESSION",
+    "OTEL_EXPORTER_OTLP_TIMEOUT",
+    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
+    "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+    "OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_TRACES_CLIENT_KEY",
+    "OTEL_EXPORTER_OTLP_TRACES_CLIENT_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_TRACES_INSECURE",
+    "OTEL_EXPORTER_OTLP_TRACES_COMPRESSION",
+    "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT",
+    "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL",
+    "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
+    "OTEL_EXPORTER_OTLP_LOGS_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_LOGS_CLIENT_KEY",
+    "OTEL_EXPORTER_OTLP_LOGS_CLIENT_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_LOGS_INSECURE",
+    "OTEL_EXPORTER_OTLP_LOGS_COMPRESSION",
+    "OTEL_EXPORTER_OTLP_LOGS_TIMEOUT",
+    "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL",
+    "OTEL_EXPORTER_OTLP_METRICS_HEADERS",
+    "OTEL_EXPORTER_OTLP_METRICS_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_METRICS_CLIENT_KEY",
+    "OTEL_EXPORTER_OTLP_METRICS_CLIENT_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_METRICS_INSECURE",
+    "OTEL_EXPORTER_OTLP_METRICS_COMPRESSION",
+    "OTEL_EXPORTER_OTLP_METRICS_TIMEOUT",
+    "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE",
+    "OTEL_EXPORTER_OTLP_METRICS_DEFAULT_HISTOGRAM_AGGREGATION",
+];
+static DISPATCHER_ENQUEUE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Parse Compose's canonical config-file label. Compose stores multiple `-f`
+/// inputs as a comma-separated list; an ordinary Curie stack carries one.
+fn compose_config_files(label: &str) -> Result<Vec<String>> {
+    let files: Vec<String> = label
+        .trim()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != "<no value>" && *value != "<nil>")
+        .map(str::to_string)
+        .collect();
+    if files.is_empty() {
+        bail!(
+            "the running local worker has no `{COMPOSE_CONFIG_FILES_LABEL}` label; restart it with `curie local up`"
+        );
+    }
+    Ok(files)
+}
+
+/// The dispatcher image the one-shot producer should run, or None to leave
+/// compose's default alone.
+///
+/// Derived from the RUNNING api container's tag, then checked for existence, and
+/// both halves are load-bearing:
+///
+/// - Derived, because the tag is a property of the stack rather than of this
+///   invocation. Compose substitutes its variables from each caller's own
+///   environment, so after `local up --build` the stack ran `:dev` while this
+///   verb resolved `:latest` and died on `No module named
+///   curie_dispatcher.enqueue_once`.
+/// - Checked, because a tag that exists for the platform images need not exist
+///   for the dispatcher. CI runs the ladder with `CURIE_BASE_TAG=ci-local` and
+///   builds its dispatcher as `:latest`, so pointing this at `:ci-local` asked
+///   for an image nothing had built and failed the stack.
+///
+/// Best-effort throughout: any unreadable step leaves compose's default in
+/// force, which is the behaviour that existed before #1915.
+///
+/// Both halves now live in `local.rs` (#1925), because every `local` verb that
+/// recreates a service needs the same derivation -- this one just narrows it to
+/// the single image the one-shot producer runs.
+async fn one_shot_dispatcher_image() -> Option<String> {
+    let tag = crate::local::running_stack_tag().await?;
+    let candidate = crate::local::image_ref("curie-dispatcher", &tag);
+    crate::local::image_present(&candidate)
+        .await
+        .then_some(candidate)
+}
+
+fn worker_compose_config_command(container: &str) -> OpsCommand {
+    OpsCommand::new(
+        "docker",
+        vec![
+            plain("inspect"),
+            plain("--format"),
+            plain(format!(
+                "{{{{ index .Config.Labels \"{COMPOSE_CONFIG_FILES_LABEL}\" }}}}"
+            )),
+            plain(container),
+        ],
+    )
+}
+
+fn worker_otel_exporter_env_command(container: &str) -> OpsCommand {
+    // Filter before captured stdout crosses the worker process boundary. Each
+    // selected entry is encoded as one JSON string so the first `=` and
+    // everything after it survive intact.
+    let mut template = concat!(
+        "{{range .Config.Env}}",
+        "{{$entry := .}}",
+        "{{$name := index (split $entry \"=\") 0}}",
+        "{{if or "
+    )
+    .to_string();
+    for name in OTEL_EXPORTER_ENV_KEYS {
+        template.push_str(&format!("(eq $name \"{name}\") "));
+    }
+    template.push_str("}}{{json $entry}}{{println}}{{end}}{{end}}");
+    OpsCommand::new(
+        "docker",
+        vec![
+            plain("inspect"),
+            plain("--format"),
+            plain(template),
+            plain(container),
+        ],
+    )
+}
+
+fn parse_worker_otel_env(stdout: &str) -> Result<Vec<(String, String)>> {
+    let mut selected = Vec::new();
+    for (index, line) in stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .enumerate()
+    {
+        let line = line.trim();
+        let entry = if line.starts_with('"') {
+            serde_json::from_str::<String>(line).with_context(|| {
+                format!(
+                    "parsing the local worker's telemetry environment entry {}",
+                    index + 1
+                )
+            })?
+        } else {
+            // Some already-filtered callers and test doubles return one plain
+            // Docker environment entry per line. Production inspection emits
+            // JSON strings, but retaining this narrow seam is harmless because
+            // the exact allowlist below still gates every accepted name.
+            line.to_string()
+        };
+        let Some((name, value)) = entry.split_once('=') else {
+            continue;
+        };
+        // Keep the same allowlist here as defense in depth if the Docker
+        // formatting boundary ever changes independently.
+        if OTEL_EXPORTER_ENV_KEYS.contains(&name) {
+            selected.push((name.to_string(), value.to_string()));
+        }
+    }
+    Ok(selected)
+}
+
+struct LocalDispatcherContext {
+    compose_files: Vec<String>,
+    /// The dispatcher image the running stack would use, when it can be
+    /// determined and is actually present.
+    dispatcher_image: Option<String>,
+    otel_env: Vec<(String, String)>,
+}
+
+async fn local_dispatcher_context() -> Result<LocalDispatcherContext> {
+    let container = local_worker_container().await?;
+    let cmd = worker_compose_config_command(&container);
+    let (ok, stdout, stderr) = run_capture(&cmd).await?;
+    if !ok {
+        bail!(
+            "reading the local stack's Compose configuration: {}",
+            stderr.trim()
+        );
+    }
+    let compose_files = compose_config_files(&stdout)?;
+
+    let telemetry_cmd = worker_otel_exporter_env_command(&container);
+    let (ok, telemetry_stdout, telemetry_stderr) = run_capture(&telemetry_cmd).await?;
+    if !ok {
+        bail!(
+            "reading the local worker's telemetry configuration: {}",
+            telemetry_stderr.trim()
+        );
+    }
+    let otel_env = parse_worker_otel_env(&telemetry_stdout)?;
+
+    // #1915: the stack's own image tag, so the one-shot producer below runs what
+    // the stack runs. Best-effort: an unreadable image is not worth failing an
+    // enqueue over, and compose's default then applies exactly as before.
+    let dispatcher_image = one_shot_dispatcher_image().await;
+
+    Ok(LocalDispatcherContext {
+        compose_files,
+        otel_env,
+        dispatcher_image,
+    })
+}
+
+/// Build the bounded one-shot dispatcher producer. Secrets ride named process
+/// environment entries, never argv; Slack variables are explicitly cleared so
+/// this process cannot acquire or use a workspace credential.
+fn dispatcher_enqueue_command(
+    compose_files: &[String],
+    container_name: &str,
+    stream: &str,
+    valkey_password: &str,
+    otel_env: &[(String, String)],
+    dispatcher_image: Option<&str>,
+) -> OpsCommand {
+    // The dispatcher service lives in the slack profile but depends on core
+    // services (notably the API and Valkey). Compose resolves that dependency
+    // graph before the one-shot Python producer starts.
+    let mut args = vec![
+        plain("compose"),
+        plain("--profile"),
+        plain("core"),
+        plain("--profile"),
+        plain("slack"),
+    ];
+    for file in compose_files {
+        args.extend([plain("-f"), plain(file)]);
+    }
+    args.extend([
+        plain("run"),
+        plain("--rm"),
+        plain("--name"),
+        plain(container_name),
+        plain("--no-deps"),
+        plain("-T"),
+        plain("-e"),
+        plain("VALKEY_PASSWORD"),
+        plain("-e"),
+        plain("CURIE_STREAM"),
+        plain("-e"),
+        plain("SLACK_APP_TOKEN="),
+        plain("-e"),
+        plain("SLACK_BOT_TOKEN="),
+        plain("-e"),
+        plain("SLACK_SIGNING_SECRET="),
+    ]);
+    for (name, _) in otel_env {
+        if OTEL_EXPORTER_ENV_KEYS.contains(&name.as_str()) {
+            args.extend([plain("-e"), plain(name)]);
+        }
+    }
+    args.extend([
+        plain(COMPOSE_DISPATCHER_SERVICE),
+        plain("python"),
+        plain("-m"),
+        plain(DISPATCHER_ENQUEUE_MODULE),
+    ]);
+    let mut secret_env = vec![("VALKEY_PASSWORD".to_string(), valkey_password.to_string())];
+    secret_env.extend(
+        otel_env
+            .iter()
+            .filter(|(name, _)| OTEL_EXPORTER_ENV_KEYS.contains(&name.as_str()))
+            .cloned(),
+    );
+    let mut env = vec![
+        (
+            "COMPOSE_PROJECT_NAME".to_string(),
+            crate::local::COMPOSE_PROJECT.to_string(),
+        ),
+        ("CURIE_STREAM".to_string(), stream.to_string()),
+    ];
+    // Only when the running stack has one. Passing nothing leaves compose's
+    // `${CURIE_BASE_TAG:-latest}` default in force, so a published stack behaves
+    // exactly as it did.
+    if let Some(image) = dispatcher_image {
+        env.push(("CURIE_DISPATCHER_IMAGE".to_string(), image.to_string()));
+    }
+    OpsCommand::new("docker", args)
+        .with_env(env)
+        .with_secret_env(secret_env)
+}
+
+fn redact_dispatcher_diagnostic(stderr: &str, sensitive_values: &[&str]) -> String {
+    let clean = sensitive_values
+        .iter()
+        .filter(|value| !value.is_empty())
+        .fold(stderr.to_string(), |text, value| {
+            text.replace(value, "[REDACTED]")
+        });
+    let clean = clean.trim();
+    if clean.is_empty() {
+        "one-shot dispatcher exited without a diagnostic".to_string()
+    } else {
+        clean.chars().take(4096).collect()
+    }
+}
+
+fn parse_dispatcher_stream_id(stdout: &str) -> Result<String> {
+    let mut lines = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let stream_id = lines
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("one-shot dispatcher returned no Stream id"))?;
+    let valid = stream_id.split_once('-').is_some_and(|(ms, sequence)| {
+        !ms.is_empty()
+            && !sequence.is_empty()
+            && ms.bytes().all(|byte| byte.is_ascii_digit())
+            && sequence.bytes().all(|byte| byte.is_ascii_digit())
+    });
+    if !valid || lines.next().is_some() {
+        bail!("one-shot dispatcher returned malformed stdout instead of one Stream id");
+    }
+    Ok(stream_id.to_string())
+}
+
+/// Enqueue a local synthetic turn through code running in the dispatcher image.
+/// The CLI retains its open Valkey connection only for completion observation;
+/// the producer write itself happens inside this bounded child process.
+async fn dispatcher_enqueue_local(opts: &MessageOpts, turn: &QueuedTurn) -> Result<String> {
+    let context = local_dispatcher_context().await?;
+    let sequence = DISPATCHER_ENQUEUE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let container_name = format!("curie-dispatcher-enqueue-{}-{sequence}", std::process::id());
+    let cmd = dispatcher_enqueue_command(
+        &context.compose_files,
+        &container_name,
+        &opts.stream,
+        &opts.valkey_password,
+        &context.otel_env,
+        context.dispatcher_image.as_deref(),
+    );
+    crate::ui::ui().plumbing(&format!("+ {}", cmd.display()));
+    let payload = queue::payload_json(turn)?;
+
+    let mut child = tokio::process::Command::new(&cmd.program)
+        .args(cmd.argv())
+        .envs(cmd.env.iter().chain(cmd.secret_env.iter()).cloned())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .context("starting the one-shot local dispatcher producer")?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("one-shot dispatcher stdin was unavailable"))?;
+    let child_run = async move {
+        stdin
+            .write_all(payload.as_bytes())
+            .await
+            .context("sending the queued turn to the one-shot dispatcher")?;
+        drop(stdin);
+        child
+            .wait_with_output()
+            .await
+            .context("waiting for the one-shot dispatcher producer")
+    };
+    let output = match tokio::time::timeout(DISPATCHER_ENQUEUE_TIMEOUT, child_run).await {
+        Ok(result) => result?,
+        Err(_) => {
+            // Dropping child_run kills the Docker CLI. Remove the explicitly
+            // named Compose container too: otherwise a blocked Valkey connect
+            // can outlive the CLI with its secret environment still attached.
+            let _ = crate::docker::remove_container(&container_name).await;
+            bail!(
+                "one-shot dispatcher did not finish within {}s",
+                DISPATCHER_ENQUEUE_TIMEOUT.as_secs()
+            );
+        }
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut sensitive_values = vec![opts.valkey_password.as_str()];
+    sensitive_values.extend(context.otel_env.iter().map(|(_, value)| value.as_str()));
+    if !stderr.trim().is_empty() {
+        let sanitized = redact_dispatcher_diagnostic(&stderr, &sensitive_values);
+        for line in sanitized.lines() {
+            crate::ui::ui().plumbing(line);
+        }
+    }
+    if !output.status.success() {
+        let diagnostic = redact_dispatcher_diagnostic(&stderr, &sensitive_values);
+        bail!("one-shot dispatcher failed: {diagnostic}");
+    }
+    parse_dispatcher_stream_id(&stdout)
+}
+
+async fn enqueue_for_turn_verb(
+    opts: &MessageOpts,
+    conn: &mut MultiplexedConnection,
+    verb: TurnVerb,
+    turn: &QueuedTurn,
+) -> Result<String> {
+    match verb {
+        TurnVerb::Local => dispatcher_enqueue_local(opts, turn).await,
+        // Deliberately retain the direct lane as the missing-carrier
+        // compatibility control required by #1817.
+        TurnVerb::Cluster => xadd(conn, &opts.stream, turn).await,
+    }
+}
+
 /// The `curie local message` handler: drive the compose stack directly.
 ///
 /// The cluster path's self-plumbing (kubectl port-forwards) is cluster-specific,
-/// so local mode keeps only the shared engine: bind the Slack stub, enqueue the
-/// `QueuedTurn` carrying this stub as its reply endpoint (issue #19), and wait on
-/// the XACK signal. The compose worker reaches the stub on the fixed loopback
-/// port `http://localhost:{DEFAULT_LOCAL_STUB_PORT}/api/`.
+/// so local mode keeps only the shared engine: bind the Slack stub, send the
+/// `QueuedTurn` through the compose dispatcher's bounded producer, and wait on
+/// the XACK signal. The turn still carries this stub as its reply endpoint
+/// (issue #19). The compose worker reaches the stub on the fixed loopback port
+/// `http://localhost:{DEFAULT_LOCAL_STUB_PORT}/api/`.
 async fn message_local(opts: MessageOpts) -> Result<()> {
     let ui = crate::ui::ui();
     let valkey_url = local_valkey_url(&opts.valkey_password);
@@ -1751,7 +2220,9 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
         let reply_endpoint = local_stub_reply_endpoint(&local_stub_binding().advertise_host);
         let channel_line = match opts.channel.as_deref() {
             Some(channel) => format!("channel {channel}"),
-            None => format!("channel <the sole deployed agent via {api_base}/agents>"),
+            None => format!(
+                "channel <the sole bound (agent, Slack channel) pair via {api_base}/agents>"
+            ),
         };
         let human_lines = vec![
             "local mode (compose stack; no kubectl/helm)".to_string(),
@@ -1790,7 +2261,7 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
                 select_channel(&agents, None)?
             }
         };
-        ui.note(&format!(
+        ui.plumbing(&format!(
             "routing to channel {channel} over the connected Slack transport"
         ));
         return enqueue_over_connected_transport(
@@ -1817,12 +2288,12 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
         &binding.advertise_host,
     )
     .await?;
-    ui.note(&format!(
+    ui.plumbing(&format!(
         "slack stub listening; the worker posts to {}",
         stub.base_api_url()
     ));
 
-    // Channel: explicit --channel, else the sole deployed agent from the compose
+    // Channel: explicit --channel, else the sole bound Slack pair from the compose
     // API (reached directly; routers mount at root, so the base carries no /api).
     // `agent_hint` is the sole agent's NAME when we resolved it (so an approval
     // resolve hint is copy-paste runnable), and `None` for an explicit --channel
@@ -1839,7 +2310,7 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
             (channel, agents.first().map(|a| a.name.clone()))
         }
     };
-    ui.note(&format!("routing to channel {channel}"));
+    ui.plumbing(&format!("routing to channel {channel}"));
 
     // This turn carries its own reply endpoint (issue #19), so the compose worker
     // finalizes it against this stub without relying on a worker-global setting.
@@ -1855,12 +2326,12 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
         &placeholder_ts,
         Some(reply_endpoint),
     );
-    let stream_id = xadd(&mut conn, &opts.stream, &event).await?;
-    ui.note(&format!(
+    let stream_id = enqueue_for_turn_verb(&opts, &mut conn, TurnVerb::Local, &event).await?;
+    ui.plumbing(&format!(
         "enqueued {} on {} as {stream_id}",
         event.event_id, opts.stream
     ));
-    ui.note(&format!(
+    ui.plumbing(&format!(
         "waiting up to {}s for the worker to finalize the turn...",
         opts.timeout_secs
     ));
@@ -1868,15 +2339,23 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
     let cl = ui.checklist();
     let step = cl.step("waiting for worker reply");
     let wait_started = Instant::now();
-    let outcome = await_reply(
-        &mut stub,
-        &mut conn,
-        &opts.stream,
-        &stream_id,
-        &placeholder_ts,
-        Duration::from_secs(opts.timeout_secs),
-    )
-    .await;
+    let outcome = {
+        let mut observe_update = |text: &str| {
+            if let Some(line) = text.lines().rev().find(|line| !line.trim().is_empty()) {
+                step.tick_detail(line.trim());
+            }
+        };
+        await_reply(
+            &mut stub,
+            &mut conn,
+            &opts.stream,
+            &stream_id,
+            &placeholder_ts,
+            Duration::from_secs(opts.timeout_secs),
+            &mut observe_update,
+        )
+        .await
+    };
 
     match outcome {
         Outcome::Replied(reply) => {
@@ -2099,10 +2578,11 @@ async fn hint_channel(
                 local_api_base(opts.api_url.as_deref()),
             ),
             TurnVerb::Cluster => {
+                let fullname = crate::ops::release_fullname(&opts.namespace, &opts.release).await;
                 let (api_pf, api_local_port) = start_port_forward(
                     &port_forward_command(
                         &opts.namespace,
-                        &opts.release,
+                        &fullname,
                         "api",
                         opts.api_local_port,
                         API_REMOTE_PORT,
@@ -2336,16 +2816,27 @@ async fn resume_after_approval(
         // (`resumequeue.resume_event_id`), which is how we recognize that turn on
         // the shared runs stream.
         let resume_event_id = format!("approval-{current_id}-resolved");
-        let observed = await_resume(
-            stub,
-            conn,
-            &opts.stream,
-            &resume_event_id,
-            after_id,
-            placeholder_ts,
-            remaining,
-        )
-        .await;
+        let cl = ui.checklist();
+        let step = cl.step("waiting for resumed worker reply");
+        let observed = {
+            let mut observe_update = |text: &str| {
+                if let Some(line) = text.lines().rev().find(|line| !line.trim().is_empty()) {
+                    step.tick_detail(line.trim());
+                }
+            };
+            await_resume(
+                stub,
+                conn,
+                &opts.stream,
+                &resume_event_id,
+                after_id,
+                placeholder_ts,
+                remaining,
+                &mut observe_update,
+            )
+            .await
+        };
+        step.clear();
         match observed.outcome {
             Outcome::Replied(reply) => {
                 ui.emit(&MessageOutcomeOutput::Replied {
@@ -2695,8 +3186,8 @@ pub async fn enqueue_over_connected_transport(
             })?;
 
     let event = connected_turn(channel, opts, explicit_thread, &placeholder_ts);
-    let stream_id = xadd(conn, &opts.stream, &event).await?;
-    ui.note(&format!(
+    let stream_id = enqueue_for_turn_verb(opts, conn, verb, &event).await?;
+    ui.plumbing(&format!(
         "enqueued {} on {} as {stream_id}",
         event.event_id, opts.stream
     ));
@@ -2744,17 +3235,20 @@ fn connected_turn(
 }
 
 /// Resolve the target channel (and the sole-agent hint for resolve messages) for
-/// a cluster turn: an explicit `--channel`, else the sole deployed agent via a
+/// a cluster turn: an explicit `--channel`, else the sole bound Slack pair via a
 /// short-lived API port-forward (dropped once the lookup returns). Shared by the
 /// stub path and the connected-transport path.
-async fn resolve_cluster_channel(opts: &MessageOpts) -> Result<(String, Option<String>)> {
+async fn resolve_cluster_channel(
+    opts: &MessageOpts,
+    fullname: &crate::ops::ReleaseFullname,
+) -> Result<(String, Option<String>)> {
     match opts.channel.as_deref() {
         Some(channel) => Ok((channel.to_string(), None)),
         None => {
             let (_api_pf, api_local_port) = start_port_forward(
                 &port_forward_command(
                     &opts.namespace,
-                    &opts.release,
+                    fullname,
                     "api",
                     opts.api_local_port,
                     API_REMOTE_PORT,
@@ -2782,14 +3276,17 @@ async fn resolve_cluster_channel(opts: &MessageOpts) -> Result<(String, Option<S
 /// resumed reply ride the connected transport. The CLI cannot observe a reply
 /// that lands in Slack, so it enqueues and points the operator there rather than
 /// waiting on a (nonexistent) stub.
-async fn message_connected(opts: MessageOpts) -> Result<()> {
+async fn message_connected(
+    opts: MessageOpts,
+    fullname: &crate::ops::ReleaseFullname,
+) -> Result<()> {
     let ui = crate::ui::ui();
 
     // Valkey port-forward for the enqueue (killed on drop at fn end).
     let (_valkey_pf, valkey_local_port) = start_port_forward(
         &port_forward_command(
             &opts.namespace,
-            &opts.release,
+            fullname,
             "valkey",
             opts.valkey_local_port,
             VALKEY_REMOTE_PORT,
@@ -2799,8 +3296,8 @@ async fn message_connected(opts: MessageOpts) -> Result<()> {
     )
     .await?;
 
-    let (channel, _agent_hint) = resolve_cluster_channel(&opts).await?;
-    ui.note(&format!(
+    let (channel, _agent_hint) = resolve_cluster_channel(&opts, fullname).await?;
+    ui.plumbing(&format!(
         "routing to channel {channel} over the connected Slack transport"
     ));
 
@@ -2903,13 +3400,18 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
 
     require_on_path("kubectl")?;
 
+    // Resolve the release's rendered fullname once, here: every kubectl target
+    // below is a chart resource, and `--dry-run` returned above without ever
+    // reaching a cluster (#1533).
+    let fullname = crate::ops::release_fullname(&opts.namespace, &opts.release).await;
+
     // Connected-transport path (#770/ADR-0078): when a real workspace is
     // connected (a running dispatcher), post a real placeholder and enqueue
     // against its ts with no per-turn endpoint, so the approval card and any
     // resumed reply ride the connected transport -- no throwaway stub. A kubectl
     // failure reads as NOT connected, so this falls through to the stub path.
-    if dispatcher_connected_strict(&opts.namespace, &opts.release).await? {
-        return message_connected(opts).await;
+    if dispatcher_connected_strict(&opts.namespace, &fullname).await? {
+        return message_connected(opts, &fullname).await;
     }
 
     // Advertise a host the in-cluster worker can reach, then bind the stub on
@@ -2918,7 +3420,7 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
     let advertise_host = resolve_advertise_host(opts.listen_host.as_deref()).await?;
     let mut stub = SlackStub::start("0.0.0.0", opts.listen_port, &advertise_host).await?;
     let url = stub.base_api_url().to_string();
-    ui.note(&format!(
+    ui.plumbing(&format!(
         "slack stub listening; the worker will post to {url}"
     ));
 
@@ -2927,13 +3429,14 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
     // Slack-connected release. The guard restores the default closed posture on
     // every normal/error return and is moved into non-unwinding exits below.
     let mut stub_trust =
-        ClusterStubTrust::install(&opts.namespace, &opts.release, &advertise_host).await?;
+        ClusterStubTrust::install(&opts.namespace, &opts.release, &fullname, &advertise_host)
+            .await?;
 
     // Valkey port-forward for the enqueue (killed on drop at fn end).
     let (_valkey_pf, valkey_local_port) = start_port_forward(
         &port_forward_command(
             &opts.namespace,
-            &opts.release,
+            &fullname,
             "valkey",
             opts.valkey_local_port,
             VALKEY_REMOTE_PORT,
@@ -2945,8 +3448,8 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
 
     // Channel: explicit --channel, else the sole deployed agent via a
     // short-lived API port-forward (#766). Shared with the connected path.
-    let (channel, agent_hint) = resolve_cluster_channel(&opts).await?;
-    ui.note(&format!("routing to channel {channel}"));
+    let (channel, agent_hint) = resolve_cluster_channel(&opts, &fullname).await?;
+    ui.plumbing(&format!("routing to channel {channel}"));
 
     // Enqueue the exact event the dispatcher would produce and wait for the ack.
     // The turn carries its reply endpoint (this stub's advertised URL) on the
@@ -2970,11 +3473,11 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
         Some(url),
     );
     let stream_id = xadd(&mut conn, &opts.stream, &event).await?;
-    ui.note(&format!(
+    ui.plumbing(&format!(
         "enqueued {} on {} as {stream_id}",
         event.event_id, opts.stream
     ));
-    ui.note(&format!(
+    ui.plumbing(&format!(
         "waiting up to {}s for the worker to finalize the turn...",
         opts.timeout_secs
     ));
@@ -2982,15 +3485,23 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
     let cl = ui.checklist();
     let step = cl.step("waiting for worker reply");
     let wait_started = Instant::now();
-    let outcome = await_reply(
-        &mut stub,
-        &mut conn,
-        &opts.stream,
-        &stream_id,
-        &placeholder_ts,
-        Duration::from_secs(opts.timeout_secs),
-    )
-    .await;
+    let outcome = {
+        let mut observe_update = |text: &str| {
+            if let Some(line) = text.lines().rev().find(|line| !line.trim().is_empty()) {
+                step.tick_detail(line.trim());
+            }
+        };
+        await_reply(
+            &mut stub,
+            &mut conn,
+            &opts.stream,
+            &stream_id,
+            &placeholder_ts,
+            Duration::from_secs(opts.timeout_secs),
+            &mut observe_update,
+        )
+        .await
+    };
 
     match outcome {
         Outcome::Replied(reply) => {
@@ -3312,7 +3823,7 @@ pub fn eval_dry_run_lines(opts: &EvalOpts, suite_name: &str, case_count: usize) 
         match opts.channel.as_deref() {
             Some(channel) => lines.push(format!("channel {channel}")),
             None => lines.push(format!(
-                "channel <the sole deployed agent via {api_base}/agents>"
+                "channel <the sole bound (agent, Slack channel) pair via {api_base}/agents>"
             )),
         }
     } else {
@@ -3320,10 +3831,14 @@ pub fn eval_dry_run_lines(opts: &EvalOpts, suite_name: &str, case_count: usize) 
             .listen_host
             .clone()
             .unwrap_or_else(|| "<auto-detected-local-ip>".to_string());
+        // Offline by contract: a dry run contacts no cluster, so it renders the
+        // chart's no-override `curie.fullname` rule rather than discovering the
+        // rendered name (#1533).
+        let fullname = crate::ops::chart_fullname(&opts.release);
         lines.push(
             port_forward_command(
                 &opts.namespace,
-                &opts.release,
+                &fullname,
                 "valkey",
                 opts.valkey_local_port,
                 VALKEY_REMOTE_PORT,
@@ -3334,7 +3849,7 @@ pub fn eval_dry_run_lines(opts: &EvalOpts, suite_name: &str, case_count: usize) 
             lines.push(
                 port_forward_command(
                     &opts.namespace,
-                    &opts.release,
+                    &fullname,
                     "api",
                     opts.api_local_port,
                     API_REMOTE_PORT,
@@ -3423,6 +3938,7 @@ async fn run_eval_turns(
                 eval_threads.push(conversation_id.clone());
                 let started = Instant::now();
                 let stream_id = xadd(conn, &opts.stream, &event).await?;
+                let mut observe_update = |_: &str| {};
                 let outcome = await_reply(
                     stub,
                     conn,
@@ -3430,6 +3946,7 @@ async fn run_eval_turns(
                     &stream_id,
                     &placeholder_ts,
                     Duration::from_secs(opts.timeout_secs),
+                    &mut observe_update,
                 )
                 .await;
                 // Release this sample's sandbox on every completed/red/timed-out
@@ -3659,7 +4176,7 @@ pub fn select_agent_id(agents: &[Agent], channel: Option<&str>) -> Result<String
     if let Some(channel) = channel {
         return agents
             .iter()
-            .find(|a| a.channel.address == channel)
+            .find(|a| a.channels.iter().any(|c| c.address == channel))
             .map(|a| a.id.clone())
             .ok_or_else(|| anyhow::anyhow!("no deployed agent has channel {channel:?}"));
     }
@@ -3672,7 +4189,11 @@ pub fn select_agent_id(agents: &[Agent], channel: Option<&str>) -> Result<String
         many => {
             let listed = many
                 .iter()
-                .map(|a| format!("{} -> {}", a.name, a.channel.address))
+                .flat_map(|a| {
+                    a.channels
+                        .iter()
+                        .map(move |c| format!("{} -> {}", a.name, c.address))
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
             bail!("multiple agents are deployed; pass --channel <id> to pick one ({listed})")
@@ -3728,6 +4249,34 @@ pub fn guard_fake_sweep(fake: bool, models: &[String], local: bool) -> Result<()
     ))
 }
 
+/// The resource ref the fake-model probe reads, named in ONE place so the argv
+/// and the failure diagnostic can never name different Deployments (#1533).
+fn fake_model_probe_target(fullname: &crate::ops::ReleaseFullname) -> String {
+    format!("deployment/{}", fullname.resource("worker"))
+}
+
+/// The kubectl read behind the cluster branch of `probe_fake_model`, extracted
+/// pure so the Deployment NAME is unit-testable without a cluster (#1533).
+///
+/// The chart renders `{{ include "curie.fullname" . }}-worker`; the old
+/// `{release}-worker` guess made `cluster eval --release platform` fail before a
+/// single eval case ran.
+fn fake_model_probe_command(namespace: &str, fullname: &crate::ops::ReleaseFullname) -> OpsCommand {
+    OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("-n"),
+            plain(namespace),
+            plain("get"),
+            plain(fake_model_probe_target(fullname)),
+            plain("-o"),
+            plain(
+                "jsonpath={.spec.template.spec.containers[*].env[?(@.name==\"CURIE_FAKE_MODEL\")].value}",
+            ),
+        ],
+    )
+}
+
 /// Read the fake-ness of the tier's DEPLOYED worker: the already-composed value
 /// of `CURIE_FAKE_MODEL` on the artifact that is actually running.
 ///
@@ -3738,7 +4287,16 @@ pub fn guard_fake_sweep(fake: bool, models: &[String], local: bool) -> Result<()
 /// `inference.deploy` + `fakeModel=true` install is a REAL install, and shell
 /// env is not what the running container was booted with). A probe failure is
 /// reported as itself; it never falls back to a default guess.
-async fn probe_fake_model(opts: &EvalOpts) -> Result<bool> {
+///
+/// `fullname` is the CALLER's already-resolved release name, threaded in rather
+/// than resolved here: the sweep needs the same name for its api port-forward,
+/// and resolving twice costs a second kubectl discovery round-trip per
+/// invocation (#1533). It is `None` on the `--local` path, which reaches no
+/// cluster and must make zero kubectl calls.
+async fn probe_fake_model(
+    opts: &EvalOpts,
+    fullname: Option<&crate::ops::ReleaseFullname>,
+) -> Result<bool> {
     let env = if opts.local {
         let worker = local_worker_container().await?;
         let cmd = OpsCommand::new(
@@ -3763,20 +4321,11 @@ async fn probe_fake_model(opts: &EvalOpts) -> Result<bool> {
             .map(str::to_string)
     } else {
         require_on_path("kubectl")?;
-        let deployment = format!("deployment/{}-worker", opts.release);
-        let cmd = OpsCommand::new(
-            "kubectl",
-            vec![
-                plain("-n"),
-                plain(&opts.namespace),
-                plain("get"),
-                plain(&deployment),
-                plain("-o"),
-                plain(
-                    "jsonpath={.spec.template.spec.containers[*].env[?(@.name==\"CURIE_FAKE_MODEL\")].value}",
-                ),
-            ],
-        );
+        let fullname = fullname.context(
+            "internal: the cluster fake-model probe needs the release fullname its caller resolved",
+        )?;
+        let deployment = fake_model_probe_target(fullname);
+        let cmd = fake_model_probe_command(&opts.namespace, fullname);
         let (ok, stdout, stderr) = run_capture(&cmd).await?;
         if !ok {
             bail!(
@@ -3878,7 +4427,22 @@ async fn eval_sweep(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
         });
         return Ok(());
     }
-    guard_fake_sweep(probe_fake_model(&opts).await?, &opts.models, opts.local)?;
+    // Resolved ONCE for the whole sweep and threaded into both consumers (the
+    // fake-model probe below and the api port-forward further down), so a
+    // `cluster eval --model` pays exactly one discovery round-trip rather than
+    // one per consumer. `--local` reaches no cluster, so it resolves nothing and
+    // makes zero kubectl calls (#1533).
+    let fullname = if opts.local {
+        None
+    } else {
+        require_on_path("kubectl")?;
+        Some(crate::ops::release_fullname(&opts.namespace, &opts.release).await)
+    };
+    guard_fake_sweep(
+        probe_fake_model(&opts, fullname.as_ref()).await?,
+        &opts.models,
+        opts.local,
+    )?;
 
     // The trigger + matrix reads go over the platform API. Local reaches it
     // directly; cluster tunnels an api port-forward kept alive for the whole poll.
@@ -3887,10 +4451,13 @@ async fn eval_sweep(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
         (ApiClient::new(&base, &opts.api_key)?, None)
     } else {
         require_on_path("kubectl")?;
+        let fullname = fullname.as_ref().context(
+            "internal: the cluster api tunnel needs the release fullname resolved above",
+        )?;
         let (pf, api_local_port) = start_port_forward(
             &port_forward_command(
                 &opts.namespace,
-                &opts.release,
+                fullname,
                 "api",
                 opts.api_local_port,
                 API_REMOTE_PORT,
@@ -4033,10 +4600,13 @@ async fn eval_trajectory_platform(opts: EvalOpts, suite: EvalSuite) -> Result<()
         (ApiClient::new(&api_base, &opts.api_key)?, None)
     } else {
         require_on_path("kubectl")?;
+        // Cluster-only branch, so the discovery round-trip never fires for
+        // `--local` (#1533).
+        let fullname = crate::ops::release_fullname(&opts.namespace, &opts.release).await;
         let (pf, api_local_port) = start_port_forward(
             &port_forward_command(
                 &opts.namespace,
-                &opts.release,
+                &fullname,
                 "api",
                 opts.api_local_port,
                 API_REMOTE_PORT,
@@ -4354,6 +4924,10 @@ async fn eval_cluster(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
 
     require_on_path("kubectl")?;
 
+    // Resolved once here: `--dry-run` returned above without contacting a
+    // cluster, and every kubectl target below is a chart resource (#1533).
+    let fullname = crate::ops::release_fullname(&opts.namespace, &opts.release).await;
+
     let advertise_host = resolve_advertise_host(opts.listen_host.as_deref()).await?;
     let mut stub = SlackStub::start("0.0.0.0", opts.listen_port, &advertise_host).await?;
     ui.note(&format!(
@@ -4365,7 +4939,7 @@ async fn eval_cluster(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
     let (_valkey_pf, valkey_local_port) = start_port_forward(
         &port_forward_command(
             &opts.namespace,
-            &opts.release,
+            &fullname,
             "valkey",
             opts.valkey_local_port,
             VALKEY_REMOTE_PORT,
@@ -4381,7 +4955,7 @@ async fn eval_cluster(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
             let (_api_pf, api_local_port) = start_port_forward(
                 &port_forward_command(
                     &opts.namespace,
-                    &opts.release,
+                    &fullname,
                     "api",
                     opts.api_local_port,
                     API_REMOTE_PORT,
@@ -4418,6 +4992,266 @@ async fn eval_cluster(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const EXPECTED_OTEL_EXPORTER_ENV_KEYS: [&str; 38] = [
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_PROTOCOL",
+        "OTEL_EXPORTER_OTLP_HEADERS",
+        "OTEL_EXPORTER_OTLP_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_CLIENT_KEY",
+        "OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_INSECURE",
+        "OTEL_EXPORTER_OTLP_COMPRESSION",
+        "OTEL_EXPORTER_OTLP_TIMEOUT",
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
+        "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+        "OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_TRACES_CLIENT_KEY",
+        "OTEL_EXPORTER_OTLP_TRACES_CLIENT_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_TRACES_INSECURE",
+        "OTEL_EXPORTER_OTLP_TRACES_COMPRESSION",
+        "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT",
+        "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL",
+        "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
+        "OTEL_EXPORTER_OTLP_LOGS_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_LOGS_CLIENT_KEY",
+        "OTEL_EXPORTER_OTLP_LOGS_CLIENT_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_LOGS_INSECURE",
+        "OTEL_EXPORTER_OTLP_LOGS_COMPRESSION",
+        "OTEL_EXPORTER_OTLP_LOGS_TIMEOUT",
+        "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL",
+        "OTEL_EXPORTER_OTLP_METRICS_HEADERS",
+        "OTEL_EXPORTER_OTLP_METRICS_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_METRICS_CLIENT_KEY",
+        "OTEL_EXPORTER_OTLP_METRICS_CLIENT_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_METRICS_INSECURE",
+        "OTEL_EXPORTER_OTLP_METRICS_COMPRESSION",
+        "OTEL_EXPORTER_OTLP_METRICS_TIMEOUT",
+        "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE",
+        "OTEL_EXPORTER_OTLP_METRICS_DEFAULT_HISTOGRAM_AGGREGATION",
+    ];
+
+    fn otel_exporter_test_value(name: &str) -> String {
+        if name.ends_with("_PROTOCOL") {
+            "grpc".to_string()
+        } else if name.ends_with("_HEADERS") {
+            "authorization=Bearer example==,tenant=acme".to_string()
+        } else if name.ends_with("_ENDPOINT") {
+            "https://collector.example.com/v1/data?signature=example==".to_string()
+        } else if name.ends_with("_CLIENT_KEY") {
+            "/tls/client=key.pem".to_string()
+        } else if name.ends_with("_CLIENT_CERTIFICATE") {
+            "/tls/client=certificate.pem".to_string()
+        } else if name.ends_with("_CERTIFICATE") {
+            "/tls/ca=certificate.pem".to_string()
+        } else if name.ends_with("_INSECURE") {
+            "false".to_string()
+        } else if name.ends_with("_COMPRESSION") {
+            "gzip".to_string()
+        } else if name.ends_with("_TIMEOUT") {
+            "12.5".to_string()
+        } else if name.ends_with("_TEMPORALITY_PREFERENCE") {
+            "delta".to_string()
+        } else {
+            "base2_exponential_bucket_histogram".to_string()
+        }
+    }
+
+    fn sensitive_otel_exporter_value(name: &str) -> bool {
+        name.ends_with("_ENDPOINT")
+            || name.ends_with("_HEADERS")
+            || name.ends_with("_CERTIFICATE")
+            || name.ends_with("_CLIENT_KEY")
+            || name.ends_with("_CLIENT_CERTIFICATE")
+    }
+
+    #[test]
+    fn local_dispatcher_command_is_slack_free_and_keeps_secrets_off_argv() {
+        let secret = "private-valkey-password";
+        let otel_env: Vec<(String, String)> = EXPECTED_OTEL_EXPORTER_ENV_KEYS
+            .iter()
+            .map(|name| (name.to_string(), otel_exporter_test_value(name)))
+            .collect();
+        let command = dispatcher_enqueue_command(
+            &["/tmp/curie compose.yaml".to_string()],
+            "curie-dispatcher-enqueue-test",
+            "test:curie:runs",
+            secret,
+            &otel_env,
+            None,
+        );
+        let argv = command.argv();
+
+        // `curie-dispatcher` is declared in the slack profile but depends on
+        // `curie-api` from the core profile. Selecting slack alone makes the
+        // one-shot producer fail before Python runs because Compose cannot
+        // resolve that dependency.
+        assert!(
+            argv.windows(2).any(|pair| pair == ["--profile", "core"]),
+            "one-shot dispatcher must activate core dependencies: {argv:?}"
+        );
+        assert!(argv
+            .windows(2)
+            .any(|pair| { pair[0] == COMPOSE_DISPATCHER_SERVICE && pair[1] == "python" }));
+        assert!(argv
+            .windows(2)
+            .any(|pair| pair[0] == "-m" && pair[1] == DISPATCHER_ENQUEUE_MODULE));
+        assert!(argv.contains(&"--no-deps".to_string()));
+        assert!(argv
+            .windows(2)
+            .any(|pair| pair == ["--name", "curie-dispatcher-enqueue-test"]));
+        assert!(argv.contains(&"-T".to_string()));
+        assert!(argv.contains(&"SLACK_APP_TOKEN=".to_string()));
+        assert!(argv.contains(&"SLACK_BOT_TOKEN=".to_string()));
+        assert!(!argv.iter().any(|arg| arg.contains(secret)));
+        assert!(!command.display().contains(secret));
+        for (name, value) in &otel_env {
+            assert!(
+                argv.windows(2)
+                    .any(|pair| pair[0] == "-e" && pair[1] == *name),
+                "one-shot dispatcher did not forward {name}: {argv:?}"
+            );
+            assert!(
+                !argv.iter().any(|arg| arg.contains(value)),
+                "telemetry value for {name} leaked onto argv"
+            );
+            if sensitive_otel_exporter_value(name) {
+                assert!(
+                    !command.display().contains(value),
+                    "sensitive telemetry value for {name} leaked into command display"
+                );
+            }
+            assert!(
+                command.secret_env.contains(&(name.clone(), value.clone())),
+                "telemetry value for {name} was not preserved exactly"
+            );
+        }
+        assert!(command
+            .secret_env
+            .contains(&("VALKEY_PASSWORD".to_string(), secret.to_string())));
+    }
+
+    #[test]
+    fn compose_config_label_preserves_each_declared_file() {
+        assert_eq!(
+            compose_config_files(" /tmp/base.yaml,/tmp/override.yaml\n").unwrap(),
+            vec!["/tmp/base.yaml", "/tmp/override.yaml"]
+        );
+        assert!(compose_config_files("  \n").is_err());
+        assert!(compose_config_files("<no value>\n").is_err());
+    }
+
+    #[test]
+    fn worker_telemetry_probe_outputs_only_standard_exporter_configuration() {
+        let command = worker_otel_exporter_env_command("curie-worker-example");
+        let template = &command.argv()[2];
+
+        assert_eq!(
+            OTEL_EXPORTER_ENV_KEYS.as_slice(),
+            EXPECTED_OTEL_EXPORTER_ENV_KEYS.as_slice()
+        );
+        for name in EXPECTED_OTEL_EXPORTER_ENV_KEYS {
+            assert!(template.contains(name), "inspect template omitted {name}");
+        }
+        assert!(!template.contains("{{json .Config.Env}}"));
+        assert!(!template.contains("UNRELATED_SECRET"));
+        assert!(!template.contains("println ."));
+        assert!(!template.contains("range .Config.Env}}{{println"));
+    }
+
+    #[test]
+    fn worker_telemetry_probe_preserves_equals_in_exporter_values() {
+        let inspected = concat!(
+            "\"OTEL_EXPORTER_OTLP_PROTOCOL=grpc\"\n",
+            "\"OTEL_EXPORTER_OTLP_HEADERS=authorization=Bearer example==,tenant=acme\"\n",
+            "\"OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=https://logs.example.com/v1/logs?signature=example==\"\n",
+            "\"OTEL_EXPORTER_OTLP_LOGS_CLIENT_KEY=/tls/client=key.pem\"\n",
+            "\"OTEL_EXPORTER_OTLP_LOGS_CLIENT_CERTIFICATE=/tls/client=certificate.pem\"\n",
+            "\"OTEL_EXPORTER_OTLP_METRICS_ENDPOINT=\"\n",
+            "\"UNRELATED_SECRET=must-not-forward\"\n",
+        );
+
+        assert_eq!(
+            parse_worker_otel_env(inspected).unwrap(),
+            vec![
+                (
+                    "OTEL_EXPORTER_OTLP_PROTOCOL".to_string(),
+                    "grpc".to_string(),
+                ),
+                (
+                    "OTEL_EXPORTER_OTLP_HEADERS".to_string(),
+                    "authorization=Bearer example==,tenant=acme".to_string(),
+                ),
+                (
+                    "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT".to_string(),
+                    "https://logs.example.com/v1/logs?signature=example==".to_string(),
+                ),
+                (
+                    "OTEL_EXPORTER_OTLP_LOGS_CLIENT_KEY".to_string(),
+                    "/tls/client=key.pem".to_string(),
+                ),
+                (
+                    "OTEL_EXPORTER_OTLP_LOGS_CLIENT_CERTIFICATE".to_string(),
+                    "/tls/client=certificate.pem".to_string(),
+                ),
+                (
+                    "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT".to_string(),
+                    "".to_string(),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn worker_telemetry_probe_accepts_already_filtered_plain_lines() {
+        let inspected = concat!(
+            "OTEL_EXPORTER_OTLP_ENDPOINT=https://collector.example.com?signature=example==\n",
+            "UNRELATED_SECRET=must-not-forward\n",
+            "/tmp/non-telemetry-inspect-output\n",
+        );
+
+        assert_eq!(
+            parse_worker_otel_env(inspected).unwrap(),
+            vec![(
+                "OTEL_EXPORTER_OTLP_ENDPOINT".to_string(),
+                "https://collector.example.com?signature=example==".to_string(),
+            )]
+        );
+    }
+
+    #[test]
+    fn dispatcher_failure_diagnostic_is_present_bounded_and_redacted() {
+        let secret = "private-valkey-password";
+        let endpoint = "https://token@collector.example.com";
+        let stderr = format!(
+            "connection failed for password {secret} at {endpoint} {}",
+            "x".repeat(5000)
+        );
+        let diagnostic = redact_dispatcher_diagnostic(&stderr, &[secret, endpoint]);
+        assert!(diagnostic.contains("connection failed"));
+        assert!(diagnostic.contains("[REDACTED]"));
+        assert!(!diagnostic.contains(secret));
+        assert!(!diagnostic.contains(endpoint));
+        assert!(diagnostic.chars().count() <= 4096);
+        assert_eq!(
+            redact_dispatcher_diagnostic("", &[secret]),
+            "one-shot dispatcher exited without a diagnostic"
+        );
+    }
+
+    #[test]
+    fn dispatcher_stdout_must_be_exactly_one_stream_id() {
+        assert_eq!(
+            parse_dispatcher_stream_id("1700000000000-0\n").unwrap(),
+            "1700000000000-0"
+        );
+        assert!(parse_dispatcher_stream_id("").is_err());
+        assert!(parse_dispatcher_stream_id("telemetry\n1700000000000-0\n").is_err());
+        assert!(parse_dispatcher_stream_id("not-an-id\n").is_err());
+    }
 
     /// An empty `--thread` must not survive as a thread: carried through, it
     /// enqueues `conversation_id: ""` and puts a literal `"thread_ts": ""` in an
@@ -5326,19 +6160,27 @@ mod tests {
         );
     }
 
-    fn agent(name: &str, channel: &str) -> Agent {
+    fn test_agent(name: &str, channel: &str) -> Agent {
+        test_agent_bound_to(name, &[channel])
+    }
+
+    fn test_agent_bound_to(name: &str, channels: &[&str]) -> Agent {
         Agent {
             id: format!("id-{name}"),
             name: name.to_string(),
-            channel: crate::api::ChannelBinding {
-                kind: "slack".to_string(),
-                address: channel.to_string(),
-            },
+            channels: channels
+                .iter()
+                .map(|c| crate::api::ChannelBinding {
+                    kind: "slack".to_string(),
+                    address: c.to_string(),
+                })
+                .collect(),
             repo_full_name: None,
             approval_required_tools: None,
             approval_routes: None,
             model: None,
             thinking: None,
+            memory: false,
         }
     }
 
@@ -5492,10 +6334,115 @@ mod tests {
 
     #[test]
     fn port_forward_command_renders_svc_and_ports() {
-        let cmd = port_forward_command("curie", "curie", "valkey", 56381, 6379);
+        let cmd = port_forward_command(
+            "curie",
+            &crate::ops::chart_fullname("curie"),
+            "valkey",
+            56381,
+            6379,
+        );
         assert_eq!(
             cmd.display(),
             "kubectl -n curie port-forward svc/curie-valkey 56381:6379"
+        );
+    }
+
+    /// #1533 (S14): a release name that does not contain the chart name renders
+    /// `{release}-curie-{component}` in the chart, so the tunnel must ask for
+    /// that. `platform` renders `platform-curie`, never `platform`.
+    ///
+    /// The Implementer builds this against a RESOLVED `ReleaseFullname`; a raw
+    /// release name cannot reach the builder, which is the point of the newtype.
+    #[test]
+    fn port_forward_command_uses_the_resolved_fullname() {
+        let fullname = crate::ops::chart_fullname("platform");
+        assert_eq!(
+            port_forward_command("curie", &fullname, "api", 18000, 8000).display(),
+            "kubectl -n curie port-forward svc/platform-curie-api 18000:8000"
+        );
+        assert_eq!(
+            port_forward_command("curie", &fullname, "valkey", 56381, 6379).display(),
+            "kubectl -n curie port-forward svc/platform-curie-valkey 56381:6379"
+        );
+
+        // Negative control: the default release must stay byte-identical to
+        // what shipped before this change.
+        let default = crate::ops::chart_fullname("curie");
+        assert_eq!(
+            port_forward_command("curie", &default, "api", 18000, 8000).display(),
+            "kubectl -n curie port-forward svc/curie-api 18000:8000"
+        );
+        assert_eq!(
+            port_forward_command("curie", &default, "valkey", 56381, 6379).display(),
+            "kubectl -n curie port-forward svc/curie-valkey 56381:6379"
+        );
+    }
+
+    /// #1533 (S15), the highest-consequence site. `dispatcher_connected_strict`
+    /// probes with `--ignore-not-found`, so a Deployment name that does not
+    /// exist returns success with EMPTY output -- which the caller reads as
+    /// "Slack is disconnected" and acts on by widening worker Slack trust.
+    /// That collapses the disconnected-vs-unprobeable distinction PR #1839 /
+    /// issue #1812 exists to preserve, silently and in the wrong direction.
+    ///
+    /// Asserted on the whole rendered argv rather than the name alone: the
+    /// `--ignore-not-found` and `-o name` flags are what make a wrong name
+    /// silent, so they are pinned here too.
+    #[test]
+    fn dispatcher_probe_names_the_chart_rendered_deployment() {
+        assert_eq!(
+            dispatcher_probe_command("acme-system", &crate::ops::chart_fullname("platform"))
+                .display(),
+            "kubectl -n acme-system get deployment platform-curie-dispatcher \
+             --ignore-not-found -o name"
+        );
+
+        // Negative control: unchanged for the default release.
+        assert_eq!(
+            dispatcher_probe_command("curie", &crate::ops::chart_fullname("curie")).display(),
+            "kubectl -n curie get deployment curie-dispatcher --ignore-not-found -o name"
+        );
+    }
+
+    /// #1533 (S16): the temporary trust widening (#1812) patches the release's
+    /// worker Deployment. A wrong name means the patch targets nothing, the
+    /// stub reply never arrives, and the guard's ownership annotation lands on
+    /// no object.
+    #[test]
+    fn stub_trust_targets_the_chart_rendered_worker() {
+        assert_eq!(
+            stub_trust_deployment(&crate::ops::chart_fullname("platform")),
+            "platform-curie-worker"
+        );
+
+        // Negative control.
+        assert_eq!(
+            stub_trust_deployment(&crate::ops::chart_fullname("curie")),
+            "curie-worker"
+        );
+    }
+
+    /// #1533 (S34): `cluster eval --release platform` used to read
+    /// `deployment/platform-worker` and fail before a single eval case ran.
+    #[test]
+    fn probe_fake_model_targets_the_chart_rendered_worker() {
+        let argv =
+            fake_model_probe_command("acme-system", &crate::ops::chart_fullname("platform")).argv();
+        assert!(
+            argv.iter().any(|a| a == "deployment/platform-curie-worker"),
+            "the fake-model probe must read the chart-rendered worker: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a == "deployment/platform-worker"),
+            "the fake-model probe must not compute `{{release}}-worker`: {argv:?}"
+        );
+
+        // Negative control.
+        let control =
+            fake_model_probe_command("curie", &crate::ops::chart_fullname("curie")).argv();
+        assert!(
+            control.iter().any(|a| a == "deployment/curie-worker"),
+            "the default release must be unchanged: {control:?}"
         );
     }
 
@@ -5566,13 +6513,13 @@ mod tests {
 
     #[test]
     fn select_channel_prefers_explicit() {
-        let agents = [agent("a", "C1"), agent("b", "C2")];
+        let agents = [test_agent("a", "C1"), test_agent("b", "C2")];
         assert_eq!(select_channel(&agents, Some("CX")).unwrap(), "CX");
     }
 
     #[test]
     fn select_channel_uses_the_sole_agent() {
-        let agents = [agent("only", "C-ONLY")];
+        let agents = [test_agent("only", "C-ONLY")];
         assert_eq!(select_channel(&agents, None).unwrap(), "C-ONLY");
     }
 
@@ -5585,11 +6532,67 @@ mod tests {
 
     #[test]
     fn select_channel_errors_on_many_agents_listing_them() {
-        let agents = [agent("alpha", "C1"), agent("beta", "C2")];
+        let agents = [test_agent("alpha", "C1"), test_agent("beta", "C2")];
         let err = select_channel(&agents, None).unwrap_err().to_string();
         assert!(err.contains("--channel"), "{err}");
         assert!(err.contains("alpha -> C1"), "{err}");
         assert!(err.contains("beta -> C2"), "{err}");
+    }
+
+    #[test]
+    fn select_channel_uses_the_sole_bound_channel_across_agents() {
+        // Selection counts (agent, channel) PAIRS, not agents (D4). One pair
+        // across the whole platform is unambiguous however many agents are
+        // deployed, so an agent bound to nothing must not make the one real
+        // binding ambiguous.
+        let agents = [
+            test_agent_bound_to("only", &["C0EXAMPLE1"]),
+            test_agent_bound_to("idle", &[]),
+        ];
+        assert_eq!(select_channel(&agents, None).unwrap(), "C0EXAMPLE1");
+    }
+
+    #[test]
+    fn select_channel_errors_when_one_agent_has_two_channels_listing_both_pairs() {
+        // The heart of D4. Today's `[only]` arm returns `only.channel.address`
+        // and structurally CANNOT see a second binding, so a single deployed
+        // agent bound to two channels silently routes to whichever one the
+        // scalar column happened to hold. Two pairs is ambiguous, and the
+        // error must name BOTH so the operator can pick.
+        let agents = [test_agent_bound_to("solo", &["C0EXAMPLE1", "C0EXAMPLE2"])];
+        let err = select_channel(&agents, None).unwrap_err().to_string();
+        assert!(err.contains("--channel"), "{err}");
+        assert!(err.contains("solo -> C0EXAMPLE1"), "{err}");
+        assert!(err.contains("solo -> C0EXAMPLE2"), "{err}");
+    }
+
+    #[test]
+    fn select_agent_id_matches_any_of_an_agents_channels() {
+        // `select_agent_id` resolves by channel too, and today's
+        // `.find(|a| a.channel.address == channel)` sees only the first
+        // binding: an explicit --channel naming the SECOND one would report
+        // "no deployed agent has channel ..." for an agent that plainly does.
+        let agents = [
+            test_agent_bound_to("one", &["C0EXAMPLE1", "C0EXAMPLE2"]),
+            test_agent_bound_to("two", &["C0EXAMPLE3"]),
+        ];
+        assert_eq!(
+            select_agent_id(&agents, Some("C0EXAMPLE2")).unwrap(),
+            "id-one"
+        );
+        assert_eq!(
+            select_agent_id(&agents, Some("C0EXAMPLE3")).unwrap(),
+            "id-two"
+        );
+        // An address bound to nobody still errors, naming it.
+        assert!(select_agent_id(&agents, Some("C0EXAMPLE9"))
+            .unwrap_err()
+            .to_string()
+            .contains("C0EXAMPLE9"));
+        // Agent selection still counts AGENTS, not pairs: a sole agent with
+        // two bindings is one agent, so it resolves with no flag. This is the
+        // deliberate asymmetry with `select_channel` above -- do not "fix" it.
+        assert_eq!(select_agent_id(&agents[..1], None).unwrap(), "id-one");
     }
 
     #[test]
@@ -5783,7 +6786,10 @@ mod tests {
             bot_token: "xoxb-real-workspace".to_string(),
             disconnect,
             model_mode: crate::local::ModelMode::DefaultFake,
+            model_credentials: Vec::new(),
+            model: None,
             minimal: false,
+            stack_image_env: Vec::new(),
         }
     }
 
@@ -6070,6 +7076,91 @@ mod tests {
         assert!(!prefers_docker_internal_host("my-eks.example.com", true));
     }
 
+    const ADVERTISE_HOST_CHILD_CASE: &str = "CURIE_TEST_ADVERTISE_HOST_CASE";
+
+    fn run_advertise_host_child(case: &str, path: &std::path::Path) {
+        let output =
+            std::process::Command::new(std::env::current_exe().expect("resolve test executable"))
+                .arg("message::tests::advertise_host_child")
+                .arg("--exact")
+                .arg("--nocapture")
+                .env(ADVERTISE_HOST_CHILD_CASE, case)
+                .env("PATH", path)
+                .output()
+                .expect("run advertise host child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "advertise host child failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let sentinel = format!("ADVERTISE_HOST_OK {case}");
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line.trim() == sentinel.as_str()),
+            "advertise host child did not prove case {case} ran\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    #[tokio::test]
+    async fn advertise_host_child() {
+        let Ok(case) = std::env::var(ADVERTISE_HOST_CHILD_CASE) else {
+            return;
+        };
+        match case.as_str() {
+            "kernel_route" => {
+                let target = "192.0.2.1";
+                let socket =
+                    std::net::UdpSocket::bind("0.0.0.0:0").expect("bind route source probe");
+                socket
+                    .connect((target, 6443))
+                    .expect("select route toward documentation address");
+                let expected = socket.local_addr().expect("read route source").ip();
+                let actual = resolve_advertise_host(None)
+                    .await
+                    .expect("derive advertise host");
+                assert_eq!(actual, expected.to_string());
+                assert_ne!(actual, target);
+            }
+            "explicit" => {
+                let actual = resolve_advertise_host(Some("192.0.2.44"))
+                    .await
+                    .expect("accept explicit listen host");
+                assert_eq!(actual, "192.0.2.44");
+            }
+            other => panic!("unknown advertise host child case {other}"),
+        }
+        println!("ADVERTISE_HOST_OK {case}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_advertise_host_uses_kernel_route_source() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tools = tempfile::tempdir().expect("create kubectl stub directory");
+        let kubectl = tools.path().join("kubectl");
+        std::fs::write(
+            &kubectl,
+            "#!/bin/sh\nprintf '%s\\n' 'https://192.0.2.1:6443'\n",
+        )
+        .expect("write kubectl stub");
+        let mut permissions = std::fs::metadata(&kubectl)
+            .expect("read kubectl stub metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&kubectl, permissions).expect("make kubectl stub executable");
+
+        run_advertise_host_child("kernel_route", tools.path());
+    }
+
+    #[test]
+    fn explicit_listen_host_bypasses_auto_detection() {
+        let no_tools = tempfile::tempdir().expect("create empty executable directory");
+        run_advertise_host_child("explicit", no_tools.path());
+    }
+
     #[test]
     fn dry_run_lists_the_valkey_forward_and_the_enqueue_with_the_reply_endpoint() {
         let lines = dry_run_lines(&opts(Some("C123")), "10.1.2.3");
@@ -6125,7 +7216,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|l| l.contains("the sole deployed agent's channel")),
+                .any(|l| l.contains("the sole bound (agent, Slack channel) pair")),
             "channel placeholder when omitted: {lines:?}"
         );
     }
@@ -6387,7 +7478,9 @@ mod tests {
     fn local_eval_dry_run_names_the_channel_lookup_when_omitted() {
         let lines = eval_dry_run_lines(&eval_opts(true, None), "smoke", 1);
         assert!(
-            lines.iter().any(|l| l.contains("sole deployed agent")),
+            lines
+                .iter()
+                .any(|l| l.contains("the sole bound (agent, Slack channel) pair")),
             "channel placeholder when omitted: {lines:?}"
         );
     }
@@ -6480,28 +7573,30 @@ mod tests {
             Agent {
                 id: "a1".into(),
                 name: "one".into(),
-                channel: crate::api::ChannelBinding {
+                channels: vec![crate::api::ChannelBinding {
                     kind: "slack".into(),
                     address: "C1".into(),
-                },
+                }],
                 repo_full_name: None,
                 approval_required_tools: None,
                 approval_routes: None,
                 model: None,
                 thinking: None,
+                memory: false,
             },
             Agent {
                 id: "a2".into(),
                 name: "two".into(),
-                channel: crate::api::ChannelBinding {
+                channels: vec![crate::api::ChannelBinding {
                     kind: "slack".into(),
                     address: "C2".into(),
-                },
+                }],
                 repo_full_name: None,
                 approval_required_tools: None,
                 approval_routes: None,
                 model: None,
                 thinking: None,
+                memory: false,
             },
         ];
         // Explicit channel picks the matching agent's id.
@@ -6753,6 +7848,50 @@ mod tests {
             fix.contains("--cases") && fix.contains("--model"),
             "the fix points at both the drop-flag and the in-CLI path: {fix}"
         );
+    }
+
+    /// #1915: the one-shot producer must run the dispatcher image the STACK
+    /// runs, not whatever this shell resolves.
+    ///
+    /// Compose substitutes its variables from each invocation's own environment,
+    /// so after `local up --build` the stack ran `:dev` while `local message`
+    /// resolved `:latest` and died on `No module named
+    /// curie_dispatcher.enqueue_once` -- the module the published image predates.
+    #[test]
+    fn the_one_shot_producer_runs_the_stacks_dispatcher_image() {
+        let cmd = dispatcher_enqueue_command(
+            &["compose.dev.yaml".to_string()],
+            "enqueue-1",
+            "curie:runs",
+            "pw",
+            &[],
+            Some("ghcr.io/curie-eng/curie-dispatcher:dev"),
+        );
+
+        assert!(
+            cmd.env.iter().any(|(k, v)| k == "CURIE_DISPATCHER_IMAGE"
+                && v == "ghcr.io/curie-eng/curie-dispatcher:dev"),
+            "expected the stack's dispatcher image in the child env, got {:?}",
+            cmd.env
+        );
+    }
+
+    /// A stack on the published images passes nothing, so compose's own default
+    /// still applies. This is also what keeps CI working: the ladder builds its
+    /// dispatcher as `:latest` while setting CURIE_BASE_TAG=ci-local, so a
+    /// derived-but-unchecked tag would ask for an image nothing built.
+    #[test]
+    fn a_published_stack_leaves_the_image_to_compose() {
+        let cmd = dispatcher_enqueue_command(
+            &["compose.dev.yaml".to_string()],
+            "enqueue-1",
+            "curie:runs",
+            "pw",
+            &[],
+            None,
+        );
+
+        assert!(!cmd.env.iter().any(|(k, _)| k == "CURIE_DISPATCHER_IMAGE"));
     }
 
     // --- --case-id selector (#2007) -----------------------------------------

@@ -59,7 +59,8 @@ fn placeholder(id: &str) -> &'static str {
 
 /// Every LEAF verb path (e.g. `["cluster", "kill"]`) whose `args` include an arg
 /// with `"id": "dry_run"`, paired with the argv fragment of its required-arg
-/// placeholders (positional value, or `--<long>` + value for a required flag).
+/// placeholders. Required boolean switches contribute only `--<long>`; value
+/// options and positionals also contribute their placeholder value.
 fn dry_run_verbs() -> Vec<(Vec<String>, Vec<String>)> {
     let mut out = Vec::new();
     fn args_of(node: &serde_json::Value) -> &[serde_json::Value] {
@@ -112,7 +113,17 @@ fn dry_run_verbs() -> Vec<(Vec<String>, Vec<String>)> {
                             .and_then(|l| l.as_str())
                             .expect("required non-positional arg has a --long");
                         required.push(format!("--{long}"));
-                        required.push(placeholder(id).to_string());
+                        let boolean_switch = a
+                            .get("possible_values")
+                            .and_then(|values| values.as_array())
+                            .is_some_and(|values| {
+                                values.len() == 2
+                                    && values.iter().any(|value| value == "true")
+                                    && values.iter().any(|value| value == "false")
+                            });
+                        if !boolean_switch {
+                            required.push(placeholder(id).to_string());
+                        }
                     }
                 }
                 out.push((path, required));
@@ -1037,6 +1048,11 @@ fn delete_output_json_shape_is_pinned() {
 #[test]
 fn deploy_output_json_shape_is_pinned() {
     use curie::commands::DeployOutput;
+
+    let expected: serde_json::Value =
+        serde_json::from_str(include_str!("data/deploy-provider-wire.json"))
+            .expect("cli/tests/data/deploy-provider-wire.json must contain valid JSON");
+
     assert_eq!(
         DeployOutput {
             plugin_name: "weather".to_string(),
@@ -1046,7 +1062,7 @@ fn deploy_output_json_shape_is_pinned() {
             agent_id: "agt_1".to_string(),
             version_label: "v1-123".to_string(),
             version_id: "ver_1".to_string(),
-            channel: "unchanged (C123)".to_string(),
+            channel: "unchanged (C0EXAMPLE1)".to_string(),
             bundle_ref: "bundles/abc.tar.gz".to_string(),
             bundle_sha256: "deadbeef00".to_string(),
             bundle_size_bytes: 4096,
@@ -1055,16 +1071,7 @@ fn deploy_output_json_shape_is_pinned() {
             deployment_status: "active".to_string(),
         }
         .to_json(),
-        json!({
-            "plugin": "weather",
-            "label": "v1-123",
-            "environment": "dev",
-            "agent": {"name": "weather", "id": "agt_1"},
-            "version": {"label": "v1-123", "id": "ver_1"},
-            "channel": "unchanged (C123)",
-            "bundle": {"ref": "bundles/abc.tar.gz", "sha256": "deadbeef00", "size_bytes": 4096},
-            "deployment": {"id": "dep_1", "environment": "dev", "status": "active"},
-        })
+        expected
     );
 }
 
@@ -1463,7 +1470,8 @@ fn deploy_api_response(
                 json!({
                     "id": format!("agent-{target}"),
                     "name": name,
-                    "channel": {"kind": "slack", "address": channel}
+                    "channels": [{"kind": "slack", "address": channel}],
+                    "memory": false
                 }),
             )
         }

@@ -66,13 +66,19 @@ is a judgement call, not something derivable from the tree.
    column is a native Postgres `Enum(Environment, name="environment", schema=SCHEMA)`
    (`apps/api/src/curie_api/models.py::Deployment`), which materializes as a `CREATE TYPE` in the `curie` schema.
 3. **`JSONB` column type** — `apps/api/src/curie_api/models.py::JSONB` is imported from
-   `sqlalchemy.dialects.postgresql` on the same line as `UUID` and used on **six** columns:
-   `behavior_packs`, `approval_required_tools`, `approval_routes` and `secrets` on
-   `apps/api/src/curie_api/models.py::Agent`, `evidence` on
-   `apps/api/src/curie_api/models.py::ApprovalAuditEntry`, and `value` on
-   `apps/api/src/curie_api/models.py::WorkflowStateEntry`. The last one is load-bearing
-   rather than incidental: the workflow-state store exists precisely because Postgres
-   JSONB meant no new datastore was needed (see that class's docstring).
+   `sqlalchemy.dialects.postgresql` on the same line as `UUID` and used on **fourteen** columns:
+   `behavior_packs`, `approval_required_tools`, `approval_routes`, `secrets`,
+   `hook_partitions`, `changed_paths`, `evidence`, `arguments`, `result`, `prior_state`,
+   `target`, `post_state`, and `value`. The last one is
+   `apps/api/src/curie_api/models.py::WorkflowStateEntry.value`; `evidence` is used
+   by both approval and action audit rows. Three of them are
+   load-bearing rather than incidental: the workflow-state store exists precisely because
+   Postgres JSONB meant no new datastore was needed (see that class's docstring), the
+   action ledger's `prior_state` holds a snapshot whose shape belongs to whatever resource
+   a connector wrote to, which no column type can know in advance (ADR-0117), and
+   `hook_partitions` holds per-hook delivery partitioning — hook name to the JSON Pointer
+   into a delivery body naming the thing each delivery is about; NULL means one thread
+   per hook (ADR-0134, Draft).
 4. **Raw dialect-specific SQL outside the ORM** — `DISTINCT ON`, which is Postgres-only,
    is written by hand in `apps/api/src/curie_api/commitpoller.py::_DEPLOYED_SQL` (executed
    through `text(...)` in `apps/api/src/curie_api/commitpoller.py::CommitPoller.poll_once`)

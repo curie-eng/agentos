@@ -1,0 +1,108 @@
+deploymentMode: SingleBinary
+loki:
+  image:
+    tag: 3.7.6
+  auth_enabled: false
+  config: |
+    auth_enabled: {{ .Values.loki.auth_enabled }}
+    analytics:
+      reporting_enabled: false
+    common:
+      path_prefix: /var/loki
+      replication_factor: {{ .Values.loki.commonConfig.replication_factor }}
+      ring:
+        kvstore:
+          store: inmemory
+      storage:
+        filesystem:
+          chunks_directory: /var/loki/chunks
+          rules_directory: /var/loki/rules
+    compactor:
+      {{- toYaml .Values.loki.compactor | nindent 6 }}
+    ingester:
+      {{- toYaml .Values.loki.ingester | nindent 6 }}
+    limits_config:
+      {{- toYaml .Values.loki.limits_config | nindent 6 }}
+    ruler:
+      storage:
+        type: local
+      wal:
+        dir: /var/loki/ruler-wal
+    runtime_config:
+      file: /etc/loki/runtime-config/runtime-config.yaml
+    schema_config:
+      {{- toYaml .Values.loki.schemaConfig | nindent 6 }}
+    server:
+      graceful_shutdown_timeout: 5s
+      grpc_listen_port: 9095
+      http_listen_port: 3100
+      log_level: info
+    tracing:
+      enabled: false
+  commonConfig:
+    replication_factor: 1
+  storage:
+    type: filesystem
+  schemaConfig:
+    configs:
+      - from: "2024-04-01"
+        store: tsdb
+        object_store: filesystem
+        schema: v13
+        index:
+          prefix: index_
+          period: 24h
+  limits_config:
+    retention_period: 168h
+    allow_structured_metadata: true
+    volume_enabled: true
+    ingestion_rate_mb: 2
+    ingestion_burst_size_mb: 4
+    per_stream_rate_limit: 1MB
+    per_stream_rate_limit_burst: 2MB
+    max_global_streams_per_user: 1000
+    reject_old_samples: true
+    reject_old_samples_max_age: 24h
+    max_line_size: 64KB
+  ingester:
+    chunk_idle_period: 1h
+    wal:
+      enabled: true
+      dir: /var/loki/wal
+      replay_memory_ceiling: 512MB
+      disk_full_threshold: 0.9
+  compactor:
+    retention_enabled: true
+    delete_request_store: filesystem
+singleBinary:
+  replicas: 1
+  persistence:
+    enabled: true
+    size: 10Gi
+    storageClass: local-path
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 768Mi
+read:
+  replicas: 0
+write:
+  replicas: 0
+backend:
+  replicas: 0
+chunksCache:
+  enabled: false
+resultsCache:
+  enabled: false
+gateway:
+  enabled: false
+lokiCanary:
+  enabled: false
+test:
+  enabled: false
+minio:
+  enabled: false
+rollout_operator:
+  enabled: false

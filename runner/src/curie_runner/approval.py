@@ -206,6 +206,38 @@ _TOOL_NAME = "request_approval"
 # The fully qualified tool identifier as it appears on ToolUseBlock.name.
 APPROVAL_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__{_TOOL_NAME}"
 
+# Platform-owned remote-development publication gate.  This is deliberately
+# mounted beside the policy tool rather than shipped by a bundle: a bundle is
+# untrusted input and must not be able to remove, execute, or grant its own
+# publication action.  The worker recognizes this exact runner-stamped
+# permission-gate provenance before it captures a patch.
+_PUBLISH_TOOL = "publish_changes"
+PUBLISH_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__{_PUBLISH_TOOL}"
+
+_PUBLISH_DESCRIPTION = (
+    "Request publication of the current repository changes. The platform will"
+    " capture the patch, ask for human approval in the requesting thread, and"
+    " publish it from a separate trusted job only after approval. This tool"
+    " never publishes changes itself."
+)
+_PUBLISH_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": {
+            "type": "string",
+            "description": "Short proposed pull request title.",
+            "minLength": 1,
+            "maxLength": 240,
+        },
+        "body": {
+            "type": "string",
+            "description": "Optional proposed pull request description.",
+            "maxLength": 65_536,
+        },
+    },
+    "required": ["title"],
+}
+
 _TOOL_DESCRIPTION = (
     "Request human approval before proceeding. Call this when your"
     " instructions say a step needs sign-off (a discount, an invoice, a"
@@ -267,7 +299,9 @@ def _distinct_routes(gate: ApprovalGate | None) -> list[str]:
     return sorted({r for r in gate.route_by_tool.values() if r})
 
 
-def build_approval_server(gate: ApprovalGate | None = None) -> McpSdkServerConfig:
+def build_approval_server(
+    gate: ApprovalGate | None = None, *, managed_workspace: bool = False
+) -> McpSdkServerConfig:
     """The in-process MCP server carrying the approval-request tool.
 
     Per-gate (#544, Decision B): the tool closes over ``gate`` so it can
@@ -289,8 +323,25 @@ def build_approval_server(gate: ApprovalGate | None = None) -> McpSdkServerConfi
     async def request_approval(args: dict[str, Any]) -> dict[str, Any]:
         return process_approval_request(gate, args)
 
+    tools = [request_approval]
+    if managed_workspace:
+
+        @tool(_PUBLISH_TOOL, _PUBLISH_DESCRIPTION, _PUBLISH_SCHEMA)
+        async def publish_changes(_args: dict[str, Any]) -> dict[str, Any]:
+            # Defence in depth: the permission callback must deny the call before
+            # execution. If a harness bypasses that callback, the in-process tool
+            # still performs no action and grants no capability.
+            return _approval_error(
+                "Publication is performed only by the platform after human approval; "
+                "this sandbox tool cannot execute it directly."
+            )
+
+        tools.append(publish_changes)
+
     return create_sdk_mcp_server(
-        name=APPROVAL_SERVER_NAME, version="1.0.0", tools=[request_approval]
+        name=APPROVAL_SERVER_NAME,
+        version="1.0.0",
+        tools=tools,
     )
 
 
@@ -509,6 +560,8 @@ class ApprovalGate:
     policy_route: str | None = None
     grant_tool: str | None = None
     grantable_by_route: dict[str, str] = field(default_factory=dict)
+    publication_title: str | None = None
+    publication_body: str | None = None
     # Set by ``block()`` whenever the gate refuses a call (#1852). Since the
     # refusal now carries the SDK's turn-stopping flags, the CLI aborts the turn
     # and its terminal result arrives shaped like a failure; this marker is how
@@ -537,6 +590,8 @@ class ApprovalGate:
         self.policy_requested = False
         self.policy_rejected = False
         self.policy_route = None
+        self.publication_title = None
+        self.publication_body = None
         # Strictly per-turn, and cleared with the other pending state rather
         # than with the boot-turn grant below: a halt that leaked forward would
         # make every later errored turn finalize as awaiting-approval (#1852).
@@ -563,6 +618,15 @@ class ApprovalGate:
         # for a stop. Do not tidy this back inside the guard below.
         self.pending_halt = True
         if self.pending_summary is None:
+            if tool_name == PUBLISH_TOOL_NAME:
+                title = tool_input.get("title")
+                body = tool_input.get("body", "")
+                if not isinstance(title, str) or not title.strip() or len(title) > 240:
+                    raise ValueError("publication title must be 1-240 characters")
+                if not isinstance(body, str) or len(body) > 65_536:
+                    raise ValueError("publication body must be at most 65536 characters")
+                self.publication_title = title.strip()
+                self.publication_body = body
             self.pending_summary = summarize_tool_call(tool_name, tool_input)
             self.pending_route = self.route_by_tool.get(tool_name)
             # Provenance for the permission gate (#544, Decision C): the tool
@@ -608,7 +672,9 @@ def _decide_gate(gate: ApprovalGate, tool_name: str, tool_input: dict[str, Any])
 
     if tool_name not in gate.required:
         return _GateDecision(blocked=False, ungated=True)
-    if gate.consume_grant(tool_name):
+    # Publication is completed outside the sandbox after approval, so an
+    # injected or stale grant must never let the in-sandbox tool execute.
+    if tool_name != PUBLISH_TOOL_NAME and gate.consume_grant(tool_name):
         return _GateDecision(blocked=False, ungated=False)
     gate.block(tool_name, tool_input)
     return _GateDecision(blocked=True, ungated=False)
@@ -645,7 +711,13 @@ def build_can_use_tool(gate: ApprovalGate) -> CanUseTool:
         # exactly this tool lets one call through (no block recorded, the
         # approved action completes) and re-arms the gate. ``_decide_gate``
         # applies this rule (shared with the hook below).
-        decision = _decide_gate(gate, tool_name, tool_input)
+        try:
+            decision = _decide_gate(gate, tool_name, tool_input)
+        except ValueError as exc:
+            return PermissionResultDeny(
+                message=f"Publication request was not recorded: {exc}. Correct it and retry.",
+                interrupt=True,
+            )
         if decision.blocked:
             # ``interrupt`` is the SDK-native "deny AND stop the turn" flag
             # (``PermissionResultDeny.interrupt``, claude_agent_sdk/types.py:247-252),
@@ -769,7 +841,19 @@ def build_approval_hook(gate: ApprovalGate) -> dict[str, list[HookMatcher]]:
         # ``_decide_gate`` applies the shared ungated/granted/blocked rule (also
         # used by ``build_can_use_tool`` above); the grant, if any, is spent as
         # a side effect of this call.
-        decision = _decide_gate(gate, tool_name, tool_input)
+        try:
+            decision = _decide_gate(gate, tool_name, tool_input)
+        except ValueError as exc:
+            reason = f"Publication request was not recorded: {exc}. Correct it and retry."
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": reason,
+                },
+                "continue_": False,
+                "stopReason": reason,
+            }
         if not decision.blocked:
             # Observability for #1852 (accepted, not fixed): the grant is spent
             # HERE, before the concurrently-dispatched bundle PreToolUse hook's
@@ -983,6 +1067,7 @@ def build_approval_gate(
     bundle_name: str | None = None,
     mcp_servers: set[str] | None = None,
     connector_servers: set[str] | None = None,
+    managed_workspace: bool = False,
 ) -> ApprovalGate | None:
     """Merge the operator's gated tools with the bundle's declared gates.
 
@@ -1079,7 +1164,15 @@ def build_approval_gate(
         # extra approval card, under-arming is a silent fail-open.
         normalized.extend(effective)
 
-    operator = frozenset(normalized)
+    operator = frozenset(name for name in normalized if name != PUBLISH_TOOL_NAME)
+    # The publication gate is platform-owned and requester-thread scoped. A
+    # bundle may mention the name, but it cannot attach its own audience route
+    # or cause publication to exist without a mounted managed workspace.
+    policy_routes = {
+        tool_name: route
+        for tool_name, route in policy_routes.items()
+        if tool_name != PUBLISH_TOOL_NAME
+    }
     redefined = sorted(operator & set(policy_routes))
     if redefined:
         logger.warning(
@@ -1088,13 +1181,19 @@ def build_approval_gate(
             " gated and the bundle's route decides the approving audience",
             redefined,
         )
+    # Publication is a mandatory platform gate only for a managed checkout. It
+    # is additive to both operator and bundle policy, has no audience route of
+    # its own (the request thread owns the card), and cannot consume a grant.
     gated_tools = operator | frozenset(policy_routes)
+    if managed_workspace:
+        gated_tools |= frozenset({PUBLISH_TOOL_NAME})
     if not gated_tools:
         return None
+    safe_grant_tool = None if grant_tool == PUBLISH_TOOL_NAME else grant_tool
     return ApprovalGate(
         required=gated_tools,
         route_by_tool=policy_routes,
-        grant_tool=grant_tool,
+        grant_tool=safe_grant_tool,
         grantable_by_route=grantable_by_route or {},
     )
 

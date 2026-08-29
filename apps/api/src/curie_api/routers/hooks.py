@@ -33,14 +33,19 @@ upstream's configuration.
 from __future__ import annotations
 
 import logging
-import re
 import secrets as pysecrets
 import uuid
 from datetime import UTC, datetime
-from typing import Annotated
+from typing import Annotated, Any
 
 import redis.asyncio as redis
-from aci_protocol import STREAM_PAYLOAD_FIELD, QueuedTurn, ReplyHandle, TurnSource
+from aci_protocol import (
+    STREAM_PAYLOAD_FIELD,
+    QueuedTurn,
+    ReplyHandle,
+    TurnSource,
+    parse_queued_turn,
+)
 from fastapi import APIRouter, Header, HTTPException, Request, Response, status
 from pydantic import BaseModel
 from sqlalchemy import select
@@ -58,7 +63,13 @@ from ..delivery import (
 )
 from ..deps import SessionDep
 from ..graveyardwatcher import _text
-from ..models import Agent
+from ..hook_partition import (
+    HOOK_NAME,
+    PartitionError,
+    conversation_id,
+    derive_partition,
+)
+from ..models import Agent, AgentChannel
 from ..wirebody import read_bounded_body
 
 logger = logging.getLogger(__name__)
@@ -76,12 +87,6 @@ _CLAIM_PREFIX = "curie:hook"
 # route to discover which agent ids exist.
 _AUTH_DETAIL = "missing or invalid signature"
 
-# A hook name is an operator-chosen label that ends up inside Valkey key names
-# and inside the conversation id, so it is constrained rather than trusted: no
-# separators, no unbounded length, nothing that could make two distinct hooks
-# build one key.
-_HOOK_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
-
 # The header an upstream names its delivery with.
 _DELIVERY_HEADER = "X-Curie-Delivery-Id"
 
@@ -91,35 +96,28 @@ class HookAccepted(BaseModel):
 
     ``stream_id`` is None only while another request holds the claim and has not
     enqueued yet (the 202 case).
+
+    ``conversation_id`` is the thread this delivery ACTUALLY landed on. A
+    partitioned hook (ADR-0134) mints one id per partition value, and the caller
+    has no other way to learn which of them it got -- it is the last segment of
+    the thread key that ``POST /agents/{agent_id}/threads/{thread_key}/reset``
+    takes, and it is also what the
+    ``GET /approvals?conversation_id=`` filter takes directly.
+
+    On a DUPLICATE it is read back from the queued turn, never re-derived from
+    this request's body: a retry of the same delivery id may carry a different
+    partition value, or the operator may have changed the pointer since, and
+    either would name a thread the queued turn never landed on.
+
+    It is None when the landing thread is not knowable from this request: a
+    pending twin still mid-flight, a stream an operator has trimmed, or the 202
+    no-claim case where this request enqueued nothing and nothing is yet known.
     """
 
     event_id: str
     stream_id: str | None
     duplicate: bool
-
-
-def _conversation_id(agent_id: uuid.UUID, hook: str) -> str:
-    """The thread every firing of one hook shares.
-
-    Per HOOK rather than per delivery, and the choice is load-bearing in two
-    directions. Per delivery would claim a fresh sandbox for every event, and two
-    rapid firings would run concurrently with no ordering at all. Sharing one
-    thread instead means a hook reuses its session and a second firing arriving
-    mid-run defers until the first finishes, which is exactly ADR-0079's "jobs
-    are outputs, not steering inputs" applied to a hook competing with itself.
-
-    It is also disjoint from the agent's Slack thread ids, so a hook can never
-    land in the middle of a human conversation.
-
-    Args:
-        agent_id: The agent this hook belongs to.
-        hook: The validated hook name.
-
-    Returns:
-        The conversation key.
-    """
-
-    return f"hook:{agent_id}:{hook}"
+    conversation_id: str | None
 
 
 def _hook_text(hook: str, body: bytes) -> str:
@@ -143,19 +141,68 @@ def _hook_text(hook: str, body: bytes) -> str:
     return f"Inbound hook `{hook}` fired with this payload:\n\n{payload}"
 
 
+async def _landed_conversation_id(
+    client: redis.Redis, stream: str, held: str
+) -> str | None:
+    """The conversation id of the turn a held claim already enqueued.
+
+    Read back from the stream rather than recomputed, and the reason is the very
+    property that makes the claim correct: the claim key is DELIBERATELY
+    partition-independent, so one upstream delivery id runs at most once whatever
+    partition it names (see the key construction below). That is exactly why a
+    duplicate receipt cannot trust the current request -- a retry carrying a
+    different partition value, or one arriving after the operator moved the
+    pointer, derives a thread the single queued turn never landed on. Only the
+    queued turn itself knows.
+
+    Args:
+        client: The Valkey client.
+        stream: The runs stream the turn was appended to.
+        held: The claim key's current value: ``pending:<token>`` while another
+            request is mid-flight, otherwise the stream id of its entry.
+
+    Returns:
+        The queued turn's conversation id, or None when it is not knowable --
+        the claim is still ``pending:``, or the entry is gone because an operator
+        trimmed the stream.
+    """
+
+    if held.startswith("pending:"):
+        return None
+    entries: Any = await client.xrange(stream, min=held, max=held)
+    if not entries:
+        return None
+    _entry_id, fields_raw = entries[0]
+    # Keys decode because the API's client is built without `decode_responses`;
+    # a `decode_responses=True` client (tests) already hands back str.
+    fields = {_text(name): value for name, value in (fields_raw or {}).items()}
+    payload = fields.get(STREAM_PAYLOAD_FIELD)
+    if payload is None:
+        return None
+    return parse_queued_turn(_text(payload)).conversation_id
+
+
 async def _load_agent(session: SessionDep, agent_id: uuid.UUID) -> Agent | None:
-    """Load the agent and its single channel binding, or None."""
+    """Load the agent and every surface binding, or None."""
 
     # Annotated rather than returned bare: `session.scalar` is typed Any, and the
     # local annotation is how the rest of this package pins it (see `crud.py` and
     # `channels._resolve_binding`).
     agent: Agent | None = await session.scalar(
-        select(Agent).where(Agent.id == agent_id).options(selectinload(Agent.channel))
+        select(Agent).where(Agent.id == agent_id).options(selectinload(Agent.channels))
     )
     return agent
 
 
-def _mint_turn(agent: Agent, hook: str, event_id: str, body: bytes) -> QueuedTurn:
+def _mint_turn(
+    agent: Agent,
+    binding: AgentChannel,
+    hook: str,
+    event_id: str,
+    body: bytes,
+    *,
+    partition: str | None,
+) -> QueuedTurn:
     """Build the ``QueuedTurn`` a verified hook delivery becomes.
 
     The reply route comes wholly from the agent's binding row, never from the
@@ -171,15 +218,18 @@ def _mint_turn(agent: Agent, hook: str, event_id: str, body: bytes) -> QueuedTur
         hook: The validated hook name.
         event_id: This delivery's deterministic event id.
         body: The raw request body.
+        partition: The derived partition value, or None when this hook is
+            unpartitioned. It reaches the conversation id and nothing else: the
+            author stays the hook, since the partition names the thing the
+            delivery is about rather than who sent it.
 
     Returns:
         The queued turn.
     """
 
-    binding = agent.channel
     return QueuedTurn(
         event_id=event_id,
-        conversation_id=_conversation_id(agent.id, hook),
+        conversation_id=conversation_id(agent.id, hook, partition),
         # The author is the platform, not a person: no human sent this, and
         # putting an upstream-supplied identity here would let a hook impersonate
         # one to anything downstream that reads the field.
@@ -204,6 +254,8 @@ async def ingest_hook(
     session: SessionDep,
     agent_id: uuid.UUID,
     hook: str,
+    kind: str | None = None,
+    address: str | None = None,
     x_curie_signature_256: Annotated[str | None, Header()] = None,
     x_curie_delivery_id: Annotated[str | None, Header()] = None,
 ) -> HookAccepted:
@@ -212,7 +264,8 @@ async def ingest_hook(
     Order, and why each step sits where it does:
 
     1. the hook NAME, validated before anything else, because it is about to be
-       used to build key names;
+       used to build key names -- with ``fullmatch``, since the pattern's ``$``
+       matches before a trailing newline and would let one into those keys;
     2. the size bound, before the signature is computed, so an oversized body is
        refused without the server ever HMAC-ing it;
     3. the agent row, which unavoidably precedes authentication here (see the
@@ -220,10 +273,12 @@ async def ingest_hook(
     4. the SIGNATURE over the raw body;
     5. the delivery id, checked after authentication so an unsigned caller learns
        nothing about what this route wants;
-    6. routability, then the claim, quota and enqueue.
+    6. the PARTITION this delivery belongs to, if the hook has one (ADR-0134),
+       after both of those and before anything is claimed;
+    7. routability, then the claim, quota and enqueue.
     """
 
-    if not _HOOK_NAME.match(hook):
+    if not HOOK_NAME.fullmatch(hook):
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             "hook name must be 1-63 characters of lowercase letters, digits, dot, "
@@ -254,6 +309,48 @@ async def ingest_hook(
             "agent twice",
         )
 
+    # Derived here and nowhere else in the order. After the signature and the
+    # delivery id, so an unsigned caller is never told which field of its payload
+    # the operator reads -- nor that this hook is partitioned at all. Before the
+    # claim, so a refusal leaves no claim key behind and the upstream's retry of a
+    # CORRECTED payload is not deduplicated away as a duplicate. And before the
+    # reply surface is selected, so a partition misconfiguration is attributed to
+    # the hook's configuration rather than surfacing as a 404 or 409 about a
+    # binding the operator would then go and inspect for nothing.
+    try:
+        partition = derive_partition(agent.hook_partitions, hook, raw)
+    except PartitionError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+
+    if (kind is None) != (address is None):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "hook reply surface requires both kind and address",
+        )
+    if kind is None:
+        if len(agent.channels) != 1:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "this agent has multiple surfaces; select the hook reply surface "
+                "with both kind and address query parameters",
+            )
+        binding = agent.channels[0]
+    else:
+        selected = next(
+            (
+                candidate
+                for candidate in agent.channels
+                if candidate.kind == kind and candidate.address == address
+            ),
+            None,
+        )
+        if selected is None:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                "this agent has no binding for the selected kind and address",
+            )
+        binding = selected
+
     # No unbound-agent branch, deliberately. `AgentCreate.channel` is required and
     # `crud.update_agent_binding` mutates the row in place rather than clearing
     # it, so an agent with no binding is not a reachable state and a branch for it
@@ -263,6 +360,11 @@ async def ingest_hook(
     digest = sha16(x_curie_delivery_id)
     # Namespaced by agent AND hook, so two hooks on one agent cannot swallow each
     # other's deliveries when an upstream reuses its id space across them.
+    #
+    # Neither of these carries the partition, and that is deliberate rather than
+    # an oversight: one upstream delivery id must run at most once, whatever
+    # partition it names. Folding the partition in would let a retry that derived
+    # a different value run the agent a second time for the same delivery.
     event_id = f"hook-{agent.id}-{hook}-{digest}"
     key = f"{_CLAIM_PREFIX}:delivery:{agent.id}:{hook}:{digest}"
     owner = f"pending:{pysecrets.token_hex(16)}"
@@ -295,7 +397,7 @@ async def ingest_hook(
                     "too many new hook deliveries for this agent; retry later",
                     headers={"Retry-After": str(settings.hook_backlog_window_s)},
                 )
-            turn = _mint_turn(agent, hook, event_id, raw)
+            turn = _mint_turn(agent, binding, hook, event_id, raw, partition=partition)
             enqueued, current = await enqueue_owned(
                 client,
                 key=key,
@@ -306,29 +408,56 @@ async def ingest_hook(
                 lease_s=settings.channel_delivery_lease_s,
             )
             if enqueued:
+                # The conversation id is here because it is the operator's only
+                # server-side record of which thread a delivery landed on. There
+                # is no verb that resets every partition of one hook, so a
+                # partition is reset by its full id, and this line plus the
+                # receipt are the two places that id is shown.
                 logger.info(
-                    "hook ingress enqueued event_id=%s stream_id=%s hook=%s",
+                    "hook ingress enqueued event_id=%s stream_id=%s hook=%s "
+                    "conversation_id=%s",
                     event_id,
                     current,
                     hook,
+                    turn.conversation_id,
                 )
                 return HookAccepted(
-                    event_id=event_id, stream_id=current, duplicate=False
+                    event_id=event_id,
+                    stream_id=current,
+                    duplicate=False,
+                    conversation_id=turn.conversation_id,
                 )
+            # Not `turn.conversation_id`: this request enqueued nothing, so the thread
+            # the delivery landed on is the one the WINNING turn named, whatever
+            # partition this body derives.
             return HookAccepted(
                 event_id=event_id,
                 stream_id=duplicate_stream_id(current, response),
                 duplicate=True,
+                conversation_id=await _landed_conversation_id(
+                    client, settings.runs_stream, current
+                ),
             )
         held = await client.get(key)
         if held is not None:
+            current = _text(held)
             return HookAccepted(
                 event_id=event_id,
-                stream_id=duplicate_stream_id(_text(held), response),
+                stream_id=duplicate_stream_id(current, response),
                 duplicate=True,
+                conversation_id=await _landed_conversation_id(
+                    client, settings.runs_stream, current
+                ),
             )
 
     # Both attempts found the key absent after failing to claim it. Someone is
-    # mid-flight; answering "come back" is honest and never a second XADD.
+    # mid-flight; answering "come back" is honest and never a second XADD. The
+    # conversation id is None for the same reason the stream id is: nothing has
+    # been enqueued that this request can name.
     response.status_code = status.HTTP_202_ACCEPTED
-    return HookAccepted(event_id=event_id, stream_id=None, duplicate=True)
+    return HookAccepted(
+        event_id=event_id,
+        stream_id=None,
+        duplicate=True,
+        conversation_id=None,
+    )

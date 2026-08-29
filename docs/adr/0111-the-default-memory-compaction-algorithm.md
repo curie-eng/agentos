@@ -4,6 +4,10 @@ Date: 2026-08-17
 
 Status: Draft
 
+Supersedes in part [ADR-0095](0095-tiered-memory-lifecycle.md) only for its
+incremental compaction mechanism, as narrowed on 2026 08 17. ADR-0095 remains
+current for durable storage and session injection.
+
 Sits between [ADR-0095](0095-tiered-memory-lifecycle.md) (where a memory
 document is stored and how it is injected) and
 [ADR-0099](0099-hooks-are-bundle-declared-turns-the-system-starts.md) (how
@@ -12,10 +16,11 @@ one does, as an opt-in default rather than a requirement.
 
 ## Context
 
-ADR-0095, as narrowed by the 2026-08-17 architecture review, defines exactly two
-things: where a memory document lives durably, and that it is injected into a
-session when it exists. It is explicit that *"how the heck did these get
-created? Who updates them? Not the responsibility of that ADR."*
+[ADR-0095](0095-tiered-memory-lifecycle.md#narrowing-recorded-2026-08-17), as
+narrowed by the 2026-08-17 architecture review, defines exactly two things:
+where a memory document lives durably, and that it is injected into a session
+when it exists. It is explicit that *"how the heck did these get created? Who
+updates them? Not the responsibility of that ADR."*
 
 ADR-0099 gives an agent a way to run work no user started, on a schedule.
 
@@ -74,8 +79,10 @@ The cost of this clause is the reason for clause 3.
 
 ### 2. The source is the platform's transcripts, not the surface.
 
-A run reads the thread transcripts belonging to the scope, which the platform
-already stores, and never the surface's own history.
+A run reads the thread transcripts belonging to the scope after the scope
+attribution work in #27 is complete, and never the surface's own history. Today
+the platform serves transcript state by agent and thread, not by scope, so #27
+is a prerequisite for this scope tier default.
 
 This keeps the algorithm available on every surface from its first day: a
 surface with no readable backlog (email) is not a special case, because the
@@ -94,8 +101,9 @@ clause 7.
 
 Rebuilding from scratch is the expensive shape, and expense is not something to
 enable on a builder's behalf. A bundle declares that it wants the default
-algorithm; absent that declaration nothing runs and no document appears, which
-is the state ADR-0095 already handles as ordinary.
+algorithm. Issue #27 scope attribution is a prerequisite for this default
+configuration. The default remains opt in, and ADR-0095 handles an absent
+document as ordinary.
 
 ### 4. Scope tier by default. No default agent-tier algorithm.
 
@@ -199,8 +207,10 @@ document standing" is the only visible failure mode the design has.
 - Nothing here requires ADR-0100. Where it is enabled a run gains pointers;
   where it is not the document is self-contained.
 - Because the algorithm is a scheduled turn, everything ADR-0099 says about
-  silent turns, run records, and per-scope serialisation applies unchanged. This
-  ADR adds no new machinery.
+  silent turns, run records, and per-scope serialisation applies unchanged. The
+  scheduled turn reuses existing machinery, but the complete default depends
+  on new scope attribution work in #27 and the audit machinery required by
+  clause 8, so "adds no new machinery" is not an accurate claim.
 - **Clause 8 is the one thing here that does need machinery, and it is absent.**
   The record-shaped memory of ADR-0025 has an inspect/edit surface (#267); the
   document does not, and no version of it is retained. Both are separate work

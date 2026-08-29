@@ -20,6 +20,69 @@ fn output_text(output: &std::process::Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned() + &String::from_utf8_lossy(&output.stderr)
 }
 
+fn live_command_manifest() -> serde_json::Value {
+    let output = Command::new(bin())
+        .arg("schema")
+        .output()
+        .expect("run curie schema");
+    assert!(
+        output.status.success(),
+        "curie schema failed\n{}",
+        output_text(&output)
+    );
+    serde_json::from_slice(&output.stdout).expect("curie schema emits JSON")
+}
+
+fn cluster_status_plan(env_namespace: &str, flag_namespace: Option<&str>) -> Vec<String> {
+    let mut command = Command::new(bin());
+    command
+        .arg("--json")
+        .args(["cluster", "status", "--dry-run"])
+        .env("CURIE_NAMESPACE", env_namespace);
+    if let Some(namespace) = flag_namespace {
+        command.args(["--namespace", namespace]);
+    }
+    let output = command.output().expect("run curie cluster status dry run");
+    assert!(
+        output.status.success(),
+        "curie cluster status dry run failed\n{}",
+        output_text(&output)
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("status dry run emits JSON");
+    value["plan"]
+        .as_array()
+        .expect("status dry run includes a plan")
+        .iter()
+        .map(|line| {
+            line.as_str()
+                .expect("status plan entries are strings")
+                .to_string()
+        })
+        .collect()
+}
+
+fn assert_status_plan_namespace(plan: &[String], namespace: &str) {
+    let namespaced: Vec<_> = plan.iter().filter(|line| line.contains(" -n ")).collect();
+    assert!(
+        !namespaced.is_empty(),
+        "status plan must include namespace aware commands: {plan:?}"
+    );
+    let expected = format!(" -n {namespace}");
+    assert!(
+        namespaced.iter().all(|line| line.contains(&expected)),
+        "every namespace aware command must use {namespace}: {plan:?}"
+    );
+    assert!(
+        namespaced.iter().any(|line| line.starts_with("helm ")),
+        "the Helm status command must use {namespace}: {plan:?}"
+    );
+    assert!(
+        namespaced.iter().any(|line| line.starts_with("kubectl ")),
+        "the kubectl status commands must use {namespace}: {plan:?}"
+    );
+}
+
 #[test]
 fn apply_help_references_shipped_curie_yaml_example() {
     let output = run_help(&["apply"]);
@@ -79,6 +142,7 @@ fn process_help_routes_positive_forms() {
         &["cluster", "message"],
         &["cluster", "eval"],
         &["cluster", "deploy"],
+        &["try"],
         &["init"],
         &["interactive"],
         &["secrets", "set"],
@@ -149,6 +213,7 @@ fn process_help_top_level_lists_new_surface_and_hides_retired_verbs() {
         "skill",
         "local",
         "cluster",
+        "try",
         "init",
         "interactive",
         "secrets",
@@ -179,6 +244,31 @@ fn process_help_top_level_lists_new_surface_and_hides_retired_verbs() {
             "unexpected retired verb {needle}\n{text}"
         );
     }
+}
+
+#[test]
+fn process_skill_help_distinguishes_tier_from_bundle_artifact() {
+    let output = run_help(&["skill"]);
+    assert!(
+        output.status.success(),
+        "expected success for skill help\n{}",
+        output_text(&output)
+    );
+    let text = output_text(&output);
+    let distinction =
+        "`skill` names that tier, not a bundle skill artifact at `skills/<name>/SKILL.md`.";
+    assert!(
+        text.contains(distinction),
+        "skill help must clearly distinguish its runner tier from the bundle artifact\n{text}"
+    );
+    assert!(
+        text.contains("Subcommands: `skill <up|down|status|message|eval|approvals>`"),
+        "skill help must introduce its subcommand list separately\n{text}"
+    );
+    assert!(
+        !text.contains("skills/<name>/SKILL.md`: `skill <up|down|status|message|eval|approvals>"),
+        "skill help must not attach the subcommand list to the artifact distinction\n{text}"
+    );
 }
 
 /// `curie dev plugin-compat` is the operator-facing name of the outbound
@@ -343,6 +433,103 @@ fn command_manifest_matches_committed_artifact() {
     );
 }
 
+#[test]
+fn message_tiers_share_the_conversation_flag_and_default() {
+    let manifest = live_command_manifest();
+    let mut contracts = Vec::new();
+
+    for tier in ["skill", "local", "cluster"] {
+        let tier_command = manifest["subcommands"]
+            .as_array()
+            .expect("manifest has top level subcommands")
+            .iter()
+            .find(|command| command["name"] == tier)
+            .unwrap_or_else(|| panic!("manifest has the {tier} tier"));
+        let message = tier_command["subcommands"]
+            .as_array()
+            .expect("tier has subcommands")
+            .iter()
+            .find(|command| command["name"] == "message")
+            .unwrap_or_else(|| panic!("{tier} has the message verb"));
+        let conversation = message["args"]
+            .as_array()
+            .expect("message has arguments")
+            .iter()
+            .find(|arg| arg["id"] == "continue")
+            .unwrap_or_else(|| panic!("{tier} message exposes --continue"));
+
+        contracts.push(serde_json::json!({
+            "id": conversation["id"],
+            "long": conversation["long"],
+            "positional": conversation["positional"],
+            "required": conversation["required"],
+            "possible_values": conversation["possible_values"],
+            "default_values": conversation["default_values"],
+        }));
+    }
+
+    assert!(
+        contracts.windows(2).all(|pair| pair[0] == pair[1]),
+        "skill, local, and cluster message must share conversation flag semantics: {contracts:?}"
+    );
+    assert!(
+        contracts[0]["default_values"].is_null(),
+        "message must start a fresh conversation unless --continue is present"
+    );
+}
+
+#[test]
+fn cluster_namespace_env_reaches_every_cluster_verb() {
+    let manifest = live_command_manifest();
+    let cluster = manifest["subcommands"]
+        .as_array()
+        .expect("manifest has top level subcommands")
+        .iter()
+        .find(|command| command["name"] == "cluster")
+        .expect("manifest has the cluster command");
+    let subcommands = cluster["subcommands"]
+        .as_array()
+        .expect("cluster has subcommands");
+    assert!(
+        !subcommands.is_empty(),
+        "cluster namespace coverage must not be vacuous"
+    );
+
+    for subcommand in subcommands {
+        let name = subcommand["name"]
+            .as_str()
+            .expect("cluster subcommand has a name");
+        let namespace_args: Vec<_> = subcommand["args"]
+            .as_array()
+            .expect("cluster subcommand has arguments")
+            .iter()
+            .filter(|arg| arg["id"] == "namespace")
+            .collect();
+        assert_eq!(
+            namespace_args.len(),
+            1,
+            "cluster {name} must expose exactly one namespace argument"
+        );
+        assert_eq!(
+            namespace_args[0]["env"], "CURIE_NAMESPACE",
+            "cluster {name} must read CURIE_NAMESPACE"
+        );
+    }
+}
+
+#[test]
+fn cluster_namespace_flag_wins_over_environment() {
+    let env_plan = cluster_status_plan("env-namespace", None);
+    assert_status_plan_namespace(&env_plan, "env-namespace");
+
+    let flag_plan = cluster_status_plan("env-namespace", Some("flag-namespace"));
+    assert_status_plan_namespace(&flag_plan, "flag-namespace");
+    assert!(
+        flag_plan.iter().all(|line| !line.contains("env-namespace")),
+        "the environment namespace must not survive an explicit flag: {flag_plan:?}"
+    );
+}
+
 /// `dump-commands` is the documented alias for the hidden `schema` verb.
 #[test]
 fn dump_commands_alias_emits_same_manifest() {
@@ -372,6 +559,24 @@ fn help_flags(args: &[&str]) -> std::collections::BTreeSet<String> {
         .filter(|token| token.starts_with("--") && token.len() > 2)
         .map(|token| token.trim_end_matches(',').to_string())
         .collect()
+}
+
+#[test]
+fn process_try_help_lists_only_keep_beyond_global_flags() {
+    let top_level = output_text(&run_help(&[]));
+    assert!(
+        help_lists_subcommand(&top_level, "try"),
+        "top level help must list try\n{top_level}"
+    );
+
+    let global_flags = help_flags(&[]);
+    let try_flags = help_flags(&["try"]);
+    let command_flags: Vec<_> = try_flags.difference(&global_flags).cloned().collect();
+    assert_eq!(
+        command_flags,
+        vec!["--keep".to_string()],
+        "try must expose --keep as its only command specific flag"
+    );
 }
 
 /// The agent-target verbs share one `AgentTarget<T>` whose only per-tier
@@ -431,6 +636,27 @@ fn agent_target_verbs_expose_the_same_flags_on_both_tiers() {
             extra.len(),
             2,
             "cluster {verb} should add exactly --namespace/--release; got extras {extra:?}"
+        );
+    }
+}
+
+#[test]
+fn approval_help_exposes_strict_route_inputs_and_retires_convenience_flags() {
+    for tier in ["skill", "local", "cluster"] {
+        let flags = help_flags(&[tier, "approvals"]);
+        for required in ["--route-resolution", "--route-approvers", "--routes-from"] {
+            assert!(
+                flags.contains(required),
+                "{tier} approvals is missing {required}: {flags:?}"
+            );
+        }
+        assert!(
+            !flags.contains("--route"),
+            "{tier} approvals still exposes the retired compatibility flag: {flags:?}"
+        );
+        assert!(
+            !flags.contains("--route-notification"),
+            "{tier} approvals still exposes the removed convenience flag: {flags:?}"
         );
     }
 }

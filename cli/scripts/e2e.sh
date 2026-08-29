@@ -122,6 +122,211 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# These are every model credential and model routing input recognized by the
+# current CLI, plus the deprecated cluster credential alias. The empty private
+# store below is the other half of the negative control: making credential
+# discovery mandatory must make this first observation fail rather than quietly
+# borrowing a credential from the host running the E2E.
+TRY_ENV_UNSET=(
+    -u CURIE_CREDENTIALS
+    -u CURIE_MODEL_CREDENTIALS
+    -u CLAUDE_CODE_OAUTH_TOKEN
+    -u ANTHROPIC_API_KEY
+    -u CURIE_MODEL_BASE_URL
+    -u ANTHROPIC_BASE_URL
+    -u CURIE_MODEL
+    -u CURIE_FAKE_MODEL
+)
+TRY_RUNNER_CONTAINER="curie-runner-local"
+
+# `try` uses the product's standard local runner name. Refuse to exercise any
+# try path when it already belongs to somebody else; the EXIT trap only
+# removes the E2E-specific runner, never this shared name.
+if docker inspect "$TRY_RUNNER_CONTAINER" >/dev/null 2>&1; then
+    echo "error: try E2E needs $TRY_RUNNER_CONTAINER to be absent before it starts." >&2
+    echo "fix: stop the existing local runner, then rerun this E2E." >&2
+    exit 1
+fi
+
+echo
+echo "=== curie try (clean keyless first run, closed stdin) ==="
+TRY_ROOT="$WORKDIR/try-clean"
+TRY_CONFIG_DIR="$TRY_ROOT/config"
+TRY_TMPDIR="$TRY_ROOT/tmp"
+mkdir -p "$TRY_CONFIG_DIR" "$TRY_TMPDIR"
+TRY_JSON="$(
+    cd "$TRY_ROOT"
+    env "${TRY_ENV_UNSET[@]}" \
+        TMPDIR="$TRY_TMPDIR" \
+        CURIE_CONFIG_DIR="$TRY_CONFIG_DIR" \
+        "$BIN" --json try </dev/null
+)"
+printf '%s\n' "$TRY_JSON"
+printf '%s' "$TRY_JSON" | python3 -c '
+import json, sys
+
+raw = sys.stdin.read()
+try:
+    payload = json.loads(raw)
+except json.JSONDecodeError as error:
+    sys.exit(f"error: curie --json try must emit exactly one JSON value: {error}")
+if not isinstance(payload, dict):
+    sys.exit("error: curie --json try must emit one JSON object")
+if "all done" not in payload.get("reply", ""):
+    sys.exit(f"error: keyless curie try did not return the fake reply: {payload!r}")
+if payload.get("status") != "done":
+    sys.exit(f"error: keyless curie try did not finish done: {payload!r}")
+if payload.get("finalized") is not True:
+    sys.exit(f"error: keyless curie try did not emit a finalized reply: {payload!r}")
+print("confirmed: keyless curie try emitted exactly one finalized reply object")
+'
+if [[ -e "$TRY_ROOT/curie-demo" ]]; then
+    echo "error: plain \`curie try\` retained $TRY_ROOT/curie-demo; only --keep may create it." >&2
+    exit 1
+fi
+if [[ -n "$(find "$TRY_TMPDIR" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+    echo "error: plain \`curie try\` left its disposable scaffold under $TRY_TMPDIR." >&2
+    exit 1
+fi
+echo "confirmed: plain curie try left no ./curie-demo or temporary scaffold"
+
+echo
+echo "=== curie try (discovered credential, safely rejected) ==="
+TRY_CREDENTIAL_ROOT="$WORKDIR/try-credential"
+TRY_CREDENTIAL_CONFIG_DIR="$TRY_CREDENTIAL_ROOT/config"
+TRY_CREDENTIAL_TMPDIR="$TRY_CREDENTIAL_ROOT/tmp"
+TRY_CREDENTIAL_STDOUT="$TRY_CREDENTIAL_ROOT/stdout"
+TRY_CREDENTIAL_STDERR="$TRY_CREDENTIAL_ROOT/stderr"
+TRY_CREDENTIAL_NAME="ANTHROPIC_API_KEY"
+TRY_CREDENTIAL_VALUE="curie-e2e-fake-credential-value"
+mkdir -p "$TRY_CREDENTIAL_CONFIG_DIR" "$TRY_CREDENTIAL_TMPDIR"
+
+if (
+    cd "$TRY_CREDENTIAL_ROOT"
+    env "${TRY_ENV_UNSET[@]}" \
+        TMPDIR="$TRY_CREDENTIAL_TMPDIR" \
+        CURIE_CONFIG_DIR="$TRY_CREDENTIAL_CONFIG_DIR" \
+        "$TRY_CREDENTIAL_NAME=$TRY_CREDENTIAL_VALUE" \
+        "$BIN" try </dev/null >"$TRY_CREDENTIAL_STDOUT" 2>"$TRY_CREDENTIAL_STDERR"
+); then
+    echo "error: curie try accepted the E2E's deliberately fake discovered credential." >&2
+    exit 1
+fi
+if ! grep -qF "$TRY_CREDENTIAL_NAME" "$TRY_CREDENTIAL_STDOUT" && \
+   ! grep -qF "$TRY_CREDENTIAL_NAME" "$TRY_CREDENTIAL_STDERR"; then
+    echo "error: curie try rejected the credential without naming its discovered source." >&2
+    exit 1
+fi
+if grep -qF "$TRY_CREDENTIAL_VALUE" "$TRY_CREDENTIAL_STDOUT" "$TRY_CREDENTIAL_STDERR"; then
+    echo "error: curie try exposed a discovered credential value in its output." >&2
+    exit 1
+fi
+if [[ -n "$(find "$TRY_CREDENTIAL_TMPDIR" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+    echo "error: rejected credential run left its disposable scaffold under $TRY_CREDENTIAL_TMPDIR." >&2
+    exit 1
+fi
+if docker inspect "$TRY_RUNNER_CONTAINER" >/dev/null 2>&1; then
+    echo "error: rejected credential run left its local runner behind." >&2
+    exit 1
+fi
+echo "confirmed: discovered credential is named but never exposed, then its scaffold and runner are removed"
+
+echo
+echo "=== curie try --keep (graduate into normal skill commands) ==="
+TRY_KEEP_ROOT="$WORKDIR/try-keep"
+TRY_KEEP_CONFIG_DIR="$TRY_KEEP_ROOT/config"
+TRY_KEEP_PROJECT="$TRY_KEEP_ROOT/curie-demo"
+mkdir -p "$TRY_KEEP_CONFIG_DIR"
+TRY_KEEP_OUTPUT="$(
+    cd "$TRY_KEEP_ROOT"
+    env "${TRY_ENV_UNSET[@]}" \
+        CURIE_CONFIG_DIR="$TRY_KEEP_CONFIG_DIR" \
+        "$BIN" try --keep </dev/null 2>&1
+)"
+printf '%s\n' "$TRY_KEEP_OUTPUT"
+if ! printf '%s' "$TRY_KEEP_OUTPUT" | grep -qF "all done"; then
+    echo "error: keyless \`curie try --keep\` did not return the fake runner reply." >&2
+    exit 1
+fi
+if [[ ! -f "$TRY_KEEP_PROJECT/.claude-plugin/plugin.json" ]]; then
+    echo "error: \`curie try --keep\` did not retain the standard plugin manifest." >&2
+    exit 1
+fi
+python3 - "$TRY_KEEP_PROJECT/.claude-plugin/plugin.json" <<'PY'
+import json, sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    manifest = json.load(handle)
+if manifest.get("name") != "curie-demo":
+    raise SystemExit(f"error: retained scaffold has the wrong plugin name: {manifest!r}")
+print("confirmed: --keep retained the standard curie-demo scaffold")
+PY
+
+(
+    cd "$TRY_KEEP_PROJECT"
+
+    echo
+    echo "=== graduated project: curie skill up --fake-model ==="
+    "$BIN" skill up --fake-model
+
+    echo
+    echo "=== graduated project: curie skill status --json ==="
+    GRADUATED_STATUS_JSON="$("$BIN" skill status --json)"
+    printf '%s\n' "$GRADUATED_STATUS_JSON"
+    printf '%s' "$GRADUATED_STATUS_JSON" | python3 -c '
+import json, sys
+
+payload = json.load(sys.stdin)
+digest = payload.get("bundle_digest")
+if not isinstance(digest, str) or not digest:
+    sys.exit(f"error: graduated project status has no bundle digest: {payload!r}")
+print(f"confirmed: graduated project bundle digest is {digest}")
+'
+
+    echo
+    echo "=== graduated project: curie skill message ==="
+    GRADUATED_REPLY="$("$BIN" skill message "hello again")"
+    printf '%s\n' "$GRADUATED_REPLY"
+    if ! printf '%s' "$GRADUATED_REPLY" | grep -qF "all done"; then
+        echo "error: the graduated project did not return the fake runner reply." >&2
+        exit 1
+    fi
+
+    echo
+    echo "=== graduated project: curie skill down ==="
+    "$BIN" skill down
+    if [[ -e .curie/runner.json ]]; then
+        echo "error: graduated project teardown left .curie/runner.json behind." >&2
+        exit 1
+    fi
+)
+if [[ ! -d "$TRY_KEEP_PROJECT" ]]; then
+    echo "error: normal skill commands removed the graduated curie-demo project." >&2
+    exit 1
+fi
+echo "confirmed: normal skill up, status, message, and down operate on the retained project"
+
+echo
+echo "=== curie try --keep (refuse an existing graduated project) ==="
+TRY_KEEP_MANIFEST="$TRY_KEEP_PROJECT/.claude-plugin/plugin.json"
+TRY_KEEP_MANIFEST_SHA256="$(sha256sum "$TRY_KEEP_MANIFEST" | awk '{print $1}')"
+if TRY_KEEP_COLLISION_OUTPUT="$(
+    cd "$TRY_KEEP_ROOT"
+    env "${TRY_ENV_UNSET[@]}" \
+        CURIE_CONFIG_DIR="$TRY_KEEP_CONFIG_DIR" \
+        "$BIN" try --keep </dev/null 2>&1
+)"; then
+    printf '%s\n' "$TRY_KEEP_COLLISION_OUTPUT"
+    echo "error: curie try --keep overwrote an existing curie-demo project." >&2
+    exit 1
+fi
+printf '%s\n' "$TRY_KEEP_COLLISION_OUTPUT"
+if [[ "$(sha256sum "$TRY_KEEP_MANIFEST" | awk '{print $1}')" != "$TRY_KEEP_MANIFEST_SHA256" ]]; then
+    echo "error: refused curie try --keep altered the existing plugin manifest." >&2
+    exit 1
+fi
+echo "confirmed: a second --keep refuses and preserves the graduated plugin manifest"
+
 echo
 echo "=== Resolve the bundle under test ==="
 if [[ -n "${CURIE_E2E_BUNDLE:-}" ]]; then

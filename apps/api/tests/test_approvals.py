@@ -12,9 +12,10 @@ import json
 import os
 import time
 import uuid
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -27,20 +28,35 @@ from aci_protocol import QueuedTurn
 from alembic import command
 from alembic.config import Config
 from curie_api import crud
+from curie_api import sweeper as sweeper_module
 from curie_api.config import get_settings
 from curie_api.deps import get_approver_sets
 from curie_api.main import create_app
 from curie_api.models import Approval
 from curie_api.resumequeue import ResumeQueue
 from curie_api.resumereconciler import ResumeReconciler
+from curie_api.routers import approvals as approvals_module
 from curie_api.sandbox_token import mint
 from curie_api.slack_approvers import SlackApproverSetSelector
 from curie_api.slack_usergroups import SlackUserGroupClient
-from curie_api.sweeper import run_expiry_sweeper, sweep_expired_approvals
+from curie_api.sweeper import (
+    observe_pending_approvals,
+    run_expiry_sweeper,
+    sweep_expired_approvals,
+)
+from curie_telemetry import (
+    TRACEPARENT_STREAM_FIELD,
+    extract_trace_context,
+    operation_span,
+    record_metric,
+)
 from curie_test_support.valkey import (
     connect_or_skip,
 )
 from fastapi.testclient import TestClient
+from opentelemetry import context as otel_context
+from opentelemetry import trace
+from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags, TraceState
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -48,6 +64,24 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 # The migration test (18) drives alembic directly against the disposable DB the
 # conftest provisions, so it needs the same script location conftest uses.
 ALEMBIC_DIR = Path(__file__).resolve().parents[1] / "alembic"
+_TRACE_ID = int("2123456789abcdef0123456789abcdef", 16)
+_SPAN_ID = int("2123456789abcdef", 16)
+
+
+@asynccontextmanager
+async def _remote_parent() -> AsyncIterator[None]:
+    parent = SpanContext(
+        trace_id=_TRACE_ID,
+        span_id=_SPAN_ID,
+        is_remote=True,
+        trace_flags=TraceFlags.SAMPLED,
+        trace_state=TraceState(),
+    )
+    token = otel_context.attach(trace.set_span_in_context(NonRecordingSpan(parent)))
+    try:
+        yield
+    finally:
+        otel_context.detach(token)
 
 
 @pytest.fixture
@@ -363,6 +397,48 @@ def test_happy_path_resolve_marks_resumed(
 
     # ... and the record is now marked resumed (the new #411 contract).
     assert _read_resumed_at(created["id"]) is not None
+
+
+def test_resume_queue_injects_traceparent_adjacent_to_unchanged_payload(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+) -> None:
+    """Approval resume uses the same transport carrier without widening the DTO."""
+
+    created = approvals_client.post(
+        "/approvals", json=_payload(), headers=auth_headers
+    ).json()
+
+    async def _resolve_with_parent() -> Any:
+        async with _remote_parent():
+            return await asyncio.to_thread(
+                approvals_client.post,
+                f"/approvals/{created['id']}/resolve",
+                json={
+                    "decision": "approved",
+                    "resolved_by": "U9",
+                    "actor_channel": "C1",
+                },
+                headers=auth_headers,
+            )
+
+    resolved = asyncio.run(_resolve_with_parent())
+    assert resolved.status_code == 200, resolved.text
+
+    entries = valkey.xrange(runs_stream)
+    assert len(entries) == 1
+    _entry_id, fields = entries[0]
+    assert set(fields) == {"payload", TRACEPARENT_STREAM_FIELD}
+    raw_payload = fields["payload"]
+    assert QueuedTurn.model_validate_json(raw_payload).model_dump_json() == raw_payload
+
+    parent = trace.get_current_span(extract_trace_context(fields)).get_span_context()
+    assert parent.is_valid is True
+    assert parent.is_remote is True
+    assert parent.trace_id == _TRACE_ID
 
 
 def test_create_get_list_round_trip(
@@ -747,7 +823,7 @@ def test_bound_approver_is_accepted_and_requesting_channel_is_not(
             "channel": {"kind": "slack", "address": "C0LOCALDEV"},
             "approval_routes": {
                 "deal-desk": {
-                    "channel": "C0BOUND01",
+                    "resolution": {"kind": "slack", "address": "C0EXAMPLE1"},
                     "approvers": {"users": ["U0BOUND01"]},
                 }
             },
@@ -763,7 +839,7 @@ def test_bound_approver_is_accepted_and_requesting_channel_is_not(
             author="U0AUTHOR1",
             reply_channel="C0LOCALDEV",
             route="deal-desk",
-            card_channel="C0BOUND01",
+            card_channel="C0EXAMPLE1",
             gate_kind="policy",
         ),
         headers=auth_headers,
@@ -798,7 +874,7 @@ def test_bound_approver_is_accepted_and_requesting_channel_is_not(
         json={
             "decision": "approved",
             "resolved_by": "U0BOUND01",
-            "actor_channel": "C0BOUND01",
+            "actor_channel": "C0EXAMPLE1",
         },
         headers=auth_headers,
     )
@@ -1633,8 +1709,9 @@ def test_run_expiry_sweeper_loop_sweeps_and_stops(
 
 # --- #420: approver sets unfused from the card's channel -----------------------
 #
-# Setup shape throughout: an agent binds route "managers" to the BROAD channel
-# (where the card posts) and, optionally, an `approvers` block (who may act).
+# Setup shape throughout: an agent binds route "managers" to a resolution target
+# in the BROAD channel (where the card posts) and, optionally, an `approvers`
+# block (who may act).
 # The approval then names that agent + route, with card_channel=C_BROAD -- the
 # exact shape the worker produces at kernel.py:626-627.
 #
@@ -1666,6 +1743,10 @@ def _agent_with_routes(
     )
     assert created.status_code == 201, created.text
     return str(created.json()["id"])
+
+
+def _slack_resolution(address: str) -> dict[str, str]:
+    return {"kind": "slack", "address": address}
 
 
 def _routed_payload(agent_id: str | None, **overrides: Any) -> dict[str, Any]:
@@ -1768,7 +1849,7 @@ def test_group_bound_route_denies_non_group_member_even_in_card_channel(
     agent_id = _agent_with_routes(
         approvals_client,
         auth_headers,
-        {"managers": {"channel": _BROAD, "approvers": {"group": _GROUP}}},
+        {"managers": {"resolution": _slack_resolution(_BROAD), "approvers": {"group": _GROUP}}},
     )
     created = approvals_client.post(
         "/approvals", json=_routed_payload(agent_id), headers=auth_headers
@@ -1800,7 +1881,7 @@ def test_group_member_resolves_and_session_resumes(
     agent_id = _agent_with_routes(
         approvals_client,
         auth_headers,
-        {"managers": {"channel": _BROAD, "approvers": {"group": _GROUP}}},
+        {"managers": {"resolution": _slack_resolution(_BROAD), "approvers": {"group": _GROUP}}},
     )
     payload = _routed_payload(agent_id)
     created = approvals_client.post(
@@ -1836,7 +1917,7 @@ def test_user_list_bound_route_denies_an_unlisted_actor_without_calling_slack(
     agent_id = _agent_with_routes(
         approvals_client,
         auth_headers,
-        {"managers": {"channel": _BROAD, "approvers": {"users": [_LISTED]}}},
+        {"managers": {"resolution": _slack_resolution(_BROAD), "approvers": {"users": [_LISTED]}}},
     )
     created = approvals_client.post(
         "/approvals", json=_routed_payload(agent_id), headers=auth_headers
@@ -1863,7 +1944,12 @@ def test_user_list_bound_route_resolves_for_a_listed_actor(
     agent_id = _agent_with_routes(
         approvals_client,
         auth_headers,
-        {"managers": {"channel": _BROAD, "approvers": {"users": [_LISTED, _APPROVER]}}},
+        {
+            "managers": {
+                "resolution": _slack_resolution(_BROAD),
+                "approvers": {"users": [_LISTED, _APPROVER]},
+            }
+        },
     )
     created = approvals_client.post(
         "/approvals", json=_routed_payload(agent_id), headers=auth_headers
@@ -1893,7 +1979,7 @@ def test_explicit_user_list_wins_over_the_group_binding(
         auth_headers,
         {
             "managers": {
-                "channel": _BROAD,
+                "resolution": _slack_resolution(_BROAD),
                 "approvers": {"group": _GROUP, "users": [_LISTED]},
             }
         },
@@ -1935,7 +2021,7 @@ def test_requester_cannot_self_approve_under_the_group_authorizer(
     agent_id = _agent_with_routes(
         approvals_client,
         auth_headers,
-        {"managers": {"channel": _BROAD, "approvers": {"group": _GROUP}}},
+        {"managers": {"resolution": _slack_resolution(_BROAD), "approvers": {"group": _GROUP}}},
     )
     created = approvals_client.post(
         "/approvals",
@@ -1967,7 +2053,12 @@ def test_requester_cannot_self_approve_under_the_user_list_authorizer(
     agent_id = _agent_with_routes(
         approvals_client,
         auth_headers,
-        {"managers": {"channel": _BROAD, "approvers": {"users": [_LISTED, _APPROVER]}}},
+        {
+            "managers": {
+                "resolution": _slack_resolution(_BROAD),
+                "approvers": {"users": [_LISTED, _APPROVER]},
+            }
+        },
     )
     created = approvals_client.post(
         "/approvals",
@@ -1995,7 +2086,7 @@ def test_requester_cannot_self_approve_under_a_bound_channel_authorizer(
     route."""
 
     agent_id = _agent_with_routes(
-        approvals_client, auth_headers, {"managers": {"channel": _BROAD}}
+        approvals_client, auth_headers, {"managers": {"resolution": _slack_resolution(_BROAD)}}
     )
     created = approvals_client.post(
         "/approvals",
@@ -2031,7 +2122,7 @@ def test_audit_names_authorizer_and_membership_evidence(
     agent_id = _agent_with_routes(
         approvals_client,
         auth_headers,
-        {"managers": {"channel": _BROAD, "approvers": {"group": _GROUP}}},
+        {"managers": {"resolution": _slack_resolution(_BROAD), "approvers": {"group": _GROUP}}},
     )
     created = approvals_client.post(
         "/approvals", json=_routed_payload(agent_id), headers=auth_headers
@@ -2078,7 +2169,12 @@ def test_audit_evidence_for_a_user_list_decision(
     agent_id = _agent_with_routes(
         approvals_client,
         auth_headers,
-        {"managers": {"channel": _BROAD, "approvers": {"users": [_LISTED, _APPROVER]}}},
+        {
+            "managers": {
+                "resolution": _slack_resolution(_BROAD),
+                "approvers": {"users": [_LISTED, _APPROVER]},
+            }
+        },
     )
     created = approvals_client.post(
         "/approvals", json=_routed_payload(agent_id), headers=auth_headers
@@ -2111,7 +2207,7 @@ def test_audit_evidence_for_a_channel_decision(
     channel that held the authority and the channel the click came from."""
 
     agent_id = _agent_with_routes(
-        approvals_client, auth_headers, {"managers": {"channel": _BROAD}}
+        approvals_client, auth_headers, {"managers": {"resolution": _slack_resolution(_BROAD)}}
     )
     created = approvals_client.post(
         "/approvals", json=_routed_payload(agent_id), headers=auth_headers
@@ -2186,7 +2282,7 @@ def test_group_binding_without_a_bot_token_denies_instead_of_channel_fallback(
     agent_id = _agent_with_routes(
         approvals_client,
         auth_headers,
-        {"managers": {"channel": _BROAD, "approvers": {"group": _GROUP}}},
+        {"managers": {"resolution": _slack_resolution(_BROAD), "approvers": {"group": _GROUP}}},
     )
     created = approvals_client.post(
         "/approvals", json=_routed_payload(agent_id), headers=auth_headers
@@ -2218,7 +2314,7 @@ def test_group_lookup_failure_denies_and_audits_the_failure(
     agent_id = _agent_with_routes(
         approvals_client,
         auth_headers,
-        {"managers": {"channel": _BROAD, "approvers": {"group": _GROUP}}},
+        {"managers": {"resolution": _slack_resolution(_BROAD), "approvers": {"group": _GROUP}}},
     )
     created = approvals_client.post(
         "/approvals", json=_routed_payload(agent_id), headers=auth_headers
@@ -2256,6 +2352,60 @@ def test_group_lookup_failure_denies_and_audits_the_failure(
 # asserting the old channel fallback.
 
 
+def test_notification_target_cannot_widen_card_channel_authorization(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+) -> None:
+    """A notification address is visibility, never verified resolver evidence.
+
+    The stored route deliberately names both Slack channels. The actor presents
+    the notification channel first; authorization must still use the durable
+    ``Approval.card_channel`` that held the sole interactive resolution card.
+    """
+
+    agent_id = _agent_with_routes(
+        approvals_client,
+        auth_headers,
+        {
+            "managers": {
+                "resolution": _slack_resolution(_BROAD),
+                "notification": _slack_resolution(_ELSEWHERE),
+            }
+        },
+    )
+    created = approvals_client.post(
+        "/approvals", json=_routed_payload(agent_id), headers=auth_headers
+    ).json()
+    assert created["card_channel"] == _BROAD
+
+    notified_actor = _resolve(
+        approvals_client,
+        auth_headers,
+        created["id"],
+        _OTHER,
+        _ELSEWHERE,
+    )
+    assert notified_actor.status_code == 403, notified_actor.text
+    record = approvals_client.get(
+        f"/approvals/{created['id']}", headers=auth_headers
+    )
+    assert record.json()["status"] == "pending"
+    assert valkey.xrange(runs_stream) == []
+
+    card_actor = _resolve(
+        approvals_client,
+        auth_headers,
+        created["id"],
+        _OTHER,
+        _BROAD,
+    )
+    assert card_actor.status_code == 200, card_actor.text
+    assert len(valkey.xrange(runs_stream)) == 1
+
+
 def test_binding_without_approvers_keeps_channel_membership(
     approvals_client: TestClient,
     auth_headers: dict[str, str],
@@ -2263,12 +2413,14 @@ def test_binding_without_approvers_keeps_channel_membership(
     valkey: redis.Redis,
     runs_stream: str,
 ) -> None:
-    """AC4: an existing deployment's bare ``{channel}`` binding keeps resolving
-    against ``card_channel`` -- anyone in the card channel, nobody outside it.
-    Zero-setup stays zero-setup."""
+    """AC4: a bare resolution binding keeps resolving against ``card_channel``.
+
+    Anyone in the card channel may act and nobody outside it may. Zero-setup
+    stays zero-setup.
+    """
 
     agent_id = _agent_with_routes(
-        approvals_client, auth_headers, {"managers": {"channel": _BROAD}}
+        approvals_client, auth_headers, {"managers": {"resolution": _slack_resolution(_BROAD)}}
     )
     created = approvals_client.post(
         "/approvals", json=_routed_payload(agent_id), headers=auth_headers
@@ -2356,7 +2508,7 @@ def test_a_route_absent_from_the_map_is_unresolvable_and_borrows_no_other_route(
     agent_id = _agent_with_routes(
         approvals_client,
         auth_headers,
-        {"legal": {"channel": _ELSEWHERE, "approvers": {"users": [_LISTED]}}},
+        {"legal": {"resolution": _slack_resolution(_ELSEWHERE), "approvers": {"users": [_LISTED]}}},
     )
     created = approvals_client.post(
         "/approvals",
@@ -2421,7 +2573,12 @@ def test_clearing_a_bound_route_makes_a_pending_approval_unresolvable_not_wider(
     agent_id = _agent_with_routes(
         approvals_client,
         auth_headers,
-        {"managers": {"channel": _BROAD, "approvers": {"group": _GROUP}}},
+        {
+            "managers": {
+                "resolution": _slack_resolution(_BROAD),
+                "approvers": {"group": _GROUP},
+            }
+        },
     )
     created = approvals_client.post(
         "/approvals", json=_routed_payload(agent_id), headers=auth_headers
@@ -2436,7 +2593,11 @@ def test_clearing_a_bound_route_makes_a_pending_approval_unresolvable_not_wider(
     # Step 2: the route map is rewritten without `managers`.
     rewritten = approvals_client.patch(
         f"/agents/{agent_id}",
-        json={"approval_routes": {"legal": {"channel": _ELSEWHERE}}},
+        json={
+            "approval_routes": {
+                "legal": {"resolution": _slack_resolution(_ELSEWHERE)}
+            }
+        },
         headers=auth_headers,
     )
     assert rewritten.status_code == 200, rewritten.text
@@ -2466,7 +2627,10 @@ def test_clearing_a_bound_route_makes_a_pending_approval_unresolvable_not_wider(
         f"/agents/{agent_id}",
         json={
             "approval_routes": {
-                "managers": {"channel": _BROAD, "approvers": {"group": _GROUP}}
+                "managers": {
+                    "resolution": _slack_resolution(_BROAD),
+                    "approvers": {"group": _GROUP},
+                }
             }
         },
         headers=auth_headers,
@@ -2477,3 +2641,202 @@ def test_clearing_a_bound_route_makes_a_pending_approval_unresolvable_not_wider(
     assert ok.status_code == 200, ok.text
     assert ok.json()["status"] == "approved"
     assert len(valkey.xrange(runs_stream)) == 1
+
+
+@dataclass(frozen=True)
+class _ApprovalMetric:
+    name: str
+    value: float
+    attributes: dict[str, str]
+
+
+class _ApprovalSpan:
+    def add_event(
+        self, _name: str, _attributes: Mapping[str, str] | None = None
+    ) -> None:
+        pass
+
+
+class _ApprovalTelemetryProbe:
+    def __init__(self) -> None:
+        self.spans: list[str] = []
+        self.metrics: list[_ApprovalMetric] = []
+
+    @contextmanager
+    def operation_span(
+        self,
+        name: str,
+        *,
+        kind: Any,
+        parent: Any = None,
+        attributes: Mapping[str, str] | None = None,
+    ) -> Iterator[_ApprovalSpan]:
+        del kind, parent, attributes
+        self.spans.append(name)
+        yield _ApprovalSpan()
+
+    def record_metric(
+        self,
+        name: str,
+        value: float = 1,
+        *,
+        attributes: Mapping[str, str] | None = None,
+    ) -> None:
+        self.metrics.append(
+            _ApprovalMetric(name, float(value), dict(attributes or {}))
+        )
+
+
+def _install_approval_telemetry(monkeypatch: pytest.MonkeyPatch) -> _ApprovalTelemetryProbe:
+    import curie_telemetry
+
+    probe = _ApprovalTelemetryProbe()
+    monkeypatch.setattr(curie_telemetry, "operation_span", probe.operation_span)
+    monkeypatch.setattr(curie_telemetry, "record_metric", probe.record_metric)
+    for module in (approvals_module, sweeper_module):
+        if hasattr(module, "operation_span"):
+            monkeypatch.setattr(module, "operation_span", probe.operation_span)
+        if hasattr(module, "record_metric"):
+            monkeypatch.setattr(module, "record_metric", probe.record_metric)
+    return probe
+
+
+def test_pending_age_resolved_and_expired_approval_metrics_are_bounded(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    runs_stream: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One real record traverses each approval state required by the catalog."""
+
+    assert callable(operation_span)
+    assert callable(record_metric)
+    probe = _install_approval_telemetry(monkeypatch)
+
+    resolved_record = approvals_client.post(
+        "/approvals", json=_payload(), headers=auth_headers
+    ).json()
+    pending = approvals_client.get(
+        "/approvals", params={"status_filter": "pending"}, headers=auth_headers
+    )
+    assert pending.status_code == 200
+    resolved = approvals_client.post(
+        f"/approvals/{resolved_record['id']}/resolve",
+        json={"decision": "approved", "resolved_by": "U9", "actor_channel": "C1"},
+        headers=auth_headers,
+    )
+    assert resolved.status_code == 200, resolved.text
+
+    approvals_client.post(
+        "/approvals",
+        json=_payload(expires_in_seconds=1),
+        headers=auth_headers,
+    )
+
+    async def _expire() -> int:
+        async with _sweeper_stack(runs_stream) as (sessionmaker, queue, _client):
+            async with sessionmaker() as session:
+                return await sweep_expired_approvals(
+                    session,
+                    queue,
+                    now=_naive_utc(2),
+                )
+
+    assert asyncio.run(_expire()) == 1
+
+    pending_counts = [
+        point for point in probe.metrics if point.name == "curie.approval.pending"
+    ]
+    pending_ages = [
+        point
+        for point in probe.metrics
+        if point.name == "curie.approval.pending.age"
+    ]
+    lifecycle = [
+        point for point in probe.metrics if point.name == "curie.approval.lifecycle"
+    ]
+    assert pending_counts and pending_counts[-1].value == 0
+    assert pending_ages and all(point.value >= 0 for point in pending_ages)
+    assert {point.attributes["outcome"] for point in lifecycle} >= {
+        "resolved",
+        "expired",
+    }
+    assert {"curie.approval.resolve", "curie.approval.expire"} <= set(probe.spans)
+    assert all(
+        set(point.attributes)
+        <= {"service.name", "operation", "role", "source", "outcome"}
+        for point in probe.metrics
+    )
+    assert all(
+        resolved_record["id"] not in point.attributes.values()
+        for point in probe.metrics
+    )
+
+
+def test_pending_inventory_ignores_filtered_page_and_counts_more_than_200(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe = _install_approval_telemetry(monkeypatch)
+    observed_at = datetime.now(UTC).replace(tzinfo=None)
+    created_at = observed_at - timedelta(minutes=5)
+
+    async def seed() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with sessionmaker() as session:
+                session.add_all(
+                    [
+                        Approval(
+                            conversation_id=f"bulk-{index}",
+                            author="U0EXAMPLE1",
+                            summary="example approval",
+                            reply_kind="slack",
+                            reply_channel="C0EXAMPLE1",
+                            dedupe_key=f"bulk-pending-{index}",
+                            created_at=created_at,
+                        )
+                        for index in range(205)
+                    ]
+                )
+                await session.commit()
+        finally:
+            await engine.dispose()
+
+    asyncio.run(seed())
+    page = approvals_client.get(
+        "/approvals",
+        params={
+            "status_filter": "pending",
+            "conversation_id": "bulk-0",
+            "limit": 1,
+        },
+        headers=auth_headers,
+    )
+    assert page.status_code == 200
+    assert len(page.json()) == 1
+    assert not [point for point in probe.metrics if point.name == "curie.approval.pending"]
+
+    async def observe() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with sessionmaker() as session:
+                await observe_pending_approvals(session, now=observed_at)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(observe())
+    counts = [point for point in probe.metrics if point.name == "curie.approval.pending"]
+    ages = [point for point in probe.metrics if point.name == "curie.approval.pending.age"]
+    assert [point.value for point in counts] == [205]
+    assert [point.value for point in ages] == [300]
+    assert counts[0].attributes == ages[0].attributes == {
+        "service.name": "curie-api",
+        "operation": "observe",
+        "outcome": "pending",
+    }

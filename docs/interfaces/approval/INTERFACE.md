@@ -10,6 +10,15 @@ order: 13
 
 # INTERFACE: Approval / authorizer
 
+Repository publication uses this same approval plane but does not wake the
+sandbox after resolution. The trusted worker atomically creates the approval
+and private publication row through `POST /v1/internal/publications`; requester
+self-approval is allowed only for records whose server-owned purpose is
+`publication`. Approve schedules the platform publication reconciler, while
+deny and expiry terminalize without redeeming a write credential. Terminal
+results are delivered from a bounded durable outbox, independently of patch and
+credential cleanup, so adapter retries cannot repeat a GitHub mutation.
+
 > Part of the Curie swappable-seam catalog — see the [seam index](../../interfaces.md).
 
 <!-- BEGIN GENERATED: header (curie dev docs-lint) -->
@@ -208,12 +217,17 @@ in code now:
   silently arm nothing. A manifest with zero declared routes yields a generic approval
   (`route=None`), for which ADR-0034's channel-membership default is correct. Route names are
   bound to workspace
-  channels per agent (`agents.approval_routes`, deployment config, never in the bundle);
-  the worker resolves a raised route through the binding and posts the card into the bound
-  channel (`card_channel` on the record), whose members the authorizer then counts as the
-  approvers. **A named-but-unbound route now escalates loudly and creates no approval**
+  targets per agent (`agents.approval_routes`, deployment config, never in the bundle);
+  the worker resolves a raised route through its required Slack `resolution` target, posts
+  the one interactive card there, and persists that address as `card_channel` on the durable
+  record. The optional `notification` target receives a separate text-only ping with the
+  approval id and a direction to use the configured approval channel, but no channel
+  identifier, `ConfirmIntent`, action value, card-store entry, or other resolving
+  affordance. **A named-but-unbound route now escalates
+  loudly and creates no approval**
   (#544, ADR-0046, AC2), reversing #247's earlier warn-and-route-to-requesting-channel
-  fallback — authority must never silently widen. ADR-0123 brings resolve time into line
+  fallback — authority must never silently widen. This is distinct from genuinely
+  agent-less generic approvals. ADR-0123 brings resolve time into line
   with that creation-time rule: the API's `get_approval_route_binding` channel fallback
   (`apps/api/src/curie_api/crud.py`) now applies only to a **routeless** approval, so a
   routed approval with no binding is refused at BOTH ends of the lifecycle — no approval is
@@ -222,8 +236,10 @@ in code now:
   requesting channel is deployment policy, not part of the triggering conversation, so the
   card posts top-level over the worker's default Slack transport rather than the trigger's
   per-turn endpoint (this is what lets a non-Slack-triggered turn, e.g. CLI or API, still
-  deliver a real Slack card); the requesting-channel case (including the unbound fallback)
-  keeps the trigger's endpoint and threads under the conversation as before. Every
+  deliver a real Slack card); the requesting-channel case keeps the trigger's endpoint and
+  threads under the conversation as before. Notification transport is independent: a Slack
+  notification may use the default transport, while another kind stores its own required
+  `endpoint` and `adapter`. Those transport fields are redacted from API/CLI reads. Every
   resolution attempt appends to the platform audit log (`approval_audit_entries`,
   `GET /approvals/{id}/audit`): actor, channel evidence, decision, and the authorizer
   snapshot -- who resolved, and why they counted (or were refused).
@@ -337,17 +353,27 @@ name, so `approval_audit.authorizer` still records `ChannelMembershipAuthorizer`
 column is append-only history and rows already on main carry those values, so renaming the
 vocabulary would make old rows lie about what decided.
 
-### Unfusing who from where
+### Unfusing notification, resolution, and authority
 
-The route binding keeps `channel` as *where the card posts* and gains an optional
-`approvers` block as *who may approve*, so a card can be visible in a broad channel while
-authority stays narrow:
+The route binding has three separate concerns: required `resolution` says where the one
+verified interactive card posts; optional `notification` says where else to announce the
+request without making that place interactive; and optional `approvers` says who may act.
+That lets a second channel carry visibility without widening the single resolution surface:
 
 ```
 approval_routes: {
   "<route-name>": {
-    "channel": "C0123ABCD",                 # where the card posts (unchanged)
-    "approvers": {                          # optional; absent means channel membership
+    "resolution": {
+      "kind": "slack",                     # only verified interactive surface today
+      "address": "C0123ABCD"
+    },
+    "notification": {                       # optional text-only ping, never a card
+      "kind": "email",
+      "address": "approvals@example.com",
+      "endpoint": "https://adapter.example.com/replies",
+      "adapter": "mail"
+    },
+    "approvers": {                          # optional; absent means resolution membership
       "group": "S0123ABCD",                 # Slack user-group ID
       "users": ["U0123ABCD", "U0456EFGH"]   # explicit allowlist
     }
@@ -355,9 +381,19 @@ approval_routes: {
 }
 ```
 
-Both take IDs, never `@handles` or names, matching the channel-ID precedent (#143): names
-never route and fail silently. The group and user-list authorizers deliberately ignore
-`actor_channel` — the whole point is that authority does not depend on card location.
+Resolution, group, and user entries take IDs, never `@handles` or names, matching the
+channel-ID precedent (#143): names never route and fail silently. Notification text carries
+the durable approval ID and directs humans to the configured approval channel without
+disclosing its kind or address; its message has `interaction=None` and no action values.
+Only the resolution card is remembered for later settlement. The group and user-list
+authorizers deliberately ignore `actor_channel` — the whole point is that authority does
+not depend on card location.
+
+`resolution.kind` is the explicit extension point, but the writer rejects every kind except
+Slack today. A second interactive channel first needs an adapter-scoped credential that
+establishes a verified resolver identity; this change does not build that credential or
+turn notification delivery into resolution. Notification `endpoint` and `adapter` remain
+stored server-side for egress and are omitted from read responses.
 
 **Precedence: `users` > `group` > channel membership.** When `users` is set, `group` is
 ignored and no Slack call is made. When neither is declared, channel membership decides.
@@ -454,11 +490,14 @@ into the sandbox as the memory/transcript token, and because `POST /approvals/{i
 is guarded by the same platform key, a compromised sandbox could self-approve its own
 gated tool call. ADR-0033 (#410) closed that gap by minting a scoped, agent-bound `state`
 token for the sandbox that only the state router accepts; the resolve endpoint stays
-platform-key-only, so the sandbox credential can no longer resolve an approval. The
-runtime `canUseTool` gate (#245) will block the *tool call*, but
+platform-key-only, so the sandbox credential can no longer resolve an approval. A
+notification transport credential likewise confers no resolution capability: the
+notification contains no interaction, and this contract exposes no second-channel resolver.
+The runtime `canUseTool` gate (#245) will block the *tool call*, but
 the authorization decision (who may resolve a pending approval) stays on the server that
 owns the durable `Approval` record. Policy gate points ship versioned in the bundle; route
-bindings (which channel, who may approve) are per-agent deployment config (#247).
+bindings (where the verified card resolves, where a text-only notification goes, and who may
+approve) are per-agent deployment config (#247, #1460).
 
 One limit the audit trail must not be read as overstating (#420, ADR-0034): the evidence
 proves that the ASSERTED identity satisfied policy at click time; it does not prove who

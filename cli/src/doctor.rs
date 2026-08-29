@@ -829,6 +829,52 @@ mod tests {
         assert_eq!(guidance(&checks_with(1)), None);
     }
 
+    /// #1533 (S17). `api_nodeport` reads the API Service to report how the API
+    /// is exposed. It spawns kubectl, so the NAME it asks for is extracted into
+    /// a pure command builder and asserted here -- no cluster, no child
+    /// process.
+    ///
+    /// A wrong name makes the read return nothing, which `cluster_facts`
+    /// renders as "API not exposed": a FALSE readiness verdict, the precise
+    /// failure mode PR #1348 built `curie doctor` to prevent.
+    ///
+    /// Required signature (`cli/src/doctor.rs`):
+    ///   fn api_nodeport_command(
+    ///       namespace: &str,
+    ///       fullname: &crate::ops::ReleaseFullname,
+    ///   ) -> crate::ops::OpsCommand
+    /// with `api_nodeport` calling it and running it through
+    /// `crate::ops::run_capture`.
+    #[test]
+    fn api_nodeport_reads_the_chart_rendered_service() {
+        let argv =
+            api_nodeport_command("acme-system", &crate::ops::chart_fullname("platform")).argv();
+        assert!(
+            argv.iter().any(|a| a == "platform-curie-api"),
+            "doctor must read the chart-rendered API service: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a == "platform-api"),
+            "doctor must not compute `{{release}}-api`: {argv:?}"
+        );
+        assert!(
+            argv.iter().any(|a| a == "acme-system"),
+            "the namespace must still be passed through: {argv:?}"
+        );
+        assert!(
+            argv.iter()
+                .any(|a| a.contains("jsonpath={.spec.ports[?(@.nodePort)].nodePort}")),
+            "the nodePort jsonpath must be preserved: {argv:?}"
+        );
+
+        // Negative control: byte-identical for the default release.
+        let control = api_nodeport_command("curie", &crate::ops::chart_fullname("curie")).argv();
+        assert!(
+            control.iter().any(|a| a == "curie-api"),
+            "the default release must be unchanged: {control:?}"
+        );
+    }
+
     /// Several gaps have an ORDER and depend on values not yet collected, which
     /// is the work the guided workflow exists to do.
     #[test]
@@ -2244,9 +2290,7 @@ mod tests {
     /// probe site must fail this test.
     #[tokio::test]
     async fn gather_reads_the_shell_model_and_records_the_target() {
-        let _lock = crate::PROCESS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _lock = crate::PROCESS_ENV_LOCK.lock().await;
         let names = [curie_aci_protocol::env_keys::CURIE_MODEL];
         let env = ModelEnvRestore::clear(&names);
         env.set(
@@ -2392,9 +2436,7 @@ esac
     /// early at the kubectl context probe, before a single helm read.
     #[tokio::test]
     async fn gather_reads_the_release_default_model_from_computed_helm_values() {
-        let _lock = crate::PROCESS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _lock = crate::PROCESS_ENV_LOCK.lock().await;
         let _cluster = StubbedCluster::install(
             r#"{"agentSandbox":{"runner":{"model":"chart-default-model-20250101"}}}"#,
         );
@@ -2432,9 +2474,7 @@ esac
     /// report a model the pods do not boot.
     #[tokio::test]
     async fn gather_records_the_inference_model_and_key_on_a_local_model_install() {
-        let _lock = crate::PROCESS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _lock = crate::PROCESS_ENV_LOCK.lock().await;
         let _cluster = StubbedCluster::install(
             r#"{"inference":{"deploy":true,"model":"local-inference-model"},"agentSandbox":{"runner":{"model":"chart-default-model-20250101"}}}"#,
         );
@@ -2614,21 +2654,39 @@ pub async fn gather(namespace: &str, release: &str, api: Option<(&str, &str)>) -
     f
 }
 
-/// The API Service's nodePort, when it is exposed that way.
-async fn api_nodeport(namespace: &str, release: &str) -> Option<String> {
-    let (ok, out, _) = capture(
+/// The kubectl read behind `api_nodeport`, extracted pure so the Service NAME
+/// it asks for is unit-testable without a cluster or a child process (#1533).
+///
+/// The chart renders the API Service as `{{ include "curie.fullname" . }}-api`,
+/// so a `{release}-api` guess reads nothing and `cluster_facts` renders "API
+/// not exposed" -- a FALSE readiness verdict from a doctor that exists to
+/// prevent exactly that.
+fn api_nodeport_command(
+    namespace: &str,
+    fullname: &crate::ops::ReleaseFullname,
+) -> crate::ops::OpsCommand {
+    crate::ops::OpsCommand::new(
         "kubectl",
-        &[
-            "get",
-            "svc",
-            &format!("{release}-api"),
-            "-n",
-            namespace,
-            "-o",
-            "jsonpath={.spec.ports[?(@.nodePort)].nodePort}",
+        vec![
+            crate::ops::plain("get"),
+            crate::ops::plain("svc"),
+            crate::ops::plain(fullname.resource("api")),
+            crate::ops::plain("-n"),
+            crate::ops::plain(namespace),
+            crate::ops::plain("-o"),
+            crate::ops::plain("jsonpath={.spec.ports[?(@.nodePort)].nodePort}"),
         ],
     )
-    .await;
+}
+
+/// The API Service's nodePort, when it is exposed that way.
+///
+/// Resolves the rendered fullname here rather than at `cluster_facts`' entry:
+/// this is the only branch that needs it (the ingress branch returns before
+/// reaching it), so an ingress install pays no extra kubectl round-trip.
+async fn api_nodeport(namespace: &str, release: &str) -> Option<String> {
+    let fullname = crate::ops::release_fullname(namespace, release).await;
+    let (ok, out, _) = capture_cmd(&api_nodeport_command(namespace, &fullname)).await;
     let port = out.trim().to_string();
     (ok && !port.is_empty()).then_some(port)
 }
@@ -2648,7 +2706,16 @@ async fn capture(program: &str, args: &[&str]) -> (bool, String, String) {
         program,
         args.iter().map(|a| crate::ops::plain(*a)).collect(),
     );
-    crate::ops::run_capture(&cmd)
+    capture_cmd(&cmd).await
+}
+
+/// Run an already-built [`crate::ops::OpsCommand`] and read it the way `doctor`
+/// reads everything: a spawn failure is indistinguishable from the command
+/// failing, because either way the fact being probed could not be established.
+/// One spelling of that fallback, so a caller cannot accidentally treat a spawn
+/// failure as a real answer.
+async fn capture_cmd(cmd: &crate::ops::OpsCommand) -> (bool, String, String) {
+    crate::ops::run_capture(cmd)
         .await
         .unwrap_or((false, String::new(), String::new()))
 }

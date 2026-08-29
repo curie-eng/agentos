@@ -15,10 +15,10 @@ is documentation of where the code already draws the line, not a new abstraction
 | Substrate / SandboxClient | CLEAN | 2 (k8s, docker) | not separately graded | #86, #44 | [Substrate / SandboxClient](interfaces/substrate/INTERFACE.md) |
 | Harness in-proc / ModelSession | CLEAN | 1 + fake | A- | (folds into #25) | [Harness in-proc / ModelSession](interfaces/harness-modelsession/INTERFACE.md) |
 | ACI producer (frozen protocol) | CLEAN, frozen | 1 + reference | A- | #25, #47 | [ACI producer (frozen protocol)](interfaces/aci-producer/INTERFACE.md) |
-| Channel / ingress (Slack) | SOFT | 1 | B- | #7, #19, #27, #38 | [Channel / ingress (Slack)](interfaces/channel-ingress/INTERFACE.md) |
+| Channel / ingress | SOFT | 1 | B- | #7, #19, #27, #38, #1515 | [Channel / ingress](interfaces/channel-ingress/INTERFACE.md) |
 | Channel interaction message | CLEAN | 2 renderers (Slack, terminal) | not separately graded | ADR-0020 | [Channel interaction message](interfaces/channel-interaction/INTERFACE.md) |
 | Model provider / credentials | SOFT | 2 prefix-routed (Anthropic, OpenRouter) + base-URL-selected provider-native endpoints (Zhipu, Moonshot, DeepSeek, Ollama) | not separately graded | #24, #46 | [Model provider / credentials](interfaces/model-provider/INTERFACE.md) |
-| Telemetry / OTEL | SOFT | 1 | B+ | #47 | [Telemetry / OTEL](interfaces/telemetry-otel/INTERFACE.md) |
+| Telemetry / OTEL | SOFT | 1 | B+ | #47, #1817, #1818, #1819 | [Telemetry / OTEL](interfaces/telemetry-otel/INTERFACE.md) |
 | Evals (case + scorer) | SOFT | 2 scorers (grader family + trajectory matcher) | B | #8, #26 | [Evals (case + scorer)](interfaces/evals/INTERFACE.md) |
 | Blob storage (S3/RustFS) | CLEAN | 1 backend (S3/RustFS) behind the ObjectStore port | B+ | #83 | [Blob storage (S3/RustFS)](interfaces/blob-storage/INTERFACE.md) |
 | Relational DB (Postgres) | SOFT | 1 | A- | #84 | [Relational DB (Postgres)](interfaces/relational-db/INTERFACE.md) |
@@ -29,7 +29,7 @@ is documentation of where the code already draws the line, not a new abstraction
 | Memory | CLEAN | 1 loader (StateApiMemoryStore) | not separately graded | #28 | [Memory](interfaces/memory/INTERFACE.md) |
 | Conversation history | CLEAN | 1 loader (StateApiTranscriptStore) | not separately graded | #20 | [Conversation history](interfaces/conversation-history/INTERFACE.md) |
 | Triggers | SOFT | 3 hardcoded (Slack, GH push, commit poll) | not separately graded | #29 | [Triggers](interfaces/triggers/INTERFACE.md) |
-| CLI output (agent-facing `--json`) | CLEAN | 41 outputs behind one trait | not separately graded | #456 | [CLI output (agent-facing `--json`)](interfaces/cli-output/INTERFACE.md) |
+| CLI output (agent-facing `--json`) | CLEAN | 46 outputs behind one trait | not separately graded | #456 | [CLI output (agent-facing `--json`)](interfaces/cli-output/INTERFACE.md) |
 | Harness package (declared contribution) | CLEAN | 1 (built-in Claude) behind the entry-point registry | not separately graded | #844 | [Harness package (declared contribution)](interfaces/harness-package/INTERFACE.md) |
 | Connector host (bundle-declared MCP servers) | CLEAN | 1 (Kubernetes) + in-memory fake | not separately graded | #1063, #1184 | [Connector host (bundle-declared MCP servers)](interfaces/connector-host/INTERFACE.md) |
 | Sealed credential (cluster-sealed connector secrets) | SOFT | 2 halves (Rust sealer, Python opener) over one frozen wire | not separately graded | #1240 | [Sealed credential (cluster-sealed connector secrets)](interfaces/sealed-credential/INTERFACE.md) |

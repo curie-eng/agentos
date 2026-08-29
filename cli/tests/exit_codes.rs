@@ -427,8 +427,8 @@ fn skill_message_invalid_url_has_runner_message_and_absolute_url_remedy() {
     );
     assert!(
         debug_stderr.contains(
-            "POST localhost:8787/v1/event: builder error for url \
-             (localhost:8787/v1/event): URL scheme is not allowed"
+            "POST localhost:8787/v1/reset: builder error for url \
+             (localhost:8787/v1/reset): URL scheme is not allowed"
         ),
         "debug plumbing must retain the runner request cause: {debug_stderr}"
     );

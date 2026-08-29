@@ -33,17 +33,17 @@ spec:
   template:
     metadata:
       labels:
-        {{- with (include "curie.placement.labels" .Values.placement.platform) }}
+        {{- with (include "curie.placement.labels" (dict "root" $ "class" "platform")) }}
         {{- . | nindent 8 }}
         {{- end }}
         {{- include "curie.labels" . | nindent 8 }}
         {{- include "curie.selectorLabels" (dict "root" . "component" "api") | nindent 8 }}
-      {{- with (include "curie.placement.annotations" .Values.placement.platform) }}
+      {{- with (include "curie.placement.annotations" (dict "root" $ "class" "platform")) }}
       annotations:
         {{- . | nindent 8 }}
       {{- end }}
     spec:
-      {{- with (include "curie.placement.spec" .Values.placement.platform) }}
+      {{- with (include "curie.placement.spec" (dict "root" $ "class" "platform")) }}
       {{- . | nindent 6 }}
       {{- end }}
       # The runner-logs proxy lists pods and reads pod logs via the K8s API, so
@@ -123,11 +123,22 @@ spec:
                 secretKeyRef:
                   name: {{ include "curie.secretName" . }}
                   key: apiKey
+            - name: CURIE_INTERNAL_WORKER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "curie.secretName" . }}
+                  key: internalWorkerToken
+            - name: CURIE_PUBLICATION_PATCH_MAX_BYTES
+              value: {{ .Values.worker.publication.patchMaxBytes | quote }}
+            - name: CURIE_PUBLICATION_RETENTION_SECONDS
+              value: {{ .Values.worker.publication.retentionSeconds | quote }}
             - name: GITHUB_WEBHOOK_SECRET
               valueFrom:
                 secretKeyRef:
                   name: {{ include "curie.secretName" . }}
                   key: githubWebhookSecret
+            - name: GITHUB_API_URL
+              value: {{ .Values.api.githubApiUrl | quote }}
             # Outbound GitHub credential: the eval commit status AND the
             # git-flow bundle clone, without which a private repo cannot
             # deploy (#1058).
@@ -138,6 +149,9 @@ spec:
                          below): the token never passes through helm values on
                          this path. */}}
                   {{- include "curie.secretRef" (dict "root" . "existingSecret" .Values.api.githubTokenExistingSecret "existingSecretKey" .Values.api.githubTokenExistingSecretKey "defaultKey" "githubToken") | nindent 18 }}
+            - name: GITHUB_REPO_ALLOWLIST
+              value: {{ .Values.api.githubRepoAllowlist | toJson | quote }}
+            {{- include "curie.env.otel" (dict "root" . "extraEnv" .Values.api.extraEnv) | nindent 12 }}
             # GitHub App identity (ADR-0092). When both are set the platform
             # mints a one-hour token scoped to the single repository it is
             # cloning, instead of using GITHUB_TOKEN above. Both empty is fine:
@@ -232,6 +246,9 @@ spec:
             # the setting an operator is trying to make.
             - name: SLACK_USERGROUP_CACHE_TTL_S
               value: {{ .Values.api.slackUsergroupCacheTtlSeconds | quote }}
+            {{- with .Values.api.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           ports:
             - name: http
               containerPort: 8000

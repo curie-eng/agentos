@@ -5,17 +5,21 @@ bundle columns; J1 added the git-flow columns (agents.repo_full_name,
 agent_versions.commit_sha, deployments.bot_identity/commit_sha).
 """
 
+from __future__ import annotations
+
 import enum
 import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Enum, ForeignKey, UniqueConstraint, func
+from sqlalchemy import Enum, ForeignKey, Index, LargeBinary, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from .db import SCHEMA, Base
 from .repo_full_name import normalize_repo_full_name
+
+GIT_FLOW_CREATED_BY = "git-flow"
 
 
 class Environment(enum.StrEnum):
@@ -32,6 +36,20 @@ class ApprovalStatus(enum.StrEnum):
     approved = "approved"
     rejected = "rejected"
     expired = "expired"
+
+
+class ActionStatus(enum.StrEnum):
+    """Lifecycle of one recorded action (ADR-0117).
+
+    Two frames make one record. ``pending`` is the opening frame: the call was
+    made and its result has not arrived. A turn that dies here leaves the row at
+    ``pending`` forever, which is the honest state -- something may have changed
+    and nothing came back to say what.
+    """
+
+    pending = "pending"
+    succeeded = "succeeded"
+    failed = "failed"
 
 
 class Agent(Base):
@@ -92,11 +110,12 @@ class Agent(Base):
     # Per-agent approval route bindings (#247, ADR-0010): the workspace half of
     # the split policy. The bundle manifest declares gate points and route
     # NAMES (versioned with the agent); this maps each declared name to
-    # workspace specifics, today a Slack channel: {"managers": {"channel":
-    # "C0123..."}}. The worker resolves a raised route through this map to
-    # decide where the approval card goes (and therefore who the
-    # channel-membership authorizer counts as approvers). NULL means no
-    # bindings; an unbound route falls back to the requesting channel.
+    # workspace specifics: one Slack-only resolution target and an optional
+    # channel-neutral notification target. The worker posts the sole resolving
+    # card at ``resolution`` (whose address is persisted on the Approval row for
+    # authorization) and may send a text-only ping at ``notification``. NULL
+    # means no bindings; a named unbound route escalates rather than widening to
+    # the requesting channel.
     approval_routes: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
     # Per-agent connector secrets (ADR-0009, #429): the named secret VALUES the
     # bundle's authed MCP servers need (e.g. GITHUB_PERSONAL_ACCESS_TOKEN). The
@@ -116,24 +135,56 @@ class Agent(Base):
     # sitting in plaintext in the control plane, and rotating it any other way
     # means rotating the platform key for every agent at once.
     hook_generation: Mapped[int] = mapped_column(default=0, server_default="0")
+    # Which of this agent's hooks fan out, and by what (ADR-0134, amending
+    # ADR-0079): hook name -> ``{"pointer": <RFC 6901 pointer>}``, the pointer
+    # naming the field of a delivery body that identifies the thing the delivery
+    # is about. NULL means no hook on this agent partitions, which is the
+    # behavior every hook had before the column existed: one thread per hook.
+    #
+    # The pointer must name a STABLE identity of that thing -- a pull request
+    # number, a ticket key, a thread ts -- and never a run id or a timestamp. A
+    # partition IS a thread and owns a transcript, so an identity that changes
+    # per delivery makes every transcript single-use and grows the state store
+    # without bound. Nothing secret belongs here either (the neighbouring
+    # `hook_generation` comment's discipline): a pointer is configuration, and it
+    # must not be extended into anything carrying a VALUE from the payload.
+    hook_partitions: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
+    # Whether this agent's bindings share one workflow-state namespace or each
+    # get their own (#1525 follow-up). Cardinality alone (ADR-0118 decision 2)
+    # governs routing and agent-scoped controls (budget, kill state, bundle
+    # version) unconditionally -- those are never gated by this column. This
+    # ONLY decides `workflow_state_entries.binding_scope`: False (default) keys
+    # every binding's state store separately, so an agent invited to a second
+    # channel it never explicitly opted into sharing does not silently start
+    # mixing that channel's state into the first's. True shares one namespace
+    # across every binding. Existing single-binding agents are unaffected
+    # either way, since there is nothing else to share with.
+    memory: Mapped[bool] = mapped_column(default=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
-    versions: Mapped[list["AgentVersion"]] = relationship(
+    versions: Mapped[list[AgentVersion]] = relationship(
         back_populates="agent", cascade="all, delete-orphan"
     )
-    # The agent's channel binding (ADR-0096, #1459). SINGULAR: one agent binds
-    # one channel (ADR-0089), so this is `uselist=False` rather than a list, and
-    # the API surface is an object rather than an array.
+    # The agent's channel bindings (ADR-0096, #1459; PLURAL since ADR-0118,
+    # migration 0030): an agent may hold more than one, so the API surface is a
+    # list rather than an object.
+    #
+    # `order_by` is load-bearing, not cosmetic: `agent_channels` has no
+    # `created_at` to fall back on, so without an explicit order the serialized
+    # list's element order is whatever Postgres happens to return, and two
+    # identical GETs could differ. `(kind, address)` is used because it is the
+    # pair every other layer already treats as the binding's identity
+    # (`binding._RESOLVE_SQL`, `agent_channels_kind_address_key`).
     #
     # `lazy="selectin"` is load-bearing, not a preference: every read path builds
     # `AgentOut` from this attribute after its session has been handed back, and
     # the default lazy strategy RAISES on attribute access outside an await under
     # asyncio instead of loading. Dropping it turns all three read endpoints into
     # 500s while the crud-level tests, which hold a live session, stay green.
-    channel: Mapped["AgentChannel"] = relationship(
+    channels: Mapped[list[AgentChannel]] = relationship(
         back_populates="agent",
         cascade="all, delete-orphan",
-        uselist=False,
+        order_by="(AgentChannel.kind, AgentChannel.address)",
         lazy="selectin",
     )
 
@@ -157,7 +208,7 @@ class AgentChannel(Base):
     `endpoint`/`adapter` are the server-controlled reply route: where this kind's
     replies go back through, and which egress credential authenticates them. They
     are set here by the platform and never accepted from an ingress request body.
-    `generation` counts rebinds: `update_agent_binding` mutates this row IN PLACE,
+    `generation` counts rebinds: `update_channel_binding` mutates this row IN PLACE,
     so the row id is a stable identity and the generation is the only thing that
     makes a rebind observable to a credential minted before it.
     """
@@ -176,12 +227,18 @@ class AgentChannel(Base):
         # exists to close, which is why the cutover proves no old worker pod is
         # running before migration 0023 applies.
         UniqueConstraint("kind", "address", name="agent_channels_kind_address_key"),
-        # One binding per agent (ADR-0089: "one agent still binds one channel.
-        # Declaring two targets creates two agents; it does not let one agent
-        # serve two channels."). The old scalar column got this for free; a child
-        # table silently discards it unless it is re-established, and nothing
-        # fails until an operator binds a second channel and finds one dead.
-        UniqueConstraint("agent_id", name="agent_channels_agent_id_key"),
+        # No agent_id uniqueness here (ADR-0118, migration 0030): an agent may
+        # hold more than one binding now. ADR-0089's "one agent still binds one
+        # channel" is amended in part -- the (kind, address) constraint above is
+        # still what stops two agents claiming the same channel; nothing stops
+        # one agent from claiming several.
+        #
+        # PLAIN index on agent_id, because dropping that uniqueness dropped the
+        # column's only index with it (migration 0030 recreates it as this).
+        # `crud.lock_agent_bindings` filters and orders by agent_id under
+        # `FOR UPDATE` on every add, move and delete; unindexed, each of those
+        # scans the whole table while holding locks.
+        Index("ix_agent_channels_agent_id", "agent_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -201,7 +258,7 @@ class AgentChannel(Base):
     # with this route" gesture that should invalidate outstanding credentials.
     generation: Mapped[int] = mapped_column(server_default="0", default=0)
 
-    agent: Mapped[Agent] = relationship(back_populates="channel")
+    agent: Mapped[Agent] = relationship(back_populates="channels")
 
 
 class AgentVersion(Base):
@@ -237,8 +294,36 @@ class Deployment(Base):
         Enum(Environment, name="environment", schema=SCHEMA)
     )
     commit_sha: Mapped[str | None] = mapped_column(default=None)
+    # A deployment-level capability. The concrete repository is selected from
+    # the opening thread message and stored in ThreadWorkspace only after the
+    # operator allowlist authorizes it.
+    workspace_enabled: Mapped[bool] = mapped_column(default=False)
     status: Mapped[str] = mapped_column(server_default="active")
     deployed_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class ThreadWorkspace(Base):
+    """One immutable repository selection for an agent conversation."""
+
+    __tablename__ = "thread_workspaces"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"), index=True
+    )
+    selected_by_deployment_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(f"{SCHEMA}.deployments.id", ondelete="SET NULL"), default=None
+    )
+    conversation_id: Mapped[str]
+    repo_full_name: Mapped[str]
+    selected_by: Mapped[str]
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint(
+            "agent_id", "conversation_id", name="thread_workspaces_agent_conversation_key"
+        ),
+    )
 
 
 class Approval(Base):
@@ -322,6 +407,126 @@ class Approval(Base):
     # which is the rolling-deploy window the worker's prefix fallback covers.
     gate_kind: Mapped[str | None] = mapped_column(default=None)
     granted_tool: Mapped[str | None] = mapped_column(default=None)
+    # Server-owned purpose. Only ``publication`` enables the narrowly scoped
+    # requester self-approval rule and suppresses the ordinary model wake.
+    purpose: Mapped[str] = mapped_column(server_default="session", default="session")
+
+    publication: Mapped[Publication | None] = relationship(back_populates="approval", uselist=False)
+
+
+class Publication(Base):
+    """Private patch state settled by the platform publication reconciler."""
+
+    __tablename__ = "publications"
+    __table_args__ = (
+        Index("ix_publications_status_lease", "status", "lease_expires_at"),
+        Index("ix_publications_deployment_id", "deployment_id"),
+        Index(
+            "ix_publications_approval_card_delivery",
+            "approval_card_reported_at",
+            "approval_card_delivery_dead_lettered_at",
+            "approval_card_lease_expires_at",
+        ),
+        Index(
+            "ix_publications_resource_cleanup",
+            "resource_cleanup_completed_at",
+            "resource_cleanup_lease_expires_at",
+        ),
+        Index(
+            "ix_publications_result_delivery",
+            "result_reported_at",
+            "result_delivery_dead_lettered_at",
+            "lease_expires_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    approval_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.approvals.id", ondelete="CASCADE"),
+        unique=True,
+    )
+    deployment_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.deployments.id", ondelete="CASCADE")
+    )
+    repo_full_name: Mapped[str]
+    status: Mapped[str] = mapped_column(server_default="pending")
+    version: Mapped[int] = mapped_column(server_default="1", default=1)
+    base_sha: Mapped[str]
+    # Deliberately excluded from every public DTO. Terminal retention clears
+    # these bytes while preserving the audit/result metadata.
+    patch_bytes: Mapped[bytes | None] = mapped_column(LargeBinary, default=None)
+    changed_paths: Mapped[list[str]] = mapped_column(JSONB)
+    title: Mapped[str]
+    body: Mapped[str] = mapped_column(Text)
+    reply_kind: Mapped[str]
+    reply_channel: Mapped[str]
+    reply_placeholder: Mapped[str | None] = mapped_column(default=None)
+    reply_endpoint: Mapped[str | None] = mapped_column(default=None)
+    reply_adapter: Mapped[str | None] = mapped_column(default=None)
+    # Durable initial approval-card outbox. Its lease/version are separate from
+    # publication mutation, while claim_next gates Job creation on delivery so
+    # even an immediate CLI approval cannot race ahead of the required card.
+    approval_card_reported_at: Mapped[datetime | None] = mapped_column(default=None)
+    approval_card_delivery_started_at: Mapped[datetime | None] = mapped_column(
+        default=None
+    )
+    approval_card_delivery_attempts: Mapped[int] = mapped_column(
+        server_default="0", default=0
+    )
+    approval_card_version: Mapped[int] = mapped_column(server_default="1", default=1)
+    approval_card_delivery_error: Mapped[str | None] = mapped_column(Text, default=None)
+    approval_card_delivery_dead_lettered_at: Mapped[datetime | None] = mapped_column(
+        default=None
+    )
+    approval_card_lease_owner: Mapped[str | None] = mapped_column(default=None)
+    approval_card_lease_expires_at: Mapped[datetime | None] = mapped_column(default=None)
+    # Resource cleanup is an unbounded durable obligation, separate from the
+    # bounded human-facing result outbox. A Slack outage can dead-letter its
+    # report; credentials and publication resources can never be abandoned.
+    resource_cleanup_completed_at: Mapped[datetime | None] = mapped_column(default=None)
+    resource_cleanup_error: Mapped[str | None] = mapped_column(Text, default=None)
+    resource_cleanup_version: Mapped[int] = mapped_column(server_default="1", default=1)
+    resource_cleanup_lease_owner: Mapped[str | None] = mapped_column(default=None)
+    resource_cleanup_lease_expires_at: Mapped[datetime | None] = mapped_column(default=None)
+    lease_owner: Mapped[str | None] = mapped_column(default=None)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(default=None)
+    result_url: Mapped[str | None] = mapped_column(default=None)
+    error: Mapped[str | None] = mapped_column(Text, default=None)
+    # Terminalization and credential/resource cleanup happen before reply
+    # delivery. These fields form the durable result outbox so a transient
+    # adapter failure cannot resurrect publication work or retain patch bytes.
+    result_reported_at: Mapped[datetime | None] = mapped_column(default=None)
+    result_delivery_attempts: Mapped[int] = mapped_column(server_default="0", default=0)
+    result_delivery_error: Mapped[str | None] = mapped_column(Text, default=None)
+    result_delivery_dead_lettered_at: Mapped[datetime | None] = mapped_column(default=None)
+    reconcile_attempts: Mapped[int] = mapped_column(server_default="0", default=0)
+    reconcile_dead_lettered_at: Mapped[datetime | None] = mapped_column(default=None)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+    terminal_at: Mapped[datetime | None] = mapped_column(default=None)
+
+    approval: Mapped[Approval] = relationship(back_populates="publication")
+
+
+class CredentialRedemptionAuditEntry(Base):
+    """Credential-boundary audit containing names and outcomes, never material."""
+
+    __tablename__ = "credential_redemption_audit_entries"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    purpose: Mapped[str]
+    outcome: Mapped[str]
+    deployment_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(f"{SCHEMA}.deployments.id", ondelete="SET NULL"),
+        default=None,
+    )
+    publication_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(f"{SCHEMA}.publications.id", ondelete="SET NULL"),
+        default=None,
+    )
+    repo_full_name: Mapped[str | None] = mapped_column(default=None)
+    detail: Mapped[str | None] = mapped_column(default=None)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 
 class ApprovalAuditEntry(Base):
@@ -360,6 +565,130 @@ class ApprovalAuditEntry(Base):
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 
+class AgentAction(Base):
+    """One thing an agent did to the world, and what it takes to put it back.
+
+    Curie already classified every tool absent from a harness-declared read-only
+    allowlist as side-effecting and reduced the whole stream to one boolean, for
+    one purpose: refusing to auto-retry. This is that same classification
+    recorded rather than reduced (ADR-0117).
+
+    Shaped after ``Approval`` because the needs are the same ones that table
+    already answers: routing by conversation, a lifecycle resolved once, and an
+    audit trail beside it. ``dedupe_key`` (the triggering event id and the call
+    id) makes record creation idempotent under at-least-once redelivery, exactly
+    as it does there.
+
+    One CALL is one row. The ACI emits an opening frame when the call is made and
+    a closing frame when its result arrives, joined on ``call_id``; the second
+    completes this row rather than minting another.
+    """
+
+    __tablename__ = "agent_actions"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # Nullable for the same reason ``Approval.agent_id`` is: a run without a
+    # deployment binding still acts on the world and still owes a record.
+    agent_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"),
+        index=True,
+        default=None,
+    )
+    conversation_id: Mapped[str] = mapped_column(index=True)
+    # The harness's own id for the call, carried on both ACI frames. The join
+    # key, not a display value.
+    call_id: Mapped[str]
+    tool: Mapped[str]
+    # What the call was made with, and what the tool answered. ``result`` is
+    # present only for a structured reply: a connector that answers in prose has
+    # none, because guessing structure out of a sentence is how a restore ends up
+    # acting on a guess.
+    arguments: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
+    result: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
+    # The state the connector read immediately before it wrote, and the resource
+    # it wrote to. These two are what a restore replays; without either, there is
+    # nothing to put back or nowhere to put it.
+    prior_state: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
+    target: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
+    # What the call LEFT, reported by the same reply that reported what it read.
+    # The world-moved check compares the live resource against this, never
+    # against ``prior_state`` -- that is where the resource came from, not where
+    # the action put it. It cannot be derived from ``arguments``: a PATCH's
+    # result is not its request body, and deriving it is the mapping-DSL
+    # approach ADR-0117 rejects.
+    post_state: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
+    # The frame's human-readable note. On a record that is not undoable this is
+    # the stated reason the receipt shows instead of a control.
+    detail: Mapped[str | None] = mapped_column(default=None)
+    # The approval that gated the call, when one did (ADR-0117 decision 3). NULL
+    # means the tool was not gated, and an undo is then not gated either.
+    #
+    # Deliberately NOT a foreign key. This is the record of what authorization
+    # the forward action required, and a sweeper deleting the approval row must
+    # not silently downgrade a gated action to an ungated one. An id whose
+    # approval can no longer be read fails closed at the undo instead.
+    gate_approval_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), default=None
+    )
+    status: Mapped[str] = mapped_column(server_default=ActionStatus.pending, index=True)
+    dedupe_key: Mapped[str] = mapped_column(unique=True)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    # When the closing frame arrived, and when a restore was performed. Both are
+    # written by later slices; they live here because they are lifecycle of this
+    # row, and a two-column migration later buys nothing.
+    completed_at: Mapped[datetime | None] = mapped_column(default=None)
+    undone_at: Mapped[datetime | None] = mapped_column(default=None)
+    undone_by: Mapped[str | None] = mapped_column(default=None)
+
+    @property
+    def undoable(self) -> bool:
+        """Whether this record holds what a restore needs -- derived, never stored.
+
+        A stored flag can be set by a writer that captured nothing, and the
+        platform would then offer an undo it cannot honor. Deny-by-default falls
+        out of this: a third-party tool that reports neither a prior state nor a
+        target lands on ``False`` without anyone declaring anything.
+        """
+
+        return (
+            self.status == ActionStatus.succeeded
+            and self.prior_state is not None
+            and self.target is not None
+            and self.undone_at is None
+        )
+
+
+class ActionAuditEntry(Base):
+    """The platform audit log for actions (ADR-0117), append-only.
+
+    One row per authorization-relevant event on a recorded action: an undo that
+    ran, an undo refused because the world had moved, an undo refused because the
+    actor could not have permitted the forward change. A refusal is as much of a
+    record as a restore -- more, since a refused undo leaves no trace anywhere
+    else.
+    """
+
+    __tablename__ = "action_audit_entries"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    action_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agent_actions.id", ondelete="CASCADE"), index=True
+    )
+    # What happened: undone / refused_conflict / refused_unauthorized.
+    action: Mapped[str]
+    actor: Mapped[str]
+    actor_channel: Mapped[str | None] = mapped_column(default=None)
+    # The authorizer snapshot, as on an approval: which implementation decided,
+    # its verdict, and its stated reason at the time of the attempt.
+    authorizer: Mapped[str]
+    authorized: Mapped[bool]
+    reason: Mapped[str | None] = mapped_column(default=None)
+    # For a conflict refusal, the two states that disagreed. Naming both is the
+    # point: an operator has to see that their manual fix is what stopped it.
+    evidence: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
 class WorkflowStateEntry(Base):
     """Durable, agent-scoped key/value state (#23, first slice).
 
@@ -374,13 +703,23 @@ class WorkflowStateEntry(Base):
 
     __tablename__ = "workflow_state_entries"
     __table_args__ = (
-        UniqueConstraint("agent_id", "namespace", "key", name="uq_state_agent_ns_key"),
+        UniqueConstraint(
+            "agent_id", "binding_scope", "namespace", "key", name="uq_state_agent_scope_ns_key"
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     agent_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE")
     )
+    # NULL when the owning agent has `memory=True` (one shared namespace); the
+    # binding's own `"{kind}:{address}"` when `memory=False` (#1525 follow-up).
+    # Minted into the worker's `state.app`/`state` token per turn from the
+    # agent's CURRENT `memory` value, never read back off this column -- the
+    # column only picks which row a request lands on. Part of the unique key
+    # (not just an extra filter) so a memory=False agent's two bindings get
+    # two independent rows for the same namespace+key instead of colliding.
+    binding_scope: Mapped[str | None] = mapped_column(default=None)
     namespace: Mapped[str]
     key: Mapped[str]
     # Any JSON value: an object (a pending-approvals map), an array (a log
@@ -410,17 +749,13 @@ class ConsoleSession(Base):
 
     __tablename__ = "console_sessions"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     # SHA-256 hex of the single-use login code. Unique so a hash collision or a
     # duplicate mint cannot produce two rows one code could satisfy.
     login_code_hash: Mapped[str] = mapped_column(unique=True, index=True)
     login_code_expires_at: Mapped[datetime]
     # Set at exchange, so NULL means "minted, never redeemed".
-    session_token_hash: Mapped[str | None] = mapped_column(
-        default=None, unique=True, index=True
-    )
+    session_token_hash: Mapped[str | None] = mapped_column(default=None, unique=True, index=True)
     session_expires_at: Mapped[datetime | None] = mapped_column(default=None)
     # Stamped at exchange; its presence is what makes the code single-use.
     consumed_at: Mapped[datetime | None] = mapped_column(default=None)

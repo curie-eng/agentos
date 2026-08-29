@@ -19,7 +19,8 @@ import logging
 import tarfile
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -29,6 +30,11 @@ import httpx
 import pytest
 import redis
 from aci_protocol import STREAM_PAYLOAD_FIELD
+from curie_telemetry import (
+    TRACEPARENT_STREAM_FIELD,
+    operation_span,
+    record_metric,
+)
 from curie_test_support.valkey import (
     VALKEY_HOST as _VH,
 )
@@ -38,6 +44,7 @@ from curie_test_support.valkey import (
 from curie_test_support.valkey import (
     VALKEY_PW as _VPW,
 )
+from curie_worker import stream_consumer as stream_consumer_module
 from curie_worker.binding import BUDGET_ENV, BUNDLE_REF_ENV, MODEL_ENV, THINKING_ENV
 from curie_worker.bundle_store import BundleStore
 from curie_worker.config import WorkerConfig
@@ -57,9 +64,11 @@ from curie_worker.eval import (
     LangfuseEvalRecorder,
     load_suite_from_bundle,
 )
+from curie_worker.eval import stream as eval_stream_module
 from curie_worker.eval.models import EvalCaseResult, EvalOutcome, EvalRunResult
 from curie_worker.sandbox import AffinityStore, SandboxSubstrate, SubstrateConfig
-from curie_worker.sandbox.types import ClaimView, SandboxView
+from curie_worker.sandbox.types import ClaimView, SandboxError, SandboxView
+from opentelemetry import trace
 from redis.asyncio import Redis as AsyncRedis
 
 CONTAINS = GraderKind.CONTAINS
@@ -89,6 +98,9 @@ class _StubRepo:
         # the agent's secrets so an authed-MCP bundle authenticates during eval.
         return None
 
+    async def name_for(self, _agent_id: uuid.UUID) -> str | None:
+        return None
+
     async def thinking_for(self, agent_id: uuid.UUID) -> str | None:
         self.thinking_agent_id = agent_id
         return self._thinking
@@ -116,6 +128,7 @@ class _FakeClaim:
     sandbox_name: str
     labels: dict[str, str]
     env: dict[str, str]
+    pool: str = ""
 
 
 @dataclass
@@ -123,6 +136,8 @@ class _FakeK8s:
     namespace: str = "test-ns"
     claims: dict[str, _FakeClaim] = field(default_factory=dict)
     claim_envs: list[dict[str, str]] = field(default_factory=list)
+    created_pools: list[str] = field(default_factory=list)
+    created_labels: list[dict[str, str]] = field(default_factory=list)
     deleted: list[str] = field(default_factory=list)
 
     def create_claim(
@@ -134,11 +149,16 @@ class _FakeK8s:
         labels: dict[str, str] | None = None,
     ) -> None:
         self.claim_envs.append(dict(env or {}))
+        self.created_pools.append(pool)
+        self.created_labels.append(
+            {"curietech.ai/managed-by": "curie-sandbox-substrate", **(labels or {})}
+        )
         self.claims[name] = _FakeClaim(
             name=name,
             sandbox_name=f"sbx-{name}",
             labels={"curietech.ai/managed-by": "curie-sandbox-substrate", **(labels or {})},
             env=dict(env or {}),
+            pool=pool,
         )
 
     def get_claim(self, name: str) -> ClaimView | None:
@@ -1148,7 +1168,9 @@ class _TokenSubstrate:
         self._token = token
         self.released: list[str] = []
 
-    def claim(self, _key: str, *, env: dict[str, str] | None = None) -> _FakeHandle:
+    def claim(
+        self, _key: str, *, env: dict[str, str] | None = None, **_: object
+    ) -> _FakeHandle:
         return _FakeHandle(base_url="http://sandbox.local:8080", token=self._token)
 
     def release(self, key: str) -> None:
@@ -1313,7 +1335,9 @@ class _ConcurrencyProbeSubstrate:
         self.peak = 0
         self.claims = 0
 
-    def claim(self, _key: str, *, env: dict[str, str] | None = None) -> _FakeHandle:
+    def claim(
+        self, _key: str, *, env: dict[str, str] | None = None, **_: object
+    ) -> _FakeHandle:
         with self._lock:
             self._live += 1
             self.claims += 1
@@ -1428,6 +1452,106 @@ def _fake_job_consumer(reporter: Any) -> EvalStreamConsumer:
     )
 
 
+@dataclass(frozen=True)
+class _EvalMetric:
+    name: str
+    value: float
+    attributes: dict[str, str]
+
+
+class _EvalSpan:
+    def add_event(
+        self, _name: str, _attributes: Mapping[str, str] | None = None
+    ) -> None:
+        pass
+
+
+class _EvalTelemetryProbe:
+    def __init__(self) -> None:
+        self.spans: list[tuple[str, bool]] = []
+        self.metrics: list[_EvalMetric] = []
+
+    @contextmanager
+    def operation_span(
+        self,
+        name: str,
+        *,
+        kind: Any,
+        parent: Any = None,
+        attributes: Mapping[str, str] | None = None,
+    ) -> Iterator[_EvalSpan]:
+        del kind, attributes
+        span = trace.get_current_span(parent) if parent is not None else trace.get_current_span()
+        self.spans.append((name, span.get_span_context().is_valid))
+        yield _EvalSpan()
+
+    def record_metric(
+        self,
+        name: str,
+        value: float = 1,
+        *,
+        attributes: Mapping[str, str] | None = None,
+    ) -> None:
+        self.metrics.append(_EvalMetric(name, float(value), dict(attributes or {})))
+
+
+@pytest.mark.parametrize(
+    "carrier",
+    [None, "not-a-valid-traceparent"],
+    ids=["missing", "malformed"],
+)
+def test_eval_consumer_uses_a_safe_root_and_records_bounded_completion(
+    monkeypatch: pytest.MonkeyPatch,
+    carrier: str | None,
+) -> None:
+    """The eval sibling must tolerate the same carrier failures as runs."""
+
+    assert callable(operation_span)
+    assert callable(record_metric)
+    probe = _EvalTelemetryProbe()
+    import curie_telemetry
+
+    monkeypatch.setattr(curie_telemetry, "operation_span", probe.operation_span)
+    monkeypatch.setattr(curie_telemetry, "record_metric", probe.record_metric)
+    for module in (eval_stream_module, stream_consumer_module):
+        if hasattr(module, "operation_span"):
+            monkeypatch.setattr(module, "operation_span", probe.operation_span)
+        if hasattr(module, "record_metric"):
+            monkeypatch.setattr(module, "record_metric", probe.record_metric)
+
+    _canned_run(monkeypatch, [EvalOutcome.PASS])
+    reporter = _FakeReporter()
+    consumer = _fake_job_consumer(reporter)
+    acked: list[str] = []
+
+    async def _record_ack(entry_id: str) -> None:
+        acked.append(entry_id)
+
+    monkeypatch.setattr(consumer, "_ack", _record_ack)
+    item = _item(
+        suite="s",
+        sha="deadbeef",
+        bundle_ref="bundles/x.tgz",
+        target_url=None,
+    )
+    fields = {STREAM_PAYLOAD_FIELD: item.model_dump_json()}
+    if carrier is not None:
+        fields[TRACEPARENT_STREAM_FIELD] = carrier
+
+    asyncio.run(consumer._handle("1-0", fields))
+
+    assert acked == ["1-0"]
+    assert ("curie.eval.process", False) in probe.spans
+    completed = [point for point in probe.metrics if point.name == "curie.eval.process"]
+    assert completed
+    assert {point.attributes["outcome"] for point in completed} == {"success"}
+    assert all(
+        set(point.attributes)
+        <= {"service.name", "operation", "role", "source", "outcome"}
+        for point in completed
+    )
+
+
 def test_an_all_plumbing_run_posts_no_eval_report_but_is_still_acked(monkeypatch) -> None:
     """The frozen EvalReport carries passed_count/total only, and the API turns it
     into a GitHub commit status. That shape cannot express non-graded: 0/N posts a
@@ -1538,6 +1662,64 @@ def test_eval_boot_env_drops_reserved_connector_secret() -> None:
     assert env["GITHUB_PERSONAL_ACCESS_TOKEN"] == "ghp_ok"
     # ...and is the ONLY key marked as a delivered connector secret.
     assert env.get("CURIE_CONNECTOR_SECRET_KEYS") == "GITHUB_PERSONAL_ACCESS_TOKEN"
+
+
+def test_eval_claim_with_connector_secrets_targets_the_per_agent_pool(monkeypatch) -> None:
+    """Eval is the sibling of the runs claim path (#1488): secrets + agent name
+    must route the claim to the per-agent pool, not the generic one."""
+    from curie_worker.eval import stream as stream_module
+    from curie_worker.sandbox.types import AGENT_LABEL
+
+    class _NamedSecrets(_StubRepo):
+        async def secrets_for(self, _agent_id: uuid.UUID) -> dict[str, str] | None:
+            return {"GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_ok"}
+
+        async def name_for(self, _agent_id: uuid.UUID) -> str | None:
+            return "acme-a"
+
+    async def _skip_suite(*_args: object, **_kwargs: object) -> EvalRunResult:
+        return EvalRunResult(version="deadbeef", suite="s", results=[])
+
+    monkeypatch.setattr(stream_module, "run_eval_suite", _skip_suite)
+    fake_k8s = _FakeK8s()
+    sandbox_prefix = f"test:curie:sandbox:{uuid.uuid4().hex}"
+    affinity = AffinityStore(
+        redis.Redis(host=_VH, port=_VP, password=_VPW or None, decode_responses=False),
+        key_prefix=sandbox_prefix,
+    )
+    substrate = SandboxSubstrate(
+        fake_k8s,  # type: ignore[arg-type]
+        affinity,
+        SubstrateConfig(
+            namespace="test-ns",
+            warm_pool="curie-runner-pool",
+            claim_timeout_seconds=3.0,
+            poll_interval_seconds=0.005,
+            key_prefix=sandbox_prefix,
+        ),
+    )
+    consumer = _consumer(
+        WorkerConfig(fake_model=True),
+        bundle_store=_FakeBundleStore(
+            _suite_bundle(
+                EvalSuite(
+                    name="s",
+                    cases=[EvalCase(id="1", input="q", grader=Grader(kind=CONTAINS, expected="a"))],
+                )
+            )
+        ),
+        substrate=substrate,
+        reporter=_FakeReporter(),
+        repo_lookup=_NamedSecrets(),
+    )
+    item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.tgz", target_url=None)
+
+    async def go() -> None:
+        await consumer._run_and_report(item, "test-stream-id")
+
+    asyncio.run(go())
+    assert fake_k8s.created_pools == ["curie-agent-acme-a-runner-pool"]
+    assert fake_k8s.created_labels[-1][AGENT_LABEL] == "acme-a"
 
 
 def test_eval_threads_claim_token_into_run_eval_suite(monkeypatch) -> None:
@@ -2301,5 +2483,964 @@ def test_stream_records_the_trigger_identity_and_selected_trajectory_scorer(
 
             await client.delete(cfg.eval_stream)
             await client.aclose()
+
+    asyncio.run(go())
+
+
+# --- ADR-0131 (#1971): the eval lane's own delivery-ownership coverage --------
+#
+# "Runs and evals must share the lease implementation by construction. A fix on
+# only one consumer lane is incomplete." These are the eval-lane twins of R1-R5
+# in ``tests/kernel/test_delivery_ownership.py``, and they are deliberately NOT
+# a shared parametrized body with the runs lane: the two lanes have genuinely
+# different handler shapes -- the runs lane spawns ``_handle`` as a task behind a
+# semaphore, the eval lane awaits ``_handle_entry`` INLINE inside ``_consume`` --
+# and one shared body would hide exactly the difference that matters. Each twin
+# carries its own negative control.
+#
+# Valkey is real, as everywhere in this file. What IS substituted is
+# ``_run_and_report``: these twins are about the lease lifecycle the shared base
+# owns (acquire, refuse, renew, fence the ACK, skip the cap), not about suite
+# execution, which the rest of this file already drives end-to-end against real
+# RustFS and real Langfuse. Substituting the suite run keeps the in-flight window
+# under the test's control and leaves the whole of ``_handle_entry`` -- the body
+# the lease wraps -- under test.
+#
+# Time is compressed by CONFIGURING short lease clocks, never by patching a
+# clock: TTL (1.0) >= 3 * heartbeat (0.3), reclaim interval (0.05) < TTL, runner
+# ceiling (30) <= budget (60, its configurable floor). The Valkey server ``TIME``
+# read behind the deadline is never stubbed.
+
+_EVAL_TTL_S = 1.0
+
+
+def _lease_cfg(token: str, **overrides: object) -> WorkerConfig:
+    base: dict[str, object] = {
+        "key_prefix": f"test:curie:worker:{token}",
+        "delivery_budget_s": 60.0,
+        "delivery_lease_ttl_s": _EVAL_TTL_S,
+        "delivery_lease_heartbeat_s": 0.3,
+        "reclaim_interval_s": 0.05,
+        "runner_total_timeout_s": 30.0,
+    }
+    base.update(overrides)
+    return _cfg(f"test:evals:{token}", f"g-{token}", **base)
+
+
+def _lease_result(entry_id: str) -> EvalRunResult:
+    return EvalRunResult(
+        version="v1",
+        suite="lease",
+        stream_id=entry_id,
+        results=[
+            EvalCaseResult(
+                case_id="1", outcome=EvalOutcome.PASS, output="ok", latency_ms=1.0
+            )
+        ],
+    )
+
+
+class _HeldSuiteRun:
+    """A suite run the test starts, holds open, and releases on demand."""
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.hold = asyncio.Event()
+        self.runs: list[str] = []
+
+    async def __call__(self, _item: EvalJob, stream_id: str) -> EvalRunResult:
+        self.runs.append(stream_id)
+        self.started.set()
+        await self.hold.wait()
+        return _lease_result(stream_id)
+
+
+async def _instant_suite_run(_item: EvalJob, stream_id: str) -> EvalRunResult:
+    return _lease_result(stream_id)
+
+
+def _lease_consumer(
+    *, redis_client: AsyncRedis, cfg: WorkerConfig, leases: Any, suite_run: Any
+) -> EvalStreamConsumer:
+    consumer = EvalStreamConsumer(
+        redis=redis_client,
+        config=cfg,
+        bundle_store=cast("Any", None),
+        substrate=_UnusedSubstrate(),
+        reporter=cast("Any", None),
+        recorder=cast("Any", None),
+        repo_lookup=_StubRepo(),
+        leases=leases,
+    )
+    consumer._run_and_report = suite_run  # type: ignore[method-assign,assignment]
+    return consumer
+
+
+async def _eval_payload(client: AsyncRedis, cfg: WorkerConfig, *, sha: str) -> str:
+    item = _item(suite="lease", sha=sha, bundle_ref="unused", target_url="http://unused")
+    return await client.xadd(cfg.eval_stream, {STREAM_PAYLOAD_FIELD: item.model_dump_json()})
+
+
+async def _eval_read_one(
+    client: AsyncRedis, cfg: WorkerConfig, consumer_name: str
+) -> tuple[str, dict[str, str]]:
+    rows = await client.xreadgroup(
+        cfg.eval_consumer_group, consumer_name, {cfg.eval_stream: ">"}, count=1
+    )
+    assert rows, "expected an eval entry to read"
+    entry_id, fields = rows[0][1][0]
+    return entry_id, dict(fields)
+
+
+async def _eval_pending(client: AsyncRedis, cfg: WorkerConfig) -> dict[str, int]:
+    rows = await client.xpending_range(
+        cfg.eval_stream, cfg.eval_consumer_group, min="-", max="+", count=50
+    )
+    return {row["message_id"]: int(row["times_delivered"]) for row in rows}
+
+
+async def _eval_cleanup(client: AsyncRedis, cfg: WorkerConfig) -> None:
+    await client.delete(cfg.eval_stream, cfg.eval_dead_letter_stream_name())
+    keys = [key async for key in client.scan_iter(match=f"{cfg.key_prefix}*")]
+    if keys:
+        await client.delete(*keys)
+    await client.aclose()
+
+
+def test_eval_a_second_replica_is_refused_while_the_first_holds_a_live_lease() -> None:
+    """R1's eval twin. Two eval consumers, one entry, one suite run.
+
+    Red on revert of the ``async with self._delivery_lease(...)`` wrapper in
+    ``EvalStreamConsumer._handle_entry``: both replicas run the suite and the
+    platform receives two reports for one job. The refused replica returns
+    WITHOUT acking, so the entry stays pending for the true owner.
+
+    The positive control is the second entry, delivered to the very same refused
+    consumer and carried to an ACK.
+    """
+    from curie_worker.delivery_lease import DeliveryLeaseStore
+
+    async def go() -> None:
+        token = uuid.uuid4().hex[:8]
+        cfg = _lease_cfg(token)
+        cfg_a = cfg.model_copy(update={"eval_consumer_name": "eval-a"})
+        cfg_b = cfg.model_copy(update={"eval_consumer_name": "eval-b"})
+        client = AsyncRedis(host=_VH, port=_VP, password=_VPW, decode_responses=True)
+        store = DeliveryLeaseStore(client, cfg)
+        held = _HeldSuiteRun()
+        consumer_a = _lease_consumer(
+            redis_client=client, cfg=cfg_a, leases=store, suite_run=held
+        )
+        consumer_b = _lease_consumer(
+            redis_client=client, cfg=cfg_b, leases=store, suite_run=_instant_suite_run
+        )
+        await consumer_a.ensure_group()
+
+        await _eval_payload(client, cfg, sha=f"sha-{token}")
+        entry_id, fields = await _eval_read_one(client, cfg, "eval-a")
+        task = asyncio.create_task(consumer_a._handle(entry_id, fields))
+        await _wait_until(held.started.is_set)
+        assert await store.is_live(cfg.eval_stream, cfg.eval_consumer_group, entry_id)
+
+        # B takes the PEL row exactly as XAUTOCLAIM does on the reclaim path.
+        await client.xclaim(cfg.eval_stream, cfg.eval_consumer_group, "eval-b", 0, [entry_id])
+        await consumer_b._handle(entry_id, dict(fields))
+
+        assert held.runs == [entry_id], "the refused replica ran the suite a second time"
+        assert entry_id in await _eval_pending(client, cfg), "the refused replica acked"
+
+        # POSITIVE CONTROL: an entry B legitimately owns runs and acks.
+        second_id = await _eval_payload(client, cfg, sha=f"sha2-{token}")
+        entry_b, fields_b = await _eval_read_one(client, cfg, "eval-b")
+        assert entry_b == second_id
+        await consumer_b._handle(entry_b, fields_b)
+        assert entry_b not in await _eval_pending(client, cfg)
+
+        held.hold.set()
+        await task
+        await _eval_cleanup(client, cfg)
+
+    asyncio.run(go())
+
+
+def test_eval_a_running_suite_holds_its_lease_without_burning_a_delivery() -> None:
+    """R2's eval twin: the heartbeat renews across several TTLs, and the
+    same-owner ``XCLAIM ... JUSTID`` does not bump ``times_delivered``.
+
+    Red on dropping the background heartbeat (a long suite's lease expires
+    mid-run and a peer takes it) and, independently, on dropping ``JUSTID`` (each
+    beat burns one of the ADR-0039 delivery budget's five, dead-lettering a
+    healthy suite in under a minute).
+
+    The negative control is the sibling entry leased directly and never renewed:
+    it expires inside the same window.
+    """
+    from curie_worker.delivery_lease import DeliveryLeaseStore
+
+    async def go() -> None:
+        token = uuid.uuid4().hex[:8]
+        cfg = _lease_cfg(token)
+        client = AsyncRedis(host=_VH, port=_VP, password=_VPW, decode_responses=True)
+        store = DeliveryLeaseStore(client, cfg)
+        held = _HeldSuiteRun()
+        consumer = _lease_consumer(
+            redis_client=client, cfg=cfg, leases=store, suite_run=held
+        )
+        await consumer.ensure_group()
+
+        await _eval_payload(client, cfg, sha=f"sha-{token}")
+        await _eval_payload(client, cfg, sha=f"sib-{token}")
+        renewed_id, renewed_fields = await _eval_read_one(client, cfg, cfg.eval_consumer_name)
+        abandoned_id, _fields = await _eval_read_one(client, cfg, cfg.eval_consumer_name)
+        await store.acquire(
+            cfg.eval_stream,
+            cfg.eval_consumer_group,
+            abandoned_id,
+            consumer=cfg.eval_consumer_name,
+        )
+
+        before = (await _eval_pending(client, cfg))[renewed_id]
+        task = asyncio.create_task(consumer._handle(renewed_id, renewed_fields))
+        await _wait_until(held.started.is_set)
+
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            assert await store.is_live(
+                cfg.eval_stream, cfg.eval_consumer_group, renewed_id
+            ), "a running eval lost its lease: the heartbeat is not renewing"
+            await asyncio.sleep(0.1)
+
+        assert (
+            await store.is_live(cfg.eval_stream, cfg.eval_consumer_group, abandoned_id) is False
+        ), "the un-renewed sibling never expired, so the survival above is vacuous"
+        after = (await _eval_pending(client, cfg))[renewed_id]
+        assert after == before, (
+            "the same-owner XCLAIM must use JUSTID: it reset PEL idle but "
+            f"burned {after - before} deliveries of the ADR-0039 budget"
+        )
+
+        held.hold.set()
+        await task
+        assert renewed_id not in await _eval_pending(client, cfg)
+        await _eval_cleanup(client, cfg)
+
+    asyncio.run(go())
+
+
+def test_eval_a_dead_owners_entry_transfers_only_after_expiry() -> None:
+    """R3's eval twin: force-kill recovery on the eval lane.
+
+    The dead owner's lease is taken through the store and abandoned, because a
+    SIGKILLed process runs no ``finally`` -- cancelling a task would exercise the
+    graceful release instead and prove nothing about expiry.
+
+    Red on removing the expiry gate (the replacement runs the suite immediately,
+    beside one the killed pod may still have live) and on turning the
+    ``HSETNX`` on ``deadline_ms`` into an ``HSET`` (the replacement gets a fresh
+    budget). Refused before expiry, granted after it: both halves asserted.
+    """
+    from curie_worker.delivery_lease import DeliveryLeaseStore
+
+    async def go() -> None:
+        token = uuid.uuid4().hex[:8]
+        cfg = _lease_cfg(token)
+        client = AsyncRedis(host=_VH, port=_VP, password=_VPW, decode_responses=True)
+        store = DeliveryLeaseStore(client, cfg)
+        held = _HeldSuiteRun()
+        consumer = _lease_consumer(
+            redis_client=client, cfg=cfg, leases=store, suite_run=held
+        )
+        await consumer.ensure_group()
+
+        await _eval_payload(client, cfg, sha=f"sha-{token}")
+        entry_id, fields = await _eval_read_one(client, cfg, "dead-eval-worker")
+        dead = await store.acquire(
+            cfg.eval_stream, cfg.eval_consumer_group, entry_id, consumer="dead-eval-worker"
+        )
+        assert dead.generation == 1
+        await client.xclaim(
+            cfg.eval_stream, cfg.eval_consumer_group, cfg.eval_consumer_name, 0, [entry_id]
+        )
+
+        await consumer._handle(entry_id, dict(fields))
+        assert held.runs == [], "a replacement ran an eval whose lease was still live"
+        assert entry_id in await _eval_pending(client, cfg)
+
+        await asyncio.sleep(_EVAL_TTL_S + 0.4)
+        assert await store.is_live(cfg.eval_stream, cfg.eval_consumer_group, entry_id) is False
+
+        task = asyncio.create_task(consumer._handle(entry_id, dict(fields)))
+        await _wait_until(held.started.is_set)
+        state = await store.peek(cfg.eval_stream, cfg.eval_consumer_group, entry_id)
+        assert state["gen"] == "2", "the fencing generation did not increment on transfer"
+        assert int(state["deadline_ms"]) == dead.budget.deadline_ms, (
+            "the replacement minted a FRESH deadline: reclaim multiplied the budget"
+        )
+
+        held.hold.set()
+        await task
+        assert held.runs == [entry_id]
+        assert entry_id not in await _eval_pending(client, cfg)
+        await _eval_cleanup(client, cfg)
+
+    asyncio.run(go())
+
+
+def test_eval_a_live_lease_holds_off_the_delivery_cap() -> None:
+    """R4's eval twin: "a live lease is checked before cap evaluation".
+
+    The eval lane runs its own delivery cap into its own graveyard, so the guard
+    has to be proven here too and not inferred from the runs lane. The entry is
+    driven to the cap while a peer holds a LIVE lease; ``_inflight_ids`` is
+    asserted empty so only the new cross-replica check can explain the skip.
+
+    Red on reverting the ``is_live`` guard in ``_dead_letter_over_cap``: a
+    healthy long eval is dead-lettered mid-run and reported as poison. The
+    positive control is the second pass, after the lease is released.
+    """
+    from curie_worker.delivery_lease import DeliveryLeaseStore
+
+    async def go() -> None:
+        token = uuid.uuid4().hex[:8]
+        cfg = _lease_cfg(token, max_delivery=2, reclaim_min_idle_ms=0)
+        client = AsyncRedis(host=_VH, port=_VP, password=_VPW, decode_responses=True)
+        store = DeliveryLeaseStore(client, cfg)
+        consumer = _lease_consumer(
+            redis_client=client, cfg=cfg, leases=store, suite_run=_instant_suite_run
+        )
+        await consumer.ensure_group()
+
+        await _eval_payload(client, cfg, sha=f"sha-{token}")
+        entry_id, _fields = await _eval_read_one(client, cfg, "peer-eval")
+        await client.xclaim(
+            cfg.eval_stream, cfg.eval_consumer_group, "peer-eval", 0, [entry_id]
+        )
+        assert (await _eval_pending(client, cfg))[entry_id] >= cfg.max_delivery
+
+        lease = await store.acquire(
+            cfg.eval_stream, cfg.eval_consumer_group, entry_id, consumer="peer-eval"
+        )
+        assert consumer._inflight_ids == set(), (
+            "the in-flight guard would mask the lease guard under test"
+        )
+
+        assert await consumer._dead_letter_over_cap() == set()
+        assert await client.xrange(cfg.eval_dead_letter_stream_name()) == [], (
+            "a healthy long eval was dead-lettered"
+        )
+        assert entry_id in await _eval_pending(client, cfg)
+
+        # POSITIVE CONTROL: released, the same entry at the same count is
+        # dead-lettered on the next pass.
+        assert (
+            await store.release(
+                cfg.eval_stream, cfg.eval_consumer_group, entry_id, owner=lease.owner
+            )
+            is True
+        )
+        assert await consumer._dead_letter_over_cap() == {entry_id}
+        rows = await client.xrange(cfg.eval_dead_letter_stream_name())
+        assert len(rows) == 1
+        assert rows[0][1]["dl_original_id"] == entry_id
+        assert entry_id not in await _eval_pending(client, cfg)
+        await _eval_cleanup(client, cfg)
+
+    asyncio.run(go())
+
+
+def test_eval_request_stop_stops_the_read_loop_but_never_the_heartbeat() -> None:
+    """R5's eval twin: the voluntary-rollout drain.
+
+    ``request_stop()`` must stop the read loop taking NEW entries while the
+    in-flight suite keeps renewing its lease and runs to completion. Red on
+    reverting the "the heartbeat sleeps with a plain ``asyncio.sleep``, never
+    ``self._sleep_or_stop``" decision, which would drop every in-flight lease the
+    instant SIGTERM landed.
+
+    The eval lane drains by construction rather than through a post-gather
+    ``_inflight`` wait (its handler is awaited INLINE inside ``_consume``), which
+    is exactly why this twin exists instead of a shared body with the runs lane.
+
+    The negative control is the sibling lease that is never renewed: it expires
+    across the same post-stop window.
+    """
+    from curie_worker.delivery_lease import DeliveryLeaseStore
+
+    async def go() -> None:
+        token = uuid.uuid4().hex[:8]
+        cfg = _lease_cfg(token)
+        client = AsyncRedis(host=_VH, port=_VP, password=_VPW, decode_responses=True)
+        store = DeliveryLeaseStore(client, cfg)
+        held = _HeldSuiteRun()
+        consumer = _lease_consumer(
+            redis_client=client, cfg=cfg, leases=store, suite_run=held
+        )
+        await consumer.ensure_group()
+
+        await _eval_payload(client, cfg, sha=f"sha-{token}")
+        task = asyncio.create_task(consumer.run())
+        await _wait_until(held.started.is_set)
+        entry_id = held.runs[0]
+
+        await _eval_payload(client, cfg, sha=f"sib-{token}")
+        sibling_id, _fields = await _eval_read_one(client, cfg, cfg.eval_consumer_name)
+        await store.acquire(
+            cfg.eval_stream,
+            cfg.eval_consumer_group,
+            sibling_id,
+            consumer=cfg.eval_consumer_name,
+        )
+
+        consumer.request_stop()
+        late_id = await _eval_payload(client, cfg, sha=f"late-{token}")
+
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            assert await store.is_live(
+                cfg.eval_stream, cfg.eval_consumer_group, entry_id
+            ), "request_stop() dropped the in-flight lease: the drain cannot finish"
+            await asyncio.sleep(0.1)
+
+        assert (
+            await store.is_live(cfg.eval_stream, cfg.eval_consumer_group, sibling_id) is False
+        ), "the un-renewed sibling never expired, so the survival above is vacuous"
+        assert held.runs == [entry_id], "the read loop took a new entry after request_stop()"
+        assert late_id not in await _eval_pending(client, cfg)
+
+        held.hold.set()
+        await asyncio.wait_for(task, timeout=10.0)
+        assert entry_id not in await _eval_pending(client, cfg), (
+            "the drained eval never acked"
+        )
+        await _eval_cleanup(client, cfg)
+
+    asyncio.run(go())
+
+
+# --- ADR-0131 (#1971): the two defects review found on THIS lane ---------------
+#
+# Both were found after the twins above were written, and neither is pinned by
+# them, because both live below the lease LIFECYCLE the twins cover:
+#
+#   1. ``_report`` resolved the fence from ``result.stream_id``. The two
+#      failure DTOs built by ``_report_failed`` carry no run, so that field is
+#      ``None`` on exactly the Valkey/K8s-adjacent failures most likely to
+#      coincide with a lease loss -- the lookup missed, and a missing lease read
+#      as "no fence" is a fence that FAILS OPEN.
+#   2. The lane acquired a lease and never read its remaining budget, so a suite
+#      outran the delivery's one deadline while the heartbeat renewed forever.
+#
+# Valkey stays real. What is substituted is the RustFS bundle fetch, the
+# substrate, and (for the deadline tests) ``run_eval_suite`` at the module seam
+# -- the same seams ``_canned_run`` and ``_fake_job_consumer`` already hold still
+# so the report gate itself is what is under test.
+
+
+class _ProvisioningFailureSubstrate:
+    """A substrate whose ``claim`` fails the way a cluster out of capacity does.
+
+    ``_acquire_target`` catches ``SandboxError`` and answers ``(None, None,
+    None)``, which is the "runner provisioning failed" path. ``release`` records
+    so a test can prove the un-provisioned path frees nothing.
+    """
+
+    def __init__(self) -> None:
+        self.released: list[str] = []
+
+    def claim(self, _key: str, **_kwargs: object) -> Any:
+        raise SandboxError("no capacity for an eval sandbox")
+
+    def release(self, key: str) -> None:  # pragma: no cover - must not be reached
+        self.released.append(key)
+
+
+def _fence_suite() -> EvalSuite:
+    return EvalSuite(
+        name="fence",
+        cases=[EvalCase(id="1", input="q", grader=Grader(kind=CONTAINS, expected="ok"))],
+    )
+
+
+# The two ``_run_and_report`` failure paths whose ``EvalRunResult`` has no run
+# behind it, so ``result.stream_id`` is None and the reverted fence missed.
+_FENCED_FAILURE_PATHS = ("unresolvable-bundle", "provisioning-failed")
+
+
+def _failure_path_wiring(path: str) -> tuple[Any, Any, EvalJob]:
+    """Bundle store, substrate, and job that drive ``_run_and_report`` down one
+    of the two failure paths for real (no monkeypatching of the lane itself)."""
+    if path == "unresolvable-bundle":
+        # Not a readable archive: ``_extract_eval_files`` raises, ``_load_suite``
+        # answers None, and the lane reports "unresolvable suite/bundle".
+        return (
+            _FakeBundleStore(b"this is not a tar.gz"),
+            _UnusedSubstrate(),
+            _item(
+                suite="fence",
+                sha="sha-unresolvable",
+                bundle_ref="bundles/corrupt.tgz",
+                target_url="http://unused",
+            ),
+        )
+    # A loadable suite, but no ``target_url``: the lane provisions, the substrate
+    # refuses, and it reports "runner provisioning failed".
+    return (
+        _FakeBundleStore(_suite_bundle(_fence_suite())),
+        _ProvisioningFailureSubstrate(),
+        _item(
+            suite="fence",
+            sha="sha-provisioning",
+            bundle_ref="bundles/ok.tgz",
+            target_url=None,
+        ),
+    )
+
+
+def _fence_consumer(
+    *,
+    redis_client: AsyncRedis | None,
+    cfg: WorkerConfig,
+    leases: Any,
+    bundle_store: Any,
+    substrate: Any,
+    reporter: Any,
+) -> EvalStreamConsumer:
+    return _consumer(
+        cfg,
+        redis=redis_client,
+        leases=leases,
+        bundle_store=bundle_store,
+        substrate=substrate,
+        reporter=reporter,
+        repo_lookup=_StubRepo(),
+    )
+
+
+@pytest.mark.parametrize("failure_path", _FENCED_FAILURE_PATHS)
+def test_eval_a_fenced_out_owner_publishes_no_report_on_a_failure_path(
+    failure_path: str,
+) -> None:
+    """Defect 1. A lost lease must suppress the report on the FAILURE paths too.
+
+    Red on the exact pre-fix shape: ``_report`` resolving its lease from
+    ``result.stream_id`` instead of the ``stream_id`` ARGUMENT, with no
+    fail-closed branch behind it. ``_report_failed`` builds an ``EvalRunResult``
+    that never populates that field, so the lookup misses, absence reads as "no
+    fence", and a fenced-out owner publishes a report for a job a replacement now
+    owns. Reverting ONLY the lookup is caught as well, by the positive control:
+    the healthy owner's lease misses the same way and the failure paths stop
+    reporting at all. Also red on deleting the ``lease.lost.is_set()`` guard.
+
+    The lease is a REAL one from the real store, fenced out by setting ``lost``
+    exactly as ``_heartbeat_lease`` does when Valkey refuses a renewal.
+
+    The positive control is the second delivery, driven down the SAME failure
+    path with a healthy lease: without it this test would pass even if reporting
+    were broken entirely.
+    """
+    from curie_worker.delivery_lease import DeliveryLeaseStore
+
+    async def go() -> None:
+        token = uuid.uuid4().hex[:8]
+        cfg = _lease_cfg(token)
+        client = AsyncRedis(host=_VH, port=_VP, password=_VPW, decode_responses=True)
+        store = DeliveryLeaseStore(client, cfg)
+        bundle_store, substrate, item = _failure_path_wiring(failure_path)
+        reporter = _FakeReporter()
+        consumer = _fence_consumer(
+            redis_client=client,
+            cfg=cfg,
+            leases=store,
+            bundle_store=bundle_store,
+            substrate=substrate,
+            reporter=reporter,
+        )
+        await consumer.ensure_group()
+
+        # Two real pending deliveries, so the store grants two real leases. The
+        # EvalJob is handed to ``_run_and_report`` directly -- the stream entries
+        # exist to make the lease real, not to carry the payload.
+        await _eval_payload(client, cfg, sha=f"lost-{token}")
+        await _eval_payload(client, cfg, sha=f"live-{token}")
+        lost_id, _lost_fields = await _eval_read_one(client, cfg, cfg.eval_consumer_name)
+        live_id, _live_fields = await _eval_read_one(client, cfg, cfg.eval_consumer_name)
+
+        lost_lease = await store.acquire(
+            cfg.eval_stream, cfg.eval_consumer_group, lost_id, consumer=cfg.eval_consumer_name
+        )
+        lost_lease.lost.set()
+        consumer._held_leases[lost_id] = lost_lease
+
+        fenced = await consumer._run_and_report(item, lost_id)
+
+        assert fenced.stream_id is None, (
+            "the failure DTO must still carry NO stream_id: if it ever gained one "
+            "the reverted lookup would resolve by luck and this test would stop "
+            "pinning the fail-open"
+        )
+        assert reporter.reports == [], (
+            f"a fenced-out owner published a report on the {failure_path} path: "
+            "the fence failed open on exactly the failure most likely to coincide "
+            "with a lease loss"
+        )
+        if isinstance(substrate, _ProvisioningFailureSubstrate):
+            assert substrate.released == [], "nothing was provisioned, so nothing frees"
+
+        # POSITIVE CONTROL: the same failure path, same consumer, same job -- with
+        # a lease this owner still holds -- publishes exactly one report.
+        live_lease = await store.acquire(
+            cfg.eval_stream, cfg.eval_consumer_group, live_id, consumer=cfg.eval_consumer_name
+        )
+        assert not live_lease.lost.is_set()
+        consumer._held_leases[live_id] = live_lease
+
+        await consumer._run_and_report(item, live_id)
+
+        assert len(reporter.reports) == 1, (
+            "the healthy owner published no report, so the suppression above is "
+            "vacuous -- reporting is broken on this path regardless of the fence"
+        )
+        published = reporter.reports[0]
+        assert published.sha == item.sha
+        assert published.repo_full_name == "owner/repo"
+        # The failure DTO reports 0/0: a real red, not a skipped all-plumbing run.
+        assert (published.passed_count, published.total) == (0, 0)
+
+        await _eval_cleanup(client, cfg)
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("failure_path", _FENCED_FAILURE_PATHS)
+def test_eval_report_fails_closed_when_a_fenced_lane_records_no_lease(
+    failure_path: str,
+) -> None:
+    """Defect 1's other half: absence of a lease is NOT permission.
+
+    On a lane wired with a lease store, an entry with no recorded lease means
+    this owner cannot prove it still holds authority, so it must not publish.
+    Red on deleting the ``if lease is None and self._leases is not None: return``
+    branch in ``_report`` -- the branch that turns the reverted lookup's miss
+    from a fail-open into a refusal.
+
+    The positive control is the leaseless lane (no lease store at all, the
+    base-only degradation ``unfenced_lease`` exists for), which must still
+    publish: without it, "return early always" would pass this test.
+    """
+    from curie_worker.delivery_lease import DeliveryLeaseStore
+
+    async def go() -> None:
+        token = uuid.uuid4().hex[:8]
+        cfg = _lease_cfg(token)
+        client = AsyncRedis(host=_VH, port=_VP, password=_VPW, decode_responses=True)
+        store = DeliveryLeaseStore(client, cfg)
+
+        bundle_store, substrate, item = _failure_path_wiring(failure_path)
+        fenced_reporter = _FakeReporter()
+        fenced = _fence_consumer(
+            redis_client=client,
+            cfg=cfg,
+            leases=store,
+            bundle_store=bundle_store,
+            substrate=substrate,
+            reporter=fenced_reporter,
+        )
+        assert fenced._held_leases == {}, "the entry must have NO recorded lease"
+
+        await fenced._run_and_report(item, "9999-0")
+
+        assert fenced_reporter.reports == [], (
+            "a fenced lane published without being able to name its lease; "
+            "absence was read as authority"
+        )
+
+        # POSITIVE CONTROL: the same job on a lane built with NO lease store still
+        # publishes -- the pre-ADR-0131 degradation must be preserved, not broken
+        # by the fail-closed branch above.
+        base_bundle, base_substrate, base_item = _failure_path_wiring(failure_path)
+        base_reporter = _FakeReporter()
+        unfenced = _fence_consumer(
+            redis_client=client,
+            cfg=cfg,
+            leases=None,
+            bundle_store=base_bundle,
+            substrate=base_substrate,
+            reporter=base_reporter,
+        )
+        assert unfenced._leases is None
+
+        await unfenced._run_and_report(base_item, "9999-0")
+
+        assert len(base_reporter.reports) == 1, (
+            "the leaseless lane stopped reporting: the fail-closed branch caught "
+            "the base-only degradation it was never meant to touch"
+        )
+        assert base_reporter.reports[0].sha == base_item.sha
+
+        await _eval_cleanup(client, cfg)
+
+    asyncio.run(go())
+
+
+class _TimedSuiteRun:
+    """A ``run_eval_suite`` stand-in that takes a known amount of wall time.
+
+    Substituted at the module seam exactly as ``_canned_run`` does: the deadline
+    the lease carries is what is under test here, not suite execution, which the
+    rest of this file drives end-to-end against a real runner.
+    """
+
+    def __init__(self, duration_s: float) -> None:
+        self._duration_s = duration_s
+        self.started = asyncio.Event()
+        self.completed = asyncio.Event()
+
+    async def __call__(
+        self,
+        suite: EvalSuite,
+        *,
+        version: str,
+        stream_id: str | None = None,
+        **_kwargs: Any,
+    ) -> EvalRunResult:
+        self.started.set()
+        await asyncio.sleep(self._duration_s)
+        self.completed.set()
+        return EvalRunResult(
+            version=version,
+            suite=suite.name,
+            stream_id=stream_id,
+            results=[
+                EvalCaseResult(case_id="1", outcome=EvalOutcome.PASS, output="ok", latency_ms=1.0)
+            ],
+        )
+
+
+def test_eval_a_suite_is_cut_short_at_the_deliverys_remaining_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defect 2: ADR-0131's ONE deadline must bound an eval suite.
+
+    Red on reverting ``_run_and_report``'s ``deadline_s =
+    self._remaining_budget_s(stream_id)`` / ``async with
+    asyncio.timeout(deadline_s)`` wrapper: the lane acquires a lease, the shared
+    heartbeat renews it indefinitely, and the suite runs to completion long past
+    the budget -- a deadline that exists in Valkey and is enforced nowhere.
+
+    Time is NOT compressed by patching a clock. ``delivery_budget_s`` has a
+    configurable floor of 60s and ``runner_total_timeout_s`` may not exceed it,
+    so a config-only harness could only build a 60-second test. Instead the store
+    grants a REAL lease -- real Valkey server ``TIME`` anchor, real monotonic
+    arithmetic -- and only its ``deadline_ms`` is moved in, which is precisely
+    the "construct a lease with a short remaining budget" lever. No validator is
+    weakened and ``time.monotonic``/``TIME`` are untouched.
+
+    Three legs: cut short and reported; cut short while FENCED OUT and therefore
+    silent (the two defects overlapping, since "delivery deadline exceeded" is
+    the third stream_id-less failure DTO); and the positive control, an ample
+    budget under which the very same suite completes and is reported -- without
+    which this would pass if the suite never ran at all.
+    """
+    from curie_worker.delivery_lease import DeliveryBudget, DeliveryLeaseStore
+
+    async def go() -> None:
+        token = uuid.uuid4().hex[:8]
+        cfg = _lease_cfg(token)
+        client = AsyncRedis(host=_VH, port=_VP, password=_VPW, decode_responses=True)
+        store = DeliveryLeaseStore(client, cfg)
+        substrate = _TokenSubstrate("tok")
+        reporter = _FakeReporter()
+        consumer = _fence_consumer(
+            redis_client=client,
+            cfg=cfg,
+            leases=store,
+            bundle_store=_FakeBundleStore(_suite_bundle(_fence_suite())),
+            substrate=substrate,
+            reporter=reporter,
+        )
+        await consumer.ensure_group()
+
+        item = _item(
+            suite="fence", sha=f"sha-{token}", bundle_ref="bundles/ok.tgz", target_url=None
+        )
+
+        async def lease_with_remaining(entry_id: str, remaining_ms: int | None) -> Any:
+            lease = await store.acquire(
+                cfg.eval_stream,
+                cfg.eval_consumer_group,
+                entry_id,
+                consumer=cfg.eval_consumer_name,
+            )
+            if remaining_ms is not None:
+                lease.budget = DeliveryBudget(
+                    deadline_ms=lease.budget.anchor_server_ms + remaining_ms,
+                    anchor_server_ms=lease.budget.anchor_server_ms,
+                    anchor_monotonic=time.monotonic(),
+                )
+            consumer._held_leases[entry_id] = lease
+            return lease
+
+        for label in ("short", "fenced", "ample"):
+            await _eval_payload(client, cfg, sha=f"{label}-{token}")
+        short_id, _f1 = await _eval_read_one(client, cfg, cfg.eval_consumer_name)
+        fenced_id, _f2 = await _eval_read_one(client, cfg, cfg.eval_consumer_name)
+        ample_id, _f3 = await _eval_read_one(client, cfg, cfg.eval_consumer_name)
+
+        # LEG 1: 0.5s of budget left, a 10s suite.
+        slow = _TimedSuiteRun(duration_s=10.0)
+        monkeypatch.setattr(eval_stream_module, "run_eval_suite", slow)
+        await lease_with_remaining(short_id, 500)
+
+        started = time.monotonic()
+        cut = await consumer._run_and_report(item, short_id)
+        elapsed = time.monotonic() - started
+
+        assert slow.started.is_set(), (
+            "the suite never started, so 'it did not complete' proves nothing"
+        )
+        assert not slow.completed.is_set(), (
+            "the suite ran to completion past its delivery deadline"
+        )
+        assert elapsed < 4.0, (
+            f"the suite ran {elapsed:.1f}s on 0.5s of remaining budget; it was not "
+            "bounded at roughly the budget"
+        )
+        assert cut.total == 0, "a suite that outran its deadline must not report rows"
+        assert len(substrate.released) == 1, (
+            "the sandbox was not released on the deadline path; the finally leaks a claim"
+        )
+        assert len(reporter.reports) == 1
+        assert (reporter.reports[0].passed_count, reporter.reports[0].total) == (0, 0)
+
+        # LEG 2: the same abandonment while fenced out. "delivery deadline
+        # exceeded" is the third failure DTO with no ``stream_id``, so it rides
+        # the same fail-open the tests above pin -- asserted here, on the path
+        # that only exists because of defect 2.
+        slow2 = _TimedSuiteRun(duration_s=10.0)
+        monkeypatch.setattr(eval_stream_module, "run_eval_suite", slow2)
+        fenced_lease = await lease_with_remaining(fenced_id, 500)
+        fenced_lease.lost.set()
+
+        await consumer._run_and_report(item, fenced_id)
+
+        assert slow2.started.is_set() and not slow2.completed.is_set()
+        assert len(substrate.released) == 2, (
+            "the sandbox must be released even when this owner may not report"
+        )
+        assert len(reporter.reports) == 1, (
+            "a fenced-out owner published its deadline-exceeded report"
+        )
+
+        # POSITIVE CONTROL: an ample budget (the real 60s the store granted) and a
+        # fast suite -- the same code path completes and reports real rows.
+        fast = _TimedSuiteRun(duration_s=0.05)
+        monkeypatch.setattr(eval_stream_module, "run_eval_suite", fast)
+        ample = await lease_with_remaining(ample_id, None)
+        assert ample.remaining_s() > 30.0, (
+            "the control's budget must comfortably exceed the suite, or it proves "
+            "nothing about completion"
+        )
+
+        control = await consumer._run_and_report(item, ample_id)
+
+        assert fast.completed.is_set(), "the control suite did not run to completion"
+        assert (control.passed_count, control.total) == (1, 1)
+        assert len(substrate.released) == 3
+        assert len(reporter.reports) == 2
+        assert (reporter.reports[1].passed_count, reporter.reports[1].total) == (1, 1)
+
+        await _eval_cleanup(client, cfg)
+
+    asyncio.run(go())
+
+
+def test_an_unfenced_eval_lane_has_no_deadline_at_all_while_a_fenced_one_does() -> None:
+    """``leases=None`` means NO budget -- ``None``, never the sentinel's 86400s.
+
+    Retiring the eval lane's own lease registry in favour of the shared base's
+    made a documented path reachable: the base registers a REAL lease in
+    ``_held_leases`` and never the permissive sentinel, so a consumer built with
+    no lease store records nothing, ``_remaining_budget_s`` answers ``None``, and
+    ``asyncio.timeout(None)`` leaves the suite bounded by nothing -- exactly the
+    pre-ADR-0131 behaviour a base-only consumer had. The retired shape resolved
+    the same miss with ``... or unfenced_lease()`` and so bounded that suite at
+    the sentinel's 86400s instead. The change is deliberate; this test is what
+    makes it a decision rather than an accident.
+
+    Both directions are pinned, because both fail silently. Restoring the ``or
+    unfenced_lease()`` fallback turns the unfenced lane's ``None`` into roughly
+    86400.0 (red on leg 1). A lookup that stopped finding the real lease turns
+    the fenced lane's float into ``None`` (red on leg 2) -- an eval suite running
+    unbounded past a delivery deadline that exists in Valkey and is enforced
+    nowhere, which is precisely what ``_remaining_budget_s`` exists to prevent.
+    """
+    from curie_worker.delivery_lease import DeliveryLeaseStore, unfenced_lease
+
+    async def go() -> None:
+        token = uuid.uuid4().hex[:8]
+        cfg = _lease_cfg(token)
+        client = AsyncRedis(host=_VH, port=_VP, password=_VPW, decode_responses=True)
+
+        # LEG 1: the UNFENCED lane. No store, so no lease is ever registered and
+        # there is no budget to read -- before, during and after a handler body.
+        unfenced = _fence_consumer(
+            redis_client=client,
+            cfg=cfg,
+            leases=None,
+            bundle_store=_FakeBundleStore(_suite_bundle(_fence_suite())),
+            substrate=_UnusedSubstrate(),
+            reporter=_FakeReporter(),
+        )
+        assert unfenced._leases is None
+        assert unfenced._remaining_budget_s("1-0") is None
+
+        async with unfenced._delivery_lease("1-0", {}) as sentinel:
+            # The one place absence reads as permission: the body still runs.
+            assert sentinel is not None
+            assert unfenced._held_leases == {}, (
+                "an unfenced lane registered the permissive sentinel; its suite is "
+                "now bounded by the sentinel's budget instead of by nothing"
+            )
+            assert unfenced._remaining_budget_s("1-0") is None
+
+        # The value that must NOT show up above. A fallback that resolves the
+        # miss to the sentinel would hand the eval lane this number as a real
+        # deadline, which is the pre-consolidation semantics.
+        assert unfenced_lease().remaining_s() > 86_000.0
+
+        # LEG 2: the FENCED counterpart, same call, on a real lease from the real
+        # store -- so leg 1's ``None`` is the absence of a lease and not a
+        # ``_remaining_budget_s`` that answers ``None`` for everything.
+        store = DeliveryLeaseStore(client, cfg)
+        fenced = _fence_consumer(
+            redis_client=client,
+            cfg=cfg,
+            leases=store,
+            bundle_store=_FakeBundleStore(_suite_bundle(_fence_suite())),
+            substrate=_UnusedSubstrate(),
+            reporter=_FakeReporter(),
+        )
+        await fenced.ensure_group()
+        await _eval_payload(client, cfg, sha=f"budget-{token}")
+        entry_id, fields = await _eval_read_one(client, cfg, cfg.eval_consumer_name)
+
+        async with fenced._delivery_lease(entry_id, fields) as lease:
+            assert lease is not None
+            assert fenced._held_leases.get(entry_id) is lease
+            remaining = fenced._remaining_budget_s(entry_id)
+            assert isinstance(remaining, float), (
+                f"a fenced lane read no deadline from a lease it holds: {remaining!r}"
+            )
+            assert 0.0 < remaining <= cfg.delivery_budget_s
+            assert remaining > 30.0, (
+                f"the granted budget was {remaining:.1f}s of a {cfg.delivery_budget_s:.0f}s "
+                "delivery budget; it is not the real one"
+            )
+
+        # Deregistered on the way out, so a finished delivery reads as unfenced
+        # again rather than keeping a budget nobody holds.
+        assert fenced._remaining_budget_s(entry_id) is None
+
+        await _eval_cleanup(client, cfg)
 
     asyncio.run(go())

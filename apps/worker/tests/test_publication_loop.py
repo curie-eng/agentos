@@ -1,0 +1,1120 @@
+"""Approval decisions reconcile to one publication Job and a direct routed result."""
+
+from __future__ import annotations
+
+import asyncio
+import importlib
+import logging
+import threading
+import uuid
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+from channel_protocol.reply import ReplyAck, ReplyTarget
+from curie_worker.approval_cards import ApprovalCardRef
+from curie_worker.reply_sink import TargetRoute
+
+PUBLICATION_ID = uuid.UUID("22222222-2222-4222-8222-222222222222")
+APPROVAL_ID = uuid.UUID("33333333-3333-4333-8333-333333333333")
+AGENT_ID = uuid.UUID("11111111-1111-4111-8111-111111111111")
+PR_URL = "https://github.com/acme-corp/acme-bot/pull/123"
+RESOLVER = "U0APPROVE1"
+RESOLUTION_NOTE = "Ready to publish."
+
+pytestmark = pytest.mark.anyio
+
+
+@pytest.fixture
+def anyio_backend() -> str:
+    return "asyncio"
+
+
+@pytest.fixture
+def publication() -> Any:
+    return importlib.import_module("curie_worker.publication_loop")
+
+
+class _Store:
+    def __init__(self) -> None:
+        self.completed: dict[uuid.UUID, tuple[str, str | None]] = {}
+        self.failures: list[tuple[uuid.UUID, str]] = []
+        self.pending: dict[uuid.UUID, Any] = {}
+        self.delivered: set[uuid.UUID] = set()
+        self.retries: list[tuple[uuid.UUID, str]] = []
+        self.delivery_retries: list[tuple[uuid.UUID, str]] = []
+        self.target = _target()
+        self.route = TargetRoute(endpoint=None, adapter=None)
+        self.retry_terminal_after = 99
+        self.card_pending: Any | None = None
+        self.card_delivery_retries: list[tuple[uuid.UUID, str]] = []
+        self.card_delivered: set[uuid.UUID] = set()
+        self.card_retry_terminal_after = 99
+        self.cleanup_pending: set[uuid.UUID] = set()
+        self.cleanup_claimed: set[uuid.UUID] = set()
+        self.cleanup_completed: set[uuid.UUID] = set()
+        self.cleanup_retries: list[tuple[uuid.UUID, str]] = []
+
+    def claim_pending_card(self) -> Any | None:
+        return self.card_pending
+
+    def mark_card_delivered(self, publication_id: uuid.UUID) -> None:
+        self.card_delivered.add(publication_id)
+        self.card_pending = None
+
+    def retry_card_delivery(self, publication_id: uuid.UUID, *, error: str) -> None:
+        self.card_delivery_retries.append((publication_id, error))
+        if len(self.card_delivery_retries) >= self.card_retry_terminal_after:
+            self.completed[publication_id] = ("failed", None)
+            self.pending[publication_id] = {
+                "outcome": "failed",
+                "pr_url": None,
+                "error": f"publication approval card could not be delivered: {error}",
+            }
+            self.cleanup_pending.add(publication_id)
+            self.card_pending = None
+
+    def claim_pending_cleanup(self) -> Any | None:
+        publication_id = next(iter(self.cleanup_pending), None)
+        if publication_id is None:
+            return None
+        self.cleanup_claimed.add(publication_id)
+        return SimpleNamespace(publication_id=publication_id, version=1)
+
+    def mark_cleanup_completed(self, publication_id: uuid.UUID) -> None:
+        self.cleanup_pending.discard(publication_id)
+        self.cleanup_claimed.discard(publication_id)
+        self.cleanup_completed.add(publication_id)
+
+    def retry_cleanup(self, publication_id: uuid.UUID, *, error: str) -> None:
+        self.cleanup_retries.append((publication_id, error))
+        self.cleanup_claimed.discard(publication_id)
+
+    def is_terminal(self, publication_id: uuid.UUID) -> bool:
+        return publication_id in self.completed
+
+    def complete(self, publication_id: uuid.UUID, *, outcome: str, pr_url: str | None) -> None:
+        self.completed[publication_id] = (outcome, pr_url)
+
+    def fail(self, publication_id: uuid.UUID, *, error: str) -> None:
+        self.failures.append((publication_id, error))
+
+    def pending_result(self, publication_id: uuid.UUID | None = None) -> Any | None:
+        if publication_id is None:
+            publication_id = next(iter(self.pending), None)
+        if publication_id is None:
+            return None
+        value = self.pending.get(publication_id)
+        if value is None:
+            return None
+        if (
+            value["outcome"] in {"published", "failed"}
+            and publication_id in self.cleanup_pending
+        ):
+            return None
+        result = {
+            "resolved_by": None,
+            "resolution_note": None,
+            **value,
+        }
+        return SimpleNamespace(
+            publication_id=publication_id,
+            approval_id=APPROVAL_ID,
+            agent_id=AGENT_ID,
+            target=self.target,
+            route=self.route,
+            attempt=1,
+            version=1,
+            **result,
+        )
+
+    def persist_result(
+        self,
+        publication_id: uuid.UUID,
+        *,
+        outcome: str,
+        pr_url: str | None,
+        error: str | None,
+    ) -> None:
+        self.completed[publication_id] = (outcome, pr_url)
+        if outcome == "failed" and error is not None:
+            self.failures.append((publication_id, error))
+        self.pending[publication_id] = {
+            "outcome": outcome,
+            "pr_url": pr_url,
+            "error": error,
+            "resolved_by": RESOLVER if outcome != "expired" else None,
+            "resolution_note": RESOLUTION_NOTE if outcome != "expired" else None,
+        }
+        if outcome in {"published", "failed"}:
+            self.cleanup_pending.add(publication_id)
+
+    def mark_result_delivered(self, publication_id: uuid.UUID) -> None:
+        self.delivered.add(publication_id)
+        self.pending.pop(publication_id, None)
+
+    def retry_result_delivery(self, publication_id: uuid.UUID, *, error: str) -> None:
+        self.delivery_retries.append((publication_id, error))
+
+    def retry(self, publication_id: uuid.UUID, *, error: str) -> None:
+        self.retries.append((publication_id, error))
+        if len(self.retries) >= self.retry_terminal_after:
+            self.completed[publication_id] = ("failed", None)
+            self.failures.append((publication_id, error))
+            self.pending[publication_id] = {
+                "outcome": "failed",
+                "pr_url": None,
+                "error": error,
+            }
+            self.cleanup_pending.add(publication_id)
+
+    async def claim_next(self) -> None:
+        return None
+
+
+class _Credentials:
+    def __init__(self, module: Any) -> None:
+        self.module = module
+        self.calls: list[uuid.UUID] = []
+        self.error: Exception | None = None
+
+    def redeem(self, publication_id: uuid.UUID) -> Any:
+        self.calls.append(publication_id)
+        if self.error is not None:
+            raise self.error
+        return self.module.PublicationCredential(
+            clean_clone_url="https://github.com/acme-corp/acme-bot.git",
+            authorization_header="Basic publication-write-credential-value",
+        )
+
+
+class _Cluster:
+    def __init__(self, module: Any) -> None:
+        self.module = module
+        self.applied: list[Any] = []
+        self.credentials_cleaned: list[Any] = []
+        self.terminals_cleaned: list[Any] = []
+        self.observation = module.PublicationJobObservation(
+            phase="succeeded", pr_url=PR_URL, logs=f"CURIE_PR_URL={PR_URL}\n"
+        )
+        self.preexisting_observation: Any | None = None
+        self.raise_after_apply = False
+        self.apply_error: Exception | None = None
+        self.observe_after_apply_error: Exception | None = None
+        self.terminal_cleanup_fail_once = False
+        self.terminal_cleanup_failures_remaining = 0
+        self.validated_existing: list[Any] = []
+        self.observe_release: threading.Event | None = None
+        self.observe_timed_out = False
+
+    def apply(self, resources: Any) -> None:
+        self.applied.append(resources)
+        if self.apply_error is not None:
+            raise self.apply_error
+        if self.raise_after_apply:
+            self.raise_after_apply = False
+            raise RuntimeError("worker stopped after apiserver accepted resources")
+
+    def validate_existing(self, resources: Any) -> None:
+        self.validated_existing.append(resources)
+
+    def observe(self, job_name: str) -> Any:
+        if self.observe_release is not None and not self.observe_release.wait(
+            timeout=0.2
+        ):
+            self.observe_timed_out = True
+        if self.applied and self.observe_after_apply_error is not None:
+            raise self.observe_after_apply_error
+        if not self.applied:
+            return self.preexisting_observation or self.module.PublicationJobObservation(
+                phase="pending", pr_url=None, logs="", exists=False
+            )
+        return self.observation
+
+    def cleanup(self, names: Any) -> None:
+        self.credentials_cleaned.append(names)
+        self.terminals_cleaned.append(names)
+
+    def cleanup_credentials(self, names: Any) -> None:
+        self.credentials_cleaned.append(names)
+
+    def cleanup_terminal(self, names: Any) -> None:
+        if self.terminal_cleanup_fail_once or self.terminal_cleanup_failures_remaining:
+            self.terminal_cleanup_fail_once = False
+            self.terminal_cleanup_failures_remaining = max(
+                0, self.terminal_cleanup_failures_remaining - 1
+            )
+            raise RuntimeError("publication resource cleanup unavailable")
+        self.terminals_cleaned.append(names)
+
+
+class _GitHub:
+    def __init__(self, recovered: str | None = None) -> None:
+        self.recovered = recovered
+        self.calls: list[tuple[str, str, str, str, str]] = []
+
+    def recover_pr_by_head(
+        self,
+        repo_full_name: str,
+        branch: str,
+        title: str,
+        body: str,
+        authorization_header: str,
+    ) -> str | None:
+        self.calls.append((repo_full_name, branch, title, body, authorization_header))
+        return self.recovered
+
+
+class _Replies:
+    def __init__(self) -> None:
+        self.events: list[tuple[Any, TargetRoute]] = []
+        self.fail_once = False
+        self.on_emit: Any | None = None
+        self.post_refs: dict[str, str] = {}
+
+    async def emit(
+        self, event: Any, *, route: TargetRoute, best_effort_unreachable: bool = False
+    ) -> Any:
+        if self.fail_once:
+            self.fail_once = False
+            raise RuntimeError("reply transport unavailable")
+        self.events.append((event, route))
+        if self.on_emit is not None:
+            self.on_emit()
+        interaction = getattr(getattr(event, "message", None), "interaction", None)
+        interaction_id = getattr(interaction, "id", None)
+        if event.event == "reply.post" and interaction_id:
+            ref = self.post_refs.setdefault(interaction_id, "1700000000.000050")
+            return ReplyAck(ref=ref)
+        return ReplyAck(ref=event.target.reply_ref)
+
+
+class _Cards:
+    def __init__(self) -> None:
+        self.ref: ApprovalCardRef | None = None
+        self.key = str(APPROVAL_ID)
+        self.popped: list[str] = []
+        self.restored: list[tuple[str, ApprovalCardRef]] = []
+        self.remember_fail_once = False
+        self.restore_failures_remaining = 0
+
+    async def pop(self, approval_id: str) -> ApprovalCardRef | None:
+        self.popped.append(approval_id)
+        if approval_id != self.key:
+            return None
+        ref, self.ref = self.ref, None
+        return ref
+
+    async def restore(self, approval_id: str, ref: ApprovalCardRef) -> None:
+        self.restored.append((approval_id, ref))
+        if self.restore_failures_remaining:
+            self.restore_failures_remaining -= 1
+            raise RuntimeError("card ref restore unavailable")
+        if self.ref is None:
+            self.ref = ref
+            self.key = approval_id
+
+    async def remember(
+        self,
+        approval_id: str,
+        *,
+        channel: str,
+        ts: str,
+        summary: str,
+        endpoint: str | None,
+        requested_by: str = "",
+        kind: str = "",
+        adapter: str | None = None,
+    ) -> None:
+        if self.remember_fail_once:
+            self.remember_fail_once = False
+            raise RuntimeError("card ref store unavailable")
+        self.ref = ApprovalCardRef(
+            channel=channel,
+            ts=ts,
+            summary=summary,
+            endpoint=endpoint,
+            requested_by=requested_by,
+            kind=kind,
+            adapter=adapter,
+        )
+        self.key = approval_id
+
+
+class _Transcript:
+    def __init__(self) -> None:
+        self.records: list[tuple[uuid.UUID, str, uuid.UUID, str]] = []
+        self.failures_remaining = 0
+        self.error: Exception = RuntimeError("transcript API unavailable")
+
+    async def record_result(
+        self,
+        agent_id: uuid.UUID,
+        conversation_id: str,
+        publication_id: uuid.UUID,
+        text: str,
+    ) -> None:
+        if self.failures_remaining:
+            self.failures_remaining -= 1
+            raise self.error
+        self.records.append((agent_id, conversation_id, publication_id, text))
+
+
+def _card() -> ApprovalCardRef:
+    return ApprovalCardRef(
+        channel="C0EXAMPLE1",
+        ts="1700000000.000050",
+        summary="Publish these repository changes?",
+        requested_by="requester@example.test",
+        kind="slack",
+    )
+
+
+def _target(kind: str = "slack") -> ReplyTarget:
+    return ReplyTarget(
+        kind=kind,
+        address="C0EXAMPLE1" if kind == "slack" else "agent@example.test",
+        conversation_id="1700000000.000100",
+        reply_ref=None,
+    )
+
+
+def _work(module: Any, *, decision: str = "approved", kind: str = "slack") -> Any:
+    return module.PublicationWork(
+        publication_id=PUBLICATION_ID,
+        approval_id=APPROVAL_ID,
+        decision=decision,
+        repo_full_name="acme-corp/acme-bot",
+        base_sha="a" * 40,
+        patch=b"diff --git a/README.md b/README.md\n",
+        changed_paths=("README.md",),
+        title="Update repository",
+        body="Approved platform publication.",
+        target=_target(kind),
+        route=TargetRoute(
+            endpoint=None if kind == "slack" else "https://adapter.example.com/replies",
+            adapter=None if kind == "slack" else "agentmail-sandbox",
+        ),
+        version=1,
+    )
+
+
+def _card_work() -> Any:
+    return SimpleNamespace(
+        publication_id=PUBLICATION_ID,
+        approval_id=APPROVAL_ID,
+        summary="Publish these repository changes?",
+        requested_by="U0REQUEST1",
+        target=ReplyTarget(
+            kind="slack",
+            address="C0EXAMPLE1",
+            conversation_id="1700000000.000100",
+            reply_ref=None,
+        ),
+        route=TargetRoute(endpoint=None, adapter=None),
+        attempt=1,
+        version=1,
+    )
+
+
+def _loop(
+    module: Any,
+    cards: _Cards | None = None,
+    transcript: _Transcript | None = None,
+) -> tuple[Any, _Store, _Credentials, _Cluster, _GitHub, _Replies]:
+    k8s = importlib.import_module("curie_worker.publication_k8s")
+    store = _Store()
+    credentials = _Credentials(module)
+    cluster = _Cluster(module)
+    github = _GitHub()
+    replies = _Replies()
+    cards = cards or _Cards()
+    loop = module.PublicationReconciler(
+        store=store,
+        credentials=credentials,
+        cluster=cluster,
+        github=github,
+        replies=replies,
+        card_store=cards,
+        transcript=transcript,
+        job_settings=k8s.PublicationJobSettings(
+            namespace="curie",
+            runner_image="ghcr.io/curie-eng/curie-runner:v0.7.0",
+            image_pull_policy="IfNotPresent",
+            image_pull_secrets=("registry-creds",),
+            priority_class_name="curie-platform-critical",
+            service_account_name="curie-publication",
+            owner_name="curie-publication-owner",
+            git_user_name="Curie Publisher",
+            git_user_email="publisher@example.com",
+            cpu_request="100m",
+            cpu_limit="1",
+            memory_request="256Mi",
+            memory_limit="1Gi",
+            ephemeral_request="1Gi",
+            ephemeral_limit="4Gi",
+        ),
+    )
+    return loop, store, credentials, cluster, github, replies
+
+
+async def test_publication_card_outbox_posts_and_remembers_before_ack(
+    publication: Any,
+) -> None:
+    cards = _Cards()
+    loop, store, _, _, _, replies = _loop(publication, cards)
+    store.card_pending = _card_work()
+
+    assert await loop.deliver_pending_card() is True
+
+    assert store.card_delivered == {PUBLICATION_ID}
+    assert store.card_pending is None
+    assert cards.ref is not None
+    assert cards.ref.ts == "1700000000.000050"
+    assert cards.key == str(APPROVAL_ID)
+    event = replies.events[0][0]
+    assert event.event == "reply.post"
+    assert event.target.conversation_id == "1700000000.000100"
+    assert event.message.interaction.id == str(APPROVAL_ID)
+
+
+async def test_terminal_result_is_recorded_for_the_next_model_turn(
+    publication: Any,
+) -> None:
+    transcript = _Transcript()
+    loop, store, _, _, _, replies = _loop(publication, transcript=transcript)
+    store.completed[PUBLICATION_ID] = ("published", PR_URL)
+    store.pending[PUBLICATION_ID] = {
+        "outcome": "published",
+        "pr_url": PR_URL,
+        "error": None,
+    }
+
+    assert await loop.deliver_pending_result(PUBLICATION_ID) is True
+
+    assert transcript.records == [
+        (
+            AGENT_ID,
+            "1700000000.000100",
+            PUBLICATION_ID,
+            f"Published the approved changes: {PR_URL}",
+        )
+    ]
+    assert PR_URL in replies.events[0][0].text
+
+
+async def test_transient_transcript_failure_delivers_and_settles_before_retry(
+    publication: Any,
+) -> None:
+    cards = _Cards()
+    transcript = _Transcript()
+    transcript.failures_remaining = 1
+    loop, store, _, _, _, replies = _loop(
+        publication,
+        cards,
+        transcript=transcript,
+    )
+    cards.ref = _card()
+    store.pending[PUBLICATION_ID] = {
+        "outcome": "published",
+        "pr_url": PR_URL,
+        "error": None,
+        "resolved_by": RESOLVER,
+        "resolution_note": RESOLUTION_NOTE,
+    }
+
+    assert await loop.deliver_pending_result(PUBLICATION_ID) is True
+
+    assert [event.event for event, _ in replies.events] == [
+        "reply.update",
+        "reply.update",
+    ]
+    assert replies.events[1][0].settled.decision == "approved"
+    assert cards.ref is None
+    assert PUBLICATION_ID not in store.delivered
+    assert store.delivery_retries == [
+        (
+            PUBLICATION_ID,
+            "publication transcript recording failed: transcript API unavailable",
+        )
+    ]
+
+    assert await loop.deliver_pending_result(PUBLICATION_ID) is True
+
+    assert PUBLICATION_ID in store.delivered
+    assert len(transcript.records) == 1
+    assert len(replies.events) == 3
+    assert replies.events[2][0].settled is None
+
+
+async def test_transcript_capacity_refusal_cannot_veto_result_or_card(
+    publication: Any,
+) -> None:
+    cards = _Cards()
+    transcript = _Transcript()
+    transcript.failures_remaining = 1
+    transcript.error = publication.PublicationTranscriptPermanentError(
+        "publication transcript append exceeded durable state capacity"
+    )
+    loop, store, _, _, _, replies = _loop(
+        publication,
+        cards,
+        transcript=transcript,
+    )
+    cards.ref = _card()
+    store.pending[PUBLICATION_ID] = {
+        "outcome": "published",
+        "pr_url": PR_URL,
+        "error": None,
+        "resolved_by": RESOLVER,
+        "resolution_note": RESOLUTION_NOTE,
+    }
+
+    assert await loop.deliver_pending_result(PUBLICATION_ID) is True
+
+    assert PUBLICATION_ID in store.delivered
+    assert store.delivery_retries == []
+    assert PR_URL in replies.events[0][0].text
+    assert replies.events[1][0].settled.decision == "approved"
+    assert cards.ref is None
+
+
+async def test_missing_transcript_wiring_is_logged_loudly(
+    publication: Any,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.ERROR, logger="curie_worker.publication_loop"):
+        _loop(publication)
+
+    assert "publication transcript recording is not configured" in caplog.text
+
+
+async def test_publication_card_crash_after_post_adopts_same_ref_on_retry(
+    publication: Any,
+) -> None:
+    cards = _Cards()
+    cards.remember_fail_once = True
+    loop, store, _, _, _, replies = _loop(publication, cards)
+    store.card_pending = _card_work()
+
+    with pytest.raises(RuntimeError, match="card ref store unavailable"):
+        await loop.deliver_pending_card()
+    assert store.card_delivered == set()
+
+    await loop.deliver_pending_card()
+
+    assert len(replies.events) == 2
+    assert {
+        replies.post_refs[str(APPROVAL_ID)]
+    } == {"1700000000.000050"}, "the UUID idempotency key adopts one Slack message"
+    assert cards.ref is not None and cards.ref.ts == "1700000000.000050"
+    assert store.card_delivered == {PUBLICATION_ID}
+
+
+async def test_publication_card_delivery_cap_fails_safely_and_reports_result(
+    publication: Any,
+) -> None:
+    cards = _Cards()
+    loop, store, _, _, _, replies = _loop(publication, cards)
+    store.card_pending = _card_work()
+    store.card_retry_terminal_after = 2
+    replies.fail_once = True
+
+    with pytest.raises(RuntimeError, match="reply transport unavailable"):
+        await loop.deliver_pending_card()
+    replies.fail_once = True
+    with pytest.raises(RuntimeError, match="reply transport unavailable"):
+        await loop.deliver_pending_card()
+
+    assert store.completed == {PUBLICATION_ID: ("failed", None)}
+    assert store.card_pending is None
+    assert store.card_delivered == set()
+    assert await loop.deliver_pending_cleanup() is True
+    assert await loop.deliver_pending_result(PUBLICATION_ID) is True
+    assert "approval card could not be delivered" in replies.events[0][0].text
+
+
+async def test_approved_publication_launches_job_and_reports_pr_url(
+    publication: Any,
+) -> None:
+    loop, store, credentials, cluster, github, replies = _loop(publication)
+    work = _work(publication)
+
+    await loop.reconcile(work)
+
+    assert credentials.calls == [PUBLICATION_ID]
+    assert len(cluster.applied) == 1
+    resources = cluster.applied[0]
+    assert resources.job["kind"] == "Job"
+    assert PR_URL not in str(resources.secret), "the result is learned from the Job"
+    assert len(github.calls) == 1
+    assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
+    assert cluster.credentials_cleaned == [resources.names]
+    assert cluster.terminals_cleaned == [resources.names]
+    assert len(replies.events) == 1
+    event, route = replies.events[0]
+    assert event.target == work.target
+    assert PR_URL in event.text
+    assert route == work.route
+    assert not hasattr(loop, "runner") and not hasattr(loop, "model")
+
+
+async def test_nonapproved_work_is_inert_in_the_job_reconciler(publication: Any) -> None:
+    loop, store, credentials, cluster, github, replies = _loop(publication)
+    work = _work(publication, decision="denied")
+
+    await loop.reconcile(work)
+
+    assert credentials.calls == []
+    assert cluster.applied == []
+    assert cluster.credentials_cleaned == []
+    assert cluster.terminals_cleaned == []
+    assert github.calls == []
+    assert store.completed == {}
+    assert replies.events == []
+
+
+async def test_worker_crash_reuses_the_same_job_and_cannot_duplicate_publication(
+    publication: Any,
+) -> None:
+    loop, store, credentials, cluster, github, replies = _loop(publication)
+    work = _work(publication)
+    cluster.raise_after_apply = True
+
+    await loop.reconcile(work)
+    await loop.reconcile(work)  # terminal duplicate callback is a no-op
+
+    job_names = [resources.names.job for resources in cluster.applied]
+    assert len(set(job_names)) == 1
+    assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
+    assert len(replies.events) == 1
+    assert len(github.calls) == 1
+
+
+async def test_existing_remote_pr_is_adopted_before_recreating_a_missing_job(
+    publication: Any,
+) -> None:
+    loop, store, credentials, cluster, github, replies = _loop(publication)
+    github.recovered = PR_URL
+    work = _work(publication)
+
+    await loop.reconcile(work)
+
+    branch = publication.deterministic_publication_branch(PUBLICATION_ID)
+    assert github.calls == [
+        (
+            "acme-corp/acme-bot",
+            branch,
+            "Update repository",
+            "Approved platform publication.",
+            "Basic publication-write-credential-value",
+        )
+    ]
+    assert cluster.applied == [], "remote adoption must happen before a replacement Job"
+    assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
+    assert PR_URL in replies.events[0][0].text
+
+
+async def test_non_slack_publication_result_uses_the_stored_adapter_route_without_model(
+    publication: Any,
+) -> None:
+    loop, store, _, _, _, replies = _loop(publication)
+    work = _work(publication, kind="email")
+    store.target = work.target
+    store.route = work.route
+
+    await loop.reconcile(work)
+
+    event, route = replies.events[0]
+    assert event.target.kind == "email"
+    assert route == TargetRoute(
+        endpoint="https://adapter.example.com/replies", adapter="agentmail-sandbox"
+    )
+    assert PR_URL in event.text
+    assert store.completed[PUBLICATION_ID] == ("published", PR_URL)
+    assert not hasattr(loop, "runner") and not hasattr(loop, "model")
+
+
+@pytest.mark.parametrize(
+    ("outcome", "pr_url", "error", "decision", "text_fragment"),
+    [
+        ("published", PR_URL, None, "approved", "Published the approved changes"),
+        ("denied", None, None, "rejected", "request was denied"),
+        ("failed", None, "push failed", "approved", "failed safely after approval"),
+        ("expired", None, None, None, "approval expired"),
+    ],
+)
+async def test_terminal_result_settles_card_with_durable_resolution_identity(
+    publication: Any,
+    outcome: str,
+    pr_url: str | None,
+    error: str | None,
+    decision: str | None,
+    text_fragment: str,
+) -> None:
+    cards = _Cards()
+    loop, store, _, _, _, replies = _loop(publication, cards)
+    cards.ref = _card()
+    store.pending[PUBLICATION_ID] = {
+        "outcome": outcome,
+        "pr_url": pr_url,
+        "error": error,
+        "resolved_by": RESOLVER if decision is not None else None,
+        "resolution_note": RESOLUTION_NOTE if decision is not None else None,
+    }
+
+    await loop.deliver_pending_result(PUBLICATION_ID)
+
+    assert text_fragment in replies.events[0][0].text
+    card_update, card_route = replies.events[1]
+    assert card_update.target.reply_ref == "1700000000.000050"
+    assert card_update.message.text == "Publish these repository changes?"
+    assert card_update.settled.decision == decision
+    assert card_update.settled.requested_by == "requester@example.test"
+    assert card_update.settled.resolver == (
+        RESOLVER if decision is not None else None
+    )
+    assert card_update.settled.note == (
+        RESOLUTION_NOTE if decision is not None else None
+    )
+    assert card_route == TargetRoute(endpoint=None, adapter=None)
+    assert cards.ref is None
+    assert cards.restored == []
+
+
+async def test_result_does_not_consume_a_card_stored_under_another_approval(
+    publication: Any,
+) -> None:
+    cards = _Cards()
+    loop, store, _, _, _, replies = _loop(publication, cards)
+    mismatched = _card()
+    cards.ref = mismatched
+    cards.key = "44444444-4444-4444-8444-444444444444"
+    store.pending[PUBLICATION_ID] = {
+        "outcome": "published",
+        "pr_url": PR_URL,
+        "error": None,
+    }
+    await loop.deliver_pending_result(PUBLICATION_ID)
+
+    assert cards.ref == mismatched
+    assert cards.restored == []
+    assert len(replies.events) == 1
+    assert replies.events[0][0].settled is None
+    assert PUBLICATION_ID in store.delivered
+
+
+async def test_only_exact_approved_decision_can_redeem_write_credential(
+    publication: Any,
+) -> None:
+    for decision in ("denied", "expired", "pending"):
+        loop, _, credentials, cluster, github, _ = _loop(publication)
+        await loop.reconcile(_work(publication, decision=decision))
+        assert credentials.calls == [], decision
+        assert cluster.applied == [], decision
+        assert github.calls == [], decision
+
+
+async def test_terminal_result_is_persisted_and_credentials_removed_before_reply_retry(
+    publication: Any,
+) -> None:
+    cards = _Cards()
+    loop, store, credentials, cluster, _, replies = _loop(publication, cards)
+    replies.fail_once = True
+    work = _work(publication)
+    cards.ref = _card()
+
+    with pytest.raises(RuntimeError, match="reply transport unavailable"):
+        await loop.reconcile(work)
+
+    assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
+    assert PUBLICATION_ID in store.pending
+    assert len(cluster.credentials_cleaned) == 1
+    assert len(cluster.terminals_cleaned) == 1
+    assert credentials.calls == [PUBLICATION_ID]
+    assert cards.ref == _card()
+    assert cards.restored == [(str(APPROVAL_ID), _card())]
+
+    await loop.deliver_pending_result(PUBLICATION_ID)
+
+    assert PUBLICATION_ID in store.delivered
+    assert store.pending == {}
+    assert len(cluster.credentials_cleaned) == 1
+    assert len(cluster.terminals_cleaned) == 1
+    assert credentials.calls == [PUBLICATION_ID]
+    assert len(replies.events) == 2
+    assert replies.events[1][0].settled.decision == "approved"
+    assert replies.events[1][0].settled.resolver == RESOLVER
+    assert replies.events[1][0].settled.note == RESOLUTION_NOTE
+    assert cards.ref is None
+    assert store.delivery_retries == [(PUBLICATION_ID, "reply transport unavailable")]
+
+
+async def test_card_restore_failure_preserves_original_error_and_ref_for_retry(
+    publication: Any,
+) -> None:
+    cards = _Cards()
+    cards.ref = _card()
+    cards.restore_failures_remaining = 1
+    loop, store, _, _, _, replies = _loop(publication, cards)
+    store.pending[PUBLICATION_ID] = {
+        "outcome": "published",
+        "pr_url": PR_URL,
+        "error": None,
+        "resolved_by": RESOLVER,
+        "resolution_note": RESOLUTION_NOTE,
+    }
+    replies.fail_once = True
+
+    with pytest.raises(RuntimeError, match="reply transport unavailable"):
+        await loop.deliver_pending_result(PUBLICATION_ID)
+
+    assert cards.ref is None
+    assert store.delivery_retries == [(PUBLICATION_ID, "reply transport unavailable")]
+
+    assert await loop.deliver_pending_result(PUBLICATION_ID) is True
+
+    assert PUBLICATION_ID in store.delivered
+    assert replies.events[1][0].settled.decision == "approved"
+    assert cards.ref is None
+
+
+async def test_supervisor_drains_terminal_result_outbox_without_job_work(
+    publication: Any,
+) -> None:
+    reconciler, store, _, cluster, _, replies = _loop(publication)
+    store.completed[PUBLICATION_ID] = ("published", PR_URL)
+    store.pending[PUBLICATION_ID] = {
+        "outcome": "published",
+        "pr_url": PR_URL,
+        "error": None,
+    }
+    store.cleanup_pending.add(PUBLICATION_ID)
+    shutdown = asyncio.Event()
+    replies.on_emit = shutdown.set
+    supervisor = publication.PublicationReconcileLoop(
+        store=store,
+        reconciler=reconciler,
+        interval_seconds=0.01,
+    )
+
+    await supervisor.run_forever(shutdown)
+
+    assert PUBLICATION_ID in store.delivered
+    assert len(cluster.credentials_cleaned) == 1
+    assert len(cluster.terminals_cleaned) == 1
+    assert PR_URL in replies.events[0][0].text
+
+
+@pytest.mark.parametrize("phase", ["failed", "succeeded"])
+async def test_terminal_job_recovers_remote_branch_or_lost_rest_response_before_failure(
+    publication: Any,
+    phase: str,
+) -> None:
+    loop, store, credentials, cluster, github, replies = _loop(publication)
+    github.recovered = PR_URL
+    cluster.preexisting_observation = publication.PublicationJobObservation(
+        phase=phase,
+        pr_url=None,
+        logs="publication process exited without a marker\n",
+        error="job process exited" if phase == "failed" else None,
+    )
+
+    await loop.reconcile(_work(publication))
+
+    assert credentials.calls == [PUBLICATION_ID]
+    assert len(github.calls) == 1
+    assert cluster.applied == []
+    assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
+    assert PR_URL in replies.events[0][0].text
+
+
+async def test_running_job_is_validated_without_redeeming_another_credential(
+    publication: Any,
+) -> None:
+    loop, store, credentials, cluster, github, replies = _loop(publication)
+    cluster.preexisting_observation = publication.PublicationJobObservation(
+        phase="running", pr_url=None, logs=""
+    )
+
+    await loop.reconcile(_work(publication))
+
+    assert len(cluster.validated_existing) == 1
+    assert credentials.calls == []
+    assert github.calls == []
+    assert cluster.applied == []
+    assert store.completed == {}
+    assert replies.events == []
+
+
+async def test_blocking_cluster_client_does_not_stall_event_loop_ticker(
+    publication: Any,
+) -> None:
+    loop, _, _, cluster, _, _ = _loop(publication)
+    release = threading.Event()
+    cluster.observe_release = release
+    ticks = 0
+
+    async def ticker() -> None:
+        nonlocal ticks
+        await asyncio.sleep(0)
+        ticks += 1
+        release.set()
+
+    await asyncio.gather(loop.reconcile(_work(publication)), ticker())
+
+    assert ticks == 1
+    assert cluster.observe_timed_out is False
+
+
+async def test_credential_setup_failure_is_bounded_and_terminalized(publication: Any) -> None:
+    loop, store, credentials, cluster, github, replies = _loop(publication)
+    credentials.error = publication.PublicationReconcileError(
+        "publication credential endpoint is unreachable"
+    )
+    work = _work(publication)
+    store.retry_terminal_after = 2
+
+    await loop.reconcile(work)
+    assert store.retries == [
+        (PUBLICATION_ID, "publication credential endpoint is unreachable")
+    ]
+    assert store.completed == {}
+    assert replies.events == []
+
+    await loop.reconcile(work)
+    assert store.completed == {PUBLICATION_ID: ("failed", None)}
+    assert store.failures == [
+        (PUBLICATION_ID, "publication credential endpoint is unreachable")
+    ]
+    assert cluster.applied == []
+    assert github.calls == []
+    assert "failed safely" in replies.events[0][0].text.lower()
+
+
+async def test_hostile_resource_collision_is_bounded_and_terminalized(
+    publication: Any,
+) -> None:
+    k8s = importlib.import_module("curie_worker.publication_k8s")
+    loop, store, _, cluster, _, replies = _loop(publication)
+    cluster.apply_error = k8s.PublicationResourceError(
+        "existing publication Job metadata contract does not match"
+    )
+    store.retry_terminal_after = 2
+    work = _work(publication)
+
+    await loop.reconcile(work)
+    await loop.reconcile(work)
+
+    assert len(cluster.applied) == 2
+    assert store.completed == {PUBLICATION_ID: ("failed", None)}
+    assert len(store.retries) == 2
+    assert "failed safely" in replies.events[0][0].text.lower()
+
+
+async def test_unvalidated_terminal_marker_cannot_bypass_resource_adoption(
+    publication: Any,
+) -> None:
+    k8s = importlib.import_module("curie_worker.publication_k8s")
+    loop, store, _, cluster, _, replies = _loop(publication)
+    cluster.preexisting_observation = publication.PublicationJobObservation(
+        phase="succeeded",
+        pr_url="https://github.com/other-corp/other-repo/pull/9",
+        logs="CURIE_PR_URL=https://github.com/other-corp/other-repo/pull/9\n",
+    )
+    cluster.apply_error = k8s.PublicationResourceError(
+        "existing publication Job metadata contract does not match"
+    )
+
+    await loop.reconcile(_work(publication))
+
+    assert len(cluster.applied) == 1
+    assert store.completed == {}
+    assert len(store.retries) == 1
+    assert replies.events == []
+
+
+async def test_foreign_repository_pr_url_is_bounded_instead_of_reported(
+    publication: Any,
+) -> None:
+    loop, store, _, cluster, _, replies = _loop(publication)
+    cluster.observation = publication.PublicationJobObservation(
+        phase="succeeded",
+        pr_url="https://github.com/other-corp/other-repo/pull/9",
+        logs="CURIE_PR_URL=https://github.com/other-corp/other-repo/pull/9\n",
+    )
+
+    await loop.reconcile(_work(publication))
+
+    assert store.completed == {}
+    assert store.retries == [
+        (
+            PUBLICATION_ID,
+            "publication result URL does not belong to the requested repository",
+        )
+    ]
+    assert replies.events == []
+
+
+async def test_result_url_accepts_github_canonical_repository_casing(
+    publication: Any,
+) -> None:
+    loop, store, _, cluster, _, replies = _loop(publication)
+    work = _work(publication)
+    work = publication.PublicationWork(
+        **{**work.__dict__, "repo_full_name": "Acme-Corp/Acme-Bot"}
+    )
+    cluster.observation = publication.PublicationJobObservation(
+        phase="succeeded", pr_url=PR_URL, logs=f"CURIE_PR_URL={PR_URL}\n"
+    )
+
+    await loop.reconcile(work)
+
+    assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
+    assert PR_URL in replies.events[0][0].text
+
+
+async def test_repeated_apiserver_failure_after_apply_is_dead_lettered(
+    publication: Any,
+) -> None:
+    loop, store, _, cluster, _, replies = _loop(publication)
+    cluster.apply_error = RuntimeError("apiserver response was lost")
+    cluster.observe_after_apply_error = RuntimeError("apiserver is unavailable")
+    store.retry_terminal_after = 2
+    work = _work(publication)
+
+    await loop.reconcile(work)
+    await loop.reconcile(work)
+
+    assert store.completed == {PUBLICATION_ID: ("failed", None)}
+    assert len(store.retries) == 2
+    assert all("apiserver" in error for _, error in store.retries)
+    assert "failed safely" in replies.events[0][0].text.lower()
+
+
+async def test_cleanup_retries_beyond_result_cap_before_result_outbox_ack(
+    publication: Any,
+) -> None:
+    loop, store, _, cluster, _, replies = _loop(publication)
+    cluster.terminal_cleanup_failures_remaining = 6
+    work = _work(publication)
+
+    with pytest.raises(RuntimeError, match="resource cleanup unavailable"):
+        await loop.reconcile(work)
+
+    for _ in range(5):
+        with pytest.raises(RuntimeError, match="resource cleanup unavailable"):
+            await loop.deliver_pending_cleanup()
+
+    assert PUBLICATION_ID not in store.delivered
+    assert PUBLICATION_ID in store.pending
+    assert replies.events == []
+    assert len(store.cleanup_retries) == 6
+    assert store.delivery_retries == []
+
+    assert await loop.deliver_pending_cleanup() is True
+    await loop.deliver_pending_result(PUBLICATION_ID)
+
+    assert PUBLICATION_ID in store.delivered
+    assert cluster.terminals_cleaned
+    assert PR_URL in replies.events[0][0].text

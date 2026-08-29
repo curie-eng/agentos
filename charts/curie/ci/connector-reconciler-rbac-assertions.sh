@@ -53,6 +53,7 @@ render() {
   helm template curie "$CHART" -n "$NS" \
     -f "$CHART/values-dev.yaml" \
     --set "worker.connectorReconciler.enabled=$1" \
+    --set worker.publication.enabled=false \
     -s templates/worker.yaml
 }
 

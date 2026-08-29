@@ -28,6 +28,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -52,6 +53,7 @@ _JWT_LIFETIME_SECONDS = 480
 # Re-mint this long before a token actually expires, so a clone that starts just
 # under the wire does not have its credential expire mid-transfer.
 _TOKEN_REFRESH_MARGIN_SECONDS = 300
+_REPOSITORY_CACHE_LIMIT = 256
 
 
 # Resolvers are shared per credential configuration, because the token cache
@@ -142,8 +144,8 @@ class GitHubCredentials:
     """
 
     settings: Settings
-    _tokens: dict[str, _CachedToken] = field(default_factory=dict)
-    _installations: dict[str, int] = field(default_factory=dict)
+    _tokens: OrderedDict[str, _CachedToken] = field(default_factory=OrderedDict)
+    _installations: OrderedDict[str, int] = field(default_factory=OrderedDict)
     # Per-repository, never global: a mint for one repo must not serialize a
     # mint for another, and the HTTP call happens while this is held.
     _mint_locks: dict[str, threading.Lock] = field(default_factory=dict)
@@ -215,6 +217,7 @@ class GitHubCredentials:
 
         cached = self._tokens.get(repo_full_name)
         if cached is not None and cached.usable(time.time()):
+            self._tokens.move_to_end(repo_full_name)
             return cached.token
 
         with self._mint_lock_for(repo_full_name):
@@ -222,10 +225,14 @@ class GitHubCredentials:
             # certainly just populated the cache we lost the race to read.
             cached = self._tokens.get(repo_full_name)
             if cached is not None and cached.usable(time.time()):
+                self._tokens.move_to_end(repo_full_name)
                 return cached.token
 
             token, expires_at = self._mint_installation_token(repo_full_name)
             self._tokens[repo_full_name] = _CachedToken(token=token, expires_at=expires_at)
+            self._tokens.move_to_end(repo_full_name)
+            while len(self._tokens) > _REPOSITORY_CACHE_LIMIT:
+                self._tokens.popitem(last=False)
             return token
 
     def _mint_lock_for(self, repo_full_name: str) -> threading.Lock:
@@ -263,6 +270,7 @@ class GitHubCredentials:
 
         known = self._installations.get(repo_full_name)
         if known is not None:
+            self._installations.move_to_end(repo_full_name)
             return known, True
         return self._discover_installation_id(repo_full_name), False
 
@@ -278,6 +286,9 @@ class GitHubCredentials:
         if not isinstance(installation_id, int):
             raise GitHubAppError(f"GitHub did not report an installation id for {repo_full_name!r}")
         self._installations[repo_full_name] = installation_id
+        self._installations.move_to_end(repo_full_name)
+        while len(self._installations) > _REPOSITORY_CACHE_LIMIT:
+            self._installations.popitem(last=False)
         return installation_id
 
     def _mint_installation_token(self, repo_full_name: str) -> tuple[str, float]:

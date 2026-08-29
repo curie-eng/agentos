@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/observability-run/v1.json",
+  "title": "curie local|cluster observability run --json",
+  "description": "The complete existing Curie API TraceTree DTO, serialized wholesale. Open-ended trace data is retained while typed observation nodes and stable nullable correlation fields are explicit.",
+  "$defs": {
+    "observationNode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "type",
+        "name",
+        "startTime",
+        "model",
+        "usageDetails",
+        "children"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string"
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "startTime": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "usageDetails": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true
+        },
+        "children": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/observationNode"
+          }
+        }
+      }
+    }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "trace",
+    "tree",
+    "sandbox_id",
+    "approval_decision"
+  ],
+  "properties": {
+    "trace": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "tree": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/observationNode"
+      }
+    },
+    "sandbox_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "approval_decision": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  }
+}

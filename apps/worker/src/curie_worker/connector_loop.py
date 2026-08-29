@@ -35,11 +35,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
+from curie_telemetry import record_metric
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -53,6 +55,7 @@ from .connector_agent import (
 from .connector_apply import ConnectorClient
 
 logger = logging.getLogger(__name__)
+_monotonic = time.monotonic
 
 _PLATFORM_5XX_GRACE_PASSES = 3
 
@@ -289,7 +292,30 @@ class ConnectorReconcileLoop:
             summary.skipped,
             summary.failed,
         )
+        self._record_pass_metrics(
+            outcome="failure" if summary.failed else "success",
+        )
         return summary
+
+    def _record_pass_metrics(self, *, outcome: str) -> None:
+        now = _monotonic()
+        last_success = getattr(self, "_last_success_monotonic", None)
+        if outcome == "success":
+            self._last_success_monotonic = now
+            last_success = now
+        attributes = {
+            "service.name": "curie-worker",
+            "operation": "connector-reconciler",
+            "role": "background",
+            "outcome": outcome,
+        }
+        record_metric("curie.background.loop", attributes=attributes)
+        if last_success is not None:
+            record_metric(
+                "curie.background.last_success.age",
+                max(0.0, now - last_success),
+                attributes={key: value for key, value in attributes.items() if key != "outcome"},
+            )
 
     async def run_forever(self, stop: asyncio.Event | None = None) -> None:
         """Reconcile on an interval until told to stop.

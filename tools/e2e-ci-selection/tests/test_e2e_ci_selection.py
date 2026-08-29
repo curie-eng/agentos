@@ -12,6 +12,10 @@ import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
+# NOT `select.py`. Python puts a script's own directory first on sys.path, so a
+# module named `select` shadows the stdlib one -- and this script imports
+# subprocess, which imports selectors, which imports select. That made every
+# test here fail on macOS while CI stayed green (#1878).
 SELECTOR = REPO_ROOT / "tools" / "e2e-ci-selection" / "select_tiers.py"
 REGISTRY = REPO_ROOT / ".github" / "e2e-selection.yaml"
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yaml"

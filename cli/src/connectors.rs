@@ -488,7 +488,7 @@ mod tests {
     }
 
     fn with_isolated_store<T>(body: impl FnOnce() -> T) -> T {
-        let _lock = crate::PROCESS_ENV_LOCK.lock().expect("env lock");
+        let _lock = crate::PROCESS_ENV_LOCK.blocking_lock();
         let dir = tempfile::tempdir().unwrap();
         let previous = std::env::var_os("CURIE_CONFIG_DIR");
         std::env::set_var("CURIE_CONFIG_DIR", dir.path());
@@ -521,6 +521,7 @@ mod tests {
                 &["K8S_WRITE_KUBECONFIG".to_string()],
                 &a,
                 "acme-bot",
+                &BTreeMap::new(),
             )
             .unwrap();
             let intent = prepared.write_intent().unwrap();
@@ -537,6 +538,7 @@ mod tests {
                 &["K8S_WRITE_KUBECONFIG".to_string()],
                 &b,
                 "acme-bot",
+                &BTreeMap::new(),
             )
             .unwrap_err()
             .to_string();
@@ -633,11 +635,21 @@ pub async fn discover_app_name(target: &ClusterTarget) -> Result<String> {
 fn resolve_secret_values(
     keys: &[String],
     target: &SecretScope,
+    overrides: &BTreeMap<String, String>,
 ) -> Result<(BTreeMap<String, String>, BTreeMap<String, String>)> {
     let mut values = BTreeMap::new();
     let mut sources = BTreeMap::new();
     let mut missing = Vec::new();
     for k in keys {
+        if let Some(value) = overrides.get(k) {
+            if value.is_empty() {
+                missing.push(k.clone());
+            } else {
+                sources.insert(k.clone(), "explicit deploy input".to_string());
+                values.insert(k.clone(), value.clone());
+            }
+            continue;
+        }
         match crate::secrets::resolve_cluster_secret(k, target)? {
             Some(resolved) => {
                 sources.insert(k.clone(), resolved.source_label());
@@ -748,6 +760,7 @@ pub fn prepare(
     owned_secret_keys: &[String],
     target: &SecretScope,
     agent_name: &str,
+    secret_overrides: &std::collections::BTreeMap<String, String>,
 ) -> Result<PreparedConnectorSync> {
     let mut objects = Vec::new();
     let mut secret_name = None;
@@ -755,7 +768,7 @@ pub fn prepare(
     let mut secret_sources = BTreeMap::new();
 
     if let Some((name, keys)) = owned_secret(owned_secret_name, owned_secret_keys) {
-        let (values, sources) = resolve_secret_values(&keys, target)?;
+        let (values, sources) = resolve_secret_values(&keys, target, secret_overrides)?;
         objects.push(render_secret(&name, &target.namespace, &values));
         secret_name = Some(name);
         secret_keys = keys;
@@ -856,6 +869,48 @@ pub async fn sync(prepared: PreparedConnectorSync) -> Result<ConnectorSync> {
         ));
     }
     Ok(result)
+}
+/// Render and reconcile the connectors declared by one deployed version.
+///
+/// The API owns rendering and the CLI owns applying under the operator's
+/// kubectl identity. Callers must always state their locally owned secret
+/// overrides explicitly, including the normal deploy path's empty map.
+pub async fn sync_deployed_version(
+    api_url: &str,
+    api_key: &str,
+    namespace: &str,
+    release: &str,
+    deployed: &crate::commands::DeployOutput,
+    secret_overrides: &std::collections::BTreeMap<String, String>,
+) -> Result<()> {
+    let target = bind_current_cluster(namespace, release).await?;
+    let app_name = discover_app_name(&target).await?;
+    let client = crate::api::ApiClient::new(api_url, api_key)?;
+    let rendered = client
+        .version_connectors(
+            &deployed.agent_id,
+            &deployed.version_id,
+            release,
+            namespace,
+            &app_name,
+        )
+        .await?;
+    let prepared = prepare(
+        &rendered.manifests,
+        &rendered.mcp_entries,
+        &rendered.owned_secret_name,
+        &rendered.owned_secret_keys,
+        &target.scope,
+        &deployed.agent_name,
+        secret_overrides,
+    )?
+    .bind_target(target)?;
+    let synced = sync(prepared).await?;
+    let ui = crate::ui::ui();
+    for (name, url) in &synced.urls {
+        ui.note(&format!("connector {name}: {url}"));
+    }
+    Ok(())
 }
 
 async fn inspect_secret_keys(

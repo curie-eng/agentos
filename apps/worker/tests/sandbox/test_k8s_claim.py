@@ -10,6 +10,7 @@ named entries fails ``test_bundle_ref_targets_init_containers_by_name``.
 from __future__ import annotations
 
 import copy
+import os
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -17,6 +18,7 @@ import pytest
 from curie_worker.sandbox import QuotaRejection
 from curie_worker.sandbox.k8s import (
     BUNDLE_INIT_CONTAINERS,
+    WORKSPACE_INIT_CONTAINERS,
     KubernetesSandboxClient,
     _claim_view,
 )
@@ -115,6 +117,34 @@ def test_no_named_env_without_bundle_ref() -> None:
     assert all("containerName" not in e for e in entries)
 
 
+def test_workspace_capability_targets_only_workspace_init_containers() -> None:
+    api = _FakeApi()
+    workspace_ref = "opaque-presigned-workspace-reference"
+    workspace_sha256 = "a" * 64
+    _client(api).create_claim(
+        "claim-workspace",
+        pool="pool",
+        env={
+            "CURIE_BUDGET": "{}",
+            "CURIE_WORKSPACE_REF": workspace_ref,
+            "CURIE_WORKSPACE_SHA256": workspace_sha256,
+        },
+    )
+    entries = _env_entries(api)
+
+    unnamed = {entry["name"] for entry in entries if "containerName" not in entry}
+    assert "CURIE_WORKSPACE_REF" not in unnamed
+    assert "CURIE_WORKSPACE_SHA256" not in unnamed
+    named = {
+        (entry["containerName"], entry["name"]): entry["value"]
+        for entry in entries
+        if "containerName" in entry
+    }
+    for container in WORKSPACE_INIT_CONTAINERS:
+        assert named[(container, "CURIE_WORKSPACE_REF")] == workspace_ref
+        assert named[(container, "CURIE_WORKSPACE_SHA256")] == workspace_sha256
+
+
 def test_credential_is_never_written_to_the_claim() -> None:
     # The SandboxClaim env is value-only, so the secret must not be persisted on
     # the claim; the template's secretKeyRef supplies it to the runner instead.
@@ -129,6 +159,37 @@ def test_credential_is_never_written_to_the_claim() -> None:
     assert all("super-secret-token" not in e.get("value", "") for e in entries)
     # The rest of the boot env is still written.
     assert {"name": "CURIE_BUDGET", "value": "{}"} in entries
+
+
+def test_host_credentials_are_never_written_to_the_claim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    denied_names = {
+        "POSTGRES_PASSWORD",
+        "DATABASE_URL",
+        "VALKEY_PASSWORD",
+        "SLACK_BOT_TOKEN",
+        "S3_ACCESS_KEY",
+        "S3_SECRET_KEY",
+        "CURIE_API_KEY",
+        "LANGFUSE_SECRET_KEY",
+        "CURIE_ADAPTER_CREDENTIALS",
+        "CURIE_SEALING_PRIVATE_KEY",
+        "CURIE_SEALING_PREVIOUS_PRIVATE_KEY",
+    }
+    for name in denied_names:
+        monkeypatch.setenv(name, "placeholder")
+    monkeypatch.setenv("CURIE_BUDGET", "{}")
+    monkeypatch.setenv("CURIE_CREDENTIALS", "placeholder")
+    monkeypatch.delenv("CURIE_CONNECTOR_SECRET_KEYS", raising=False)
+
+    api = _FakeApi()
+    _client(api).create_claim("claim-credentials", pool="pool", env=os.environ)
+
+    claim_env_names = {entry["name"] for entry in _env_entries(api)}
+    assert denied_names.isdisjoint(claim_env_names)
+    assert "CURIE_BUDGET" in claim_env_names
+    assert "CURIE_CREDENTIALS" not in claim_env_names
 
 
 def test_runner_token_is_a_plaintext_env_entry_credential_excluded() -> None:
@@ -297,7 +358,7 @@ def test_connector_secrets_are_never_written_to_the_claim() -> None:
     # Per-agent connector secrets (#429) ride the substrate-agnostic boot env by
     # value, but the value-only claim CR would persist them in plaintext in etcd.
     # The binding marks their keys in CURIE_CONNECTOR_SECRET_KEYS; the substrate
-    # strips both the marker and every key it names (cluster delivery is #440).
+    # strips both the marker and every key it names (cluster delivery is #1488).
     api = _FakeApi()
     _client(api).create_claim(
         "claim-1",
@@ -319,3 +380,23 @@ def test_connector_secrets_are_never_written_to_the_claim() -> None:
     assert "CURIE_CONNECTOR_SECRET_KEYS" not in names
     # Non-secret boot env is still written.
     assert {"name": "CURIE_BUDGET", "value": "{}"} in entries
+    body = api.created[0]
+    assert "additionalPodMetadata" not in body["spec"]
+    assert body["spec"]["warmPoolRef"]["name"] == "pool"
+
+
+def test_claim_metadata_agent_label_is_not_additional_pod_metadata() -> None:
+    # The adopted controller rejects spec.additionalPodMetadata.labels under
+    # curietech.ai (Ready=False reason=InvalidMetadata). Claim object labels
+    # are ordinary Kubernetes metadata and are the rotation selector.
+    api = _FakeApi()
+    _client(api).create_claim(
+        "claim-1",
+        pool="curie-agent-acme-a-runner-pool",
+        labels={"curietech.ai/agent": "acme-a"},
+        env={"CURIE_BUDGET": "{}"},
+    )
+    body = api.created[0]
+    assert body["metadata"]["labels"]["curietech.ai/agent"] == "acme-a"
+    assert "additionalPodMetadata" not in body["spec"]
+    assert body["spec"]["warmPoolRef"]["name"] == "curie-agent-acme-a-runner-pool"

@@ -11,6 +11,36 @@ component and rail detail in `charts/curie/README.md`.
   counts, and probe settings belong in `values.yaml` / a values overlay, not
   hardcoded in `templates/`. A value safe on a 4 GB scratch cluster can OOMKill
   on a smaller install.
+  - **One recorded exception: `templates/mail-adapter.yaml`**, which hardcodes
+    `replicas: 1` and `strategy: type: Recreate`. The reason is correctness, not
+    sizing: the adapter is one serialized SQLite writer on a single-writer
+    `ReadWriteOnce` or `ReadWriteOncePod` PVC.
+    A second replica or a rolling update creates two writers and defeats the
+    ownership/lease invariant even on storage that happens to multi-attach. Any
+    count other than 1 is wrong at every cluster size, which is exactly what
+    makes it unlike the resource limits and probe settings the invariant is
+    about, and `Recreate` is required for the same reason (a rolling update runs
+    two pods for the duration of every upgrade).
+    There is deliberately **no `mailAdapter.replicas` key**: a values key that
+    must never be changed advertises a knob that silently breaks reply routing,
+    which is worse than no knob. Pinned behaviorally by
+    `ci/mail-adapter-wiring-assertions.sh` assertion 10, which asserts
+    `spec.replicas` is 1 even under `--set mailAdapter.replicas=3`. Horizontal
+    scale for this adapter needs an Accepted shared-store/multi-writer design;
+    when it lands, this exception is removed rather than extended. Do not
+    generalize it into a rule about stateful services -- one named file, one
+    named reason.
+- **Mail-adapter egress is a separate fail-closed rail.** Enabling
+  `mailAdapter.deploy` requires at least one
+  `mailAdapter.agentmail.httpsCidrs` entry. Its single egress-only policy allows
+  DNS, this release's API pods, and those CIDRs on TCP 443; with `api.deploy`
+  false, `mailAdapter.apiEgress.httpsCidrs` and `.port` replace the pod selector
+  with an explicit narrow BYO-API peer. It never selects a runner sandbox and
+  never allows the Kubernetes API. The runtime pod mounts no ServiceAccount
+  token and has no RBAC. Prefix-0 and prefix-1 routes fail render, including
+  split default routes. Do not turn provider DNS into a broad CIDR or add a
+  private-network allow: use current provider ranges or a controlled egress
+  proxy with a stable range.
 - **Every backing store follows the same toggle + BYO idiom.** `<store>.deploy`
   (default `true`) gates whether the in-chart resource renders; flipping it
   to `false` repoints consumers (Langfuse env, the collector config) at the
@@ -20,6 +50,19 @@ component and rail detail in `charts/curie/README.md`.
 - **Values keys are camelCase, not hyphenated.** Go templates cannot
   dot-index a hyphenated key. Keep this consistent across any new values
   additions.
+- **Placement-class lookups go through `curie.placement.class`; never
+  index `.Values.placement.<class>` directly in a template.** Helm's
+  values coalescing deletes a key whose replayed value is YAML null, so
+  `helm upgrade --reuse-values` on a release created before placement
+  classes existed -- which stored `placement: null` -- leaves
+  `.Values.placement` nil, and a direct dereference crashes the render
+  before any cluster mutation (#2008). A nil or missing tree/class
+  degrades to the chart's empty defaults; a tree or class that is present
+  but not a map is refused with `fail`, deliberately -- `fromYaml` returns
+  an error map rather than an error for a non-map document, so softening
+  that refusal into a default would silently drop every scheduling
+  constraint the operator asked for. A new pod surface added to the chart
+  uses the helper with its class name rather than a fresh direct index.
 - **Fail-closed egress, always.** `security.networkPolicy.allowedEgress` is
   empty by default; an unset allowlist must never mean allow-all. If you add
   a new egress destination the runner needs, it goes into this allowlist
@@ -100,7 +143,12 @@ component and rail detail in `charts/curie/README.md`.
     instead by the worker's own boot-time refusal. Both checks are
     load-bearing -- the schema catches a bad value early for the common
     cases, the worker's refusal is the backstop for the coalescing gap the
-    schema cannot see.
+    schema cannot see. `placement` is the second instance of this exact
+    coalescing gap -- a release created before placement classes existed
+    can store `placement: null`, and `--reuse-values` on upgrade replays
+    it, deleting the key -- and the `curie.placement.class` helper (see
+    the values-keys invariant above) is its template-level backstop
+    (#2008).
 
 ## Verify
 

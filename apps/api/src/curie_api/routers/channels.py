@@ -36,6 +36,12 @@ from typing import Annotated, Any
 
 import redis.asyncio as redis
 from aci_protocol import STREAM_PAYLOAD_FIELD, QueuedTurn, ReplyHandle, TurnSource
+from curie_telemetry import (
+    TRACEPARENT_STREAM_FIELD,
+    inject_trace_context,
+    operation_span,
+    record_metric,
+)
 from fastapi import (
     APIRouter,
     Depends,
@@ -46,6 +52,7 @@ from fastapi import (
     status,
 )
 from fastapi.exceptions import RequestValidationError
+from opentelemetry.trace import SpanKind, StatusCode
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import select
 
@@ -224,9 +231,13 @@ def _unroutable(kind: str, address: str) -> HTTPException:
     return HTTPException(
         status.HTTP_409_CONFLICT,
         f"the binding for kind {kind!r} at address {address!r} has no reply "
-        "route: set its endpoint and adapter (PATCH the agent's channel) before "
-        "minting a token for it or posting turns to it, or its turns would be "
-        "enqueued with nowhere to reply and no credential to reply with.",
+        "route: set its endpoint and adapter before minting a token for it or "
+        "posting turns to it, or its turns would be enqueued with nowhere to "
+        "reply and no credential to reply with. Send them on "
+        "PATCH /agents/{agent_id}/channels, selecting this binding with "
+        f"?kind={kind}&address={address} -- or on POST /agents/{{agent_id}}"
+        "/channels when adding the binding. The agent-level `channel` field is "
+        "retired and rejects a binding write.",
     )
 
 
@@ -440,7 +451,7 @@ async def ingest_turn(
     owner = f"pending:{secrets.token_hex(16)}"
 
     # The generation, re-read at the LAST moment before the claim. The row above
-    # was loaded at the top of the request, and `update_agent_binding` bumps the
+    # was loaded at the top of the request, and `update_channel_binding` bumps the
     # generation on a rebind, so a credential revoked mid-request would otherwise
     # still enqueue against the binding it no longer names. Re-reading here
     # narrows that race from the whole request to the gap below; it does NOT
@@ -494,16 +505,70 @@ async def ingest_turn(
             # those requests answers from `event_id` alone and would have thrown
             # the payload away.
             turn = _mint_turn(row, body, event_id)
-            enqueued, current = await enqueue_owned(
-                client,
-                key=key,
-                stream=settings.runs_stream,
-                owner=owner,
-                payload=turn.model_dump_json(),
-                payload_field=STREAM_PAYLOAD_FIELD,
-                lease_s=settings.channel_delivery_lease_s,
-            )
+            carrier: dict[str, str] = {}
+            enqueue_error: Exception | None = None
+            enqueue_result: tuple[bool, str] | None = None
+            with operation_span(
+                "curie.queue.enqueue",
+                kind=SpanKind.PRODUCER,
+                attributes={"service.name": "curie-api", "source": "api"},
+            ) as span:
+                inject_trace_context(carrier)
+                try:
+                    enqueue_result = await enqueue_owned(
+                        client,
+                        key=key,
+                        stream=settings.runs_stream,
+                        owner=owner,
+                        payload=turn.model_dump_json(),
+                        payload_field=STREAM_PAYLOAD_FIELD,
+                        lease_s=settings.channel_delivery_lease_s,
+                        transport_field=(
+                            TRACEPARENT_STREAM_FIELD
+                            if TRACEPARENT_STREAM_FIELD in carrier
+                            else None
+                        ),
+                        transport_value=carrier.get(TRACEPARENT_STREAM_FIELD),
+                    )
+                except Exception as exc:
+                    enqueue_error = exc
+                    span.set_status(StatusCode.ERROR)
+                    span.add_event("queue.enqueue.failed", {"outcome": "failure"})
+                else:
+                    assert enqueue_result is not None
+                    span.add_event(
+                        "queue.enqueued" if enqueue_result[0] else "queue.duplicate",
+                        {"outcome": "success" if enqueue_result[0] else "pending"},
+                    )
+            if enqueue_error is not None:
+                record_metric(
+                    "curie.queue.enqueue",
+                    attributes={
+                        "service.name": "curie-api",
+                        "source": "api",
+                        "outcome": "failure",
+                    },
+                )
+                raise enqueue_error
+            assert enqueue_result is not None
+            enqueued, current = enqueue_result
             if enqueued:
+                record_metric(
+                    "curie.queue.enqueue",
+                    attributes={
+                        "service.name": "curie-api",
+                        "source": "api",
+                        "outcome": "success",
+                    },
+                )
+                record_metric(
+                    "curie.turn.accepted",
+                    attributes={
+                        "service.name": "curie-api",
+                        "source": "api",
+                        "outcome": "accepted",
+                    },
+                )
                 logger.info(
                     "channel ingress enqueued event_id=%s stream_id=%s kind=%s",
                     event_id,

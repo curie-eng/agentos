@@ -124,9 +124,8 @@ def _parse_trusted_origins(value: object) -> object:
 # ("http://localhost,http://127.0.0.1,...") raised SettingsError and killed the
 # worker at boot, and the BeforeValidator below was only ever reachable when the
 # env var was absent. Same declared-not-parsed defect as the boot env's (#1195).
-TrustedOrigins = Annotated[
-    tuple[str, ...], NoDecode, BeforeValidator(_parse_trusted_origins)
-]
+TrustedOrigins = Annotated[tuple[str, ...], NoDecode, BeforeValidator(_parse_trusted_origins)]
+CommaSeparatedNames = Annotated[tuple[str, ...], NoDecode, BeforeValidator(_parse_trusted_origins)]
 
 
 class WorkerConfig(BaseSettings):
@@ -338,16 +337,19 @@ class WorkerConfig(BaseSettings):
     # its first reclaim, and values below 3 undermine ADR-0013 crash recovery
     # (which relies on a reclaim actually retrying the entry).
     #
-    # Leave headroom above what a HEALTHY turn can legitimately burn. A single
-    # delivery may span up to ``max_attempts * runner_total_timeout_s`` (~1800s
-    # at defaults, see the retry knobs below), which exceeds
-    # ``reclaim_min_idle_ms`` (900s), so another replica can reclaim a turn that
-    # is still working and bump its delivery count. A healthy long turn can
-    # therefore accrue roughly
-    # ``(max_attempts * runner_total_timeout_s) / reclaim_min_idle_ms`` (~2 at
-    # defaults) deliveries on its own. ``max_delivery`` must stay comfortably
-    # above that: at the ``ge=2`` floor a slow but healthy turn could be
-    # dead-lettered while it is still making progress.
+    # A healthy long turn now accrues NO self-inflicted deliveries (ADR-0131).
+    # The delivery lease's heartbeat resets same-owner PEL idle with
+    # ``XCLAIM ... JUSTID``, which does not increment the delivery counter, and
+    # reclaim consults the lease's liveness before dispatching or dead-lettering
+    # a claim. This is a change from the pre-lease world: a single delivery
+    # could span up to ``max_attempts * runner_total_timeout_s`` (~1800s at
+    # defaults), which exceeded ``reclaim_min_idle_ms`` (900s), so another
+    # replica could reclaim a turn that was still working and bump its delivery
+    # count -- roughly 2 self-inflicted deliveries at defaults. That headroom no
+    # longer needs to exist; do not read the lease's arrival as license to lower
+    # ``max_delivery`` on the strength of it. The cap and its ``ge=2`` floor
+    # DO NOT CHANGE -- ADR-0039 stands, and weakening the cap is the #505 total
+    # stall regression, not a simplification.
     max_delivery: int = Field(default=5, ge=2, validation_alias="CURIE_MAX_DELIVERY")
     # Empty means "derive ``<stream>:dead``" at the use site; a static Field
     # default cannot reference ``self.stream``. An explicit override equal to
@@ -416,6 +418,114 @@ class WorkerConfig(BaseSettings):
             )
         return self
 
+    @model_validator(mode="after")
+    def _lease_spans_three_heartbeats(self) -> WorkerConfig:
+        """Fail at construction if the lease cannot survive two lost heartbeats.
+
+        ADR-0131: "the lease spans at least three heartbeat periods". With a
+        Valkey blip or a slow renewal, one missed heartbeat is routine; the
+        floor of three periods means two consecutive misses still leave a
+        healthy owner's lease live. A tighter ratio would drop a healthy long
+        turn on a single transient hiccup -- the exact flakiness the lease
+        exists to avoid, not introduce.
+        """
+        if self.delivery_lease_ttl_s < 3 * self.delivery_lease_heartbeat_s:
+            raise ValueError(
+                "CURIE_DELIVERY_LEASE_TTL_S "
+                f"({self.delivery_lease_ttl_s!r}) must be at least 3x "
+                "CURIE_DELIVERY_LEASE_HEARTBEAT_S "
+                f"({self.delivery_lease_heartbeat_s!r}): a shorter span drops a "
+                "healthy owner's lease on a single missed heartbeat"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _reclaim_scan_shorter_than_lease(self) -> WorkerConfig:
+        """Fail at construction if the reclaim scan is not faster than the lease.
+
+        ADR-0131: "the reclaim interval is shorter than the lease". A scan
+        cadence at or above the lease TTL leaves an expired lease unrecovered
+        for a whole extra scan pass -- directly widening the stranded-delivery
+        recovery window the lease exists to bound.
+        """
+        if self.reclaim_interval_s >= self.delivery_lease_ttl_s:
+            raise ValueError(
+                "CURIE_RECLAIM_INTERVAL_S "
+                f"({self.reclaim_interval_s!r}) must be strictly shorter than "
+                f"CURIE_DELIVERY_LEASE_TTL_S ({self.delivery_lease_ttl_s!r}): "
+                "a scan slower than the lease leaves an expired lease "
+                "unrecovered for a whole extra scan"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _termination_grace_covers_the_budget(self) -> WorkerConfig:
+        """Fail at construction if platform grace cannot cover budget + reserve.
+
+        ADR-0131: "platform termination grace is at least the execution budget
+        plus shutdown reserve." Below it, a worker draining a maximum-budget
+        turn is SIGKILLed at the exact moment it would settle -- the turn's
+        terminal effect is lost and the entry is left pending. ``None`` means
+        no platform grace was declared (compose, tests) and skips this check
+        entirely rather than guessing a value to compare against.
+        """
+        if self.termination_grace_period_s is None:
+            return self
+        required = self.delivery_budget_s + self.delivery_shutdown_reserve_s
+        if self.termination_grace_period_s < required:
+            raise ValueError(
+                "CURIE_TERMINATION_GRACE_PERIOD_S "
+                f"({self.termination_grace_period_s!r}) must be at least "
+                "CURIE_DELIVERY_BUDGET_S + CURIE_DELIVERY_SHUTDOWN_RESERVE_S "
+                f"({self.delivery_budget_s!r} + "
+                f"{self.delivery_shutdown_reserve_s!r} = {required!r}): a "
+                "shorter grace SIGKILLs a draining worker before it can settle "
+                "a maximum-budget turn"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _runner_request_fits_the_budget(self) -> WorkerConfig:
+        """Fail at construction if the per-request ceiling exceeds the budget.
+
+        ``runner_total_timeout_s`` is now a per-request ceiling INSIDE the
+        overall delivery budget, not an independent clock. A ceiling above the
+        budget is always dead configuration -- the budget expires first on
+        every request -- and reads as if it granted more time than it does.
+        """
+        if self.runner_total_timeout_s > self.delivery_budget_s:
+            raise ValueError(
+                "CURIE_RUNNER_TOTAL_TIMEOUT_S "
+                f"({self.runner_total_timeout_s!r}) must not exceed "
+                f"CURIE_DELIVERY_BUDGET_S ({self.delivery_budget_s!r}): a "
+                "per-request ceiling above the overall budget is dead "
+                "configuration, since the budget always expires first"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _quiesce_outlives_the_drain_wait(self) -> WorkerConfig:
+        """Fail at construction if the quiesce flag can lapse mid-drain.
+
+        The gate sets the flag once and then waits up to
+        ``upgrade_drain_timeout_s`` for the in-flight deliveries to settle. A
+        TTL at or below that wait expires the flag while the gate is still
+        waiting, so the replicas resume claiming into an upgrade that is about
+        to roll them -- re-creating the very interruption the gate exists to
+        prevent, and doing it silently (the gate would still report a clean
+        drain). Strictly greater, so there is real headroom.
+        """
+        if self.upgrade_quiesce_ttl_s <= self.upgrade_drain_timeout_s:
+            raise ValueError(
+                "CURIE_UPGRADE_QUIESCE_TTL_S "
+                f"({self.upgrade_quiesce_ttl_s!r}) must be strictly greater than "
+                "CURIE_UPGRADE_DRAIN_TIMEOUT_S "
+                f"({self.upgrade_drain_timeout_s!r}): a flag that lapses mid-drain "
+                "lets the replicas resume claiming into a roll that is about to "
+                "interrupt them"
+            )
+        return self
+
     # Read loop
     read_count: int = 16
     read_block_ms: int = 5000
@@ -460,20 +570,35 @@ class WorkerConfig(BaseSettings):
     # Crash recovery: reclaim stream entries pending longer than this, and run
     # the orphan-claim reaper, on this cadence.
     #
-    # This window does NOT cover the longest legitimate in-flight time. One
-    # delivery is not one runner call: the kernel may retry a flag-clean failure
-    # up to max_attempts (3) times WITHIN a single delivery, each bounded by
-    # runner_total_timeout_s (600s), so a healthy delivery can legitimately span
-    # up to ~max_attempts * runner_total_timeout_s = ~1800s -- twice this 900s
-    # idle threshold. A long healthy turn can therefore be reclaimed by another
-    # replica and accrue delivery count (see max_delivery's headroom note above).
-    # The consumer skips its OWN in-flight entry ids, so this only bites across
-    # replicas; that cross-replica dup-dispatch is pre-existing and tracked
-    # separately. Raising this threshold past
-    # max_attempts * runner_total_timeout_s would close it at the cost of slower
-    # crash recovery.
+    # This window is now a COMPATIBILITY BACKSTOP behind the delivery lease
+    # (ADR-0131), not the primary guard. Before the lease, this was the only
+    # signal available: one delivery is not one runner call -- the kernel may
+    # retry a flag-clean failure up to max_attempts (3) times WITHIN a single
+    # delivery, each bounded by runner_total_timeout_s (600s), so a healthy
+    # delivery could legitimately span up to ~max_attempts *
+    # runner_total_timeout_s = ~1800s, twice this 900s idle threshold -- and a
+    # long healthy turn could therefore be reclaimed by another replica and
+    # accrue delivery count. That cross-replica dup-dispatch is the defect this
+    # ticket fixes: the lease is checked for liveness before any reclaim path
+    # dispatches or dead-letters, so a live-leased entry is skipped regardless
+    # of this idle window. This value stays unchanged at 900000 as the backstop
+    # for the case a lease itself is somehow absent or already expired (e.g. a
+    # crashed owner past its lease TTL, where this threshold provides an
+    # independent, coarser second opinion). Raising it past
+    # max_attempts * runner_total_timeout_s would close the pre-lease gap
+    # entirely, but is not needed now that the lease is the primary guard, and
+    # would slow crash recovery for entries the lease mechanism cannot cover.
     reclaim_min_idle_ms: int = 900000
-    reclaim_interval_s: float = 30.0
+    # Unchanged at 30.0; now bound by ``_reclaim_scan_shorter_than_lease``,
+    # which enforces the ADR's actual requirement (scan strictly shorter than
+    # the lease TTL) rather than a specific number. See the delivery-lease
+    # block above for why 30.0 (not the ADR's stated initial 10.0) is kept: it
+    # is the whole maintenance-tick cadence, not a dedicated lease-scan loop.
+    reclaim_interval_s: float = Field(
+        default=30.0, gt=0, validation_alias="CURIE_RECLAIM_INTERVAL_S"
+    )
+    # Prompt reclaim for a consumer that has stopped interacting with the
+    # group (#1532). Entry idle is the wrong signal: a live replica's
     # A cheap observation threshold for prompt peer recovery (#1532), not a
     # liveness proof. XINFO consumer idle also rises while a live worker drains
     # an in-flight turn or waits at its concurrency limit, so prompt reclaim is
@@ -513,6 +638,70 @@ class WorkerConfig(BaseSettings):
 
     # Slack placeholder edits are throttled to avoid rate limits while streaming.
     slack_edit_min_interval_s: float = 0.7
+
+    # Delivery budget and ownership lease (ADR-0131, #1971).
+    #
+    # One deadline and one renewable fenced owner per ``(stream, group,
+    # entry_id)``. ``delivery_budget_s`` is the OVERALL wall-clock deadline for
+    # the whole delivery -- claim, every runner request, every retry backoff,
+    # reclaim, and terminal cleanup -- not just one runner call.
+    # ``runner_total_timeout_s`` (above) is now a per-request ceiling INSIDE
+    # this budget, not an independent clock: a stalled request is cut short by
+    # whichever of the two is smaller, but the budget is what actually bounds
+    # the delivery. The lease is the renewable proof of ownership that makes a
+    # healthy long turn un-reclaimable and a dead owner's turn recoverable
+    # after a bounded expiry, replacing the old dead pair of a flat HTTP
+    # timeout and a 900s idle-based steal window.
+    delivery_budget_s: float = Field(
+        default=600.0, ge=60.0, le=1800.0, validation_alias="CURIE_DELIVERY_BUDGET_S"
+    )
+    delivery_lease_ttl_s: float = Field(
+        default=45.0, gt=0, validation_alias="CURIE_DELIVERY_LEASE_TTL_S"
+    )
+    delivery_lease_heartbeat_s: float = Field(
+        default=10.0, gt=0, validation_alias="CURIE_DELIVERY_LEASE_HEARTBEAT_S"
+    )
+    delivery_shutdown_reserve_s: float = Field(
+        default=60.0, ge=0, validation_alias="CURIE_DELIVERY_SHUTDOWN_RESERVE_S"
+    )
+    # ---- Upgrade drain gate (issue #2010) --------------------------------
+    #
+    # ADR-0131 made ONE worker's own shutdown safe: grace covers budget +
+    # reserve, so a SIGTERMed replica can settle the delivery it owns. It says
+    # nothing about the PLATFORM roll around it. A `helm upgrade` rolls the
+    # worker and its backing services together, and an already-accepted
+    # side-effecting turn whose owner dies mid-flight is reclaimed by the
+    # replacement, which correctly refuses to re-run the action and escalates to
+    # a human. Duplicate effects are prevented and the requested task still does
+    # not complete -- the failure #2010 reports.
+    #
+    # These three knobs drive the pre-upgrade gate (``upgrade_drain.py``), which
+    # quiesces new claims and waits for every live-leased delivery to reach its
+    # terminal outcome BEFORE the roll begins, and refuses the upgrade when they
+    # do not.
+    upgrade_drain_timeout_s: float = Field(
+        default=900.0, gt=0, validation_alias="CURIE_UPGRADE_DRAIN_TIMEOUT_S"
+    )
+    upgrade_drain_poll_interval_s: float = Field(
+        default=5.0, gt=0, validation_alias="CURIE_UPGRADE_DRAIN_POLL_INTERVAL_S"
+    )
+    # How long the quiesce flag lives. FINITE on purpose: an upgrade that is
+    # killed between the gate and the post-upgrade release must not leave the
+    # fleet permanently unable to claim, so the flag lapses on its own. It must
+    # also outlast the drain wait, which is what the validator below enforces.
+    upgrade_quiesce_ttl_s: float = Field(
+        default=1200.0, gt=0, validation_alias="CURIE_UPGRADE_QUIESCE_TTL_S"
+    )
+
+    # The platform's voluntary termination grace, injected by the chart from
+    # the SAME value it renders onto the Pod's ``terminationGracePeriodSeconds``
+    # so the app's validator and the platform can never drift apart. ``None``
+    # means "no platform grace declared" (compose, tests, a bare
+    # ``WorkerConfig()`` in a unit test) and SKIPS the grace validator below
+    # rather than guessing a value for an environment that has none.
+    termination_grace_period_s: float | None = Field(
+        default=None, validation_alias="CURIE_TERMINATION_GRACE_PERIOD_S"
+    )
 
     # Runner HTTP timeouts
     runner_connect_timeout_s: float = 10.0
@@ -565,6 +754,150 @@ class WorkerConfig(BaseSettings):
     s3_secret_key: str = ""
     s3_region: str = "us-east-1"
     bundle_bucket: str = "curie-bundles"
+    # Managed repository workspaces use the same object-store endpoint but a
+    # private prefix and an exact-object signed read capability. The internal
+    # token is distinct from the operator/CLI API key and is mounted only into
+    # API and worker. The public dev default is replaced by the chart Secret in
+    # a cluster install.
+    internal_worker_token: str = Field(
+        default="curie-dev-worker-token",
+        validation_alias="CURIE_INTERNAL_WORKER_TOKEN",
+    )
+    workspace_bucket: str = Field(
+        default="curie-workspaces", validation_alias="CURIE_WORKSPACE_BUCKET"
+    )
+    workspace_enabled: bool = Field(
+        default=True, validation_alias="CURIE_WORKSPACE_ENABLED"
+    )
+    workspace_object_prefix: str = Field(
+        default="private/workspaces",
+        validation_alias="CURIE_WORKSPACE_OBJECT_PREFIX",
+    )
+    workspace_scratch_root: str = Field(
+        default="/tmp/curie-workspaces",
+        validation_alias="CURIE_WORKSPACE_SCRATCH_ROOT",
+    )
+    workspace_clone_timeout_seconds: int = Field(
+        default=90, gt=0, validation_alias="CURIE_WORKSPACE_CLONE_TIMEOUT_SECONDS"
+    )
+    workspace_archive_timeout_seconds: int = Field(
+        default=30, gt=0, validation_alias="CURIE_WORKSPACE_ARCHIVE_TIMEOUT_SECONDS"
+    )
+    workspace_upload_timeout_seconds: int = Field(
+        default=30, gt=0, validation_alias="CURIE_WORKSPACE_UPLOAD_TIMEOUT_SECONDS"
+    )
+    workspace_total_timeout_seconds: int = Field(
+        default=150, gt=0, validation_alias="CURIE_WORKSPACE_TOTAL_TIMEOUT_SECONDS"
+    )
+    workspace_max_checkout_bytes: int = Field(
+        default=512 * 1024 * 1024,
+        gt=0,
+        validation_alias="CURIE_WORKSPACE_MAX_CHECKOUT_BYTES",
+    )
+    workspace_max_archive_bytes: int = Field(
+        default=256 * 1024 * 1024,
+        gt=0,
+        validation_alias="CURIE_WORKSPACE_MAX_ARCHIVE_BYTES",
+    )
+    workspace_max_members: int = Field(
+        default=50_000, gt=0, validation_alias="CURIE_WORKSPACE_MAX_MEMBERS"
+    )
+    workspace_max_compression_ratio: float = Field(
+        default=20.0,
+        gt=0,
+        validation_alias="CURIE_WORKSPACE_MAX_COMPRESSION_RATIO",
+    )
+    workspace_reference_ttl_seconds: int = Field(
+        default=300, gt=0, validation_alias="CURIE_WORKSPACE_REFERENCE_TTL_SECONDS"
+    )
+    workspace_max_concurrent_clones: int = Field(
+        default=2, gt=0, validation_alias="CURIE_WORKSPACE_MAX_CONCURRENT_CLONES"
+    )
+    # Approval-gated publication runs only on the Kubernetes substrate. These
+    # values shape the worker-owned Job; none are bundle inputs.
+    publication_enabled: bool = Field(
+        default=True, validation_alias="CURIE_PUBLICATION_ENABLED"
+    )
+    publication_namespace: str = Field(
+        default="curie-publication", validation_alias="CURIE_PUBLICATION_NAMESPACE"
+    )
+    publication_patch_max_bytes: int = Field(
+        default=900_000,
+        gt=0,
+        le=900_000,
+        validation_alias="CURIE_PUBLICATION_PATCH_MAX_BYTES",
+    )
+    publication_result_max_attempts: int = Field(
+        default=5, gt=0, validation_alias="CURIE_PUBLICATION_RESULT_MAX_ATTEMPTS"
+    )
+    publication_reconcile_max_attempts: int = Field(
+        default=10,
+        gt=0,
+        validation_alias="CURIE_PUBLICATION_RECONCILE_MAX_ATTEMPTS",
+    )
+    publication_job_active_deadline_seconds: int = Field(
+        default=300,
+        gt=0,
+        validation_alias="CURIE_PUBLICATION_JOB_ACTIVE_DEADLINE_SECONDS",
+    )
+    publication_git_command_timeout_seconds: int = Field(
+        default=120,
+        gt=0,
+        validation_alias="CURIE_PUBLICATION_GIT_COMMAND_TIMEOUT_SECONDS",
+    )
+    publication_github_api_url: str = Field(
+        default="https://api.github.com",
+        validation_alias="CURIE_PUBLICATION_GITHUB_API_URL",
+    )
+    publication_reconcile_interval_seconds: float = Field(
+        default=2.0,
+        gt=0,
+        validation_alias="CURIE_PUBLICATION_RECONCILE_INTERVAL_SECONDS",
+    )
+    publication_lease_seconds: int = Field(
+        default=60, gt=0, validation_alias="CURIE_PUBLICATION_LEASE_SECONDS"
+    )
+    publication_image_pull_policy: str = Field(
+        default="IfNotPresent", validation_alias="CURIE_PUBLICATION_IMAGE_PULL_POLICY"
+    )
+    publication_image_pull_secrets: CommaSeparatedNames = Field(
+        default=(), validation_alias="CURIE_PUBLICATION_IMAGE_PULL_SECRETS"
+    )
+    publication_priority_class_name: str = Field(
+        default="curie-platform-critical",
+        validation_alias="CURIE_PUBLICATION_PRIORITY_CLASS_NAME",
+    )
+    publication_service_account_name: str = Field(
+        default="curie-publication",
+        validation_alias="CURIE_PUBLICATION_SERVICE_ACCOUNT_NAME",
+    )
+    publication_owner_name: str = Field(
+        default="curie-publication-owner",
+        validation_alias="CURIE_PUBLICATION_OWNER_NAME",
+    )
+    publication_git_user_name: str = Field(
+        default="Curie Publisher", validation_alias="CURIE_PUBLICATION_GIT_USER_NAME"
+    )
+    publication_git_user_email: str = Field(
+        default="publisher@example.com",
+        validation_alias="CURIE_PUBLICATION_GIT_USER_EMAIL",
+    )
+    publication_cpu_request: str = Field(
+        default="100m", validation_alias="CURIE_PUBLICATION_CPU_REQUEST"
+    )
+    publication_cpu_limit: str = Field(default="1", validation_alias="CURIE_PUBLICATION_CPU_LIMIT")
+    publication_memory_request: str = Field(
+        default="256Mi", validation_alias="CURIE_PUBLICATION_MEMORY_REQUEST"
+    )
+    publication_memory_limit: str = Field(
+        default="1Gi", validation_alias="CURIE_PUBLICATION_MEMORY_LIMIT"
+    )
+    publication_ephemeral_request: str = Field(
+        default="1Gi", validation_alias="CURIE_PUBLICATION_EPHEMERAL_REQUEST"
+    )
+    publication_ephemeral_limit: str = Field(
+        default="4Gi", validation_alias="CURIE_PUBLICATION_EPHEMERAL_LIMIT"
+    )
     # Bundle extraction bounds (ADR-0059 decision 3), applied by the Docker
     # substrate's claim-time bundle-fetch (`sandbox/docker.py`'s
     # `_prepare_bundle` -> `bundle_store.extract_bundle`) and the eval-stream
@@ -677,6 +1010,28 @@ class WorkerConfig(BaseSettings):
     def side_effect_key(self, event_id: str) -> str:
         return f"{self.key_prefix}:sidefx:{event_id}"
 
+    def delivery_lease_key(self, stream: str, group: str, entry_id: str) -> str:
+        """The lease STRING key: the opaque owner token, TTL'd at
+        ``delivery_lease_ttl_s``. Keyed by the delivery triple
+        ``(stream, group, entry_id)``, NOT the event id -- the same event id
+        can legitimately be redelivered under a new entry id after a
+        dead-letter, and keying by event id would fence the wrong thing. Absent
+        means no live owner; expiry IS how ownership becomes transferable.
+        """
+        return f"{self.key_prefix}:lease:{stream}:{group}:{entry_id}"
+
+    def delivery_state_key(self, stream: str, group: str, entry_id: str) -> str:
+        """The delivery state HASH key: ``deadline_ms`` (absolute, Valkey server
+        time, create-if-absent) and ``gen`` (the fencing generation,
+        HINCRBY'd on each acquisition). Retained for ``idempotency_ttl_s``
+        (86400s) -- deliberately longer than the lease so the generation
+        survives lease expiry and a fresh acquisition's deadline is never
+        re-minted from an entry that merely lost its short-lived lease.
+        Explicitly deleted on terminal ACK and dead-letter settlement; the TTL
+        is only the backstop for a crash between the two.
+        """
+        return f"{self.key_prefix}:delivery:{stream}:{group}:{entry_id}"
+
     def completion_key(self, event_id: str) -> str:
         # The durable outbox record for this event's ``turn.completed``. NO TTL:
         # a payload that expires under a longer-lived set membership is a
@@ -688,6 +1043,14 @@ class WorkerConfig(BaseSettings):
         # loop must not scan a production Valkey, and a redelivery-only sweep
         # would never reach a turn whose stream entry was already acked.
         return f"{self.key_prefix}:completions:pending"
+
+    def upgrade_quiesce_key(self) -> str:
+        # The fleet-wide "stop taking new work" flag the pre-upgrade gate sets
+        # (issue #2010). One key for the whole release, not one per replica: the
+        # gate runs as a Job that knows nothing about how many replicas exist,
+        # and every consumer reads the same flag. Always written with a TTL --
+        # see ``upgrade_quiesce_ttl_s`` for why it must never be permanent.
+        return f"{self.key_prefix}:upgrade:quiesce"
 
     def lock_key(self, thread_key: str) -> str:
         return f"{self.key_prefix}:lock:{thread_key}"

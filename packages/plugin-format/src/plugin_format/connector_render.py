@@ -542,10 +542,23 @@ def render(
     no pod: every connector tool call dies as a bare connection timeout with no
     policy error anywhere. A positional call site cannot express that mistake
     here because there is no positional call site.
+
+    A `build:` connector whose lock has not been applied raises instead of
+    rendering (ADR 0113). The alternative is `render_deployment` emitting
+    `"image": None`, which applies as an invalid Deployment and surfaces as an
+    opaque Kubernetes error a long way from its cause. `connector_lock.apply_lock`
+    is what resolves it, so the message names the artifact that is missing.
     """
 
     if not spec.is_hosted:
         return []
+    if spec.image is None:
+        raise ValueError(
+            f"connector {connector!r} declares `build:` and has no resolved image. "
+            "Its digest lives in connectors.lock.yaml, which `curie build "
+            "--plugin-dir <dir>` writes, and connector_lock.apply_lock applies "
+            "before anything renders."
+        )
     return [
         render_service(release, agent, connector, spec),
         render_deployment(release, agent, namespace, connector, spec, secret_name),

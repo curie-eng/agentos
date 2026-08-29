@@ -34,7 +34,7 @@ from . import bundles, crud, deploy
 from .config import Settings
 from .evalqueue import EvalQueue, now_iso
 from .github_app import credentials_for
-from .models import Agent, AgentVersion, Environment
+from .models import GIT_FLOW_CREATED_BY, Agent, AgentVersion, Environment
 from .repo_full_name import InvalidRepoFullName, repo_url_path
 from .schemas import WebhookResult
 from .storage import ObjectStore
@@ -607,7 +607,9 @@ async def process_push(
         # correct and is what an unmatched branch already does.
         return WebhookResult(status="ignored")
 
-    version = await crud.get_version_by_commit(session, agent.id, after)
+    version = await crud.get_version_by_commit(
+        session, agent.id, after, created_by=GIT_FLOW_CREATED_BY
+    )
     # Only a version whose bundle is actually stored may be reused for promote.
     # A row with bundle_ref still None is the residue of a prior attempt that
     # failed after the row committed; rebuild and store into it rather than
@@ -621,7 +623,7 @@ async def process_push(
                 session,
                 agent.id,
                 version_label=after[:12],
-                created_by="git-flow",
+                created_by=GIT_FLOW_CREATED_BY,
                 commit_sha=after,
             )
         # Bundle-once, bind-many (ADR-0091). A sibling agent in this repository
@@ -930,7 +932,9 @@ async def _bundled_version_for_commit(
     for candidate in repo_agents:
         if exclude_agent_id is not None and candidate.id == exclude_agent_id:
             continue
-        existing = await crud.get_version_by_commit(session, candidate.id, commit_sha)
+        existing = await crud.get_version_by_commit(
+            session, candidate.id, commit_sha, created_by=GIT_FLOW_CREATED_BY
+        )
         if existing is not None and existing.bundle_ref:
             return existing
     return None

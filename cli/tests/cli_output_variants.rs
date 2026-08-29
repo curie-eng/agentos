@@ -34,10 +34,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use curie::api::{ApprovalRecord, MemoryEntry, Version};
+use curie::api::{
+    ApprovalRecord, ChannelBinding, MemoryEntry, MetricPoint, MetricSeries, MetricsSummary, Version,
+};
 use curie::commands::{
-    ApprovalsOutput, BudgetOutput, DeleteOutput, KillOutput, MemoryOutput, OverridesOutput,
-    ResetThreadOutput, ResumeOutput, SkillApprovalsOutput, VersionsOutput,
+    ApprovalsOutput, BudgetOutput, ChannelsOutput, DeleteOutput, KillOutput, MemoryOutput,
+    OverridesOutput, ResetThreadOutput, ResumeOutput, SkillApprovalsOutput, VersionsOutput,
 };
 use curie::comms::CommsOutput;
 use curie::github_app::GithubAppOutput;
@@ -47,7 +49,7 @@ use curie::local::{
 };
 use curie::message::MessageOutcomeOutput;
 use curie::migrate_store::MigrateStoreOutput;
-use curie::observability::{Endpoint, ObservabilityOutput};
+use curie::observability::{Endpoint, ObservabilityMetricsOutput, ObservabilityOutput};
 use curie::ops::{
     ClusterDownOutput, ClusterRollbackOutput, ClusterStatus, ClusterStatusOutput, ClusterUpOutput,
 };
@@ -225,6 +227,23 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
         ],
     );
     m.insert(
+        "ChannelsOutput",
+        samples![
+            "DryRun" => ChannelsOutput::DryRun(plan()),
+            // Two bindings, because one is the case that hid the whole defect
+            // class: a payload shaped right for a single binding says nothing
+            // about the plural surface ADR-0118 introduced.
+            "Done" => ChannelsOutput::Done {
+                agent: "a".to_string(),
+                channels: vec![
+                    ChannelBinding { kind: "slack".to_string(), address: "C0EXAMPLE1".to_string() },
+                    ChannelBinding { kind: "slack".to_string(), address: "C0EXAMPLE2".to_string() },
+                ],
+                changed: true,
+            },
+        ],
+    );
+    m.insert(
         "ResetThreadOutput",
         samples![
             "DryRun" => ResetThreadOutput::DryRun(plan()),
@@ -281,31 +300,23 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 truncated: false,
             },
             "Resolved" => ApprovalsOutput::Resolved { record: approval_record() },
-            // Both binding shapes in one sample so the schema gate sees a route
-            // WITH an approvers block and one without: the absent block is the
-            // zero-setup default (card-channel membership), which is a distinct
-            // wire state from a declared one, not merely a missing key.
+            // Both binding shapes in one sample so the schema gate sees the
+            // resolution/notification split and the optional approvers block.
+            // Response deserialization is deliberate: transport fields are
+            // write-only and must never be constructible in display output.
             "Routes" => ApprovalsOutput::Routes {
                 agent: "a".to_string(),
-                routes: std::collections::BTreeMap::from([
-                    (
-                        "deal_desk".to_string(),
-                        curie::api::ApprovalRouteBinding {
-                            channel: Some("C0MANAGERS".to_string()),
-                            approvers: None,
-                        },
-                    ),
-                    (
-                        "finance".to_string(),
-                        curie::api::ApprovalRouteBinding {
-                            channel: Some("C0FINANCE0".to_string()),
-                            approvers: Some(curie::api::ApprovalApprovers {
-                                group: Some("S0FINGRP0".to_string()),
-                                users: None,
-                            }),
-                        },
-                    ),
-                ]),
+                routes: serde_json::from_value(serde_json::json!({
+                    "deal_desk": {
+                        "resolution": {"kind": "slack", "address": "C0EXAMPLE1"},
+                        "notification": {"kind": "slack", "address": "C0EXAMPLE2"}
+                    },
+                    "finance": {
+                        "resolution": {"kind": "slack", "address": "C0EXAMPLE3"},
+                        "approvers": {"group": "S0FINGRP0"}
+                    }
+                }))
+                .expect("approval route response mirror deserializes its display shape"),
             },
         ],
     );
@@ -427,6 +438,31 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
         samples![
             "DryRun" => ObservabilityOutput::DryRun(plan()),
             "Surfaces" => ObservabilityOutput::Surfaces(Vec::<Endpoint>::new()),
+        ],
+    );
+    m.insert(
+        "ObservabilityMetricsOutput",
+        samples![
+            "Summary" => ObservabilityMetricsOutput::Summary(MetricsSummary {
+                start: "2026-08-22T00:00:00Z".to_string(),
+                end: "2026-08-23T00:00:00Z".to_string(),
+                runs: 3,
+                latency_p95_ms: 25.0,
+                tokens: 42,
+                cost_usd: 0.0,
+                cost_known: false,
+                error_rate: 0.0,
+            }),
+            "Series" => ObservabilityMetricsOutput::Series(MetricSeries {
+                metric: "runs".to_string(),
+                granularity: "day".to_string(),
+                start: "2026-08-22T00:00:00Z".to_string(),
+                end: "2026-08-23T00:00:00Z".to_string(),
+                points: vec![MetricPoint {
+                    ts: "2026-08-22T00:00:00Z".to_string(),
+                    value: 3.0,
+                }],
+            }),
         ],
     );
     m.insert(

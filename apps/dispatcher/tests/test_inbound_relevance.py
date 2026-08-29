@@ -1060,16 +1060,16 @@ def test_every_inbound_payload_is_enqueued_or_refused_with_a_named_reason(
         assert redis_client.exists(config.dedupe_key(row.dedupe_id)) == 0, row.why
 
 
-def test_a_non_empty_top_level_text_is_enqueued_byte_identically(
+def test_a_non_empty_top_level_text_is_derived_before_nexts_self_mention_policy(
     redis_client: redis.Redis, config: DispatcherConfig
 ) -> None:
-    """The negative control for AC 1: derivation must not fire when it must not.
+    """The negative control for AC 1: derivation must not rewrite authored text.
 
-    Slack sends the `<@U0BOT>` mention markup inside `text`, and the worker's own
-    mention handling depends on it surviving. If the derivation rewrote, joined,
-    stripped or re-ordered a message that already had a body, every existing
-    enqueue would silently change meaning -- so this asserts byte identity,
-    including the surrounding whitespace, rather than "contains".
+    The next release train already strips its own Slack mention after text
+    derivation (#1525), so the end-to-end queue value reflects that established
+    policy. The dedicated inbound-text tests retain the byte-identical contract
+    at the derivation seam itself; this assertion makes the forward merge prove
+    that main's Block Kit fallback composes with next's mention normalization.
     """
     original = "  <@U0BOT> deploy prod  "
     harness = _build_harness(config, redis_client)
@@ -1084,7 +1084,7 @@ def test_a_non_empty_top_level_text_is_enqueued_byte_identically(
     assert harness.errors == []
     entries = _stream_entries(redis_client, config)
     assert len(entries) == 1
-    assert from_stream_fields(entries[0][1]).text == original
+    assert from_stream_fields(entries[0][1]).text == "deploy prod"
 
 
 # ---------------------------------------------------------------------------

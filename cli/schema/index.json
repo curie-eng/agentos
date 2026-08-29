@@ -19,7 +19,7 @@
       "result": "ApprovalsOutput",
       "kind": "CliOutput",
       "schema": "approvals.schema.json",
-      "version": "1.2"
+      "version": "2.0"
     },
     {
       "result": "BudgetOutput",
@@ -31,6 +31,12 @@
       "result": "BumpVersionOutput",
       "kind": "CliOutput",
       "schema": "bump-version.schema.json",
+      "version": "1.0"
+    },
+    {
+      "result": "ChannelsOutput",
+      "kind": "CliOutput",
+      "schema": "surfaces.schema.json",
       "version": "1.0"
     },
     {
@@ -73,6 +79,12 @@
       "result": "CommsOutput",
       "kind": "CliOutput",
       "schema": "comms.schema.json",
+      "version": "1.0"
+    },
+    {
+      "result": "ConnectorBuildOutput",
+      "kind": "CliOutput",
+      "schema": "build.schema.json",
       "version": "1.0"
     },
     {
@@ -190,9 +202,27 @@
       "version": "1.0"
     },
     {
+      "result": "ObservabilityMetricsOutput",
+      "kind": "CliOutput",
+      "schema": "observability-metrics.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "ObservabilityOutput",
       "kind": "CliOutput",
       "schema": "observability.schema.json",
+      "version": "1.0"
+    },
+    {
+      "result": "ObservabilityRunOutput",
+      "kind": "CliOutput",
+      "schema": "observability-run.schema.json",
+      "version": "1.0"
+    },
+    {
+      "result": "ObservabilityRunsOutput",
+      "kind": "CliOutput",
+      "schema": "observability-runs.schema.json",
       "version": "1.0"
     },
     {

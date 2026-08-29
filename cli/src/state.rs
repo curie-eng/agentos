@@ -43,6 +43,16 @@ pub struct RunnerState {
     /// (never re-derived) so teardown removes exactly what boot created.
     #[serde(default)]
     pub bundle_snapshot_dir: Option<String>,
+    /// The connector containers this boot created, recorded (never re-derived)
+    /// so `skill down` reaps exactly what `skill up` started. Without the
+    /// record a run that dies mid-turn leaves labeled containers holding a
+    /// resolved credential -- the failure class #747 fixed once for the runner.
+    #[serde(default)]
+    pub connector_containers: Vec<String>,
+    /// The network the connectors and the runner share, when this boot made
+    /// one. `None` for a bundle that declares no hosted connector.
+    #[serde(default)]
+    pub connector_network: Option<String>,
 }
 
 fn state_path(dir: &Path) -> PathBuf {
@@ -259,6 +269,8 @@ mod tests {
             model_base_url: None,
             bundle_digest: None,
             bundle_snapshot_dir: None,
+            connector_containers: Vec::new(),
+            connector_network: None,
         }
     }
 

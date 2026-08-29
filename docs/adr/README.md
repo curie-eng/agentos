@@ -141,8 +141,27 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0109 | [Retention, capacity, and back pressure are one policy: a claim is admitted, not discovered](0109-retention-capacity-and-back-pressure-are-one-policy.md) | Draft |
 | 0110 | [Deterministic security posture classification distinguishes manifest declarations from operator gates](0110-deterministic-security-posture-classification.md) | Draft |
 | 0111 | [The default memory compaction algorithm](0111-the-default-memory-compaction-algorithm.md) | Draft |
+| 0112 | [A turn source names what caused the turn, not the channel it arrived on](0112-a-turn-source-names-what-caused-the-turn.md) | Draft |
 | 0113 | [Bundles declare connector build inputs and tiers deliver pinned images](0113-bundles-declare-connector-build-inputs-and-tiers-deliver-pinned-images.md) | Accepted |
 | 0114 | [Cluster up infers detected install facts](0114-cluster-up-infers-detected-install-facts.md) | Accepted |
 | 0115 | [Agents call each other directly, with no third party in the path](0115-agents-call-each-other-with-no-third-party.md) | Draft |
+| 0116 | [Session identity arrives over the ACI so a sandbox can be pre-bound](0116-session-identity-arrives-over-the-aci-so-a-sandbox-can-be-pre-bound.md) | Accepted |
+| 0117 | [A tool that changes the world reports what it changed, and the platform can put it back](0117-a-tool-that-changes-the-world-reports-what-it-changed.md) | Accepted |
+| 0118 | [Binding cardinality is the multi surface opt in](0118-binding-cardinality-is-the-multi-surface-opt-in.md) | Accepted |
+| 0119 | [A resumed thread rebuilds its prefix so the prompt cache still hits](0119-a-resumed-thread-rebuilds-its-prefix-so-the-prompt-cache-still-hits.md) | Draft |
+| 0120 | [First-party email delivery state is local durable single-writer state](0120-durable-first-party-email-state.md) | Accepted |
+| 0121 | [A restore is the connector's own verb, run under the same pinned connector](0121-a-restore-is-the-connectors-own-verb-run-under-the-same-pinned-connector.md) | Draft |
+| 0122 | [A warm pool's runner token is per version, not per pod](0122-a-warm-pools-runner-token-is-per-version-not-per-pod.md) | Draft |
 | 0123 | [A pending approval's approver set does not follow its route binding](0123-a-pending-approvals-approver-set-does-not-follow-its-route-binding.md) | Accepted |
+| 0124 | [A snapshot is sealed to the connector that wrote it](0124-a-snapshot-is-sealed-to-the-connector-that-wrote-it.md) | Draft |
+| 0125 | [Managed repository workspaces and approval-gated publication are platform capabilities](0125-managed-repository-workspaces-and-approval-gated-publication.md) | Accepted |
+| 0126 | [Runtime repository selection is sticky authorized thread state](0126-runtime-repository-selection-is-sticky-authorized-thread-state.md) | Accepted |
+| 0127 | [An inbound ACP client admits any ACP harness behind the harness port](0127-an-inbound-acp-client-admits-any-acp-harness.md) | Draft |
+| 0128 | [An installation owns the model gateway and operator bindings select its aliases](0128-install-owned-model-gateway-and-agent-aliases.md) | Draft |
+| 0129 | [One release owns a cluster's shared singletons; every other release declares what it needs from them](0129-one-release-owns-a-clusters-shared-singletons.md) | Draft |
+| 0130 | [Deliberate progress is bounded durable channel state, not answer streaming](0130-deliberate-progress-is-bounded-durable-channel-state.md) | Accepted |
+| 0131 | [A delivery has one deadline and one renewable fenced owner](0131-a-delivery-has-one-deadline-and-one-renewable-fenced-owner.md) | Accepted |
+| 0132 | [Gate evals on the worst cohort and require cross-family verifiers](0132-worst-cohort-eval-gates-and-cross-family-verifiers.md) | Draft |
+| 0133 | [The control agent renders screens; a human presses the buttons](0133-the-control-agent-renders-screens-a-human-presses.md) | Draft |
+| 0134 | [A hook shares one thread per partition](0134-a-hook-shares-one-thread-per-partition.md) | Draft |
 <!-- END GENERATED: adr-index -->

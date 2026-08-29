@@ -739,3 +739,263 @@ def test_recorder_health_precondition_fails_when_service_is_unavailable(
         assert unavailable_host in message
     else:
         pytest.fail("health precondition returned successfully while its service was absent")
+
+
+# --- Delivery budget and ownership lease (ADR-0131, #1971) --------------------
+#
+# One deadline and one renewable fenced owner per delivery. The four cross-field
+# validators below exist because each relationship is invisible until an
+# incident: a lease that cannot span three heartbeat periods drops a healthy turn
+# on a single Valkey blip; a reclaim scan slower than the lease leaves an expired
+# lease unrecovered for a whole extra scan; a termination grace below
+# budget + reserve SIGKILLs a draining worker at the exact moment it would
+# settle; and a per-request runner ceiling above the overall budget is dead
+# configuration that reads as if it granted more time than it does. The operator
+# must learn at boot, not at 2am -- so each rejection NAMES the env vars.
+
+_LEASE_BASELINE: dict[str, object] = {
+    "delivery_budget_s": 600.0,
+    "delivery_lease_ttl_s": 45.0,
+    "delivery_lease_heartbeat_s": 10.0,
+    "delivery_shutdown_reserve_s": 60.0,
+    "reclaim_interval_s": 30.0,
+    "runner_total_timeout_s": 600.0,
+    "termination_grace_period_s": None,
+}
+
+
+def _lease_config(**overrides: object) -> WorkerConfig:
+    """A self-consistent delivery config with exactly ONE relationship perturbed.
+
+    Validators run in declaration order and the first raise wins, so a test that
+    perturbed two relationships at once could assert on the wrong message. Every
+    test below moves one knob off this baseline and leaves the rest satisfied.
+    """
+    values = dict(_LEASE_BASELINE)
+    values.update(overrides)
+    return WorkerConfig(**values)
+
+
+def test_delivery_lease_fields_carry_the_adr_initial_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ADR-0131's stated initial values. Drifting a default here silently changes
+    the fence's timing on every deployment that does not override it."""
+    _clear_all_config_env(monkeypatch)
+
+    config = WorkerConfig()
+
+    assert config.delivery_budget_s == 600.0
+    assert config.delivery_lease_ttl_s == 45.0
+    assert config.delivery_lease_heartbeat_s == 10.0
+    assert config.delivery_shutdown_reserve_s == 60.0
+    # None means "no platform grace declared" (compose, tests) and SKIPS the
+    # grace validator rather than guessing a value for it.
+    assert config.termination_grace_period_s is None
+    # Unchanged by this train, but now bound by a validator: 30 < 45 satisfies
+    # the ADR's "the reclaim interval is shorter than the lease".
+    assert config.reclaim_interval_s == 30.0
+
+
+def test_delivery_knobs_read_their_curie_aliases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The chart templates these five as first-class env; a name drift here means
+    an operator's --set silently does nothing."""
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_DELIVERY_BUDGET_S", "1800")
+    monkeypatch.setenv("CURIE_DELIVERY_LEASE_TTL_S", "90")
+    monkeypatch.setenv("CURIE_DELIVERY_LEASE_HEARTBEAT_S", "20")
+    monkeypatch.setenv("CURIE_DELIVERY_SHUTDOWN_RESERVE_S", "45")
+    monkeypatch.setenv("CURIE_TERMINATION_GRACE_PERIOD_S", "1860")
+    monkeypatch.setenv("CURIE_RECLAIM_INTERVAL_S", "10")
+
+    config = WorkerConfig()
+
+    assert config.delivery_budget_s == 1800.0
+    assert config.delivery_lease_ttl_s == 90.0
+    assert config.delivery_lease_heartbeat_s == 20.0
+    assert config.delivery_shutdown_reserve_s == 45.0
+    assert config.termination_grace_period_s == 1860.0
+    assert config.reclaim_interval_s == 10.0
+
+
+def test_delivery_knobs_ignore_bare_field_name_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Aliased like every other CURIE_* knob: a stray bare-name env var in the
+    pod env must not leak into the fence's timing."""
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("DELIVERY_BUDGET_S", "1800")
+    monkeypatch.setenv("DELIVERY_LEASE_TTL_S", "1")
+    monkeypatch.setenv("DELIVERY_LEASE_HEARTBEAT_S", "1")
+    monkeypatch.setenv("DELIVERY_SHUTDOWN_RESERVE_S", "0")
+    monkeypatch.setenv("TERMINATION_GRACE_PERIOD_S", "5")
+
+    config = WorkerConfig()
+
+    assert config.delivery_budget_s == 600.0
+    assert config.delivery_lease_ttl_s == 45.0
+    assert config.delivery_lease_heartbeat_s == 10.0
+    assert config.delivery_shutdown_reserve_s == 60.0
+    assert config.termination_grace_period_s is None
+
+
+def test_delivery_budget_accepts_the_adr_maximum_and_rejects_above_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """1800s is the ADR's stated maximum ("Operators may configure 1,800
+    seconds"). A higher value would silently require a termination grace the
+    chart schema will not accept, so it is refused here instead."""
+    _clear_all_config_env(monkeypatch)
+
+    assert _lease_config(delivery_budget_s=1800.0).delivery_budget_s == 1800.0
+
+    with pytest.raises(ValueError):
+        _lease_config(delivery_budget_s=1800.5)
+
+
+def test_delivery_budget_accepts_its_floor_and_rejects_below_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A budget under a minute cannot cover claim + one runner request + settle,
+    so it is a misconfiguration rather than an aggressive tuning choice."""
+    _clear_all_config_env(monkeypatch)
+
+    # runner_total_timeout_s must come down with it -- see the fourth validator.
+    assert (
+        _lease_config(delivery_budget_s=60.0, runner_total_timeout_s=60.0).delivery_budget_s
+        == 60.0
+    )
+
+    with pytest.raises(ValueError):
+        _lease_config(delivery_budget_s=59.9, runner_total_timeout_s=59.9)
+
+
+def test_lease_ttl_must_span_three_heartbeat_periods(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ADR-0131: "the lease spans at least three heartbeat periods". Two lost
+    heartbeats must not lose a healthy turn's lease -- reverting this validator
+    lets an operator configure a fence that a single Valkey blip breaks."""
+    _clear_all_config_env(monkeypatch)
+
+    # The boundary itself PASSES: exactly three periods is the ADR's floor.
+    at_the_boundary = _lease_config(delivery_lease_ttl_s=45.0, delivery_lease_heartbeat_s=15.0)
+    assert at_the_boundary.delivery_lease_ttl_s == 45.0
+
+    # One tick below the boundary fails.
+    with pytest.raises(ValueError) as exc_info:
+        _lease_config(delivery_lease_ttl_s=44.9, delivery_lease_heartbeat_s=15.0)
+
+    message = str(exc_info.value)
+    assert "CURIE_DELIVERY_LEASE_TTL_S" in message
+    assert "CURIE_DELIVERY_LEASE_HEARTBEAT_S" in message
+
+
+def test_reclaim_interval_must_be_strictly_shorter_than_the_lease_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ADR-0131: "the reclaim interval is shorter than the lease". A scan slower
+    than the lease leaves an expired lease unrecovered for a whole extra scan,
+    which is exactly the stranded-delivery latency the fence exists to bound."""
+    _clear_all_config_env(monkeypatch)
+
+    just_under = _lease_config(delivery_lease_ttl_s=45.0, reclaim_interval_s=44.9)
+    assert just_under.reclaim_interval_s == 44.9
+
+    # Equal is NOT shorter: the relationship is strict.
+    with pytest.raises(ValueError) as exc_info:
+        _lease_config(delivery_lease_ttl_s=45.0, reclaim_interval_s=45.0)
+
+    message = str(exc_info.value)
+    assert "CURIE_RECLAIM_INTERVAL_S" in message
+    assert "CURIE_DELIVERY_LEASE_TTL_S" in message
+
+
+def test_termination_grace_must_cover_the_budget_plus_the_shutdown_reserve(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ADR-0131: "platform termination grace is at least the execution budget
+    plus shutdown reserve". Below it, a worker draining a maximum-budget turn is
+    SIGKILLed at the exact moment it would settle -- the turn's terminal effect
+    is lost and the entry is left pending."""
+    _clear_all_config_env(monkeypatch)
+
+    exactly_enough = _lease_config(
+        delivery_budget_s=600.0,
+        delivery_shutdown_reserve_s=60.0,
+        termination_grace_period_s=660.0,
+    )
+    assert exactly_enough.termination_grace_period_s == 660.0
+
+    with pytest.raises(ValueError) as exc_info:
+        _lease_config(
+            delivery_budget_s=600.0,
+            delivery_shutdown_reserve_s=60.0,
+            termination_grace_period_s=659.9,
+        )
+
+    message = str(exc_info.value)
+    assert "CURIE_TERMINATION_GRACE_PERIOD_S" in message
+    assert "CURIE_DELIVERY_BUDGET_S" in message
+    assert "CURIE_DELIVERY_SHUTDOWN_RESERVE_S" in message
+
+
+def test_termination_grace_of_none_skips_the_grace_validator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """None means "no platform grace declared", which is the compose and test
+    case. Reverting the None guard into a comparison makes every leaseless local
+    stack -- and this whole test suite -- fail to construct a config at all."""
+    _clear_all_config_env(monkeypatch)
+
+    config = _lease_config(
+        delivery_budget_s=1800.0,
+        delivery_shutdown_reserve_s=60.0,
+        termination_grace_period_s=None,
+        runner_total_timeout_s=600.0,
+    )
+
+    assert config.termination_grace_period_s is None
+    assert config.delivery_budget_s == 1800.0
+
+
+def test_runner_total_timeout_must_not_exceed_the_delivery_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``runner_total_timeout_s`` is now a per-request ceiling INSIDE the overall
+    deadline, not an independent clock. A ceiling above the budget is always dead
+    configuration and reads as if it granted more time than it does."""
+    _clear_all_config_env(monkeypatch)
+
+    equal = _lease_config(delivery_budget_s=600.0, runner_total_timeout_s=600.0)
+    assert equal.runner_total_timeout_s == 600.0
+
+    with pytest.raises(ValueError) as exc_info:
+        _lease_config(delivery_budget_s=600.0, runner_total_timeout_s=600.1)
+
+    message = str(exc_info.value)
+    assert "RUNNER_TOTAL_TIMEOUT_S" in message
+    assert "CURIE_DELIVERY_BUDGET_S" in message
+
+
+def test_delivery_key_helpers_are_keyed_by_the_delivery_triple(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A delivery is a ``(stream, group, entry_id)``, NOT an event id: the same
+    event id can legitimately be redelivered under a new entry id after a
+    dead-letter, and keying the lease by event id would fence the wrong thing.
+    The two keys are separate because the generation must outlive the lease --
+    a generation stored in the short-lived lease key would restart at 1 on
+    expiry, and a stale owner holding generation 1 would then validate."""
+    _clear_all_config_env(monkeypatch)
+
+    config = WorkerConfig(key_prefix="curie:worker")
+
+    lease_key = config.delivery_lease_key("curie:runs", "curie-workers", "1-0")
+    state_key = config.delivery_state_key("curie:runs", "curie-workers", "1-0")
+
+    assert lease_key == "curie:worker:lease:curie:runs:curie-workers:1-0"
+    assert state_key == "curie:worker:delivery:curie:runs:curie-workers:1-0"
+    assert lease_key != state_key

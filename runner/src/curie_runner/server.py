@@ -27,23 +27,29 @@ from __future__ import annotations
 
 import contextlib
 import hmac
+import inspect
+from collections.abc import Awaitable, Callable
 from typing import cast
 
 from aci_protocol import Event, Interrupt, parse_inbound
 from aiohttp import web
 from aiohttp.typedefs import Handler, Middleware
+from curie_telemetry import TRACEPARENT_STREAM_FIELD, extract_trace_context
 
 from .session import SessionRunner
+from .workspace_snapshot import WorkspaceSnapshot, WorkspaceSnapshotError
 
 _NDJSON = "application/x-ndjson"
 
-# The three ACI POST routes that drive a turn; gated when a token is configured.
+# The five runner POST routes; gated when a token is configured.
 # /healthz and /status stay open so the chart readinessProbe (no auth header)
 # keeps working.
-_GATED_PATHS = frozenset({"/v1/event", "/v1/steer", "/v1/interrupt", "/v1/reset"})
+_GATED_PATHS = frozenset({"/v1/event", "/v1/steer", "/v1/interrupt", "/v1/reset", "/v1/snapshot"})
 
 # Typed app key so aiohttp resolves the runner without the string-key warning.
 RUNNER: web.AppKey[SessionRunner] = web.AppKey("runner", SessionRunner)
+Snapshotter = Callable[[], WorkspaceSnapshot | Awaitable[WorkspaceSnapshot]]
+SNAPSHOTTER: web.AppKey[object] = web.AppKey("snapshotter", object)
 
 
 def _auth_middleware(token: str) -> Middleware:
@@ -59,16 +65,12 @@ def _auth_middleware(token: str) -> Middleware:
     token_bytes = token.encode("utf-8")
 
     @web.middleware
-    async def middleware(
-        request: web.Request, handler: Handler
-    ) -> web.StreamResponse:
+    async def middleware(request: web.Request, handler: Handler) -> web.StreamResponse:
         if request.method == "POST" and request.path in _GATED_PATHS:
             header = request.headers.get("Authorization", "")
             scheme = "Bearer "
             if not header.startswith(scheme):
-                return web.json_response(
-                    {"error": "missing bearer token"}, status=401
-                )
+                return web.json_response({"error": "missing bearer token"}, status=401)
             presented = header[len(scheme) :]
             # Compare UTF-8 bytes: hmac.compare_digest raises TypeError on a
             # non-ASCII str, which aiohttp would surface as a 500 instead of a
@@ -80,10 +82,14 @@ def _auth_middleware(token: str) -> Middleware:
     return middleware
 
 
-def create_app(runner: SessionRunner, token: str | None = None) -> web.Application:
+def create_app(
+    runner: SessionRunner,
+    token: str | None = None,
+    snapshotter: Snapshotter | None = None,
+) -> web.Application:
     """Build the aiohttp application bound to a started SessionRunner.
 
-    When ``token`` is set, the three ACI POST routes require a matching bearer
+    When ``token`` is set, the five runner POST routes require a matching bearer
     token; when it is ``None`` the app is a pass-through (CLI, fake-model CI, and
     pre-token sandboxes stay unauthenticated).
     """
@@ -94,6 +100,7 @@ def create_app(runner: SessionRunner, token: str | None = None) -> web.Applicati
     middlewares = [_auth_middleware(token)] if token else []
     app = web.Application(middlewares=middlewares)
     app[RUNNER] = runner
+    app[SNAPSHOTTER] = snapshotter
     app.add_routes(
         [
             web.get("/healthz", _healthz),
@@ -102,6 +109,7 @@ def create_app(runner: SessionRunner, token: str | None = None) -> web.Applicati
             web.post("/v1/steer", _steer),
             web.post("/v1/interrupt", _interrupt),
             web.post("/v1/reset", _reset),
+            web.post("/v1/snapshot", _snapshot),
         ]
     )
     app.on_cleanup.append(_on_cleanup)
@@ -125,6 +133,28 @@ async def _status(request: web.Request) -> web.Response:
             "turn_active": runner.turn_active,
         }
     )
+
+
+async def _snapshot(request: web.Request) -> web.Response:
+    """Capture the managed checkout for the bearer-authenticated worker."""
+
+    snapshotter = cast("Snapshotter | None", request.app[SNAPSHOTTER])
+    if snapshotter is None:
+        return web.json_response(
+            {
+                "error": (
+                    "this session has no managed repository workspace; deploy with "
+                    "workspace support before requesting publication"
+                )
+            },
+            status=409,
+        )
+    try:
+        result = snapshotter()
+        captured = await result if inspect.isawaitable(result) else result
+    except WorkspaceSnapshotError as exc:
+        return web.json_response({"error": str(exc)}, status=422)
+    return web.json_response(captured.to_json())
 
 
 def _parse(body: object) -> Event | Interrupt:
@@ -153,7 +183,12 @@ async def _event(request: web.Request) -> web.StreamResponse:
     # asyncgen GC on a different task, releasing the turn lock cross-task (see
     # SessionRunner._turn_lock). aclosing keeps the teardown -- and the turn
     # interrupt in run_turn's finally -- on the task that opened it.
-    async with contextlib.aclosing(runner.run_turn(frame)) as stream:
+    carrier: dict[str, str] = {}
+    traceparent = request.headers.get(TRACEPARENT_STREAM_FIELD)
+    if traceparent is not None:
+        carrier[TRACEPARENT_STREAM_FIELD] = traceparent
+    parent = extract_trace_context(carrier)
+    async with contextlib.aclosing(runner.run_turn(frame, parent=parent)) as stream:
         async for line in stream:
             await response.write(line.encode("utf-8"))
     await response.write_eof()
@@ -196,8 +231,6 @@ async def _reset(request: web.Request) -> web.Response:
     # live turn would strand the open /v1/event stream. 409 mirrors the steer
     # finish-race boundary -- the caller resets once the turn has completed.
     if runner.turn_active:
-        return web.json_response(
-            {"error": "cannot reset while a turn is active"}, status=409
-        )
+        return web.json_response({"error": "cannot reset while a turn is active"}, status=409)
     await runner.reset()
     return web.json_response({"ok": True})

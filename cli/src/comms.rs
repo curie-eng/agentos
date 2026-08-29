@@ -32,12 +32,23 @@ pub struct LocalCommsOpts {
     /// `fake_model_env_override` as `up_command` so `local comms` never
     /// silently downgrades a live stack back to the fake model.
     pub model_mode: ModelMode,
+    /// Model credentials resolved with the same precedence as `local up`.
+    pub model_credentials: Vec<(String, String)>,
+    /// Explicit provider model id to preserve from `local up`.
+    pub model: Option<String>,
     /// Whether the stack was brought up with `local up --minimal` (the `core`
     /// profile, no otel-collector). Same parity obligation as `model_mode`: the
     /// worker-restarting commands below apply the same
     /// `otel_endpoint_env_override` as `up_command` so `local comms` never
     /// re-points a collector-less stack at a collector that is not running.
     pub minimal: bool,
+    /// The image env the running stack is already on (#1925), resolved by
+    /// `local::resolve_stack_image_env`. Same parity obligation as `model_mode`
+    /// and `minimal`: `up -d --wait curie-worker curie-dispatcher` recreates
+    /// those services AND their `depends_on` dependencies, so without this the
+    /// verb silently reverts five services from a `--build` stack's tag to
+    /// `:latest`.
+    pub stack_image_env: Vec<(String, String)>,
 }
 
 pub fn connect_commands(opts: &CommsOpts) -> Vec<OpsCommand> {
@@ -81,7 +92,11 @@ pub fn disconnect_commands(opts: &CommsOpts) -> Vec<OpsCommand> {
 pub fn local_connect_commands(o: &LocalCommsOpts) -> Vec<OpsCommand> {
     let mut env = vec![("SLACK_API_BASE_URL".into(), String::new())];
     env.extend(fake_model_env_override(o.model_mode));
+    if let Some(model) = &o.model {
+        env.push(("CURIE_MODEL".into(), model.clone()));
+    }
     env.extend(otel_endpoint_env_override(o.minimal));
+    env.extend(o.stack_image_env.iter().cloned());
     vec![OpsCommand::new(
         "docker",
         vec![
@@ -100,10 +115,14 @@ pub fn local_connect_commands(o: &LocalCommsOpts) -> Vec<OpsCommand> {
         ],
     )
     .with_env(env)
-    .with_secret_env(vec![
-        ("SLACK_APP_TOKEN".into(), o.app_token.clone()),
-        ("SLACK_BOT_TOKEN".into(), o.bot_token.clone()),
-    ])]
+    .with_secret_env({
+        let mut secret_env = vec![
+            ("SLACK_APP_TOKEN".into(), o.app_token.clone()),
+            ("SLACK_BOT_TOKEN".into(), o.bot_token.clone()),
+        ];
+        secret_env.extend(o.model_credentials.clone());
+        secret_env
+    })]
 }
 
 pub fn local_disconnect_commands(o: &LocalCommsOpts) -> Vec<OpsCommand> {
@@ -112,7 +131,11 @@ pub fn local_disconnect_commands(o: &LocalCommsOpts) -> Vec<OpsCommand> {
         ("SLACK_BOT_TOKEN".into(), LOCAL_SLACK_STUB_BOT_TOKEN.into()),
     ];
     worker_env.extend(fake_model_env_override(o.model_mode));
+    if let Some(model) = &o.model {
+        worker_env.push(("CURIE_MODEL".into(), model.clone()));
+    }
     worker_env.extend(otel_endpoint_env_override(o.minimal));
+    worker_env.extend(o.stack_image_env.iter().cloned());
     vec![
         OpsCommand::new(
             "docker",
@@ -142,14 +165,19 @@ pub fn local_disconnect_commands(o: &LocalCommsOpts) -> Vec<OpsCommand> {
                 plain("curie-worker"),
             ],
         )
-        .with_env(worker_env),
+        .with_env(worker_env)
+        .with_secret_env(o.model_credentials.clone()),
     ]
 }
 
 /// `kubectl -n <ns> rollout restart deployment/<release>-<component>`: force the
 /// pods to pick up the new Secret-backed Slack tokens (secretKeyRef env vars are
 /// resolved once at pod start, so a Secret change alone does not roll them).
-fn rollout_restart_command(namespace: &str, release: &str, component: &str) -> OpsCommand {
+fn rollout_restart_command(
+    namespace: &str,
+    fullname: &crate::ops::ReleaseFullname,
+    component: &str,
+) -> OpsCommand {
     OpsCommand::new(
         "kubectl",
         vec![
@@ -157,14 +185,18 @@ fn rollout_restart_command(namespace: &str, release: &str, component: &str) -> O
             plain(namespace),
             plain("rollout"),
             plain("restart"),
-            plain(format!("deployment/{release}-{component}")),
+            plain(format!("deployment/{}", fullname.resource(component))),
         ],
     )
 }
 
 /// `kubectl -n <ns> rollout status deployment/<release>-<component> --timeout=120s`:
 /// wait for the restarted pods to become ready before reporting success.
-fn rollout_status_command(namespace: &str, release: &str, component: &str) -> OpsCommand {
+fn rollout_status_command(
+    namespace: &str,
+    fullname: &crate::ops::ReleaseFullname,
+    component: &str,
+) -> OpsCommand {
     OpsCommand::new(
         "kubectl",
         vec![
@@ -172,7 +204,7 @@ fn rollout_status_command(namespace: &str, release: &str, component: &str) -> Op
             plain(namespace),
             plain("rollout"),
             plain("status"),
-            plain(format!("deployment/{release}-{component}")),
+            plain(format!("deployment/{}", fullname.resource(component))),
             plain("--timeout=120s"),
         ],
     )
@@ -184,7 +216,17 @@ fn rollout_status_command(namespace: &str, release: &str, component: &str) -> Op
 /// is rolled harmlessly). Disconnect rolls only the worker -- helm deletes the
 /// dispatcher (its gate `curie.dispatcher.enabled` goes false), so there is no
 /// dispatcher to wait on.
-pub fn rollout_commands(disconnect: bool, namespace: &str, release: &str) -> Vec<OpsCommand> {
+///
+/// Takes a RESOLVED `ReleaseFullname` (#1533): the chart names both Deployments
+/// `{{ include "curie.fullname" . }}-<component>`, which is NOT
+/// `{release}-<component>` unless the release name already contains the chart
+/// name. A wrong name makes the restart reach nothing, so the pods keep the
+/// stale Slack tokens after a "connected" report.
+pub fn rollout_commands(
+    disconnect: bool,
+    namespace: &str,
+    fullname: &crate::ops::ReleaseFullname,
+) -> Vec<OpsCommand> {
     let components: &[&str] = if disconnect {
         &["worker"]
     } else {
@@ -192,12 +234,12 @@ pub fn rollout_commands(disconnect: bool, namespace: &str, release: &str) -> Vec
     };
     let mut cmds: Vec<OpsCommand> = components
         .iter()
-        .map(|c| rollout_restart_command(namespace, release, c))
+        .map(|c| rollout_restart_command(namespace, fullname, c))
         .collect();
     cmds.extend(
         components
             .iter()
-            .map(|c| rollout_status_command(namespace, release, c)),
+            .map(|c| rollout_status_command(namespace, fullname, c)),
     );
     cmds
 }
@@ -300,13 +342,15 @@ pub async fn comms(opts: CommsOpts) -> Result<CommsOutput> {
     } else {
         connect_commands(&opts)
     };
-    let rollout = rollout_commands(
-        opts.disconnect,
-        &opts.common.namespace,
-        &opts.common.release,
-    );
-
+    // `--dry-run` stays offline, so it renders the chart's no-override rule
+    // rather than asking the cluster (#1533). The live path below discovers the
+    // rendered fullname, which is override-proof.
     if opts.common.dry_run {
+        let rollout = rollout_commands(
+            opts.disconnect,
+            &opts.common.namespace,
+            &crate::ops::chart_fullname(&opts.common.release),
+        );
         return Ok(CommsOutput::DryRun(crate::ui::DryRunPlan {
             lines: cmds
                 .iter()
@@ -335,6 +379,13 @@ pub async fn comms(opts: CommsOpts) -> Result<CommsOutput> {
     // The Secret change alone does not roll the pods (secretKeyRef env vars are
     // resolved once at pod start), so restart them and wait for the new/cleared
     // token to be live before reporting success.
+    //
+    // Resolved HERE rather than above: the rollout is the only consumer of the
+    // fullname, so a helm failure in the loop above no longer pays for a
+    // discovery round-trip whose answer nothing reads (#1533). The live path
+    // discovers the rendered name, which is override-proof.
+    let fullname = crate::ops::release_fullname(&opts.common.namespace, &opts.common.release).await;
+    let rollout = rollout_commands(opts.disconnect, &opts.common.namespace, &fullname);
     let roll_label = format!("rolling {} to pick up tokens", opts.common.release);
     for cmd in &rollout {
         run_step(&cl, &roll_label, "rolled", cmd).await?;
@@ -411,6 +462,77 @@ mod tests {
         assert!(require_provider(true).is_ok());
         let err = require_provider(false).unwrap_err().to_string();
         assert!(err.contains("specify a chat surface"), "{err}");
+    }
+
+    /// #1533 (S19 + S20): after a `cluster comms --slack` upgrade the pods must
+    /// be rolled so the Secret-backed tokens go live. Under a release name that
+    /// does not contain the chart name the CLI asked for
+    /// `deployment/platform-worker`, which the chart never rendered: the
+    /// rollout failed to reach anything and the operator was left with stale
+    /// Slack tokens after a "connected" report.
+    #[test]
+    fn rollout_restart_targets_the_chart_rendered_deployment() {
+        let fullname = crate::ops::chart_fullname("platform");
+        assert_eq!(
+            rollout_restart_command("acme-system", &fullname, "worker").display(),
+            "kubectl -n acme-system rollout restart deployment/platform-curie-worker"
+        );
+        assert_eq!(
+            rollout_restart_command("acme-system", &fullname, "dispatcher").display(),
+            "kubectl -n acme-system rollout restart deployment/platform-curie-dispatcher"
+        );
+
+        // Negative control: byte-identical for the default release.
+        let default = crate::ops::chart_fullname("curie");
+        assert_eq!(
+            rollout_restart_command("curie", &default, "worker").display(),
+            "kubectl -n curie rollout restart deployment/curie-worker"
+        );
+    }
+
+    /// The status wait must name the same Deployment the restart named --
+    /// otherwise `cluster comms` waits on a rollout that is not happening (or,
+    /// with `--ignore-not-found` semantics absent here, fails confusingly).
+    #[test]
+    fn rollout_status_targets_the_chart_rendered_deployment() {
+        let fullname = crate::ops::chart_fullname("platform");
+        assert_eq!(
+            rollout_status_command("acme-system", &fullname, "worker").display(),
+            "kubectl -n acme-system rollout status deployment/platform-curie-worker \
+             --timeout=120s"
+        );
+
+        // Negative control.
+        let default = crate::ops::chart_fullname("curie");
+        assert_eq!(
+            rollout_status_command("curie", &default, "worker").display(),
+            "kubectl -n curie rollout status deployment/curie-worker --timeout=120s"
+        );
+    }
+
+    /// The public entry point, so the fix is pinned where `comms` actually
+    /// calls it and not only on the two private builders.
+    #[test]
+    fn connect_rolls_both_chart_rendered_deployments() {
+        let rendered: Vec<String> = rollout_commands(
+            false,
+            "acme-system",
+            &crate::ops::chart_fullname("platform"),
+        )
+        .iter()
+        .map(super::OpsCommand::display)
+        .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "kubectl -n acme-system rollout restart deployment/platform-curie-worker",
+                "kubectl -n acme-system rollout restart deployment/platform-curie-dispatcher",
+                "kubectl -n acme-system rollout status deployment/platform-curie-worker \
+                 --timeout=120s",
+                "kubectl -n acme-system rollout status deployment/platform-curie-dispatcher \
+                 --timeout=120s",
+            ]
+        );
     }
 
     /// #749 token resolution precedence: the clap-merged `--flag`/env value wins;
@@ -505,7 +627,7 @@ mod tests {
 
     #[test]
     fn rollout_commands_connect_rolls_worker_and_dispatcher() {
-        let cmds = rollout_commands(false, "curie", "curie");
+        let cmds = rollout_commands(false, "curie", &crate::ops::chart_fullname("curie"));
         let lines: Vec<String> = cmds.iter().map(OpsCommand::display).collect();
         assert_eq!(
             lines,
@@ -522,7 +644,7 @@ mod tests {
 
     #[test]
     fn rollout_commands_disconnect_rolls_worker_only() {
-        let cmds = rollout_commands(true, "curie", "curie");
+        let cmds = rollout_commands(true, "curie", &crate::ops::chart_fullname("curie"));
         let lines: Vec<String> = cmds.iter().map(OpsCommand::display).collect();
         assert_eq!(
             lines,
@@ -612,7 +734,10 @@ mod tests {
             },
             disconnect,
             model_mode: mode,
+            model_credentials: vec![],
+            model: None,
             minimal,
+            stack_image_env: Vec::new(),
         }
     }
 
@@ -625,7 +750,10 @@ mod tests {
             bot_token: "xoxb-1-secretsecret".into(),
             disconnect: false,
             model_mode: ModelMode::DefaultFake,
+            model_credentials: vec![],
+            model: None,
             minimal: false,
+            stack_image_env: Vec::new(),
         });
         assert_eq!(cmds.len(), 1);
         let line = cmds[0].display();
@@ -776,6 +904,8 @@ mod tests {
                 slack: false,
                 model_mode: mode,
                 env_file: None,
+                build: None,
+                stack_image_env: Vec::new(),
             })
             .env;
             let connect_env = local_connect_commands(&local_comms_opts(false, mode))[0]
@@ -812,6 +942,8 @@ mod tests {
                 slack: false,
                 model_mode: mode,
                 env_file: None,
+                build: None,
+                stack_image_env: Vec::new(),
             })
             .env;
             let disconnect_env = local_disconnect_commands(&local_comms_opts(true, mode))[1]
@@ -846,6 +978,8 @@ mod tests {
                 slack: false,
                 model_mode: ModelMode::DefaultFake,
                 env_file: None,
+                build: None,
+                stack_image_env: Vec::new(),
             })
             .env;
             let connect_env = local_connect_commands(&local_comms_opts_with(
@@ -884,6 +1018,8 @@ mod tests {
                 slack: false,
                 model_mode: ModelMode::DefaultFake,
                 env_file: None,
+                build: None,
+                stack_image_env: Vec::new(),
             })
             .env;
             let disconnect_env = local_disconnect_commands(&local_comms_opts_with(

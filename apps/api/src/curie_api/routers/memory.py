@@ -175,7 +175,7 @@ async def create_memory(
     if entry is None:
         new_value = [record]
         await _enforce_caps(
-            session, agent_id, MEMORY_NAMESPACE, MEMORY_LOG_KEY, new_value
+            session, agent_id, None, MEMORY_NAMESPACE, MEMORY_LOG_KEY, new_value
         )
         entry = WorkflowStateEntry(
             agent_id=agent_id,
@@ -192,7 +192,7 @@ async def create_memory(
             )
         new_value = [*entry.value, record]
         await _enforce_caps(
-            session, agent_id, MEMORY_NAMESPACE, MEMORY_LOG_KEY, new_value
+            session, agent_id, None, MEMORY_NAMESPACE, MEMORY_LOG_KEY, new_value
         )
         entry.value = new_value
         entry.version += 1
@@ -248,8 +248,11 @@ async def edit_memory(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "memory entry not found")
     updated = {**records[index], "content": data.content}
     replacement = [*records[:index], updated, *records[index + 1 :]]
+    # None: the memory port stays agent-wide regardless of `agents.memory`
+    # (#1525 follow-up) -- it is a different reserved namespace with no
+    # per-binding story, same as every row this port has ever written.
     await _enforce_caps(
-        session, agent_id, MEMORY_NAMESPACE, MEMORY_LOG_KEY, replacement
+        session, agent_id, None, MEMORY_NAMESPACE, MEMORY_LOG_KEY, replacement
     )
     entry.value = replacement
     entry.version += 1

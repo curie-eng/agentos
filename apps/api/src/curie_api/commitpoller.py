@@ -27,10 +27,9 @@ Four properties worth stating, because each is a way this could go wrong:
 - **It polls per REPOSITORY, not per agent.** Several agents share one
   repository (ADR-0091), so per-agent polling would make N identical API calls
   and race N deploys of the same commit against each other.
-- **It never deploys a commit it has already deployed.** The check is the
-  ``commit_sha`` already recorded for that repository, so a restart does not
-  redeploy the current HEAD, and a webhook that already handled a push makes
-  the next poll a no-op.
+- **It never redeploys a commit already deployed by Git flow.** Only Git flow
+  authored versions establish this baseline. A CLI deployment at the same SHA
+  must not suppress the build, evaluation, and deployment owned by Git flow.
 - **One failing repository does not stop the others.** A repo whose credential
   has been revoked, or that has been deleted, must not silently halt polling
   for every other agent on the cluster.
@@ -53,8 +52,11 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 import httpx
+from curie_telemetry import operation_span, record_metric
+from opentelemetry.trace import SpanKind, StatusCode
 
 from .config import Settings
+from .models import GIT_FLOW_CREATED_BY
 from .repo_full_name import InvalidRepoFullName, repo_url_path
 
 logger = logging.getLogger(__name__)
@@ -257,18 +259,24 @@ class GitHubBranchTip:
         return str(sha) if isinstance(sha, str) else None
 
 
-# The last commit deployed per (repository, environment). Environment rather
-# than branch because that is what a Deployment records; the caller maps
-# environments back to branch names via Settings, the same mapping
-# `environment_for_ref` uses in the other direction.
+# The last Git flow authored version commit deployed per (repository, environment).
+# Only a Git flow authored version with recorded deployment provenance settles
+# this baseline. The authoritative value still comes from the version, so a
+# mutable deployment value cannot redefine it. Environment rather than branch
+# because that is what a Deployment records; the caller maps environments back
+# to branch names via Settings, the same mapping `environment_for_ref` uses in
+# the other direction.
 _DEPLOYED_SQL = """
 SELECT DISTINCT ON (a.repo_full_name, d.environment)
        a.repo_full_name AS repo_full_name,
        d.environment    AS environment,
-       d.commit_sha     AS commit_sha
+       v.commit_sha     AS commit_sha
 FROM {schema}.deployments d
 JOIN {schema}.agents a ON a.id = d.agent_id
-WHERE a.repo_full_name IS NOT NULL AND d.commit_sha IS NOT NULL
+JOIN {schema}.agent_versions v ON v.id = d.version_id
+WHERE a.repo_full_name IS NOT NULL
+  AND d.commit_sha IS NOT NULL
+  AND v.created_by = :git_flow_created_by
 ORDER BY a.repo_full_name, d.environment, d.deployed_at DESC
 """
 
@@ -398,6 +406,7 @@ class CommitPoller:
         # the sha, while routing failures settle until the repository binding
         # snapshot changes. In memory only, so restart can retry once.
         self._settled: dict[tuple[str, str], Settled] = {}
+        self._last_success_monotonic: float | None = None
         # A retryable rejection is neither forgotten nor terminal: it waits a
         # geometrically growing, capped delay before earning another clone
         # (#1309). Keyed the same way as _settled, per (repository, branch).
@@ -423,6 +432,51 @@ class CommitPoller:
             await asyncio.sleep(self._interval)
 
     async def poll_once(self) -> list[Move]:
+        """Run one measured poll pass without changing its returned moves."""
+
+        moves: list[Move] = []
+        error: Exception | None = None
+        attributes = {
+            "service.name": "curie-api",
+            "operation": "commit-poller",
+            "role": "background",
+        }
+        with operation_span(
+            "curie.background.commit-poller",
+            kind=SpanKind.INTERNAL,
+            attributes=attributes,
+        ) as span:
+            try:
+                moves = await self._poll_once()
+            except Exception as exc:
+                error = exc
+                if hasattr(span, "set_status"):
+                    span.set_status(StatusCode.ERROR)
+                span.add_event(
+                    "background.pass.failed",
+                    {"outcome": "failure", "error.class": type(exc).__name__},
+                )
+            else:
+                span.add_event("background.pass.completed", {"outcome": "success"})
+        outcome = "failure" if error is not None else "success"
+        record_metric(
+            "curie.background.loop",
+            attributes={**attributes, "outcome": outcome},
+        )
+        now = time.monotonic()
+        if error is None:
+            self._last_success_monotonic = now
+        if self._last_success_monotonic is not None:
+            record_metric(
+                "curie.background.last_success.age",
+                max(0.0, now - self._last_success_monotonic),
+                attributes=attributes,
+            )
+        if error is not None:
+            raise error
+        return moves
+
+    async def _poll_once(self) -> list[Move]:
         from sqlalchemy import text
 
         from . import gitflow
@@ -440,7 +494,10 @@ class CommitPoller:
             ):
                 bindings.setdefault(str(repo), []).append(str(agent_name))
             deployed: dict[tuple[str, str], str] = {}
-            for repo, env, sha in await session.execute(text(_DEPLOYED_SQL.format(schema=schema))):
+            deployed_stmt = text(_DEPLOYED_SQL.format(schema=schema)).bindparams(
+                git_flow_created_by=GIT_FLOW_CREATED_BY
+            )
+            for repo, env, sha in await session.execute(deployed_stmt):
                 branch = branch_for_env.get(str(env))
                 if branch:
                     deployed[(str(repo), branch)] = str(sha)

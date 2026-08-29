@@ -16,6 +16,10 @@ impl Channel {
     /// Read the build-stamped channel. Uses option_env! so it compiles even
     /// before build.rs exists; defaults to Dev when unset or unrecognized.
     pub fn current() -> Channel {
+        #[cfg(debug_assertions)]
+        if std::env::var("CURIE_TEST_ARTIFACT_CHANNEL").as_deref() == Ok("release") {
+            return Channel::Release;
+        }
         match option_env!("CURIE_BUILD_CHANNEL") {
             Some("release") => Channel::Release,
             _ => Channel::Dev,
@@ -88,7 +92,7 @@ pub fn resolve_compose(
         // ./compose, which is absent from a fetched copy), so there is nothing
         // safe to fall back to. Error instead of fetching a file that cannot run.
         Channel::Dev => Err(anyhow!(
-            "dev build with no local compose.dev.yaml in cwd; pass -f <compose> or use a released binary"
+            "dev build with no local compose.dev.yaml in cwd; pass -f <compose>, or use a released binary (which resolves the version-pinned release compose and so cannot serve --build)"
         )),
     }
 }

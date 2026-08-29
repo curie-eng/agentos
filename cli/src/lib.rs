@@ -9,8 +9,10 @@ pub mod artifacts;
 pub mod bundle;
 pub mod channel;
 pub mod chat;
+pub mod cluster_secrets;
 pub mod commands;
 pub mod comms;
+pub mod connector_build;
 pub mod connectors;
 pub mod credcheck;
 pub mod discover;
@@ -19,6 +21,7 @@ pub mod doctor;
 pub mod eval_init;
 pub mod eval_sampling;
 pub mod evals;
+pub mod examples;
 pub mod exit;
 pub mod github_app;
 pub mod guide;
@@ -50,4 +53,4 @@ pub mod ui;
 pub use retired::retired_hint;
 
 #[cfg(test)]
-pub(crate) static PROCESS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static PROCESS_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());

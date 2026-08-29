@@ -43,28 +43,72 @@ app.kubernetes.io/instance: {{ .root.Release.Name }}
 app.kubernetes.io/component: {{ .component }}
 {{- end -}}
 
+{{/* Resolve one named placement class. Pass a dict with "root" (the top
+     context) and "class" (the placement class name). Every class lookup in the
+     chart goes through this helper rather than indexing the placement values
+     directly, so that a legacy release whose retained values carry
+     `placement: null` (issue #2008) degrades to the chart's empty defaults
+     instead of crashing the render. Helm's coalescing deletes a null-valued key
+     outright, so when `helm upgrade --reuse-values` replays the stored config of
+     a release created before placement classes existed, the placement map is nil
+     -- even though values.yaml defines all five classes -- and every direct
+     per-class dereference in a template would panic on that nil. The
+     empty-dict substitution on the class lookup itself likewise covers a
+     placement map that is present but missing this class.
+
+     The kind checks are the fail-CLOSED half of that tolerance, and they are
+     not optional: this helper hands its result to consumers as YAML, and
+     Helm's `fromYaml` on a non-map document returns an error map rather than
+     raising, so a malformed class (say `placement.platform: spot`) would
+     resolve `.podLabels`, `.annotations`, and `.nodeSelector` to nothing and
+     render clean -- silently dropping every scheduling constraint the operator
+     meant to apply and letting workloads land on unintended nodes. The
+     pre-#2008 templates dereferenced the class directly and aborted on that
+     shape; refusing here keeps that behavior while still degrading a *nil*
+     placement to the chart's empty defaults. The refusal lives in the template
+     rather than in `values.schema.json` because that schema is deliberately
+     permissive and does not type `placement` at all (see charts/curie/CLAUDE.md),
+     so a template-level refusal is this chart's established backstop for the
+     gap. Note the kind tests use `kindIs`/`kindOf` and not truthiness: an
+     `and $class (...)` guard would read a `false` or `0` class as absent and
+     default it away, which is the same fail-open bug in a different costume. */}}
+{{- define "curie.placement.class" -}}
+{{- $classes := .root.Values.placement | default dict -}}
+{{- if not (kindIs "map" $classes) -}}
+{{- fail (printf "placement must be a map of placement classes, got %s" (kindOf $classes)) -}}
+{{- end -}}
+{{- $class := index $classes .class -}}
+{{- if kindIs "invalid" $class -}}
+{{- $class = dict -}}
+{{- else if not (kindIs "map" $class) -}}
+{{- fail (printf "placement.%s must be a map of placement fields (podLabels, annotations, nodeSelector, tolerations, affinity), got %s" .class (kindOf $class)) -}}
+{{- end -}}
+{{- toYaml $class -}}
+{{- end -}}
+
 {{- define "curie.placement.labels" -}}
-{{- with .podLabels }}
+{{- with (fromYaml (include "curie.placement.class" .)).podLabels }}
 {{- toYaml . }}
 {{- end }}
 {{- end -}}
 
 {{- define "curie.placement.annotations" -}}
-{{- with .annotations }}
+{{- with (fromYaml (include "curie.placement.class" .)).annotations }}
 {{- toYaml . }}
 {{- end }}
 {{- end -}}
 
 {{- define "curie.placement.spec" -}}
-{{- with .nodeSelector }}
+{{- $class := fromYaml (include "curie.placement.class" .) -}}
+{{- with $class.nodeSelector }}
 nodeSelector:
 {{- toYaml . | nindent 2 }}
 {{- end }}
-{{- with .tolerations }}
+{{- with $class.tolerations }}
 tolerations:
 {{- toYaml . | nindent 2 }}
 {{- end }}
-{{- with .affinity }}
+{{- with $class.affinity }}
 affinity:
 {{- toYaml . | nindent 2 }}
 {{- end }}
@@ -73,6 +117,11 @@ affinity:
 {{/* Secret name that carries all credential material. */}}
 {{- define "curie.secretName" -}}
 {{- printf "%s-secrets" (include "curie.fullname" .) -}}
+{{- end -}}
+
+{{/* Dedicated namespace for short-lived publication resources. */}}
+{{- define "curie.publicationNamespace" -}}
+{{- default (printf "%s-%s-publication" .Release.Namespace (include "curie.fullname" .)) .Values.worker.publication.namespace | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
 {{/* ---- Reserved connector-secret boot-env names (#457, ADR-0009) ----
@@ -224,6 +273,16 @@ true
 {{- printf "%s-langfuse-web" (include "curie.fullname" .) -}}
 {{- end -}}
 
+{{/* Base URL of the platform API for a first-party service that calls it. Call
+     with a dict: root (the top context) and baseUrl (the caller's own BYO
+     override). An empty override derives the in-chart API Service; a set value
+     renders verbatim and is the BYO answer, including when api.deploy is false.
+     Keep this separate from curie.env.api so callers such as the mail adapter
+     can receive the API URL without also receiving the platform API key. */}}
+{{- define "curie.api.url" -}}
+{{- .baseUrl | default (printf "http://%s-api:%v" (include "curie.fullname" .root) .root.Values.api.service.port) -}}
+{{- end -}}
+
 {{/* base64("<publicKey>:<secretKey>") for the OTel Collector config checksum,
      and the operand the default-credential gate judges. The header this chart
      actually emits is resolved in secrets.yaml, from the managed-secret value
@@ -266,11 +325,84 @@ true
 {{- end -}}
 {{- end -}}
 
+{{/* Reject absent, malformed, negative, and zero-equivalent retry durations.
+     Keep max_interval and max_elapsed_time on this one validation path so the
+     finite retry bound cannot harden one field while leaving its sibling open. */}}
+{{- define "curie.otelCollector.requirePositiveDuration" -}}
+{{- $value := trim (toString .value) -}}
+{{- $durationPattern := "^\\+?(?:(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:ns|us|µs|μs|ms|s|m|h))+$" -}}
+{{- $zeroPattern := "^\\+?(?:(?:0+(?:\\.0*)?|\\.0+)(?:ns|us|µs|μs|ms|s|m|h))+$" -}}
+{{- if or (empty $value) (not (regexMatch $durationPattern $value)) (regexMatch $zeroPattern $value) -}}
+{{- fail (printf "otelCollector.extraExporters[%q] retry_on_failure.%s must use a supported finite, non-zero positive duration." .exporter .field) -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "curie.otelCollector.config" -}}
-# Receives OTLP over gRPC (4317) and HTTP (4318) from app services and
-# forwards to Langfuse over HTTP. Langfuse OTLP ingest is HTTP-only (gRPC is
-# silently unsupported), so the collector is the adapter. Langfuse appends
-# /v1/traces to the otlphttp base path itself.
+{{- $debugEnabled := .Values.otelCollector.debugExporter.enabled -}}
+{{- $builtInExporters := dict "otlphttp/langfuse" true "nop/logs" true "nop/metrics" true -}}
+{{- /* Reserve built-in names even when the development-only debug exporter is disabled.
+      An extra exporter with one of these keys would otherwise replace chart-owned
+      configuration in the rendered ConfigMap. */ -}}
+{{- $reservedExporterNames := dict "otlphttp/langfuse" true "nop/logs" true "nop/metrics" true "debug" true -}}
+{{- if $debugEnabled -}}
+{{- $_ := set $builtInExporters "debug" true -}}
+{{- end -}}
+{{- $pipelineExporters := dict
+      "extraPipelineExporters" .Values.otelCollector.extraPipelineExporters
+      "extraLogPipelineExporters" .Values.otelCollector.extraLogPipelineExporters
+      "extraMetricPipelineExporters" .Values.otelCollector.extraMetricPipelineExporters -}}
+{{- range $valueName, $exporters := $pipelineExporters -}}
+{{- range $exporter := $exporters -}}
+{{- if not (or (hasKey $builtInExporters $exporter) (hasKey $.Values.otelCollector.extraExporters $exporter)) -}}
+{{- fail (printf "otelCollector.%s references undefined exporter %q. Add it under otelCollector.extraExporters." $valueName $exporter) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- range $name, $config := .Values.otelCollector.extraExporters -}}
+{{- if hasKey $reservedExporterNames $name -}}
+{{- fail (printf "otelCollector.extraExporters[%q] must not replace built-in exporter %q." $name $name) -}}
+{{- end -}}
+{{- $exporterType := first (splitList "/" $name) -}}
+{{- if not (or (eq $exporterType "nop") (eq $exporterType "debug")) -}}
+{{- if not (kindIs "map" $config) -}}
+{{- fail (printf "otelCollector.extraExporters[%q] is a network exporter and must be a map with retry_on_failure and sending_queue settings." $name) -}}
+{{- end -}}
+{{- $headers := get $config "headers" -}}
+{{- if and $headers (not (kindIs "map" $headers)) -}}
+{{- fail (printf "otelCollector.extraExporters[%q].headers must be a map." $name) -}}
+{{- end -}}
+{{- if kindIs "map" $headers -}}
+{{- $sensitiveHeaderPattern := "(?i)(^|[-_])(authorization|token|api[-_]?key|secret|password|credential)([-_]|$)" -}}
+{{- $collectorEnvPattern := "^\\$\\{env:[A-Za-z_][A-Za-z0-9_]*\\}$" -}}
+{{- range $headerName, $headerValue := $headers -}}
+{{- if and (regexMatch $sensitiveHeaderPattern (lower (toString $headerName))) (not (regexMatch $collectorEnvPattern (trim (toString $headerValue)))) -}}
+{{- fail (printf "otelCollector.extraExporters[%q].headers[%q] is sensitive and must use Collector environment expansion ${env:NAME}; put its value in otelCollector.extraEnv via valueFrom.secretKeyRef." $name $headerName) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $retry := get $config "retry_on_failure" -}}
+{{- if not (kindIs "map" $retry) -}}
+{{- fail (printf "otelCollector.extraExporters[%q] must configure retry_on_failure with enabled: true and finite max_interval/max_elapsed_time." $name) -}}
+{{- end -}}
+{{- if ne (lower (toString (get $retry "enabled"))) "true" -}}
+{{- fail (printf "otelCollector.extraExporters[%q] retry_on_failure must be enabled and use finite, non-zero max_interval and max_elapsed_time values." $name) -}}
+{{- end -}}
+{{- include "curie.otelCollector.requirePositiveDuration" (dict "exporter" $name "field" "max_interval" "value" (get $retry "max_interval")) -}}
+{{- include "curie.otelCollector.requirePositiveDuration" (dict "exporter" $name "field" "max_elapsed_time" "value" (get $retry "max_elapsed_time")) -}}
+{{- $queue := get $config "sending_queue" -}}
+{{- if not (kindIs "map" $queue) -}}
+{{- fail (printf "otelCollector.extraExporters[%q] must configure sending_queue with enabled: true, storage: file_storage, and a finite queue_size." $name) -}}
+{{- end -}}
+{{- $queueSize := int (get $queue "queue_size") -}}
+{{- if or (ne (lower (toString (get $queue "enabled"))) "true") (ne (toString (get $queue "storage")) "file_storage") (le $queueSize 0) (gt $queueSize 100000) -}}
+{{- fail (printf "otelCollector.extraExporters[%q] sending_queue must be enabled, use storage: file_storage, and set queue_size between 1 and 100000." $name) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+# Receives OTLP traces, logs, and metrics over gRPC (4317) and HTTP (4318).
+# Traces go to Langfuse over HTTP; logs and metrics retain explicit nop defaults
+# until #1765 supplies their backends. Langfuse OTLP ingest is HTTP-only (gRPC
+# is silently unsupported), so the collector adapts trace traffic to otlphttp.
 receivers:
   otlp:
     protocols:
@@ -279,28 +411,152 @@ receivers:
       http:
         endpoint: 0.0.0.0:4318
 processors:
+  memory_limiter:
+    check_interval: {{ .Values.otelCollector.memoryLimiter.checkInterval }}
+    limit_percentage: {{ .Values.otelCollector.memoryLimiter.limitPercentage }}
+    spike_limit_percentage: {{ .Values.otelCollector.memoryLimiter.spikeLimitPercentage }}
   batch: {}
 exporters:
   otlphttp/langfuse:
     endpoint: http://{{ include "curie.langfuse.webHost" . }}:{{ .Values.langfuse.web.service.port }}/api/public/otel
     headers:
       Authorization: ${env:LANGFUSE_OTLP_AUTH_HEADER}
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 5m
+    sending_queue:
+      enabled: true
+      storage: file_storage
+      queue_size: 1000
+      num_consumers: 2
+  nop/logs: {}
+  nop/metrics: {}
+{{- if $debugEnabled }}
   debug:
     verbosity: normal
+{{- end }}
+{{- with .Values.otelCollector.extraExporters }}
+{{ toYaml . | nindent 2 }}
+{{- end }}
 extensions:
   health_check:
     endpoint: 0.0.0.0:13133
+  file_storage:
+    directory: {{ .Values.otelCollector.persistence.mountPath }}
+    timeout: 1s
+    create_directory: true
+    fsync: true
+    compaction:
+      on_start: true
+      on_rebound: true
+      directory: {{ .Values.otelCollector.persistence.mountPath }}
+      cleanup_on_start: true
 service:
-  extensions: [health_check]
+  extensions: [health_check, file_storage]
   telemetry:
     metrics:
-      level: none
+      level: normal
+      address: 0.0.0.0:{{ .Values.otelCollector.service.metricsPort }}
   pipelines:
     traces:
       receivers: [otlp]
-      processors: [batch]
-      exporters: [otlphttp/langfuse, debug]
+      processors: [memory_limiter, batch]
+      exporters: [otlphttp/langfuse{{- if $debugEnabled }}, debug{{- end }}{{- range .Values.otelCollector.extraPipelineExporters }}, {{ . }}{{- end }}]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [nop/logs{{- if $debugEnabled }}, debug{{- end }}{{- range .Values.otelCollector.extraLogPipelineExporters }}, {{ . }}{{- end }}]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [nop/metrics{{- if $debugEnabled }}, debug{{- end }}{{- range .Values.otelCollector.extraMetricPipelineExporters }}, {{ . }}{{- end }}]
 {{- end }}
+
+{{/* Chart-owned OTLP destination (#1819). In-cluster Service while deploy is
+     true; otelCollector.endpoint when the operator brings their own collector.
+     Empty when telemetry is explicitly disabled or when no-endpoint mode is
+     valid (gate off, deploy false, endpoint empty). */}}
+{{- define "curie.otel.endpoint" -}}
+{{- if .Values.otelCollector.deploy -}}
+http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.service.httpPort }}
+{{- else if not .Values.otelCollector.telemetryDisabled -}}
+{{- .Values.otelCollector.endpoint | default "" -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Fail closed on contradictory OTEL values always. Fail closed on accidental
+     missing only when security.checkDefaultCredentials is on: local/offline
+     no-endpoint remains valid outside that gate. extraEnv-only does not satisfy
+     the production gate because the four workloads can drift. */}}
+{{- define "curie.otel.validate" -}}
+{{- $otel := .Values.otelCollector -}}
+{{- if and $otel.telemetryDisabled $otel.deploy -}}
+{{- fail "otelCollector.telemetryDisabled cannot be true while otelCollector.deploy is true. Deploy the chart-managed collector, or set deploy to false and keep telemetryDisabled true." -}}
+{{- end -}}
+{{- if and $otel.telemetryDisabled (not (empty $otel.endpoint)) -}}
+{{- fail "otelCollector.telemetryDisabled cannot be true while otelCollector.endpoint is set. Set one destination or acknowledge that telemetry is disabled." -}}
+{{- end -}}
+{{- if and $otel.telemetryDisabled (not (empty $otel.headers)) -}}
+{{- fail "otelCollector.telemetryDisabled cannot be true while otelCollector.headers is set." -}}
+{{- end -}}
+{{- if and $otel.telemetryDisabled (not (empty $otel.headersExistingSecret)) -}}
+{{- fail "otelCollector.telemetryDisabled cannot be true while otelCollector.headersExistingSecret is set." -}}
+{{- end -}}
+{{- if and (not (empty $otel.headers)) (not (empty $otel.headersExistingSecret)) -}}
+{{- fail "otelCollector.headers and otelCollector.headersExistingSecret cannot both be set. Use headersExistingSecret for credentials." -}}
+{{- end -}}
+{{- $sensitiveHeaderPattern := "(?i)(^|[,;\\s])(authorization|token|api[-_]?key|secret|password|credential)=" -}}
+{{- if and (not (empty $otel.headers)) (regexMatch $sensitiveHeaderPattern (toString $otel.headers)) -}}
+{{- fail "otelCollector.headers is sensitive and must use headersExistingSecret so the value never enters Helm values or the rendered workload env as a literal." -}}
+{{- end -}}
+{{- $protocol := $otel.protocol | default "http/protobuf" -}}
+{{- if and (not (empty $protocol)) (not (or (eq $protocol "http/protobuf") (eq $protocol "grpc") (eq $protocol "http/json"))) -}}
+{{- fail "otelCollector.protocol must be grpc, http/protobuf, or http/json." -}}
+{{- end -}}
+{{- if and .Values.security.checkDefaultCredentials (not $otel.deploy) (not $otel.telemetryDisabled) (empty $otel.endpoint) -}}
+{{- fail "security.checkDefaultCredentials is on but neither a chart-managed collector nor otelCollector.endpoint is configured. Set otelCollector.endpoint to the external collector, keep otelCollector.deploy true, or set otelCollector.telemetryDisabled=true to acknowledge that telemetry is disabled." -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Standard OTEL_EXPORTER_OTLP_* env for every instrumented workload. extraEnv
+     still wins per variable. Include with nindent 12. Call with
+     dict "root" $ "extraEnv" .Values.<workload>.extraEnv */}}
+{{- define "curie.env.otel" -}}
+{{- include "curie.otel.validate" .root -}}
+{{- $extra := .extraEnv | default list -}}
+{{- $hasEndpoint := false -}}
+{{- $hasProtocol := false -}}
+{{- $hasHeaders := false -}}
+{{- range $extra -}}
+{{- if eq .name "OTEL_EXPORTER_OTLP_ENDPOINT" -}}{{- $hasEndpoint = true -}}{{- end -}}
+{{- if eq .name "OTEL_EXPORTER_OTLP_PROTOCOL" -}}{{- $hasProtocol = true -}}{{- end -}}
+{{- if eq .name "OTEL_EXPORTER_OTLP_HEADERS" -}}{{- $hasHeaders = true -}}{{- end -}}
+{{- end -}}
+{{- $endpoint := include "curie.otel.endpoint" .root | trim -}}
+{{- $protocol := .root.Values.otelCollector.protocol | default "http/protobuf" -}}
+{{- if and (not $hasEndpoint) (ne $endpoint "") }}
+- name: OTEL_EXPORTER_OTLP_ENDPOINT
+  value: {{ $endpoint | quote }}
+{{- end }}
+{{- if and (not $hasProtocol) (ne $endpoint "") }}
+- name: OTEL_EXPORTER_OTLP_PROTOCOL
+  value: {{ $protocol | quote }}
+{{- end }}
+{{- if and (not $hasHeaders) (not .root.Values.otelCollector.deploy) (not .root.Values.otelCollector.telemetryDisabled) (ne $endpoint "") }}
+{{- if not (empty .root.Values.otelCollector.headersExistingSecret) }}
+- name: OTEL_EXPORTER_OTLP_HEADERS
+  valueFrom:
+    secretKeyRef:
+      name: {{ .root.Values.otelCollector.headersExistingSecret | quote }}
+      key: {{ .root.Values.otelCollector.headersSecretKey | default "headers" | quote }}
+{{- else if not (empty .root.Values.otelCollector.headers) }}
+- name: OTEL_EXPORTER_OTLP_HEADERS
+  value: {{ .root.Values.otelCollector.headers | quote }}
+{{- end }}
+{{- end }}
+{{- end -}}
 
 {{/* ---- Default-credential gate (issue #198) ----
      When security.checkDefaultCredentials is on, refuse to render if a Langfuse
@@ -401,6 +657,7 @@ service:
 {{- fail "security.checkDefaultCredentials is on but the chart would ship the published dev header \"Basic cGstbGYtY3VyaWUtZGV2OnNrLWxmLWN1cmllLWRldg==\" as the OTel Collector auth credential in its Secret (auth scheme spelling, whitespace and base64 padding aside), which the collector authenticates with when deployed. That is the dev project key pk-lf-curie-dev:sk-lf-curie-dev, which anyone reading this repository holds. That header arrives either from otelCollector.otlpAuthHeader set to it directly, or from the chart composing it out of langfuse.init.projectPublicKey and langfuse.init.projectSecretKey when the chart-managed Secret is the one the collector reads. Set otelCollector.otlpAuthHeader from your own project keys, override those two langfuse.init values, or point langfuse.existingSecret at your own Secret and supply otlpAuthHeader there." -}}
 {{- end -}}
 {{- end -}}
+{{- include "curie.otel.validate" . -}}
 {{- end -}}
 
 {{/* ---- Auto-generated per-release chart credential (issue #195) ----
@@ -522,7 +779,7 @@ service:
 # the only correct one when api.deploy is false. The port comes from
 # api.service.port so the two sides cannot drift.
 - name: CURIE_API_URL
-  value: {{ .Values.dispatcher.apiBaseUrl | default (printf "http://%s-api:%v" (include "curie.fullname" .) .Values.api.service.port) | quote }}
+  value: {{ include "curie.api.url" (dict "root" . "baseUrl" .Values.dispatcher.apiBaseUrl) | quote }}
 {{- end -}}
 
 {{- define "curie.env.apiKey" -}}
@@ -540,6 +797,41 @@ service:
 {{- define "curie.env.api" -}}
 {{- include "curie.env.apiUrl" . }}
 {{ include "curie.env.apiKey" . }}
+{{- end -}}
+
+{{/* Coalesce the worker's egress credentials and the first-party mail
+     adapter's paired credential. The chart Secret and the worker rollout
+     checksum must use this same rendered JSON so a rotation reaches both
+     sides. mailAdapter.egressSecret is the source of truth; accepting an equal
+     hand-written worker entry keeps migrations from hand-rolled manifests
+     possible, while a disagreement fails rather than deploying a reply path
+     that can only return 401. */}}
+{{- define "curie.adapterCredentials" -}}
+{{- $creds := deepCopy (.Values.worker.adapterCredentials | default dict) -}}
+{{- if .Values.mailAdapter.deploy -}}
+{{- $slug := .Values.mailAdapter.adapterSlug -}}
+{{- $derived := .Values.mailAdapter.egressSecret -}}
+{{- if hasKey $creds $slug -}}
+{{- $existing := get $creds $slug -}}
+{{- if ne $existing $derived -}}
+{{- fail (printf "worker.adapterCredentials.%s and mailAdapter.egressSecret are set to DIFFERENT values. mailAdapter.egressSecret is the source of truth for both halves of the mail adapter's egress pair: the chart derives worker.adapterCredentials.%s from it. Fix the two configuration keys to the same value. Neither value is printed here because both are live egress credentials." $slug $slug) -}}
+{{- end -}}
+{{- else -}}
+{{- $_ := set $creds $slug $derived -}}
+{{- end -}}
+{{- end -}}
+{{- $creds | toJson -}}
+{{- end -}}
+
+{{/* Keep the historical inline checksum byte-for-byte while also rolling the
+     worker when an operator switches the BYO Secret source. */}}
+{{- define "curie.adapterCredentialsChecksumSource" -}}
+{{- $creds := include "curie.adapterCredentials" . -}}
+{{- if not (empty .Values.worker.adapterCredentialsExistingSecret) -}}
+{{- printf "%s|%s|%s" $creds .Values.worker.adapterCredentialsExistingSecret .Values.worker.adapterCredentialsExistingSecretKey -}}
+{{- else -}}
+{{- $creds -}}
+{{- end -}}
 {{- end -}}
 
 {{/* Heartbeat exec probes for the worker and dispatcher. Neither has an HTTP
@@ -829,4 +1121,145 @@ securityContext:
 {{- define "curie.containerSecurityContext" -}}
 securityContext:
 {{- toYaml . | nindent 2 }}
+{{- end -}}
+
+{{/* ---- ADR-0131 drain-budget relationship (worker) ----
+     `worker.terminationGracePeriodSeconds` must cover
+     `worker.deliveryBudgetSeconds` + `worker.deliveryShutdownReserveSeconds`.
+     The chart renders that same grace value BOTH onto the Pod's
+     `spec.terminationGracePeriodSeconds` and into the worker's
+     `CURIE_TERMINATION_GRACE_PERIOD_S`, where `WorkerConfig` re-checks the
+     inequality at boot -- and that check raises before `asyncio.run`, so the
+     supervisor cannot catch it and the pod CrashLoopBackOffs.
+
+     Without this render-time guard, an existing install that overrides
+     `worker.terminationGracePeriodSeconds` to any value the schema accepts but
+     the inequality rejects `helm upgrade`s CLEANLY and then takes the entire
+     turn plane down: a silent breaking upgrade. `values.schema.json` cannot
+     close it -- JSON Schema has no cross-field arithmetic -- and the CI
+     render-assertion never sees operator values. So the fence has to be here,
+     where `helm template`/`install`/`upgrade` all pass through it.
+
+     This does NOT replace the worker's boot validator, which remains the
+     backstop for the non-Helm substrates (Compose, bare env). It only moves the
+     Helm-shaped failure from pod boot to render time, where it is actionable. */}}
+{{- define "curie.worker.validateDrainBudget" -}}
+{{- $grace := int64 .Values.worker.terminationGracePeriodSeconds -}}
+{{- $budget := int64 .Values.worker.deliveryBudgetSeconds -}}
+{{- $reserve := int64 .Values.worker.deliveryShutdownReserveSeconds -}}
+{{- $required := add $budget $reserve -}}
+{{- if lt $grace $required -}}
+{{- fail (printf "worker.terminationGracePeriodSeconds (%d) must be at least worker.deliveryBudgetSeconds (%d) + worker.deliveryShutdownReserveSeconds (%d) = %d (ADR-0131). At %d a worker draining a full-budget delivery is SIGKILLed before it can settle, and the worker refuses this configuration at boot, so the Pod CrashLoopBackOffs instead of starting. Fix: raise worker.terminationGracePeriodSeconds to %d or more, or lower worker.deliveryBudgetSeconds and/or worker.deliveryShutdownReserveSeconds so their sum is at most %d." $grace $budget $reserve $required $grace $required $grace) -}}
+{{- end -}}
+{{- end -}}
+
+{{/* ---- Upgrade drain gate arithmetic (issue #2010) ----
+     The gate's two clocks are DERIVED, with the values as floors, and only a
+     self-contradictory pair is refused outright. The split is deliberate.
+
+     `timeoutSeconds` vs the delivery budget is a CROSS-FAMILY relationship an
+     operator does not author together: raising `deliveryBudgetSeconds` is a
+     decision about how long a turn may run, made for reasons that have nothing
+     to do with upgrades. Refusing that render would break configurations that
+     are valid today, on a chart upgrade, for a value the operator never touched
+     -- so the effective wait is raised to cover the budget instead. The gate
+     must never give up on a delivery that is still inside the budget ADR-0131
+     already promised it; a gate that refuses upgrades during ordinary traffic
+     is a gate that gets switched off in its first week.
+
+     The quiesce TTL is then derived above that, because the worker's OWN boot
+     validator refuses a TTL that does not outlast the wait -- so a rendered
+     pair the app would reject is a green `helm upgrade` followed by a
+     CrashLoopBackOff, the same failure `validateDrainBudget` above exists to
+     prevent.
+
+     What IS refused is the one pair an operator writes together and can only
+     get wrong by contradicting themselves: a `quiesceTtlSeconds` at or below
+     the `timeoutSeconds` they set beside it. Silently raising that one would
+     hide a stated intent rather than an unrelated default. */}}
+{{- define "curie.worker.upgradeDrain.timeout" -}}
+{{- max (int64 .Values.worker.upgradeDrain.timeoutSeconds) (add (int64 .Values.worker.deliveryBudgetSeconds) (int64 .Values.worker.deliveryShutdownReserveSeconds)) -}}
+{{- end -}}
+
+{{/* Headroom over the effective wait, so the flag cannot lapse in the moments
+     between the gate's last poll and the roll it clears the way for. */}}
+{{- define "curie.worker.upgradeDrain.quiesceTtl" -}}
+{{- max (int64 .Values.worker.upgradeDrain.quiesceTtlSeconds) (add (int64 (include "curie.worker.upgradeDrain.timeout" .)) 60) -}}
+{{- end -}}
+
+{{- define "curie.worker.validateUpgradeDrain" -}}
+{{- $timeout := int64 .Values.worker.upgradeDrain.timeoutSeconds -}}
+{{- $quiesce := int64 .Values.worker.upgradeDrain.quiesceTtlSeconds -}}
+{{- if le $quiesce $timeout -}}
+{{- fail (printf "worker.upgradeDrain.quiesceTtlSeconds (%d) must be strictly greater than worker.upgradeDrain.timeoutSeconds (%d) (issue #2010). As set, the fleet-wide quiesce flag lapses while the gate is still waiting, so the replicas resume claiming into a roll that is about to interrupt them -- and the gate would still report a clean drain. Fix: raise worker.upgradeDrain.quiesceTtlSeconds above %d, or lower worker.upgradeDrain.timeoutSeconds below %d." $quiesce $timeout $timeout $quiesce) -}}
+{{- end -}}
+{{- end -}}
+
+{{/* ---- Langfuse ClickHouse startup gate (issue #2009) ----
+     Both Langfuse deployments run their ClickHouse migrations during boot, so a
+     Helm upgrade that recreates the ClickHouse Service can start them before the
+     name resolves; Langfuse then exits with `failed to open database: dial tcp:
+     lookup <release>-clickhouse ... no such host` and the rollout converges only
+     through CrashLoopBackOff. This init container polls ClickHouse's HTTP
+     `/ping` until it answers 200, so the application container is not started
+     until the dependency is actually accepting connections -- the same
+     wait-then-hand-over shape `templates/api.yaml` uses for Postgres.
+
+     `node` is the Langfuse images' own runtime, so the probe needs no extra
+     tooling in the image. Bounded like the Postgres gate: after `maxAttempts`
+     polls the container exits non-zero and the kubelet restarts it, which keeps
+     a genuinely-down ClickHouse visible instead of hanging forever. Every probe
+     setting (attempts, interval, per-request timeout) comes from values rather
+     than the template, per the chart's probe-settings invariant -- a BYO
+     ClickHouse that answers slowly needs a longer timeout, not a patched chart.
+
+     Call with a dict: `root` (the chart context), `image` (the component's
+     image repository), `containerSecurityContext` and `resources` (the
+     component's, so the gate inherits the same posture and the pod's effective
+     request is unchanged -- init and app container requests are maxed, not
+     summed). */}}
+{{- define "curie.langfuse.clickhouseGate" -}}
+{{- $root := .root -}}
+- name: wait-for-clickhouse
+  image: "{{ .image }}:{{ $root.Values.langfuse.image.tag }}"
+  imagePullPolicy: {{ $root.Values.global.imagePullPolicy }}
+  {{- with .containerSecurityContext }}
+  securityContext:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  command: ["/bin/sh", "-c"]
+  args:
+    - |
+      attempt=1
+      max_attempts={{ $root.Values.langfuse.clickhouseReadiness.maxAttempts }}
+      interval={{ $root.Values.langfuse.clickhouseReadiness.intervalSeconds }}
+      probe_timeout_ms={{ mulf $root.Values.langfuse.clickhouseReadiness.timeoutSeconds 1000 | int }}
+      while [ "$attempt" -le "$max_attempts" ]; do
+        if PROBE_TIMEOUT_MS="$probe_timeout_ms" node -e '
+      const http = require("http");
+      const request = http.get(process.env.CLICKHOUSE_URL + "/ping", { timeout: Number(process.env.PROBE_TIMEOUT_MS) }, (response) => {
+        response.resume();
+        process.exit(response.statusCode === 200 ? 0 : 1);
+      });
+      request.on("timeout", () => { request.destroy(); process.exit(1); });
+      request.on("error", () => { process.exit(1); });
+      ' 2>/dev/null; then
+          echo "ClickHouse ready after $attempt attempt(s); starting Langfuse"
+          exit 0
+        fi
+        if [ "$attempt" -eq 1 ]; then
+          echo "Waiting for ClickHouse readiness at $CLICKHOUSE_URL"
+        fi
+        if [ "$attempt" -lt "$max_attempts" ]; then
+          sleep "$interval"
+        fi
+        attempt=$((attempt + 1))
+      done
+      echo "ClickHouse unreachable at $CLICKHOUSE_URL after $max_attempts readiness attempts; exiting for init container restart" >&2
+      exit 1
+  env:
+    - name: CLICKHOUSE_URL
+      value: http://{{ include "curie.clickhouse.host" $root }}:{{ $root.Values.clickhouse.httpPort }}
+  resources:
+    {{- toYaml .resources | nindent 4 }}
 {{- end -}}

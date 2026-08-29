@@ -127,6 +127,25 @@ pub fn placeholder_update_text<'a>(call: &'a SlackCall, placeholder_ts: &str) ->
     }
 }
 
+/// Notify the caller immediately for each distinct edit to the tracked placeholder,
+/// then retain that snapshot as the latest reply. Both the normal receive arm and
+/// the final drain use this helper so their filtering and notification cannot drift.
+fn observe_placeholder_update(
+    call: &SlackCall,
+    placeholder_ts: &str,
+    latest: &mut Option<String>,
+    observer: &mut impl FnMut(&str),
+) {
+    let Some(text) = placeholder_update_text(call, placeholder_ts) else {
+        return;
+    };
+    if latest.as_deref() == Some(text) {
+        return;
+    }
+    observer(text);
+    *latest = Some(text.to_string());
+}
+
 /// Extract `channel`, `ts`, `text` from a Slack Web API request body, which
 /// slack_sdk sends form-urlencoded by default and JSON when a param is complex.
 pub fn extract_fields(
@@ -284,6 +303,8 @@ pub enum Outcome {
 /// Wait for the worker to consume and finalize the turn. Terminal signal is the
 /// XACK of our entry; the reply is the latest `chat.update` we captured. Shared
 /// by `chat` and `message` (both stand up the same stub + enqueue + ack seam).
+/// The observer sees each distinct matching edit immediately, but the returned
+/// outcome still uses the latest edit only after XACK and the final drain.
 ///
 /// The turn counts as awaiting approval on EITHER of two signals:
 ///
@@ -307,6 +328,7 @@ pub async fn await_reply(
     entry_id: &str,
     placeholder_ts: &str,
     timeout: Duration,
+    observer: &mut impl FnMut(&str),
 ) -> Outcome {
     let deadline = Instant::now() + timeout;
     let mut latest: Option<String> = None;
@@ -319,9 +341,7 @@ pub async fn await_reply(
             call = stub.recv() => {
                 if let Some(call) = call {
                     awaiting_approval |= call.approval_card;
-                    if let Some(text) = placeholder_update_text(&call, placeholder_ts) {
-                        latest = Some(text.to_string());
-                    }
+                    observe_placeholder_update(&call, placeholder_ts, &mut latest, observer);
                 }
             }
             _ = poll.tick() => {
@@ -341,9 +361,7 @@ pub async fn await_reply(
                     // Drain any final edit still in flight before deciding.
                     while let Ok(Some(call)) = tokio::time::timeout(FINAL_DRAIN, stub.recv()).await {
                         awaiting_approval |= call.approval_card;
-                        if let Some(text) = placeholder_update_text(&call, placeholder_ts) {
-                            latest = Some(text.to_string());
-                        }
+                        observe_placeholder_update(&call, placeholder_ts, &mut latest, observer);
                     }
                     // Either signal parks the turn: the card seen here, or an
                     // authoritative approval notice in the latest placeholder
@@ -481,6 +499,7 @@ pub struct ResumeObservation {
 /// a stalled Valkey cannot block past `timeout`. A failed or overrunning scan is
 /// treated as "not found yet" and retried until the deadline, so a blip cannot be
 /// misread as a resolution; a persistently failing scan warns once.
+#[allow(clippy::too_many_arguments)]
 pub async fn await_resume(
     stub: &mut SlackStub,
     conn: &mut redis::aio::MultiplexedConnection,
@@ -489,6 +508,7 @@ pub async fn await_resume(
     after_id: &str,
     placeholder_ts: &str,
     timeout: Duration,
+    observer: &mut impl FnMut(&str),
 ) -> ResumeObservation {
     let deadline = Instant::now() + timeout;
     let mut cursor = after_id.to_string();
@@ -528,6 +548,7 @@ pub async fn await_resume(
                 &resume_stream_id,
                 placeholder_ts,
                 remaining,
+                observer,
             )
             .await;
             return ResumeObservation {

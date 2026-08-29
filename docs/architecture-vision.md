@@ -163,7 +163,11 @@ Kubernetes the chart's bundle-fetch init container fetches with the AWS CLI
 (`charts/curie/templates/agent-sandbox.yaml`), also pure S3 protocol.
 
 **Current adapter:** RustFS (Apache-2.0), deployed by the chart
-(`charts/curie/templates/rustfs.yaml`).
+(`charts/curie/templates/rustfs.yaml`) with the pinned image
+`rustfs/rustfs:1.0.0-beta.12`. This release is before general availability.
+RustFS's [feature status](https://github.com/rustfs/rustfs/blob/22b4ef9f0c24e22633a4eb62fb600f0d6675ee1d/README.md#feature--status)
+marks Lifecycle Management, Distributed Mode, and RustFS KMS as Under Testing.
+AWS S3 and Cloudflare R2 remain configuration only alternatives.
 
 **Swap:** AWS S3, Cloudflare R2, or any S3-compatible store is config only
 (endpoint, keys, region). GCS is a real decision: either rely on its
@@ -197,7 +201,7 @@ schema-scoped native enum (`apps/api/src/curie_api/db.py::SCHEMA`, the
 `Environment` enum). Both have portable SQLAlchemy equivalents if a
 non-Postgres target ever materializes.
 
-### 6. Communication channel (Slack today)
+### 6. Communication channel (Slack, Discord, and email today)
 
 **Port:** the ingress half of this seam is clean, and the worker now ships a
 neutral egress port. The ingress contract was promoted out of the dispatcher
@@ -256,6 +260,8 @@ increment; the interaction-primitive half is driven now by the approval interfac
 flowchart TB
     subgraph channel["Job 6: communication channel"]
         Slack["Slack via Bolt (today)"]
+        Discord["adapters/discord (today)"]
+        Mail["apps/mail-adapter (email, today)"]
         CLIStub["curie local message / cluster message stub (swap proof)"]
     end
 
@@ -296,6 +302,10 @@ flowchart TB
     end
 
     Slack -- "QueuedTurn" --> Dispatcher
+    Discord -- "POST /channels/turns" --> API
+    Worker -- "reply events" --> Discord
+    Mail -- "POST /channels/turns" --> API
+    Worker -- "reply events" --> Mail
     CLIStub -- "same wire payload" --> Queue
     Runner -- "frozen ACI protocol" --> SDK
     Runner -- "OTLP HTTP" --> Collector
@@ -320,9 +330,10 @@ flowchart TB
 
 ## What we deliberately do not abstract yet
 
-The second implementation teaches the interface. Every port above has exactly
-one implementation, and we resist writing adapter layers ahead of a real swap
-demand: a speculative `StorageInterface` or `ChannelAdapter` would encode
+The second implementation teaches the interface. Communication is the one port
+above with three (Slack, Discord, and email); the rest have one, and we resist
+writing adapter layers ahead of a real swap demand: a speculative
+`StorageInterface` or `ChannelAdapter` would encode
 guesses about the second implementation's needs and would be wrong in the
 ways that matter. Concretely, we do not yet abstract:
 

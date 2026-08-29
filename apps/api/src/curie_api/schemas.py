@@ -1,5 +1,7 @@
 """Pydantic v2 request/response models for the API surface."""
 
+import base64
+import binascii
 import json
 import logging
 import re
@@ -29,8 +31,10 @@ from pydantic import (
 )
 
 from .config import get_settings
-from .models import Environment
+from .hook_partition import HOOK_NAME, validate_pointer_syntax
+from .models import GIT_FLOW_CREATED_BY, Environment
 from .repo_full_name import RepoFullName
+from .workspace_policy import REPOSITORY_FULL_NAME_PATTERN, valid_repository_name
 
 # Slack channel IDs start with C (public/private channel), D (DM), or G (legacy
 # private group) followed by uppercase-alphanumeric chars. Allowlist-shaped on
@@ -125,6 +129,14 @@ def _nullable_override_validator(field: str, examples: str) -> Callable[[str | N
     return _validate
 
 
+def _validate_optional_commit_sha(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if not value.strip():
+        raise ValueError("commit_sha must not be empty; omit it when unavailable")
+    return value.strip()
+
+
 _validate_thinking_override = _nullable_override_validator(
     "thinking", "a value like 'disabled', 'adaptive' or 'enabled:2000'"
 )
@@ -169,25 +181,6 @@ def _slack_shape_error(value: str) -> str:
 _CHANNEL_ADDRESS_SHAPES: dict[str, tuple[re.Pattern[str], Callable[[str], str]]] = {
     "slack": (_SLACK_CHANNEL_ID, _slack_shape_error),
 }
-
-
-def _validate_slack_channel_id(value: str | None) -> str | None:
-    """Enforce a Slack channel-ID shape on an APPROVAL ROUTE's destination.
-
-    Scoped to `ApprovalRouteBinding` since ADR-0096 (#1459). The agent's channel
-    binding is validated by `_validate_channel_binding` below instead: an
-    approval route's channel is a different concept that merely shared this
-    validator (bf717203d), so it keeps a Slack-specific rule of its own rather
-    than being dragged through a kind dispatch it has no kind for. Making it
-    neutral is #1460's work, not this one's.
-
-    None (an omitted PATCH field) passes through as a no-op.
-    """
-    if value is None:
-        return value
-    if not _SLACK_CHANNEL_ID.match(value):
-        raise ValueError(_slack_shape_error(value))
-    return value
 
 
 def _validate_channel_binding(kind: str, address: str) -> str:
@@ -511,11 +504,12 @@ class _StoredWithoutNulls(BaseModel):
 
 class ApprovalApprovers(_StoredWithoutNulls):
     """WHO may resolve a route's approvals (#420), as opposed to the binding's
-    ``channel``, which is only WHERE the card posts.
+    ``resolution``, which is only WHERE the interactive card posts.
 
     Declaring an approvers block is what lets a request sit in a broad channel
     where everyone can see it while only a narrow set may act on it. Omitting it
-    keeps the zero-setup default: the card channel's members are the approvers.
+    keeps the zero-setup default: the resolution-card channel's members are the
+    approvers. Notification recipients never enter this policy.
     """
 
     # A typo in an optional key must not be ignored: silently dropping it would
@@ -575,28 +569,59 @@ class ApprovalApprovers(_StoredWithoutNulls):
         return self
 
 
-class ApprovalRouteBinding(_StoredWithoutNulls):
-    """One workspace binding for a manifest-declared approval route (#247):
-    the Slack channel whose members are that route's approvers (under the
-    channel-membership authorizer), and optionally the ``approvers`` block that
-    narrows WHO may act (#420), leaving ``channel`` to mean only WHERE the card
-    posts.
+class HookPartitionConfig(BaseModel):
+    """How one hook names the thing each delivery is about (ADR-0134).
+
+    One model serves ``AgentCreate``, ``AgentUpdate`` AND ``AgentOut``, which the
+    ``_StoredWithoutNulls`` tripwire above would otherwise argue against: that
+    split only happens for models carrying the wrap serializer, and this one has
+    neither it nor an optional field, so the dumped and validated shapes are the
+    same and no ``-Input``/``-Output`` pair is generated. Do not add a separate
+    ``...Out`` variant.
     """
 
-    # Rejects a typo'd ``approver`` rather than storing a channel-only binding
-    # the operator believes narrows authority. Pre-#420 bindings are
-    # ``{"channel": ...}`` only, so forbidding extras does not reject them.
+    # A typo'd key must not be silently dropped: here the dropped key would be
+    # the whole partition, and the hook would run unpartitioned while its config
+    # still looked right in a GET. Same reason as `ApprovalApprovers`.
     model_config = ConfigDict(extra="forbid")
 
-    channel: str
-    approvers: ApprovalApprovers | None = None
+    # An RFC 6901 pointer into the delivery body.
+    pointer: str
 
-    _check_channel = field_validator("channel")(_validate_slack_channel_id)
+    @field_validator("pointer")
+    @classmethod
+    def _check_pointer(cls, value: str) -> str:
+        # The ingress's own syntax rule, imported rather than restated, so a
+        # pointer the write surface accepts is exactly one the resolver can read.
+        return validate_pointer_syntax(value)
+
+
+def _validate_hook_partitions(
+    value: "dict[str, HookPartitionConfig] | None",
+) -> "dict[str, HookPartitionConfig] | None":
+    """Partition keys are hook NAMES, checked against the shape the ingress
+    enforces.
+
+    A key outside that shape can never match a firing, so it configures nothing
+    while looking configured -- the operator sees a partition map and gets
+    unpartitioned threads.
+    """
+
+    if value is None:
+        return value
+    for name in value:
+        if not HOOK_NAME.fullmatch(name):
+            raise ValueError(
+                f"hook_partitions key {name!r} is not a hook name: 1-63 "
+                "characters of lowercase letters, digits, dot, dash or "
+                "underscore, beginning with a letter or a digit"
+            )
+    return value
 
 
 def _validate_route_names(
-    value: dict[str, ApprovalRouteBinding] | None,
-) -> dict[str, ApprovalRouteBinding] | None:
+    value: "dict[str, ApprovalRouteBinding] | None",
+) -> "dict[str, ApprovalRouteBinding] | None":
     """Route names must be non-empty; they are matched verbatim against the
     manifest's declared route names."""
     if value is None:
@@ -613,9 +638,10 @@ def _reject_retired_binding_keys(data: Any) -> Any:
 
     - `slack_channel` WAS the agent's binding until migration 0021 replaced it
       with `channel: {kind, address}`.
-    - `channels` (plural) never was: ADR-0096/ADR-0089 fix the binding as
-      singular (one agent, one channel), so a caller sending the plural key
-      is describing a shape this API has never had.
+    - `channels` (plural) is not a CREATE field: a create binds exactly one
+      channel and every binding after it is written through the
+      `/agents/{id}/channels` subresource (ADR-0118), so the plural key here
+      describes a shape this endpoint has never had.
 
     These models inherit pydantic's `extra="ignore"`, so without this a
     `PATCH /agents/{id}` carrying either key validates into an EMPTY
@@ -640,44 +666,60 @@ def _reject_retired_binding_keys(data: Any) -> Any:
             raise ValueError(
                 "slack_channel is no longer an agent field: it was replaced by "
                 "the channel-neutral binding (ADR-0096), so sending it would "
-                'leave the agent bound where it already was. Send channel: '
+                "leave the agent bound where it already was. Send channel: "
                 '{"kind": "slack", "address": "C0123ABCD"} instead.'
             )
         if "channels" in data:
             raise ValueError(
-                "channels is not an agent field: an agent binds exactly one "
-                "channel (ADR-0089), so sending the plural key would leave "
-                'the agent bound where it already was. Send channel: {"kind": '
-                '"slack", "address": "C0123ABCD"} instead.'
+                "channels is not an agent field: a create binds exactly ONE "
+                'channel, so send channel: {"kind": "slack", "address": '
+                '"C0123ABCD"} here and add the rest through POST '
+                "/agents/{id}/channels (ADR-0118). Creating with no binding at "
+                "all would leave the agent unable to receive a turn."
             )
     return data
 
 
-def _channel_schema_omittable_not_null(schema: dict[str, Any]) -> None:
-    """Publish `AgentUpdate.channel` as omittable but NOT nullable.
+def _reject_retired_update_binding_key(data: Any) -> Any:
+    """Refuse `channel` on an agent UPDATE (ADR-0118, #1525).
 
-    The annotation is `ChannelBinding | None` because `None` is how an OMITTED
-    field arrives, but `_reject_explicit_null_channel` 422s an explicit null. Left
-    alone, generation reads the annotation literally and the committed
-    `openapi.json` advertises `channel: null` as valid -- so a generated client
-    sends the value the published contract blessed and gets a validation error.
-    Collapsing the `anyOf` (and dropping the `null` default with it) makes the
-    exported schema say what the model actually accepts.
+    Separate from `_reject_retired_binding_keys` rather than a flag on it,
+    because `AgentCreate` must keep ACCEPTING `channel` -- a create still binds
+    exactly one. Only the update surface withdrew the key.
+
+    `PATCH /agents/{id}` with `channel: {...}` meant "move the agent's only
+    binding". With several bindings that sentence has no referent, and widening
+    it to "add, or move, depending" would silently turn a redeploy against a
+    different channel into an accumulate. Left merely undeclared it would be
+    worse still: `extra="ignore"` parses the retired key into an AgentUpdate
+    with nothing set, so the caller is told 200 while the agent keeps answering
+    on its old address -- #38's silent misroute, reached by a caller who read
+    last release's docs.
+
+    Runs `mode="before"`, since by `mode="after"` the extra key is already gone.
     """
 
-    options = [option for option in schema.get("anyOf", []) if option.get("type") != "null"]
-    if len(options) == 1:
-        schema.pop("anyOf")
-        schema.pop("default", None)
-        schema.update(options[0])
+    if isinstance(data, dict) and "channel" in data:
+        raise ValueError(
+            "channel is no longer an agent field: an agent may hold several "
+            "bindings (ADR-0118), so moving 'the' binding has no referent. Use "
+            "the subresource, where each verb means one thing: POST "
+            "/agents/{id}/channels to add a binding, PATCH "
+            "/agents/{id}/channels?kind=&address= to move the one that pair "
+            "names, DELETE /agents/{id}/channels?kind=&address= to remove it."
+        )
+    return data
 
 
 class ChannelBinding(BaseModel):
     """Where one agent listens: a channel KIND and an ADDRESS (ADR-0096, #1459).
 
-    Singular wherever it appears -- one agent binds one channel (ADR-0089) --
-    so `AgentCreate`, `AgentUpdate` and `AgentOut` all carry a `channel` OBJECT
-    and there is no plural surface anywhere on this API.
+    An agent holds ONE OR MORE of these (ADR-0118, #1525, amending ADR-0089's
+    singular clause). `AgentCreate` still carries one `channel` OBJECT -- the
+    first binding, required, since an agent with none cannot receive a turn --
+    `AgentOut` carries the `channels` LIST, and every write after the create
+    goes through the `/agents/{id}/channels` subresource. `AgentUpdate` carries
+    no binding key at all.
 
     `kind` names the adapter that owns the binding, selects the address-shape
     check, AND routes: since ADR-0096 phase 2 the worker resolves on the
@@ -703,11 +745,43 @@ class ChannelBinding(BaseModel):
         return self
 
 
+class ChannelBindingOut(BaseModel):
+    """The READ side of a binding: the stored pair, serialized as it is stored.
+
+    Deliberately NOT a subclass of `ChannelBinding`, and that is the whole point.
+    `ChannelBinding` carries the address-shape rule three write paths inherit
+    (`ChannelBindingWrite`, `ChannelTokenRequest`, `TurnIn`), and it used to be
+    the element type of `AgentOut.channels` as well -- so the rule that guards a
+    BIND also ran when an existing row was READ, and one row it rejected failed
+    the whole response for every agent in it (#1914).
+
+    An install reaches that state by upgrading: migration 0021 backfills
+    `agent_channels.address` from `agents.slack_channel` verbatim, and that column
+    is exactly where a literal `#name` from before the validator lived. So an
+    install that was merely mis-routed became one whose agent list was
+    unavailable, reporting a Pydantic error instead of the bad value.
+
+    Serializing a stored row must not re-litigate whether it should have been
+    stored. Showing the bad address is also the more useful outcome: an operator
+    cannot fix a value the API refuses to tell them.
+
+    The shape stays `{kind, address}`, identical to what `ChannelBinding`
+    serialized, so this is not a wire change -- `ChannelBindingWrite`'s docstring
+    already describes that as the read contract.
+    """
+
+    model_config = ConfigDict(extra="forbid", from_attributes=True)
+
+    kind: str
+    address: str
+
+
 class ChannelBindingWrite(ChannelBinding):
     """The WRITE side of a binding: the public pair plus its reply ROUTE.
 
-    A separate model from `ChannelBinding` because that one doubles as
-    `AgentOut.channel` in RESPONSES, and the public read contract is exactly
+    A separate model from `ChannelBinding` because that one doubles as the
+    element type of `AgentOut.channels` in RESPONSES, and the read contract is
+    exactly
     `{kind, address}` (ADR-0096 phase 2, EB-A18 as relocated). `endpoint` and
     `adapter` are server-controlled facts an operator configures at bind time --
     where this kind's replies go back through, and which egress credential
@@ -774,6 +848,121 @@ class ChannelBindingWrite(ChannelBinding):
         return self
 
 
+class ChannelBindingPatch(ChannelBindingWrite):
+    """A binding move with partial semantics for the write only reply route.
+
+    `kind` and `address` always describe the replacement routing key. Omitting
+    both route fields preserves their stored values because callers cannot read
+    them back. Supplying both fields replaces them, including the explicit
+    `null` pair that clears the route.
+    """
+
+    @model_validator(mode="after")
+    def _check_route_presence(self) -> "ChannelBindingPatch":
+        endpoint_sent = "endpoint" in self.model_fields_set
+        adapter_sent = "adapter" in self.model_fields_set
+        if endpoint_sent != adapter_sent:
+            missing = "adapter" if endpoint_sent else "endpoint"
+            raise ValueError(
+                f"channel route patch must send endpoint and adapter together; "
+                f"{missing} was omitted"
+            )
+        return self
+
+
+class ApprovalResolutionTarget(ChannelBinding):
+    """The one target permitted to carry an approval-resolving affordance.
+
+    ``kind`` is an explicit extension point, but it is intentionally Slack-only
+    until a second adapter can present the scoped verified identity ADR-0096
+    requires. Merely teaching an adapter to render buttons cannot widen this
+    authority boundary.
+    """
+
+    kind: Literal["slack"]
+
+
+class ApprovalNotificationTarget(ChannelBindingWrite, _StoredWithoutNulls):
+    """A visibility-only approval ping target and its server-side transport.
+
+    Slack may use the worker's configured default transport. Every other kind
+    needs the full endpoint/adapter pair at write time, so a declared
+    notification cannot persist as a permanently undeliverable best-effort
+    branch.
+    """
+
+    @model_validator(mode="after")
+    def _require_non_slack_transport(self) -> "ApprovalNotificationTarget":
+        if self.kind != "slack" and self.endpoint is None:
+            raise ValueError(
+                "a non-slack approval notification target requires both endpoint "
+                "and adapter; only slack can use the worker's configured default "
+                "transport"
+            )
+        return self
+
+
+class ApprovalRouteBinding(_StoredWithoutNulls):
+    """One strict workspace binding for a declared approval route (#1460).
+
+    ``resolution`` is the single verified-identity action surface.
+    ``notification`` may make the pending request visible elsewhere, but its
+    message carries no interaction. ``approvers`` continues to narrow WHO may
+    act through the resolution card path and is never inferred from notification
+    recipients.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    resolution: ApprovalResolutionTarget
+    notification: ApprovalNotificationTarget | None = None
+    approvers: ApprovalApprovers | None = None
+
+    @model_validator(mode="after")
+    def _targets_must_differ(self) -> "ApprovalRouteBinding":
+        if self.notification is not None and (
+            self.resolution.kind,
+            self.resolution.address,
+        ) == (self.notification.kind, self.notification.address):
+            raise ValueError(
+                "approval notification must differ from the resolution target; "
+                "a duplicate target adds no notification surface"
+            )
+        return self
+
+
+class ApprovalTargetOut(ChannelBindingOut):
+    """Display-safe target identity; stored transport is write-only.
+
+    This is deliberately a tolerant read projection. Write models validate the
+    channel kind/address pair before persistence, while reads must still expose
+    a malformed historical address so an operator can repair it.
+    """
+
+    # Stored bindings contain endpoint/adapter. Accept and discard those
+    # server-controlled fields so AgentOut never discloses them.
+    model_config = ConfigDict(extra="ignore")
+
+
+class ApprovalApproversOut(BaseModel):
+    """Repair-oriented read projection of the stored approver declaration."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    group: str | None = None
+    users: list[str] | None = None
+
+
+class ApprovalRouteBindingOut(BaseModel):
+    """The required resolution plus optional, redacted visibility policy."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    resolution: ApprovalTargetOut
+    notification: ApprovalTargetOut | None = None
+    approvers: ApprovalApproversOut | None = None
+
+
 class AgentCreate(BaseModel):
     name: str
     # Required, and singular. Every create path supplies exactly one binding
@@ -782,7 +971,8 @@ class AgentCreate(BaseModel):
     # answering nothing, which is #38's silent-shadow failure.
     #
     # The WRITE model: a create may also configure the reply route (ADR-0096
-    # phase 2). `AgentOut.channel` stays the read-only `{kind, address}` pair.
+    # phase 2). `AgentOut.channels` stays a list of read-only `{kind, address}`
+    # pairs. Additional bindings are added through the subresource, never here.
     channel: ChannelBindingWrite
     repo_full_name: RepoFullName | None = None
     behavior_packs: BehaviorPacksConfig | None = None
@@ -795,14 +985,22 @@ class AgentCreate(BaseModel):
     # Per-agent permission gates (#245): tool names requiring human approval.
     # None means no gates (the bypass posture).
     approval_required_tools: list[str] | None = None
-    # Per-agent approval route bindings (#247): manifest route name -> workspace
-    # channel. None means no bindings (unbound routes fall back to the
-    # requesting channel).
+    # Per-agent approval route bindings (#247/#1460): manifest route name -> one
+    # verified Slack resolution target and optional visibility-only notification
+    # target. None means no bindings; a named unbound route escalates.
     approval_routes: dict[str, ApprovalRouteBinding] | None = None
     # Per-agent connector secret VALUES (ADR-0009, #429): env-var-style name ->
     # secret. Stored on the agent row for the local tier and forwarded into the
     # sandbox by the worker binding. None means no connector secrets.
     secrets: dict[str, str] | None = None
+    # Per-hook delivery partitioning (ADR-0134): hook name -> the JSON Pointer
+    # into the delivery body that names the thing each delivery is about. None
+    # (the default) is the unpartitioned behavior: one thread per hook.
+    hook_partitions: dict[str, HookPartitionConfig] | None = None
+    # Whether this agent's bindings share one workflow-state namespace (#1525
+    # follow-up). False (the default) matches a single-binding agent's existing
+    # behavior exactly, since there is nothing yet to share with.
+    memory: bool = False
 
     _check_name = field_validator("name")(_validate_agent_name)
     _check_model = field_validator("model")(_validate_model_override)
@@ -810,6 +1008,7 @@ class AgentCreate(BaseModel):
     _check_approval_tools = field_validator("approval_required_tools")(_validate_tool_names)
     _check_approval_routes = field_validator("approval_routes")(_validate_route_names)
     _check_secrets = field_validator("secrets")(_validate_secret_map)
+    _check_hook_partitions = field_validator("hook_partitions")(_validate_hook_partitions)
     _reject_retired_channel_keys = model_validator(mode="before")(_reject_retired_binding_keys)
 
 
@@ -827,21 +1026,11 @@ class AgentUpdate(BaseModel):
     many agents now, so binding is a routing fact, not a name.
     """
 
-    # The agent's channel binding (ADR-0096, #1459). OMITTED leaves the current
-    # binding unchanged; a value REPLACES it (an agent holds exactly one).
+    # No binding key, in either number (ADR-0118, #1525). The binding's write
+    # surface is `/agents/{id}/channels`, where add, move and remove are three
+    # verbs instead of one overloaded field; `_reject_retired_update_binding_key`
+    # refuses the withdrawn `channel` key loudly rather than ignoring it.
     #
-    # Explicit JSON null is REJECTED, deliberately breaking the convention its
-    # neighbours `model` and `thinking` follow two fields down. Their null means
-    # "fall back to the platform default"; there is no default binding to fall
-    # back to, so a null here would strand the agent -- deployed,
-    # healthy-looking, and unable to receive a turn. `None` is therefore only
-    # ever "omitted", never "sent as null" (see `_reject_explicit_null_channel`).
-    # `json_schema_extra` keeps the PUBLISHED contract honest about that: the
-    # annotation has to admit `None` for the omitted case, but the exported
-    # OpenAPI must not offer `null` as a value a client may send.
-    channel: ChannelBindingWrite | None = Field(
-        default=None, json_schema_extra=_channel_schema_omittable_not_null
-    )
     # New per-agent model id (#254). OMITTED leaves the current model unchanged;
     # explicit null clears it back to the platform default (#1310).
     model: str | None = None
@@ -858,39 +1047,34 @@ class AgentUpdate(BaseModel):
     # New connector secrets (#429). Omitted (None) leaves current secrets
     # unchanged; an explicit empty dict clears them.
     secrets: dict[str, str] | None = None
+    # New per-hook delivery partitioning (ADR-0134). Omitted (None) leaves the
+    # partitions unchanged; an explicit empty dict clears them, returning every
+    # hook on this agent to one thread per hook. Deliberately `approval_routes`'
+    # semantics and NOT the `model`/`thinking` `model_fields_set` three-way:
+    # there is no platform default for this field to be cleared back TO, so
+    # reading None as "omitted" conflates nothing.
+    hook_partitions: dict[str, HookPartitionConfig] | None = None
     # Which repository's pushes deploy this agent (ADR-0091). PATCHable because
     # an agent created before its repo existed -- or, until migration 0018, the
     # SECOND agent of a repo, which the unique index forbade from carrying it --
     # has no other way to be bound. Without this, git-flow cannot find that
     # agent and a target naming it is rejected as unknown.
     repo_full_name: RepoFullName | None = None
+    # Whether this agent's bindings share one workflow-state namespace.
+    memory: bool | None = None
 
     _check_model = field_validator("model")(_validate_model_override)
     _check_thinking = field_validator("thinking")(_validate_thinking_override)
     _check_approval_tools = field_validator("approval_required_tools")(_validate_tool_names)
     _check_approval_routes = field_validator("approval_routes")(_validate_route_names)
     _check_secrets = field_validator("secrets")(_validate_secret_map)
+    _check_hook_partitions = field_validator("hook_partitions")(_validate_hook_partitions)
     _reject_retired_channel_keys = model_validator(mode="before")(_reject_retired_binding_keys)
-
-    @model_validator(mode="after")
-    def _reject_explicit_null_channel(self) -> "AgentUpdate":
-        """Refuse `{"channel": null}`; see the field comment for why.
-
-        Keyed on `model_fields_set` for the same reason the router is (#1310):
-        `is None` alone cannot tell "the client did not mention this field" from
-        "the client explicitly sent null", and here those two must not mean the
-        same thing.
-        """
-
-        if "channel" in self.model_fields_set and self.channel is None:
-            raise ValueError(
-                "channel must not be null: unlike model and thinking, there is "
-                "no platform-default binding to fall back to, so clearing it "
-                "would leave the agent unable to receive a turn. Omit the field "
-                "to leave the binding unchanged, or send a new "
-                "{kind, address} to move it."
-            )
-        return self
+    # The update-only half: a withdrawn `channel` here is refused, while the
+    # same key stays required on `AgentCreate`.
+    _reject_retired_channel_key = model_validator(mode="before")(
+        _reject_retired_update_binding_key
+    )
 
 
 class AgentOut(BaseModel):
@@ -898,21 +1082,29 @@ class AgentOut(BaseModel):
 
     id: uuid.UUID
     name: str
-    # Serialized from the singular `Agent.channel` relationship. Ordering is
-    # moot because there is exactly one, which is a second reason the surface is
-    # an object rather than a list; the LOADING strategy is not moot, and lives
-    # on the relationship (`models.Agent.channel`, lazy="selectin").
-    channel: ChannelBinding
+    # Serialized from the plural `Agent.channels` relationship (ADR-0118).
+    # Ordering is NOT moot now that there can be more than one: it is
+    # `(kind, address)`, enforced on the relationship, because `agent_channels`
+    # has no `created_at` and an unordered list makes two identical GETs differ
+    # -- which re-renders the console's rows on every poll. The LOADING strategy
+    # lives on the relationship too (`models.Agent.channels`, lazy="selectin").
+    channels: list[ChannelBindingOut]
     repo_full_name: str | None
     behavior_packs: dict[str, Any] | None
     model: str | None
     thinking: str | None
     approval_required_tools: list[str] | None
-    approval_routes: dict[str, Any] | None
+    approval_routes: dict[str, ApprovalRouteBindingOut] | None
+    # Which hooks fan out, and by what (ADR-0134). Null is the unpartitioned
+    # posture and the value every pre-existing agent row carries.
+    hook_partitions: dict[str, HookPartitionConfig] | None
     # Connector secret NAMES only (#429) -- values are never returned. The stored
     # column is a name->value map; expose just the sorted names so an operator can
     # see which secrets an agent has bound without the material leaving the API.
     secrets: list[str] | None
+    # Whether this agent's bindings share one workflow-state namespace (#1525
+    # follow-up).
+    memory: bool
     created_at: datetime
 
     @field_validator("secrets", mode="before")
@@ -957,7 +1149,17 @@ class EvalCaseOut(BaseModel):
 class VersionCreate(BaseModel):
     version_label: str
     bundle_ref: str | None = None
+    commit_sha: str | None = None
     created_by: str
+
+    _check_commit_sha = field_validator("commit_sha")(_validate_optional_commit_sha)
+
+    @field_validator("created_by")
+    @classmethod
+    def reject_internal_provenance(cls, value: str) -> str:
+        if value == GIT_FLOW_CREATED_BY:
+            raise ValueError("created_by is reserved for internal Git flow versions")
+        return value
 
 
 class VersionOut(BaseModel):
@@ -1107,8 +1309,14 @@ class DeploymentCreate(BaseModel):
     agent_id: uuid.UUID
     version_id: uuid.UUID
     environment: Environment
+    commit_sha: str | None = None
+    # Three states are distinguished by ``model_fields_set`` in the router:
+    # omitted carries the last active deployment value, true enables runtime
+    # repository selection, and false disables it.
+    workspace_enabled: bool | None = None
     status: str = "active"
 
+    _check_commit_sha = field_validator("commit_sha")(_validate_optional_commit_sha)
 
 class DeploymentOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -1118,17 +1326,156 @@ class DeploymentOut(BaseModel):
     version_id: uuid.UUID
     environment: Environment
     commit_sha: str | None
+    workspace_enabled: bool
     status: str
     deployed_at: datetime
+
+
+class RepositoryCredentialOut(BaseModel):
+    """One server-derived Git credential returned only to the trusted worker."""
+
+    repo_full_name: str
+    clone_url: str
+    authorization_header: str
+
+
+class WorkspaceSelectionRequest(BaseModel):
+    conversation_id: str = Field(min_length=1)
+    author: str = Field(min_length=1)
+    repo_full_name: str | None = None
+
+    @field_validator("repo_full_name")
+    @classmethod
+    def _canonical_repo(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not valid_repository_name(value):
+            raise ValueError("repo_full_name must be one canonical owner/repository name")
+        return value
+
+
+class WorkspaceSelectionOut(BaseModel):
+    repo_full_name: str
+
+
+class WorkspaceCredentialRequest(BaseModel):
+    conversation_id: str = Field(min_length=1)
+
+
+class PublicationCreate(BaseModel):
+    """Trusted snapshot facts used to atomically create approval + publication."""
+
+    deployment_id: uuid.UUID
+    conversation_id: str = Field(min_length=1)
+    repo_full_name: str = Field(pattern=REPOSITORY_FULL_NAME_PATTERN)
+    author: str = Field(min_length=1)
+    summary: str = Field(min_length=1)
+    reply_kind: str = Field(min_length=1)
+    reply_channel: str = Field(min_length=1)
+    reply_placeholder: str | None = None
+    reply_endpoint: str | None = None
+    reply_adapter: str | None = None
+    dedupe_key: str = Field(min_length=1)
+    base_sha: str
+    patch_b64: str = Field(min_length=1)
+    changed_paths: list[str] = Field(min_length=1, max_length=4096)
+    expires_in_seconds: int | None = Field(default=None, ge=1)
+    title: str | None = Field(default=None, max_length=256)
+    body: str | None = Field(default=None, max_length=65_536)
+
+    @field_validator("repo_full_name")
+    @classmethod
+    def _canonical_publication_repo(cls, value: str) -> str:
+        if not valid_repository_name(value):
+            raise ValueError("repo_full_name must be one canonical owner/repository name")
+        return value
+
+    @field_validator("base_sha")
+    @classmethod
+    def _full_base_sha(cls, value: str) -> str:
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", value):
+            raise ValueError("base_sha must be one full 40-character hexadecimal commit id")
+        return value.lower()
+
+    @model_validator(mode="after")
+    def _valid_reply_route(self) -> "PublicationCreate":
+        _validate_channel_binding(self.reply_kind, self.reply_channel)
+        if (self.reply_endpoint is None) != (self.reply_adapter is None):
+            raise ValueError(
+                "publication reply route must set endpoint and adapter together"
+            )
+        if self.reply_adapter is not None and not _CHANNEL_KIND.match(
+            self.reply_adapter
+        ):
+            raise ValueError("publication reply adapter must be a lowercase slug")
+        if self.reply_endpoint is not None:
+            _validate_channel_endpoint(self.reply_endpoint)
+        return self
+
+    @field_validator("changed_paths")
+    @classmethod
+    def _safe_changed_paths(cls, value: list[str]) -> list[str]:
+        for path in value:
+            parts = path.split("/")
+            if tuple(part.casefold() for part in parts[:2]) == (
+                ".github",
+                "workflows",
+            ):
+                raise ValueError(
+                    "GitHub workflow changes cannot be published by this capability"
+                )
+            if (
+                not path
+                or path.startswith("/")
+                or parts[0].casefold() == ".git"
+                or any(part in ("", ".", "..") for part in parts)
+            ):
+                raise ValueError(
+                    "changed_paths must contain safe repository-relative paths"
+                )
+        return value
+
+    def decoded_patch(self) -> bytes:
+        try:
+            return base64.b64decode(self.patch_b64, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("patch_b64 must be canonical base64") from exc
+
+
+class PublicationOut(BaseModel):
+    """Patch-free publication metadata safe for operator and worker reads."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    approval_id: uuid.UUID
+    deployment_id: uuid.UUID
+    repo_full_name: str
+    status: str
+    version: int
+    base_sha: str
+    changed_paths: list[str]
+    title: str
+    body: str
+    reply_kind: str
+    reply_channel: str
+    reply_placeholder: str | None
+    reply_endpoint: str | None
+    reply_adapter: str | None
+    result_url: str | None
+    error: str | None
+    created_at: datetime
+    updated_at: datetime
+    terminal_at: datetime | None
 
 
 class ApprovalResolve(BaseModel):
     """One resolution attempt. Exactly one attempt wins (compare-and-set), and
     the server-side authorizer (#246) decides first whether this actor may
-    resolve at all: self-approval is blocked, and channel membership is proven
-    by ``actor_channel`` -- the channel the resolution attempt was made from
-    (the card click's channel, relayed by the dispatcher; asserted explicitly
-    by API-key operators)."""
+    resolve at all: ordinary self-approval is blocked, while a server-linked
+    publication requester must still prove membership. ``actor_channel`` is the
+    channel the resolution attempt was made from (the card click's channel,
+    relayed by the dispatcher; asserted explicitly by API-key operators)."""
 
     decision: Literal["approved", "rejected"]
     resolved_by: str = Field(min_length=1)
@@ -1162,6 +1509,119 @@ class ApprovalOut(BaseModel):
     resolution_note: str | None
     created_at: datetime
     resolved_at: datetime | None
+
+
+class ActionRecord(BaseModel):
+    """The opening frame of a side-effecting call, as the worker forwards it.
+
+    ``dedupe_key`` is the triggering event id and the call id. The worker
+    redelivers at least once (ADR-0013), so a replayed turn must adopt the record
+    it already wrote rather than mint a second account of one call.
+    """
+
+    agent_id: uuid.UUID | None = None
+    conversation_id: str
+    call_id: str
+    tool: str
+    arguments: dict[str, Any] | None = None
+    detail: str | None = None
+    # The approval that gated this call, when one did. The worker knows it
+    # because a gated call only executes on an approval-resume turn.
+    gate_approval_id: uuid.UUID | None = None
+    dedupe_key: str
+
+
+class ActionComplete(BaseModel):
+    """The closing frame: what came back, and what it takes to put it back.
+
+    ``prior_state`` and ``target`` are what a restore replays. Both are optional
+    because a connector that answers in prose reports neither, and a record that
+    holds neither is not undoable -- which is the honest answer rather than a
+    missing one.
+    """
+
+    failed: bool = False
+    result: dict[str, Any] | None = None
+    prior_state: dict[str, Any] | None = None
+    post_state: dict[str, Any] | None = None
+    target: dict[str, Any] | None = None
+    detail: str | None = None
+
+
+class ActionOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    agent_id: uuid.UUID | None
+    conversation_id: str
+    call_id: str
+    tool: str
+    arguments: dict[str, Any] | None
+    result: dict[str, Any] | None
+    prior_state: dict[str, Any] | None
+    post_state: dict[str, Any] | None
+    target: dict[str, Any] | None
+    detail: str | None
+    gate_approval_id: uuid.UUID | None
+    status: str
+    dedupe_key: str
+    created_at: datetime
+    completed_at: datetime | None
+    undone_at: datetime | None
+    undone_by: str | None
+    # Derived on the model, never stored, so a record cannot claim a
+    # reversibility nothing captured the state for (ADR-0117).
+    undoable: bool
+
+
+class ActionUndo(BaseModel):
+    """A request to put back what an action changed.
+
+    ``observed_state`` is the resource as it looks NOW, read by whoever will
+    perform the restore. The platform cannot read it itself -- nothing here can
+    reach a connector -- and it will not assume: an absent observation is refused
+    rather than treated as "unchanged".
+    """
+
+    actor: str
+    actor_channel: str | None = None
+    observed_state: dict[str, Any] | None = None
+
+
+class ActionRestore(BaseModel):
+    """The call an authorized undo permits: put this state back on that target."""
+
+    target: dict[str, Any]
+    prior_state: dict[str, Any]
+
+
+class ActionUndoOut(BaseModel):
+    """An authorization, not a receipt.
+
+    The API rules and returns; something else performs the restore (ADR-0117
+    leaves where that executor lives undecided). So this names the call to make
+    rather than claiming it was made.
+    """
+
+    action: ActionOut
+    restore: ActionRestore
+
+
+class ActionAuditOut(BaseModel):
+    """One entry in an action's audit trail: an authorized undo, or a refused one."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    action_id: uuid.UUID
+    action: str
+    actor: str
+    actor_channel: str | None
+    authorizer: str
+    authorized: bool
+    reason: str | None
+    evidence: dict[str, Any] | None
+    created_at: datetime
 
 
 class ApprovalAuditOut(BaseModel):

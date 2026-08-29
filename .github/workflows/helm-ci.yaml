@@ -13,6 +13,7 @@ on:
     branches: [main, next]
     paths:
       - "charts/curie/**"
+      - "examples/sre-bot/observability/**"
       - ".github/workflows/helm-ci.yaml"
       # The object-store web-identity gate below EXECUTES these repository
       # files, so a change to one of them can break the gate without touching
@@ -160,6 +161,16 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/otel-collector-checksum-assertions.sh
 
+      - name: helm render assertions (otel collector durable delivery)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/otel-collector-durability-assertions.sh
+
+      - name: helm render assertions (SRE bot observability stack)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/observability-stack-assertions.sh
+
       # Prove the collector's Langfuse credential and the Secret that carries it
       # stay the same decision (issue #1563): under `langfuse.existingSecret` the
       # collector follows the operator's Secret, the chart-managed Secret ships no
@@ -169,6 +180,17 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/otel-collector-langfuse-secret-assertions.sh
+
+      # Prove Langfuse startup is gated on ClickHouse being up (issue #2009). A
+      # Helm upgrade that recreates the ClickHouse Service otherwise lets the new
+      # Langfuse pods start their migrations against an unresolvable name, so the
+      # rollout converges only through CrashLoopBackOff. This one EXECUTES the
+      # rendered init-container script against a stub ClickHouse that is down and
+      # then comes up, so it fails on a gate that merely renders without waiting.
+      - name: helm render assertions (langfuse clickhouse readiness gate)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/langfuse-clickhouse-readiness-assertions.sh
 
       # Prove the Langfuse web+worker containers carry a numeric runAsUser
       # alongside runAsNonRoot (issue #351) so the kubelet can verify non-root
@@ -243,6 +265,24 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/connector-reconciler-rbac-assertions.sh
 
+      - name: helm render assertions (remote dev capability)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/remote-dev-capability-assertions.sh
+
+      # The pre-upgrade drain gate (issue #2010). A routine `helm upgrade` used
+      # to admit a side-effecting turn and then roll the worker and its backing
+      # services out from under it, so the replacement reclaimed the delivery
+      # and escalated accepted work to a human. These assertions prove the gate
+      # is wired to the hook phases that actually run before the roll, that its
+      # clocks are derived from the delivery budget rather than silently left
+      # too short, and that the one self-contradictory value pair is refused at
+      # render time.
+      - name: helm render assertions (upgrade drain gate)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/upgrade-drain-assertions.sh
+
       # Prove every container in the untrusted sandbox pod renders the identical
       # Rail 3 hardened securityContext from the shared helper (issue #493), so a
       # helper edit that weakens the lockdown -- or a container that skips it --
@@ -270,6 +310,18 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/dispatcher-api-wiring-assertions.sh
+
+      # Prove the mail adapter's chart wiring (issue #1515): it does not render
+      # at all by default, it is told where the platform API is, it receives its
+      # channel token, egress secret and AgentMail key by reference only, and it
+      # receives NO CURIE_API_KEY -- the adapter authenticates with a token
+      # scoped to one channel binding and must hold no platform key. The same
+      # script pins the single-source-of-truth egress pair and the rotation
+      # annotations on both this Deployment and the worker.
+      - name: helm render assertions (mail adapter wiring)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/mail-adapter-wiring-assertions.sh
 
       # Prove the tenant capacity ceiling (issue #758, ADR-0059 decision 4): the
       # ResourceQuota scopes to the sandbox PriorityClass with the published

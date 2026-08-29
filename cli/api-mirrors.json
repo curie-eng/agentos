@@ -23,22 +23,51 @@
         {
           "field": "created_at",
           "why": "No CLI verb prints an agent's creation timestamp; the deploy summary and lifecycle verbs render id/name/channel only."
+        },
+        {
+          "field": "hook_partitions",
+          "why": "No CLI verb reads or prints an agent's hook partition map; it is configured through the API write surface and surfaced back on the hook receipt, which the CLI never calls."
         }
       ]
     },
     {
       "struct": "ChannelBinding",
-      "schema": "ChannelBinding",
+      "schema": "ChannelBindingOut",
       "omissions": []
     },
     {
-      "struct": "ApprovalRouteBinding",
-      "schema": "ApprovalRouteBinding",
+      "struct": "ApprovalRouteBindingResponse",
+      "schema": "ApprovalRouteBindingOut",
+      "omissions": []
+    },
+    {
+      "struct": "ApprovalResolutionTargetResponse",
+      "schema": "ApprovalTargetOut",
+      "omissions": []
+    },
+    {
+      "struct": "ApprovalNotificationTargetResponse",
+      "schema": "ApprovalTargetOut",
       "omissions": []
     },
     {
       "struct": "ApprovalApprovers",
-      "schema": "ApprovalApprovers",
+      "schema": "ApprovalApproversOut",
+      "omissions": []
+    },
+    {
+      "struct": "ApprovalRouteBindingWrite",
+      "schema": "ApprovalRouteBinding",
+      "omissions": []
+    },
+    {
+      "struct": "ApprovalResolutionTargetWrite",
+      "schema": "ApprovalResolutionTarget",
+      "omissions": []
+    },
+    {
+      "struct": "NotificationTargetWrite",
+      "schema": "ApprovalNotificationTarget",
       "omissions": []
     },
     {
@@ -220,6 +249,31 @@
       "omissions": []
     },
     {
+      "struct": "ObservationNode",
+      "schema": "ObservationNode",
+      "omissions": []
+    },
+    {
+      "struct": "TraceTree",
+      "schema": "TraceTree",
+      "omissions": []
+    },
+    {
+      "struct": "MetricsSummary",
+      "schema": "MetricsSummary",
+      "omissions": []
+    },
+    {
+      "struct": "MetricPoint",
+      "schema": "MetricPoint",
+      "omissions": []
+    },
+    {
+      "struct": "MetricSeries",
+      "schema": "MetricSeries",
+      "omissions": []
+    },
+    {
       "struct": "RoutingCheckProblem",
       "schema": "RoutingCheckProblem",
       "omissions": []
@@ -230,7 +284,12 @@
       "omissions": []
     }
   ],
-  "non_mirrors": [],
+  "non_mirrors": [
+    {
+      "struct": "TraceListRow",
+      "reason": "GET /langfuse/traces returns list[dict[str, object]] with no named OpenAPI component schema. The CLI requires id and timestamp, preserves the API's nullable name, and flattens every other anonymous field so the response is retained wholesale."
+    }
+  ],
   "_emits_comment": "The second, emit-hop gate (#699): a CliOutput::to_json can hand-project one of the mirror structs above into a serde_json::json! literal and drop a field the struct-level gate already proved it carries (the named drift was VersionsOutput dropping Version.id, fixed in #691). Each entry below declares that a specific `output` type's to_json projects a specific mirror `struct`, and every allowlisted omission needs a consumer-derived justification just like the mirrors list above. Check with: curie dev emit-parity. This is a narrower gate than the struct-level one: it verifies every DECLARED (output, struct) pair stays honest, but (unlike mirrors' UndeclaredStruct check) it cannot discover a NEW projection on its own -- see cli/tests/support/emit_parity.rs's module doc for why that reach is out of scope for a syntax-only check.",
   "emits": [
     {
@@ -287,8 +346,12 @@
           "why": "Same reason as `channel`: a routing fact owned by the git-flow binding (ADR-0091), not part of the override pair this result is about."
         },
         {
-          "field": "channel",
-          "why": "The verb reads and writes the two nullable model/thinking overrides; an agent's channel binding (kind + address) is a different concern with its own surface (`deploy --slack-channel`), and emitting it here would imply this verb can change it."
+          "field": "channels",
+          "why": "The verb reads and writes the two nullable model/thinking overrides; an agent's channel bindings (kind + address) are a different concern with their own surface (`<tier> surfaces`), and emitting them here would imply this verb can change them."
+        },
+        {
+          "field": "memory",
+          "why": "Same reason as `channels`: whether an agent's bindings share workflow state (#1525 follow-up, ADR-0118) is a separate concern from the model/thinking pair this verb reads and writes, and it has no CLI surface of its own yet -- emitting it here would imply this verb can change it."
         }
       ]
     }

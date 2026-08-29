@@ -36,6 +36,7 @@ from channel_protocol.reply import (
     SettledOutcome,
     TurnStatus,
 )
+from curie_worker import slack_sink as slack_sink_module
 from curie_worker.config import WorkerConfig
 from curie_worker.reply_sink import TargetRoute
 from curie_worker.slack_sink import SlackReplyAdapter, UntrustedSlackEndpointError
@@ -294,9 +295,18 @@ def test_update_renders_status_and_link_blocks_for_a_reply() -> None:
 # once and never re-enqueues.
 
 
-def test_update_falls_back_to_text_only_on_slack_api_error() -> None:
+def test_update_falls_back_to_text_only_on_slack_api_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     sink = SlackReplyAdapter("xoxb-test")
     calls: list[dict[str, object]] = []
+    metrics: list[tuple[str, dict[str, str]]] = []
+
+    monkeypatch.setattr(
+        slack_sink_module,
+        "record_metric",
+        lambda name, *, attributes: metrics.append((name, attributes)),
+    )
 
     async def _fake_chat_update(**kwargs: object) -> None:
         calls.append(kwargs)
@@ -313,6 +323,54 @@ def test_update_falls_back_to_text_only_on_slack_api_error() -> None:
     second = calls[1]
     assert "blocks" not in second  # the retry is text-only
     assert second["text"] == "body"  # same accessibility fallback text
+    assert metrics == [
+        (
+            "curie.reply.retry",
+            {
+                "service.name": "curie-worker",
+                "operation": "update",
+                "role": "client",
+                "retry_class": "block-fallback",
+            },
+        )
+    ]
+
+
+def test_update_labels_a_429_retry_as_rate_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = SlackReplyAdapter("xoxb-test")
+    metrics: list[dict[str, str]] = []
+    monkeypatch.setattr(
+        slack_sink_module,
+        "record_metric",
+        lambda _name, *, attributes: metrics.append(attributes),
+    )
+    calls = 0
+
+    async def _fake_chat_update(**kwargs: object) -> None:
+        nonlocal calls
+        calls += 1
+        if "blocks" in kwargs:
+            raise SlackApiError(
+                "ratelimited",
+                {"ok": False, "error": "ratelimited", "status_code": 429},
+            )
+
+    sink._client_for(None).chat_update = _fake_chat_update  # type: ignore[method-assign]
+    text = '```curie-reply\n{"header": "Hi", "text": "body"}\n```'
+
+    asyncio.run(_update(sink, text=text))
+
+    assert calls == 2
+    assert metrics == [
+        {
+            "service.name": "curie-worker",
+            "operation": "update",
+            "role": "client",
+            "retry_class": "rate-limit",
+        }
+    ]
 
 
 def test_update_fallback_text_stays_within_slack_text_cap() -> None:
@@ -343,9 +401,17 @@ def test_update_fallback_text_stays_within_slack_text_cap() -> None:
     assert len(final["text"]) <= 40000
 
 
-def test_update_does_not_retry_when_blocks_update_succeeds() -> None:
+def test_update_does_not_retry_when_blocks_update_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     sink = SlackReplyAdapter("xoxb-test")
     calls: list[dict[str, object]] = []
+    metrics: list[str] = []
+    monkeypatch.setattr(
+        slack_sink_module,
+        "record_metric",
+        lambda name, *, attributes: metrics.append(name),
+    )
 
     async def _fake_chat_update(**kwargs: object) -> None:
         calls.append(kwargs)
@@ -357,6 +423,7 @@ def test_update_does_not_retry_when_blocks_update_succeeds() -> None:
 
     assert len(calls) == 1  # a spurious retry would make this 2
     assert isinstance(calls[0].get("blocks"), list)
+    assert metrics == []
 
 
 # --- #530: fall back to the default transport when a resumed reply endpoint is
@@ -378,9 +445,17 @@ def _record_call(sink_calls, label):
     return _fake
 
 
-def test_update_falls_back_to_default_when_endpoint_unreachable() -> None:
+def test_update_falls_back_to_default_when_endpoint_unreachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     sink = SlackReplyAdapter("xoxb-test", base_url=_DEFAULT)
     landed: list[str] = []
+    metrics: list[dict[str, str]] = []
+    monkeypatch.setattr(
+        slack_sink_module,
+        "record_metric",
+        lambda _name, *, attributes: metrics.append(attributes),
+    )
     # The per-turn client's PATH is dead (a stub whose route moved) -> connection
     # error on a trusted origin, which is the surviving #530 shape under D4.4.
     sink._client_for(_STUB).chat_update = _raise_connection_error()  # type: ignore[method-assign]
@@ -389,6 +464,14 @@ def test_update_falls_back_to_default_when_endpoint_unreachable() -> None:
     asyncio.run(_update(sink, text="hi", endpoint=_STUB))
 
     assert landed == ["default"], "the resumed reply must land on the default transport"
+    assert metrics == [
+        {
+            "service.name": "curie-worker",
+            "operation": "update",
+            "role": "client",
+            "retry_class": "transport-fallback",
+        }
+    ]
 
 
 def test_slack_api_error_is_not_treated_as_unreachable() -> None:
@@ -609,6 +692,35 @@ def test_post_renders_the_approval_card_from_a_confirm_intent() -> None:
     assert reject["action_id"] == REJECT_ACTION_ID
     assert reject["value"] == "appr-1"
     assert reject["style"] == "danger"
+
+
+def test_uuid_approval_post_uses_the_record_id_as_slack_idempotency_key() -> None:
+    # Slack's chat.postMessage contract associates duplicate messages with
+    # client_msg_id, including duplicate-specific errors. Keeping the durable
+    # approval UUID in that field closes crash-after-post retries without a
+    # second visible card. Provider contract:
+    # https://docs.slack.dev/reference/methods/chat.postMessage/
+    approval_id = "33333333-3333-4333-8333-333333333333"
+    sink = SlackReplyAdapter("xoxb-test")
+    calls: list[dict[str, object]] = []
+
+    async def _fake_post(**kwargs: object):
+        calls.append(kwargs)
+        return {"ok": True, "ts": "9.9"}
+
+    sink._client_for(None).chat_postMessage = _fake_post  # type: ignore[method-assign]
+
+    asyncio.run(
+        _post(
+            sink,
+            channel="C1",
+            message=_approval_message(approval_id, "Publish repository changes"),
+            requested_by="U_AE",
+            thread="th-card",
+        )
+    )
+
+    assert calls[0]["client_msg_id"] == approval_id
 
 
 def test_post_falls_back_to_text_only_when_card_blocks_rejected() -> None:

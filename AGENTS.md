@@ -34,6 +34,7 @@ before editing there, in addition to this file.
 | `packages/plugin-format` | Python (Pydantic + codegen) | [`packages/CLAUDE.md`](packages/CLAUDE.md) |
 | `apps/api` | Python (FastAPI) | [`apps/api/CLAUDE.md`](apps/api/CLAUDE.md) |
 | `apps/dispatcher` | Python (Slack Bolt) | [`apps/dispatcher/CLAUDE.md`](apps/dispatcher/CLAUDE.md) |
+| `apps/mail-adapter` | Python (stdlib HTTP + Pydantic) | [`apps/mail-adapter/CLAUDE.md`](apps/mail-adapter/CLAUDE.md) |
 | `apps/worker` | Python (redis-py) | [`apps/worker/CLAUDE.md`](apps/worker/CLAUDE.md) |
 | `runner` | Python (claude-agent-sdk) | [`runner/CLAUDE.md`](runner/CLAUDE.md) |
 | `apps/ui` | React (Vite + TS) | [`apps/ui/CLAUDE.md`](apps/ui/CLAUDE.md) |
@@ -106,7 +107,7 @@ broken.
 ```bash
 cd cli
 cargo fmt --check
-cargo clippy -- -D warnings
+cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 The Rust CI job sets `CI_REQUIRE_VALKEY_TESTS` and starts Valkey, so Valkey-backed
@@ -139,6 +140,7 @@ pass by weakening assertions is a regression. At parity seams, include at least
 one negative or secondary-path test per AC (see the parity-seam registry).
 A fix PR changing `apps/*/tests/`, `packages/*/tests/`, `cli/tests/`, or `charts/curie/ci/` is expected to be verifiable with the exact command
 `curie dev verify-fix-pin <CHANGE> <SELECTOR>`.
+A fix PR includes exactly one `Fix pin: <SELECTOR>` line in its body. A non fix PR omits it.
 Assertions about an external API or SDK's shape or auth must be grounded in
 provider docs or observed behavior, cited in a test comment, never in the
 implementation's own assumption. Any read-modify-write on a versioned row needs a

@@ -14,7 +14,7 @@ fn agent_list() -> Response {
     Response::json(
         200,
         &format!(
-            r##"[{{"id":"{AGENT_ID}","name":"translation-bot","channel":{{"kind":"slack","address":"#x"}},"created_at":"2026-07-05T00:00:00Z"}}]"##
+            r##"[{{"id":"{AGENT_ID}","name":"translation-bot","channels":[{{"kind":"slack","address":"#x"}}],"memory":false,"created_at":"2026-07-05T00:00:00Z"}}]"##
         ),
     )
 }

@@ -75,6 +75,22 @@ class BundleStore:
         body: bytes = obj["Body"].read()
         return body
 
+    def presign_get(self, key: str, *, expires_seconds: int) -> str:
+        """Mint one short-lived exact-object read URL for a claim init lane.
+
+        The SandboxClaim receives this URL instead of a bucket credential. The
+        worker remains the only identity that can list or sign arbitrary bundle
+        keys; the URL expires shortly after the claim binds.
+        """
+
+        return str(
+            self._client.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": self._bucket, "Key": key},
+                ExpiresIn=expires_seconds,
+            )
+        )
+
 
 def extract_bundle(
     data: bytes,

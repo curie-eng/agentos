@@ -45,6 +45,7 @@ fn local_up_without_credentials_warns_about_fake_model() {
         ])
         .env("PATH", path)
         .env("LC_ALL", "C")
+        .env("CURIE_CONFIG_DIR", temp.path().join("config"))
         .env_remove("CURIE_CREDENTIALS")
         .env_remove("ANTHROPIC_API_KEY")
         .env_remove("CLAUDE_CODE_OAUTH_TOKEN")

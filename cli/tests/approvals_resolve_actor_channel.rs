@@ -211,7 +211,7 @@ async fn list_json_reports_the_card_channel_the_recipe_promises() {
     let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/agents") => Response::json(
             200,
-            r##"[{"id":"11111111-1111-1111-1111-111111111111","name":"weather","channel":{"kind":"slack","address":"CREQUEST01"},"created_at":"2026-07-05T00:00:00Z"}]"##,
+            r##"[{"id":"11111111-1111-1111-1111-111111111111","name":"weather","channels":[{"kind":"slack","address":"CREQUEST01"}],"created_at":"2026-07-05T00:00:00Z","memory":false}]"##,
         ),
         ("GET", p) if p.starts_with("/approvals") => Response::json(
             200,
@@ -300,7 +300,7 @@ fn pending_list_server(card_channel: &'static str) -> MockServer {
     serve(move |req| match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/agents") => Response::json(
             200,
-            r##"[{"id":"11111111-1111-1111-1111-111111111111","name":"weather","channel":{"kind":"slack","address":"CREQUEST01"},"created_at":"2026-07-05T00:00:00Z"}]"##,
+            r##"[{"id":"11111111-1111-1111-1111-111111111111","name":"weather","channels":[{"kind":"slack","address":"CREQUEST01"}],"created_at":"2026-07-05T00:00:00Z","memory":false}]"##,
         ),
         ("GET", p) if p.starts_with("/approvals") => Response::json(
             200,

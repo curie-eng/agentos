@@ -211,10 +211,40 @@ class ApprovalCardStore:
             kind=kind,
             adapter=adapter,
         )
+        await self._write(approval_id, ref)
+
+    async def _write(
+        self, key: str, ref: ApprovalCardRef, *, nx: bool = False
+    ) -> None:
         payload = json.dumps(asdict(ref))
         await self._redis.set(
-            self._config.approval_card_key(approval_id), payload, ex=self._ttl_s
+            self._config.approval_card_key(key), payload, ex=self._ttl_s, nx=nx
         )
+
+    async def restore(self, key: str, ref: ApprovalCardRef) -> None:
+        """Restore a popped ref only when no newer ref replaced it."""
+
+        await self._write(key, ref, nx=True)
+
+    async def pop(self, key: str) -> ApprovalCardRef | None:
+        """Atomically return and delete a remembered ref."""
+
+        raw = await self._redis.getdel(self._config.approval_card_key(key))
+        if not raw:
+            return None
+        try:
+            data = json.loads(raw)
+            return ApprovalCardRef(
+                channel=str(data["channel"]),
+                ts=str(data["ts"]),
+                summary=str(data["summary"]),
+                endpoint=data.get("endpoint"),
+                requested_by=str(data.get("requested_by") or ""),
+                kind=str(data.get("kind") or ""),
+                adapter=data.get("adapter"),
+            )
+        except (ValueError, KeyError, TypeError):
+            return None
 
     async def read(
         self, approval_id: str
