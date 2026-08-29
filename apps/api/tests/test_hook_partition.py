@@ -488,9 +488,10 @@ def test_an_unconfigured_hook_enqueues_the_three_segment_id(
     assert answer.status_code == 200, answer.text
     (turn,) = _queued(valkey, runs_stream)
     assert turn.conversation_id == f"hook:{agent_id}:issues"
-    assert turn.conversation_id.count(":") == 2
-    # The body carried a value a pointer COULD have read. Nothing read it.
-    assert "41" not in turn.conversation_id
+    assert turn.conversation_id.split(":") == ["hook", agent_id, "issues"]
+    # The body carried number 41. A substring search on conversation_id is not
+    # the proof: agent UUIDs are hex and can contain "41", which is what failed
+    # on 4fc0d1c6. The segment list is the proof the payload was not read.
 
 
 def test_a_hook_with_no_entry_in_a_populated_map_is_unpartitioned(
