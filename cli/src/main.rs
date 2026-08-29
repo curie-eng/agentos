@@ -1535,6 +1535,10 @@ enum ClusterAction {
         /// Install with the chart's built-in dev-default secrets instead of
         /// generating strong per-release randoms. Deterministic, for local dev
         /// and CI only -- these defaults are published in the public repo.
+        /// Applies to a fresh install or a release already on dev defaults; it
+        /// is refused against a release installed without it, since switching
+        /// an existing release onto the published defaults breaks
+        /// authentication against the credentials its PVCs still hold.
         #[arg(long)]
         dev: bool,
         /// Print the helm command that would run and exit without executing.

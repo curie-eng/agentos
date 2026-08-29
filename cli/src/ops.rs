@@ -1316,6 +1316,39 @@ fn lookup_dotted(values: &serde_json::Value, dotted: &str) -> Option<String> {
     cursor.as_str().map(str::to_string)
 }
 
+/// Read a dotted helm key the way the chart's own truthiness gate reads it:
+/// `true` for the JSON boolean `true` and for the JSON string `"true"`, and
+/// `false` for everything else -- `false`, `"false"`, `"TRUE"`, `""`, any other
+/// string, a number, an object, a null leaf, a missing leaf, and a missing or
+/// non-object intermediate segment all read as off.
+///
+/// It mirrors two contracts and must not drift from either: the
+/// `eq (toString ...) "true"` branch of `curie.managedSecret` in
+/// `charts/curie/templates/_helpers.tpl`, which decides whether a chart-owned
+/// credential renders as the published dev default, and the quoted-`"false"`
+/// render assertion in `charts/curie/ci/render-assertions.sh`, which pins that
+/// spelling as fail-closed. Reading as on what the chart reads as off would
+/// wave through exactly the flip this exists to catch, so every ambiguous
+/// gate-shaped value fails closed (#1375, #1145).
+///
+/// This cannot reuse [`lookup_dotted`]: helm records `--set KEY=true` as a JSON
+/// *boolean*, and `lookup_dotted` ends in `as_str()`, so it returns `None` for
+/// exactly the shape this key normally has.
+fn lookup_dotted_flag(values: &serde_json::Value, dotted: &str) -> bool {
+    let mut cursor = values;
+    for part in dotted.split('.') {
+        let Some(next) = cursor.get(part) else {
+            return false;
+        };
+        cursor = next;
+    }
+    match cursor {
+        serde_json::Value::Bool(flag) => *flag,
+        serde_json::Value::String(raw) => raw == "true",
+        _ => false,
+    }
+}
+
 /// The value helm already recorded for `key`, when there is a real one. An
 /// empty record is what a `--disconnect` / `--clear-*` wrote and is not a
 /// credential; returning `None` for it is what stops a cleared value being
@@ -3340,7 +3373,7 @@ impl UpValuePlan {
 pub(crate) fn up_value_plan(o: &UpOpts) -> UpValuePlan {
     let mut plan = UpValuePlan::default();
     if o.dev {
-        plan.set("security.allowDevDefaults", "true");
+        plan.set(ALLOW_DEV_DEFAULTS_KEY, "true");
     }
     if !o.no_expose {
         plan.set("ui.service.type", "NodePort");
@@ -3490,6 +3523,16 @@ const CONTROLLER_DEPLOYMENT_NAME: &str = "agent-sandbox-controller";
 const CONTROLLER_DEPLOYMENT_NAMESPACE: &str = "agent-sandbox-system";
 const CONTROLLER_DEPLOY_KEY: &str = "agentSandbox.controller.deploy";
 const GVISOR_MODE_KEY: &str = "security.gvisor.mode";
+
+/// The chart value that switches every chart-owned credential to its published
+/// dev default (`curie.managedSecret` in `charts/curie/templates/_helpers.tpl`).
+/// Named once because three call sites are ONE decision and must not drift
+/// (#1145): the value `up_value_plan` emits for `--dev`, the recorded-value read
+/// [`guard_dev_defaults_flip`] does to decide whether a release is already on
+/// dev defaults, and the operator-override membership test that exempts a run
+/// the operator has taken ownership of. A literal in any one of them silently
+/// desynchronises the guard from what helm actually renders.
+const ALLOW_DEV_DEFAULTS_KEY: &str = "security.allowDevDefaults";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ClusterUpInference {
@@ -5194,6 +5237,99 @@ fn should_read_existing(dev: bool, dry_run: bool) -> bool {
     !dry_run
 }
 
+/// Refuse a `--dev` run that would flip an already-installed release onto the
+/// chart's published dev defaults (#1145).
+///
+/// `curie.managedSecret`'s dev-defaults branch short-circuits *ahead of* its
+/// `hasKey .existingData` preservation branch, so pointing an existing sealed
+/// release at dev defaults rewrites every chart-owned credential in the release
+/// Secret while the PVC-backed Postgres and RustFS data keeps the originals.
+/// That leaves the install unbootable until those PVCs are wiped -- a state the
+/// operator cannot back out of -- so the run is refused up front rather than
+/// diagnosed afterwards.
+///
+/// The decision, in order:
+///
+/// 1. `dev == false` -> always allowed. A plain `up` over a *dev* release is
+///    safe by construction: [`resolve_generated_secrets`] re-supplies only what
+///    the release already recorded and never mints a value for an unrecorded
+///    key, so `managedSecret` sees `value == default` and preserves. If that
+///    ever became mint-on-missing, this arm has to change with it.
+/// 2. `existing.is_none()` -> allowed. Either helm positively reported
+///    "release: not found" (the fresh install `--dev` exists for), or the read
+///    was skipped. `--dry-run` is that second case -- `should_read_existing`
+///    returns `false` for it -- so a `--dev --dry-run` plan is never refused:
+///    it reaches no helm invocation and so has no release to damage.
+/// 3. The release already records dev defaults -> allowed. That is the
+///    idempotent `--dev` re-run, and also the retry after a `--dev` install
+///    that failed partway, since helm records a failed install's values.
+/// 4. The operator explicitly supplied [`ALLOW_DEV_DEFAULTS_KEY`] through
+///    `--set` or `--set-string` -> allowed. `up_value_plan` emits the CLI's own
+///    `=true` FIRST and appends the operator's expressions AFTER it, and helm is
+///    last-wins, so the operator's value is the one the chart actually renders:
+///    `--dev --set security.allowDevDefaults=false` renders the flag OFF and
+///    preserves the recorded credentials. Honouring it is therefore not a
+///    bypass, it is reading the same effective value the chart will. Kept
+///    DELIBERATELY NARROW: membership of that EXACT dotted key, never a
+///    substring and never "some override was passed" -- almost every real
+///    `cluster up` carries unrelated overrides, so the wider spelling would
+///    disable the guard outright.
+/// 5. Anything else -> refused, Usage class (exit 2), a deterministic input
+///    error rather than a runtime failure. The truthiness read fails closed, so
+///    an unrecognised recorded shape refuses rather than waves through.
+///
+/// Arm 4 sits ahead of the refusal because it decides what helm renders, not
+/// what the CLI intended. It also subsumes `--set security.allowDevDefaults=true`
+/// staying unguarded on purpose: that is the documented verbatim escape hatch,
+/// and this file's standing rule is that an operator `--set` always wins. Do not
+/// "close the gap" by guarding it. It is kept out of the operator-facing message
+/// and fix hint too, because against an existing release it is destructive
+/// advice.
+fn guard_dev_defaults_flip(
+    dev: bool,
+    existing: Option<&serde_json::Value>,
+    operator_sets: &[String],
+) -> Result<()> {
+    if !dev {
+        return Ok(());
+    }
+    let Some(values) = existing else {
+        return Ok(());
+    };
+    if lookup_dotted_flag(values, ALLOW_DEV_DEFAULTS_KEY) {
+        return Ok(());
+    }
+    if operator_set_entries(operator_sets)
+        .into_iter()
+        .any(|(key, _)| key.trim() == ALLOW_DEV_DEFAULTS_KEY)
+    {
+        return Ok(());
+    }
+    // `curie cluster down` is deliberately NOT the headline advice. It deletes
+    // only the namespaces the release itself created and leaves a pre-existing
+    // one untouched (#707), and the runtime PVCs are not helm-owned -- they go
+    // only with that namespace sweep. Followed there it would delete the release
+    // Secret holding the store credentials while the data outlives it, which is
+    // the very lockout this guard exists to prevent, so the teardown path has to
+    // name the PVCs explicitly (#1145).
+    let fix = "re-run without `--dev`, which preserves the credentials the release already \
+               recorded; if a dev-default stack is genuinely what you want here, the \
+               backing-store PVCs have to go WITH the release before you reinstall -- \
+               `curie cluster down` alone does not remove them when the release was \
+               installed into a pre-existing namespace, and dropping the release while \
+               that data survives locks you out of your own stores";
+    Err(crate::exit::CliError::usage(
+        "this release was not installed with `--dev`, so `--dev` is refused: it would rewrite \
+         every chart-owned credential in the release Secret to the published dev defaults \
+         while the Postgres and RustFS data on the release's PVCs still holds the original \
+         generated credentials, so the store init hook times out and the API migrate init \
+         container fails password authentication, leaving the install broken until the PVCs \
+         are wiped",
+    )
+    .with_fix(fix)
+    .into())
+}
+
 enum UpInferencePolicy {
     Detect(Vec<ClusterUpInference>),
     Disabled,
@@ -5280,6 +5416,12 @@ async fn run_prepared_up(
     github_token: Option<&str>,
     inference_policy: UpInferencePolicy,
 ) -> Result<ClusterUpOutput> {
+    // The single call site, and deliberately the first statement of the single
+    // choke point both `up()` and `up_prepared()` funnel through: upstream of
+    // the `inference.render(ui)` loop, of the `!opts.dev` preservation notes,
+    // and of every helm invocation, so a refused run (#1145) emits the error
+    // and nothing else.
+    guard_dev_defaults_flip(opts.dev, existing.as_ref(), &opts.operator_sets())?;
     let ui = crate::ui::ui();
     let (detect_facts, initial_inferences) = match inference_policy {
         UpInferencePolicy::Detect(inferences) => (true, inferences),
@@ -11948,6 +12090,344 @@ mod tests {
                 .iter()
                 .any(|body| body.contains(GH_SENTINEL)),
             "the --dev install dropped the credential"
+        );
+    }
+
+    /// #1145 / G1, G2: the guard's `dev == false` arm is unconditional -- a
+    /// plain `cluster up` is never refused, whatever the release recorded.
+    ///
+    /// The reverse flip (a sealed run over a release that IS on dev defaults)
+    /// is safe by construction, which is why this arm can be unconditional:
+    /// `resolve_generated_secrets` re-supplies only what the release already
+    /// recorded and never mints a value for an unrecorded key, so
+    /// `curie.managedSecret` sees `value == default`, falls through to its
+    /// `hasKey .existingData` branch, and preserves the dev values. If that
+    /// ever became mint-on-missing, a plain `up` would rotate the credential
+    /// and this arm would have to change with it.
+    ///
+    /// Inverting the `dev == false` arm fails here.
+    #[test]
+    fn a_non_dev_up_is_never_refused_whatever_the_release_recorded() {
+        // The guard is a pure function precisely so it can be pinned here.
+        // `run_prepared_up`, its single call site, is `async` and shells out to
+        // helm, so no unit test drives that call site end to end -- worth
+        // stating rather than leaving implied, exactly as the #1124 tests above
+        // do. These tests pin the DECISION; the live evidence that a refused
+        // `--dev` mutates nothing (`helm history` shows no new revision) is the
+        // E2E arm's.
+        let sealed = serde_json::json!({"api": {"githubToken": "gh"}});
+        guard_dev_defaults_flip(false, Some(&sealed), &[])
+            .expect("a plain `cluster up` over a sealed release must never be refused");
+
+        let dev_release = serde_json::json!({"security": {"allowDevDefaults": true}});
+        guard_dev_defaults_flip(false, Some(&dev_release), &[])
+            .expect("a plain `cluster up` over a DEV release must never be refused either");
+
+        guard_dev_defaults_flip(false, None, &[])
+            .expect("a fresh non-dev install is never refused");
+    }
+
+    /// #1145 / G3, AC3: `--dev` on a fresh namespace is the supported case and
+    /// the whole point of the flag. `existing == None` means helm positively
+    /// reported "release: not found" -- and it is also exactly what `--dry-run`
+    /// produces (`should_read_existing(_, true)` is `false`), so a
+    /// `--dev --dry-run` plan is never refused either.
+    #[test]
+    fn dev_is_allowed_when_there_is_no_existing_release() {
+        guard_dev_defaults_flip(true, None, &[])
+            .expect("`--dev` on a fresh namespace is the supported case (AC3)");
+    }
+
+    /// #1145 / G4: a real release that recorded no user-supplied values yields
+    /// `Some(Value::Null)`, not `None` -- `fetch_existing_values` returns
+    /// `None` only when helm positively reports "release: not found". It is
+    /// still an existing release whose Secret the flip would rewrite, so it
+    /// must be refused. A guard written as a bare `existing.is_none()` check
+    /// gets this exact case wrong.
+    #[test]
+    fn an_existing_release_with_no_recorded_values_is_still_an_existing_release() {
+        let err = guard_dev_defaults_flip(true, Some(&serde_json::Value::Null), &[])
+            .expect_err("Some(Value::Null) is an existing release and must be refused");
+        assert_eq!(crate::exit::classify(&err).0, crate::exit::ExitClass::Usage);
+    }
+
+    /// #1145 / G5, G6: an idempotent `--dev` re-run over a release that is
+    /// already on dev defaults is allowed, in BOTH shapes helm can record the
+    /// key in -- the JSON boolean that `--set security.allowDevDefaults=true`
+    /// produces, and the JSON string that `--set-string` or a quoted
+    /// `curie.yaml` `set:` map produces (#1375). The boolean case is also the
+    /// retry-after-a-failed-`--dev`-install case, since helm records the values
+    /// of an install that failed partway.
+    #[test]
+    fn dev_reruns_over_a_release_already_on_dev_defaults_are_allowed() {
+        let json_bool = serde_json::json!({"security": {"allowDevDefaults": true}});
+        guard_dev_defaults_flip(true, Some(&json_bool), &[])
+            .expect("an idempotent `--dev` re-run over a dev release must be allowed");
+
+        let json_string = serde_json::json!({"security": {"allowDevDefaults": "true"}});
+        guard_dev_defaults_flip(true, Some(&json_string), &[]).expect(
+            "the `--set-string` / quoted `curie.yaml` spelling records the STRING \"true\" \
+             and must read as dev-on too (#1375)",
+        );
+    }
+
+    /// #1145 / G7-G10: every recorded shape the chart's
+    /// `eq (toString .root.Values.security.allowDevDefaults) "true"` reads as
+    /// OFF must be refused, and every refusal must be Usage class (exit 2) --
+    /// a deterministic input error, not a runtime failure (AC5).
+    ///
+    /// `{}` with the key absent is the #1145 defect itself. The quoted
+    /// `"false"` mirrors `charts/curie/ci/render-assertions.sh:247-258`, which
+    /// asserts that spelling fails closed: the CLI must not read as dev-on what
+    /// the chart reads as off. `"TRUE"`, a bare `security` map, a number and a
+    /// null leaf pin the fail-closed default against a reader that treats any
+    /// non-empty string (or any present key) as truthy.
+    #[test]
+    fn dev_refuses_every_recorded_shape_the_chart_reads_as_off() {
+        for existing in [
+            serde_json::json!({"security": {"allowDevDefaults": false}}),
+            serde_json::json!({"security": {"allowDevDefaults": "false"}}),
+            serde_json::json!({}),
+            serde_json::json!({"security": {"allowDevDefaults": "TRUE"}}),
+            serde_json::json!({"security": {}}),
+            serde_json::json!({"security": {"allowDevDefaults": 1}}),
+            serde_json::json!({"security": {"allowDevDefaults": null}}),
+        ] {
+            let refused = guard_dev_defaults_flip(true, Some(&existing), &[]);
+            assert!(
+                refused.is_err(),
+                "`--dev` must refuse this recorded shape: {existing}"
+            );
+            let err = refused.unwrap_err();
+            assert_eq!(
+                crate::exit::classify(&err).0,
+                crate::exit::ExitClass::Usage,
+                "a refused `--dev` is a deterministic input error (exit 2), not a runtime \
+                 failure: {existing}"
+            );
+        }
+    }
+
+    /// #1145 / AC2: the refusal has to SAY WHY, and the part an operator cannot
+    /// recover from without being told is that the PVC-backed Postgres and
+    /// RustFS data still holds the ORIGINAL generated credentials -- so the
+    /// flip breaks authentication rather than merely reconfiguring. Asserted on
+    /// the concept, case-insensitively, rather than by pinning a whole sentence
+    /// that will churn as the wording improves.
+    ///
+    /// A fix hint must ride along (`classify(&err).1`), steering to a re-run
+    /// without `--dev` or a teardown first.
+    #[test]
+    fn the_refusal_explains_the_pvc_held_original_credentials_and_carries_a_fix() {
+        let existing = serde_json::json!({"api": {"githubToken": "gh"}});
+        let err = guard_dev_defaults_flip(true, Some(&existing), &[])
+            .expect_err("`--dev` over a sealed release is the #1145 defect and must be refused");
+
+        let (class, fix) = crate::exit::classify(&err);
+        assert_eq!(class, crate::exit::ExitClass::Usage);
+        assert!(
+            fix.is_some(),
+            "a refused `--dev` must carry a fix hint: the operator has to be told what to \
+             run instead: {err}"
+        );
+
+        let message = err.to_string().to_lowercase();
+        assert!(
+            message.contains("pvc"),
+            "the refusal must name the PVC-backed store data as why the flip breaks: {err}"
+        );
+        assert!(
+            message.contains("original"),
+            "the refusal must say the store data still holds the ORIGINAL credentials: {err}"
+        );
+        assert!(
+            message.contains("--dev"),
+            "the refusal must name the flag it is refusing: {err}"
+        );
+    }
+
+    /// #1145: `--set security.allowDevDefaults=true` stays a deliberately
+    /// unguarded operator escape hatch, but on an existing release it is
+    /// DESTRUCTIVE advice and must never be advertised in operator-facing text
+    /// -- not in the message and not in the fix hint. It belongs in the guard's
+    /// doc comment only. This fails loudly if someone "helpfully" adds it.
+    #[test]
+    fn the_refusal_never_advertises_the_dev_defaults_escape_hatch() {
+        let existing = serde_json::json!({"security": {"allowDevDefaults": false}});
+        let err = guard_dev_defaults_flip(true, Some(&existing), &[]).expect_err("must refuse");
+        let (_, fix) = crate::exit::classify(&err);
+
+        let operator_text = format!("{err}\n{}", fix.unwrap_or_default()).to_lowercase();
+        assert!(
+            !operator_text.contains("allowdevdefaults"),
+            "the refusal leaked the escape hatch into operator-facing text: {operator_text}"
+        );
+    }
+
+    /// #1145 follow-up: an operator who explicitly supplies
+    /// `security.allowDevDefaults` through `--set` or `--set-string` OWNS the
+    /// effective value, so the guard must not refuse the run.
+    ///
+    /// `up_value_plan` emits the CLI's own `security.allowDevDefaults=true`
+    /// FIRST when `--dev` is set and appends the operator's own expressions
+    /// AFTER it. Helm is last-wins, so `--dev --set
+    /// security.allowDevDefaults=false` actually renders the chart with the
+    /// flag OFF and preserves the credentials the release already recorded --
+    /// a safe run the guard used to refuse, and refuse with a message that
+    /// misdescribed what was about to happen. The `=true` spelling is the
+    /// documented unguarded escape hatch and stays open too. Both match this
+    /// file's standing rule that an operator `--set` always wins.
+    ///
+    /// Every lane `UpOpts::operator_sets` can deliver the key through is
+    /// covered: repeated `--set`, helm's comma-joined `a=1,b=2` form (which
+    /// `operator_set_keys` also parses), and `--set-string`.
+    #[test]
+    fn an_explicit_operator_allow_dev_defaults_set_is_never_refused() {
+        // Non-empty and recording no `security.allowDevDefaults`: a SEALED
+        // release, which is exactly the shape the guard refuses on its own.
+        let sealed = serde_json::json!({"security": {"gvisor": {"mode": "off"}}});
+
+        for sets in [
+            vec!["security.allowDevDefaults=false".to_string()],
+            vec!["security.allowDevDefaults=true".to_string()],
+            // Helm's comma-joined form, with the key in a non-leading position.
+            vec!["api.replicas=2,security.allowDevDefaults=false".to_string()],
+            vec!["security.gvisor.mode=off,security.allowDevDefaults=true".to_string()],
+            // An unrelated override ahead of the explicit one.
+            vec![
+                "api.githubToken=x".to_string(),
+                "security.allowDevDefaults=false".to_string(),
+            ],
+        ] {
+            guard_dev_defaults_flip(true, Some(&sealed), &sets).unwrap_or_else(|error| {
+                panic!(
+                    "an explicit operator `security.allowDevDefaults` override owns the \
+                     effective value and must not be refused: {sets:?}: {error}"
+                )
+            });
+        }
+
+        // The `--set-string` lane, threaded through `UpOpts::operator_sets()`
+        // itself rather than a hand-built Vec, so this pins the real wiring:
+        // `operator_sets` chains `--set` THEN `--set-string`, and a key the
+        // operator supplied only through the latter must exempt the run too.
+        let opts = UpOpts {
+            common: common(),
+            github_token: GithubTokenPlan::Untouched,
+            allow_egress_host: vec![],
+            resolved_egress_cidrs: vec![],
+            chart: "charts/curie".into(),
+            secrets: vec![],
+            dev: true,
+            no_expose: false,
+            set: vec![],
+            set_string: vec!["security.allowDevDefaults=false".into()],
+            allow_web_egress: vec![],
+            fake_model: false,
+            credentials: None,
+            local_model: None,
+            model: None,
+        };
+        guard_dev_defaults_flip(true, Some(&sealed), &opts.operator_sets()).expect(
+            "an explicit `--set-string security.allowDevDefaults=false` must exempt the run \
+             too: `operator_sets()` chains both lanes",
+        );
+    }
+
+    /// #1145 follow-up, mutation resistance: the exemption is keyed to the ONE
+    /// key the operator overrode, NOT to "any `--set` was passed". A run
+    /// carrying only unrelated overrides still leaves the CLI's own
+    /// `security.allowDevDefaults=true` as helm's last word, so it is still the
+    /// destructive flip and must still be refused, Usage class (exit 2).
+    ///
+    /// Widening the exemption to `!operator_sets.is_empty()` -- the easy way to
+    /// write it -- fails here, and would in practice disable the guard for
+    /// almost every real `cluster up`, since those nearly always carry
+    /// overrides. Near-miss keys are included so a substring or bare-leaf match
+    /// cannot stand in for the real dotted key either.
+    #[test]
+    fn unrelated_operator_sets_do_not_exempt_a_dev_flip() {
+        let sealed = serde_json::json!({"security": {"gvisor": {"mode": "off"}}});
+
+        for sets in [
+            vec!["api.githubToken=x".to_string()],
+            vec!["security.gvisor.mode=off,api.replicas=2".to_string()],
+            // Same prefix, different leaf.
+            vec!["security.allowDevDefaultsExtra=false".to_string()],
+            // The bare leaf name, without the `security.` path helm records.
+            vec!["allowDevDefaults=false".to_string()],
+        ] {
+            let refused = guard_dev_defaults_flip(true, Some(&sealed), &sets);
+            assert!(
+                refused.is_err(),
+                "only an explicit `security.allowDevDefaults` override exempts a `--dev` \
+                 flip over a sealed release: {sets:?}"
+            );
+            let err = refused.unwrap_err();
+            assert_eq!(
+                crate::exit::classify(&err).0,
+                crate::exit::ExitClass::Usage,
+                "a refused `--dev` stays a deterministic input error (exit 2): {sets:?}"
+            );
+        }
+    }
+
+    /// #1145: the reader mirrors the chart's
+    /// `eq (toString .root.Values.security.allowDevDefaults) "true"`
+    /// (`charts/curie/templates/_helpers.tpl:453`) and the fail-closed contract
+    /// `charts/curie/ci/render-assertions.sh:247-258` pins. ONLY the JSON
+    /// boolean `true` and the JSON string `"true"` read as dev-on; every other
+    /// shape -- including a plausible-looking `"TRUE"`, a number, an object, a
+    /// null leaf, a missing leaf and a missing intermediate segment -- fails
+    /// closed to dev-off, continuing #1375's rule that a gate-shaped value of
+    /// ambiguous spelling must fail closed.
+    #[test]
+    fn lookup_dotted_flag_mirrors_the_charts_tostring_coercion() {
+        const KEY: &str = "security.allowDevDefaults";
+
+        for on in [
+            serde_json::json!({"security": {"allowDevDefaults": true}}),
+            serde_json::json!({"security": {"allowDevDefaults": "true"}}),
+        ] {
+            assert!(lookup_dotted_flag(&on, KEY), "must read as dev-on: {on}");
+        }
+
+        for off in [
+            serde_json::json!({"security": {"allowDevDefaults": false}}),
+            serde_json::json!({"security": {"allowDevDefaults": "false"}}),
+            serde_json::json!({"security": {"allowDevDefaults": "TRUE"}}),
+            serde_json::json!({"security": {"allowDevDefaults": ""}}),
+            serde_json::json!({"security": {"allowDevDefaults": 1}}),
+            serde_json::json!({"security": {"allowDevDefaults": {"enabled": true}}}),
+            serde_json::json!({"security": {"allowDevDefaults": null}}),
+            serde_json::json!({"security": {}}),
+            serde_json::json!({}),
+            serde_json::json!({"security": "true"}),
+            serde_json::json!({"other": {"allowDevDefaults": true}}),
+            serde_json::Value::Null,
+        ] {
+            assert!(!lookup_dotted_flag(&off, KEY), "must fail closed: {off}");
+        }
+    }
+
+    /// #1145: WHY this sibling reader exists rather than reusing
+    /// `lookup_dotted`. Helm records `--set security.allowDevDefaults=true` as
+    /// a JSON BOOLEAN, and `lookup_dotted` ends in `as_str()`, so it returns
+    /// `None` for exactly the shape this key normally has. "Simplifying" the
+    /// guard back onto `lookup_dotted` would make every idempotent `--dev`
+    /// re-run (G5) refuse, silently reintroducing #1145's class of surprise --
+    /// so this test states the structural gap rather than trusting a comment.
+    #[test]
+    fn lookup_dotted_cannot_read_the_json_boolean_this_flag_reader_exists_for() {
+        let doc = serde_json::json!({"security": {"allowDevDefaults": true}});
+        assert_eq!(
+            lookup_dotted(&doc, "security.allowDevDefaults"),
+            None,
+            "if this ever returns Some, re-check whether the sibling reader is still needed"
+        );
+        assert!(
+            lookup_dotted_flag(&doc, "security.allowDevDefaults"),
+            "the boolean-aware reader is the one that can see helm's recorded shape"
         );
     }
 
