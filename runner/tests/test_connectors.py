@@ -7,6 +7,7 @@ URL the agent dials is the one the Service actually has.
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 from aci_protocol import BootEnv, Budget
@@ -360,3 +361,73 @@ def test_the_reserved_list_matches_the_runner_constants() -> None:
     # never the reverse. This is the pin that keeps the copy honest: rename
     # either constant here and the deploy-time guard stops fencing it.
     assert RESERVED_CONNECTOR_NAMES == {APPROVAL_SERVER_NAME, STATE_SERVER_NAME}
+
+
+# --------------------------------------------------------------------------- #
+# An agent name that forges the object-name join -- #1446
+#
+# `mcp_entry` derives the URL through `object_name`, which builds
+# `{release}-{agent}-mcp-{connector}`. Since #1446 that function fails closed on
+# an agent name that would forge a SECOND `-mcp-` (it contains the delimiter, or
+# it ends in `-mcp`), because two different `(agent, connector)` pairs would
+# otherwise render one Service, one Deployment, both NetworkPolicies and one
+# `app.kubernetes.io/name` pod selector -- and the connector is unauthenticated
+# by design (ADR-0086), so that name is the only thing binding a sandbox to a
+# credential.
+#
+# The connector-name half of that rule is already fail-soft here: `_read` runs
+# `validate_connectors` and returns None on any error, so a forging CONNECTOR
+# name logs and mounts nothing. The AGENT name has no such path -- it arrives on
+# the boot env, is never validated in this module, and goes straight into the
+# `mcp_entry` comprehension in `derive_mcp_servers`. An uncaught raise there
+# contradicts this module's own documented contract (see `_read`): "Log and
+# mount nothing rather than fail the turn ... a crashed boot loses the whole
+# session." Losing the connector's tools is visible in the agent's tool list and
+# recoverable by renaming the agent; losing the boot is the entire session, for
+# every turn, until someone reads a stack trace out of a sandbox pod's logs.
+# --------------------------------------------------------------------------- #
+FORGING_AGENT = "a-mcp-b"
+
+
+def test_a_forging_agent_name_mounts_nothing_rather_than_crashing_the_boot(
+    tmp_path: Path, caplog
+) -> None:
+    root = _bundle(tmp_path, HOSTED)
+
+    with caplog.at_level(logging.WARNING, logger="curie_runner.connectors"):
+        servers = derive_mcp_servers(
+            root, release="curie", agent=FORGING_AGENT, namespace="curie"
+        )
+
+    assert servers == {}, f"a forging agent name must mount nothing, got {servers}"
+    # Silence would be worse than the crash it replaces: the agent boots, its
+    # tool list is quietly short one connector, and every tool call fails as
+    # "no such tool" with nothing anywhere naming the cause. The warning must
+    # carry the AGENT NAME, because that is the single thing an operator has to
+    # change and it is assigned at deploy time, not written in the bundle.
+    assert any(
+        FORGING_AGENT in record.getMessage() for record in caplog.records
+    ), caplog.text
+
+    # The control, in the same test on purpose: if `_bundle`, `HOSTED`, or
+    # `derive_mcp_servers` broke for any reason unrelated to #1446, the
+    # assertion above would pass vacuously on an empty dict. Same bundle, same
+    # release, same namespace -- only the agent name differs.
+    assert derive_mcp_servers(root, **SCOPE)["grafana"]["url"] == (
+        "http://curie-acme-dev-mcp-grafana.curie.svc.cluster.local:8000/mcp"
+    )
+
+
+def test_an_agent_name_that_only_looks_like_the_join_still_mounts(tmp_path: Path) -> None:
+    # A LEADING `mcp-` on the agent side is unambiguous -- the only alternative
+    # split of `curie-mcp-x-mcp-grafana` leaves an empty agent -- so it must
+    # keep working. This is the test that reddens if someone "simplifies" the
+    # rule to a bare `'-mcp-' in name` substring ban or a
+    # `base.count('-mcp-') == 1` guard: both over-reject, and an over-rejecting
+    # rule silently strips a live agent of its connectors for no security gain.
+    servers = derive_mcp_servers(
+        _bundle(tmp_path, HOSTED), release="curie", agent="mcp-x", namespace="curie"
+    )
+    assert servers["grafana"]["url"] == (
+        "http://curie-mcp-x-mcp-grafana.curie.svc.cluster.local:8000/mcp"
+    )

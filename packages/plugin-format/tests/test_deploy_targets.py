@@ -201,3 +201,88 @@ def test_bundle_allows_chained_merge_anchors(tmp_path: Path) -> None:
 
 def test_the_real_acme_bot_routing_validates(tmp_path: Path) -> None:
     assert validate_bundle(str(_bundle(tmp_path, REAL))).valid
+
+
+# --------------------------------------------------------------------------- #
+# Agent names that forge the renderer's `-mcp-` join -- #1446
+#
+# Every connector Curie renders for an agent is named
+# `{release}-{agent}-mcp-{connector}`. `-mcp-` is a bare substring inside one
+# DNS label, not a structural separator, so an agent name that ends in `-mcp` or
+# contains `-mcp-` makes that name ambiguous about where the agent ends: a
+# DIFFERENT agent/connector pair renders the same Service, the same Deployment,
+# both the same NetworkPolicies, and -- worst of all -- the same
+# `app.kubernetes.io/name`, which IS the pod selector. One agent's sandbox then
+# reaches the other agent's connector and the credential bound to it (ADR-0086
+# leaves the connector deliberately unauthenticated, so the network is the whole
+# of the access control).
+#
+# This is the same class of silent failure the shape check already guards: a
+# typo does not fail, it MINTS A NEW AGENT. A forged join is one level deeper --
+# it does not mint a new agent, it MERGES two.
+# --------------------------------------------------------------------------- #
+FORGING_AGENT_NAMES = ["a-mcp-b", "x-mcp", "grafana-mcp"]
+SAFE_AGENT_NAMES = ["mcp-x", "mcp", "acme-dev", "acme-bot"]
+
+
+@pytest.mark.parametrize("agent", FORGING_AGENT_NAMES)
+def test_an_agent_name_that_forges_the_render_join_is_rejected(agent: str) -> None:
+    # Each of these is a well-formed RFC 1123 label, so the existing shape check
+    # passes it and always has. Only the new code can catch it, which is what
+    # the exact-list assertion pins -- a passing test here cannot be a
+    # `deploy.bad_agent_name` standing in.
+    assert _codes({"targets": {"p": {"agent": agent}}}) == ["deploy.ambiguous_agent_name"]
+
+
+@pytest.mark.parametrize("agent", SAFE_AGENT_NAMES)
+def test_an_agent_name_that_merely_starts_with_mcp_is_accepted(agent: str) -> None:
+    # The asymmetry that reads like a bug: a LEADING `mcp-` is fine on the agent
+    # and fatal on the connector, because the alternative split of
+    # `curie-mcp-x-mcp-c` would leave an EMPTY agent, which no bundle can
+    # declare. Each side abuts a different half of the delimiter. Over-rejecting
+    # here is not the safe direction -- every name refused is a working install
+    # that must be renamed before its next deploy.
+    assert "deploy.ambiguous_agent_name" not in _codes({"targets": {"p": {"agent": agent}}})
+
+
+def test_a_malformed_and_forging_agent_name_reports_both() -> None:
+    # `Acme-mcp-bot` is both badly shaped (uppercase is not an RFC 1123 label)
+    # and forging. The file's convention is to accumulate every applicable code
+    # so the author fixes the whole file in one pass; this fails if the new
+    # check lands as an `elif` and swallows one of the two.
+    codes = _codes({"targets": {"p": {"agent": "Acme-mcp-bot"}}})
+    assert "deploy.bad_agent_name" in codes
+    assert "deploy.ambiguous_agent_name" in codes
+
+
+def test_a_malformed_name_that_does_not_forge_reports_only_the_shape_error() -> None:
+    # Regression pin on the existing behaviour: adding the new code must not
+    # start attaching it to every malformed name. `Acme_Bot` is a shape problem
+    # and nothing else.
+    codes = _codes({"targets": {"p": {"agent": "Acme_Bot"}}})
+    assert "deploy.bad_agent_name" in codes
+    assert "deploy.ambiguous_agent_name" not in codes
+
+
+def test_a_missing_agent_still_reports_only_missing_agent() -> None:
+    # The new check has to be guarded on the agent being present. The obvious
+    # placement -- a sibling `if` beside the existing `elif not _is_valid_name`
+    # chain -- calls the predicate on `None` and raises TypeError out of a
+    # validator whose entire contract is to RETURN errors, turning a friendly
+    # "targets.p: agent is required" into a crash during bundle validation.
+    codes = _codes({"targets": {"p": {"agent": None, "env": "prod"}}})
+    assert codes == ["deploy.missing_agent"]
+
+
+def test_the_ambiguous_agent_name_error_says_what_to_do() -> None:
+    # The operator hitting this is hitting it on an install that deployed
+    # yesterday -- `grafana-mcp` was a legal agent name before this fix. The
+    # message has to name the target key (which of several targets to edit), the
+    # agent, and say to rename, or the only way to resolve it is to read the
+    # renderer's source.
+    _, errors = validate_deploy_targets({"targets": {"p": {"agent": "grafana-mcp"}}})
+    message = next(m for c, m in errors if c == "deploy.ambiguous_agent_name")
+    assert "targets.p" in message
+    assert "grafana-mcp" in message
+    assert "-mcp-" in message
+    assert "rename" in message.lower()
