@@ -47,7 +47,7 @@ from curie_dispatcher.queue import from_stream_fields
 from curie_dispatcher.relevance import DROP_RATIONALES, DropReason
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
-from slack_sdk.errors import SlackApiError
+from slack_sdk.errors import SlackApiError, SlackRequestError
 from slack_sdk.socket_mode.request import SocketModeRequest
 from slack_sdk.web import WebClient
 
@@ -277,6 +277,21 @@ def _mention(
     return event
 
 
+def _mention_missing(field: str, **kwargs: Any) -> dict[str, Any]:
+    """An ``app_mention`` Slack always stamps ``field`` on, delivered without it.
+
+    Slack documents ``channel`` and ``ts`` as present on every delivered
+    ``app_mention`` (docs.slack.dev/reference/events/app_mention), so these are
+    shapes production should never see -- which is exactly why the adapter must
+    refuse them by name instead of indexing them and raising after the claim.
+    Built by removing the key from the well-formed builder above, so the two
+    cannot drift apart.
+    """
+    event = _mention(**kwargs)
+    del event[field]
+    return event
+
+
 def _dm(
     *,
     text: str = "hello bot",
@@ -335,6 +350,24 @@ def _block_action_body(
         # neither ``channel`` nor ``message``, so there is no thread to answer in.
         body["container"] = {"type": "view", "view_id": "V1"}
         body["view"] = {"id": "V1", "type": "home"}
+    return body
+
+
+def _anonymous_action_body() -> dict[str, Any]:
+    """A click carrying no identity to build an idempotency key from.
+
+    Slack stamps ``trigger_id`` on the ``block_actions`` payload and
+    ``action_ts`` / ``action_id`` on each entry of ``actions`` (Slack:
+    docs.slack.dev/reference/interaction-payloads/block-actions-payload). A
+    payload carrying none of the three still addresses a real thread and still
+    names a command through the button's ``value`` -- it just has no interaction
+    identity, so the synthesized key collapses to ``action--``.
+    """
+    body = _block_action_body(
+        actions=[{"type": "button", "value": "restart the deploy"}],
+        trigger_id="unused",
+    )
+    del body["trigger_id"]
     return body
 
 
@@ -559,6 +592,91 @@ MATRIX: tuple[Row, ...] = (
             ),
         ),
     ),
+    Row(
+        name="dm_message_deleted_is_not_content",
+        expected=DropReason.NON_CONTENT_SUBTYPE,
+        why=(
+            "A deletion notice: Slack names the removed `deleted_ts` and nests the "
+            "`previous_message`, and there is no new user request anywhere in it "
+            "(Slack: docs.slack.dev/reference/events/message, subtype message_deleted). "
+            "NON_CONTENT_SUBTYPES is a closed denylist, so every member needs its own "
+            "row -- without one, deleting this member from the set is a mutation the "
+            "suite cannot see."
+        ),
+        request=_events_api_request(
+            "env-deleted",
+            "Ev-deleted",
+            {
+                "type": "message",
+                "subtype": "message_deleted",
+                "channel": "D1",
+                "channel_type": "im",
+                "hidden": True,
+                "ts": "1808.0002",
+                "deleted_ts": "1808.0001",
+                "previous_message": {
+                    "type": "message",
+                    "user": "U9",
+                    "text": "never mind",
+                    "ts": "1808.0001",
+                },
+            },
+        ),
+    ),
+    Row(
+        name="dm_message_replied_is_not_content",
+        expected=DropReason.NON_CONTENT_SUBTYPE,
+        why=(
+            "Parent-message bookkeeping: Slack re-sends the PARENT, with its `message` "
+            "nested and `reply_count` bumped, when someone replies in its thread "
+            "(Slack: message subtype message_replied). The reply itself arrives as its "
+            "own event, so admitting this one would mint a second turn for text the "
+            "user sent once."
+        ),
+        request=_events_api_request(
+            "env-replied",
+            "Ev-replied",
+            {
+                "type": "message",
+                "subtype": "message_replied",
+                "channel": "D1",
+                "channel_type": "im",
+                "hidden": True,
+                "ts": "1809.0002",
+                "message": {
+                    "type": "message",
+                    "user": "U9",
+                    "text": "the parent message",
+                    "ts": "1809.0001",
+                    "thread_ts": "1809.0001",
+                    "reply_count": 1,
+                },
+            },
+        ),
+    ),
+    Row(
+        name="dm_tombstone_is_not_content",
+        expected=DropReason.NON_CONTENT_SUBTYPE,
+        why=(
+            "The marker Slack leaves where a threaded parent was removed (Slack: "
+            "message subtype tombstone). Its `text` is Slack's own chrome, not "
+            "something a person wrote, so admitting it would enqueue a turn whose "
+            "prompt Slack authored."
+        ),
+        request=_events_api_request(
+            "env-tombstone",
+            "Ev-tombstone",
+            {
+                "type": "message",
+                "subtype": "tombstone",
+                "channel": "D1",
+                "channel_type": "im",
+                "hidden": True,
+                "ts": "1810.0001",
+                "text": "This message was deleted.",
+            },
+        ),
+    ),
     # -- AC 3: bot identity. TWO DISTINCT IDS -- see the comments on each row --
     Row(
         name="mention_from_self_b1_is_dropped_by_bolt",
@@ -617,6 +735,27 @@ MATRIX: tuple[Row, ...] = (
             ),
         ),
     ),
+    Row(
+        name="mention_from_a_human_in_a_thread",
+        expected=Disposition.ENQUEUED,
+        why=(
+            "THE negative control for the loop guard above, and the mutation it exists "
+            "to kill. BOT_AUTHORED_THREAD_REPLY is bot-authored AND threaded; widening "
+            "it to every threaded mention would swallow the single most ordinary "
+            "inbound Curie has -- a person answering in the thread Curie is already "
+            "replying in. Without this row that mutation passes the whole file."
+        ),
+        request=_events_api_request(
+            "env-human-thread",
+            "Ev-human-thread",
+            _mention(
+                text="<@U0BOT> and what about staging",
+                thread_ts="1903.0001",
+                ts="1903.0002",
+            ),
+        ),
+        text_contains=("and what about staging",),
+    ),
     # -- AC 3: the DM lane ----------------------------------------------------
     Row(
         name="dm_from_a_human",
@@ -644,7 +783,78 @@ MATRIX: tuple[Row, ...] = (
         ),
         text_contains=("deploy finished, 3 warnings",),
     ),
+    Row(
+        name="dm_from_a_foreign_bot_in_a_thread",
+        expected=Disposition.ENQUEUED,
+        why=(
+            "The lane half of the same mutation. `relevance.classify` consults bot "
+            "authorship only when `lane == 'mention'`, because the cross-installation "
+            "mention loop is a mention-lane phenomenon. A bot-authored DM that happens "
+            "to be threaded -- an incoming webhook or Workflow Builder post answering "
+            "in an existing DM thread -- carries no such loop, so extending the guard "
+            "to this lane would be a brand-new silent drop that today's rows miss."
+        ),
+        request=_events_api_request(
+            "env-dm-bot-thread",
+            "Ev-dm-bot-thread",
+            _dm(
+                text="deploy rolled back",
+                bot_id="B2",
+                ts="1806.0003",
+                extra={"thread_ts": "1806.0002"},
+            ),
+        ),
+        text_contains=("deploy rolled back",),
+    ),
     # -- AC 3: envelope validation, dedupe, and the action lane ---------------
+    Row(
+        name="mention_without_a_channel_is_malformed",
+        expected=DropReason.MALFORMED_ENVELOPE,
+        why=(
+            "Slack stamps `channel` on every delivered app_mention (Slack: "
+            "docs.slack.dev/reference/events/app_mention), so a delivery without one "
+            "cannot be answered -- there is nowhere to post the placeholder. Reading it "
+            "as `event['channel']` used to raise AFTER `claim_event` succeeded: Bolt "
+            "had already acked and swallowed the exception, so the claim outlived a "
+            "turn that never existed and Slack's redelivery was then refused as an "
+            "already-seen delivery. The dedupe assertion below is the half that pins "
+            "validation ahead of the claim -- move the check back after `claim_event` "
+            "and this row fails on the burned key even though the log line is "
+            "unchanged."
+        ),
+        request=_events_api_request(
+            "env-no-channel", "Ev-no-channel", _mention_missing("channel", text="are we up")
+        ),
+        dedupe_id="Ev-no-channel",
+    ),
+    Row(
+        name="mention_without_a_thread_key_is_malformed",
+        expected=DropReason.MALFORMED_ENVELOPE,
+        why=(
+            "`ts` is the message's own timestamp and doubles as the thread key for a "
+            "root post (Slack: docs.slack.dev/reference/events/app_mention); a reply is "
+            "posted with `thread_ts` set to one or the other. With neither there is no "
+            "thread to answer in, and the blank key would become ONE conversation id "
+            "shared by every such delivery. Same ordering pin as the row above."
+        ),
+        request=_events_api_request(
+            "env-no-ts", "Ev-no-ts", _mention_missing("ts", text="are we up")
+        ),
+        dedupe_id="Ev-no-ts",
+    ),
+    Row(
+        name="event_without_an_event_id_is_malformed",
+        expected=DropReason.MALFORMED_ENVELOPE,
+        why=(
+            "`event_id` is the Events API wrapper's own identifier (Slack: "
+            "docs.slack.dev/apis/events-api, the event_callback envelope) and is the "
+            "idempotency key this adapter claims. A blank one would claim a single key "
+            "shared by every delivery that omits it, refusing all but the first as "
+            "duplicates -- so it is refused before the claim, leaving that key free."
+        ),
+        request=_events_api_request("env-no-id", "", _mention(text="are we up")),
+        dedupe_id="",
+    ),
     Row(
         name="message_outside_the_subscribed_lane",
         expected=DropReason.UNSUBSCRIBED_LANE,
@@ -724,6 +934,26 @@ MATRIX: tuple[Row, ...] = (
             trigger_id="trig-no-command",
         ),
         dedupe_id="action-trig-no-command",
+    ),
+    Row(
+        name="block_action_with_no_interaction_identity",
+        expected=DropReason.MALFORMED_ENVELOPE,
+        why=(
+            "The action lane's own malformed shape. Slack stamps `trigger_id` on the "
+            "payload and `action_ts` / `action_id` on each `actions` entry (Slack: "
+            "docs.slack.dev/reference/interaction-payloads/block-actions-payload). With "
+            "none of the three the synthesized key collapses to `action--`: ONE key "
+            "shared by every such click, so the first would burn it and every later "
+            "click -- from any user, on any card -- would be refused as an already-seen "
+            "delivery. This click names a command and addresses a real thread, so it "
+            "reaches the identity check rather than the two guards above it. Driven "
+            "directly -- see _DIRECT_DRIVER_NOTE: with no `action_id` key at all, "
+            "Bolt's catch-all matcher indexes `action['action_id']` and raises "
+            "KeyError, so no listener ever runs."
+        ),
+        driver=Driver.DIRECT_ACTION,
+        action_body=_anonymous_action_body(),
+        dedupe_id="action--",
     ),
 )
 
@@ -983,6 +1213,147 @@ def test_a_failed_enqueue_after_a_successful_placeholder_keeps_the_claim(
     assert redis_client.exists(config.dedupe_key("Ev-xadd")) == 1, (
         "the claim must be HELD after a successful placeholder: releasing it would "
         "let Slack's redelivery post a second placeholder in the same thread"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The other half of the release rule: ONLY an unambiguous refusal releases
+# ---------------------------------------------------------------------------
+#
+# The three tests above all fail the placeholder with a `SlackApiError` carrying
+# a real Slack error code, which is the one case where the claim is released.
+# That is a narrow evidence claim, not "the call raised": Slack answered, named
+# its refusal, and delivered nothing, so a later retry is clean.
+#
+# Everything else is ambiguous and KEEPS the claim. Two shapes are pinned below.
+#
+#   * A transport failure (`SlackRequestError`, a timeout, a dropped connection)
+#     carries no answer from Slack at all -- the request may well have been
+#     accepted before the connection died.
+#   * `fatal_error` wears an error code but is not a refusal. Slack documents it
+#     on chat.postMessage as "The server could not complete your operation(s)
+#     without encountering a catastrophic error. It's possible some aspect of
+#     the operation succeeded before the error was raised."
+#     (Slack: docs.slack.dev/reference/methods/chat.postMessage, errors table.)
+#
+# In both cases a placeholder may already be sitting in the thread, so releasing
+# would let a replay post a SECOND one -- exactly the duplicate the
+# claim-before-placeholder ordering exists to prevent. Keeping the claim is the
+# quieter of two imperfect outcomes, and it is a deliberate choice rather than
+# the #2006 bug reappearing, which is why it is pinned here.
+
+
+def test_an_ambiguous_transport_failure_keeps_the_claim_on_the_event_lane(
+    redis_client: redis.Redis, config: DispatcherConfig
+) -> None:
+    """A failure with no answer from Slack must NOT release: the post may have
+    landed, and a released claim would let a replay post a second placeholder."""
+    boom = SlackRequestError("the connection died mid-request")
+    failing = _build_harness(config, redis_client, chat_post_message=_raising_post_message(boom))
+
+    failing.handler.handle(
+        failing.sock,
+        _events_api_request("env-transport", "Ev-transport", _mention(text="please answer")),
+    )
+    _drain(failing.app)
+
+    assert failing.sock.acked_envelope_ids == ["env-transport"]
+    assert len(failing.errors) == 1, failing.errors
+    assert _stream_entries(redis_client, config) == []
+    assert redis_client.exists(config.dedupe_key("Ev-transport")) == 1, (
+        "a transport failure released the dedupe claim: Slack never answered, so the "
+        "placeholder may already be in the thread and a replay would post a second one"
+    )
+
+    # The user-visible consequence of holding the claim, asserted rather than
+    # inferred from the key: a redelivery of the same event id is refused with an
+    # enumerated reason instead of posting into the thread a second time.
+    retry = _build_harness(config, redis_client)
+    retry.handler.handle(
+        retry.sock,
+        _events_api_request("env-transport-2", "Ev-transport", _mention(text="please answer")),
+    )
+    _drain(retry.app)
+
+    assert retry.errors == []
+    assert _stream_entries(redis_client, config) == []
+    assert _drop_reasons_logged(retry.records) == [DropReason.DUPLICATE_DELIVERY]
+
+
+def test_a_fatal_error_response_keeps_the_claim_on_the_event_lane(
+    redis_client: redis.Redis, config: DispatcherConfig
+) -> None:
+    """`fatal_error` is an error code, but Slack's own chat.postMessage docs say
+    "some aspect of the operation succeeded before the error was raised" -- so it
+    is an ambiguous outcome, and treating it as a refusal would release a claim
+    whose placeholder may already be visible."""
+    boom = SlackApiError("fatal_error", {"ok": False, "error": "fatal_error"})
+    failing = _build_harness(config, redis_client, chat_post_message=_raising_post_message(boom))
+
+    failing.handler.handle(
+        failing.sock,
+        _events_api_request("env-fatal", "Ev-fatal", _mention(text="please answer")),
+    )
+    _drain(failing.app)
+
+    assert len(failing.errors) == 1, failing.errors
+    assert _stream_entries(redis_client, config) == []
+    assert redis_client.exists(config.dedupe_key("Ev-fatal")) == 1, (
+        "`fatal_error` released the dedupe claim, but Slack documents it as possibly "
+        "having succeeded in part -- a replay could post a second placeholder"
+    )
+
+
+def test_an_ambiguous_transport_failure_keeps_the_claim_on_the_action_lane(
+    redis_client: redis.Redis, config: DispatcherConfig
+) -> None:
+    """The identical rule on the sibling mint site: `process_action` shares
+    `_post_placeholder`, and a lane-specific divergence here is this repo's
+    dominant drift shape."""
+    boom = SlackRequestError("the connection died mid-request")
+    failing = _build_harness(config, redis_client, chat_post_message=_raising_post_message(boom))
+
+    click = _block_action_body(
+        actions=[{"type": "button", "action_id": "reports", "action_ts": "1.5"}],
+        trigger_id="trig-transport",
+    )
+    failing.handler.handle(failing.sock, _interactive_request("env-click-transport", click))
+    _drain(failing.app)
+
+    assert len(failing.errors) == 1, failing.errors
+    assert _stream_entries(redis_client, config) == []
+    assert redis_client.exists(config.dedupe_key("action-trig-transport")) == 1, (
+        "a transport failure released the dedupe claim on the action lane"
+    )
+
+    retry = _build_harness(config, redis_client)
+    retry.handler.handle(retry.sock, _interactive_request("env-click-transport-2", click))
+    _drain(retry.app)
+
+    assert retry.errors == []
+    assert _stream_entries(redis_client, config) == []
+    assert _drop_reasons_logged(retry.records) == [DropReason.DUPLICATE_DELIVERY]
+
+
+def test_a_fatal_error_response_keeps_the_claim_on_the_action_lane(
+    redis_client: redis.Redis, config: DispatcherConfig
+) -> None:
+    """`fatal_error`'s ambiguity is a property of Slack's Web API, not of a lane,
+    so the action lane must hold its claim for exactly the same reason."""
+    boom = SlackApiError("fatal_error", {"ok": False, "error": "fatal_error"})
+    failing = _build_harness(config, redis_client, chat_post_message=_raising_post_message(boom))
+
+    click = _block_action_body(
+        actions=[{"type": "button", "action_id": "reports", "action_ts": "1.5"}],
+        trigger_id="trig-fatal",
+    )
+    failing.handler.handle(failing.sock, _interactive_request("env-click-fatal", click))
+    _drain(failing.app)
+
+    assert len(failing.errors) == 1, failing.errors
+    assert _stream_entries(redis_client, config) == []
+    assert redis_client.exists(config.dedupe_key("action-trig-fatal")) == 1, (
+        "`fatal_error` released the dedupe claim on the action lane"
     )
 
 

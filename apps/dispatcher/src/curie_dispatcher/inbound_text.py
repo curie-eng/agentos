@@ -32,19 +32,30 @@ whatever recognized text they nest (plus a plain-string ``text`` value where
 they happen to carry one, which is how ``date`` surfaces) and nothing more.
 This is accepted partial coverage, not completeness.
 
-**UI chrome is not message content.** Button labels, confirmation-dialog copy,
-select placeholders, option lists and input hints are interface strings the
-sender never wrote as prose. Feeding them to the model is both noise and a
-prompt-injection surface, so the walker refuses to descend into those keys at
-all. That refusal is also what makes the attachment ``fallback`` rule correct:
-chrome can no longer be the thing that "yielded", so an attachment whose only
-content is a button still emits its fallback string.
+**The denied keys are not message content.** ``accessory``, ``confirm``,
+``options``, ``option_groups``, ``placeholder``, ``hint``, and an ``actions``
+block's ``elements`` carry button labels, confirmation-dialog copy, select
+placeholders and input hints -- interface strings the sender never wrote as
+prose, and both noise and a prompt-injection surface -- so the walker refuses to
+descend into them at any depth. That denylist is the whole of what is excluded;
+it is not a claim that every interface string is filtered out. An ``input``
+block's ``label`` is the standing counter-example: it is *not* denied and does
+reach the output, because input blocks do not appear in ordinary channel
+messages and the label is authored copy rather than a canned control string.
+The denylist is also what makes the attachment ``fallback`` rule correct: a
+denied key can no longer be the thing that "yielded", so an attachment whose
+only content is a button still emits its fallback string.
 
 **The bounds bound traversal, not just the output.** A hostile or merely
 enormous payload is bounded three ways -- recursion depth, visited-node count,
 and accumulated characters -- and each stops the *walk*. Truncating only the
 final joined string would still pay the CPU and memory cost of visiting a
-200k-element flat list, so every budget is checked before descending.
+200k-element flat list, so every budget is checked before descending. Two
+consequences are load-bearing rather than incidental: **every** visited node is
+charged, scalars and non-dict list entries included, so breadth cannot be spent
+for free down a container path; and each segment is trimmed to the *remaining*
+character budget at emit time, so a single 10MB ``mrkdwn`` string is never
+stored -- let alone joined -- whole on the way to a 40k-character result.
 """
 
 from typing import Any
@@ -84,12 +95,23 @@ class _Collector:
     then collapsed as a repeat of its immediate predecessor. The budget
     measures work done walking the payload, not the size of the result, which
     is what makes it a real bound on a bulky repetitive payload.
+
+    Storage is bounded at the same instant as the charge: a segment is trimmed
+    to whatever is left of the character budget *before* it is kept, so the
+    accumulator never holds, and ``render`` never joins, a string larger than
+    the cap.
     """
 
     def __init__(self) -> None:
         self.segments: list[str] = []
         self.chars = 0
         self.nodes = 0
+        #: Emit attempts that carried real (non-blank, ``str``) text, counted
+        #: even when the segment is then collapsed as an adjacent duplicate or
+        #: trimmed away by the budget. "Did this subtree have content?" is a
+        #: question about the payload, so it must not be inferred from a change
+        #: in ``len(segments)``, which those two cases leave untouched.
+        self.text_emits = 0
 
     @property
     def exhausted(self) -> bool:
@@ -97,7 +119,13 @@ class _Collector:
         return self.chars >= _MAX_CHARS or self.nodes >= _MAX_NODES
 
     def charge_node(self) -> None:
-        """Count one visited container node against the node budget."""
+        """Count one visited node against the node budget.
+
+        *Every* node the walk touches is charged -- scalars and non-dict list
+        entries as much as dicts and lists. Charging only containers would
+        leave a list of a million bare strings, or an attachment with a million
+        empty ``{}`` fields, bounded by input size rather than by ``_MAX_NODES``.
+        """
         self.nodes += 1
 
     def emit(self, value: object) -> None:
@@ -110,14 +138,24 @@ class _Collector:
         """
         if not isinstance(value, str) or not value.strip():
             return
+        self.text_emits += 1
+        remaining = _MAX_CHARS - self.chars
         # Charged before the adjacency check: the walk did the work either way.
         self.chars += len(value) + 1
-        if self.segments and self.segments[-1] == value:
+        if remaining <= 0:
             return
-        self.segments.append(value)
+        segment = value[:remaining]
+        if self.segments and self.segments[-1] == segment:
+            return
+        self.segments.append(segment)
 
     def render(self) -> str:
-        """Join the collected segments and enforce the character cap."""
+        """Join the collected segments and enforce the character cap.
+
+        Every segment was already trimmed to the budget remaining when it
+        arrived, so the join is bounded by construction; the slice here is the
+        belt to that pair of braces, not the thing doing the bounding.
+        """
         return "\n".join(self.segments)[:_MAX_CHARS]
 
 
@@ -185,8 +223,10 @@ def _walk(node: object, depth: int, out: _Collector) -> None:
     """
     if out.exhausted or depth > _MAX_DEPTH:
         return
+    # Charged for every node, container or not: a scalar list element costs a
+    # visit even though it is a dead end, and that is what bounds breadth.
+    out.charge_node()
     if isinstance(node, list):
-        out.charge_node()
         for item in node:
             if out.exhausted:
                 return
@@ -194,7 +234,6 @@ def _walk(node: object, depth: int, out: _Collector) -> None:
         return
     if not isinstance(node, dict):
         return
-    out.charge_node()
 
     node_type = node.get("type")
     if isinstance(node_type, str) and _emit_recognized(node, node_type, out):
@@ -227,26 +266,43 @@ def _walk_attachment(attachment: object, out: _Collector) -> None:
     field twice. ``fallback`` is Slack's own plain-text summary of the rest of
     the attachment, so it is emitted only when nothing else in this attachment
     yielded anything.
+
+    "Yielded anything" is read off ``text_emits``, never off a change in
+    ``len(out.segments)``: an attachment whose text repeats the segment
+    immediately before it is collapsed by ``emit``, leaving the segment count
+    unmoved, and inferring from the count would then emit the ``fallback`` of an
+    attachment that plainly did have content.
+
+    Every budget is re-checked between this attachment's own keys, exactly as
+    the generic walker checks between a dict's values -- otherwise an
+    attachment that exhausted the budget on its ``pretext`` would go on to walk
+    its fields, footer and nested blocks anyway.
     """
+    out.charge_node()
     if not isinstance(attachment, dict):
         return
-    out.charge_node()
-    before = len(out.segments)
+    before = out.text_emits
 
     for key in _ATTACHMENT_LEAD_KEYS:
+        if out.exhausted:
+            return
         out.emit(attachment.get(key))
     fields = attachment.get("fields")
     if isinstance(fields, list):
+        out.charge_node()
         for field in fields:
             if out.exhausted:
                 break
+            out.charge_node()
             if isinstance(field, dict):
                 out.emit(field.get("title"))
                 out.emit(field.get("value"))
+    if out.exhausted:
+        return
     out.emit(attachment.get("footer"))
     _walk(attachment.get("blocks"), 1, out)
 
-    if len(out.segments) == before:
+    if out.text_emits == before:
         out.emit(attachment.get("fallback"))
 
 
@@ -258,9 +314,9 @@ def _emit_file(file_entry: object, out: _Collector) -> None:
     admitting it would open a brand-new silent-empty path, the exact defect
     this module exists to close.
     """
+    out.charge_node()
     if not isinstance(file_entry, dict):
         return
-    out.charge_node()
     title = file_entry.get("title")
     out.emit(title if isinstance(title, str) and title.strip() else file_entry.get("name"))
 

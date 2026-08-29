@@ -12,6 +12,7 @@ a comment citing Slack's own reference docs -- never in an assumption about
 what the walker will do.
 """
 
+import time
 from typing import Any
 
 import pytest
@@ -334,6 +335,40 @@ def test_attachment_whose_only_content_is_chrome_still_emits_fallback() -> None:
     assert "Approve" not in derived
 
 
+def test_an_attachment_repeating_the_previous_segment_does_not_leak_its_fallback() -> None:
+    """A duplicate is not an absence.
+
+    https://docs.slack.dev/messaging/legacy-secondary-message-attachments/ --
+    ``fallback`` is the plain-text summary Slack shows where the attachment
+    cannot render, so it belongs in the derived prompt only when the attachment
+    contributed nothing else. An alerting integration that posts the same line
+    twice (a repeated status attached to two cards) is a payload where the second
+    attachment plainly DID have content and its fallback must stay out.
+
+    This is the interaction the two rules have with each other: the second
+    attachment's ``text`` is identical to the segment immediately before it, so
+    the adjacent-duplicate collapse leaves the emitted-segment list unchanged.
+    Inferring "this attachment yielded nothing" from that unchanged list is what
+    leaks the fallback, and it is the only shape in which the two rules can
+    disagree.
+    """
+    event: dict[str, Any] = {
+        "attachments": [
+            {"text": "Checkout latency is back to normal"},
+            {
+                "text": "Checkout latency is back to normal",
+                "fallback": "SHOULD_NOT_APPEAR_second_fallback",
+            },
+        ],
+    }
+
+    derived = derive_text(event)
+
+    assert "SHOULD_NOT_APPEAR_second_fallback" not in derived
+    # The repeated line is collapsed, so the whole derivation is that one line.
+    assert derived == "Checkout latency is back to normal"
+
+
 # ---------------------------------------------------------------------------
 # UI-chrome key denylist
 # ---------------------------------------------------------------------------
@@ -522,6 +557,84 @@ def test_node_count_cap_bounds_a_broad_shallow_payload() -> None:
     derived = derive_text(event)
     assert "seg0" in derived
     assert f"seg{_MAX_NODES * 4 - 1}" not in derived
+
+
+def test_a_flat_list_of_bare_scalars_is_charged_against_the_node_budget() -> None:
+    """Breadth spent on scalars must cost the same as breadth spent on dicts.
+
+    https://docs.slack.dev/reference/block-kit/blocks/ -- ``blocks`` is a JSON
+    array whose entries Slack defines as objects, so an array of bare strings and
+    numbers is a payload only a hostile or broken sender produces. It must still
+    be bounded: charging only dicts and lists lets a sender buy an unlimited
+    number of visits for free and then place real content past the point the walk
+    should have stopped.
+
+    The sentinel is the oracle here, not the clock. It sits AFTER more scalars
+    than the node budget allows, so a walk that charges every visited node can
+    never reach it; a walk that charges only containers reaches it immediately.
+    The elapsed-time assertion is the secondary guard against the same defect
+    showing up as a stall rather than as leaked content.
+    """
+    scalars: list[Any] = ["filler", 12345] * 150_000
+    sentinel = {"type": "mrkdwn", "text": "SENTINEL_PAST_THE_SCALAR_RUN"}
+    event: dict[str, Any] = {"blocks": [*scalars, sentinel]}
+
+    started = time.perf_counter()
+    derived = derive_text(event)
+    elapsed = time.perf_counter() - started
+
+    assert "SENTINEL_PAST_THE_SCALAR_RUN" not in derived
+    # Bare scalars are structure, not prose, so nothing at all is derived.
+    assert derived == ""
+    assert elapsed < 1.0, f"walking 300k bare scalars took {elapsed:.2f}s"
+
+
+def test_an_attachment_with_an_enormous_fields_list_is_charged_per_field() -> None:
+    """The container path must be charged too, not just ``blocks``.
+
+    https://docs.slack.dev/messaging/legacy-secondary-message-attachments/ --
+    ``fields`` is an array of ``{title, value}`` objects. An attachment carrying
+    hundreds of thousands of empty ``{}`` fields is bounded only if the list AND
+    each field are charged; otherwise the whole array is walked for free and the
+    real field placed at its end is still reached.
+    """
+    fields: list[Any] = [{} for _ in range(200_000)]
+    fields.append({"title": "SENTINEL_FIELD_TITLE", "value": "SENTINEL_FIELD_VALUE"})
+    event: dict[str, Any] = {"attachments": [{"fields": fields}]}
+
+    started = time.perf_counter()
+    derived = derive_text(event)
+    elapsed = time.perf_counter() - started
+
+    assert "SENTINEL_FIELD_TITLE" not in derived
+    assert "SENTINEL_FIELD_VALUE" not in derived
+    assert derived == ""
+    assert elapsed < 1.0, f"walking 200k empty attachment fields took {elapsed:.2f}s"
+
+
+def test_a_single_enormous_text_value_is_trimmed_rather_than_kept_whole() -> None:
+    """One huge string must not be stored, joined, or returned in full.
+
+    https://docs.slack.dev/reference/block-kit/composition-objects/text-object/
+    -- a ``mrkdwn`` text object's ``text`` is a single string, so a sender can
+    put megabytes in ONE node. A cap applied only to the final joined result
+    would still hold that whole string in memory on the way there; the visible
+    consequence asserted here is that the derived prompt is exactly the cap and
+    that the walk stopped, so nothing after the huge value is derived either.
+    """
+    huge = "z" * (5 * 1024 * 1024)
+    event: dict[str, Any] = {
+        "blocks": [
+            {"type": "section", "text": {"type": "mrkdwn", "text": huge}},
+            {"type": "section", "text": {"type": "mrkdwn", "text": "SENTINEL_PAST_HUGE_VALUE"}},
+        ],
+    }
+
+    derived = derive_text(event)
+
+    assert len(derived) == _MAX_CHARS
+    assert derived == "z" * _MAX_CHARS
+    assert "SENTINEL_PAST_HUGE_VALUE" not in derived
 
 
 # ---------------------------------------------------------------------------

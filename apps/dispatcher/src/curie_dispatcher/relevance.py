@@ -54,6 +54,7 @@ class DropReason(StrEnum):
     a demonstration of what it refuses and why.
     """
 
+    MALFORMED_ENVELOPE = "malformed_envelope"
     UNSUBSCRIBED_LANE = "unsubscribed_lane"
     BOT_AUTHORED_THREAD_REPLY = "bot_authored_thread_reply"
     NON_CONTENT_SUBTYPE = "non_content_subtype"
@@ -68,6 +69,13 @@ class DropReason(StrEnum):
 #: an orphan rationale means a reason was deleted without its explanation.
 DROP_RATIONALES: Mapping[DropReason, str] = MappingProxyType(
     {
+        DropReason.MALFORMED_ENVELOPE: (
+            "The delivery omits a field the turn is minted from -- the event id on an "
+            "event, the channel, the thread key, or the interaction identity on a "
+            "click -- and refusing it before the idempotency claim beats raising after "
+            "it, because Bolt has already acked and would swallow the exception while "
+            "the claim survived for work that never happened."
+        ),
         DropReason.UNSUBSCRIBED_LANE: (
             "The delivered envelope is outside the adapter's declared subscription "
             "surface -- apps/dispatcher/slack-app-manifest.yaml subscribes to "
@@ -153,6 +161,33 @@ def drop(
         reason.value,
         DROP_RATIONALES[reason],
         details,
+    )
+
+
+def missing_envelope_fields(required: Mapping[str, object]) -> tuple[str, ...]:
+    """The names of the mint-site fields this delivery did not usably supply.
+
+    Envelope validation, deliberately separate from :func:`classify`: it reads
+    the *envelope* (``body``) as well as the event, and it must run before the
+    idempotency claim, whereas ``classify`` answers "is this event content we
+    should answer" from the event alone.
+
+    A field counts as present only when it is a non-blank string. Slack's ids
+    and timestamps are strings, and a blank one is no more usable than an absent
+    one -- an empty event id yields a dedupe key shared by every delivery that
+    omits it, and an empty thread key is a single lock across unrelated threads.
+
+    Args:
+        required: Field name -> the value the delivery supplied (or None).
+
+    Returns:
+        The unusable field names in the order given, or ``()`` when all are
+        present -- an empty tuple is falsy, so callers read as ``if missing:``.
+    """
+    return tuple(
+        name
+        for name, value in required.items()
+        if not isinstance(value, str) or not value.strip()
     )
 
 

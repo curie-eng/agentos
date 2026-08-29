@@ -140,7 +140,21 @@ tests assert the two sets equal in both directions.
 The last three sit on the Block Kit click lane, which is a real ingest lane:
 `apps/dispatcher/src/curie_dispatcher/handlers.py::process_action` mints a `QueuedTurn`
 exactly as `apps/dispatcher/src/curie_dispatcher/handlers.py::process_event` does, so a
-dropped click is inbound loss of the same class. An approval-card click is deliberately
+dropped click is inbound loss of the same class. Of the three, only `UNADDRESSABLE_ACTION`
+is a disposition Bolt actually delivers today: an App Home or modal click really does
+arrive with no channel and no message. `NO_ACTION_IN_PAYLOAD` and `EMPTY_ACTION_COMMAND`
+are **defensive guards on that lane that the current matcher does not reach**. The
+catch-all registration in
+`apps/dispatcher/src/curie_dispatcher/handlers.py::register_handlers` is
+`@app.action(re.compile(r".+"))`, and `slack_bolt` resolves the clicked action inside its
+own matcher before invoking the listener: a payload with an empty `actions` list raises
+there rather than arriving at `process_action`, and an empty `action_id` never matches
+`.+` at all. The dispatcher's tests therefore exercise those two rows directly instead of
+through Bolt. They are kept, not deleted, for three reasons: they are one comparison each;
+the matcher's payload handling is a `slack_bolt` implementation detail rather than a
+contract this seam holds, so a release that starts delivering either shape must meet a
+logged refusal; and a silent `return None` on that path is the defect #2006 removes, which
+is exactly what a deleted guard would restore. An approval-card click is deliberately
 absent — it is *handled* by the dedicated approval listener, not dropped.
 
 - **The framework's admission boundary sits above the adapter, and is documented rather
@@ -186,6 +200,21 @@ absent — it is *handled* by the dedicated approval listener, not dropped.
   later: an alert bot that replies *inside* a thread with a mention is not ingested.
   Root-only admission is what separates the ticket's case from the loop without a new
   `QueuedTurn` field or a bot allowlist.
+
+  Its known consequence, stated here rather than left to be found: a bot-authored event
+  normally carries no human `user`, so the turn is queued with an empty `author` while its
+  text becomes a model turn like any other. That is not a new prompt-injection primitive —
+  the same text was already reachable from any member of the workspace — but it does widen
+  the set of *automated* principals that can drive the model, a compromised third-party app
+  or the holder of an incoming-webhook URL among them, and routing cannot tell one from a
+  person afterwards because the adapter carries neither `bot_id` nor the message subtype
+  onto the queue. Carrying machine provenance onto the turn is deliberately deferred, not
+  overlooked: `QueuedTurn`
+  (`packages/aci-protocol/src/aci_protocol/turn.py::QueuedTurn`) cannot gain a field
+  without a protocol-version bump
+  (`packages/aci-protocol/src/aci_protocol/version.py::PROTOCOL_VERSION`) and the matching
+  `packages/aci-protocol/schema/wire.lock` regeneration, which is a change to the frozen
+  package rather than to this adapter.
 - **Sibling ingress paths — audited, unchanged.** The first-party HTTP ingress paths
   (`apps/api/src/curie_api/routers/hooks.py`,
   `apps/api/src/curie_api/routers/channels.py`) already refuse explicitly: every refusal is

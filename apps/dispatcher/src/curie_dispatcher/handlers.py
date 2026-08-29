@@ -47,6 +47,7 @@ from typing import TYPE_CHECKING, Any
 
 from aci_protocol import QueuedTurn, ReplyHandle, TurnSource
 from slack_bolt import App
+from slack_sdk.errors import SlackApiError
 from slack_sdk.web import WebClient
 
 from .approval_actions import (
@@ -66,7 +67,7 @@ from .approval_actions import (
 from .config import DispatcherConfig
 from .inbound_text import derive_text
 from .queue import claim_event, enqueue, release_event
-from .relevance import DropReason, Lane, classify, drop
+from .relevance import DropReason, Lane, classify, drop, missing_envelope_fields
 
 if TYPE_CHECKING:
     from redis import Redis
@@ -78,11 +79,31 @@ def _utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _is_unambiguous_rejection(error: SlackApiError) -> bool:
+    """True when Slack itself answered this call with an error code.
+
+    That answer is the only evidence we get that NOTHING was posted: Slack
+    received the request, refused it by name (``ratelimited``,
+    ``channel_not_found``, ``invalid_auth``, ...) and did not deliver a message.
+    A transport failure carries no such answer -- the request may well have been
+    accepted before the connection died.
+
+    ``fatal_error`` is excluded on Slack's own word: ``chat.postMessage``
+    documents that when it is returned "some aspect of the operation succeeded
+    before the error was raised", so it is an ambiguous outcome wearing an error
+    code, not a refusal.
+    """
+    response = getattr(error, "response", None)
+    code = getattr(response, "get", lambda _key: None)("error") if response is not None else None
+    return isinstance(code, str) and bool(code) and code != "fatal_error"
+
+
 def _post_placeholder(
     *,
     web_client: WebClient,
     redis_client: "Redis",
     config: DispatcherConfig,
+    log: logging.Logger,
     slack_event_id: str,
     channel: str,
     thread_ts: str,
@@ -110,6 +131,19 @@ def _post_placeholder(
     into the same thread, trading an invisible failure for a visible, confusing
     one. Before the placeholder nothing user-visible has occurred, so releasing
     is free.
+
+    ONLY AN UNAMBIGUOUS REFUSAL RELEASES. "The call raised" is not the same
+    claim as "nothing was posted". A ``SlackApiError`` carrying Slack's own
+    error code means Slack answered and refused, so no placeholder exists and a
+    later retry is clean -- release. Everything else (a timeout, a dropped
+    connection, ``SlackRequestError``, ``fatal_error``, an exception type we do
+    not recognise) may have failed *after* Slack accepted the post, so a
+    placeholder may already be sitting in the thread; releasing there would let
+    a replay post a SECOND one, which is precisely the duplicate the
+    claim-before-placeholder ordering exists to prevent. Both outcomes are
+    imperfect and we pick the quieter one: keep the claim, and log at ERROR that
+    it is being kept deliberately so the retained key is never mistaken for the
+    silent-loss bug this function fixes. Either way the exception is re-raised.
     """
     try:
         return web_client.chat_postMessage(
@@ -117,8 +151,17 @@ def _post_placeholder(
             thread_ts=thread_ts,
             text=config.placeholder_text,
         )
-    except BaseException:
-        release_event(redis_client, config, slack_event_id)
+    except BaseException as error:
+        if isinstance(error, SlackApiError) and _is_unambiguous_rejection(error):
+            release_event(redis_client, config, slack_event_id)
+            raise
+        log.error(
+            "placeholder for slack delivery %r failed with an ambiguous outcome (%s); "
+            "keeping the idempotency claim because a placeholder may already be in the "
+            "thread and a retry could post a second one",
+            slack_event_id,
+            type(error).__name__,
+        )
         raise
 
 
@@ -144,27 +187,46 @@ def process_event(
     """
     log = logger or logging.getLogger(__name__)
 
-    # `body.get`, not `body["event_id"]`: this drop runs before the claim and a
-    # malformed envelope with no event_id must be refused, not crash the listener.
-    reason = classify(event, lane=lane)
-    if reason is not None:
-        drop(log, reason, event_id=str(body.get("event_id", "")), lane=lane)
+    # ENVELOPE VALIDATION FIRST, AND BEFORE THE CLAIM (#2006). Everything the
+    # mint site needs is read with `.get` and checked here, because indexing it
+    # later is the silent-loss shape this ticket closes: `body["event_id"]`
+    # raised before any claim (Bolt acked, swallowed the exception, message
+    # gone), and `event["ts"]`/`event["channel"]` raised *after* `claim_event`
+    # succeeded -- so the claim outlived a turn that never existed and Slack's
+    # redelivery was refused as an already-seen delivery. Refusing through the
+    # normal `drop` path leaves the key free and the refusal visible.
+    #
+    # Reply in-thread: for a root message the thread key is its own ts.
+    slack_event_id = str(body.get("event_id") or "")
+    channel = str(event.get("channel") or "")
+    thread_ts = str(event.get("thread_ts") or event.get("ts") or "")
+    missing = missing_envelope_fields(
+        {"event_id": slack_event_id, "channel": channel, "thread_ts_or_ts": thread_ts}
+    )
+    if missing:
+        drop(
+            log,
+            DropReason.MALFORMED_ENVELOPE,
+            event_id=slack_event_id,
+            lane=lane,
+            missing=missing,
+        )
         return None
 
-    slack_event_id = body["event_id"]
+    reason = classify(event, lane=lane)
+    if reason is not None:
+        drop(log, reason, event_id=slack_event_id, lane=lane)
+        return None
 
     if not claim_event(redis_client, config, slack_event_id):
         drop(log, DropReason.DUPLICATE_DELIVERY, event_id=slack_event_id)
         return None
 
-    # Reply in-thread: for a root message the thread key is its own ts.
-    thread_ts = event.get("thread_ts") or event["ts"]
-    channel = event["channel"]
-
     placeholder = _post_placeholder(
         web_client=web_client,
         redis_client=redis_client,
         config=config,
+        log=log,
         slack_event_id=slack_event_id,
         channel=channel,
         thread_ts=thread_ts,
@@ -275,6 +337,16 @@ def process_action(
     interaction = interaction_id or (
         f"{actions[0].get('action_ts', '')}-{actions[0].get('action_id', '')}"
     )
+    # The same pre-claim envelope validation `process_event` does, for the one
+    # field this mint site requires and has not already checked: the identity
+    # the dedupe key is built from. `strip("-")` collapses the synthesized
+    # "<action_ts>-<action_id>" to "" when the payload carried neither, and
+    # claiming `action--` would burn ONE key shared by every such click --
+    # refusing the first and every later one as an already-seen delivery.
+    missing = missing_envelope_fields({"trigger_id_or_action_ts": interaction.strip("-")})
+    if missing:
+        drop(log, DropReason.MALFORMED_ENVELOPE, event_id=interaction_id, missing=missing)
+        return None
     slack_event_id = f"action-{interaction}"
     if not claim_event(redis_client, config, slack_event_id):
         drop(log, DropReason.DUPLICATE_DELIVERY, event_id=slack_event_id)
@@ -289,6 +361,7 @@ def process_action(
         web_client=web_client,
         redis_client=redis_client,
         config=config,
+        log=log,
         slack_event_id=slack_event_id,
         channel=channel,
         thread_ts=thread_ts,
