@@ -57,6 +57,31 @@ pub struct Check {
     pub fix: Option<String>,
 }
 
+/// What the `helm list` probe established about the release.
+///
+/// `Option<(String, String)>` could not express "we do not know", so a laptop
+/// with no helm, an expired cluster credential and a genuinely empty namespace
+/// all printed the same two lines (#1358). Every variant is diagnostic-free by
+/// construction: helm's stderr is an arbitrary external line that can carry
+/// an `Authorization` header, an exec-plugin's argv, or a token-bearing URL, and
+/// this report is pasted into issues. No prefix denylist can enumerate that, so
+/// no subprocess stderr is carried here at all -- only the bounded, structured
+/// `chart` field that this report exists to display (#1348).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ReleaseProbe {
+    /// `helm` is not on PATH, so the release was never inspected at all.
+    HelmMissing,
+    /// helm ran and did not answer: a nonzero exit, or a zero exit whose stdout
+    /// is not the release list this code understands. The `fix` hands the
+    /// operator the diagnostic to run themselves.
+    ProbeFailed,
+    /// helm answered, and reports no deployed release by this name here.
+    #[default]
+    NotInstalled,
+    /// helm answered, and this release is deployed.
+    Installed { chart: String },
+}
+
 /// Everything the checks reason about, gathered once.
 ///
 /// Separating observation from judgement is what makes the judgement testable:
@@ -98,6 +123,14 @@ pub struct Facts {
     /// about the run, kept on `Facts` so `evaluate` stays pure and the fix
     /// string can name the release actually diagnosed rather than `curie/curie`
     /// (#1358 item 1).
+    ///
+    /// ONE field for one fact: #1950 and #1358 each arrived with their own
+    /// spelling of it, and two fields carrying the same fact drift a writer at
+    /// a time until the model-pin fix and the cluster fixes name different
+    /// releases. `None` is a run or fixture that never exercised targeting;
+    /// [`target`] renders that as [`DEFAULT_TARGET`] so a cluster fix stays
+    /// runnable, while `model_pin_fix` keeps its own `<ns>`/`<release>`
+    /// placeholders (#1950).
     pub target: Option<(String, String)>,
     /// Non-secret provider inferred from the bound `CURIE_CREDENTIALS` value.
     /// The credential itself is deliberately discarded during observation.
@@ -106,10 +139,25 @@ pub struct Facts {
     /// Plugin name from `.claude-plugin/plugin.json` in the working directory.
     pub bundle_name: Option<String>,
     pub kube_context: Option<String>,
-    /// `(release, chart)` when a Curie release is installed.
-    pub release: Option<(String, String)>,
-    /// Whether the release has non-empty Slack tokens recorded.
-    pub slack_configured: bool,
+    /// What the `helm list` probe established. `NotInstalled` is the `Default`
+    /// only because it is the state a fixture that says nothing means.
+    pub release: ReleaseProbe,
+    /// The CIDRs `security.networkPolicy.allowedEgress` records, in recorded
+    /// order. Empty means either nothing recorded or nothing this reader can
+    /// reproduce -- the two are never distinguished, because a partial list is
+    /// exactly what must not be emitted.
+    pub sandbox_egress_cidrs: Vec<String>,
+    /// Whether `cluster up` can re-supply that allowlist EXACTLY. One fact
+    /// rather than two conditions: the consumer's only question is "can the fix
+    /// reproduce this, yes or no", and splitting it invites a partial-emission
+    /// branch. `false` by default, so a fixture silent about egress can never
+    /// produce egress flags.
+    pub sandbox_egress_is_reproducible: bool,
+    /// Whether the release records a non-empty Slack app token. Presence only --
+    /// the value is never read.
+    pub slack_app_token: bool,
+    /// Whether the release records a non-empty Slack bot token.
+    pub slack_bot_token: bool,
     /// Which clone credential the release carries, if any.
     pub clone_credential: Option<String>,
     /// Every agent and its repository binding. `None` means the platform API
@@ -157,11 +205,95 @@ fn skipped(id: &'static str, title: &'static str, detail: impl Into<String>) -> 
     }
 }
 
+/// The target a fix names when `Facts` carries none, and what `resolve_target`
+/// falls back to when neither a flag nor a `curie.yaml` supplies one.
+const DEFAULT_TARGET: &str = "curie";
+
+/// The `release` detail when helm itself is absent.
+///
+/// `HelmMissing` and `NotInstalled` both render as (cluster `Ok`, release
+/// `Missing`), so `summary` cannot tell them apart from the check states alone
+/// and matches this sentinel instead. Shared rather than written out twice, so a
+/// later wording tweak cannot silently break the verdict with every test green.
+const HELM_ABSENT_DETAIL: &str = "helm is not installed, so nothing about a cluster release \
+                                  could be read";
+
+/// Classify a `helm list` run. Pure, so every outcome is a unit test rather than
+/// a cluster fixture -- and it takes the exit status and stdout ONLY. helm's
+/// stderr is never passed in, because nothing it says may reach a payload.
+fn classify_release_probe(
+    helm_present: bool,
+    ok: bool,
+    stdout: &str,
+    release: &str,
+) -> ReleaseProbe {
+    if !helm_present {
+        return ReleaseProbe::HelmMissing;
+    }
+    if !ok {
+        return ReleaseProbe::ProbeFailed;
+    }
+    let stdout = stdout.trim();
+    // helm prints `null`, or nothing at all, for a namespace holding no
+    // releases. That is a known output shape, not a failure to read one.
+    if stdout.is_empty() || stdout == "null" {
+        return ReleaseProbe::NotInstalled;
+    }
+    let Ok(serde_json::Value::Array(listed)) = serde_json::from_str::<serde_json::Value>(stdout)
+    else {
+        // Exit zero this reader cannot parse is NOT an absence claim. Turning
+        // "I could not read the answer" into "your release is gone" is the
+        // #1354 shape, and it is what `ops::fetch_existing_values` already fails
+        // closed on: "the release state is unknown".
+        return ReleaseProbe::ProbeFailed;
+    };
+    // By name, never by position: the namespace can hold other releases, and
+    // taking the first element reports someone else's chart as this one's.
+    let Some(entry) = listed
+        .iter()
+        .find(|e| e.get("name").and_then(serde_json::Value::as_str) == Some(release))
+    else {
+        return ReleaseProbe::NotInstalled;
+    };
+    match entry.get("chart").and_then(serde_json::Value::as_str) {
+        Some(chart) if !chart.is_empty() => ReleaseProbe::Installed {
+            chart: chart.to_string(),
+        },
+        // Listed, but without the one field this reader needs: a helm whose
+        // `list -o json` shape moved must make doctor say it could not tell.
+        _ => ReleaseProbe::ProbeFailed,
+    }
+}
+
+/// The namespace and release to name in a fix string.
+///
+/// A `Facts` built by a test that never exercised targeting carries no target,
+/// and `--namespace  --release ` is not a runnable command. This is a RENDERING
+/// fallback only; resolution itself lives in `resolve_target`.
+fn target(f: &Facts) -> (&str, &str) {
+    match &f.target {
+        Some((namespace, release)) => (namespace.as_str(), release.as_str()),
+        None => (DEFAULT_TARGET, DEFAULT_TARGET),
+    }
+}
+
+/// The `curie cluster <subcommand>` prefix every targeted fix opens with. Five
+/// fixes name the same release, and a prefix spelled five times is a prefix that
+/// drifts a flag at a time; each site appends only what is its own.
+fn targeted(subcommand: &str, namespace: &str, release: &str) -> String {
+    format!("curie cluster {subcommand} --namespace {namespace} --release {release}")
+}
+
 /// The recovery command for a missing cluster release. Provider egress follows
 /// the same credential-prefix map as `cluster up`; an absent or unrecognized
 /// credential leaves egress sealed rather than guessing Anthropic.
-fn missing_release_recovery(provider: Option<&str>) -> String {
-    let mut command = "curie cluster up --namespace <ns> --release <name>".to_string();
+///
+/// It deliberately does NOT re-supply a recorded egress allowlist the way the
+/// webhook fix does: it fires only when there is no release, so there is nothing
+/// recorded to preserve, and `--allow-egress-host` is the right flag for a fresh
+/// install (#1813).
+fn missing_release_recovery(namespace: &str, release: &str, provider: Option<&str>) -> String {
+    let mut command = targeted("up", namespace, release);
     if let Some(provider) = provider {
         command.push_str(&format!(" --allow-egress-host {provider}"));
     }
@@ -487,6 +619,36 @@ fn release_fake_model_clause(f: &Facts, in_force: &ModelSource) -> &'static str 
     }
 }
 
+/// The exposure fix, which is a full `cluster up` and therefore drops every
+/// value nothing re-supplies -- including the sandbox's egress allowlist, which
+/// is how following doctor's advice sealed a working release's model path.
+///
+/// The allowlist is reproduced in full or not at all. `ops::up_value_plan`
+/// rewrites every `--allow-web-egress` CIDR as exactly one TCP/443 rule, so a
+/// rule shaped any other way would be COERCED, and a capped list would drop
+/// entries outright; both NARROW a live NetworkPolicy, and a caveat is read
+/// after the policy is already broken. There is deliberately no middle branch.
+fn webhook_recovery(f: &Facts, namespace: &str, release: &str) -> String {
+    let mut command = targeted("up", namespace, release);
+    command.push_str(" --set api.ingress.enabled=true --set api.ingress.host=<host>");
+    if f.sandbox_egress_is_reproducible {
+        // `--allow-web-egress` rather than `--allow-egress-host`: a CIDR read
+        // back off a release cannot be reversed to a provider name, and
+        // ADR-0114 errors when an explicit provider list omits the detected one.
+        for cidr in &f.sandbox_egress_cidrs {
+            command.push_str(&format!(" --allow-web-egress {cidr}"));
+        }
+    } else {
+        command.push_str(&format!(
+            "   (WARNING: this release records a sandbox egress allowlist this command \
+             cannot reproduce; running it as-is would narrow the policy. Read it first \
+             with `helm get values {release} -n {namespace}` and re-supply those rules \
+             deliberately.)"
+        ));
+    }
+    command
+}
+
 /// Judge the gathered facts. Pure.
 pub fn evaluate(f: &Facts) -> Vec<Check> {
     let mut out = Vec::new();
@@ -618,40 +780,124 @@ pub fn evaluate(f: &Facts) -> Vec<Check> {
         }
         return out;
     };
-    out.push(ok("cluster", "Cluster", context.clone()));
+    let (namespace, release) = target(f);
 
-    let Some((release, chart)) = &f.release else {
-        out.push(missing(
-            "release",
-            "Curie release",
-            "not installed in this namespace",
-            missing_release_recovery(f.model_credential_provider),
-        ));
+    // helm is what answers "is there a release here", so these two checks may
+    // only assert what the probe proved. `Ok` on Cluster means a kube context is
+    // configured; the detail says whether anything actually contacted the
+    // cluster, and `Missing` is reserved for the one outcome where doctor has
+    // positive evidence that something did not work. Before this, a missing
+    // helm, an expired credential and an empty namespace printed the same two
+    // lines (#1358).
+    let downstream_blocked = match &f.release {
+        ReleaseProbe::HelmMissing => {
+            out.push(ok(
+                "cluster",
+                "Cluster",
+                format!(
+                    "{context} (from the kubeconfig; helm is not installed, so the \
+                     cluster was not contacted)"
+                ),
+            ));
+            out.push(missing(
+                "release",
+                "Curie release",
+                HELM_ABSENT_DETAIL,
+                "install helm, then re-run: https://helm.sh/docs/intro/install/",
+            ));
+            Some("needs helm to read the release")
+        }
+        ReleaseProbe::ProbeFailed => {
+            out.push(missing(
+                "cluster",
+                "Cluster",
+                format!(
+                    "{context} — from the kubeconfig; `helm list` did not answer, so the \
+                     cluster was not confirmed reachable"
+                ),
+                // The diagnostic the operator runs themselves, which is what
+                // replaces echoing helm's message: it enumerates the causes
+                // categorically without claiming which one occurred, and
+                // without carrying a byte doctor did not author.
+                format!(
+                    "run `helm list -n {namespace}` and `kubectl config current-context` to \
+                     see why — an expired credential, an unreachable API server and an RBAC \
+                     denial all land here — then re-run `curie doctor`"
+                ),
+            ));
+            out.push(skipped(
+                "release",
+                "Curie release",
+                "`helm list` did not answer, so nothing about the release is known",
+            ));
+            Some("the release could not be inspected")
+        }
+        ReleaseProbe::NotInstalled => {
+            out.push(ok("cluster", "Cluster", format!("{context} (reached)")));
+            // "no DEPLOYED release" is what plain `helm list` actually shows:
+            // it filters out pending and failed ones. `helm list -a` was the
+            // alternative and is worse -- it also lists releases kept with
+            // --keep-history, so a deleted release would read as present, and
+            // over-claiming presence is the wrong direction for a check whose
+            // fix is "install it".
+            out.push(missing(
+                "release",
+                "Curie release",
+                format!(
+                    "helm reports no deployed release named {release} in this namespace \
+                     (a pending or failed release is not listed)"
+                ),
+                missing_release_recovery(namespace, release, f.model_credential_provider),
+            ));
+            Some("needs a release")
+        }
+        ReleaseProbe::Installed { chart } => {
+            out.push(ok("cluster", "Cluster", format!("{context} (reached)")));
+            out.push(ok(
+                "release",
+                "Curie release",
+                format!("{release} ({chart})"),
+            ));
+            None
+        }
+    };
+
+    // Everything below reads the release's own values, so an outcome that did
+    // not reach one skips them with the reason it did not -- not with a verdict
+    // about a release nobody could see.
+    if let Some(reason) = downstream_blocked {
         for (id, title) in [
             ("slack", "Slack"),
             ("clone-credential", "Clone credential"),
             ("webhook", "Webhook exposure"),
             ("repo-binding", "Repo binding"),
         ] {
-            out.push(skipped(id, title, "needs a release"));
+            out.push(skipped(id, title, reason));
         }
         return out;
-    };
-    out.push(ok(
-        "release",
-        "Curie release",
-        format!("{release} ({chart})"),
-    ));
+    }
 
-    out.push(if f.slack_configured {
-        ok("slack", "Slack", "app and bot tokens recorded")
-    } else {
-        missing(
+    // Socket mode needs BOTH tokens, and this check used to read only the bot
+    // token while claiming both were recorded -- so a half-configured release
+    // read as wired and the bot silently never connected.
+    let slack_fix = || {
+        targeted("comms --slack", namespace, release) + " --app-token xapp-... --bot-token xoxb-..."
+    };
+    out.push(match (f.slack_app_token, f.slack_bot_token) {
+        (true, true) => ok("slack", "Slack", "app and bot tokens recorded"),
+        (true, false) => missing(
             "slack",
             "Slack",
-            "no tokens recorded",
-            "curie cluster comms --slack --app-token xapp-... --bot-token xoxb-...",
-        )
+            "only the app token is recorded — socket mode needs both",
+            slack_fix(),
+        ),
+        (false, true) => missing(
+            "slack",
+            "Slack",
+            "only the bot token is recorded — socket mode needs both",
+            slack_fix(),
+        ),
+        (false, false) => missing("slack", "Slack", "no tokens recorded", slack_fix()),
     });
 
     out.push(match &f.clone_credential {
@@ -660,7 +906,7 @@ pub fn evaluate(f: &Facts) -> Vec<Check> {
             "clone-credential",
             "Clone credential",
             "none — a private repo cannot be cloned, so git-push deploys will fail",
-            "curie cluster github-app --app-id <id> --private-key ./key.pem",
+            targeted("github-app", namespace, release) + " --app-id <id> --private-key ./key.pem",
         ),
     });
 
@@ -676,7 +922,7 @@ pub fn evaluate(f: &Facts) -> Vec<Check> {
             "Webhook exposure",
             "no ingress and no NodePort — if a load balancer or tunnel fronts the API, \
              this check cannot see it and you can ignore this",
-            "curie cluster up --set api.ingress.enabled=true --set api.ingress.host=<host>",
+            webhook_recovery(f, namespace, release),
         ),
     });
 
@@ -713,9 +959,10 @@ pub fn evaluate(f: &Facts) -> Vec<Check> {
                          silently ignored",
                         unbound.join(", ")
                     ),
-                    "curie cluster deploy --plugin-dir . --repo <owner>/<name>   \
-                     (binds an agent that has none; it will NOT rebind one already \
-                     pointing at a different repository)",
+                    targeted("deploy", namespace, release)
+                        + " --plugin-dir . --repo <owner>/<name>   (binds an agent that has \
+                           none; it will NOT rebind one already pointing at a different \
+                           repository)",
                 )
             }
         }
@@ -754,6 +1001,10 @@ pub fn guidance(checks: &[Check]) -> Option<String> {
 pub fn summary(checks: &[Check]) -> String {
     let state = |id: &str| checks.iter().find(|c| c.id == id).map(|c| c.state);
     let has = |id: &str| state(id) == Some(State::Ok);
+    let release_detail = checks
+        .iter()
+        .find(|c| c.id == "release")
+        .map(|c| c.detail.as_str());
 
     if !has("bundle") {
         return "No bundle here. Start with `curie init my-agent`.".to_string();
@@ -764,6 +1015,22 @@ pub fn summary(checks: &[Check]) -> String {
     if !has("model-credential") {
         return "Ready to run offline (`curie skill up --fake-model`). A model \
                 credential is needed for real replies."
+            .to_string();
+    }
+    // Two ways the release is UNKNOWN rather than absent, and neither may reach
+    // the verdict below it -- reporting "no cluster release yet" off a probe
+    // that never answered is a positive absence claim built on no evidence
+    // (#1354, in the states #1358 introduced).
+    if state("cluster") == Some(State::Missing) {
+        return "A cluster context is configured but `helm list` did not answer, so \
+                nothing about the release is known -- see the Cluster line above."
+            .to_string();
+    }
+    // `HelmMissing` and `NotInstalled` are both (cluster Ok, release Missing),
+    // so only the detail separates them; hence the shared sentinel.
+    if release_detail == Some(HELM_ABSENT_DETAIL) {
+        return "Ready to run locally. helm is not installed, so nothing about a \
+                cluster release could be read."
             .to_string();
     }
     if !has("release") {
@@ -794,6 +1061,53 @@ pub fn summary(checks: &[Check]) -> String {
             .to_string();
     }
     "Fully wired: local runs, Slack, and git-push deploys.".to_string()
+}
+
+// -- targeting ----------------------------------------------------------------
+
+/// Which release doctor will inspect, and whether that was inferred.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Target {
+    pub namespace: String,
+    pub release: String,
+    /// The line to print when a field came from `curie.yaml`. `None` when
+    /// nothing was inferred: a built-in default is not an inference from a file,
+    /// and announcing one would be noise on every run.
+    pub announcement: Option<String>,
+}
+
+/// Resolve the target: the flag wins, else `curie.yaml`'s `install:` block, else
+/// the built-in default. Pure, so the precedence table is a unit test with no
+/// filesystem access; reading the file is the caller's job, and doctor must not
+/// fail when it cannot.
+///
+/// Precedence is per FIELD. An all-or-nothing implementation throws away the
+/// file's release the moment `--namespace` alone is passed, which is how an
+/// operator ends up reported on a release they did not name. `diff` already
+/// takes its target from `install:` (ADR-0097); this makes `doctor` follow.
+pub fn resolve_target(
+    flag_namespace: Option<&str>,
+    flag_release: Option<&str>,
+    declared: Option<(&str, &str)>,
+) -> Target {
+    let declared_namespace = declared.map(|(namespace, _)| namespace);
+    let declared_release = declared.map(|(_, release)| release);
+    let namespace = flag_namespace
+        .or(declared_namespace)
+        .unwrap_or(DEFAULT_TARGET);
+    let release = flag_release.or(declared_release).unwrap_or(DEFAULT_TARGET);
+    // Announced, never silent: doctor run in someone else's installation
+    // directory would otherwise report on a release the operator never named,
+    // and the announcement is what makes that survivable.
+    let inferred = (flag_namespace.is_none() && declared_namespace.is_some())
+        || (flag_release.is_none() && declared_release.is_some());
+    Target {
+        namespace: namespace.to_string(),
+        release: release.to_string(),
+        announcement: inferred.then(|| {
+            format!("inferred from curie.yaml: --namespace {namespace} --release {release}")
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -3715,6 +4029,160 @@ esac
     }
 }
 
+// -- reading the release's values ---------------------------------------------
+//
+// Pure, so every shape a real values file can take is a unit test rather than a
+// cluster fixture. They are extracted for that reason and no other: the reads
+// they replaced were type-strict, and a bug in one could only be found by
+// installing a release that had it.
+
+/// Read a scalar at `path`, coercing the JSON kinds a Helm values file produces.
+///
+/// A values file is YAML, and what reaches here depends on whether the author
+/// quoted the value: `githubAppId: 4475970` arrives as a number and
+/// `--set-string` arrives as a string. An `as_str()`-only read called an install
+/// with the unquoted form credential-less (#1253). Arrays, objects and null stay
+/// `None` -- widening to "stringify anything" would let structure leak into a
+/// report -- and the empty-string filter predates this and survives it, because
+/// a chart default of `""` is an unset field, not a value.
+fn scalar_at(values: &serde_json::Value, path: &[&str]) -> Option<String> {
+    let mut node = values;
+    for key in path {
+        node = node.get(key)?;
+    }
+    let rendered = match node {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Number(n) => render_number(n),
+        serde_json::Value::Bool(b) => b.to_string(),
+        _ => return None,
+    };
+    Some(rendered).filter(|s| !s.is_empty())
+}
+
+fn render_number(n: &serde_json::Number) -> String {
+    if let Some(i) = n.as_i64() {
+        return i.to_string();
+    }
+    if let Some(u) = n.as_u64() {
+        return u.to_string();
+    }
+    match n.as_f64() {
+        // The scientific-notation shape (#1253): an unquoted id can reach us as
+        // `4.47597e6`, which is the same id, not a new one. Rendering it as
+        // `4475970.0` would report a value nobody typed.
+        Some(f) if f.is_finite() && f.fract() == 0.0 => format!("{f:.0}"),
+        _ => n.to_string(),
+    }
+}
+
+/// Whether a values entry means `true`.
+///
+/// A real bool, or the literal string, case- and space-insensitively: both
+/// `--set-string api.ingress.enabled=true` and a quoted values-file entry record
+/// a string, and an `as_bool()`-only read reported an install whose ingress was
+/// already on as unexposed. Nothing else counts -- not `"1"`, not `"yes"`, not a
+/// number. Reading any non-empty string as true would report an install as
+/// exposed on a typo, in the one check whose job is to say whether the API is
+/// reachable from outside.
+fn truthy(node: Option<&serde_json::Value>) -> bool {
+    match node {
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(serde_json::Value::String(s)) => s.trim().eq_ignore_ascii_case("true"),
+        _ => false,
+    }
+}
+
+/// Which clone credential the release carries. NAMES and shapes only -- never
+/// the Secret's key name, and never key material.
+///
+/// The existing-Secret path is checked first because it is what the chart
+/// template actually consumes when it is set, and the chart calls it the
+/// recommended path while the inline flags are a quick trial (#1255). Reporting
+/// both would invite an operator to "fix" an install that is already working.
+fn clone_credential_from_values(values: &serde_json::Value) -> Option<String> {
+    if let Some(secret) = scalar_at(values, &["api", "githubAppExistingSecret"]) {
+        return Some(format!("github app (secret={secret})"));
+    }
+    match scalar_at(values, &["api", "githubAppId"]) {
+        Some(id) => Some(format!("github app (app_id={id})")),
+        None => scalar_at(values, &["api", "githubToken"]).map(|_| "personal access token".into()),
+    }
+}
+
+/// How the API is reachable from outside, given the release's values and the
+/// NodePort read (`None` when there is none, or when nothing looked).
+fn api_exposure_from_values(
+    values: &serde_json::Value,
+    nodeport: Option<String>,
+) -> Option<String> {
+    let ingress = values.get("api").and_then(|api| api.get("ingress"));
+    if truthy(ingress.and_then(|i| i.get("enabled"))) {
+        return Some(match scalar_at(values, &["api", "ingress", "host"]) {
+            Some(host) => format!("ingress ({host})"),
+            None => "ingress".to_string(),
+        });
+    }
+    nodeport.map(|port| format!("NodePort {port}"))
+}
+
+/// The recorded sandbox egress allowlist, and whether `cluster up` can re-supply
+/// it exactly.
+///
+/// Returns `(cidrs, is_reproducible)`, and **a false gate always returns an empty
+/// list**. `ops::up_value_plan` rewrites every `--allow-web-egress` entry as one
+/// TCP/443 rule, so an entry shaped any other way cannot be reproduced by the
+/// flag; an entry this reader cannot name makes the WHOLE allowlist
+/// non-reproducible rather than being skipped, because handing the operator a
+/// `cluster up` carrying fewer CIDRs than the release records narrows a live
+/// NetworkPolicy. The count bound is readability only and flips the gate -- it
+/// never truncates.
+fn sandbox_egress_from_values(values: &serde_json::Value) -> (Vec<String>, bool) {
+    // More than this and the fix stops being readable. Exceeding it refuses; it
+    // does not drop entries.
+    const READABILITY_BOUND: usize = 10;
+    let recorded = values
+        .get("security")
+        .and_then(|s| s.get("networkPolicy"))
+        .and_then(|n| n.get("allowedEgress"));
+    let entries = match recorded {
+        // No policy recorded is not a lossy read: emitting no flags reproduces
+        // "nothing" exactly. Otherwise every release without an allowlist would
+        // carry the hazard clause.
+        None | Some(serde_json::Value::Null) => return (Vec::new(), true),
+        Some(serde_json::Value::Array(entries)) => entries,
+        // A shape this reader does not understand is still a recorded policy.
+        Some(_) => return (Vec::new(), false),
+    };
+    if entries.len() > READABILITY_BOUND {
+        return (Vec::new(), false);
+    }
+    let mut cidrs = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let cidr = scalar_at(entry, &["cidr"]).unwrap_or_default();
+        let cidr = cidr.trim();
+        if cidr.is_empty() || !is_plain_https(entry) {
+            return (Vec::new(), false);
+        }
+        cidrs.push(cidr.to_string());
+    }
+    (cidrs, true)
+}
+
+/// Whether one `allowedEgress` entry is exactly the one TCP/443 rule that
+/// `--allow-web-egress` produces. Anything else -- another protocol, another
+/// port, more than one rule, no rules at all -- would be COERCED to TCP/443 by
+/// re-supplying it, which is a narrowing wearing the shape of a fix.
+fn is_plain_https(entry: &serde_json::Value) -> bool {
+    let Some(serde_json::Value::Array(ports)) = entry.get("ports") else {
+        return false;
+    };
+    let [rule] = ports.as_slice() else {
+        return false;
+    };
+    scalar_at(rule, &["protocol"]).is_some_and(|p| p.eq_ignore_ascii_case("TCP"))
+        && scalar_at(rule, &["port"]).as_deref() == Some("443")
+}
+
 // -- observation --------------------------------------------------------------
 
 /// Gather the facts. Every probe is read-only and failure-tolerant: a missing
@@ -3723,8 +4191,10 @@ pub async fn gather(namespace: &str, release: &str, api: Option<(&str, &str)>) -
     let mut f = Facts {
         docker_ok: probe_ok("docker", &["info"]).await,
         bundle_name: bundle_name(),
-        // What this run was pointed at, so the model-pin fix names the release
-        // just diagnosed rather than curie/curie (#1358 item 1).
+        // What this run was pointed at, so every fix -- the model-pin `--set`
+        // and the four cluster commands alike -- names the release this run
+        // reported on rather than whatever `cluster up` happens to default to
+        // (#1358 item 1, #1950).
         target: Some((namespace.to_string(), release.to_string())),
         ..Default::default()
     };
@@ -3792,16 +4262,31 @@ pub async fn gather(namespace: &str, release: &str, api: Option<(&str, &str)>) -
     }
     f.kube_context = Some(ctx.trim().to_string());
 
+    // The probe runs here rather than through `ops::fetch_release_chart`, which
+    // collapses every nonzero exit to `Ok(None)` -- the collapse that made a
+    // missing helm, a cluster that could not answer and an empty namespace
+    // report identically. `fetch_release_chart` is left alone; installation.rs
+    // still calls it.
+    let helm_present = probe_ok("helm", &["version", "--short"]).await;
+    // helm's stderr is bound to `_` and never read, and that is the security
+    // property rather than an oversight: it is an arbitrary external line that
+    // can carry an `Authorization` header, an exec-plugin's argv, or a
+    // token-bearing URL, and this report is pasted into issues and chat. No
+    // prefix denylist can enumerate that risk, so no subprocess stderr reaches
+    // a check's `detail` or `fix` -- the chart, context and NodePort values a
+    // check does render are bounded, structured fields, not diagnostic text
+    // (#1348).
+    let (listed, stdout, _) = capture("helm", &["list", "-n", namespace, "-o", "json"]).await;
+    f.release = classify_release_probe(helm_present, listed, &stdout, release);
+    if !matches!(f.release, ReleaseProbe::Installed { .. }) {
+        return f;
+    }
+
     let common = crate::ops::CommonOpts {
         namespace: namespace.to_string(),
         release: release.to_string(),
         dry_run: false,
     };
-    let Ok(Some(chart)) = crate::ops::fetch_release_chart(&common).await else {
-        return f;
-    };
-    f.release = Some((release.to_string(), chart));
-
     // Two SEPARATE reads, deliberately, issued CONCURRENTLY.
     //
     // Separate: `fetch_release_values` reports only what the operator supplied,
@@ -3833,35 +4318,24 @@ pub async fn gather(namespace: &str, release: &str, api: Option<(&str, &str)>) -
     }
 
     if let Ok(Some(values)) = values {
-        let at = |path: &[&str]| -> Option<String> {
-            let mut node = &values;
-            for k in path {
-                node = node.get(k)?;
-            }
-            node.as_str().map(str::to_string).filter(|s| !s.is_empty())
+        // Presence only, both of them: socket mode needs the pair, and reading
+        // one while reporting both is what made a half-wired release read as Ok.
+        f.slack_bot_token = scalar_at(&values, &["dispatcher", "slack", "botToken"]).is_some();
+        f.slack_app_token = scalar_at(&values, &["dispatcher", "slack", "appToken"]).is_some();
+        // Ask the single decision function first with no NodePort. A `Some`
+        // means ingress already answered and the probe would only be discarded,
+        // so the kubectl round-trip is skipped on the wired path -- doctor is
+        // interactive and that is a subprocess plus an API call per run. The
+        // decision itself still lives in exactly one place; deciding it here
+        // too, to skip the read, is how a helper stays right while the report
+        // goes wrong.
+        f.api_exposure = match api_exposure_from_values(&values, None) {
+            Some(exposure) => Some(exposure),
+            None => api_exposure_from_values(&values, api_nodeport(namespace, release).await),
         };
-        f.slack_configured = at(&["dispatcher", "slack", "botToken"]).is_some();
-        let ingress_on = values
-            .get("api")
-            .and_then(|a| a.get("ingress"))
-            .and_then(|i| i.get("enabled"))
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-        f.api_exposure = if ingress_on {
-            Some(match at(&["api", "ingress", "host"]) {
-                Some(host) => format!("ingress ({host})"),
-                None => "ingress".to_string(),
-            })
-        } else {
-            api_nodeport(namespace, release)
-                .await
-                .map(|p| format!("NodePort {p}"))
-        };
-        // NAMES and shapes only -- never the key or token itself.
-        f.clone_credential = match at(&["api", "githubAppId"]) {
-            Some(id) => Some(format!("github app (app_id={id})")),
-            None => at(&["api", "githubToken"]).map(|_| "personal access token".to_string()),
-        };
+        f.clone_credential = clone_credential_from_values(&values);
+        (f.sandbox_egress_cidrs, f.sandbox_egress_is_reproducible) =
+            sandbox_egress_from_values(&values);
     }
     f
 }

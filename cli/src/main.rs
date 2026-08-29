@@ -878,12 +878,14 @@ enum Command {
     ///
     /// Read-only. Safe to run anywhere, including against production.
     Doctor {
-        /// Kubernetes namespace to inspect.
-        #[arg(long, default_value = "curie")]
-        namespace: String,
-        /// Helm release to inspect.
-        #[arg(long, default_value = "curie")]
-        release: String,
+        /// Kubernetes namespace to inspect. Defaults to `curie.yaml`'s `install:`
+        /// block when one is present in this directory, otherwise `curie`.
+        #[arg(long)]
+        namespace: Option<String>,
+        /// Helm release to inspect. Defaults to `curie.yaml`'s `install:` block
+        /// when one is present in this directory, otherwise `curie`.
+        #[arg(long)]
+        release: Option<String>,
         /// Platform API, to include the repo-binding check. Optional: every
         /// other check needs only kubectl and helm.
         #[arg(long, env = "CURIE_API_URL")]
@@ -4777,8 +4779,48 @@ async fn run(command: Option<Command>) -> Result<()> {
             api_url,
             api_key,
         }) => {
+            // Read-only, and its whole job is to report: a `curie.yaml` it
+            // cannot parse must narrow what doctor knows, never stop it
+            // answering, so the load is best-effort and never propagates. Saying
+            // so out loud matters -- silence would make doctor look like it
+            // ignored the operator's file. But an explicit --namespace/--release
+            // always wins over the file (see resolve_target's precedence), so
+            // only warn about whichever of the two the operator did NOT supply
+            // -- that's the only part an unreadable file could actually change.
+            let declared_path = std::path::Path::new("curie.yaml");
+            let declared = curie::installation::Installation::load(declared_path).ok();
+            if declared.is_none() && declared_path.exists() {
+                // The three sayable cases differ only in which defaults are
+                // being fallen back to, so only that noun phrase varies.
+                let defaults = match (namespace.is_some(), release.is_some()) {
+                    (true, true) => None,
+                    (false, false) => Some("--namespace and --release defaults"),
+                    (true, false) => Some("--release default"),
+                    (false, true) => Some("--namespace default"),
+                };
+                if let Some(defaults) = defaults {
+                    ui::ui().note(&format!(
+                        "a curie.yaml is here but could not be read; \
+                         falling back to the {defaults}"
+                    ));
+                }
+            }
+            let target = curie::doctor::resolve_target(
+                namespace.as_deref(),
+                release.as_deref(),
+                declared
+                    .as_ref()
+                    .map(|c| (c.install.namespace.as_str(), c.install.release.as_str())),
+            );
+            // On stderr, via `note`: `--json` owns stdout, and a machine
+            // consumer parses it whole. The resolution is a fact about how
+            // doctor was TARGETED, not about what it observed, so it also does
+            // not belong in a schema-validated check payload.
+            if let Some(announcement) = &target.announcement {
+                ui::ui().note(announcement);
+            }
             let api = api_url.as_deref().zip(api_key.as_deref());
-            emit(curie::doctor::doctor(&namespace, &release, api).await)
+            emit(curie::doctor::doctor(&target.namespace, &target.release, api).await)
         }
         Some(Command::Diff { file, chart }) => {
             let cfg = curie::installation::Installation::load(&file)?;
