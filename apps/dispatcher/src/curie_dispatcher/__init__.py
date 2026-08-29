@@ -4,7 +4,9 @@ Acks Slack events fast, posts an in-thread placeholder, and enqueues a normalize
 job onto a Valkey Stream keyed by the delivery's event id (idempotent), under
 reconnect supervision. The queue payload is ``aci_protocol.QueuedTurn`` (issue
 #7); this package owns its Valkey Stream transport (the ``payload`` encoding and
-dedupe) plus the Slack ingress.
+dedupe) plus the Slack ingress. Refusals on the ingest path are enumerated by
+``relevance.DropReason`` and logged, so no inbound message is dropped in silence
+(#2006).
 """
 
 from aci_protocol import STREAM_PAYLOAD_FIELD as STREAM_PAYLOAD_FIELD
@@ -16,13 +18,14 @@ from .app import (
     build_web_client,
 )
 from .config import DispatcherConfig
-from .handlers import is_actionable, process_event, register_handlers
+from .handlers import process_event, register_handlers
 from .queue import (
     claim_event,
     enqueue,
     from_stream_fields,
     to_stream_fields,
 )
+from .relevance import DropReason, classify
 from .supervisor import BackoffPolicy, Connection, Supervisor
 
 __version__ = "0.0.0"
@@ -32,6 +35,7 @@ __all__ = [
     "BackoffPolicy",
     "Connection",
     "DispatcherConfig",
+    "DropReason",
     "SocketModeConnection",
     "Supervisor",
     "__version__",
@@ -39,9 +43,9 @@ __all__ = [
     "build_redis",
     "build_web_client",
     "claim_event",
+    "classify",
     "enqueue",
     "from_stream_fields",
-    "is_actionable",
     "process_event",
     "register_handlers",
     "to_stream_fields",

@@ -5,10 +5,33 @@ The Socket Mode transport acks the envelope in under three seconds on its own
 own the rest of the lifecycle step: dedupe the delivery, post an in-thread
 placeholder reply, and enqueue the normalized job for the worker.
 
-Two event types feed the same processing path:
-  - ``app_mention``: the bot was @-mentioned in a channel; always process.
-  - ``message``: only direct messages to the bot (``channel_type == "im"``) are
-    processed, so ordinary channel chatter is not enqueued.
+Two event types feed the same processing path, with lane-specific admission
+(#2006). Every refusal these listeners make is an enumerated
+``relevance.DropReason`` emitted through ``relevance.drop`` -- no drop of ours is
+silent, which is the defect that ticket closes.
+
+  - ``app_mention``: the bot was @-mentioned. A human mention is always
+    processed, at root or in a thread. A *bot*-authored mention is processed
+    only as a ROOT post: one carrying ``thread_ts`` is refused as
+    ``BOT_AUTHORED_THREAD_REPLY``, because Curie's own replies are always
+    threaded and two installations in one workspace could otherwise mention-loop
+    each other -- a case Bolt's self filter cannot see, since the two bot
+    identities differ.
+  - ``message``: only the direct-message lane (``channel_type == "im"``) is
+    processed. That is envelope validation, not a relevance judgement:
+    ``apps/dispatcher/slack-app-manifest.yaml`` subscribes to ``app_mention``
+    and ``message.im`` only, so any other channel type is outside the declared
+    subscription surface and is refused as ``UNSUBSCRIBED_LANE``. Bot authorship
+    is NOT consulted on this lane -- incoming webhooks, Workflow Builder posts
+    and other apps all reach us as bot-authored ``message.im`` events, and our
+    own posts are already gone: Bolt's ``IgnoringSelfEvents`` middleware drops
+    self-authored events before any listener here runs.
+
+On both lanes the only content filter is the closed ``NON_CONTENT_SUBTYPES``
+denylist; unknown and future subtypes are actionable. Refusals made *above*
+these listeners by Bolt's own middleware (self events, authorization, listener
+matching) are documented in ``docs/interfaces/channel-ingress/INTERFACE.md``
+rather than re-implemented here.
 
 We use the dispatcher's own ``WebClient`` (built from the bot token) rather than
 Bolt's per-request injected client so the Web API surface is a single, mockable
@@ -41,7 +64,9 @@ from .approval_actions import (
     resolve_note_submission,
 )
 from .config import DispatcherConfig
-from .queue import claim_event, enqueue
+from .inbound_text import derive_text
+from .queue import claim_event, enqueue, release_event
+from .relevance import DropReason, Lane, classify, drop
 
 if TYPE_CHECKING:
     from redis import Redis
@@ -53,23 +78,55 @@ def _utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def is_actionable(event: dict[str, Any]) -> bool:
-    """False for events the dispatcher must ignore to avoid loops and noise.
+def _post_placeholder(
+    *,
+    web_client: WebClient,
+    redis_client: "Redis",
+    config: DispatcherConfig,
+    slack_event_id: str,
+    channel: str,
+    thread_ts: str,
+) -> Any:
+    """Post the in-thread placeholder, releasing the dedupe claim if it fails (#2006).
 
-    Bot-authored messages (including the dispatcher's own placeholder) and
-    subtyped messages (edits, joins, deletions) are not user requests.
+    ``claim_event`` runs before this call, and Bolt acks an Events API envelope
+    before running the listener body and then catches the body's exception in its
+    executor. So a raising ``chat_postMessage`` used to leave the key claimed with
+    no work done: any later delivery of that event id hit the claim and was
+    refused, and the message was lost for good with only a framework log line --
+    exactly the silent-loss class this ticket closes.
+
+    HONEST BOUND on what this buys. Because Bolt already acked, a Slack
+    redelivery of the failed event is rare; it is not the normal consequence of
+    the body raising. Releasing restores idempotency *correctness* -- the adapter
+    stops holding a claim for work it never did, so a retry, a replay or an
+    operator re-send can still be processed. It does not guarantee that every
+    failed placeholder is recovered.
+
+    THE ASYMMETRY IS DELIBERATE, do not "fix" it for consistency: only a failure
+    *before* the placeholder releases. Once the placeholder is in the channel
+    something user-visible has happened, so a failing ``enqueue`` after it keeps
+    the claim -- releasing there would let a redelivery post a SECOND placeholder
+    into the same thread, trading an invisible failure for a visible, confusing
+    one. Before the placeholder nothing user-visible has occurred, so releasing
+    is free.
     """
-    if event.get("bot_id"):
-        return False
-    if event.get("subtype"):
-        return False
-    return True
+    try:
+        return web_client.chat_postMessage(
+            channel=channel,
+            thread_ts=thread_ts,
+            text=config.placeholder_text,
+        )
+    except BaseException:
+        release_event(redis_client, config, slack_event_id)
+        raise
 
 
 def process_event(
     *,
     body: dict[str, Any],
     event: dict[str, Any],
+    lane: Lane,
     web_client: WebClient,
     redis_client: "Redis",
     config: DispatcherConfig,
@@ -78,28 +135,39 @@ def process_event(
 ) -> str | None:
     """Dedupe, post the placeholder, and enqueue one Slack event.
 
+    ``lane`` says which subscribed lane the delivery arrived on; the
+    bot-authorship rule is lane-specific (see ``relevance.classify``) and cannot
+    be inferred from the event body alone.
+
     Returns the Valkey Stream id when a job was enqueued, or None when the event
-    was skipped (non-actionable, or a duplicate delivery already claimed).
+    was refused. Every refusal is logged with its enumerated ``DropReason``.
     """
     log = logger or logging.getLogger(__name__)
 
-    if not is_actionable(event):
+    # `body.get`, not `body["event_id"]`: this drop runs before the claim and a
+    # malformed envelope with no event_id must be refused, not crash the listener.
+    reason = classify(event, lane=lane)
+    if reason is not None:
+        drop(log, reason, event_id=str(body.get("event_id", "")), lane=lane)
         return None
 
     slack_event_id = body["event_id"]
 
     if not claim_event(redis_client, config, slack_event_id):
-        log.info("duplicate slack event %s, skipping", slack_event_id)
+        drop(log, DropReason.DUPLICATE_DELIVERY, event_id=slack_event_id)
         return None
 
     # Reply in-thread: for a root message the thread key is its own ts.
     thread_ts = event.get("thread_ts") or event["ts"]
     channel = event["channel"]
 
-    placeholder = web_client.chat_postMessage(
+    placeholder = _post_placeholder(
+        web_client=web_client,
+        redis_client=redis_client,
+        config=config,
+        slack_event_id=slack_event_id,
         channel=channel,
         thread_ts=thread_ts,
-        text=config.placeholder_text,
     )
     placeholder_ts = placeholder["ts"]
 
@@ -116,7 +184,12 @@ def process_event(
         event_id=slack_event_id,
         conversation_id=thread_ts,
         author=event.get("user", ""),
-        text=event.get("text", ""),
+        # NOT `event.get("text", "")`: a Block Kit or attachment-shaped post
+        # carries an empty or fallback-only top-level `text` and its real body in
+        # `blocks`/`attachments`, so that read emptied the turn while still
+        # burning a placeholder (#2006). `derive_text` returns a non-empty
+        # top-level text byte-identically, so existing enqueues are unchanged.
+        text=derive_text(event),
         # A person spoke, so this turn MAY steer a live one. Stated rather than
         # left to the model default for the same reason `kind` is: a producer
         # that does not say what it is produces turns nobody can audit.
@@ -162,8 +235,14 @@ def process_action(
     """
     log = logger or logging.getLogger(__name__)
 
+    # A click carries no Slack event_id; the trigger_id is the interaction's own
+    # identity and is what the synthesized dedupe key below is built from, so it
+    # is the useful thing to name in a pre-claim drop.
+    interaction_id = str(body.get("trigger_id") or "")
+
     actions = body.get("actions") or []
     if not actions:
+        drop(log, DropReason.NO_ACTION_IN_PAYLOAD, event_id=interaction_id)
         return None
     # Approval-card buttons (#246) resolve through the API, never become a
     # turn. Bolt runs every matching listener, so this catch-all sees the
@@ -172,6 +251,7 @@ def process_action(
         return None
     command = action_command(actions[0])
     if not command:
+        drop(log, DropReason.EMPTY_ACTION_COMMAND, event_id=interaction_id)
         return None
 
     # The catch-all matcher fires on *every* block action, including ones from an
@@ -186,26 +266,32 @@ def process_action(
     # Reply in the clicked message's thread (its thread_ts, or its own ts if root).
     thread_ts = message.get("thread_ts") or message.get("ts")
     if not channel or not thread_ts:
-        log.info("block action without channel/message, skipping")
+        drop(log, DropReason.UNADDRESSABLE_ACTION, event_id=interaction_id)
         return None
 
     # A click carries no Slack event_id, so synthesize a stable idempotency key
     # from the interaction; a re-delivered click cannot enqueue (or post a second
     # placeholder) twice, same as the event dedupe.
-    interaction = body.get("trigger_id") or (
+    interaction = interaction_id or (
         f"{actions[0].get('action_ts', '')}-{actions[0].get('action_id', '')}"
     )
     slack_event_id = f"action-{interaction}"
     if not claim_event(redis_client, config, slack_event_id):
-        log.info("duplicate block action %s, skipping", slack_event_id)
+        drop(log, DropReason.DUPLICATE_DELIVERY, event_id=slack_event_id)
         return None
 
     user = (body.get("user") or {}).get("id", "")
 
-    placeholder = web_client.chat_postMessage(
+    # Same claim -> placeholder ordering as `process_event`, so the same release
+    # rule applies on this lane; fixing one mint site and not its twin is this
+    # repo's dominant drift shape.
+    placeholder = _post_placeholder(
+        web_client=web_client,
+        redis_client=redis_client,
+        config=config,
+        slack_event_id=slack_event_id,
         channel=channel,
         thread_ts=thread_ts,
-        text=config.placeholder_text,
     )
     queued = QueuedTurn(
         event_id=slack_event_id,
@@ -240,12 +326,17 @@ def register_handlers(
     injectable for tests; None builds the production client from config."""
 
     approval_resolver = resolver if resolver is not None else build_resolver(config)
+    # Resolved once here rather than per listener: the lane filter below drops
+    # outside `process_event`, so it needs a logger of its own, and the injected
+    # one is the single logger every drop must land on.
+    log = logger or logging.getLogger(__name__)
 
     @app.event("app_mention")
     def _on_app_mention(body: dict[str, Any], event: dict[str, Any]) -> None:
         process_event(
             body=body,
             event=event,
+            lane="mention",
             web_client=web_client,
             redis_client=redis_client,
             config=config,
@@ -255,11 +346,27 @@ def register_handlers(
 
     @app.event("message")
     def _on_message(body: dict[str, Any], event: dict[str, Any]) -> None:
-        if event.get("channel_type") != "im":
+        # ENVELOPE VALIDATION, not a relevance decision (#2006). The manifest at
+        # `apps/dispatcher/slack-app-manifest.yaml` subscribes bot_events to
+        # exactly `app_mention` and `message.im`, so a message on any other
+        # channel type cannot legitimately arrive in production -- a burst on
+        # this reason means the installed app is subscribed to something the
+        # manifest does not declare. It also cannot move to the routing seam even
+        # in principle: `QueuedTurn` carries no lane and no subtype, and
+        # `BindingResolver.resolve` sees only (kind, channel).
+        channel_type = event.get("channel_type")
+        if channel_type != "im":
+            drop(
+                log,
+                DropReason.UNSUBSCRIBED_LANE,
+                event_id=str(body.get("event_id", "")),
+                channel_type=channel_type,
+            )
             return
         process_event(
             body=body,
             event=event,
+            lane="im",
             web_client=web_client,
             redis_client=redis_client,
             config=config,
