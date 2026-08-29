@@ -328,7 +328,26 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
         # be both badly shaped and forging, and this validator's convention is
         # to report every applicable code so the author fixes the whole file in
         # one pass instead of discovering the next problem after each rename.
-        if _forges_the_render_join(name):
+        #
+        # Gated on `spec.is_hosted`: this guard exists because the name reaches
+        # `object_name` and could collide with another agent/connector pair
+        # there. A remote connector's name never reaches `object_name` at all
+        # -- `render()` emits zero objects for it, and `mcp_entry()` returns the
+        # authored `url` verbatim -- so there is no object name for it to make
+        # ambiguous. Refusing it would reject a previously valid bundle for a
+        # collision it cannot cause (#1446). A hosted connector that also sets
+        # `unhosted_url` still has `image` set (`is_hosted` True) and stays
+        # guarded, correctly: it renders real objects on the cluster tier.
+        #
+        # This is a deliberate ASYMMETRY with `deploy.ambiguous_agent_name`,
+        # which stays unconditional. An agent name is durable platform identity
+        # that outlives any one bundle version (ADR-0089 -- a typo there mints a
+        # new agent), it feeds `object_name` for every hosted connector the
+        # agent will EVER declare, and `deploy.yaml` validation does not read
+        # `connectors.yaml`, so it cannot know whether a hosted connector even
+        # exists yet. Refusing the agent name up front is the conservative
+        # choice; refusing a remote connector name here is not.
+        if spec.is_hosted and _forges_the_render_join(name):
             errors.append(
                 (
                     "connectors.ambiguous_name",

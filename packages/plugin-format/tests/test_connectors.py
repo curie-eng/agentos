@@ -456,10 +456,64 @@ def test_a_forging_name_and_a_bad_shape_report_both() -> None:
     # Same accumulation convention as the reserved-name check above: the author
     # sees every problem in the file in one pass, rather than discovering the
     # next one only after renaming to fix the first. This fails if the new check
-    # lands as an `elif` on the shape check.
-    codes = _codes({"connectors": {"mcp-c": {"secrets": ["T"]}}})
+    # lands as an `elif` on the shape check. Paired against `image` + `url`
+    # rather than the underspecified shape below -- that shape is hosted
+    # (`image` is set), so the ambiguous-name guard is live for it too.
+    codes = _codes({"connectors": {"mcp-c": {"image": "x:1", "url": "https://y/mcp"}}})
     assert "connectors.ambiguous_name" in codes
-    assert "connectors.underspecified" in codes
+    assert "connectors.ambiguous" in codes
+
+
+def test_a_forging_name_on_an_underspecified_connector_is_not_yet_judged() -> None:
+    # Neither `image:` nor `url:` is set, so `is_hosted` is False and the
+    # ambiguous-name guard does not fire -- not because the name is safe, but
+    # because we do not yet know it will ever reach `object_name`. If the
+    # author resolves `connectors.underspecified` by adding `url:`, this exact
+    # name is perfectly legal. Reporting `connectors.ambiguous_name` here would
+    # be a spurious error chasing a shape the author hasn't chosen yet.
+    assert _codes({"connectors": {"mcp-c": {"secrets": ["T"]}}}) == ["connectors.underspecified"]
+
+
+def test_a_forging_remote_connector_name_is_accepted() -> None:
+    # `render()` emits zero objects for a `url` connector and `mcp_entry()`
+    # returns the authored URL verbatim, so `object_name` is never called on
+    # this name -- it cannot collide with anything. Refusing it anyway would
+    # break a previously valid bundle for a collision it cannot cause.
+    assert "connectors.ambiguous_name" not in _codes(
+        {"connectors": {"mcp-internal": {"url": "https://mcp.internal/mcp"}}}
+    )
+    assert "connectors.ambiguous_name" not in _codes(
+        {"connectors": {"x-mcp-y": {"url": "https://mcp.internal/mcp"}}}
+    )
+
+
+@pytest.mark.parametrize("name", ["mcp-internal", "x-mcp-y"])
+def test_the_same_forging_name_is_refused_only_when_hosted(name: str) -> None:
+    # The important half of the boundary: the exact same name that is safe as
+    # `url` (above) is still refused once it is `image` -- a hosted connector
+    # renders real Kubernetes objects through `object_name`, so the collision
+    # this check exists to prevent is live again. Pinning both outcomes side
+    # by side is what stops a future widening of the remote exemption from
+    # quietly disabling the hosted guard too.
+    remote_codes = _codes({"connectors": {name: {"url": "https://mcp.internal/mcp"}}})
+    hosted_codes = _codes({"connectors": {name: {"image": "x:1"}}})
+    assert "connectors.ambiguous_name" not in remote_codes
+    assert hosted_codes == ["connectors.ambiguous_name"]
+
+
+def test_a_forging_hosted_connector_with_an_unhosted_url_stays_refused() -> None:
+    # `unhosted_url` is the tier-3 fallback address, not a substitute for
+    # `image` -- the connector is still hosted (`is_hosted` reads `image`) and
+    # still renders real objects on any tier that can host it. This is the
+    # shape most likely to be mis-gated by a later edit that broadens the
+    # `url`-only exemption to "anything with a URL on it."
+    assert _codes(
+        {
+            "connectors": {
+                "mcp-grafana": {"image": "x:1", "unhosted_url": "${GRAFANA_MCP_URL}"}
+            }
+        }
+    ) == ["connectors.ambiguous_name"]
 
 
 def test_bundle_surfaces_an_ambiguous_connector_name(tmp_path: Path) -> None:
