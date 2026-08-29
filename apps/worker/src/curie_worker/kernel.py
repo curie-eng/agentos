@@ -2166,6 +2166,31 @@ class Kernel:
             return TurnOutcome(terminal_ok=True)
         except WorkspaceSelectionRefused as exc:
             release_order()
+            # LOG it, not only reply (#2004). This was the one turn-ending branch
+            # in this handler that ended a turn silently, and it ends it with no
+            # sandbox: `WorkspaceSelectionRefused` subclasses
+            # `WorkspacePreparationError`, so this narrower `except` runs first
+            # and the turn never reaches the sibling below that logs "turn start
+            # failed".
+            #
+            # The reply covers a person in Slack, who reads the refusal and acts
+            # on it. It covers nobody when the turn came from a hook: there is no
+            # placeholder to edit and no one watching, so an acknowledged entry
+            # with no sandbox and no log is indistinguishable from an idle bot --
+            # and the last change anyone made was a boolean they would not
+            # connect to it.
+            #
+            # info rather than warning: a refusal is this feature working as
+            # designed, and routing routine policy outcomes to warning is how
+            # warnings stop being read. It names the agent because that is the
+            # only thing an operator chasing a silent bot has to search on.
+            logger.info(
+                "workspace selection refused for agent=%s deployment=%s thread=%s: %s",
+                agent_name,
+                workspace_deployment_id,
+                thread_key,
+                exc.public_detail,
+            )
             await self._reply_for(qevent, route, exc.public_detail)
             return TurnOutcome(terminal_ok=True)
         except (

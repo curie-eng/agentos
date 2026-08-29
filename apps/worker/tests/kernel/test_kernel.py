@@ -399,6 +399,75 @@ def test_workspace_selection_precedes_fresh_thread_greeting(make_harness) -> Non
     asyncio.run(go())
 
 
+def test_a_selection_refusal_is_logged_so_an_operator_can_find_it(
+    make_harness, caplog
+) -> None:
+    """The refusal ends the turn; without a log line it ends it invisibly (#2004).
+
+    `WorkspaceSelectionRefused` subclasses `WorkspacePreparationError`, so its
+    narrower `except` runs first and the turn never reaches the sibling branch
+    that logs "turn start failed". Every other turn-ending branch in that handler
+    logs; this one did not.
+
+    The reply covers the Slack case, where the person who asked reads the
+    refusal. It covers nothing when the turn came from a hook: there is no
+    placeholder to edit and no one watching, so an acknowledged entry with no
+    sandbox and no log is indistinguishable from an idle bot -- which is exactly
+    how this was found, and the whole of the reported defect.
+
+    Asserts the agent is named, because "no line naming the agent" is what made
+    the live install unsearchable.
+    """
+
+    class WorkspaceResolved(_FakeResolved):
+        def __init__(self) -> None:
+            super().__init__(uuid.uuid4())
+            self.deployment_id = uuid.uuid4()
+            self.workspace_enabled = True
+
+    class WorkspaceBinding:
+        async def resolve(self, _kind: str, _channel: str) -> WorkspaceResolved:
+            return WorkspaceResolved()
+
+        def boot_env(
+            self,
+            _resolved: object,
+            _thread_key: str,
+            *,
+            kind: str | None = None,
+            address: str | None = None,
+        ) -> dict[str, str]:
+            return {}
+
+        def packs_for(self, _resolved: object) -> BehaviorPacks:
+            return BehaviorPacks.from_config({})
+
+    async def go() -> None:
+        async with make_harness(binding=WorkspaceBinding()) as h:
+            class WorkspaceProbe:
+                def select_repository(self, **kwargs: object) -> str:
+                    raise WorkspaceSelectionRefused(
+                        "Start the thread by naming one allowed root GitHub "
+                        "repository URL."
+                    )
+
+            h.kernel._workspace = WorkspaceProbe()  # type: ignore[assignment]
+            with caplog.at_level(logging.INFO, logger="curie_worker.kernel"):
+                await h.kernel.process_event(_qevent("hi", thread="tRefusalLog"))
+
+            assert h.runner.opened == []
+            logged = "\n".join(record.getMessage() for record in caplog.records)
+            assert "test-agent" in logged, (
+                "the refusal log must name the agent; an operator searching for "
+                f"a silent bot has only that to search on. Got: {logged!r}"
+            )
+            assert "naming one allowed root GitHub repository" in logged, (
+                f"the refusal log must carry the reason. Got: {logged!r}"
+            )
+
+    asyncio.run(go())
+
+
 def test_tool_notes_are_consumed_without_reaching_user_facing_updates(
     make_harness,
 ) -> None:
