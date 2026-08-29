@@ -334,6 +334,12 @@ clearing it (`--clear-github-token`) does not restart the API pod
 automatically; `cluster up` prints the exact restart command to run, and
 until you run it the API keeps using the old value.
 
+On the commit-polling lane, a repeated `git.archive_failed` for the same
+commit now backs off geometrically -- five minutes, then ten, twenty,
+forty, to a one-hour ceiling -- instead of re-cloning every poll interval,
+and after three consecutive failures the API logs an error saying deploys
+from that repository are NOT happening (#1309).
+
 Once wired, a push to the agent's dev branch builds and deploys under its
 dev bot identity; a push or merge to its prod branch promotes that same
 built artifact without rebuilding.
