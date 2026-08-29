@@ -16,6 +16,7 @@ import pytest
 import redis.exceptions
 from aci_protocol import Final, QueuedTurn, ReplyHandle, SessionStatus, TextDelta
 from curie_dispatcher.queue import to_stream_fields
+from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from curie_worker import consumer as consumer_module
 from curie_worker import kernel as kernel_module
 from curie_worker.consumer import (
@@ -1604,5 +1605,205 @@ def test_maintenance_tick_thread_reset_is_not_stalled_by_a_hanging_substrate_rel
 
             # The request was popped either way; a fresh reset is needed to retry.
             assert await h.async_redis.scard(THREAD_RESET_SET) == 0
+
+    asyncio.run(go())
+
+
+def test_maintenance_tick_thread_reset_claim_and_mark_is_atomic(make_harness) -> None:
+    """#855: claiming a reset request and marking it in-progress must be ONE
+    server-side step. As an SPOP followed by a separate SADD they are two round
+    trips, and between them the thread_key is in NEITHER set -- so the API's
+    ``is_pending`` (the UNION of the two) reads False for a request whose
+    sandbox has not been touched yet, and the CLI's ``reset-thread`` poll takes
+    that single ``requested: false`` as proof and prints "reset complete,
+    sandbox released" before ``release_thread`` has even been invoked. That is
+    #812's user-visible failure narrowed to one network hop.
+
+    Both halves matter. (a) The gap must never be observable, and the observer
+    that proves it sits at the CENTRAL COMMAND BOUNDARY -- ``execute_command``,
+    the single funnel every redis-py call (``spop``, ``sadd``, ``eval``,
+    ``srem``, a pipeline's writes) is issued through -- rather than on any one
+    named method. After every command the drain issues, it reads the union on a
+    SECOND, INDEPENDENT connection (so the observation never recurses through
+    the client under test, and never perturbs what it measures) and records a
+    violation if the live request is in neither set. That is what makes this
+    mutation-resistant rather than shape-recognising: the old ``.spop()`` +
+    ``.sadd()`` pair, two separate ``EVAL``s (one SPOP-ing, one SADD-ing), and a
+    raw ``execute_command("SPOP", ...)`` + ``execute_command("SADD", ...)`` pair
+    ALL go red, because all three are two commands with an observable gap
+    between them -- the observer never has to know which method name was used.
+    (b) The mark must still land, and land from the atomic claim itself:
+    mid-release the key IS in the in-progress set, yet no separate marking
+    command (an ``SADD``/``SMOVE`` against ``THREAD_RESET_INFLIGHT_SET``) was
+    ever issued through that same boundary. (a) alone would pass vacuously if
+    the drain simply stopped claiming anything; (b) is what proves it did not.
+    """
+
+    async def go() -> None:
+        async with make_harness() as h:
+            h.runner.default_script = [Final(text="hi", status=DONE)]
+            await h.kernel.process_event(_qevent("hi", thread="tAtomicClaim"))
+            assert h.substrate.lookup("tAtomicClaim") is not None
+
+            violations: list[str] = []
+            observed: list[str] = []
+            observer_errors: list[str] = []
+            inflight_marks: list[tuple[Any, ...]] = []
+            original_execute = h.async_redis.execute_command
+            original_sadd = h.async_redis.sadd
+            original_srem = h.async_redis.srem
+
+            # The observer reads on its own connection: issuing its reads through
+            # the spied client would recurse into the spy and would interleave
+            # extra commands into the very sequence under observation.
+            observer_redis: AsyncRedis = AsyncRedis(
+                host=VALKEY_HOST,
+                port=VALKEY_PORT,
+                password=VALKEY_PW or None,
+                decode_responses=True,
+            )
+
+            started = asyncio.Event()
+            proceed = asyncio.Event()
+            original_release = h.kernel.release_thread
+
+            async def blocking_release(thread_key: str) -> bool:
+                started.set()
+                await proceed.wait()
+                return await original_release(thread_key)
+
+            async def spy_execute_command(*args: Any, **options: Any) -> Any:
+                name = args[0]
+                name = (name.decode() if isinstance(name, bytes) else name).upper()
+                # A separate marking round trip is itself the defect: record any
+                # command that writes the in-progress set from the client side.
+                if (
+                    not started.is_set()
+                    and name in {"SADD", "SMOVE"}
+                    and THREAD_RESET_INFLIGHT_SET in args[1:]
+                ):
+                    inflight_marks.append(args)
+                result = await original_execute(*args, **options)
+                # The observation window runs from "a live request exists in the
+                # request set" up to the instant the release begins. Before the
+                # release starts the key MUST be somewhere in the union; once the
+                # release is running the mid-release assertion below covers it,
+                # and after a successful release both sets are legitimately empty
+                # -- observing past that point would manufacture false
+                # violations.
+                if not started.is_set():
+                    observed.append(name)
+                    try:
+                        in_requests = await observer_redis.sismember(
+                            THREAD_RESET_SET, "tAtomicClaim"
+                        )
+                        in_flight = await observer_redis.sismember(
+                            THREAD_RESET_INFLIGHT_SET, "tAtomicClaim"
+                        )
+                        if not in_requests and not in_flight:
+                            violations.append(name)
+                    except Exception as exc:  # never raise inside the spy
+                        observer_errors.append(f"{name}: {exc!r}")
+                return result
+
+            h.kernel.release_thread = blocking_release  # type: ignore[method-assign]
+            task: asyncio.Task[None] | None = None
+            try:
+                # THREAD_RESET_SET / THREAD_RESET_INFLIGHT_SET are FIXED
+                # cross-service constants -- unlike this harness's stream and
+                # sandbox keys they are not namespaced per run, so their contents
+                # outlive the test, the process, and the run on a shared Valkey.
+                # Residue matters asymmetrically: a leftover "tAtomicClaim" in
+                # the in-progress set makes the observer read `in_flight` True at
+                # every boundary, so arm (a) can never record a violation and
+                # goes SILENTLY VACUOUS rather than red. This test also *creates*
+                # that residue -- an assertion firing mid-release leaves the drain
+                # blocked before its SREM -- so both the pre-clean here and the
+                # unconditional post-clean below are load-bearing.
+                # These writes happen before the spy is installed (and, in the
+                # `finally`, after it is restored), so they can never be counted
+                # as violations or as inflight_marks.
+                await original_srem(THREAD_RESET_SET, "tAtomicClaim")
+                await original_srem(THREAD_RESET_INFLIGHT_SET, "tAtomicClaim")
+                assert not await observer_redis.sismember(
+                    THREAD_RESET_SET, "tAtomicClaim"
+                )
+                assert not await observer_redis.sismember(
+                    THREAD_RESET_INFLIGHT_SET, "tAtomicClaim"
+                ), "stale in-progress residue would make arm (a) vacuous"
+
+                await original_sadd(THREAD_RESET_SET, "tAtomicClaim")
+                # The live request now exists; install the spy before the drain
+                # can issue its first command. The spy is only ever installed
+                # between here and the `finally` below, so its own presence is
+                # the observation window -- `not started.is_set()` alone closes
+                # it at the release.
+                h.async_redis.execute_command = (  # type: ignore[method-assign,assignment]
+                    spy_execute_command
+                )
+                consumer = Consumer(
+                    redis=h.async_redis, kernel=h.kernel, config=h.config
+                )
+                task = asyncio.create_task(consumer._drain_thread_reset_requests())
+                await asyncio.wait_for(started.wait(), timeout=5.0)
+
+                # (b) The mark landed -- the pending signal is still True while
+                # the release runs...
+                assert await observer_redis.sismember(
+                    THREAD_RESET_INFLIGHT_SET, "tAtomicClaim"
+                )
+                # ...and it came from the atomic claim, not a second round trip
+                # through the command boundary.
+                assert inflight_marks == []
+
+                proceed.set()
+                await asyncio.wait_for(task, timeout=10.0)
+            finally:
+                h.async_redis.execute_command = (  # type: ignore[method-assign,assignment]
+                    original_execute
+                )
+                proceed.set()
+                # Unblock and settle the drain first: while it is still parked in
+                # the release it has not reached its own SREM, and a cleanup that
+                # raced it could be undone by a late claim write.
+                if task is not None and not task.done():
+                    with contextlib.suppress(Exception):
+                        await asyncio.wait_for(asyncio.shield(task), timeout=10.0)
+                    if not task.done():
+                        task.cancel()
+                        with contextlib.suppress(BaseException):
+                            await task
+                # Exception-safe so a cleanup failure cannot mask the assertion
+                # that brought us here.
+                for _set in (THREAD_RESET_SET, THREAD_RESET_INFLIGHT_SET):
+                    with contextlib.suppress(Exception):
+                        await original_srem(_set, "tAtomicClaim")
+                with contextlib.suppress(Exception):
+                    await observer_redis.aclose()
+
+            assert observer_errors == [], f"observer failed to read: {observer_errors}"
+            # The observer must actually have run. An empty `violations` list is
+            # only evidence if commands reached the boundary at all -- if a future
+            # change stops routing the claim through ``execute_command``, arm (a)
+            # fails loudly here instead of passing on zero observations.
+            assert observed, (
+                "no command was observed at the command boundary while the "
+                "window was open; arm (a) proved nothing"
+            )
+            # (a) Every command the drain issued left the live request visible in
+            # the union. A non-empty list names the command after which
+            # `is_pending` would have read False for a request whose sandbox had
+            # not been released yet.
+            assert violations == [], (
+                "thread_key was in NEITHER THREAD_RESET_SET nor "
+                f"THREAD_RESET_INFLIGHT_SET after: {violations}"
+            )
+
+            # End state is clean: released, and nothing left pending.
+            assert h.substrate.lookup("tAtomicClaim") is None
+            assert not await h.async_redis.sismember(THREAD_RESET_SET, "tAtomicClaim")
+            assert not await h.async_redis.sismember(
+                THREAD_RESET_INFLIGHT_SET, "tAtomicClaim"
+            )
 
     asyncio.run(go())
