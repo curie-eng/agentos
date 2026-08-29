@@ -64,7 +64,7 @@ _READ_ERROR_BACKOFF_S = 0.5
 _CAP_SCAN_PAGE = 1000
 
 # An operator-requested thread reset (#713): the API SADDs a thread_key here
-# (`apps/api/src/curie_api/threadreset.py`) and the maintenance tick SPOPs
+# (`apps/api/src/curie_api/threadreset.py`) and the maintenance tick claims
 # it to force-release that thread's sandbox. `curie local eval` /
 # `curie cluster eval` SADDs each eval-owned conversation_id onto the same
 # set (#1534) so the next turn's `_handle` (and the tick) release that
@@ -74,17 +74,49 @@ _CAP_SCAN_PAGE = 1000
 # needs, so a plain Valkey SET is enough.
 THREAD_RESET_SET = "curie:thread-reset-requests"
 
-# Claimed-but-not-yet-released thread-reset requests (#812). The drain SPOPs a
-# request off THREAD_RESET_SET (the atomic claim, so no second replica/tick
-# double-releases it) and immediately SADDs it here; it is SREMoved only after
-# `release_thread` actually completes. The API's `is_pending` reads the UNION of
-# both sets, so the observable "reset still outstanding" signal the CLI polls on
-# flips to done only when the sandbox is truly released -- not at claim time, and
-# NOT at all if the release raises or times out (the key is left here, so the CLI
-# reports the reset as unconfirmed rather than a false success). Mirrored verbatim
-# in `apps/api/src/curie_api/threadreset.py`, the same cross-service-constant
+# Claimed-but-not-yet-released thread-reset requests (#812). The drain MOVES a
+# request off THREAD_RESET_SET into this set in one atomic server-side step
+# (`_THREAD_RESET_CLAIM_LUA`, #855) -- the claim and the in-progress mark are the
+# same operation, so no second replica/tick double-releases it AND that claim
+# transition is never observable as a member missing from both sets. It is
+# SREMoved only after `release_thread` actually completes. The API's
+# `is_pending` reads the UNION of both sets, so the observable "reset still
+# outstanding" signal the CLI polls on flips to done only when the sandbox is
+# truly released -- not at claim time, and NOT at all if the release raises or
+# times out (the key is left here, so the CLI reports the reset as unconfirmed
+# rather than a false success). Mirrored verbatim in
+# `apps/api/src/curie_api/threadreset.py`, the same cross-service-constant
 # pattern as THREAD_RESET_SET itself.
+#
+# The marker itself carries no claim identity, though: if a second operator
+# request for the same thread lands while an earlier release is still
+# in-flight, both claims collapse onto this one SADDed key, and the earlier
+# release's unconditional SREM on completion empties it (and the union) while
+# the later release is still running. That duplicate-request gap predates
+# this change and is adjacent to #734 -- not something the atomic claim step
+# closes.
 THREAD_RESET_INFLIGHT_SET = "curie:thread-reset-inflight"
+
+# Claim a thread-reset request and mark it in-progress as ONE atomic unit (#855).
+# Valkey runs a script to completion with nothing interleaved, so the claim
+# transition -- moving the key from the request set to the in-progress set --
+# is never observable as absent from both: there is no window where the API's
+# `is_pending` (the UNION of both) reads False for a live request. A
+# client-side SPOP-then-SADD pair cannot offer that: the RTT between the two
+# commands is a real gap in which the key belongs to neither set, and a poll
+# landing in it reads "released" before `release_thread` has even been
+# invoked (#812's exact user-visible failure). (This says nothing about a
+# repeat request for a thread whose earlier release is still in flight --
+# see the identity-less-marker note above THREAD_RESET_INFLIGHT_SET.)
+# Returns the claimed member, or Lua `false` (Python ``None``) when the request
+# set is empty -- the same bare-member reply shape SPOP itself has.
+_THREAD_RESET_CLAIM_LUA = """
+local claimed = redis.call('SPOP', KEYS[1])
+if claimed then
+  redis.call('SADD', KEYS[2], claimed)
+end
+return claimed
+"""
 
 # Per-tick time budget for draining THREAD_RESET_SET (#743, follow-up to
 # #739). #739 bounded the courtesy interrupt to 5s per *request*, but the
@@ -331,6 +363,11 @@ class Consumer(StreamConsumer):
         into ``THREAD_RESET_INFLIGHT_SET`` (which ``is_pending`` also reads) for
         the duration of the release, and cleared from it only on SUCCESS.
 
+        The claim and that in-progress mark are ONE server-side step
+        (``_THREAD_RESET_CLAIM_LUA``, #855), not an ``SPOP`` followed by a
+        separate ``SADD`` -- see that constant's comment for why the two-round-trip
+        version would reopen #812's failure at RTT scale.
+
         A release that raises or times out is logged and LEFT in the in-progress
         set: ``is_pending`` therefore stays True and the CLI reports the reset as
         unconfirmed rather than a false success (scenario B). It is deliberately
@@ -345,23 +382,30 @@ class Consumer(StreamConsumer):
         the budget is spent, rather than serially paying every request's
         release bound inline in this tick. Members not yet popped simply stay
         in ``THREAD_RESET_SET`` and are drained on a later tick -- safe
-        because ``SPOP`` never removes a member without this loop taking
-        ownership of it in the same step."""
+        because the atomic claim never removes a member from the request set
+        without this loop taking ownership of it, and marking it in-progress,
+        in the same step."""
         start = time.monotonic()
         while True:
-            raw = await self._valkey.spop(THREAD_RESET_SET)
+            # Claim the request AND mark it in-progress in one atomic step, so
+            # `is_pending` (the union of the request and in-progress sets) stays
+            # True across the whole claim rather than briefly reading False in
+            # the gap between two round trips (#812, #855).
+            raw = await self._valkey.eval(
+                _THREAD_RESET_CLAIM_LUA,
+                2,
+                THREAD_RESET_SET,
+                THREAD_RESET_INFLIGHT_SET,
+            )
             if raw is None:
                 return
-            # SPOP with no count (as called here) always returns a single
-            # bare member, never the set-of-members shape its overload
-            # allows with an explicit count -- narrow away that shape for
-            # the type checker rather than the client's imprecise overload.
-            assert isinstance(raw, (str, bytes)), f"unexpected SPOP shape: {raw!r}"
+            # The script returns the SPOP reply verbatim, and SPOP with no count
+            # always returns a single bare member, never the set-of-members shape
+            # its overload allows with an explicit count -- narrow away that
+            # shape for the type checker rather than the client's imprecise
+            # overload.
+            assert isinstance(raw, (str, bytes)), f"unexpected claim shape: {raw!r}"
             thread_key = raw.decode("utf-8") if isinstance(raw, bytes) else raw
-            # Mark the claim in-progress BEFORE releasing, so `is_pending` (the
-            # union of the request and in-progress sets) stays True for the whole
-            # release rather than flipping at claim time (#812).
-            await self._valkey.sadd(THREAD_RESET_INFLIGHT_SET, thread_key)
             try:
                 released = await self._kernel.release_thread(thread_key)
             except Exception:
