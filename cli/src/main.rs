@@ -629,6 +629,45 @@ enum DevAction {
         #[arg(long)]
         force: bool,
     },
+    /// Run the gated cluster soak and chaos scenario
+    /// (`tests/soak/test_soak_resilience.py`) against the cluster the current
+    /// kube context points at, with `CURIE_SOAK=1` set for you (#2056). See
+    /// `tests/soak/README.md` for what the scenario proves and how to size the
+    /// warm pool.
+    ///
+    /// The scenario needs a STANDING cluster, so this verb preflights the kube
+    /// context, the namespace, and the warm pool before spending anything. When
+    /// any of the three is missing it SKIPS with a named reason and exits 0
+    /// rather than failing: an absent cluster is not a regression, and a red
+    /// exit there would make the nightly rung uninterpretable. A real scenario
+    /// failure exits non-zero, carrying the same result object.
+    ///
+    /// Long-running by construction (concurrent threads, a killed sandbox, a
+    /// resume under load), and `--runs` multiplies it. No timeout is imposed.
+    Soak {
+        /// Namespace the standing cluster runs in.
+        ///
+        /// This and `--pool` read the same environment variables the pytest
+        /// harness reads (tests/soak/harness.py), so a caller that already
+        /// exported the harness env -- the nightly soak rung does -- gets it
+        /// honored with no flag at all, and the flag stays available to
+        /// override it. Inferring from the facts already present beats
+        /// requiring a flag whose value we can derive.
+        #[arg(long, env = "CURIE_SANDBOX_E2E_NAMESPACE", default_value = "curie-g1")]
+        namespace: String,
+        /// Sandbox warm pool the scenario claims its sandboxes from. Reads
+        /// `CURIE_SANDBOX_E2E_POOL` for the same reason `--namespace` does.
+        #[arg(
+            long,
+            env = "CURIE_SANDBOX_E2E_POOL",
+            default_value = "curie-g1-runner-pool"
+        )]
+        pool: String,
+        /// Consecutive runs in one invocation. The definition-of-done target is
+        /// three; the default of one keeps an exploratory run cheap.
+        #[arg(long, env = "CURIE_SOAK_RUNS", default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+        runs: u32,
+    },
     /// Lint the interface catalog docs (`bash scripts/check-docs.sh`).
     DocsLint,
     /// Validate every `examples/` bundle against Claude Code (`bash scripts/check-plugin-compat.sh`).
@@ -2306,6 +2345,11 @@ async fn run(command: Option<Command>) -> Result<()> {
                 let args: &[&str] = if force { &["--force"] } else { &[] };
                 commands::dev_script("scripts/chart-runtime-e2e.sh", args).await
             }
+            DevAction::Soak {
+                namespace,
+                pool,
+                runs,
+            } => commands::dev_soak(&namespace, &pool, runs).await,
             DevAction::DocsLint => commands::dev_script("scripts/check-docs.sh", &[]).await,
             DevAction::PluginCompat => {
                 commands::dev_script("scripts/check-plugin-compat.sh", &[]).await

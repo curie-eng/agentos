@@ -4330,6 +4330,50 @@ export const commandManifest = {
           "name": "chart-runtime-e2e"
         },
         {
+          "about": "Run the gated cluster soak and chaos scenario (`tests/soak/test_soak_resilience.py`) against the cluster the current kube context points at, with `CURIE_SOAK=1` set for you (#2056). See `tests/soak/README.md` for what the scenario proves and how to size the warm pool",
+          "args": [
+            {
+              "default_values": [
+                "curie-g1"
+              ],
+              "env": "CURIE_SANDBOX_E2E_NAMESPACE",
+              "global": false,
+              "help": "Namespace the standing cluster runs in",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie-g1-runner-pool"
+              ],
+              "env": "CURIE_SANDBOX_E2E_POOL",
+              "global": false,
+              "help": "Sandbox warm pool the scenario claims its sandboxes from. Reads `CURIE_SANDBOX_E2E_POOL` for the same reason `--namespace` does",
+              "id": "pool",
+              "long": "pool",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "1"
+              ],
+              "env": "CURIE_SOAK_RUNS",
+              "global": false,
+              "help": "Consecutive runs in one invocation. The definition-of-done target is three; the default of one keeps an exploratory run cheap",
+              "id": "runs",
+              "long": "runs",
+              "positional": false,
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "long_about": "Run the gated cluster soak and chaos scenario (`tests/soak/test_soak_resilience.py`) against the cluster the current kube context points at, with `CURIE_SOAK=1` set for you (#2056). See `tests/soak/README.md` for what the scenario proves and how to size the warm pool.\n\nThe scenario needs a STANDING cluster, so this verb preflights the kube context, the namespace, and the warm pool before spending anything. When any of the three is missing it SKIPS with a named reason and exits 0 rather than failing: an absent cluster is not a regression, and a red exit there would make the nightly rung uninterpretable. A real scenario failure exits non-zero, carrying the same result object.\n\nLong-running by construction (concurrent threads, a killed sandbox, a resume under load), and `--runs` multiplies it. No timeout is imposed.",
+          "name": "soak"
+        },
+        {
           "about": "Lint the interface catalog docs (`bash scripts/check-docs.sh`)",
           "hidden": false,
           "name": "docs-lint"

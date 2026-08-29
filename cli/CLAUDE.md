@@ -37,10 +37,15 @@ Helm and the deployed release with `up`, `status`, `down`, `comms`, `message`,
   committed schemas stay byte-for-byte identical while the json-vs-human decision
   lives only in `Ui::emit`. The one intentional non-`CliOutput` emit is the
   centralized error path in `main.rs` (`error_json` under `--json`): generic
-  errors use `error.schema.json`, while `cluster deploy --all-targets`
-  reconciliation failures use `deploy.schema.json`. Errors are not success-path
-  values, so they stay on the error-emit mirror rather than the success-path
-  `CliOutput` contract.
+  errors use `error.schema.json`, `cluster deploy --all-targets` reconciliation
+  failures use `deploy.schema.json`, and `curie dev soak` failures use
+  `soak.schema.json` -- one family that also covers pass and skip, so a failing
+  run stays on its declared schema rather than degrading to `error.schema.json`;
+  it's the first `with_json_payload` call from `commands.rs` instead of
+  `main.rs`, the established shape for a verb whose failure is still a
+  structured result, not a deviation. Errors are not success-path values, so
+  they stay on the error-emit mirror rather than the success-path `CliOutput`
+  contract.
 - **The command manifest is a committed artifact; regenerate it in the same
   change as any command-surface edit (console/CLI parity, epic #145).** Any
   change to a clap `Command`/subcommand or an `*Action` enum — a renamed verb,

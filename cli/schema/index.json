@@ -238,6 +238,12 @@
       "version": "1.0"
     },
     {
+      "result": "SoakOutput",
+      "kind": "CliOutput",
+      "schema": "soak.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "StatusOutput",
       "kind": "CliOutput",
       "schema": "status.schema.json",

@@ -865,6 +865,377 @@ pub async fn dev_chart_check() -> Result<()> {
     Ok(())
 }
 
+/// The gated cluster scenario `curie dev soak` runs. Only this file, never the
+/// whole `tests/soak` directory: `test_harness_unit.py` beside it is the offline
+/// half that default CI already collects, and re-running it here would say
+/// nothing about the cluster.
+pub const SOAK_SCENARIO: &str = "tests/soak/test_soak_resilience.py";
+
+/// The three outcomes `curie dev soak` reports.
+///
+/// A type, not a string: the wire forms are exactly the three `status` values
+/// `soak.schema.json` enumerates, and `rename_all = "lowercase"` is what mints
+/// them, so renaming a variant is a visible contract change rather than a typo
+/// the compiler cannot see. Every site that classifies an outcome matches on
+/// this exhaustively, which makes a fourth outcome a compile error instead of a
+/// silently mis-rendered result.
+#[derive(Serialize, Debug, Clone, Copy, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum SoakStatus {
+    Passed,
+    Failed,
+    Skipped,
+}
+
+/// The result of `curie dev soak`, in all three outcomes.
+///
+/// One family covers pass, fail AND skip on purpose. The skip is the common
+/// case for a contributor with no standing cluster, so it has to be a
+/// first-class machine-readable result with a NAMED reason rather than an
+/// absence -- an agent reading `status == "skipped"` plus `reason` can tell
+/// "no cluster here" apart from "the scenario ran and the cluster broke",
+/// which a bare exit code cannot express.
+#[derive(Serialize)]
+pub struct SoakOutput {
+    /// The outcome, as a type rather than a string.
+    pub status: SoakStatus,
+    /// Why it skipped or failed, as a complete sentence naming the concrete
+    /// context, namespace or pool involved. `None` on a pass.
+    pub reason: Option<String>,
+    /// The kube context the preflight found, `None` when none is set.
+    pub context: Option<String>,
+    pub namespace: String,
+    pub pool: String,
+    pub runs: u32,
+    /// The pytest process exit code, `None` when the preflight skipped before
+    /// pytest ever ran.
+    pub exit_code: Option<i32>,
+}
+
+impl crate::ui::CliOutput for SoakOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({}))
+    }
+
+    fn render(&self, ui: &crate::ui::Ui) {
+        let reason = self
+            .reason
+            .as_deref()
+            .unwrap_or("no reason recorded, which is itself a bug");
+        // Exhaustive on purpose, with no catch-all: a new outcome must be
+        // rendered deliberately rather than inheriting the failure line.
+        match self.status {
+            SoakStatus::Passed => ui.success(&format!(
+                "soak scenario passed: {} run(s) against namespace {} (pool {})",
+                self.runs, self.namespace, self.pool
+            )),
+            SoakStatus::Skipped => ui.warn(&format!("soak scenario skipped: {reason}")),
+            SoakStatus::Failed => ui.failure(&format!("soak scenario failed: {reason}")),
+        }
+    }
+}
+
+impl SoakOutput {
+    /// The preflight-skip shape: exit 0, no pytest, a named reason.
+    ///
+    /// All three preflight stages emit the identical shape and differ only in
+    /// how far they got (`context`) and what was missing (`reason`), so those
+    /// are the only parameters; `status` and the absent `exit_code` are the
+    /// invariant "no child ever ran" half. The pass, pytest-failure and
+    /// launch-failure constructions stay inline literals: those vary in
+    /// `status`, `reason` AND `exit_code` together, so a shared constructor
+    /// there would relocate the field list rather than shrink it.
+    fn skipped(
+        namespace: &str,
+        pool: &str,
+        runs: u32,
+        context: Option<String>,
+        reason: String,
+    ) -> Self {
+        Self {
+            status: SoakStatus::Skipped,
+            reason: Some(reason),
+            context,
+            namespace: namespace.to_string(),
+            pool: pool.to_string(),
+            runs,
+            exit_code: None,
+        }
+    }
+}
+
+/// Map a pytest process exit code onto this verb's `(status, reason)` pair.
+///
+/// Pure, so the classification is testable with no cluster and no pytest. Only
+/// 0 passes; every other code is a failure with its OWN sentence, because the
+/// codes mean genuinely different things to whoever reads the result. Code 5 is
+/// the one worth naming explicitly: pytest collected nothing, so the scenario
+/// silently did not run at all -- the vacuity a summary line reading "no
+/// failures" would otherwise hide.
+pub fn soak_outcome_for_exit_code(code: i32) -> (SoakStatus, Option<String>) {
+    let reason = match code {
+        0 => return (SoakStatus::Passed, None),
+        1 => "the soak scenario ran and reported failing assertions (pytest exit 1).".to_string(),
+        2 => "the soak run was interrupted before it finished (pytest exit 2); its result says \
+              nothing about the cluster."
+            .to_string(),
+        3 => "pytest hit an internal error while running the soak scenario (pytest exit 3)."
+            .to_string(),
+        4 => "pytest rejected the soak invocation as a usage error (pytest exit 4); the scenario \
+              never started."
+            .to_string(),
+        5 => format!(
+            "pytest collected no tests: the scenario did not run (pytest exit 5). {SOAK_SCENARIO} \
+             collected nothing, so this run proves nothing about the cluster."
+        ),
+        other => format!(
+            "pytest exited with the unexpected status {other}; the soak scenario reported no \
+             result."
+        ),
+    };
+    (SoakStatus::Failed, Some(reason))
+}
+
+/// Run one preflight command, capturing its stdout AND stderr. Mirrors
+/// `doctor.rs`'s private `capture`: a failure to even spawn the program reads as
+/// a failed probe, which is what we want -- no `kubectl` on PATH means no
+/// cluster to soak, and that is a skip, not a crash. The stderr comes back
+/// because it is the only place `kubectl` says WHY a `get` failed, and "the
+/// object is not there" and "I could not ask the cluster" are different
+/// sentences to whoever reads the skip.
+async fn soak_capture(program: &str, args: &[&str]) -> (bool, String, String) {
+    let cmd = crate::ops::OpsCommand::new(
+        program,
+        args.iter().map(|a| crate::ops::plain(*a)).collect(),
+    );
+    match crate::ops::run_capture(&cmd).await {
+        Ok((ok, out, err)) => (ok, out, err),
+        // The spawn itself failed, so there is no child stderr; carry our own
+        // error text in its place rather than an empty string, which would read
+        // as "kubectl said nothing" instead of "kubectl never ran".
+        Err(err) => (false, String::new(), err.to_string()),
+    }
+}
+
+/// Does a failed `kubectl get` mean the object is ABSENT, or that the cluster
+/// could not be asked?
+///
+/// `kubectl` writes `Error from server (NotFound): namespaces "x" not found` --
+/// and `(Forbidden)`, TLS errors, and connection refusals -- to stderr, so its
+/// own words are the only honest discriminator available here.
+///
+/// Anything we cannot positively read as NotFound (empty stderr, a wrapper that
+/// swallowed it, an unrecognized shape) classifies as OPERATIONAL, never as
+/// NotFound. Claiming "the namespace is absent" when the real cause was expired
+/// credentials is the false statement this function exists to prevent: a wrong
+/// "absent" reads as a verdict about the CLUSTER, while "could not be checked"
+/// reads as a verdict about the PROBE, which is all an ambiguous failure
+/// supports.
+fn soak_probe_is_not_found(stderr: &str) -> bool {
+    let lowered = stderr.to_ascii_lowercase();
+    lowered.contains("notfound") || lowered.contains("not found")
+}
+
+/// The first non-empty line of a probe's stderr, for quoting inside a skip
+/// reason. One line only: `kubectl` errors can run long, and the reason is a
+/// sentence a human reads, not a transcript.
+fn soak_probe_error_line(stderr: &str) -> String {
+    stderr
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("kubectl printed no error output")
+        .to_string()
+}
+
+/// `curie dev soak`: run the gated cluster soak and chaos scenario (#2056).
+///
+/// The scenario is `CURIE_SOAK=1`-gated and needs a standing cluster, so the
+/// verb preflights three things before spending a long run: a kube context, the
+/// namespace, and the sandbox warm pool the scenario claims from. Any one
+/// missing -- or a cluster that cannot be queried at all -- is a clean SKIP:
+/// exit 0, `status: "skipped"`, and a reason naming the concrete value, and
+/// saying whether it was absent or merely uncheckable, so the nightly rung can
+/// tell "there was no cluster tonight" from "the cluster failed the soak". A
+/// scenario that fails, or that cannot be launched, exits non-zero while still
+/// carrying this result family on stdout.
+///
+/// A release binary has no checkout, so this errors clearly outside one, same as
+/// `dev_script`.
+pub async fn dev_soak(namespace: &str, pool: &str, runs: u32) -> Result<()> {
+    let ui = crate::ui::ui();
+    let root = find_repo_root().context(
+        "runner/Dockerfile not found here or in any parent directory. Run `curie dev` \
+         from a curie source checkout -- a release binary has no dev scripts.",
+    )?;
+
+    // Preflight 1: is kubectl pointed anywhere at all?
+    let (ok, current_context, _) = soak_capture("kubectl", &["config", "current-context"]).await;
+    let context = current_context.trim().to_string();
+    if !ok || context.is_empty() {
+        ui.emit(&SoakOutput::skipped(
+            namespace,
+            pool,
+            runs,
+            None,
+            format!(
+                "no kubeconfig current-context is set, so there is no cluster to soak; the \
+                 scenario needs a standing curie cluster carrying namespace {namespace} and \
+                 sandbox warm pool {pool}."
+            ),
+        ));
+        return Ok(());
+    }
+
+    // Preflight 2: does the namespace the scenario drives exist on it?
+    let (ok, _, ns_stderr) = soak_capture("kubectl", &["get", "namespace", namespace]).await;
+    if !ok {
+        // Both branches skip and exit 0 -- neither a missing namespace nor an
+        // unreachable cluster is a soak regression -- but they get their own
+        // sentence, because "there is nothing to soak" and "I could not find
+        // out" are different things to whoever reads the nightly rung.
+        let reason = if soak_probe_is_not_found(&ns_stderr) {
+            format!(
+                "namespace {namespace} does not exist on kube context {context}, so the soak \
+                 scenario has no standing curie cluster to run against."
+            )
+        } else {
+            format!(
+                "namespace {namespace} could not be checked on kube context {context}: the \
+                 cluster could not be queried, so this is an access or reachability failure \
+                 rather than a missing namespace. kubectl said: {}",
+                soak_probe_error_line(&ns_stderr)
+            )
+        };
+        ui.emit(&SoakOutput::skipped(
+            namespace,
+            pool,
+            runs,
+            Some(context),
+            reason,
+        ));
+        return Ok(());
+    }
+
+    // Preflight 3: is the warm pool the scenario claims sandboxes from present?
+    // Without it every claim starves and the scenario fails for a reason that
+    // has nothing to do with resilience.
+    let pool_probe = ["get", "sandboxwarmpool", pool, "-n", namespace];
+    let (ok, _, pool_stderr) = soak_capture("kubectl", &pool_probe).await;
+    if !ok {
+        // Same split as the namespace probe, and for the same reason: only
+        // kubectl's own NotFound wording licenses the claim that the pool is
+        // absent; anything else we can say is that we could not check.
+        let reason = if soak_probe_is_not_found(&pool_stderr) {
+            format!(
+                "the sandbox warm pool {pool} the scenario claims from is absent from namespace \
+                 {namespace} on kube context {context}."
+            )
+        } else {
+            format!(
+                "the sandbox warm pool {pool} the scenario claims from could not be checked in \
+                 namespace {namespace} on kube context {context}: the cluster could not be \
+                 queried, so this is an access or reachability failure rather than a missing \
+                 warm pool. kubectl said: {}",
+                soak_probe_error_line(&pool_stderr)
+            )
+        };
+        ui.emit(&SoakOutput::skipped(
+            namespace,
+            pool,
+            runs,
+            Some(context),
+            reason,
+        ));
+        return Ok(());
+    }
+
+    ui.note(&format!(
+        "=== CURIE_SOAK=1 uv run pytest {SOAK_SCENARIO} -q ({runs} run(s), context {context}, \
+         namespace {namespace}, pool {pool}, in {}) ===",
+        root.display()
+    ));
+    // Child chatter goes to stderr so `--json` stdout stays exactly one result
+    // object, the same routing `run_chart_check_scripts` uses. No timeout: the
+    // scenario is long-running by construction and `--runs` multiplies it, so
+    // any bound we picked would be a false failure on a slow cluster.
+    let spawned = tokio::process::Command::new("uv")
+        .args(["run", "pytest", SOAK_SCENARIO, "-q"])
+        .env("CURIE_SOAK", "1")
+        .env("CURIE_SOAK_RUNS", runs.to_string())
+        .env("CURIE_SANDBOX_E2E_NAMESPACE", namespace)
+        .env("CURIE_SANDBOX_E2E_POOL", pool)
+        .current_dir(&root)
+        .stdout(std::io::stderr())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .await;
+    // A launch failure is still a soak RESULT. Returning it as a bare error
+    // would put the generic `{error, fix}` payload on stdout under `--json`,
+    // contradicting soak.schema.json's claim that a non-zero run carries THIS
+    // family, so it rides the same payload path the pytest failures below use.
+    // There is no child, hence no `exit_code`.
+    let status = match spawned {
+        Ok(status) => status,
+        Err(err) => {
+            let output = SoakOutput {
+                status: SoakStatus::Failed,
+                reason: Some(format!(
+                    "failed to invoke `uv run pytest` for the soak scenario ({err}); is uv on \
+                     PATH? The scenario never started, so this run says nothing about the cluster."
+                )),
+                context: Some(context),
+                namespace: namespace.to_string(),
+                pool: pool.to_string(),
+                runs,
+                exit_code: None,
+            };
+            let message = output
+                .reason
+                .clone()
+                .unwrap_or_else(|| "the soak scenario could not be launched".to_string());
+            let payload = crate::ui::CliOutput::to_json(&output);
+            return Err(crate::exit::with_json_payload(
+                anyhow::anyhow!(message),
+                payload,
+            ));
+        }
+    };
+
+    // A signal death has no code; the mapper's catch-all names that rather than
+    // letting it read as a pass.
+    let code = status.code().unwrap_or(-1);
+    let (state, reason) = soak_outcome_for_exit_code(code);
+    let output = SoakOutput {
+        status: state,
+        reason,
+        context: Some(context),
+        namespace: namespace.to_string(),
+        pool: pool.to_string(),
+        runs,
+        exit_code: Some(code),
+    };
+    if state == SoakStatus::Passed {
+        ui.emit(&output);
+        return Ok(());
+    }
+
+    // The failure rides the ERROR path so the process exits non-zero
+    // (ExitClass::Failure), but carries this result family rather than the
+    // generic error payload -- the `cluster deploy --all-targets` precedent.
+    // Nothing is emitted to stdout here: main's centralized error emit does it,
+    // and emitting again would put two objects on stdout.
+    let message = output
+        .reason
+        .clone()
+        .unwrap_or_else(|| "the soak scenario failed".to_string());
+    let payload = crate::ui::CliOutput::to_json(&output);
+    Err(crate::exit::with_json_payload(
+        anyhow::anyhow!(message),
+        payload,
+    ))
+}
+
 /// `curie list-agents`: list the plugin bundles under `agents/`, a personal,
 /// gitignored directory (sibling of `examples/`) for in-progress agent
 /// projects ready to hand to `curie deploy-local <folder>`. A release binary has

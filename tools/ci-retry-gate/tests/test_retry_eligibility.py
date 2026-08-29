@@ -149,10 +149,11 @@ NON_INVOCATION_HEADS = frozenset(
 )
 SHELL_KEYWORDS = frozenset({"do", "done", "fi", "then", "else", "esac", "true", "false"})
 
-# The one step in the repository that has the shape of a retry loop without
-# being one: a readiness poll. It waits for a service it did not build to start
-# answering, and it never re invokes a command whose failure would be a defect,
-# so a second iteration cannot bury anything. A readiness poll is not a retry.
+# The steps in the repository that have the shape of a retry loop without
+# being one: readiness polls. Each entry waits for a service it did not build
+# to start answering, and never re invokes a command whose failure would be a
+# defect, so a second iteration cannot bury anything. A readiness poll is not
+# a retry.
 #
 # This is the ONLY escape from the closed world rule 4 draws around in `run:`
 # retry constructs. Every other step in every workflow must either be on
@@ -161,6 +162,17 @@ SHELL_KEYWORDS = frozenset({"do", "done", "fi", "then", "else", "esac", "true", 
 RUN_RETRY_EXEMPT: frozenset[tuple[str, str, str]] = frozenset(
     {
         ("ci.yaml", "python", "Wait for Langfuse to serve"),
+        # The second readiness poll, same shape and same reasoning. `kubectl
+        # port-forward` returns before its listener is established, so the soak
+        # rung waits on a TCP connect to 127.0.0.1:26379 until the forwarder --
+        # a service this repository did not build -- starts answering. The loop
+        # re-attempts a bare connect, never a command whose failure would be a
+        # defect, so a second iteration cannot bury anything.
+        (
+            "nightly-graded-ladder.yaml",
+            "ladder-cluster",
+            "Soak and chaos rung (curie dev soak, REPORT ONLY, #1603/#2056)",
+        ),
     }
 )
 

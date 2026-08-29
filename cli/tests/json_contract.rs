@@ -878,7 +878,7 @@ use curie::commands::{
     ApprovalsOutput, BudgetOutput, BumpVersionOutput, ChartCheckOutcome, ChartCheckOutput,
     CheckMatch, CheckReport, DeclaredServer, DeleteOutput, DeployOutput, KillOutput,
     ListAgentsOutput, LocalAgentSummary, MemoryOutput, ResetThreadOutput, ResumeOutput,
-    SkillApprovalsOutput, SkillMessageOutput, SweepRow, VersionsOutput,
+    SkillApprovalsOutput, SkillMessageOutput, SoakOutput, SoakStatus, SweepRow, VersionsOutput,
 };
 use curie::comms::CommsOutput;
 use curie::local::{
@@ -929,6 +929,38 @@ fn chart_check_output_validates() {
         ],
     };
     assert_valid("chart-check.schema.json", &output.to_json());
+}
+
+/// `curie dev soak` emits ONE family for pass, fail and skip, so both a real
+/// pass and the far more common no-cluster skip are built here. The skip is the
+/// load-bearing half: it is the shape with `context` and `exit_code` null, and a
+/// schema that only ever saw the pass would accept a null-free result and
+/// silently reject the skip an agent actually reads.
+#[test]
+fn soak_output_validates() {
+    let passed = SoakOutput {
+        status: SoakStatus::Passed,
+        reason: None,
+        context: Some("k8scratch".to_string()),
+        namespace: "curie-g1".to_string(),
+        pool: "curie-g1-runner-pool".to_string(),
+        runs: 3,
+        exit_code: Some(0),
+    };
+    assert_valid("soak.schema.json", &passed.to_json());
+
+    let skipped = SoakOutput {
+        status: SoakStatus::Skipped,
+        reason: Some(
+            "no kubeconfig current-context is set, so there is no cluster to soak.".to_string(),
+        ),
+        context: None,
+        namespace: "curie-g1".to_string(),
+        pool: "curie-g1-runner-pool".to_string(),
+        runs: 1,
+        exit_code: None,
+    };
+    assert_valid("soak.schema.json", &skipped.to_json());
 }
 
 #[test]

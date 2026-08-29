@@ -453,7 +453,231 @@ jobs:
           CURIE_CREDENTIALS: ${{ secrets.OPENROUTER_API_KEY }}
           CURIE_MODEL: ${{ inputs.model || 'z-ai/glm-5.2' }}
         run: bash cli/scripts/e2e-ladder.sh
-      # Surface why on any failure above: pod states, recent events, and the
+      # --- Soak rung (REPORT ONLY, #2056) -----------------------------------
+      #
+      # `tests/soak/` had never run in any automated path: it needs a STANDING
+      # cluster with a claimable warm pool, and no CI job had one to lend it.
+      # This job does -- the kind cluster installed above is still up and its
+      # runner-prewarm daemonset has already rolled out -- so the soak runs
+      # HERE rather than paying for a second cluster install in a job of its
+      # own. That is what #2056 means by "the cluster tier where a sandbox
+      # exists".
+      #
+      # The rung is report only, on the #1603 precedent
+      # (`cli/scripts/e2e-ladder.sh`, the live cluster eval): it prints its
+      # result into the run log and the job summary so a reader can act on it,
+      # but nothing it observes can turn this nightly red. A soak is a
+      # load/chaos probe on a shared 2-CPU GitHub runner; graduating it to a
+      # gate needs a stable baseline first, and a flaky gate on the nightly
+      # would train the skim reflex on a workflow whose other rungs are real
+      # gates.
+      #
+      # HOW it is report only is load bearing. The whole rung is ONE step that
+      # captures every exit status inside the shell and ends in an
+      # unconditional `exit 0`, exactly the shape #1603 uses. It is
+      # deliberately NOT `continue-on-error: true`. The retry-eligibility gate
+      # (`tools/ci-retry-gate/tests/test_retry_eligibility.py`) draws a closed
+      # world around `continue-on-error`: it reads that marker as a retry, and
+      # a retry is permitted only on a step that acquires a third-party
+      # dependency before any repository code runs, never on one that builds,
+      # tests or gates this repository's code. A rung driving this repository's
+      # own soak harness is exactly what that world exists to exclude, so
+      # blanket-swallowing its failure would be the gate's central prohibition
+      # rather than an exemption from it. `exit 0` says the same thing without
+      # asking CI to swallow anything: the step really did succeed at its job,
+      # which is to report.
+      #
+      # Placement is deliberate: after the graded cluster rung (so the soak
+      # never perturbs the pods the graded turn is asserting on) and before the
+      # diagnostics dump (so a soak-visible break still gets pods, events and
+      # worker logs in the same run).
+      #
+      # The uv acquisition is the one part of the rung that stays outside that
+      # step: `uv sync` needs uv on PATH before the rung's own shell starts.
+      # It is a plain, unprotected `uses:` -- no `continue-on-error`, no
+      # `id:`, no endpoint probe, no backoff and no `(retry)` copy -- because
+      # that is exactly how this job already acquires every other third-party
+      # action it depends on: `actions/checkout`, `actions/download-artifact`,
+      # `azure/setup-helm`, `docker/setup-buildx-action`, four
+      # `docker/build-push-action` steps and the kind-cluster action, none of
+      # them retried. A retry here would buy a marginal reduction in a failure
+      # mode this job already accepts nine times over, and the price is an
+      # entry in an unrelated gate's policy table
+      # (`RETRY_ALLOWLIST` in `tools/ci-retry-gate/tests/test_retry_eligibility.py`)
+      # for a step that is not the soak rung itself. No `uv lock --check` here
+      # (unlike ci.yaml): the lockfile gate belongs to the PR CI that can act
+      # on it.
+      #
+      # The downstream consequence is already handled, and is recorded here so
+      # nobody "fixes" it: if uv never installs, the report-only step's
+      # `uv sync` fails and then `cli/target/release/curie --json dev soak`
+      # fails too. That step captures both statuses, writes them to the run log
+      # and the job summary, and still ends in its unconditional `exit 0`. The
+      # rung reports "could not run" -- which is the honest answer -- instead
+      # of reddening the nightly.
+      #
+      # Both soak steps carry `if: success() || failure()` so the rung runs
+      # whether or not an earlier step in this job succeeded. #2056 exists
+      # precisely because this scenario had no automated path anywhere; gating
+      # the rung on the graded cluster rung passing would reintroduce a whole
+      # class of night on which it still never runs -- and the nights the
+      # graded turn breaks are exactly the nights a soak signal is most worth
+      # having. The rung is report only and its result is independent of the
+      # graded turn's outcome, so running it after a failure costs nothing but
+      # runner minutes and cannot change the job's result (the step ends in an
+      # unconditional `exit 0`, and an earlier failure still fails the job).
+      # `success() || failure()` rather than a bare `always()`: `always()` also
+      # runs on job CANCELLATION, which burns a runner on a result nobody will
+      # read.
+      # The honest consequence, so nobody reads a skip as a break: if the
+      # cluster install itself failed, there is no reachable context, namespace
+      # or warm pool, and `curie dev soak`'s own preflight reports
+      # `status: "skipped"` with a NAMED reason and exits 0. A named skip in
+      # the summary is the correct, readable outcome -- neither a false green
+      # nor a false red.
+      - name: Install uv for the soak rung
+        if: success() || failure()
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          python-version: "3.13"
+      # The rung itself: workspace sync, Valkey port-forward, the scenario, and
+      # the teardown, all in one step so a single `exit 0` at the bottom is the
+      # only thing that decides this rung's effect on the job.
+      #
+      # `uv sync` resolves THIS repository's own lockfile, so it belongs inside
+      # the report-only body rather than beside the uv acquisition: it is
+      # repository code, not a bare third-party fetch.
+      #
+      # The soak harness (`tests/soak/harness.py`, `SoakConfig.from_env`)
+      # defaults `TEST_VALKEY_HOST`/`TEST_VALKEY_PORT` to localhost:26379 --
+      # the dev-stack compose Valkey a developer has running beside a standing
+      # cluster. This job has no dev stack: Valkey lives IN the kind cluster,
+      # deployed by the chart as the headless Service `curie-valkey` (release
+      # `curie`, `charts/curie/templates/valkey.yaml` renders
+      # `{{ include "curie.fullname" . }}-valkey`) on port 6379, with password
+      # `valkeypass` (charts/curie/values.yaml). Forwarding it to 26379 meets
+      # the harness's env contract without editing the harness.
+      #
+      # The readiness check is a bounded TCP-connect poll rather than a bare
+      # `sleep`: `kubectl port-forward` returns immediately and establishes the
+      # listener asynchronously, so a fixed sleep is either a false-ready race
+      # or wasted nightly minutes. That poll is why this step is on
+      # RUN_RETRY_EXEMPT in the retry gate -- it waits for a service it did not
+      # build to start answering and never re-invokes a command whose failure
+      # would be a defect, which is the gate's own stated definition of a
+      # readiness poll rather than a retry.
+      #
+      # `curie dev soak` is the one entry point for this scenario (CLAUDE.md's
+      # one-entry-point rule); it sets CURIE_SOAK=1 and preflights the kube
+      # context, so the workflow drives it purely with env.
+      #
+      # The verb's own skip path is what keeps this rung honest: with no
+      # reachable context, no such namespace, or no reachable SandboxWarmPool
+      # it emits `status: "skipped"` with a NAMED reason and exits 0. So a
+      # nightly whose install did not produce a claimable pool reports a skip
+      # -- not a false green (which a bare `|| true` would give) and not a
+      # false red. A non-zero exit means the scenario itself failed, and that
+      # is the signal worth reading in the summary below.
+      #
+      # CURIE_SOAK_CONCURRENCY=2 / CURIE_SOAK_BATCH=1 override the harness
+      # defaults (5 / 3) on purpose: the `pool_ready` fixture blocks until the
+      # warm pool reports concurrency + batch READY replicas, and a 2-CPU
+      # GitHub runner cannot hold the 8 ready sandboxes the defaults demand
+      # against the chart's default ResourceQuota -- it would sit out the
+      # fixture's 300s deadline every night. 3 is what fits, and it still
+      # exercises every phase (concurrent threads, a batch burst, a mid-run
+      # kill, a resume under load).
+      #
+      # CURIE_SOAK_RUNS=1: the three-consecutive-runs shape is the
+      # definition-of-done target for an operator-driven soak on real hardware,
+      # not something to spend nightly minutes on inside a 30-minute job.
+      - name: "Soak and chaos rung (curie dev soak, REPORT ONLY, #1603/#2056)"
+        # See the uv step above for why this is `success() || failure()` and
+        # not `always()`: the rung must still run on a night the graded rung
+        # failed (#2056's "it never runs anywhere"), but not on cancellation.
+        if: success() || failure()
+        env:
+          CURIE_SANDBOX_E2E_NAMESPACE: curie
+          # The chart names the default warm pool `<release>-runner-pool`
+          # (charts/curie/templates/agent-sandbox.yaml), so this install's pool
+          # is `curie-runner-pool` -- NOT the harness's `curie-g1` defaults,
+          # which name a developer's standing g1 cluster.
+          CURIE_SANDBOX_E2E_POOL: curie-runner-pool
+          CURIE_SOAK_CONCURRENCY: "2"
+          CURIE_SOAK_BATCH: "1"
+          CURIE_SOAK_RUNS: "1"
+          TEST_VALKEY_HOST: localhost
+          TEST_VALKEY_PORT: "26379"
+          TEST_VALKEY_PW: valkeypass
+        run: |
+          # `set +e` on purpose: GitHub's default shell is `bash -e {0}`, which
+          # would abort this step at the first non-zero status before it could
+          # be captured, summarized, or explained. This rung reports its
+          # status; it does not die on it.
+          set +e
+          set -uo pipefail
+
+          # The port-forward is torn down on every exit path, including the
+          # ones nobody planned for. A trap is not a retry construct: it fires
+          # once, on the way out, and re-invokes nothing.
+          pf_pid=""
+          cleanup() {
+            if [[ -n "$pf_pid" ]]; then
+              kill "$pf_pid" 2>/dev/null
+            fi
+          }
+          trap cleanup EXIT
+
+          uv sync
+          sync_status=$?
+
+          kubectl port-forward -n curie svc/curie-valkey 26379:6379 \
+            > /tmp/valkey-port-forward.log 2>&1 &
+          pf_pid="$!"
+          pf_ready=0
+          for attempt in $(seq 1 30); do
+            if (exec 3<>/dev/tcp/127.0.0.1/26379) 2>/dev/null; then
+              echo "valkey port-forward ready on 127.0.0.1:26379 after ${attempt} attempt(s)"
+              pf_ready=1
+              break
+            fi
+            sleep 2
+          done
+          if [[ "$pf_ready" -ne 1 ]]; then
+            echo "valkey port-forward did not become ready within 60s" >&2
+            cat /tmp/valkey-port-forward.log >&2
+          fi
+
+          # stdout and stderr are captured separately, not merged: under
+          # --json the verb puts exactly one result object on stdout and
+          # routes all pytest chatter to stderr, so redirecting only stdout
+          # keeps /tmp/soak-result.json a single parseable object for the
+          # summary block below, while the pytest transcript still reaches
+          # the job log in real time via stderr.
+          cli/target/release/curie --json dev soak > /tmp/soak-result.json
+          status=$?
+          echo "--- curie dev soak result (/tmp/soak-result.json) ---"
+          cat /tmp/soak-result.json
+          {
+            echo "### Soak and chaos rung (report only, #2056)"
+            echo
+            echo "\`uv sync\` exit status: \`${sync_status}\`"
+            echo
+            echo "Valkey port-forward ready: \`${pf_ready}\` (1 = ready)"
+            echo
+            echo "\`curie dev soak\` exit status: \`${status}\` — this rung cannot fail the nightly (#1603 precedent)."
+            echo
+            echo '```json'
+            cat /tmp/soak-result.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$status" -ne 0 ]]; then
+            echo "soak: the scenario reported a failure. Not failing the job: this rung is report only (#1603/#2056)." >&2
+          fi
+          # Unconditional, and the only exit in this body. This -- not
+          # `continue-on-error` -- is what makes the rung report only; see the
+          # block comment above for why the distinction is not cosmetic.
+          exit 0
       # worker/runner logs are what localize a reachability or scheduling break.
       # Deliberately no `kubectl get secret`: the credential reaches the pod via
       # secretKeyRef (not plaintext in the pod spec) and runner log redaction

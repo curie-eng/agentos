@@ -14,9 +14,26 @@ sandbox pod followed by `POST /v1/event` (NDJSON frames ending in a `final`).
 
 ## Opt-in gate
 
-The scenario never runs in default CI. It is gated on `CURIE_SOAK=1` and skips
-cleanly with no cluster. The pure-helper unit tests in `test_harness_unit.py`
-always run (offline, no cluster) and cover the deterministic harness logic.
+The scenario never runs in default (PR) CI. It is gated on `CURIE_SOAK=1`, and
+`curie dev soak` is the one entry point that runs it (the repo's one-entry-point
+rule, `CLAUDE.md`) — the verb sets `CURIE_SOAK=1` itself and preflights the
+cluster before invoking the suite.
+
+It does run nightly: the graded parity ladder's `ladder-cluster` job
+(`.github/workflows/nightly-graded-ladder.yaml`) drives `curie dev soak` against
+the standing kind cluster it already installed, as a **report-only** rung. The
+rung is a single step that captures the verb's exit status, prints its JSON
+result to the run log and the job summary, and then ends in an explicit
+`exit 0` — that, not a blanket `continue-on-error: true`, is what makes it
+**unable to fail the nightly** (the #1603 report-only precedent; see #2056). Its
+uv acquisition sits outside that step as a plain, unretried toolchain fetch, on
+the same footing as the job's other third-party actions; if uv never installs,
+the rung's captured statuses make it report "could not run" rather than redden
+the job. The rung overrides the concurrency and batch knobs downward because a
+2-CPU GitHub runner cannot hold the eight ready sandboxes the defaults demand.
+
+The pure-helper unit tests in `test_harness_unit.py` always run (offline, no
+cluster) and cover the deterministic harness logic.
 
 Only `test_harness_unit.py` is in the pytest `testpaths` (`pyproject.toml`), so
 the offline helpers run in default CI while `test_soak_resilience.py` (the
@@ -25,13 +42,34 @@ explicit path or under `CURIE_SOAK=1`.
 
 ## How to run
 
+The scenario, against a standing cluster and dev stack:
+
+```bash
+curie dev soak
+curie dev soak --namespace curie-g1 --pool curie-g1-runner-pool --runs 3
+```
+
+Each flag also reads its environment variable — `--namespace` from
+`CURIE_SANDBOX_E2E_NAMESPACE`, `--pool` from `CURIE_SANDBOX_E2E_POOL`, `--runs`
+from `CURIE_SOAK_RUNS` — so an already-exported harness environment is honored
+and the bare `curie dev soak` above is the normal invocation.
+
+**Skip contract.** With no reachable kube context, no such namespace, or no
+reachable `SandboxWarmPool`, the verb emits `status: "skipped"` with a named
+reason and exits **0**. It exits non-zero only when the scenario itself fails or
+could not be launched.
+That is what lets the nightly report-only rung distinguish "there was nothing to
+soak against" from "the soak found something", instead of reporting a false
+green or a false red.
+
 Offline unit tests (no cluster, always green):
 
 ```bash
 uv run pytest tests/soak/test_harness_unit.py -q
 ```
 
-Full scenario, three consecutive runs, against a standing cluster and dev stack:
+The underlying implementation, if you need to drive pytest directly (three
+consecutive runs shown; `curie dev soak --runs 3` is the supported form):
 
 ```bash
 CURIE_SOAK=1 CURIE_SOAK_RUNS=3 uv run pytest tests/soak -q
@@ -45,7 +83,7 @@ so the concurrent claims and the batch burst never starve.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `CURIE_SOAK` | unset | Set to `1` to enable the scenario. Unset skips it. |
+| `CURIE_SOAK` | unset | Set to `1` to enable the scenario. Unset skips it. `curie dev soak` sets it itself, so you only set it by hand when driving pytest directly. |
 | `CURIE_SOAK_CONCURRENCY` | `5` | Distinct concurrent Phase-A threads. |
 | `CURIE_SOAK_BATCH` | `3` | Concurrent Phase-B batch-burst threads. |
 | `CURIE_SOAK_RUNS` | `1` | Consecutive runs in one invocation (set `3` for the DoD). |
