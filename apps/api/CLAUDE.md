@@ -54,11 +54,19 @@ worker, Postgres, RustFS/S3, Langfuse, and GitHub.
   required keyword-only parameter for this reason and must not get a default.
   The clone also pins `http.followRedirects=false`, since git's default
   follows a redirect on the very request carrying the auth header.
-- **Prod push reuses the dev-built bundle; it does not rebuild.** A push to
-  the prod branch looks up the `Version` already created for that sha (from
-  the dev push) and only creates a new `Deployment` row. If you find yourself
-  rebuilding on promote, that is a bug, not a feature -- promotion is meant to
-  be "the exact artifact that passed on dev," not a fresh build.
+- **Prod push reuses the dev-built bundle; it does not rebuild.** Before any
+  clone, a **prod-branch** push looks up a stored bundle for that sha across
+  every agent bound to the repository (ADR-0091), fetches its bytes from the
+  object store, and reads `deploy.yaml` out of them to route the push; it
+  still only creates a new `Deployment` row. A prod promote of an
+  already-bundled sha therefore needs no access to the git remote -- which
+  matters because the platform's GitHub credential can expire or be revoked
+  without stopping webhook delivery (#1211). A **dev-branch** push is not
+  affected by this: it always clones and always validates, redeliveries
+  included, because the clone is also where the ancestry check (#1139) runs.
+  If you find yourself rebuilding on promote, that is a bug, not a feature --
+  promotion is meant to be "the exact artifact that passed on dev," not a
+  fresh build.
 - **The plugin bundle validator (`plugin_format.validate_bundle`) is the only
   gate a bundle passes through**, whether it arrives via the CLI's
   `curie local deploy` / `curie cluster deploy`, the UI's create-agent

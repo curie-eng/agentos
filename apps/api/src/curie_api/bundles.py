@@ -39,6 +39,7 @@ __all__ = [
     "bundle_root",
     "detect_format",
     "extract_and_validate",
+    "extract_stored_bundle",
     "read_bundle_text_files",
 ]
 
@@ -86,7 +87,7 @@ def extract_and_validate(
     """
 
     extension, content_type = detect_format(data)
-    safe_extract(
+    extract_stored_bundle(
         data,
         dest,
         max_uncompressed_bytes=max_uncompressed_bytes,
@@ -95,6 +96,47 @@ def extract_and_validate(
     )
     result = validate_bundle(bundle_root(dest))
     return extension, content_type, result
+
+
+def extract_stored_bundle(
+    data: bytes,
+    dest: Path,
+    *,
+    max_uncompressed_bytes: int = DEFAULT_MAX_UNCOMPRESSED_BYTES,
+    max_compression_ratio: float = DEFAULT_MAX_COMPRESSION_RATIO,
+    max_members: int = DEFAULT_MAX_MEMBERS,
+) -> None:
+    """Extract bytes that already passed ``validate_bundle`` at store time.
+
+    Bounded extraction under the caller's caps, and nothing else: no
+    ``detect_format``, no ``validate_bundle``. Re-validation is not so much
+    skipped here as already done -- the storage key is immutable and write-once
+    (see ``storage.ObjectStore``), so the object cannot have changed since it
+    was validated on the delivery that stored it. The part that CAN have moved
+    since is the operator's caps, and ``safe_extract`` re-applies them here:
+    the same backward-compatibility commitment ``deploy.revalidate_stored_bundle``
+    makes (ADR-0059 decision 3).
+
+    Raises ``UnsupportedArchive`` when a cap is exceeded. Mapping that onto the
+    caller's own error contract is the caller's job -- ``gitflow.process_push``
+    re-raises it as ``deploy.BundleTooLarge`` so an over-cap legacy bundle keeps
+    reporting ``bundle.too_large`` rather than the vaguer ``bundle.unsupported``.
+
+    Named sibling of ``read_bundle_text_files``, which does the same
+    bounded-extract-without-validate for the bundle-files read endpoint, and the
+    shared bounded-extract primitive ``extract_and_validate`` itself calls, so
+    the caps argument list has one home rather than two copies. The "stored" in
+    the name describes the caller whose contract this docstring records, not a
+    property this function re-checks.
+    """
+
+    safe_extract(
+        data,
+        dest,
+        max_uncompressed_bytes=max_uncompressed_bytes,
+        max_compression_ratio=max_compression_ratio,
+        max_members=max_members,
+    )
 
 
 def read_connectors(root: Path) -> ConnectorsFile:

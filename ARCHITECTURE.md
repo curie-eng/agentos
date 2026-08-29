@@ -299,10 +299,17 @@ Three properties keep an approval from becoming a standing permission:
 ## Pushing agent versions with git (deploy flow)
 
 A push is verified with an HMAC (Hash-based Message Authentication Code)
-signature, archived, validated, and stored as an immutable versioned bundle.
-A **dev-branch** push builds the artifact and fans out its eval suite as a CI
-check. A **prod-branch** push promotes that same artifact without rebuilding.
-One diagram, both branches:
+signature. The delivery that **builds** the bundle -- archiving, validating,
+and storing it as an immutable versioned bundle -- is a **dev-branch** push,
+which then fans out its eval suite as a CI check. A **prod-branch** push
+promotes that same artifact without rebuilding: if the pushed sha already has
+a stored bundle for this repository, the promote fetches its bytes straight
+from the object store and skips both the clone and the re-validation, which is
+why a prod promote does not need access to the git remote (#1211). Either way
+the deployed artifact is still the exact object that was validated when it was
+first built; the promote only re-checks its bounds against current caps
+(`deploy.revalidate_stored_bundle`, ADR-0059 decision 3). One diagram, both
+branches:
 
 There are **two ways a push reaches this flow**, and they converge immediately.
 The webhook below is the fast path. The second is a timer: `CommitPoller` in the

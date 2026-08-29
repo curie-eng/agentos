@@ -2,10 +2,12 @@
 
 A push to the dev branch builds the plugin bundle at that commit and deploys it
 under the dev bot identity; a push to the prod branch promotes the same commit
-(reusing the already-built bundle when present) under the prod bot identity. The
-bundle is produced by archiving the pushed sha from the repo, so the flow needs
-only git-protocol access to the remote (local bare repos in tests) and never the
-GitHub API.
+under the prod bot identity, reusing the already-built bundle when present --
+the lookup runs BEFORE any clone, so a promote of a sha this repository has
+already bundled needs no access to the remote at all (#1211). When the bundle
+does have to be built, it is produced by archiving the pushed sha from the repo,
+so that path needs only git-protocol access to the remote (local bare repos in
+tests) and never the GitHub API.
 """
 
 import base64
@@ -20,7 +22,7 @@ import tempfile
 import uuid
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 from urllib.parse import urlsplit
 
 from aci_protocol import EvalJob
@@ -214,25 +216,26 @@ def _git_failure_detail(
     return str(exc)[:200]
 
 
-def clone_and_archive(
-    clone_url: str,
-    sha: str,
-    settings: Settings,
-    *,
-    repo_full_name: str,
-    ref: str,
-    credentials: Any = None,
-) -> bytes:
-    """Mirror-clone the repo and return a tar of the tree at ``sha``.
+def verify_push_origin(
+    clone_url: str, sha: str, settings: Settings, *, repo_full_name: str
+) -> str:
+    """Authorize a push against its repository binding, and return the derived URL.
 
-    Refuses clone URLs outside the configured scheme allowlist and restricts git
-    to safe transports, so a webhook cannot coerce an arbitrary git command.
+    This is the network-free half of the clone's authorization: the payload
+    scheme allowlist, the ``_is_valid_sha`` option-injection gate (#65), the
+    ``repo_full_name`` derivation (``InvalidRepoFullName``, #1140), the derived
+    URL's own scheme allowlist, and whole-key origin equality (#1122). None of
+    it needs the remote.
 
-    ``clone_url`` is the untrusted webhook payload value: it is compared against
-    the origin derived from ``repo_full_name`` (which the caller must have read
-    from the agent row) and then discarded. Git is handed the derived origin,
-    for both the clone argv and the credential header, so a signed-but-forged
-    payload cannot choose where the platform GitHub token travels (#1122).
+    It is its own function so the path that reuses a stored bundle and the path
+    that clones run THE SAME CODE rather than two copies (#1211).
+    ``clone_and_archive`` still calls it, so its contract is unchanged; a
+    promote that never clones calls it directly.
+
+    Returns the trusted origin derived from ``repo_full_name`` -- the only URL
+    that may ever reach git. Raises ``GitFlowError`` for a refused scheme or a
+    malformed sha, ``InvalidRepoFullName`` for an unencodable binding, and
+    ``CloneOriginMismatch`` when the payload names a different origin.
     """
 
     if not clone_url.startswith(settings.git_allowed_schemes):
@@ -259,6 +262,33 @@ def clone_and_archive(
             f"clone url does not match the registered repository "
             f"{repo_full_name!r}: {clone_url[:200]!r}"
         )
+    return trusted_url
+
+
+def clone_and_archive(
+    clone_url: str,
+    sha: str,
+    settings: Settings,
+    *,
+    repo_full_name: str,
+    ref: str,
+    credentials: Any = None,
+) -> bytes:
+    """Mirror-clone the repo and return a tar of the tree at ``sha``.
+
+    Refuses clone URLs outside the configured scheme allowlist and restricts git
+    to safe transports, so a webhook cannot coerce an arbitrary git command.
+
+    ``clone_url`` is the untrusted webhook payload value: it is compared against
+    the origin derived from ``repo_full_name`` (which the caller must have read
+    from the agent row) and then discarded. Git is handed the derived origin,
+    for both the clone argv and the credential header, so a signed-but-forged
+    payload cannot choose where the platform GitHub token travels (#1122).
+    """
+
+    trusted_url = verify_push_origin(
+        clone_url, sha, settings, repo_full_name=repo_full_name
+    )
 
     tmp = tempfile.mkdtemp(prefix="gitflow-")
     env = {
@@ -413,16 +443,124 @@ async def process_push(
     # decides which agent receives the resulting Version.
     trusted_repo_full_name = str(repo_agents[0].repo_full_name)
 
+    # Set only on the clone path; `detect_format` is the only producer and
+    # `store_bundle` the only consumer, and neither is reachable when the bytes
+    # came from the store (see the `assert` in the bundle_built block below).
+    extension: str | None = None
+    content_type: str | None = None
+
     try:
-        archive = await run_in_threadpool(
-            clone_and_archive,
-            clone_url,
-            after,
-            settings,
-            repo_full_name=trusted_repo_full_name,
-            ref=ref,
+        # Unconditionally, before any database or object-store work: a forged
+        # push is refused and logged before this handler does anything else.
+        # Hoisting it out of the clone is what keeps #1122's origin pin, #1140's
+        # repo_full_name derivation and #65's sha gate on BOTH paths -- none of
+        # them ever needed the network, so none of them was really something the
+        # clone was providing.
+        verify_push_origin(
+            clone_url, after, settings, repo_full_name=trusted_repo_full_name
         )
-        extension, content_type = deploy.validate_archive(archive, settings)
+
+        # Has anything in this repository already built and stored this exact
+        # commit? If so, reuse those bytes and do not clone at all (#1211).
+        # The reuse fast path is PROD ONLY; the named gate below is
+        # load-bearing, so read WHY PROD ONLY before the reuse argument.
+        #
+        # WHY PROD ONLY. `CommitNotOnBranch` (#1139) is
+        # `git merge-base --is-ancestor` run against the remote, and there is no
+        # offline form of it. #1211's acceptance criterion is that the prod
+        # promote still succeeds when the remote has been deleted. Those two
+        # cannot both hold on one code path, so exactly one lane pays: prod
+        # trades the ancestry check for the offline promote, and dev -- which
+        # was never asked to work offline -- clones on every delivery exactly as
+        # it does on `main` today and keeps #1139 fully enforced.
+        #
+        # WHAT IS REUSED, AND WHY IT IS SAFE. The stored object passed
+        # `validate_bundle` when it was stored and its key is immutable and
+        # write-once, so it cannot have changed since. The promote deploys THAT
+        # object either way -- before this branch existed the freshly cloned
+        # bytes were validated and then discarded -- so cloning to re-validate
+        # bytes nobody deploys bought nothing but a network dependency. The
+        # bounded read of `deploy.yaml` off the stored bytes is
+        # `_read_stored_targets`; its docstring carries the
+        # extract-without-revalidate argument in full.
+        #
+        # WHAT IS PRESERVED. `verify_push_origin` above runs unconditionally, on
+        # both paths and in both environments, so #1122's origin pin, both
+        # scheme allowlists, #65's sha format gate and #1140's repo_full_name
+        # derivation are untouched by this change.
+        #
+        # WHAT IS NOT PRESERVED, plainly, and only on prod. A holder of the
+        # webhook signing secret can POST a signed push with
+        # `ref: refs/heads/main` and an `after` sha that has a stored bundle for
+        # THIS repository but is not an ancestor of the prod branch -- a sha
+        # pushed to dev, bundled, then abandoned rather than merged -- and it
+        # will be promoted. Five facts bound that:
+        #
+        #   1. It is exactly the pre-#1194 posture. Before c655ab9e the promote
+        #      performed zero clones and there was no ancestry check at all;
+        #      this restores that, it does not open something new.
+        #   2. The sha must ALREADY have a stored bundle for this repository, so
+        #      it already passed `validate_bundle` on a prior delivery here.
+        #      #1139's actual attack -- promoting a hostile fork's
+        #      `refs/pull/N/head` sha out of the `--mirror` clone -- is NOT
+        #      reachable, because such a sha has no stored bundle. The escape is
+        #      "promote a commit of ours that is not on main", not "promote a
+        #      stranger's code".
+        #   3. Because the dev lane always clones, the only way a sha acquires a
+        #      stored bundle in the first place is by passing #1139's ancestry
+        #      check on a dev delivery. That is what bounds the prod escape to
+        #      "a commit of ours that was on dev and is not on main" rather than
+        #      to arbitrary code: the dev gate does the containment work.
+        #   4. The clone path is unaffected: any sha without a stored bundle
+        #      still clones and still gets the full ancestry check, so #1139's
+        #      coverage is intact for every first-time delivery.
+        #   5. The attacker is the one `apps/api/CLAUDE.md` already assumes --
+        #      "the HMAC signature authenticates the sender, not the payload".
+        #
+        # This deliberately leaves the dev-redelivery row of #1211's measured
+        # table (0 clones before #1194, 1 clone after) unfixed: a re-delivered
+        # dev sha still pays a clone. Closing that row means an
+        # offline-checkable replacement for #1139, which needs a new invariant
+        # and a schema change -- a separate ticket with an ADR, not something to
+        # improvise here.
+        may_reuse_without_remote_verification = environment is Environment.prod
+        prebuilt = (
+            await _bundled_version_for_commit(session, repo_agents, after)
+            if may_reuse_without_remote_verification
+            else None
+        )
+        if prebuilt is not None:
+            archive = await store.get(str(prebuilt.bundle_ref))
+            try:
+                targets = await run_in_threadpool(_read_stored_targets, archive, settings)
+            except bundles.UnsupportedArchive as exc:
+                # Exact, not a catch-all. `safe_extract` raises
+                # `UnsupportedArchive` for unsafe entries OR for a cap
+                # violation, and on already-stored bytes the unsafe-entry causes
+                # are unreachable: they were refused before the object could be
+                # stored, and the key is immutable. A cap violation is all that
+                # is left, and it is what `deploy.revalidate_stored_bundle`
+                # -- which this extract now runs in FRONT of -- reports as
+                # `bundle.too_large` (ADR-0059 decision 3). Letting it surface
+                # as `bundle.unsupported` instead would regress an
+                # operator-facing error contract as a side effect of a
+                # performance fix.
+                raise deploy.BundleTooLarge(
+                    f"stored bundle for version {prebuilt.id} fails the current "
+                    f"bundle size/ratio limits and must be rebuilt and "
+                    f"re-uploaded: {exc}"
+                ) from exc
+        else:
+            archive = await run_in_threadpool(
+                clone_and_archive,
+                clone_url,
+                after,
+                settings,
+                repo_full_name=trusted_repo_full_name,
+                ref=ref,
+            )
+            extension, content_type = deploy.validate_archive(archive, settings)
+            targets = await run_in_threadpool(_read_targets, archive, settings)
     except InvalidRepoFullName as exc:
         return WebhookResult(
             status="rejected", errors=[{"code": "git.invalid_repository", "message": str(exc)}]
@@ -444,10 +582,16 @@ async def process_push(
         return WebhookResult(
             status="rejected", errors=[{"code": "bundle.unsupported", "message": str(exc)}]
         )
+    except deploy.BundleTooLarge as exc:
+        # The same code the `revalidate_stored_bundle` block below returns, so a
+        # legacy over-cap bundle reports identically whichever of the two
+        # bounds checks reaches it first.
+        return WebhookResult(
+            status="rejected", errors=[{"code": "bundle.too_large", "message": str(exc)}]
+        )
     except deploy.BundleInvalid as exc:
         return WebhookResult(status="rejected", errors=exc.errors)
 
-    targets = await run_in_threadpool(_read_targets, archive, settings)
     named = _target_agent_name(targets, environment)
     named_elsewhere = (
         await crud.get_agent_by_name(session, named)
@@ -486,12 +630,21 @@ async def process_push(
         # again: prod then promotes not merely an identical artifact but the
         # SAME one, which is what makes "promote what you validated" a property
         # of the schema rather than of discipline.
-        sibling = await _sibling_bundle(session, repo_agents, agent.id, after)
+        sibling = await _bundled_version_for_commit(
+            session, repo_agents, after, exclude_agent_id=agent.id
+        )
         if sibling is not None:
             version = await crud.attach_bundle(
                 session, version, str(sibling.bundle_ref), str(sibling.bundle_sha256)
             )
         else:
+            # Unreachable when the archive came from the store: the pre-clone
+            # lookup only returns a bundled version belonging to one of
+            # `repo_agents`, so either that version IS this agent's (bundle_built
+            # is False and this block does not run) or it is a sibling's and the
+            # branch above attaches it. So `archive` here is always freshly
+            # cloned, and `validate_archive` has always supplied the pair.
+            assert extension is not None and content_type is not None
             await deploy.store_bundle(
                 store, session, agent.id, version, archive, extension, content_type
             )
@@ -503,9 +656,18 @@ async def process_push(
     # A prod promote (bundle_built is False) reuses a bundle that may have been
     # stored before the current size/ratio caps existed, or under looser ones --
     # revalidate it here (ADR-0059 decision 3's backward-compat commitment). The
-    # bundle_built branch above already ran these bytes through
+    # bundle_built branch above ran freshly CLONED bytes through
     # `deploy.validate_archive` under the current caps moments ago, so re-fetching
     # and rechecking the identical bytes here would be redundant.
+    #
+    # On the reuse path (#1211) `extract_stored_bundle` has already re-applied
+    # the same caps to these bytes minutes earlier in this handler, so this call
+    # repeats work. It is kept deliberately: this is the single documented home
+    # of ADR-0059 decision 3's commitment, it also covers deliveries where the
+    # earlier extract did not happen (a sibling attach, where the object the
+    # version now points at is not the object `deploy.yaml` was read from), and
+    # deleting it would make the commitment depend on the shape of an
+    # optimization. Both routes report `bundle.too_large`.
     if not bundle_built:
         try:
             await deploy.revalidate_stored_bundle(store, version, settings)
@@ -644,15 +806,38 @@ def resolve_target_agent(
     )
 
 
-def _read_targets(archive: bytes, settings: Settings) -> DeployTargetsFile | None:
-    """Read ``deploy.yaml`` out of an already-validated archive.
+class _BundleExtract(Protocol):
+    """The bounded-extract call shape the two ``deploy.yaml`` readers share."""
 
-    Extracted to a temp dir because that is the only way to read one file out
-    of the bundle, and run in a threadpool by the caller since it is blocking.
+    def __call__(
+        self,
+        data: bytes,
+        dest: Path,
+        *,
+        max_uncompressed_bytes: int,
+        max_compression_ratio: float,
+        max_members: int,
+    ) -> object: ...
+
+
+def _read_deploy_targets(
+    extract: _BundleExtract, archive: bytes, settings: Settings
+) -> DeployTargetsFile | None:
+    """Extract ``archive`` under the operator's caps and read its ``deploy.yaml``.
+
+    The three caps are security-relevant (ADR-0059 decision 3), so the argument
+    list lives HERE, once: the two wrappers below differ only in which extract
+    they hand in, and a change to the caps cannot reach one reader and miss the
+    other. Extraction to a temp dir is the only way to read one file out of a
+    bundle, and it is blocking, so callers run the wrappers in a threadpool.
+
+    Read the wrapper you were sent from, not this helper, for what the choice of
+    ``extract`` means: ``_read_stored_targets``'s docstring carries the
+    extract-without-revalidate argument in full.
     """
 
     with tempfile.TemporaryDirectory() as tmp:
-        bundles.extract_and_validate(
+        extract(
             archive,
             Path(tmp),
             max_uncompressed_bytes=settings.bundle_max_uncompressed_bytes,
@@ -660,6 +845,47 @@ def _read_targets(archive: bytes, settings: Settings) -> DeployTargetsFile | Non
             max_members=settings.bundle_max_members,
         )
         return bundles.read_deploy_targets(Path(tmp))
+
+
+def _read_targets(archive: bytes, settings: Settings) -> DeployTargetsFile | None:
+    """Read ``deploy.yaml`` out of an already-validated archive.
+
+    Extracted to a temp dir because that is the only way to read one file out
+    of the bundle, and run in a threadpool by the caller since it is blocking.
+    """
+
+    return _read_deploy_targets(bundles.extract_and_validate, archive, settings)
+
+
+def _read_stored_targets(archive: bytes, settings: Settings) -> DeployTargetsFile | None:
+    """Read ``deploy.yaml`` out of a bundle fetched from the object store.
+
+    THIS PATH STILL EXTRACTS. It extracts the whole archive to a temp dir, under
+    exactly the same configured uncompressed-size, compression-ratio and
+    member-count caps `_read_targets` uses -- that is the only way to read one
+    file out of a bundle, and it is blocking, so the caller runs it in a
+    threadpool. What it does NOT do is re-run ``detect_format`` and
+    ``validate_bundle``: these bytes came from the immutable, write-once
+    storage key, where they passed ``validate_bundle`` on the delivery that
+    stored them, and they are the object this delivery deploys either way.
+
+    #1211's acceptance criterion asks for "zero extractions" on a promote. That
+    is, precisely, a zero of ``bundles.extract_and_validate`` calls -- which is
+    the honest measure here, because ``extract_and_validate`` is the composite
+    (detect + extract + validate) whose second and third parts are the redundant
+    work, and because it is the function the issue's own instrumentation
+    counted. A reader who sees "zero extractions" in a test name and then finds
+    a ``safe_extract`` call underneath this function has found the right thing,
+    not a lie: the extraction is bounded and unavoidable, the re-validation is
+    what went away.
+
+    Raises ``bundles.UnsupportedArchive`` when the current caps refuse bytes
+    stored under looser ones; ``process_push`` maps that to
+    ``deploy.BundleTooLarge`` so ADR-0059 decision 3's operator-facing code
+    survives the reorder.
+    """
+
+    return _read_deploy_targets(bundles.extract_stored_bundle, archive, settings)
 
 
 def _target_agent_name(targets: DeployTargetsFile | None, environment: Environment) -> str | None:
@@ -671,18 +897,40 @@ def _target_agent_name(targets: DeployTargetsFile | None, environment: Environme
     return matching[0].agent if len(matching) == 1 else None
 
 
-async def _sibling_bundle(
+async def _bundled_version_for_commit(
     session: AsyncSession,
     repo_agents: "Sequence[Agent]",
-    agent_id: uuid.UUID,
     commit_sha: str,
+    *,
+    exclude_agent_id: uuid.UUID | None = None,
 ) -> "AgentVersion | None":
-    """A version another agent of this repo already stored for this commit."""
+    """A version of this repository that already has this commit's bundle stored.
 
-    for sibling in repo_agents:
-        if sibling.id == agent_id:
+    Two questions, one predicate, on purpose. With ``exclude_agent_id`` it is
+    the ADR-0091 bundle-once/bind-many sibling reuse (#1194): has ANOTHER agent
+    of this repository already stored this commit, so the target agent can bind
+    the same object instead of uploading the bytes again? Without it, it is the
+    pre-clone check (#1211): has ANYTHING in this repository already built and
+    stored this exact commit, so this delivery needs no remote at all?
+
+    They are the same question with a different exclusion, and #1211 is exactly
+    what happens when they drift -- the lookup already existed, it just ran
+    after the clone it could have avoided. Keeping one function means the two
+    can never disagree about what "already bundled" means.
+
+    ``repo_agents`` arrives in ``Agent.name`` order (``crud.get_agents_by_repo``
+    orders it), so the version returned for a repository is deterministic.
+
+    Note the truthiness test on ``bundle_ref``, not ``is not None``: a row whose
+    bundle_ref is NULL is the residue of a prior attempt that failed after the
+    row committed (d3a0f4b8) and must be rebuilt, and an empty-string ref would
+    otherwise sail into ``store.get("")``.
+    """
+
+    for candidate in repo_agents:
+        if exclude_agent_id is not None and candidate.id == exclude_agent_id:
             continue
-        existing = await crud.get_version_by_commit(session, sibling.id, commit_sha)
+        existing = await crud.get_version_by_commit(session, candidate.id, commit_sha)
         if existing is not None and existing.bundle_ref:
             return existing
     return None
