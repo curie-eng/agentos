@@ -4,8 +4,8 @@
   "repository": {
     "name": "curie-eng/curie",
     "branch": "main",
-    "commit": "8dcd09ee476c6d40706c3972536bfbd051a1e74b",
-    "shortCommit": "8dcd09ee",
+    "commit": "460598767b6df2c5d53c6b57bd0e77e29c50ac11",
+    "shortCommit": "46059876",
     "release": "v0.7.3"
   },
   "title": "Curie architecture atlas",
@@ -208,77 +208,77 @@
       "type": "architecture",
       "title": "Architecture as built",
       "path": "ARCHITECTURE.md",
-      "href": "https://github.com/curie-eng/curie/blob/8dcd09ee476c6d40706c3972536bfbd051a1e74b/ARCHITECTURE.md"
+      "href": "https://github.com/curie-eng/curie/blob/460598767b6df2c5d53c6b57bd0e77e29c50ac11/ARCHITECTURE.md"
     },
     {
       "id": "vision",
       "type": "vision",
       "title": "Product vision",
       "path": "docs/vision.md",
-      "href": "https://github.com/curie-eng/curie/blob/8dcd09ee476c6d40706c3972536bfbd051a1e74b/docs/vision.md"
+      "href": "https://github.com/curie-eng/curie/blob/460598767b6df2c5d53c6b57bd0e77e29c50ac11/docs/vision.md"
     },
     {
       "id": "architecture-vision",
       "type": "architecture",
       "title": "Swappable jobs around an opinionated core",
       "path": "docs/architecture-vision.md",
-      "href": "https://github.com/curie-eng/curie/blob/8dcd09ee476c6d40706c3972536bfbd051a1e74b/docs/architecture-vision.md"
+      "href": "https://github.com/curie-eng/curie/blob/460598767b6df2c5d53c6b57bd0e77e29c50ac11/docs/architecture-vision.md"
     },
     {
       "id": "interfaces",
       "type": "catalog",
       "title": "Interface catalog",
       "path": "docs/interfaces.md",
-      "href": "https://github.com/curie-eng/curie/blob/8dcd09ee476c6d40706c3972536bfbd051a1e74b/docs/interfaces.md"
+      "href": "https://github.com/curie-eng/curie/blob/460598767b6df2c5d53c6b57bd0e77e29c50ac11/docs/interfaces.md"
     },
     {
       "id": "message-flow",
       "type": "diagram",
       "title": "Message flow",
       "path": "docs/diagrams/message-flow.md",
-      "href": "https://github.com/curie-eng/curie/blob/8dcd09ee476c6d40706c3972536bfbd051a1e74b/docs/diagrams/message-flow.md"
+      "href": "https://github.com/curie-eng/curie/blob/460598767b6df2c5d53c6b57bd0e77e29c50ac11/docs/diagrams/message-flow.md"
     },
     {
       "id": "kubernetes",
       "type": "diagram",
       "title": "Kubernetes architecture",
       "path": "docs/diagrams/kubernetes.md",
-      "href": "https://github.com/curie-eng/curie/blob/8dcd09ee476c6d40706c3972536bfbd051a1e74b/docs/diagrams/kubernetes.md"
+      "href": "https://github.com/curie-eng/curie/blob/460598767b6df2c5d53c6b57bd0e77e29c50ac11/docs/diagrams/kubernetes.md"
     },
     {
       "id": "aci-diagram",
       "type": "diagram",
       "title": "Agent Container Interface",
       "path": "docs/diagrams/aci.md",
-      "href": "https://github.com/curie-eng/curie/blob/8dcd09ee476c6d40706c3972536bfbd051a1e74b/docs/diagrams/aci.md"
+      "href": "https://github.com/curie-eng/curie/blob/460598767b6df2c5d53c6b57bd0e77e29c50ac11/docs/diagrams/aci.md"
     },
     {
       "id": "channel-api-code",
       "type": "code",
       "title": "Generic channel HTTP ingress",
       "path": "apps/api/src/curie_api/routers/channels.py",
-      "href": "https://github.com/curie-eng/curie/blob/8dcd09ee476c6d40706c3972536bfbd051a1e74b/apps/api/src/curie_api/routers/channels.py"
+      "href": "https://github.com/curie-eng/curie/blob/460598767b6df2c5d53c6b57bd0e77e29c50ac11/apps/api/src/curie_api/routers/channels.py"
     },
     {
       "id": "reply-sink-code",
       "type": "code",
       "title": "Neutral reply sink and router",
       "path": "apps/worker/src/curie_worker/reply_sink.py",
-      "href": "https://github.com/curie-eng/curie/blob/8dcd09ee476c6d40706c3972536bfbd051a1e74b/apps/worker/src/curie_worker/reply_sink.py"
+      "href": "https://github.com/curie-eng/curie/blob/460598767b6df2c5d53c6b57bd0e77e29c50ac11/apps/worker/src/curie_worker/reply_sink.py"
     },
     {
       "id": "binding-code",
       "type": "code",
       "title": "Kind/address deployment binding",
       "path": "apps/worker/src/curie_worker/binding.py",
-      "href": "https://github.com/curie-eng/curie/blob/8dcd09ee476c6d40706c3972536bfbd051a1e74b/apps/worker/src/curie_worker/binding.py"
+      "href": "https://github.com/curie-eng/curie/blob/460598767b6df2c5d53c6b57bd0e77e29c50ac11/apps/worker/src/curie_worker/binding.py"
     },
     {
       "id": "runner-adapter-code",
       "type": "code",
       "title": "Claude-shaped ModelSession boundary",
       "path": "runner/src/curie_runner/adapter.py",
-      "href": "https://github.com/curie-eng/curie/blob/8dcd09ee476c6d40706c3972536bfbd051a1e74b/runner/src/curie_runner/adapter.py"
+      "href": "https://github.com/curie-eng/curie/blob/460598767b6df2c5d53c6b57bd0e77e29c50ac11/runner/src/curie_runner/adapter.py"
     }
   ],
   "documentationDrift": [],
@@ -2587,7 +2587,7 @@
       "seamIds": [
         "substrate"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/8dcd09ee476c6d40706c3972536bfbd051a1e74b/docs/adr/0002-kubernetes-agent-sandbox-as-runtime-substrate.md"
+      "href": "https://github.com/curie-eng/curie/blob/460598767b6df2c5d53c6b57bd0e77e29c50ac11/docs/adr/0002-kubernetes-agent-sandbox-as-runtime-substrate.md"
     },
     {
       "id": "ADR-0005",
@@ -2604,7 +2604,7 @@
         "aci",
         "harness-modelsession"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/8dcd09ee476c6d40706c3972536bfbd051a1e74b/docs/adr/0005-claude-agent-sdk-adapter-and-frozen-aci.md"
+      "href": "https://github.com/curie-eng/curie/blob/460598767b6df2c5d53c6b57bd0e77e29c50ac11/docs/adr/0005-claude-agent-sdk-adapter-and-frozen-aci.md"
     },
     {
       "id": "ADR-0009",
@@ -2621,7 +2621,7 @@
         "mcp-service-auth",
         "sealed-credential"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/8dcd09ee476c6d40706c3972536bfbd051a1e74b/docs/adr/0009-per-agent-connector-auth.md"
+      "href": "https://github.com/curie-eng/curie/blob/460598767b6df2c5d53c6b57bd0e77e29c50ac11/docs/adr/0009-per-agent-connector-auth.md"
     },
     {
       "id": "ADR-0010",
@@ -2639,7 +2639,7 @@
         "approval-authorizer",
         "channel-interaction"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/8dcd09ee476c6d40706c3972536bfbd051a1e74b/docs/adr/0010-approval-gates-and-human-in-the-loop.md"
+      "href": "https://github.com/curie-eng/curie/blob/460598767b6df2c5d53c6b57bd0e77e29c50ac11/docs/adr/0010-approval-gates-and-human-in-the-loop.md"
     },
     {
       "id": "ADR-0014",
@@ -2659,7 +2659,7 @@
         "bundle-format",
         "eval-scorer"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/8dcd09ee476c6d40706c3972536bfbd051a1e74b/docs/adr/0014-git-push-is-the-deploy.md"
+      "href": "https://github.com/curie-eng/curie/blob/460598767b6df2c5d53c6b57bd0e77e29c50ac11/docs/adr/0014-git-push-is-the-deploy.md"
     },
     {
       "id": "ADR-0016",
@@ -2680,7 +2680,7 @@
         "blob-storage",
         "relational-db"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/8dcd09ee476c6d40706c3972536bfbd051a1e74b/docs/adr/0016-swappable-jobs-around-an-opinionated-core.md"
+      "href": "https://github.com/curie-eng/curie/blob/460598767b6df2c5d53c6b57bd0e77e29c50ac11/docs/adr/0016-swappable-jobs-around-an-opinionated-core.md"
     },
     {
       "id": "ADR-0020",
@@ -2699,7 +2699,7 @@
         "channel-reply",
         "channel-interaction"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/8dcd09ee476c6d40706c3972536bfbd051a1e74b/docs/adr/0020-message-port-rendering-free-channel-interface.md"
+      "href": "https://github.com/curie-eng/curie/blob/460598767b6df2c5d53c6b57bd0e77e29c50ac11/docs/adr/0020-message-port-rendering-free-channel-interface.md"
     },
     {
       "id": "ADR-0025",
@@ -2717,7 +2717,7 @@
         "memory",
         "workflow-state"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/8dcd09ee476c6d40706c3972536bfbd051a1e74b/docs/adr/0025-memory-port-and-first-loader.md"
+      "href": "https://github.com/curie-eng/curie/blob/460598767b6df2c5d53c6b57bd0e77e29c50ac11/docs/adr/0025-memory-port-and-first-loader.md"
     },
     {
       "id": "ADR-0029",
@@ -2735,7 +2735,7 @@
         "conversation-history",
         "workflow-state"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/8dcd09ee476c6d40706c3972536bfbd051a1e74b/docs/adr/0029-conversation-history-port-and-first-loader.md"
+      "href": "https://github.com/curie-eng/curie/blob/460598767b6df2c5d53c6b57bd0e77e29c50ac11/docs/adr/0029-conversation-history-port-and-first-loader.md"
     },
     {
       "id": "ADR-0030",
@@ -2750,7 +2750,7 @@
       "seamIds": [
         "memory"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/8dcd09ee476c6d40706c3972536bfbd051a1e74b/docs/adr/0030-proactive-within-episode-memory-agent.md"
+      "href": "https://github.com/curie-eng/curie/blob/460598767b6df2c5d53c6b57bd0e77e29c50ac11/docs/adr/0030-proactive-within-episode-memory-agent.md"
     },
     {
       "id": "ADR-0042",
@@ -2765,7 +2765,7 @@
       "seamIds": [
         "eval-scorer"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/8dcd09ee476c6d40706c3972536bfbd051a1e74b/docs/adr/0042-llm-as-a-verifier-grader-and-progress-signal.md"
+      "href": "https://github.com/curie-eng/curie/blob/460598767b6df2c5d53c6b57bd0e77e29c50ac11/docs/adr/0042-llm-as-a-verifier-grader-and-progress-signal.md"
     },
     {
       "id": "ADR-0060",
@@ -2782,7 +2782,7 @@
         "harness-package",
         "harness-modelsession"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/8dcd09ee476c6d40706c3972536bfbd051a1e74b/docs/adr/0060-the-harness-is-a-declared-package.md"
+      "href": "https://github.com/curie-eng/curie/blob/460598767b6df2c5d53c6b57bd0e77e29c50ac11/docs/adr/0060-the-harness-is-a-declared-package.md"
     },
     {
       "id": "ADR-0061",
@@ -2799,7 +2799,7 @@
         "aci",
         "harness-modelsession"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/8dcd09ee476c6d40706c3972536bfbd051a1e74b/docs/adr/0061-out-of-process-harness-boundary.md"
+      "href": "https://github.com/curie-eng/curie/blob/460598767b6df2c5d53c6b57bd0e77e29c50ac11/docs/adr/0061-out-of-process-harness-boundary.md"
     },
     {
       "id": "ADR-0062",
@@ -2816,7 +2816,7 @@
         "aci",
         "harness-package"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/8dcd09ee476c6d40706c3972536bfbd051a1e74b/docs/adr/0062-harness-conformance-has-teeth.md"
+      "href": "https://github.com/curie-eng/curie/blob/460598767b6df2c5d53c6b57bd0e77e29c50ac11/docs/adr/0062-harness-conformance-has-teeth.md"
     },
     {
       "id": "ADR-0075",
@@ -2834,7 +2834,7 @@
         "agent-proxy",
         "model-provider"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/8dcd09ee476c6d40706c3972536bfbd051a1e74b/docs/adr/0075-the-agent-proxy-credential-and-egress-boundary.md"
+      "href": "https://github.com/curie-eng/curie/blob/460598767b6df2c5d53c6b57bd0e77e29c50ac11/docs/adr/0075-the-agent-proxy-credential-and-egress-boundary.md"
     },
     {
       "id": "ADR-0079",
@@ -2853,7 +2853,7 @@
         "triggers",
         "queue-stream"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/8dcd09ee476c6d40706c3972536bfbd051a1e74b/docs/adr/0079-inbound-triggers-as-a-new-event-kind.md"
+      "href": "https://github.com/curie-eng/curie/blob/460598767b6df2c5d53c6b57bd0e77e29c50ac11/docs/adr/0079-inbound-triggers-as-a-new-event-kind.md"
     },
     {
       "id": "ADR-0094",
@@ -2871,7 +2871,7 @@
         "sealed-credential",
         "mcp-service-auth"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/8dcd09ee476c6d40706c3972536bfbd051a1e74b/docs/adr/0094-a-bundle-carries-its-own-sealed-connector-keys.md"
+      "href": "https://github.com/curie-eng/curie/blob/460598767b6df2c5d53c6b57bd0e77e29c50ac11/docs/adr/0094-a-bundle-carries-its-own-sealed-connector-keys.md"
     },
     {
       "id": "ADR-0086",
@@ -2888,7 +2888,7 @@
         "connector-host",
         "mcp-service-auth"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/8dcd09ee476c6d40706c3972536bfbd051a1e74b/docs/adr/0086-bundles-declare-connectors-the-platform-hosts-them.md"
+      "href": "https://github.com/curie-eng/curie/blob/460598767b6df2c5d53c6b57bd0e77e29c50ac11/docs/adr/0086-bundles-declare-connectors-the-platform-hosts-them.md"
     },
     {
       "id": "ADR-0088",
@@ -2909,7 +2909,7 @@
         "mcp-service-auth",
         "approval-authorizer"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/8dcd09ee476c6d40706c3972536bfbd051a1e74b/docs/adr/0088-per-user-delegated-oauth-for-mcp.md"
+      "href": "https://github.com/curie-eng/curie/blob/460598767b6df2c5d53c6b57bd0e77e29c50ac11/docs/adr/0088-per-user-delegated-oauth-for-mcp.md"
     },
     {
       "id": "ADR-0095",
@@ -2927,7 +2927,7 @@
         "memory",
         "workflow-state"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/8dcd09ee476c6d40706c3972536bfbd051a1e74b/docs/adr/0095-tiered-memory-lifecycle.md"
+      "href": "https://github.com/curie-eng/curie/blob/460598767b6df2c5d53c6b57bd0e77e29c50ac11/docs/adr/0095-tiered-memory-lifecycle.md"
     },
     {
       "id": "ADR-0096",
@@ -2946,7 +2946,7 @@
         "channel-ingress",
         "channel-reply"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/8dcd09ee476c6d40706c3972536bfbd051a1e74b/docs/adr/0096-port-adapters-are-deployed-services.md"
+      "href": "https://github.com/curie-eng/curie/blob/460598767b6df2c5d53c6b57bd0e77e29c50ac11/docs/adr/0096-port-adapters-are-deployed-services.md"
     },
     {
       "id": "ADR-0099",
@@ -2963,7 +2963,7 @@
       "seamIds": [
         "triggers"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/8dcd09ee476c6d40706c3972536bfbd051a1e74b/docs/adr/0099-hooks-are-bundle-declared-turns-the-system-starts.md"
+      "href": "https://github.com/curie-eng/curie/blob/460598767b6df2c5d53c6b57bd0e77e29c50ac11/docs/adr/0099-hooks-are-bundle-declared-turns-the-system-starts.md"
     },
     {
       "id": "ADR-0100",
@@ -2980,7 +2980,7 @@
         "channel-ingress",
         "port-adapter-service"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/8dcd09ee476c6d40706c3972536bfbd051a1e74b/docs/adr/0100-agents-search-their-own-surface-through-the-channel-port.md"
+      "href": "https://github.com/curie-eng/curie/blob/460598767b6df2c5d53c6b57bd0e77e29c50ac11/docs/adr/0100-agents-search-their-own-surface-through-the-channel-port.md"
     },
     {
       "id": "ADR-0105",
@@ -2998,7 +2998,7 @@
         "harness-modelsession",
         "conversation-history"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/8dcd09ee476c6d40706c3972536bfbd051a1e74b/docs/adr/0105-external-native-session-checkpoints.md"
+      "href": "https://github.com/curie-eng/curie/blob/460598767b6df2c5d53c6b57bd0e77e29c50ac11/docs/adr/0105-external-native-session-checkpoints.md"
     },
     {
       "id": "ADR-0106",
@@ -3014,7 +3014,7 @@
       "seamIds": [
         "approval-authorizer"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/8dcd09ee476c6d40706c3972536bfbd051a1e74b/docs/adr/0106-an-approver-is-an-authenticated-principal.md"
+      "href": "https://github.com/curie-eng/curie/blob/460598767b6df2c5d53c6b57bd0e77e29c50ac11/docs/adr/0106-an-approver-is-an-authenticated-principal.md"
     },
     {
       "id": "ADR-0107",
@@ -3032,7 +3032,7 @@
         "telemetry",
         "connector-host"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/8dcd09ee476c6d40706c3972536bfbd051a1e74b/docs/adr/0107-an-agent-reads-its-own-runs-through-a-first-party-scoped-surface.md"
+      "href": "https://github.com/curie-eng/curie/blob/460598767b6df2c5d53c6b57bd0e77e29c50ac11/docs/adr/0107-an-agent-reads-its-own-runs-through-a-first-party-scoped-surface.md"
     },
     {
       "id": "ADR-0108",
@@ -3050,7 +3050,7 @@
         "bundle-format",
         "connector-host"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/8dcd09ee476c6d40706c3972536bfbd051a1e74b/docs/adr/0108-a-deploy-target-carries-its-environments-values.md"
+      "href": "https://github.com/curie-eng/curie/blob/460598767b6df2c5d53c6b57bd0e77e29c50ac11/docs/adr/0108-a-deploy-target-carries-its-environments-values.md"
     },
     {
       "id": "ADR-0109",
@@ -3068,7 +3068,7 @@
         "substrate",
         "workflow-state"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/8dcd09ee476c6d40706c3972536bfbd051a1e74b/docs/adr/0109-retention-capacity-and-back-pressure-are-one-policy.md"
+      "href": "https://github.com/curie-eng/curie/blob/460598767b6df2c5d53c6b57bd0e77e29c50ac11/docs/adr/0109-retention-capacity-and-back-pressure-are-one-policy.md"
     },
     {
       "id": "ADR-0110",
@@ -3086,7 +3086,7 @@
         "connector-host",
         "agent-proxy"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/8dcd09ee476c6d40706c3972536bfbd051a1e74b/docs/adr/0110-deterministic-security-posture-classification.md"
+      "href": "https://github.com/curie-eng/curie/blob/460598767b6df2c5d53c6b57bd0e77e29c50ac11/docs/adr/0110-deterministic-security-posture-classification.md"
     },
     {
       "id": "ADR-0111",
@@ -3104,7 +3104,7 @@
         "memory",
         "conversation-history"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/8dcd09ee476c6d40706c3972536bfbd051a1e74b/docs/adr/0111-the-default-memory-compaction-algorithm.md"
+      "href": "https://github.com/curie-eng/curie/blob/460598767b6df2c5d53c6b57bd0e77e29c50ac11/docs/adr/0111-the-default-memory-compaction-algorithm.md"
     }
   ],
   "investments": [
