@@ -1,14 +1,15 @@
-"""The plugin-compat gate must exercise all five Curie authoring extensions.
+"""The plugin-compat gate must exercise all six Curie authoring extensions.
 
 `scripts/check-plugin-compat.sh` runs `claude plugin validate` over every bundle
-under `examples/`, asserting our five extension fields (systemPrompt,
-starterPrompts, secrets, triggers, approvalPolicy) stay warn-and-ignored rather
-than rejected by Claude Code. But the gate can only exercise a field that some
-discovered bundle actually declares -- and before the compat-fixture bundle,
-three of the five (systemPrompt, triggers, approvalPolicy) appeared in NO example
-manifest, so the gate silently covered only two of them (#538).
+under `examples/`, asserting our six extension fields (systemPrompt,
+starterPrompts, secrets, triggers, approvalPolicy, toolPolicy) stay
+warn-and-ignored rather than rejected by Claude Code. But the gate can only
+exercise a field that some discovered bundle actually declares -- and before the
+compat-fixture bundle, three of the then-five (systemPrompt, triggers,
+approvalPolicy) appeared in NO example manifest, so the gate silently covered
+only two of them (#538).
 
-This test defends that coverage: every one of the five fields must appear in at
+This test defends that coverage: every one of the six fields must appear in at
 least one discovered example bundle, so a future edit that drops a field from the
 fixture (leaving the gate to cover it vacuously) fails here.
 """
@@ -18,7 +19,7 @@ from pathlib import Path
 
 EXAMPLES = Path(__file__).resolve().parents[1]
 
-# The five Curie authoring extensions on the plugin manifest (plugin_format
+# The six Curie authoring extensions on the plugin manifest (plugin_format
 # models.py); each is unknown-to-Claude-Code by design and warned-and-ignored.
 _EXTENSION_FIELDS = (
     "systemPrompt",
@@ -26,6 +27,7 @@ _EXTENSION_FIELDS = (
     "secrets",
     "triggers",
     "approvalPolicy",
+    "toolPolicy",
 )
 
 
