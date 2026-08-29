@@ -242,6 +242,16 @@ exit 1
         dir: tempfile::TempDir,
     }
 
+    /// One PEM marker line, composed from its boundary word rather than
+    /// written out whole. This fixture carries no key material -- the
+    /// placeholder bytes between the markers are never read as a key -- but
+    /// spelling the markers out contiguously reads as a pasted credential to
+    /// a secret scanner, a false positive that would otherwise have to be
+    /// allowlisted in every repo that vendors this test.
+    fn pem_marker(boundary: &str) -> String {
+        format!("-----{boundary} RSA PRIVATE KEY-----")
+    }
+
     impl FakeRelease {
         fn new() -> Self {
             let dir = tempfile::tempdir().expect("tempdir");
@@ -254,15 +264,21 @@ exit 1
                 perms.set_mode(0o755);
                 std::fs::set_permissions(&path, perms).expect("chmod shim");
             }
-            // Deliberately NOT PEM-shaped: `require_connect_inputs` only stats
-            // this path with `Path::is_file`, and the chart-held branch hands
-            // helm the PATH (never the contents) via `--set-file`. No
-            // assertion in this file reads or checks the file's bytes, so a
-            // credential-shaped body here would be a secret-scanner tripwire
-            // with no test value.
+            // Must be PEM-SHAPED: since #1260, `require_connect_inputs`
+            // validates the file's shape (a BEGIN/END PRIVATE KEY pair), not
+            // just `Path::is_file`, so a non-PEM body would be refused before
+            // ever reaching the BYO-conflict guard these tests exercise. The
+            // contents are still never parsed as an actual key -- the
+            // chart-held branch only hands helm the PATH (never the
+            // contents) via `--set-file` -- so an inert placeholder between
+            // the markers is enough; no credential-shaped body is needed.
             std::fs::write(
                 dir.path().join("app.pem"),
-                "placeholder; these bytes are never read -- the CLI only stats this path\n",
+                format!(
+                    "{}\nplaceholder; these bytes are never read as a key\n{}\n",
+                    pem_marker("BEGIN"),
+                    pem_marker("END"),
+                ),
             )
             .expect("write pem fixture");
             Self { dir }

@@ -75,7 +75,16 @@ pub fn connect_commands(opts: &GithubAppOpts, clone_base: &str) -> Vec<OpsComman
         // cannot see it, because it only appears once a real numeric value
         // has been through a --reuse-values round trip.
         plain("--set-string"),
-        plain(format!("api.githubAppId={}", opts.app_id)),
+        // The TRIMMED form, never the raw field. `--app-id ' 1234567 '` is what
+        // a paste out of the App's settings page actually produces, and helm
+        // stores the surrounding whitespace verbatim: the api pod then signs a
+        // JWT whose `iss` claim is " 1234567 ", GitHub answers 401 on every
+        // call, and `helm get values` prints something that LOOKS right to the
+        // operator reading it back. That is #1236's symptom reached by a
+        // different route -- a wrong `iss` -- and no chart-render test can see
+        // it. `require_connect_inputs` has already proven the trimmed form is
+        // all digits, so this is a normalisation, not a sanitisation.
+        plain(format!("api.githubAppId={}", opts.app_id.trim())),
     ];
     if opts.existing_secret.trim().is_empty() {
         // The key's CONTENTS never enter argv; helm reads the file itself.
@@ -564,6 +573,84 @@ fn is_secret_data_key(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
 }
 
+/// True when `value` is a GitHub App id: one or more ASCII digits, no leading
+/// zero, and not `"0"`.
+///
+/// The CHARSET is validated, deliberately not a parse into an integer type.
+/// `9007199254740993` is above 2^53 and must round-trip EXACTLY -- that is the
+/// #1236 fix on the CLI path, and a `f64` hop silently renders it as
+/// `9007199254740992`. Parsing into a `u64` would survive today and still put a
+/// ceiling on an id GitHub is free to grow past, at which point a perfectly
+/// valid App would be refused by our own arithmetic. Nothing here needs the
+/// NUMBER; the value is a string on the wire, in the release, and in the JWT's
+/// `iss` claim, so it stays a string the whole way.
+///
+/// A positive charset rather than a blocklist, for exactly the reason spelled
+/// out above [`is_rfc1123_subdomain`]: `--set-string` stops helm TYPING a value
+/// but helm still splits the expression on commas STRUCTURALLY, so
+/// `--app-id '1,api.githubCloneBase=https://evil.example.com'` is one argv entry
+/// helm reads as TWO assignments -- the second silently re-pointing every clone
+/// at a host the operator never named. With digits-only, that case and
+/// `123,api.githubToken=INJECTED-PAT` fall out as refused by construction, along
+/// with `=`, spaces, newlines and whatever a future helm decides is structural.
+///
+/// The leading zero is refused rather than normalised: `0001234` is not the id
+/// on the settings page, so accepting it would mean guessing that the operator
+/// meant `1234` on the one credential that mints tokens for every repository in
+/// the installation. `0` is not an App id at all.
+fn is_github_app_id(value: &str) -> bool {
+    !value.is_empty() && !value.starts_with('0') && value.chars().all(|c| c.is_ascii_digit())
+}
+
+/// True when `body` has the SHAPE of a PEM private key: a `-----BEGIN` line and
+/// a matching `-----END` line that name the SAME PRIVATE KEY block.
+///
+/// A shape check, not a parse: the chart hands helm the PATH and helm reads the
+/// file, so the CLI is not in the business of validating key material -- it is
+/// in the business of catching the file that is obviously not one. The two
+/// realistic mistakes are the `.pub`/`.txt` next to the PEM in ~/Downloads, and
+/// a file the download never wrote anything into.
+///
+/// The empty case is why this exists at all. A 0-byte file passes `is_file`,
+/// helm renders `githubAppPrivateKey: ""`, and the platform's `is_configured`
+/// then answers False and falls back to `api.githubToken` -- so the App is
+/// silently not in use while the CLI printed "GitHub App configured" and rolled
+/// the API to prove it. Refusing here is the only point in the chain where that
+/// is still visible to the operator.
+///
+/// The BEGIN and END labels must match. Checking each marker line
+/// independently (any BEGIN line plus any END line, regardless of which block
+/// each names) let a `-----BEGIN ... PRIVATE KEY-----` naming one block type
+/// pair with an unrelated `-----END ... PRIVATE KEY-----` naming a different
+/// one -- e.g. two truncated halves of different keys concatenated -- pass as
+/// "shaped like a PEM". That file is not usable, and it reaches the exact same
+/// silent-failure path as the empty file above: helm ships it, `is_configured`
+/// answers True, and signing 401s at runtime with the operator already told
+/// the App is configured.
+///
+/// This intentionally does NOT narrow the accepted labels to `RSA PRIVATE
+/// KEY`. A GitHub App key is RSA today, but PKCS#8 (`PRIVATE KEY`),
+/// `ENCRYPTED PRIVATE KEY`, and `EC PRIVATE KEY` are all real, legitimately
+/// downloaded key shapes. Tightening this to an RSA-only allowlist would
+/// falsely refuse a real key the operator downloaded, which is a worse
+/// regression than the false-positive this function exists to close -- so any
+/// label ending in `PRIVATE KEY` is accepted as long as BEGIN and END agree on
+/// it.
+fn is_pem_private_key(body: &str) -> bool {
+    let marker_label = |line: &str, marker: &str| -> Option<String> {
+        line.trim()
+            .strip_prefix(marker)?
+            .strip_suffix("-----")
+            .map(|label| label.trim().to_string())
+    };
+    let begin_label = body.lines().find_map(|l| marker_label(l, "-----BEGIN"));
+    let end_label = body.lines().find_map(|l| marker_label(l, "-----END"));
+    matches!(
+        (begin_label, end_label),
+        (Some(begin), Some(end)) if begin == end && end.ends_with("PRIVATE KEY")
+    )
+}
+
 /// Render a rejected value for an error message without echoing something that
 /// might be key material.
 ///
@@ -588,16 +675,24 @@ fn describe_rejected_value(value: &str) -> String {
 /// the old three-argument form was already one argument swap away from a
 /// silent bug, and the rules below now read five of the fields.
 ///
-/// All eight refusals here are deterministic input errors -- the identical argv
-/// fails identically every time -- so they exit 2 (ADR-0021 Usage) with a
+/// All thirteen refusals here are deterministic input errors -- the identical
+/// argv fails identically every time -- so they exit 2 (ADR-0021 Usage) with a
 /// non-null `fix` naming the flag to correct (#1261). A bare `bail!` classified
 /// them as exit 1 with a null fix -- indistinguishable to an agent from the helm
 /// upgrade itself failing, which is retryable and these are not. clap gives
 /// every one of these flags a `default_value`, so clap never raises its own exit
 /// 2 for them and this is the only place the class is set. That covers the three
 /// original refusals (a missing `--app-id`, a missing `--private-key`, a
-/// `--private-key` path that is not a file) and the five `--existing-secret`
-/// rules #1255 adds below; they are the same category and take the same class.
+/// `--private-key` path that is not a file), the five `--existing-secret` rules
+/// #1255 adds below, and the five #1260 adds: an `--app-id` that is not a
+/// positive decimal integer, and a `--private-key` that is a directory,
+/// unreadable, empty or not PEM-shaped. Every one is the same category and takes
+/// the same class.
+///
+/// The #1260 arms exist because "the file is there" and "the id is non-empty"
+/// were the whole of the check: `--app-id abc` and a 0-byte PEM both reached
+/// helm, exited 0, and printed "GitHub App configured" over an install where the
+/// App was never in use.
 ///
 /// The refusals that are NOT here stay `CliError::failure` on purpose:
 /// [`guard_byo_key_conflict`] and [`opaque_byo_field_error`] judge the state of
@@ -703,6 +798,25 @@ pub fn require_connect_inputs(opts: &GithubAppOpts) -> Result<()> {
             .with_fix("rerun with --app-id <numeric app id from the App's settings page>"),
         ));
     }
+    // Checked on the TRIMMED form, and `connect_commands` emits that same
+    // trimmed form -- the two must agree, or a value validated here reaches
+    // helm in a shape that was never validated. See `is_github_app_id` for why
+    // the charset is checked rather than the value parsed.
+    if !is_github_app_id(opts.app_id.trim()) {
+        return Err(anyhow::Error::from(
+            crate::exit::CliError::usage(format!(
+                "--app-id {} is not a GitHub App id. It must be a positive decimal integer: \
+                 digits only, no leading zero. The id is the number on the App's settings page \
+                 (Settings -> Developer settings -> GitHub Apps -> your app); it is not the App \
+                 slug, the client id, or the installation id.",
+                describe_rejected_value(opts.app_id.trim())
+            ))
+            .with_fix(
+                "rerun with --app-id <the numeric App ID from the App's settings page>, digits \
+                 only",
+            ),
+        ));
+    }
     // Both remaining checks are chart-held only: a BYO run supplies no PEM by
     // design, so it must never be asked for one and must never stat a path it
     // was never given.
@@ -716,10 +830,85 @@ pub fn require_connect_inputs(opts: &GithubAppOpts) -> Result<()> {
                 .with_fix("rerun with --private-key <path to the App's PEM file>"),
             ));
         }
-        if !std::path::Path::new(key_path).is_file() {
+        let path = std::path::Path::new(key_path);
+        // A directory BEFORE the is_file check, which answers false for one and
+        // would report "no such file" about something that plainly exists --
+        // sending the operator to look for a typo in a path that is correct.
+        // `~/Downloads/my-app.private-key.pem` tab-completing to its parent is
+        // the ordinary way this happens.
+        if path.is_dir() {
+            return Err(anyhow::Error::from(
+                crate::exit::CliError::usage(format!(
+                    "--private-key: {key_path} is a directory, not a PEM file"
+                ))
+                .with_fix("rerun with --private-key pointing at the .pem file inside it"),
+            ));
+        }
+        if !path.is_file() {
             return Err(anyhow::Error::from(
                 crate::exit::CliError::usage(format!("--private-key: no such file: {key_path}"))
                     .with_fix("rerun with --private-key pointing at an existing PEM file"),
+            ));
+        }
+        // Read here even though helm is the one that reads the file for real:
+        // `--set-file` on an unreadable path fails DURING the upgrade, after
+        // the release has already begun changing, and helm's own message about
+        // it is opaque. Doing it first turns that into an input error, which is
+        // what it is. A non-UTF-8 file lands in this arm too, which is correct:
+        // a PEM is ASCII.
+        let body = match std::fs::read_to_string(path) {
+            Ok(body) => body,
+            Err(err) => {
+                return Err(anyhow::Error::from(
+                    crate::exit::CliError::usage(format!(
+                        "--private-key: cannot read {key_path}: {err}"
+                    ))
+                    .with_fix(
+                        "rerun with --private-key pointing at a readable PEM file, or fix the \
+                         file's permissions",
+                    ),
+                ));
+            }
+        };
+        // An empty file is the one that MUST be refused rather than passed
+        // through. helm renders `githubAppPrivateKey: ""` from it, the
+        // platform's `is_configured` then answers False and silently falls back
+        // to `api.githubToken` -- so the App is not in use at all, while this
+        // command printed "GitHub App configured" and rolled the API to prove
+        // it. Nothing downstream ever surfaces that; this is the last place it
+        // is visible. Checked with `trim` because a file holding only a newline
+        // is the same nothing.
+        if body.trim().is_empty() {
+            return Err(anyhow::Error::from(
+                crate::exit::CliError::usage(format!("--private-key: {key_path} is empty"))
+                    .with_fix(
+                        "re-download the App's private key (its settings page, under 'Private \
+                         keys') and rerun with --private-key pointing at that file",
+                    ),
+            ));
+        }
+        // Same false-success shape, one step less obvious: a non-PEM file (the
+        // .pub or the .txt sitting beside it in ~/Downloads) renders as a
+        // perfectly non-empty value that no JWT can ever be signed with, and
+        // every GitHub call 401s long after this command reported success.
+        //
+        // The refusal names the PATH and the SHAPE only. The contents are never
+        // echoed -- not into the terminal, the shell history, or the `--json`
+        // error payload -- because on the day this fires against a real PEM
+        // (a misdetected shape) the message would be a copy of the one
+        // credential that mints tokens for every repository in the installation.
+        if !is_pem_private_key(&body) {
+            return Err(anyhow::Error::from(
+                crate::exit::CliError::usage(format!(
+                    "--private-key: {key_path} is not a PEM private key. It must contain a \
+                     '-----BEGIN ... PRIVATE KEY-----' line and a matching '-----END' line. \
+                     A public key, a .txt, or a partial download all look like a configured App \
+                     to this command and then 401 on every GitHub call."
+                ))
+                .with_fix(
+                    "rerun with --private-key pointing at the .pem file downloaded from the \
+                     App's settings page under 'Private keys'",
+                ),
             ));
         }
     }
@@ -729,6 +918,27 @@ pub fn require_connect_inputs(opts: &GithubAppOpts) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One PEM marker line, composed from its boundary word rather than
+    /// written out whole.
+    ///
+    /// These fixtures carry no key material -- the bytes between the
+    /// markers (where present) are inert, and nothing here is ever parsed
+    /// as a key; `is_pem_private_key` only checks the SHAPE. Composing the
+    /// line keeps a fixture that exists to test PEM validation from reading
+    /// as a pasted credential to a secret scanner, which is a false
+    /// positive that would otherwise have to be allowlisted in every repo
+    /// that vendors this test.
+    fn pem_marker(boundary: &str) -> String {
+        pem_marker_labeled(boundary, "RSA PRIVATE KEY")
+    }
+
+    /// Sibling to [`pem_marker`] that lets a test pick the label, so a BEGIN
+    /// and END pair with mismatched labels can be composed without ever
+    /// writing the literal marker text into the test source.
+    fn pem_marker_labeled(boundary: &str, label: &str) -> String {
+        format!("-----{boundary} {label}-----")
+    }
 
     fn opts(disconnect: bool) -> GithubAppOpts {
         GithubAppOpts {
@@ -1832,6 +2042,286 @@ mod tests {
         assert!(
             guard_byo_key_conflict(&opts(false), None).is_ok(),
             "a dry run must still produce a plan with no release knowledge"
+        );
+    }
+
+    // ---- T15: --app-id is validated, and emitted trimmed (#1260) -----------
+
+    /// A chart-held connect with a real PEM on disk and the given App id, so an
+    /// `--app-id` case is judged by the `--app-id` rules and never trips the
+    /// key checks on the way there.
+    fn app_id_opts(app_id: &str) -> (tempfile::TempDir, GithubAppOpts) {
+        let (dir, path) = key_fixture();
+        let mut o = opts(false);
+        o.app_id = app_id.into();
+        o.private_key_path = path;
+        (dir, o)
+    }
+
+    #[test]
+    fn a_padded_app_id_is_accepted_and_reaches_helm_trimmed() {
+        // AC1. `--app-id ' 1234567 '` is what a paste out of the settings page
+        // produces. helm stores the surrounding whitespace verbatim, the api
+        // pod signs a JWT whose `iss` is " 1234567 ", and GitHub answers 401 on
+        // every call -- while `helm get values` prints something that reads as
+        // correct. Asserted as the WHOLE argv entry, never a `contains` on the
+        // joined line: `contains("api.githubAppId=1234567")` is also satisfied
+        // by `api.githubAppId= 1234567 ` (#1263).
+        let (_dir, o) = app_id_opts(" 1234567 ");
+        assert!(
+            require_connect_inputs(&o).is_ok(),
+            "a padded id is a valid id: {:?}",
+            require_connect_inputs(&o).err()
+        );
+        let args = argv(&connect_commands(&o, DEFAULT_CLONE_BASE)[0]);
+        assert!(
+            has_entry(&args, "api.githubAppId=1234567"),
+            "the padded id reached helm unnormalised: {args:?}"
+        );
+        assert_eq!(
+            flag_before(&args, "api.githubAppId=1234567"),
+            "--set-string",
+            "the App id must not be helm-typed: {args:?}"
+        );
+    }
+
+    #[test]
+    fn an_app_id_above_two_to_the_fifty_third_round_trips_exactly() {
+        // AC4, and the red-on-revert guard for #1236's fix on the CLI path.
+        // 9007199254740993 is 2^53 + 1: any hop through an f64 -- helm's `--set`
+        // typing, or a `parse::<f64>()` in a validator written here -- renders
+        // it as 9007199254740992, and the JWT's `iss` names an App that does not
+        // exist. Validating the CHARSET rather than parsing is what keeps this
+        // exact, and a `u64` parse would merely move the ceiling.
+        let (_dir, o) = app_id_opts("9007199254740993");
+        assert!(
+            require_connect_inputs(&o).is_ok(),
+            "an id above 2^53 is still an id: {:?}",
+            require_connect_inputs(&o).err()
+        );
+        let args = argv(&connect_commands(&o, DEFAULT_CLONE_BASE)[0]);
+        assert!(
+            has_entry(&args, "api.githubAppId=9007199254740993"),
+            "an id above 2^53 did not round-trip exactly: {args:?}"
+        );
+        assert_eq!(
+            flag_before(&args, "api.githubAppId=9007199254740993"),
+            "--set-string",
+            "the App id must not be helm-typed: {args:?}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_app_id_is_a_usage_error_naming_the_flag() {
+        // AC2. Every one of these exited 0 and reported "GitHub App configured"
+        // before #1260: a non-numeric id renders into the release, the api pod
+        // mints a JWT with a nonsense `iss`, and every GitHub call 401s with
+        // nothing the CLI printed to explain it.
+        for (case, app_id) in [
+            ("a non-numeric id", "abc"),
+            ("a zero-padded id", "0001234"),
+            ("an id with an interior space", "12 34"),
+            (
+                "a comma-injected clone base",
+                "1,api.githubCloneBase=https://evil.example.com",
+            ),
+            ("a comma-injected PAT", "123,api.githubToken=INJECTED-PAT"),
+            ("zero", "0"),
+            ("a negative id", "-5"),
+            ("a decimal id", "1.0"),
+            ("an empty id", ""),
+            ("a whitespace-only id", "   "),
+        ] {
+            let (_dir, o) = app_id_opts(app_id);
+            let err = require_connect_inputs(&o)
+                .expect_err(&format!("{case} ({app_id:?}) must be refused"));
+            assert_usage_with_a_fix_naming(&err, "--app-id", case);
+        }
+    }
+
+    #[test]
+    fn a_comma_injected_app_id_is_refused_by_the_gate_before_any_argv_is_built() {
+        // The negative control for the two comma cases above, and the reason
+        // the charset is positive rather than a blocklist. `--set-string` stops
+        // helm TYPING a value but helm still splits the expression on commas
+        // STRUCTURALLY, so one argv entry is read as TWO assignments: the
+        // second silently re-points every clone at a host the operator never
+        // named, or writes an attacker-supplied PAT into the release.
+        //
+        // `connect_commands` is a pure argv builder with no validation and no
+        // `Result`; it is only ever reached after `require_connect_inputs` has
+        // already refused, so this layer can only prove the refusal happens
+        // and names the right flag -- not the builder's argv shape. The
+        // ordering half of the guarantee -- that no plan is built or printed
+        // before the refusal -- is proven end to end, against the real binary,
+        // by `a_comma_injected_app_id_is_refused_with_an_actionable_fix_and_no_plan`
+        // in cli/tests/github_app_input_validation.rs. Do not re-add a
+        // `connect_commands` assertion here; add to that test instead.
+        for (case, injected) in [
+            (
+                "a comma-injected clone base",
+                "1,api.githubCloneBase=https://evil.example.com",
+            ),
+            ("a comma-injected PAT", "123,api.githubToken=INJECTED-PAT"),
+        ] {
+            let (_dir, o) = app_id_opts(injected);
+            let err = require_connect_inputs(&o)
+                .expect_err(&format!("the injected id was accepted: {injected}"));
+            assert_usage_with_a_fix_naming(&err, "--app-id", case);
+        }
+    }
+
+    // ---- T16: --private-key is a readable, non-empty PEM (#1260) -----------
+
+    #[test]
+    fn a_private_key_that_is_not_a_usable_pem_is_a_usage_error_naming_the_flag() {
+        // AC3. Each of these passed the old `is_file` check (or, for the
+        // directory, was misreported as "no such file" about something that
+        // exists). The 0-byte case is the worst: helm renders
+        // githubAppPrivateKey: "", the platform's `is_configured` answers False
+        // and silently falls back to api.githubToken, so the App is not in use
+        // at all -- while this command printed "GitHub App configured" and
+        // rolled the API to prove it.
+        //
+        // No assertion here reads the files' CONTENTS, and none may: the day a
+        // shape check misfires on a real PEM, an assertion on contents is a copy
+        // of the credential in the test output.
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let empty = dir.path().join("empty.pem");
+        std::fs::write(&empty, "").expect("write empty");
+
+        let not_pem = dir.path().join("notes.txt");
+        std::fs::write(&not_pem, "the app id is 1234567\n").expect("write non-pem");
+
+        for (case, path) in [
+            ("a directory", dir.path().to_path_buf()),
+            ("a 0-byte file", empty),
+            ("a file that is not PEM-shaped", not_pem),
+        ] {
+            let mut o = opts(false);
+            o.private_key_path = path.to_string_lossy().into_owned();
+            let err = require_connect_inputs(&o).expect_err(&format!("{case} must be refused"));
+            assert_usage_with_a_fix_naming(&err, "--private-key", case);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_private_key_is_a_usage_error_naming_the_flag() {
+        // `--set-file` on an unreadable path fails DURING the helm upgrade,
+        // after the release has begun changing, with an opaque message. Split
+        // out from its siblings because it is the one case root cannot observe:
+        // root reads a 0600-cleared file regardless of its mode, so the check
+        // would look broken rather than skipped. Skipping beats asserting a
+        // property the environment cannot have.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("locked.pem");
+        std::fs::write(&path, format!("{}\n", pem_marker("BEGIN"))).expect("write");
+        let mut perms = std::fs::metadata(&path).expect("stat").permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(&path, perms).expect("chmod 000");
+        // Root reads a 0o000 file regardless of its mode, and so does a
+        // filesystem mounted without permission enforcement. Probe the
+        // ENVIRONMENT's capability rather than the CLI's behaviour, and skip
+        // when the case is unobservable -- asserting a property the box cannot
+        // have would make this a flake, and asserting the opposite would make
+        // it vacuous. The probe is not the assertion; the refusal below is.
+        if std::fs::read(&path).is_ok() {
+            return;
+        }
+
+        let mut o = opts(false);
+        o.private_key_path = path.to_string_lossy().into_owned();
+        let err = require_connect_inputs(&o).expect_err("an unreadable key must be refused");
+        assert_usage_with_a_fix_naming(&err, "--private-key", "a chmod 000 file");
+    }
+
+    #[test]
+    fn mismatched_begin_and_end_labels_are_refused() {
+        // The core of this fix. Each marker line passes on its own -- both
+        // name SOME private key -- but they name DIFFERENT blocks, which is
+        // what two truncated/concatenated halves of different keys look like.
+        // A pre-fix `is_pem_private_key` checked each marker independently
+        // and accepted this.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mismatched.pem");
+        let body = format!(
+            "{}\nMIIEowIBAAKCAQEAtestkeymaterial\n{}\n",
+            pem_marker_labeled("BEGIN", "RSA PRIVATE KEY"),
+            pem_marker_labeled("END", "PRIVATE KEY"),
+        );
+        std::fs::write(&path, body).expect("write mismatched pem");
+
+        let mut o = opts(false);
+        o.private_key_path = path.to_string_lossy().into_owned();
+        let err =
+            require_connect_inputs(&o).expect_err("mismatched BEGIN/END labels must be refused");
+        assert_usage_with_a_fix_naming(&err, "--private-key", "mismatched BEGIN/END labels");
+    }
+
+    #[test]
+    fn every_real_private_key_label_shape_is_still_accepted() {
+        // The "do not narrow" half of the contract. RSA is what GitHub Apps
+        // issue today, but PKCS#8, encrypted PKCS#8, and EC keys are all real
+        // downloads an operator might have, and CRLF is what a Windows editor
+        // or a Windows `Send-MailMessage` attachment produces. Any of these
+        // going red is a future "tightened" allowlist rejecting a real key,
+        // not a caught bug.
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        for (case, label, crlf) in [
+            ("PKCS#8 PRIVATE KEY", "PRIVATE KEY", false),
+            ("ENCRYPTED PRIVATE KEY", "ENCRYPTED PRIVATE KEY", false),
+            ("EC PRIVATE KEY", "EC PRIVATE KEY", false),
+            ("CRLF line endings", "RSA PRIVATE KEY", true),
+        ] {
+            let mut body = format!(
+                "{}\nMIIEowIBAAKCAQEAtestkeymaterial\n{}\n",
+                pem_marker_labeled("BEGIN", label),
+                pem_marker_labeled("END", label),
+            );
+            if crlf {
+                body = body.replace('\n', "\r\n");
+            }
+            let path = dir.path().join(format!("{label}.pem").replace(' ', "_"));
+            std::fs::write(&path, body).expect("write fixture");
+
+            let mut o = opts(false);
+            o.private_key_path = path.to_string_lossy().into_owned();
+            assert!(
+                require_connect_inputs(&o).is_ok(),
+                "a real PEM shape ({case}) was refused: {:?}",
+                require_connect_inputs(&o).err()
+            );
+        }
+    }
+
+    #[test]
+    fn a_valid_pem_and_a_byo_connect_are_both_still_accepted() {
+        // The other half of the validator's contract, and the more dangerous
+        // half to get wrong: a check that refused a LEGAL input would break
+        // every existing install while looking like hardening. The BYO case is
+        // the sharper one -- it supplies no PEM by design, so the new arms must
+        // not merely accept it but must never stat a path at all.
+        let (_dir, path) = key_fixture();
+        let mut chart_held = opts(false);
+        chart_held.private_key_path = path;
+        assert!(
+            require_connect_inputs(&chart_held).is_ok(),
+            "a real PEM was refused: {:?}",
+            require_connect_inputs(&chart_held).err()
+        );
+
+        let mut byo = byo_opts();
+        // A path that cannot exist. If any new arm stats it, this refuses --
+        // and the recommended BYO path becomes unreachable from the CLI.
+        byo.private_key_path = String::new();
+        assert!(
+            require_connect_inputs(&byo).is_ok(),
+            "the BYO path must never be asked for a PEM: {:?}",
+            require_connect_inputs(&byo).err()
         );
     }
 }
