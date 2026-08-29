@@ -341,6 +341,27 @@ def test_over_long_names_that_share_a_prefix_still_differ() -> None:
 # --------------------------------------------------------------------------- #
 
 
+def _render_connector(agent: str, connector: str, release: str = "curie") -> list[dict]:
+    """Render one connector's objects, holding everything but the names fixed.
+
+    The one render call both the refusal tests and their controls go through.
+    The namespace, app name, spec and secret name are incidental to #1446, and
+    pinning them in a single place is what lets a refusal and the control it is
+    paired with differ in nothing but the agent and connector names -- which is
+    the entire claim those pairs make.
+    """
+
+    return r.render(
+        release=release,
+        agent=agent,
+        namespace="ns",
+        app_name="curie",
+        connector=connector,
+        spec=DEV,
+        secret_name="s",
+    )
+
+
 def _rendered_names(release: str, agent: str, connector: str) -> dict[str, str]:
     """The four object names one connector renders, keyed by what they are.
 
@@ -351,15 +372,7 @@ def _rendered_names(release: str, agent: str, connector: str) -> dict[str, str]:
     all four take their name from `object_name`, which is where the guard lives.
     """
 
-    objs = r.render(
-        release=release,
-        agent=agent,
-        namespace="ns",
-        app_name="curie",
-        connector=connector,
-        spec=DEV,
-        secret_name="s",
-    )
+    objs = _render_connector(agent, connector, release)
     # Select the policies by direction, never by kind: two NetworkPolicies ship
     # per connector, so `kind == "NetworkPolicy"` silently picks whichever is
     # first and tests the wrong object.
@@ -369,18 +382,6 @@ def _rendered_names(release: str, agent: str, connector: str) -> dict[str, str]:
         "egress": _egress_np(objs)["metadata"]["name"],
         "ingress": _ingress_np(objs)["metadata"]["name"],
     }
-
-
-def _render_forging(agent: str, connector: str, release: str = "curie") -> list[dict]:
-    return r.render(
-        release=release,
-        agent=agent,
-        namespace="ns",
-        app_name="curie",
-        connector=connector,
-        spec=DEV,
-        secret_name="s",
-    )
 
 
 def test_the_issue_pair_cannot_render_the_same_objects() -> None:
@@ -398,9 +399,9 @@ def test_the_issue_pair_cannot_render_the_same_objects() -> None:
     )
 
     with pytest.raises(r.AmbiguousObjectName) as first:
-        _render_forging(agent="a-mcp-b", connector="c")
+        _render_connector(agent="a-mcp-b", connector="c")
     with pytest.raises(r.AmbiguousObjectName) as second:
-        _render_forging(agent="a", connector="b-mcp-c")
+        _render_connector(agent="a", connector="b-mcp-c")
 
     assert "a-mcp-b" in str(first.value), "the error must name the offending agent"
     assert "b-mcp-c" in str(second.value), "the error must name the offending connector"
@@ -413,7 +414,7 @@ def test_every_rendered_object_kind_is_refused() -> None:
     # stopped emitting the ingress policy #1443 added. The control below pins
     # the full set and its names, so dropping an object fails here too.
     with pytest.raises(r.AmbiguousObjectName):
-        _render_forging(agent="a-mcp-b", connector="c")
+        _render_connector(agent="a-mcp-b", connector="c")
 
     control = _rendered_names("curie", "acme-dev", "grafana")
     assert control == {
@@ -442,9 +443,9 @@ def test_a_substring_ban_would_miss_this_pair() -> None:
     assert f"curie-{'x-mcp'}-mcp-{'c'}" == f"curie-{'x'}-mcp-{'mcp-c'}"
 
     with pytest.raises(r.AmbiguousObjectName):
-        _render_forging(agent="x-mcp", connector="c")
+        _render_connector(agent="x-mcp", connector="c")
     with pytest.raises(r.AmbiguousObjectName):
-        _render_forging(agent="x", connector="mcp-c")
+        _render_connector(agent="x", connector="mcp-c")
 
 
 def test_a_forging_pair_is_refused_even_past_the_digest_boundary() -> None:
@@ -467,9 +468,9 @@ def test_a_forging_pair_is_refused_even_past_the_digest_boundary() -> None:
     assert len(left) > 63, "this pair must reach the truncate-with-digest branch"
 
     with pytest.raises(r.AmbiguousObjectName):
-        _render_forging(agent=long_agent, connector=short_connector)
+        _render_connector(agent=long_agent, connector=short_connector)
     with pytest.raises(r.AmbiguousObjectName):
-        _render_forging(agent=short_agent, connector=long_connector)
+        _render_connector(agent=short_agent, connector=long_connector)
 
 
 _FORGING_AGENT = "a-mcp-b"
@@ -502,7 +503,7 @@ _DERIVATIONS: list[tuple[str, Callable[[], object]]] = [
         "render_ingress_networkpolicy",
         lambda: r.render_ingress_networkpolicy("curie", _FORGING_AGENT, "curie", "c", DEV),
     ),
-    ("render", lambda: _render_forging(agent=_FORGING_AGENT, connector="c")),
+    ("render", lambda: _render_connector(agent=_FORGING_AGENT, connector="c")),
 ]
 
 
