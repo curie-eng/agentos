@@ -80,6 +80,11 @@ _CHROME_KEYS = frozenset(
     {"accessory", "confirm", "options", "option_groups", "placeholder", "hint"}
 )
 
+#: ``_CHROME_KEYS`` plus ``elements``, for an ``actions`` block whose elements
+#: are buttons. Hoisted to module scope so it is computed once, not on every
+#: ``actions`` node the walker visits.
+_ACTIONS_DENIED_KEYS = _CHROME_KEYS | {"elements"}
+
 #: Composition-object and rich-text node types whose ``text`` is the content.
 _TEXT_OBJECT_TYPES = frozenset({"plain_text", "mrkdwn", "text"})
 
@@ -163,7 +168,7 @@ def _denied_keys(node_type: object) -> frozenset[str]:
     """Keys the walker must not descend into for a node of this type."""
     if node_type == "actions":
         # An actions block's elements are buttons; their labels are chrome.
-        return _CHROME_KEYS | {"elements"}
+        return _ACTIONS_DENIED_KEYS
     return _CHROME_KEYS
 
 
@@ -239,7 +244,7 @@ def _walk(node: object, depth: int, out: _Collector) -> None:
     if isinstance(node_type, str) and _emit_recognized(node, node_type, out):
         return
 
-    skip = set(_denied_keys(node_type))
+    skip: frozenset[str] = _denied_keys(node_type)
     if isinstance(node_type, str):
         # Accepted partial coverage: an unrecognized typed node whose own
         # ``text`` is a plain string still yields it (Slack's ``date`` element
@@ -248,7 +253,7 @@ def _walk(node: object, depth: int, out: _Collector) -> None:
         own_text = node.get("text")
         if isinstance(own_text, str):
             out.emit(own_text)
-            skip.add("text")
+            skip = skip | {"text"}
 
     for key, value in node.items():
         if key in skip:

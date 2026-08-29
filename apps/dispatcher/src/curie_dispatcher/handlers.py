@@ -165,6 +165,85 @@ def _post_placeholder(
         raise
 
 
+def _mint_turn(
+    *,
+    web_client: WebClient,
+    redis_client: "Redis",
+    config: DispatcherConfig,
+    log: logging.Logger,
+    clock: Clock,
+    slack_event_id: str,
+    delivery_kind: str,
+    author: str,
+    text: str,
+    channel: str,
+    thread_ts: str,
+) -> str:
+    """Post the placeholder, enqueue the turn, and return its Stream id.
+
+    THE SHARED TAIL OF BOTH MINT SITES, held in one place so they cannot drift.
+    ``process_event`` and ``process_action`` differ in how they validate an
+    envelope, judge relevance, take the dedupe claim and derive their text; from
+    the placeholder onward they owe the queue an identical ``QueuedTurn``.
+    Fixing one mint site and not its twin is this repo's dominant drift shape,
+    so the invariants below (#1312's ordering rule, ADR-0096 D4.4's literal
+    ``kind`` and explicit ``adapter``) are asserted here once rather than once
+    per lane, and a field added at the next protocol bump has one site to touch.
+
+    The caller MUST have taken the dedupe claim already: ``_post_placeholder``
+    owns the release-only-on-an-unambiguous-refusal rule (#2006) and is called
+    from here, so the claim -> placeholder -> ``XADD`` ordering and the release
+    asymmetry are the same on both lanes by construction.
+
+    ``delivery_kind`` names what arrived ("slack event", "block action") for the
+    enqueue log line -- the one thing that still differs downstream of here.
+    """
+    placeholder = _post_placeholder(
+        web_client=web_client,
+        redis_client=redis_client,
+        config=config,
+        log=log,
+        slack_event_id=slack_event_id,
+        channel=channel,
+        thread_ts=thread_ts,
+    )
+    placeholder_ts = placeholder["ts"]
+
+    # Nothing else goes between the placeholder and the XADD below. The Slack
+    # assistant-thread status ("shimmer") used to sit right here, and it was the
+    # wrong side of the durable write (#1312): a best-effort cosmetic call, whose
+    # own failures are swallowed at debug, gating the only moment this turn
+    # becomes recoverable. slack_sdk's retry handler puts the worst case near
+    # 4.5s (see app.py's timeout constant), and Bolt has five shared listener
+    # workers, so a handful of slow status calls could stall ingestion with no
+    # visible explanation. The worker raises and lowers the shimmer now, which
+    # also puts set and clear in one process instead of racing across two.
+    queued = QueuedTurn(
+        event_id=slack_event_id,
+        conversation_id=thread_ts,
+        author=author,
+        text=text,
+        # A person spoke, or a person clicked a button -- still a person, still
+        # steerable -- so this turn MAY steer a live one. Stated rather than
+        # left to the model default for the same reason `kind` is: a producer
+        # that does not say what it is produces turns nobody can audit.
+        source=TurnSource.SLACK,
+        # The literal "slack" is this dispatcher stating what it is; it never
+        # comes from config, because a Slack Socket Mode dispatcher that could
+        # claim another kind is a misrouting vector. `adapter=None` is explicit
+        # rather than defaulted so a reader sees that Slack's route is the
+        # worker's configured origin, not an oversight (ADR-0096 D4.4). Same
+        # literal, same reason, on both lanes.
+        reply_handle=ReplyHandle(
+            kind="slack", channel=channel, placeholder=placeholder_ts, adapter=None
+        ),
+        received_at=clock(),
+    )
+    stream_id = enqueue(redis_client, config, queued)
+    log.info("enqueued %s %s as stream entry %s", delivery_kind, slack_event_id, stream_id)
+    return stream_id
+
+
 def process_event(
     *,
     body: dict[str, Any],
@@ -222,29 +301,14 @@ def process_event(
         drop(log, DropReason.DUPLICATE_DELIVERY, event_id=slack_event_id)
         return None
 
-    placeholder = _post_placeholder(
+    return _mint_turn(
         web_client=web_client,
         redis_client=redis_client,
         config=config,
         log=log,
+        clock=clock,
         slack_event_id=slack_event_id,
-        channel=channel,
-        thread_ts=thread_ts,
-    )
-    placeholder_ts = placeholder["ts"]
-
-    # Nothing else goes between the placeholder and the XADD below. The Slack
-    # assistant-thread status ("shimmer") used to sit right here, and it was the
-    # wrong side of the durable write (#1312): a best-effort cosmetic call, whose
-    # own failures are swallowed at debug, gating the only moment this turn
-    # becomes recoverable. slack_sdk's retry handler puts the worst case near
-    # 4.5s (see app.py's timeout constant), and Bolt has five shared listener
-    # workers, so a handful of slow status calls could stall ingestion with no
-    # visible explanation. The worker raises and lowers the shimmer now, which
-    # also puts set and clear in one process instead of racing across two.
-    queued = QueuedTurn(
-        event_id=slack_event_id,
-        conversation_id=thread_ts,
+        delivery_kind="slack event",
         author=event.get("user", ""),
         # NOT `event.get("text", "")`: a Block Kit or attachment-shaped post
         # carries an empty or fallback-only top-level `text` and its real body in
@@ -252,23 +316,9 @@ def process_event(
         # burning a placeholder (#2006). `derive_text` returns a non-empty
         # top-level text byte-identically, so existing enqueues are unchanged.
         text=derive_text(event),
-        # A person spoke, so this turn MAY steer a live one. Stated rather than
-        # left to the model default for the same reason `kind` is: a producer
-        # that does not say what it is produces turns nobody can audit.
-        source=TurnSource.SLACK,
-        # The literal "slack" is this dispatcher stating what it is; it never
-        # comes from config, because a Slack Socket Mode dispatcher that could
-        # claim another kind is a misrouting vector. `adapter=None` is explicit
-        # rather than defaulted so a reader sees that Slack's route is the
-        # worker's configured origin, not an oversight (ADR-0096 D4.4).
-        reply_handle=ReplyHandle(
-            kind="slack", channel=channel, placeholder=placeholder_ts, adapter=None
-        ),
-        received_at=clock(),
+        channel=channel,
+        thread_ts=thread_ts,
     )
-    stream_id = enqueue(redis_client, config, queued)
-    log.info("enqueued slack event %s as stream entry %s", slack_event_id, stream_id)
-    return stream_id
 
 
 def action_command(action: dict[str, Any]) -> str:
@@ -354,34 +404,22 @@ def process_action(
 
     user = (body.get("user") or {}).get("id", "")
 
-    # Same claim -> placeholder ordering as `process_event`, so the same release
-    # rule applies on this lane; fixing one mint site and not its twin is this
-    # repo's dominant drift shape.
-    placeholder = _post_placeholder(
+    # The shared tail: same claim -> placeholder -> XADD ordering as
+    # `process_event`, because it IS `process_event`'s, so the same release rule
+    # and the same `QueuedTurn` shape apply on this lane by construction.
+    return _mint_turn(
         web_client=web_client,
         redis_client=redis_client,
         config=config,
         log=log,
+        clock=clock,
         slack_event_id=slack_event_id,
+        delivery_kind="block action",
+        author=user,
+        text=command,
         channel=channel,
         thread_ts=thread_ts,
     )
-    queued = QueuedTurn(
-        event_id=slack_event_id,
-        conversation_id=thread_ts,
-        author=user,
-        text=command,
-        # A person clicked a button. Still a person, still steerable.
-        source=TurnSource.SLACK,
-        # Same literal, same reason, on the sibling lane (ADR-0096 D4.4).
-        reply_handle=ReplyHandle(
-            kind="slack", channel=channel, placeholder=placeholder["ts"], adapter=None
-        ),
-        received_at=clock(),
-    )
-    stream_id = enqueue(redis_client, config, queued)
-    log.info("enqueued block action %s as stream entry %s", slack_event_id, stream_id)
-    return stream_id
 
 
 def register_handlers(
