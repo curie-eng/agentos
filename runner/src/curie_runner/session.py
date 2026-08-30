@@ -624,12 +624,6 @@ class SessionRunner:
         final = _apply_approval_override(Final(text="", status=status), state)
         for line in self._approval_not_acted_lines(state, final):
             yield line
-        # An exhausted iterator has no result payload, but it may have streamed
-        # a substantive answer before ending. Persist that answer only when the
-        # delivered terminal outcome is a clean DONE, matching the translated
-        # Final path above.
-        if final.status is SessionStatus.DONE:
-            state.final_text = state.assistant_text
         for line in self._false_completion_lines(state, final):
             yield line
         self._status = final.status
