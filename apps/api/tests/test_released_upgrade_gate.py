@@ -494,11 +494,13 @@ def _plan_seed(
     columns: tuple[Any, ...],
     *,
     approval_route_era: str,
+    released_state_repaired: bool = False,
 ) -> tuple[tuple[str, ...], Any]:
     """The planner's SQL and the exact metadata that describes what it wrote."""
     statements, metadata = gate._plan_seed_statements(
         columns,
         approval_route_era=approval_route_era,
+        released_state_repaired=released_state_repaired,
     )
     assert isinstance(statements, tuple)
     return statements, metadata
@@ -869,7 +871,10 @@ def test_seed_released_database_returns_the_exact_released_state_metadata(
     monkeypatch.setattr(
         gate,
         "_plan_seed_statements",
-        lambda _columns, *, approval_route_era: (("SELECT 1",), metadata),
+        lambda _columns, *, approval_route_era, released_state_repaired: (
+            ("SELECT 1",),
+            metadata,
+        ),
     )
     monkeypatch.setattr(gate, "_checked_output", lambda *_args, **_kwargs: "")
 
@@ -896,7 +901,10 @@ def test_seed_released_database_refuses_state_capable_schema_without_a_sentinel(
     monkeypatch.setattr(
         gate,
         "_plan_seed_statements",
-        lambda _columns, *, approval_route_era: (("SELECT 1",), empty_metadata),
+        lambda _columns, *, approval_route_era, released_state_repaired: (
+            ("SELECT 1",),
+            empty_metadata,
+        ),
     )
 
     with pytest.raises(gate.GateError) as excinfo:
@@ -954,6 +962,98 @@ def test_upgrade_pair_threads_the_exact_released_state_metadata_into_readback(
 
     assert result == gate.PairResult(gate.READBACK_PHASE, 0, "read-back ok")
     assert captured["seed_metadata"] is metadata
+
+
+def test_upgrade_pair_from_released_0037_seeds_a_valid_shared_state_owner(
+    gate: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A stable 0037 line must not recreate the pre-repair invalid owner shape.
+
+    The sentinel remains enabled in the candidate read-back so this direction
+    still proves exactly one NULL-scope row, unchanged value, and a
+    runner-visible memory owner. Only the one-shot false-to-true migration repair
+    is no longer fabricated after that migration has already shipped.
+    """
+    released_tree = _fake_released_tree(
+        tmp_path / "released",
+        revisions=("0037_multibinding_state_identity.py",),
+    )
+    candidate_tree = _fake_released_tree(
+        tmp_path / "candidate",
+        revisions=("0037_multibinding_state_identity.py",),
+    )
+    columns = (
+        *_agent_channels_columns(gate),
+        _column(gate, "agents", "memory", nullable=False, default="false"),
+        *_state_columns(gate, binding_scope=True),
+    )
+    captured: dict[str, Any] = {}
+
+    monkeypatch.setattr(
+        gate,
+        "_run_alembic",
+        lambda *_args, **_kwargs: gate.CommandResult(0, "ok"),
+    )
+    monkeypatch.setattr(
+        gate,
+        "_detect_approval_route_era",
+        lambda _tree: gate.APPROVAL_ROUTE_ERA_SPLIT,
+    )
+
+    def _fake_seed(*_args: Any, **kwargs: Any) -> Any:
+        captured["released_state_repaired"] = kwargs["released_state_repaired"]
+        statements, metadata = gate._plan_seed_statements(
+            columns,
+            approval_route_era=kwargs["approval_route_era"],
+            released_state_repaired=kwargs["released_state_repaired"],
+        )
+        captured["statements"] = statements
+        return metadata
+
+    def _fake_run_in_tree(command: list[str], **_kwargs: Any) -> Any:
+        captured["readback_command"] = command
+        return gate.CommandResult(0, "read-back ok")
+
+    monkeypatch.setattr(gate, "_seed_released_database", _fake_seed)
+    monkeypatch.setattr(gate, "_run_in_tree", _fake_run_in_tree)
+
+    result = gate._upgrade_pair(
+        released_tree,
+        candidate_tree,
+        database_url="postgresql+asyncpg://gate/test",
+        database_name="released_state_already_repaired",
+        released_ref="v0.9.0",
+        released_commit="1" * 40,
+        candidate_ref="HEAD",
+        candidate_commit="2" * 40,
+    )
+
+    assert result == gate.PairResult(gate.READBACK_PHASE, 0, "read-back ok")
+    assert captured["released_state_repaired"] is True
+    owner_insert = next(
+        statement
+        for statement in captured["statements"]
+        if gate.LEGACY_STATE_SEED.owner_name in statement
+        and "INSERT INTO curie.agents" in statement
+    )
+    assert "memory" in owner_insert
+    assert "TRUE" in owner_insert
+    state_insert = next(
+        statement
+        for statement in captured["statements"]
+        if "INSERT INTO curie.workflow_state_entries" in statement
+    )
+    assert "binding_scope" in state_insert
+    assert "NULL" in state_insert
+    for option in (
+        "--expect-state-owner",
+        "--expect-state-namespace",
+        "--expect-state-key",
+        "--expect-state-value",
+    ):
+        assert option in captured["readback_command"]
 
 
 def test_agent_channels_branch_with_a_legacy_route_era_seeds_the_channel_shape(
