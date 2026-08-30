@@ -567,6 +567,7 @@ def test_pull_request_template_documents_the_opt_in_declaration() -> None:
     for selector_shape in (
         "apps/*/tests/*.py::test",
         "packages/*/tests/*.py::test",
+        "runner/tests/*.py::test",
         "cli/tests/name.rs::test",
         "charts/curie/ci/name.sh",
     ):

@@ -261,6 +261,30 @@ def test_successful_turn_is_appended_to_the_transcript() -> None:
     assert store.turns[0].ts  # a timestamp was stamped
 
 
+def test_synthetic_done_after_incomplete_turn_is_not_appended_to_the_transcript() -> None:
+    # The runner synthesizes DONE when the SDK ends after streamed text but omits
+    # its ResultMessage. That closes the wire stream, not an assistant reply, so
+    # it must preserve the incomplete-turn history contract.
+    from aci_protocol import Event, SessionStatus
+    from claude_agent_sdk import AssistantMessage, TextBlock
+
+    store = _RecordingStore()
+    final = _run_recording_turn(
+        _recording_runner(
+            store,
+            script=lambda: [
+                AssistantMessage(
+                    content=[TextBlock(text="partial streamed answer")], model="fake-model"
+                )
+            ],
+        ),
+        Event(type="message", text="q", user="U", ts="1"),
+    )
+
+    assert final.status is SessionStatus.DONE
+    assert store.turns == []
+
+
 def test_classified_failure_turn_is_not_appended_to_the_transcript() -> None:
     from aci_protocol import Event, SessionStatus
     from claude_agent_sdk import ResultMessage
