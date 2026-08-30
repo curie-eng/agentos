@@ -184,13 +184,24 @@ class SkillFrontmatter(BaseModel):
     ``name`` and ``description`` are required. The tool restriction field is the
     verbatim Claude Code key ``allowed-tools`` (see the package README Decisions
     for why this differs from the task's shorthand "tools").
+
+    ``allowed-tools`` accepts BOTH authored shapes, because both occur in real
+    bundles: the space- or comma-separated string the Agent Skills specification
+    calls canonical, and the YAML list Claude Code equally accepts. The model
+    preserves whichever the author wrote and deliberately does NOT normalize --
+    there is exactly one normalization boundary, ``plugin_format
+    .parse_allowed_tools``, and every consumer must read the field through it
+    rather than raw. A second reader is how the #1852 gate-shadow fail-open
+    returns: ``runner/src/curie_runner/approval.py`` parses the frontmatter YAML
+    itself and never builds a ``SkillFrontmatter``, so a normalization living in
+    the model would be one the boot check never sees.
     """
 
     model_config = _LENIENT
 
     name: str
     description: str
-    allowed_tools: list[str] | None = Field(default=None, alias="allowed-tools")
+    allowed_tools: str | list[str] | None = Field(default=None, alias="allowed-tools")
 
 
 class HookDefinition(BaseModel):

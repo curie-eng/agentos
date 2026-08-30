@@ -55,7 +55,12 @@ raising. The shapes it checks (`packages/plugin-format/src/plugin_format/models.
 `homepage`, `repository`, `license`, `keywords`, `commands`, `agents`, `hooks`, `mcpServers`;
 `SkillFrontmatter`
 (`packages/plugin-format/src/plugin_format/models.py::SkillFrontmatter`, a `SKILL.md` frontmatter)
-with `name`/`description` required and `allowed_tools` aliased to the verbatim `allowed-tools` key;
+with `name`/`description` required and `allowed_tools` aliased to the verbatim `allowed-tools` key,
+which accepts **either** a string or a list of strings — the canonical serialized shape is the
+space-separated string (`allowed-tools: Read Bash`), split on whitespace or a comma at parenthesis
+depth 0 so a specifier such as `Bash(git commit:*)` stays one entry, and the list forms are accepted
+for compatibility ([ADR-0135](../../adr/0135-a-skill-bundle-has-two-conformance-profiles.md), Draft,
+which also adds the second, non-default `agent-skills-strict` validation profile);
 `McpServer`/`McpConfig` (`packages/plugin-format/src/plugin_format/models.py::McpConfig`, the
 `.mcp.json` file) where the validator enforces each server define `command` (stdio) or `url`
 (remote).

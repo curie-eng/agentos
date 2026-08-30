@@ -493,10 +493,13 @@
     },
     "SkillFrontmatter": {
       "additionalProperties": true,
-      "description": "The YAML frontmatter of a `skills/<name>/SKILL.md` file.\n\n``name`` and ``description`` are required. The tool restriction field is the\nverbatim Claude Code key ``allowed-tools`` (see the package README Decisions\nfor why this differs from the task's shorthand \"tools\").",
+      "description": "The YAML frontmatter of a `skills/<name>/SKILL.md` file.\n\n``name`` and ``description`` are required. The tool restriction field is the\nverbatim Claude Code key ``allowed-tools`` (see the package README Decisions\nfor why this differs from the task's shorthand \"tools\").\n\n``allowed-tools`` accepts BOTH authored shapes, because both occur in real\nbundles: the space- or comma-separated string the Agent Skills specification\ncalls canonical, and the YAML list Claude Code equally accepts. The model\npreserves whichever the author wrote and deliberately does NOT normalize --\nthere is exactly one normalization boundary, ``plugin_format\n.parse_allowed_tools``, and every consumer must read the field through it\nrather than raw. A second reader is how the #1852 gate-shadow fail-open\nreturns: ``runner/src/curie_runner/approval.py`` parses the frontmatter YAML\nitself and never builds a ``SkillFrontmatter``, so a normalization living in\nthe model would be one the boot check never sees.",
       "properties": {
         "allowed-tools": {
           "anyOf": [
+            {
+              "type": "string"
+            },
             {
               "items": {
                 "type": "string"

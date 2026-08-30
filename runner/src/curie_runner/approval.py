@@ -53,6 +53,7 @@ from plugin_format import (
     declared_mcp_server_names,
     effective_operator_gates,
     grantable_routes,
+    parse_allowed_tools,
     resolve_manifest,
 )
 
@@ -1280,19 +1281,27 @@ def _entry_tool(entry: str) -> str | None:
 
 
 def _skill_allowed_tools(root: Path) -> list[tuple[str, list[str]]]:
-    """Read every skill's ``allowed-tools`` list from a bundle directory.
+    """Read every skill's ``allowed-tools`` declaration from a bundle directory.
 
     Deliberately tolerant: a skill whose frontmatter is missing, unterminated,
     unparseable, or not a mapping contributes nothing. ``validate_bundle`` already
     reports those, and failing the gate check on a malformed skill would report
     the wrong defect and hide the real one.
 
+    Normalization (list or comma/space-delimited string) goes through
+    ``plugin_format.parse_allowed_tools``, the single shared boundary for this
+    field. #1852's commit noted that with one implementation there was no
+    second path to disagree with, so a shared-helper extraction did not yet
+    apply -- the dual-profile validator now reads this same field too, so a
+    second call site exists and the shared helper is the required form to keep
+    both readings in agreement.
+
     Args:
         root: The bundle root directory.
 
     Returns:
-        ``(skill_path_relative_to_root, entries)`` per skill that declares a list,
-        sorted by path so output is deterministic.
+        ``(skill_path_relative_to_root, entries)`` per skill that declares
+        allowed-tools, sorted by path so output is deterministic.
     """
 
     skills_dir = root / "skills"
@@ -1315,15 +1324,10 @@ def _skill_allowed_tools(root: Path) -> list[tuple[str, list[str]]]:
             continue
         if not isinstance(loaded, dict):
             continue
-        entries = loaded.get("allowed-tools")
-        if not isinstance(entries, list):
+        entries = parse_allowed_tools(loaded.get("allowed-tools"))
+        if not entries:
             continue
-        found.append(
-            (
-                str(skill_file.relative_to(root)),
-                [entry for entry in entries if isinstance(entry, str)],
-            )
-        )
+        found.append((str(skill_file.relative_to(root)), entries))
     return found
 
 

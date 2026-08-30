@@ -37,6 +37,11 @@ from .models import (
     TriggerDeclaration,
 )
 from .reserved_env import RESERVED_BOOT_ENV, is_reserved_boot_env_name
+from .skills import (
+    PROFILE_AGENT_SKILLS_STRICT,
+    PROFILE_CLAUDE_PLUGIN,
+    parse_allowed_tools,
+)
 from .tool_policy import (
     TOOL_POLICY_ENFORCEMENT,
     ToolPolicyDecision,
@@ -63,6 +68,9 @@ __all__ = [
     "PluginManifest",
     "Author",
     "SkillFrontmatter",
+    "parse_allowed_tools",
+    "PROFILE_CLAUDE_PLUGIN",
+    "PROFILE_AGENT_SKILLS_STRICT",
     "McpServer",
     "McpConfig",
     "HookDefinition",
