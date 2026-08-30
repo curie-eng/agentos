@@ -22,7 +22,7 @@ use support::{serve, MockServer, Response};
 
 const OBSERVABILITY_NAMESPACE: &str = "observability";
 const FIRST_RELEASE: &str = "grafana";
-const REQUIRED_MIB: u64 = 1312;
+const REQUIRED_MIB: u64 = 1376;
 const TEMPO_TAGGED_IMAGE: &str = "ghcr.io/curie-eng/curie-sre-bot-tempo:0.8.0";
 const REGISTRY_INDEX: &str =
     r#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}"#;
@@ -818,7 +818,7 @@ fn managed_stack_pods(node_name: &str) -> Vec<Value> {
             node_name,
             OBSERVABILITY_NAMESPACE,
             json!({"app.kubernetes.io/name": "tempo"}),
-            "192Mi",
+            "256Mi",
         ),
         labeled_pod(
             "prometheus-server",
@@ -860,7 +860,7 @@ fn assert_reached_helm_upgrade(fixture: &Fixture, output: &Output) -> String {
     );
     let text = shown(output);
     assert!(
-        !text.contains("required 1312Mi") && !text.contains("available"),
+        !text.contains(&format!("required {REQUIRED_MIB}Mi")) && !text.contains("available"),
         "a cluster with enough capacity must not be refused: {text}"
     );
     text
@@ -1808,7 +1808,7 @@ fn optional_slack_channel_reaches_the_same_embedded_deploy_path() {
 
 #[test]
 fn exactly_required_memory_and_more_both_pass_the_capacity_gate() {
-    for memory in ["1343488Ki", "2Gi"] {
+    for memory in ["1409024Ki", "2Gi"] {
         let fixture = Fixture::new(nodes(vec![node("node-a", memory, true)]), pods(vec![]));
         let output = fixture.run(&[]);
         assert_reached_helm_upgrade(&fixture, &output);
@@ -1827,17 +1827,17 @@ fn rerun_replaces_managed_stack_requests_but_keeps_unrelated_observability_load(
     ));
 
     let fixture = Fixture::new(
-        nodes(vec![node("node-a", "1376Mi", true)]),
+        nodes(vec![node("node-a", "1440Mi", true)]),
         pods(items.clone()),
     );
     let output = fixture.run(&[]);
     assert_reached_helm_upgrade(&fixture, &output);
 
-    let insufficient = Fixture::new(nodes(vec![node("node-a", "1375Mi", true)]), pods(items));
+    let insufficient = Fixture::new(nodes(vec![node("node-a", "1439Mi", true)]), pods(items));
     let output = insufficient.run(&[]);
     let text = assert_refused_before_helm(&insufficient, &output);
     assert!(
-        text.contains("required 1312Mi") && text.contains("available 1311Mi"),
+        text.contains("required 1376Mi") && text.contains("available 1375Mi"),
         "only managed stack requests may be replaced during a rerun: {text}"
     );
 }
@@ -1846,8 +1846,8 @@ fn rerun_replaces_managed_stack_requests_but_keeps_unrelated_observability_load(
 fn daemonset_requests_scale_the_required_memory_per_ready_node() {
     let enough = Fixture::new(
         nodes(vec![
-            node("node-a", "736Mi", true),
-            node("node-b", "736Mi", true),
+            node("node-a", "768Mi", true),
+            node("node-b", "768Mi", true),
         ]),
         pods(vec![]),
     );
@@ -1856,15 +1856,15 @@ fn daemonset_requests_scale_the_required_memory_per_ready_node() {
 
     let insufficient = Fixture::new(
         nodes(vec![
-            node("node-a", "736Mi", true),
-            node("node-b", "735Mi", true),
+            node("node-a", "768Mi", true),
+            node("node-b", "767Mi", true),
         ]),
         pods(vec![]),
     );
     let output = insufficient.run(&[]);
     let text = assert_refused_before_helm(&insufficient, &output);
     assert!(
-        text.contains("required 1472Mi") && text.contains("available 1471Mi"),
+        text.contains("required 1536Mi") && text.contains("available 1535Mi"),
         "two Ready nodes must reserve two Alloy and node exporter requests: {text}"
     );
 }
@@ -1906,7 +1906,7 @@ fn capacity_aggregates_ready_nodes_and_only_their_nonterminal_scheduled_pods() {
     let fixture = Fixture::new(
         nodes(vec![
             node("ready-a", "1Gi", true),
-            node("ready-b", "1248Mi", true),
+            node("ready-b", "1312Mi", true),
             node("not-ready", "16Gi", false),
         ]),
         pods(items),
@@ -1949,20 +1949,20 @@ fn restartable_init_scheduling_semantics_pin_the_exact_five_hundred_mib_request(
     // restartable sidecars. Summing every init container would overcount;
     // taking only the largest single init container would undercount.
     let exact = Fixture::new(
-        nodes(vec![node("node-a", "1812Mi", true)]),
+        nodes(vec![node("node-a", "1876Mi", true)]),
         pods(vec![restartable_init_pod()]),
     );
     let exact_output = exact.run(&[]);
     assert_reached_helm_upgrade(&exact, &exact_output);
 
     let one_short = Fixture::new(
-        nodes(vec![node("node-a", "1811Mi", true)]),
+        nodes(vec![node("node-a", "1875Mi", true)]),
         pods(vec![restartable_init_pod()]),
     );
     let one_short_output = one_short.run(&[]);
     let text = assert_refused_before_helm(&one_short, &one_short_output);
     assert!(
-        text.contains("required 1312Mi") && text.contains("available 1311Mi"),
+        text.contains("required 1376Mi") && text.contains("available 1375Mi"),
         "the capacity boundary must use the effective 500Mi pod request: {text}"
     );
 }
@@ -2425,6 +2425,115 @@ fn custom_targets_thread_through_helm_kubectl_manifests_secret_discovery_and_con
     );
 }
 
+/// #2059: the memory envelope and query bounds must survive the INSTALLER path.
+///
+/// The OOM in #2059 was in the SHIPPED manifest -- the bytes the CLI actually
+/// hands `kubectl apply`, not the bytes sitting in
+/// `examples/sre-bot/observability/tempo.yaml`. The CLI embeds that file with
+/// `include_bytes!` (`cli/src/examples.rs`) and rewrites it before applying, so
+/// asserting the source file alone proves nothing about what an operator gets.
+/// This test reads the captured applied document and asserts the envelope there.
+///
+/// It parses the applied YAML rather than substring-matching, so a bound
+/// restored to Tempo's distributed default fails on the VALUE rather than
+/// passing a presence check. Each bound has its own assertion and its own
+/// message, so a failure names the key that went missing.
+#[test]
+fn applied_tempo_manifest_carries_the_bounded_memory_envelope() {
+    let fixture = Fixture::with_modes(
+        nodes(vec![node("node-a", "4Gi", true)]),
+        pods(vec![]),
+        "success",
+        "success",
+        "success",
+    );
+    let output = fixture.run(&[]);
+    let shown_output = shown(&output);
+    assert!(
+        output.status.success(),
+        "the default install must complete: {shown_output}"
+    );
+
+    let tempo = fixture.applied_file("tempo.yaml");
+    let documents = manifest_documents(&tempo);
+
+    let stateful_set = documents
+        .iter()
+        .find(|document| document["kind"] == "StatefulSet")
+        .unwrap_or_else(|| panic!("applied Tempo must carry a StatefulSet: {tempo}"));
+    let container = &stateful_set["spec"]["template"]["spec"]["containers"][0];
+
+    let resources = &container["resources"];
+    assert_eq!(
+        resources["requests"]["memory"], "256Mi",
+        "the applied Tempo container must request the measured 256Mi that the installer \
+         capacity preflight sums (REQUIRED_MIB {REQUIRED_MIB}Mi): {tempo}"
+    );
+    assert_eq!(
+        resources["limits"]["memory"], "1Gi",
+        "the applied Tempo container must carry the measured 1Gi hard ceiling: {tempo}"
+    );
+
+    let gomemlimit = container["env"]
+        .as_array()
+        .map(|env| env.to_vec())
+        .unwrap_or_default()
+        .into_iter()
+        .find(|entry| entry["name"] == "GOMEMLIMIT");
+    assert_eq!(
+        gomemlimit.as_ref().map(|entry| entry["value"].clone()),
+        Some(Value::from("600MiB")),
+        "the applied Tempo container must carry the soft Go heap ceiling below its cgroup \
+         limit; without it the Go GC never learns the cgroup ceiling: {tempo}"
+    );
+
+    let annotations = &stateful_set["spec"]["template"]["metadata"]["annotations"];
+    assert_ne!(
+        annotations["checksum/config"], "v1",
+        "checksum/config must move off v1, or `kubectl apply` updates the ConfigMap and the \
+         running pod keeps the unbounded config: {tempo}"
+    );
+
+    let config_map = documents
+        .iter()
+        .find(|document| document["kind"] == "ConfigMap")
+        .unwrap_or_else(|| panic!("applied Tempo must carry a ConfigMap: {tempo}"));
+    let config_text = config_map["data"]["tempo.yaml"]
+        .as_str()
+        .unwrap_or_else(|| panic!("applied Tempo ConfigMap must carry tempo.yaml: {tempo}"));
+    let config: Value = serde_norway::from_str(config_text)
+        .unwrap_or_else(|error| panic!("applied Tempo config must be valid YAML: {error}"));
+
+    // The read-buffer product `max_workers * read_buffer_count *
+    // read_buffer_size_bytes` is the structural defect: at Tempo's distributed
+    // defaults it is 12.8 GiB against a small-node limit. These two bounds are
+    // what turn it into a ceiling rather than a threshold.
+    assert_eq!(
+        config["storage"]["trace"]["pool"]["max_workers"], 20,
+        "storage.trace.pool.max_workers must be bounded (Tempo's distributed default is 400): \
+         {config_text}"
+    );
+    assert_eq!(
+        config["storage"]["trace"]["search"]["read_buffer_count"], 8,
+        "storage.trace.search.read_buffer_count must be bounded (default 32): {config_text}"
+    );
+    assert_eq!(
+        config["ingester"]["max_block_bytes"], 52428800,
+        "ingester.max_block_bytes must be bounded; the 500 MiB default lets one in-memory head \
+         block reach the whole pod limit: {config_text}"
+    );
+    assert_eq!(
+        config["query_frontend"]["search"]["concurrent_jobs"], 40,
+        "query_frontend.search.concurrent_jobs must be bounded (default 1000) so search fan-out \
+         does not scale with block count: {config_text}"
+    );
+    assert_eq!(
+        config["query_frontend"]["search"]["max_result_limit"], 50,
+        "query_frontend.search.max_result_limit must mirror MAX_LIMIT in \
+         examples/sre-bot/connectors/tempo/server.py; the two move together: {config_text}"
+    );
+}
+
 #[test]
 fn selected_observability_namespace_is_the_only_managed_capacity_namespace() {
     let mut items = managed_stack_pods("node-a");
@@ -2436,17 +2545,17 @@ fn selected_observability_namespace_is_the_only_managed_capacity_namespace() {
         "64Mi",
     ));
     let fixture = Fixture::new(
-        nodes(vec![node("node-a", "1376Mi", true)]),
+        nodes(vec![node("node-a", "1440Mi", true)]),
         pods(items.clone()),
     );
     let default_output = fixture.run(&[]);
     assert_reached_helm_upgrade(&fixture, &default_output);
 
-    let custom = Fixture::new(nodes(vec![node("node-a", "1376Mi", true)]), pods(items));
+    let custom = Fixture::new(nodes(vec![node("node-a", "1440Mi", true)]), pods(items));
     let output = custom.run(&custom_target_args());
     let text = assert_refused_before_helm(&custom, &output);
     assert!(
-        text.contains("required 1312Mi"),
+        text.contains("required 1376Mi"),
         "load in the default observability namespace must count when targeting soak-obs: {text}"
     );
 }

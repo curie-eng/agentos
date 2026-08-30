@@ -16,10 +16,37 @@ data:
               endpoint: 0.0.0.0:4317
             http:
               endpoint: 0.0.0.0:4318
+    # --- #2059: the single-pod memory and query envelope ---------------------
+    # Every knob below that is not a path or a receiver exists because Tempo's
+    # default for it is a DISTRIBUTED-deployment default, and this stack runs
+    # ONE Tempo pod under the container limit set on the StatefulSet further
+    # down. These are values measured in #2059, not preferences: removing one
+    # as "redundant configuration" restores a default sized for a fleet of
+    # queriers and re-opens the OOM. The three that mattered most:
+    #   * ingester.max_block_bytes defaulted to 500MiB, so one in-memory head
+    #     block could reach the entire 512MiB container the stack shipped with.
+    #     That is the ordinary-traffic OOM (exit 137, CONSTRAINT_MEMCG) on its
+    #     own, with no query load at all.
+    #   * storage.trace.pool.max_workers defaulted to 400 and
+    #     storage.trace.search.read_buffer_count to 32, so worst-case read
+    #     buffers were 400 x 32 x 1MiB = 12.8 GiB against the pod's whole
+    #     limit. No plausible small-node limit is above 12.8 GiB, so this
+    #     product has to be BOUNDED; it cannot be out-run by raising memory.
+    #   * No GOMEMLIMIT, so the Go GC never learned there was a ceiling at all
+    #     (see the container env below).
     ingester:
       max_block_duration: 5m
+      # Cut the head block at 50MiB rather than the 500MiB default, and let a
+      # cut block leave memory after 5m rather than the default 15m, so
+      # complete blocks do not stack up behind the head block.
+      max_block_bytes: 52428800
+      complete_block_timeout: 5m
     compactor:
       compaction:
+        # NOT a memory knob, despite driving block count. 48h is the evidence
+        # window the SRE bot reads; shortening it destroys evidence rather than
+        # saving memory. Query fan-out over these blocks is bounded under
+        # query_frontend.search below instead.
         block_retention: 48h
     storage:
       trace:
@@ -28,6 +55,51 @@ data:
           path: /var/tempo/blocks
         wal:
           path: /var/tempo/wal
+        pool:
+          # 20 x 8 x 1MiB = 160MiB of worst-case read buffers, down from the
+          # default 400 x 32 x 1MiB = 12.8 GiB. Keep max_workers and
+          # search.read_buffer_count below in step: their product with
+          # read_buffer_size_bytes is the number that has to stay small
+          # relative to resources.limits.memory.
+          max_workers: 20
+          queue_depth: 2000
+        search:
+          read_buffer_count: 8
+          read_buffer_size_bytes: 1048576
+          # Default 1000. Prefetching a thousand traces to satisfy a query
+          # bounded at 50 results (see max_result_limit) is pure headroom loss.
+          prefetch_trace_count: 100
+    querier:
+      # Default 20. One pod serves both the read and write path here, so cap
+      # concurrent query execution well below the ingest path's needs.
+      max_concurrent_queries: 4
+    query_frontend:
+      max_outstanding_per_tenant: 200
+      trace_by_id:
+        query_shards: 8
+      search:
+        concurrent_jobs: 40
+        target_bytes_per_job: 26214400
+        # Must never exceed compactor.compaction.block_retention above. The
+        # 168h default was longer than retention, so a single search could fan
+        # out over the entire store.
+        max_duration: 24h
+        # Mirrors MAX_LIMIT in examples/sre-bot/connectors/tempo/server.py.
+        # That connector clamps client-side; setting the identical number here
+        # turns its courtesy cap into a server-side boundary that also binds a
+        # direct Grafana Explore query. The two move together -- chart CI fails
+        # if they disagree.
+        max_result_limit: 50
+    overrides:
+      defaults:
+        global:
+          # A single pathological trace cannot grow past 2MB in the ingester...
+          max_bytes_per_trace: 2000000
+        read:
+          # ...and a tag-values lookup (Grafana renders these on every Explore
+          # dropdown) cannot materialise more than 1MB of values.
+          max_bytes_per_tag_values_query: 1000000
+    # --- end #2059 envelope --------------------------------------------------
     usage_report:
       reporting_enabled: false
 ---
@@ -66,7 +138,12 @@ spec:
       labels:
         app.kubernetes.io/name: tempo
       annotations:
-        checksum/config: v1
+        # Bump this on EVERY change to the ConfigMap above. `kubectl apply` of a
+        # changed ConfigMap updates the map and leaves this StatefulSet's pod
+        # running its OLD config -- nothing rolls unless the pod template itself
+        # changes. Without the bump the #2059 bounds are present in git and
+        # absent from the cluster: every assertion passes and nothing is fixed.
+        checksum/config: v2
     spec:
       securityContext:
         fsGroup: 10001
@@ -79,6 +156,17 @@ spec:
         - name: tempo
           image: docker.io/grafana/tempo:2.9.1@sha256:290414580eabd1bde91f22e4a4579242fe77377c425223f45d59b8ad1540ce3c
           args: ["-config.file=/conf/tempo.yaml"]
+          env:
+            # A SOFT ceiling that the Go GC respects, set deliberately BELOW the
+            # hard cgroup limit in resources.limits.memory below: the runtime
+            # collects harder as it approaches this, instead of being killed at
+            # the cgroup limit with no warning. It governs the Go HEAP only --
+            # goroutine stacks, runtime overhead and the mmap'd block reads
+            # Tempo does on the search path all sit outside it -- which is why
+            # it is ~59% of the limit rather than just under it. Move it and
+            # resources.limits.memory together (#2059).
+            - name: GOMEMLIMIT
+              value: "600MiB"
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -99,9 +187,18 @@ spec:
           resources:
             requests:
               cpu: 50m
-              memory: 192Mi
+              # requests.memory is what the installer's capacity preflight sums:
+              # FIXED_MEMORY_MIB in cli/src/examples.rs must move in lockstep,
+              # or the preflight admits a node that cannot hold the stack.
+              # 256Mi/1Gi is the #2059 measured envelope (594MiB peak at
+              # soak scale, ~290 blocks) and matches the 256Mi request Loki --
+              # the comparable ingest+query backend in this same install --
+              # already ships.
+              memory: 256Mi
             limits:
-              memory: 512Mi
+              # The HARD cgroup ceiling; GOMEMLIMIT above must stay below it
+              # with real headroom for the non-heap memory it does not cover.
+              memory: 1Gi
           volumeMounts:
             - name: config
               mountPath: /conf
