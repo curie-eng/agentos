@@ -1742,8 +1742,10 @@ agentSandbox:
     # Per-workload OTEL_EXPORTER_OTLP_* overrides still win over the
     # chart-owned collector endpoint.
     extraEnv: []
-    # Compatibility tombstone: true is rejected by ADR-0037; direct provider
-    # routing is session-pinned at claim time.
+    # Compatibility tombstone: only unquoted boolean false is supported; true
+    # and any non-empty non-boolean value (including quoted "false") are
+    # rejected by ADR-0037. Direct provider routing is session-pinned at claim
+    # time.
     liteLLM:
       enabled: false
     # --- Bundle-fetch provisioning ---

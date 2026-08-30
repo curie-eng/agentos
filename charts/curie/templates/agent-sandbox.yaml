@@ -26,7 +26,7 @@ the worker claims from, plus (optionally) the vendored upstream controller.
   behavior would otherwise silently widen (not be narrowed by) Rail 1's
   default-deny + allowlist in security-networkpolicy.yaml.
 */}}
-{{- if .Values.agentSandbox.runner.liteLLM.enabled }}
+{{- if (dig "liteLLM" "enabled" false .Values.agentSandbox.runner) }}
 {{- fail "agentSandbox.runner.liteLLM.enabled is unsupported by ADR-0037: in-path LiteLLM gateways are unsupported; remove or disable agentSandbox.runner.liteLLM.enabled and use direct session-pinned provider routing." }}
 {{- end }}
 {{- if .Values.agentSandbox.controller.deploy }}
