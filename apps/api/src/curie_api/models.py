@@ -704,7 +704,12 @@ class WorkflowStateEntry(Base):
     __tablename__ = "workflow_state_entries"
     __table_args__ = (
         UniqueConstraint(
-            "agent_id", "binding_scope", "namespace", "key", name="uq_state_agent_scope_ns_key"
+            "agent_id",
+            "binding_scope",
+            "namespace",
+            "key",
+            name="uq_state_agent_scope_ns_key",
+            postgresql_nulls_not_distinct=True,
         ),
     )
 
@@ -712,13 +717,14 @@ class WorkflowStateEntry(Base):
     agent_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE")
     )
-    # NULL when the owning agent has `memory=True` (one shared namespace); the
-    # binding's own `"{kind}:{address}"` when `memory=False` (#1525 follow-up).
-    # Minted into the worker's `state.app`/`state` token per turn from the
-    # agent's CURRENT `memory` value, never read back off this column -- the
-    # column only picks which row a request lands on. Part of the unique key
-    # (not just an extra filter) so a memory=False agent's two bindings get
-    # two independent rows for the same namespace+key instead of colliding.
+    # NULL is one agent-wide shared identity: for general state when the owning
+    # agent has `memory=True`, and always for the reserved `memory`/`transcript`
+    # namespaces. The binding's own `"{kind}:{address}"` is the isolated identity
+    # for general state when `memory=False` (#1525 follow-up). Minted into the
+    # worker's `state.app`/`state` token per turn from the agent's CURRENT
+    # `memory` value, never read back off this column -- the column only picks
+    # which row a request lands on. The NULLS-NOT-DISTINCT unique key makes the
+    # shared identity singular while distinct non-NULL scopes remain isolated.
     binding_scope: Mapped[str | None] = mapped_column(default=None)
     namespace: Mapped[str]
     key: Mapped[str]

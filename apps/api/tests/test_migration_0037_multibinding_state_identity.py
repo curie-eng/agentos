@@ -453,13 +453,15 @@ def test_duplicate_null_constraint_catalog_and_scoped_controls(
 
     assert _sql(
         """
-        SELECT constraint.connullsnotdistinct
-        FROM pg_constraint AS constraint
-        JOIN pg_class AS relation ON relation.oid = constraint.conrelid
+        SELECT backing_index.indnullsnotdistinct
+        FROM pg_constraint AS catalog_constraint
+        JOIN pg_class AS relation ON relation.oid = catalog_constraint.conrelid
+        JOIN pg_index AS backing_index
+          ON backing_index.indexrelid = catalog_constraint.conindid
         JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
         WHERE namespace.nspname = 'curie'
           AND relation.relname = 'workflow_state_entries'
-          AND constraint.conname = 'uq_state_agent_scope_ns_key'
+          AND catalog_constraint.conname = 'uq_state_agent_scope_ns_key'
         """
     ) == [(True,)]
 
