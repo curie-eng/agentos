@@ -140,7 +140,9 @@ pass by weakening assertions is a regression. At parity seams, include at least
 one negative or secondary-path test per AC (see the parity-seam registry).
 A fix PR changing `apps/*/tests/`, `packages/*/tests/`, `cli/tests/`, or `charts/curie/ci/` is expected to be verifiable with the exact command
 `curie dev verify-fix-pin <CHANGE> <SELECTOR>`.
-A fix PR includes exactly one `Fix pin: <SELECTOR>` line in its body. A non fix PR omits it.
+A PR closing a `bug`-labeled issue includes exactly one `Fix pin: <SELECTOR>` line in its body,
+or an explicit `Fix pin: n/a - <reason>` line; CI enforces this. A PR closing no bug-labeled issue may omit
+the declaration, but a selector supplied voluntarily on any PR is still verified.
 Assertions about an external API or SDK's shape or auth must be grounded in
 provider docs or observed behavior, cited in a test comment, never in the
 implementation's own assumption. Any read-modify-write on a versioned row needs a

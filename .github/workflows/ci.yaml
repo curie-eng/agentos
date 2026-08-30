@@ -21,6 +21,12 @@ jobs:
   python:
     name: Python (ruff + mypy + pytest)
     runs-on: ubuntu-latest
+    # A job-level block REPLACES the workflow-level one, so `contents: read` is
+    # repeated here. `issues: read` is what lets the fix pin gate read the
+    # labels of the closed issues a pull request names, through the Issues API.
+    permissions:
+      contents: read
+      issues: read
     env:
       CI_REQUIRE_VALKEY_TESTS: "1"
     steps:
@@ -152,6 +158,7 @@ jobs:
         if: github.event_name == 'pull_request'
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/cli/target
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: >-
           python3 tools/fix-pin-ci/check.py
           --event "$GITHUB_EVENT_PATH"
