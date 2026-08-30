@@ -1262,8 +1262,8 @@ jobs:
       # off (no runsc on kind nodes), and drop the dispatcher (no Slack; its
       # presence would trip the `cluster message` reply-hijack guard). The worker
       # is deliberately installed with the chart's empty/default trusted-origin
-      # posture: the rollout-recovery regression below must exercise the first
-      # `cluster message` command's temporary trust rollout from that cold state.
+      # posture: the regression below must prove the first disconnected
+      # `cluster message` reply works without mutating that worker Deployment.
       - name: Install the platform (curie cluster up)
         env:
           CURIE_BIN: cli/target/release/curie
@@ -1294,14 +1294,14 @@ jobs:
           kubectl rollout status deploy/curie-ui -n curie --timeout=300s
           kubectl rollout status daemonset/curie-runner-prewarm -n curie --timeout=300s
       # QA4-02: drive the first no-Slack invocation from the default/untrusted
-      # install through its real Deployment rollout and prove the outgoing
-      # worker never claims it. Then kill a real PEL owner while its sandbox
+      # install and prove it neither rolls the worker Deployment nor replaces
+      # its pod. Then kill a real PEL owner while its sandbox
       # is held Pending by a namespaced, sandbox-only node selector and require
       # the same CLI process to transfer the PEL entry and recover its reply in
       # under three minutes. The shared agent-sandbox controller stays Ready and
       # untouched throughout. Red-on-revert binaries/images are opt-in harness
       # knobs; CI deliberately exercises only the current branch.
-      - name: First invocation rollout and dead-consumer recovery
+      - name: Rollout-free first invocation and dead-consumer recovery
         env:
           CURIE_BIN: cli/target/release/curie
         run: bash cli/scripts/e2e-cluster-rollout-recovery.sh

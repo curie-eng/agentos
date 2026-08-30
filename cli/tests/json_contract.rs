@@ -616,7 +616,7 @@ fn message_dry_run_json_validates_against_message_schema() {
         "local",
         "curie:turns",
         Some("C123"),
-        "http://localhost:8155/api/",
+        Some("http://localhost:8155/api/"),
     );
     assert!(
         v.is_valid(&with_channel),
@@ -626,8 +626,7 @@ fn message_dry_run_json_validates_against_message_schema() {
     assert_eq!(with_channel["target"], serde_json::json!("local"));
     assert_eq!(with_channel["channel"], serde_json::json!("C123"));
     // Null channel (cluster target, sole-agent resolution).
-    let no_channel =
-        message_dry_run_json("cluster", "curie:turns", None, "http://10.1.2.3:8155/api/");
+    let no_channel = message_dry_run_json("cluster", "curie:turns", None, None);
     assert!(
         v.is_valid(&no_channel),
         "message_dry_run_json (no channel) must validate: {no_channel}"
@@ -637,6 +636,10 @@ fn message_dry_run_json_validates_against_message_schema() {
         "omitted channel must be JSON null: {no_channel}"
     );
     assert_eq!(no_channel["target"], serde_json::json!("cluster"));
+    assert!(
+        no_channel["reply_endpoint"].is_null(),
+        "cluster relay has no callback endpoint: {no_channel}"
+    );
 }
 
 /// The direct statement of #955's acceptance criterion, carrying BOTH schema
@@ -712,7 +715,7 @@ fn every_message_payload_matches_exactly_one_message_schema_branch() {
         })
         .chain([(
             "message_dry_run_json".to_string(),
-            message_dry_run_json("local", "s", Some("C1"), "http://x/api/"),
+            message_dry_run_json("local", "s", Some("C1"), Some("http://x/api/")),
         )])
     {
         assert!(

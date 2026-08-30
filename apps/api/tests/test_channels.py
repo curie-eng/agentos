@@ -52,6 +52,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 # come from the binding row and are never accepted from an ingress body (D4.1).
 EMAIL_ENDPOINT = "http://curie-mail-adapter:8080/"
 EMAIL_ADAPTER = "agentmail-sandbox"
+CLUSTER_MESSAGE_ADAPTER = "curie-cluster-message"
 PAST = 1000000000  # 2001, comfortably expired
 FAR_FUTURE = 4102444800  # 2100-01-01
 _TRACE_ID = int("1123456789abcdef0123456789abcdef", 16)
@@ -1373,6 +1374,59 @@ def test_an_adapter_that_is_not_a_slug_is_rejected(
     )
     assert created.status_code == 422, created.text
     assert "adapter" in created.text, created.text
+
+
+def test_the_builtin_cluster_message_adapter_is_reserved_on_every_binding_write(
+    channels_client: TestClient, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """The in-cluster relay is selected by worker code, never operator config.
+
+    The literal is a syntactically valid lowercase slug, so the ordinary slug
+    validator alone would let a binding shadow the built-in and divert a
+    connected Slack turn.  Reject it on create and patch while proving that an
+    ordinary adapter and the public read shape remain valid.
+    """
+
+    refused_create = _create_agent(
+        channels_client,
+        auth_headers,
+        name="reserved-relay",
+        channel=_channel(
+            "email",
+            "reserved@example.test",
+            endpoint=EMAIL_ENDPOINT,
+            adapter=CLUSTER_MESSAGE_ADAPTER,
+        ),
+    )
+    assert refused_create.status_code == 422, refused_create.text
+    assert CLUSTER_MESSAGE_ADAPTER in refused_create.text, refused_create.text
+
+    agent_id = _bind(
+        channels_client,
+        auth_headers,
+        name="ordinary-adapter",
+        channel=_email_channel("ordinary@example.test"),
+    )
+    refused_patch = channels_client.patch(
+        f"/agents/{agent_id}/channels",
+        params={"kind": "email", "address": "ordinary@example.test"},
+        json=_channel(
+            "email",
+            "ordinary@example.test",
+            endpoint=EMAIL_ENDPOINT,
+            adapter=CLUSTER_MESSAGE_ADAPTER,
+        ),
+        headers=auth_headers,
+    )
+    assert refused_patch.status_code == 422, refused_patch.text
+
+    fetched = channels_client.get(f"/agents/{agent_id}", headers=auth_headers)
+    assert fetched.status_code == 200, fetched.text
+    assert fetched.json()["channels"] == [
+        {"kind": "email", "address": "ordinary@example.test"}
+    ]
+    row = _binding_row(agent_id)
+    assert row["adapter"] == EMAIL_ADAPTER
 
 
 def test_a_valid_route_is_stored_and_never_leaks_into_the_response(

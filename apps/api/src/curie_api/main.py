@@ -42,6 +42,7 @@ from .routers import (
     approvals,
     bundles,
     channels,
+    cluster_message_replies,
     config,
     console,
     control,
@@ -338,6 +339,8 @@ def create_app() -> FastAPI:
     app.include_router(actions.router)
     app.include_router(publications.router)
     app.include_router(publications.internal_router)
+    app.include_router(cluster_message_replies.router)
+    app.include_router(cluster_message_replies.internal_router)
     app.include_router(workspaces.router)
     app.include_router(channels.router)
     app.include_router(hooks.router)
