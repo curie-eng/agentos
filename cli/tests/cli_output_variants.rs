@@ -230,14 +230,20 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
         "ChannelsOutput",
         samples![
             "DryRun" => ChannelsOutput::DryRun(plan()),
-            // Two bindings, because one is the case that hid the whole defect
-            // class: a payload shaped right for a single binding says nothing
-            // about the plural surface ADR-0118 introduced.
+            // The single Done sample keeps plural coverage while deliberately
+            // exercising both row shapes for the optional signal: a legacy stored name
+            // carries a warning, while a valid channel ID omits it.
             "Done" => ChannelsOutput::Done {
                 agent: "a".to_string(),
                 channels: vec![
-                    ChannelBinding { kind: "slack".to_string(), address: "C0EXAMPLE1".to_string() },
-                    ChannelBinding { kind: "slack".to_string(), address: "C0EXAMPLE2".to_string() },
+                    ChannelBinding {
+                        kind: "slack".to_string(),
+                        address: "#legacy-alerts".to_string(),
+                    },
+                    ChannelBinding {
+                        kind: "slack".to_string(),
+                        address: "C0EXAMPLE1".to_string(),
+                    },
                 ],
                 changed: true,
             },
@@ -558,6 +564,42 @@ fn every_variant_of_every_cli_output_enum_has_a_sample() {
         "variant(s) {failures:?} are declared in cli/src but have no sample (or name a \
          variant that no longer exists), so their `to_json()` never reaches the schema \
          gate (#965)"
+    );
+}
+
+#[test]
+fn channels_done_sample_covers_warning_present_and_absent_rows() {
+    let registry = registry();
+    let samples = registry
+        .get("ChannelsOutput")
+        .expect("ChannelsOutput has variant samples");
+    let done = samples
+        .iter()
+        .find_map(|(variant, value)| (*variant == "Done").then_some(value))
+        .expect("ChannelsOutput::Done has a sample");
+    let surfaces = done["surfaces"]
+        .as_array()
+        .expect("ChannelsOutput::Done carries surfaces");
+
+    let legacy = surfaces
+        .iter()
+        .find(|binding| binding["address"] == "#legacy-alerts")
+        .expect("the sample carries the legacy binding");
+    assert!(
+        legacy
+            .get("warning")
+            .and_then(serde_json::Value::as_str)
+            .is_some(),
+        "the legacy row must carry a string warning: {legacy}"
+    );
+
+    let valid = surfaces
+        .iter()
+        .find(|binding| binding["address"] == "C0EXAMPLE1")
+        .expect("the sample carries the valid binding");
+    assert!(
+        valid.get("warning").is_none(),
+        "the valid row must omit the warning field: {valid}"
     );
 }
 

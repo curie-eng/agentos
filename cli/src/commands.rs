@@ -3006,6 +3006,32 @@ pub enum ChannelsOutput {
     },
 }
 
+const CHANNEL_BINDING_NEVER_RESOLVES_WARNING: &str =
+    "mentions match on the channel ID, not the name, so this binding never resolves";
+
+#[derive(Serialize)]
+struct ChannelBindingPresentation<'a> {
+    kind: &'a str,
+    address: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<&'static str>,
+}
+
+fn channel_binding_never_resolves(kind: &str, address: &str) -> bool {
+    kind == "slack" && address.trim_start().starts_with('#')
+}
+
+fn channel_binding_presentation(
+    binding: &crate::api::ChannelBinding,
+) -> ChannelBindingPresentation<'_> {
+    ChannelBindingPresentation {
+        kind: &binding.kind,
+        address: &binding.address,
+        warning: channel_binding_never_resolves(&binding.kind, &binding.address)
+            .then_some(CHANNEL_BINDING_NEVER_RESOLVES_WARNING),
+    }
+}
+
 impl crate::ui::CliOutput for ChannelsOutput {
     fn to_json(&self) -> serde_json::Value {
         match self {
@@ -3014,14 +3040,21 @@ impl crate::ui::CliOutput for ChannelsOutput {
                 agent,
                 channels,
                 changed,
-            } => serde_json::json!({
-                "agent": agent,
-                // Delegated to `Serialize` rather than hand-picked: a
-                // hand-projection could drop a field and would need its own
-                // `emits` declaration for the emit-parity gate (cli/CLAUDE.md).
-                "surfaces": serde_json::to_value(channels).unwrap_or(serde_json::Value::Null),
-                "changed": changed,
-            }),
+            } => {
+                let surfaces = channels
+                    .iter()
+                    .map(channel_binding_presentation)
+                    .collect::<Vec<_>>();
+                serde_json::json!({
+                    "agent": agent,
+                    // Serialize each CLI presentation row wholesale. The raw
+                    // API mirror remains unchanged while this output adds its
+                    // optional, derived warning without hand-projecting fields.
+                    "surfaces": serde_json::to_value(surfaces)
+                        .unwrap_or(serde_json::Value::Null),
+                    "changed": changed,
+                })
+            }
         }
     }
 
@@ -3044,6 +3077,14 @@ impl crate::ui::CliOutput for ChannelsOutput {
                         .join(", ")
                 };
                 ui.payload(&format!("surfaces for {agent}{verb}: {bound}"));
+                for channel in channels {
+                    if channel_binding_never_resolves(&channel.kind, &channel.address) {
+                        ui.warn(&format!(
+                            "{}:{}: {CHANNEL_BINDING_NEVER_RESOLVES_WARNING}",
+                            channel.kind, channel.address
+                        ));
+                    }
+                }
             }
         }
     }
@@ -6713,7 +6754,7 @@ pub async fn observability(open: bool) -> Result<crate::observability::Observabi
 /// and never routes -- a silently dead binding. Fail the deploy up front
 /// instead.
 fn validate_channel_binding(kind: &str, address: &str) -> Result<()> {
-    if kind == "slack" && address.trim_start().starts_with('#') {
+    if channel_binding_never_resolves(kind, address) {
         return Err(crate::exit::usage(format!(
             "slack channel {address:?} is a name, not an ID: real Slack events carry the \
              channel ID (e.g. C0EXAMPLE1) and the worker routes on it, so a #name binding \
