@@ -34,6 +34,7 @@ import dataclasses
 import importlib.util
 import json
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -85,15 +86,21 @@ def readback() -> ModuleType:
     return _load_script("released_upgrade_readback", READBACK_SCRIPT)
 
 
-def _direction(gate: ModuleType, candidate_ref: str) -> Any:
-    matching = [
-        direction
-        for direction in gate.SELF_TEST_DIRECTIONS
-        if direction.candidate_ref == candidate_ref
-    ]
+def _direction(
+    gate: ModuleType,
+    description: str,
+    predicate: Callable[[Any], bool],
+) -> Any:
+    """The single direction matching `predicate`, or a failure naming the count.
+
+    Every caller wants EXACTLY one row, so the count assertion lives here rather
+    than at each call site: a table that grew a second matching direction fails
+    loudly instead of silently handing back the first match.
+    """
+
+    matching = [row for row in gate.SELF_TEST_DIRECTIONS if predicate(row)]
     assert len(matching) == 1, (
-        f"expected exactly one direction with candidate ref {candidate_ref}, "
-        f"got {len(matching)}"
+        f"expected exactly one direction {description}, got {len(matching)}"
     )
     return matching[0]
 
@@ -122,35 +129,37 @@ def test_direction_is_a_frozen_record_of_refs_expectation_and_markers(
 
 def test_exactly_one_direction_pins_a_read_back_failure(gate: ModuleType) -> None:
     """#1914's reproduction: v0.6.2 upgrades cleanly to v0.7.3 and still fails."""
-    read_back = [
-        direction
-        for direction in gate.SELF_TEST_DIRECTIONS
-        if direction.expect_failure_phase == "read-back"
-    ]
+    read_back = _direction(
+        gate,
+        "expecting a read-back failure",
+        lambda row: row.expect_failure_phase == "read-back",
+    )
 
-    assert len(read_back) == 1
-    assert read_back[0].released_ref == "v0.6.2"
-    assert read_back[0].candidate_ref == "v0.7.3"
+    assert read_back.released_ref == "v0.6.2"
+    assert read_back.candidate_ref == "v0.7.3"
 
 
 def test_exactly_one_direction_must_pass_cleanly(gate: ModuleType) -> None:
     """The must-PASS direction. Without it the self test only knows how to fail."""
-    passing = [
-        direction
-        for direction in gate.SELF_TEST_DIRECTIONS
-        if direction.expect_failure_phase is None
-    ]
+    passing = _direction(
+        gate,
+        "that must pass cleanly",
+        lambda row: row.expect_failure_phase is None,
+    )
 
-    assert len(passing) == 1
-    assert passing[0].released_ref == "v0.6.2"
-    assert passing[0].candidate_ref == "v0.8.0"
+    assert passing.released_ref == "v0.6.2"
+    assert passing.candidate_ref == "v0.8.0"
 
 
 def test_the_1706_collision_direction_is_retained_with_all_three_markers(
     gate: ModuleType,
 ) -> None:
     """#1706's coverage is EXTENDED here, never replaced."""
-    direction = _direction(gate, "v0.7.0-rc.1")
+    direction = _direction(
+        gate,
+        "with candidate ref v0.7.0-rc.1",
+        lambda row: row.candidate_ref == "v0.7.0-rc.1",
+    )
 
     assert direction.released_ref == "v0.6.2"
     assert direction.expect_failure_phase == "candidate upgrade"
@@ -386,6 +395,15 @@ def _agent_channels_columns(gate: ModuleType) -> tuple[Any, ...]:
     )
 
 
+def _routed_agent(gate: ModuleType) -> Any:
+    """The one fixture row that carries an approval route."""
+    return next(
+        agent
+        for agent in gate.SEED_FIXTURE
+        if agent.approval_route_address is not None
+    )
+
+
 def test_legacy_column_branch_writes_every_address_into_curie_agents(
     gate: ModuleType,
 ) -> None:
@@ -438,11 +456,7 @@ def test_legacy_branch_seeds_the_pre_0034_approval_route_shape(
         )
     )
 
-    routed = next(
-        agent
-        for agent in gate.SEED_FIXTURE
-        if agent.approval_route_address is not None
-    )
+    routed = _routed_agent(gate)
     assert "approval_routes" in rendered
     assert "channel" in rendered
     assert routed.approval_route_address in rendered
@@ -459,23 +473,10 @@ def test_agent_channels_branch_seeds_the_post_0034_approval_route_shape(
         )
     )
 
-    routed = next(
-        agent
-        for agent in gate.SEED_FIXTURE
-        if agent.approval_route_address is not None
-    )
+    routed = _routed_agent(gate)
     assert "approval_routes" in rendered
     assert "resolution" in rendered
     assert routed.approval_route_address in rendered
-
-
-def _routed_agent(gate: ModuleType) -> Any:
-    """The one fixture row that carries an approval route."""
-    return next(
-        agent
-        for agent in gate.SEED_FIXTURE
-        if agent.approval_route_address is not None
-    )
 
 
 def _legacy_route_json(gate: ModuleType) -> str:

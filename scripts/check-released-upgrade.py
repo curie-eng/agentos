@@ -45,6 +45,22 @@ COMMIT_PATTERN = re.compile(r"^[0-9a-f]+$")
 # imports, not the assertions themselves.
 READBACK_SCRIPT = REPO_ROOT / "scripts" / "released_upgrade_readback.py"
 
+# The six phase names, in the order `_upgrade_pair` walks them. Each one is a
+# THREE-way coupling -- it is printed in a banner the marker checks read, it is
+# what a `PairResult` reports, and `SELF_TEST_DIRECTIONS.expect_failure_phase`
+# names it -- so they are constants rather than literals hand-synced across the
+# module. The strings themselves are load-bearing and must not be reworded.
+RELEASED_UPGRADE_PHASE = "released upgrade"
+RELEASED_HEAD_CHECK_PHASE = "released head check"
+SEED_PHASE = "seed"
+CANDIDATE_UPGRADE_PHASE = "candidate upgrade"
+CANDIDATE_HEAD_CHECK_PHASE = "candidate head check"
+READBACK_PHASE = "read-back"
+
+# One alembic phase, as `_upgrade_pair` walks it:
+# (phase name, tree, ref, commit, alembic arguments).
+_AlembicPhase = tuple[str, Path, str, str, tuple[str, ...]]
+
 
 @dataclass(frozen=True)
 class SelfTestDirection:
@@ -75,7 +91,7 @@ SELF_TEST_DIRECTIONS: tuple[SelfTestDirection, ...] = (
     SelfTestDirection(
         released_ref="v0.6.2",
         candidate_ref="v0.7.0-rc.1",
-        expect_failure_phase="candidate upgrade",
+        expect_failure_phase=CANDIDATE_UPGRADE_PHASE,
         markers=(
             "asyncpg.exceptions.UndefinedTableError",
             'relation "curie.agent_channels" does not exist',
@@ -88,7 +104,7 @@ SELF_TEST_DIRECTIONS: tuple[SelfTestDirection, ...] = (
         # which makes it a clean pin on the read path rather than on migrations.
         released_ref="v0.6.2",
         candidate_ref="v0.7.3",
-        expect_failure_phase="read-back",
+        expect_failure_phase=READBACK_PHASE,
         markers=("C-0a1b2c3d", "is not a Slack channel ID"),
     ),
     SelfTestDirection(
@@ -288,13 +304,21 @@ def _check_postgres() -> None:
     )
 
 
-def _database_command(sql: str, *, database_name: str = "postgres") -> list[str]:
+def _database_command(
+    sql: str,
+    *,
+    database_name: str = "postgres",
+    flags: tuple[str, ...] = (),
+) -> list[str]:
     """psql into `database_name`, defaulting to the maintenance database.
 
     The default keeps every pre-#2098 caller (`_reset_database`, `_cleanup`)
     byte-for-byte identical: DROP/CREATE DATABASE cannot be issued from inside
     the database being dropped. The seed is the only caller that needs the
     SCRATCH database, and it is the reason this parameter exists.
+
+    `flags` is spliced in ahead of `-v`, so the default empty tuple leaves those
+    callers' argv unchanged; `_scratch_query` is the only caller that passes it.
     """
 
     return _compose_command(
@@ -306,6 +330,7 @@ def _database_command(sql: str, *, database_name: str = "postgres") -> list[str]
         "postgres",
         "-d",
         database_name,
+        *flags,
         "-v",
         "ON_ERROR_STOP=1",
         "-c",
@@ -321,22 +346,7 @@ def _scratch_query(database_name: str, sql: str) -> str:
     """
 
     return _checked_output(
-        _compose_command(
-            "exec",
-            "-T",
-            "postgres",
-            "psql",
-            "-U",
-            "postgres",
-            "-d",
-            database_name,
-            "-t",
-            "-A",
-            "-v",
-            "ON_ERROR_STOP=1",
-            "-c",
-            sql,
-        ),
+        _database_command(sql, database_name=database_name, flags=("-t", "-A")),
         description=f"querying scratch database {database_name}",
     )
 
@@ -359,7 +369,13 @@ def _add_worktree(path: Path, commit: str, *, label: str) -> None:
     )
 
 
-def _alembic_command(tree: Path, *arguments: str) -> list[str]:
+def _tree_command(tree: Path, *arguments: str) -> list[str]:
+    """Resolve an executable's dependencies from the tree under judgement.
+
+    Every phase that runs code runs it this way, so `uv` builds the environment
+    from `<tree>`'s own lockfile rather than from HEAD's.
+    """
+
     return [
         "uv",
         "run",
@@ -368,9 +384,69 @@ def _alembic_command(tree: Path, *arguments: str) -> list[str]:
         str(tree),
         "--directory",
         str(tree / "apps" / "api"),
-        "alembic",
         *arguments,
     ]
+
+
+def _alembic_command(tree: Path, *arguments: str) -> list[str]:
+    return _tree_command(tree, "alembic", *arguments)
+
+
+def _readback_command(tree: Path, *arguments: str) -> list[str]:
+    """Run HEAD's read-back runner inside `tree`'s environment.
+
+    It shares `_alembic_command`'s `_tree_command` prefix because it is the same
+    trick: resolve the executable's dependencies from the tree under judgement.
+    The inversion here is that the SCRIPT is HEAD's (`READBACK_SCRIPT`, never
+    `tree`'s copy) while the `curie_api` it imports is the tree's -- one fixed
+    assertion harness pointed at whichever read models we are judging.
+    """
+
+    return _tree_command(tree, "python", str(READBACK_SCRIPT), *arguments)
+
+
+def _run_in_tree(
+    command: list[str],
+    *,
+    database_url: str,
+    phase: str,
+    ref: str,
+    commit: str,
+) -> CommandResult:
+    """Announce a phase, run it against the scratch database, echo its output.
+
+    Both code-running phase families go through here so neither can drift off
+    the other's contract: banner, copied environment plus `DATABASE_URL`, and
+    stderr folded into stdout.
+
+    The output has to come back combined AND echoed -- `_run_self_test` pins
+    markers against it, and a marker that landed on a stderr stream the caller
+    never captured is a marker that silently stops defending anything.
+
+    Only `DATABASE_URL` is added to the environment. `curie_api` was verified to
+    import with nothing else set at v0.7.3, v0.8.0 and HEAD; a candidate that
+    needs more would fail here loudly rather than skip the phase.
+    """
+
+    print(f"=== {phase}: {ref} ({commit}) ===", flush=True)
+    environment = os.environ.copy()
+    environment["DATABASE_URL"] = database_url
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=REPO_ROOT,
+            env=environment,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    except OSError as exc:
+        raise GateError(f"could not run {phase}: {exc}") from exc
+    output = completed.stdout or ""
+    if output:
+        print(output, end="" if output.endswith("\n") else "\n")
+    return CommandResult(completed.returncode, output)
 
 
 def _run_alembic(
@@ -382,50 +458,13 @@ def _run_alembic(
     commit: str,
     arguments: tuple[str, ...],
 ) -> CommandResult:
-    print(f"=== {phase}: {ref} ({commit}) ===", flush=True)
-    environment = os.environ.copy()
-    environment["DATABASE_URL"] = database_url
-    try:
-        completed = subprocess.run(
-            _alembic_command(tree, *arguments),
-            cwd=REPO_ROOT,
-            env=environment,
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-    except OSError as exc:
-        raise GateError(f"could not run {phase}: {exc}") from exc
-    output = completed.stdout or ""
-    if output:
-        print(output, end="" if output.endswith("\n") else "\n")
-    return CommandResult(completed.returncode, output)
-
-
-def _readback_command(tree: Path, *arguments: str) -> list[str]:
-    """Run HEAD's read-back runner inside `tree`'s environment.
-
-    The `uv run --frozen --project <tree> --directory <tree>/apps/api` prefix is
-    `_alembic_command`'s, verbatim, because it is the same trick: resolve the
-    executable's dependencies from the tree under judgement. The inversion here
-    is that the SCRIPT is HEAD's (`READBACK_SCRIPT`, never `tree`'s copy) while
-    the `curie_api` it imports is the tree's -- one fixed assertion harness
-    pointed at whichever read models we are judging.
-    """
-
-    return [
-        "uv",
-        "run",
-        "--frozen",
-        "--project",
-        str(tree),
-        "--directory",
-        str(tree / "apps" / "api"),
-        "python",
-        str(READBACK_SCRIPT),
-        *arguments,
-    ]
+    return _run_in_tree(
+        _alembic_command(tree, *arguments),
+        database_url=database_url,
+        phase=phase,
+        ref=ref,
+        commit=commit,
+    )
 
 
 def _run_readback(
@@ -436,43 +475,20 @@ def _run_readback(
     ref: str,
     commit: str,
 ) -> CommandResult:
-    """Follow `_run_alembic`'s contract exactly: banner, env, combined output.
-
-    The output has to come back combined and echoed for the same reason the
-    alembic phases do -- `_run_self_test` pins markers against it, and a marker
-    that landed on a stderr stream the caller never captured is a marker that
-    silently stops defending anything.
-
-    Only `DATABASE_URL` is added to the environment. `curie_api` was verified to
-    import with nothing else set at v0.7.3, v0.8.0 and HEAD; a candidate that
-    needs more would fail here loudly rather than skip the phase.
-    """
-
     arguments: list[str] = []
     for agent in SEED_FIXTURE:
+        # Both options are `action="append"` on the runner side, so pairing them
+        # per agent builds the same two lists a pass per option would.
         arguments.extend(("--expect-agent", agent.name))
-    for agent in SEED_FIXTURE:
         arguments.extend(("--expect-address", agent.address))
 
-    print(f"=== {phase}: {ref} ({commit}) ===", flush=True)
-    environment = os.environ.copy()
-    environment["DATABASE_URL"] = database_url
-    try:
-        completed = subprocess.run(
-            _readback_command(tree, *arguments),
-            cwd=REPO_ROOT,
-            env=environment,
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-    except OSError as exc:
-        raise GateError(f"could not run {phase}: {exc}") from exc
-    output = completed.stdout or ""
-    if output:
-        print(output, end="" if output.endswith("\n") else "\n")
-    return CommandResult(completed.returncode, output)
+    return _run_in_tree(
+        _readback_command(tree, *arguments),
+        database_url=database_url,
+        phase=phase,
+        ref=ref,
+        commit=commit,
+    )
 
 
 def _sql_literal(value: str) -> str:
@@ -498,7 +514,13 @@ def _introspect_columns(database_name: str) -> tuple[ColumnInfo, ...]:
         database_name,
         "SELECT table_name, column_name, is_nullable, "
         "coalesce(column_default, '') FROM information_schema.columns "
-        "WHERE table_schema = 'curie' ORDER BY table_name, ordinal_position",
+        "WHERE table_schema = 'curie' "
+        # The two tables the fixture can write. Narrowing here rather than in the
+        # consumers keeps `_verify_mandatory_columns` honest: it only reports a
+        # mandatory column for a table the branch actually fills, so every other
+        # table's rows were dead weight the caller had to filter back out.
+        "AND table_name IN ('agents', 'agent_channels') "
+        "ORDER BY table_name, ordinal_position",
     )
     columns: list[ColumnInfo] = []
     for line in rows.splitlines():
@@ -596,6 +618,34 @@ def _detect_approval_route_era(released_tree: Path) -> str:
     return APPROVAL_ROUTE_ERA_LEGACY
 
 
+def _route_literal(agent: SeedAgent, era: str) -> str:
+    """Render one `agents.approval_routes` value in `era`'s storage shape.
+
+    Both eras are reachable from `_plan_seed_statements`' `agent_channels`
+    branch; only the legacy one is reachable from its pre-0021 `slack_channel`
+    branch, which passes the era explicitly rather than inferring it.
+    """
+
+    if agent.approval_route_address is None:
+        return _json_literal(None)
+    if era == APPROVAL_ROUTE_ERA_SPLIT:
+        # Post-0034 storage: already the split shape.
+        return _json_literal(
+            {
+                "deploy": {
+                    "resolution": {
+                        "kind": agent.kind,
+                        "address": agent.approval_route_address,
+                    }
+                }
+            }
+        )
+    # Pre-0034 storage; migration 0034 (#1460) rewrites it into the split
+    # `resolution` shape on the way up with NO validation, which is what carries
+    # the legacy address into the read models.
+    return _json_literal({"deploy": {"channel": agent.approval_route_address}})
+
+
 def _plan_seed_statements(
     columns: tuple[ColumnInfo, ...],
     *,
@@ -639,14 +689,9 @@ def _plan_seed_statements(
             # `slack_channel` present means pre-0021, and 0021 precedes 0034, so
             # this branch is pre-0034 by construction: the `slack_channel` +
             # `split` quadrant cannot exist and nothing here is conditioned on
-            # the era. Pre-0034 storage; migration 0034 (#1460) rewrites it into
-            # the split `resolution` shape on the way up with NO validation,
-            # which is what carries the legacy address into the read models.
-            route = _json_literal(
-                None
-                if agent.approval_route_address is None
-                else {"deploy": {"channel": agent.approval_route_address}}
-            )
+            # the era. The legacy era is therefore passed as a constant, NOT
+            # forwarded from `approval_route_era`.
+            route = _route_literal(agent, APPROVAL_ROUTE_ERA_LEGACY)
             statements.append(
                 "INSERT INTO curie.agents (id, name, slack_channel, "
                 "approval_routes)\n"
@@ -663,28 +708,15 @@ def _plan_seed_statements(
                 "agent_channels": {"id", "agent_id", "kind", "address"},
             },
         )
-        split_era = approval_route_era == APPROVAL_ROUTE_ERA_SPLIT
         for agent in SEED_FIXTURE:
-            if agent.approval_route_address is None:
-                route_value: dict[str, Any] | None = None
-            elif split_era:
-                # Post-0034 storage: already the split shape.
-                route_value = {
-                    "deploy": {
-                        "resolution": {
-                            "kind": agent.kind,
-                            "address": agent.approval_route_address,
-                        }
-                    }
-                }
-            else:
-                # Post-0021 but pre-0034 (v0.7.0..v0.7.3). The channel binding
-                # already lives in `agent_channels`, yet the route is still the
-                # legacy `channel` shape -- seeding `resolution` here writes a
-                # fixture the released code could never have produced, and the
-                # candidate's 0034 rejects it as an unknown legacy key (#2098).
-                route_value = {"deploy": {"channel": agent.approval_route_address}}
-            route = _json_literal(route_value)
+            # This is the branch that can reach BOTH eras, so the era is
+            # forwarded rather than assumed. Post-0021 but pre-0034
+            # (v0.7.0..v0.7.3) is the quadrant that only exists here: the channel
+            # binding already lives in `agent_channels`, yet the route is still
+            # the legacy `channel` shape -- seeding `resolution` there writes a
+            # fixture the released code could never have produced, and the
+            # candidate's 0034 rejects it as an unknown legacy key (#2098).
+            route = _route_literal(agent, approval_route_era)
             # One statement per agent, so the binding is written in the same
             # transaction as the row it belongs to and the new id never has to be
             # round-tripped back through psql. `endpoint` / `adapter` are left
@@ -731,11 +763,14 @@ def _seed_released_database(
     statements = _plan_seed_statements(
         columns, approval_route_era=approval_route_era
     )
-    for statement in statements:
-        _checked_output(
-            _database_command(statement, database_name=database_name),
-            description=f"seeding the released database {database_name}",
-        )
+    # One psql invocation for the whole plan, not one per row. psql runs a
+    # multi-statement simple query inside a single implicit transaction, so the
+    # fixture now lands whole or not at all -- and a PARTIAL seed is worse than
+    # none, because the read-back would then pass on whichever rows survived.
+    _checked_output(
+        _database_command(";\n".join(statements), database_name=database_name),
+        description=f"seeding the released database {database_name}",
+    )
     print(
         f"Seeded {len(statements)} released-shaped agent rows into "
         f"{database_name}."
@@ -753,32 +788,32 @@ def _upgrade_pair(
     candidate_ref: str,
     candidate_commit: str,
 ) -> PairResult:
-    released_phases = (
+    released_phases: tuple[_AlembicPhase, ...] = (
         (
-            "released upgrade",
+            RELEASED_UPGRADE_PHASE,
             released_tree,
             released_ref,
             released_commit,
             ("upgrade", "head"),
         ),
         (
-            "released head check",
+            RELEASED_HEAD_CHECK_PHASE,
             released_tree,
             released_ref,
             released_commit,
             ("current", "--check-heads"),
         ),
     )
-    candidate_phases = (
+    candidate_phases: tuple[_AlembicPhase, ...] = (
         (
-            "candidate upgrade",
+            CANDIDATE_UPGRADE_PHASE,
             candidate_tree,
             candidate_ref,
             candidate_commit,
             ("upgrade", "head"),
         ),
         (
-            "candidate head check",
+            CANDIDATE_HEAD_CHECK_PHASE,
             candidate_tree,
             candidate_ref,
             candidate_commit,
@@ -786,17 +821,30 @@ def _upgrade_pair(
         ),
     )
 
-    for phase, tree, ref, commit, arguments in released_phases:
-        result = _run_alembic(
-            tree,
-            database_url=database_url,
-            phase=phase,
-            ref=ref,
-            commit=commit,
-            arguments=arguments,
-        )
-        if result.returncode != 0:
-            return PairResult(phase, result.returncode, result.output)
+    def _walk(phases: tuple[_AlembicPhase, ...]) -> PairResult | None:
+        """Run phases in order; return the FIRST failure, or None if all passed.
+
+        Returning `None` for success rather than a `PairResult` is what keeps the
+        caller's control flow honest: only a failing phase short-circuits the
+        pair, and the pair's real verdict is the read-back at the end.
+        """
+
+        for phase, tree, ref, commit, arguments in phases:
+            result = _run_alembic(
+                tree,
+                database_url=database_url,
+                phase=phase,
+                ref=ref,
+                commit=commit,
+                arguments=arguments,
+            )
+            if result.returncode != 0:
+                return PairResult(phase, result.returncode, result.output)
+        return None
+
+    failure = _walk(released_phases)
+    if failure is not None:
+        return failure
 
     # The seed sits HERE, between the two lines' phases, because that is the only
     # window in which the released schema is what an operator's database actually
@@ -808,30 +856,22 @@ def _upgrade_pair(
     # released ref can sit between them (#2098).
     _seed_released_database(
         database_name,
-        phase="seed",
+        phase=SEED_PHASE,
         approval_route_era=_detect_approval_route_era(released_tree),
     )
 
-    for phase, tree, ref, commit, arguments in candidate_phases:
-        result = _run_alembic(
-            tree,
-            database_url=database_url,
-            phase=phase,
-            ref=ref,
-            commit=commit,
-            arguments=arguments,
-        )
-        if result.returncode != 0:
-            return PairResult(phase, result.returncode, result.output)
+    failure = _walk(candidate_phases)
+    if failure is not None:
+        return failure
 
     readback = _run_readback(
         candidate_tree,
         database_url=database_url,
-        phase="read-back",
+        phase=READBACK_PHASE,
         ref=candidate_ref,
         commit=candidate_commit,
     )
-    return PairResult("read-back", readback.returncode, readback.output)
+    return PairResult(READBACK_PHASE, readback.returncode, readback.output)
 
 
 def _cleanup(
