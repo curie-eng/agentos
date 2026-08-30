@@ -84,7 +84,7 @@ fi
 
 is_test_path() {
   case "$1" in
-    apps/*/tests/* | packages/*/tests/* | cli/tests/* | charts/curie/ci/*)
+    apps/*/tests/* | packages/*/tests/* | runner/tests/* | cli/tests/* | charts/curie/ci/*)
       return 0
       ;;
     *)
@@ -115,7 +115,7 @@ selector_kind=
 rust_target=
 rust_test=
 case "$selector" in
-  apps/*/tests/*.py::* | packages/*/tests/*.py::*)
+  apps/*/tests/*.py::* | packages/*/tests/*.py::* | runner/tests/*.py::*)
     selector_file=${selector%%::*}
     if [[ "$selector" == "$selector_file" || -z "${selector#*::}" ]]; then
       fail "unsupported selector: $selector"
