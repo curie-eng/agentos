@@ -21,8 +21,11 @@ import os
 import sys
 from pathlib import Path
 
+import anyio
 import pytest
 import yaml
+from mcp.server.fastmcp.exceptions import ToolError
+from mcp.shared.memory import create_connected_server_and_client_session as _connect
 
 _MODULE_NAME = "sre_bot_self_upgrade_server"
 _SERVER_PY = Path(__file__).parent / "server.py"
@@ -151,9 +154,9 @@ def test_it_refuses_while_an_upgrade_is_still_running(tmp_path, monkeypatch):
     seen = {}
     running = {"items": [{"metadata": {"name": "in-flight"}, "status": {"active": 1}}]}
     monkeypatch.setattr(srv, "_client", lambda: _FakeClient(seen, jobs=(200, running)))
-    result = json.loads(srv.upgrade_self())
-    assert result["ok"] is False
-    assert "in-flight" in result["summary"]
+    with pytest.raises(ToolError) as excinfo:
+        srv.upgrade_self()
+    assert "in-flight" in str(excinfo.value)
     assert "post_body" not in seen
 
 
@@ -170,17 +173,18 @@ def test_an_unset_cronjob_refuses_before_reaching_the_api(tmp_path, monkeypatch)
     srv = _load(tmp_path, cronjob="")
     seen = {}
     monkeypatch.setattr(srv, "_client", lambda: _FakeClient(seen))
-    result = json.loads(srv.upgrade_self())
-    assert result["ok"] is False
+    with pytest.raises(ToolError) as excinfo:
+        srv.upgrade_self()
+    assert "SELF_UPGRADE_CRONJOB is not set" in str(excinfo.value)
     assert seen == {}
 
 
 def test_a_missing_cronjob_says_it_is_not_installed(tmp_path, monkeypatch):
     srv = _load(tmp_path)
     monkeypatch.setattr(srv, "_client", lambda: _FakeClient({}, cronjob=(404, {})))
-    result = json.loads(srv.upgrade_self())
-    assert result["ok"] is False
-    assert "not installed" in result["summary"]
+    with pytest.raises(ToolError) as excinfo:
+        srv.upgrade_self()
+    assert "not installed" in str(excinfo.value)
 
 
 @pytest.mark.parametrize("status", [401, 403])
@@ -188,9 +192,9 @@ def test_permission_errors_name_the_missing_verb(tmp_path, monkeypatch, status):
     """So the reader fixes RBAC instead of retrying a call that cannot succeed."""
     srv = _load(tmp_path)
     monkeypatch.setattr(srv, "_client", lambda: _FakeClient({}, create=(status, {})))
-    result = json.loads(srv.upgrade_self())
-    assert result["ok"] is False
-    assert "create on jobs" in result["summary"]
+    with pytest.raises(ToolError) as excinfo:
+        srv.upgrade_self()
+    assert "create on jobs" in str(excinfo.value)
 
 
 def test_prior_is_null_even_when_it_succeeds(tmp_path, monkeypatch):
@@ -252,22 +256,84 @@ def test_insecure_skip_tls_verify_is_refused(tmp_path):
             "users": [{"user": {"token": "upgrade-token"}}],
         },
     )
-    assert "insecure-skip-tls-verify" in srv._client()
+    with pytest.raises(ToolError) as excinfo:
+        srv._client()
+    assert "insecure-skip-tls-verify" in str(excinfo.value)
 
 
 def test_missing_kubeconfig_is_a_sentence_not_a_traceback(tmp_path):
     srv = _load(tmp_path)
     srv.KUBECONFIG = str(tmp_path / "absent")
-    result = json.loads(srv.upgrade_self())
-    assert result["ok"] is False
-    assert "not mounted" in result["summary"]
+    with pytest.raises(ToolError) as excinfo:
+        srv.upgrade_self()
+    assert "not mounted" in str(excinfo.value)
 
 
-def test_the_token_never_appears_in_a_returned_message(tmp_path, monkeypatch):
+def test_the_token_never_appears_in_an_error_message(tmp_path, monkeypatch):
     """A refusal is posted back into Slack; a credential must not ride along."""
     srv = _load(tmp_path)
     monkeypatch.setattr(srv, "_client", lambda: _FakeClient({}, cronjob=(500, {})))
-    assert "upgrade-token" not in srv.upgrade_self()
+    with pytest.raises(ToolError) as excinfo:
+        srv.upgrade_self()
+    assert "upgrade-token" not in str(excinfo.value)
+
+
+# --- The MCP wire distinguishes a refusal from a started upgrade -------------
+
+
+def _call_tool(srv, name, args):
+    """Call one tool through the real MCP path and return its CallToolResult."""
+
+    async def go():
+        async with _connect(srv.mcp._mcp_server) as client:
+            return await client.call_tool(name, args)
+
+    return anyio.run(go)
+
+
+def test_an_active_job_refusal_and_a_started_upgrade_have_different_error_flags(
+    tmp_path, monkeypatch
+):
+    srv = _load(tmp_path)
+    refused_seen = {}
+    running = {"items": [{"metadata": {"name": "in-flight"}, "status": {"active": 1}}]}
+    monkeypatch.setattr(
+        srv,
+        "_client",
+        lambda: _FakeClient(refused_seen, jobs=(200, running)),
+    )
+
+    refused = _call_tool(srv, "upgrade_self", {})
+    assert refused.isError is True
+    assert "post_body" not in refused_seen
+    refusal_text = refused.content[0].text
+
+    # OBSERVED against the pinned mcp==1.28.1. FastMCP builds this prefix at
+    # mcp/server/fastmcp/tools/base.py:117
+    # (`raise ToolError(f"Error executing tool {self.name}: {e}") from e`) and
+    # puts str(e) in the result as its only text content. Pin the whole string so
+    # an SDK change cannot silently reshape what operators and agents read.
+    assert refusal_text == (
+        "Error executing tool upgrade_self: refusing: upgrade job in-flight is "
+        "still running. Wait for it to finish rather than starting a second one "
+        "-- two overlapping runs race on creating the version."
+    )
+
+    started_seen = {}
+    monkeypatch.setattr(srv, "_client", lambda: _FakeClient(started_seen))
+    started = _call_tool(srv, "upgrade_self", {})
+    assert started.isError is False
+    assert not started.content[0].text.startswith("Error executing tool")
+    payload = json.loads(started.content[0].text)
+    assert payload["ok"] is True
+    assert payload["prior"] is None
+    assert payload["post"] == {"job": "sre-bot-self-upgrade-abc12"}
+    assert payload["target"] == {
+        "kind": "Job",
+        "namespace": "curie",
+        "name": "sre-bot-self-upgrade-abc12",
+    }
+    assert refused.isError != started.isError
 
 
 def test_the_fake_client_cannot_accept_a_call_the_real_one_rejects():

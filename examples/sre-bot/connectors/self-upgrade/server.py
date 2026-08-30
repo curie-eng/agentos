@@ -69,6 +69,7 @@ from typing import Any
 import httpx
 import yaml
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 log = logging.getLogger("self-upgrade-mcp")
@@ -105,11 +106,11 @@ UPGRADE = ToolAnnotations(
 
 
 def _reply(ok, summary, prior=None, post=None, target=None):
-    """Every return path is this shape, so a caller never has to guess.
+    """Return the successful Job-start result as structured JSON.
 
     Matches the scale connector's reply so a reader of either learns one shape.
-    `prior` is null on every path here, including the successful one, because
-    this action has no recorded prior state to restore.
+    `prior` is null because this action has no recorded prior state to restore.
+    Refusals raise `ToolError` and carry `isError: true` on the MCP wire.
     """
     return json.dumps(
         {"ok": ok, "summary": summary, "prior": prior, "post": post, "target": target},
@@ -117,8 +118,8 @@ def _reply(ok, summary, prior=None, post=None, target=None):
     )
 
 
-def _client() -> Any:
-    """Build an httpx client from the mounted kubeconfig, or return a string.
+def _client() -> httpx.Client:
+    """Build an httpx client from the mounted kubeconfig, or raise `ToolError`.
 
     Parsed here rather than pulling in the full Kubernetes client, so the failure
     modes are ones this file can explain. Kept deliberately identical to the
@@ -130,9 +131,11 @@ def _client() -> Any:
         with open(KUBECONFIG, encoding="utf-8") as fh:
             cfg = yaml.safe_load(fh)
     except FileNotFoundError:
-        return f"no kubeconfig at {KUBECONFIG}: the upgrade credential is not mounted"
+        raise ToolError(
+            f"no kubeconfig at {KUBECONFIG}: the upgrade credential is not mounted"
+        ) from None
     except (OSError, yaml.YAMLError) as exc:
-        return f"could not read the kubeconfig at {KUBECONFIG}: {exc}"
+        raise ToolError(f"could not read the kubeconfig at {KUBECONFIG}: {exc}") from exc
 
     try:
         cluster = cfg["clusters"][0]["cluster"]
@@ -140,7 +143,7 @@ def _client() -> Any:
         server = cluster["server"]
         token = user["token"]
     except (KeyError, IndexError, TypeError):
-        return "kubeconfig is missing a cluster server or a user token"
+        raise ToolError("kubeconfig is missing a cluster server or a user token") from None
 
     # Both CA shapes. Handling only the file-path form left `verify` silently
     # True, so httpx checked the cluster certificate against the system trust
@@ -155,17 +158,21 @@ def _client() -> Any:
         try:
             pem = base64.b64decode(ca_data).decode("ascii")
         except (ValueError, TypeError, UnicodeDecodeError) as exc:
-            return f"kubeconfig certificate-authority-data is not a valid base64 PEM: {exc}"
+            raise ToolError(
+                f"kubeconfig certificate-authority-data is not a valid base64 PEM: {exc}"
+            ) from exc
         ctx = ssl.create_default_context()
         try:
             ctx.load_verify_locations(cadata=pem)
         except ssl.SSLError as exc:
-            return f"kubeconfig certificate-authority-data is not a usable CA certificate: {exc}"
+            raise ToolError(
+                f"kubeconfig certificate-authority-data is not a usable CA certificate: {exc}"
+            ) from exc
         verify = ctx
     elif ca_path:
         verify = ca_path
     elif cluster.get("insecure-skip-tls-verify"):
-        return (
+        raise ToolError(
             "kubeconfig sets insecure-skip-tls-verify; refusing to write over an "
             "unverified connection"
         )
@@ -245,48 +252,43 @@ def upgrade_self() -> str:
 
     The reply is a JSON object: `ok`, `summary`, `prior`, `post`, `target`.
     `prior` is always null, because this action has no prior state to restore.
+    Refusals are tool errors rather than successful JSON replies.
     """
 
     if not CRONJOB:
-        return _reply(
-            False,
+        raise ToolError(
             "refusing: SELF_UPGRADE_CRONJOB is not set, so this connector does not "
-            "know which upgrade to start. Setting it is an operator change.",
+            "know which upgrade to start. Setting it is an operator change."
         )
 
     namespace = _namespace()
     if not namespace:
-        return _reply(
-            False,
+        raise ToolError(
             "refusing: could not determine a namespace to act in. Set "
-            "SELF_UPGRADE_NAMESPACE.",
+            "SELF_UPGRADE_NAMESPACE."
         )
 
     client = _client()
-    if isinstance(client, str):
-        return _reply(False, client)
 
     with client:
         path = f"/apis/batch/v1/namespaces/{namespace}/cronjobs/{CRONJOB}"
         try:
             existing = client.get(path)
         except httpx.HTTPError as exc:
-            return _reply(False, f"could not reach the API server: {exc}")
+            raise ToolError(f"could not reach the API server: {exc}") from exc
         if existing.status_code == 404:
-            return _reply(
-                False,
+            raise ToolError(
                 f"no CronJob {namespace}/{CRONJOB}. The upgrade job is not installed "
-                "on this cluster; installing it is an operator change.",
+                "on this cluster; installing it is an operator change."
             )
         if existing.status_code in (401, 403):
-            return _reply(
-                False,
+            raise ToolError(
                 f"the upgrade identity may not read {namespace}/{CRONJOB} "
-                f"({existing.status_code}). It needs get on that cronjob.",
+                f"({existing.status_code}). It needs get on that cronjob."
             )
         if existing.status_code >= 400:
-            return _reply(
-                False, f"could not read {namespace}/{CRONJOB}: {existing.status_code}"
+            raise ToolError(
+                f"could not read {namespace}/{CRONJOB}: {existing.status_code}"
             )
 
         try:
@@ -295,19 +297,17 @@ def upgrade_self() -> str:
             template = {}
         job_spec = template.get("spec")
         if not job_spec:
-            return _reply(
-                False,
+            raise ToolError(
                 f"{namespace}/{CRONJOB} has no jobTemplate.spec to run; the CronJob "
-                "is malformed.",
+                "is malformed."
             )
 
         running = _active_job(client, namespace)
         if running:
-            return _reply(
-                False,
+            raise ToolError(
                 f"refusing: upgrade job {running} is still running. Wait for it to "
                 "finish rather than starting a second one -- two overlapping runs "
-                "race on creating the version.",
+                "race on creating the version."
             )
 
         # generateName, so the server picks a unique suffix and two approvals
@@ -344,17 +344,14 @@ def upgrade_self() -> str:
                 f"/apis/batch/v1/namespaces/{namespace}/jobs", json=body
             )
         except httpx.HTTPError as exc:
-            return _reply(False, f"could not reach the API server: {exc}")
+            raise ToolError(f"could not reach the API server: {exc}") from exc
         if created.status_code in (401, 403):
-            return _reply(
-                False,
+            raise ToolError(
                 f"the upgrade identity may not create Jobs in {namespace} "
-                f"({created.status_code}). It needs create on jobs.",
+                f"({created.status_code}). It needs create on jobs."
             )
         if created.status_code >= 400:
-            return _reply(
-                False, f"the upgrade job was refused: {created.status_code}"
-            )
+            raise ToolError(f"the upgrade job was refused: {created.status_code}")
         try:
             name = (created.json().get("metadata") or {}).get("name") or "(unnamed)"
         except (ValueError, AttributeError):
