@@ -1,17 +1,21 @@
-"""Offline unit tests for the pure soak helpers.
+"""Offline unit tests for the pure sandbox-resilience helpers.
 
 These run with no cluster and no dev stack: they exercise only the pure
-functions in ``harness.py`` (``thread_hash``, ``unique_marker``, ``final_frame``,
-``collected_text``, ``detect_cross_talk``). They are deliberately not gated by
-``CURIE_SOAK`` so the harness logic stays covered in default CI paths when the
-suite is run by explicit path.
+functions in ``resilience_harness.py`` (``thread_hash``, ``unique_marker``,
+``final_frame``, ``collected_text``, ``detect_cross_talk``). They are deliberately
+not gated by ``CURIE_SANDBOX_E2E`` so the harness logic stays covered in default
+CI collection.
 """
 
 from __future__ import annotations
 
 import hashlib
+import sys
+from pathlib import Path
 
-from harness import (
+sys.path.insert(0, str(Path(__file__).parent))
+
+from resilience_harness import (  # noqa: E402
     collected_text,
     detect_cross_talk,
     final_frame,

@@ -40,7 +40,6 @@ before editing there, in addition to this file.
 | `apps/ui` | React (Vite + TS) | [`apps/ui/CLAUDE.md`](apps/ui/CLAUDE.md) |
 | `cli` | Rust (clap + tokio) | [`cli/CLAUDE.md`](cli/CLAUDE.md) |
 | `charts/curie` | Helm | [`charts/curie/CLAUDE.md`](charts/curie/CLAUDE.md) |
-| `tests/soak` | Python | -- |
 
 The Python packages are one **uv workspace** (root `pyproject.toml`); ruff,
 mypy, and pytest are configured at the root and run across all members.
@@ -502,7 +501,7 @@ not carried as a note.
 
 ## Cluster verification
 
-Chart, sandbox, and soak verification need a real cluster; a disposable local
+Chart and sandbox-substrate resilience verification need a real cluster; a disposable local
 `kind` or `k3s` cluster works. The cheap default for a chart/sandbox/bundle
 change is `curie dev chart-runtime-e2e` (implemented by
 `scripts/chart-runtime-e2e.sh`): it installs a trimmed slice, runs the
