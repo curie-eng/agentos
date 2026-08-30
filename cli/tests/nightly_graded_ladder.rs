@@ -12,7 +12,7 @@
 //!   auto-selects `OPENROUTER_BASE_URL`; no `ANTHROPIC_BASE_URL` is set for this
 //!   provider, and the real key travels as `ANTHROPIC_API_KEY` inside the
 //!   runner -- the CLI-facing input for that credential is `CURIE_CREDENTIALS`.
-//! - `cli/src/ops.rs:529-532`: `--allow-egress-host` takes the provider
+//! - `cli/src/ops/providers.rs` (`parse_egress_provider` / `provider_egress_hosts`): `--allow-egress-host` takes the provider
 //!   KEYWORD `openrouter` (resolved to `openrouter.ai` at install time), never
 //!   a bare hostname like `openrouter.ai` itself.
 //!
@@ -356,7 +356,8 @@ fn nightly_covers_both_the_skill_local_and_cluster_tier_sets() {
 // --- Assertion group 2: cluster graded install -----------------------------
 
 /// The cluster install must open egress to the `openrouter` provider keyword
-/// (resolved to `openrouter.ai` at install time by `cli/src/ops.rs:529-532`),
+/// (resolved to `openrouter.ai` at install time by `cli/src/ops/providers.rs`'s
+/// `parse_egress_provider` / `provider_egress_hosts`),
 /// and the workflow must never contain the sealed-install flag anywhere --
 /// proving the cluster rung is graded, not fake.
 #[test]

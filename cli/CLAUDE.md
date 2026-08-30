@@ -140,7 +140,7 @@ Helm and the deployed release with `up`, `status`, `down`, `comms`, `message`,
   `cluster message`, `cluster deploy`, and every operator verb
   (`local up`, `local status`, `local down`, `local comms`, `cluster up`, `cluster status`, `cluster down`, `cluster comms`) reach a Valkey, API, or cluster by design.
 - **The operator verbs are a thin wrapper; the chart stays the source of
-  truth.** `cluster up`/`cluster status`/`cluster down` (`src/ops.rs`),
+  truth.** `cluster up`/`cluster status`/`cluster down` (`src/ops/`),
   `cluster comms` (`src/comms.rs`), and `local <up|down|status>`
   (`src/local.rs`) shell out to
   `helm`/`kubectl`/`docker compose` and never re-derive what a values file

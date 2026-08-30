@@ -1191,7 +1191,7 @@ falling back to an empty credential.
 **Known gap, tracked in #1801.** None of these 16 new fields are yet covered
 by the CLI's preserved-values mechanism (the same one `COMMS_MANAGED_KEYS` and
 `GITHUB_APP_MANAGED_KEYS` give the Slack tokens and the GitHub App identity in
-`cli/src/ops.rs`). A plain `curie cluster up` runs a full `helm upgrade
+`cli/src/ops/up.rs`). A plain `curie cluster up` runs a full `helm upgrade
 --install` with no `--reuse-values`, so it resets any values key it does not
 explicitly re-supply -- set one of these fields today and keep it declared in
 the values file you pass to every `cluster up`/`helm upgrade`, the same way you
