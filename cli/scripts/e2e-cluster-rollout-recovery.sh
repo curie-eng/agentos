@@ -354,6 +354,23 @@ for pod in json.load(sys.stdin).get("items",[]):
     return 1
 }
 
+wait_worker_pod_gone() {
+    local pod="$1" budget="$2" started=$SECONDS resource
+    while true; do
+        if ! resource="$(kubectl -n "$NAMESPACE" get pod "$pod" \
+            --ignore-not-found -o name)"; then
+            echo "error: could not observe worker pod $pod during rollout" >&2
+            return 1
+        fi
+        [[ -n "$resource" ]] || return 0
+        if (( SECONDS - started >= budget )); then
+            echo "error: worker pod $pod remained after its stop gate opened" >&2
+            return 1
+        fi
+        sleep 0.25
+    done
+}
+
 worker_generation() {
     kubectl -n "$NAMESPACE" get deployment "$WORKER_DEPLOYMENT" \
         -o jsonpath='{.metadata.generation}'
@@ -609,10 +626,16 @@ echo "first invocation kept worker generation=$BASE_GENERATION observedGeneratio
 echo "=== deliberate termination: recover a real PEL entry promptly ==="
 kubectl -n "$NAMESPACE" patch configmap "$GATE_CONFIGMAP" --type=merge \
     -p '{"data":{"ready":"open","stop":"open"}}' >/dev/null
+# The projected ConfigMap can lag behind the Deployment update. Open the old
+# pod's stop gate directly so it cannot keep consuming during preStop after the
+# intentional rollout, then wait for that exact pod to disappear before
+# selecting the recovery consumer.
+wait_exec_touch "$OLD_POD" /tmp/curie-e2e-stop 30
 TRUST_ORIGIN="http://${CURIE_E2E_LISTEN_HOST}"
 kubectl -n "$NAMESPACE" set env "deployment/$WORKER_DEPLOYMENT" \
     "CURIE_SLACK_TRUSTED_ORIGINS=$TRUST_ORIGIN" >/dev/null
 kubectl -n "$NAMESPACE" rollout status "deployment/$WORKER_DEPLOYMENT" --timeout=300s >/dev/null
+wait_worker_pod_gone "$OLD_POD" 120
 if [[ -n "$PRE_FIX_WORKER_IMAGE" ]]; then
     kubectl -n "$NAMESPACE" set image "deployment/$WORKER_DEPLOYMENT" \
         "worker=${PRE_FIX_WORKER_IMAGE}:${PRE_FIX_WORKER_TAG}" >/dev/null
