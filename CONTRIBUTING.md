@@ -72,6 +72,13 @@ CI (`.github/workflows/ci.yaml`) runs the same commands below. Run the ones for
 the area you touched before opening a PR. Scope test runs to what you changed;
 CI covers the rest.
 
+A PR whose `uv.lock` changes the `claude-agent-sdk` entry also triggers a
+separate, conditional check
+(`.github/workflows/sdk-approval-gate.yaml`) that runs a live approval-gate
+turn against a real model. It needs an `OPENROUTER_API_KEY` configured in the
+repo, not in your fork, so it can go red for reasons outside your diff; ping a
+maintainer rather than trying to fix it yourself.
+
 **Python (all packages, from the repo root):**
 
 ```bash

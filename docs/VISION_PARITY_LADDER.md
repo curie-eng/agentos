@@ -16,6 +16,20 @@ Local brings up the development compose stack, deploys the same bundle, sends a 
 
 Cluster deploys the bundle and messages an already installed release. The nightly cluster job uses kind, and a live green has the same finalized reply and fake sentinel checks as local. [Ladder script](../cli/scripts/e2e-ladder.sh) [Nightly workflow](../.github/workflows/nightly-graded-ladder.yaml) [ADR 0081](adr/0081-nightly-graded-parity-ladder.md)
 
+## Approval gate
+
+Skill rung 1 also carries a live-only case, `case_live_approval_gate_denies`
+(issue #2094): it gates `Bash` through `CURIE_APPROVAL_REQUIRED_TOOLS`, sends a
+prompt that provokes exactly that tool, and asserts a real Claude Agent SDK
+dispatch against a real model denies the call and the turn parks
+`awaiting-approval` within a bounded time, with the gated command never
+running. It is skipped under a fake run: `FakeModelSession` cannot exhibit the
+failure modes this case proves absent. A separate PR check,
+[SDK approval-gate live workflow](../.github/workflows/sdk-approval-gate.yaml),
+runs this same case on any pull request whose `uv.lock` changes the
+`claude-agent-sdk` entry, so a dependency bump that could reopen that failure
+class is checked before merge rather than only at the next nightly run.
+
 ## What runs nightly
 
 GitHub Actions runs the core skill, local, and cluster rungs against a real OpenRouter model at 08:00 UTC. Local release is separate companion coverage of the generated release compose path, not a fourth core rung. [Nightly workflow](../.github/workflows/nightly-graded-ladder.yaml) [Ladder script](../cli/scripts/e2e-ladder.sh)
