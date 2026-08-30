@@ -58,6 +58,12 @@
       "version": "1.0"
     },
     {
+      "result": "ClusterRollbackOutput",
+      "kind": "CliOutput",
+      "schema": "cluster-rollback.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "ClusterStatusOutput",
       "kind": "CliOutput",
       "schema": "cluster-status.schema.json",
@@ -97,7 +103,7 @@
       "result": "DiffOutput",
       "kind": "CliOutput",
       "schema": "diff.schema.json",
-      "version": "2.1"
+      "version": "2.2"
     },
     {
       "result": "DoctorOutput",
@@ -247,7 +253,7 @@
       "result": "SecretsListOutput",
       "kind": "CliOutput",
       "schema": "secrets.schema.json",
-      "version": "1.0"
+      "version": "1.1"
     },
     {
       "result": "SkillApprovalsOutput",

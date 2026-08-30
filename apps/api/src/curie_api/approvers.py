@@ -142,6 +142,58 @@ class InvalidApprovers:
         )
 
 
+class UnboundRoute:
+    """The approval named a route whose binding is gone: a set admitting nobody.
+
+    A pending approval that named a route is resolvable only through that
+    route's binding (ADR-0123). Once the binding is gone there is no set left to
+    resolve and no fallback applies: falling through to the card channel would
+    swap a server-enforced approver set for a caller-asserted ``actor_channel``
+    check on an approval that is ALREADY pending, which is exactly the
+    escalation ADR-0123 closes. An absent binding is therefore NOT the same fact
+    as a binding present with no ``approvers`` block -- that one is still ADR-0034
+    AC4's zero-setup default and still resolves through channel membership.
+
+    Like ``InvalidApprovers``, this is modelled as a set rather than a special
+    path: it reports ``undetermined`` and the authorizer's existing fail-closed
+    rule denies it, so nothing in ``authorizer.py`` needs to know this set
+    exists. ``undetermined`` and not ``member=False`` because the clicker is not
+    outside a set that was evaluated -- the configuration stopped them, and
+    telling them otherwise sends them arguing with a policy that is not there.
+    """
+
+    # NEW vocabulary added by ADR-0123, not a rename: see the audit-vocabulary
+    # note above. The four strings that ship in rows already on main stay
+    # byte-identical; an operator reading the append-only trail must be able to
+    # tell "the route you named is gone" from "the approvers block does not
+    # parse", so this refusal gets its own name rather than borrowing one.
+    audit_name = "UnboundRouteBinding"
+
+    def __init__(self, route: str) -> None:
+        self._route = route
+
+    async def contains(
+        self, actor: str, actor_channel: str | None
+    ) -> MembershipVerdict:
+        # The reason names the CLASS of failure and the evidence carries the
+        # route, following ``SlackUserGroupMembers._undetermined``: the reason is
+        # echoed to whoever clicked, while the evidence lands on the audit row
+        # where ADR-0123 requires the missing binding to be named.
+        return MembershipVerdict(
+            member=False,
+            undetermined=True,
+            reason=(
+                "could not verify approvers: this approval's route is no longer "
+                "bound, so the approvers it named cannot be resolved"
+            ),
+            evidence={
+                "kind": "route_binding",
+                "route": self._route,
+                "binding_present": False,
+            },
+        )
+
+
 class ApproverSetSelector(Protocol):
     """Pick the approver set an approval's route binding calls for.
 

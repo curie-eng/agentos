@@ -20,6 +20,7 @@ from .models import (
     McpServer,
     PluginManifest,
     SkillFrontmatter,
+    ToolPolicy,
     TriggerDeclaration,
 )
 
@@ -34,6 +35,7 @@ _MODELS = (
     TriggerDeclaration,
     ApprovalPolicy,
     ApprovalGate,
+    ToolPolicy,
 )
 
 SCHEMA_ID = "https://curietech.ai/schemas/plugin-format.schema.json"

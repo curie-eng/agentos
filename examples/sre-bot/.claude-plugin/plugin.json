@@ -38,6 +38,10 @@
       {
         "gate": "mcp__k8s-scale__scale_deployment",
         "route": "sre-approvals"
+      },
+      {
+        "gate": "mcp__self-upgrade__upgrade_self",
+        "route": "sre-approvals"
       }
     ]
   }

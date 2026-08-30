@@ -77,6 +77,9 @@ class MailState:
         self.threads: dict[str, list[dict[str, Any]]] = {}
         self.replies: list[tuple[str, str]] = []  # (in_reply_to_message_id, text)
         self.list_calls = 0
+        # time.monotonic() per list call, so the retry CADENCE is observable at
+        # the real external seam rather than inferred from the adapter's logs.
+        self.list_times: list[float] = []
         self.list_queries: list[dict[str, str]] = []  # the parsed query of each list call
         self.list_authorization: list[str] = []
         self.thread_calls = 0
@@ -93,6 +96,23 @@ class MailState:
         self.fail_next_list: int | None = None
         self.fail_next_body: int | None = None
         self.fail_next_thread: int | None = None
+        # The body a NON-ZERO injected failure answers with, when a test needs
+        # to choose it. Provider-authored failure bodies are exactly what the
+        # adapter must never render into a log, and putting recognisable content
+        # in one is the only way a test can prove it never does.
+        self.injected_body: dict[str, Any] | None = None
+        # N CONSECUTIVE transport failures on List Messages before answering
+        # normally, mirroring `IngressState.drop_next`. `fail_next_list` is
+        # one-shot and so cannot express a repeated outage, which is the whole
+        # subject of #2012: one dropped call is noise, a sustained one is the
+        # condition the poller has to slow down for.
+        self.drop_next_lists = 0
+        # The index into `list_times` of every list call answered with a dropped
+        # connection, so a test can judge the retry cadence by the gaps it KNOWS
+        # were failures rather than inferring them from elapsed time on a shared
+        # box, where a descheduled normal poll is indistinguishable from a
+        # backed-off one.
+        self.dropped_list_indexes: list[int] = []
         # Provider accepted the reply and exposed it in the thread, but the
         # HTTP response disappeared. Recovery must resolve this from the
         # provider-visible event witness rather than sending again.
@@ -266,7 +286,8 @@ class MailHandler(_JsonHandler):
         if failure == 0:
             self.close_connection = True  # a real transport failure
             return True
-        self._send(failure, {"detail": "injected provider failure"})
+        body = self.state.injected_body
+        self._send(failure, body if body is not None else {"detail": "injected provider failure"})
         return True
 
     def do_GET(self) -> None:
@@ -276,8 +297,15 @@ class MailHandler(_JsonHandler):
         if len(parts) == 4 and parts[3] == "messages":
             query = self._query()
             state.list_calls += 1
+            state.list_times.append(time.monotonic())
             state.list_queries.append(query)
             state.list_authorization.append(self.headers.get("Authorization") or "")
+            if state.drop_next_lists > 0:
+                state.drop_next_lists -= 1
+                # `list_times` was appended above, so this is that call's index.
+                state.dropped_list_indexes.append(len(state.list_times) - 1)
+                self.close_connection = True  # a real transport failure
+                return
             failure, state.fail_next_list = state.fail_next_list, None
             if self._injected(failure):
                 return

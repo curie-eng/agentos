@@ -22,7 +22,10 @@ crash before that attempt leaves the entry pending, so the next redelivery re-ru
 it -- an eval is never lost to a mid-run crash. A malformed payload cannot be
 processed on any redelivery, so it is logged and acked (a poison-pill drop). A
 missing/corrupt bundle or a provisioning failure is a failed run reported and
-acked, not a crash; a failing eval case is a failed count in the report.
+acked, not a crash; a failing eval case is a failed count in the report. A suite
+that outruns its ADR-0131 delivery deadline is the same shape: abandoned,
+reported as a failure, and acked -- a replacement inherits the SAME deadline, so
+re-running would only spend a budget that is already gone.
 """
 
 from __future__ import annotations
@@ -67,9 +70,12 @@ from ..binding import (
 )
 from ..bundle_store import BundleReader
 from ..config import WorkerConfig
+from ..consumer_liveness import ConsumerLivenessStore
+from ..delivery_lease import DeliveryLeaseStore, LeaseLostError
 from ..sandbox import SandboxSubstrate
 from ..sandbox.types import SandboxError
 from ..stream_consumer import DeliverySpec, ReadLoopSpec, StreamConsumer
+from ..upgrade_drain import UpgradeDrainGate
 from .models import EvalCaseResult, EvalOutcome, EvalRunResult, EvalScorer, EvalSuite
 from .recorder import LangfuseEvalRecorder
 from .run import run_eval_suite, sample_config_from_env
@@ -257,8 +263,28 @@ class EvalStreamConsumer(StreamConsumer):
         reporter: EvalReporter,
         recorder: LangfuseEvalRecorder,
         repo_lookup: Any,
+        leases: DeliveryLeaseStore | None = None,
+        drain: UpgradeDrainGate | None = None,
     ) -> None:
-        super().__init__(redis)
+        # ADR-0131: "runs and evals must share the lease implementation by
+        # construction. A fix on only one consumer lane is incomplete." The whole
+        # lifecycle is the shared base's; this lane only hands it the store.
+        #
+        # It deliberately wires NO ``on_lease_lost``: an eval suite has no single
+        # runner turn to interrupt through the kernel's bounded control path, so
+        # there is nothing for the callback to stop. Active cancellation on lease
+        # loss is the named follow-up (F2), and the residual is documented at
+        # ``_report`` below -- not papered over with a second interrupt mechanism.
+        # ``drain`` is the same pre-upgrade quiesce gate the runs lane takes
+        # (#2010), and for the same construction reason ADR-0131 gives above: a
+        # gate wired on only one lane is incomplete. An eval delivery holds a
+        # sandbox and a lease exactly as a turn does.
+        super().__init__(
+            redis,
+            leases=leases,
+            drain=drain,
+            liveness_store=ConsumerLivenessStore(redis),
+        )
         self._config = config
         self._bundles = bundle_store
         self._substrate = substrate
@@ -273,9 +299,11 @@ class EvalStreamConsumer(StreamConsumer):
         # many claims are being created/bound at the same time (default 1: the
         # next claim waits until the current one binds -- sequential-with-
         # backpressure), so a suite completes on one node instead of flooding it.
+        self._max_concurrent_claims = config.eval_max_concurrent_claims
         self._claim_slots = asyncio.Semaphore(config.eval_max_concurrent_claims)
+        self._inflight: set[asyncio.Task[None]] = set()
         # The reclaim/dead-letter knobs the shared base machinery reads; handler
-        # is the bound self._handle. The eval-specific dead_letter_log/logger stay
+        # is the tracked/shielded self._dispatch. The eval-specific log strings stay
         # eval-specific (logger curie_worker.eval.stream) so eval dead-letters
         # remain alert-free -- they are NOT unified with the runs-lane strings.
         self._delivery = DeliverySpec(
@@ -287,16 +315,16 @@ class EvalStreamConsumer(StreamConsumer):
             max_delivery=config.max_delivery,
             dead_letter_maxlen=config.dead_letter_maxlen,
             reclaim_min_idle_ms=config.reclaim_min_idle_ms,
-            # The eval read loop awaits ``_handle`` inline, so XINFO CONSUMERS
-            # idle tracks in-flight suite runtime rather than process liveness.
-            # Prompt reclaim here would steal a live eval after 15s. Use the
-            # entry-idle window instead; the shared helper still runs, and tests
-            # that need the fast path replace this field.
-            dead_consumer_idle_ms=config.reclaim_min_idle_ms,
+            # Eval can use the same prompt threshold as runs now that consumer
+            # idle is only a candidate filter and the independent alive lease is
+            # the liveness proof. Its lease refreshes through inline suite drain.
+            dead_consumer_idle_ms=config.dead_consumer_idle_ms,
+            heartbeat_ttl_ms=config.consumer_heartbeat_ttl_ms,
+            capability_ttl_ms=config.consumer_capability_ttl_ms,
             read_count=config.read_count,
             cap_scan_page=_EVAL_CAP_SCAN_PAGE,
             telemetry_source="eval",
-            handler=self._handle,
+            handler=self._dispatch,
             logger=logger,
             dead_letter_log="dead-lettered eval entry %s after %d deliveries (reason=%s) -> %s",
             dead_letter_fail_log="dead-lettering eval entry %s failed; left pending, not re-run",
@@ -327,7 +355,20 @@ class EvalStreamConsumer(StreamConsumer):
 
     async def run(self) -> None:
         await self.ensure_group()
-        await asyncio.gather(self._read_loop(), self._reclaim_loop())
+        await self._run_consumer_generation(
+            {
+                "read": self._read_loop,
+                "maintenance": self._reclaim_loop,
+                "prompt-reclaim": self._prompt_reclaim_loop,
+            }
+        )
+
+    def _generation_inflight_tasks(self) -> set[asyncio.Task[None]]:
+        return set(self._inflight)
+
+    def _reset_generation_resources(self) -> None:
+        self._inflight.clear()
+        self._claim_slots = asyncio.Semaphore(self._max_concurrent_claims)
 
     async def _read_loop(self) -> None:
         # count=1 is load-bearing, not a tunable: this consumer handles an entry
@@ -348,7 +389,7 @@ class EvalStreamConsumer(StreamConsumer):
                 connection_msg="eval stream read failed transiently; retrying: %s",
                 logger=logger,
             ),
-            self._handle,
+            self._dispatch,
         )
 
     async def _reclaim_loop(self) -> None:
@@ -356,12 +397,28 @@ class EvalStreamConsumer(StreamConsumer):
         them. Without this, an entry left pending by a crash before ``_ack``
         would sit in the group's PEL forever -- the at-least-once promise the
         ``_handle`` pending path relies on lives here."""
-        while not self._stop.is_set():
+        while not self._should_stop():
             try:
                 await self._reclaim_once()
             except Exception:
                 logger.exception("eval reclaim tick failed")
             await self._sleep_or_stop(self._config.reclaim_interval_s)
+
+    async def _dispatch(self, entry_id: str, fields: dict[str, str]) -> None:
+        """Track the inline eval handler so graceful stop can drain it alive."""
+
+        if entry_id in self._inflight_ids:
+            return
+        # Reserve before spawning so the read and reclaim producers cannot both
+        # pass the duplicate check in the same event-loop turn.
+        self._inflight_ids.add(entry_id)
+        task = asyncio.create_task(self._handle(entry_id, fields))
+        self._inflight.add(task)
+        task.add_done_callback(self._inflight.discard)
+        # The read/reclaim producer may be cancelled to stop new ownership, but
+        # graceful shutdown keeps this handler alive and the lifecycle drains it
+        # before deleting the consumer lease.
+        await asyncio.shield(task)
 
     async def _handle(self, entry_id: str, fields: dict[str, str]) -> None:
         # Eval jobs are their own lifecycle. Ignore any adjacent turn carrier so
@@ -378,61 +435,90 @@ class EvalStreamConsumer(StreamConsumer):
     async def _handle_entry(self, entry_id: str, fields: dict[str, str]) -> None:
         self._inflight_ids.add(entry_id)
         try:
-            try:
-                # The sanctioned tolerant decode: a newer API adding an optional
-                # field must not land in the poison-pill branch below, which
-                # would ack and DROP the job with no dead letter.
-                item = parse_eval_job(fields[STREAM_PAYLOAD_FIELD])
-            except Exception:
-                # Poison pill: unprocessable on any redelivery. Dead-letter it
-                # (not a bare ack) so the malformed entry is observable in the
-                # eval graveyard, matching the runs lane's unparseable path (#535).
-                logger.exception("malformed eval work item %s; dead-lettering as poison", entry_id)
+            # ADR-0131: the same fence the runs lane holds, in the same shared
+            # context manager. Placed inside the outer ``try`` and outside the
+            # inner one so the ``finally`` below still discards the in-flight id
+            # last, after the lease has been released.
+            async with self._delivery_lease(entry_id, fields) as lease:
+                if lease is None:
+                    # Leased elsewhere: return WITHOUT acking so the entry stays
+                    # pending for its true owner. A refusal is a normal early
+                    # return, never an exception.
+                    return
+                try:
+                    # The sanctioned tolerant decode: a newer API adding an optional
+                    # field must not land in the poison-pill branch below, which
+                    # would ack and DROP the job with no dead letter.
+                    item = parse_eval_job(fields[STREAM_PAYLOAD_FIELD])
+                except Exception:
+                    # Poison pill: unprocessable on any redelivery. Dead-letter it
+                    # (not a bare ack) so the malformed entry is observable in the
+                    # eval graveyard, matching the runs lane's unparseable path (#535).
+                    logger.exception(
+                        "malformed eval work item %s; dead-lettering as poison", entry_id
+                    )
+                    record_metric(
+                        "curie.eval.process",
+                        attributes={
+                            "service.name": "curie-worker",
+                            "source": "eval",
+                            "outcome": "failure",
+                        },
+                    )
+                    await self._dead_letter(
+                        entry_id, fields, reason="unparseable", delivery_count=1
+                    )
+                    return
+                try:
+                    result = await self._run_and_report(item, entry_id)
+                    logger.info("eval %s @ %s: %s", item.suite, item.sha, result.summary())
+                except Exception:
+                    # An unexpected error before the report attempt: leave pending so
+                    # the reclaim loop re-runs it (an eval must not be lost to a crash).
+                    logger.exception("eval processing failed for %s; left pending", entry_id)
+                    record_metric(
+                        "curie.eval.process",
+                        attributes={
+                            "service.name": "curie-worker",
+                            "source": "eval",
+                            "outcome": "failure",
+                        },
+                    )
+                    return
+                metric_outcome = (
+                    "plumbing"
+                    if result.results
+                    and all(row.outcome is EvalOutcome.PLUMBING_OK for row in result.results)
+                    else (
+                        "failure"
+                        if any(row.outcome is EvalOutcome.FAIL for row in result.results)
+                        else "success"
+                    )
+                )
                 record_metric(
                     "curie.eval.process",
                     attributes={
                         "service.name": "curie-worker",
                         "source": "eval",
-                        "outcome": "failure",
+                        "outcome": metric_outcome,
                     },
                 )
-                await self._dead_letter(entry_id, fields, reason="unparseable", delivery_count=1)
-                return
-            try:
-                result = await self._run_and_report(item, entry_id)
-                logger.info("eval %s @ %s: %s", item.suite, item.sha, result.summary())
-            except Exception:
-                # An unexpected error before the report attempt: leave pending so
-                # the reclaim loop re-runs it (an eval must not be lost to a crash).
-                logger.exception("eval processing failed for %s; left pending", entry_id)
-                record_metric(
-                    "curie.eval.process",
-                    attributes={
-                        "service.name": "curie-worker",
-                        "source": "eval",
-                        "outcome": "failure",
-                    },
-                )
-                return
-            metric_outcome = (
-                "plumbing"
-                if result.results
-                and all(row.outcome is EvalOutcome.PLUMBING_OK for row in result.results)
-                else (
-                    "failure"
-                    if any(row.outcome is EvalOutcome.FAIL for row in result.results)
-                    else "success"
-                )
-            )
-            record_metric(
-                "curie.eval.process",
-                attributes={
-                    "service.name": "curie-worker",
-                    "source": "eval",
-                    "outcome": metric_outcome,
-                },
-            )
-            await self._ack(entry_id)
+                try:
+                    # A stale owner may not ACK: the entry belongs to whoever
+                    # holds the fence now.
+                    lease.raise_if_lost()
+                except LeaseLostError:
+                    logger.warning(
+                        "refusing to ack eval entry %s: this owner lost the "
+                        "delivery lease mid-suite; leaving it pending",
+                        entry_id,
+                    )
+                    return
+                await self._ack(entry_id)
+                # Terminal acknowledgement removes the delivery STATE as well as
+                # the lease; the base's release drops only the lease. Best-effort:
+                # the ack above already happened.
+                await self._settle_delivery_best_effort(entry_id)
         finally:
             self._inflight_ids.discard(entry_id)
 
@@ -440,7 +526,9 @@ class EvalStreamConsumer(StreamConsumer):
         repo = await self._repo_lookup.repo_full_name(item.agent_id)
         loaded = await self._load_suite(item)
         if loaded is None:
-            return await self._report_failed(item, repo, "unresolvable suite/bundle")
+            return await self._report_failed(
+                item, repo, "unresolvable suite/bundle", stream_id=stream_id
+            )
 
         suite = loaded.suite
         model = self._eval_model(item)
@@ -464,45 +552,97 @@ class EvalStreamConsumer(StreamConsumer):
             )
             if self._recorder is not None:
                 await self._recorder.record(result)
-            await self._report(item, repo, result)
+            await self._report(item, repo, result, stream_id=stream_id)
             return result
 
         base_url, release_key, token = await self._acquire_target(item)
         if base_url is None:
-            return await self._report_failed(item, repo, "runner provisioning failed")
+            return await self._report_failed(
+                item, repo, "runner provisioning failed", stream_id=stream_id
+            )
         samples = sample_config_from_env(os.environ)
+        # ADR-0131 gives a delivery ONE overall deadline, and it covers the whole
+        # delivery -- not just the runs lane. Without this bound the eval lane
+        # acquires a lease, lets the shared heartbeat renew it indefinitely, and
+        # runs a suite that can outlive its own budget: the deadline would exist
+        # in Valkey and be enforced nowhere. Read AFTER provisioning on purpose,
+        # so the claim/bind wait is charged against the budget rather than gifted
+        # back. ``asyncio.timeout`` is used instead of plumbing a deadline through
+        # ``run_eval_suite``'s signature because cancellation genuinely STOPS the
+        # in-flight case (a parameter would only be advisory), and widening that
+        # frozen-ish run-layer API is a separate change.
+        deadline_s = self._remaining_budget_s(stream_id)
+        run_result: EvalRunResult | None = None
         try:
-            if loaded.scorer is None:
-                result = await run_eval_suite(
-                    suite,
-                    base_url=base_url,
-                    version=item.sha,
-                    recorder=self._recorder,
-                    token=token,
-                    model=model,
-                    fake=self._config.fake_model,
-                    samples=samples,
-                    stream_id=stream_id,
-                )
-            else:
-                result = await run_eval_suite(
-                    suite,
-                    base_url=base_url,
-                    version=item.sha,
-                    recorder=self._recorder,
-                    token=token,
-                    model=model,
-                    fake=self._config.fake_model,
-                    scorer=loaded.scorer,
-                    samples=samples,
-                    stream_id=stream_id,
-                )
+            async with asyncio.timeout(deadline_s):
+                if loaded.scorer is None:
+                    run_result = await run_eval_suite(
+                        suite,
+                        base_url=base_url,
+                        version=item.sha,
+                        recorder=self._recorder,
+                        token=token,
+                        model=model,
+                        fake=self._config.fake_model,
+                        samples=samples,
+                        stream_id=stream_id,
+                    )
+                else:
+                    run_result = await run_eval_suite(
+                        suite,
+                        base_url=base_url,
+                        version=item.sha,
+                        recorder=self._recorder,
+                        token=token,
+                        model=model,
+                        fake=self._config.fake_model,
+                        scorer=loaded.scorer,
+                        samples=samples,
+                        stream_id=stream_id,
+                    )
+        except TimeoutError:
+            # Terminal for THIS delivery, not a crash to be reclaimed: the
+            # deadline is inherited by a replacement (``HSETNX`` on
+            # ``deadline_ms``), so re-running would only exhaust it again. Report
+            # the failure -- through the fenced path below -- and let the caller
+            # ack. Logged before the release so the deadline is named even if
+            # teardown is slow.
+            logger.error(
+                "eval %s @ %s exceeded its delivery deadline (%.1fs of budget "
+                "remained when the suite started); abandoning the suite",
+                item.suite,
+                item.sha,
+                deadline_s if deadline_s is not None else -1.0,
+            )
         finally:
             if release_key is not None:
                 await asyncio.to_thread(self._substrate.release, release_key)
 
-        await self._report(item, repo, result)
-        return result
+        if run_result is None:
+            return await self._report_failed(
+                item, repo, "delivery deadline exceeded", stream_id=stream_id
+            )
+        await self._report(item, repo, run_result, stream_id=stream_id)
+        return run_result
+
+    def _remaining_budget_s(self, stream_id: str) -> float | None:
+        """Seconds left of this delivery's one deadline, or ``None`` when this
+        lane is unfenced.
+
+        Never negative: an already-spent budget must bound the run at zero rather
+        than wrap into "no deadline", which is how a budget check turns into the
+        opposite of itself. ``None`` (no recorded lease) maps to
+        ``asyncio.timeout(None)`` -- unbounded, exactly the pre-ADR-0131
+        behaviour a base-only consumer had. That is the UNFENCED lane: the shared
+        base registers a lease in ``_held_leases`` only when there is a real one
+        to register, never the permissive sentinel, so a consumer built with no
+        lease store records nothing here and its suite is bounded by nothing --
+        as it was before the ADR.
+        """
+        lease = self._held_leases.get(stream_id)
+        if lease is None:
+            return None
+        return max(0.0, lease.remaining_s())
 
     async def _load_suite(self, item: EvalJob) -> _LoadedEvalSuite | None:
         if item.bundle_ref is None:
@@ -617,13 +757,65 @@ class EvalStreamConsumer(StreamConsumer):
         )
         return env
 
-    async def _report_failed(self, item: EvalJob, repo: str | None, reason: str) -> EvalRunResult:
+    async def _report_failed(
+        self, item: EvalJob, repo: str | None, reason: str, *, stream_id: str
+    ) -> EvalRunResult:
+        # ``stream_id`` is threaded in rather than carried on the result: the
+        # failure DTO below has no run to attach one to, and the fence is
+        # resolved from this argument (see ``_report``).
         logger.error("eval %s @ %s failed: %s", item.suite, item.sha, reason)
         result = EvalRunResult(version=item.sha, suite=item.suite, results=[])
-        await self._report(item, repo, result)
+        await self._report(item, repo, result, stream_id=stream_id)
         return result
 
-    async def _report(self, item: EvalJob, repo: str | None, result: EvalRunResult) -> None:
+    async def _report(
+        self, item: EvalJob, repo: str | None, result: EvalRunResult, *, stream_id: str
+    ) -> None:
+        # ADR-0131, the eval lane's one user-visible terminal effect. A suite
+        # whose fence has already moved must not publish a second report for a
+        # job a replacement now owns, so the loss is checked immediately before
+        # the send rather than only at the ack.
+        #
+        # The fence is resolved from the ``stream_id`` ARGUMENT, never from
+        # ``result.stream_id``. The failure paths above build an
+        # ``EvalRunResult`` with no run behind it, so that field is ``None`` on
+        # exactly the "unresolvable bundle" / "provisioning failed" / "deadline
+        # exceeded" cases -- the Valkey/K8s-adjacent failures most likely to
+        # coincide with a lease loss. Looking the lease up by an absent field
+        # would miss, and a missing lease read as "no fence" is a fence that
+        # FAILS OPEN. Resolution is therefore explicit and total.
+        #
+        # This closes MOST of the window, not all of it: a lease lost between
+        # this check and the platform's apply still produces a report that the
+        # replacement will duplicate. Eval reports are therefore an explicitly
+        # AT-LEAST-ONCE boundary -- the kind ADR-0131 requires be named rather
+        # than papered over -- and closing it needs eval-report idempotency at
+        # the platform API, tracked as follow-up F2.
+        lease = self._held_leases.get(stream_id)
+        if lease is None and self._leases is not None:
+            # A fenced lane whose lease cannot be resolved for this entry: this
+            # owner cannot prove it still holds authority, so it does not
+            # publish. Fail closed, the same posture the lease store itself
+            # takes. The ``self._leases is not None`` half is what keeps an
+            # UNFENCED lane publishing: the base records no lease at all for it
+            # (it registers only real ones, never the permissive sentinel), and
+            # with no lease store there is no fence to fail closed on.
+            logger.warning(
+                "not reporting eval %s @ %s: no delivery lease is recorded for "
+                "entry %s, so this owner cannot prove it still holds the fence",
+                item.suite,
+                item.sha,
+                stream_id,
+            )
+            return
+        if lease is not None and lease.lost.is_set():
+            logger.warning(
+                "not reporting eval %s @ %s: this owner lost the delivery lease "
+                "mid-suite and a replacement owns the job",
+                item.suite,
+                item.sha,
+            )
+            return
         # The frozen EvalReport carries passed_count/total only, and the API turns
         # it into a GitHub commit status. That shape cannot express "ran but was
         # never graded": 0/N posts a red that did not happen and N/N posts the

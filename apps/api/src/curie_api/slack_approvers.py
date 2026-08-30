@@ -13,6 +13,12 @@ usergroup IDs and ``C...`` channel IDs: the binding format is Slack's shape, so
 the code that reads it is Slack-aware and belongs on this side of the port. That
 is what lets ``authorizer.py`` be pure policy with no Slack in it at all.
 
+Selection also decides the ABSENT-binding case (ADR-0123), and the set it
+returns for it lives in ``approvers.py`` rather than here: "this route is not
+bound" is a fact about ``agents.approval_routes``, not about Slack, so
+``approvers.UnboundRoute`` is provider-neutral even though only a Slack-aware
+selector can tell that case apart from a binding that declares no approvers.
+
 The evidence asymmetry is deliberate and worth stating plainly. ``SlackChannelMembers``
 performs no lookup: the click's channel IS the proof, because Slack only renders
 a card (and only accepts clicks on it) for members of the channel it posted in,
@@ -28,7 +34,13 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from .approvers import ApproverSet, ExplicitUsers, InvalidApprovers, MembershipVerdict
+from .approvers import (
+    ApproverSet,
+    ExplicitUsers,
+    InvalidApprovers,
+    MembershipVerdict,
+    UnboundRoute,
+)
 from .models import Approval
 from .schemas import ApprovalApprovers
 from .usergroups import GroupMembershipSource, UserGroupLookupError
@@ -152,6 +164,11 @@ class SlackApproverSetSelector:
     Holds the ``GroupMembershipSource`` so it can hand it to a user-group set;
     None when no bot token is configured, which is a normal Slack-free deployment
     (a route bound to a group then fails closed at resolve time).
+
+    The no-approvers case is a three-way split, not a single fallback
+    (ADR-0123): a binding present with no ``approvers`` block and a routeless
+    approval both keep channel membership, while an approval that NAMED a route
+    with no binding to read is refused outright.
     """
 
     def __init__(self, group_client: GroupMembershipSource | None) -> None:
@@ -159,7 +176,15 @@ class SlackApproverSetSelector:
 
     def __call__(self, approval: Approval, binding: Any) -> ApproverSet:
         """Precedence, exactly as issue #420 states it: ``users`` wins over
-        ``group``, which wins over channel membership. No I/O happens here."""
+        ``group``, which wins over channel membership. No I/O happens here.
+
+        Channel membership is not the universal fallback it once was: an
+        approval that named a route whose binding is absent is refused outright
+        rather than falling through to it (ADR-0123). That split keys on
+        ``binding is None``, NOT on the parsed approvers block -- ``_parse_approvers``
+        returns ``(None, None)`` for both "no binding at all" and "binding
+        present, no approvers declared", and conflating those two is the defect.
+        """
 
         approvers, spec_error = _parse_approvers(binding)
         if spec_error is not None:
@@ -169,8 +194,25 @@ class SlackApproverSetSelector:
             # what the binding was trying to say.
             return InvalidApprovers(spec_error)
         if approvers is None:
-            # No approvers declared: the card channel's members are the approvers,
-            # exactly as before #420 (AC4).
+            if approval.route and binding is None:
+                # The approval NAMED a route and there is no binding left to
+                # read (ADR-0123). Not the same fact as a binding that declares
+                # no approvers: falling through would let whoever rewrote the
+                # route map swap a server-enforced approver set for a
+                # caller-asserted ``actor_channel`` check on an approval that is
+                # ALREADY pending, which is the whole escalation.
+                #
+                # ``binding is None`` and not ``not binding``: a route bound to
+                # ``{}`` is BOUND, the operator just declared nothing, and only
+                # ``None`` is absence. The truthiness test on ``approval.route``
+                # is deliberate too -- ``crud.get_approval_route_binding``
+                # returns early on ``not approval.route``, so keying on
+                # ``is not None`` here would refuse a ``route=""`` approval that
+                # crud has already classified as routeless.
+                return UnboundRoute(approval.route)
+            # A binding that is present and declares no approvers, or an approval
+            # that named no route at all: the card channel's members are the
+            # approvers, exactly as before #420 (AC4).
             return SlackChannelMembers(approval.card_channel or approval.reply_channel)
         if approvers.users:
             return ExplicitUsers(approvers.users)

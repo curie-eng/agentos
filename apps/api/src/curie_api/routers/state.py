@@ -14,12 +14,13 @@ platform key.
 """
 
 import enum
+import hashlib
 import json
 import uuid
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import crud, sandbox_token
@@ -156,6 +157,57 @@ def _json_size(value: Any) -> int:
     return len(json.dumps(value, separators=(",", ":")).encode("utf-8"))
 
 
+# Advisory-lock class for the per-agent namespace-count cap (#933). The
+# TWO-argument ``pg_advisory_xact_lock(int4, int4)`` form is used deliberately:
+# Postgres keeps the two-int4 lock space entirely separate from the
+# one-argument bigint space, so this can never collide with a
+# ``pg_advisory_lock(<bigint>)`` taken anywhere else -- including the test-only
+# write gates in apps/api/tests/, which use the one-arg form. The number is the
+# issue.
+_NAMESPACE_LOCK_CLASS = 933
+
+
+def _namespace_lock_key(agent_id: uuid.UUID) -> int:
+    """A stable int4 advisory-lock key for one agent (#933).
+
+    Deterministic in every process and across restarts, which is the whole
+    point: Python's builtin ``hash()`` is PER-PROCESS randomized (PYTHONHASHSEED),
+    so two API workers would derive different keys for the same agent and the
+    lock would silently stop serializing anything. Hence hashlib. blake2b over
+    the UUID's 16 raw bytes, truncated to a signed int4 because
+    ``pg_advisory_xact_lock(int4, int4)`` takes int4s.
+
+    A collision between two DIFFERENT agents is SAFE: it only makes those two
+    agents serialize their new-namespace creations against each other for the
+    few statements the lock is held. It can never produce a wrong verdict,
+    because every query in the critical section -- the existence probe, the
+    re-check, and the ``count(distinct namespace)`` -- is still filtered by
+    ``agent_id``.
+    """
+    digest = hashlib.blake2b(agent_id.bytes, digest_size=4).digest()
+    return int.from_bytes(digest, "big", signed=True)
+
+
+async def _namespace_exists(
+    session: AsyncSession, agent_id: uuid.UUID, scope: str | None, namespace: str
+) -> bool:
+    """Does this agent already have any row in ``namespace``? (#933)
+
+    Extracted so the unlocked pre-check and the re-check under the advisory lock
+    are provably the same query; a future edit cannot let them drift apart.
+    """
+    found = await session.scalar(
+        select(WorkflowStateEntry.namespace)
+        .where(
+            WorkflowStateEntry.agent_id == agent_id,
+            WorkflowStateEntry.binding_scope == scope,
+            WorkflowStateEntry.namespace == namespace,
+        )
+        .limit(1)
+    )
+    return found is not None
+
+
 async def _enforce_caps(
     session: AsyncSession,
     agent_id: uuid.UUID,
@@ -202,29 +254,71 @@ async def _enforce_caps(
     # once the agent is at its limit -- writes to an existing namespace never hit
     # this. Without it a sandbox could loop creating unbounded namespaces, each
     # under the byte caps, after #840 made the namespace agent-chosen.
-    namespace_exists = await session.scalar(
-        select(WorkflowStateEntry.namespace)
-        .where(
+    #
+    # #933: the check and the caller's INSERT are separate statements, so the
+    # bare check was a TOCTOU a concurrent burst could walk straight past (N
+    # requests to N brand-new namespaces all read cap-1 and all pass). The guard
+    # below is DOUBLE-CHECKED LOCKING: an unlocked pre-check keeps the hot path
+    # free, and only a would-be namespace CREATION serializes on a per-agent
+    # advisory lock held to COMMIT/ROLLBACK.
+
+    # 1. Hot path. Every write into an already-existing namespace returns here,
+    #    at exactly the cost of the single probe this code ran before #933 --
+    #    no lock, no extra round trip. dadf93e2's "writes to an existing
+    #    namespace are unaffected" is load-bearing and is preserved literally.
+    if await _namespace_exists(session, agent_id, scope, namespace):
+        return
+
+    # 2. Serialize the creation. Transaction-level, so it is released by the
+    #    COMMIT or the ROLLBACK with no explicit unlock and no leak path when
+    #    the 403 below propagates. This REQUIRES a transaction to already be
+    #    open -- outside one the lock would be released immediately and this
+    #    guard would be vacuous. The byte-cap ``others`` SELECT above runs
+    #    unconditionally and autobegins it; moving this block above those
+    #    queries would silently make the lock meaningless.
+    #
+    #    LOCK ORDERING (no deadlock cycle exists, and this is what a future
+    #    change would break): the advisory lock is only ever requested when the
+    #    namespace has no rows for this agent, so no ``SELECT ... FOR UPDATE``
+    #    row lock is held at that moment -- in ``append_state`` and in
+    #    ``routers/memory.py`` a FOR UPDATE that matches zero rows takes no
+    #    lock, and any caller that DOES hold a row lock is by definition writing
+    #    an already-existing namespace and returned at step 1. The order is
+    #    strictly one-way, advisory lock -> row locks. Moving a FOR UPDATE above
+    #    the existence check, or making this lock unconditional, reopens that
+    #    analysis from scratch.
+    await session.execute(
+        text("SELECT pg_advisory_xact_lock(:cls, :key)"),
+        {"cls": _NAMESPACE_LOCK_CLASS, "key": _namespace_lock_key(agent_id)},
+    )
+
+    # 3. Re-check under the lock. A sibling request may have created this exact
+    #    namespace while we waited; refusing it then would be a FALSE POSITIVE
+    #    -- two concurrent writes to the same brand-new namespace must both
+    #    succeed when the agent has room. Not optional.
+    #
+    #    READ COMMITTED DEPENDENCY: this re-check and the count below only see
+    #    the sibling's commit because READ COMMITTED gives each statement a
+    #    fresh snapshot. Under REPEATABLE READ or SERIALIZABLE the snapshot
+    #    predates that commit and this guard degrades SILENTLY -- no error, just
+    #    the old overshoot plus a spurious 403 here. Nothing sets an isolation
+    #    level today; changing that breaks this.
+    if await _namespace_exists(session, agent_id, scope, namespace):
+        return
+
+    namespace_count = await session.scalar(
+        select(func.count(func.distinct(WorkflowStateEntry.namespace))).where(
             WorkflowStateEntry.agent_id == agent_id,
             WorkflowStateEntry.binding_scope == scope,
-            WorkflowStateEntry.namespace == namespace,
         )
-        .limit(1)
     )
-    if namespace_exists is None:
-        namespace_count = await session.scalar(
-            select(func.count(func.distinct(WorkflowStateEntry.namespace))).where(
-                WorkflowStateEntry.agent_id == agent_id,
-                WorkflowStateEntry.binding_scope == scope,
-            )
+    if (namespace_count or 0) >= settings.state_max_namespaces:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            f"agent is at its {settings.state_max_namespaces}-namespace cap; "
+            f"delete a namespace or reuse an existing one before creating "
+            f"{namespace!r}",
         )
-        if (namespace_count or 0) >= settings.state_max_namespaces:
-            raise HTTPException(
-                status.HTTP_403_FORBIDDEN,
-                f"agent is at its {settings.state_max_namespaces}-namespace cap; "
-                f"delete a namespace or reuse an existing one before creating "
-                f"{namespace!r}",
-            )
 
 
 async def _get_entry(

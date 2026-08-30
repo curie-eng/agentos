@@ -29,6 +29,11 @@ POLL_LIMIT = 20
 POLL_MAX_PAGES = 5
 BACKOFF_STEP_SECONDS = 5.0
 BACKOFF_MAX_SECONDS = 60.0
+# Status 0 is a transport failure and 429 is provider rate limiting; both mean
+# "slow down", and neither did except 429, so a provider outage re-polled at the
+# normal cadence and burst a warning per pass (373 in 24h in the soak, #2012).
+POLL_BACKOFF_STATUSES = frozenset({0, 429})
+CAUSE_MAX_CHARS = 120
 REJECTED_LABELS = frozenset({"unauthenticated", "spam", "blocked"})
 
 
@@ -137,10 +142,21 @@ class MailAdapter:
             if self.shutdown.is_set():
                 return
             status = self.poll_once()
-            if status == 429:
+            if status in POLL_BACKOFF_STATUSES:
                 backoff = min(backoff * 2 + BACKOFF_STEP_SECONDS, BACKOFF_MAX_SECONDS)
-                logger.warning("poll: 429 rate limited, backing off %ss", backoff)
-            else:
+                logger.warning(
+                    "poll: status=%s, backing off %ss before the next discovery pass",
+                    status,
+                    backoff,
+                )
+            # Only a successful listing proves the provider recovered, so it is the
+            # only thing that clears the delay. A 5xx does not arm the backoff -
+            # that stays deliberately out of this issue's scope - but it must not be
+            # able to un-arm one either: an outage is rarely one failure mode end to
+            # end, and letting a mid-outage 500 reset the delay puts the poller back
+            # on its normal cadence in the middle of the outage, which is the exact
+            # warning burst this backoff exists to stop.
+            elif status == 200:
                 backoff = 0.0
 
     def poll_once(self) -> int:
@@ -152,7 +168,11 @@ class MailAdapter:
         for _ in range(POLL_MAX_PAGES):
             status, page = self.client.list_messages(POLL_LIMIT, page_token)
             if status != 200 or not isinstance(page, dict):
-                logger.warning("poll: list failed with status=%s", status)
+                logger.warning(
+                    "poll: list failed with status=%s cause=%s",
+                    status,
+                    self._transport_cause(status, page),
+                )
                 self.page_cursor = None
                 return status
             messages = [item for item in page.get("messages", []) if isinstance(item, dict)]
@@ -208,6 +228,50 @@ class MailAdapter:
                     _correlation(message_id),
                 )
         return status
+
+    def _transport_cause(self, status: int, body: Any) -> str:
+        """Render a failed list call's cause as a bounded, credential-free string.
+
+        Status is the gate, not the body's shape. Only a status 0 body is one
+        this package synthesized locally: ``agentmail.request`` builds
+        ``{"error": str(exc)}`` for an ``OSError`` and ``{"error": "response
+        body exceeds configured byte limit"}`` for an oversize response, both
+        local strings with a shape the adapter can reason about. Every other
+        status carries a body the PROVIDER authored - arbitrary, unbounded, and
+        able to carry mail content, an upstream stack trace or a page of HTML -
+        including one that happens to hold an ``error`` key. Such a body is
+        never rendered, only counted by its status code, because logging any
+        part of it would breach this package's no-mail-PII rule and push
+        whatever the provider felt like sending into the cluster's log
+        retention. That is a structural refusal at the top of this helper rather
+        than a condition at the call site, so a future caller cannot reintroduce
+        the exposure by passing a provider payload in.
+
+        The budget is a fixed constant rather than a config knob because the
+        size of a log line must not be something a hostile or broken provider
+        can grow, and an operator cannot tune a value they only discover after
+        the disk filled. The redaction pass is defence in depth: ``str(OSError)``
+        from urllib carries no request header today, but the adapter must not
+        depend on a stdlib rendering staying that way.
+        """
+        if status != 0:
+            return "unavailable"
+        if not isinstance(body, dict):
+            return "unavailable"
+        error = body.get("error")
+        if not isinstance(error, str) or not error.strip():
+            return "unavailable"
+        cause = " ".join(error.split())
+        for credential in (
+            self.config.agentmail_api_key,
+            self.config.channel_token,
+            self.config.egress_secret,
+        ):
+            if credential:
+                cause = cause.replace(credential, "[redacted]")
+        if len(cause) > CAUSE_MAX_CHARS:
+            cause = cause[:CAUSE_MAX_CHARS] + "..."
+        return cause
 
     def _retry_pending(self) -> None:
         for pending in self.state.pending():

@@ -664,6 +664,18 @@ fn cluster_rung_repeats_eval_then_messages_inside_claim_timeout() {
         "the post-eval message must still finalize a reply, proving a normal \
          turn can claim after repeated evals; ladder contents:\n{text}"
     );
+    let finalized_assertion = text
+        .find(r#"if ! assert_finalized_reply "cluster" "$retention_out"; then"#)
+        .expect("the bounded post-eval message must validate its captured reply");
+    let timeout_rejection = text
+        .find(r#"if [[ "$retention_rc" -eq 124 ]]; then"#)
+        .expect("the bounded post-eval message must still diagnose a real timeout");
+    assert!(
+        finalized_assertion < timeout_rejection,
+        "a response that finalized at the timeout boundary must be accepted from \
+         its captured JSON before exit 124 is diagnosed; otherwise the ladder can \
+         reject the exact successful outcome it exists to prove; ladder contents:\n{text}"
+    );
 }
 
 // --- Assertion group 6: the EXECUTING parity controls -----------------------

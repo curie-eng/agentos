@@ -8,7 +8,7 @@
 # command`. That exception is not classified by the kernel, so the turn hangs,
 # the entry is re-delivered to dead-letter, and every attempt leaks a sandbox.
 # `values.schema.json` makes helm refuse the value at install/template time so it
-# never reaches worker env at all. Nine assertions:
+# never reaches worker env at all. Ten assertions:
 #
 #   (a) POSITIVE, defaults: the render SUCCEEDS and the worker Deployment
 #       carries the three env vars at their shipped defaults.
@@ -50,12 +50,28 @@
 #       test_substrate_config_refuses_an_unparseable_ttl_naming_the_env_var. (i)
 #       and that case are one seam read from two ends; deleting either removes
 #       half of the only gate on the null path.
+#   (j) ADR-0131 RELATIONSHIP, positive and negative: the rendered
+#       terminationGracePeriodSeconds must cover the rendered
+#       CURIE_DELIVERY_BUDGET_S + CURIE_DELIVERY_SHUTDOWN_RESERVE_S. The
+#       positive raises budget and grace together and must still render+pass;
+#       the negative raises the budget while leaving grace at its pre-ADR-0131
+#       value of 1800 and must be REFUSED BY THE RENDER ITSELF, by the
+#       `curie.worker.validateDrainBudget` guard in _helpers.tpl.
+#       That guard is the only fence an operator actually hits: JSON Schema
+#       cannot express cross-field arithmetic, so values.schema.json accepts
+#       grace=1800, `helm upgrade` used to succeed, and the worker then
+#       CrashLoopBackOffed because its `WorkerConfig` check raises before
+#       `asyncio.run` and no supervisor can catch it -- a silent breaking
+#       upgrade for any install that overrides grace. The fixed-value
+#       assertion in (a) only ever sees 1860 at the default; this is the half
+#       that actually exercises the inequality the ADR mandates, and the only
+#       assertion that demonstrates the guard REJECTING something.
 #
-# WORDING IS NOT ASSERTED, AND MUST NOT BECOME ASSERTED. Every negative below
-# checks only (1) that helm exited non-zero and (2) that the captured output
-# contains the bare knob name. The failure text comes from helm's own bundled
-# JSON-Schema validator, whose wording changed between the CI-pinned helm and
-# current helm while the pass/fail outcomes stayed identical:
+# SCHEMA WORDING IS NOT ASSERTED, AND MUST NOT BECOME ASSERTED. Every negative
+# below EXCEPT (j) checks only (1) that helm exited non-zero and (2) that the
+# captured output contains the bare knob name. The failure text comes from
+# helm's own bundled JSON-Schema validator, whose wording changed between the
+# CI-pinned helm and current helm while the pass/fail outcomes stayed identical:
 #
 #   helm 3.16.4 (the CI pin, .github/workflows/helm-ci.yaml:40):
 #     - worker.routeTtlSeconds: Must be greater than 0
@@ -69,6 +85,12 @@
 # `want integer`, or the `- <path>: ` prefix shape: a wording-locked assertion
 # passes on the author's machine and fails in CI, or the reverse, for a reason
 # that has nothing to do with the chart.
+#
+# (j) is the deliberate exception: its message is CHART-OWNED text from
+# `fail` in _helpers.tpl, not helm's validator, so it cannot drift with the
+# helm version and asserting it is what proves the guard -- rather than some
+# unrelated template error -- is what refused the render. It checks the three
+# key names and the arithmetic, not the full sentence.
 #
 # Runnable locally (from anywhere) and from CI. Fails loudly.
 set -euo pipefail
@@ -125,10 +147,42 @@ deploys = [
 if len(deploys) != 1:
     raise SystemExit(f"expected exactly one worker Deployment, rendered {len(deploys)}")
 got = deploys[0]["spec"]["template"]["spec"].get("terminationGracePeriodSeconds")
-if type(got) is not int or got != 1800:
+if type(got) is not int or got != 1860:
     raise SystemExit(
         "worker terminationGracePeriodSeconds rendered "
-        f"{got!r}, expected integer 1800"
+        f"{got!r}, expected integer 1860"
+    )
+PY
+)"
+
+# ADR-0131 relationship: rendered grace must be >= rendered delivery budget +
+# rendered shutdown reserve. The fixed-value check above catches a values-file
+# drift; THIS catches an operator who raises the budget (or leaves an old grace
+# override in place) without raising the grace to match -- the actual
+# ADR-0131 misconfiguration, and the one the fixed check cannot see.
+WORKER_GRACE_COVERS_BUDGET_PY="$(
+  cat <<'PY'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+deploys = [
+    d for d in docs
+    if d.get("kind") == "Deployment"
+    and (d["metadata"].get("labels") or {}).get("app.kubernetes.io/component") == "worker"
+]
+if len(deploys) != 1:
+    raise SystemExit(f"expected exactly one worker Deployment, rendered {len(deploys)}")
+spec = deploys[0]["spec"]["template"]["spec"]
+grace = spec.get("terminationGracePeriodSeconds")
+env = {e["name"]: e.get("value") for c in spec["containers"] for e in c.get("env", [])}
+budget = int(env["CURIE_DELIVERY_BUDGET_S"])
+reserve = int(env["CURIE_DELIVERY_SHUTDOWN_RESERVE_S"])
+required = budget + reserve
+if type(grace) is not int or grace < required:
+    raise SystemExit(
+        f"terminationGracePeriodSeconds ({grace!r}) does not cover "
+        f"CURIE_DELIVERY_BUDGET_S + CURIE_DELIVERY_SHUTDOWN_RESERVE_S "
+        f"({budget} + {reserve} = {required}): a draining worker would be "
+        "SIGKILLed before it could settle"
     )
 PY
 )"
@@ -189,10 +243,18 @@ fi
 if ! msg="$(python3 -c "$WORKER_TERMINATION_GRACE_PY" "$DEFAULT_RENDER" 2>&1)"; then
   fail a "$msg"
 fi
+if ! msg="$(python3 -c "$WORKER_GRACE_COVERS_BUDGET_PY" "$DEFAULT_RENDER" 2>&1)"; then
+  fail a "$msg"
+fi
 assert_env a -- \
   CURIE_CLAIM_TIMEOUT_SECONDS=90 \
   CURIE_ROUTE_TTL_SECONDS=3600 \
-  CURIE_SUSPENDED_ROUTE_TTL_SECONDS=86400
+  CURIE_SUSPENDED_ROUTE_TTL_SECONDS=86400 \
+  CURIE_DELIVERY_BUDGET_S=600 \
+  CURIE_DELIVERY_LEASE_TTL_S=45 \
+  CURIE_DELIVERY_LEASE_HEARTBEAT_S=10 \
+  CURIE_DELIVERY_SHUTDOWN_RESERVE_S=60 \
+  CURIE_TERMINATION_GRACE_PERIOD_S=1860
 
 # (b)
 assert_env b \
@@ -262,4 +324,50 @@ done
 # (i)
 assert_env i --set worker.routeTtlSeconds=null -- CURIE_ROUTE_TTL_SECONDS=
 
-echo "worker-ttl-bounds-assertions: all nine assertions passed"
+# (j) ADR-0131 grace/budget relationship, POSITIVE and NEGATIVE. This is the
+# important half of the assertion, not a formality -- a render assertion that
+# only ever sees the default values is vacuous. The negative reproduces the
+# actual ADR-0131 misconfiguration: an operator raises the delivery budget to
+# 1800 but leaves an old terminationGracePeriodSeconds override (1800, the
+# pre-ADR-0131 value) in place, so grace no longer covers budget + reserve
+# (1800 + 60 = 1860 > 1800). That combination used to render clean and kill the
+# worker at boot; it is now refused at render time by
+# `curie.worker.validateDrainBudget`, so the negative asserts the REFUSAL and
+# its message rather than inspecting a rendered manifest.
+J_POSITIVE="$TMP/j-positive.yaml"
+if ! helm template curie "$CHART" \
+  --set worker.deliveryBudgetSeconds=1800 \
+  --set worker.terminationGracePeriodSeconds=1860 \
+  >"$J_POSITIVE" 2>&1; then
+  fail j "the render FAILED on a raised budget with a matching grace; it must succeed
+  $(head -5 "$J_POSITIVE")"
+fi
+if ! msg="$(python3 -c "$WORKER_GRACE_COVERS_BUDGET_PY" "$J_POSITIVE" 2>&1)"; then
+  fail j "$msg"
+fi
+
+# The NEGATIVE control. Captured, not piped: helm exits non-zero by design here
+# and `set -o pipefail` would abort the script on the very outcome being
+# asserted.
+J_NEGATIVE_OUT=""
+if J_NEGATIVE_OUT="$(helm template curie "$CHART" \
+  --set worker.deliveryBudgetSeconds=1800 \
+  --set worker.terminationGracePeriodSeconds=1800 2>&1)"; then
+  fail j "helm ACCEPTED deliveryBudgetSeconds=1800 with terminationGracePeriodSeconds=1800 (grace 1800 < required 1860). That render must be refused: it upgrades clean and then CrashLoopBackOffs the worker on the boot validator"
+fi
+# The three key names and the arithmetic, checked one token at a time so the
+# assertion says WHICH part of the message went missing. Chart-owned wording,
+# not helm's -- see the header note above.
+for token in \
+  "worker.terminationGracePeriodSeconds" \
+  "worker.deliveryBudgetSeconds" \
+  "worker.deliveryShutdownReserveSeconds" \
+  "(1800) + " \
+  "(60) = 1860" \
+  "ADR-0131"; do
+  grep -qF "$token" <<<"$J_NEGATIVE_OUT" \
+    || fail j "the refusal does not mention $token; an operator reading it during an upgrade cannot tell which value to raise
+  $(head -3 <<<"$J_NEGATIVE_OUT")"
+done
+
+echo "worker-ttl-bounds-assertions: all ten assertions passed"

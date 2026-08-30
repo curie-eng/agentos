@@ -43,28 +43,72 @@ app.kubernetes.io/instance: {{ .root.Release.Name }}
 app.kubernetes.io/component: {{ .component }}
 {{- end -}}
 
+{{/* Resolve one named placement class. Pass a dict with "root" (the top
+     context) and "class" (the placement class name). Every class lookup in the
+     chart goes through this helper rather than indexing the placement values
+     directly, so that a legacy release whose retained values carry
+     `placement: null` (issue #2008) degrades to the chart's empty defaults
+     instead of crashing the render. Helm's coalescing deletes a null-valued key
+     outright, so when `helm upgrade --reuse-values` replays the stored config of
+     a release created before placement classes existed, the placement map is nil
+     -- even though values.yaml defines all five classes -- and every direct
+     per-class dereference in a template would panic on that nil. The
+     empty-dict substitution on the class lookup itself likewise covers a
+     placement map that is present but missing this class.
+
+     The kind checks are the fail-CLOSED half of that tolerance, and they are
+     not optional: this helper hands its result to consumers as YAML, and
+     Helm's `fromYaml` on a non-map document returns an error map rather than
+     raising, so a malformed class (say `placement.platform: spot`) would
+     resolve `.podLabels`, `.annotations`, and `.nodeSelector` to nothing and
+     render clean -- silently dropping every scheduling constraint the operator
+     meant to apply and letting workloads land on unintended nodes. The
+     pre-#2008 templates dereferenced the class directly and aborted on that
+     shape; refusing here keeps that behavior while still degrading a *nil*
+     placement to the chart's empty defaults. The refusal lives in the template
+     rather than in `values.schema.json` because that schema is deliberately
+     permissive and does not type `placement` at all (see charts/curie/CLAUDE.md),
+     so a template-level refusal is this chart's established backstop for the
+     gap. Note the kind tests use `kindIs`/`kindOf` and not truthiness: an
+     `and $class (...)` guard would read a `false` or `0` class as absent and
+     default it away, which is the same fail-open bug in a different costume. */}}
+{{- define "curie.placement.class" -}}
+{{- $classes := .root.Values.placement | default dict -}}
+{{- if not (kindIs "map" $classes) -}}
+{{- fail (printf "placement must be a map of placement classes, got %s" (kindOf $classes)) -}}
+{{- end -}}
+{{- $class := index $classes .class -}}
+{{- if kindIs "invalid" $class -}}
+{{- $class = dict -}}
+{{- else if not (kindIs "map" $class) -}}
+{{- fail (printf "placement.%s must be a map of placement fields (podLabels, annotations, nodeSelector, tolerations, affinity), got %s" .class (kindOf $class)) -}}
+{{- end -}}
+{{- toYaml $class -}}
+{{- end -}}
+
 {{- define "curie.placement.labels" -}}
-{{- with .podLabels }}
+{{- with (fromYaml (include "curie.placement.class" .)).podLabels }}
 {{- toYaml . }}
 {{- end }}
 {{- end -}}
 
 {{- define "curie.placement.annotations" -}}
-{{- with .annotations }}
+{{- with (fromYaml (include "curie.placement.class" .)).annotations }}
 {{- toYaml . }}
 {{- end }}
 {{- end -}}
 
 {{- define "curie.placement.spec" -}}
-{{- with .nodeSelector }}
+{{- $class := fromYaml (include "curie.placement.class" .) -}}
+{{- with $class.nodeSelector }}
 nodeSelector:
 {{- toYaml . | nindent 2 }}
 {{- end }}
-{{- with .tolerations }}
+{{- with $class.tolerations }}
 tolerations:
 {{- toYaml . | nindent 2 }}
 {{- end }}
-{{- with .affinity }}
+{{- with $class.affinity }}
 affinity:
 {{- toYaml . | nindent 2 }}
 {{- end }}
@@ -882,8 +926,13 @@ livenessProbe:
     secretKeyRef:
       name: {{ .Values.rustfs.existingSecret | default (include "curie.secretName" .) }}
       key: rustfsSecretKey
+{{- /* Both endpoints go through curie.rustfs.endpoint, never a literal
+       scheme. They were hardcoded http:// while api/worker/sandbox used the
+       helper, so a BYO store on rustfs.port 443 got https:// everywhere except
+       Langfuse, and trace ingestion died at the TLS handshake -- with the rest
+       of the release healthy, which is why nothing pointed at the cause. */}}
 - name: LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT
-  value: http://{{ include "curie.rustfs.host" . }}:{{ .Values.rustfs.port }}
+  value: {{ include "curie.rustfs.endpoint" . }}
 - name: LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE
   value: "true"
 - name: LANGFUSE_S3_EVENT_UPLOAD_PREFIX
@@ -900,7 +949,7 @@ livenessProbe:
       name: {{ .Values.rustfs.existingSecret | default (include "curie.secretName" .) }}
       key: rustfsSecretKey
 - name: LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT
-  value: http://{{ include "curie.rustfs.host" . }}:{{ .Values.rustfs.port }}
+  value: {{ include "curie.rustfs.endpoint" . }}
 - name: LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE
   value: "true"
 - name: LANGFUSE_S3_MEDIA_UPLOAD_PREFIX
@@ -1072,4 +1121,145 @@ securityContext:
 {{- define "curie.containerSecurityContext" -}}
 securityContext:
 {{- toYaml . | nindent 2 }}
+{{- end -}}
+
+{{/* ---- ADR-0131 drain-budget relationship (worker) ----
+     `worker.terminationGracePeriodSeconds` must cover
+     `worker.deliveryBudgetSeconds` + `worker.deliveryShutdownReserveSeconds`.
+     The chart renders that same grace value BOTH onto the Pod's
+     `spec.terminationGracePeriodSeconds` and into the worker's
+     `CURIE_TERMINATION_GRACE_PERIOD_S`, where `WorkerConfig` re-checks the
+     inequality at boot -- and that check raises before `asyncio.run`, so the
+     supervisor cannot catch it and the pod CrashLoopBackOffs.
+
+     Without this render-time guard, an existing install that overrides
+     `worker.terminationGracePeriodSeconds` to any value the schema accepts but
+     the inequality rejects `helm upgrade`s CLEANLY and then takes the entire
+     turn plane down: a silent breaking upgrade. `values.schema.json` cannot
+     close it -- JSON Schema has no cross-field arithmetic -- and the CI
+     render-assertion never sees operator values. So the fence has to be here,
+     where `helm template`/`install`/`upgrade` all pass through it.
+
+     This does NOT replace the worker's boot validator, which remains the
+     backstop for the non-Helm substrates (Compose, bare env). It only moves the
+     Helm-shaped failure from pod boot to render time, where it is actionable. */}}
+{{- define "curie.worker.validateDrainBudget" -}}
+{{- $grace := int64 .Values.worker.terminationGracePeriodSeconds -}}
+{{- $budget := int64 .Values.worker.deliveryBudgetSeconds -}}
+{{- $reserve := int64 .Values.worker.deliveryShutdownReserveSeconds -}}
+{{- $required := add $budget $reserve -}}
+{{- if lt $grace $required -}}
+{{- fail (printf "worker.terminationGracePeriodSeconds (%d) must be at least worker.deliveryBudgetSeconds (%d) + worker.deliveryShutdownReserveSeconds (%d) = %d (ADR-0131). At %d a worker draining a full-budget delivery is SIGKILLed before it can settle, and the worker refuses this configuration at boot, so the Pod CrashLoopBackOffs instead of starting. Fix: raise worker.terminationGracePeriodSeconds to %d or more, or lower worker.deliveryBudgetSeconds and/or worker.deliveryShutdownReserveSeconds so their sum is at most %d." $grace $budget $reserve $required $grace $required $grace) -}}
+{{- end -}}
+{{- end -}}
+
+{{/* ---- Upgrade drain gate arithmetic (issue #2010) ----
+     The gate's two clocks are DERIVED, with the values as floors, and only a
+     self-contradictory pair is refused outright. The split is deliberate.
+
+     `timeoutSeconds` vs the delivery budget is a CROSS-FAMILY relationship an
+     operator does not author together: raising `deliveryBudgetSeconds` is a
+     decision about how long a turn may run, made for reasons that have nothing
+     to do with upgrades. Refusing that render would break configurations that
+     are valid today, on a chart upgrade, for a value the operator never touched
+     -- so the effective wait is raised to cover the budget instead. The gate
+     must never give up on a delivery that is still inside the budget ADR-0131
+     already promised it; a gate that refuses upgrades during ordinary traffic
+     is a gate that gets switched off in its first week.
+
+     The quiesce TTL is then derived above that, because the worker's OWN boot
+     validator refuses a TTL that does not outlast the wait -- so a rendered
+     pair the app would reject is a green `helm upgrade` followed by a
+     CrashLoopBackOff, the same failure `validateDrainBudget` above exists to
+     prevent.
+
+     What IS refused is the one pair an operator writes together and can only
+     get wrong by contradicting themselves: a `quiesceTtlSeconds` at or below
+     the `timeoutSeconds` they set beside it. Silently raising that one would
+     hide a stated intent rather than an unrelated default. */}}
+{{- define "curie.worker.upgradeDrain.timeout" -}}
+{{- max (int64 .Values.worker.upgradeDrain.timeoutSeconds) (add (int64 .Values.worker.deliveryBudgetSeconds) (int64 .Values.worker.deliveryShutdownReserveSeconds)) -}}
+{{- end -}}
+
+{{/* Headroom over the effective wait, so the flag cannot lapse in the moments
+     between the gate's last poll and the roll it clears the way for. */}}
+{{- define "curie.worker.upgradeDrain.quiesceTtl" -}}
+{{- max (int64 .Values.worker.upgradeDrain.quiesceTtlSeconds) (add (int64 (include "curie.worker.upgradeDrain.timeout" .)) 60) -}}
+{{- end -}}
+
+{{- define "curie.worker.validateUpgradeDrain" -}}
+{{- $timeout := int64 .Values.worker.upgradeDrain.timeoutSeconds -}}
+{{- $quiesce := int64 .Values.worker.upgradeDrain.quiesceTtlSeconds -}}
+{{- if le $quiesce $timeout -}}
+{{- fail (printf "worker.upgradeDrain.quiesceTtlSeconds (%d) must be strictly greater than worker.upgradeDrain.timeoutSeconds (%d) (issue #2010). As set, the fleet-wide quiesce flag lapses while the gate is still waiting, so the replicas resume claiming into a roll that is about to interrupt them -- and the gate would still report a clean drain. Fix: raise worker.upgradeDrain.quiesceTtlSeconds above %d, or lower worker.upgradeDrain.timeoutSeconds below %d." $quiesce $timeout $timeout $quiesce) -}}
+{{- end -}}
+{{- end -}}
+
+{{/* ---- Langfuse ClickHouse startup gate (issue #2009) ----
+     Both Langfuse deployments run their ClickHouse migrations during boot, so a
+     Helm upgrade that recreates the ClickHouse Service can start them before the
+     name resolves; Langfuse then exits with `failed to open database: dial tcp:
+     lookup <release>-clickhouse ... no such host` and the rollout converges only
+     through CrashLoopBackOff. This init container polls ClickHouse's HTTP
+     `/ping` until it answers 200, so the application container is not started
+     until the dependency is actually accepting connections -- the same
+     wait-then-hand-over shape `templates/api.yaml` uses for Postgres.
+
+     `node` is the Langfuse images' own runtime, so the probe needs no extra
+     tooling in the image. Bounded like the Postgres gate: after `maxAttempts`
+     polls the container exits non-zero and the kubelet restarts it, which keeps
+     a genuinely-down ClickHouse visible instead of hanging forever. Every probe
+     setting (attempts, interval, per-request timeout) comes from values rather
+     than the template, per the chart's probe-settings invariant -- a BYO
+     ClickHouse that answers slowly needs a longer timeout, not a patched chart.
+
+     Call with a dict: `root` (the chart context), `image` (the component's
+     image repository), `containerSecurityContext` and `resources` (the
+     component's, so the gate inherits the same posture and the pod's effective
+     request is unchanged -- init and app container requests are maxed, not
+     summed). */}}
+{{- define "curie.langfuse.clickhouseGate" -}}
+{{- $root := .root -}}
+- name: wait-for-clickhouse
+  image: "{{ .image }}:{{ $root.Values.langfuse.image.tag }}"
+  imagePullPolicy: {{ $root.Values.global.imagePullPolicy }}
+  {{- with .containerSecurityContext }}
+  securityContext:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  command: ["/bin/sh", "-c"]
+  args:
+    - |
+      attempt=1
+      max_attempts={{ $root.Values.langfuse.clickhouseReadiness.maxAttempts }}
+      interval={{ $root.Values.langfuse.clickhouseReadiness.intervalSeconds }}
+      probe_timeout_ms={{ mulf $root.Values.langfuse.clickhouseReadiness.timeoutSeconds 1000 | int }}
+      while [ "$attempt" -le "$max_attempts" ]; do
+        if PROBE_TIMEOUT_MS="$probe_timeout_ms" node -e '
+      const http = require("http");
+      const request = http.get(process.env.CLICKHOUSE_URL + "/ping", { timeout: Number(process.env.PROBE_TIMEOUT_MS) }, (response) => {
+        response.resume();
+        process.exit(response.statusCode === 200 ? 0 : 1);
+      });
+      request.on("timeout", () => { request.destroy(); process.exit(1); });
+      request.on("error", () => { process.exit(1); });
+      ' 2>/dev/null; then
+          echo "ClickHouse ready after $attempt attempt(s); starting Langfuse"
+          exit 0
+        fi
+        if [ "$attempt" -eq 1 ]; then
+          echo "Waiting for ClickHouse readiness at $CLICKHOUSE_URL"
+        fi
+        if [ "$attempt" -lt "$max_attempts" ]; then
+          sleep "$interval"
+        fi
+        attempt=$((attempt + 1))
+      done
+      echo "ClickHouse unreachable at $CLICKHOUSE_URL after $max_attempts readiness attempts; exiting for init container restart" >&2
+      exit 1
+  env:
+    - name: CLICKHOUSE_URL
+      value: http://{{ include "curie.clickhouse.host" $root }}:{{ $root.Values.clickhouse.httpPort }}
+  resources:
+    {{- toYaml .resources | nindent 4 }}
 {{- end -}}

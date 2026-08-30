@@ -100,16 +100,63 @@ def _is_auth_rejection(message: object) -> bool:
 
 
 def _apply_approval_override(final: Final, state: TurnState) -> Final:
-    """Flip a successful final to awaiting-approval when a gate fired (ADR-0010).
+    """Flip a final to awaiting-approval when a gate fired (ADR-0010, #1852).
 
-    Only a DONE final is overridden: a failure, budget halt, or intentional
-    interrupt outranks a pending approval (the turn did not complete cleanly,
-    so suspending on it would strand a broken run behind a human decision).
+    A DONE final is overridden, as it always was. A NON-DONE final is overridden
+    only when the runner's own gate requested the halt
+    (``approval_halt_requested``) AND nothing else reported a real failure:
+    since #1852 a gated deny carries the SDK's turn-stopping flags
+    (``PermissionResultDeny.interrupt`` / the hook's ``continue_: False``), so
+    the CLI aborts the turn and its terminal ``ResultMessage`` arrives
+    ``is_error``-shaped, which ``translate.py::_translate_result`` maps to
+    CLASSIFIED_FAILURE. Without honoring the flag, the fix for the hang would
+    turn it into a failure carrying no approval record -- a worse outcome than
+    the hang, because there would be nothing for a human to approve.
+
+    **Precedence: a failure the runner did not cause outranks the halt.** The
+    halt marker is set by ``ApprovalGate.block`` at deny time, BEFORE the turn's
+    terminal cause is known, so on its own it cannot tell "the CLI aborted
+    because we asked it to" from "the provider fell over a moment later". The
+    tiebreaker is ``TurnState.error_classification``, which ``translate.py``
+    sets ONLY where the model or transport reported a classified error of its
+    own (an ``AssistantMessage.error``, or a rejected ``RateLimitEvent``) and
+    deliberately NOT on the bare error-shaped result an abort produces. So:
+
+    - halt marker, no classified error  -> the abort is ours; pause for approval
+      (the #1852 case, where the alternative is losing the approval record);
+    - halt marker AND a classified error -> the model/transport failed on its
+      own; report the failure. Relabelling a provider outage as
+      awaiting-approval would hide it behind a human decision that cannot fix
+      it, and approving it would resume straight back into the same failure.
+
+    Both branches require ``state.approval_summary``, so a halt recorded with
+    no summary cannot flip a final on its own.
+
+    What still outranks a pending approval, unchanged:
+
+    - the **budget halt**, checked before this call in ``_drive_turn`` (a run
+      that blew its ceiling has not completed cleanly, and approving it would
+      resume straight back into the same halt);
+    - a **genuine operator interrupt**, excluded upstream at the
+      ``_merge_gate_block`` guard (the operator asked for the turn to stop and
+      must get idle-awaiting-input, not a pause behind a decision they did not
+      request);
+    - an **auth rejection**, which returns before any final exists.
+
+    A DONE final is untouched by the new guard: a turn the model finished
+    cleanly is an approval pause regardless of any non-terminal error frame it
+    streamed along the way (a recovered rate limit, say).
+
     The captured summary rides the final so the platform can persist it on the
     durable Approval record.
     """
 
-    if state.approval_summary and final.status is SessionStatus.DONE:
+    runner_halted_the_turn = (
+        state.approval_halt_requested and state.error_classification is None
+    )
+    if state.approval_summary and (
+        final.status is SessionStatus.DONE or runner_halted_the_turn
+    ):
         return Final(
             text=final.text,
             status=SessionStatus.AWAITING_APPROVAL,
@@ -686,6 +733,12 @@ class SessionRunner:
           summary already stands) lets ``_apply_approval_override`` treat both
           trigger types identically, along with the durable provenance
           (#544, Decision C) the worker branches on.
+        - **Approval halt (#1852):** a gated deny now asks the CLI to stop the
+          turn, so the gate's ``pending_halt`` marker is carried onto the turn
+          state for ``_apply_approval_override`` -- but only when the operator
+          did not also interrupt. A human pressing stop is an intentional stop,
+          not an approval request; reporting it as awaiting-approval would
+          suspend the thread behind a decision nobody asked for.
         """
 
         gate = self._approval_gate
@@ -712,6 +765,11 @@ class SessionRunner:
             state.approval_route = gate.pending_route
             state.approval_gate_kind = gate.pending_gate_kind
             state.approval_granted_tool = gate.pending_granted_tool
+
+        # See the "Approval halt" bullet above: an operator interrupt outranks a
+        # runner-requested one, so the marker is copied only in its absence.
+        if gate.pending_halt and not self._interrupt_requested:
+            state.approval_halt_requested = True
 
     def _budget_halt_lines(self) -> list[str]:
         """The error+final pair emitted whenever the output-token ceiling trips.

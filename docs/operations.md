@@ -207,6 +207,44 @@ once the cluster is reachable again. See ADR-0064 (Architecture Decision
 Record; `docs/adr/0064-fail-forward-cluster-teardown.md`) for the full
 fail-forward design.
 
+### `curie cluster rollback`
+
+```bash
+curie cluster rollback
+```
+
+| Flag | What it does |
+|---|---|
+| `--revision <n>` | Roll back to this exact revision instead of the newest safe one. |
+| `--allow-failed-revision` | Permit a `--revision` that Helm never finished applying. |
+| `--yes` | Skip the confirmation prompt. |
+| `--dry-run` | Print the commands that would run and exit. |
+
+`curie cluster rollback` puts the release back on the newest revision that
+Helm actually finished applying.
+
+That is not what a bare `helm rollback` does, and the difference bites on a
+cluster without gVisor. `cluster up` tries the install with the chart's
+gVisor default first; if the cluster has no `runsc` RuntimeClass, that attempt
+is recorded as a **failed** Helm revision before the successful retry with
+gVisor off. Do that a few times and the release history alternates
+failed/superseded/failed/superseded. `helm rollback` with no revision targets
+the immediately preceding revision -- which, on that history, is a failed one:
+a manifest Helm never finished putting on the cluster. Rolling back to it does
+not restore a working release, it re-applies a broken one.
+
+So this verb reads the history first, skips every revision whose status is not
+`deployed` or `superseded`, and rolls back to the newest one that is. It prints
+which revisions it passed over, so you can see exactly what a bare
+`helm rollback` would have landed on instead.
+
+If you know which revision you want, `--revision <n>` takes it. A revision that
+isn't in the history is refused, and so is one Helm never finished applying --
+unless you also pass `--allow-failed-revision` to say you accept that. If no
+revision is safe to roll back to (a first install, or a release whose every
+prior revision failed), the command tells you so rather than doing nothing or
+rolling back to something broken. See issue #1899 for the original report.
+
 ## Deploying your plugin bundle onto the Curie platform
 
 ### Manually, with `curie cluster deploy`
@@ -224,6 +262,7 @@ curie cluster deploy --plugin-dir <bundle-dir>
 | `--repo <owner/name>` | Bind this agent to a GitHub repo so pushes deploy it; set only on the deploy that creates the agent and unchangeable after. Omit it and the agent can never use git-flow. |
 | `--api-url <url>` / `CURIE_API_URL` | Direct-dial this URL instead of self-plumbing a loopback tunnel. |
 | `--api-key <key>` / `CURIE_API_KEY` | Override the auto-discovered API key. |
+| `--api-local-port <port>` | Local end of the self-plumbed tunnel. Default `0` lets the kernel assign an ephemeral port, so two deploys never fight over the same one. |
 
 Beyond pointing it at your bundle, `cluster deploy` needs no `--api-url` or
 `--api-key` by default: it automatically finds a way to reach the Curie API
@@ -235,7 +274,13 @@ you do need is `--repo`, and only if you want git-flow -- see
 Under the hood, it opens a secure local tunnel to the Curie API (so
 nothing needs to be exposed publicly) and reads the API key straight out
 of the release's own Kubernetes Secret -- the key is never printed or
-stored anywhere in your shell history.
+stored anywhere in your shell history. Before posting the bundle, it
+also checks the tunnel's unauthenticated `/health` to confirm it really
+reaches the Curie API -- a squatted local port or a tunnel that resolved
+to the wrong workload both look reachable, so a 404, an HTML response, a
+non-`ok` JSON body, or a redirect is refused rather than posted to. This
+check only runs on the self-plumbed tunnel; an explicit `--api-url` is
+not probed.
 
 Override this only for a non-default setup: `--api-url` to talk to a
 specific address instead of tunneling, or `--api-key` to use a specific key
@@ -303,6 +348,12 @@ whatever the release already has, so you only set it once. Changing or
 clearing it (`--clear-github-token`) does not restart the API pod
 automatically; `cluster up` prints the exact restart command to run, and
 until you run it the API keeps using the old value.
+
+On the commit-polling lane, a repeated `git.archive_failed` for the same
+commit now backs off geometrically -- five minutes, then ten, twenty,
+forty, to a one-hour ceiling -- instead of re-cloning every poll interval,
+and after three consecutive failures the API logs an error saying deploys
+from that repository are NOT happening (#1309).
 
 Once wired, a push to the agent's dev branch builds and deploys under its
 dev bot identity; a push or merge to its prod branch promotes that same
@@ -522,19 +573,40 @@ data too.
 curie diff -f curie.yaml
 ```
 
-`chart_version_differs: true` means the comparison above it is values-only and
-cannot see a component added, removed, or renamed between versions. A renamed
+`diff` reads the release's live StatefulSets and renders the target chart, so a
+stateful component that chart would DELETE is reported directly as
+`stateful_removals` and counted in `changes`, instead of surfacing as an
+ordinary value add. A non-empty list is not a routine change count: `curie
+apply` on that same file will REFUSE.
+
+`migration` names the object-store rename (`minio` → `rustfs`) that `curie
+apply --migrate-store` carries the data across. Its absence beside a non-empty
+`stateful_removals` means there is no automatic carry -- a store disabled
+through the chart's own BYO gate (`postgres.deploy: false`) removes a component
+`--migrate-store` has nothing to move.
+
+`chart_version_differs: true` means the value-level entry comparison cannot see
+a NON-STATEFUL component added, removed, or renamed between versions. A renamed
 component's old keys appear as ordinary resets, which reads far milder than the
-swap it would be.
+swap it would be. Stateful components are the exception: those come from the
+live read above, whatever the chart versions say.
+
+`curie diff --chart <ref>` points the comparison at the same chart `curie apply
+--chart <ref>` would use, and reports that chart's version as the target. A dev
+build run outside a source checkout needs it, since resolving and rendering a
+chart is now part of `diff`.
 
 `curie apply` refuses outright when the upgrade would delete a StatefulSet the
 release is running, and names it. `--migrate-store` is the option to reach
-for: apply stages every object, upgrades, loads them back, and verifies per
-object, all in one command, so the data survives. It is opt-in rather than
-automatic because the migration has a window where the store is empty and the
-bot cannot answer, so an apply that only changes a log level must never
-silently start moving data. `--allow-stateful-removal` proceeds WITHOUT the
-data instead, for a store you genuinely intend to discard. The two flags are
+for: apply stages the object store, upgrades, loads it back, and verifies it,
+all in one command, so the store's data survives. It carries the object store
+only; if the same upgrade would also delete another stateful component, apply
+still refuses and names that component, since `--migrate-store` gives it no
+way to carry that data too. It is opt-in rather than automatic because the
+migration has a window where the store is empty and the bot cannot answer, so
+an apply that only changes a log level must never silently start moving data.
+`--allow-stateful-removal` proceeds WITHOUT the data instead, for a store you
+genuinely intend to discard. The two flags are
 mutually exclusive: passing both is rejected by the parser with a nonzero
 exit, never silently resolved by picking one.
 
@@ -544,6 +616,11 @@ unreachable cluster classifies as transient (exit code 3), so an automation
 loop can retry the same command. This also applies to `--dry-run`: a dry run
 that could not read the cluster cannot honestly claim the store is safe, so it
 now errors instead of printing a plan.
+
+`curie diff` fails closed the same way, and classifies the same: it mutates
+nothing and resolves no credential (an unresolvable one is reported, never
+fatal), but answering "no removals" when the cluster read failed is the false
+assurance this check exists to prevent.
 
 Without the CLI, the same check by hand:
 
@@ -638,6 +715,39 @@ deliberately rather than discovering it.
 previous chart. Deleting a StatefulSet does not delete the PVCs its
 `volumeClaimTemplates` created, so the old store's volume survives the upgrade
 and the rollback re-attaches it with the data intact. Keep the export anyway.
+
+### Approvals pending across a worker roll
+
+An upgrade restarts the worker, and an approval can easily be pending for hours
+or days -- so approvals routinely straddle a roll. The worker remembers where it
+posted each Slack approval card so it can settle that card (strip the
+Approve/Reject buttons) when the approval is resolved out of band or EXPIRES.
+That memory used to be keyed by conversation and is now keyed by approval id.
+
+A resolution through the buttons carries its own card location, so it settles
+either way. An **expiry** carries no click: if the worker cannot find the
+remembered card, the expired approval keeps buttons that answer every later
+click with an error.
+
+**No operator action is required.** On startup the worker moves any remaining
+conversation-keyed entries onto their approval id once, so those approvals
+settle normally. The pass is best-effort and cannot fail startup; if Valkey is
+unreachable at that moment the affected cards simply stay live until their
+memory lapses (14 days).
+
+One narrow window stays open while the roll is in progress. The startup pass
+runs once, so it cannot see an entry written after it finished -- and a replica
+still on the old build keeps serving, and keeps recording cards the old way,
+until it is replaced. An approval created by such a replica after the new one
+started can therefore still keep live buttons if it later expires. The window
+closes on its own once the roll completes and every replica is on the new
+build; anything missed lapses with its existing 14 day memory.
+
+One residual case is not recoverable: a card remembered by a build old enough
+that the entry did not record which approval it belonged to cannot be paired
+with anything. If such an approval expires, its message keeps its buttons.
+Edit or delete that Slack message by hand, or ignore it -- the approval itself
+is expired in the API either way, so a click on it cannot approve anything.
 
 ## Known gotchas
 

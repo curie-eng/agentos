@@ -446,6 +446,19 @@
           "default": null,
           "title": "Systemprompt"
         },
+        "toolPolicy": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Toolpolicy"
+        },
         "triggers": {
           "anyOf": [
             {
@@ -511,6 +524,40 @@
         "description"
       ],
       "title": "SkillFrontmatter",
+      "type": "object"
+    },
+    "ToolPolicy": {
+      "additionalProperties": false,
+      "description": "The manifest ``toolPolicy`` object: tri-state globs over MCP tool names.\n\nPatterns are canonical ``\"<server>/<tool>\"`` globs -- server-qualified and\ntransport-independent -- NOT live SDK tool names. Precedence is by CLASS and\nnever by specificity: ``deny`` > ``approvalRequired`` > ``allow``. A tool no\ncollection matches is **DENIED**, so a tool a server begins advertising after\nthe bundle was authored fails closed rather than being inherited. The three\ncollections default to empty lists so an omitted collection means \"matches\nnothing\", never \"matches everything\"; ``approvalRequired`` is camelCase to\nmatch ``grantableViaPolicy`` / ``starterPrompts``.\n\n``enforcement`` is a mandatory, versioned discriminator\n(``tool_policy.TOOL_POLICY_ENFORCEMENT``), so a future v2 semantics ships as a\nNEW id that a v1 platform REJECTS at ``validate_bundle`` rather than\nreinterpreting under v1 rules. It is *modelled* with an empty default rather\nthan as a pydantic-required field so that OMITTING it lands on the pointed\n``tool_policy.enforcement_unsupported`` error -- which names the id this build\nimplements -- instead of an opaque \"field required\". The empty string is not a\ncontract id, so it is refused exactly like a wrong one; there is no value of\nthis field that means \"unset, so apply the default semantics\".\n\n**This model is STRICT (``extra=\"forbid\"``) where every other model in this\nfile is lenient, and that difference is load-bearing.** Leniency exists to\ntolerate keys Claude Code may add to shapes it owns; this object is\nCurie-owned, so no external producer can legitimately carry an unknown key in\nit. Under leniency a misspelled collection (``\"denny\"``) would validate, the\nintended deny list would be silently dropped from classification, and a typo\nwould become permission WIDENING. ``ConnectorSpec``, ``ConnectorLockEntry`` and\n``DeployTarget`` forbid extras for the same reason. ``PluginManifest`` itself\nstays lenient -- only this object is strict.",
+      "properties": {
+        "allow": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Allow",
+          "type": "array"
+        },
+        "approvalRequired": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Approvalrequired",
+          "type": "array"
+        },
+        "deny": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Deny",
+          "type": "array"
+        },
+        "enforcement": {
+          "default": "",
+          "title": "Enforcement",
+          "type": "string"
+        }
+      },
+      "title": "ToolPolicy",
       "type": "object"
     },
     "TriggerDeclaration": {

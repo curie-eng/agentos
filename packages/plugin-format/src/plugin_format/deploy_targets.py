@@ -37,6 +37,12 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+# The renderer owns the join rule, and it is imported rather than restated so
+# the name this validator refuses and the name the renderer refuses cannot
+# drift. A plain module-level import is fine here: unlike `connectors`, this
+# module is not imported by `connector_render`, so there is no cycle (#1446).
+from .connector_render import agent_forges_join
+
 # Curie's two deployment environments. Not open-ended: the worker's binding
 # query ranks prod over dev explicitly, so a third value would silently never
 # be selected.
@@ -124,15 +130,42 @@ def validate_deploy_targets(data: Any) -> tuple[DeployTargetsFile | None, list[t
                     f"{where}: agent is required for every declared target",
                 )
             )
-        elif not _is_valid_name(target.agent):
-            errors.append(
-                (
-                    "deploy.bad_agent_name",
-                    f"{where}: `{target.agent}` is not a valid agent name. A typo here does "
-                    "not fail -- it MINTS A NEW AGENT and the deploy reports success, so the "
-                    "name is checked before anything is created (ADR-0089).",
+        else:
+            # Two independent `if`s inside the `else`, not an `elif` chain. A
+            # name can be both malformed and forging (`Acme-mcp-bot`), and this
+            # file accumulates every applicable code. The `else` is what keeps
+            # the forging check off a `None` agent: called on `None` the
+            # predicate raises TypeError out of a validator whose whole contract
+            # is to RETURN errors, turning "agent is required" into a crash.
+            if not _is_valid_name(target.agent):
+                errors.append(
+                    (
+                        "deploy.bad_agent_name",
+                        f"{where}: `{target.agent}` is not a valid agent name. A typo here does "
+                        "not fail -- it MINTS A NEW AGENT and the deploy reports success, so the "
+                        "name is checked before anything is created (ADR-0089).",
+                    )
                 )
-            )
+            # The same class of silent failure one level deeper: a typo MINTS a
+            # new agent, a forged join MERGES two. Every connector Curie renders
+            # for this agent is named `<release>-<agent>-mcp-<connector>`, and
+            # `-mcp-` is a bare substring inside one DNS label rather than a
+            # structural separator (#1446).
+            if agent_forges_join(target.agent):
+                errors.append(
+                    (
+                        "deploy.ambiguous_agent_name",
+                        f"{where}: `{target.agent}` would forge a second `-mcp-` in every "
+                        "connector object name Curie renders for this agent "
+                        "(`<release>-<agent>-mcp-<connector>`), so a DIFFERENT "
+                        "agent/connector pair would render the same Service, Deployment, "
+                        "both NetworkPolicies and the same `app.kubernetes.io/name` -- which "
+                        "IS the pod selector, so one agent's sandbox would reach the other's "
+                        "connector and the credential bound to it (the connector is "
+                        "deliberately unauthenticated, ADR-0086) -- rename the agent so it "
+                        "does not end in `-mcp` or contain `-mcp-`",
+                    )
+                )
         if target.slack_channel is not None and not _SLACK_RE.fullmatch(target.slack_channel):
             errors.append(
                 (

@@ -32,7 +32,7 @@ jobs:
   # Gates the ENTIRE tag-triggered publish pipeline (issue #628). A `v*` tag push
   # proves nothing about the tagged commit on its own, so nothing below may run
   # for one until this job says the commit is reviewed, on an allowed release
-  # branch, and green.
+  # branch, green, and covered by its registered architecture-atlas snapshot.
   # See ADR-0058 for the ancestry/checks design and ADR-0065 for the trust
   # boundary this job actually sits behind: it stops an accidentally-tagged
   # commit, not a write actor willing to edit the gate itself, because both
@@ -89,6 +89,11 @@ jobs:
           python3 release/authorize.py "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY" \
             --reviewed-ref origin/${{ env.RELEASE_MAIN_BRANCH }} \
             --reviewed-ref origin/${{ env.RELEASE_NEXT_BRANCH }}
+      - name: Tag must carry its architecture atlas snapshot
+        run: |
+          python3 release/atlas.py \
+            --version "$GITHUB_REF_NAME" \
+            --commit "$GITHUB_SHA"
 
   build:
     name: Build ${{ matrix.name }} image (${{ matrix.platform }})
@@ -106,7 +111,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        name: [runner, api, dispatcher, mail-adapter, worker, ui, sre-bot-tempo, sre-bot-k8s-write, sre-bot-k8s-scale]
+        name: [runner, api, dispatcher, mail-adapter, worker, ui, sre-bot-tempo, sre-bot-k8s-write, sre-bot-k8s-scale, sre-bot-self-upgrade]
         platform: [linux/amd64, linux/arm64]
         include:
           - name: runner
@@ -142,6 +147,12 @@ jobs:
           - name: sre-bot-k8s-scale
             context: examples/sre-bot/connectors/k8s-scale
             dockerfile: examples/sre-bot/connectors/k8s-scale/Dockerfile
+          # The button the bot presses to upgrade itself. Same reasoning as the
+          # two above: unpublished, it is a verb the live bot cannot have, and
+          # the one it cannot have here is the one that keeps it current.
+          - name: sre-bot-self-upgrade
+            context: examples/sre-bot/connectors/self-upgrade
+            dockerfile: examples/sre-bot/connectors/self-upgrade/Dockerfile
           - platform: linux/amd64
             runner: ubuntu-latest
             arch: amd64
@@ -238,7 +249,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        name: [runner, api, dispatcher, mail-adapter, worker, ui, sre-bot-tempo, sre-bot-k8s-write, sre-bot-k8s-scale]
+        name: [runner, api, dispatcher, mail-adapter, worker, ui, sre-bot-tempo, sre-bot-k8s-write, sre-bot-k8s-scale, sre-bot-self-upgrade]
     steps:
       - name: Download digests
         id: download_digests

@@ -33,6 +33,15 @@ answers: a record proves its turn finished, so a turn that owns one must not be
 rerun for as long as that record can exist. Completion emit is at-least-once;
 turn SIDE EFFECTS are at-most-once for the whole outbox retention window, and
 that is why ``mark_done`` widens the marker's own TTL to match.
+
+Since ADR-0131 the terminal write has TWO forms, and they differ only by a
+precondition. ``settle_fenced`` is the form a delivery OWNER uses: it verifies
+the ownership lease and its fencing generation in the same script that writes
+the record and the marker, so a fenced-out owner writes nothing at all.
+``mark_completion_pending`` + ``mark_done`` remain the leaseless form, used by a
+kernel called without a lease and by the sweeper -- neither of which is an owner
+and neither of which has a fence to check. The ordering, the TTLs, and the
+resulting state are identical in both; only the precondition is new.
 """
 
 from __future__ import annotations
@@ -70,6 +79,46 @@ redis.call('SET', KEYS[1], '1', 'EX', ARGV[1])
 if redis.call('EXISTS', KEYS[2]) == 1 then
   redis.call('HSET', KEYS[2], ARGV[2], '1')
 end
+return 1
+"""
+
+# The fencing generation field inside the DELIVERY STATE hash. Owned by
+# ``delivery_lease.py`` (which HINCRBYs it on every change of authority); named
+# here because ``_SETTLE_FENCED_LUA`` below reads it, and a literal buried in Lua
+# is exactly the kind of cross-module constant that drifts silently.
+_DELIVERY_GENERATION_FIELD = "gen"
+
+# The FENCED terminal settlement (ADR-0131): the ownership check and the whole
+# terminal write, indivisibly.
+#
+# This is the ADR's "one atomic operation verifies the current lease, writes the
+# done marker and completion outbox, and identifies the winning owner". It fuses
+# what ``mark_completion_pending`` + ``mark_done`` do in two calls, and the
+# fusion is the point: two calls cannot be atomic with a fence check, so a slow
+# owner could pass the check and then write after a replacement had already
+# taken authority.
+#
+# It does NOT reorder anything. The record is still written BEFORE/WITH the done
+# marker, for the reason the module docstring gives, and is still cleared only
+# after a CONFIRMED emit (by ``clear_completion``, which is untouched). The fence
+# adds a PRECONDITION in front of the same ordering.
+#
+# Two guards, both before any write, both fail-closed:
+#   - the lease key must still hold OUR owner token; and
+#   - the delivery state's fencing generation must still be the one we hold.
+# ``_ACQUIRE_LUA`` installs the token and increments the generation in one
+# script, so the two move together; checking both means a hand-rolled or
+# partially-applied change of authority cannot slip between them.
+#
+# ``_MARK_DONE_LUA`` above is deliberately NOT modified: it still serves the
+# leaseless path (a kernel called without a lease) and the completion sweeper,
+# neither of which is a delivery owner.
+_SETTLE_FENCED_LUA = """
+if redis.call('GET', KEYS[4]) ~= ARGV[7] then return 0 end
+if redis.call('HGET', KEYS[5], ARGV[8]) ~= ARGV[9] then return 0 end
+redis.call('HSET', KEYS[2], ARGV[3], ARGV[5], ARGV[2], '1', ARGV[4], ARGV[6])
+redis.call('SADD', KEYS[3], ARGV[10])
+redis.call('SET', KEYS[1], '1', 'EX', ARGV[1])
 return 1
 """
 
@@ -228,6 +277,66 @@ class Markers:
             pipe.sadd(self._config.completions_pending_key(), event_id)
             await pipe.execute()
         return generation
+
+    async def settle_fenced(
+        self,
+        event_id: str,
+        record: CompletionRecord,
+        *,
+        stream: str,
+        group: str,
+        entry_id: str,
+        owner: str,
+        generation: int,
+    ) -> str | None:
+        """Settle this turn terminally, but only if this owner still holds the fence.
+
+        The fenced sibling of ``mark_completion_pending`` + ``mark_done``, fused
+        into one script so the ownership check and the terminal write cannot be
+        separated (see ``_SETTLE_FENCED_LUA``). On success the outbox record is
+        stored, indexed, and flagged done, and the done marker is set -- the same
+        state, in the same order, the two-call path produces.
+
+        The delivery triple is the caller's, taken straight off the
+        ``DeliveryLease`` it was granted for, so the lease and state keys named
+        here are EXACTLY the ones the fence was acquired on. There is no lookup:
+        ADR-0131 keys a delivery by ``(stream, group, entry_id)``, the lease
+        carries that triple, and the two key helpers on ``WorkerConfig`` are the
+        single definition of how it becomes a key. A settle therefore costs one
+        round trip and touches nothing but this delivery.
+
+        Returns the record's GENERATION on success, so the caller can
+        compare-and-clear the record it wrote, exactly as the leaseless path
+        does. Returns ``None`` when the fence refused: this owner's lease has
+        moved on, and per ADR-0131 it "may not ACK, dead-letter, clear an outbox
+        record, or emit a terminal result". Nothing was written.
+        """
+        lease_key = self._config.delivery_lease_key(stream, group, entry_id)
+        state_key = self._config.delivery_state_key(stream, group, entry_id)
+        record_generation = uuid.uuid4().hex
+        ttl_s = max(
+            self._config.idempotency_ttl_s, int(self._config.completion_max_retention_s)
+        )
+        settled = await self._redis.eval(
+            _SETTLE_FENCED_LUA,
+            5,
+            self._config.done_key(event_id),
+            self._config.completion_key(event_id),
+            self._config.completions_pending_key(),
+            lease_key,
+            state_key,
+            str(ttl_s),
+            _DONE_FIELD,
+            _RECORD_FIELD,
+            _GENERATION_FIELD,
+            record.model_dump_json(),
+            record_generation,
+            owner,
+            _DELIVERY_GENERATION_FIELD,
+            str(generation),
+            event_id,
+        )
+        return record_generation if int(settled) == 1 else None
 
     async def read_completion(self, event_id: str) -> StoredCompletion | None:
         """The stored record AS STORED, or None when some emitter cleared it.

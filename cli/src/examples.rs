@@ -41,6 +41,7 @@ const WRITE_KUBECONFIG_SECRET_KEY: &str = "K8S_WRITE_KUBECONFIG";
 const WRITE_ALLOWLIST_ENV: &str = "K8S_WRITE_ALLOWLIST";
 const WRITE_GATE: &str = "mcp__k8s-write__restart_deployment";
 const SCALE_GATE: &str = "mcp__k8s-scale__scale_deployment";
+const UPGRADE_GATE: &str = "mcp__self-upgrade__upgrade_self";
 // The one grant the write path may carry. Read from the shipped manifest and
 // asserted rather than assumed, so editing that file to widen the verb set stops
 // the install instead of shipping in it -- the same posture the connector and
@@ -1309,14 +1310,16 @@ async fn resolve_embedded_cluster_connection(
         .ok()
         .filter(|value| !value.trim().is_empty());
     let local_port = crate::message::DEFAULT_API_LOCAL_PORT;
-    let (api_url, port_forward) = match commands::deploy_port_forward(
+    let tunnel = commands::deploy_api_tunnel(
         explicit_api_url.as_deref(),
         &identity.namespace,
         &identity.release,
         local_port,
         crate::message::API_REMOTE_PORT,
-    ) {
-        Some(command) => {
+    )
+    .await;
+    let (api_url, port_forward) = match tunnel {
+        Some((_fullname, command)) => {
             let (child, effective_port) =
                 crate::message::start_port_forward(&command, local_port, "SRE bot deploy API")
                     .await?;
@@ -1743,6 +1746,15 @@ fn runtime_connector_declaration(
     if connectors.remove("k8s-scale").is_none() {
         bail!("embedded SRE bot must declare connectors.k8s-scale");
     }
+    // Self-upgrade stays out too, and for a stronger reason than scale. It is
+    // inert without a CronJob this installer does not create, and its identity
+    // holds namespace-wide `create` on `jobs` in the namespace that holds the
+    // platform API key (see manifests/upgrade-role.yaml). A grant that wide is
+    // an operator's decision made while reading that file, never a side effect
+    // of running an installer.
+    if connectors.remove("self-upgrade").is_none() {
+        bail!("embedded SRE bot must declare connectors.self-upgrade");
+    }
     // Fail closed on a connector this build does not know about. Removing the
     // write connectors by name is only as narrow as intended if the bundle has no
     // third one -- and the bundle is edited far more often than this file, so an
@@ -1817,7 +1829,8 @@ fn runtime_plugin_manifest(source: &[u8], write_enabled: bool) -> Result<Vec<u8>
     let expected_policy = serde_json::json!({
         "gates": [
             {"gate": WRITE_GATE, "route": "sre-approvals"},
-            {"gate": SCALE_GATE, "route": "sre-approvals"}
+            {"gate": SCALE_GATE, "route": "sre-approvals"},
+            {"gate": UPGRADE_GATE, "route": "sre-approvals"}
         ]
     });
     if manifest.get("approvalPolicy") != Some(&expected_policy) {
@@ -2449,7 +2462,7 @@ mod tests {
 
     #[test]
     fn write_opt_in_still_refuses_an_unknown_connector() {
-        let source = b"connectors:\n  kubernetes: {}\n  grafana: {}\n  tempo:\n    build:\n      context: connectors/tempo\n  k8s-write: {}\n  k8s-scale: {}\n  mystery: {}\n";
+        let source = b"connectors:\n  kubernetes: {}\n  grafana: {}\n  tempo:\n    build:\n      context: connectors/tempo\n  k8s-write: {}\n  k8s-scale: {}\n  self-upgrade: {}\n  mystery: {}\n";
         let error = runtime_connector_declaration(
             source,
             "sha256:fixture",

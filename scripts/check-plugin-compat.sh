@@ -3,10 +3,10 @@
 # The bundle format is the Claude Code plugin shape verbatim (the distribution
 # wedge), so outbound compatibility is a contract, not a claim: this is the
 # local mirror of the CI plugin-compat gate. Plain `claude plugin validate`, no
-# --strict: our five authoring extensions (systemPrompt, starterPrompts,
-# secrets, triggers, approvalPolicy) are unknown-to-Claude-Code by design, and
-# --strict would promote those unknown-field warnings to errors. Warnings are
-# expected and allowed; a non-zero exit is the failure signal.
+# --strict: our six authoring extensions (systemPrompt, starterPrompts,
+# secrets, triggers, approvalPolicy, toolPolicy) are unknown-to-Claude-Code by
+# design, and --strict would promote those unknown-field warnings to errors.
+# Warnings are expected and allowed; a non-zero exit is the failure signal.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

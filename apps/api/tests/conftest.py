@@ -11,6 +11,7 @@ real Postgres (and real Valkey/Langfuse); nothing here mocks them.
 import asyncio
 import os
 import secrets
+import uuid
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -18,10 +19,12 @@ from typing import Any
 
 import asyncpg
 import pytest
+import redis
 from alembic import command
 from alembic.config import Config
 from curie_api.config import get_settings
 from curie_api.main import create_app
+from curie_test_support.valkey import connect_or_skip
 from fastapi.testclient import TestClient
 from sqlalchemy import make_url
 from sqlalchemy.engine import URL
@@ -161,6 +164,41 @@ def clean_db(migrated: None) -> None:
 def client(_disposable_db: Any) -> Any:
     # Depends on _disposable_db so the app engine is built against the disposable
     # DB (the app lifespan already requires the compose stack: RustFS, Valkey).
+    with TestClient(create_app()) as test_client:
+        yield test_client
+
+
+# --- hook ingress fixtures (test_hooks.py, test_hook_partition.py) -------------
+#
+# Shared here rather than imported across test modules: the suite runs under
+# ``--import-mode=importlib`` with no ``__init__.py``, so one test module
+# cannot reliably import another by name, but pytest discovers conftest
+# fixtures regardless of import mode.
+
+
+@pytest.fixture
+def runs_stream() -> Iterator[str]:
+    """A per-test runs stream, so enqueued turns never leak between tests."""
+
+    name = f"test:curie:runs:{uuid.uuid4().hex}"
+    os.environ["RUNS_STREAM"] = name
+    get_settings.cache_clear()
+    yield name
+    os.environ.pop("RUNS_STREAM", None)
+    get_settings.cache_clear()
+
+
+@pytest.fixture
+def valkey(runs_stream: str) -> Iterator[redis.Redis]:
+    client = connect_or_skip(decode_responses=True)
+    yield client
+    client.delete(runs_stream)
+    client.close()
+
+
+@pytest.fixture
+def hooks_client(_disposable_db: Any, runs_stream: str) -> Iterator[TestClient]:
+    # Built AFTER runs_stream so the app reads the per-test stream name.
     with TestClient(create_app()) as test_client:
         yield test_client
 

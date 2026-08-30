@@ -19,14 +19,16 @@ import asyncio
 import base64
 import binascii
 import json
+import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from types import TracebackType
-from typing import TypeVar
+from typing import Any, TypeVar
 
 import aiohttp
 from aci_protocol import Event, Final, Interrupt, OutboundEvent, parse_ndjson_line
+from aiohttp.helpers import sentinel
 from curie_telemetry import inject_trace_context, operation_span, record_metric
 from opentelemetry.trace import SpanKind, StatusCode
 
@@ -43,9 +45,14 @@ from opentelemetry.trace import SpanKind, StatusCode
 # going) instead of re-deriving the bound -- or a coupling to this client's
 # other timeouts -- at each call site.
 _DEFAULT_INTERRUPT_TIMEOUT_S = 5.0
+# The smallest per-request bound a spent budget may derive. See
+# ``_request_timeout``: aiohttp treats a total of 0.0 as "no timeout".
+_MIN_REQUEST_TIMEOUT_S = 0.05
 _POST_FINAL_CLEANUP_TIMEOUT_S = 1.0
 _POST_FINAL_DISCARD_CHUNK_BYTES = 64 * 1024
 _T = TypeVar("_T")
+
+logger = logging.getLogger(__name__)
 
 
 def _auth_headers(token: str | None) -> dict[str, str] | None:
@@ -60,8 +67,31 @@ def _auth_headers(token: str | None) -> dict[str, str] | None:
     return None
 
 
+def _mark_rpc_failed(span: Any, outcome: str, cause: BaseException) -> None:
+    """Stamp one runner-RPC span as failed, in the one shared vocabulary."""
+    if hasattr(span, "set_status"):
+        span.set_status(StatusCode.ERROR)
+    span.add_event(
+        "runner.rpc.failed",
+        {"outcome": outcome, "error.class": type(cause).__name__},
+    )
+
+
 class RunnerError(Exception):
     """The runner returned an unexpected HTTP status or an unreadable stream."""
+
+
+class RunnerStreamTimeout(TimeoutError):
+    """The streamed turn body exceeded the client's total/sock-read budget.
+
+    A ``TimeoutError`` subclass on purpose (#2011): every existing
+    ``except TimeoutError`` / ``except (aiohttp.ClientError, TimeoutError)``
+    handler in the worker keeps catching this unchanged. What it adds is a
+    non-empty ``str()`` -- ``str(TimeoutError())`` is the EMPTY STRING, which is
+    how a real 600s cluster timeout reached the operator log as "turn stream
+    dropped for <id>: " with nothing after the colon -- naming both the
+    normalized underlying exception class and the budget that expired.
+    """
 
 
 @dataclass(frozen=True)
@@ -80,25 +110,77 @@ class RunnerWorkspaceSnapshot:
 class TurnStream:
     """An open ``/v1/event`` response: the turn is active; iterate for frames."""
 
-    def __init__(self, response: aiohttp.ClientResponse) -> None:
+    def __init__(
+        self, response: aiohttp.ClientResponse, budget_s: float | None = None
+    ) -> None:
         self._response = response
         self._saw_final = False
+        # The streaming budget this stream is running under, carried from the
+        # client so the stream can NAME the budget it blew (#2011). Optional so
+        # a directly-constructed TurnStream (tests, evals) still works.
+        self._budget_s = budget_s
 
     async def __aiter__(self) -> AsyncIterator[OutboundEvent]:
-        async for raw in self._response.content:
-            line = raw.decode("utf-8").strip()
-            if not line:
-                continue
-            frame = parse_ndjson_line(line)
-            if isinstance(frame, Final):
-                self._saw_final = True
-            yield frame
-            if isinstance(frame, Final):
-                # Final is terminal for every consumer, including evals that
-                # naturally iterate to stream end. Bytes after it belong only
-                # to the bounded transport cleanup in __aexit__; they must not
-                # be parsed, applied, or allowed to occupy the 600s turn budget.
-                return
+        try:
+            async for raw in self._response.content:
+                line = raw.decode("utf-8").strip()
+                if not line:
+                    continue
+                frame = parse_ndjson_line(line)
+                if isinstance(frame, Final):
+                    self._saw_final = True
+                yield frame
+                if isinstance(frame, Final):
+                    # Final is terminal for every consumer, including evals that
+                    # naturally iterate to stream end. Bytes after it belong only
+                    # to the bounded transport cleanup in __aexit__; they must not
+                    # be parsed, applied, or allowed to occupy the 600s turn budget.
+                    return
+        except TimeoutError as cause:
+            # ONLY TimeoutError (which covers asyncio.TimeoutError,
+            # aiohttp.ServerTimeoutError and aiohttp.SocketTimeoutError). A
+            # genuine connection reset is an aiohttp.ClientError and is NOT a
+            # timeout: it must keep flowing to the kernel as the generic
+            # runner-error it has always been. asyncio.CancelledError does not
+            # subclass TimeoutError, so cooperative cancellation still passes
+            # straight through -- do not broaden this clause.
+            self._record_stream_timeout(cause)
+            raise RunnerStreamTimeout(self._timeout_reason(cause)) from cause
+
+    def _timeout_reason(self, cause: BaseException) -> str:
+        budget = "unbounded" if self._budget_s is None else f"{self._budget_s}s"
+        return (
+            f"runner turn stream exceeded its {budget} total/sock-read budget "
+            f"({type(cause).__name__})"
+        )
+
+    def _record_stream_timeout(self, cause: BaseException) -> None:
+        """Emit the terminal record this boundary previously never produced.
+
+        ``RunnerClient._rpc``'s span for ``start_turn`` closes as soon as the
+        response HEADERS arrive, so a budget expiring while the NDJSON BODY is
+        read left no evidence at the RPC boundary at all -- the only
+        ``curie.runner.rpc.result`` point for the turn said ``success`` (#2011).
+        The attribute values here are already in the shared allowlist, and the
+        span/event keys are the same closed vocabulary ``_rpc`` uses.
+        """
+        reason = self._timeout_reason(cause)
+        logger.warning("%s", reason)
+        attributes = {
+            "service.name": "curie-worker",
+            "operation": "event",
+            "role": "client",
+        }
+        record_metric(
+            "curie.runner.rpc.result",
+            attributes={**attributes, "outcome": "timeout"},
+        )
+        with operation_span(
+            "curie.runner.rpc",
+            kind=SpanKind.CLIENT,
+            attributes=attributes,
+        ) as span:
+            _mark_rpc_failed(span, "timeout", cause)
 
     async def _discard_post_final(self) -> None:
         """Briefly keep the transport open while discarding bytes through EOF.
@@ -159,7 +241,14 @@ class RunnerClient:
     ) -> None:
         if snapshot_patch_max_bytes <= 0:
             raise ValueError("snapshot patch byte limit must be positive")
+        self._total_timeout_s = total_timeout_s
         self._own_session = session is None
+        self._connect_timeout_s = connect_timeout_s
+        # Since ADR-0131 this is a per-request CEILING inside the delivery's one
+        # overall deadline, not an independent clock. It stays the session
+        # default (so every caller without a budget is behaviourally unchanged)
+        # and is the upper half of the ``min`` in ``_request_timeout``.
+        self._total_timeout_s = total_timeout_s
         self._session = session or aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(
                 total=total_timeout_s, connect=connect_timeout_s, sock_read=total_timeout_s
@@ -168,11 +257,48 @@ class RunnerClient:
         # A per-request override, not folded into the session default above: it
         # replaces (not merges with) the session timeout for this one call, so
         # ``/v1/interrupt`` gets its own short control-plane budget regardless of
-        # how the streaming timeouts above are tuned.
+        # how the streaming timeouts above are tuned. The budget-derived
+        # overrides below rely on exactly that mechanic.
+        #
+        # ``/v1/interrupt`` is DELIBERATELY excluded from the budget path and a
+        # test guards it structurally: the interrupt is the fail-closed stop a
+        # lost lease fires, and deriving its timeout from a budget that may
+        # already be exhausted would make the fence unable to stop the runner it
+        # just fenced.
         self._interrupt_timeout = aiohttp.ClientTimeout(total=interrupt_timeout_s)
         self._snapshot_patch_max_bytes = snapshot_patch_max_bytes
         self._snapshot_body_max_bytes = (
             4 * ((snapshot_patch_max_bytes + 2) // 3) + 131_072
+        )
+
+    def _request_timeout(self, remaining_s: float | None) -> aiohttp.ClientTimeout | Any:
+        """The per-request timeout for a delivery with ``remaining_s`` of budget.
+
+        Returns aiohttp's own ``sentinel`` when there is no budget in hand, so
+        the session default applies and every leaseless caller is
+        byte-identical in behavior. An explicit ``timeout=None`` would not do
+        that: aiohttp reads it as ``ClientTimeout(total=None)``, i.e. no
+        timeout at all -- the one shape this method must never produce. The
+        sentinel is aiohttp's own "use the session default" value (it is what
+        ``timeout`` defaults to internally); its type is private to aiohttp,
+        hence the ``Any`` half of the return annotation.
+
+        The effective bound is ``min(total_timeout_s, remaining_s)``: the budget
+        can only ever SHORTEN a request. A 30-minute delivery must not hand one
+        runner request a 30-minute HTTP deadline.
+
+        A spent budget is floored to ``_MIN_REQUEST_TIMEOUT_S`` rather than
+        passed through. aiohttp starts a timeout handle only ``if timeout > 0``,
+        so a bounded value of exactly 0.0 disables the timeout entirely -- the
+        "no timeout at all" shape this method must never produce, and it would
+        arrive precisely when the delivery has the least time to spare. The
+        floor is small enough that an exhausted budget still fails fast.
+        """
+        if remaining_s is None:
+            return sentinel
+        bounded = max(_MIN_REQUEST_TIMEOUT_S, min(self._total_timeout_s, remaining_s))
+        return aiohttp.ClientTimeout(
+            total=bounded, connect=self._connect_timeout_s, sock_read=bounded
         )
 
     async def _rpc(
@@ -204,12 +330,7 @@ class RunnerClient:
             except Exception as exc:
                 error = exc
                 outcome = "timeout" if isinstance(exc, TimeoutError) else "failure"
-                if hasattr(span, "set_status"):
-                    span.set_status(StatusCode.ERROR)
-                span.add_event(
-                    "runner.rpc.failed",
-                    {"outcome": outcome, "error.class": type(exc).__name__},
-                )
+                _mark_rpc_failed(span, outcome, exc)
             else:
                 span.add_event("runner.rpc.completed", {"outcome": outcome})
 
@@ -224,27 +345,47 @@ class RunnerClient:
             raise error
         return result  # type: ignore[return-value]
 
-    async def start_turn(self, base_url: str, event: Event, token: str | None = None) -> TurnStream:
+    async def start_turn(
+        self,
+        base_url: str,
+        event: Event,
+        token: str | None = None,
+        *,
+        remaining_s: float | None = None,
+    ) -> TurnStream:
         """Open a turn. Returns once the runner has accepted it (turn active)."""
 
         async def request(headers: dict[str, str] | None) -> tuple[TurnStream, str]:
             resp = await self._session.post(
-                f"{base_url}/v1/event", json=event.model_dump(), headers=headers
+                f"{base_url}/v1/event",
+                json=event.model_dump(),
+                headers=headers,
+                timeout=self._request_timeout(remaining_s),
             )
             if resp.status != 200:
                 body = await resp.text()
                 resp.release()
                 raise RunnerError(f"/v1/event -> {resp.status}: {body}")
-            return TurnStream(resp), "success"
+            return TurnStream(resp, self._total_timeout_s), "success"
 
         return await self._rpc("event", token, request)
 
-    async def steer(self, base_url: str, event: Event, token: str | None = None) -> bool:
+    async def steer(
+        self,
+        base_url: str,
+        event: Event,
+        token: str | None = None,
+        *,
+        remaining_s: float | None = None,
+    ) -> bool:
         """Inject a follow-up into the live turn. False on 409 (no active turn)."""
 
         async def request(headers: dict[str, str] | None) -> tuple[bool, str]:
             async with self._session.post(
-                f"{base_url}/v1/steer", json=event.model_dump(), headers=headers
+                f"{base_url}/v1/steer",
+                json=event.model_dump(),
+                headers=headers,
+                timeout=self._request_timeout(remaining_s),
             ) as resp:
                 if resp.status == 409:
                     return False, "conflict"
@@ -281,7 +422,13 @@ class RunnerClient:
 
         await self._rpc("interrupt", token, request)
 
-    async def reset(self, base_url: str, token: str | None = None) -> None:
+    async def reset(
+        self,
+        base_url: str,
+        token: str | None = None,
+        *,
+        remaining_s: float | None = None,
+    ) -> None:
         """Discard the runner's conversation so the next turn starts fresh (#550).
 
         The eval driver calls this between cases to enforce per-case isolation.
@@ -291,7 +438,11 @@ class RunnerClient:
         condition to swallow.
         """
         async def request(headers: dict[str, str] | None) -> tuple[None, str]:
-            async with self._session.post(f"{base_url}/v1/reset", headers=headers) as resp:
+            async with self._session.post(
+                f"{base_url}/v1/reset",
+                headers=headers,
+                timeout=self._request_timeout(remaining_s),
+            ) as resp:
                 if resp.status != 200:
                     body = await resp.text()
                     raise RunnerError(f"/v1/reset -> {resp.status}: {body}")
@@ -299,7 +450,13 @@ class RunnerClient:
 
         await self._rpc("reset", token, request)
 
-    async def snapshot(self, base_url: str, token: str | None = None) -> RunnerWorkspaceSnapshot:
+    async def snapshot(
+        self,
+        base_url: str,
+        token: str | None = None,
+        *,
+        remaining_s: float | None = None,
+    ) -> RunnerWorkspaceSnapshot:
         """Capture a bounded patch before a publication approval suspends.
 
         This call is always runner-token authenticated. A missing token is a
@@ -311,7 +468,9 @@ class RunnerClient:
         if not token:
             raise RunnerError("publication snapshot requires a runner token")
         async with self._session.post(
-            f"{base_url}/v1/snapshot", headers=_auth_headers(token)
+            f"{base_url}/v1/snapshot",
+            headers=_auth_headers(token),
+            timeout=self._request_timeout(remaining_s),
         ) as resp:
             if resp.status != 200:
                 body = await resp.text()
@@ -359,9 +518,15 @@ class RunnerClient:
             except (KeyError, TypeError, ValueError, binascii.Error, json.JSONDecodeError) as exc:
                 raise RunnerError("/v1/snapshot returned an invalid bounded payload") from exc
 
-    async def status(self, base_url: str) -> dict[str, object]:
+    async def status(
+        self, base_url: str, *, remaining_s: float | None = None
+    ) -> dict[str, object]:
         async def request(headers: dict[str, str] | None) -> tuple[dict[str, object], str]:
-            async with self._session.get(f"{base_url}/status", headers=headers) as resp:
+            async with self._session.get(
+                f"{base_url}/status",
+                headers=headers,
+                timeout=self._request_timeout(remaining_s),
+            ) as resp:
                 if resp.status != 200:
                     body = await resp.text()
                     raise RunnerError(f"/status -> {resp.status}: {body}")

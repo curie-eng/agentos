@@ -4,11 +4,19 @@ Nothing mocked -- exercises the API against the compose Postgres (the
 disposable-DB conftest provisions and migrates a throwaway database per run).
 """
 
+import asyncio
+import threading
+import time
 import uuid
+from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
+import asyncpg
 from curie_api.config import get_settings
+from curie_api.routers.state import _NAMESPACE_LOCK_CLASS, _namespace_lock_key
 from curie_api.sandbox_token import mint
+from sqlalchemy import make_url
 
 # Scoped-sandbox-token auth matrix constants (#410).
 _FAR_FUTURE = 4102444800  # 2100-01-01, valid at test time
@@ -424,6 +432,362 @@ def test_namespace_count_over_the_per_agent_cap_is_rejected(
         assert "cap" in over.text.lower() and "namespace" in over.text.lower()
         # More keys in an EXISTING namespace still succeed (not a new namespace).
         assert put("ns1", "k2").status_code == 200
+    finally:
+        get_settings.cache_clear()
+
+
+def _asyncpg_dsn() -> str:
+    url = make_url(get_settings().database_url).set(drivername="postgresql")
+    return url.render_as_string(hide_password=False)
+
+
+async def _install_state_insert_gate() -> None:
+    """Hold every INSERT into the state store at an advisory lock (#933).
+
+    The state variant of test_memory.py's BEFORE UPDATE gate: the write that can
+    create a new namespace is an INSERT, not an UPDATE. Lock id 933933 is
+    distinct from test_memory's 391391 so the two gates can never alias, and both
+    live in the ONE-argument advisory space, which Postgres keeps entirely
+    separate from the two-int4 space the production namespace lock uses.
+    """
+    connection = await asyncpg.connect(_asyncpg_dsn())
+    try:
+        await connection.execute(
+            """
+            CREATE OR REPLACE FUNCTION curie.test_state_insert_gate()
+            RETURNS trigger
+            LANGUAGE plpgsql
+            AS $$
+            BEGIN
+                PERFORM pg_advisory_xact_lock(933933);
+                RETURN NEW;
+            END;
+            $$
+            """
+        )
+        await connection.execute(
+            """
+            CREATE TRIGGER test_state_insert_gate
+            BEFORE INSERT ON curie.workflow_state_entries
+            FOR EACH ROW
+            EXECUTE FUNCTION curie.test_state_insert_gate()
+            """
+        )
+    finally:
+        await connection.close()
+
+
+async def _remove_state_insert_gate() -> None:
+    connection = await asyncpg.connect(_asyncpg_dsn())
+    try:
+        await connection.execute(
+            """
+            DROP TRIGGER IF EXISTS test_state_insert_gate
+            ON curie.workflow_state_entries
+            """
+        )
+        await connection.execute("DROP FUNCTION IF EXISTS curie.test_state_insert_gate()")
+    finally:
+        await connection.close()
+
+
+async def _wait_for_blocked_state_requests(minimum: int, requests: list[Future[Any]]) -> None:
+    """Block until `minimum` sessions are waiting on a lock, or fail loudly.
+
+    Deliberately NOT filtered by `query LIKE '%workflow_state_entries%'` the way
+    test_memory's twin is: once the cap is atomic, the second writer waits on
+    `SELECT pg_advisory_xact_lock($1, $2)` inside the cap check and never reaches
+    an INSERT, so its query text names no table and that filter would never see
+    it. Leaving the predicate on `wait_event_type` alone is safe because the
+    disposable-DB conftest gives the run its own database (so `current_database()`
+    already scopes the count to this test's traffic) and the gate holder *holds*
+    its advisory lock rather than waiting on one.
+    """
+    connection = await asyncpg.connect(_asyncpg_dsn())
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            count = await connection.fetchval(
+                """
+                SELECT count(*)
+                FROM pg_stat_activity
+                WHERE datname = current_database()
+                  AND wait_event_type = 'Lock'
+                """
+            )
+            if int(count) >= minimum:
+                return
+            # A request that finished instead of blocking means the interleaving
+            # under test never happened -- fail loudly rather than hang to the
+            # deadline and report a timeout.
+            completed = [request.result() for request in requests if request.done()]
+            assert not completed, f"request completed before blocking: {completed}"
+            await asyncio.sleep(0.01)
+        raise AssertionError(f"only some of {minimum} state requests blocked")
+    finally:
+        await connection.close()
+
+
+def _hold_advisory_lock(
+    args: tuple[int, ...],
+    acquired: threading.Event,
+    release: threading.Event,
+    errors: list[Exception],
+) -> None:
+    """Hold a Postgres session-level advisory lock from an outside session (#933).
+
+    Shared by both #933 gates: the one-argument INSERT gate (`(933933,)`) and
+    the two-argument PRODUCTION namespace lock (`_NAMESPACE_LOCK_CLASS`,
+    `_namespace_lock_key(...)`). Postgres keeps the one-argument and
+    two-argument advisory-lock spaces entirely separate, so 933933 as a
+    single arg can never collide with the two-arg production key.
+
+    Session-level (`pg_advisory_lock`), not transaction-level, because it has
+    to outlive the statement that takes it and be released on a signal from
+    the test.
+    """
+    placeholders = ", ".join(f"${i}" for i in range(1, len(args) + 1))
+
+    async def hold() -> None:
+        connection = await asyncpg.connect(_asyncpg_dsn())
+        try:
+            await connection.execute(f"SELECT pg_advisory_lock({placeholders})", *args)
+            acquired.set()
+            release.wait()
+            await connection.execute(f"SELECT pg_advisory_unlock({placeholders})", *args)
+        finally:
+            # Closing the connection releases the session lock too, so no
+            # failure path can leave the key held and wedge every later test.
+            await connection.close()
+
+    try:
+        asyncio.run(hold())
+    except Exception as error:
+        errors.append(error)
+        acquired.set()
+
+
+def _run_ordered_state_requests(
+    first: Callable[[], Any], second: Callable[[], Any]
+) -> tuple[Any, Any]:
+    """Run two real requests concurrently, both parked at the INSERT gate.
+
+    Ordering is established by the database, not by a timer: `first` is submitted
+    and confirmed blocked before `second` is submitted, and both are confirmed
+    blocked before the gate is released. "Confirmed blocked" means observed --
+    polling `pg_stat_activity` until the expected number of waiters is seen --
+    not timed; the poll loop's sleep is pacing between observations, not a
+    handoff window, so the interleaving is identical on a loaded box regardless
+    of that sleep's duration.
+    """
+    asyncio.run(_install_state_insert_gate())
+    acquired = threading.Event()
+    release = threading.Event()
+    lock_errors: list[Exception] = []
+    lock_thread = threading.Thread(
+        target=_hold_advisory_lock,
+        args=((933933,), acquired, release, lock_errors),
+        daemon=True,
+    )
+    lock_thread.start()
+    try:
+        assert acquired.wait(timeout=10), "database gate was not acquired"
+        assert not lock_errors, lock_errors
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first_request = executor.submit(first)
+            try:
+                asyncio.run(_wait_for_blocked_state_requests(1, [first_request]))
+                second_request = executor.submit(second)
+                asyncio.run(_wait_for_blocked_state_requests(2, [first_request, second_request]))
+            finally:
+                release.set()
+            first_response = first_request.result(timeout=10)
+            second_response = second_request.result(timeout=10)
+    finally:
+        # An INSERT gate left installed would block essentially every later test
+        # in the session, so it comes down even if the orchestration failed.
+        release.set()
+        lock_thread.join(timeout=10)
+        asyncio.run(_remove_state_insert_gate())
+
+    assert not lock_thread.is_alive(), "database gate did not release"
+    assert not lock_errors, lock_errors
+    return first_response, second_response
+
+
+def _state_writer(
+    client: Any, headers: dict[str, str], aid: str, namespace: str, key: str
+) -> Callable[[], Any]:
+    def request() -> Any:
+        return client.put(
+            f"/agents/{aid}/state/{namespace}/{key}", json={"value": 1}, headers=headers
+        )
+
+    return request
+
+
+def test_existing_namespace_write_does_not_take_the_namespace_lock(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """#933 AC4: an existing-namespace write never touches the advisory lock.
+
+    The mutation this catches is deleting the hot-path early `return` in
+    `_enforce_caps` (routers/state.py) -- i.e. making the advisory lock
+    unconditional. Every other test in this file still passes under that
+    mutation, because they all create ABSENT namespaces and so take the lock
+    either way. dadf93e2's stated contract is that "writes to an existing
+    namespace are unaffected": no lock, no added latency. Without this test that
+    sentence is pinned by nothing.
+
+    Both directions are proved under ONE held lock, which is what makes a pass
+    meaningful rather than vacuous:
+
+    * the brand-NEW namespace write is confirmed blocked on the key (via
+      `pg_stat_activity`, not a sleep), so the key really is the production one
+      and the lock really is being contended; then
+    * the EXISTING-namespace write must return 200 inside a bounded timeout.
+
+    Failure is a `TimeoutError` from `.result()`, never a hang: the holder is
+    released in a `finally` on every path.
+    """
+    aid = _agent(client, auth_headers)
+    # Seed the namespace so the second write into it is an EXISTING-namespace
+    # write. Seeded before the lock is taken; seeding afterwards would itself
+    # block on the very key under test.
+    seed = client.put(f"/agents/{aid}/state/existing/k1", json={"value": 1}, headers=auth_headers)
+    assert seed.status_code == 200, seed.text
+
+    acquired = threading.Event()
+    release = threading.Event()
+    lock_errors: list[Exception] = []
+    lock_thread = threading.Thread(
+        target=_hold_advisory_lock,
+        args=(
+            (_NAMESPACE_LOCK_CLASS, _namespace_lock_key(uuid.UUID(aid))),
+            acquired,
+            release,
+            lock_errors,
+        ),
+        daemon=True,
+    )
+    lock_thread.start()
+    try:
+        assert acquired.wait(timeout=10), "production namespace lock was not acquired"
+        assert not lock_errors, lock_errors
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            # Control arm: a NEW namespace must serialize on the held key.
+            blocked = executor.submit(_state_writer(client, auth_headers, aid, "brand-new", "k1"))
+            try:
+                asyncio.run(_wait_for_blocked_state_requests(1, [blocked]))
+                # The arm under test. Post-fix it returns before the lock is ever
+                # requested; with the hot-path `return` deleted it joins the
+                # queue behind the holder and this `.result` raises TimeoutError.
+                unblocked = executor.submit(
+                    _state_writer(client, auth_headers, aid, "existing", "k2")
+                )
+                existing_response = unblocked.result(timeout=5)
+            finally:
+                # Released INSIDE the executor context: exiting the `with` joins
+                # its workers with no timeout, so a still-blocked request would
+                # hang there instead of failing.
+                release.set()
+            blocked_response = blocked.result(timeout=10)
+    finally:
+        release.set()
+        lock_thread.join(timeout=10)
+
+    assert not lock_thread.is_alive(), "namespace lock holder did not release"
+    assert not lock_errors, lock_errors
+    assert existing_response.status_code == 200, existing_response.text
+    # The control arm proves the block was real contention, not a dead key: it
+    # only completes once the holder lets go.
+    assert blocked_response.status_code == 200, blocked_response.text
+
+    listing = client.get(f"/agents/{aid}/state", headers=auth_headers)
+    assert listing.status_code == 200, listing.text
+    by_ns = {row["namespace"]: row for row in listing.json()}
+    assert by_ns["existing"]["key_count"] == 2, listing.text
+    assert by_ns["brand-new"]["key_count"] == 1, listing.text
+
+
+def test_concurrent_new_namespaces_cannot_exceed_the_cap(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """#933: a concurrent burst must not walk past the per-agent namespace cap.
+
+    Pre-fix this is RED. The cap is a check-then-write TOCTOU: writer 2's
+    unlocked `count(distinct namespace)` sees only the seed, because writer 1's
+    `race-a` row is still uncommitted behind the gate, so it reads 1 < 2 and
+    passes its check too. Both insert -- two 200s, zero 403s, three namespaces
+    for a cap of 2.
+    """
+    aid = _agent(client, auth_headers)
+    # Seed BEFORE the gate is installed; a seed written afterwards would itself
+    # block on the gate.
+    seed = client.put(f"/agents/{aid}/state/seed/k", json={"value": 1}, headers=auth_headers)
+    assert seed.status_code == 200, seed.text
+
+    get_settings().state_max_namespaces = 2
+    try:
+        # The distinct-namespace count reaches 2 either way, so the same wait
+        # predicate holds pre-fix and post-fix. Post-fix writer 1 blocks at the
+        # gate while holding the namespace advisory lock and writer 2 blocks on
+        # that lock inside the cap check; pre-fix writer 2 sails through its
+        # check and blocks at the gate on its own INSERT. Two waiters either way.
+        first, second = _run_ordered_state_requests(
+            _state_writer(client, auth_headers, aid, "race-a", "k"),
+            _state_writer(client, auth_headers, aid, "race-b", "k"),
+        )
+
+        # Which writer wins is not under test, so assert the multiset.
+        statuses = sorted([first.status_code, second.status_code])
+        assert statuses == [200, 403], (first.text, second.text)
+        refused = first if first.status_code == 403 else second
+        assert "cap" in refused.text.lower() and "namespace" in refused.text.lower()
+
+        listing = client.get(f"/agents/{aid}/state", headers=auth_headers)
+        assert listing.status_code == 200, listing.text
+        assert len(listing.json()) == 2, listing.text
+    finally:
+        get_settings.cache_clear()
+
+
+def test_concurrent_writes_to_the_same_new_namespace_both_succeed(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """The false-positive guard for #933's own fix, not regression coverage.
+
+    Stated honestly: this test also passes PRE-fix, because today both writers
+    sail through the unlocked check and insert. Its value is in the other
+    direction -- it goes RED against a fix that takes the namespace lock WITHOUT
+    re-checking existence under it. Such a fix would make writer 2 run the count,
+    see 2 (`seed` + `shared-new`) >= 2, and 403 a write that must be allowed. The
+    cap and seed numbers are chosen so it discriminates; do not raise the cap.
+
+    The two writers use DIFFERENT keys so the `uq_state_agent_ns_key` unique
+    constraint is not involved: this is about the cap, not about insert
+    conflicts.
+    """
+    aid = _agent(client, auth_headers)
+    seed = client.put(f"/agents/{aid}/state/seed/k", json={"value": 1}, headers=auth_headers)
+    assert seed.status_code == 200, seed.text
+
+    get_settings().state_max_namespaces = 2
+    try:
+        first, second = _run_ordered_state_requests(
+            _state_writer(client, auth_headers, aid, "shared-new", "k1"),
+            _state_writer(client, auth_headers, aid, "shared-new", "k2"),
+        )
+
+        assert first.status_code == 200, first.text
+        assert second.status_code == 200, second.text
+
+        listing = client.get(f"/agents/{aid}/state", headers=auth_headers)
+        assert listing.status_code == 200, listing.text
+        body = listing.json()
+        assert len(body) == 2, body
+        by_ns = {row["namespace"]: row for row in body}
+        assert by_ns["shared-new"]["key_count"] == 2, body
     finally:
         get_settings.cache_clear()
 

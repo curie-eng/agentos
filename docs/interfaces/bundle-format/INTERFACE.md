@@ -24,11 +24,11 @@ The frozen bundle/plugin manifest format: the **Claude Code plugin shape verbati
 distribution wedge. What is swappable is the harness that consumes a bundle; what stays fixed is
 the shape a bundle must have to be accepted. The base is the Claude Code plugin shape, and the
 models are lenient (`extra="allow"`) rather than strict so any bundle written for Claude Code
-validates unchanged. On top of that base the package **does add five Curie authoring
-extensions** — `systemPrompt`, `starterPrompts`, `secrets`, `triggers`, `approvalPolicy` on
-`packages/plugin-format/src/plugin_format/models.py::PluginManifest`, optional fields Claude Code
-does not define. Leniency is what lets the Claude Code base and these extensions coexist; the
-earlier "does not invent format extensions" framing was wrong.
+validates unchanged. On top of that base the package **does add six Curie authoring
+extensions** — `systemPrompt`, `starterPrompts`, `secrets`, `triggers`, `approvalPolicy`,
+`toolPolicy` on `packages/plugin-format/src/plugin_format/models.py::PluginManifest`, optional
+fields Claude Code does not define. Leniency is what lets the Claude Code base and these
+extensions coexist; the earlier "does not invent format extensions" framing was wrong.
 
 The manifest is not the whole bundle either. Three **Curie-only root files** sit beside the Claude
 Code surfaces and are validated by the same entry point: `connectors.yaml` (ADR-0086, Accepted), its
@@ -78,7 +78,12 @@ files**, each absent from a bundle that needs none, all three invisible to Claud
   which emits `connectors.*` codes (`connectors.not_object`, `connectors.ambiguous`,
   `connectors.underspecified`, `connectors.reserved_name`, `connectors.duplicate_connector`,
   `connectors.duplicate_server`, `connectors.build_context_escapes`,
-  `connectors.build_no_platforms`, and others). Authored mapping keys are checked for
+  `connectors.build_no_platforms`, `connectors.ambiguous_name` (a connector name that contains
+  `-mcp-` or STARTS with `mcp-`, forging the `-mcp-` join used to render the connector's object
+  name, so two different (agent, connector) pairs would render byte-identical objects — checked
+  only for a hosted connector, one declaring `image:`; a remote connector, declaring `url:`,
+  derives no Kubernetes object name, since `render()` emits no objects for it and its `.mcp.json`
+  entry is the authored URL, so its name is not checked), and others). Authored mapping keys are checked for
   duplicates before validation, so a repeated connector name is rejected rather than
   silently replaced by the last YAML value.
 - `connectors.lock.yaml` (ADR-0113,
@@ -120,7 +125,11 @@ files**, each absent from a bundle that needs none, all three invisible to Claud
   `packages/plugin-format/src/plugin_format/validate.py::_validate_deploy_targets`, which emits
   `deploy.*` codes (`deploy.not_object`, `deploy.duplicate_target`, `deploy.bad_target_name`,
   `deploy.bad_env`, `deploy.missing_agent` (a declared target must name its agent; the error names
-  the target key), `deploy.bad_agent_name`, `deploy.bad_slack_channel`). Authored mapping keys are
+  the target key), `deploy.bad_agent_name`, `deploy.ambiguous_agent_name` (the agent, not the
+  connector, must not contain `-mcp-` or END in `-mcp`, since the agent sits immediately left of
+  the `-mcp-` join — same collision as `connectors.ambiguous_name`, viewed from the other side of
+  the join),
+  `deploy.bad_slack_channel`). Authored mapping keys are
   checked for duplicates before validation, so a repeated target name fails closed instead of
   silently selecting the last YAML value.
 
@@ -146,9 +155,43 @@ script from `.github/workflows/plugin-compat.yaml` on two triggers, because drif
 directions: a path-filtered `pull_request` trigger catches our own drift when we touch the bundles
 or the format models, and a nightly `schedule` catches Claude Code changing the format under us,
 which no PR of ours would ever surface. The check is deliberately not `--strict`: strict mode
-promotes unknown-field warnings to errors, and the five Curie authoring extensions are
+promotes unknown-field warnings to errors, and the six Curie authoring extensions are
 unknown-to-Claude-Code by design, so warnings are the expected steady state and only a non-zero
 exit is a failure.
+
+Outbound compatibility and **spec conformance** are different contracts, and the second needs its
+own gate: Claude Code accepting our bundles does not establish that the skills inside them satisfy
+the published Agent Skills spec, which is stricter about what a `SKILL.md` frontmatter may contain.
+`scripts/check-agent-skills.sh` (run it as `curie dev agent-skills`) defends that direction, and CI
+runs the same script from `.github/workflows/agent-skills.yaml`. Determinism here takes three pins
+working together, not one: `SKILLS_REF_VERSION` fixes the reference validator at
+`skills-ref==0.1.1`, `SKILLS_REF_EXCLUDE_NEWER` is threaded through every `uvx` invocation as a
+resolution cutoff that freezes the transitive dependency set, and the workflow pins the uv version
+on its `setup-uv` step because uv's resolver is what picks those transitive deps. The transitive
+set matters because it decides verdicts — `skills-ref` declares floating dependencies, and
+strictyaml's refusal of JSON-style flow collections is precisely what makes `allowed-tools: []`
+fail, so a strictyaml release could flip the gate with no change of ours. Given those three pins
+and a reachable PyPI the gate is deterministic, which is why this workflow has no nightly
+`schedule` trigger while plugin-compat does, since a pinned validator cannot drift between runs and
+adopting a newer spec revision is a reviewed edit. The check runs over an explicit allowlist rather
+than pure discovery, and a discovery drift check asserts that allowlist covers exactly the skills
+found under the Curie-owned roots, so a newly added skill cannot silently escape the gate by being
+unlisted. The script also preflights the validator and refuses to emit any verdict when it cannot
+be resolved or launched, so a network failure reds the gate rather than being mistaken for a skill
+being invalid — which is what lets the next claim be trusted. The fixture
+`packages/plugin-format/tests/fixtures/bad_skill/skills/broken` is carried as an **asserted
+negative**: the gate requires the reference validator to keep rejecting it, which makes
+the deliberately malformed fixture proof that the gate is not vacuous rather than an unexplained
+exclusion. Note that this constrains Curie's OWN skills only — the `plugin_format` loader stays
+deliberately lenient and keeps accepting Claude-Code-shaped bundles carrying keys the spec does not
+know about, and the two bars are intentionally different.
+
+Conforming had one real cost, paid once. `.claude/skills/implement` is the single skill the gate
+forced a migration on: its top-level `disable-model-invocation: true` is not one of the fixed
+fields the spec allows, so it moved under `metadata`, the spec's designated slot for vendor
+extensions. That keeps the declaration but drops its effect — Claude Code reads the key only at the
+top level, so it no longer enforces slash-command-only invocation for that skill. Nothing in this
+repo reads the key, and the trade is accepted deliberately.
 
 ## Implementations today
 
@@ -166,18 +209,32 @@ Code keys still validate.
 
 By intent, the manifest, skill, and MCP surfaces are Claude-Code-shaped — that is the wedge, not a
 leak. What the wedge
-costs is asymmetric fidelity: a bundle loaded by Claude Code **validates but degrades**. All five
+costs is asymmetric fidelity: a bundle loaded by Claude Code **validates but degrades**. All six
 Curie authoring extensions — `systemPrompt`, `starterPrompts`, `secrets`, `triggers`,
-`approvalPolicy` — are unknown fields to Claude Code, which warns about each and then silently
-ignores it at load time. The manifest is accepted and the commands, agents, hooks, and MCP servers
-work; the agent's persona, its suggested openers, its secret declarations, its wake-up triggers,
-and its approval gates do not travel. That degradation is by design (there is nowhere in the Claude
-Code shape to put them), but it is silent from the operator's side, so it is documented here rather
-than discovered.
+`approvalPolicy`, `toolPolicy` — are unknown fields to Claude Code, which warns about each and then
+silently ignores it at load time. The manifest is accepted and the commands, agents, hooks, and MCP
+servers work; the agent's persona, its suggested openers, its secret declarations, its wake-up
+triggers, its approval gates, and its tool policy do not travel. That degradation is by design
+(there is nowhere in the Claude Code shape to put them), but it is silent from the operator's side,
+so it is documented here rather than discovered.
+
+`toolPolicy` degrades **worse than the other five**, and the difference is the reason it is
+gated the way it is. The rest lose a capability: the agent is less useful. This one loses a
+**restriction**: a bundle whose tool surface is fenced by `toolPolicy`
+(`packages/plugin-format/src/plugin_format/models.py::ToolPolicy`) runs *unfenced* in Claude
+Code, with the manifest still claiming otherwise. That asymmetry is why the declaration carries a
+versioned `enforcement` discriminator, why `validate_bundle` refuses a policy-bearing bundle unless
+its caller states which contract it enforces
+(`packages/plugin-format/src/plugin_format/validate.py::_validate_tool_policy`, code
+`tool_policy.unenforced`), and why bundle adoption is blocked on the runtime lane. **This change is
+declaration and validation only: nothing enforces a `toolPolicy` at runtime today, that is a
+separate blocking follow-up, and no bundle may ship a policy until it lands.** The residual gap that
+no in-package mechanism can close: a platform built before this package version does not model the
+key at all, and the lenient models accept and silently ignore it.
 
 The two Curie-only root files degrade **more quietly still**, and they belong on the same list. A
 manifest extension at least draws a warning: `claude plugin validate examples/compat-fixture` (the
-fixture at `examples/compat-fixture/.claude-plugin/plugin.json`, which exists to carry all five)
+fixture at `examples/compat-fixture/.claude-plugin/plugin.json`, which exists to carry all six)
 reports one `Unknown field ... Claude Code ignores it at load time` warning per extension.
 `connectors.yaml` and `deploy.yaml` are not manifest fields at all, so Claude Code neither loads them
 nor mentions them: validating `examples/weather` (which carries `examples/weather/connectors.yaml`)
@@ -187,7 +244,7 @@ servers simply absent, and with no signal at all that anything was dropped. `dep
 harmlessly by comparison, since routing is Curie's concern and Claude Code has nothing to route.
 
 The outbound gate covers this unevenly, and the gap is worth naming.
-`examples/tests/test_plugin_compat_coverage.py` pins that each of the five manifest extensions
+`examples/tests/test_plugin_compat_coverage.py` pins that each of the six manifest extensions
 appears in at least one discovered example bundle, so the gate cannot cover them vacuously, but it
 checks manifest FIELDS only. `connectors.yaml` is exercised incidentally because the weather bundle
 happens to carry one; **no example bundle carries a `deploy.yaml`**, so nothing asserts that Claude
@@ -205,7 +262,7 @@ control, matching Claude Code convention for author-declared hooks. Only `PreToo
 other hook events validate but are not yet consumed. Epic #30 continues to define the remaining authoring extensions (approval-policy and
 trigger declarations) alongside this.
 
-Two of those Curie authoring extensions are **deploy-time validated** (shape enforced, malformed
+Three of those Curie authoring extensions are **deploy-time validated** (shape enforced, malformed
 declarations rejected), but they differ in whether the runtime acts on them yet:
 
 - `approvalPolicy` (`{gates: [{gate, route, grantableViaPolicy}]}` approval declarations, #273) is **consumed at
@@ -227,9 +284,29 @@ declarations rejected), but they differ in whether the runtime acts on them yet:
 - `triggers` (a list of `cron`/`webhook` declarations for waking the agent beyond chat, #273/#270 —
   see the [triggers seam](../triggers/INTERFACE.md)) is still **declaration-only**: its validator
   runs at deploy, but no runtime scheduler/ingress consumes a declared trigger yet (Epic #29).
+- `toolPolicy` (`{enforcement, allow, approvalRequired, deny}` glob collections over canonical
+  `"<server>/<tool>"` MCP tool names,
+  `packages/plugin-format/src/plugin_format/models.py::ToolPolicy`) is **declaration-only and
+  fenced as such**. Precedence is by class — `deny` > `approvalRequired` > `allow` — and an
+  unmatched tool is DENIED, so server tool-surface drift fails closed. The grammar and pattern
+  rules live in one shared module, `packages/plugin-format/src/plugin_format/tool_policy.py`, so
+  the deploy validator and the future runtime loader normalize identically — the #453/#544 lesson
+  that normalizing separately silently disagrees and ships a fail-open. The deploy validator
+  (`packages/plugin-format/src/plugin_format/validate.py::_validate_tool_policy`) calls that
+  module's `check_policy_patterns` / `validate_pattern` (grammar, duplicates, cross-collection
+  conflicts) and `literal_server_segment` (the declared-server cross-check) today; it never
+  classifies a live tool, because at deploy time there is no live tool surface to classify.
+  `packages/plugin-format/src/plugin_format/tool_policy.py::classify_tool`, the precedence ladder that turns a policy plus a runtime tool
+  name into allow/approval-required/deny, belongs to the not-yet-built runtime enforcement lane —
+  the deploy validator does not call it. Because a declared-but-unenforced restriction is worse
+  than no restriction, `validate_bundle`
+  takes an `enforces_tool_policy` handshake argument and REFUSES a policy-bearing bundle from any
+  caller that does not name `curie/mcp-tool-policy@1`; `load_tool_policy` raises rather than
+  returning a policy such a caller would not apply. Runtime enforcement is a separate **blocking**
+  follow-up, and no bundle may ship a `toolPolicy` until it lands.
 
-Their validators live alongside the others in `validate.py` (`triggers.*` / `approval_policy.*`
-error codes).
+Their validators live alongside the others in `validate.py` (`triggers.*` / `approval_policy.*` /
+`tool_policy.*` error codes).
 
 ## Cross-links
 

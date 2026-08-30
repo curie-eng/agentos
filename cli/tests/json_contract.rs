@@ -1059,7 +1059,10 @@ use curie::comms::CommsOutput;
 use curie::local::{
     LocalDownOutput, LocalRebuildOutput, LocalStatusOutput, LocalUpOutput, ModelMode,
 };
-use curie::ops::{ClusterDownOutput, ClusterStatus, ClusterStatusOutput, ClusterUpOutput, PodRow};
+use curie::ops::{
+    ClusterDownOutput, ClusterRollbackOutput, ClusterStatus, ClusterStatusOutput, ClusterUpOutput,
+    PodRow,
+};
 use curie::secrets::SecretsListOutput;
 
 fn assert_valid(schema_file: &str, value: &serde_json::Value) {
@@ -1283,9 +1286,32 @@ fn diff_output_validates() {
         chart_deployed: Some("curie-0.5.1".to_string()),
         chart_target: "0.6.0".to_string(),
         entries,
+        // #1352: the common case is nothing to lose, and the payload must still
+        // carry the key so a consumer that reads it cannot mistake "not
+        // reported" for "no removals".
+        stateful_removals: Vec::new(),
+        // #1352: and the same reasoning for the rename discriminator -- an
+        // upgrade that renames no object store must say so as `null`, not by
+        // omitting the key, or a consumer cannot tell it from a CLI that does
+        // not report renames at all.
+        migration: None,
     };
     let json = out.to_json();
     assert_valid("diff.schema.json", &json);
+    assert_eq!(
+        json["stateful_removals"],
+        serde_json::json!([]),
+        "an empty removal list must still be emitted as an array: {json}"
+    );
+    assert_eq!(
+        json["migration"],
+        serde_json::Value::Null,
+        "no store rename must still be emitted, as an explicit null: {json}"
+    );
+    assert!(
+        json.get("migration").is_some(),
+        "the migration key must be PRESENT, not merely absent-and-read-as-null: {json}"
+    );
 
     // Every classification the schema enumerates must be reachable from a real
     // plan, or the enum is documenting states the code cannot produce.
@@ -1332,6 +1358,102 @@ fn diff_output_validates() {
     );
 }
 
+/// #1352: the schema addition has to be EXERCISED, not merely accepted. A
+/// removal-carrying payload is the shape an agent consumer gates a destructive
+/// apply on, and `RemovalCause` has no serde derive -- `to_json` writes the
+/// encoding by hand, so nothing but this test holds the two cause spellings and
+/// the conditional `renamed_to` in place.
+#[test]
+fn diff_output_with_stateful_removals_validates() {
+    let out = curie::installation::DiffOutput {
+        unresolved_credentials: Vec::new(),
+        namespace: "acme-bot".to_string(),
+        release: "acme-bot".to_string(),
+        release_exists: true,
+        chart_deployed: Some("curie-0.6.0".to_string()),
+        chart_target: "0.6.0".to_string(),
+        entries: vec![curie::installation::DiffEntry {
+            key: "worker.replicas".to_string(),
+            kind: curie::installation::DiffKind::Change,
+            from: Some("1".to_string()),
+            to: Some("2".to_string()),
+            unresolved_credential: None,
+        }],
+        stateful_removals: vec![
+            // The chart does not render this component at all: a chart version
+            // renamed or dropped it, and `--migrate-store` is the remedy.
+            curie::ops::StatefulRemoval {
+                name: "acme-bot-minio".to_string(),
+                component: "minio".to_string(),
+                cause: curie::ops::RemovalCause::ComponentGone,
+            },
+            // The component survives under another resource name: a values
+            // difference, whose remedy is declaring `nameOverride` instead.
+            curie::ops::StatefulRemoval {
+                name: "acme-bot-postgres".to_string(),
+                component: "postgres".to_string(),
+                cause: curie::ops::RemovalCause::RenamedTo("acme-bot-curie-postgres".to_string()),
+            },
+        ],
+        // The discriminator that makes the `component_gone` remedy actionable:
+        // the store IS renamed here, so `--migrate-store` is the operator's
+        // path for the minio removal above -- and would still be a dead end for
+        // the postgres rename beside it. COMPONENT names, never resource names:
+        // `acme-bot-minio` embeds the chart fullname, which a `nameOverride`
+        // moves, while `minio` is what every consumer can match on (#1352).
+        migration: Some(("minio".to_string(), "rustfs".to_string())),
+    };
+
+    let json = out.to_json();
+    assert_valid("diff.schema.json", &json);
+
+    let removals = json["stateful_removals"]
+        .as_array()
+        .expect("stateful_removals is an array");
+    assert_eq!(
+        removals.len(),
+        2,
+        "both removals must survive to_json: {json}"
+    );
+
+    let gone = &removals[0];
+    assert_eq!(gone["name"], "acme-bot-minio");
+    assert_eq!(gone["component"], "minio");
+    assert_eq!(gone["cause"], "component_gone");
+    assert!(
+        gone.get("renamed_to").is_none(),
+        "a component that is gone has no rename target: {gone}"
+    );
+
+    let renamed = &removals[1];
+    assert_eq!(renamed["name"], "acme-bot-postgres");
+    assert_eq!(renamed["component"], "postgres");
+    assert_eq!(renamed["cause"], "renamed");
+    assert_eq!(
+        renamed["renamed_to"], "acme-bot-curie-postgres",
+        "the rename target is the half the operator needs to fix their file: {renamed}"
+    );
+
+    // The count an agent gates on has to include the removals, or a payload
+    // whose only change is store destruction reads as `changes: 1`.
+    assert_eq!(
+        json["changes"],
+        serde_json::json!(3),
+        "one changed entry plus two removals: {json}"
+    );
+
+    // `to_json` writes this object by hand too, so nothing but this holds the
+    // `from`/`to` spelling in place. Both removals above report the SAME
+    // `component_gone`/`renamed` pair whether or not a store moves, so without
+    // this object the payload cannot say which of them `--migrate-store` can
+    // actually carry -- the ambiguity #1352 exists to close.
+    assert_eq!(
+        json["migration"],
+        serde_json::json!({"from": "minio", "to": "rustfs"}),
+        "the store rename must survive to_json as a component pair: {json}"
+    );
+}
+
 #[test]
 fn diff_schema_keeps_unresolved_credential_marker_optional() {
     let schema = load_schema("diff.schema.json");
@@ -1361,9 +1483,61 @@ fn diff_schema_keeps_unresolved_credential_marker_optional() {
     );
 }
 
+// #1352: `curie diff --chart` reports the version of the chart it actually
+// RENDERS, so it reads that chart's own Chart.yaml rather than this CLI's
+// package version. Answered from the real file the flag points at: a stub
+// inventing a version here would make the CHART VERSION MISMATCH note this
+// run emits a fiction. Shell builtins only -- PATH here holds these two
+// stubs and nothing else, so `cat` would silently produce an empty chart.
+// This is shell text spliced verbatim into a generated `helm` stub script
+// (not a Rust comment), so the explanation travels with the branch into
+// every stub that embeds it.
+const HELM_SHOW_CHART_STUB_BRANCH: &str = r#"if [ "$1" = show ] && [ "$2" = chart ]; then
+    # #1352: `curie diff --chart` reports the version of the chart it actually
+    # RENDERS, so it reads that chart's own Chart.yaml rather than this CLI's
+    # package version. Answered from the real file the flag points at: a stub
+    # inventing a version here would make the CHART VERSION MISMATCH note this
+    # run emits a fiction. Shell builtins only -- PATH here holds these two
+    # stubs and nothing else, so `cat` would silently produce an empty chart.
+    while IFS= read -r chart_line; do
+        printf '%s\n' "$chart_line"
+    done < "$3/Chart.yaml"
+    exit 0
+fi
+"#;
+
+// #1352: `curie diff` now reads the live StatefulSets before it will render
+// the target chart, the same stateful-removal guard `curie apply` runs. An
+// empty live list is the "fresh install, nothing at stake" answer, so the
+// guard short-circuits before it would ever need the chart's rendered
+// StatefulSet specs -- which is why this stub needs no `template` branch,
+// unlike the helm stub's `show chart` branch above.
+fn write_stateful_probe_stubs(bin_dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let kubectl = bin_dir.join("kubectl");
+    std::fs::write(
+        &kubectl,
+        r#"#!/bin/sh
+if [ "$1" = get ] && [ "$2" = statefulset ]; then
+    printf '%s\n' '{"apiVersion":"v1","items":[],"kind":"List","metadata":{"resourceVersion":""}}'
+    exit 0
+fi
+exit 64
+"#,
+    )
+    .expect("write kubectl stub");
+    let mut permissions = std::fs::metadata(&kubectl)
+        .expect("kubectl stub metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&kubectl, permissions).expect("make kubectl stub executable");
+}
+
 #[test]
 fn credentialless_diff_human_output_names_export_and_never_claims_a_reset() {
     use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
     use std::process::Command;
 
     let temp = tempfile::tempdir().expect("temporary directory");
@@ -1385,8 +1559,10 @@ fn credentialless_diff_human_output_names_export_and_never_claims_a_reset() {
     let helm = bin_dir.join("helm");
     std::fs::write(
         &helm,
-        r#"#!/bin/sh
-if [ "$1" = get ] && [ "$2" = values ]; then
+        format!(
+            "#!/bin/sh\n{}{}",
+            HELM_SHOW_CHART_STUB_BRANCH,
+            r#"if [ "$1" = get ] && [ "$2" = values ]; then
     printf '%s\n' '{"agentSandbox":{"runner":{"credentials":"model live","fakeModel":false}},"ui":{"service":{"type":"NodePort"}},"langfuse":{"web":{"service":{"type":"NodePort"}}}}'
     exit 0
 fi
@@ -1395,7 +1571,8 @@ if [ "$1" = list ]; then
     exit 0
 fi
 exit 64
-"#,
+"#
+        ),
     )
     .expect("write helm stub");
     let mut permissions = std::fs::metadata(&helm)
@@ -1404,10 +1581,20 @@ exit 64
     permissions.set_mode(0o755);
     std::fs::set_permissions(&helm, permissions).expect("make helm stub executable");
 
+    write_stateful_probe_stubs(&bin_dir);
+
     let output = Command::new(env!("CARGO_BIN_EXE_curie"))
         .arg("diff")
         .arg("--file")
         .arg(&config)
+        // #1352: diff now resolves a chart exactly as apply does, so a dev
+        // build with no `charts/curie` under the process cwd errors before
+        // ever reaching the credential-leniency behaviour under test. The
+        // test binary's cwd is the `cli` crate dir, which has no
+        // `charts/curie`, so point at the repository's own chart the same
+        // way an operator would with `--chart`.
+        .arg("--chart")
+        .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../charts/curie"))
         .env("PATH", &bin_dir)
         .env("CURIE_CONFIG_DIR", temp.path().join("config"))
         .env_remove("CURIE_MODEL")
@@ -1458,6 +1645,7 @@ exit 64
 #[test]
 fn credentialless_diff_without_a_release_does_not_claim_every_declared_value_is_created() {
     use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
     use std::process::Command;
 
     let temp = tempfile::tempdir().expect("temporary directory");
@@ -1479,8 +1667,10 @@ fn credentialless_diff_without_a_release_does_not_claim_every_declared_value_is_
     let helm = bin_dir.join("helm");
     std::fs::write(
         &helm,
-        r##"#!/bin/sh
-if [ "$1" = get ] && [ "$2" = values ]; then
+        format!(
+            "#!/bin/sh\n{}{}",
+            HELM_SHOW_CHART_STUB_BRANCH,
+            r##"if [ "$1" = get ] && [ "$2" = values ]; then
     printf '%s\n' 'Error: release: not found' >&2
     exit 1
 fi
@@ -1489,7 +1679,8 @@ if [ "$1" = list ]; then
     exit 0
 fi
 exit 64
-"##,
+"##
+        ),
     )
     .expect("write helm stub");
     let mut permissions = std::fs::metadata(&helm)
@@ -1498,10 +1689,20 @@ exit 64
     permissions.set_mode(0o755);
     std::fs::set_permissions(&helm, permissions).expect("make helm stub executable");
 
+    write_stateful_probe_stubs(&bin_dir);
+
     let output = Command::new(env!("CARGO_BIN_EXE_curie"))
         .arg("diff")
         .arg("--file")
         .arg(&config)
+        // #1352: diff now resolves a chart exactly as apply does, so a dev
+        // build with no `charts/curie` under the process cwd errors before
+        // ever reaching the credential-leniency behaviour under test. The
+        // test binary's cwd is the `cli` crate dir, which has no
+        // `charts/curie`, so point at the repository's own chart the same
+        // way an operator would with `--chart`.
+        .arg("--chart")
+        .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../charts/curie"))
         .env("PATH", &bin_dir)
         .env("CURIE_CONFIG_DIR", temp.path().join("config"))
         .env_remove("CURIE_MODEL")
@@ -1558,8 +1759,17 @@ fn doctor_output_validates() {
         model_credential: Some("CURIE_CREDENTIALS".to_string()),
         model_credential_source: Some("environment".to_string()),
         // A dated snapshot, so the schema is validated against the pinned
-        // branch of the model-pin check rather than its advisory branch.
-        model_pin: Some("claude-haiku-4-5-20251001".to_string()),
+        // branch of the model-pin check rather than its advisory branch. It
+        // arrives from the RELEASE DEFAULT rather than the invoking shell,
+        // which is the state #1950 is about: the release is what the sandboxes
+        // actually boot, and the shell is not a declared producer of the value
+        // at all.
+        model_shell: None,
+        model_release_default: Some("claude-haiku-4-5-20251001".to_string()),
+        model_release_key: Some(curie::doctor::ReleaseModelKey::Runner),
+        model_release_fake: false,
+        model_agent_overrides: vec![],
+        target: Some(("curie".to_string(), "curie".to_string())),
         model_credential_provider: None,
         docker_ok: true,
         bundle_name: Some("my-agent".to_string()),
@@ -1637,12 +1847,39 @@ fn guide_output_validates() {
 fn secrets_list_output_validates() {
     let out = SecretsListOutput {
         names: vec!["ANTHROPIC_API_KEY".to_string()],
+        entries: vec![curie::secrets::SecretListEntry {
+            name: "ANTHROPIC_API_KEY".to_string(),
+            scope: None,
+            version: None,
+        }],
     };
     assert_valid("secrets.schema.json", &out.to_json());
     assert_valid(
         "secrets.schema.json",
-        &SecretsListOutput { names: vec![] }.to_json(),
+        &SecretsListOutput {
+            names: vec![],
+            entries: vec![],
+        }
+        .to_json(),
     );
+    let scoped = SecretsListOutput {
+        names: vec!["K8S_WRITE_KUBECONFIG".to_string()],
+        entries: vec![curie::secrets::SecretListEntry {
+            name: "K8S_WRITE_KUBECONFIG".to_string(),
+            scope: Some(curie::secrets::SecretScope {
+                cluster_identity:
+                    "ca:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .to_string(),
+                release: "curie".to_string(),
+                namespace: "curie-test".to_string(),
+            }),
+            version: Some(1),
+        }],
+    };
+    assert_valid("secrets.schema.json", &scoped.to_json());
+    let rendered = scoped.to_json().to_string();
+    assert!(!rendered.contains("token"));
+    assert!(!rendered.contains("kubeconfig"));
 }
 
 #[test]
@@ -2033,6 +2270,32 @@ fn connector_build_output_validates_empty_and_populated() {
         }],
     };
     assert_valid("build.schema.json", &built.to_json());
+}
+
+#[test]
+fn cluster_rollback_output_validates_all_variants() {
+    let dry = ClusterRollbackOutput::DryRun(DryRunPlan {
+        lines: vec!["helm rollback".to_string()],
+    });
+    assert_valid("cluster-rollback.schema.json", &dry.to_json());
+    assert_valid(
+        "cluster-rollback.schema.json",
+        &ClusterRollbackOutput::Aborted.to_json(),
+    );
+    let rolled_back = ClusterRollbackOutput::RolledBack {
+        from_revision: 4,
+        to_revision: 3,
+        skipped: vec![],
+        forced: false,
+    };
+    assert_valid("cluster-rollback.schema.json", &rolled_back.to_json());
+    let forced = ClusterRollbackOutput::RolledBack {
+        from_revision: 5,
+        to_revision: 2,
+        skipped: vec![4, 3],
+        forced: true,
+    };
+    assert_valid("cluster-rollback.schema.json", &forced.to_json());
 }
 
 #[test]

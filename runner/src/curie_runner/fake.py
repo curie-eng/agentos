@@ -22,7 +22,7 @@ from claude_agent_sdk import (
     ToolUseBlock,
     UserMessage,
 )
-from claude_agent_sdk.types import CanUseTool, ToolPermissionContext
+from claude_agent_sdk.types import CanUseTool, PermissionResultDeny, ToolPermissionContext
 
 from .approval import APPROVAL_TOOL_NAME, ApprovalGate, process_approval_request
 
@@ -166,13 +166,16 @@ class FakeModelSession:
 
     ``can_use_tool`` (the #245 permission gate) lets the offline path exercise the
     same intercept the SDK applies: before each scripted ``ToolUseBlock`` is
-    yielded, the permission callback runs for its side effect (a gated tool's deny
-    records the block on the shared gate, flipping the turn to awaiting-approval).
-    The block itself is delivered unchanged -- matching the real SDK, which emits
-    the ``tool_use`` even for a denied call -- so a gated turn still surfaces the
-    tool note it would in production. Defaults None, so a fake constructed without
-    it behaves exactly as before. Bundle PreToolUse command hooks (#272) are NOT
-    run here: they shell out and would break the fake's offline no-op guarantee.
+    yielded, the permission callback runs and its DECISION is honored -- a gated
+    tool's deny records the block on the shared gate (flipping the turn to
+    awaiting-approval), and a deny carrying ``interrupt=True`` additionally ends
+    the replay, the same way the real CLI aborts the turn (#1852; see
+    ``_apply_gate``). The block itself is delivered unchanged -- matching the
+    real SDK, which emits the ``tool_use`` even for a denied call -- so a gated
+    turn still surfaces the tool note it would in production. Defaults None, so
+    a fake constructed without it behaves exactly as before. Bundle PreToolUse
+    command hooks (#272) are NOT run here: they shell out and would break the
+    fake's offline no-op guarantee.
     """
 
     def __init__(
@@ -195,6 +198,12 @@ class FakeModelSession:
         self.queries: list[str] = []
         self.interrupts = 0
         self._interrupted = False
+        # Set when the permission callback denies WITH interrupt=True (#1852):
+        # the real CLI aborts the turn on that flag, so the replay must stop too
+        # or the offline tier silently models a gate weaker than production's.
+        # Strictly per-turn -- reset in ``query`` beside ``_interrupted``, so a
+        # halt can never truncate an unrelated later replay.
+        self._halted = False
 
     def _default_script(self) -> list[Any]:
         """The default per-turn script, branching on the approval marker.
@@ -219,6 +228,7 @@ class FakeModelSession:
     async def query(self, text: str) -> None:
         self.queries.append(text)
         self._interrupted = False
+        self._halted = False
 
     async def interrupt(self) -> None:
         self.interrupts += 1
@@ -230,9 +240,17 @@ class FakeModelSession:
                 return
             await self._apply_gate(message)
             yield message
+            if self._halted:
+                # The denied ToolUseBlock above IS delivered (the real SDK emits
+                # the tool_use even for a denied call), and nothing after it is:
+                # an interrupting deny aborts the turn, so any scripted text or
+                # terminal result that followed never happens (#1852). This is a
+                # separate mechanism from the ``_interrupted`` truncation above,
+                # which models an OPERATOR stop and must keep working on its own.
+                return
 
     async def _apply_gate(self, message: Any) -> None:
-        """Run the permission gate over each ToolUseBlock for its side effect.
+        """Run the permission gate over each ToolUseBlock and honor its decision.
 
         Mirrors the SDK: the gate decides a call before it executes, and a gated
         deny records the block on the shared ``ApprovalGate`` (flipping the turn to
@@ -240,6 +258,15 @@ class FakeModelSession:
         SDK emits the ``tool_use`` before the permission decision, so a denied call
         still surfaces as a tool note. A no-op unless a gate is configured, keeping
         the un-gated fake unchanged.
+
+        The callback's return value is READ, not discarded (#1852): a
+        ``PermissionResultDeny`` with ``interrupt=True`` is forwarded by the SDK
+        to the CLI as ``response_data["interrupt"]``
+        (``claude_agent_sdk/_internal/query.py:474-477``), which aborts the turn.
+        Recording it here is what lets the offline tier prove the halt rather
+        than replay past a call production would have stopped on. A deny WITHOUT
+        the flag is unchanged: the replay continues and the scripted terminal
+        result still arrives.
         """
 
         if not isinstance(message, AssistantMessage):
@@ -256,7 +283,11 @@ class FakeModelSession:
                 payload = block.input if isinstance(block.input, dict) else {}
                 process_approval_request(self._approval_gate, payload)
             if self._can_use_tool is not None:
-                await self._can_use_tool(block.name, block.input, ToolPermissionContext())
+                decision = await self._can_use_tool(
+                    block.name, block.input, ToolPermissionContext()
+                )
+                if isinstance(decision, PermissionResultDeny) and decision.interrupt:
+                    self._halted = True
 
     async def close(self) -> None:
         self.connected = False

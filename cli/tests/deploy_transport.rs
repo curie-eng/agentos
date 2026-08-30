@@ -12,7 +12,7 @@
 //!   pub fn deploy_port_forward(
 //!       api_url: Option<&str>,
 //!       namespace: &str,
-//!       release: &str,
+//!       fullname: &ops::ReleaseFullname,
 //!       local_port: u16,
 //!       remote_port: u16,
 //!   ) -> Option<OpsCommand>
@@ -31,8 +31,14 @@ use curie::commands::{deploy_needs_key_discovery, deploy_port_forward, normalize
 /// strong key never travels over the cleartext NodePort proxy.
 #[test]
 fn auto_path_builds_port_forward_to_api_service() {
-    let cmd = deploy_port_forward(None, "curie", "curie", 18000, 8000)
-        .expect("the auto path (no --api-url) must build a port-forward tunnel");
+    let cmd = deploy_port_forward(
+        None,
+        "curie",
+        &curie::ops::chart_fullname("curie"),
+        18000,
+        8000,
+    )
+    .expect("the auto path (no --api-url) must build a port-forward tunnel");
 
     assert_eq!(cmd.program, "kubectl");
     let argv = cmd.argv();
@@ -57,7 +63,7 @@ fn explicit_api_url_builds_no_port_forward() {
     let cmd = deploy_port_forward(
         Some("http://example:9000/api"),
         "curie",
-        "curie",
+        &curie::ops::chart_fullname("curie"),
         18000,
         8000,
     );
@@ -95,8 +101,14 @@ fn discovered_key_cleartext_refusal_and_no_credential_argv() {
     );
 
     // (b) The port-forward command line carries no credential-shaped argument.
-    let cmd = deploy_port_forward(None, "curie", "curie", 18000, 8000)
-        .expect("the auto path must build a port-forward tunnel");
+    let cmd = deploy_port_forward(
+        None,
+        "curie",
+        &curie::ops::chart_fullname("curie"),
+        18000,
+        8000,
+    )
+    .expect("the auto path must build a port-forward tunnel");
     for token in cmd.argv() {
         let lower = token.to_ascii_lowercase();
         assert!(

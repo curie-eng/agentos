@@ -36,6 +36,57 @@
           "maximum": 31536000,
           "description": "Seconds a route suspended awaiting an approval pins its sandbox. Must be greater than 0 and at most 31536000 (one year). Integer rather than number for the same reason as routeTtlSeconds: a YAML float renders through `| quote` as scientific notation for larger values (ci/github-app-credential-assertions.sh:11)."
         },
+        "deliveryBudgetSeconds": {
+          "type": "integer",
+          "minimum": 60,
+          "maximum": 1800,
+          "description": "Overall wall-clock deadline for one delivery (ADR-0131). Below 60s a budget cannot cover claim + one runner request + settle; above 1800s (the ADR's stated maximum) silently requires a termination grace the schema will not accept."
+        },
+        "deliveryLeaseTtlSeconds": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 3600,
+          "description": "How long the renewable ownership lease lives before it is considered expired and transferable (ADR-0131). Must be at least 3x deliveryLeaseHeartbeatSeconds; the worker's own validator enforces the relationship, not this schema."
+        },
+        "deliveryLeaseHeartbeatSeconds": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 3600,
+          "description": "How often the delivery lease owner renews its lease and resets its PEL idle (ADR-0131). Too large relative to deliveryLeaseTtlSeconds drops a healthy owner's lease on a single missed heartbeat; the worker's own validator enforces that relationship."
+        },
+        "deliveryShutdownReserveSeconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3600,
+          "description": "Budget reserved for fenced terminal settlement after runner work completes (ADR-0131). terminationGracePeriodSeconds must be at least deliveryBudgetSeconds plus this value, or a draining worker is SIGKILLed before it can settle."
+        },
+        "terminationGracePeriodSeconds": {
+          "type": "integer",
+          "minimum": 60,
+          "maximum": 86400,
+          "description": "Voluntary Pod termination grace before SIGKILL. Must be at least deliveryBudgetSeconds + deliveryShutdownReserveSeconds (ADR-0131, #1971), or a worker draining a maximum-budget turn is killed at the exact moment it would settle; below 60s not even a fast drain reliably completes."
+        },
+        "upgradeDrain": {
+          "type": "object",
+          "description": "Pre-upgrade drain gate (issue #2010): quiesce new claims and drain already-accepted deliveries to their terminal outcome before the roll, or refuse the upgrade while unsafe in-flight work exists.",
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "timeoutSeconds": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 7200,
+              "description": "Floor for how long the gate waits for in-flight deliveries before refusing the upgrade. The effective wait is raised to at least deliveryBudgetSeconds + deliveryShutdownReserveSeconds so the gate never gives up on a delivery still inside the budget ADR-0131 promised it."
+            },
+            "pollIntervalSeconds": {"type": "integer", "exclusiveMinimum": 0, "maximum": 3600},
+            "quiesceTtlSeconds": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 86400,
+              "description": "Floor for the lifetime of the fleet-wide quiesce flag, derived above the effective drain wait so it cannot lapse mid-drain. Setting it at or below timeoutSeconds is refused at render time. Finite by construction, so an upgrade killed between the two hooks cannot leave the fleet permanently unable to claim."
+            },
+            "resources": {"type": "object"}
+          }
+        },
         "workspace": {
           "type": "object",
           "properties": {

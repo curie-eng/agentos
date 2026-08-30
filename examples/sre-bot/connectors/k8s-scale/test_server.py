@@ -7,11 +7,13 @@ the platform would hold an action it believes happened and cannot undo.
 """
 
 import importlib.util
+import inspect
 import json
 import os
 import sys
 from pathlib import Path
 
+import httpx
 import pytest
 import yaml
 
@@ -61,13 +63,22 @@ class _FakeClient:
     def __exit__(self, *exc):
         return False
 
-    def get(self, path):
+    # These signatures MIRROR httpx.Client deliberately, keyword-only marker
+    # included. The first version of this fake took the patch body positionally,
+    # so it accepted a call the real client rejects with TypeError -- the tool
+    # could never scale anything and every test here passed (#1947). A fake
+    # looser than the thing it stands in for tests the fake.
+    def get(self, path, *, params=None):
         self.seen["get_path"] = path
         return _Response(*self._get)
 
-    def patch(self, path, body):
+    def patch(self, path, *, content=None, headers=None, json=None):
+        # Records only; the tests decode. A recorder that also interprets is a
+        # second place for the expectation to live.
         self.seen["patch_path"] = path
-        self.seen["patch_body"] = body
+        self.seen["patch_headers"] = headers
+        self.seen["patch_content"] = content
+        self.seen["patch_json"] = json
         return _Response(*self._patch)
 
 
@@ -99,7 +110,8 @@ def test_the_patch_body_only_ever_sets_replicas(tmp_path, monkeypatch):
     seen = {}
     monkeypatch.setattr(srv, "_client", lambda: _FakeClient(seen))
     srv.scale_deployment("public", "api", 7)
-    assert seen["patch_body"] == {"spec": {"replicas": 7}}
+    assert json.loads(seen["patch_content"]) == {"spec": {"replicas": 7}}
+    assert seen["patch_headers"] == {"Content-Type": "application/merge-patch+json"}
 
 
 def test_a_failed_read_refuses_instead_of_scaling(tmp_path, monkeypatch):
@@ -110,7 +122,7 @@ def test_a_failed_read_refuses_instead_of_scaling(tmp_path, monkeypatch):
     result = json.loads(srv.scale_deployment("public", "api", 10))
     assert result["ok"] is False
     assert result["prior"] is None
-    assert "patch_body" not in seen
+    assert "patch_content" not in seen
 
 
 def test_a_read_with_no_replica_count_refuses(tmp_path, monkeypatch):
@@ -120,7 +132,7 @@ def test_a_read_with_no_replica_count_refuses(tmp_path, monkeypatch):
     result = json.loads(srv.scale_deployment("public", "api", 10))
     assert result["ok"] is False
     assert "prior state" in result["summary"]
-    assert "patch_body" not in seen
+    assert "patch_content" not in seen
 
 
 @pytest.mark.parametrize("ns,name", [("public", "not-listed"), ("platform", "api")])
@@ -229,3 +241,73 @@ def test_a_refusal_reports_neither_state(tmp_path, monkeypatch):
 def test_streamable_http_is_mounted_at_curie_connector_path(tmp_path):
     srv = _load(tmp_path)
     assert [route.path for route in srv.mcp.streamable_http_app().routes] == ["/mcp"]
+
+
+def test_the_fake_client_cannot_accept_a_call_the_real_one_rejects():
+    """The defect in #1947 survived a full test suite because of this.
+
+    `scale_deployment` passed the patch body positionally. Every test here
+    passed, because `_FakeClient.patch` accepted it positionally too -- while the
+    real `httpx.Client.patch` takes everything after the URL keyword-only and
+    raises `TypeError`. The suite was testing the fake.
+
+    So the fake's signature is pinned against the real client's: every parameter
+    it accepts after the URL must exist on `httpx.Client` and be keyword-only
+    there and here. Loosening the fake fails this test instead of silently
+    re-opening the hole.
+    """
+
+    import httpx
+
+    for method in ("get", "patch"):
+        real = inspect.signature(getattr(httpx.Client, method)).parameters
+        fake = inspect.signature(getattr(_FakeClient, method)).parameters
+        # [0] is self, [1] is the URL; both are positional in httpx too.
+        for name, param in list(fake.items())[2:]:
+            assert name in real, f"_FakeClient.{method} accepts {name!r}, httpx does not"
+            assert param.kind is inspect.Parameter.KEYWORD_ONLY, (
+                f"_FakeClient.{method}'s {name!r} must be keyword-only, "
+                f"because httpx's is -- see this test's docstring"
+            )
+            assert real[name].kind is inspect.Parameter.KEYWORD_ONLY
+
+
+def test_it_scales_through_a_real_httpx_client(tmp_path, monkeypatch):
+    """The one test in this file that would have caught #1947 on its own.
+
+    Every other test here substitutes the client. This one keeps the REAL
+    `httpx.Client` -- its real signatures, its real request encoding -- and
+    replaces only the transport underneath it. The positional-body call raises
+    `TypeError` here exactly as it did in the cluster, and no fake stands between
+    the tool and that fact.
+
+    Worth the extra machinery precisely because the cheaper tests all passed
+    while the verb could never scale anything.
+    """
+
+    srv = _load(tmp_path)
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen[request.method] = request
+        if request.method == "GET":
+            return httpx.Response(200, json={"spec": {"replicas": 3}})
+        return httpx.Response(200, json={})
+
+    monkeypatch.setattr(
+        srv,
+        "_client",
+        lambda: httpx.Client(
+            base_url="https://k8s.example:6443",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    result = json.loads(srv.scale_deployment("public", "api", 9))
+
+    assert result["ok"] is True, result["summary"]
+    assert result["prior"] == {"spec": {"replicas": 3}}
+    patch = seen["PATCH"]
+    assert patch.url.path == "/apis/apps/v1/namespaces/public/deployments/api/scale"
+    assert json.loads(patch.content) == {"spec": {"replicas": 9}}
+    assert patch.headers["content-type"] == "application/merge-patch+json"

@@ -1,4 +1,4 @@
-//! `curie cluster up | cluster status | cluster down`: the operator
+//! `curie cluster up | cluster status | cluster rollback | cluster down`: the operator
 //! day-1 lifecycle, wrapping the Helm chart and `kubectl` the way linkerd or
 //! cilium wrap theirs -- a deliberately thin CLI over the chart, which stays the
 //! source of truth. Every verb shells out to the `helm`/`kubectl` binaries; the
@@ -537,6 +537,18 @@ pub struct DownOpts {
     pub yes: bool,
 }
 
+pub struct RollbackOpts {
+    pub common: CommonOpts,
+    /// An operator-named revision. `None` lets [`select_rollback_revision`] pick
+    /// the newest `deployed`/`superseded` revision below the current one, which
+    /// is the whole point of the verb (#1899).
+    pub revision: Option<u32>,
+    /// Admit a `--revision` whose status is not `deployed`/`superseded`. Refused
+    /// without this flag, since helm never finished applying such a revision.
+    pub allow_failed_revision: bool,
+    pub yes: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Command builders (pure; unit-tested below)
 // ---------------------------------------------------------------------------
@@ -1049,11 +1061,22 @@ pub fn sealed_credential_warning(
     }
 }
 
+/// Shared tail of the no-credential guidance: both the live fake-model note
+/// and the dry-run fresh-install note end with exactly this text, so the two
+/// paths cannot drift apart (#1898).
+const NO_CREDENTIAL_GUIDANCE: &str = "Set CURIE_CREDENTIALS to an Anthropic, OpenRouter, Zhipu, \
+     Moonshot, or DeepSeek credential and configure matching egress before re-running \
+     `curie cluster up` to enable the real model. Provider native Zhipu, Moonshot, and \
+     DeepSeek also need their matching worker runtime base URL.";
+
 /// The ordered model+egress status lines `up` prints, as (is_warning, message)
 /// pairs, derived purely so every credential/egress combination is unit-tested.
 /// The web-egress *count* note and the default-route warning stay in the handler
 /// (they keep their own tested helpers). `any_egress_opened` folds resolved
 /// provider routes, declared web egress, and (under dry-run) the intent to open.
+/// Under `--dry-run`, the no-credential arm reports that whether the model is
+/// preserved is unknown offline, instead of asserting the fake-model outcome
+/// (#1898).
 pub fn model_egress_status_lines(
     credentials_present: bool,
     local_model: bool,
@@ -1084,7 +1107,7 @@ pub fn model_egress_status_lines(
             false,
             "local model enabled; installing the chart inference deployment".into(),
         ));
-    } else if !fake_model {
+    } else if !fake_model && !dry_run {
         lines.push((
             true,
             format!(
@@ -1098,7 +1121,34 @@ pub fn model_egress_status_lines(
         ));
         lines.push((
             false,
-            "Replies will be canned. Set CURIE_CREDENTIALS to an Anthropic, OpenRouter, Zhipu, Moonshot, or DeepSeek credential and configure matching egress before re-running `curie cluster up` to enable the real model. Provider native Zhipu, Moonshot, and DeepSeek also need their matching worker runtime base URL.".into(),
+            format!("Replies will be canned. {NO_CREDENTIAL_GUIDANCE}"),
+        ));
+    } else if !fake_model {
+        // `--dry-run` stays offline (#1898): it cannot read the release's
+        // recorded model configuration the way `resolve_preserved_runner_identity_values`
+        // does on the live path, so it cannot know whether a rerun would
+        // preserve a real credential or land on the fake model. Asserting the
+        // fake-model outcome here contradicted the live run and `cluster up
+        // --help`, which is corrosive for the one preflight signal an operator
+        // has before an upgrade -- so state what is unknown offline instead.
+        lines.push((
+            true,
+            format!(
+                "no CURIE_CREDENTIALS set; a live run preserves the release's recorded model \
+                 configuration when there is one -- not read under --dry-run{}",
+                if any_egress_opened {
+                    ""
+                } else {
+                    "; no model egress is opened by this run"
+                }
+            ),
+        ));
+        lines.push((
+            false,
+            format!(
+                "With nothing recorded -- a fresh install -- the release comes up on the fake \
+                 model and replies will be canned. {NO_CREDENTIAL_GUIDANCE}"
+            ),
         ));
     }
     lines
@@ -1324,6 +1374,39 @@ fn lookup_dotted(values: &serde_json::Value, dotted: &str) -> Option<String> {
     cursor.as_str().map(str::to_string)
 }
 
+/// Read a dotted helm key the way the chart's own truthiness gate reads it:
+/// `true` for the JSON boolean `true` and for the JSON string `"true"`, and
+/// `false` for everything else -- `false`, `"false"`, `"TRUE"`, `""`, any other
+/// string, a number, an object, a null leaf, a missing leaf, and a missing or
+/// non-object intermediate segment all read as off.
+///
+/// It mirrors two contracts and must not drift from either: the
+/// `eq (toString ...) "true"` branch of `curie.managedSecret` in
+/// `charts/curie/templates/_helpers.tpl`, which decides whether a chart-owned
+/// credential renders as the published dev default, and the quoted-`"false"`
+/// render assertion in `charts/curie/ci/render-assertions.sh`, which pins that
+/// spelling as fail-closed. Reading as on what the chart reads as off would
+/// wave through exactly the flip this exists to catch, so every ambiguous
+/// gate-shaped value fails closed (#1375, #1145).
+///
+/// This cannot reuse [`lookup_dotted`]: helm records `--set KEY=true` as a JSON
+/// *boolean*, and `lookup_dotted` ends in `as_str()`, so it returns `None` for
+/// exactly the shape this key normally has.
+fn lookup_dotted_flag(values: &serde_json::Value, dotted: &str) -> bool {
+    let mut cursor = values;
+    for part in dotted.split('.') {
+        let Some(next) = cursor.get(part) else {
+            return false;
+        };
+        cursor = next;
+    }
+    match cursor {
+        serde_json::Value::Bool(flag) => *flag,
+        serde_json::Value::String(raw) => raw == "true",
+        _ => false,
+    }
+}
+
 /// The value helm already recorded for `key`, when there is a real one. An
 /// empty record is what a `--disconnect` / `--clear-*` wrote and is not a
 /// credential; returning `None` for it is what stops a cleared value being
@@ -1345,7 +1428,7 @@ fn preserved_value(existing: Option<&serde_json::Value>, key: &str) -> Option<St
 /// report a plausible but wrong value, which is worse than reporting none.
 /// Pure and testable; the actual `helm get values` read stays in the async
 /// caller.
-fn resolve_existing_secret_ref(
+pub(crate) fn resolve_existing_secret_ref(
     existing: Option<&serde_json::Value>,
     existing_secret_key: &str,
     existing_secret_key_key: &str,
@@ -1542,6 +1625,11 @@ pub(crate) const FAKE_MODEL_KEY: &str = "agentSandbox.runner.fakeModel";
 const ALLOWED_EGRESS_KEY: &str = "security.networkPolicy.allowedEgress";
 const WORKER_EXTRA_ENV_KEY: &str = "worker.extraEnv";
 
+/// The ADDITIONAL Slack origins a per-turn reply endpoint may name (ADR-0096
+/// D4.4). Named here so `up`'s preservation, `diff`'s reset reporting, and the
+/// secret classifier below all read the one key.
+const SLACK_TRUSTED_ORIGINS_KEY: &str = "worker.slackTrustedOrigins";
+
 fn key_is_or_descends_from(key: &str, parent: &str) -> bool {
     key == parent
         || key
@@ -1693,6 +1781,37 @@ fn resolve_preserved_worker_extra_env_values(
     );
 }
 
+/// Carry an operator-recorded Slack trusted-origin list into a later plain
+/// `cluster up` (issue #1897).
+///
+/// `up` is a FULL helm upgrade, not `--reuse-values`, so a
+/// `worker.slackTrustedOrigins` an operator set once is reset to the chart's
+/// fail-closed `""` default by the next unrelated `up` -- the #1256
+/// preservation class again, and it silently re-breaks the dev reply path the
+/// operator had working. Emitted via `--set-string` with
+/// [`escape_helm_set_string_value`] because the value is a COMMA-SEPARATED
+/// origin list: an unescaped comma would make Helm read it as a list.
+///
+/// Preserves, never invents. [`preserved_value`] already filters an empty
+/// record, so a release that never set the key -- or one whose value was
+/// deliberately cleared -- supplies nothing and keeps the chart default. An
+/// explicit operator `--set` / `--set-string` owns the key and always wins.
+fn resolve_preserved_slack_trusted_origins_value(
+    opts: &mut UpOpts,
+    existing: Option<&serde_json::Value>,
+    operator_sets: &[String],
+) {
+    if operator_set_keys(operator_sets).contains(SLACK_TRUSTED_ORIGINS_KEY) {
+        return;
+    }
+    if let Some(origins) = preserved_value(existing, SLACK_TRUSTED_ORIGINS_KEY) {
+        opts.set_string.push(format!(
+            "{SLACK_TRUSTED_ORIGINS_KEY}={}",
+            escape_helm_set_string_value(&origins)
+        ));
+    }
+}
+
 fn resolve_preserved_runner_egress_values(
     opts: &mut UpOpts,
     existing: Option<&serde_json::Value>,
@@ -1780,8 +1899,10 @@ fn reindex_inferred_provider_egress(
 /// on the release but absent from `curie.yaml` is normally reset to the chart
 /// default -- except for the families [`resolve_preserved_values`],
 /// [`resolve_preserved_runner_identity_values`], and
-/// [`resolve_preserved_runner_egress_values`], and
-/// [`resolve_preserved_gvisor_mode_value`] re-supply, which survive untouched.
+/// [`resolve_preserved_runner_egress_values`],
+/// [`resolve_preserved_gvisor_mode_value`], and
+/// [`resolve_preserved_slack_trusted_origins_value`] re-supply, which survive
+/// untouched.
 /// Reporting those as removals would be the exact
 /// "proposing to delete what it did not create" failure ADR-0097 named.
 ///
@@ -1802,6 +1923,7 @@ pub fn is_preserved_by_up(key: &str) -> bool {
         || REQUIRED_SECRETS.iter().any(|(k, _)| *k == key)
         || crate::sealing::SEALING_MANAGED_KEYS.contains(&key)
         || key == GVISOR_MODE_KEY
+        || key == SLACK_TRUSTED_ORIGINS_KEY
 }
 
 /// Substrings that mark a chart key as carrying a credential.
@@ -1845,7 +1967,11 @@ const SECRET_KEY_MARKERS: &[&str] = &[
 pub fn is_secret_value_key(key: &str) -> bool {
     // Most preserve-on-up keys are credentials, but an inferred gVisor posture
     // is ordinary safety configuration and must remain visible in `curie diff`.
-    if (is_preserved_by_up(key) && key != GVISOR_MODE_KEY)
+    // A Slack trusted-origin list (issue #1897) is the same shape: it is
+    // operator-visible dev configuration -- hostnames, not a token -- and
+    // masking it would hide the very value the operator opens `curie diff` to
+    // confirm survived the upgrade.
+    if (is_preserved_by_up(key) && key != GVISOR_MODE_KEY && key != SLACK_TRUSTED_ORIGINS_KEY)
         || key == GITHUB_TOKEN_KEY
         || key == MODEL_CREDENTIAL_KEY
     {
@@ -2047,6 +2173,30 @@ pub(crate) async fn chart_stateful_components(
     Ok(parse_statefulset_components(&out))
 }
 
+/// The version declared by the chart at `chart`, read from its own `Chart.yaml`.
+///
+/// `helm show chart` accepts every reference form `--chart` does -- a
+/// directory, a `.tgz`, a repo ref -- so this is the version of the chart that
+/// was actually rendered rather than one guessed from the reference's spelling.
+///
+/// A non-zero exit is fatal on purpose: this feeds the CHART VERSION MISMATCH
+/// comparison, and failing open to a guessed version would raise (or suppress)
+/// that warning about a chart nothing looked at (#1352).
+pub async fn chart_version(chart: &str) -> Result<String> {
+    let cmd = OpsCommand::new("helm", vec![plain("show"), plain("chart"), plain(chart)]);
+    let (ok, out, err) = run_capture(&cmd).await?;
+    if !ok {
+        bail!("could not read the chart version of {chart}: {err}");
+    }
+    let chart_yaml: serde_json::Value = serde_norway::from_str(&out)
+        .with_context(|| format!("could not parse the Chart.yaml of {chart}"))?;
+    chart_yaml
+        .get("version")
+        .and_then(|version| version.as_str())
+        .map(str::to_string)
+        .with_context(|| format!("the Chart.yaml of {chart} declares no version"))
+}
+
 /// The component identities of StatefulSets in a multi-document helm render.
 ///
 /// Split-and-parse rather than a regex: a `kind: StatefulSet` line can appear
@@ -2202,6 +2352,493 @@ mod release_secret_name_tests {
         assert_eq!(pick_release_secret(""), None);
         assert_eq!(pick_release_secret("sh.helm.release.v1.t.v1\n"), None);
         assert_eq!(pick_release_secret("only-connector-secrets\n"), None);
+    }
+}
+
+#[cfg(test)]
+mod chart_fullname_tests {
+    use super::*;
+
+    /// Every component the CLI derives from a release name. The chart names
+    /// each one `{{ include "curie.fullname" . }}-<component>`
+    /// (`charts/curie/templates/_helpers.tpl:16-26`), so this is the full set
+    /// the sweep has to keep byte-identical for the default release.
+    const COMPONENTS: [&str; 7] = [
+        "api",
+        "ui",
+        "langfuse-web",
+        "valkey",
+        "dispatcher",
+        "worker",
+        "secrets",
+    ];
+
+    fn opts(release: &str, namespace: &str) -> CommonOpts {
+        CommonOpts {
+            namespace: namespace.into(),
+            release: release.into(),
+            dry_run: false,
+        }
+    }
+
+    // --- the negative control -------------------------------------------------
+
+    /// THE regression guard for the whole sweep.
+    ///
+    /// `"curie".contains("curie")` is true, so the chart's fullname for the
+    /// default release is the release name itself and every derived resource
+    /// name is exactly what the CLI built before this change. Every install
+    /// anyone runs locally, in CI, and on the parity ladder uses `--release
+    /// curie`; if this goes red the fix broke all of them.
+    ///
+    /// The expectation is a literal, never a second call to the rule under
+    /// test -- comparing the rule against itself would pass whatever the rule
+    /// happened to be.
+    #[test]
+    fn the_default_release_is_a_byte_identical_no_op() {
+        for component in COMPONENTS {
+            assert_eq!(
+                chart_fullname("curie").resource(component),
+                format!("curie-{component}"),
+                "the default release must derive the same name it always did"
+            );
+        }
+    }
+
+    // --- the chart's naming rule ----------------------------------------------
+
+    /// `contains`, not `starts_with` and not an exact match: the chart tests
+    /// `contains $name .Release.Name`, so a release that merely embeds the
+    /// chart name anywhere takes no suffix. A "stricter" reading here would
+    /// diverge from what helm actually renders.
+    #[test]
+    fn a_release_containing_curie_takes_no_suffix() {
+        assert_eq!(chart_fullname("curie").as_str(), "curie");
+        assert_eq!(chart_fullname("curieish").as_str(), "curieish");
+        assert_eq!(chart_fullname("my-curie-prod").as_str(), "my-curie-prod");
+        assert_eq!(chart_fullname("curieish").resource("api"), "curieish-api");
+    }
+
+    /// The reported bug: `helm template platform charts/curie` renders
+    /// `platform-curie-api`, and the CLI used to ask for `platform-api`.
+    #[test]
+    fn a_release_not_containing_curie_takes_the_chart_suffix() {
+        assert_eq!(chart_fullname("platform").as_str(), "platform-curie");
+        assert_eq!(chart_fullname("acme-prod").as_str(), "acme-prod-curie");
+        assert_eq!(
+            chart_fullname("platform").resource("api"),
+            "platform-curie-api"
+        );
+        assert_eq!(
+            chart_fullname("acme-prod").resource("worker"),
+            "acme-prod-curie-worker"
+        );
+    }
+
+    /// Helm applies `trunc 63` to the FULLNAME -- `printf "%s-%s" .Release.Name
+    /// $name | trunc 63` -- and the template appends `-<component>` after that,
+    /// so a rendered object name can exceed 63 characters. Truncating the
+    /// joined string instead yields 63 and names an object the chart never
+    /// created. This test is what pins that ordering.
+    #[test]
+    fn truncation_happens_before_the_component_suffix() {
+        let release = "a".repeat(70);
+        let fullname = chart_fullname(&release);
+
+        assert_eq!(fullname.as_str(), "a".repeat(63));
+        assert_eq!(fullname.as_str().len(), 63);
+
+        let resource = fullname.resource("api");
+        assert_eq!(resource, format!("{}-api", "a".repeat(63)));
+        assert_eq!(
+            resource.len(),
+            67,
+            "the component suffix is appended after truncation, so 63 + \"-api\""
+        );
+    }
+
+    /// `trimSuffix "-"` runs after `trunc`, so a cut that lands on a dash
+    /// leaves the object named `<...>-api`, never `<...>--api`.
+    #[test]
+    fn a_trailing_dash_after_truncation_is_trimmed() {
+        // 62 `a`s and a dash: the fullname is `<62 a>--curie`, and the 63rd
+        // character is the release's own trailing dash.
+        let release = format!("{}-", "a".repeat(62));
+        let fullname = chart_fullname(&release);
+
+        assert_eq!(fullname.as_str(), "a".repeat(62));
+        assert_eq!(fullname.resource("api"), format!("{}-api", "a".repeat(62)));
+        assert!(
+            !fullname.resource("api").contains("--"),
+            "a doubled dash means the trim ran before the truncation"
+        );
+    }
+
+    /// Sprig's `trimSuffix "-"` removes exactly ONE trailing dash;
+    /// `str::trim_end_matches('-')` removes all of them. A release whose
+    /// truncation boundary lands after a `--` is where the two diverge, and the
+    /// CLI must follow the chart.
+    ///
+    /// Confirmed against helm rather than against a reading of Sprig. The
+    /// release-name path cannot be rendered directly: helm rejects any release
+    /// name longer than 53 characters, so no release can reach the 63-character
+    /// cut. The `fullnameOverride` branch runs the byte-identical
+    /// `| trunc 63 | trimSuffix "-"` pipeline and has no such limit, so
+    ///
+    ///   helm template platform charts/curie \
+    ///     --set fullnameOverride=<61 a's>--<10 z's>
+    ///
+    /// renders the api Service as `<61 a's>--api` (66 characters): the cut left
+    /// `<61 a's>--`, and exactly one dash was removed, leaving one behind for
+    /// the component suffix to join to. That is the behavior pinned here.
+    #[test]
+    fn only_one_trailing_dash_is_trimmed_matching_helms_trimsuffix() {
+        // 61 `a`s, then `--`, then filler so the fullname overruns 63. The
+        // release does not contain "curie", so the chart appends the suffix and
+        // the cut lands exactly on the second of the two dashes.
+        let release = format!("{}--{}", "a".repeat(61), "z".repeat(10));
+        let fullname = chart_fullname(&release);
+
+        assert_eq!(
+            fullname.as_str(),
+            format!("{}-", "a".repeat(61)),
+            "one dash is trimmed, not both: trimming both would name an object \
+             the chart never rendered"
+        );
+        assert_eq!(fullname.as_str().len(), 62);
+        assert!(
+            !fullname.as_str().ends_with("--"),
+            "the truncation must still have trimmed one dash"
+        );
+
+        // helm rendered `<61 a's>--api`: the retained dash plus the template's
+        // own `-api`. A `trim_end_matches` implementation gives `<61 a's>-api`.
+        assert_eq!(fullname.resource("api"), format!("{}--api", "a".repeat(61)));
+        assert_eq!(fullname.resource("api").len(), 66);
+    }
+    /// Helm's `printf "%s-%s" "" "curie"` is `-curie`. Kubernetes rejects that
+    /// name, which is the right place for the failure -- pin what the chart
+    /// does rather than "improving" it here and diverging from the render.
+    #[test]
+    fn an_empty_release_still_produces_the_chart_name() {
+        assert_eq!(chart_fullname("").as_str(), "-curie");
+        assert_eq!(chart_fullname("").resource("api"), "-curie-api");
+    }
+
+    // --- the discovery parse --------------------------------------------------
+
+    /// Discovery reads back the name of a Service selected by label, so the
+    /// fullname is whatever precedes the component suffix. Both shapes are
+    /// real: `platform-api` is an override install, `platform-curie-api` is
+    /// the no-override chart rule.
+    #[test]
+    fn a_discovered_api_service_name_yields_the_fullname() {
+        assert_eq!(
+            fullname_from_resource_name("platform-api", "api"),
+            Some("platform".to_string())
+        );
+        assert_eq!(
+            fullname_from_resource_name("platform-curie-api", "api"),
+            Some("platform-curie".to_string())
+        );
+    }
+
+    /// A name that does not carry the suffix we asked for is not ours to
+    /// truncate. Blind stripping would mint a confidently wrong fullname,
+    /// which is worse than falling through to the chart rule.
+    #[test]
+    fn a_name_without_the_expected_suffix_is_rejected_not_stripped() {
+        assert_eq!(fullname_from_resource_name("platform-ui", "api"), None);
+        assert_eq!(fullname_from_resource_name("platformapi", "api"), None);
+        assert_eq!(fullname_from_resource_name("api", "api"), None);
+    }
+
+    /// The jsonpath yields an empty string when the selector matches nothing.
+    /// That must be `None` so the caller falls through to the worker probe and
+    /// then to `chart_fullname`, rather than resolving to the empty fullname.
+    #[test]
+    fn empty_discovery_output_yields_none() {
+        assert_eq!(fullname_from_resource_name("", "api"), None);
+        assert_eq!(fullname_from_resource_name("", "worker"), None);
+    }
+
+    /// Step 2 of discovery: with `api.deploy=false` there is no api Service,
+    /// but the worker Deployment still carries the release labels. It strips
+    /// its OWN suffix, and must not accept a name carrying another one.
+    #[test]
+    fn the_worker_fallback_strips_its_own_suffix() {
+        assert_eq!(
+            fullname_from_resource_name("platform-worker", "worker"),
+            Some("platform".to_string())
+        );
+        assert_eq!(
+            fullname_from_resource_name("platform-curie-worker", "worker"),
+            Some("platform-curie".to_string())
+        );
+        assert_eq!(fullname_from_resource_name("platform-api", "worker"), None);
+    }
+
+    // --- discovery cardinality ------------------------------------------------
+
+    /// The ordinary case: one labelled object, one answer.
+    #[test]
+    fn exactly_one_match_yields_the_fullname() {
+        assert_eq!(
+            component_discovery("platform-curie-api\n", "api"),
+            ComponentDiscovery::Found(chart_fullname("platform"))
+        );
+        assert_eq!(
+            component_discovery("platform-api", "api"),
+            ComponentDiscovery::Found(ReleaseFullname("platform".to_string()))
+        );
+    }
+
+    /// Zero matches is absence, not failure: the caller falls through to the
+    /// worker probe and then to the chart rule, and says nothing, because a
+    /// not-yet-installed release is a supported state.
+    #[test]
+    fn zero_matches_is_not_present() {
+        assert_eq!(
+            component_discovery("", "api"),
+            ComponentDiscovery::NotPresent
+        );
+        assert_eq!(
+            component_discovery("\n  \n", "api"),
+            ComponentDiscovery::NotPresent
+        );
+
+        let absent = ComponentDiscovery::NotPresent;
+        let fallback = chart_fullname("platform");
+        assert_eq!(
+            absent.fallback_warning("platform-ns", "platform", &fallback),
+            None,
+            "an absent release must degrade quietly; only a FAILED probe warns"
+        );
+    }
+
+    /// THE finding. Kubernetes does not enforce label uniqueness, so `items[0]`
+    /// could name a workload that is not ours -- a stray `unexpected-api`
+    /// carrying the release labels would resolve the fullname to `unexpected`
+    /// and point `cluster message`/`comms`/`eval` at it. Two matches are
+    /// refused, never resolved to the first.
+    #[test]
+    fn two_matches_are_refused_not_resolved_to_the_first() {
+        let outcome = component_discovery("platform-curie-api\nunexpected-api\n", "api");
+        match &outcome {
+            ComponentDiscovery::Ambiguous { component, names } => {
+                let listed: Vec<&str> = names.iter().map(String::as_str).collect();
+                assert_eq!(component.as_str(), "api");
+                assert_eq!(listed, ["platform-curie-api", "unexpected-api"]);
+            }
+            other => panic!("two matches must be refused, not resolved: {other:?}"),
+        }
+    }
+
+    /// A single match that does not carry the component suffix is rejected, not
+    /// blind-stripped -- the rule `fullname_from_resource_name` pins, asserted
+    /// here at the level that actually decides what discovery returns.
+    #[test]
+    fn a_single_match_without_the_suffix_is_rejected_not_stripped() {
+        assert_eq!(
+            component_discovery("platform-ui\n", "api"),
+            ComponentDiscovery::NotPresent
+        );
+        assert_eq!(
+            component_discovery("api\n", "api"),
+            ComponentDiscovery::NotPresent,
+            "stripping `-api` off `api` leaves an empty fullname"
+        );
+    }
+
+    /// A FAILED probe is not an absent release. It must warn, say why, and say
+    /// that the name in use is a guess -- otherwise `cluster status` reports
+    /// the Service as "not found" and masks an RBAC denial.
+    #[test]
+    fn a_failed_probe_warns_that_the_name_is_a_guess() {
+        let denied = ComponentDiscovery::ProbeFailed {
+            component: "api".to_string(),
+            detail: "Error from server (Forbidden): services is forbidden".to_string(),
+        };
+        let fallback = chart_fullname("platform");
+        let warning = denied
+            .fallback_warning("platform-ns", "platform", &fallback)
+            .expect("a failed probe must warn");
+
+        assert!(warning.contains("FAILED"), "{warning}");
+        assert!(warning.contains("Forbidden"), "{warning}");
+        assert!(warning.contains("platform-ns"), "the namespace: {warning}");
+        assert!(warning.contains("COMPUTED GUESS"), "{warning}");
+        assert!(warning.contains("platform-curie-<component>"), "{warning}");
+        assert!(
+            warning.contains("nameOverride/fullnameOverride"),
+            "{warning}"
+        );
+    }
+
+    /// The ambiguity warning has to be actionable: the namespace, the selector,
+    /// and every candidate name, so the operator can see the collision it has
+    /// to resolve.
+    #[test]
+    fn the_ambiguity_warning_names_the_selector_and_the_candidates() {
+        let ambiguous = ComponentDiscovery::Ambiguous {
+            component: "api".to_string(),
+            names: vec![
+                "platform-curie-api".to_string(),
+                "unexpected-api".to_string(),
+            ],
+        };
+        let fallback = chart_fullname("platform");
+        let warning = ambiguous
+            .fallback_warning("platform-ns", "platform", &fallback)
+            .expect("an ambiguous match must warn");
+
+        assert!(warning.contains("platform-ns"), "{warning}");
+        assert!(
+            warning.contains(&component_selector("platform", "api")),
+            "{warning}"
+        );
+        assert!(warning.contains("platform-curie-api"), "{warning}");
+        assert!(warning.contains("unexpected-api"), "{warning}");
+        assert!(warning.contains("COMPUTED GUESS"), "{warning}");
+    }
+
+    /// A resolved name wins from either probe; otherwise a PROBLEM outranks
+    /// absence, so a denied api probe is not buried by an absent worker.
+    #[test]
+    fn a_probe_problem_outranks_an_absent_second_probe() {
+        let denied = ComponentDiscovery::ProbeFailed {
+            component: "api".to_string(),
+            detail: "forbidden".to_string(),
+        };
+        let absent = ComponentDiscovery::NotPresent;
+        let found = ComponentDiscovery::Found(chart_fullname("platform"));
+
+        assert_eq!(
+            preferred_probe_outcome(denied.clone(), absent.clone()),
+            denied
+        );
+        assert_eq!(
+            preferred_probe_outcome(absent.clone(), denied.clone()),
+            denied
+        );
+        // A real answer from either probe still wins.
+        assert_eq!(preferred_probe_outcome(denied, found.clone()), found);
+        assert_eq!(
+            preferred_probe_outcome(absent.clone(), absent.clone()),
+            absent
+        );
+    }
+
+    // --- the chart Secret's offline name --------------------------------------
+
+    /// `release_secret_name_or_default` fell back to `format!("{release}-secrets")`,
+    /// the raw chart-resource form #1533 names explicitly. A `platform` install
+    /// renders `platform-curie-secrets`, so the old fallback had `migrate-store`
+    /// stage a pod against a Secret that does not exist. The fallback is now the
+    /// `secrets` resource of `chart_fullname`, pinned here as a literal rather
+    /// than by re-deriving it.
+    #[test]
+    fn the_secret_fallback_uses_the_chart_rule_for_a_non_default_release() {
+        assert_eq!(
+            chart_fullname("platform").resource("secrets"),
+            "platform-curie-secrets"
+        );
+        assert_eq!(
+            chart_fullname("acme-prod").resource("secrets"),
+            "acme-prod-curie-secrets"
+        );
+    }
+
+    /// The negative control for that change: `"curie".contains("curie")`, so
+    /// the default release's Secret name is byte-identical to the computed
+    /// `format!("{release}-secrets")` it replaced. Every local, CI, and
+    /// parity-ladder install uses `--release curie`.
+    #[test]
+    fn the_secret_fallback_is_byte_identical_for_the_default_release() {
+        assert_eq!(chart_fullname("curie").resource("secrets"), "curie-secrets");
+        assert_eq!(
+            chart_fullname("my-curie-prod").resource("secrets"),
+            "my-curie-prod-secrets"
+        );
+    }
+
+    // --- rendered argv for a non-default release ------------------------------
+
+    /// `cluster status` under a release that does not contain the chart name.
+    /// The literals are what `helm template platform charts/curie` actually
+    /// renders; before this change the CLI asked for `platform-ui` and
+    /// `platform-langfuse-web`, which do not exist.
+    #[test]
+    fn status_queries_the_chart_rendered_services_for_a_non_default_release() {
+        let o = opts("platform", "platform-ns");
+        let lines: Vec<String> = status_commands(&o, &chart_fullname("platform"))
+            .iter()
+            .map(OpsCommand::display)
+            .collect();
+
+        assert!(
+            lines.contains(&"kubectl get svc platform-curie-ui -n platform-ns -o json".to_string()),
+            "status must query the chart-rendered ui Service: {lines:#?}"
+        );
+        assert!(
+            lines.contains(
+                &"kubectl get svc platform-curie-langfuse-web -n platform-ns -o json".to_string()
+            ),
+            "status must query the chart-rendered langfuse Service: {lines:#?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("svc platform-ui ")
+                || line.contains("svc platform-langfuse-web ")),
+            "the raw release name must not reach a service query: {lines:#?}"
+        );
+    }
+
+    /// `cluster observability` resolves the same two Services and had the same
+    /// defect.
+    #[test]
+    fn observability_queries_the_chart_rendered_services_for_a_non_default_release() {
+        let o = opts("platform", "platform-ns");
+        let lines: Vec<String> = observability_commands(&o, &chart_fullname("platform"))
+            .iter()
+            .map(OpsCommand::display)
+            .collect();
+
+        assert!(
+            lines.contains(&"kubectl get svc platform-curie-ui -n platform-ns -o json".to_string()),
+            "observability must query the chart-rendered ui Service: {lines:#?}"
+        );
+        assert!(
+            lines.contains(
+                &"kubectl get svc platform-curie-langfuse-web -n platform-ns -o json".to_string()
+            ),
+            "observability must query the chart-rendered langfuse Service: {lines:#?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("svc platform-ui ")
+                || line.contains("svc platform-langfuse-web ")),
+            "the raw release name must not reach a service query: {lines:#?}"
+        );
+    }
+
+    /// The default release renders the same argv it always has. The sibling
+    /// `status_lists_the_readonly_commands` pins this at the argv level too;
+    /// this is the observability half of that control.
+    #[test]
+    fn the_default_release_renders_the_same_service_argv_it_always_did() {
+        let o = opts("curie", "curie");
+        let lines: Vec<String> = observability_commands(&o, &chart_fullname("curie"))
+            .iter()
+            .map(OpsCommand::display)
+            .collect();
+
+        assert!(
+            lines.contains(&"kubectl get svc curie-ui -n curie -o json".to_string()),
+            "{lines:#?}"
+        );
+        assert!(
+            lines.contains(&"kubectl get svc curie-langfuse-web -n curie -o json".to_string()),
+            "{lines:#?}"
+        );
     }
 }
 
@@ -2929,6 +3566,21 @@ pub async fn fetch_release_values(o: &CommonOpts) -> Result<Option<serde_json::V
     fetch_existing_values(o).await
 }
 
+/// The **computed** values of an existing release: the chart's own defaults
+/// merged with whatever the operator overrode.
+///
+/// That merge is the whole difference from [`fetch_release_values`], which
+/// reports only what the operator supplied. An operator who ran `curie cluster
+/// up` and never set a model supplied nothing, so helm recorded nothing, and
+/// the user-supplied read cannot see the chart default the sandboxes actually
+/// boot. `--all` is the only way to observe a default nobody supplied (#1950).
+///
+/// `None` only when Helm positively reports the release does not exist; read
+/// failures, malformed JSON, and non-object/non-null shapes fail closed.
+pub async fn fetch_release_computed_values(o: &CommonOpts) -> Result<Option<serde_json::Value>> {
+    fetch_helm_values(o, helm_get_all_values_cmd(o), "computed Helm values").await
+}
+
 /// Resolve [`GITHUB_TOKEN_KEY`] for this run.
 ///
 /// - `flag` is the `--github-token` value: `None` when the flag and
@@ -2982,6 +3634,7 @@ fn complete_up_opts_without_runner_egress(
     resolve_preserved_runner_identity_values(&mut opts, existing, &operator_sets);
     resolve_preserved_gvisor_mode_value(&mut opts, existing, &operator_sets);
     resolve_preserved_worker_extra_env_values(&mut opts, existing, &operator_sets);
+    resolve_preserved_slack_trusted_origins_value(&mut opts, existing, &operator_sets);
     if !opts.dev {
         opts.secrets = resolve_generated_secrets(existing, &operator_sets)?;
         opts.secrets.extend(resolve_managed_values_for_up(
@@ -3073,22 +3726,38 @@ fn resolve_generated_secrets(
     Ok(resolved)
 }
 
+/// `helm get values <release> -n <ns> [--all] -o json`. `all` is the only
+/// difference between the two wrappers below, and it is load bearing rather
+/// than stylistic: without it helm reports only what the operator supplied.
+fn helm_get_values_cmd_with(o: &CommonOpts, all: bool) -> OpsCommand {
+    let mut args = vec![
+        plain("get"),
+        plain("values"),
+        plain(&o.release),
+        plain("-n"),
+        plain(&o.namespace),
+    ];
+    if all {
+        args.push(plain("--all"));
+    }
+    args.push(plain("-o"));
+    args.push(plain("json"));
+    OpsCommand::new("helm", args)
+}
+
 /// `helm get values <release> -n <ns> -o json`: helm's record of the values a
 /// prior install supplied. `cluster up` reads it back so an upgrade re-supplies
 /// the same generated secrets instead of rotating them.
 fn helm_get_values_cmd(o: &CommonOpts) -> OpsCommand {
-    OpsCommand::new(
-        "helm",
-        vec![
-            plain("get"),
-            plain("values"),
-            plain(&o.release),
-            plain("-n"),
-            plain(&o.namespace),
-            plain("-o"),
-            plain("json"),
-        ],
-    )
+    helm_get_values_cmd_with(o, false)
+}
+
+/// `helm get values <release> -n <ns> --all -o json`: the COMPUTED values --
+/// chart defaults merged with the operator's overrides. The sibling above
+/// reports only what the operator supplied, which is why `--all` is load
+/// bearing here and not a stylistic difference.
+fn helm_get_all_values_cmd(o: &CommonOpts) -> OpsCommand {
+    helm_get_values_cmd_with(o, true)
 }
 
 /// Whether Helm positively reported that the requested release does not exist.
@@ -3103,7 +3772,20 @@ fn helm_release_is_absent(stderr: &str) -> bool {
 /// shapes fail closed. Helm prints `null` for an existing release with no user
 /// supplied values.
 async fn fetch_existing_values(o: &CommonOpts) -> Result<Option<serde_json::Value>> {
-    let (ok, out, err) = run_capture(&helm_get_values_cmd(o)).await?;
+    fetch_helm_values(o, helm_get_values_cmd(o), "Helm values").await
+}
+
+/// The shared read for both `helm get values` shapes. `what` names the read in
+/// the operator facing message ("Helm values" or "computed Helm values") and is
+/// the only thing that varies between callers; the absent-release, connectivity
+/// vs failure, malformed-JSON and non-object ladders are deliberately single
+/// sourced so the fail-closed contract cannot drift between them.
+async fn fetch_helm_values(
+    o: &CommonOpts,
+    cmd: OpsCommand,
+    what: &str,
+) -> Result<Option<serde_json::Value>> {
+    let (ok, out, err) = run_capture(&cmd).await?;
     let fix = format!(
         "verify the release and cluster access with `helm status {} -n {}`, then retry",
         o.release, o.namespace
@@ -3114,7 +3796,7 @@ async fn fetch_existing_values(o: &CommonOpts) -> Result<Option<serde_json::Valu
         }
         let reason = failure_reason(&err);
         let message = format!(
-            "could not read Helm values for release {} in namespace {}: {reason}",
+            "could not read {what} for release {} in namespace {}: {reason}",
             o.release, o.namespace
         );
         let error = if is_connectivity_failure(&err) {
@@ -3127,14 +3809,14 @@ async fn fetch_existing_values(o: &CommonOpts) -> Result<Option<serde_json::Valu
 
     let values: serde_json::Value = serde_json::from_str(out.trim()).map_err(|error| {
         crate::exit::CliError::failure(format!(
-            "could not read Helm values for release {} in namespace {}: malformed Helm values JSON ({error})",
+            "could not read {what} for release {} in namespace {}: malformed Helm values JSON ({error})",
             o.release, o.namespace
         ))
         .with_fix(fix.clone())
     })?;
     if !values.is_object() && !values.is_null() {
         return Err(crate::exit::CliError::failure(format!(
-            "could not read Helm values for release {} in namespace {}: malformed Helm values JSON, expected an object or null",
+            "could not read {what} for release {} in namespace {}: malformed Helm values JSON, expected an object or null",
             o.release, o.namespace
         ))
         .with_fix(fix)
@@ -3197,10 +3879,10 @@ impl UpValuePlan {
     }
 
     fn set_string_expression(&mut self, expression: String) {
-        let effective = if expression
-            .split_once('=')
-            .is_some_and(|(key, _)| key_is_or_descends_from(key.trim(), WORKER_EXTRA_ENV_KEY))
-        {
+        let effective = if expression.split_once('=').is_some_and(|(key, _)| {
+            key_is_or_descends_from(key.trim(), WORKER_EXTRA_ENV_KEY)
+                || key_is_or_descends_from(key.trim(), SLACK_TRUSTED_ORIGINS_KEY)
+        }) {
             helm_set_string_entries(&expression)
         } else {
             operator_set_entries(std::slice::from_ref(&expression))
@@ -3270,7 +3952,7 @@ impl UpValuePlan {
 pub(crate) fn up_value_plan(o: &UpOpts) -> UpValuePlan {
     let mut plan = UpValuePlan::default();
     if o.dev {
-        plan.set("security.allowDevDefaults", "true");
+        plan.set(ALLOW_DEV_DEFAULTS_KEY, "true");
     }
     if !o.no_expose {
         plan.set("ui.service.type", "NodePort");
@@ -3420,6 +4102,16 @@ const CONTROLLER_DEPLOYMENT_NAME: &str = "agent-sandbox-controller";
 const CONTROLLER_DEPLOYMENT_NAMESPACE: &str = "agent-sandbox-system";
 const CONTROLLER_DEPLOY_KEY: &str = "agentSandbox.controller.deploy";
 const GVISOR_MODE_KEY: &str = "security.gvisor.mode";
+
+/// The chart value that switches every chart-owned credential to its published
+/// dev default (`curie.managedSecret` in `charts/curie/templates/_helpers.tpl`).
+/// Named once because three call sites are ONE decision and must not drift
+/// (#1145): the value `up_value_plan` emits for `--dev`, the recorded-value read
+/// [`guard_dev_defaults_flip`] does to decide whether a release is already on
+/// dev defaults, and the operator-override membership test that exempts a run
+/// the operator has taken ownership of. A literal in any one of them silently
+/// desynchronises the guard from what helm actually renders.
+const ALLOW_DEV_DEFAULTS_KEY: &str = "security.allowDevDefaults";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ClusterUpInference {
@@ -4041,12 +4733,16 @@ pub fn up_commands(o: &UpOpts) -> Vec<OpsCommand> {
 }
 
 /// The read-only commands `curie cluster status` runs (and prints under `--dry-run`).
-pub fn status_commands(o: &CommonOpts) -> Vec<OpsCommand> {
+///
+/// Pure: the caller resolves the release's [`ReleaseFullname`] and passes it in
+/// (live for a real run, [`chart_fullname`] under `--dry-run`), so this builder
+/// still makes no cluster call of its own.
+pub fn status_commands(o: &CommonOpts, fullname: &ReleaseFullname) -> Vec<OpsCommand> {
     vec![
         helm_status_cmd(o),
         pods_cmd(o),
-        svc_cmd(o, "ui"),
-        svc_cmd(o, "langfuse-web"),
+        svc_cmd(o, fullname, "ui"),
+        svc_cmd(o, fullname, "langfuse-web"),
         kubeconfig_host_cmd(),
     ]
 }
@@ -4077,13 +4773,20 @@ fn pods_cmd(o: &CommonOpts) -> OpsCommand {
     )
 }
 
-fn svc_cmd(o: &CommonOpts, suffix: &str) -> OpsCommand {
+/// `kubectl get svc <fullname>-<suffix> -n <ns> -o json`.
+///
+/// The choke point for every release Service the CLI reads. It takes a resolved
+/// [`ReleaseFullname`], never the release name: the chart names each Service
+/// `{{ include "curie.fullname" . }}-<component>`, which equals
+/// `<release>-<component>` only when the release name happens to contain the
+/// chart name (#1533).
+fn svc_cmd(o: &CommonOpts, fullname: &ReleaseFullname, suffix: &str) -> OpsCommand {
     OpsCommand::new(
         "kubectl",
         vec![
             plain("get"),
             plain("svc"),
-            plain(format!("{}-{}", o.release, suffix)),
+            plain(fullname.resource(suffix)),
             plain("-n"),
             plain(&o.namespace),
             plain("-o"),
@@ -4581,9 +5284,17 @@ pub async fn run_capture(cmd: &OpsCommand) -> Result<(bool, String, String)> {
     // end of this function, so the temp files are removed after `helm` exits
     // (including on error paths below).
     let (cmd, _secret_files) = cmd.materialize_secret_files()?;
+    // `kill_on_drop` so a caller that ABANDONS this future does not leave the
+    // child running. Dropping the future only stops the wait; without this the
+    // process keeps going, which is worst precisely where the abandonment is
+    // deliberate -- `message::local_connected_transport` bounds its `docker`
+    // reads by a timeout for a wedged daemon, and each timed-out call would
+    // otherwise strand another hung `docker` client (#1031). Inert for every
+    // caller that awaits to completion: the child has already exited by then.
     let output = Command::new(&cmd.program)
         .args(cmd.argv())
         .envs(cmd.env.iter().chain(cmd.secret_env.iter()).cloned())
+        .kill_on_drop(true)
         .output()
         .await
         .with_context(|| format!("failed to invoke `{}`; is it on PATH?", cmd.program))?;
@@ -5116,6 +5827,99 @@ fn should_read_existing(dev: bool, dry_run: bool) -> bool {
     !dry_run
 }
 
+/// Refuse a `--dev` run that would flip an already-installed release onto the
+/// chart's published dev defaults (#1145).
+///
+/// `curie.managedSecret`'s dev-defaults branch short-circuits *ahead of* its
+/// `hasKey .existingData` preservation branch, so pointing an existing sealed
+/// release at dev defaults rewrites every chart-owned credential in the release
+/// Secret while the PVC-backed Postgres and RustFS data keeps the originals.
+/// That leaves the install unbootable until those PVCs are wiped -- a state the
+/// operator cannot back out of -- so the run is refused up front rather than
+/// diagnosed afterwards.
+///
+/// The decision, in order:
+///
+/// 1. `dev == false` -> always allowed. A plain `up` over a *dev* release is
+///    safe by construction: [`resolve_generated_secrets`] re-supplies only what
+///    the release already recorded and never mints a value for an unrecorded
+///    key, so `managedSecret` sees `value == default` and preserves. If that
+///    ever became mint-on-missing, this arm has to change with it.
+/// 2. `existing.is_none()` -> allowed. Either helm positively reported
+///    "release: not found" (the fresh install `--dev` exists for), or the read
+///    was skipped. `--dry-run` is that second case -- `should_read_existing`
+///    returns `false` for it -- so a `--dev --dry-run` plan is never refused:
+///    it reaches no helm invocation and so has no release to damage.
+/// 3. The release already records dev defaults -> allowed. That is the
+///    idempotent `--dev` re-run, and also the retry after a `--dev` install
+///    that failed partway, since helm records a failed install's values.
+/// 4. The operator explicitly supplied [`ALLOW_DEV_DEFAULTS_KEY`] through
+///    `--set` or `--set-string` -> allowed. `up_value_plan` emits the CLI's own
+///    `=true` FIRST and appends the operator's expressions AFTER it, and helm is
+///    last-wins, so the operator's value is the one the chart actually renders:
+///    `--dev --set security.allowDevDefaults=false` renders the flag OFF and
+///    preserves the recorded credentials. Honouring it is therefore not a
+///    bypass, it is reading the same effective value the chart will. Kept
+///    DELIBERATELY NARROW: membership of that EXACT dotted key, never a
+///    substring and never "some override was passed" -- almost every real
+///    `cluster up` carries unrelated overrides, so the wider spelling would
+///    disable the guard outright.
+/// 5. Anything else -> refused, Usage class (exit 2), a deterministic input
+///    error rather than a runtime failure. The truthiness read fails closed, so
+///    an unrecognised recorded shape refuses rather than waves through.
+///
+/// Arm 4 sits ahead of the refusal because it decides what helm renders, not
+/// what the CLI intended. It also subsumes `--set security.allowDevDefaults=true`
+/// staying unguarded on purpose: that is the documented verbatim escape hatch,
+/// and this file's standing rule is that an operator `--set` always wins. Do not
+/// "close the gap" by guarding it. It is kept out of the operator-facing message
+/// and fix hint too, because against an existing release it is destructive
+/// advice.
+fn guard_dev_defaults_flip(
+    dev: bool,
+    existing: Option<&serde_json::Value>,
+    operator_sets: &[String],
+) -> Result<()> {
+    if !dev {
+        return Ok(());
+    }
+    let Some(values) = existing else {
+        return Ok(());
+    };
+    if lookup_dotted_flag(values, ALLOW_DEV_DEFAULTS_KEY) {
+        return Ok(());
+    }
+    if operator_set_entries(operator_sets)
+        .into_iter()
+        .any(|(key, _)| key.trim() == ALLOW_DEV_DEFAULTS_KEY)
+    {
+        return Ok(());
+    }
+    // `curie cluster down` is deliberately NOT the headline advice. It deletes
+    // only the namespaces the release itself created and leaves a pre-existing
+    // one untouched (#707), and the runtime PVCs are not helm-owned -- they go
+    // only with that namespace sweep. Followed there it would delete the release
+    // Secret holding the store credentials while the data outlives it, which is
+    // the very lockout this guard exists to prevent, so the teardown path has to
+    // name the PVCs explicitly (#1145).
+    let fix = "re-run without `--dev`, which preserves the credentials the release already \
+               recorded; if a dev-default stack is genuinely what you want here, the \
+               backing-store PVCs have to go WITH the release before you reinstall -- \
+               `curie cluster down` alone does not remove them when the release was \
+               installed into a pre-existing namespace, and dropping the release while \
+               that data survives locks you out of your own stores";
+    Err(crate::exit::CliError::usage(
+        "this release was not installed with `--dev`, so `--dev` is refused: it would rewrite \
+         every chart-owned credential in the release Secret to the published dev defaults \
+         while the Postgres and RustFS data on the release's PVCs still holds the original \
+         generated credentials, so the store init hook times out and the API migrate init \
+         container fails password authentication, leaving the install broken until the PVCs \
+         are wiped",
+    )
+    .with_fix(fix)
+    .into())
+}
+
 enum UpInferencePolicy {
     Detect(Vec<ClusterUpInference>),
     Disabled,
@@ -5204,6 +6008,12 @@ async fn run_prepared_up(
     github_token: Option<&str>,
     inference_policy: UpInferencePolicy,
 ) -> Result<ClusterUpOutput> {
+    // The single call site, and deliberately the first statement of the single
+    // choke point both `up()` and `up_prepared()` funnel through: upstream of
+    // the `inference.render(ui)` loop, of the `!opts.dev` preservation notes,
+    // and of every helm invocation, so a refused run (#1145) emits the error
+    // and nothing else.
+    guard_dev_defaults_flip(opts.dev, existing.as_ref(), &opts.operator_sets())?;
     let ui = crate::ui::ui();
     let (detect_facts, initial_inferences) = match inference_policy {
         UpInferencePolicy::Detect(inferences) => (true, inferences),
@@ -5285,8 +6095,9 @@ async fn run_prepared_up(
     // label match the Deployment's own `selectorLabels` regardless of any
     // `nameOverride`/`fullnameOverride`, so this is correct in every case.
     let restart_hint = format!(
-        "kubectl -n {} rollout restart deployment -l app.kubernetes.io/instance={},app.kubernetes.io/component=api",
-        opts.common.namespace, opts.common.release
+        "kubectl -n {} rollout restart deployment -l {}",
+        opts.common.namespace,
+        component_selector(&opts.common.release, "api")
     );
     // An explicit but EMPTY `--github-token` / `CURIE_GITHUB_TOKEN`: a routine
     // shell accident that preserves rather than clears (`resolve_github_token`),
@@ -5632,8 +6443,12 @@ impl crate::ui::CliOutput for ClusterStatusOutput {
 
 pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
     if opts.dry_run {
+        // A dry run makes no cluster call, so the release's fullname cannot be
+        // discovered and the chart's no-override rule is the honest best guess.
+        // `dry_run_fullname` computes it and emits the caveat that says so.
+        let fullname = dry_run_fullname(&opts.release);
         return Ok(ClusterStatusOutput::DryRun(crate::ui::DryRunPlan {
-            lines: status_commands(&opts)
+            lines: status_commands(&opts, &fullname)
                 .iter()
                 .map(|cmd| cmd.display())
                 .collect(),
@@ -5677,11 +6492,18 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
         (Vec::new(), 0, 0, Vec::new())
     };
 
-    // (c) URL discovery.
-    let host = discover_host().await;
+    // (c) URL discovery. Resolve the release's rendered fullname once, here on
+    // the live branch -- `--dry-run` returned above without touching kubectl.
+    // The host lookup does not depend on the fullname, so the two run
+    // concurrently rather than paying for each other's round-trip; the service
+    // reads below need both and fan out after.
+    let (fullname, host) = tokio::join!(
+        release_fullname(&opts.namespace, &opts.release),
+        discover_host(),
+    );
     let urls = vec![
-        resolve_service_url(&opts, "ui", "UI", &host, true).await,
-        resolve_service_url(&opts, "langfuse-web", "Langfuse", &host, false).await,
+        resolve_service_url(&opts, &fullname, "ui", "UI", &host, true).await,
+        resolve_service_url(&opts, &fullname, "langfuse-web", "Langfuse", &host, false).await,
     ];
 
     Ok(ClusterStatusOutput::Status(Box::new(ClusterStatus {
@@ -5820,6 +6642,541 @@ pub async fn down(opts: DownOpts) -> Result<ClusterDownOutput> {
         &sweep_err,
         &opts.common,
     )
+}
+
+// ---------------------------------------------------------------------------
+// `cluster rollback` (#1899)
+// ---------------------------------------------------------------------------
+
+/// One row of `helm history -o json`. Only the fields the rollback decision
+/// needs are modelled; helm adds others (`updated`, `app_version`) that are
+/// deliberately ignored so a helm version bump cannot break parsing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HelmRevision {
+    pub revision: u32,
+    pub status: String,
+    pub chart: String,
+    pub description: String,
+}
+
+/// The revision statuses it is safe to roll back TO. Everything else
+/// (`failed`, the four `pending-*` states, `uninstalling`, `uninstalled`,
+/// `unknown`) names a revision helm never finished putting on the cluster, so
+/// rolling back to it re-applies a manifest that was never known good.
+const ROLLBACK_ELIGIBLE_STATUSES: [&str; 2] = ["deployed", "superseded"];
+
+fn is_eligible_rollback_status(status: &str) -> bool {
+    ROLLBACK_ELIGIBLE_STATUSES.contains(&status.trim().to_ascii_lowercase().as_str())
+}
+
+/// The revision the release is on right now.
+///
+/// Normally that is the one helm marks `deployed`. The fallback to the highest
+/// revision is the real recovery case this verb exists for: when the newest
+/// revision FAILED there is no `deployed` row at all, and treating the failed
+/// revision as "current" is what lets the selector look below it.
+fn current_revision(history: &[HelmRevision]) -> Option<u32> {
+    history
+        .iter()
+        .filter(|r| r.status.trim().eq_ignore_ascii_case("deployed"))
+        .map(|r| r.revision)
+        .max()
+        .or_else(|| history.iter().map(|r| r.revision).max())
+}
+
+/// [`current_revision`], or the error every entry point owes an operator whose
+/// history came back empty. One copy on purpose: the wording here has already
+/// been reworked twice, and a second hand-written copy would silently keep the
+/// old text the next time it changes.
+fn require_current_revision(history: &[HelmRevision]) -> Result<u32> {
+    match current_revision(history) {
+        Some(current) => Ok(current),
+        None => Err(crate::exit::CliError::failure(
+            "`helm history` returned no revisions for this release, so there is nothing to roll back to",
+        )
+        .with_fix("confirm the release name and namespace with `helm list -n <namespace>`")
+        .into()),
+    }
+}
+
+/// The INELIGIBLE revisions between `to` and `from`. The status filter is not
+/// redundant: it is only the auto-select path that leaves nothing eligible in
+/// the gap. An operator-named `--revision` can step over revisions that were
+/// perfectly good, and reporting those as "not deployed/superseded" is a false
+/// claim in both the note and the `--json` `skipped` field, so the list is
+/// computed rather than assumed. Reporting the rest is the whole point of AC2.
+///
+/// Deduplicated defensively: [`parse_helm_history`] already collapses a corrupt
+/// history to one row per revision, but this is pure over any slice a caller
+/// hands it, and a number must never surface twice in the report.
+fn skipped_between(history: &[HelmRevision], to: u32, from: u32) -> Vec<u32> {
+    let mut skipped: Vec<u32> = history
+        .iter()
+        .filter(|r| r.revision > to && r.revision < from)
+        .filter(|r| !is_eligible_rollback_status(&r.status))
+        .map(|r| r.revision)
+        .collect();
+    skipped.sort_unstable();
+    skipped.dedup();
+    skipped
+}
+
+/// A resolved rollback: where the release is now, where it is going, and what
+/// was stepped over on the way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RollbackChoice {
+    pub from_revision: u32,
+    pub to_revision: u32,
+    pub skipped: Vec<u32>,
+    /// True only when `--allow-failed-revision` admitted a revision whose status
+    /// is not `deployed`/`superseded`.
+    pub forced: bool,
+}
+
+/// The outcome of the pure selection. `NoEligible` is a legitimate reading of a
+/// real history (a first install, or a release whose every prior revision
+/// failed), not a parse error, so it is carried as a value and turned into the
+/// operator-facing refusal by [`RollbackTarget::require_eligible`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RollbackTarget {
+    Eligible(RollbackChoice),
+    NoEligible { current: u32, skipped: Vec<u32> },
+}
+
+impl RollbackTarget {
+    /// The chosen revision, or the AC4 refusal: never a silent no-op, and never
+    /// a rollback to a revision helm never finished applying.
+    pub fn require_eligible(self) -> Result<RollbackChoice> {
+        match self {
+            RollbackTarget::Eligible(choice) => Ok(choice),
+            RollbackTarget::NoEligible { current, skipped } => {
+                let detail = if skipped.is_empty() {
+                    format!("revision {current} is the only revision in its history")
+                } else {
+                    format!(
+                        "every revision below {current} ({}) has a status helm never finished applying",
+                        skipped
+                            .iter()
+                            .map(u32::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
+                // The next step rides in the message as well as the fix: a bare
+                // `CliError` shows only its message to a human presenter, so an
+                // operator on a TTY would otherwise never learn there is one.
+                Err(crate::exit::CliError::failure(format!(
+                    "no revision is safe to roll back to: {detail}; inspect \
+                     `helm history <release> -n <namespace>` and, if you accept the risk, name one \
+                     explicitly with --revision <n> --allow-failed-revision"
+                ))
+                .with_fix(
+                    "inspect `helm history <release> -n <namespace>` and, if you accept the risk, \
+                     name one explicitly with --revision <n> --allow-failed-revision",
+                )
+                .into())
+            }
+        }
+    }
+}
+
+/// Pick the rollback target: the NEWEST revision strictly below the current one
+/// whose status is `deployed` or `superseded`.
+///
+/// This is the whole fix for #1899. A `cluster up` against a cluster with no
+/// `runsc` RuntimeClass records a FAILED revision before its successful retry,
+/// so the history alternates failed/superseded and the immediately preceding
+/// revision -- the one bare `helm rollback` targets -- is a failed one. Skipping
+/// ineligible statuses is what stops an operator having to know that.
+///
+/// Pure by construction so the decision is unit-testable with no cluster.
+pub fn select_rollback_revision(history: &[HelmRevision]) -> Result<RollbackTarget> {
+    let current = require_current_revision(history)?;
+
+    match history
+        .iter()
+        .filter(|r| r.revision < current && is_eligible_rollback_status(&r.status))
+        .map(|r| r.revision)
+        .max()
+    {
+        Some(to_revision) => Ok(RollbackTarget::Eligible(RollbackChoice {
+            from_revision: current,
+            to_revision,
+            skipped: skipped_between(history, to_revision, current),
+            forced: false,
+        })),
+        None => Ok(RollbackTarget::NoEligible {
+            current,
+            skipped: skipped_between(history, 0, current),
+        }),
+    }
+}
+
+/// Validate an operator-named `--revision`. A revision that is not in the
+/// history is always refused (helm would otherwise fail obscurely mid-rollback);
+/// an ineligible status is refused unless `allow_failed` was passed, and the
+/// refusal names both the status and the override so the operator does not have
+/// to guess (AC3).
+pub fn resolve_explicit_revision(
+    history: &[HelmRevision],
+    revision: u32,
+    allow_failed: bool,
+) -> Result<RollbackChoice> {
+    let current = require_current_revision(history)?;
+
+    let row = history.iter().find(|r| r.revision == revision).ok_or_else(|| {
+        let known: Vec<String> = history.iter().map(|r| r.revision.to_string()).collect();
+        crate::exit::CliError::usage(format!(
+            "revision {revision} is not in this release's Helm history (it has {})",
+            known.join(", ")
+        ))
+        .with_fix("run `curie cluster rollback` with no --revision to let it pick the newest safe revision")
+    })?;
+
+    let eligible = is_eligible_rollback_status(&row.status);
+    if !eligible && !allow_failed {
+        return Err(crate::exit::CliError::usage(format!(
+            "revision {revision} has status `{}`, not `deployed` or `superseded`; \
+             helm never finished applying it, so rolling back to it re-applies a manifest \
+             that was never known good; pass --allow-failed-revision to roll back to it anyway, \
+             or omit --revision to let Curie pick the newest safe one",
+            row.status
+        ))
+        .with_fix("pass --allow-failed-revision to roll back to it anyway, or omit --revision to let Curie pick the newest safe one")
+        .into());
+    }
+
+    Ok(RollbackChoice {
+        from_revision: current,
+        to_revision: revision,
+        skipped: skipped_between(history, revision, current),
+        forced: !eligible,
+    })
+}
+
+/// Parse `helm history -o json`: an array of objects. Unknown fields are
+/// tolerated (helm adds them across versions) and `revision` is accepted as a
+/// JSON number or a string, since that shape has moved between helm releases.
+/// Never panics on operator-visible input -- a malformed payload becomes a
+/// `CliError` naming the command to run by hand.
+pub fn parse_helm_history(json: &str) -> Result<Vec<HelmRevision>> {
+    let malformed = |detail: String| {
+        crate::exit::CliError::failure(format!(
+            "could not read `helm history -o json` output: {detail}"
+        ))
+        .with_fix(
+            "run `helm history <release> -n <namespace> -o json` by hand to see what helm returned",
+        )
+    };
+
+    let rows: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| malformed(e.to_string()))?;
+    let rows = rows
+        .as_array()
+        .ok_or_else(|| malformed("expected a JSON array of revisions".to_string()))?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let revision = row
+            .get("revision")
+            .and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+            })
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| {
+                malformed(format!("a revision has no usable `revision` field: {row}"))
+            })?;
+        let field = |name: &str| {
+            row.get(name)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        // A row with no `status` is treated as `unknown`, which is ineligible:
+        // the safe reading of a field we could not see is "not known good".
+        let status = match field("status").as_str() {
+            "" => "unknown".to_string(),
+            s => s.to_string(),
+        };
+        out.push(HelmRevision {
+            revision,
+            status,
+            chart: field("chart"),
+            description: field("description"),
+        });
+    }
+    // The invariant every consumer below relies on: ascending by revision, and
+    // exactly ONE row per revision number. Eligibility is a property of the
+    // REVISION, not of a row, so both the auto-selector (which filters rows by
+    // status) and `--revision` (which looks a row up) must read the same answer
+    // for the same number. A truncated or corrupt helm secret can yield two
+    // rows for one revision that disagree -- say 20 `superseded` and 20
+    // `failed` -- and before collapsing them the two paths contradicted each
+    // other: `--revision 20` refused it as failed while a bare rollback happily
+    // picked it. A revision whose own history contradicts itself was never
+    // known good, so it collapses to its ineligible reading: sort ineligible
+    // first within a revision number (`false` orders before `true`), then keep
+    // the first row of each run.
+    out.sort_by_key(|r| (r.revision, is_eligible_rollback_status(&r.status)));
+    out.dedup_by_key(|r| r.revision);
+    Ok(out)
+}
+
+/// `helm history` for the release, as JSON. `--max 256` because helm's default
+/// of 10 silently truncates the history, and a truncated history would make the
+/// selector pick a revision that merely looks like the newest safe one.
+pub fn helm_history_cmd(o: &CommonOpts) -> OpsCommand {
+    OpsCommand::new(
+        "helm",
+        vec![
+            plain("history"),
+            plain(&o.release),
+            plain("-n"),
+            plain(&o.namespace),
+            plain("-o"),
+            plain("json"),
+            plain("--max"),
+            plain("256"),
+        ],
+    )
+}
+
+/// `helm rollback` to an explicit revision. Always explicit: the whole point of
+/// the verb is that helm's own default target (the immediately preceding
+/// revision) is the wrong one on a failed/superseded history.
+pub fn helm_rollback_cmd(o: &CommonOpts, revision: u32) -> OpsCommand {
+    helm_rollback_cmd_to(o, revision.to_string())
+}
+
+/// The revision slot of the rollback argv, as printed by `--dry-run` before the
+/// history that decides it has been read.
+const SELECTED_REVISION: &str = "<selected-revision>";
+
+/// [`helm_rollback_cmd`] with the revision slot left as text, so the plan a dry
+/// run prints and the command a live run executes are built by one function
+/// rather than a builder and a `format!` that drift apart.
+fn helm_rollback_cmd_to(o: &CommonOpts, revision: String) -> OpsCommand {
+    OpsCommand::new(
+        "helm",
+        vec![
+            plain("rollback"),
+            plain(&o.release),
+            plain(revision),
+            plain("-n"),
+            plain(&o.namespace),
+        ],
+    )
+}
+
+/// The commands `curie cluster rollback` runs (and prints under `--dry-run`):
+/// the history read that decides the target, then the rollback itself. A `None`
+/// revision is one the caller has not resolved yet, and stands in the argv as
+/// [`SELECTED_REVISION`].
+pub fn rollback_commands(o: &CommonOpts, revision: Option<u32>) -> Vec<OpsCommand> {
+    let target = revision.map_or_else(|| SELECTED_REVISION.to_string(), |r| r.to_string());
+    vec![helm_history_cmd(o), helm_rollback_cmd_to(o, target)]
+}
+
+/// One printed plan line. `display()` everywhere, except that it shell-quotes
+/// [`SELECTED_REVISION`] (the angle brackets are not shell-safe) into something
+/// that reads like a literal argument. The placeholder is a prompt to the
+/// reader, not a value, so it is unquoted back out; everything else in the line
+/// keeps `display()`'s quoting and masking.
+fn plan_line(cmd: &OpsCommand) -> String {
+    cmd.display()
+        .replace(&shell_quote(SELECTED_REVISION), SELECTED_REVISION)
+}
+
+/// Output of `cluster rollback`: the dry-run plan, an operator abort, or the
+/// completed rollback. `skipped` is carried into `--json` so an agent sees the
+/// revisions bare `helm rollback` would have landed on.
+#[derive(Debug)]
+pub enum ClusterRollbackOutput {
+    DryRun(crate::ui::DryRunPlan),
+    Aborted,
+    RolledBack {
+        from_revision: u32,
+        to_revision: u32,
+        skipped: Vec<u32>,
+        forced: bool,
+    },
+}
+
+impl crate::ui::CliOutput for ClusterRollbackOutput {
+    fn to_json(&self) -> serde_json::Value {
+        match self {
+            ClusterRollbackOutput::DryRun(plan) => plan.to_json(),
+            ClusterRollbackOutput::Aborted => {
+                serde_json::json!({"rolled_back": false, "aborted": true})
+            }
+            ClusterRollbackOutput::RolledBack {
+                from_revision,
+                to_revision,
+                skipped,
+                forced,
+            } => serde_json::json!({
+                "rolled_back": true,
+                "from_revision": from_revision,
+                "to_revision": to_revision,
+                "skipped": skipped,
+                "forced": forced,
+            }),
+        }
+    }
+
+    fn render(&self, ui: &crate::ui::Ui) {
+        match self {
+            ClusterRollbackOutput::DryRun(plan) => plan.render(ui),
+            ClusterRollbackOutput::Aborted => ui.note("aborted"),
+            ClusterRollbackOutput::RolledBack {
+                from_revision,
+                to_revision,
+                skipped,
+                forced,
+            } => {
+                ui.payload(&format!(
+                    "curie rolled back from revision {from_revision} to revision {to_revision}"
+                ));
+                if let Some(note) = skipped_note(skipped, *from_revision) {
+                    ui.note(&note);
+                }
+                if *forced {
+                    ui.warn(&format!(
+                        "revision {to_revision} was admitted by --allow-failed-revision; helm never finished applying it, so verify the release with `curie cluster status`"
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// The AC2 line: which revisions were passed over, and -- only when it is
+/// actually so -- which of them a bare `helm rollback` would have targeted.
+///
+/// helm's own default target is always the revision immediately below `from`,
+/// so that half of the sentence is true only when the highest skipped revision
+/// IS `from - 1`. On an explicit `--revision` the gap can contain eligible
+/// revisions that are not in this list, and naming the highest ineligible one
+/// as helm's target would be a fabrication. `None` when nothing was skipped, so
+/// the common case stays quiet.
+fn skipped_note(skipped: &[u32], from: u32) -> Option<String> {
+    let highest = *skipped.iter().max()?;
+    let list = skipped
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(if from.checked_sub(1) == Some(highest) {
+        format!(
+            "skipped revision(s) {list} (not deployed/superseded); a bare `helm rollback` would have targeted {highest}"
+        )
+    } else {
+        format!("skipped revision(s) {list} (not deployed/superseded)")
+    })
+}
+
+pub async fn rollback(opts: RollbackOpts) -> Result<ClusterRollbackOutput> {
+    let ui = crate::ui::ui();
+    let history_cmd = helm_history_cmd(&opts.common);
+
+    if opts.common.dry_run {
+        // The target revision is a function of the live history, so a dry run
+        // that has not read it can only name the revision when the operator did.
+        return Ok(ClusterRollbackOutput::DryRun(crate::ui::DryRunPlan {
+            lines: rollback_commands(&opts.common, opts.revision)
+                .iter()
+                .map(plan_line)
+                .collect(),
+        }));
+    }
+    require_on_path("helm")?;
+
+    ui.plumbing(&format!("+ {}", history_cmd.display()));
+    let (ok, history_out, history_err) = run_capture(&history_cmd).await?;
+    if !ok {
+        // A missing release fails HERE, with helm's own words, rather than
+        // downstream as a misleading "no eligible revision" (AC6).
+        let detail = history_err
+            .trim()
+            .lines()
+            .next()
+            .unwrap_or("helm exited nonzero with no message");
+        return Err(crate::exit::CliError::failure(format!(
+            "could not read the Helm history of release '{}' in namespace '{}': {detail}",
+            opts.common.release, opts.common.namespace
+        ))
+        .with_fix(format!(
+            "confirm the release exists with `helm list -n {}`",
+            opts.common.namespace
+        ))
+        .into());
+    }
+    let history = parse_helm_history(&history_out)?;
+
+    let choice = match opts.revision {
+        Some(revision) => {
+            resolve_explicit_revision(&history, revision, opts.allow_failed_revision)?
+        }
+        None => select_rollback_revision(&history)?.require_eligible()?,
+    };
+
+    // Disclosed BEFORE the prompt, and on stderr like `cluster down` does it:
+    // the operator confirms knowing both the target and what was passed over,
+    // which is the difference this verb exists to make. It cannot go through
+    // `payload` -- ADR-0021 (#474) reserves that channel for `CliOutput::render`,
+    // and routing it here told an operator who then declined the prompt that the
+    // release was rolling back, on stdout, while printing it twice on success.
+    ui.note(&format!(
+        "rolling release '{}' back from revision {} to revision {}",
+        opts.common.release, choice.from_revision, choice.to_revision
+    ));
+    if let Some(note) = skipped_note(&choice.skipped, choice.from_revision) {
+        ui.warn(&note);
+    }
+
+    if !opts.yes
+        && !confirm(&format!(
+            "This rolls back release '{}' in namespace '{}' from revision {} to revision {}. Continue? [y/N] ",
+            opts.common.release, opts.common.namespace, choice.from_revision, choice.to_revision
+        ))?
+    {
+        return Ok(ClusterRollbackOutput::Aborted);
+    }
+
+    let cl = ui.checklist();
+    let rollback_cmd = helm_rollback_cmd(&opts.common, choice.to_revision);
+    ui.plumbing(&format!("+ {}", rollback_cmd.display()));
+    let step = cl.step("rolling back release");
+    let (ok, out, err) = run_capture(&rollback_cmd).await?;
+    for line in out.lines().chain(err.lines()) {
+        ui.plumbing(line);
+    }
+    if !ok {
+        step.fail("failed");
+        let detail = err
+            .trim()
+            .lines()
+            .next()
+            .unwrap_or("helm exited nonzero with no message");
+        return Err(crate::exit::CliError::failure(format!(
+            "helm could not roll release '{}' back to revision {}: {detail}",
+            opts.common.release, choice.to_revision
+        ))
+        .with_fix(format!(
+            "inspect the release with `curie cluster status --release {} --namespace {}`",
+            opts.common.release, opts.common.namespace
+        ))
+        .into());
+    }
+    step.done("rolled back");
+
+    Ok(ClusterRollbackOutput::RolledBack {
+        from_revision: choice.from_revision,
+        to_revision: choice.to_revision,
+        skipped: choice.skipped,
+        forced: choice.forced,
+    })
 }
 
 /// Read a y/N confirmation from stderr/stdin for `down` when `--yes` is absent.
@@ -6065,8 +7422,9 @@ fn deployed_release_namespace(
 }
 
 /// Discover a Helm release's platform API key by reading it out of the chart
-/// Secret (`<release>-secrets`, data key `apiKey`), decoded server-side by
-/// kubectl's `base64decode` so the plaintext never lands in argv (#524). The
+/// Secret (data key `apiKey`), whose name is discovered by label selector
+/// rather than computed -- see [`release_secret_name`] -- decoded server-side
+/// by kubectl's `base64decode` so the plaintext never lands in argv (#524). The
 /// governance verbs use this so they authenticate against a REAL release whose
 /// `api.apiKey` was randomized at `cluster up`, instead of silently sending the
 /// dev sentinel `curie-dev-key` and 401-ing. An explicit `--api-key`/env still
@@ -6183,7 +7541,8 @@ fn valkey_password_usage_err(msg: impl Into<String>) -> anyhow::Error {
 }
 
 /// Discover a Helm release's Valkey password from the same chart Secret
-/// (`<release>-secrets`, data key `valkeyPassword`). `cluster message` enqueues
+/// (name discovered by label selector -- see [`release_secret_name`] -- data
+/// key `valkeyPassword`). `cluster message` enqueues
 /// onto the release's Valkey, whose password `cluster up` randomizes, so without
 /// this the dev sentinel `valkeypass` reaches a strong-secrets install and the
 /// connection fails authentication (#786). An explicit
@@ -6209,12 +7568,13 @@ fn slack_bot_token_usage_err(msg: impl Into<String>) -> anyhow::Error {
 }
 
 /// Discover a Helm release's Slack bot token from the chart Secret
-/// (`<release>-secrets`, data key `slackBotToken`), or from the operator's own
+/// (name discovered by label selector -- see [`release_secret_name`] -- data
+/// key `slackBotToken`), or from the operator's own
 /// `dispatcher.slack.botTokenExistingSecret` when one is configured (#1759).
 /// In connected mode `cluster message` posts a real placeholder to the
 /// workspace with this token so the approval card and resumed reply ride the
 /// connected transport, instead of the throwaway stub (#770/ADR-0078). Only
-/// reached when a `<release>-dispatcher` is present (a workspace IS
+/// reached when the release's dispatcher Deployment is present (a workspace IS
 /// connected), so the token is expected to be set; an empty or unreadable
 /// value is an actionable error. The value is never printed -- it flows only
 /// into the `chat.postMessage` auth header.
@@ -6264,7 +7624,24 @@ pub enum SlackApiBase {
 /// defect `release_secret_name` already avoids by selecting on labels, and this
 /// selects the same way for the same reason.
 fn worker_deployment_selector(release: &str) -> String {
-    format!("app.kubernetes.io/instance={release},app.kubernetes.io/component=worker")
+    component_selector(release, "worker")
+}
+
+/// The label pair that finds one component of a release whatever it is named.
+///
+/// `curie.selectorLabels` (`charts/curie/templates/_helpers.tpl:40-44`) emits
+/// `app.kubernetes.io/instance: {{ .Release.Name }}` and
+/// `app.kubernetes.io/component: {{ .component }}` and reads NEITHER
+/// `nameOverride` nor `fullnameOverride`, so these labels are stable on exactly
+/// the installs whose rendered NAMES are not. One spelling, because three
+/// hand-built copies of the same pair is three places for it to drift from the
+/// chart.
+///
+/// Not the shape [`release_secret_name`] uses: that one deliberately selects on
+/// `instance` alone and filters by name suffix, because the chart Secret
+/// carries no component label.
+fn component_selector(release: &str, component: &str) -> String {
+    format!("app.kubernetes.io/instance={release},app.kubernetes.io/component={component}")
 }
 
 /// Parse `kubectl get deployment -o jsonpath=...` output into an outcome.
@@ -6318,7 +7695,7 @@ pub async fn discover_slack_api_base_url(namespace: &str, release: &str) -> Slac
     }
 }
 
-/// Whether a `<release>-dispatcher` Deployment exists in `namespace` -- i.e. a
+/// Whether the release's dispatcher Deployment exists in `namespace` -- i.e. a
 /// real Slack workspace is connected (via `curie cluster comms --slack`). In
 /// that case `cluster message` posts a real placeholder and routes the approval
 /// card + resumed reply over that connected transport rather than a throwaway
@@ -6328,6 +7705,12 @@ pub async fn discover_slack_api_base_url(namespace: &str, release: &str) -> Slac
 /// absent Deployment an empty success, so "connected" is exactly "non-empty
 /// output on a zero exit".
 pub async fn dispatcher_connected(namespace: &str, release: &str) -> bool {
+    // The chart renders `{{ curie.fullname }}-dispatcher`, so the name must be
+    // resolved and not computed from the release. `--ignore-not-found` turns a
+    // wrong name into a confident empty success, which reads as "no workspace
+    // connected" -- a silent wrong answer rather than a visible failure (#1533).
+    let fullname = release_fullname(namespace, release).await;
+    let dispatcher = fullname.resource("dispatcher");
     let cmd = OpsCommand::new(
         "kubectl",
         vec![
@@ -6335,7 +7718,7 @@ pub async fn dispatcher_connected(namespace: &str, release: &str) -> bool {
             plain(namespace),
             plain("get"),
             plain("deployment"),
-            plain(format!("{release}-dispatcher")),
+            plain(&dispatcher),
             plain("--ignore-not-found"),
             plain("-o"),
             plain("name"),
@@ -6351,7 +7734,7 @@ pub async fn dispatcher_connected(namespace: &str, release: &str) -> bool {
         Ok((false, _, err)) => {
             crate::ui::ui().warn(&format!(
                 "could not determine whether a Slack workspace is connected \
-                 (kubectl probe for {release}-dispatcher failed: {}); assuming \
+                 (kubectl probe for {dispatcher} failed: {}); assuming \
                  NOT connected and using the local reply stub",
                 err.trim().lines().next().unwrap_or("no stderr")
             ));
@@ -6418,17 +7801,365 @@ pub fn pick_release_secret(names: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The chart Secret's name, falling back to the historical guess.
+/// The chart Secret's name, falling back to the chart's own naming rule.
 ///
 /// A caller that must NAME the Secret (rather than read through it) still needs
 /// a string when the cluster is unreachable -- a `--dry-run` plan, for
-/// instance. The fallback is the old computed form, which is right for the
-/// installs that set `nameOverride` and wrong in exactly the way this function
-/// exists to fix, so it is a last resort and never silent in a live run.
+/// instance. That fallback used to be `format!("{release}-secrets")`, the raw
+/// chart-resource form this sweep exists to delete: for an ordinary `platform`
+/// install the chart renders `platform-curie-secrets`, so a transient discovery
+/// failure had `migrate-store` stage a pod against a Secret that does not
+/// exist. It now goes through [`chart_fullname`], which is the chart's
+/// no-override rule and byte-identical for the default `curie` release.
+///
+/// Only the FALLBACK changed. Live discovery still selects on the instance
+/// label alone and filters by suffix afterwards ([`pick_release_secret`]),
+/// which is what makes it correct under `nameOverride`/`fullnameOverride`.
 pub async fn release_secret_name_or_default(namespace: &str, release: &str) -> String {
     release_secret_name(namespace, release)
         .await
-        .unwrap_or_else(|| format!("{release}-secrets"))
+        .unwrap_or_else(|| chart_fullname(release).resource("secrets"))
+}
+
+/// A release's rendered `curie.fullname` -- the prefix every Curie-owned object
+/// in the chart is named from.
+///
+/// A newtype rather than a bare `String` on purpose. Every affected call site
+/// used to build `format!("{release}-{component}")` from a raw release name, so
+/// a `&str` parameter merely RENAMED to `fullname` would still compile when a
+/// caller passed the release name -- the original defect, type-checked as
+/// correct. This value is constructible only by [`chart_fullname`] and
+/// [`release_fullname`], so a raw release name cannot reach a resource name at
+/// all, and the compiler finds every site that has not been routed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseFullname(String);
+
+impl ReleaseFullname {
+    /// The chart's name for one of the release's components:
+    /// `{{ include "curie.fullname" . }}-<component>`
+    /// (`charts/curie/templates/_helpers.tpl:16-26`).
+    ///
+    /// The suffix is appended AFTER the fullname's own `trunc 63`, exactly as
+    /// the chart templates do, so a rendered object name can legitimately
+    /// exceed 63 characters. Truncating the joined string instead would name an
+    /// object helm never created; `truncation_happens_before_the_component_suffix`
+    /// pins the ordering.
+    pub fn resource(&self, component: &str) -> String {
+        format!("{}-{component}", self.0)
+    }
+
+    /// The fullname itself, for a caller that needs the prefix rather than a
+    /// component's name.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The chart's `curie.fullname` computed from the release name alone.
+///
+/// **Offline fallback only.** This is the chart's NO-OVERRIDE path
+/// (`charts/curie/templates/_helpers.tpl:16-26`):
+///
+/// ```text
+/// fullnameOverride                 if set
+/// .Release.Name                    if it contains the chart name
+/// "{.Release.Name}-curie"          otherwise
+///                                  ... then | trunc 63 | trimSuffix "-"
+/// ```
+///
+/// It cannot see `nameOverride` or `fullnameOverride`, and both move the
+/// rendered name somewhere this rule computes WRONGLY: `helm template platform
+/// charts/curie --set fullnameOverride=platform` renders `platform-api` while
+/// this rule says `platform-curie-api`. So a live path calls
+/// [`release_fullname`], which asks the cluster and only falls back here when
+/// the cluster cannot answer (`--dry-run`, no kubectl, no release yet).
+/// `cli/tests/chart_fullname_parity.rs` pins both the rule and its limit
+/// against the chart's own render.
+pub fn chart_fullname(release: &str) -> ReleaseFullname {
+    const CHART_NAME: &str = "curie";
+
+    let fullname = if release.contains(CHART_NAME) {
+        release.to_string()
+    } else {
+        format!("{release}-{CHART_NAME}")
+    };
+    // `trunc 63` first, then `trimSuffix "-"`, with sprig's exact semantics:
+    // `trimSuffix` removes EXACTLY ONE trailing dash where
+    // `str::trim_end_matches('-')` removes all of them. Confirmed against the
+    // chart rather than against a reading of sprig -- `--set
+    // fullnameOverride=<61 a's>--<10 z's>` renders the api Service as
+    // `<61 a's>--api`, so one dash survives for the component suffix to join to.
+    let truncated: String = fullname.chars().take(63).collect();
+    let trimmed = truncated.strip_suffix('-').unwrap_or(truncated.as_str());
+    ReleaseFullname(trimmed.to_string())
+}
+
+/// The fullname a `--dry-run` plan prints, plus the caveat that goes with it.
+///
+/// A dry run makes no cluster call, so the release's rendered name cannot be
+/// discovered and [`chart_fullname`]'s no-override rule is the honest best
+/// guess. Every dry-run branch owes the reader the same caveat, so the note
+/// lives with the value rather than being restated at each verb.
+fn dry_run_fullname(release: &str) -> ReleaseFullname {
+    let fullname = chart_fullname(release);
+    crate::ui::ui().note(&format!(
+        "dry run: service names assume the chart's default naming ({}); an install \
+         using nameOverride/fullnameOverride renders them differently",
+        fullname.resource("<component>")
+    ));
+    fullname
+}
+
+/// The fullname implied by a discovered object name, or `None` when that name
+/// does not carry the component suffix we selected on.
+///
+/// Pure, extracted for the same reason [`pick_release_secret`] is: the part
+/// that can be wrong is the selection rule, and it has to be testable with no
+/// cluster. Rejecting rather than blind-stripping is load-bearing -- a name
+/// that does not end in `-<component>` is not ours to truncate, and a
+/// confidently wrong fullname is worse than falling through to the chart rule.
+pub fn fullname_from_resource_name(name: &str, component: &str) -> Option<String> {
+    let fullname = name.trim().strip_suffix(&format!("-{component}"))?;
+    if fullname.is_empty() {
+        return None;
+    }
+    Some(fullname.to_string())
+}
+
+/// The outcome of one discovery probe, kept as four distinct cases on purpose.
+///
+/// The probe used to collapse "this release is not installed", "kubectl is not
+/// on PATH", "RBAC denied the read" and "two objects matched" into a single
+/// `None`, and the caller then silently computed a name. The distinction that
+/// matters: falling back for a genuinely ABSENT or not-yet-installed release is
+/// defensible -- `doctor` and a fresh namespace must still work -- while
+/// falling back because the probe FAILED is a guess dressed as an answer, and
+/// doing it silently is the defect. Each case is its own variant so
+/// [`release_fullname`] can say which one happened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComponentDiscovery {
+    /// Exactly one labelled object matched and its name carries the component
+    /// suffix: the release's rendered fullname, read off the cluster.
+    Found(ReleaseFullname),
+    /// The probe ran and answered: this release has no such object.
+    NotPresent,
+    /// The probe did not answer -- kubectl missing, unreachable API server,
+    /// RBAC denial, malformed request. Carries the first line of stderr.
+    ProbeFailed { component: String, detail: String },
+    /// More than one object carried the release's labels for this component.
+    /// Kubernetes does not enforce label uniqueness, so this is reachable with
+    /// a hand-applied or copy-pasted object, and taking `items[0]` would
+    /// silently point every downstream verb at a workload that is not ours.
+    Ambiguous {
+        component: String,
+        names: Vec<String>,
+    },
+}
+
+impl ComponentDiscovery {
+    /// The warning an operator must see before this outcome degrades into a
+    /// COMPUTED name, or `None` when degrading is the honest, normal thing.
+    ///
+    /// Pure, so the wording -- the part that has to be actionable -- is
+    /// testable with no cluster.
+    pub fn fallback_warning(
+        &self,
+        namespace: &str,
+        release: &str,
+        fallback: &ReleaseFullname,
+    ) -> Option<String> {
+        let guess = format!(
+            "the name being used, `{}`, is a COMPUTED GUESS from the chart's default \
+             naming and is WRONG on an install using nameOverride/fullnameOverride",
+            fallback.resource("<component>")
+        );
+        match self {
+            // A real answer needs no caveat, and an absent release is the
+            // documented reason this path has a fallback at all.
+            Self::Found(_) | Self::NotPresent => None,
+            Self::ProbeFailed { component, detail } => Some(format!(
+                "could not discover release `{release}` resource names in namespace \
+                 `{namespace}`: the kubectl probe for the `{component}` object FAILED \
+                 ({detail}). Continuing, but {guess}. Check kubectl access and RBAC \
+                 (get/list on services and deployments in `{namespace}`)."
+            )),
+            Self::Ambiguous { component, names } => Some(format!(
+                "refusing to choose: {} objects in namespace `{namespace}` match \
+                 `{}` ({}). Curie cannot tell which one belongs to release `{release}`, \
+                 so it targets NONE of them. Continuing, but {guess}. Relabel or remove \
+                 the objects that are not part of release `{release}`.",
+                names.len(),
+                component_selector(release, component),
+                names.join(", ")
+            )),
+        }
+    }
+}
+
+/// The outcome implied by the names a probe matched.
+///
+/// Pure, extracted for the same reason [`fullname_from_resource_name`] is: the
+/// cardinality rule is the part that can be wrong, and it has to be testable
+/// with no cluster.
+///
+/// EXACTLY ONE match resolves. Zero is absence. Two or more is
+/// [`ComponentDiscovery::Ambiguous`] and never `names[0]`: those labels are not
+/// unique by construction, so a stray Service named `unexpected-api` carrying
+/// the release's labels would otherwise resolve the fullname to `unexpected`
+/// and send `cluster message`/`comms`/`eval` at an unrelated workload.
+///
+/// Two legitimate releases are NOT this case: the selector pins
+/// `app.kubernetes.io/instance=<release>`, so another release's objects never
+/// match in the first place.
+pub fn component_discovery(names: &str, component: &str) -> ComponentDiscovery {
+    let matched: Vec<String> = names
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect();
+
+    match matched.len() {
+        0 => ComponentDiscovery::NotPresent,
+        1 => match fullname_from_resource_name(&matched[0], component) {
+            Some(fullname) => ComponentDiscovery::Found(ReleaseFullname(fullname)),
+            // Labelled for the component but not NAMED for it: not ours to
+            // truncate. Fall through to the next probe rather than mint a
+            // confidently wrong fullname.
+            None => ComponentDiscovery::NotPresent,
+        },
+        _ => ComponentDiscovery::Ambiguous {
+            component: component.to_string(),
+            names: matched,
+        },
+    }
+}
+
+/// One discovery probe: select the release's `<component>` objects by label and
+/// read their names back.
+///
+/// The jsonpath ranges over ALL matches rather than reading `.items[0]`, so
+/// cardinality is observable at all -- a single-item jsonpath cannot tell one
+/// match from three.
+async fn discover_component_fullname(
+    namespace: &str,
+    release: &str,
+    kind: &str,
+    component: &str,
+) -> ComponentDiscovery {
+    let cmd = OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("-n"),
+            plain(namespace),
+            plain("get"),
+            plain(kind),
+            plain("-l"),
+            plain(component_selector(release, component)),
+            plain("-o"),
+            plain("jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{end}"),
+        ],
+    );
+    match run_capture(&cmd).await {
+        Ok((true, out, _err)) => component_discovery(&out, component),
+        Ok((false, _out, err)) => {
+            let detail = err.trim().lines().next().unwrap_or("no stderr");
+            ComponentDiscovery::ProbeFailed {
+                component: component.to_string(),
+                detail: detail.to_string(),
+            }
+        }
+        Err(exc) => ComponentDiscovery::ProbeFailed {
+            component: component.to_string(),
+            detail: exc.to_string(),
+        },
+    }
+}
+
+/// Which of the two probes' outcomes to report.
+///
+/// A resolved name wins from either probe. Otherwise a PROBLEM (a failed probe,
+/// an ambiguous match) outranks absence, because absence is the one case that
+/// degrades silently and it must not mask the other two.
+fn preferred_probe_outcome(
+    api: ComponentDiscovery,
+    worker: ComponentDiscovery,
+) -> ComponentDiscovery {
+    if matches!(api, ComponentDiscovery::Found(_)) {
+        return api;
+    }
+    if matches!(worker, ComponentDiscovery::Found(_)) {
+        return worker;
+    }
+    if matches!(api, ComponentDiscovery::NotPresent) {
+        return worker;
+    }
+    api
+}
+
+/// The release's rendered fullname, read off the cluster.
+///
+/// Discovered rather than computed for the same reason [`release_secret_name`]
+/// is: `nameOverride` and `fullnameOverride` both change the rendered name and
+/// neither is visible from the release name alone. It works because
+/// `curie.selectorLabels` (`charts/curie/templates/_helpers.tpl:40-44`) emits
+/// `app.kubernetes.io/instance: {{ .Release.Name }}` and
+/// `app.kubernetes.io/component: {{ .component }}` and reads NEITHER override,
+/// so the labels stay stable on exactly the installs whose NAMES do not.
+/// Verified against both override renders, and pinned by
+/// `overrides_preserve_the_discovery_labels`.
+///
+/// Two probes, deliberately: the api Service first, then the worker Deployment.
+/// `api.deploy=false` is a supported install with no api Service, and the
+/// worker Deployment still carries the release labels.
+///
+/// Neither probe picks among matches. `app.kubernetes.io/instance=<release>`
+/// separates two legitimate releases, but nothing in Kubernetes stops a stray
+/// object from carrying the same pair of labels, so a set of size two or more
+/// is refused rather than resolved -- see [`component_discovery`].
+async fn discover_release_fullname(namespace: &str, release: &str) -> ComponentDiscovery {
+    let api = discover_component_fullname(namespace, release, "svc", "api").await;
+    if matches!(api, ComponentDiscovery::Found(_)) {
+        return api;
+    }
+    let worker = discover_component_fullname(namespace, release, "deployment", "worker").await;
+    preferred_probe_outcome(api, worker)
+}
+
+/// The release's fullname: discovered from the cluster, falling back to the
+/// chart's no-override rule.
+///
+/// THE live entry point. Every path that can reach a cluster resolves here, and
+/// [`chart_fullname`] is what it degrades to. Discovery finding nothing is
+/// normal rather than an error -- `doctor` and a not-yet-installed release must
+/// still work -- so this never fails.
+///
+/// It is not, however, silent about WHY it degraded. A failed probe (RBAC
+/// denial, no kubectl, unreachable API server) and an ambiguous match both warn
+/// before the computed name is used, because on an install using
+/// `nameOverride`/`fullnameOverride` that name is known to be wrong: without
+/// the warning `cluster status` reports "not found" for a Service that exists
+/// and a self-plumbed deploy fails against a name helm never rendered. Control
+/// flow is deliberately unchanged -- the fallback still happens, loudly.
+/// Failing mutating verbs closed on a failed probe is the stronger fix and is
+/// left as a follow-up policy decision.
+///
+/// Resolve LAZILY, on the branch that actually needs a cluster-derived name.
+/// Resolving at a verb's entry point fires kubectl on the explicit-`--api-url`
+/// and `--dry-run` paths, which are contractually cluster-offline
+/// (`cli/tests/cluster_connection_transport.rs`). Under `--dry-run`, call
+/// [`chart_fullname`] directly and make no cluster call at all.
+pub async fn release_fullname(namespace: &str, release: &str) -> ReleaseFullname {
+    match discover_release_fullname(namespace, release).await {
+        ComponentDiscovery::Found(fullname) => fullname,
+        outcome => {
+            let fallback = chart_fullname(release);
+            if let Some(warning) = outcome.fallback_warning(namespace, release, &fallback) {
+                crate::ui::ui().warn(&warning);
+            }
+            fallback
+        }
+    }
 }
 
 /// The release's sealing keys (ADR-0094): current first, then the previous one
@@ -6592,24 +8323,33 @@ pub async fn discover_api_url(namespace: &str, release: &str) -> Result<String> 
         release: release.to_string(),
         dry_run: false,
     };
+    // This function is only reached when no `--api-url` was supplied, so it is
+    // already a cluster path: resolving the fullname here keeps the explicit
+    // `--api-url` and `--dry-run` routes free of any kubectl call.
+    let fullname = release_fullname(namespace, release).await;
+    let ui_svc = fullname.resource("ui");
+    let api_svc = fullname.resource("api");
     let host = resolve_node_host().await;
 
-    if let Ok((true, ui_json, _)) = run_capture(&svc_cmd(&common, "ui")).await {
+    if let Ok((true, ui_json, _)) = run_capture(&svc_cmd(&common, &fullname, "ui")).await {
         return ui_api_url_from_parts(&ui_json, host.as_deref());
     }
 
     // No UI. The api service may still be reachable on its own NodePort.
-    if let Ok((true, api_json, _)) = run_capture(&svc_cmd(&common, "api")).await {
+    if let Ok((true, api_json, _)) = run_capture(&svc_cmd(&common, &fullname, "api")).await {
         if let Some(url) = api_url_from_parts(&api_json, host.as_deref()) {
             return Ok(url);
         }
+        // The port-forward hint names 8000:8000, not the old 8123: `cluster
+        // deploy` no longer binds 8123 for its own tunnel, and a hint naming
+        // that exact port would send the operator at the thing #1533 fixed.
         return Err(api_url_usage_err(format!(
-            "the {release}-ui service is absent (ui.deploy=false?) and {release}-api is not NodePort-exposed, so there is no reachable platform API URL; expose it with --set api.service.type=NodePort, or pass --api-url (e.g. via `kubectl port-forward svc/{release}-api 8123:8000`)"
+            "the {ui_svc} service is absent (ui.deploy=false?) and {api_svc} is not NodePort-exposed, so there is no reachable platform API URL; expose it with --set api.service.type=NodePort, or pass --api-url (e.g. via `kubectl port-forward svc/{api_svc} 8000:8000`)"
         )));
     }
 
     Err(api_url_usage_err(format!(
-        "could not read the {release}-ui or {release}-api service in namespace {namespace} to discover the platform API URL; pass --api-url to target the API directly"
+        "could not read the {ui_svc} or {api_svc} service in namespace {namespace} to discover the platform API URL; pass --api-url to target the API directly"
     )))
 }
 
@@ -6720,14 +8460,20 @@ impl ServiceUrl {
     }
 }
 
+/// One `cluster status` URL row.
+///
+/// The displayed `name` and the name `svc_cmd` QUERIES come from the same
+/// resolved fullname on purpose: they diverged before, so status could report a
+/// service it had never asked about.
 async fn resolve_service_url(
     o: &CommonOpts,
+    fullname: &ReleaseFullname,
     suffix: &str,
     label: &str,
     host: &str,
     api: bool,
 ) -> ServiceUrl {
-    let name = format!("{}-{}", o.release, suffix);
+    let name = fullname.resource(suffix);
     let mk = |kind| ServiceUrl {
         label: label.to_string(),
         name: name.clone(),
@@ -6735,7 +8481,7 @@ async fn resolve_service_url(
         api,
         kind,
     };
-    let (ok, out, _) = match run_capture(&svc_cmd(o, suffix)).await {
+    let (ok, out, _) = match run_capture(&svc_cmd(o, fullname, suffix)).await {
         Ok(res) => res,
         Err(_) => return mk(ServiceUrlKind::NotFound),
     };
@@ -6848,7 +8594,7 @@ fn port_forward_hint(ns: &str, name: &str, local: u16, port: u16, path: &str) ->
     )
 }
 
-/// The platform API service's port (`{release}-api`, `api.service.port` in the
+/// The platform API service's port (`<fullname>-api`, `api.service.port` in the
 /// chart). Owned here so the port-forward hint carries no bare literal.
 const API_SERVICE_PORT: u16 = 8000;
 
@@ -6864,6 +8610,7 @@ const API_SERVICE_PORT: u16 = 8000;
 /// service -- plain text, since `--json` serializes this note.
 fn api_base_endpoint(
     o: &CommonOpts,
+    fullname: &ReleaseFullname,
     ui_svc_json: Option<&str>,
     host: Option<&str>,
 ) -> crate::observability::Endpoint {
@@ -6874,19 +8621,23 @@ fn api_base_endpoint(
         browsable: false,
     };
     let Some(ui_svc_json) = ui_svc_json else {
-        return row(None, Some(format!("service {}-ui not found", o.release)));
+        return row(
+            None,
+            Some(format!("service {} not found", fullname.resource("ui"))),
+        );
     };
     match ui_api_url_from_parts(ui_svc_json, host) {
         Ok(url) => row(Some(url), None),
         // Any other failure -- ClusterIP / `--no-expose` (a supported install
         // mode), an unassigned nodePort, an unreadable service, or an
         // unresolvable host -- still leaves a way in: port-forward the API
-        // service directly.
+        // service directly. The operator copies and runs that line, so it must
+        // name the object the chart actually rendered.
         Err(_) => row(
             None,
             Some(port_forward_hint(
                 &o.namespace,
-                &format!("{}-api", o.release),
+                &fullname.resource("api"),
                 API_SERVICE_PORT,
                 API_SERVICE_PORT,
                 "",
@@ -6901,13 +8652,14 @@ fn api_base_endpoint(
 /// port-forward.
 fn service_surface(
     o: &CommonOpts,
+    fullname: &ReleaseFullname,
     suffix: &str,
     name: &str,
     svc_json: Option<&str>,
     host: Option<&str>,
     api: bool,
 ) -> crate::observability::Endpoint {
-    let svc_name = format!("{}-{}", o.release, suffix);
+    let svc_name = fullname.resource(suffix);
     let degraded = |note: String| crate::observability::Endpoint {
         name: name.to_string(),
         url: None,
@@ -6944,8 +8696,8 @@ fn service_surface(
 }
 
 /// Fetch one release service's JSON, or None when kubectl cannot read it.
-async fn fetch_service(o: &CommonOpts, suffix: &str) -> Option<String> {
-    match run_capture(&svc_cmd(o, suffix)).await {
+async fn fetch_service(o: &CommonOpts, fullname: &ReleaseFullname, suffix: &str) -> Option<String> {
+    match run_capture(&svc_cmd(o, fullname, suffix)).await {
         Ok((true, out, _)) => Some(out),
         _ => None,
     }
@@ -6967,14 +8719,24 @@ pub async fn cluster_observability_endpoints(
     // URL-producing path (`discover_api_url`) and the `api_base_endpoint`
     // row. `cluster status` stays human-facing and keeps its display
     // convenience.
-    let (host, ui_svc, langfuse_svc) = tokio::join!(
+    //
+    // Resolved once, before the fan-out: both service reads and all three rows
+    // must agree on the release's rendered name. This is a live path only --
+    // `observability`'s `--dry-run` branch returns before reaching here.
+    // `resolve_node_host()` needs no fullname, so it runs alongside the
+    // resolution instead of behind it; only the service reads have to wait.
+    let (fullname, host) = tokio::join!(
+        release_fullname(&opts.namespace, &opts.release),
         resolve_node_host(),
-        fetch_service(opts, "ui"),
-        fetch_service(opts, "langfuse-web"),
+    );
+    let (ui_svc, langfuse_svc) = tokio::join!(
+        fetch_service(opts, &fullname, "ui"),
+        fetch_service(opts, &fullname, "langfuse-web"),
     );
     vec![
         service_surface(
             opts,
+            &fullname,
             "ui",
             "Curie Console",
             ui_svc.as_deref(),
@@ -6983,13 +8745,14 @@ pub async fn cluster_observability_endpoints(
         ),
         service_surface(
             opts,
+            &fullname,
             "langfuse-web",
             "Langfuse UI (traces / cost / evals)",
             langfuse_svc.as_deref(),
             host.as_deref(),
             false,
         ),
-        api_base_endpoint(opts, ui_svc.as_deref(), host.as_deref()),
+        api_base_endpoint(opts, &fullname, ui_svc.as_deref(), host.as_deref()),
     ]
 }
 
@@ -6998,12 +8761,12 @@ pub async fn cluster_observability_endpoints(
 ///
 /// A superset of what actually runs, not a 1:1 trace: `resolve_node_host` only
 /// falls through to `nodes_cmd()` when `kubeconfig_host_cmd()` yields no host.
-pub fn observability_commands(o: &CommonOpts) -> Vec<OpsCommand> {
+pub fn observability_commands(o: &CommonOpts, fullname: &ReleaseFullname) -> Vec<OpsCommand> {
     vec![
         kubeconfig_host_cmd(),
         nodes_cmd(),
-        svc_cmd(o, "ui"),
-        svc_cmd(o, "langfuse-web"),
+        svc_cmd(o, fullname, "ui"),
+        svc_cmd(o, fullname, "langfuse-web"),
     ]
 }
 
@@ -7017,9 +8780,13 @@ pub async fn observability(
     open: bool,
 ) -> Result<crate::observability::ObservabilityOutput> {
     if opts.dry_run {
+        // No cluster call, so no discovery: the printed names follow the
+        // chart's no-override rule and an override install renders them
+        // differently. `dry_run_fullname` emits that caveat with the value.
+        let fullname = dry_run_fullname(&opts.release);
         return Ok(crate::observability::ObservabilityOutput::DryRun(
             crate::ui::DryRunPlan {
-                lines: observability_commands(&opts)
+                lines: observability_commands(&opts, &fullname)
                     .iter()
                     .map(|cmd| cmd.display())
                     .collect(),
@@ -7049,6 +8816,14 @@ mod tests {
             release: "curie".into(),
             dry_run: false,
         }
+    }
+
+    /// The default release's resolved fullname, for the builders that now take
+    /// one. `curie` contains the chart name, so this is byte-identical to the
+    /// names these tests have always asserted -- see
+    /// `chart_fullname_tests::the_default_release_is_a_byte_identical_no_op`.
+    fn fullname() -> ReleaseFullname {
+        chart_fullname("curie")
     }
 
     #[test]
@@ -7271,6 +9046,251 @@ mod tests {
         assert!(
             argv.contains(&"worker.extraEnv[0].value=10.0.0.0/8\\,localhost".into()),
             "recorded worker extraEnv values must escape commas for Helm: {argv:?}"
+        );
+    }
+
+    /// A plain `cluster up` for an unrelated reason must not silently switch
+    /// the worker back to refusing every dev reply endpoint the operator had
+    /// already trusted (issue #1897).
+    #[test]
+    fn plain_up_re_supplies_recorded_slack_trusted_origins_without_reuse_values() {
+        let existing = serde_json::json!({
+            "worker": { "slackTrustedOrigins": "http://host.docker.internal" }
+        });
+        let opts = complete_up_opts_without_runner_egress(
+            UpOpts {
+                common: common(),
+                github_token: GithubTokenPlan::Untouched,
+                allow_egress_host: vec![],
+                resolved_egress_cidrs: vec![],
+                chart: "charts/curie".into(),
+                secrets: vec![],
+                dev: false,
+                no_expose: true,
+                set: vec![],
+                set_string: vec![],
+                allow_web_egress: vec![],
+                fake_model: false,
+                credentials: None,
+                local_model: None,
+                model: None,
+            },
+            Some(&existing),
+            None,
+            false,
+        )
+        .unwrap();
+
+        let (materialized, _guards) = up_commands(&opts)[0].materialize_secret_files().unwrap();
+        let argv = materialized.argv().join(" ");
+        assert!(
+            argv.contains("--set-string worker.slackTrustedOrigins=http://host.docker.internal"),
+            "plain up dropped the recorded Slack trusted origin: {argv}"
+        );
+        assert!(
+            !argv.contains("--reuse-values"),
+            "up must remain a full Helm upgrade: {argv}"
+        );
+    }
+
+    /// An operator who names the trusted origins on this run owns the key: the
+    /// stale recorded list must not be smuggled back alongside it, or the
+    /// worker keeps trusting a host the operator just removed.
+    #[test]
+    fn explicit_slack_trusted_origins_override_the_recorded_value() {
+        let existing = serde_json::json!({
+            "worker": { "slackTrustedOrigins": "https://recorded.example.com" }
+        });
+        let opts = complete_up_opts_without_runner_egress(
+            UpOpts {
+                common: common(),
+                github_token: GithubTokenPlan::Untouched,
+                allow_egress_host: vec![],
+                resolved_egress_cidrs: vec![],
+                chart: "charts/curie".into(),
+                secrets: vec![],
+                dev: false,
+                no_expose: true,
+                set: vec![],
+                set_string: vec!["worker.slackTrustedOrigins=https://trusted.example.com".into()],
+                allow_web_egress: vec![],
+                fake_model: false,
+                credentials: None,
+                local_model: None,
+                model: None,
+            },
+            Some(&existing),
+            None,
+            false,
+        )
+        .unwrap();
+
+        let (materialized, _guards) = up_commands(&opts)[0].materialize_secret_files().unwrap();
+        let argv = materialized.argv().join(" ");
+        assert!(
+            argv.contains("--set-string worker.slackTrustedOrigins=https://trusted.example.com"),
+            "the explicit Slack trusted origin must reach Helm: {argv}"
+        );
+        assert!(
+            !argv.contains("recorded.example.com"),
+            "explicit trusted origins must suppress the recorded value: {argv}"
+        );
+    }
+
+    /// A plain `--set` names the trusted origins on this run just as much as
+    /// `--set-string` does -- an operator using the shorthand flag must still
+    /// own the key, not have the stale recorded list smuggled back alongside it.
+    #[test]
+    fn explicit_set_slack_trusted_origins_override_the_recorded_value() {
+        let existing = serde_json::json!({
+            "worker": { "slackTrustedOrigins": "https://recorded.example.com" }
+        });
+        let opts = complete_up_opts_without_runner_egress(
+            UpOpts {
+                common: common(),
+                github_token: GithubTokenPlan::Untouched,
+                allow_egress_host: vec![],
+                resolved_egress_cidrs: vec![],
+                chart: "charts/curie".into(),
+                secrets: vec![],
+                dev: false,
+                no_expose: true,
+                set: vec!["worker.slackTrustedOrigins=https://trusted.example.com".into()],
+                set_string: vec![],
+                allow_web_egress: vec![],
+                fake_model: false,
+                credentials: None,
+                local_model: None,
+                model: None,
+            },
+            Some(&existing),
+            None,
+            false,
+        )
+        .unwrap();
+
+        let (materialized, _guards) = up_commands(&opts)[0].materialize_secret_files().unwrap();
+        let argv = materialized.argv().join(" ");
+        assert!(
+            argv.contains("--set worker.slackTrustedOrigins=https://trusted.example.com"),
+            "the explicit Slack trusted origin must reach Helm: {argv}"
+        );
+        assert!(
+            !argv.contains("recorded.example.com"),
+            "explicit trusted origins must suppress the recorded value: {argv}"
+        );
+    }
+
+    /// The key is a COMMA-SEPARATED origin list, so an operator who trusts two
+    /// hosts must not have Helm read the second one as a list element and the
+    /// diff report an origin the worker was never sent.
+    #[test]
+    fn plain_up_round_trips_multi_origin_slack_trusted_origins() {
+        let recorded = "http://host.docker.internal,http://10.20.30.40";
+        let existing = serde_json::json!({
+            "worker": { "slackTrustedOrigins": recorded }
+        });
+        let opts = complete_up_opts_without_runner_egress(
+            UpOpts {
+                common: common(),
+                github_token: GithubTokenPlan::Untouched,
+                allow_egress_host: vec![],
+                resolved_egress_cidrs: vec![],
+                chart: "charts/curie".into(),
+                secrets: vec![],
+                dev: false,
+                no_expose: true,
+                set: vec![],
+                set_string: vec![],
+                allow_web_egress: vec![],
+                fake_model: false,
+                credentials: None,
+                local_model: None,
+                model: None,
+            },
+            Some(&existing),
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            up_value_plan(&opts)
+                .effective_values()
+                .get("worker.slackTrustedOrigins"),
+            Some(&recorded.to_string()),
+            "the escaped Helm expression must retain the recorded origin list verbatim"
+        );
+
+        let (materialized, _guards) = up_commands(&opts)[0].materialize_secret_files().unwrap();
+        let argv = materialized.argv();
+        assert!(
+            argv.contains(
+                &"worker.slackTrustedOrigins=http://host.docker.internal\\,http://10.20.30.40"
+                    .into()
+            ),
+            "a recorded origin list must escape its commas for Helm: {argv:?}"
+        );
+    }
+
+    /// Preservation must never widen where the platform bot token can go: a
+    /// release that never trusted an extra origin -- whose list was
+    /// deliberately cleared, or that has no recorded release at all (a fresh
+    /// install) -- keeps the chart's fail-closed empty default.
+    #[test]
+    fn up_invents_no_slack_trusted_origins_when_none_is_recorded() {
+        for existing in [
+            Some(serde_json::json!({ "worker": { "slackTrustedOrigins": "" } })),
+            Some(serde_json::json!({ "worker": {} })),
+            None,
+        ] {
+            let opts = complete_up_opts_without_runner_egress(
+                UpOpts {
+                    common: common(),
+                    github_token: GithubTokenPlan::Untouched,
+                    allow_egress_host: vec![],
+                    resolved_egress_cidrs: vec![],
+                    chart: "charts/curie".into(),
+                    secrets: vec![],
+                    dev: false,
+                    no_expose: true,
+                    set: vec![],
+                    set_string: vec![],
+                    allow_web_egress: vec![],
+                    fake_model: false,
+                    credentials: None,
+                    local_model: None,
+                    model: None,
+                },
+                existing.as_ref(),
+                None,
+                false,
+            )
+            .unwrap();
+
+            let (materialized, _guards) = up_commands(&opts)[0].materialize_secret_files().unwrap();
+            let argv = materialized.argv().join(" ");
+            assert!(
+                !argv.contains("slackTrustedOrigins"),
+                "up must not supply a trusted-origin value it has no record of: {argv}"
+            );
+        }
+    }
+
+    /// `curie diff` has to agree with what `up` actually does: announcing a
+    /// reset for a value `up` hands straight back sends the operator chasing a
+    /// change that never happens. And the list is hostnames, not a credential
+    /// -- masking it would hide the very dev configuration the operator opens
+    /// `diff` to confirm.
+    #[test]
+    fn slack_trusted_origins_are_preserved_and_never_masked() {
+        assert!(
+            is_preserved_by_up("worker.slackTrustedOrigins"),
+            "diff must not report a reset for a key up re-supplies"
+        );
+        assert!(
+            !is_secret_value_key("worker.slackTrustedOrigins"),
+            "the trusted-origin list is operator-visible configuration, not a credential"
         );
     }
 
@@ -8842,7 +10862,7 @@ mod tests {
 
     #[test]
     fn status_lists_the_readonly_commands() {
-        let cmds = status_commands(&common());
+        let cmds = status_commands(&common(), &fullname());
         let lines: Vec<String> = cmds.iter().map(OpsCommand::display).collect();
         assert_eq!(lines[0], "helm status curie -n curie");
         assert_eq!(lines[1], "kubectl get pods -n curie -o json");
@@ -9511,6 +11531,22 @@ mod tests {
         assert_eq!(cmd.display(), "helm get values curie -n curie -o json");
     }
 
+    /// `--all` is the entire point of this helper, and its absence is invisible
+    /// at runtime: helm answers happily either way, just without the chart
+    /// defaults. That is exactly the bug #1950 reports -- an operator who never
+    /// supplied a model has no user-supplied value to read, so the sibling
+    /// command above returns nothing and `doctor` reports the floating chart
+    /// default as "not applicable". A test that does not pin `--all` lets a
+    /// refactor reintroduce that silently.
+    #[test]
+    fn helm_get_all_values_reads_computed_values_as_json() {
+        let cmd = helm_get_all_values_cmd(&common());
+        assert_eq!(
+            cmd.display(),
+            "helm get values curie -n curie --all -o json"
+        );
+    }
+
     #[test]
     fn ui_api_url_nodeport_with_host_builds_proxy_url() {
         let json = r#"{"spec":{"type":"NodePort","ports":[{"port":80,"nodePort":31234}]}}"#;
@@ -9785,7 +11821,7 @@ mod tests {
     fn api_base_endpoint_maps_ui_service_to_a_non_browsable_api_endpoint() {
         // A NodePort ui service resolves to the UI /api proxy URL (#360) and is
         // NEVER browsable -- it is an agent target, not a webapp.
-        let ep = api_base_endpoint(&common(), Some(NODEPORT_SVC), Some("10.0.0.5"));
+        let ep = api_base_endpoint(&common(), &fullname(), Some(NODEPORT_SVC), Some("10.0.0.5"));
         assert_eq!(ep.name, "Curie API");
         assert_eq!(ep.url.as_deref(), Some("http://10.0.0.5:31234/api"));
         assert_eq!(ep.note, None);
@@ -9796,7 +11832,7 @@ mod tests {
     fn api_base_endpoint_degrades_to_a_note_when_the_ui_service_is_unreadable() {
         // Unreadable ui service: degrade to a note endpoint rather than failing
         // the whole command, and never smuggle the message into `url`.
-        let ep = api_base_endpoint(&common(), Some(""), Some("10.0.0.5"));
+        let ep = api_base_endpoint(&common(), &fullname(), Some(""), Some("10.0.0.5"));
         assert_eq!(ep.name, "Curie API");
         assert_eq!(ep.url, None, "a degraded endpoint must not carry a url");
         assert!(
@@ -9822,7 +11858,7 @@ mod tests {
         // Not "could not read" (the deploy-path wording): the true condition is
         // not-found, and this row must agree with the `ui` row from
         // `service_surface`.
-        let ep = api_base_endpoint(&common(), None, Some("10.0.0.5"));
+        let ep = api_base_endpoint(&common(), &fullname(), None, Some("10.0.0.5"));
         assert_eq!(ep.url, None);
         assert_eq!(ep.note.as_deref(), Some("service curie-ui not found"));
         assert!(!ep.browsable);
@@ -9834,7 +11870,12 @@ mod tests {
         // `--no-expose` is a supported install mode, so this is a real path,
         // not an error: hand back an actionable port-forward for the API
         // service instead of deploy's dead --api-url hint.
-        let ep = api_base_endpoint(&common(), Some(CLUSTERIP_SVC), Some("10.0.0.5"));
+        let ep = api_base_endpoint(
+            &common(),
+            &fullname(),
+            Some(CLUSTERIP_SVC),
+            Some("10.0.0.5"),
+        );
         assert_eq!(ep.url, None);
         assert_eq!(
             ep.note.as_deref(),
@@ -9850,10 +11891,15 @@ mod tests {
     fn api_base_endpoint_notes_stay_plain_for_the_json_payload() {
         // `Ui::emit_json` documents the payload as machine-consumed: no ANSI.
         for ep in [
-            api_base_endpoint(&common(), None, Some("10.0.0.5")),
-            api_base_endpoint(&common(), Some(CLUSTERIP_SVC), Some("10.0.0.5")),
-            api_base_endpoint(&common(), Some(""), Some("10.0.0.5")),
-            api_base_endpoint(&common(), Some(NODEPORT_SVC), None),
+            api_base_endpoint(&common(), &fullname(), None, Some("10.0.0.5")),
+            api_base_endpoint(
+                &common(),
+                &fullname(),
+                Some(CLUSTERIP_SVC),
+                Some("10.0.0.5"),
+            ),
+            api_base_endpoint(&common(), &fullname(), Some(""), Some("10.0.0.5")),
+            api_base_endpoint(&common(), &fullname(), Some(NODEPORT_SVC), None),
         ] {
             let note = ep.note.as_deref().unwrap_or("");
             assert!(
@@ -9866,7 +11912,7 @@ mod tests {
 
     #[test]
     fn api_base_endpoint_hints_a_port_forward_when_the_host_is_unresolvable() {
-        let ep = api_base_endpoint(&common(), Some(NODEPORT_SVC), None);
+        let ep = api_base_endpoint(&common(), &fullname(), Some(NODEPORT_SVC), None);
         assert_eq!(ep.url, None);
         assert_eq!(
             ep.note.as_deref(),
@@ -9885,6 +11931,7 @@ mod tests {
     fn service_surface_maps_a_nodeport_service_to_a_browsable_url_row() {
         let ep = service_surface(
             &common(),
+            &fullname(),
             "ui",
             "Curie Console",
             Some(NODEPORT_SVC),
@@ -9901,6 +11948,7 @@ mod tests {
     fn service_surface_degrades_when_the_service_is_not_found() {
         let ep = service_surface(
             &common(),
+            &fullname(),
             "ui",
             "Curie Console",
             None,
@@ -9919,6 +11967,7 @@ mod tests {
         // unresolvable host is an explicit note, never a fabricated URL.
         let ep = service_surface(
             &common(),
+            &fullname(),
             "ui",
             "Curie Console",
             Some(NODEPORT_SVC),
@@ -9938,6 +11987,7 @@ mod tests {
         let unassigned = r#"{"spec":{"type":"NodePort","ports":[{"port":80}]}}"#;
         let ep = service_surface(
             &common(),
+            &fullname(),
             "ui",
             "Curie Console",
             Some(unassigned),
@@ -9956,6 +12006,7 @@ mod tests {
     fn service_surface_maps_a_clusterip_service_to_a_plain_port_forward_note() {
         let ep = service_surface(
             &common(),
+            &fullname(),
             "langfuse-web",
             "Langfuse UI",
             Some(CLUSTERIP_SVC),
@@ -9980,6 +12031,7 @@ mod tests {
     fn service_surface_degrades_an_unreadable_service_to_a_note() {
         let ep = service_surface(
             &common(),
+            &fullname(),
             "ui",
             "Curie Console",
             Some("{not json"),
@@ -9993,7 +12045,7 @@ mod tests {
 
     #[test]
     fn observability_dry_run_plan_lists_the_read_only_lookups() {
-        let lines: Vec<String> = observability_commands(&common())
+        let lines: Vec<String> = observability_commands(&common(), &fullname())
             .iter()
             .map(|c| c.display())
             .collect();
@@ -10435,6 +12487,118 @@ mod tests {
             model_egress_status_lines(true, false, false, &["anthropic".to_string()], true, true);
         for (_, m) in &lines {
             assert!(!m.contains("egress opened"), "{m}");
+        }
+    }
+
+    #[test]
+    fn model_egress_status_lines_dry_run_does_not_assert_fake_model() {
+        // #1898: under --dry-run there is no `existing` release to read, so the
+        // no-credential arm must not assert the fake-model outcome -- it must
+        // say preservation is unknown offline instead, as a warning. It also
+        // must not claim the sandbox "stays sealed": a live rerun could
+        // re-supply the release's recorded egress, so that assertion would be
+        // just as false offline as the fake-model one.
+        let lines = model_egress_status_lines(false, false, false, &[], false, true);
+        let msgs: Vec<&str> = lines.iter().map(|(_, m)| m.as_str()).collect();
+        for m in &msgs {
+            assert!(!m.contains("installing with the fake model"), "{m}");
+            assert!(!m.contains("sealed"), "{m}");
+        }
+        let (is_warning, preservation_msg) = lines
+            .iter()
+            .find(|(_, m)| m.contains("preserves the release's recorded model configuration"))
+            .expect("a preservation-unknown message");
+        assert!(
+            preservation_msg.contains("not read under --dry-run"),
+            "{preservation_msg}"
+        );
+        assert!(*is_warning, "{msgs:?}");
+    }
+
+    #[test]
+    fn model_egress_status_lines_live_run_still_asserts_fake_model_install() {
+        // Sibling of model_egress_status_lines_dry_run_does_not_assert_fake_model:
+        // same inputs but a live run, which must keep asserting the fake-model
+        // outcome. Pins that only the dry-run path changed under #1898.
+        let lines = model_egress_status_lines(false, false, false, &[], false, false);
+        let msgs: Vec<&str> = lines.iter().map(|(_, m)| m.as_str()).collect();
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("installing with the fake model")),
+            "{msgs:?}"
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("(model egress stays sealed)")),
+            "{msgs:?}"
+        );
+        for m in &msgs {
+            assert!(!m.contains("not read under --dry-run"), "{m}");
+        }
+    }
+
+    #[test]
+    fn model_egress_status_lines_dry_run_keeps_credential_guidance() {
+        // An operator on a fresh install must still be told how to enable the
+        // real model, so softening the assertion under --dry-run must not drop
+        // the guidance.
+        let lines = model_egress_status_lines(false, false, false, &[], false, true);
+        let note = lines
+            .iter()
+            .find(|(is_warning, _)| !*is_warning)
+            .map(|(_, m)| m.as_str())
+            .expect("a non-warn note");
+        assert!(note.contains("CURIE_CREDENTIALS"), "{note}");
+        assert!(note.contains("fresh install"), "{note}");
+        assert!(note.contains("replies will be canned"), "{note}");
+        assert!(note.contains("worker runtime base URL"), "{note}");
+    }
+
+    #[test]
+    fn model_egress_status_lines_dry_run_open_egress_never_says_sealed() {
+        // Dry-run sibling of model_egress_status_lines_no_cred_open_egress_never_says_sealed:
+        // no credential, dry-run, but a provider egress is opened. The
+        // preservation-unknown line must not carry the live-only "sealed" or
+        // "installing with the fake model" language, and its "no model egress
+        // is opened by this run" suffix must drop when egress is in fact open.
+        let lines =
+            model_egress_status_lines(false, false, false, &["anthropic".to_string()], true, true);
+        let msgs: Vec<&str> = lines.iter().map(|(_, m)| m.as_str()).collect();
+        for m in &msgs {
+            assert!(!m.contains("sealed"), "{m}");
+            assert!(!m.contains("installing with the fake model"), "{m}");
+            assert!(!m.contains("no model egress is opened by this run"), "{m}");
+        }
+        assert!(
+            msgs.iter().any(|m| m.contains("not read under --dry-run")),
+            "{msgs:?}"
+        );
+    }
+
+    #[test]
+    fn model_egress_status_lines_explicit_fake_model_stays_silent_under_dry_run() {
+        // No test above ever passes fake_model = true. An explicit --fake-model
+        // run has already declared the outcome, so this helper must emit
+        // nothing for it even under --dry-run.
+        let lines = model_egress_status_lines(false, false, true, &[], false, true);
+        let msgs: Vec<&str> = lines.iter().map(|(_, m)| m.as_str()).collect();
+        assert!(lines.is_empty(), "{msgs:?}");
+    }
+
+    #[test]
+    fn model_egress_status_lines_local_model_wins_over_dry_run_arm() {
+        // No test above ever passes local_model = true. --dry-run --local-model
+        // must keep reporting the local-model install, not the new
+        // preservation-unknown warning.
+        let lines = model_egress_status_lines(false, true, false, &[], false, true);
+        let msgs: Vec<&str> = lines.iter().map(|(_, m)| m.as_str()).collect();
+        assert!(
+            msgs.iter().any(|m| m.contains("local model enabled")),
+            "{msgs:?}"
+        );
+        for m in &msgs {
+            assert!(!m.contains("not read under --dry-run"), "{m}");
+            assert!(!m.contains("installing with the fake model"), "{m}");
         }
     }
 
@@ -10980,6 +13144,344 @@ mod tests {
                 .iter()
                 .any(|body| body.contains(GH_SENTINEL)),
             "the --dev install dropped the credential"
+        );
+    }
+
+    /// #1145 / G1, G2: the guard's `dev == false` arm is unconditional -- a
+    /// plain `cluster up` is never refused, whatever the release recorded.
+    ///
+    /// The reverse flip (a sealed run over a release that IS on dev defaults)
+    /// is safe by construction, which is why this arm can be unconditional:
+    /// `resolve_generated_secrets` re-supplies only what the release already
+    /// recorded and never mints a value for an unrecorded key, so
+    /// `curie.managedSecret` sees `value == default`, falls through to its
+    /// `hasKey .existingData` branch, and preserves the dev values. If that
+    /// ever became mint-on-missing, a plain `up` would rotate the credential
+    /// and this arm would have to change with it.
+    ///
+    /// Inverting the `dev == false` arm fails here.
+    #[test]
+    fn a_non_dev_up_is_never_refused_whatever_the_release_recorded() {
+        // The guard is a pure function precisely so it can be pinned here.
+        // `run_prepared_up`, its single call site, is `async` and shells out to
+        // helm, so no unit test drives that call site end to end -- worth
+        // stating rather than leaving implied, exactly as the #1124 tests above
+        // do. These tests pin the DECISION; the live evidence that a refused
+        // `--dev` mutates nothing (`helm history` shows no new revision) is the
+        // E2E arm's.
+        let sealed = serde_json::json!({"api": {"githubToken": "gh"}});
+        guard_dev_defaults_flip(false, Some(&sealed), &[])
+            .expect("a plain `cluster up` over a sealed release must never be refused");
+
+        let dev_release = serde_json::json!({"security": {"allowDevDefaults": true}});
+        guard_dev_defaults_flip(false, Some(&dev_release), &[])
+            .expect("a plain `cluster up` over a DEV release must never be refused either");
+
+        guard_dev_defaults_flip(false, None, &[])
+            .expect("a fresh non-dev install is never refused");
+    }
+
+    /// #1145 / G3, AC3: `--dev` on a fresh namespace is the supported case and
+    /// the whole point of the flag. `existing == None` means helm positively
+    /// reported "release: not found" -- and it is also exactly what `--dry-run`
+    /// produces (`should_read_existing(_, true)` is `false`), so a
+    /// `--dev --dry-run` plan is never refused either.
+    #[test]
+    fn dev_is_allowed_when_there_is_no_existing_release() {
+        guard_dev_defaults_flip(true, None, &[])
+            .expect("`--dev` on a fresh namespace is the supported case (AC3)");
+    }
+
+    /// #1145 / G4: a real release that recorded no user-supplied values yields
+    /// `Some(Value::Null)`, not `None` -- `fetch_existing_values` returns
+    /// `None` only when helm positively reports "release: not found". It is
+    /// still an existing release whose Secret the flip would rewrite, so it
+    /// must be refused. A guard written as a bare `existing.is_none()` check
+    /// gets this exact case wrong.
+    #[test]
+    fn an_existing_release_with_no_recorded_values_is_still_an_existing_release() {
+        let err = guard_dev_defaults_flip(true, Some(&serde_json::Value::Null), &[])
+            .expect_err("Some(Value::Null) is an existing release and must be refused");
+        assert_eq!(crate::exit::classify(&err).0, crate::exit::ExitClass::Usage);
+    }
+
+    /// #1145 / G5, G6: an idempotent `--dev` re-run over a release that is
+    /// already on dev defaults is allowed, in BOTH shapes helm can record the
+    /// key in -- the JSON boolean that `--set security.allowDevDefaults=true`
+    /// produces, and the JSON string that `--set-string` or a quoted
+    /// `curie.yaml` `set:` map produces (#1375). The boolean case is also the
+    /// retry-after-a-failed-`--dev`-install case, since helm records the values
+    /// of an install that failed partway.
+    #[test]
+    fn dev_reruns_over_a_release_already_on_dev_defaults_are_allowed() {
+        let json_bool = serde_json::json!({"security": {"allowDevDefaults": true}});
+        guard_dev_defaults_flip(true, Some(&json_bool), &[])
+            .expect("an idempotent `--dev` re-run over a dev release must be allowed");
+
+        let json_string = serde_json::json!({"security": {"allowDevDefaults": "true"}});
+        guard_dev_defaults_flip(true, Some(&json_string), &[]).expect(
+            "the `--set-string` / quoted `curie.yaml` spelling records the STRING \"true\" \
+             and must read as dev-on too (#1375)",
+        );
+    }
+
+    /// #1145 / G7-G10: every recorded shape the chart's
+    /// `eq (toString .root.Values.security.allowDevDefaults) "true"` reads as
+    /// OFF must be refused, and every refusal must be Usage class (exit 2) --
+    /// a deterministic input error, not a runtime failure (AC5).
+    ///
+    /// `{}` with the key absent is the #1145 defect itself. The quoted
+    /// `"false"` mirrors `charts/curie/ci/render-assertions.sh:247-258`, which
+    /// asserts that spelling fails closed: the CLI must not read as dev-on what
+    /// the chart reads as off. `"TRUE"`, a bare `security` map, a number and a
+    /// null leaf pin the fail-closed default against a reader that treats any
+    /// non-empty string (or any present key) as truthy.
+    #[test]
+    fn dev_refuses_every_recorded_shape_the_chart_reads_as_off() {
+        for existing in [
+            serde_json::json!({"security": {"allowDevDefaults": false}}),
+            serde_json::json!({"security": {"allowDevDefaults": "false"}}),
+            serde_json::json!({}),
+            serde_json::json!({"security": {"allowDevDefaults": "TRUE"}}),
+            serde_json::json!({"security": {}}),
+            serde_json::json!({"security": {"allowDevDefaults": 1}}),
+            serde_json::json!({"security": {"allowDevDefaults": null}}),
+        ] {
+            let refused = guard_dev_defaults_flip(true, Some(&existing), &[]);
+            assert!(
+                refused.is_err(),
+                "`--dev` must refuse this recorded shape: {existing}"
+            );
+            let err = refused.unwrap_err();
+            assert_eq!(
+                crate::exit::classify(&err).0,
+                crate::exit::ExitClass::Usage,
+                "a refused `--dev` is a deterministic input error (exit 2), not a runtime \
+                 failure: {existing}"
+            );
+        }
+    }
+
+    /// #1145 / AC2: the refusal has to SAY WHY, and the part an operator cannot
+    /// recover from without being told is that the PVC-backed Postgres and
+    /// RustFS data still holds the ORIGINAL generated credentials -- so the
+    /// flip breaks authentication rather than merely reconfiguring. Asserted on
+    /// the concept, case-insensitively, rather than by pinning a whole sentence
+    /// that will churn as the wording improves.
+    ///
+    /// A fix hint must ride along (`classify(&err).1`), steering to a re-run
+    /// without `--dev` or a teardown first.
+    #[test]
+    fn the_refusal_explains_the_pvc_held_original_credentials_and_carries_a_fix() {
+        let existing = serde_json::json!({"api": {"githubToken": "gh"}});
+        let err = guard_dev_defaults_flip(true, Some(&existing), &[])
+            .expect_err("`--dev` over a sealed release is the #1145 defect and must be refused");
+
+        let (class, fix) = crate::exit::classify(&err);
+        assert_eq!(class, crate::exit::ExitClass::Usage);
+        assert!(
+            fix.is_some(),
+            "a refused `--dev` must carry a fix hint: the operator has to be told what to \
+             run instead: {err}"
+        );
+
+        let message = err.to_string().to_lowercase();
+        assert!(
+            message.contains("pvc"),
+            "the refusal must name the PVC-backed store data as why the flip breaks: {err}"
+        );
+        assert!(
+            message.contains("original"),
+            "the refusal must say the store data still holds the ORIGINAL credentials: {err}"
+        );
+        assert!(
+            message.contains("--dev"),
+            "the refusal must name the flag it is refusing: {err}"
+        );
+    }
+
+    /// #1145: `--set security.allowDevDefaults=true` stays a deliberately
+    /// unguarded operator escape hatch, but on an existing release it is
+    /// DESTRUCTIVE advice and must never be advertised in operator-facing text
+    /// -- not in the message and not in the fix hint. It belongs in the guard's
+    /// doc comment only. This fails loudly if someone "helpfully" adds it.
+    #[test]
+    fn the_refusal_never_advertises_the_dev_defaults_escape_hatch() {
+        let existing = serde_json::json!({"security": {"allowDevDefaults": false}});
+        let err = guard_dev_defaults_flip(true, Some(&existing), &[]).expect_err("must refuse");
+        let (_, fix) = crate::exit::classify(&err);
+
+        let operator_text = format!("{err}\n{}", fix.unwrap_or_default()).to_lowercase();
+        assert!(
+            !operator_text.contains("allowdevdefaults"),
+            "the refusal leaked the escape hatch into operator-facing text: {operator_text}"
+        );
+    }
+
+    /// #1145 follow-up: an operator who explicitly supplies
+    /// `security.allowDevDefaults` through `--set` or `--set-string` OWNS the
+    /// effective value, so the guard must not refuse the run.
+    ///
+    /// `up_value_plan` emits the CLI's own `security.allowDevDefaults=true`
+    /// FIRST when `--dev` is set and appends the operator's own expressions
+    /// AFTER it. Helm is last-wins, so `--dev --set
+    /// security.allowDevDefaults=false` actually renders the chart with the
+    /// flag OFF and preserves the credentials the release already recorded --
+    /// a safe run the guard used to refuse, and refuse with a message that
+    /// misdescribed what was about to happen. The `=true` spelling is the
+    /// documented unguarded escape hatch and stays open too. Both match this
+    /// file's standing rule that an operator `--set` always wins.
+    ///
+    /// Every lane `UpOpts::operator_sets` can deliver the key through is
+    /// covered: repeated `--set`, helm's comma-joined `a=1,b=2` form (which
+    /// `operator_set_keys` also parses), and `--set-string`.
+    #[test]
+    fn an_explicit_operator_allow_dev_defaults_set_is_never_refused() {
+        // Non-empty and recording no `security.allowDevDefaults`: a SEALED
+        // release, which is exactly the shape the guard refuses on its own.
+        let sealed = serde_json::json!({"security": {"gvisor": {"mode": "off"}}});
+
+        for sets in [
+            vec!["security.allowDevDefaults=false".to_string()],
+            vec!["security.allowDevDefaults=true".to_string()],
+            // Helm's comma-joined form, with the key in a non-leading position.
+            vec!["api.replicas=2,security.allowDevDefaults=false".to_string()],
+            vec!["security.gvisor.mode=off,security.allowDevDefaults=true".to_string()],
+            // An unrelated override ahead of the explicit one.
+            vec![
+                "api.githubToken=x".to_string(),
+                "security.allowDevDefaults=false".to_string(),
+            ],
+        ] {
+            guard_dev_defaults_flip(true, Some(&sealed), &sets).unwrap_or_else(|error| {
+                panic!(
+                    "an explicit operator `security.allowDevDefaults` override owns the \
+                     effective value and must not be refused: {sets:?}: {error}"
+                )
+            });
+        }
+
+        // The `--set-string` lane, threaded through `UpOpts::operator_sets()`
+        // itself rather than a hand-built Vec, so this pins the real wiring:
+        // `operator_sets` chains `--set` THEN `--set-string`, and a key the
+        // operator supplied only through the latter must exempt the run too.
+        let opts = UpOpts {
+            common: common(),
+            github_token: GithubTokenPlan::Untouched,
+            allow_egress_host: vec![],
+            resolved_egress_cidrs: vec![],
+            chart: "charts/curie".into(),
+            secrets: vec![],
+            dev: true,
+            no_expose: false,
+            set: vec![],
+            set_string: vec!["security.allowDevDefaults=false".into()],
+            allow_web_egress: vec![],
+            fake_model: false,
+            credentials: None,
+            local_model: None,
+            model: None,
+        };
+        guard_dev_defaults_flip(true, Some(&sealed), &opts.operator_sets()).expect(
+            "an explicit `--set-string security.allowDevDefaults=false` must exempt the run \
+             too: `operator_sets()` chains both lanes",
+        );
+    }
+
+    /// #1145 follow-up, mutation resistance: the exemption is keyed to the ONE
+    /// key the operator overrode, NOT to "any `--set` was passed". A run
+    /// carrying only unrelated overrides still leaves the CLI's own
+    /// `security.allowDevDefaults=true` as helm's last word, so it is still the
+    /// destructive flip and must still be refused, Usage class (exit 2).
+    ///
+    /// Widening the exemption to `!operator_sets.is_empty()` -- the easy way to
+    /// write it -- fails here, and would in practice disable the guard for
+    /// almost every real `cluster up`, since those nearly always carry
+    /// overrides. Near-miss keys are included so a substring or bare-leaf match
+    /// cannot stand in for the real dotted key either.
+    #[test]
+    fn unrelated_operator_sets_do_not_exempt_a_dev_flip() {
+        let sealed = serde_json::json!({"security": {"gvisor": {"mode": "off"}}});
+
+        for sets in [
+            vec!["api.githubToken=x".to_string()],
+            vec!["security.gvisor.mode=off,api.replicas=2".to_string()],
+            // Same prefix, different leaf.
+            vec!["security.allowDevDefaultsExtra=false".to_string()],
+            // The bare leaf name, without the `security.` path helm records.
+            vec!["allowDevDefaults=false".to_string()],
+        ] {
+            let refused = guard_dev_defaults_flip(true, Some(&sealed), &sets);
+            assert!(
+                refused.is_err(),
+                "only an explicit `security.allowDevDefaults` override exempts a `--dev` \
+                 flip over a sealed release: {sets:?}"
+            );
+            let err = refused.unwrap_err();
+            assert_eq!(
+                crate::exit::classify(&err).0,
+                crate::exit::ExitClass::Usage,
+                "a refused `--dev` stays a deterministic input error (exit 2): {sets:?}"
+            );
+        }
+    }
+
+    /// #1145: the reader mirrors the chart's
+    /// `eq (toString .root.Values.security.allowDevDefaults) "true"`
+    /// (`charts/curie/templates/_helpers.tpl:453`) and the fail-closed contract
+    /// `charts/curie/ci/render-assertions.sh:247-258` pins. ONLY the JSON
+    /// boolean `true` and the JSON string `"true"` read as dev-on; every other
+    /// shape -- including a plausible-looking `"TRUE"`, a number, an object, a
+    /// null leaf, a missing leaf and a missing intermediate segment -- fails
+    /// closed to dev-off, continuing #1375's rule that a gate-shaped value of
+    /// ambiguous spelling must fail closed.
+    #[test]
+    fn lookup_dotted_flag_mirrors_the_charts_tostring_coercion() {
+        const KEY: &str = "security.allowDevDefaults";
+
+        for on in [
+            serde_json::json!({"security": {"allowDevDefaults": true}}),
+            serde_json::json!({"security": {"allowDevDefaults": "true"}}),
+        ] {
+            assert!(lookup_dotted_flag(&on, KEY), "must read as dev-on: {on}");
+        }
+
+        for off in [
+            serde_json::json!({"security": {"allowDevDefaults": false}}),
+            serde_json::json!({"security": {"allowDevDefaults": "false"}}),
+            serde_json::json!({"security": {"allowDevDefaults": "TRUE"}}),
+            serde_json::json!({"security": {"allowDevDefaults": ""}}),
+            serde_json::json!({"security": {"allowDevDefaults": 1}}),
+            serde_json::json!({"security": {"allowDevDefaults": {"enabled": true}}}),
+            serde_json::json!({"security": {"allowDevDefaults": null}}),
+            serde_json::json!({"security": {}}),
+            serde_json::json!({}),
+            serde_json::json!({"security": "true"}),
+            serde_json::json!({"other": {"allowDevDefaults": true}}),
+            serde_json::Value::Null,
+        ] {
+            assert!(!lookup_dotted_flag(&off, KEY), "must fail closed: {off}");
+        }
+    }
+
+    /// #1145: WHY this sibling reader exists rather than reusing
+    /// `lookup_dotted`. Helm records `--set security.allowDevDefaults=true` as
+    /// a JSON BOOLEAN, and `lookup_dotted` ends in `as_str()`, so it returns
+    /// `None` for exactly the shape this key normally has. "Simplifying" the
+    /// guard back onto `lookup_dotted` would make every idempotent `--dev`
+    /// re-run (G5) refuse, silently reintroducing #1145's class of surprise --
+    /// so this test states the structural gap rather than trusting a comment.
+    #[test]
+    fn lookup_dotted_cannot_read_the_json_boolean_this_flag_reader_exists_for() {
+        let doc = serde_json::json!({"security": {"allowDevDefaults": true}});
+        assert_eq!(
+            lookup_dotted(&doc, "security.allowDevDefaults"),
+            None,
+            "if this ever returns Some, re-check whether the sibling reader is still needed"
+        );
+        assert!(
+            lookup_dotted_flag(&doc, "security.allowDevDefaults"),
+            "the boolean-aware reader is the one that can see helm's recorded shape"
         );
     }
 

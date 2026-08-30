@@ -135,9 +135,10 @@ async fn cluster_message_uses_ephemeral_defaults_and_propagates_assigned_ports()
     let dir = tempfile::tempdir().expect("create fake kubectl directory");
     let ipv4 = write_fake_kubectl(dir.path(), "kubectl-ipv4", "127.0.0.1");
     let ipv6 = write_fake_kubectl(dir.path(), "kubectl-ipv6", "::1");
-    let mut first_cmd = port_forward_command("acme-system", "acme-release", "valkey", 0, 6379);
+    let fullname = curie::ops::chart_fullname("acme-release");
+    let mut first_cmd = port_forward_command("acme-system", &fullname, "valkey", 0, 6379);
     first_cmd.program = ipv4.to_string_lossy().into_owned();
-    let mut second_cmd = port_forward_command("acme-system", "acme-release", "api", 0, 8000);
+    let mut second_cmd = port_forward_command("acme-system", &fullname, "api", 0, 8000);
     second_cmd.program = ipv6.to_string_lossy().into_owned();
 
     let (first_guard, first_port) = start_port_forward(&first_cmd, 0, "Valkey")

@@ -7,6 +7,7 @@ errors instead of raising, so the caller can surface every problem at once.
 
 import json
 import re
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -38,9 +39,16 @@ from .models import (
     McpConfig,
     PluginManifest,
     SkillFrontmatter,
+    ToolPolicy,
     TriggerDeclaration,
 )
 from .reserved_env import SECRET_NAME_RE, is_reserved_boot_env_name
+from .tool_policy import (
+    TOOL_POLICY_ENFORCEMENT,
+    check_policy_patterns,
+    literal_server_segment,
+    policy_patterns,
+)
 from .yaml_loader import DuplicateKeyError, safe_load_unique
 
 # The hooks field is a mapping of event name -> list of matcher entries. Reused
@@ -79,8 +87,31 @@ class _Collector:
         return ValidationResult(valid=not self.errors, errors=self.errors, warnings=self.warnings)
 
 
-def validate_bundle(path: str | Path) -> ValidationResult:
-    """Validate the plugin bundle at ``path`` and return a ValidationResult."""
+def validate_bundle(
+    path: str | Path, *, enforces_tool_policy: str | None = None
+) -> ValidationResult:
+    """Validate the plugin bundle at ``path`` and return a ValidationResult.
+
+    ``enforces_tool_policy`` is the CALLER's statement of which vanilla MCP
+    tool-policy contract it enforces at runtime. It is the enforcement handshake,
+    and it is the point of the ``toolPolicy`` extension: a bundle that declares a
+    ``toolPolicy`` is REJECTED (``tool_policy.unenforced``) unless the caller
+    passes ``tool_policy.TOOL_POLICY_ENFORCEMENT``, which it may only do once it
+    actually applies the policy.
+
+    Without that rule the field would be worse than absent. It is tempting to
+    argue that a non-enforcing runtime "cannot obtain a parsed policy" because
+    ``load_tool_policy`` raises -- but nothing forces a consumer to call that
+    function. ``apps/api``'s bundle intake and the runner's plugin loader both
+    call ``validate_bundle(root)`` and neither reads ``toolPolicy`` at all, so
+    without this check both would accept a policy-bearing bundle and apply
+    nothing: a bundle that looks fenced and runs unfenced. With it, both REFUSE
+    such a bundle until the runtime lane exists to pass the id.
+
+    The keyword-only ``None`` default keeps every existing call site
+    source-compatible, and a bundle that declares no ``toolPolicy`` is entirely
+    unaffected -- it yields the same ``valid``/``errors``/``warnings`` as before.
+    """
 
     root = Path(path)
     c = _Collector()
@@ -95,7 +126,13 @@ def validate_bundle(path: str | Path) -> ValidationResult:
         mcp_servers = _validate_mcp(root, manifest, c)
         _validate_hooks(root, manifest, c)
         _validate_triggers(manifest, c)
-        _validate_approval_policy(manifest, mcp_servers, connector_server_names(root), c)
+        # One derivation of the connectors.yaml server names, shared by both
+        # cross-checks below. Computing it twice would re-read and re-parse the
+        # file and let the two checks assert against DIFFERENT sets on a racing
+        # or partially-written bundle -- the drift shape #453 is about.
+        connector_servers = connector_server_names(root)
+        _validate_approval_policy(manifest, mcp_servers, connector_servers, c)
+        _validate_tool_policy(manifest, mcp_servers, connector_servers, enforces_tool_policy, c)
         _validate_secrets(manifest, c)
         _validate_scripts(root, c)
         _validate_connectors(root, c)
@@ -731,6 +768,202 @@ def _gate_not_namespaced_message(
     )
 
 
+def _validate_tool_policy(
+    manifest: PluginManifest,
+    mcp_servers: set[str] | None,
+    connector_servers: set[str] | None,
+    enforces: str | None,
+    c: _Collector,
+) -> None:
+    """Validate the manifest ``toolPolicy`` declaration (deploy-time).
+
+    Shape ``{enforcement, allow, approvalRequired, deny}``: glob collections over
+    canonical ``"<server>/<tool>"`` tool names. Every grammar, duplicate and
+    conflict rule lives in ``tool_policy`` and is CALLED from here, never
+    reimplemented -- ``approval_policy.py`` exists precisely because a deploy
+    validator and a runtime loader that normalize separately silently disagree
+    and ship a fail-open (#453/#544), and the runtime lane for this contract is
+    still to be written.
+
+    ``mcp_servers`` and ``connector_servers`` are the same two sets
+    ``_validate_approval_policy`` receives, from the same locals, so the two
+    checks provably see an identical view of the bundle. Unlike the approval
+    check the union here is of bare server NAMES rather than live tool prefixes,
+    because the canonical form is transport-independent and carries the same
+    server name for both mount styles. ``None`` on either side means a
+    declaration existed but could not be read, so the accepted set is unknowable
+    and the cross-check stays silent rather than stacking a misleading second
+    error on top of the ``mcp.*`` / ``connectors.*`` error that already fired.
+
+    Nothing here early-returns past work it owes once the policy has parsed: a
+    wrong ``enforcement`` id and three bad globs are four errors in one pass, not
+    four ``curie build`` round-trips.
+    """
+
+    declared = manifest.toolPolicy
+    if declared is None:
+        # The backward-compatible path every bundle shipped to date takes.
+        return
+
+    # The enforcement HANDSHAKE, and the reason this extension is safe to add at
+    # all. Declaring a policy that no consumer applies is strictly worse than
+    # declaring none: the bundle reads as fenced and runs unfenced. So a
+    # policy-bearing bundle is refused outright until its validating caller
+    # states which contract it enforces. Reported before the shape checks and
+    # WITHOUT returning, so an author sees both this and any real defects.
+    if enforces != TOOL_POLICY_ENFORCEMENT:
+        c.error(
+            "tool_policy.unenforced",
+            f"this bundle declares a toolPolicy, but the caller validating it enforces "
+            f"{enforces!r} rather than {TOOL_POLICY_ENFORCEMENT!r}. Accepting the bundle "
+            "here would apply NO policy at all, leaving the agent's tool surface "
+            "completely unfenced while the manifest claims otherwise. Runtime "
+            "enforcement of the tool policy is a separate, blocking follow-up; until "
+            "it lands and passes enforces_tool_policy="
+            f"{TOOL_POLICY_ENFORCEMENT!r}, no bundle may ship a toolPolicy.",
+            "plugin.json (toolPolicy)",
+        )
+
+    if not isinstance(declared, dict):
+        c.error(
+            "tool_policy.invalid",
+            "toolPolicy must be an object with an 'enforcement' id and the "
+            "'allow'/'approvalRequired'/'deny' glob collections",
+            "plugin.json",
+        )
+        return
+
+    try:
+        policy = ToolPolicy.model_validate(declared)
+    except ValidationError as exc:
+        for issue in _tool_policy_invalid_messages(exc):
+            c.error("tool_policy.invalid", issue, "plugin.json (toolPolicy)")
+        return
+
+    # Compared EXACTLY -- deliberately NOT stripped, matching
+    # ``load_tool_policy``. The id is a wire constant a bundle writes verbatim,
+    # so " curie/mcp-tool-policy@1 " is not it; refusing it here is fail-CLOSED,
+    # where accepting it would silently apply v1 rules to a string that is not
+    # the v1 id. This differs on purpose from the approval-gate check above,
+    # which strips GATE names so the validator and the runtime loader agree on
+    # one tool name: a version discriminator is not a tool name. Do not "fix"
+    # this back to a ``.strip()``.
+    enforcement = policy.enforcement
+    if enforcement != TOOL_POLICY_ENFORCEMENT:
+        c.error(
+            "tool_policy.enforcement_unsupported",
+            f"toolPolicy.enforcement is {enforcement!r}, which this build does not "
+            f"implement; it implements {TOOL_POLICY_ENFORCEMENT!r}. The id is a "
+            "versioned discriminator: a bundle asking for different semantics is "
+            "rejected rather than reinterpreted under this build's rules.",
+            "plugin.json (toolPolicy)",
+        )
+
+    # The SHARED rule set: this is the same ``check_policy_patterns`` call
+    # ``tool_policy.load_tool_policy`` makes, and the ONLY difference between the
+    # two paths is the rendering. Here each issue becomes its own
+    # ``ValidationIssue`` with a code and a location, so an author fixes every
+    # typo in one ``curie build``; the loader has no per-issue surface and
+    # collapses them into a single ``ToolPolicyInvalid``. Never inline a rule
+    # here -- a validator and a runtime loader that own separate copies of a
+    # grammar silently diverge and ship a fail-open (#453/#544).
+    for defect in check_policy_patterns(policy):
+        c.error(
+            f"tool_policy.{defect.code}",
+            defect.message,
+            f"plugin.json (toolPolicy.{defect.collection}[{defect.index}])",
+        )
+
+    # The declared-server cross-check. A pattern whose server segment is a
+    # LITERAL name (``literal_server_segment`` returns ``None`` for a wildcarded
+    # or malformed one) must name a server the bundle actually declares, in
+    # either the MCP map or connectors.yaml -- a typo'd segment is an inert rule
+    # the author believes is live. A wildcard segment is the deliberate escape
+    # hatch for a bundle whose servers are not statically declared and is never
+    # cross-checked; that makes this check advisory, which is accepted, because
+    # the property that actually defends the capability is classify_tool's
+    # unmatched-is-DENY default, not this check.
+    expected_servers: set[str] | None = (
+        mcp_servers | connector_servers
+        if mcp_servers is not None and connector_servers is not None
+        else None
+    )
+    if expected_servers is not None:
+        for collection, i, pattern in policy_patterns(policy):
+            server = literal_server_segment(pattern)
+            if server is None or server in expected_servers:
+                continue
+            c.error(
+                "tool_policy.unknown_server",
+                _unknown_tool_policy_server_message(pattern, server, expected_servers),
+                f"plugin.json (toolPolicy.{collection}[{i}])",
+            )
+
+    if not policy.deny and not policy.approvalRequired and not policy.allow:
+        # Coherent, not vacuous: with three empty collections every tool falls
+        # through to the DENY default, so the agent may call no MCP tool at all.
+        # A WARNING rather than an error because that is fail-CLOSED and
+        # rejecting it would make "fence this agent out entirely" inexpressible
+        # -- but it is far more often a half-finished edit.
+        c.warn(
+            "tool_policy.denies_everything",
+            "toolPolicy declares no patterns in 'allow', 'approvalRequired' or "
+            "'deny', so every MCP tool falls through to the deny-by-default rule "
+            "and the agent can call none of them. That is coherent if it is what "
+            "you meant; otherwise the collections are unfinished.",
+            "plugin.json (toolPolicy)",
+        )
+
+
+def _tool_policy_invalid_messages(exc: ValidationError) -> list[str]:
+    """``_explain`` for a toolPolicy, with a pointed message for an unknown key.
+
+    ``ToolPolicy`` is the one strict model reached from the manifest, so pydantic's
+    generic "Extra inputs are not permitted" is the message an author is most
+    likely to hit -- and the case where a bare restatement helps least. A
+    misspelled collection (``"denny"``) is a typo that would otherwise become
+    permission widening, so the message names the offending key and the three
+    collections it was probably meant to be.
+
+    Only that one case is special-cased; every other error keeps ``_explain``'s
+    generic rendering, from ``_explain`` itself, so toolPolicy's locations cannot
+    drift from the rest of the file's.
+    """
+
+    def rewrite(err: Mapping[str, Any], loc: str) -> str | None:
+        if err["type"] != "extra_forbidden":
+            return None
+        return (
+            f"{loc}: unknown key in toolPolicy. A tool policy is a Curie-owned "
+            "authorization object, so unknown keys are rejected rather than "
+            "ignored: a misspelled collection would silently drop the rules it "
+            "was meant to carry. Valid keys are 'enforcement', 'allow', "
+            "'approvalRequired' and 'deny'."
+        )
+
+    return _explain(exc, rewrite=rewrite)
+
+
+def _unknown_tool_policy_server_message(
+    pattern: str, server: str, expected_servers: set[str]
+) -> str:
+    """Actionable message for a pattern naming a server the bundle does not declare."""
+
+    if expected_servers:
+        declared = "This bundle declares: " + ", ".join(sorted(expected_servers))
+    else:
+        declared = f"This bundle declares no MCP servers and no {CONNECTORS_FILE} connectors"
+    return (
+        f"tool pattern {pattern!r} names server {server!r}, which this bundle does "
+        f"not declare. {declared}. A canonical tool name is '<server>/<tool>', where "
+        "<server> is the bare server name from the manifest's mcpServers map or "
+        f"from {CONNECTORS_FILE} -- NOT the live mcp__... SDK name, whose namespacing "
+        "differs between the two mount styles. Fix the server name, declare the "
+        "server, or use a wildcard segment (e.g. '*/<tool>') if the server is not "
+        "statically declared."
+    )
+
+
 def _validate_secrets(manifest: PluginManifest, c: _Collector) -> None:
     """Validate the manifest ``secrets`` policy (deploy-time gate, ADR-0009 / #429).
 
@@ -805,9 +1038,23 @@ def _read_frontmatter(skill_file: Path, rel: str, c: _Collector) -> dict[str, An
     return loaded
 
 
-def _explain(exc: ValidationError) -> list[str]:
+def _explain(
+    exc: ValidationError,
+    *,
+    rewrite: Callable[[Mapping[str, Any], str], str | None] | None = None,
+) -> list[str]:
+    """One ``"<loc>: <message>"`` line per pydantic error, in pydantic's order.
+
+    ``rewrite`` lets a caller replace the line for errors it can explain better,
+    returning ``None`` to keep the generic one. It is handed the already-rendered
+    ``loc`` so no caller re-derives the location format: a second copy of the
+    join-and-``(root)`` rule is how one validator's messages silently start
+    pointing at locations differently from every other validator's.
+    """
+
     out: list[str] = []
     for err in exc.errors():
         loc = ".".join(str(p) for p in err["loc"]) or "(root)"
-        out.append(f"{loc}: {err['msg']}")
+        replacement = rewrite(err, loc) if rewrite is not None else None
+        out.append(replacement if replacement is not None else f"{loc}: {err['msg']}")
     return out

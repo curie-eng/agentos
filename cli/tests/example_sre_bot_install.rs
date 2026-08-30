@@ -130,6 +130,10 @@ for arg in "$@"; do
 done
 
 case " $* " in
+    *" config view --minify --raw -o json "*)
+        printf '%s\n' '{"clusters":[{"cluster":{"server":"https://cluster.example.com","certificate-authority-data":"Y2E="}}]}'
+        exit 0
+        ;;
     *" get nodes "*|*" get node "*)
         case "$CURIE_TEST_NODES_MODE" in
             success) printf '%s\n' "$CURIE_TEST_NODES_JSON" ;;
@@ -1698,12 +1702,14 @@ fn reader_kubeconfig_is_owned_secret_stdin_and_connectors_reconcile_after_deploy
 
     let kubectl = fixture.kubectl_calls();
     assert!(
-        kubectl.iter().any(|call| call == "-n curie apply -f -"),
+        kubectl
+            .iter()
+            .any(|call| call.contains("-n curie apply -f -")),
         "rendered connector objects must be applied from stdin: {kubectl:?}"
     );
     assert!(
         kubectl.iter().any(|call| {
-            call.starts_with("-n curie delete deployment,service,networkpolicy,secret ")
+            call.contains("-n curie delete deployment,service,networkpolicy,secret ")
         }),
         "stale connector objects must be reconciled after apply: {kubectl:?}"
     );
@@ -2328,12 +2334,14 @@ fn custom_targets_thread_through_helm_kubectl_manifests_secret_discovery_and_con
         "API key discovery must use the selected Curie identity: {kubectl:?}"
     );
     assert!(
-        kubectl.iter().any(|call| call == "-n soak apply -f -"),
+        kubectl
+            .iter()
+            .any(|call| call.contains("-n soak apply -f -")),
         "connector reconciliation must apply in soak: {kubectl:?}"
     );
     assert!(
         kubectl.iter().any(|call| {
-            call.starts_with("-n soak delete deployment,service,networkpolicy,secret ")
+            call.contains("-n soak delete deployment,service,networkpolicy,secret ")
         }),
         "stale connector objects must be deleted from soak: {kubectl:?}"
     );

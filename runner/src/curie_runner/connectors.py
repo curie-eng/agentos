@@ -40,7 +40,11 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from plugin_format.connector_render import mcp_entry, unhosted_mcp_entry
+from plugin_format.connector_render import (
+    AmbiguousObjectName,
+    mcp_entry,
+    unhosted_mcp_entry,
+)
 from plugin_format.connectors import CONNECTORS_FILE, ConnectorsFile, validate_connectors
 from plugin_format.yaml_loader import safe_load_unique
 
@@ -118,10 +122,34 @@ def derive_mcp_servers(
                 entries[name] = entry
         return entries
 
-    return {
-        name: mcp_entry(release, agent, namespace, name, spec)
-        for name, spec in sorted(declared.connectors.items())
-    }
+    try:
+        return {
+            name: mcp_entry(release, agent, namespace, name, spec)
+            for name, spec in sorted(declared.connectors.items())
+        }
+    except AmbiguousObjectName as exc:
+        # The same trade `_read` makes above, for the same reason. The CONNECTOR
+        # half of this rule is already fail-soft here, because `_read` runs
+        # `validate_connectors` and returns None on any error. The AGENT half
+        # has no such path: the name arrives on the boot env, is never validated
+        # in this module, and goes straight into the comprehension above, where
+        # `object_name` fails closed on a name that forges its `-mcp-` join
+        # (#1446). Uncaught, that crashes the boot -- and a crashed boot loses
+        # the whole session, for every turn, until someone reads a stack trace
+        # out of a sandbox pod's logs. Mounting nothing costs the agent this
+        # connector's tools, which is visible in its tool list and fixed by
+        # recreating the agent under a non-forging name.
+        #
+        # Narrow on purpose: `AmbiguousObjectName`, never a bare `ValueError`.
+        # Widening it would turn an unrelated programming error into a silent
+        # "mounted no connectors", which is the exact class of silent failure
+        # #1446 is about.
+        logger.warning(
+            "agent name %r forges the connector object-name join, mounting no connectors: %s",
+            agent,
+            exc,
+        )
+        return {}
 
 
 def build_mcp_servers(platform: dict[str, Any], derived: dict[str, Any]) -> dict[str, Any]:

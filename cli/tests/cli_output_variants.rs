@@ -50,7 +50,9 @@ use curie::local::{
 use curie::message::MessageOutcomeOutput;
 use curie::migrate_store::MigrateStoreOutput;
 use curie::observability::{Endpoint, ObservabilityMetricsOutput, ObservabilityOutput};
-use curie::ops::{ClusterDownOutput, ClusterStatus, ClusterStatusOutput, ClusterUpOutput};
+use curie::ops::{
+    ClusterDownOutput, ClusterRollbackOutput, ClusterStatus, ClusterStatusOutput, ClusterUpOutput,
+};
 use curie::ui::{CliOutput, DryRunPlan};
 
 #[path = "support/enum_variants.rs"]
@@ -486,6 +488,19 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
             "DryRun" => ClusterDownOutput::DryRun(plan()),
             "Aborted" => ClusterDownOutput::Aborted,
             "Down" => ClusterDownOutput::Down { release_was_absent: false },
+        ],
+    );
+    m.insert(
+        "ClusterRollbackOutput",
+        samples![
+            "DryRun" => ClusterRollbackOutput::DryRun(plan()),
+            "Aborted" => ClusterRollbackOutput::Aborted,
+            "RolledBack" => ClusterRollbackOutput::RolledBack {
+                from_revision: 21,
+                to_revision: 19,
+                skipped: vec![20],
+                forced: false,
+            },
         ],
     );
 

@@ -43,6 +43,11 @@ oauth.env
 # a render-assertion script, not secret material. Without this the `*secret*`
 # rule drops it and the CI step that runs it goes red on a missing file.
 !charts/curie/ci/direct-passthrough-existing-secret-assertions.sh
+# Exception: CLI tests that prove connector-secret cluster scoping (#1913). They
+# assert names, scopes, and versions and never embed credential values. Without
+# this the `*secret*` rule drops them and the red-on-revert coverage is untracked.
+!cli/tests/cluster_secret_scope.rs
+!cli/tests/cluster_secret_scope_kind.rs
 
 # Python
 __pycache__/

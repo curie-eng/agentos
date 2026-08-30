@@ -48,6 +48,7 @@ from .routers import (
     deploy_targets,
     deployments,
     evals,
+    gitflow_routing,
     github,
     hooks,
     memory,
@@ -326,6 +327,7 @@ def create_app() -> FastAPI:
     app.include_router(bundles.router)
     app.include_router(deploy_targets.router)
     app.include_router(github.router)
+    app.include_router(gitflow_routing.router)
     app.include_router(observability.router)
     app.include_router(control.router)
     app.include_router(evals.router)

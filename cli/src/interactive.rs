@@ -449,8 +449,8 @@ fn run_tui_action(
             if confirm != name {
                 return Ok("Remove secret canceled.".to_string());
             }
-            crate::secrets::remove_value(&name)?;
-            Ok(format!("Removed {name}."))
+            crate::secrets::remove_all_values(&name)?;
+            Ok(format!("Removed all stored entries for {name}."))
         }
     }
 }
@@ -1253,16 +1253,15 @@ pub(crate) fn troubleshooting_lines(
 /// The chart's default `curie.fullname` rule, followed by the dispatcher
 /// suffix from `templates/dispatcher.yaml`. The guided flow only knows the
 /// chosen release, so it intentionally uses the chart's no-override path.
+///
+/// The rule itself lives in `ops::chart_fullname` (#1533); this delegates
+/// rather than carrying a second copy of it. Deliberately offline: the guided
+/// troubleshooting preview prints suggested commands without contacting a
+/// cluster, so it never calls `ops::release_fullname`. The printed name
+/// therefore assumes a no-override install -- under `nameOverride` or
+/// `fullnameOverride` the real Deployment is named differently.
 fn chart_dispatcher_deployment_name(release: &str) -> String {
-    const CHART_NAME: &str = "curie";
-
-    let fullname = if release.contains(CHART_NAME) {
-        release.to_string()
-    } else {
-        format!("{release}-{CHART_NAME}")
-    };
-    let fullname = fullname.chars().take(63).collect::<String>();
-    format!("{}-dispatcher", fullname.trim_end_matches('-'))
+    crate::ops::chart_fullname(release).resource("dispatcher")
 }
 
 fn ensure_secret_available(

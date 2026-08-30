@@ -8,6 +8,12 @@
 {{- if gt (float64 $workspaceStageBudget) (float64 .Values.worker.workspace.totalTimeoutSeconds) }}
 {{- fail "worker.workspace stage timeouts must sum to no more than totalTimeoutSeconds" }}
 {{- end }}
+{{/* ADR-0131: grace must cover deliveryBudget + deliveryShutdownReserve. Render
+     time is the ONLY place this can fail usefully -- values.schema.json cannot
+     express cross-field arithmetic, and the worker's own boot check raises
+     before its supervisor exists, so a bad value that reaches a Pod is a
+     CrashLoopBackOff after a green `helm upgrade`. */}}
+{{- include "curie.worker.validateDrainBudget" . }}
 {{- if .Values.worker.serviceAccount.create }}
 {{/*
 The worker drives the Kubernetes API to claim and manage agent-sandbox custom
@@ -109,7 +115,7 @@ spec:
   template:
     metadata:
       annotations:
-        {{- with (include "curie.placement.annotations" .Values.placement.platform) }}
+        {{- with (include "curie.placement.annotations" (dict "root" $ "class" "platform")) }}
         {{- . | nindent 8 }}
         {{- end }}
         # Roll the workers when the per-adapter egress credentials change
@@ -133,13 +139,13 @@ spec:
         # secretKeyRef env resolves once at pod start).
         checksum/adapter-credentials: {{ include "curie.adapterCredentialsChecksumSource" . | sha256sum }}
       labels:
-        {{- with (include "curie.placement.labels" .Values.placement.platform) }}
+        {{- with (include "curie.placement.labels" (dict "root" $ "class" "platform")) }}
         {{- . | nindent 8 }}
         {{- end }}
         {{- include "curie.labels" . | nindent 8 }}
         {{- include "curie.selectorLabels" (dict "root" . "component" "worker") | nindent 8 }}
     spec:
-      {{- with (include "curie.placement.spec" .Values.placement.platform) }}
+      {{- with (include "curie.placement.spec" (dict "root" $ "class" "platform")) }}
       {{- . | nindent 6 }}
       {{- end }}
       terminationGracePeriodSeconds: {{ .Values.worker.terminationGracePeriodSeconds }}
@@ -336,6 +342,30 @@ spec:
               value: {{ .Values.worker.routeTtlSeconds | quote }}
             - name: CURIE_SUSPENDED_ROUTE_TTL_SECONDS
               value: {{ .Values.worker.suspendedRouteTtlSeconds | quote }}
+            # Delivery budget and ownership lease (ADR-0131, #1971). The
+            # overall wall-clock deadline for one delivery -- claim, every
+            # runner request, every retry backoff, reclaim, and terminal
+            # cleanup.
+            - name: CURIE_DELIVERY_BUDGET_S
+              value: {{ .Values.worker.deliveryBudgetSeconds | quote }}
+            # How long the renewable ownership lease lives before it is
+            # considered expired and transferable to a new owner.
+            - name: CURIE_DELIVERY_LEASE_TTL_S
+              value: {{ .Values.worker.deliveryLeaseTtlSeconds | quote }}
+            # How often the owner renews its lease and resets its PEL idle.
+            - name: CURIE_DELIVERY_LEASE_HEARTBEAT_S
+              value: {{ .Values.worker.deliveryLeaseHeartbeatSeconds | quote }}
+            # Budget reserved for terminal settlement after the runner work is
+            # done; terminationGracePeriodSeconds below must be at least the
+            # delivery budget plus this reserve.
+            - name: CURIE_DELIVERY_SHUTDOWN_RESERVE_S
+              value: {{ .Values.worker.deliveryShutdownReserveSeconds | quote }}
+            # The platform's own voluntary termination grace, injected from the
+            # SAME value that renders onto this Pod's spec.terminationGracePeriodSeconds
+            # (line ~145) so the worker's boot validator and the platform can
+            # never disagree about how long a drain is allowed to take.
+            - name: CURIE_TERMINATION_GRACE_PERIOD_S
+              value: {{ .Values.worker.terminationGracePeriodSeconds | quote }}
             # Slack assistant-thread "shimmer" (#1182). Rendered on the WORKER
             # only: it both raises the caption and lowers it, so one value
             # governs the feature release-wide and the two halves cannot be

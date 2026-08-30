@@ -13,7 +13,7 @@ use clap::ValueEnum;
 use curie_aci_protocol::{Budget, EventType, OutboundEvent, SessionStatus};
 use serde::{Deserialize, Serialize};
 
-use crate::api::{ApiClient, BudgetConfig, ChannelOutcome};
+use crate::api::{ApiClient, BudgetConfig, ChannelOutcome, RoutingCheck};
 use crate::bundle::{git_status_is_clean_for_pack, pack_tar_gz};
 use crate::docker::{self, CheckSpec, StartSpec};
 use crate::evals::{
@@ -3411,6 +3411,7 @@ impl crate::ui::CliOutput for SkillMessageOutput {
 
 pub async fn eval(
     cases_path: Option<PathBuf>,
+    case_ids: Vec<String>,
     url: Option<String>,
     models: Vec<String>,
     secrets: Vec<String>,
@@ -3434,9 +3435,22 @@ pub async fn eval(
             state_plugin_dir.as_deref(),
         )?;
         let loaded = load_eval(&cases_path)?;
+        let total_cases = loaded.suite.cases.len();
+        let trajectory = loaded.trajectory;
+        // Unlike the local/cluster sweep -- the platform eval plane, which
+        // `POST /evals/trigger`s a suite NAME and lets the worker reload the
+        // deployed suite server-side, so a local selection can never reach it --
+        // the skill-tier sweep boots a transient LOCAL runner per model and runs
+        // the suite in-CLI via `run_suite_cases`. A selection made here DOES
+        // reach the run, so it is honored rather than refused.
+        let suite = crate::evals::select_cases(loaded.suite, &case_ids)?;
+        if let Some(note) = crate::evals::selection_note(&case_ids, suite.cases.len(), total_cases)
+        {
+            crate::ui::ui().note(&note);
+        }
         return eval_sweep(
-            &loaded.suite,
-            loaded.trajectory.as_ref(),
+            &suite,
+            trajectory.as_ref(),
             &models,
             &secrets,
             &image,
@@ -3461,6 +3475,11 @@ pub async fn eval(
         state_plugin_dir.as_deref(),
     )?;
     let loaded = load_eval(&cases_path)?;
+    let total_cases = loaded.suite.cases.len();
+    let trajectory = loaded.trajectory;
+    // A selector that matches nothing exits 2 before any runner contact, so a
+    // mistyped --case-id fails the gate rather than greening an empty run.
+    let suite = crate::evals::select_cases(loaded.suite, &case_ids)?;
     // #1087 AC2: the bundle this eval graded, on the machine surface, so an
     // agent can confirm it is the SAME digest `skill status`/`skill message`
     // report without reading a human note off stderr (docs/agents.md bans
@@ -3469,22 +3488,21 @@ pub async fn eval(
     let bundle_digest = recorded_bundle_digest(saved.as_ref(), &url);
     let client = RunnerClient::new(&url)?;
     let ui = crate::ui::ui();
+    if let Some(note) = crate::evals::selection_note(&case_ids, suite.cases.len(), total_cases) {
+        ui.note(&note);
+    }
     // `run_suite_cases` also tallies completion for the `--model` sweep path;
     // the single-runner report doesn't need the count (it already reports the
     // per-case `Fail` either way and exits on any of them), so it is discarded.
     let bar = ui.progress_bar(
-        (loaded.suite.cases.len() as u64).saturating_mul(u64::from(sampling.n)),
+        (suite.cases.len() as u64).saturating_mul(u64::from(sampling.n)),
         "running evals",
     );
-    let (results, _completed) = run_suite_cases(
-        &client,
-        &loaded.suite,
-        fake,
-        loaded.trajectory.as_ref(),
-        sampling,
-        |_| bar.inc(1),
-    )
-    .await?;
+    let (results, _completed) =
+        run_suite_cases(&client, &suite, fake, trajectory.as_ref(), sampling, |_| {
+            bar.inc(1)
+        })
+        .await?;
     bar.finish();
 
     report_eval(&results, bundle_digest.as_deref(), ())
@@ -4362,6 +4380,17 @@ fn unbound_declared_secrets(declared: &[String], bound: &[String]) -> Vec<String
         .collect()
 }
 
+/// True when a cluster verb SELF-PLUMBS its API transport: no explicit
+/// `--api-url`/`CURIE_API_URL` was given, so the release's api Service is
+/// reached over a loopback kubectl port-forward rather than direct-dialed.
+///
+/// The single statement of that discriminant (#1533). [`deploy_port_forward`]
+/// and [`deploy_api_tunnel`] both key on this one predicate, so "is a tunnel in
+/// play?" cannot answer differently in the two places a call site consults it.
+pub fn deploy_self_plumbs(api_url: Option<&str>) -> bool {
+    api_url.is_none()
+}
+
 /// The kubectl port-forward the auto `cluster deploy` path opens to the
 /// release's api service (ADR-0057, superseding ADR-0024's deploy transport).
 /// When no `--api-url` is given, deploy self-plumbs this loopback tunnel and
@@ -4372,20 +4401,53 @@ fn unbound_declared_secrets(declared: &[String], bound: &[String]) -> Vec<String
 pub fn deploy_port_forward(
     api_url: Option<&str>,
     namespace: &str,
-    release: &str,
+    fullname: &crate::ops::ReleaseFullname,
     local_port: u16,
     remote_port: u16,
 ) -> Option<crate::ops::OpsCommand> {
-    match api_url {
-        Some(_) => None,
-        None => Some(crate::message::port_forward_command(
-            namespace,
-            release,
-            "api",
-            local_port,
-            remote_port,
-        )),
+    if !deploy_self_plumbs(api_url) {
+        return None;
     }
+    Some(crate::message::port_forward_command(
+        namespace,
+        fullname,
+        "api",
+        local_port,
+        remote_port,
+    ))
+}
+
+/// The self-plumbed API tunnel for a cluster verb: the release's RESOLVED
+/// [`crate::ops::ReleaseFullname`] and the port-forward command that reaches its
+/// api Service, returned TOGETHER. `None` when an explicit
+/// `--api-url`/`CURIE_API_URL` was given, since that path direct-dials the URL
+/// and builds no tunnel.
+///
+/// The fullname is resolved LAZILY, on the self-plumbed branch only: the
+/// explicit `--api-url` path names no Service, and
+/// `cli/tests/cluster_connection_transport.rs` pins a fully explicit connection
+/// as never invoking kubectl at all, so resolving eagerly would fire kubectl on
+/// a path proven not to.
+///
+/// Paired rather than handed back as two independent `Option`s (#1533): the
+/// fullname the tunnel forwards to is the same one the caller needs for its
+/// `svc/<name>` diagnostics and unreachable hints. Carrying them apart left
+/// every call site re-deriving the self-plumbed discriminant for itself and
+/// asserting at runtime that the two `Option`s agreed.
+pub async fn deploy_api_tunnel(
+    api_url: Option<&str>,
+    namespace: &str,
+    release: &str,
+    local_port: u16,
+    remote_port: u16,
+) -> Option<(crate::ops::ReleaseFullname, crate::ops::OpsCommand)> {
+    if !deploy_self_plumbs(api_url) {
+        return None;
+    }
+    let fullname = crate::ops::release_fullname(namespace, release).await;
+    let command =
+        crate::message::port_forward_command(namespace, &fullname, "api", local_port, remote_port);
+    Some((fullname, command))
 }
 
 /// True when `cluster deploy` must auto-discover the release Secret key: no
@@ -4411,6 +4473,11 @@ pub struct PreparedDeploy {
     label: String,
     env: String,
     requested_repo: Option<String>,
+    /// The bundle's `deploy.yaml` TEXT, or None when the bundle has no such
+    /// file. Carried rather than re-read so the routing check (#1221) asks
+    /// about the file that was actually packed, and unparsed because ADR-0089
+    /// keeps exactly one parser for this format and it is not in this binary.
+    deploy_targets_yaml: Option<String>,
     connect_hint: String,
     step: crate::ui::Step,
     tier: DeployTier,
@@ -4550,17 +4617,23 @@ pub async fn prepare_deploy(opts: DeployOpts) -> Result<PreparedDeploy> {
     // Resolve a declared target, if one was named (ADR-0089). The file is sent
     // as TEXT and parsed server-side: one parser means the CLI and the
     // validator cannot disagree about where this deploy lands.
+    // Read ONCE, for two consumers: `--target` resolution below and the
+    // post-deploy routing check (#1221). Absence is the ordinary case, not an
+    // error -- most bundles declare no targets -- so the read is kept as a
+    // Result only so `--target` can still name the io failure precisely.
+    let deploy_targets_path = plugin_dir.join("deploy.yaml");
+    let deploy_targets_read = std::fs::read_to_string(&deploy_targets_path);
+    let deploy_targets_yaml = deploy_targets_read.as_ref().ok().cloned();
     let resolved = match &opts.target {
         Some(name) => {
-            let path = plugin_dir.join("deploy.yaml");
-            let content = std::fs::read_to_string(&path).map_err(|err| {
+            let content = deploy_targets_read.as_ref().map_err(|err| {
                 crate::exit::usage(format!(
                     "--target {name} needs a deploy.yaml in the bundle, but {} could not be \
                      read: {err}",
-                    path.display()
+                    deploy_targets_path.display()
                 ))
             })?;
-            Some(client.resolve_deploy_target(&content, name).await?)
+            Some(client.resolve_deploy_target(content, name).await?)
         }
         None => None,
     };
@@ -4652,11 +4725,79 @@ pub async fn prepare_deploy(opts: DeployOpts) -> Result<PreparedDeploy> {
         label,
         env: env.to_string(),
         requested_repo: opts.repo,
+        deploy_targets_yaml,
         connect_hint: opts.connect_hint,
         step,
         tier: opts.tier,
         plugin_dir,
     })
+}
+
+/// The operator-facing text for a repository whose pushes no longer route (#1221).
+///
+/// Pure, so the wording is unit-testable without a platform. Three things it
+/// must do and one it must not:
+///
+/// - name the repository and every agent now bound to it, because the operator
+///   who just deployed one of them cannot otherwise tell who else is affected;
+/// - carry the resolver's own `message` VERBATIM -- paraphrasing it would put a
+///   second statement of the routing rule in the client, free to drift from the
+///   one `gitflow.py` enforces on a push (the drift #1212 exists to correct);
+/// - say plainly that the affected pushes break for EVERY agent bound to the
+///   repository, including ones this deploy never touched, since the surprise
+///   is that a working agent breaks without being deployed to.
+///
+/// What it must NOT do is widen the damage past what the resolver reported. A
+/// bundle can declare a valid `dev` target and a `prod` target naming an agent
+/// that does not exist: the answer comes back unresolvable carrying ONLY the
+/// prod problem, while dev pushes still deploy exactly as before. Claiming
+/// every push is rejected would be false there, and appending a fixed "declare
+/// a target" remedy would be worse than false -- targets already exist, and the
+/// real remedy is the one the resolver named in its own `message`. So the
+/// affected environments are read off `unresolvable`, and no generic remedy is
+/// appended at all: each problem's own text carries the fix for its own code
+/// (`deploy.no_targets` already ends with "Declare a target (ADR-0089)."), and
+/// a hardcoded second remedy could only contradict it.
+fn routing_warning(check: &RoutingCheck) -> String {
+    let agents = if check.agents.is_empty() {
+        "(none)".to_string()
+    } else {
+        check.agents.join(", ")
+    };
+    // Environments as the resolver named them, deduplicated in the order it
+    // sent them. A problem with a blank `environment` (the field is
+    // `serde(default)`) contributes no name rather than an empty one.
+    let mut envs: Vec<&str> = Vec::new();
+    for problem in &check.unresolvable {
+        let env = problem.environment.trim();
+        if !env.is_empty() && !envs.contains(&env) {
+            envs.push(env);
+        }
+    }
+    // With no environment named, the response says routing is broken without
+    // saying where. Staying vague is the honest rendering: inventing a list
+    // would be the same overstatement this function exists to avoid.
+    let scope = if envs.is_empty() {
+        "some pushes to this repository no longer deploy anything".to_string()
+    } else {
+        format!(
+            "pushes that deploy the {} environment{} no longer deploy anything",
+            envs.join(", "),
+            if envs.len() == 1 { "" } else { "s" }
+        )
+    };
+    let mut lines = vec![format!(
+        "git-flow routing for {} is broken: {} agents are bound to it ({agents}), and {scope} \
+         -- for every one of those agents, including agents this deploy did not touch.",
+        check.repo_full_name, check.agent_count
+    )];
+    for problem in &check.unresolvable {
+        lines.push(format!(
+            "  {} ({}): {}",
+            problem.environment, problem.code, problem.message
+        ));
+    }
+    lines.join("\n")
 }
 
 pub async fn deploy_prepared(prepared: PreparedDeploy) -> Result<DeployOutput> {
@@ -4668,6 +4809,7 @@ pub async fn deploy_prepared(prepared: PreparedDeploy) -> Result<DeployOutput> {
         label,
         env,
         requested_repo,
+        deploy_targets_yaml,
         connect_hint,
         step,
         tier,
@@ -4704,6 +4846,28 @@ pub async fn deploy_prepared(prepared: PreparedDeploy) -> Result<DeployOutput> {
         ui.note(&format!(
             "repo binding: git-flow pushes to {repo} deploy this agent"
         ));
+        // ...unless they no longer route anywhere (#1221). Migration 0018
+        // (ADR-0091) dropped the unique index on `repo_full_name`, so a SECOND
+        // agent may bind the same repository -- and with no declared targets
+        // that silently flips every future push for the agent that was ALREADY
+        // bound from "deploys" to "rejected". This is the one point BOTH
+        // binding paths converge on: an agent bound at creation and one bound
+        // by a later PATCH (#1212) both arrive here.
+        //
+        // The API answers, because the API owns the resolver. Asking it is what
+        // keeps this warning from becoming a second copy of the routing rule,
+        // free to drift from the one a push actually enforces. It is advisory
+        // in every direction: an older platform, an unreachable one, or an
+        // undecodable answer all print nothing rather than souring a deploy
+        // that already succeeded.
+        if let Ok(Some(check)) = client
+            .check_git_flow_routing(repo, deploy_targets_yaml.as_deref())
+            .await
+        {
+            if !check.resolvable {
+                ui.warn(&routing_warning(&check));
+            }
+        }
     }
 
     let channel = match &outcome.channel {
@@ -6143,10 +6307,26 @@ impl crate::ui::CliOutput for ApprovalsOutput {
                     for r in records {
                         let tool = r.granted_tool.as_deref().unwrap_or("-");
                         let route = r.route.as_deref().unwrap_or("(requesting channel)");
+                        // A null card_channel means an older row or a direct API
+                        // write that omitted the field, for which the requesting
+                        // channel applies (#1431); it must NOT render as "null",
+                        // "none" or "-", which would state the wrong fact.
+                        // The server picks approvers from `card_channel or
+                        // reply_channel`, and in Python only the empty string
+                        // is falsy, so an empty card_channel is absent too and
+                        // must show the same requesting-channel meaning as the
+                        // resolve hint in message.rs. A whitespace-only channel
+                        // is truthy in Python and is NOT absent, so it is still
+                        // printed verbatim here; do not trim it.
+                        let card = r
+                            .card_channel
+                            .as_deref()
+                            .filter(|c| !c.is_empty())
+                            .unwrap_or("(requesting channel)");
                         ui.kv(
                             &r.id,
                             &format!(
-                                "{} — {} [tool: {tool}, route: {route}, by: {}]",
+                                "{} — {} [tool: {tool}, route: {route}, channel: {card}, by: {}]",
                                 r.summary, r.conversation_id, r.author
                             ),
                         );
@@ -7210,13 +7390,169 @@ mod tests {
         absent_container_note, merge_secret_env, model_credential_summary,
         parse_credential_env_file, parse_manifest_gates, plan_recorded_state,
         plan_recorded_teardown, plan_skill_down, recorded_ids_match, replace_first_line,
-        report_sweep, resolve_cases_path, resolve_env_file_credentials, seed_env_if_missing,
-        select_in_force_deployment, select_passthrough_env, sweep_json_row, sweep_table_row,
-        validate_channel_binding, ApprovalGateDecl, DownPlan, EnvSeed, RecordedStatePlan,
-        RecordedStateQuery, RecordedTeardown, SweepRow,
+        report_sweep, resolve_cases_path, resolve_env_file_credentials, routing_warning,
+        seed_env_if_missing, select_in_force_deployment, select_passthrough_env, sweep_json_row,
+        sweep_table_row, validate_channel_binding, ApprovalGateDecl, DownPlan, EnvSeed,
+        RecordedStatePlan, RecordedStateQuery, RecordedTeardown, SweepRow,
     };
     use serde::Deserialize;
     use std::path::{Path, PathBuf};
+
+    // --- the eval exit-code contract (#2007) --------------------------------
+    //
+    // The exit-0/exit-1 halves of the contract are proven end-to-end in
+    // `cli/tests/eval_case_selector.rs`, against the real binary's process exit
+    // code and the requests the runner actually received. A unit test here
+    // could only re-derive the verdict rule from a row vector, which stays
+    // green under a mutation that runs the UNFILTERED suite.
+
+    #[tokio::test]
+    async fn a_mistyped_case_id_fails_a_skill_eval_model_sweep_rather_than_greening_it() {
+        // #2007: the skill-tier `--model` sweep boots a transient LOCAL runner
+        // per model and grades in-CLI via `run_suite_cases`, so a `--case-id`
+        // selection reaches it (unlike the local/cluster sweep, which is the
+        // platform plane and only ever sees a suite NAME). `select_cases` runs
+        // before `eval_sweep` boots anything, and an explicit --cases path
+        // skips cwd-dependent resolution, so this reaches the exit-2 gate with
+        // no Docker daemon and no `.curie/runner.json` needed.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cases = dir.path().join("cases.json");
+        std::fs::write(
+            &cases,
+            r#"{"name":"smoke","cases":[{"id":"greets-the-user","input":"hi","grader":{"kind":"contains","expected":"hi"}}]}"#,
+        )
+        .expect("write suite");
+        let err = super::eval(
+            Some(cases),
+            vec!["greets-the-usr".to_string()],
+            None,
+            vec!["opus".to_string()],
+            Vec::new(),
+            "curie-runner:test".to_string(),
+            crate::eval_sampling::SampleConfig::default(),
+        )
+        .await
+        .expect_err("a mistyped --case-id must fail the sweep, not silently sweep everything");
+        assert_eq!(
+            crate::exit::classify(&err).0,
+            crate::exit::ExitClass::Usage,
+            "{err:#}"
+        );
+        assert!(format!("{err:#}").contains("greets-the-usr"), "{err:#}");
+    }
+
+    /// The platform's answer for a repository two agents bind with no declared
+    /// targets -- built by deserializing the WIRE shape, so the test cannot
+    /// drift from what the endpoint actually sends (#1221).
+    fn unroutable_check() -> crate::api::RoutingCheck {
+        serde_json::from_str(
+            r#"{
+                "repo_full_name": "octo/shared-repo",
+                "agent_count": 2,
+                "agents": ["acme-bot", "acme-dev"],
+                "resolvable": false,
+                "unresolvable": [
+                    {
+                        "environment": "dev",
+                        "code": "deploy.no_targets",
+                        "message": "2 agents are built from this repository but the bundle has no deploy.yaml, so there is nothing to say which one this branch deploys to. Declare a target (ADR-0089)."
+                    }
+                ]
+            }"#,
+        )
+        .expect("the routing-check wire shape should decode")
+    }
+
+    #[test]
+    fn the_routing_warning_names_the_repository_and_every_bound_agent() {
+        // The operator just deployed ONE of these agents. Naming only that one
+        // would hide the actual damage: the sibling that was working stops
+        // deploying without anyone touching it.
+        let warning = routing_warning(&unroutable_check());
+        assert!(warning.contains("octo/shared-repo"), "was {warning}");
+        assert!(warning.contains("acme-bot"), "was {warning}");
+        assert!(warning.contains("acme-dev"), "was {warning}");
+    }
+
+    #[test]
+    fn the_routing_warning_carries_the_resolvers_own_words_verbatim() {
+        // Paraphrasing here would put a second statement of the routing rule in
+        // the client, free to drift from the one a push enforces (#1212).
+        let check = unroutable_check();
+        let warning = routing_warning(&check);
+        assert!(
+            warning.contains(&check.unresolvable[0].message),
+            "was {warning}"
+        );
+        assert!(warning.contains("deploy.no_targets"), "was {warning}");
+        assert!(warning.contains("dev"), "was {warning}");
+    }
+
+    #[test]
+    fn the_routing_warning_states_the_blast_radius_it_was_told_about() {
+        let warning = routing_warning(&unroutable_check());
+        // The damage is real and must read as such, but scoped to the
+        // environment the resolver actually named.
+        assert!(warning.contains("dev"), "was {warning}");
+        assert!(
+            warning.contains("no longer deploy anything"),
+            "was {warning}"
+        );
+        assert!(
+            warning.contains("did not touch"),
+            "the warning must say untouched agents are affected too: {warning}"
+        );
+        // The remedy is the resolver's, carried in its own message. A second,
+        // hardcoded one is what made this warning misleading for a bundle that
+        // already declares targets.
+        assert!(
+            !warning.contains("Fix: declare a target"),
+            "the client must not append its own remedy: {warning}"
+        );
+    }
+
+    /// One environment broken and one fine -- a bundle with a good `dev` target
+    /// and a `prod` target naming an agent that does not exist. Dev pushes
+    /// still deploy, so the warning must not say otherwise (#1221).
+    fn prod_only_unroutable_check() -> crate::api::RoutingCheck {
+        serde_json::from_str(
+            r#"{
+                "repo_full_name": "octo/shared-repo",
+                "agent_count": 2,
+                "agents": ["acme-bot", "acme-dev"],
+                "resolvable": false,
+                "unresolvable": [
+                    {
+                        "environment": "prod",
+                        "code": "deploy.unknown_agent",
+                        "message": "The prod target names agent 'acme-prod', which does not exist."
+                    }
+                ]
+            }"#,
+        )
+        .expect("the routing-check wire shape should decode")
+    }
+
+    #[test]
+    fn the_routing_warning_does_not_widen_one_broken_environment_to_all() {
+        let check = prod_only_unroutable_check();
+        let warning = routing_warning(&check);
+        assert!(warning.contains("prod"), "was {warning}");
+        assert!(
+            warning.contains(&check.unresolvable[0].message),
+            "was {warning}"
+        );
+        // Nothing may suggest the dev lane broke: it did not, and telling the
+        // operator it did sends them to fix working configuration.
+        assert!(
+            !warning.contains("dev environment"),
+            "dev still routes and must not be named as broken: {warning}"
+        );
+        assert!(
+            !warning.contains("every push"),
+            "only the reported environments are affected: {warning}"
+        );
+    }
 
     #[test]
     fn env_file_resolver_respects_shell_and_vault_precedence() {

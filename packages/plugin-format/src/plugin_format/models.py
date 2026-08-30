@@ -69,10 +69,24 @@ class PluginManifest(BaseModel):
     secrets: list[str] | None = None
     # Curie authoring extensions (epic #30 / #29), validated at deploy time by
     # ``validate.py``. Kept loosely typed on the manifest (the models stay
-    # lenient); the dedicated ``TriggerDeclaration`` / ``ApprovalPolicy`` models
-    # below carry the shape the validator enforces.
+    # lenient); the dedicated ``TriggerDeclaration`` / ``ApprovalPolicy`` /
+    # ``ToolPolicy`` models below carry the shape the validator enforces.
     triggers: list[Any] | None = None
     approvalPolicy: dict[str, Any] | None = None
+    # Curie authoring extension: the vanilla MCP tool policy. Tri-state glob
+    # collections over CANONICAL ``"<server>/<tool>"`` tool names -- server
+    # qualified and transport-independent, deliberately NOT the SDK's live
+    # ``mcp__...`` name (see ``tool_policy``'s module docstring). DECLARATION-ONLY
+    # today: nothing enforces it at runtime yet, that lane is a BLOCKING
+    # follow-up, and no bundle may ship a real policy until it lands.
+    # ``tool_policy.load_tool_policy`` is the only supported reader -- it refuses
+    # to hand a policy to a caller that does not name the enforcement contract,
+    # and ``validate_bundle`` rejects a policy-bearing bundle whose caller does
+    # not either. Loose typing here (identical to ``approvalPolicy``) so an
+    # unparseable declaration surfaces as an actionable ``tool_policy.*``
+    # validator error rather than an opaque manifest-level pydantic failure that
+    # would reject the whole bundle.
+    toolPolicy: dict[str, Any] | None = None
 
 
 # Trigger types the manifest may declare beyond inbound chat (epic #29). The
@@ -121,6 +135,47 @@ class ApprovalPolicy(BaseModel):
     model_config = _LENIENT
 
     gates: list[ApprovalGate] = Field(default_factory=list)
+
+
+class ToolPolicy(BaseModel):
+    """The manifest ``toolPolicy`` object: tri-state globs over MCP tool names.
+
+    Patterns are canonical ``"<server>/<tool>"`` globs -- server-qualified and
+    transport-independent -- NOT live SDK tool names. Precedence is by CLASS and
+    never by specificity: ``deny`` > ``approvalRequired`` > ``allow``. A tool no
+    collection matches is **DENIED**, so a tool a server begins advertising after
+    the bundle was authored fails closed rather than being inherited. The three
+    collections default to empty lists so an omitted collection means "matches
+    nothing", never "matches everything"; ``approvalRequired`` is camelCase to
+    match ``grantableViaPolicy`` / ``starterPrompts``.
+
+    ``enforcement`` is a mandatory, versioned discriminator
+    (``tool_policy.TOOL_POLICY_ENFORCEMENT``), so a future v2 semantics ships as a
+    NEW id that a v1 platform REJECTS at ``validate_bundle`` rather than
+    reinterpreting under v1 rules. It is *modelled* with an empty default rather
+    than as a pydantic-required field so that OMITTING it lands on the pointed
+    ``tool_policy.enforcement_unsupported`` error -- which names the id this build
+    implements -- instead of an opaque "field required". The empty string is not a
+    contract id, so it is refused exactly like a wrong one; there is no value of
+    this field that means "unset, so apply the default semantics".
+
+    **This model is STRICT (``extra="forbid"``) where every other model in this
+    file is lenient, and that difference is load-bearing.** Leniency exists to
+    tolerate keys Claude Code may add to shapes it owns; this object is
+    Curie-owned, so no external producer can legitimately carry an unknown key in
+    it. Under leniency a misspelled collection (``"denny"``) would validate, the
+    intended deny list would be silently dropped from classification, and a typo
+    would become permission WIDENING. ``ConnectorSpec``, ``ConnectorLockEntry`` and
+    ``DeployTarget`` forbid extras for the same reason. ``PluginManifest`` itself
+    stays lenient -- only this object is strict.
+    """
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    enforcement: str = ""
+    allow: list[str] = Field(default_factory=list)
+    approvalRequired: list[str] = Field(default_factory=list)
+    deny: list[str] = Field(default_factory=list)
 
 
 class SkillFrontmatter(BaseModel):

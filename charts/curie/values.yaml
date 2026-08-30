@@ -28,6 +28,12 @@ global:
 # and prewarm, Helm hooks, and the sandbox controller, respectively.
 # podLabels can drive platform selectors. nodeSelector, tolerations, and
 # affinity remain generic Kubernetes placement fields for any substrate.
+# A release upgraded from a pre-placement chart can replay `placement: null`
+# back in through `helm upgrade --reuse-values`, because Helm's coalescing
+# deletes a null-valued key outright rather than falling back to this file. The
+# templates therefore resolve every class through the `curie.placement.class`
+# helper, so that case degrades to the empty defaults below instead of failing
+# the render (#2008).
 placement:
   platform:
     podLabels: {}
@@ -103,6 +109,25 @@ langfuse:
     tag: "3"
   telemetryEnabled: false
   enableExperimentalFeatures: true
+  # Startup gate on the ClickHouse endpoint Langfuse boots against (issue
+  # #2009). Both Langfuse deployments run their schema migrations at boot; when
+  # a Helm upgrade recreates the chart-owned ClickHouse Service, the new pods
+  # can start before that Service is resolvable and die with
+  # `failed to open database: dial tcp: lookup curie-clickhouse ... no such
+  # host`, converging only via CrashLoopBackOff retries. An init container polls
+  # ClickHouse's HTTP `/ping` until it answers, so the application container is
+  # not started at all until the dependency is up. Bounded on purpose: after
+  # `maxAttempts` polls the init container exits non-zero and Kubernetes
+  # restarts it, which is the same backstop `api.migrate` uses for Postgres.
+  # Attempt budget matches that gate (60 attempts, 2s apart); `timeoutSeconds`
+  # caps how long one `/ping` may hang, so the worst-case wait before a restart
+  # is maxAttempts x (timeoutSeconds + intervalSeconds). Raise it for a BYO
+  # ClickHouse that answers slowly rather than letting every attempt time out.
+  clickhouseReadiness:
+    enabled: true
+    maxAttempts: 60
+    intervalSeconds: 2
+    timeoutSeconds: 2
   # NEXTAUTH_URL the browser reaches the web UI at. Override for a real ingress.
   nextauthUrl: http://localhost:23000
   # Dev-only secret material. Override in prod or set `existingSecret` to a
@@ -174,6 +199,18 @@ langfuse:
     # cap (~512Mi) OOM-crashes under a tight container limit; raise it in step
     # with the memory limit. Empty = leave the image default.
     nodeOptions: "--max-old-space-size=1024"
+    # Credential-free protocol readiness gate before Langfuse web starts its
+    # own migrations. Authentication and migration failures remain owned by
+    # the unmodified Langfuse entrypoint after this bounded wait succeeds.
+    postgresReadiness:
+      enabled: true
+      # Empty reuses postgres.image; override for BYO Postgres when needed.
+      # This probe always runs as non-root, independently of a web image's
+      # containerSecurityContext override, because it uses the Postgres image.
+      image: ""
+      attempts: 60
+      intervalSeconds: 2
+      probeTimeoutSeconds: 2
     resources:
       requests: { cpu: 150m, memory: 384Mi }
       limits: { cpu: "1", memory: 1536Mi }
@@ -444,7 +481,8 @@ rustfs:
   deploy: true
   image: rustfs/rustfs:1.0.0-beta.12
   awsCliImage: amazon/aws-cli:2.32.6
-  # For the API, worker, and sandbox bundle fetch endpoints, an external RustFS on port 443 uses HTTPS. All other configurations use HTTP.
+  # Applies to every object-store endpoint the chart renders (API, worker, sandbox bundle fetch,
+  # and Langfuse's event/media upload endpoints): an external RustFS on port 443 uses HTTPS. All other configurations use HTTP.
   host: ""
   port: 9000
   # Signing region for sandbox bundle fetches. Keep it aligned with the regional S3 endpoint.
@@ -1097,7 +1135,16 @@ mailAdapter:
 worker:
   deploy: true
   replicas: 1
-  terminationGracePeriodSeconds: 1800
+  # Must be >= deliveryBudgetSeconds + deliveryShutdownReserveSeconds
+  # (ADR-0131): 1800 + 60 = 1860 covers the ADR's maximum configurable budget.
+  # The prior 1800 (#1570, "Give worker turns time to drain") was sized
+  # against max_attempts * runner_total_timeout_s with zero headroom for
+  # settlement -- a worker draining a maximum-budget turn was SIGKILLed at
+  # exactly the moment it would have settled. Voluntary termination may now
+  # take up to the configured budget plus reserve, so a rollout can take up
+  # to ~31 minutes per pod at the maximum budget; operators choose that cost
+  # when they choose a long execution budget.
+  terminationGracePeriodSeconds: 1860
   image:
     repository: ghcr.io/curie-eng/curie-worker
     # Empty -> chart appVersion (immutable). Set to pin an explicit version tag.
@@ -1276,6 +1323,82 @@ worker:
   # is accepted by YAML, renders fine, and used to boot healthy and then hang
   # every turn while leaking a sandbox per attempt (#1388).
   suspendedRouteTtlSeconds: 86400
+  # Delivery budget and ownership lease (ADR-0131, #1971). One overall
+  # wall-clock deadline and one renewable fenced owner per delivery, replacing
+  # the old dead pair of a flat per-request HTTP timeout and a 900s idle-based
+  # steal window. Integers, not floats -- as with routeTtlSeconds, a YAML
+  # float renders through the template's `| quote` as scientific notation for
+  # larger values, which the worker then cannot parse.
+  #
+  # The OVERALL deadline for one delivery: claim, every runner request, every
+  # retry backoff, reclaim, and terminal cleanup. Must be between 60 and 1800
+  # (the ADR's stated maximum); values.schema.json enforces this at
+  # install/template time and the worker's own validator enforces it again at
+  # boot.
+  deliveryBudgetSeconds: 600
+  # How long the renewable ownership lease lives before it is considered
+  # expired and transferable. Must span at least 3 heartbeat periods
+  # (deliveryLeaseHeartbeatSeconds) so a single missed heartbeat never drops a
+  # healthy owner's lease -- enforced by the worker's own validator.
+  deliveryLeaseTtlSeconds: 45
+  # How often the owner renews its lease and resets its PEL idle via
+  # `XCLAIM ... JUSTID`, which does NOT increase the stream entry's delivery
+  # count.
+  deliveryLeaseHeartbeatSeconds: 10
+  # Budget reserved for terminal settlement (fenced ACK/dead-letter/outbox
+  # clear) after the runner work is done. `terminationGracePeriodSeconds`
+  # above must be at least deliveryBudgetSeconds + this value.
+  deliveryShutdownReserveSeconds: 60
+  # Pre-upgrade drain gate (issue #2010). ADR-0131 made one worker's own
+  # shutdown safe; it says nothing about the roll happening around it. A
+  # `helm upgrade` applies the worker AND its backing services in one pass, so
+  # an already-accepted, side-effecting turn whose owner is interrupted is
+  # reclaimed by the replacement, which correctly refuses to re-run the action
+  # and escalates to a human. No duplicate effect, no silent loss -- and the
+  # requested task does not complete.
+  #
+  # When enabled, a `pre-upgrade` hook Job quiesces new claims across the
+  # release and waits for every delivery that currently holds a live ownership
+  # lease to reach its terminal outcome. If they all settle, the roll proceeds
+  # and each of those turns completed exactly once. If they do not, the hook
+  # fails, `helm upgrade` fails with it, and NOTHING is rolled -- the upgrade is
+  # postponed rather than converting accepted work into an escalation. A
+  # `post-upgrade` hook clears the flag once the roll is done.
+  #
+  # Disable it for a release where an interrupted turn is acceptable (a dev
+  # cluster, a fake-model install). The chart's behavior without it is exactly
+  # what it was before the gate existed.
+  upgradeDrain:
+    enabled: true
+    # How long to wait for the in-flight deliveries before refusing. A FLOOR,
+    # not a ceiling: the effective wait is raised to at least
+    # deliveryBudgetSeconds + deliveryShutdownReserveSeconds, because a gate
+    # that gives up while a turn is still inside the budget ADR-0131 already
+    # promised it would postpone upgrades during ordinary traffic. Raising the
+    # delivery budget therefore raises this automatically rather than breaking
+    # the render for a value you never touched.
+    timeoutSeconds: 900
+    # How often the gate re-reads the in-flight set while waiting.
+    pollIntervalSeconds: 5
+    # How long the quiesce flag lives. Also a floor: it is derived above the
+    # EFFECTIVE wait above, because the worker refuses a TTL that does not
+    # outlast the drain at boot, and a render the app rejects is a green
+    # `helm upgrade` followed by a CrashLoopBackOff. Finite by construction, so
+    # an upgrade killed between the two hooks cannot leave the fleet
+    # permanently unable to claim. Size it to span the expected rollout: the
+    # flag is what keeps replacement Pods from reclaiming mid-roll.
+    #
+    # Setting it at or below timeoutSeconds IS refused at render time -- that
+    # pair is written together, so contradicting yourself there is a stated
+    # intent worth surfacing rather than silently raising.
+    quiesceTtlSeconds: 1800
+    resources:
+      requests:
+        cpu: 10m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 128Mi
   # The Slack assistant-thread "shimmer" (#1182): the animated caption Slack
   # shows next to the app's name while a turn runs. On by default -- the
   # placeholder message only changes when the model emits text, so a model that
@@ -1313,6 +1436,12 @@ worker:
   # where the platform bot token can go and belong only in development. The
   # empty default remains the fail-closed production posture.
   # Rendered only when non-empty.
+  #
+  # A plain `curie cluster up` carries a recorded non-empty value forward
+  # (issue #1897) instead of resetting it to this default, so an unrelated
+  # upgrade no longer silently drops the origins you set. It preserves and
+  # never invents: an empty or absent record still yields the fail-closed
+  # default, and an explicit `--set` or `--set-string` on the run wins.
   slackTrustedOrigins: ""
   # Per-ADAPTER egress credentials (ADR-0096 D4.2), a map of adapter slug ->
   # shared secret. The slug is the operator-chosen `adapter` on the agent's

@@ -10,6 +10,7 @@ from typing import NoReturn
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from plugin_format import connector_lock
+from plugin_format.connector_render import AmbiguousObjectName
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
@@ -192,6 +193,12 @@ async def update_agent(agent_id: uuid.UUID, data: AgentUpdate, session: SessionD
     if data.secrets is not None:
         # Omitted leaves the secrets unchanged; an explicit {} clears them (#429).
         agent = await crud.update_agent_secrets(session, agent, data.secrets)
+    if data.hook_partitions is not None:
+        # Omitted leaves the partitions unchanged; an explicit {} clears them
+        # (ADR-0134). Plain `is not None` like the siblings above rather than
+        # `model_fields_set`: there is no platform default a null would clear
+        # back to, which is the distinction `memory` already draws.
+        agent = await crud.update_agent_hook_partitions(session, agent, data.hook_partitions)
     return AgentOut.model_validate(agent)
 
 
@@ -571,7 +578,36 @@ async def read_version_connectors(
                 owned_secret_keys=bundles.owned_secret_keys(declared),
             )
 
-    return await run_in_threadpool(_render)
+    # `object_name` fails closed on an agent name that forges its `-mcp-` join
+    # (#1446), and that raise surfaces HERE: every derivation the renderer
+    # touches goes through it. The create path refuses such a name now, so the
+    # only rows still holding one predate that validator -- which is exactly the
+    # case this read-only endpoint has to survive.
+    #
+    # 422 rather than letting it fall through as a 500. The request is
+    # well-formed -- real ids, a stored bundle, valid install-time params -- and
+    # nothing about it can be corrected; what cannot be satisfied is the STORED
+    # agent name. A 500 tells an operator running `cluster deploy` only that the
+    # server broke, with no name in the body and nothing to act on, and the name
+    # is not necessarily one they are holding: the bundle's deploy.yaml chose
+    # which agent this renders for.
+    #
+    # "Recreate", not "rename": `AgentUpdate` carries no `name` field, so there
+    # is no in-place rename to point them at. Saying "rename" would send them
+    # looking for an API that does not exist.
+    try:
+        return await run_in_threadpool(_render)
+    except AmbiguousObjectName as exc:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"the stored name of agent {agent_name!r} cannot produce an "
+            f"unambiguous connector object name ({exc}). Connector objects are named "
+            "'{release}-{agent}-mcp-{connector}', so this name makes two "
+            "different agents render the same Kubernetes objects and share one "
+            "connector's credential (#1446). Recreate the agent under a name "
+            "that neither contains '-mcp-' nor ends in '-mcp'; an agent's name "
+            "cannot be changed in place.",
+        ) from exc
 
 
 @router.get("/{agent_id}/versions/{version_id}/files", response_model=BundleFiles)

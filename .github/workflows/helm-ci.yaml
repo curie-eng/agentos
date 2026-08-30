@@ -181,6 +181,17 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/otel-collector-langfuse-secret-assertions.sh
 
+      # Prove Langfuse startup is gated on ClickHouse being up (issue #2009). A
+      # Helm upgrade that recreates the ClickHouse Service otherwise lets the new
+      # Langfuse pods start their migrations against an unresolvable name, so the
+      # rollout converges only through CrashLoopBackOff. This one EXECUTES the
+      # rendered init-container script against a stub ClickHouse that is down and
+      # then comes up, so it fails on a gate that merely renders without waiting.
+      - name: helm render assertions (langfuse clickhouse readiness gate)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/langfuse-clickhouse-readiness-assertions.sh
+
       # Prove the Langfuse web+worker containers carry a numeric runAsUser
       # alongside runAsNonRoot (issue #351) so the kubelet can verify non-root
       # and the pods actually start on an enforcing cluster.
@@ -188,6 +199,14 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/langfuse-runasuser-assertions.sh
+
+      # Prove the web-only Postgres readiness gate is ordered before Langfuse,
+      # credential-free, bounded/tunable, hardened like the web container, and
+      # removable through its explicit values switch. Includes a red mutation.
+      - name: helm render assertions (langfuse postgres readiness)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/langfuse-postgres-readiness-assertions.sh
 
       # Prove the controller NetworkPolicy RBAC split (issue #350): exactly one
       # read-only cluster grant (get/list/watch) so the informer syncs, no
@@ -250,6 +269,19 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/remote-dev-capability-assertions.sh
+
+      # The pre-upgrade drain gate (issue #2010). A routine `helm upgrade` used
+      # to admit a side-effecting turn and then roll the worker and its backing
+      # services out from under it, so the replacement reclaimed the delivery
+      # and escalated accepted work to a human. These assertions prove the gate
+      # is wired to the hook phases that actually run before the roll, that its
+      # clocks are derived from the delivery budget rather than silently left
+      # too short, and that the one self-contradictory value pair is refused at
+      # render time.
+      - name: helm render assertions (upgrade drain gate)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/upgrade-drain-assertions.sh
 
       # Prove every container in the untrusted sandbox pod renders the identical
       # Rail 3 hardened securityContext from the shared helper (issue #493), so a

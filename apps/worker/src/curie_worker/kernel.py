@@ -14,8 +14,9 @@ Rules implemented here (detailed-architecture section 2b):
 5. No auto-retry after side effects. A failed run that emitted ``side_effect_flag``
    escalates to a human instead of retrying; the flag is persisted the instant it
    is seen so a crash mid-side-effect still escalates on reclaim. Flag-clean
-   failures retry by error classification (rate-limit / runner-error are
-   transient; budget-exceeded and everything else escalate).
+   failures retry by error classification (rate-limit / runner-error /
+   runner-timeout / workspace-error are transient; budget-exceeded and
+   everything else escalate).
 
 Idempotency: the Slack event id gates a ``done`` marker so a redelivered or
 reclaimed event that already finished is skipped.
@@ -92,6 +93,7 @@ from .behaviorpacks import (
 )
 from .binding import DECISION_ENV, GRANT_TOOL_ENV, RESUMED_KIND_ENV, BindingResolver
 from .config import WorkerConfig
+from .delivery_lease import DeliveryLease
 from .killswitch import KillSwitch
 from .markers import CompletionRecord, MalformedCompletionError, Markers
 from .publication_validation import validate_snapshot_against_base
@@ -100,6 +102,7 @@ from .reply_sink import ObservedReplySink, ReplySink, TargetRoute
 from .runner_client import (
     RunnerClient,
     RunnerError,
+    RunnerStreamTimeout,
     RunnerWorkspaceSnapshot,
     TurnStream,
 )
@@ -168,6 +171,15 @@ _ERROR_LIFECYCLE_OUTCOMES = frozenset(
         "classified_failure",
         "side_effect_halted",
         "interrupted",
+        # ADR-0131. Deliberately DISTINCT from ``budget_halted``, which means the
+        # model spend budget was exhausted: this one means the delivery's
+        # wall-clock deadline was. Folding the two together would make both
+        # unreadable in telemetry -- an operator seeing a spike could no longer
+        # tell "agents are burning money" from "turns are running long".
+        "deadline_halted",
+        # The turn finished but a replacement already held the fence, so nothing
+        # was written and nothing was emitted.
+        "fenced_out",
     }
 )
 
@@ -264,9 +276,93 @@ def _nav_affordance(nav: NavPack | None) -> NavAffordance | None:
     return NavAffordance(label=nav.hub_label, command=nav.hub_command)
 
 
+def _exception_reason(exc: BaseException) -> str:
+    """A never-empty operator-facing reason for a caught exception (#2011).
+
+    ``str(TimeoutError())`` is the empty string, so logging a caught exception
+    directly can print nothing at all where the reason belongs. Prefer the
+    class name plus the message, and fall back to the class name alone when the
+    exception carries no message.
+    """
+    text = str(exc).strip()
+    if text:
+        return f"{type(exc).__name__}: {text}"
+    return type(exc).__name__
+
+
 # Failure classifications that are worth retrying (transient). Everything else
 # (budget-exceeded, model/server errors) escalates rather than looping.
-RETRYABLE_CLASSIFICATIONS = frozenset({"rate-limit", "runner-error"})
+# ``runner-timeout`` (#2011) is the streaming budget expiring mid-turn. It is
+# named separately from ``runner-error`` so an operator can tell "the model ran
+# past the budget" from "the sandbox died", but it stays HERE because retry
+# semantics are unchanged by that naming: a flag-clean timeout was transient
+# before it had a name and still is. The side-effect check in ``_attempt`` runs
+# BEFORE retryability is consulted (ADR-0013), so a timeout that arrives after a
+# side-effect frame still escalates and is never retried.
+# ``workspace-error`` (#2004) is a managed-workspace preparation failure -- a
+# clone, an archive, an upload, or a missing coordinator -- raised before the
+# turn was ever accepted. It is named separately from ``runner-error`` for the
+# same reason ``runner-timeout`` is: an operator reading the escalation must be
+# able to tell "this thread's repository could not be prepared" from "the
+# sandbox died", and previously the two were indistinguishable. It stays HERE
+# because naming it changes nothing about retryability: a clone or internal-API
+# blip was transient before it had a name and still is, and the side-effect
+# check above still runs first, so a workspace failure that somehow arrives
+# after a side-effect frame escalates rather than replaying it.
+RETRYABLE_CLASSIFICATIONS = frozenset(
+    {"rate-limit", "runner-error", "runner-timeout", "workspace-error"}
+)
+
+# The floor of remaining DELIVERY budget below which a fresh attempt is not
+# started (ADR-0131). The runner cannot claim a sandbox, open a turn and stream a
+# final in a couple of seconds, so an attempt started under this floor is
+# guaranteed to be cut off mid-flight -- it buys nothing and spends the last of
+# the deadline that the escalation and the terminal settle still need.
+_MIN_ATTEMPT_BUDGET_S = 5.0
+
+# How long the reclaim preflight waits for a previous owner's runner to go idle
+# after the interrupt, and how often it re-reads. Bounded (and further clamped to
+# the delivery's own remaining budget) so recovering one transferred delivery can
+# never consume the whole deadline; an interrupt that has not landed inside this
+# window is treated as an unreadable runner, which fails closed.
+_RECLAIM_PREFLIGHT_IDLE_TIMEOUT_S = 5.0
+_RECLAIM_PREFLIGHT_POLL_S = 0.05
+
+
+class ReclaimPreflightUnsafe(RuntimeError):
+    """A transferred delivery could not be proven safe to re-execute.
+
+    Raised by the reclaim preflight when the previous owner's runner still
+    reports (or cannot deny) a live turn after the bounded interrupt-and-wait.
+    Raising leaves the stream entry PENDING, which is the fail-closed answer
+    ADR-0131 requires: "a replacement does not run beside a possibly active
+    turn." It is deliberately NOT a retryable classification -- there is no
+    attempt to classify, because no attempt was started.
+    """
+
+
+def _is_fenced(lease: DeliveryLease | None) -> bool:
+    """Does this lease carry real distributed authority (ADR-0131)?
+
+    Three shapes reach the kernel and only one of them is a fence. A ``None``
+    lease is a direct caller (the sweeper's re-emit path, every pre-ADR-0131
+    test). ``unfenced_lease()`` -- the permissive sentinel a consumer built with
+    NO lease store yields -- has an empty owner and generation 0, and must take
+    the leaseless path or a base-only consumer could never settle anything. Only
+    a lease acquired from the store, with a real owner token and a generation of
+    at least 1, is authority.
+    """
+    return lease is not None and lease.generation > 0 and bool(lease.owner)
+
+
+def _remaining_budget(lease: DeliveryLease | None) -> float | None:
+    """Seconds of delivery budget left, or ``None`` for a caller with no budget.
+
+    ``None`` is what keeps every leaseless caller byte-identical: it reaches
+    ``RunnerClient`` as "no per-request override", so the session default
+    applies exactly as it did before ADR-0131.
+    """
+    return None if lease is None else lease.remaining_s()
 
 # The platform-authored prefix that marks an approval resume turn as an EXPIRY
 # (vs a resolve). Set by ``resumequeue.build_expiry_resume_turn`` on both expiry
@@ -811,8 +907,17 @@ class Kernel:
         self._adopt_ref(qevent, ack)
         return ack
 
-    async def process_event(self, qevent: QueuedTurn) -> None:
-        """Observe one kernel lifecycle while preserving its ``None`` result."""
+    async def process_event(
+        self, qevent: QueuedTurn, *, lease: DeliveryLease | None = None
+    ) -> None:
+        """Observe one kernel lifecycle while preserving its ``None`` result.
+
+        ``lease`` is this delivery's ownership fence and overall deadline
+        (ADR-0131). Keyword-only and OPTIONAL: the sweeper's re-emit path and
+        every direct caller run without one and keep their pre-ADR-0131
+        behavior exactly. It is never required, and its absence is never checked
+        for -- the leaseless path is a supported caller, not a degraded one.
+        """
 
         error: BaseException | None = None
         with operation_span(
@@ -823,7 +928,14 @@ class Kernel:
             token = _LIFECYCLE_SPAN.set(span)
             outcome_token = _LIFECYCLE_OUTCOME.set(None)
             try:
-                await self._process_event(qevent)
+                if lease is None:
+                    # A caller with no lease reaches the body exactly as it did
+                    # before ADR-0131 -- one positional argument, no keyword.
+                    # The lease is genuinely optional here, not defaulted-away,
+                    # and the leaseless call shape is part of that contract.
+                    await self._process_event(qevent)
+                else:
+                    await self._process_event(qevent, lease=lease)
             except asyncio.CancelledError as exc:
                 error = exc
                 _LIFECYCLE_OUTCOME.set("interrupted")
@@ -858,7 +970,9 @@ class Kernel:
         if error is not None:
             raise error
 
-    async def _process_event(self, qevent: QueuedTurn) -> None:
+    async def _process_event(
+        self, qevent: QueuedTurn, *, lease: DeliveryLease | None = None
+    ) -> None:
         """Handle one queued turn to a terminal state (success or escalate).
 
         Returns normally once the event is terminally handled; the consumer then
@@ -970,6 +1084,7 @@ class Kernel:
                     route,
                     "escalated",
                     telemetry_outcome="classified_failure",
+                    lease=lease,
                 )
                 return
 
@@ -1002,6 +1117,7 @@ class Kernel:
                         "No agent is configured for this "
                         f"{qevent.reply_handle.kind} address "
                         f"{qevent.reply_handle.channel} yet.",
+                        lease=lease,
                     )
                     return
                 # The FIRST sanctioned route source, and the normal path: once a
@@ -1020,6 +1136,7 @@ class Kernel:
                         qevent,
                         route,
                         "This agent is paused by an operator. Try again once it resumes.",
+                        lease=lease,
                     )
                     return
                 agent_id = resolved.agent_id
@@ -1045,9 +1162,27 @@ class Kernel:
                 if getattr(resolved, "workspace_enabled", False):
                     workspace_deployment_id = getattr(resolved, "deployment_id", None)
                     if workspace_deployment_id is None:
-                        raise WorkspacePreparationError(
+                        # Outside _attempt's handlers, so this one has to name
+                        # itself: deployment_id is legitimately optional on a
+                        # resolved binding, making this a reachable
+                        # misconfiguration that would otherwise reach the
+                        # consumer as an anonymous processing exception (#2004).
+                        # Log first so the failure names the agent, then let the
+                        # raise stand unchanged: it leaves the stream entry
+                        # pending for reclaim rather than settling it -- only
+                        # the visibility changed here.
+                        binding_failure = WorkspacePreparationError(
                             "binding", "workspace-enabled deployment has no deployment id"
                         )
+                        self._log_workspace_start_failure(
+                            qevent,
+                            qevent.text,
+                            binding_failure,
+                            agent_id=agent_id,
+                            agent_name=agent_name,
+                            workspace_deployment_id=None,
+                        )
+                        raise binding_failure
                 # One-shot post-approval allowance (#430, ADR-0035): when THIS turn is the
                 # resume of a genuinely-approved permission-gate approval, deliver a single
                 # gated-tool grant so the approved action completes once; the gate re-arms
@@ -1116,9 +1251,58 @@ class Kernel:
                 if self._config.shimmer:
                     await self._set_shimmer(qevent, route, packs)
 
+            # ADR-0131 reclaim preflight. A delivery that has CHANGED HANDS --
+            # generation > 1, a distributed-state fact and never a sniff of the
+            # message text, so kernel rule 3 stands -- may not simply route: the
+            # ordinary path would STEER into a retained live turn, which is right
+            # for a follow-up and wrong for a retry of the same event. Placed
+            # deliberately AFTER the side-effect check above (rule 1 of the
+            # preflight is that check, and a marker must forbid replay before any
+            # interrupt-and-rehydrate is contemplated) and BEFORE the first
+            # attempt.
+            if _is_fenced(lease) and lease is not None and lease.generation > 1:
+                await self._preflight_reclaimed_delivery(thread_key, lease)
+
             attempt = 0
             while True:
                 attempt += 1
+                # The delivery's overall deadline gates every attempt, and the
+                # attempts CONSUME it: a retry never restarts it.
+                if lease is not None:
+                    if lease.lost.is_set():
+                        # Fenced out between attempts. Start nothing: a
+                        # replacement holds this delivery and is entitled to run
+                        # it. Returning without completing leaves the entry
+                        # pending, and the consumer's pre-ACK check keeps this
+                        # owner from acking it away.
+                        logger.warning(
+                            "delivery lease lost before attempt %d for event %s; "
+                            "starting no attempt and settling nothing",
+                            attempt,
+                            event_id,
+                        )
+                        return
+                    remaining = lease.remaining_s()
+                    if remaining <= _MIN_ATTEMPT_BUDGET_S:
+                        # DISTINCT from the model-spend ``budget-exceeded``
+                        # classification: this is the wall-clock delivery
+                        # deadline, and conflating the two would make both
+                        # unreadable in telemetry.
+                        await self._escalate(
+                            qevent,
+                            route,
+                            "The run exceeded its delivery deadline after "
+                            f"{attempt - 1} attempt(s) and was not restarted. "
+                            "Flagging for a human.",
+                        )
+                        await self._complete(
+                            qevent,
+                            route,
+                            "escalated",
+                            telemetry_outcome="deadline_halted",
+                            lease=lease,
+                        )
+                        return
                 outcome = await self._attempt(
                     qevent,
                     route,
@@ -1129,6 +1313,7 @@ class Kernel:
                     packs,
                     workspace_deployment_id,
                     agent_name,
+                    remaining_s=_remaining_budget(lease),
                 )
 
                 if outcome.status is SessionStatus.AWAITING_APPROVAL:
@@ -1148,6 +1333,7 @@ class Kernel:
                         route,
                         "awaiting-approval",
                         telemetry_outcome="awaiting_approval",
+                        lease=lease,
                     )
                     return
 
@@ -1161,6 +1347,7 @@ class Kernel:
                             if outcome.status is SessionStatus.IDLE_AWAITING_INPUT
                             else "done"
                         ),
+                        lease=lease,
                     )
                     return
 
@@ -1176,6 +1363,7 @@ class Kernel:
                         route,
                         "escalated",
                         telemetry_outcome="side_effect_halted",
+                        lease=lease,
                     )
                     return
 
@@ -1196,6 +1384,7 @@ class Kernel:
                             if outcome.classification == "budget-exceeded"
                             else "classified_failure"
                         ),
+                        lease=lease,
                     )
                     return
 
@@ -1207,7 +1396,14 @@ class Kernel:
                         "retry_class": cast("str", outcome.classification),
                     },
                 )
-                await asyncio.sleep(self._backoff(attempt))
+                backoff_s = self._backoff(attempt)
+                if lease is not None:
+                    # The backoff CONSUMES the delivery budget; it never extends
+                    # it. Clamped, because an unclamped backoff longer than the
+                    # remaining deadline burns the whole thing asleep and then
+                    # escalates without ever having retried -- the worst of both.
+                    backoff_s = min(backoff_s, max(0.0, lease.remaining_s()))
+                await asyncio.sleep(backoff_s)
         finally:
             release_order()
             # Lower the assistant-thread "shimmer" raised above, on every exit
@@ -1276,6 +1472,90 @@ class Kernel:
                             candidate,
                         )
         return reaped
+
+    async def _preflight_reclaimed_delivery(
+        self, thread_key: str, lease: DeliveryLease
+    ) -> None:
+        """Prove a TRANSFERRED delivery is safe to re-execute, or refuse it.
+
+        ADR-0131's reclaim rules 2, 3 and 4, in that order. Rule 1 -- "a
+        side-effect marker forbids replay and settles to human escalation" -- is
+        the existing ``saw_side_effect`` check in ``_process_event``, which runs
+        BEFORE this and needs no code here; that ordering is load-bearing and is
+        pinned by a test rather than duplicated as a second check, because a
+        preflight that interrupted, waited and then rehydrated could otherwise
+        re-execute a half-done non-idempotent action.
+
+        Rule 2: a runner that still reports an active turn is interrupted and
+        must become idle (or disappear) before the retry. The interrupt goes
+        through ``interrupt_thread``, the EXISTING bounded control path -- no
+        second mechanism, and never a bare task cancel, which would skip the
+        runner-side stop.
+
+        Rule 3: an unreadable runner FAILS CLOSED. ``_turn_active`` already
+        reports busy when liveness cannot be read, so an unreadable runner
+        exhausts the bounded poll and this raises, leaving the stream entry
+        pending. A replacement never runs beside a possibly-active turn -- the
+        "just retry it" simplification is precisely the failure mode this
+        refuses.
+
+        Rule 4 is what falling off the end of this method means: old authority is
+        fenced (the lease generation moved), the old runner is inactive, and no
+        side-effect marker exists.
+
+        This deliberately diverges from the ordinary route, which STEERS into a
+        retained live turn: this is the same event being retried, not a follow-up.
+        The choice is driven by the lease generation, an explicit distributed
+        state fact, so kernel rule 3 ("never keyword-guess intent") is untouched.
+        """
+        # ONE deadline for the WHOLE preflight, established before the first
+        # probe -- not merely the gap between polls. Every liveness probe below
+        # derives its per-request HTTP bound from what is left of it, so a wedged
+        # runner (accepts the connect, then answers nothing) cannot ride
+        # ``RunnerClient``'s 600s streaming budget inside a single iteration. It
+        # could otherwise burn the delivery's entire deadline here and the next
+        # pass would escalate ``deadline_halted`` having made ZERO attempts,
+        # which is the opposite of "delivery is bounded". Clamped to the
+        # delivery's own remaining budget as well as the constant, so recovering
+        # one transferred delivery can never eat the whole deadline.
+        #
+        # Exhausting the window is not a silent pass: a probe cut short by it
+        # fails closed (``_turn_active`` reports busy on any unreadable answer)
+        # and the loop falls through to the raise below, which is exactly rule
+        # 3's refusal.
+        deadline = time.monotonic() + min(
+            _RECLAIM_PREFLIGHT_IDLE_TIMEOUT_S, max(0.0, lease.remaining_s())
+        )
+
+        def _left() -> float:
+            return max(0.0, deadline - time.monotonic())
+
+        handle = await asyncio.to_thread(self._substrate.lookup, thread_key)
+        if handle is None:
+            # No retained sandbox: the previous owner's runner is gone, which is
+            # the "or disappear" half of rule 2.
+            return
+        if not await self._turn_active(handle, remaining_s=_left()):
+            return
+        logger.warning(
+            "reclaimed delivery for thread %s (generation %d) found a live turn "
+            "from a previous owner; interrupting before retry",
+            thread_key,
+            lease.generation,
+        )
+        # The interrupt is deliberately NOT given this window: it keeps its own
+        # independent control-plane timeout, because a fence derived from a
+        # budget that may already be spent could not stop the runner it fenced.
+        await self.interrupt_thread(thread_key, "fenced transfer of a reclaimed delivery")
+        while time.monotonic() < deadline:
+            await asyncio.sleep(min(_RECLAIM_PREFLIGHT_POLL_S, _left()))
+            handle = await asyncio.to_thread(self._substrate.lookup, thread_key)
+            if handle is None or not await self._turn_active(handle, remaining_s=_left()):
+                return
+        raise ReclaimPreflightUnsafe(
+            f"thread {thread_key} still reports (or cannot deny) a live turn after "
+            "the reclaim interrupt; refusing to run a replacement beside it"
+        )
 
     async def interrupt_thread(self, thread_key: str, reason: str) -> bool:
         """Hard-stop the thread's live turn. True if a live runner was signalled."""
@@ -1464,11 +1744,15 @@ class Kernel:
         qevent: QueuedTurn,
         route: TargetRoute,
         message: str,
+        *,
+        lease: DeliveryLease | None = None,
     ) -> None:
         """Edit the placeholder with a reason and complete the turn (a polite
         drop for an unmapped channel or a paused agent, never a crash)."""
         await self._reply_for(qevent, route, message)
-        await self._complete(qevent, route, "dropped", telemetry_outcome="interrupted")
+        await self._complete(
+            qevent, route, "dropped", telemetry_outcome="interrupted", lease=lease
+        )
 
     async def _reply(
         self,
@@ -1497,6 +1781,7 @@ class Kernel:
         outcome: str,
         *,
         telemetry_outcome: str,
+        lease: DeliveryLease | None = None,
     ) -> None:
         """The terminal ordering, at every durable ``mark_done`` call site.
 
@@ -1516,9 +1801,23 @@ class Kernel:
         second sanctioned source -- no adapter can write to the stream, so the
         handle is trustworthy). A terminal path that marked done without a record
         would be a completion nothing could ever recover.
+
+        Since ADR-0131 this is also the FENCE. When the caller holds a delivery
+        lease, steps 1 and 2 fuse into ``Markers.settle_fenced``, one script that
+        verifies the lease token and the fencing generation and then performs the
+        same two writes. That adds a PRECONDITION; it reorders nothing -- the
+        record is still durable before/with the done marker, and it is still
+        cleared only after a confirmed emit.
+
+        A caller that fails the fence returns HERE, before ``_deliver_completion``
+        is ever reached: ADR-0131 says a stale owner "may not ACK, dead-letter,
+        clear an outbox record, or emit a terminal result", and all three of the
+        latter live downstream of this point. It also marks the lease lost, so the
+        consumer's pre-ACK ``raise_if_lost`` refuses the fourth verb too and the
+        entry stays pending for whoever now holds the fence. Without that, a turn
+        whose settle was refused would be acked with no completion written at all.
         """
         event_id = qevent.event_id
-        _LIFECYCLE_OUTCOME.set(telemetry_outcome)
         record = CompletionRecord(
             event_id=event_id,
             event=TurnCompleted(
@@ -1532,8 +1831,48 @@ class Kernel:
             created_at=time.time(),
             done=False,
         )
-        generation = await self._markers.mark_completion_pending(event_id, record)
-        await self._markers.mark_done(event_id)
+        if _is_fenced(lease):
+            assert lease is not None  # narrowed by _is_fenced
+            fenced = await self._markers.settle_fenced(
+                event_id,
+                record,
+                # The delivery this lease was GRANTED for, carried on the lease
+                # itself. Not `self._config.stream`: the fence must be checked
+                # against the exact keys the lease was acquired on, and the
+                # lease is the only thing that knows which entry that was.
+                stream=lease.stream,
+                group=lease.group,
+                entry_id=lease.entry_id,
+                owner=lease.owner,
+                generation=lease.generation,
+            )
+            if fenced is None:
+                # The single most diagnostic line in this feature: it is the
+                # only record that a turn ran to a terminal outcome and then
+                # discovered it no longer owned the delivery. Name what we held,
+                # so an operator can line it up against the replacement's
+                # acquisition rather than guessing which side was stale.
+                logger.warning(
+                    "fenced out of terminal settlement for event %s "
+                    "(owner=%s generation=%d outcome=%s): another owner holds "
+                    "this delivery; writing no marker, clearing nothing and "
+                    "emitting nothing",
+                    event_id,
+                    lease.owner,
+                    lease.generation,
+                    outcome,
+                )
+                _LIFECYCLE_OUTCOME.set("fenced_out")
+                # Authority is not recoverable, so record the loss locally too:
+                # the consumer's pre-ACK check is what keeps this owner from
+                # acking a delivery it just failed to settle.
+                lease.lost.set()
+                return
+            generation = fenced
+        else:
+            generation = await self._markers.mark_completion_pending(event_id, record)
+            await self._markers.mark_done(event_id)
+        _LIFECYCLE_OUTCOME.set(telemetry_outcome)
         await self._deliver_completion(record, generation=generation)
         attributes = {
             "service.name": "curie-worker",
@@ -1763,6 +2102,70 @@ class Kernel:
 
     # -- internals ------------------------------------------------------------
 
+    def _log_workspace_start_failure(
+        self,
+        qevent: QueuedTurn,
+        turn_text: str,
+        exc: WorkspacePreparationError,
+        *,
+        agent_id: uuid.UUID | None,
+        agent_name: str | None,
+        workspace_deployment_id: uuid.UUID | None,
+    ) -> None:
+        """Name the deployment behind a workspace PREPARATION failure (#2004).
+
+        The refusal branch below already covers its own half: it answers the
+        requester with ``exc.public_detail`` and tells the operator over its own
+        INFO line. This complements that rather than replacing it. Every OTHER
+        workspace start failure -- a clone, an archive, an upload, a missing
+        coordinator -- falls into ``_attempt``'s broad start-failure clause,
+        which used to log an event id and an anonymous ``repr``: naming neither
+        the agent, nor the deployment, nor the repository. A binding carrying no
+        deployment id is different again: it never reaches that clause at all,
+        because it is raised earlier, in ``_process_event``, before ``_attempt``
+        runs -- and had no log of its own before this ticket. The reported
+        symptom is what both cost -- the turn acks, creates no sandbox, and an
+        operator has nothing to search on.
+
+        So this emits one WARNING carrying everything needed to find the
+        deployment from the outside: the event, the agent, the deployment, the
+        repository the turn asked for (``<none named>`` when the message named
+        none -- that absence is itself the usual cause), the preparation stage
+        that failed, and a never-empty reason. WARNING rather than the refusal's
+        INFO because the two are different kinds of event: a refusal is a
+        decision the feature made on purpose, a preparation failure is a fault
+        nobody chose.
+
+        It takes the turn TEXT rather than an ``Event`` because the earliest
+        workspace failure -- a workspace-enabled deployment carrying no
+        deployment id -- is raised before ``_attempt`` has built one, and a
+        failure this helper cannot be called from is exactly the silence #2004
+        is about.
+        """
+        # Total by construction: parse_github_repo_fact RAISES
+        # WorkspaceSelectionRefused on a multi-repository message. That refusal
+        # is incidental here -- a second failure raised by the reparse, not the
+        # one being reported -- and letting it escape would replace the caller's
+        # fault with it, losing the outcome the caller is about to return and
+        # leaving the entry pending until dead-letter. Naming one of the two
+        # repositories instead would be a lie, so the ambiguity is reported as
+        # itself. Narrow on purpose -- a genuine bug here should still surface.
+        try:
+            repository = parse_github_repo_fact(turn_text) or "<none named>"
+        except WorkspacePreparationError:
+            repository = "<ambiguous>"
+        logger.warning(
+            "workspace start failed for %s: agent=%s agent_id=%s deployment=%s "
+            "repo=%s stage=%s reason=%s",
+            qevent.event_id,
+            agent_name or "<unknown>",
+            agent_id if agent_id is not None else "<unknown>",
+            workspace_deployment_id if workspace_deployment_id is not None else "<unknown>",
+            repository,
+            exc.stage,
+            _exception_reason(exc),
+        )
+
     async def _attempt(
         self,
         qevent: QueuedTurn,
@@ -1774,6 +2177,8 @@ class Kernel:
         packs: BehaviorPacks | None = None,
         workspace_deployment_id: uuid.UUID | None = None,
         agent_name: str | None = None,
+        *,
+        remaining_s: float | None = None,
     ) -> TurnOutcome:
         thread_key = _thread_key_for(qevent)
 
@@ -1818,6 +2223,7 @@ class Kernel:
                         workspace_deployment_id=workspace_deployment_id,
                         agent_name=agent_name,
                         source=qevent.source,
+                        remaining_s=remaining_s,
                     )
             except BaseException:
                 # start_turn owns a live response as soon as it returns, which
@@ -1855,15 +2261,59 @@ class Kernel:
             return TurnOutcome(terminal_ok=True)
         except WorkspaceSelectionRefused as exc:
             release_order()
+            # LOG it, not only reply (#2004). This was the one turn-ending branch
+            # in this handler that ended a turn silently, and it ends it with no
+            # sandbox: `WorkspaceSelectionRefused` subclasses
+            # `WorkspacePreparationError`, so this narrower `except` runs first
+            # and the turn never reaches the sibling below that logs "turn start
+            # failed".
+            #
+            # The reply covers a person in Slack, who reads the refusal and acts
+            # on it. It covers nobody when the turn came from a hook: there is no
+            # placeholder to edit and no one watching, so an acknowledged entry
+            # with no sandbox and no log is indistinguishable from an idle bot --
+            # and the last change anyone made was a boolean they would not
+            # connect to it.
+            #
+            # info rather than warning: a refusal is this feature working as
+            # designed, and routing routine policy outcomes to warning is how
+            # warnings stop being read. It names the agent because that is the
+            # only thing an operator chasing a silent bot has to search on.
+            logger.info(
+                "workspace selection refused for agent=%s deployment=%s thread=%s: %s",
+                agent_name,
+                workspace_deployment_id,
+                thread_key,
+                exc.public_detail,
+            )
             await self._reply_for(qevent, route, exc.public_detail)
             return TurnOutcome(terminal_ok=True)
+        except WorkspacePreparationError as exc:
+            # AFTER the refusal branch above, and it has to stay after it:
+            # `WorkspaceSelectionRefused` subclasses this, so ordering these two
+            # the other way round would swallow a deliberate policy answer and
+            # retry it. What reaches HERE is infrastructure, not policy -- the
+            # clone, the archive, the upload, the coordinator wiring. It used to
+            # fall into the clause below and answer to the name "runner-error",
+            # pointing an operator at a runner that never saw the fault. Retry
+            # behavior is deliberately identical (`workspace-error` is
+            # retryable); only the name and the log line change.
+            release_order()
+            self._log_workspace_start_failure(
+                qevent,
+                event.text,
+                exc,
+                agent_id=agent_id,
+                agent_name=agent_name,
+                workspace_deployment_id=workspace_deployment_id,
+            )
+            return TurnOutcome(terminal_ok=False, classification="workspace-error")
         except (
             RunnerError,
             aiohttp.ClientError,
             TimeoutError,
             OSError,
             SandboxError,
-            WorkspacePreparationError,
         ) as exc:
             # The turn was never accepted (transient runner 5xx, runner not ready,
             # claim timeout, route-lock acquire timeout). Convert to a retryable
@@ -1986,6 +2436,7 @@ class Kernel:
         workspace_deployment_id: uuid.UUID | None = None,
         agent_name: str | None = None,
         source: TurnSource = TurnSource.SLACK,
+        remaining_s: float | None = None,
     ) -> _RouteResult:
         # A workspace-enabled thread must establish (or confirm) its repository
         # before any platform response path. This deliberately precedes the
@@ -2064,7 +2515,7 @@ class Kernel:
             # guarding: the per-thread lock held across this critical section is
             # what stops another turn on this thread from opening between the read
             # and the start.
-            if await self._turn_active(handle):
+            if await self._turn_active(handle, remaining_s=remaining_s):
                 raise ThreadBusyError(
                     f"thread {thread_key} has a live session; deferring the {source} turn"
                 )
@@ -2072,6 +2523,12 @@ class Kernel:
             active_before_steer = False
             if retained_live_route:
                 try:
+                    # NOT given ``remaining_s``: see the note above _turn_active.
+                    # This read runs UNDER the per-thread lock, so its bound has
+                    # to be a short control-plane one, not the delivery budget
+                    # (min(600, a 30-minute budget) is still 600). Routed
+                    # separately; a committed test also doubles ``status`` with a
+                    # base_url-only stub here.
                     status = await self._runner.status(handle.base_url)
                 except Exception as exc:  # noqa: BLE001 -- steering still decides the route
                     logger.warning(
@@ -2088,7 +2545,9 @@ class Kernel:
                             "runner pre-steer status carried no usable turn_active: %r",
                             status,
                         )
-            steered = await self._runner.steer(handle.base_url, event, token=handle.token or None)
+            steered = await self._runner.steer(
+                handle.base_url, event, token=handle.token or None, remaining_s=remaining_s
+            )
             if steered:
                 _record_route("steer")
                 _lifecycle_event("runner.turn.steered", "steer")
@@ -2101,12 +2560,19 @@ class Kernel:
             if retained_live_route and active_before_steer:
                 _record_route("finish-race")
                 _lifecycle_event("runner.finish_race", "finish-race")
-        turn = await self._runner.start_turn(handle.base_url, event, token=handle.token or None)
+        # The per-request timeout is min(runner_total_timeout_s, remaining
+        # delivery budget): the budget can only ever SHORTEN a request, never
+        # grant one more time than the delivery has left (ADR-0131).
+        turn = await self._runner.start_turn(
+            handle.base_url, event, token=handle.token or None, remaining_s=remaining_s
+        )
         _record_route("start")
         _lifecycle_event("runner.turn.started", "start")
         return _RouteResult(steered=False, handle=handle, turn=turn)
 
-    async def _turn_active(self, handle: SandboxHandle) -> bool:
+    async def _turn_active(
+        self, handle: SandboxHandle, *, remaining_s: float | None = None
+    ) -> bool:
         """Is a turn live in this sandbox right now?
 
         The read a job uses to decide whether to run or defer. It is a plain GET
@@ -2123,12 +2589,17 @@ class Kernel:
 
         Args:
             handle: The claimed sandbox for this thread.
+            remaining_s: Wall-clock budget the caller has left, or None for a
+                caller that holds no budget. It only ever SHORTENS the probe's
+                HTTP bound (``min`` with the client's ceiling): without it this
+                GET inherits the 600s streaming session total, so one wedged
+                runner costs the caller that whole window inside a single call.
 
         Returns:
             True when a turn is live, or when liveness could not be determined.
         """
         try:
-            status = await self._runner.status(handle.base_url)
+            status = await self._runner.status(handle.base_url, remaining_s=remaining_s)
         except Exception as exc:  # noqa: BLE001 -- any unreadable answer means "assume busy"
             logger.warning("could not read turn liveness at %s: %r", handle.base_url, exc)
             return True
@@ -2220,9 +2691,14 @@ class Kernel:
         value. Sequential redelivery finds no ref after successful cleanup. If a
         newer ref replaces the value during delivery, comparison preserves it.
 
-        This remains fully best effort and never fails the resume. There is no
-        dual read for refs keyed by thread before the approval id layout. Those
-        refs are not automatically settled and remain until their TTL expires.
+        This remains fully best effort and never fails the resume. There is
+        still no RUNTIME dual read: this path reads exactly one key, the
+        approval id's. Refs keyed by thread before the approval id layout are
+        instead rekeyed onto their approval id by a one-shot boot migration
+        (``ApprovalCardStore.migrate_legacy_thread_keyed_refs``, #1751), so by
+        the time a resume arrives they are ordinary entries this read finds. A
+        pre-#1199 ref that never recorded its approval id is not migratable and
+        still lapses with its TTL.
         """
 
         if self._card_store is None or not self._is_approval_resume(qevent.event_id):
@@ -2860,12 +3336,40 @@ class Kernel:
                     if isinstance(frame, Final):
                         break
         except (aiohttp.ClientError, TimeoutError) as exc:
-            # Stream dropped mid-run (sandbox killed, network fault). No final.
-            logger.warning("turn stream dropped for %s: %s", qevent.event_id, exc)
+            # Stream dropped mid-run (sandbox killed, network fault, or the
+            # client's streaming budget expiring). No final.
+            #
+            # #2011: both halves of this used to lose information. ``str()`` of a
+            # bare TimeoutError is the EMPTY STRING, so the operator log read
+            # "turn stream dropped for <id>: " with nothing after the colon; and
+            # a timeout collapsed into the same "runner-error" a killed sandbox
+            # produces. ``_exception_reason`` guarantees a non-empty reason for
+            # EVERY exception this clause catches, and a runner timeout gets its
+            # own classification. An ErrorEvent-supplied ``acc.classification``
+            # still wins: the runner's own account of why the turn failed
+            # outranks the transport symptom the worker observed.
+            #
+            # The classification test is the CONCRETE ``RunnerStreamTimeout``,
+            # never the ``TimeoutError`` base class: this clause spans frame
+            # application, and ``_apply_frame`` delivers the reply, whose HTTP
+            # adapter has its own 30s budget. A stalled reply endpoint raises a
+            # plain ``TimeoutError`` while the runner was answering normally, so
+            # it is not a runner timeout and must not borrow the name -- it
+            # falls back to "runner-error". ``TurnStream.__aiter__`` converts
+            # every stream-budget expiry into ``RunnerStreamTimeout``, so a
+            # genuine runner timeout still lands here as "runner-timeout".
+            logger.warning(
+                "turn stream dropped for %s: %s",
+                qevent.event_id,
+                _exception_reason(exc),
+            )
+            classification = acc.classification or (
+                "runner-timeout" if isinstance(exc, RunnerStreamTimeout) else "runner-error"
+            )
             return TurnOutcome(
                 terminal_ok=False,
                 saw_side_effect=acc.saw_side_effect,
-                classification=acc.classification or "runner-error",
+                classification=classification,
                 text=acc.rendered(),
             )
         except ActionBackendError as exc:

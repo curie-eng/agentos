@@ -38,6 +38,7 @@ from .schemas import (
     ChannelBindingPatch,
     ChannelBindingWrite,
     DeploymentCreate,
+    HookPartitionConfig,
     PublicationCreate,
     VersionCreate,
 )
@@ -175,6 +176,7 @@ async def create_agent(session: AsyncSession, data: AgentCreate) -> Agent:
             if data.approval_routes is not None
             else None
         ),
+        hook_partitions=_stored_hook_partitions(data.hook_partitions),
         secrets=data.secrets,
         memory=data.memory,
     )
@@ -394,6 +396,35 @@ async def update_agent_approval_routes(
     resolution surface)."""
 
     agent.approval_routes = routes or None
+    await session.commit()
+    await session.refresh(agent)
+    return agent
+
+
+def _stored_hook_partitions(
+    partitions: dict[str, HookPartitionConfig] | None,
+) -> dict[str, Any] | None:
+    """The column value for a hook-partition map (ADR-0134).
+
+    One definition for both write paths, because create and PATCH must not
+    disagree about what "no configuration" looks like in the column: an empty
+    map is stored as NULL, the same "every hook returns to one thread per hook"
+    posture as an omitted map, which is what an operator turning the feature
+    off is asking for.
+    """
+
+    if not partitions:
+        return None
+    return {name: c.model_dump() for name, c in partitions.items()}
+
+
+async def update_agent_hook_partitions(
+    session: AsyncSession, agent: Agent, partitions: dict[str, HookPartitionConfig]
+) -> Agent:
+    """Set which of the agent's hooks fan out (ADR-0134). An empty dict clears
+    them (stored as NULL)."""
+
+    agent.hook_partitions = _stored_hook_partitions(partitions)
     await session.commit()
     await session.refresh(agent)
     return agent
@@ -985,11 +1016,21 @@ async def get_approval_route_binding(session: AsyncSession, approval: Approval) 
     approver group revokes them immediately instead of leaving them able to
     resolve yesterday's stale request.
 
-    None covers every legitimate miss -- a generic approval with no agent
+    None still covers every legitimate miss -- a generic approval with no agent
     (``agent_id`` is nullable by design), an approval with no route, an agent
-    with no bindings, a route the map does not bind -- and each of them means
-    "no approvers declared", which is channel membership by design (AC4), not a
-    failure.
+    with no bindings, a route the map does not bind -- but it no longer means
+    one thing. ADR-0123 makes the selector split a None on whether the approval
+    NAMED a route: a routeless approval keeps the AC4 zero-setup channel
+    membership, while a routed approval with no binding is refused outright,
+    because a route the operator narrowed must not be readable as one they never
+    narrowed.
+
+    This function deliberately still returns a bare None and does not say which
+    of the four misses happened. The selector needs only ``approval.route`` to
+    make that split, and a richer return type is not something ADR-0123 asks
+    for. Note the guard below is ``not approval.route``, so a ``route=""``
+    approval is routeless here; the selector keys on the same truthiness so the
+    two files cannot disagree about what "named a route" means.
 
     A present-but-non-dict value is NOT one of those misses, so it is returned
     raw (the JSONB value can be anything) rather than coerced to None: the

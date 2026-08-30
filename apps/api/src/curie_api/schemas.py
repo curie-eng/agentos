@@ -19,6 +19,7 @@ from aci_protocol import ApprovalRequest as ApprovalRequest
 from aci_protocol import EvalReport as EvalReport
 from fastapi import HTTPException
 from plugin_format import is_reserved_boot_env_name
+from plugin_format.connector_render import agent_forges_join
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -30,6 +31,7 @@ from pydantic import (
 )
 
 from .config import get_settings
+from .hook_partition import HOOK_NAME, validate_pointer_syntax
 from .models import GIT_FLOW_CREATED_BY, Environment
 from .repo_full_name import RepoFullName
 from .workspace_policy import REPOSITORY_FULL_NAME_PATTERN, valid_repository_name
@@ -425,6 +427,59 @@ def _validate_secret_map(value: dict[str, str] | None) -> dict[str, str] | None:
     return value
 
 
+def _validate_agent_name(value: str) -> str:
+    """Reject an agent name that would forge the connector object-name join.
+
+    A connector's Kubernetes objects are named
+    ``{release}-{agent}-mcp-{connector}``
+    (``plugin_format.connector_render.object_name``). The ``-mcp-`` is a bare
+    substring inside one DNS label rather than a structural separator, so the
+    join point is not recoverable from the rendered string: agent ``a-mcp-b``
+    with connector ``c`` and agent ``a`` with connector ``b-mcp-c`` render
+    byte-identical objects AND the identical ``app.kubernetes.io/name`` pod
+    selector. The connector is deliberately unauthenticated (ADR-0086 -- the
+    sandbox holds no credential to authenticate WITH, so the network is the
+    whole of the access control), which makes that name the only thing binding
+    a sandbox to a credential: one agent's sandbox reaches another agent's
+    connector holding another agent's production token, and nothing errors
+    anywhere (#1446).
+
+    ``connectors.yaml`` names and ``deploy.yaml``'s ``target.agent`` are both
+    gated by bundle validation. ``POST /agents`` is the hole -- the stored
+    ``Agent.name`` reaches the renderer with no field validator in between --
+    and it is the path the CLI's ``resolve_agent`` and the UI's create modal
+    both take. Refusing on write keeps the forging name out of the database
+    entirely; the render-time 422 in ``routers/agents.py`` only covers rows
+    created before this validator existed.
+
+    Deliberately ONLY the delimiter-forging shape. ``AgentCreate.name`` accepts
+    spaces, uppercase, and 200-character names today; that is a real but
+    SEPARATE pre-existing gap, and tightening it here would refuse names live
+    installs already hold. Do not "helpfully" widen this into general
+    name-shape validation -- that is its own change, with its own migration
+    story.
+
+    The rule itself is imported, never restated: ``agent_forges_join`` asks
+    whether ``-mcp-`` appears in ``f"{name}-"``, which catches a TRAILING
+    ``-mcp`` (the join supplies the dash that completes it) as surely as an
+    outright ``-mcp-``, while leaving a LEADING ``mcp-`` alone -- its only
+    alternative split leaves an empty agent, so nothing is ambiguous. A second
+    copy of that asymmetry here would be free to drift from the renderer it
+    exists to protect.
+    """
+
+    if agent_forges_join(value):
+        raise ValueError(
+            f"agent name {value!r} collides with the connector object-name "
+            "delimiter '-mcp-': a connector's Kubernetes objects are named "
+            "'{release}-{agent}-mcp-{connector}', so a name that contains "
+            "'-mcp-' or ends in '-mcp' makes two different agents render the "
+            "same objects and share one connector's credential (#1446). Pick a "
+            "name that neither contains '-mcp-' nor ends in '-mcp'."
+        )
+    return value
+
+
 class _StoredWithoutNulls(BaseModel):
     """Serializes to the stored-JSONB shape: unset keys are absent, not null.
 
@@ -512,6 +567,56 @@ class ApprovalApprovers(_StoredWithoutNulls):
                 "the approvers block entirely to keep channel membership"
             )
         return self
+
+
+class HookPartitionConfig(BaseModel):
+    """How one hook names the thing each delivery is about (ADR-0134).
+
+    One model serves ``AgentCreate``, ``AgentUpdate`` AND ``AgentOut``, which the
+    ``_StoredWithoutNulls`` tripwire above would otherwise argue against: that
+    split only happens for models carrying the wrap serializer, and this one has
+    neither it nor an optional field, so the dumped and validated shapes are the
+    same and no ``-Input``/``-Output`` pair is generated. Do not add a separate
+    ``...Out`` variant.
+    """
+
+    # A typo'd key must not be silently dropped: here the dropped key would be
+    # the whole partition, and the hook would run unpartitioned while its config
+    # still looked right in a GET. Same reason as `ApprovalApprovers`.
+    model_config = ConfigDict(extra="forbid")
+
+    # An RFC 6901 pointer into the delivery body.
+    pointer: str
+
+    @field_validator("pointer")
+    @classmethod
+    def _check_pointer(cls, value: str) -> str:
+        # The ingress's own syntax rule, imported rather than restated, so a
+        # pointer the write surface accepts is exactly one the resolver can read.
+        return validate_pointer_syntax(value)
+
+
+def _validate_hook_partitions(
+    value: "dict[str, HookPartitionConfig] | None",
+) -> "dict[str, HookPartitionConfig] | None":
+    """Partition keys are hook NAMES, checked against the shape the ingress
+    enforces.
+
+    A key outside that shape can never match a firing, so it configures nothing
+    while looking configured -- the operator sees a partition map and gets
+    unpartitioned threads.
+    """
+
+    if value is None:
+        return value
+    for name in value:
+        if not HOOK_NAME.fullmatch(name):
+            raise ValueError(
+                f"hook_partitions key {name!r} is not a hook name: 1-63 "
+                "characters of lowercase letters, digits, dot, dash or "
+                "underscore, beginning with a letter or a digit"
+            )
+    return value
 
 
 def _validate_route_names(
@@ -888,16 +993,22 @@ class AgentCreate(BaseModel):
     # secret. Stored on the agent row for the local tier and forwarded into the
     # sandbox by the worker binding. None means no connector secrets.
     secrets: dict[str, str] | None = None
+    # Per-hook delivery partitioning (ADR-0134): hook name -> the JSON Pointer
+    # into the delivery body that names the thing each delivery is about. None
+    # (the default) is the unpartitioned behavior: one thread per hook.
+    hook_partitions: dict[str, HookPartitionConfig] | None = None
     # Whether this agent's bindings share one workflow-state namespace (#1525
     # follow-up). False (the default) matches a single-binding agent's existing
     # behavior exactly, since there is nothing yet to share with.
     memory: bool = False
 
+    _check_name = field_validator("name")(_validate_agent_name)
     _check_model = field_validator("model")(_validate_model_override)
     _check_thinking = field_validator("thinking")(_validate_thinking_override)
     _check_approval_tools = field_validator("approval_required_tools")(_validate_tool_names)
     _check_approval_routes = field_validator("approval_routes")(_validate_route_names)
     _check_secrets = field_validator("secrets")(_validate_secret_map)
+    _check_hook_partitions = field_validator("hook_partitions")(_validate_hook_partitions)
     _reject_retired_channel_keys = model_validator(mode="before")(_reject_retired_binding_keys)
 
 
@@ -936,6 +1047,13 @@ class AgentUpdate(BaseModel):
     # New connector secrets (#429). Omitted (None) leaves current secrets
     # unchanged; an explicit empty dict clears them.
     secrets: dict[str, str] | None = None
+    # New per-hook delivery partitioning (ADR-0134). Omitted (None) leaves the
+    # partitions unchanged; an explicit empty dict clears them, returning every
+    # hook on this agent to one thread per hook. Deliberately `approval_routes`'
+    # semantics and NOT the `model`/`thinking` `model_fields_set` three-way:
+    # there is no platform default for this field to be cleared back TO, so
+    # reading None as "omitted" conflates nothing.
+    hook_partitions: dict[str, HookPartitionConfig] | None = None
     # Which repository's pushes deploy this agent (ADR-0091). PATCHable because
     # an agent created before its repo existed -- or, until migration 0018, the
     # SECOND agent of a repo, which the unique index forbade from carrying it --
@@ -950,6 +1068,7 @@ class AgentUpdate(BaseModel):
     _check_approval_tools = field_validator("approval_required_tools")(_validate_tool_names)
     _check_approval_routes = field_validator("approval_routes")(_validate_route_names)
     _check_secrets = field_validator("secrets")(_validate_secret_map)
+    _check_hook_partitions = field_validator("hook_partitions")(_validate_hook_partitions)
     _reject_retired_channel_keys = model_validator(mode="before")(_reject_retired_binding_keys)
     # The update-only half: a withdrawn `channel` here is refused, while the
     # same key stays required on `AgentCreate`.
@@ -976,6 +1095,9 @@ class AgentOut(BaseModel):
     thinking: str | None
     approval_required_tools: list[str] | None
     approval_routes: dict[str, ApprovalRouteBindingOut] | None
+    # Which hooks fan out, and by what (ADR-0134). Null is the unpartitioned
+    # posture and the value every pre-existing agent row carries.
+    hook_partitions: dict[str, HookPartitionConfig] | None
     # Connector secret NAMES only (#429) -- values are never returned. The stored
     # column is a name->value map; expose just the sorted names so an operator can
     # see which secrets an agent has bound without the material leaving the API.
@@ -1111,6 +1233,53 @@ class ListedTargets(BaseModel):
     """
 
     targets: list[NamedTarget] = []
+
+
+class RoutingCheckRequest(BaseModel):
+    """Ask whether a repository's pushes can still be routed to an agent (#1221).
+
+    Migration 0018 (ADR-0091) dropped the unique index on ``repo_full_name``, so
+    binding a SECOND agent to a repository is legal -- and silently flips every
+    future push for the agent that was already bound from "deploys" to
+    "rejected", because nothing says which of the two a branch belongs to. The
+    caller sends the bundle's ``deploy.yaml`` TEXT for the same reason
+    ``ResolveTargetRequest`` does: the API owns the resolver rule, so a client
+    restating it here would drift from the rule actually enforced on a push.
+    """
+
+    repo_full_name: str
+    # The bundle's deploy.yaml TEXT, or None when the bundle has no such file.
+    # None and an empty `targets:` map say the same thing about routing (#1210),
+    # and the resolver already treats them identically.
+    content: str | None = None
+
+
+class RoutingCheckProblem(BaseModel):
+    """One environment whose pushes this repository can no longer route.
+
+    ``message`` is the resolver's OWN text, carried verbatim so the CLI can
+    print it without paraphrasing the rule.
+    """
+
+    environment: str
+    code: str
+    message: str
+
+
+class RoutingCheck(BaseModel):
+    """Whether pushes to a repository still resolve to an agent (#1221).
+
+    ``resolvable`` is false only when the real resolver raised: a branch with no
+    matching target resolves to "ignore", which is intended behaviour, not a
+    problem. An unbound repository (``agent_count`` 0) stays resolvable too --
+    this reports ROUTING, not whether anything is bound.
+    """
+
+    repo_full_name: str
+    agent_count: int = 0
+    agents: list[str] = Field(default_factory=list)
+    resolvable: bool = True
+    unresolvable: list[RoutingCheckProblem] = Field(default_factory=list)
 
 
 class ConnectorManifests(BaseModel):

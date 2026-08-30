@@ -1,7 +1,12 @@
 ---
 name: implement
-disable-model-invocation: true
 description: Implement a ticket or feature with proportional planning, test first behavior changes, independent review when available, and verification through the real affected surface.
+# disable-model-invocation sits under metadata because the Agent Skills spec
+# only allows a fixed set of top-level fields; Claude Code reads this key only
+# at top level, so it no longer takes effect here. Full rationale:
+# docs/interfaces/bundle-format/INTERFACE.md
+metadata:
+  disable-model-invocation: "true"
 ---
 
 # Implement

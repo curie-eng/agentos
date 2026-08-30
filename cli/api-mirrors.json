@@ -23,6 +23,10 @@
         {
           "field": "created_at",
           "why": "No CLI verb prints an agent's creation timestamp; the deploy summary and lifecycle verbs render id/name/channel only."
+        },
+        {
+          "field": "hook_partitions",
+          "why": "No CLI verb reads or prints an agent's hook partition map; it is configured through the API write surface and surfaced back on the hook receipt, which the CLI never calls."
         }
       ]
     },
@@ -267,6 +271,16 @@
     {
       "struct": "MetricSeries",
       "schema": "MetricSeries",
+      "omissions": []
+    },
+    {
+      "struct": "RoutingCheckProblem",
+      "schema": "RoutingCheckProblem",
+      "omissions": []
+    },
+    {
+      "struct": "RoutingCheck",
+      "schema": "RoutingCheck",
       "omissions": []
     }
   ],

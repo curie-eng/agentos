@@ -201,6 +201,8 @@ fn write_kubectl_stub(dir: &Path) -> PathBuf {
         &path,
         r#"#!/bin/sh
 case "$*" in
+  "config view --minify --raw -o json")
+    printf '%s\n' '{"clusters":[{"cluster":{"server":"https://cluster.example.com","certificate-authority-data":"Y2E="}}]}' ;;
   *"get deployment"*) printf '%s' 'curie' ;;
   *"delete deployment,service,networkpolicy,secret"*) exit 0 ;;
   *) printf 'unexpected kubectl invocation: %s\n' "$*" >&2; exit 64 ;;

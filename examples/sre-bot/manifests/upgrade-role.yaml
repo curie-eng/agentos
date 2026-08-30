@@ -1,0 +1,110 @@
+# The upgrade identity for the gated self-upgrade connector.
+#
+#     kubectl apply -f examples/sre-bot/manifests/upgrade-role.yaml
+#
+# SEPARATE FROM the write and scale identities, and it must stay that way. This
+# one lives in the namespace the Curie RELEASE runs in -- the other two live
+# wherever the workloads this bot may touch are. Merging them would put `create`
+# on `jobs` next to the application namespace, or `patch` on `deployments` next
+# to the platform's own Secrets. Neither is a trade worth making for tidiness.
+#
+# ---------------------------------------------------------------------------
+# Read this grant honestly: it is the widest one in the bundle
+# ---------------------------------------------------------------------------
+#
+# `create` on `jobs` cannot be narrowed with `resourceNames`. Kubernetes matches
+# `resourceNames` against the name of an EXISTING object, and a create has no
+# name yet -- so there is no RBAC expression for "may create only this Job". A
+# credential with this Role can, in principle, create a Job running any image
+# with any command in this namespace, which is the namespace holding the
+# platform's API key.
+#
+# That is the same shape as `write-role.yaml`'s `patch` on `deployments`, which
+# RBAC also cannot separate from `set image`, and it gets the same answer: the
+# real ceiling is the connector, which exposes ONE tool that takes NO arguments
+# and posts the named CronJob's `jobTemplate.spec` verbatim. There is no field a
+# caller can reach. See connectors/self-upgrade/server.py.
+#
+# What that leaves is a credential whose blast radius is "this namespace, if the
+# token escapes the connector pod". It does not leave the pod: the kubeconfig is
+# mounted as a file, the sandbox never holds it, and the sandbox learns only a
+# URL (which is why the read-only connector drops `configuration_view` -- see
+# connectors.yaml). If you are not willing to accept that, do not install this
+# connector; the CronJob on a schedule remains a complete alternative.
+#
+# ---------------------------------------------------------------------------
+# Why each verb is here
+# ---------------------------------------------------------------------------
+#
+# `get` on cronjobs   -- the connector reads the template it is about to run. It
+#                        is `resourceNames`-scoped, so this identity cannot read
+#                        any other CronJob's template, and posting a body it did
+#                        not read is not a path this connector has.
+# `create` on jobs    -- the button itself.
+# `list` on jobs      -- the connector refuses to start a second upgrade while
+#                        one is still active. `concurrencyPolicy: Forbid` does
+#                        NOT cover a manually created Job, so without this the
+#                        guard is the only thing standing between two approvals
+#                        and two racing deploys.
+#
+# Deliberately absent: `delete` on jobs. Cleaning up finished Jobs is the
+# CronJob's `successfulJobsHistoryLimit`, not this bot's business, and `delete`
+# would let a prompt-injected agent erase the evidence of what it started.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sre-bot-upgrader
+  # CHANGE ME: the namespace the Curie release runs in -- the one holding the
+  # self-upgrade CronJob. NOT the application namespace.
+  namespace: curie
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sre-bot-upgrader
+  namespace: curie
+rules:
+  - apiGroups: ["batch"]
+    resources: ["cronjobs"]
+    resourceNames:
+      # CHANGE ME only if you renamed the CronJob. Must agree with the
+      # connector's SELF_UPGRADE_CRONJOB in connectors.yaml -- two places on
+      # purpose, so a ceiling stated once cannot move when someone edits the
+      # other place.
+      - sre-bot-self-upgrade
+    verbs: ["get"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    # No resourceNames: see the note at the top. A create has no name to match,
+    # so this is namespace-wide by construction and the connector is the ceiling.
+    verbs: ["create", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sre-bot-upgrader
+  namespace: curie
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: sre-bot-upgrader
+subjects:
+  - kind: ServiceAccount
+    name: sre-bot-upgrader
+    # Easy to miss: this is indented under `subjects`, not `metadata.namespace`.
+    # Getting it wrong does not fail `kubectl apply` -- every object still
+    # reports `created` and the identity simply grants nothing.
+    namespace: curie
+---
+# The non-expiring token, same reasoning as the other manifests: the connector
+# authenticates from a static kubeconfig file and cannot refresh a projected
+# token.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: sre-bot-upgrader-token
+  namespace: curie
+  annotations:
+    kubernetes.io/service-account.name: sre-bot-upgrader
+type: kubernetes.io/service-account-token

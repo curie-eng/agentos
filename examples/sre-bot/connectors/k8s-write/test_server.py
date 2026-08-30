@@ -19,9 +19,12 @@ import os
 import sys
 from pathlib import Path
 
+import anyio
 import httpx
 import pytest
 import yaml
+from mcp.server.fastmcp.exceptions import ToolError
+from mcp.shared.memory import create_connected_server_and_client_session as _connect
 
 _REAL_CA_PEM = (
     b"-----BEGIN CERTIFICATE-----\n"
@@ -139,8 +142,9 @@ def test_target_outside_the_allowlist_never_reaches_the_api(tmp_path, monkeypatc
         raise AssertionError("built a client for a target outside the allowlist")
 
     monkeypatch.setattr(srv, "_client", explode)
-    out = srv.restart_deployment(ns, name)
-    assert "refusing" in out and "allowlist" in out
+    with pytest.raises(ToolError) as excinfo:
+        srv.restart_deployment(ns, name)
+    assert "refusing" in str(excinfo.value) and "allowlist" in str(excinfo.value)
 
 
 def test_empty_allowlist_refuses_to_start(tmp_path):
@@ -193,21 +197,29 @@ def test_insecure_skip_tls_verify_is_refused(tmp_path):
             "users": [{"user": {"token": "t"}}],
         },
     )
-    out = srv._client()
-    assert isinstance(out, str) and "insecure-skip-tls-verify" in out
+    with pytest.raises(ToolError) as excinfo:
+        srv._client()
+    assert "insecure-skip-tls-verify" in str(excinfo.value)
 
 
-def test_missing_kubeconfig_is_a_sentence_not_a_traceback(tmp_path):
+def test_missing_kubeconfig_raises_a_sentence_not_a_traceback(tmp_path):
+    # A ToolError still reaches the model as its message behind FastMCP's fixed
+    # `Error executing tool ...: ` prefix and nothing else -- never a traceback
+    # -- so naming the missing mount survives the change from returning to
+    # raising. (The wire test below pins that prefix exactly.)
     srv = _load(tmp_path, kubeconfig=None)
-    out = srv.restart_deployment("public", "api")
-    assert isinstance(out, str) and "not mounted" in out
+    with pytest.raises(ToolError) as excinfo:
+        srv.restart_deployment("public", "api")
+    assert "not mounted" in str(excinfo.value)
 
 
 @pytest.mark.parametrize("failure", ["transport", "http-error"])
-def test_token_never_appears_in_a_returned_message(tmp_path, monkeypatch, failure):
+def test_token_never_appears_in_an_error_message(tmp_path, monkeypatch, failure):
     # str(exc) on an httpx error carries the URL, and the URL is built from the
     # kubeconfig -- so a message that interpolates the exception is one edit away
-    # from carrying the bearer token into a Slack channel.
+    # from carrying the bearer token into a Slack channel. Raising rather than
+    # returning does not change that: the ToolError's text is what the model
+    # sees, so it is the text that must not carry the credential.
     srv = _load(tmp_path)
 
     class Failing(_FakeClient):
@@ -220,15 +232,16 @@ def test_token_never_appears_in_a_returned_message(tmp_path, monkeypatch, failur
             return httpx.Response(500, text="internal error")
 
     monkeypatch.setattr(srv, "_client", lambda: Failing())
-    out = srv.restart_deployment("public", "api")
-    assert isinstance(out, str)
-    assert "write-token" not in out
+    with pytest.raises(ToolError) as excinfo:
+        srv.restart_deployment("public", "api")
+    message = str(excinfo.value)
+    assert "write-token" not in message
     if failure == "transport":
         # str(exc) on a transport error carries the URL, which is built from the
         # kubeconfig. It must not carry the credential with it.
-        assert "could not reach the API server" in out
+        assert "could not reach the API server" in message
     else:
-        assert "the restart was rejected: 500" in out
+        assert "the restart was rejected: 500" in message
 
 
 # --------------------------------------------------------------------------- #
@@ -242,24 +255,28 @@ def test_timeout_says_do_not_retry(tmp_path, monkeypatch):
             raise httpx.TimeoutException("slow")
 
     monkeypatch.setattr(srv, "_client", lambda: Timeouts())
-    out = srv.restart_deployment("public", "api")
-    assert "Do not call this again" in out
-    assert "MAY have" in out
+    with pytest.raises(ToolError) as excinfo:
+        srv.restart_deployment("public", "api")
+    message = str(excinfo.value)
+    assert "Do not call this again" in message
+    assert "MAY have" in message
 
 
 @pytest.mark.parametrize("status", [401, 403])
 def test_permission_errors_say_they_will_not_fix_themselves(tmp_path, monkeypatch, status):
     srv = _load(tmp_path)
     monkeypatch.setattr(srv, "_client", lambda: _FakeClient(get_status=status))
-    out = srv.restart_deployment("public", "api")
-    assert "not fix itself" in out
+    with pytest.raises(ToolError) as excinfo:
+        srv.restart_deployment("public", "api")
+    assert "not fix itself" in str(excinfo.value)
 
 
 def test_missing_deployment_is_reported_plainly(tmp_path, monkeypatch):
     srv = _load(tmp_path)
     monkeypatch.setattr(srv, "_client", lambda: _FakeClient(get_status=404))
-    out = srv.restart_deployment("public", "api")
-    assert "no Deployment public/api" in out
+    with pytest.raises(ToolError) as excinfo:
+        srv.restart_deployment("public", "api")
+    assert "no Deployment public/api" in str(excinfo.value)
 
 
 def test_success_message_does_not_claim_the_rollout_finished(tmp_path, monkeypatch):
@@ -269,6 +286,75 @@ def test_success_message_does_not_claim_the_rollout_finished(tmp_path, monkeypat
     monkeypatch.setattr(srv, "_client", lambda: _FakeClient())
     out = srv.restart_deployment("public", "api")
     assert "not that the rollout completed" in out
+
+
+# --------------------------------------------------------------------------- #
+# The wire. Everything above calls the tool function directly, and no assertion
+# at that level can see the field this connector is actually judged by. FastMCP
+# marks a result `isError: true` only when the call RAISED; a refusal that is
+# `return`ed is a string like any other, so it goes out as `isError: false` and
+# is indistinguishable from a completed restart to anything reading the protocol
+# rather than the prose -- an eval grader, an audit ledger, a retry policy.
+#
+# So this one goes through the real MCP request path, in process, and asserts
+# the flag on the CallToolResult.
+# --------------------------------------------------------------------------- #
+def _call_tool(srv, name, args):
+    """Call one tool through the real MCP request path and return the CallToolResult."""
+
+    async def go():
+        async with _connect(srv.mcp._mcp_server) as client:
+            return await client.call_tool(name, args)
+
+    return anyio.run(go)
+
+
+def test_a_refusal_and_a_restart_carry_different_is_error_flags(tmp_path, monkeypatch):
+    srv = _load(tmp_path)
+    # A client that would succeed, so the only thing separating the two calls is
+    # the allowlist -- not a broken fake.
+    monkeypatch.setattr(srv, "_client", lambda: _FakeClient())
+
+    refused = _call_tool(srv, "restart_deployment", {"namespace": "platform", "name": "api"})
+    assert refused.isError is True
+    # The prose survives the trip, minus a fixed SDK prefix: FastMCP puts our
+    # message text on the wire and adds no traceback, so raising costs nothing
+    # the sentence was doing.
+    refusal_text = refused.content[0].text
+    assert "refusing" in refusal_text
+    assert "allowlist" in refusal_text
+    assert "deliberate ceiling" in refusal_text
+
+    # The SDK prefixes the message; OBSERVED against the pinned mcp==1.28.1,
+    # which builds it at mcp/server/fastmcp/tools/base.py:117
+    # (`raise ToolError(f"Error executing tool {self.name}: {e}") from e`) and
+    # puts str(e) in as the only text content. Pinned rather than
+    # substring-matched so a version bump that reshapes or drops the prefix
+    # fails here instead of quietly changing what an operator reads in Slack.
+    prefix = "Error executing tool restart_deployment: "
+    assert refusal_text.startswith(prefix)
+    # ...and what follows it is our sentence verbatim, with the permitted list
+    # built from the module's own allowlist. Rewording the refusal fails here
+    # too, not just changing the prefix.
+    permitted = ", ".join(sorted(srv.ALLOWLIST))
+    assert refusal_text[len(prefix):] == (
+        "refusing: platform/api is not in this connector's allowlist. "
+        f"Permitted: {permitted}. This is a deliberate ceiling -- widening it "
+        "is an operator change, not something to work around."
+    )
+
+    done = _call_tool(srv, "restart_deployment", {"namespace": "public", "name": "api"})
+    assert done.isError is False
+    assert "restart triggered" in done.content[0].text
+    # The contrast in the OTHER direction: the success path carries no prefix at
+    # all, so the two results differ in text shape as well as in the flag.
+    assert not done.content[0].text.startswith("Error executing tool")
+    assert done.content[0].text.startswith("restart triggered for public/api at ")
+
+    # THE contrast, stated outright: this is the whole property. When both of
+    # these were returned strings the two results were the same shape, and a
+    # program counting successful restarts counted the refusal as one.
+    assert refused.isError != done.isError
 
 
 # --------------------------------------------------------------------------- #

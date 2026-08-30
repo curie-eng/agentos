@@ -929,6 +929,9 @@ expected = {
     ("Job", f"{prefix}-netpol-probe"): "hooks",
     ("Job", f"{prefix}-security-probe"): "hooks",
     ("Job", f"{prefix}-langfuse-model-pricing"): "hooks",
+    # The pre-upgrade drain gate and its post-upgrade release (issue #2010).
+    ("Job", f"{prefix}-upgrade-drain"): "hooks",
+    ("Job", f"{prefix}-upgrade-drain-release"): "hooks",
     ("Pod", f"{prefix}-security-probe-hardening"): "hooks",
     ("Deployment", "agent-sandbox-controller"): "controller",
 }
@@ -1095,6 +1098,159 @@ helm template placement-render "$CHART" --output-dir "$PLACEMENT_PLATFORM_ONLY_O
   -f "$PLACEMENT_PLATFORM_ONLY" "${PLACEMENT_HELM_ARGS[@]}" > /dev/null
 python3 "$PLACEMENT_CHECK" "$PLACEMENT_PLATFORM_ONLY_OUT" platform-only \
   || fail "the platform-only marker was absent from a platform pod or leaked into another placement class."
+
+echo "=== Placement assertion 4: a legacy release's retained placement: null still renders (#2008) ==="
+# `helm upgrade --reuse-values` replays the STORED release config as this
+# upgrade's user-supplied values -- it is not a merge over the chart's current
+# defaults. Helm's values coalescing then deletes any top-level key whose
+# replayed value is YAML null outright, so a release created before placement
+# classes existed, which stored `placement: null`, hands that null straight
+# back in on every future upgrade. `.Values.placement` is then nil and every
+# `.Values.placement.<class>` lookup in the templates panics with a nil
+# pointer template error (issue #2008). A live `helm upgrade --dry-run
+# --reuse-values` reproduction needs an actual prior Helm release, which this
+# chart-only CI has no cluster or release history to provide -- rendering a
+# fixture that reproduces the exact coalesced shape (`placement: null`
+# alongside an ordinary retained setting, so this reads as a real retained
+# values file and not a one-key probe) is the faithful, cluster-free stand-in
+# for the same upgrade path.
+PLACEMENT_LEGACY_NULL="$TMP/placement-legacy-null.yaml"
+cat > "$PLACEMENT_LEGACY_NULL" <<'YAMLEOF'
+placement: null
+global:
+  storageClass: gp3-legacy
+YAMLEOF
+
+PLACEMENT_LEGACY_NULL_OUT="$(mktemp -d -p "$TMP")"
+PLACEMENT_LEGACY_NULL_ERR="$TMP/placement-legacy-null.err"
+# set -euo pipefail would otherwise kill the script silently at this line on
+# the very failure we are testing for; capture stderr and check the exit
+# status explicitly so a broken render reports a useful message instead.
+if ! helm template placement-render "$CHART" --output-dir "$PLACEMENT_LEGACY_NULL_OUT" \
+  -f "$PLACEMENT_LEGACY_NULL" "${PLACEMENT_HELM_ARGS[@]}" \
+  > /dev/null 2>"$PLACEMENT_LEGACY_NULL_ERR"; then
+  fail "a legacy release's retained 'placement: null' failed to render (#2008): $(cat "$PLACEMENT_LEGACY_NULL_ERR")"
+fi
+python3 "$PLACEMENT_CHECK" "$PLACEMENT_LEGACY_NULL_OUT" default \
+  || fail "a legacy release's retained 'placement: null' rendered but did not degrade to the chart's empty placement defaults (#2008): every expected pod surface must still be present and none may carry a placement marker or scheduling field."
+
+echo "=== Placement assertion 4 negative control: reverting the nil-safe placement accessor FAILS ==="
+# Mandatory, per Assertion 7's convention: an assert that has never been shown
+# failing is not a pin. Mutate a TEMP COPY of the chart's _helpers.tpl and
+# require the legacy-null render to fail again.
+#
+# The #2008 fix has not landed on this branch yet, so this mutation cannot
+# target known-existing text the way Assertion 7's and 12b's negative
+# controls do. It instead locates its mutation target -- the nil-safe
+# placement accessor in _helpers.tpl -- by NAME: the `curie.placement.class`
+# define the fix is expected to introduce. It mutates that define's body back
+# into a raw, nil-UNSAFE `.Values.placement.<class>`-style dereference by
+# stripping this chart's own established `| default dict` nil-guard idiom
+# (see _helpers.tpl:766) from inside it. If the define cannot be found, or is
+# found but does not use that idiom, the mutation script fails loudly naming
+# what it could not find rather than silently no-op'ing, so a renamed or
+# differently-shaped fix does not leave this negative control quietly
+# pinning nothing.
+PLACEMENT_MUTANT="$TMP/mutant-placement"
+cp -a "$CHART" "$PLACEMENT_MUTANT"
+python3 - "$PLACEMENT_MUTANT/templates/_helpers.tpl" <<'PYEOF'
+import pathlib
+import re
+import sys
+
+p = pathlib.Path(sys.argv[1])
+text = p.read_text()
+
+block_re = re.compile(
+    r'{{-?\s*define "curie\.placement\.class"\s*-?}}.*?{{-?\s*end\s*-?}}',
+    re.DOTALL,
+)
+m = block_re.search(text)
+if not m:
+    sys.stderr.write(
+        "negative control could not find a 'curie.placement.class' define in "
+        "_helpers.tpl to mutate. That is the nil-safe placement accessor "
+        "Assertion 4 (#2008) expects the fix to introduce; if the fix named "
+        "it something else, update this negative control's anchor to match.\n"
+    )
+    sys.exit(1)
+
+block = m.group(0)
+if "| default dict" not in block:
+    sys.stderr.write(
+        "negative control found 'curie.placement.class' but no '| default "
+        "dict' nil-guard idiom (this chart's established pattern, see "
+        "_helpers.tpl:766) inside it to strip. Update this negative control "
+        "to match however the #2008 fix actually guards against nil "
+        ".Values.placement.\n"
+    )
+    sys.exit(1)
+
+mutated_block = block.replace("| default dict", "", 1)
+p.write_text(text.replace(block, mutated_block, 1))
+PYEOF
+
+PLACEMENT_MUTANT_OUT="$(mktemp -d -p "$TMP")"
+if helm template placement-render "$PLACEMENT_MUTANT" --output-dir "$PLACEMENT_MUTANT_OUT" \
+  -f "$PLACEMENT_LEGACY_NULL" "${PLACEMENT_HELM_ARGS[@]}" > /dev/null 2>&1; then
+  fail "negative control did not fire: a legacy release's retained 'placement: null' still rendered after stripping the nil-guard from curie.placement.class, so Placement assertion 4 (#2008) is not actually pinning anything."
+fi
+echo "  ok: stripping the nil-guard from curie.placement.class makes the legacy-null render fail again (the assert can fail)"
+
+echo "=== Placement assertion 5: a malformed placement class is refused, not silently dropped (#2008) ==="
+# The #2008 nil tolerance routes every class lookup through
+# `curie.placement.class`, which hands its result to the three consumers as
+# YAML. Helm's `fromYaml` returns an ERROR MAP rather than raising on a non-map
+# document, so without a kind refusal in that helper a malformed class renders
+# clean with `.podLabels`/`.annotations`/`.nodeSelector` all resolving to
+# nothing -- every scheduling constraint the operator asked for silently
+# dropped, and workloads free to land on unintended nodes. The pre-#2008
+# templates aborted on this shape; these asserts pin that the fix stayed
+# fail-CLOSED on it while only the nil case became tolerant.
+PLACEMENT_MALFORMED_CLASS="$TMP/placement-malformed-class.yaml"
+cat > "$PLACEMENT_MALFORMED_CLASS" <<'YAMLEOF'
+placement:
+  platform: spot
+YAMLEOF
+
+PLACEMENT_MALFORMED_CLASS_OUT="$(mktemp -d -p "$TMP")"
+PLACEMENT_MALFORMED_CLASS_ERR="$TMP/placement-malformed-class.err"
+# Same `set -euo pipefail` care as assertion 4: the expected outcome here is a
+# FAILING render, so check the exit status explicitly instead of letting the
+# non-zero status kill the script.
+if helm template placement-render "$CHART" --output-dir "$PLACEMENT_MALFORMED_CLASS_OUT" \
+  -f "$PLACEMENT_MALFORMED_CLASS" "${PLACEMENT_HELM_ARGS[@]}" \
+  > /dev/null 2>"$PLACEMENT_MALFORMED_CLASS_ERR"; then
+  fail "a malformed placement class ('placement.platform: spot', a scalar where a map of placement fields belongs) rendered successfully and silently dropped its scheduling constraints -- that is the #2008 fail-open regression: the chart must refuse the shape, not quietly schedule the workload anywhere."
+fi
+grep -q 'placement\.platform' "$PLACEMENT_MALFORMED_CLASS_ERR" \
+  || fail "a malformed placement class was refused, but the error never names the offending class ('placement.platform'), so the refusal is an incidental crash rather than an actionable message: $(cat "$PLACEMENT_MALFORMED_CLASS_ERR")"
+
+PLACEMENT_MALFORMED_TOP="$TMP/placement-malformed-top.yaml"
+cat > "$PLACEMENT_MALFORMED_TOP" <<'YAMLEOF'
+placement: spot
+YAMLEOF
+
+PLACEMENT_MALFORMED_TOP_OUT="$(mktemp -d -p "$TMP")"
+PLACEMENT_MALFORMED_TOP_ERR="$TMP/placement-malformed-top.err"
+if helm template placement-render "$CHART" --output-dir "$PLACEMENT_MALFORMED_TOP_OUT" \
+  -f "$PLACEMENT_MALFORMED_TOP" "${PLACEMENT_HELM_ARGS[@]}" \
+  > /dev/null 2>"$PLACEMENT_MALFORMED_TOP_ERR"; then
+  fail "a malformed top-level 'placement: spot' rendered successfully and silently dropped every placement class -- the chart must refuse a non-map placement, not quietly schedule every workload anywhere (#2008 fail-open regression)."
+fi
+grep -q 'placement' "$PLACEMENT_MALFORMED_TOP_ERR" \
+  || fail "a malformed top-level placement was refused, but the error never mentions 'placement', so the refusal is an incidental crash rather than an actionable message: $(cat "$PLACEMENT_MALFORMED_TOP_ERR")"
+
+# Positive control: the refusal must be narrow. The legacy nil path from
+# assertion 4 -- the whole point of #2008 -- must still render.
+PLACEMENT_REFUSAL_CONTROL_OUT="$(mktemp -d -p "$TMP")"
+PLACEMENT_REFUSAL_CONTROL_ERR="$TMP/placement-refusal-control.err"
+if ! helm template placement-render "$CHART" --output-dir "$PLACEMENT_REFUSAL_CONTROL_OUT" \
+  -f "$PLACEMENT_LEGACY_NULL" "${PLACEMENT_HELM_ARGS[@]}" \
+  > /dev/null 2>"$PLACEMENT_REFUSAL_CONTROL_ERR"; then
+  fail "the malformed-placement refusal is too broad: a legacy release's retained 'placement: null' no longer renders, so the fail-closed guard swallowed the #2008 nil tolerance it was supposed to preserve: $(cat "$PLACEMENT_REFUSAL_CONTROL_ERR")"
+fi
+echo "  ok: malformed placement values are refused by name, and legacy 'placement: null' still renders"
 
 echo "=== Assertion 12c: worker API URL and key wiring (#1529, #1578) ==="
 WORKER_API_CHECK="$TMP/check_worker_api.py"
