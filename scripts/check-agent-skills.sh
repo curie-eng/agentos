@@ -66,6 +66,7 @@ VALID_SKILLS=(
   "examples/coder/skills/coder"
   "examples/github-issues/skills/github-issues"
   "examples/sre-bot/skills/sre-bot"
+  "examples/squawk/skills/squawk"
   "examples/text-stats-engine/skills/text-stats"
   "examples/weather/skills/weather"
   "packages/plugin-format/tests/fixtures/valid_bundle/skills/greeter"
