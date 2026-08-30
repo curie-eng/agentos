@@ -146,6 +146,7 @@ def test_exact_declaration_calls_the_verifier_with_one_argv_selector(tmp_path: P
     [
         "apps/worker/tests/kernel/test_consumer.py::test_consumes_stream_entry_end_to_end_and_acks",
         "runner/tests/test_history.py::test_example",
+        "runner/tests/history/test_history.py::test_example",
         (
             "apps/api/tests/test_config_parity.py::"
             "TestResumeDeadLetterStreamCoherence::"

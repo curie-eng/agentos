@@ -22,7 +22,7 @@ SELECTOR = re.compile(
     r"(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+\.py::"
     r"(?:[A-Za-z_][A-Za-z0-9_]*::)*"
     r"test[A-Za-z0-9_]*(?:\[[A-Za-z0-9_.-]+\])?"
-    r"|runner/tests/[A-Za-z0-9_-]+\.py::"
+    r"|runner/tests/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+\.py::"
     r"(?:[A-Za-z_][A-Za-z0-9_]*::)*"
     r"test[A-Za-z0-9_]*(?:\[[A-Za-z0-9_.-]+\])?"
     r"|cli/tests/[A-Za-z0-9_-]+\.rs::[A-Za-z_][A-Za-z0-9_]*"

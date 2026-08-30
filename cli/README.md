@@ -741,7 +741,7 @@ Chart checks must return nonzero. It prints `UNPINNED` and exits nonzero when th
 selector remains green.
 
 It refuses invalid commit or pull request references, root commits, changes
-without classified test files or product files, selectors outside the four
+without classified test files or product files, selectors outside the five
 forms or not changed by the reference, a red baseline, and reverse patch
 conflicts. It also refuses unrelated collection, import, compile, setup, and
 teardown failures. Inline tests in product files are not inferred.
