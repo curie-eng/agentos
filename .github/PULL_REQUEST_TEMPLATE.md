@@ -17,6 +17,7 @@ Fix pin: <supported selector>
      Supported selector forms:
      apps/*/tests/*.py::test
      packages/*/tests/*.py::test
+     runner/tests/*.py::test
      cli/tests/name.rs::test
      charts/curie/ci/name.sh
 

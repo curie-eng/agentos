@@ -726,8 +726,8 @@ verify a fix commit or pull request. `<CHANGE>` accepts a committed change
 resolvable by Git or a pull request number or URL. The selector must be one of
 these forms:
 
-1. `apps/.../tests/test_x.py::test_y` or `packages/.../tests/test_x.py::test_y`
-   for a Python test.
+1. `apps/.../tests/test_x.py::test_y`, `packages/.../tests/test_x.py::test_y`,
+   or `runner/tests/test_x.py::test_y` for a Python test.
 2. `cli/tests/name.rs::test_name` for a Rust integration test.
 3. `charts/curie/ci/name.sh` for a chart check script.
 
@@ -741,7 +741,7 @@ Chart checks must return nonzero. It prints `UNPINNED` and exits nonzero when th
 selector remains green.
 
 It refuses invalid commit or pull request references, root commits, changes
-without classified test files or product files, selectors outside the three
+without classified test files or product files, selectors outside the five
 forms or not changed by the reference, a red baseline, and reverse patch
 conflicts. It also refuses unrelated collection, import, compile, setup, and
 teardown failures. Inline tests in product files are not inferred.

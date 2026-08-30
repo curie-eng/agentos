@@ -731,6 +731,20 @@ fn python_package_selector_uses_uv_with_the_exact_root_command() {
 }
 
 #[test]
+fn python_runner_selector_uses_uv_with_the_exact_root_command() {
+    let selector = "runner/tests/test_pin.py::test_pin";
+    assert_tool_selector_route(
+        "runner/tests/test_pin.py",
+        selector,
+        "def test_pin():\n    assert 1 == 1\n",
+        "def test_pin():\n    assert 2 == 2\n",
+        "uv",
+        &["run", "--python", "3.13", "pytest", selector],
+        &format!("FAILED {selector} - AssertionError"),
+    );
+}
+
+#[test]
 fn rust_selector_uses_cargo_with_an_exact_safe_test_name() {
     assert_tool_selector_route(
         "cli/tests/verify_pin.rs",
