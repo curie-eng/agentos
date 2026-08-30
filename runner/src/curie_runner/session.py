@@ -289,9 +289,10 @@ class SessionRunner:
     async def _record_turn(self, event: Event, state: TurnState) -> None:
         """Append one completed turn to the durable conversation transcript (#20).
 
-        Only a successful terminal final sets ``state.final_text``; a failed,
-        budget-halted, or auth-halted turn leaves it None and is not persisted, so
-        the transcript holds the delivered exchange, not error stubs. Best-effort:
+        Only a successful DONE terminal final sets ``state.final_text``; failed,
+        budget-halted, auth-halted, awaiting-approval, and idle turns leave it
+        None and are not persisted, so the transcript holds the delivered
+        exchange, not error stubs. Best-effort:
         a transient store failure is logged and never propagated -- recording
         history must not fail a turn the user already received an answer to.
         """
@@ -594,9 +595,11 @@ class SessionRunner:
                         yield line
                     self._status = final.status
                     self._turn_open = False
-                    # Capture the delivered reply so run_turn can persist the
-                    # {user, assistant} pair to the conversation transcript (#20).
-                    state.final_text = final.text
+                    # Only a clean DONE reply belongs in the conversation
+                    # transcript. Classified failures and approval pauses are
+                    # terminal delivery outcomes, not assistant answers (#20).
+                    if final.status is SessionStatus.DONE:
+                        state.final_text = final.text
                     yield to_ndjson_line(final)
                     return
                 yield to_ndjson_line(outbound)
@@ -621,8 +624,12 @@ class SessionRunner:
         final = _apply_approval_override(Final(text="", status=status), state)
         for line in self._approval_not_acted_lines(state, final):
             yield line
-        # No-op on this empty-text fallback final (the check requires a
-        # substantive answer), kept beside its twin for parity.
+        # An exhausted iterator has no result payload, but it may have streamed
+        # a substantive answer before ending. Persist that answer only when the
+        # delivered terminal outcome is a clean DONE, matching the translated
+        # Final path above.
+        if final.status is SessionStatus.DONE:
+            state.final_text = state.assistant_text
         for line in self._false_completion_lines(state, final):
             yield line
         self._status = final.status

@@ -200,15 +200,15 @@ def test_state_store_load_rejects_non_array() -> None:
     anyio.run(go)
 
 
-def _recording_runner(store: TranscriptStore):
+def _recording_runner(store: TranscriptStore, *, script=None, ceiling: int = 0):
     """A SessionRunner wired to the fake model and a recording transcript store."""
     from curie_runner import RunTracer, SideEffectClassifier
     from curie_runner.fake import FakeModelSession, default_turn
     from curie_runner.session import SessionRunner
 
     return SessionRunner(
-        session_factory=lambda: FakeModelSession(default_turn),
-        ceiling=0,
+        session_factory=lambda: FakeModelSession(script or default_turn),
+        ceiling=ceiling,
         tracer=RunTracer(None),
         classifier=SideEffectClassifier(),
         trace_name="t",
@@ -228,21 +228,32 @@ class _RecordingStore:
         self.turns.append(record)
 
 
+def _run_recording_turn(runner, event):
+    """Drive an inbound event through the real runner turn lifecycle."""
+    from aci_protocol import Final, parse_ndjson_line
+
+    async def go() -> Final:
+        await runner.start()
+        lines = [line async for line in runner.run_inbound(event)]
+        final = parse_ndjson_line(lines[-1])
+        assert isinstance(final, Final)
+        return final
+
+    return anyio.run(go)
+
+
 def test_successful_turn_is_appended_to_the_transcript() -> None:
-    from aci_protocol import Event
+    from aci_protocol import Event, SessionStatus
 
     store = _RecordingStore()
     runner = _recording_runner(store)
+    final = _run_recording_turn(
+        runner, Event(type="message", text="what changed?", user="U", ts="1")
+    )
 
-    async def go() -> None:
-        await runner.start()
-        async for _line in runner.run_inbound(
-            Event(type="message", text="what changed?", user="U", ts="1")
-        ):
-            pass
-
-    anyio.run(go)
-
+    assert final.status is SessionStatus.DONE
+    # The fully delivered DONE final records its reply once, not once per
+    # translated frame or once per store retry.
     assert len(store.turns) == 1
     assert store.turns[0].user == "what changed?"
     # default_turn's terminal result text.
@@ -250,36 +261,113 @@ def test_successful_turn_is_appended_to_the_transcript() -> None:
     assert store.turns[0].ts  # a timestamp was stamped
 
 
-def test_failed_turn_is_not_appended() -> None:
-    # A turn that never produced a successful terminal final (final_text stays
-    # None) must not be recorded, so the transcript holds only delivered answers.
-    from aci_protocol import Event
-    from curie_runner import RunTracer, SideEffectClassifier
-    from curie_runner.session import SessionRunner
-    from curie_runner.translate import TurnState
+def test_classified_failure_turn_is_not_appended_to_the_transcript() -> None:
+    from aci_protocol import Event, SessionStatus
+    from claude_agent_sdk import ResultMessage
 
+    def script():
+        return [
+            ResultMessage(
+                subtype="error_during_execution",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=True,
+                num_turns=1,
+                session_id="fake-session",
+                result="model failed",
+                usage=None,
+            )
+        ]
     store = _RecordingStore()
-    runner = SessionRunner(
-        session_factory=lambda: None,  # type: ignore[arg-type,return-value]
-        ceiling=0,
-        tracer=RunTracer(None),
-        classifier=SideEffectClassifier(),
-        trace_name="t",
-        session_id="s",
-        history_store=store,
+    final = _run_recording_turn(
+        _recording_runner(store, script=script),
+        Event(type="message", text="q", user="U", ts="1"),
     )
-    event = Event(type="message", text="q", user="U", ts="1")
 
-    # final_text None (a failed/aborted turn) -> no append.
-    anyio.run(lambda: runner._record_turn(event, TurnState()))
+    assert final.status is SessionStatus.CLASSIFIED_FAILURE
     assert store.turns == []
 
-    # final_text set (a delivered answer) -> appended.
-    state = TurnState()
-    state.final_text = "the answer"
-    anyio.run(lambda: runner._record_turn(event, state))
-    assert len(store.turns) == 1
-    assert store.turns[0].assistant == "the answer"
+
+def test_auth_rejection_turn_is_not_appended_to_the_transcript() -> None:
+    from aci_protocol import Event, SessionStatus
+    from claude_agent_sdk import AssistantMessage
+
+    store = _RecordingStore()
+    final = _run_recording_turn(
+        _recording_runner(
+            store,
+            script=lambda: [
+                AssistantMessage(content=[], model="fake-model", error="authentication_failed")
+            ],
+        ),
+        Event(type="message", text="q", user="U", ts="1"),
+    )
+
+    assert final.status is SessionStatus.CLASSIFIED_FAILURE
+    assert store.turns == []
+
+
+def test_budget_halted_turn_is_not_appended_to_the_transcript() -> None:
+    from aci_protocol import Event, SessionStatus
+    from claude_agent_sdk import AssistantMessage, TextBlock
+
+    store = _RecordingStore()
+    final = _run_recording_turn(
+        _recording_runner(
+            store,
+            ceiling=1,
+            script=lambda: [
+                AssistantMessage(
+                    content=[TextBlock(text="thinking")],
+                    model="fake-model",
+                    usage={"output_tokens": 2},
+                )
+            ],
+        ),
+        Event(type="message", text="q", user="U", ts="1"),
+    )
+
+    assert final.status is SessionStatus.CLASSIFIED_FAILURE
+    assert store.turns == []
+
+
+def test_awaiting_approval_turn_is_not_appended_to_the_transcript() -> None:
+    from aci_protocol import Event, SessionStatus
+    from curie_runner.fake import approval_turn
+
+    store = _RecordingStore()
+    final = _run_recording_turn(
+        _recording_runner(store, script=lambda: approval_turn("Approve the action")),
+        Event(type="message", text="q", user="U", ts="1"),
+    )
+
+    assert final.status is SessionStatus.AWAITING_APPROVAL
+    assert store.turns == []
+
+
+def test_interrupted_turn_is_not_appended_to_the_transcript() -> None:
+    # An interrupt reclassifies the terminal result to IDLE_AWAITING_INPUT. Drive
+    # that delivered terminal through run_inbound, rather than asserting only the
+    # internal state, to pin that it is not a completed assistant reply.
+    from aci_protocol import Event, Final, SessionStatus, parse_ndjson_line
+
+    store = _RecordingStore()
+    runner = _recording_runner(store)
+
+    async def go() -> Final:
+        await runner.start()
+        stream = runner.run_inbound(Event(type="message", text="q", user="U", ts="1"))
+        await stream.__anext__()  # The first streamed frame makes the turn live.
+        await runner.interrupt("user stop")
+        lines = [line async for line in stream]
+        final = parse_ndjson_line(lines[-1])
+        assert isinstance(final, Final)
+        return final
+
+    final = anyio.run(go)
+
+    assert final.status is SessionStatus.IDLE_AWAITING_INPUT
+    assert store.turns == []
 
 
 def test_compose_system_prompt_orders_memory_then_conversation_then_base() -> None:
@@ -355,3 +443,30 @@ def test_record_turn_swallows_store_failure() -> None:
     state.final_text = "answer"
     # Must not raise.
     anyio.run(lambda: runner._record_turn(Event(type="message", text="q", user="U", ts="1"), state))
+
+
+def test_successful_turn_survives_transcript_store_failure() -> None:
+    # A delivered successful answer remains DONE when its best-effort transcript
+    # append fails. This drives the full public inbound path so an early return
+    # before append cannot make the regression pass.
+    from aci_protocol import Event, SessionStatus
+
+    class _BoomStore:
+        def __init__(self) -> None:
+            self.append_attempts = 0
+
+        async def load(self) -> list[TurnRecord]:
+            return []
+
+        async def append(self, record: TurnRecord) -> None:
+            self.append_attempts += 1
+            raise HistoryError("state API unavailable")
+
+    store = _BoomStore()
+    final = _run_recording_turn(
+        _recording_runner(store),
+        Event(type="message", text="what changed?", user="U", ts="1"),
+    )
+
+    assert final.status is SessionStatus.DONE
+    assert store.append_attempts == 1

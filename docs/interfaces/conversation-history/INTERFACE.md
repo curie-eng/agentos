@@ -53,9 +53,11 @@ turns already spoken.
   harness-agnostically (plain prompt text, not any one harness's resume API). A
   transient load failure degrades to "no history" and does not block boot.
 - **Append side.** `append(record)` durably writes one turn. The runner appends
-  `{user, assistant}` after each successful terminal `final`
+  `{user, assistant}` only for a successful terminal `final` with `DONE` status
   (`SessionRunner._record_turn`), best-effort — a store failure never fails a
-  turn the user already received. Failed/budget/auth turns are not recorded.
+  turn the user already received. Classified failures, budget/auth halts,
+  awaiting-approval outcomes, and idle or otherwise incomplete outcomes are
+  not recorded.
 
 ## Implementations today
 
