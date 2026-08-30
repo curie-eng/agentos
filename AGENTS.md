@@ -326,37 +326,53 @@ rather than silently diverging.
 
 Sibling-path drift is the dominant historical bug class here: logic or hardening
 lands on one side of a structural seam while its twin keeps the old behavior.
-Known seam pairs:
+Known seam pairs, each tagged with what actually enforces it -- `vector:` (a
+frozen two-sided vector file), `gate:` (a test or CI job), `by construction:` (a
+shared module both sides route through), or `convention` (no gate covers the pair
+as a whole; remembered only):
 
 - worker vs CLI credential forwarding -- `_SDK_PASSTHROUGH_ENV`
   (`apps/worker/src/curie_worker/sandbox/docker.py`) and the CLI picker
   (`cli/src/commands.rs`) can't share code across Python/Rust, so they are frozen
   together in `tests/vectors/model-credential-forwarding.json`.
+  [vector: `tests/vectors/model-credential-forwarding.json`]
 - dispatcher vs CLI approval action ids -- the approval-card action-id constants
   (`apps/dispatcher/src/curie_dispatcher/approval_actions.py`) and the CLI's
   `APPROVE_ACTION_ID_PREFIX` (`cli/src/chat.rs`) can't share code across
   Python/Rust, so they are frozen together in
   `tests/vectors/approval-action-ids.json`.
+  [vector: `tests/vectors/approval-action-ids.json`]
 - API vs worker vs CLI thread-reset SET -- `THREAD_RESET_SET` /
   `THREAD_RESET_INFLIGHT_SET` (`apps/api/src/curie_api/threadreset.py`,
   `apps/worker/src/curie_worker/consumer.py`) and the CLI's `THREAD_RESET_SET`
   (`cli/src/queue.rs`) can't share code across Python/Rust. Operator
   `reset-thread` and `local`/`cluster` eval (#1534) both SADD the same set.
   Frozen in `tests/vectors/thread-reset-set.json`.
+  [vector: `tests/vectors/thread-reset-set.json`]
 - worker vs CLI eval-isolate prefix -- `EVAL_ISOLATE_THREAD_PREFIX`
   (`apps/worker/src/curie_worker/binding.py`) and the CLI copy
   (`cli/src/queue.rs`, stamped in `cli/src/message.rs::run_eval_turns`)
   cannot share code across Python/Rust, so they are frozen together in
   `tests/vectors/eval-memory-isolation.json`.
-- real SDK vs fake model session in the runner (`FakeModelSession`, `runner/src/curie_runner/fake.py`).
-- runs lane vs eval lane stream consumers (`apps/worker/src/curie_worker/consumer.py` vs `eval/stream.py`, both on the shared `stream_consumer.py`).
-- CLI-side vs API-side input validation (validate at the API/persistence boundary, mirror in the CLI).
+  [vector: `tests/vectors/eval-memory-isolation.json`]
+- real SDK vs fake model session in the runner (`FakeModelSession`,
+  `runner/src/curie_runner/fake.py`).
+  [by construction: `runner/src/curie_runner/adapter.py::ModelSession`]
+- runs lane vs eval lane stream consumers (`apps/worker/src/curie_worker/consumer.py`
+  vs `eval/stream.py`, both on the shared `stream_consumer.py`).
+  [by construction: `apps/worker/src/curie_worker/stream_consumer.py`]
+- CLI-side vs API-side input validation (validate at the API/persistence
+  boundary, mirror in the CLI). [convention]
 - `local up` vs `local down` compose profile sets.
+  [gate: `cli/src/local.rs::down_passes_every_up_profile`]
 - `compose.dev.yaml` vs the generated release compose.
+  [by construction: `compose/generate_release_compose.py`]
 - `core` vs `full` compose profiles.
-- `local` vs `cluster` verb pairs (reachability defaults, outcome enums).
-- CLI `--json` DTOs vs the API models they mirror.
-- deploy-time validators vs the runtime loaders that re-parse the same value (share normalization code).
+  [gate: `cli/src/local.rs::compose_file_declares_core_and_full_profiles`]
+- `local` vs `cluster` verb pairs (reachability defaults, outcome enums). [convention]
+- CLI `--json` DTOs vs the API models they mirror. [gate: `cli/tests/api_field_parity.rs`]
+- deploy-time validators vs the runtime loaders that re-parse the same value
+  (share normalization code). [convention]
 
 A PR touching one side of a seam must route the behavior through a shared helper
 both sides call, change both sides in the same PR, or name the sibling in the PR

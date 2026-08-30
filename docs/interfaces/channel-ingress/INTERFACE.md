@@ -1,7 +1,7 @@
 ---
 seam: Channel / ingress
-kind: SOFT
-impls: 1
+kind: CLEAN
+impls: 2 reply adapters behind the `ReplySink` port (Slack, HTTP) + a second wire ingress producer (Rust CLI)
 grade: B-
 vision_row: Communication
 epics:
@@ -16,7 +16,7 @@ order: 4
 
 > Part of the Curie swappable-seam catalog — see the [seam index](../../interfaces.md).
 <!-- BEGIN GENERATED: header (curie dev docs-lint) -->
-> **Kind:** SOFT &nbsp;·&nbsp; **Implementations today:** 1 &nbsp;·&nbsp; **Swap-readiness grade:** B-
+> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 2 reply adapters behind the `ReplySink` port (Slack, HTTP) + a second wire ingress producer (Rust CLI) &nbsp;·&nbsp; **Swap-readiness grade:** B-
 <!-- END GENERATED: header -->
 
 **Kind legend:** CLEAN = a real `Protocol`/typed port class · SOFT = swap via env/URL/prefix/wire, no code interface · NONE = not built yet.
@@ -270,8 +270,9 @@ incomplete adapter coverage and conformance.
   resolves the required `(kind, address)` pair with uniqueness on that same pair. There is
   no address-only overload or default kind: two adapters can own the same address without
   silently selecting one another's binding.
-- **Still leaks — adapter coverage and conformance.** Slack is the only registered kind, and
-  there is no multi-channel adapter framework or a second adapter proving conformance yet
+- **Still leaks — adapter coverage and conformance.** Slack is the only registered kind:
+  `HttpReplyAdapter` ships as a second adapter behind the port, but there is no
+  multi-channel adapter framework and no second adapter proving conformance yet
   (#27). The routing pair removes the binding ambiguity; it does not by itself implement or
   verify another adapter's ingress and egress behavior.
 
