@@ -166,6 +166,14 @@ SEED_FIXTURE: tuple[SeedAgent, ...] = (
 )
 
 
+# The two `agents.approval_routes` storage eras, split by migration 0034
+# (#1460). They are named constants because the era is a REQUIRED argument to
+# the seed planner: a mistyped string must raise rather than quietly select a
+# shape, which is the failure #2098 is closing here.
+APPROVAL_ROUTE_ERA_LEGACY = "legacy"
+APPROVAL_ROUTE_ERA_SPLIT = "split"
+
+
 @dataclass(frozen=True)
 class ColumnInfo:
     """One `information_schema.columns` row from the scratch database.
@@ -549,21 +557,75 @@ def _verify_mandatory_columns(
         )
 
 
-def _plan_seed_statements(columns: tuple[ColumnInfo, ...]) -> tuple[str, ...]:
+def _detect_approval_route_era(released_tree: Path) -> str:
+    """Decide which `approval_routes` shape the RELEASED code actually stored.
+
+    This is a SECOND era, independent of the 0021 channel-storage era that
+    `_plan_seed_statements` branches on (#2098). 0021 moved the channel binding
+    into `curie.agent_channels`; 0034 (#1460) rewrote the approval route from
+    `{"deploy": {"channel": X}}` into the split
+    `{"deploy": {"resolution": {"kind": ..., "address": X}}}`. A released ref can
+    sit BETWEEN them -- v0.7.0..v0.7.3 is post-0021 and pre-0034 -- so reading
+    the route shape off the channel discriminator seeds a FUTURE-shaped row the
+    released code could never have produced. The candidate's 0034 then rejects
+    `resolution` as an unknown legacy key and the gate blames the migration for
+    its own fixture, which is the worst failure mode a truth-telling gate has.
+
+    The DATABASE cannot answer this, so do not "fix" this into an
+    `information_schema` query. 0034 rewrites JSONB *content* only: it adds no
+    column, drops none, and adds no constraint, and the freshly-upgraded scratch
+    database is still empty, so there is no row whose shape could be observed.
+
+    The released WORKTREE is the authority instead. `_upgrade_pair` runs
+    `alembic upgrade head` against this tree, so every revision file present in
+    it HAS been applied by the time the seed runs.
+    """
+
+    versions = released_tree / "apps" / "api" / "alembic" / "versions"
+    if not versions.is_dir():
+        # No versions directory means the tree is not what we think it is.
+        # Guessing an era there is exactly how the bug above happens, so refuse.
+        raise GateError(
+            f"the released worktree has no alembic versions directory at "
+            f"{versions}, so the approval-route era cannot be determined; "
+            "refusing to guess an era and seed a route shape the released "
+            "code may never have stored"
+        )
+    if any(versions.glob("0034_*.py")):
+        return APPROVAL_ROUTE_ERA_SPLIT
+    return APPROVAL_ROUTE_ERA_LEGACY
+
+
+def _plan_seed_statements(
+    columns: tuple[ColumnInfo, ...],
+    *,
+    approval_route_era: str,
+) -> tuple[str, ...]:
     """Render the SQL that writes `SEED_FIXTURE` into the released schema.
 
-    Branches on `agents.slack_channel` -- the pre/post-0021 discriminator -- and
-    that same discriminator selects the `approval_routes` shape, because the 0021
-    era and the 0034 era coincide at both refs we pin. That coupling is an
-    assumption rather than a law, and it is made safe by the read-back: a future
-    released ref landing between the eras makes the seeded route go missing from
-    the dump, and the read-back FAILS naming the address instead of passing
-    vacuously.
+    Branches on `agents.slack_channel` -- the pre/post-0021 discriminator -- for
+    the channel binding, and on `approval_route_era` for the route shape. The two
+    are INDEPENDENT migration eras and must not be read off one discriminator
+    (#2098): a released ref between 0021 and 0034 gets the channel binding from
+    the schema and the route shape from the released tree.
+
+    `approval_route_era` is a required keyword with NO default on purpose. A
+    default is a silent wrong-era guess, and a silent wrong-era guess is the bug.
 
     Raises `GateError` rather than returning an empty plan when neither binding
     location exists. A seed that no-ops turns the read-back into a vacuous pass,
     which is the exact class of failure #2098 exists to close.
     """
+
+    if approval_route_era not in (
+        APPROVAL_ROUTE_ERA_LEGACY,
+        APPROVAL_ROUTE_ERA_SPLIT,
+    ):
+        raise GateError(
+            f"unrecognized approval route era {approval_route_era!r}; expected "
+            f"{APPROVAL_ROUTE_ERA_LEGACY!r} (pre-0034) or "
+            f"{APPROVAL_ROUTE_ERA_SPLIT!r} (post-0034)"
+        )
 
     present = {(column.table_name, column.column_name) for column in columns}
     statements: list[str] = []
@@ -574,12 +636,15 @@ def _plan_seed_statements(columns: tuple[ColumnInfo, ...]) -> tuple[str, ...]:
             filled={"agents": {"id", "name", "slack_channel", "approval_routes"}},
         )
         for agent in SEED_FIXTURE:
+            # `slack_channel` present means pre-0021, and 0021 precedes 0034, so
+            # this branch is pre-0034 by construction: the `slack_channel` +
+            # `split` quadrant cannot exist and nothing here is conditioned on
+            # the era. Pre-0034 storage; migration 0034 (#1460) rewrites it into
+            # the split `resolution` shape on the way up with NO validation,
+            # which is what carries the legacy address into the read models.
             route = _json_literal(
                 None
                 if agent.approval_route_address is None
-                # Pre-0034 storage. Migration 0034 rewrites it into the split
-                # `resolution` shape on the way up with NO validation, which is
-                # what carries the legacy address forward into the read models.
                 else {"deploy": {"channel": agent.approval_route_address}}
             )
             statements.append(
@@ -598,12 +663,13 @@ def _plan_seed_statements(columns: tuple[ColumnInfo, ...]) -> tuple[str, ...]:
                 "agent_channels": {"id", "agent_id", "kind", "address"},
             },
         )
+        split_era = approval_route_era == APPROVAL_ROUTE_ERA_SPLIT
         for agent in SEED_FIXTURE:
-            route = _json_literal(
-                None
-                if agent.approval_route_address is None
+            if agent.approval_route_address is None:
+                route_value: dict[str, Any] | None = None
+            elif split_era:
                 # Post-0034 storage: already the split shape.
-                else {
+                route_value = {
                     "deploy": {
                         "resolution": {
                             "kind": agent.kind,
@@ -611,7 +677,14 @@ def _plan_seed_statements(columns: tuple[ColumnInfo, ...]) -> tuple[str, ...]:
                         }
                     }
                 }
-            )
+            else:
+                # Post-0021 but pre-0034 (v0.7.0..v0.7.3). The channel binding
+                # already lives in `agent_channels`, yet the route is still the
+                # legacy `channel` shape -- seeding `resolution` here writes a
+                # fixture the released code could never have produced, and the
+                # candidate's 0034 rejects it as an unknown legacy key (#2098).
+                route_value = {"deploy": {"channel": agent.approval_route_address}}
+            route = _json_literal(route_value)
             # One statement per agent, so the binding is written in the same
             # transaction as the row it belongs to and the new id never has to be
             # round-tripped back through psql. `endpoint` / `adapter` are left
@@ -639,7 +712,12 @@ def _plan_seed_statements(columns: tuple[ColumnInfo, ...]) -> tuple[str, ...]:
     )
 
 
-def _seed_released_database(database_name: str, *, phase: str) -> None:
+def _seed_released_database(
+    database_name: str,
+    *,
+    phase: str,
+    approval_route_era: str,
+) -> None:
     """Write the fixture into the released database, between the two upgrades.
 
     Every failure in here is a SETUP fault, not a gate verdict: it raises
@@ -650,7 +728,9 @@ def _seed_released_database(database_name: str, *, phase: str) -> None:
 
     print(f"=== {phase}: {database_name} ===", flush=True)
     columns = _introspect_columns(database_name)
-    statements = _plan_seed_statements(columns)
+    statements = _plan_seed_statements(
+        columns, approval_route_era=approval_route_era
+    )
     for statement in statements:
         _checked_output(
             _database_command(statement, database_name=database_name),
@@ -722,7 +802,15 @@ def _upgrade_pair(
     # window in which the released schema is what an operator's database actually
     # looks like. Seeding earlier has no schema to write into; seeding later
     # writes rows the candidate migrations never had to carry.
-    _seed_released_database(database_name, phase="seed")
+    #
+    # The route era is detected HERE, from the released tree, and not from the
+    # schema the seed introspects: the 0021 and 0034 eras are independent and a
+    # released ref can sit between them (#2098).
+    _seed_released_database(
+        database_name,
+        phase="seed",
+        approval_route_era=_detect_approval_route_era(released_tree),
+    )
 
     for phase, tree, ref, commit, arguments in candidate_phases:
         result = _run_alembic(

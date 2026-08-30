@@ -16,8 +16,9 @@ surface the gate and its read-back runner are built to:
 * `SeedAgent` / `SEED_FIXTURE` -- the seeded rows, asserted here against the
   LIVE `_validate_channel_binding`, so a fixture softened to make the gate green
   goes red instead.
-* `ColumnInfo` / `_plan_seed_statements` -- the schema-adaptive planner, which
-  must never silently seed nothing.
+* `ColumnInfo` / `_plan_seed_statements` / `_detect_approval_route_era` -- the
+  schema-adaptive planner, which must never silently seed nothing and must pick
+  the 0021 channel era and the 0034 approval-route era INDEPENDENTLY (#2098).
 * `scripts/released_upgrade_readback.py::_collect_failures` -- the pure
   assertion helper, which must not pass vacuously and must name the DATA before
   it names Pydantic.
@@ -31,6 +32,7 @@ from __future__ import annotations
 
 import dataclasses
 import importlib.util
+import json
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -387,7 +389,10 @@ def _agent_channels_columns(gate: ModuleType) -> tuple[Any, ...]:
 def test_legacy_column_branch_writes_every_address_into_curie_agents(
     gate: ModuleType,
 ) -> None:
-    statements = gate._plan_seed_statements(_legacy_columns(gate))
+    statements = gate._plan_seed_statements(
+        _legacy_columns(gate),
+        approval_route_era=gate.APPROVAL_ROUTE_ERA_LEGACY,
+    )
 
     rendered = "\n".join(statements)
     assert statements, "the seed must never plan nothing"
@@ -402,7 +407,10 @@ def test_legacy_column_branch_writes_every_address_into_curie_agents(
 def test_agent_channels_branch_writes_agent_id_kind_and_address(
     gate: ModuleType,
 ) -> None:
-    statements = gate._plan_seed_statements(_agent_channels_columns(gate))
+    statements = gate._plan_seed_statements(
+        _agent_channels_columns(gate),
+        approval_route_era=gate.APPROVAL_ROUTE_ERA_SPLIT,
+    )
 
     rendered = "\n".join(statements)
     binding_statements = [
@@ -423,7 +431,12 @@ def test_legacy_branch_seeds_the_pre_0034_approval_route_shape(
     gate: ModuleType,
 ) -> None:
     """Pre-0034 storage: `{"deploy": {"channel": ...}}`, rewritten on the way up."""
-    rendered = "\n".join(gate._plan_seed_statements(_legacy_columns(gate)))
+    rendered = "\n".join(
+        gate._plan_seed_statements(
+            _legacy_columns(gate),
+            approval_route_era=gate.APPROVAL_ROUTE_ERA_LEGACY,
+        )
+    )
 
     routed = next(
         agent
@@ -439,7 +452,12 @@ def test_agent_channels_branch_seeds_the_post_0034_approval_route_shape(
     gate: ModuleType,
 ) -> None:
     """Post-0034 storage: the split `{"resolution": {"kind", "address"}}` shape."""
-    rendered = "\n".join(gate._plan_seed_statements(_agent_channels_columns(gate)))
+    rendered = "\n".join(
+        gate._plan_seed_statements(
+            _agent_channels_columns(gate),
+            approval_route_era=gate.APPROVAL_ROUTE_ERA_SPLIT,
+        )
+    )
 
     routed = next(
         agent
@@ -449,6 +467,163 @@ def test_agent_channels_branch_seeds_the_post_0034_approval_route_shape(
     assert "approval_routes" in rendered
     assert "resolution" in rendered
     assert routed.approval_route_address in rendered
+
+
+def _routed_agent(gate: ModuleType) -> Any:
+    """The one fixture row that carries an approval route."""
+    return next(
+        agent
+        for agent in gate.SEED_FIXTURE
+        if agent.approval_route_address is not None
+    )
+
+
+def _legacy_route_json(gate: ModuleType) -> str:
+    """The pre-0034 route literal, built the way the planner builds it."""
+    routed = _routed_agent(gate)
+    return json.dumps({"deploy": {"channel": routed.approval_route_address}})
+
+
+def _split_route_json(gate: ModuleType) -> str:
+    """The post-0034 route literal, key order included (#1460)."""
+    routed = _routed_agent(gate)
+    return json.dumps(
+        {
+            "deploy": {
+                "resolution": {
+                    "kind": routed.kind,
+                    "address": routed.approval_route_address,
+                }
+            }
+        }
+    )
+
+
+def _fake_released_tree(tmp_path: Path, *, revisions: tuple[str, ...]) -> Path:
+    """A worktree-shaped directory holding just the named revision files."""
+    versions = tmp_path / "apps" / "api" / "alembic" / "versions"
+    versions.mkdir(parents=True)
+    for name in revisions:
+        (versions / name).write_text("# stub revision\n", encoding="utf-8")
+    return tmp_path
+
+
+def test_agent_channels_branch_with_a_legacy_route_era_seeds_the_channel_shape(
+    gate: ModuleType,
+) -> None:
+    """The between-eras quadrant: post-0021 bindings, pre-0034 route (#2098).
+
+    A released ref in v0.7.0..v0.7.3 binds channels through `agent_channels` and
+    STILL stores `{"deploy": {"channel": ...}}`. Reading the route shape off the
+    0021 discriminator seeds `resolution` there -- a future-shaped fixture the
+    released code could never have produced -- and the candidate's 0034 (#1460)
+    then rejects it as an unknown legacy key, so the gate blames the migration
+    for its own seed. Revert the era split and this test goes red.
+    """
+
+    rendered = "\n".join(
+        gate._plan_seed_statements(
+            _agent_channels_columns(gate),
+            approval_route_era=gate.APPROVAL_ROUTE_ERA_LEGACY,
+        )
+    )
+
+    assert "curie.agent_channels" in rendered
+    assert _legacy_route_json(gate) in rendered
+    assert "resolution" not in rendered
+
+
+def test_agent_channels_branch_with_a_split_route_era_seeds_the_resolution_shape(
+    gate: ModuleType,
+) -> None:
+    """Post-0034 released refs keep the split shape: the era is a choice, not a drop."""
+
+    rendered = "\n".join(
+        gate._plan_seed_statements(
+            _agent_channels_columns(gate),
+            approval_route_era=gate.APPROVAL_ROUTE_ERA_SPLIT,
+        )
+    )
+
+    assert _split_route_json(gate) in rendered
+    assert _legacy_route_json(gate) not in rendered
+
+
+def test_legacy_column_branch_with_a_legacy_route_era_seeds_the_channel_shape(
+    gate: ModuleType,
+) -> None:
+    """Pre-0021 implies pre-0034, so this quadrant is unchanged by the era split."""
+
+    rendered = "\n".join(
+        gate._plan_seed_statements(
+            _legacy_columns(gate),
+            approval_route_era=gate.APPROVAL_ROUTE_ERA_LEGACY,
+        )
+    )
+
+    assert "slack_channel" in rendered
+    assert _legacy_route_json(gate) in rendered
+    assert "resolution" not in rendered
+
+
+def test_a_released_tree_holding_0034_is_the_split_era(
+    gate: ModuleType,
+    tmp_path: Path,
+) -> None:
+    """The released WORKTREE is the authority: 0034 adds no schema to introspect."""
+
+    tree = _fake_released_tree(
+        tmp_path,
+        revisions=("0021_agent_channels.py", "0034_approval_route_targets.py"),
+    )
+
+    assert gate._detect_approval_route_era(tree) == gate.APPROVAL_ROUTE_ERA_SPLIT
+
+
+def test_a_released_tree_without_0034_is_the_legacy_era(
+    gate: ModuleType,
+    tmp_path: Path,
+) -> None:
+    """v0.7.0..v0.7.3's shape: 0021 has run, 0034 has not."""
+
+    tree = _fake_released_tree(
+        tmp_path,
+        revisions=("0021_agent_channels.py", "0033_action_gate_approval.py"),
+    )
+
+    assert gate._detect_approval_route_era(tree) == gate.APPROVAL_ROUTE_ERA_LEGACY
+
+
+def test_a_released_tree_with_no_versions_directory_raises(
+    gate: ModuleType,
+    tmp_path: Path,
+) -> None:
+    """No versions directory means the tree is not what we think it is.
+
+    Guessing an era from a tree we cannot read is how a future-shaped fixture
+    gets seeded in the first place, so refuse instead of defaulting.
+    """
+
+    with pytest.raises(gate.GateError) as excinfo:
+        gate._detect_approval_route_era(tmp_path)
+
+    assert "alembic versions directory" in str(excinfo.value)
+
+
+def test_an_unrecognized_approval_route_era_raises_naming_the_value(
+    gate: ModuleType,
+) -> None:
+    """No default and no fallthrough: a bad era must never select a shape."""
+
+    with pytest.raises(gate.GateError) as excinfo:
+        gate._plan_seed_statements(
+            _agent_channels_columns(gate), approval_route_era="0034"
+        )
+
+    message = str(excinfo.value)
+    assert "0034" in message
+    assert gate.APPROVAL_ROUTE_ERA_LEGACY in message
+    assert gate.APPROVAL_ROUTE_ERA_SPLIT in message
 
 
 def test_neither_binding_location_raises_naming_both_candidates(
@@ -461,7 +636,9 @@ def test_neither_binding_location_raises_naming_both_candidates(
     )
 
     with pytest.raises(gate.GateError) as excinfo:
-        gate._plan_seed_statements(columns)
+        gate._plan_seed_statements(
+            columns, approval_route_era=gate.APPROVAL_ROUTE_ERA_LEGACY
+        )
 
     message = str(excinfo.value)
     assert "agents.slack_channel" in message
@@ -483,7 +660,9 @@ def test_an_unfilled_mandatory_column_raises_naming_that_column(
     )
 
     with pytest.raises(gate.GateError) as excinfo:
-        gate._plan_seed_statements(columns)
+        gate._plan_seed_statements(
+            columns, approval_route_era=gate.APPROVAL_ROUTE_ERA_LEGACY
+        )
 
     assert "gate_probe_required" in str(excinfo.value)
 
