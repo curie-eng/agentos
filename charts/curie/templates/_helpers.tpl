@@ -1105,7 +1105,8 @@ true
 
 {{/* ---- Sandbox container hardening (Rail 3) ----
      The identical container-level lockdown applied to the runner and every
-     helper container in the sandbox pod (bundle-fetch, bundle-extract, litellm).
+     helper container in the sandbox pod (bundle-fetch, bundle-extract,
+     workspace-init).
      Extracted so the four copies cannot drift (#493); callers keep their own
      `{{- if $runner.hardening.enabled }}` guard and apply `nindent 10`. This is
      the container securityContext only -- the pod-level securityContext
