@@ -1,4 +1,7 @@
-"""A write connector that can do exactly one thing: start this bot's upgrade.
+"""One gated write -- start this bot's upgrade -- and one read beside it.
+
+`upgrade_self` starts the upgrade. `latest_release` says what version is
+available to upgrade TO. Both take no arguments.
 
 Why the bot cannot just do the upgrade itself
 ---------------------------------------------
@@ -18,11 +21,24 @@ Why a separate server, and why zero arguments
 ----------------------------------------------
 `k8s-write`'s docstring is the standing argument: it exposes ONE tool, so there
 is no second thing for a gate to miss, and "there is no parameter through which a
-caller could reach an image, an env var, a command". This tool goes one step
+caller could reach an image, an env var, a command". `upgrade_self` goes one step
 further and takes NO arguments at all. The repository, the branch, the agent
 name, the image and the command all come from the CronJob's own `jobTemplate`,
 read from the cluster at call time. There is no field a caller can influence, so
 there is nothing to validate and nothing to escape.
+
+There are now two tools here, and the "one thing for a gate to miss" argument
+still holds, because the second one is a READ. `latest_release` takes no
+arguments either, holds no credential, and changes nothing; there is exactly one
+write on this server and exactly one gate in front of it. What would break the
+argument is a second WRITE, or either tool growing a parameter -- not a
+zero-argument read of a public page.
+
+It lives here rather than in its own connector because it answers the same
+question from the other side. "What version is available" is what a person asks
+immediately before "can we upgrade", and splitting them across two images, two
+publish jobs and two declarations buys separation between a read and a write
+that share a repository, a domain, and no credential at all.
 
 The grant RBAC cannot narrow, and what stands in for it
 --------------------------------------------------------
@@ -84,6 +100,13 @@ CRONJOB = os.environ.get("SELF_UPGRADE_CRONJOB", "").strip()
 # this defaults to the one the ServiceAccount is bound to when set.
 NAMESPACE = os.environ.get("SELF_UPGRADE_NAMESPACE", "").strip()
 
+# The repository whose published releases answer "what is the newest version".
+# Read-only and public: no credential, and none is added here on purpose -- see
+# `latest_release`. Empty disables that tool's answer rather than guessing a repo.
+RELEASE_REPO = os.environ.get("SELF_UPGRADE_RELEASE_REPO", "").strip()
+RELEASE_API = os.environ.get("SELF_UPGRADE_RELEASE_API", "https://api.github.com").rstrip("/")
+RELEASE_TIMEOUT = float(os.environ.get("SELF_UPGRADE_RELEASE_TIMEOUT_SECONDS", "15"))
+
 mcp = FastMCP(
     "self-upgrade",
     host=os.environ.get("BIND_ADDRESS", "0.0.0.0"),
@@ -96,6 +119,15 @@ mcp = FastMCP(
 # destructiveHint=True: it replaces the running bot with a different build of
 # itself. idempotentHint=False: calling it twice starts two upgrades, which is
 # exactly what the active-Job check below exists to prevent.
+# A read. Its own annotation rather than reusing UPGRADE, because a client that
+# filters on readOnlyHint must be able to tell these two apart.
+READ = ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=True,
+)
+
 UPGRADE = ToolAnnotations(
     readOnlyHint=False,
     destructiveHint=True,
@@ -371,6 +403,130 @@ def upgrade_self() -> str:
         prior=None,
         post={"job": name},
         target={"kind": "Job", "namespace": namespace, "name": name},
+    )
+
+
+@mcp.tool(annotations=READ)
+def latest_release() -> str:
+    """The newest published release of the platform this bot runs on.
+
+    Answers "what is the latest available version" -- the question a person asks
+    right before "can we upgrade". It reads the repository's published releases
+    and reports the newest tag; it changes nothing and needs no approval.
+
+    THIS IS NOT WHAT THIS BOT IS RUNNING. The installed platform version is a
+    property of the cluster, readable from `app.kubernetes.io/version` on the
+    platform's own objects with the read-only Kubernetes tools. Report both and
+    say which is which; a newer tag here does not mean anything was upgraded.
+
+    Nor is it your own bundle's version, which moves independently.
+
+    The reply is a JSON object: `ok`, `summary`, and `latest` (tag, name, url,
+    published_at) when the read succeeded.
+    """
+
+    if not RELEASE_REPO:
+        return json.dumps(
+            {
+                "ok": False,
+                "summary": (
+                    "refusing: SELF_UPGRADE_RELEASE_REPO is not set, so this "
+                    "connector does not know which project's releases to read. "
+                    "Setting it is an operator change."
+                ),
+                "latest": None,
+            },
+            sort_keys=True,
+        )
+
+    url = f"{RELEASE_API}/repos/{RELEASE_REPO}/releases/latest"
+    try:
+        # No credential, deliberately. A public repository needs none, and a
+        # token here would put a credential in a connector whose whole job is to
+        # answer one read -- the thing the read-only Kubernetes connector drops
+        # `configuration_view` to avoid. The cost is GitHub's unauthenticated
+        # rate limit, which a question asked a few times a day does not reach.
+        with httpx.Client(timeout=RELEASE_TIMEOUT) as client:
+            response = client.get(
+                url,
+                headers={
+                    "Accept": "application/vnd.github+json",
+                    "User-Agent": "curie-sre-bot-self-upgrade",
+                },
+            )
+    except httpx.HTTPError as exc:
+        return json.dumps(
+            {
+                "ok": False,
+                "summary": f"could not reach {RELEASE_API}: {exc}",
+                "latest": None,
+            },
+            sort_keys=True,
+        )
+
+    if response.status_code == 404:
+        return json.dumps(
+            {
+                "ok": False,
+                "summary": (
+                    f"{RELEASE_REPO} has no published releases, or is not visible "
+                    "without a credential this connector deliberately does not hold."
+                ),
+                "latest": None,
+            },
+            sort_keys=True,
+        )
+    if response.status_code == 403:
+        return json.dumps(
+            {
+                "ok": False,
+                "summary": (
+                    "the releases API refused this read (403). Unauthenticated "
+                    "rate limits are the usual cause; it clears on its own."
+                ),
+                "latest": None,
+            },
+            sort_keys=True,
+        )
+    if response.status_code >= 400:
+        return json.dumps(
+            {
+                "ok": False,
+                "summary": f"the releases API returned HTTP {response.status_code}",
+                "latest": None,
+            },
+            sort_keys=True,
+        )
+
+    try:
+        payload = response.json()
+        tag = payload["tag_name"]
+    except (ValueError, KeyError, TypeError):
+        return json.dumps(
+            {
+                "ok": False,
+                "summary": "the releases API returned a body with no tag_name",
+                "latest": None,
+            },
+            sort_keys=True,
+        )
+
+    return json.dumps(
+        {
+            "ok": True,
+            "summary": (
+                f"the newest published release of {RELEASE_REPO} is {tag}. This is "
+                "what is available, NOT what this install is running -- read the "
+                "installed version from the platform's own Kubernetes objects."
+            ),
+            "latest": {
+                "tag": tag,
+                "name": payload.get("name"),
+                "url": payload.get("html_url"),
+                "published_at": payload.get("published_at"),
+            },
+        },
+        sort_keys=True,
     )
 
 
