@@ -91,6 +91,25 @@
       },
       "cardinality_bound": 168
     },
+    "curie.history.resume.cache_read": {
+      "type": "histogram",
+      "unit": "{token}",
+      "description": "Provider cache read input tokens on the first turn after structured replay.",
+      "monotonic": false,
+      "attributes": {
+        "service.name": [
+          "curie-runner"
+        ],
+        "source": [
+          "runner"
+        ],
+        "cache_hit": [
+          "true",
+          "false"
+        ]
+      },
+      "cardinality_bound": 2
+    },
     "curie.queue.enqueue": {
       "type": "counter",
       "unit": "{message}",

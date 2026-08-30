@@ -1,4 +1,4 @@
-"""The conversation-history port: resolution, turn shape, preamble, the state-API
+"""The conversation-history port: resolution, structured replay, the state-API
 store, and the per-turn append that persists a thread's transcript (#20).
 
 The StateApiTranscriptStore is exercised against a tiny in-memory fake of the
@@ -15,15 +15,12 @@ from curie_runner.adapter import build_structured_resume
 from curie_runner.history import (
     ApprovalContext,
     ConversationMessage,
-    ConversationReplay,
     HistoryError,
     NullTranscriptStore,
     StateApiTranscriptStore,
-    SummaryRecord,
     TranscriptStore,
     TurnRecord,
     build_conversation_replay,
-    format_conversation_preamble,
     resolve_history,
 )
 
@@ -121,6 +118,16 @@ def test_legacy_turn_becomes_structured_user_assistant_messages() -> None:
         ),
     )
 
+
+def test_malformed_structured_turn_is_rejected_instead_of_falling_back_to_legacy() -> None:
+    with pytest.raises(HistoryError, match="structured conversation messages"):
+        TurnRecord.from_dict(
+            {
+                "user": "must not silently survive",
+                "assistant": "legacy fallback",
+                "messages": [42],
+            }
+        )
 
 def test_long_history_compacts_once_then_keeps_prefix_stable_until_next_boundary() -> None:
     records = [
@@ -245,77 +252,6 @@ def test_resolve_unsupported_scheme_raises() -> None:
         resolve_history("s3://bucket/hist", {})
 
 
-def test_preamble_empty_is_none() -> None:
-    assert format_conversation_preamble([]) is None
-
-
-def test_preamble_includes_user_and_assistant_text_oldest_first() -> None:
-    turns = [
-        TurnRecord(user="deploy the app", assistant="pushed to dev"),
-        TurnRecord(user="and prod?", assistant="promoted to prod"),
-    ]
-    preamble = format_conversation_preamble(turns)
-    assert preamble is not None
-    assert "deploy the app" in preamble
-    assert "pushed to dev" in preamble
-    assert "and prod?" in preamble
-    assert "promoted to prod" in preamble
-    # Oldest first: the first turn's user text precedes the second turn's.
-    assert preamble.index("deploy the app") < preamble.index("and prod?")
-
-
-# --- preamble windowing (the preamble must be bounded) ---------------------------
-
-
-def test_preamble_windows_by_max_turns_keeping_the_tail() -> None:
-    # A long thread must not render an unbounded preamble: with an explicit small
-    # max_turns, only the most-recent turns survive and an elision note flags that
-    # earlier turns were dropped.
-    turns = [
-        TurnRecord(user=f"user-msg-{i}", assistant=f"assistant-msg-{i}") for i in range(50)
-    ]
-    preamble = format_conversation_preamble(turns, max_turns=5)
-    assert preamble is not None
-    # The newest turn's content is kept; an old (dropped) turn's is not.
-    assert "user-msg-49" in preamble
-    assert "user-msg-0" not in preamble
-    # The truncation is announced.
-    assert "elided" in preamble
-
-
-def test_preamble_windows_by_max_bytes_keeping_the_tail() -> None:
-    # A tiny byte budget caps the rendered size: the oldest turns are dropped, the
-    # most-recent kept, and the elision note appears. Driven by an explicit
-    # max_bytes so the test does not depend on the default's exact value.
-    turns = [TurnRecord(user=f"u{i}", assistant=f"a{i}") for i in range(50)]
-    unbounded = format_conversation_preamble(turns, max_turns=None, max_bytes=None)
-    assert unbounded is not None
-    preamble = format_conversation_preamble(turns, max_bytes=400)
-    assert preamble is not None
-    assert "elided" in preamble
-    # Most-recent kept, oldest dropped.
-    assert "u49" in preamble
-    assert "u0" not in preamble
-    # Truncation actually shrank the output and stayed near the budget.
-    assert len(preamble.encode("utf-8")) < len(unbounded.encode("utf-8"))
-    assert len(preamble.encode("utf-8")) <= 2 * 400
-
-
-def test_preamble_short_transcript_is_byte_identical_and_unnoted() -> None:
-    # Backward-compat: a small transcript under the defaults renders with NO
-    # elision note and is byte-identical to the uncapped (max_turns=None,
-    # max_bytes=None) output for the same records.
-    turns = [
-        TurnRecord(user="deploy the app", assistant="pushed to dev"),
-        TurnRecord(user="and prod?", assistant="promoted to prod"),
-    ]
-    uncapped = format_conversation_preamble(turns, max_turns=None, max_bytes=None)
-    defaulted = format_conversation_preamble(turns)
-    assert defaulted == uncapped
-    assert defaulted is not None
-    assert "elided" not in defaulted
-
-
 def test_state_store_load_empty_is_empty() -> None:
     app, _ = _fake_state_app()
 
@@ -364,6 +300,26 @@ def test_state_store_load_rejects_non_array() -> None:
             url = str(server.make_url("/agents/A/state/transcript/t1"))
             store = StateApiTranscriptStore(url, token=None)
             with pytest.raises(HistoryError):
+                await store.load()
+
+    anyio.run(go)
+
+
+def test_state_store_load_rejects_malformed_log_entry() -> None:
+    app = web.Application()
+
+    async def get_key(_request: web.Request) -> web.Response:
+        return web.json_response(
+            {"namespace": "transcript", "key": "t1", "value": [42], "version": 1}
+        )
+
+    app.router.add_get("/agents/A/state/transcript/t1", get_key)
+
+    async def go() -> None:
+        async with TestServer(app) as server:
+            url = str(server.make_url("/agents/A/state/transcript/t1"))
+            store = StateApiTranscriptStore(url, token=None)
+            with pytest.raises(HistoryError, match="invalid transcript record"):
                 await store.load()
 
     anyio.run(go)
@@ -433,6 +389,7 @@ def test_successful_turn_is_appended_to_the_transcript() -> None:
         "assistant",
         "assistant",
         "user",
+        "assistant",
     ]
     assert any(
         isinstance(message.content, list)
@@ -540,7 +497,7 @@ def test_budget_halted_turn_is_not_appended_to_the_transcript() -> None:
     assert store.turns == []
 
 
-def test_awaiting_approval_turn_is_not_appended_to_the_transcript() -> None:
+def test_awaiting_approval_turn_is_appended_with_suspend_context() -> None:
     from aci_protocol import Event, SessionStatus
     from curie_runner.fake import approval_turn
 
@@ -551,7 +508,11 @@ def test_awaiting_approval_turn_is_not_appended_to_the_transcript() -> None:
     )
 
     assert final.status is SessionStatus.AWAITING_APPROVAL
-    assert store.turns == []
+    assert len(store.turns) == 1
+    assert store.turns[0].status == SessionStatus.AWAITING_APPROVAL.value
+    assert store.turns[0].approval is not None
+    assert store.turns[0].approval.gate_kind == "policy"
+    assert store.turns[0].approval.summary == "Approve the action"
 
 
 def test_interrupted_turn_is_not_appended_to_the_transcript() -> None:
@@ -579,23 +540,22 @@ def test_interrupted_turn_is_not_appended_to_the_transcript() -> None:
     assert store.turns == []
 
 
-def test_compose_system_prompt_orders_memory_then_conversation_then_base() -> None:
-    # Boot delivery (ADR-0029): durable memory leads, then this thread's recovered
-    # conversation, then the bundle/env system prompt. Any part may be absent.
+def test_compose_system_prompt_excludes_conversation_history() -> None:
+    # ADR-0119: only memory and bundle instructions belong in the system prompt;
+    # conversation history crosses as structured messages.
     from curie_runner.__main__ import _compose_system_prompt
 
-    assert _compose_system_prompt("BASE", "MEM", "CONV", model=None) == "MEM\n\nCONV\n\nBASE"
-    assert _compose_system_prompt("BASE", None, "CONV", model=None) == "CONV\n\nBASE"
-    assert _compose_system_prompt("BASE", "MEM", None, model=None) == "MEM\n\nBASE"
-    assert _compose_system_prompt(None, None, None, model=None) is None
+    assert _compose_system_prompt("BASE", "MEM", model=None) == "MEM\n\nBASE"
+    assert _compose_system_prompt("BASE", None, model=None) == "BASE"
+    assert _compose_system_prompt(None, None, model=None) is None
 
 
 def test_compose_system_prompt_appends_configured_model() -> None:
     from curie_runner.__main__ import _compose_system_prompt
 
     assert (
-        _compose_system_prompt("BASE", "MEM", "CONV", model="z-ai/glm-5.2")
-        == "MEM\n\nCONV\n\nBASE\n\nConfigured model: z-ai/glm-5.2"
+        _compose_system_prompt("BASE", "MEM", model="z-ai/glm-5.2")
+        == "MEM\n\nBASE\n\nConfigured model: z-ai/glm-5.2"
     )
 
 

@@ -15,17 +15,186 @@ this boundary and nothing above it is. ``aci-protocol`` is never mocked.
 
 from __future__ import annotations
 
+import json
+import os
+import uuid
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol, cast
 
 from claude_agent_sdk import (
+    AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKClient,
     HookMatcher,
     SdkPluginConfig,
+    ServerToolResultBlock,
+    ServerToolUseBlock,
     TaskBudget,
+    TextBlock,
+    ThinkingBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+    UserMessage,
 )
-from claude_agent_sdk.types import CanUseTool, McpSdkServerConfig, PermissionMode
+from claude_agent_sdk._cli_version import __cli_version__
+from claude_agent_sdk._internal.session_store import project_key_for_directory
+from claude_agent_sdk.types import (
+    CanUseTool,
+    McpSdkServerConfig,
+    PermissionMode,
+    SessionKey,
+    SessionStore,
+    SessionStoreEntry,
+)
+
+from .history import ConversationMessage
+
+_SDK_SESSION_NAMESPACE = uuid.UUID("83efb74f-f09e-4db6-b898-9ed8d7084ba8")
+
+
+class _SeededSessionStore:
+    """Process-local SDK store used only to materialize a portable prefix."""
+
+    def __init__(self, key: SessionKey, entries: list[SessionStoreEntry]) -> None:
+        self._key = key
+        self._entries = list(entries)
+
+    async def append(self, key: SessionKey, entries: list[SessionStoreEntry]) -> None:
+        if key == self._key:
+            self._entries.extend(entries)
+
+    async def load(self, key: SessionKey) -> list[SessionStoreEntry] | None:
+        return list(self._entries) if key == self._key and self._entries else None
+
+
+@dataclass(frozen=True)
+class StructuredResume:
+    """Claude SDK options needed to reconstruct one portable prefix."""
+
+    session_id: str
+    resume: str | None
+    session_store: SessionStore | None
+    session_key: SessionKey
+
+
+def build_structured_resume(
+    messages: tuple[ConversationMessage, ...],
+    *,
+    curie_session_id: str,
+    cwd: str | None,
+) -> StructuredResume:
+    """Materialize portable messages into the SDK's ephemeral resume envelope.
+
+    Only role/content is sourced from durable storage. UUIDs and the local JSONL
+    envelope are deterministic adapter details reconstructed on every runner;
+    no provider-native transcript is made into Curie's persistence contract.
+    """
+
+    session_id = str(uuid.uuid5(_SDK_SESSION_NAMESPACE, curie_session_id))
+    key: SessionKey = {
+        "project_key": project_key_for_directory(cwd),
+        "session_id": session_id,
+    }
+    if not messages:
+        return StructuredResume(
+            session_id=session_id,
+            resume=None,
+            session_store=None,
+            session_key=key,
+        )
+
+    effective_cwd = str(Path(cwd).resolve()) if cwd is not None else os.getcwd()
+    entries: list[SessionStoreEntry] = []
+    parent_uuid: str | None = None
+    for index, message in enumerate(messages):
+        canonical = json.dumps(message.to_dict(), separators=(",", ":"), sort_keys=True)
+        entry_uuid = str(uuid.uuid5(uuid.UUID(session_id), f"{index}:{canonical}"))
+        entry = cast(
+            "SessionStoreEntry",
+            {
+                "parentUuid": parent_uuid,
+                "isSidechain": False,
+                "userType": "external",
+                "cwd": effective_cwd,
+                "sessionId": session_id,
+                "version": __cli_version__,
+                "gitBranch": "",
+                "type": message.role,
+                "message": message.to_dict(),
+                "uuid": entry_uuid,
+                # This is adapter envelope metadata, not conversation time. Keep it
+                # stable so separate runners materialize identical local transcripts.
+                "timestamp": "1970-01-01T00:00:00.000Z",
+            },
+        )
+        entries.append(entry)
+        parent_uuid = entry_uuid
+    store = _SeededSessionStore(key, entries)
+    return StructuredResume(
+        session_id=session_id,
+        resume=session_id,
+        session_store=cast("SessionStore", store),
+        session_key=key,
+    )
+
+
+def _content_block_to_dict(block: object) -> dict[str, Any] | None:
+    if isinstance(block, TextBlock):
+        return {"type": "text", "text": block.text}
+    if isinstance(block, ThinkingBlock):
+        return {"type": "thinking", "thinking": block.thinking, "signature": block.signature}
+    if isinstance(block, ToolUseBlock):
+        return {"type": "tool_use", "id": block.id, "name": block.name, "input": block.input}
+    if isinstance(block, ToolResultBlock):
+        result: dict[str, Any] = {
+            "type": "tool_result",
+            "tool_use_id": block.tool_use_id,
+            "content": block.content,
+        }
+        if block.is_error is not None:
+            result["is_error"] = block.is_error
+        return result
+    if isinstance(block, ServerToolUseBlock):
+        return {
+            "type": "server_tool_use",
+            "id": block.id,
+            "name": block.name,
+            "input": block.input,
+        }
+    if isinstance(block, ServerToolResultBlock):
+        return {
+            "type": "server_tool_result",
+            "tool_use_id": block.tool_use_id,
+            "content": block.content,
+        }
+    return None
+
+
+def model_message_to_conversation(message: object) -> ConversationMessage | None:
+    """Project one SDK message into Curie's portable role/content shape."""
+
+    if isinstance(message, UserMessage):
+        if isinstance(message.content, str):
+            content: str | list[dict[str, Any]] = message.content
+        else:
+            content = [
+                projected
+                for block in message.content
+                if (projected := _content_block_to_dict(block)) is not None
+            ]
+        return ConversationMessage(role="user", content=content)
+    if isinstance(message, AssistantMessage):
+        return ConversationMessage(
+            role="assistant",
+            content=[
+                projected
+                for block in message.content
+                if (projected := _content_block_to_dict(block)) is not None
+            ],
+        )
+    return None
 
 
 class ModelSession(Protocol):
@@ -60,6 +229,8 @@ def build_options(
     max_turns: int,
     max_budget_usd: float | None,
     resume: str | None,
+    session_id: str | None = None,
+    session_store: SessionStore | None = None,
     thinking: dict[str, Any] | None = None,
     task_budget_hint: int | None = None,
     env: dict[str, str] | None = None,
@@ -70,10 +241,10 @@ def build_options(
 ) -> ClaudeAgentOptions:
     """Assemble ClaudeAgentOptions for the session.
 
-    ``resume`` is the rehydrate path (ADR-0003, stateless-first): when a history
-    ref is supplied it is passed as the SDK ``resume`` session id so a resumed
-    thread reconstructs its history from the store rather than assuming a
-    surviving in-RAM process.
+    ``resume`` is the provider-native rehydrate path (ADR-0003,
+    stateless-first). For Curie's portable history it names an ephemeral SDK
+    session envelope rebuilt by :func:`build_structured_resume`; it never points
+    the provider at Curie's durable state URL or assumes surviving local state.
 
     The three ACI budget fields map to distinct SDK controls: ``max_budget_usd``
     is the daily USD cap enforced natively; ``task_budget_hint`` becomes the SDK
@@ -105,6 +276,8 @@ def build_options(
         max_turns=max_turns,
         max_budget_usd=max_budget_usd,
         resume=resume,
+        session_id=session_id if resume is None else None,
+        session_store=session_store,
         task_budget=task_budget,
         permission_mode=permission_mode,
         can_use_tool=can_use_tool,

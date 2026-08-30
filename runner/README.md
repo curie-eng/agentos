@@ -56,10 +56,10 @@ readinessProbe hits `/healthz`).
   `CURIE_SESSION_ID`, `CURIE_SANDBOX_ID`, `CURIE_BUDGET`, optional
   `CURIE_MEMORY_REF` / `CURIE_CREDENTIALS`, `OTEL_EXPORTER_OTLP_*`.
 - **Runner-local**: `CURIE_MODEL`, `CURIE_MAX_TURNS`,
-  `CURIE_HISTORY_REF` (rehydrate; falls back to `CURIE_MEMORY_REF`),
+  `CURIE_HISTORY_REF` (rehydrate this thread from the durable state API),
   `CURIE_HISTORY_MAX_TURNS` / `CURIE_HISTORY_MAX_BYTES` (bound the rehydrated
-  history preamble to a tail window; defaults 40 turns / 16000 bytes, a
-  nonpositive value falls back to the default),
+  structured prefix with stable summary boundaries; defaults 40 turns / 16000
+  bytes, a nonpositive value falls back to the default),
   `CURIE_RUNNER_PORT`, `CURIE_RUNNER_TOKEN` (per-sandbox bearer token gating
   the three ACI POST routes; enforced only when set), `CURIE_FAKE_MODEL`
   (offline smoke; no model call).

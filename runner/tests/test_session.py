@@ -101,7 +101,7 @@ def test_first_resumed_turn_records_cache_read_metric_once(monkeypatch) -> None:
         (
             "curie.history.resume.cache_read",
             321,
-            {"service.name": "curie-runner", "source": "runner", "cache_hit": True},
+            {"service.name": "curie-runner", "source": "runner", "cache_hit": "true"},
         )
     ]
 

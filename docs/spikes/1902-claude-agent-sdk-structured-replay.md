@@ -37,6 +37,16 @@ Observed positive run:
 - runner B cache creation: 56 input tokens
 - runner B cache read: 67,170 input tokens
 
+The SDK's streaming-input API rejects a caller-authored assistant message as a
+new query (`Expected message role 'user', got 'assistant'`), so Curie does not
+inject history through that surface. A second spike reduced the restored store
+to deterministic entries whose only durable inputs were each message's `role`
+and `content`; UUIDs, parent links, CLI version, working directory, and timestamp
+were reconstructed adapter metadata. A fresh client recovered the exact marker
+and observed 67,641 cache-read tokens and 345 cache-creation tokens. This is the
+shape implemented by `build_structured_resume`: provider JSONL is never Curie's
+durable contract.
+
 ## Cache-breakpoint negative arm
 
 A separate run cloned the externally stored transcript twice. One fresh client
@@ -77,6 +87,37 @@ Implementation may proceed using two distinct layers:
 A harness that implements neither structured message replay nor an equivalent
 provider-native restore must declare the capability absent and fail the resume;
 it must not fall back to the legacy rendered transcript preamble.
+
+## Durable regression evidence
+
+The implementation leaves both offline and opt-in provider regressions in the
+repository. On 2026-08-30 the following disposable provider command passed in
+27.32 seconds against two selected tests:
+
+```text
+CURIE_E2E_LIVE=1 uv run pytest -q runner/tests/test_live.py \
+  -k 'structured_replay_cache_hit or cross_runner_approval_exact_once' -vv
+```
+
+The cache test primes one portable prefix, reconstructs it in a fresh client,
+and then changes one durable user message in a third fresh client. It asserts a
+positive cache read for the identical prefix, a lower read for the changed
+prefix, and greater cache creation for the changed arm. The approval test blocks
+a disposable Bash append in runner A (the file remains absent), persists the
+structured suspension including an explicit non-executed tool result, resumes
+runner B with a one-shot grant, and asserts the file has exactly one line. A
+second attempt on runner B pauses again and the file remains one line. The same
+run asserts exactly one `curie.history.resume.cache_read` observation with a
+positive value and `cache_hit=true`.
+
+The two approval-runner identities in that evidence are the distinct trace names
+`live-structured-approval-block` (runner A) and
+`live-structured-approval-resume` (runner B), both bound to the same portable
+thread identity `live-approval-thread-1902`.
+
+The offline companion in `runner/tests/test_structured_replay_e2e.py` proves the
+same one-shot/re-arm flow without a provider and proves rejected and expired
+resume decisions authorize zero calls.
 
 ## Reproduction shape
 
