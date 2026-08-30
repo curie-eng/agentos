@@ -23,7 +23,9 @@
 #                           subresource-scoped identity. Same shape as
 #                           k8s-write: no K8S_SCALE_KUBECONFIG, no scale path.
 #   self-upgrade  DECLARED. One gated verb that starts this bot's own upgrade,
-#                           so it happens when asked rather than on a schedule.
+#                           so it happens when asked rather than on a schedule,
+#                           plus an ungated read saying which version is
+#                           available to upgrade to.
 #                           Needs SELF_UPGRADE_KUBECONFIG and the CronJob it
 #                           starts. Read manifests/upgrade-role.yaml first: its
 #                           grant is the widest in this bundle.
@@ -296,6 +298,16 @@ connectors:
       # its own ServiceAccount namespace, which is the same place -- stated here
       # so a cross-namespace install does not silently look in the wrong one.
       SELF_UPGRADE_NAMESPACE: ""
+      # Which project's published releases answer "what version is available".
+      # A public, read-only lookup with NO credential -- the connector holds none
+      # for it on purpose. Empty disables that tool's answer rather than guessing.
+      #
+      # This is what closes the question the sandbox cannot answer for itself:
+      # the runner has no general internet egress (deliberately -- it is
+      # prompt-injectable), so a direct fetch of a releases page is refused at
+      # the network. Connector pods do have egress, so the read happens here and
+      # the sandbox still learns only a URL.
+      SELF_UPGRADE_RELEASE_REPO: curie-eng/curie
     # A FOURTH kubeconfig, bound to the ServiceAccount in
     # manifests/upgrade-role.yaml. Never one of the other three: those are
     # scoped to the workloads this bot may touch, and this one is scoped to the
