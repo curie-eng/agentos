@@ -21,6 +21,97 @@ prometheus-node-exporter:
       memory: 32Mi
     limits:
       memory: 64Mi
+# The source boundary (issue #2060). This Prometheus is the SRE bot's OWN
+# capacity evidence, not a cluster-wide scrape platform, and the chart's default
+# annotation-driven discovery does not know the difference: `prometheus.io/scrape`
+# on ANY Service, EndpointSlice or Pod in ANY namespace is a target. Installed
+# beside a monitoring stack that was already there, that silently ingests a
+# second kube-state-metrics and a second node exporter, so one Kubernetes object
+# comes back twice with identical workload labels and the bot reports double the
+# restarts and double the estate.
+#
+# Two halves, and each covers something the other does not:
+#
+#   1. `namespaces.own_namespace` on every annotation-driven job. Discovery is
+#      bounded to the namespace Prometheus itself runs in -- whatever
+#      `--observability-namespace` named -- which is where this installer puts
+#      kube-state-metrics and the node exporter. A stack that was already in the
+#      cluster is out of scope BY CONSTRUCTION rather than by a name filter that
+#      a differently-named release would slip past. The node-role jobs
+#      (`kubernetes-nodes`, `kubernetes-nodes-cadvisor`) are deliberately left
+#      alone: they resolve one target per Node through the API server, so they
+#      cannot double count, and namespace-scoping them would blind the bot to
+#      the kubelet. `kubernetes-api-servers` already pins `default;kubernetes`.
+#
+#   2. `curie_source` stamped on every scraped sample, so the boundary is
+#      visible in the data and a shipped query can say which install an answer
+#      came from.
+#
+# Two limits, stated because a boundary nobody can see through is worse than
+# none. `metric_relabel_configs` do NOT reach Prometheus's own per-scrape series
+# (`up`, `scrape_duration_seconds`), which are synthesized after metric
+# relabeling and so carry no stamp -- qualify those by `job`. And the scope is a
+# NAMESPACE, not a release: a second monitoring stack installed into this same
+# namespace puts both kube-state-metrics instances back in scope, stamped
+# identically, so give this stack a namespace of its own.
+#
+# What this gives up outside that namespace, and why an operator who wants a
+# cluster-wide scrape platform should run a separate one, is in
+# examples/sre-bot/README.md ("One source of capacity truth"). Enforced by
+# charts/curie/ci/observability-stack-assertions.sh, which renders this file
+# beside a second annotated stack and replays the rendered relabel program.
+#
+# Keyed by job name: Helm deep-merges these maps over the chart's own
+# `scrapeConfigs`, so each job keeps its default `relabel_configs` and only the
+# discovery scope is replaced and the stamp added. The stamp is written once and
+# aliased -- YAML anchors are resolved when Helm loads this file, so the chart
+# sees nine literal copies. They do not cross `-f` boundaries, so keep the
+# anchor and its aliases in this one file.
+scrapeConfigs:
+  # The pushgateway subchart is disabled above, so this job can only ever
+  # resolve someone else's pushgateway.
+  prometheus-pushgateway:
+    enabled: false
+  prometheus:
+    metric_relabel_configs: &curie_source_stamp
+      - target_label: curie_source
+        replacement: curie-sre-bot
+  kubernetes-api-servers:
+    metric_relabel_configs: *curie_source_stamp
+  kubernetes-nodes:
+    metric_relabel_configs: *curie_source_stamp
+  kubernetes-nodes-cadvisor:
+    metric_relabel_configs: *curie_source_stamp
+  kubernetes-service-endpoints:
+    kubernetes_sd_configs:
+      - role: endpointslice
+        namespaces:
+          own_namespace: true
+    metric_relabel_configs: *curie_source_stamp
+  kubernetes-service-endpoints-slow:
+    kubernetes_sd_configs:
+      - role: endpointslice
+        namespaces:
+          own_namespace: true
+    metric_relabel_configs: *curie_source_stamp
+  kubernetes-services:
+    kubernetes_sd_configs:
+      - role: service
+        namespaces:
+          own_namespace: true
+    metric_relabel_configs: *curie_source_stamp
+  kubernetes-pods:
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          own_namespace: true
+    metric_relabel_configs: *curie_source_stamp
+  kubernetes-pods-slow:
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          own_namespace: true
+    metric_relabel_configs: *curie_source_stamp
 server:
   retention: 7d
   retentionSize: 3GB

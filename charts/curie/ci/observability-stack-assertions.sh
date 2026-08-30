@@ -10,6 +10,10 @@ trap 'rm -rf "$TMP"' EXIT
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
+# The one place this gate names the Prometheus chart version. The assertions
+# below cross-check it against the version cli/src/examples.rs actually installs.
+PROMETHEUS_CHART_VERSION=29.27.0
+
 required_assets=(
   grafana-values.yaml
   loki-values.yaml
@@ -46,9 +50,19 @@ helm template alloy grafana/alloy \
   --namespace observability \
   -f "$ASSETS/alloy-values.yaml" >"$TMP/alloy.yaml"
 helm template prometheus prometheus-community/prometheus \
-  --version 29.27.0 \
+  --version "$PROMETHEUS_CHART_VERSION" \
   --namespace observability \
   -f "$ASSETS/prometheus-values.yaml" >"$TMP/prometheus.yaml"
+# A monitoring stack that was already in the cluster before this installer ran
+# (issue #2060). Rendering the same subcharts under a different release in a
+# different namespace is the cheapest faithful stand-in: the annotations, labels
+# and object names are the real ones, so the scrape-boundary assertion below is
+# fed what Kubernetes service discovery would actually present rather than an
+# invented fixture that could drift from the chart.
+helm template legacy prometheus-community/prometheus \
+  --version "$PROMETHEUS_CHART_VERSION" \
+  --namespace other-monitoring \
+  -f "$ASSETS/prometheus-values.yaml" >"$TMP/prometheus-second-source.yaml"
 
 helm template curie "$CHART" \
   --namespace curie \
@@ -66,10 +80,12 @@ python3 - \
   "$TMP/loki.yaml" \
   "$TMP/alloy.yaml" \
   "$TMP/prometheus.yaml" \
+  "$TMP/prometheus-second-source.yaml" \
   "$ASSETS/tempo.yaml" \
   "$TMP/curie-install.yaml" \
   "$TMP/curie-upgrade.yaml" \
   "$TMP/curie-default.yaml" \
+  "$PROMETHEUS_CHART_VERSION" \
   "${OBSERVABILITY_ASSERTION_MUTATION:-}" <<'PY'
 import base64
 from decimal import Decimal
@@ -86,10 +102,12 @@ import yaml
     loki_path,
     alloy_path,
     prometheus_path,
+    prometheus_second_source_path,
     tempo_path,
     curie_install_path,
     curie_upgrade_path,
     curie_default_path,
+    prometheus_chart_version,
     mutation,
 ) = sys.argv[1:]
 assert mutation in {
@@ -105,6 +123,11 @@ assert mutation in {
     "viewer-role",
     "rotation-restart",
     "restart-scope",
+    "scrape-namespace",
+    "scrape-source-label",
+    "scrape-source-label-inert",
+    "scrape-source-label-conditional",
+    "scrape-namespace-names",
 }, f"unknown mutation {mutation!r}"
 
 assets = Path(assets_path)
@@ -322,6 +345,322 @@ assert grafana_pvcs, "Grafana must render a persistent PVC"
 assert any(at(doc, "spec", "resources", "requests", "storage") == "2Gi" for doc in grafana_pvcs)
 assert "10Gi" in storage_requests(loki_docs), "Loki must render a 10Gi persistent claim"
 assert "8Gi" in storage_requests(prometheus_docs), "Prometheus must render an 8Gi persistent claim"
+
+# ---------------------------------------------------------------------------
+# The scrape source boundary (issue #2060).
+#
+# The shipped Prometheus used to run the chart's stock annotation-driven
+# discovery, which keeps any `prometheus.io/scrape` target in ANY namespace.
+# Installed beside a monitoring stack that was already in the cluster, it
+# ingested that stack's kube-state-metrics and node exporter too: one Kubernetes
+# object, two series, identical workload labels, different scrape-source labels,
+# and a bot that reported twice the restarts.
+#
+# So this does not read the config and agree with it. It reconstructs the
+# Kubernetes service-discovery targets that the shipped stack and a second
+# rendered stack would actually present, runs the rendered relabel program over
+# them the way Prometheus would, and asserts on which targets survive. That is
+# what makes it fail when the boundary is removed rather than when the wording
+# changes -- see the `scrape-namespace` and `scrape-source-label` mutations.
+SCRAPE_SOURCE_LABEL = "curie_source"
+SCRAPE_SOURCE_VALUE = "curie-sre-bot"
+SECOND_SOURCE_NAMESPACE = "other-monitoring"
+RELEASE_NAMESPACE = "observability"
+
+
+def relabel_text(value, default):
+    """YAML reads a bare `true` as a bool; Prometheus reads these fields as strings."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def meta_label(name):
+    return re.sub(r"[^a-zA-Z0-9_]", "_", name)
+
+
+def expand_replacement(replacement, matched):
+    def substitute(reference):
+        index = int(reference.group(1) or reference.group(2))
+        try:
+            return matched.group(index) or ""
+        except IndexError:
+            return ""
+
+    return re.sub(r"\$(?:(\d+)|\{(\d+)\})", substitute, replacement)
+
+
+def apply_relabel(labels, rules):
+    """The keep/drop/replace/labelmap subset the shipped jobs use. None = dropped."""
+    labels = dict(labels)
+    for rule in rules:
+        action = rule.get("action", "replace")
+        regex = relabel_text(rule.get("regex"), "(.*)")
+        if action == "labelmap":
+            pattern = re.compile(rf"^(?:{regex})$")
+            for name in list(labels):
+                matched = pattern.match(name)
+                if matched:
+                    renamed = expand_replacement(
+                        relabel_text(rule.get("replacement"), "$1"), matched
+                    )
+                    labels[renamed] = labels[name]
+            continue
+        separator = relabel_text(rule.get("separator"), ";")
+        value = separator.join(labels.get(name, "") for name in rule.get("source_labels", []))
+        matched = re.match(rf"^(?:{regex})$", value)
+        if action == "keep":
+            if not matched:
+                return None
+        elif action == "drop":
+            if matched:
+                return None
+        elif action == "replace":
+            if not matched:
+                continue
+            replaced = expand_replacement(relabel_text(rule.get("replacement"), "$1"), matched)
+            if replaced:
+                labels[rule["target_label"]] = replaced
+            else:
+                labels.pop(rule["target_label"], None)
+        else:
+            raise AssertionError(f"unsupported relabel action {action!r}")
+    return labels
+
+
+def discovery_scope(sd_config):
+    """The namespaces one kubernetes_sd_config can see, or None for cluster-wide.
+
+    `own_namespace` and `names` are a UNION in Prometheus, not alternatives, so
+    reading only the first would pass a config that names another stack's
+    namespace outright while production happily scrapes it.
+    """
+    namespaces = sd_config.get("namespaces") or {}
+    scope = set(namespaces.get("names") or ())
+    if namespaces.get("own_namespace"):
+        scope.add(RELEASE_NAMESPACE)
+    return scope or None
+
+
+def exporter_sd_targets(docs, namespace):
+    """Kubernetes SD targets for the capacity exporters in one rendered stack.
+
+    Which stack a target belongs to is read off its namespace rather than passed
+    in, so the assertions below cannot disagree with the render about it.
+    """
+    targets = []
+    for doc in docs:
+        metadata = doc.get("metadata", {})
+        name = metadata.get("name", "")
+        exporter = next(
+            (family for family in ("kube-state-metrics", "node-exporter") if family in name),
+            None,
+        )
+        if exporter is None:
+            continue
+        if doc.get("kind") not in {"Service", "Deployment", "DaemonSet", "StatefulSet"}:
+            continue
+        object_namespace = metadata.get("namespace")
+        assert object_namespace == namespace, (
+            f"{doc['kind']} {name} rendered into {object_namespace!r}, expected {namespace!r}: "
+            "the scrape boundary assertion reads a target's stack off its namespace"
+        )
+        if doc.get("kind") == "Service":
+            labels = {
+                "__address__": "10.0.0.1:8080",
+                "__meta_kubernetes_namespace": object_namespace,
+                "__meta_kubernetes_service_name": name,
+                "__meta_kubernetes_endpointslice_port_name": "http",
+                "__meta_kubernetes_pod_node_name": "node-1",
+            }
+            for key, value in (metadata.get("annotations") or {}).items():
+                labels[f"__meta_kubernetes_service_annotation_{meta_label(key)}"] = value
+            for key, value in (metadata.get("labels") or {}).items():
+                labels[f"__meta_kubernetes_service_label_{meta_label(key)}"] = value
+            # One Service is reachable through both the endpointslice and the
+            # service role, and the shipped config enables jobs for each.
+            for role in ("endpointslice", "service"):
+                targets.append(
+                    {
+                        "role": role,
+                        "namespace": object_namespace,
+                        "exporter": exporter,
+                        "labels": dict(labels),
+                    }
+                )
+        elif doc.get("kind") in {"Deployment", "DaemonSet", "StatefulSet"}:
+            template = at(doc, "spec", "template", "metadata")
+            labels = {
+                "__address__": "10.0.0.1:8080",
+                "__meta_kubernetes_namespace": object_namespace,
+                "__meta_kubernetes_pod_name": f"{name}-abc",
+                "__meta_kubernetes_pod_ip": "10.0.0.1",
+                "__meta_kubernetes_pod_phase": "Running",
+                "__meta_kubernetes_pod_node_name": "node-1",
+            }
+            for key, value in (template.get("annotations") or {}).items():
+                labels[f"__meta_kubernetes_pod_annotation_{meta_label(key)}"] = value
+            for key, value in (template.get("labels") or {}).items():
+                labels[f"__meta_kubernetes_pod_label_{meta_label(key)}"] = value
+            targets.append(
+                {"role": "pod", "namespace": object_namespace, "exporter": exporter,
+                 "labels": labels}
+            )
+    return targets
+
+
+# This gate renders a chart version it pins itself, while the installer pins its
+# own in cli/src/examples.rs. Let those two drift and the gate keeps rendering
+# the OLD chart: a chart upgrade that adds a new cluster-wide annotation-driven
+# job would ship unbounded and unstamped with this assertion still green, which
+# is precisely the regression it exists to catch. The three other upstream pins
+# in this script have the same latent drift, but nothing here depends on them
+# the way the scrape boundary depends on this one.
+installer_source = (chart / ".." / ".." / "cli" / "src" / "examples.rs").resolve().read_text()
+installer_pin = re.search(
+    r'"prometheus-community/prometheus",\s*\n\s*"([^"]+)"', installer_source
+)
+assert installer_pin, "could not read the Prometheus chart version out of cli/src/examples.rs"
+assert installer_pin.group(1) == prometheus_chart_version, (
+    f"this gate renders prometheus chart {prometheus_chart_version} but the installer ships "
+    f"{installer_pin.group(1)}; update PROMETHEUS_CHART_VERSION in "
+    "charts/curie/ci/observability-stack-assertions.sh"
+)
+
+prometheus_second_source_docs = load_docs(prometheus_second_source_path)
+second_source_services = [
+    doc.get("metadata", {}).get("name")
+    for doc in prometheus_second_source_docs
+    if doc.get("kind") == "Service"
+    and (doc.get("metadata", {}).get("annotations") or {}).get("prometheus.io/scrape") == "true"
+]
+assert any("kube-state-metrics" in name for name in second_source_services), (
+    "the second source must render an annotated kube-state-metrics Service"
+)
+assert any("node-exporter" in name for name in second_source_services), (
+    "the second source must render an annotated node exporter Service"
+)
+
+server_configs = [
+    parsed
+    for _, key, parsed, _ in embedded_yaml(prometheus_docs)
+    if key == "prometheus.yml" and isinstance(parsed, dict)
+]
+assert len(server_configs) == 1, f"expected one Prometheus config, found {len(server_configs)}"
+scrape_configs = at(server_configs[0], "scrape_configs")
+
+if mutation == "scrape-namespace":
+    for job in scrape_configs:
+        for sd_config in job.get("kubernetes_sd_configs", []):
+            sd_config.pop("namespaces", None)
+if mutation == "scrape-source-label":
+    for job in scrape_configs:
+        if job["job_name"] == "kubernetes-service-endpoints":
+            job.pop("metric_relabel_configs", None)
+if mutation == "scrape-source-label-inert":
+    # The rule is still there, still names the right label, and never fires.
+    for job in scrape_configs:
+        for rule in job.get("metric_relabel_configs", []):
+            if rule.get("target_label") == SCRAPE_SOURCE_LABEL:
+                rule["source_labels"] = ["__name__"]
+                rule["regex"] = "never_matches_any_metric"
+if mutation == "scrape-source-label-conditional":
+    # The rule fires, but only for one metric family: a single-sample replay
+    # would call this stamped.
+    for job in scrape_configs:
+        for rule in job.get("metric_relabel_configs", []):
+            if rule.get("target_label") == SCRAPE_SOURCE_LABEL:
+                rule["source_labels"] = ["__name__"]
+                rule["regex"] = "kube_.*"
+if mutation == "scrape-namespace-names":
+    # The scope is still bounded, and it names the other stack's namespace.
+    for job in scrape_configs:
+        for sd_config in job.get("kubernetes_sd_configs", []):
+            if sd_config.get("namespaces"):
+                sd_config["namespaces"]["names"] = [SECOND_SOURCE_NAMESPACE]
+
+sd_targets = exporter_sd_targets(prometheus_docs, RELEASE_NAMESPACE)
+sd_targets += exporter_sd_targets(prometheus_second_source_docs, SECOND_SOURCE_NAMESPACE)
+assert {(target["namespace"], target["exporter"]) for target in sd_targets} == {
+    (RELEASE_NAMESPACE, "kube-state-metrics"),
+    (RELEASE_NAMESPACE, "node-exporter"),
+    (SECOND_SOURCE_NAMESPACE, "kube-state-metrics"),
+    (SECOND_SOURCE_NAMESPACE, "node-exporter"),
+}, "both stacks must contribute discoverable kube-state-metrics and node exporter targets"
+
+scraped_by = {}
+for job in scrape_configs:
+    job_name = job["job_name"]
+    # Run real samples through the rendered metric relabel program rather than
+    # reading its fields back. A rule with the right target_label and the wrong
+    # action, source_labels or regex passes a field check and stamps nothing.
+    # Two deliberately dissimilar samples, because the claim is that EVERY
+    # scraped sample is stamped: a rule conditioned on one metric name or one
+    # label would satisfy a single-sample replay and leave the rest unstamped.
+    for sample in (
+        {
+            "__name__": "kube_pod_container_status_restarts_total",
+            "namespace": "kube-system",
+            "pod": "coredns-0",
+            "container": "coredns",
+            "job": job_name,
+        },
+        {
+            "__name__": "node_memory_MemTotal_bytes",
+            "instance": "10.0.0.1:9100",
+            "job": job_name,
+        },
+    ):
+        stamped = apply_relabel(sample, job.get("metric_relabel_configs", []))
+        assert stamped is not None, (
+            f"scrape job {job_name} drops {sample['__name__']} in metric relabeling"
+        )
+        assert stamped.get(SCRAPE_SOURCE_LABEL) == SCRAPE_SOURCE_VALUE, (
+            f"scrape job {job_name} must leave {SCRAPE_SOURCE_LABEL}={SCRAPE_SOURCE_VALUE} on "
+            f"{sample['__name__']}, got {stamped.get(SCRAPE_SOURCE_LABEL)!r}"
+        )
+        assert {
+            key: value for key, value in stamped.items() if key != SCRAPE_SOURCE_LABEL
+        } == sample, (
+            f"scrape job {job_name} must stamp the source and change nothing else about "
+            f"{sample['__name__']}"
+        )
+    roles = {sd_config.get("role") for sd_config in job.get("kubernetes_sd_configs", [])}
+    scopes = [discovery_scope(sd_config) for sd_config in job.get("kubernetes_sd_configs", [])]
+    for target in sd_targets:
+        if target["role"] not in roles:
+            continue
+        target_namespace = target["labels"]["__meta_kubernetes_namespace"]
+        if not any(scope is None or target_namespace in scope for scope in scopes):
+            continue
+        if apply_relabel(target["labels"], job.get("relabel_configs", [])) is None:
+            continue
+        assert target_namespace != SECOND_SOURCE_NAMESPACE, (
+            f"scrape job {job_name} reaches the pre-existing stack's {target['exporter']} "
+            f"in {target_namespace}: the shipped Prometheus would double count every "
+            "Kubernetes object it reports on"
+        )
+        scraped_by.setdefault(target["exporter"], set()).add(job_name)
+
+for exporter in ("kube-state-metrics", "node-exporter"):
+    owners = scraped_by.get(exporter, set())
+    assert len(owners) == 1, (
+        f"the shipped {exporter} must be scraped by exactly one job so a capacity query "
+        f"returns one series per Kubernetes object, got {sorted(owners)}"
+    )
+
+# The node roles resolve one target per Node through the API server, so they
+# cannot double count and must stay cluster-wide -- scoping them to the release
+# namespace would blind the bot to every kubelet.
+for job in scrape_configs:
+    if job["job_name"] in {"kubernetes-nodes", "kubernetes-nodes-cadvisor"}:
+        for sd_config in job.get("kubernetes_sd_configs", []):
+            assert sd_config.get("role") == "node"
+            assert discovery_scope(sd_config) is None, (
+                f"{job['job_name']} must keep cluster-wide node discovery"
+            )
 
 _, alloy_pod, alloy_container = image_container(alloy_docs, "grafana/alloy", "Alloy")
 assert any(volume.get("hostPath", {}).get("path") == "/var/lib/alloy" for volume in alloy_pod.get("volumes", []))
