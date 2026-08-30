@@ -2,12 +2,11 @@
 #
 # Render-assertion test for issue #493 (Rail 3 container hardening). The
 # container-level securityContext lockdown is applied to EVERY container in the
-# untrusted sandbox pod -- the runner, both bundle init containers, and the
-# litellm sidecar when enabled -- and was previously copy-pasted four times. It
-# now renders from one `curie.sandboxHardening.securityContext` helper; this
-# test pins that the rendered lockdown is present and identical on every
-# container, so a helper edit that weakens (or a container that skips) the
-# lockdown fails CI.
+# untrusted sandbox pod -- the runner, both bundle init containers, and
+# workspace-init -- and was previously copy-pasted four times. It now renders
+# from one `curie.sandboxHardening.securityContext` helper; this test pins that
+# the rendered lockdown is present and identical on every container, so a
+# helper edit that weakens (or a container that skips) the lockdown fails CI.
 #
 # Runnable locally (from anywhere) and from CI. Fails loudly.
 set -euo pipefail
@@ -23,15 +22,9 @@ TPL=templates/agent-sandbox.yaml
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 DEFAULT="$TMP/default.yaml"
-LITELLM="$TMP/litellm.yaml"
 
 echo "=== Rendering SandboxTemplate (defaults; hardening on) ==="
 helm template rel "$CHART" --show-only "$TPL" > "$DEFAULT"
-
-echo "=== Rendering SandboxTemplate (litellm sidecar enabled) ==="
-helm template rel "$CHART" --show-only "$TPL" \
-  --set agentSandbox.runner.liteLLM.enabled=true \
-  --set agentSandbox.runner.liteLLM.configExistingSecret=my-litellm-cfg > "$LITELLM"
 
 ASSERT_PY="$TMP/assert.py"
 cat > "$ASSERT_PY" <<'PY'
@@ -71,14 +64,13 @@ def check(path, expected_names):
     print(f"  ok: {sorted(names)} all carry the identical hardened securityContext")
 
 
-check(sys.argv[1], {"bundle-fetch", "bundle-extract", "runner"})
-check(sys.argv[2], {"bundle-fetch", "bundle-extract", "runner", "litellm"})
+check(sys.argv[1], {"bundle-fetch", "bundle-extract", "runner", "workspace-init"})
 PY
 
-if ! out="$(python3 "$ASSERT_PY" "$DEFAULT" "$LITELLM" 2>&1)"; then
+if ! out="$(python3 "$ASSERT_PY" "$DEFAULT" 2>&1)"; then
   fail "$out"
 fi
 echo "$out"
 
 echo
-echo "PASS: every sandbox container (runner, bundle-fetch, bundle-extract, and the litellm sidecar when enabled) renders the identical Rail 3 hardened securityContext from the shared helper."
+echo "PASS: every sandbox container (runner, bundle-fetch, bundle-extract, and workspace-init) renders the identical Rail 3 hardened securityContext from the shared helper."

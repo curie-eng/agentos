@@ -110,9 +110,9 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/api-service-nodeport-assertions.sh
 
-      # Prove the BYO-model LiteLLM sidecar (issue #253) is off by default,
-      # renders fully when its values flag is enabled, and yields to local
-      # inference. Runs the chart-owned assertion script.
+      # Prove the retired BYO-model LiteLLM sidecar (issue #253) is absent by
+      # default and that enabling its values flag is refused by the chart
+      # guard. Runs the chart-owned assertion script.
       - name: helm render assertions (litellm sidecar)
         run: |
           set -euo pipefail
@@ -346,11 +346,10 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/tenant-capacity-assertions.sh
 
-      # Prove every sandbox container (runner, both bundle init containers, and
-      # the litellm sidecar when enabled) declares an ephemeral-storage request
-      # AND limit (ADR-0059 decision 1, issue #755), and that the ceiling is
-      # operator-overridable (decision 6). Before this, disk was the one
-      # resource dimension with no ceiling at all.
+      # Prove the runner and both bundle init containers declare an
+      # ephemeral-storage request AND limit (ADR-0059 decision 1, issue #755),
+      # and that the ceiling is operator-overridable (decision 6). Before this,
+      # disk was the one resource dimension with no ceiling at all.
       - name: helm render assertions (ephemeral-storage ceilings)
         run: |
           set -euo pipefail
