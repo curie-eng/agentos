@@ -335,6 +335,23 @@ fn runner_tags_are_one_identity_across_both_paths() {
     );
 }
 
+/// The one-shot producer must use the same named running-stack resolver as the
+/// other recreating local verbs, not rebuild half of that chain in message.rs.
+#[test]
+fn one_shot_dispatcher_image_uses_the_shared_running_stack_resolver() {
+    let body = function_body("message.rs", "one_shot_dispatcher_image");
+    assert!(
+        body.contains("crate::local::running_stack_image("),
+        "one_shot_dispatcher_image must delegate to the shared named-image resolver; body: {body}"
+    );
+    assert!(
+        !body.contains("running_stack_tag(")
+            && !body.contains("image_ref(")
+            && !body.contains("image_present("),
+        "one_shot_dispatcher_image must not independently compose the tag and presence probes; body: {body}"
+    );
+}
+
 /// Sanity: the scanner still sees the files it claims to police.
 #[test]
 fn scanner_sees_the_two_callers() {
