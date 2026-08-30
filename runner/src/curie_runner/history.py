@@ -5,7 +5,9 @@ role/content messages. The durable record is provider-neutral: user and assistan
 roles, opaque JSON content blocks (including tool calls/results), terminal and
 approval context, plus an explicit stable summary record at compaction boundaries.
 The Claude adapter materializes these records into its provider-native resume
-envelope at boot; no provider transcript format is persisted here.
+envelope at boot. It may also persist opaque checkpoint/delta entries as a
+matching-harness cache optimization; those entries are never authoritative and
+another harness reconstructs from the portable messages alone.
 
 Design (ADR-0029):
 
@@ -35,7 +37,7 @@ import hashlib
 import json
 import logging
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any, Protocol, cast, runtime_checkable
 
@@ -139,6 +141,52 @@ class ApprovalContext:
 
 
 @dataclass(frozen=True)
+class HarnessReplayState:
+    """Optional opaque harness-native checkpoint or append delta.
+
+    Portable role/content messages remain authoritative. This state is an
+    optimization a matching harness may consume to restore provider-native
+    request shape (and therefore its message cache); every other harness ignores
+    it and replays the portable messages.
+    """
+
+    harness: str
+    kind: str
+    entries: tuple[dict[str, Any], ...]
+
+    def __post_init__(self) -> None:
+        if not self.harness:
+            raise HistoryError("harness replay state requires a harness name")
+        if self.kind not in ("checkpoint", "delta"):
+            raise HistoryError(f"invalid harness replay state kind: {self.kind!r}")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "harness": self.harness,
+            "kind": self.kind,
+            "entries": json.loads(json.dumps(self.entries)),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> HarnessReplayState:
+        harness = data.get("harness")
+        kind = data.get("kind")
+        entries = data.get("entries")
+        if (
+            not isinstance(harness, str)
+            or not isinstance(kind, str)
+            or not isinstance(entries, list)
+            or not all(isinstance(entry, Mapping) for entry in entries)
+        ):
+            raise HistoryError("invalid harness replay state")
+        return cls(
+            harness=harness,
+            kind=kind,
+            entries=tuple(dict(entry) for entry in entries),
+        )
+
+
+@dataclass(frozen=True)
 class TurnRecord:
     """One durable turn with a legacy projection and structured messages.
 
@@ -153,6 +201,7 @@ class TurnRecord:
     messages: tuple[ConversationMessage, ...] = ()
     status: str = "done"
     approval: ApprovalContext | None = None
+    harness_replay: HarnessReplayState | None = None
 
     def __post_init__(self) -> None:
         if not self.messages:
@@ -177,6 +226,9 @@ class TurnRecord:
             "messages": [message.to_dict() for message in self.messages],
             "status": self.status,
             "approval": self.approval.to_dict() if self.approval is not None else None,
+            "harness_replay": (
+                self.harness_replay.to_dict() if self.harness_replay is not None else None
+            ),
         }
 
     @classmethod
@@ -193,6 +245,7 @@ class TurnRecord:
                 for item in raw_messages
             )
         raw_approval = data.get("approval")
+        raw_harness_replay = data.get("harness_replay")
         return cls(
             user=str(data.get("user", "")),
             assistant=str(data.get("assistant", "")),
@@ -202,6 +255,11 @@ class TurnRecord:
             approval=(
                 ApprovalContext.from_dict(raw_approval)
                 if isinstance(raw_approval, Mapping)
+                else None
+            ),
+            harness_replay=(
+                HarnessReplayState.from_dict(raw_harness_replay)
+                if isinstance(raw_harness_replay, Mapping)
                 else None
             ),
         )
@@ -285,6 +343,7 @@ class ConversationReplay:
     messages: tuple[ConversationMessage, ...] = ()
     source_turns: int = 0
     summary_digest: str | None = None
+    harness_replay: HarnessReplayState | None = None
 
     @property
     def present(self) -> bool:
@@ -456,6 +515,27 @@ def _replay_bytes(messages: Sequence[ConversationMessage]) -> int:
     )
 
 
+def _fold_harness_replay(turns: Sequence[TurnRecord]) -> HarnessReplayState | None:
+    """Fold the latest checkpoint and its following deltas into one checkpoint."""
+
+    harness: str | None = None
+    entries: list[dict[str, Any]] = []
+    checkpoint_seen = False
+    for turn in turns:
+        state = turn.harness_replay
+        if state is None:
+            continue
+        if state.kind == "checkpoint":
+            harness = state.harness
+            entries = [json.loads(json.dumps(entry)) for entry in state.entries]
+            checkpoint_seen = True
+        elif checkpoint_seen and state.harness == harness:
+            entries.extend(json.loads(json.dumps(entry)) for entry in state.entries)
+    if not checkpoint_seen or harness is None:
+        return None
+    return HarnessReplayState(harness=harness, kind="checkpoint", entries=tuple(entries))
+
+
 def _turn_summary_line(turn: TurnRecord) -> str:
     tool_names: list[str] = []
     tool_results: list[str] = []
@@ -491,10 +571,18 @@ def _make_summary(
     *,
     max_bytes: int | None,
 ) -> SummaryRecord:
+    portable_turns: list[dict[str, Any]] = []
+    for turn in compacted:
+        portable = turn.to_dict()
+        portable.pop("harness_replay", None)
+        portable_turns.append(portable)
     source = {
         "prior_digest": prior.digest if prior is not None else None,
         "prior_content": prior.content if prior is not None else None,
-        "turns": [turn.to_dict() for turn in compacted],
+        # Provider-native checkpoint metadata (timestamps, UUIDs, working dirs)
+        # is deliberately excluded: a portable summary boundary must not change
+        # because the matching harness encoded the same messages differently.
+        "turns": portable_turns,
     }
     canonical = json.dumps(source, separators=(",", ":"), sort_keys=True)
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -518,7 +606,10 @@ def _make_summary(
         digest=digest,
         source_turns=source_turns,
         through_ts=through_ts,
-        tail=tuple(tail),
+        # A summary is a new portable prefix. Native state for its old turns is
+        # both unusable and potentially large, so do not embed it in the durable
+        # summary tail.
+        tail=tuple(replace(turn, harness_replay=None) for turn in tail),
         ts=datetime.now(UTC).isoformat(),
     )
 
@@ -568,11 +659,16 @@ def build_conversation_replay(
     over_turns = max_turns is not None and len(active_turns) > max_turns
     over_bytes = max_bytes is not None and _replay_bytes(current_messages) > max_bytes
     if not over_turns and not over_bytes:
+        # A summary changes the portable prefix. Native state from its embedded
+        # tail still represents the pre-summary conversation and is unusable;
+        # only a post-summary turn's fresh checkpoint may restore that shape.
+        replay_state_turns = appended_turns if latest_summary is not None else active_turns
         return (
             ConversationReplay(
                 messages=current_messages,
                 source_turns=source_turns,
                 summary_digest=latest_summary.digest if latest_summary else None,
+                harness_replay=_fold_harness_replay(replay_state_turns),
             ),
             None,
         )
@@ -604,6 +700,10 @@ def build_conversation_replay(
             messages=summary.messages,
             source_turns=summary.source_turns + len(summary.tail),
             summary_digest=summary.digest,
+            # The explicit compaction boundary intentionally changes the prefix.
+            # The matching harness writes a new checkpoint after the first turn
+            # over this synthetic summary.
+            harness_replay=None,
         ),
         summary,
     )

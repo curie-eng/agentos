@@ -49,24 +49,55 @@ from claude_agent_sdk.types import (
     SessionStoreEntry,
 )
 
-from .history import ConversationMessage
+from .history import ConversationMessage, HarnessReplayState
 
 _SDK_SESSION_NAMESPACE = uuid.UUID("83efb74f-f09e-4db6-b898-9ed8d7084ba8")
 
 
 class _SeededSessionStore:
-    """Process-local SDK store used only to materialize a portable prefix."""
+    """SDK mirror seeded from portable messages or an optional native checkpoint."""
 
-    def __init__(self, key: SessionKey, entries: list[SessionStoreEntry]) -> None:
+    def __init__(
+        self,
+        key: SessionKey,
+        entries: list[SessionStoreEntry],
+        *,
+        checkpoint_required: bool,
+    ) -> None:
         self._key = key
-        self._entries = list(entries)
+        self._entries = json.loads(json.dumps(entries))
+        self._exported_from = len(entries)
+        self._checkpoint_required = checkpoint_required
 
     async def append(self, key: SessionKey, entries: list[SessionStoreEntry]) -> None:
         if key == self._key:
-            self._entries.extend(entries)
+            self._entries.extend(json.loads(json.dumps(entries)))
 
     async def load(self, key: SessionKey) -> list[SessionStoreEntry] | None:
-        return list(self._entries) if key == self._key and self._entries else None
+        return (
+            cast("list[SessionStoreEntry]", json.loads(json.dumps(self._entries)))
+            if key == self._key and self._entries
+            else None
+        )
+
+    async def export_replay_state(self) -> HarnessReplayState | None:
+        """Return a full checkpoint once, then only newly mirrored SDK entries."""
+
+        if self._checkpoint_required:
+            kind = "checkpoint"
+            selected = self._entries
+        else:
+            kind = "delta"
+            selected = self._entries[self._exported_from :]
+        self._checkpoint_required = False
+        self._exported_from = len(self._entries)
+        if not selected:
+            return None
+        return HarnessReplayState(
+            harness="claude",
+            kind=kind,
+            entries=tuple(json.loads(json.dumps(selected))),
+        )
 
 
 @dataclass(frozen=True)
@@ -84,12 +115,15 @@ def build_structured_resume(
     *,
     curie_session_id: str,
     cwd: str | None,
+    harness_replay: HarnessReplayState | None = None,
 ) -> StructuredResume:
     """Materialize portable messages into the SDK's ephemeral resume envelope.
 
-    Only role/content is sourced from durable storage. UUIDs and the local JSONL
-    envelope are deterministic adapter details reconstructed on every runner;
-    no provider-native transcript is made into Curie's persistence contract.
+    Portable role/content is always sufficient. When the matching harness left
+    an opaque native checkpoint, it is preferred to retain the SDK's exact
+    cache-breakpoint shape; otherwise UUIDs and the local JSONL envelope are
+    deterministic adapter details reconstructed on this runner. Native entries
+    are an optional optimization, never Curie's portable persistence contract.
     """
 
     session_id = str(uuid.uuid5(_SDK_SESSION_NAMESPACE, curie_session_id))
@@ -97,11 +131,34 @@ def build_structured_resume(
         "project_key": project_key_for_directory(cwd),
         "session_id": session_id,
     }
+    if (
+        harness_replay is not None
+        and harness_replay.harness == "claude"
+        and harness_replay.kind == "checkpoint"
+        and harness_replay.entries
+    ):
+        native_entries = cast(
+            "list[SessionStoreEntry]",
+            json.loads(json.dumps(harness_replay.entries)),
+        )
+        store = _SeededSessionStore(
+            key,
+            native_entries,
+            checkpoint_required=False,
+        )
+        return StructuredResume(
+            session_id=session_id,
+            resume=session_id,
+            session_store=cast("SessionStore", store),
+            session_key=key,
+        )
+
     if not messages:
+        store = _SeededSessionStore(key, [], checkpoint_required=True)
         return StructuredResume(
             session_id=session_id,
             resume=None,
-            session_store=None,
+            session_store=cast("SessionStore", store),
             session_key=key,
         )
 
@@ -131,7 +188,7 @@ def build_structured_resume(
         )
         entries.append(entry)
         parent_uuid = entry_uuid
-    store = _SeededSessionStore(key, entries)
+    store = _SeededSessionStore(key, entries, checkpoint_required=True)
     return StructuredResume(
         session_id=session_id,
         resume=session_id,
@@ -278,6 +335,7 @@ def build_options(
         resume=resume,
         session_id=session_id if resume is None else None,
         session_store=session_store,
+        session_store_flush="eager" if session_store is not None else "batched",
         task_budget=task_budget,
         permission_mode=permission_mode,
         can_use_tool=can_use_tool,
@@ -312,3 +370,11 @@ class ClaudeAgentSession:
 
     async def close(self) -> None:
         await self._client.disconnect()
+
+    async def export_replay_state(self) -> HarnessReplayState | None:
+        """Export the provider transcript checkpoint/delta mirrored this turn."""
+
+        store = self._options.session_store
+        if isinstance(store, _SeededSessionStore):
+            return await store.export_replay_state()
+        return None

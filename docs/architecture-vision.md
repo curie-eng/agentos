@@ -74,7 +74,8 @@ the ACI server" understates that work. Resume's durable contract, by contrast,
 is harness-agnostic: `CURIE_HISTORY_REF` is a durable state-store URL whose
 ordered role/content records the runner reconstructs through a declared harness
 capability (`runner/src/curie_runner/history.py::build_conversation_replay`). The
-Claude adapter rebuilds an ephemeral SDK resume envelope from those messages;
+Claude adapter prefers its optional opaque native checkpoint for cache fidelity
+and otherwise rebuilds an ephemeral SDK resume envelope from those messages;
 another harness must implement equivalent structured replay or fail visibly
 rather than render history into system instructions (ADR-0119).
 

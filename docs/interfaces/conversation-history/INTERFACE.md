@@ -31,7 +31,9 @@ class TranscriptStore(Protocol):
 
 A `TurnRecord` preserves ordered `user`/`assistant` messages and JSON content
 blocks (including tool calls/results), terminal status, approval context, and a
-legacy text projection. A `SummaryRecord` is an explicit stable compaction
+legacy text projection. It may carry a matching harness's opaque checkpoint or
+append delta; this is a cache optimization, never the portable source of truth.
+A `SummaryRecord` is an explicit stable compaction
 boundary plus its un-compacted structured tail. `CURIE_HISTORY_REF` (a
 runner-local env, NOT a frozen ACI `SessionConfig` field) is resolved to a
 concrete `TranscriptStore` at runner boot by `resolve_history`. The state-API bearer is a runner-local knob
@@ -50,8 +52,9 @@ conversation, reconstructed through the selected harness adapter.
   and rejected loudly.
 - **Load side.** `load()` returns prior turns/summaries oldest-first (empty when
   none). At boot `build_conversation_replay` reconstructs the ordered portable
-  prefix. The Claude adapter materializes deterministic provider-local session
-  entries from only role/content; the fake consumes the same prefix, and a
+  prefix. The Claude adapter prefers an optional native checkpoint so its exact
+  cache-breakpoint shape survives; without one it materializes deterministic
+  provider-local entries from role/content. The fake consumes the same portable prefix, and a
   harness declaring no structured-replay capability fails rather than receiving
   rendered system text. A configured load failure blocks boot because continuing
   without approval/tool context could duplicate an operation.
@@ -66,7 +69,9 @@ conversation, reconstructed through the selected harness adapter.
   synthetic incomplete fallback finals are not recorded.
 - **Compaction and cache.** Crossing the turn/byte bound appends one deterministic
   `SummaryRecord`; ordinary appends retain the exact prefix until the next
-  boundary. The first resumed terminal result records
+  boundary. Compaction deliberately drops the old native checkpoint; the first
+  turn over the new portable summary writes a fresh one, while later turns append
+  only deltas. The first resumed terminal result records
   `curie.history.resume.cache_read` with the provider's observed cache-read token
   count and a bounded `cache_hit` attribute.
 

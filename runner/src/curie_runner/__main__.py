@@ -289,6 +289,7 @@ def build_runner(
             conversation_replay.messages,
             curie_session_id=config.session.session_id,
             cwd=workspace_cwd,
+            harness_replay=conversation_replay.harness_replay,
         )
         options = build_options(
             plugins=plugins,
@@ -297,8 +298,9 @@ def build_runner(
             max_turns=config.max_turns,
             max_budget_usd=config.max_usd_per_day,
             # Curie's durable contract is ordered role/content messages. The
-            # Claude adapter materializes them into a process-local SDK resume
-            # envelope; no provider-native transcript is persisted.
+            # Claude adapter prefers its optional opaque checkpoint to preserve
+            # native cache shape, and otherwise materializes a deterministic
+            # process-local SDK resume envelope from the portable messages.
             resume=structured_resume.resume,
             session_id=structured_resume.session_id,
             session_store=structured_resume.session_store,

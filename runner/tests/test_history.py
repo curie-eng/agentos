@@ -11,10 +11,11 @@ import anyio
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
-from curie_runner.adapter import build_structured_resume
+from curie_runner.adapter import ClaudeAgentSession, build_options, build_structured_resume
 from curie_runner.history import (
     ApprovalContext,
     ConversationMessage,
+    HarnessReplayState,
     HistoryError,
     NullTranscriptStore,
     StateApiTranscriptStore,
@@ -95,6 +96,11 @@ def test_structured_turn_round_trip_preserves_tools_and_approval_context() -> No
             granted_tool="Bash",
             decision=None,
         ),
+        harness_replay=HarnessReplayState(
+            harness="claude",
+            kind="checkpoint",
+            entries=({"type": "user", "uuid": "entry-1"},),
+        ),
     )
 
     loaded = TurnRecord.from_dict(record.to_dict())
@@ -139,6 +145,7 @@ def test_long_history_compacts_once_then_keeps_prefix_stable_until_next_boundary
 
     assert summary is not None
     assert summary.source_turns == 4
+    assert all(turn.harness_replay is None for turn in summary.tail)
     assert replay.summary_digest == summary.digest
     assert replay.messages[0].role == "user"
     assert "Durable conversation summary" in str(replay.messages[0].content)
@@ -167,6 +174,29 @@ def test_changed_compacted_prefix_changes_summary_digest() -> None:
     assert original is not None
     assert different is not None
     assert different.digest != original.digest
+
+
+def test_summary_digest_ignores_optional_harness_checkpoint_metadata() -> None:
+    def records(entry_uuid: str) -> list[TurnRecord]:
+        return [
+            TurnRecord(
+                user=f"u{i}",
+                assistant=f"a{i}",
+                harness_replay=HarnessReplayState(
+                    harness="claude",
+                    kind="checkpoint" if i == 0 else "delta",
+                    entries=({"uuid": f"{entry_uuid}-{i}"},),
+                ),
+            )
+            for i in range(4)
+        ]
+
+    _, first = build_conversation_replay(records("runner-a"), max_turns=2)
+    _, second = build_conversation_replay(records("runner-b"), max_turns=2)
+
+    assert first is not None
+    assert second is not None
+    assert first.digest == second.digest
 
 
 def test_structured_resume_materializes_ordered_sdk_entries_without_rendering_text(
@@ -226,8 +256,89 @@ def test_structured_resume_materializes_ordered_sdk_entries_without_rendering_te
 
     fresh = build_structured_resume((), curie_session_id="curie-thread-1", cwd=str(tmp_path))
     assert fresh.resume is None
-    assert fresh.session_store is None
+    assert fresh.session_store is not None
+    assert anyio.run(fresh.session_store.load, fresh.session_key) is None
     assert fresh.session_id == first.session_id
+
+
+def test_claude_native_checkpoint_is_restored_and_then_exports_only_a_delta(tmp_path) -> None:
+    checkpoint = HarnessReplayState(
+        harness="claude",
+        kind="checkpoint",
+        entries=(
+            {
+                "type": "user",
+                "uuid": "entry-1",
+                "timestamp": "1970-01-01T00:00:00.000Z",
+                "message": {"role": "user", "content": "prior"},
+            },
+        ),
+    )
+    resume = build_structured_resume(
+        (ConversationMessage(role="user", content="prior"),),
+        curie_session_id="curie-thread-native",
+        cwd=str(tmp_path),
+        harness_replay=checkpoint,
+    )
+    assert resume.session_store is not None
+    assert anyio.run(resume.session_store.load, resume.session_key) == list(
+        checkpoint.entries
+    )
+
+    options = build_options(
+        plugins=[],
+        model=None,
+        system_prompt=None,
+        max_turns=2,
+        max_budget_usd=1.0,
+        resume=resume.resume,
+        session_id=resume.session_id,
+        session_store=resume.session_store,
+    )
+    session = ClaudeAgentSession(options)
+    delta_entry = {"type": "assistant", "uuid": "entry-2"}
+    anyio.run(resume.session_store.append, resume.session_key, [delta_entry])
+
+    exported = anyio.run(session.export_replay_state)
+
+    assert exported == HarnessReplayState(
+        harness="claude", kind="delta", entries=(delta_entry,)
+    )
+
+
+def test_replay_folds_native_checkpoint_and_deltas_but_drops_them_at_compaction() -> None:
+    turns = [
+        TurnRecord(
+            user="u0",
+            assistant="a0",
+            harness_replay=HarnessReplayState(
+                harness="claude", kind="checkpoint", entries=({"uuid": "one"},)
+            ),
+        ),
+        TurnRecord(
+            user="u1",
+            assistant="a1",
+            harness_replay=HarnessReplayState(
+                harness="claude", kind="delta", entries=({"uuid": "two"},)
+            ),
+        ),
+    ]
+
+    replay, summary = build_conversation_replay(turns, max_turns=4, max_bytes=None)
+    assert summary is None
+    assert replay.harness_replay == HarnessReplayState(
+        harness="claude",
+        kind="checkpoint",
+        entries=({"uuid": "one"}, {"uuid": "two"}),
+    )
+
+    compacted, summary = build_conversation_replay(
+        [*turns, TurnRecord(user="u2", assistant="a2")],
+        max_turns=2,
+        max_bytes=None,
+    )
+    assert summary is not None
+    assert compacted.harness_replay is None
 
 
 def test_resolve_absent_ref_is_null_store() -> None:

@@ -36,7 +36,9 @@ Docker via `curie skill up`. Full behavior spec in `runner/README.md`.
   (`history.py`, ADR-0119/0029), while `CURIE_MEMORY_REF` is the agent's durable
   memory and still enters the system prompt (`memory.py`, ADR-0025).
   `CURIE_HISTORY_REF` is never itself an SDK resume id; the harness adapter may
-  reconstruct an ephemeral provider resume envelope from its portable messages.
+  consume optional opaque checkpoint/delta data for cache fidelity or reconstruct
+  an ephemeral provider resume envelope from its portable messages. The portable
+  messages remain authoritative across harnesses.
   Never write a code path that depends on the runner having been "the same
   process" as an earlier turn.
 - **One turn consumes the SDK generator at a time.** Steer and interrupt are

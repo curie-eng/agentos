@@ -77,7 +77,8 @@ Plugin-format entanglement: the ACI server must interpret Claude Code plugin bun
 foreign harness inherits that shape too — the A- is docked for exactly this. Rehydration is no
 longer a second dock: ADR-0119 keeps the durable contract provider-neutral as ordered role/content
 messages from the state store named by `CURIE_HISTORY_REF`. Each harness must materialize that
-prefix structurally (the Claude adapter rebuilds an ephemeral SDK resume envelope), or declare
+prefix structurally (the Claude adapter may consume its optional opaque native checkpoint, or
+rebuild an ephemeral SDK resume envelope from portable messages), or declare
 the capability absent and fail the resume; rendered system-prompt fallback is forbidden.
 Otherwise the line is clean and frozen: a producer constructs strictly (stray
 keys are rejected at construction), while a consumer tolerates unknown fields and rejects only an

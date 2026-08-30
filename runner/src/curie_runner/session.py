@@ -45,6 +45,7 @@ from .budget import BUDGET_CLASSIFICATION, BudgetTracker
 from .history import (
     ApprovalContext,
     ConversationMessage,
+    HarnessReplayState,
     NullTranscriptStore,
     TranscriptStore,
     TurnRecord,
@@ -318,6 +319,18 @@ class SessionRunner:
             and state.approval_gate_kind == "permission"
         ):
             messages = close_suspended_tool_calls(messages)
+        harness_replay: HarnessReplayState | None = None
+        exporter = getattr(self._session, "export_replay_state", None)
+        if callable(exporter):
+            try:
+                harness_replay = await exporter()
+            except Exception as exc:  # noqa: BLE001 - portable replay remains valid
+                logger.warning(
+                    "harness replay export failed session=%s error_class=%s: %s",
+                    self._session_id,
+                    type(exc).__name__,
+                    exc,
+                )
         try:
             await self._history.append(
                 TurnRecord(
@@ -345,6 +358,7 @@ class SessionRunner:
                         )
                         else None
                     ),
+                    harness_replay=harness_replay,
                 )
             )
         except Exception as exc:  # noqa: BLE001 - best-effort; never fail a completed turn
