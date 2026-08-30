@@ -15,6 +15,34 @@ pub struct ApiClient {
     http: reqwest::Client,
 }
 
+/// One cursor page from the rollout-free disconnected cluster-message reply
+/// relay. The API stores channel-protocol events verbatim; the CLI projects
+/// only the fields needed to render progress and recognize semantic completion.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct ClusterMessageReplyPage {
+    pub(crate) events: Vec<ClusterMessageReplyEvent>,
+    pub(crate) next_cursor: usize,
+    pub(crate) terminal: bool,
+}
+
+/// The tolerant CLI projection of one channel-protocol reply event.
+///
+/// Unknown fields remain server-owned, while the discriminant and the two
+/// values that drive terminal behavior are retained. This is intentionally not
+/// another copy of the channel protocol: the API validates and stores that
+/// protocol, and the CLI is only its read-side observer.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct ClusterMessageReplyEvent {
+    #[serde(rename = "event")]
+    pub(crate) kind: String,
+    #[serde(default)]
+    pub(crate) text: Option<String>,
+    #[serde(default)]
+    pub(crate) status: Option<String>,
+    #[serde(default)]
+    pub(crate) outcome: Option<String>,
+}
+
 /// The channel used when an agent is first created if `--slack-channel` is
 /// omitted; on an existing agent an omitted channel is left untouched. Must
 /// satisfy the platform API's channel-ID validation (`^[CDG][A-Z0-9]{7,}$`),
@@ -1251,6 +1279,58 @@ impl ApiClient {
             .json()
             .await
             .context("decoding agent list")
+    }
+
+    /// Poll one opaque disconnected cluster-message reply bucket.
+    ///
+    /// `reply_ref` is a UUID rather than an arbitrary string so caller input can
+    /// never become a path segment. A valid but not-yet-written bucket is a
+    /// normal race between enqueue and the worker's first reply event, exposed
+    /// as `None`; every other non-success remains a real API failure.
+    pub(crate) async fn cluster_message_replies(
+        &self,
+        reply_ref: &uuid::Uuid,
+        after: usize,
+    ) -> Result<Option<ClusterMessageReplyPage>> {
+        let resp = match self
+            .http
+            .get(format!(
+                "{}/cluster-message-replies/{}",
+                self.base_url,
+                reply_ref.hyphenated()
+            ))
+            .header("X-API-Key", &self.api_key)
+            .query(&[("after", after)])
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
+            Err(err) if err.is_connect() || err.is_timeout() => return Ok(None),
+            Err(err) => {
+                return Err(err).context("GET /cluster-message-replies/{reply_ref}");
+            }
+        };
+        if resp.status().is_server_error() {
+            return Ok(None);
+        }
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            let body = resp.text().await.unwrap_or_default();
+            if is_unrouted(reqwest::StatusCode::NOT_FOUND, &body) {
+                bail!(
+                    "reading cluster-message replies failed: this platform release does not have \
+                     the cluster-message-replies endpoint, so it is older than this CLI. Upgrade \
+                     the release, or use a CLI matching it."
+                );
+            }
+            return Ok(None);
+        }
+        Ok(Some(
+            Self::expect_ok(resp, "reading cluster-message replies")
+                .await?
+                .json()
+                .await
+                .context("decoding cluster-message reply page")?,
+        ))
     }
 
     /// Read the newest trace rows through the platform API proxy. The caller

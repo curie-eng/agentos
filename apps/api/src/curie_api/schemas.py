@@ -54,6 +54,11 @@ _SLACK_USER_ID = re.compile(r"^[UW][A-Z0-9]{7,}$")
 # membership is deliberately unchecked (see `_CHANNEL_ADDRESS_SHAPES`).
 _CHANNEL_KIND = re.compile(r"^[a-z0-9]+(?:[-_][a-z0-9]+)*$")
 
+# Selected only by the worker's built-in cluster-message relay.  Letting an
+# operator persist this slug on a binding would shadow that trusted route with
+# an arbitrary endpoint, so the write-side schema reserves it explicitly.
+BUILTIN_CLUSTER_MESSAGE_ADAPTER = "curie-cluster-message"
+
 # Any whitespace at all in an address. An address is an opaque routing key the
 # worker matches on equality, so a stray space is never meaningful and always
 # means the value was pasted wrong.
@@ -843,9 +848,33 @@ class ChannelBindingWrite(ChannelBinding):
                 "the reply and is used as a config key by the worker, so it must "
                 "be a lowercase slug (e.g. 'agentmail-sandbox', 'ms-teams')."
             )
+        if self.adapter == BUILTIN_CLUSTER_MESSAGE_ADAPTER:
+            raise ValueError(
+                f"channel adapter {BUILTIN_CLUSTER_MESSAGE_ADAPTER!r} is reserved "
+                "for the platform's built-in disconnected-message relay and "
+                "cannot be configured on an operator binding."
+            )
         if self.endpoint is not None:
             _validate_channel_endpoint(self.endpoint)
         return self
+
+
+class ClusterMessageReplyAck(BaseModel):
+    """Acknowledgement for one idempotently stored relay event."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ref: str
+
+
+class ClusterMessageReplyPage(BaseModel):
+    """Cursor page read by one disconnected ``cluster message`` caller."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    events: list[dict[str, Any]]
+    next_cursor: int
+    terminal: bool
 
 
 class ChannelBindingPatch(ChannelBindingWrite):
@@ -1400,7 +1429,15 @@ class PublicationCreate(BaseModel):
     @model_validator(mode="after")
     def _valid_reply_route(self) -> "PublicationCreate":
         _validate_channel_binding(self.reply_kind, self.reply_channel)
-        if (self.reply_endpoint is None) != (self.reply_adapter is None):
+        builtin_relay = self.reply_adapter == BUILTIN_CLUSTER_MESSAGE_ADAPTER
+        if builtin_relay and self.reply_endpoint is not None:
+            raise ValueError(
+                "the built-in cluster-message publication reply route must not "
+                "set an endpoint"
+            )
+        if not builtin_relay and (
+            (self.reply_endpoint is None) != (self.reply_adapter is None)
+        ):
             raise ValueError(
                 "publication reply route must set endpoint and adapter together"
             )

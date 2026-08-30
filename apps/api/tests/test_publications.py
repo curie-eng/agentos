@@ -25,7 +25,7 @@ from curie_api.config import get_settings
 from curie_api.github_app import _RESOLVERS
 from curie_api.main import create_app
 from curie_api.resumequeue import ResumeQueue
-from curie_api.schemas import PublicationCreate
+from curie_api.schemas import ChannelBindingWrite, PublicationCreate
 from curie_api.sweeper import sweep_expired_approvals
 from curie_test_support.valkey import connect_or_skip
 from fastapi import Response
@@ -39,6 +39,7 @@ WORKER_TOKEN = "remote-dev-publication-worker-token"
 WORKER_HEADERS = {"X-Curie-Worker-Token": WORKER_TOKEN}
 PATCH_LIMIT = 900_000
 BASE_SHA = "0123456789abcdef0123456789abcdef01234567"
+CLUSTER_MESSAGE_ADAPTER = "curie-cluster-message"
 
 
 @pytest.fixture
@@ -134,6 +135,104 @@ def test_publication_schema_refuses_github_workflow_changes() -> None:
 
     with pytest.raises(ValidationError, match="workflow changes cannot be published"):
         PublicationCreate.model_validate(payload)
+
+
+def test_publication_schema_accepts_the_builtin_reply_adapter_without_an_endpoint() -> None:
+    reply_ref = str(uuid.uuid4())
+    payload = _publication_payload(str(uuid.uuid4()))
+    payload.update(
+        reply_placeholder=reply_ref,
+        reply_endpoint=None,
+        reply_adapter=CLUSTER_MESSAGE_ADAPTER,
+    )
+
+    publication = PublicationCreate.model_validate(payload)
+
+    assert publication.reply_placeholder == reply_ref
+    assert publication.reply_endpoint is None
+    assert publication.reply_adapter == CLUSTER_MESSAGE_ADAPTER
+
+    # The exception is purpose-scoped. Operators still cannot configure the
+    # built-in worker adapter on a durable channel binding and shadow its trust.
+    with pytest.raises(ValidationError, match="reserved"):
+        ChannelBindingWrite.model_validate(
+            {
+                "kind": "email",
+                "address": "ops@example.test",
+                "endpoint": "https://adapter.example.test/replies",
+                "adapter": CLUSTER_MESSAGE_ADAPTER,
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "route",
+    [
+        {"reply_endpoint": None, "reply_adapter": "agentmail-sandbox"},
+        {
+            "reply_endpoint": "https://adapter.example.test/replies",
+            "reply_adapter": None,
+        },
+    ],
+)
+def test_ordinary_publication_adapters_still_require_both_route_halves(
+    route: dict[str, str | None],
+) -> None:
+    payload = _publication_payload(str(uuid.uuid4()))
+    payload.update(route)
+
+    with pytest.raises(ValidationError, match="endpoint and adapter together"):
+        PublicationCreate.model_validate(payload)
+
+    payload.update(
+        reply_endpoint="https://adapter.example.test/replies",
+        reply_adapter="agentmail-sandbox",
+    )
+    ordinary = PublicationCreate.model_validate(payload)
+    assert ordinary.reply_endpoint == "https://adapter.example.test/replies"
+    assert ordinary.reply_adapter == "agentmail-sandbox"
+
+
+def test_builtin_reply_adapter_and_ref_persist_on_both_publication_rows(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    reply_ref = str(uuid.uuid4())
+    payload = _publication_payload(
+        deployment["id"], dedupe_key="builtin-cluster-message-reply"
+    )
+    payload.update(
+        reply_placeholder=reply_ref,
+        reply_endpoint=None,
+        reply_adapter=CLUSTER_MESSAGE_ADAPTER,
+    )
+
+    status_code, publication = _create_publication(client, payload)
+
+    assert status_code == 201
+    stored = _rows(
+        "SELECT p.reply_placeholder AS publication_ref, "
+        "p.reply_endpoint AS publication_endpoint, "
+        "p.reply_adapter AS publication_adapter, "
+        "a.reply_placeholder AS approval_ref, "
+        "a.reply_endpoint AS approval_endpoint, "
+        "a.reply_adapter AS approval_adapter "
+        "FROM curie.publications p "
+        "JOIN curie.approvals a ON a.id = p.approval_id "
+        "WHERE p.id = :id",
+        {"id": publication["id"]},
+    )[0]
+    assert stored == {
+        "publication_ref": reply_ref,
+        "publication_endpoint": None,
+        "publication_adapter": CLUSTER_MESSAGE_ADAPTER,
+        "approval_ref": reply_ref,
+        "approval_endpoint": None,
+        "approval_adapter": CLUSTER_MESSAGE_ADAPTER,
+    }
 
 
 def _create_publication(client: TestClient, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:

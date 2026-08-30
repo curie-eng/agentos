@@ -4,6 +4,11 @@
   "source": "cli/src/api.rs",
   "mirrors": [
     {
+      "struct": "ClusterMessageReplyPage",
+      "schema": "ClusterMessageReplyPage",
+      "omissions": []
+    },
+    {
       "struct": "Version",
       "schema": "VersionOut",
       "omissions": []
@@ -285,6 +290,10 @@
     }
   ],
   "non_mirrors": [
+    {
+      "struct": "ClusterMessageReplyEvent",
+      "reason": "ClusterMessageReplyPage.events is intentionally an array of anonymous raw channel-protocol objects in OpenAPI, with no named component schema. The CLI keeps only a tolerant rendering projection of the event discriminator, text, status, and outcome while the API remains the authoritative validator and preserves every raw event field."
+    },
     {
       "struct": "TraceListRow",
       "reason": "GET /langfuse/traces returns list[dict[str, object]] with no named OpenAPI component schema. The CLI requires id and timestamp, preserves the API's nullable name, and flattens every other anonymous field so the response is retained wholesale."

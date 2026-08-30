@@ -39,6 +39,7 @@ from channel_protocol.reply import (
 )
 from curie_worker.config import WorkerConfig
 from curie_worker.reply_sink import (
+    CLUSTER_MESSAGE_ADAPTER,
     MAX_ACK_BODY_BYTES,
     HttpReplyAdapter,
     MissingAdapterCredentialError,
@@ -59,6 +60,12 @@ ADAPTER_B = "other-adapter"
 SECRET_A = "secret-for-agentmail-sandbox"
 SECRET_B = "secret-for-other-adapter"
 SLACK_TOKEN = "xoxb-test-bot-token"
+INTERNAL_WORKER_TOKEN = "worker-only-cluster-message-token"
+SHADOW_CLUSTER_MESSAGE_TOKEN = "must-never-shadow-the-built-in-token"
+CLUSTER_MESSAGE_REPLY_REF = "123e4567-e89b-42d3-a456-426614174000"
+CLUSTER_MESSAGE_REPLY_PATH = (
+    f"/v1/internal/cluster-message-replies/{CLUSTER_MESSAGE_REPLY_REF}"
+)
 
 
 class _Capture:
@@ -72,11 +79,16 @@ class _Capture:
 
     def __init__(self) -> None:
         self.requests: list[dict[str, Any]] = []
+        self.redirect_cluster_message_replies = False
         self.app = web.Application()
         self.app.add_routes(
             [
                 web.post("/a", self._record_ok),
                 web.post("/b", self._record_ok),
+                web.post(
+                    "/v1/internal/cluster-message-replies/{reply_ref}",
+                    self._record_cluster_message_reply,
+                ),
                 web.post("/slack/api/{method}", self._record_slack),
                 web.post("/slack/dead/{method}", self._drop),
                 web.post("/redirect", self._redirect_to_b),
@@ -101,6 +113,12 @@ class _Capture:
     async def _record_slack(self, request: web.Request) -> web.Response:
         await self._capture(request)
         return web.json_response({"ok": True, "ts": "1720000000.000200"})
+
+    async def _record_cluster_message_reply(self, request: web.Request) -> web.Response:
+        await self._capture(request)
+        if self.redirect_cluster_message_replies:
+            return web.Response(status=307, headers={"Location": "/b"})
+        return web.json_response({"ref": request.match_info["reply_ref"]})
 
     async def _drop(self, request: web.Request) -> web.Response:
         # Record it (so a test can prove the call was ATTEMPTED here) and then
@@ -159,6 +177,15 @@ def _update(kind: str, text: str = "the answer") -> ReplyUpdate:
         event="reply.update",
         target=_target(kind),
         text=text,
+    )
+
+
+def _cluster_message_update(reply_ref: str = CLUSTER_MESSAGE_REPLY_REF) -> ReplyUpdate:
+    return ReplyUpdate(
+        version=REPLY_WIRE_VERSION,
+        event="reply.update",
+        target=_target("slack", reply_ref=reply_ref),
+        text="the disconnected cluster answer",
     )
 
 
@@ -647,6 +674,228 @@ def test_a_slack_turn_with_no_per_turn_endpoint_uses_the_configured_origin() -> 
             )
             assert capture.paths() == ["/slack/api/chat.update"]
         finally:
+            await server.close()
+
+    asyncio.run(go())
+
+
+# --- #2096: the rollout-free disconnected cluster-message relay --------------
+
+
+def test_the_cluster_message_adapter_slug_is_the_reserved_literal() -> None:
+    assert CLUSTER_MESSAGE_ADAPTER == "curie-cluster-message"
+
+
+def test_cluster_message_adapter_wins_before_slack_kind_and_uses_worker_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The built-in route cannot be redirected or credential-shadowed by a turn.
+
+    This is the execution-level trust proof: the wire still says ``kind=slack``,
+    but the exact reserved adapter slug selects the API relay before kind lookup.
+    The URL comes only from ``api_base_url`` plus the fixed path and UUID, while
+    the secret comes only from ``internal_worker_token``.  Both hostile wire
+    fields are armed and observed receiving nothing.
+    """
+
+    async def go() -> None:
+        capture = _Capture()
+        server = TestServer(capture.app)
+        await server.start_server()
+        hostile = _Capture()
+        hostile_server = TestServer(hostile.app)
+        await hostile_server.start_server()
+        sink = None
+        try:
+            port = server.port
+            hostile_port = hostile_server.port
+            assert port is not None
+            assert hostile_port is not None
+            monkeypatch.setenv(
+                "CURIE_ADAPTER_CREDENTIALS",
+                json.dumps({CLUSTER_MESSAGE_ADAPTER: SHADOW_CLUSTER_MESSAGE_TOKEN}),
+            )
+            config = WorkerConfig(
+                slack_bot_token=SLACK_TOKEN,
+                slack_api_base_url=f"http://127.0.0.1:{port}/slack/api/",
+                api_base_url=f"http://127.0.0.1:{port}",
+                internal_worker_token=INTERNAL_WORKER_TOKEN,
+            )
+            assert (
+                config.adapter_credentials[CLUSTER_MESSAGE_ADAPTER]
+                == SHADOW_CLUSTER_MESSAGE_TOKEN
+            ), "the shadow credential must be armed for this proof"
+            sink = build_reply_sink(config)
+
+            ack = await sink.emit(
+                _cluster_message_update(),
+                route=TargetRoute(
+                    endpoint=f"http://127.0.0.1:{hostile_port}/a",
+                    adapter=CLUSTER_MESSAGE_ADAPTER,
+                ),
+            )
+
+            assert ack.ref == CLUSTER_MESSAGE_REPLY_REF
+            assert capture.paths() == [CLUSTER_MESSAGE_REPLY_PATH]
+            assert hostile.requests == [], "the wire endpoint must be ignored"
+            sent = capture.requests[0]
+            assert sent["headers"][SECRET_HEADER] == INTERNAL_WORKER_TOKEN
+            serialized = json.dumps(sent)
+            assert SHADOW_CLUSTER_MESSAGE_TOKEN not in serialized
+            assert SLACK_TOKEN not in serialized
+            body = json.loads(sent["body"])
+            assert body["target"]["kind"] == "slack"
+            assert body["target"]["reply_ref"] == CLUSTER_MESSAGE_REPLY_REF
+        finally:
+            if sink is not None:
+                await sink.aclose()
+            await hostile_server.close()
+            await server.close()
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    "reply_ref",
+    [
+        "http://evil.example",
+        "../",
+        "a/b",
+        CLUSTER_MESSAGE_REPLY_REF.upper(),
+        "123e4567-e89b-12d3-a456-426614174000",
+    ],
+)
+def test_cluster_message_rejects_noncanonical_uuid4_before_any_request(
+    reply_ref: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hostile refs fail before URL construction, I/O, or token egress."""
+
+    async def go() -> None:
+        requests: list[tuple[object, object]] = []
+
+        def refuse_request(
+            _session: aiohttp.ClientSession,
+            url: object,
+            *_args: object,
+            **kwargs: object,
+        ) -> object:
+            requests.append((url, kwargs.get("headers")))
+            raise AssertionError("invalid reply_ref attempted outbound HTTP")
+
+        monkeypatch.setattr(aiohttp.ClientSession, "post", refuse_request)
+        sink = None
+        try:
+            sink = build_reply_sink(
+                _config(
+                    api_base_url="http://api.example.test:8000",
+                    internal_worker_token=INTERNAL_WORKER_TOKEN,
+                )
+            )
+            with pytest.raises(ValueError):
+                await sink.emit(
+                    _cluster_message_update(reply_ref),
+                    route=TargetRoute(
+                        endpoint="http://evil.example/hostile-wire-endpoint",
+                        adapter=CLUSTER_MESSAGE_ADAPTER,
+                    ),
+                )
+            assert requests == [], "validation must run before any HTTP request"
+        finally:
+            if sink is not None:
+                await sink.aclose()
+
+    asyncio.run(go())
+
+
+def test_cluster_message_redirect_is_refused_without_moving_worker_token() -> None:
+    async def go() -> None:
+        capture = _Capture()
+        capture.redirect_cluster_message_replies = True
+        server = TestServer(capture.app)
+        await server.start_server()
+        sink = None
+        try:
+            port = server.port
+            assert port is not None
+            sink = build_reply_sink(
+                _config(
+                    port,
+                    api_base_url=f"http://127.0.0.1:{port}",
+                    internal_worker_token=INTERNAL_WORKER_TOKEN,
+                )
+            )
+            with pytest.raises(RedirectedAdapterEndpointError):
+                await sink.emit(
+                    _cluster_message_update(),
+                    route=TargetRoute(
+                        endpoint="http://evil.example/ignored",
+                        adapter=CLUSTER_MESSAGE_ADAPTER,
+                    ),
+                )
+            assert capture.paths() == [CLUSTER_MESSAGE_REPLY_PATH]
+            assert capture.secrets() == [INTERNAL_WORKER_TOKEN]
+        finally:
+            if sink is not None:
+                await sink.aclose()
+            await server.close()
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("kind", ["mail", "discord"])
+def test_non_reserved_kinds_keep_the_generic_http_fallback(kind: str) -> None:
+    async def go() -> None:
+        capture = _Capture()
+        server = TestServer(capture.app)
+        await server.start_server()
+        sink = None
+        try:
+            port = server.port
+            assert port is not None
+            sink = build_reply_sink(_config(port))
+            await sink.emit(
+                _update(kind),
+                route=TargetRoute(
+                    endpoint=f"http://127.0.0.1:{port}/a",
+                    adapter=ADAPTER_A,
+                ),
+            )
+            assert capture.paths() == ["/a"]
+            assert capture.secrets() == [SECRET_A]
+        finally:
+            if sink is not None:
+                await sink.aclose()
+            await server.close()
+
+    asyncio.run(go())
+
+
+def test_non_reserved_adapter_on_slack_keeps_the_slack_adapter() -> None:
+    """Only the exact reserved slug may preempt existing kind routing."""
+
+    async def go() -> None:
+        capture = _Capture()
+        server = TestServer(capture.app)
+        await server.start_server()
+        sink = None
+        try:
+            port = server.port
+            assert port is not None
+            sink = build_reply_sink(_config(port))
+            await sink.emit(
+                _update("slack"),
+                route=TargetRoute(
+                    endpoint=f"http://127.0.0.1:{port}/slack/api/",
+                    adapter=ADAPTER_A,
+                ),
+            )
+            assert capture.paths() == ["/slack/api/chat.update"]
+            assert capture.bodies_mentioning(SLACK_TOKEN)
+            assert capture.secrets() == [None]
+        finally:
+            if sink is not None:
+                await sink.aclose()
             await server.close()
 
     asyncio.run(go())

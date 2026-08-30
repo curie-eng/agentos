@@ -5,22 +5,15 @@
 //! workspace can exercise the entire deployed machinery (Valkey queue -> worker
 //! -> claimed sandbox -> the real skill -> the reply) without any Slack access,
 //! tokens, or workspace. It is the retained chat helper engine, backed by a
-//! local Slack Web API stub plus the frozen `QueuedTurn` enqueue and the
-//! ack-based completion signal, with Kubernetes-aware auto-plumbing bolted on
-//! top:
+//! ref-keyed in-cluster API relay plus the frozen `QueuedTurn` enqueue, with
+//! Kubernetes-aware auto-plumbing bolted on top:
 //!
-//! 1. Self-managed `kubectl port-forward`s (children of this process, killed on
-//!    exit) reach the in-cluster Valkey (for the enqueue) and API (for the
-//!    default-channel lookup) with no manual setup.
-//! 2. The stub binds `0.0.0.0` and advertises a routable host (either
-//!    `--listen-host` or the local IP the kernel would use to reach the cluster)
-//!    so the in-cluster worker can post its placeholder edits back to it.
-//! 3. Each enqueued turn carries its reply endpoint (this stub's URL) on the
-//!    queue payload's reply handle (issue #19), so the worker finalizes THIS
-//!    turn against the stub without re-pointing its worker-global Slack setting.
-//!    A real Slack workspace (whose turns carry no endpoint and so use the
-//!    worker default) and this driver can therefore run against one worker at
-//!    once, instead of contending for a single `worker.slackApiBaseUrl`.
+//! 1. Separate process-owned `kubectl port-forward`s reach Valkey for enqueue
+//!    and the API for reply polling, with no worker Deployment mutation.
+//! 2. A disconnected turn keeps its Slack binding kind/channel, carries no
+//!    endpoint, and selects the reserved relay adapter with a UUIDv4 ref.
+//! 3. Connected Slack bypasses the relay unchanged, so both paths share one
+//!    stable worker replica set without callback-trust rollouts.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -413,76 +406,19 @@ fn advertised_url(host: &str, port: u16) -> String {
     format!("http://{host}:{port}/api/")
 }
 
-/// Temporary worker widening for the no-Slack cluster-message stub (#1812).
-///
-/// The worker intentionally refuses per-turn Slack endpoints whose origin was
-/// not operator-trusted (ADR-0096). A default chart install has no extra trusted
-/// origins, so the CLI must trust the host it advertises before enqueueing. The
-/// guard restores the exact prior environment state on every unwinding return;
-/// callers that use the module's non-unwinding exit helper restore it
-/// asynchronously first and then move the guard into that helper as a fallback.
-const TRUST_ENV: &str = "CURIE_SLACK_TRUSTED_ORIGINS";
-const TRUST_HOLDER_ANNOTATION: &str = "curie.dev/cluster-message-trust-holder";
-const TRUST_HOLDER_JSON_PATH: &str =
-    "/metadata/annotations/curie.dev~1cluster-message-trust-holder";
-
-#[derive(Clone)]
-enum TrustMutationMode {
-    /// Real Kubernetes objects always expose a resourceVersion. The holder
-    /// annotation and env mutation are one JSON Patch guarded by that version.
-    Cas { holder: String, temporary: String },
-    /// Test doubles that are not Kubernetes objects may omit resourceVersion.
-    /// Keep the legacy command shape for those fixtures only.
-    Legacy,
-}
-
-#[derive(Clone)]
-struct TrustCleanupSpec {
-    namespace: String,
-    deployment: String,
-    origin: String,
-    original: Option<String>,
-    mode: TrustMutationMode,
-}
-
-struct ClusterStubTrust {
-    cleanup: TrustCleanupSpec,
-    /// The temporary-trust rollout can leave the prior worker in its graceful
-    /// drain period.  This is deliberately derived from the selected
-    /// Deployment rather than from `--timeout-secs`: the latter starts only
-    /// after the eventual queue entry is enqueued.
-    prevention_wait_budget: Duration,
-    armed: bool,
-}
-
-#[derive(Clone)]
-struct WorkerTrustView {
-    resource_version: Option<String>,
-    annotations_present: bool,
-    holder: Option<String>,
-    worker_index: usize,
-    env_present: bool,
-    env: Vec<serde_json::Value>,
-    trust: Option<String>,
-    termination_grace_period: Duration,
-}
-
-#[cfg(unix)]
-static CLUSTER_TRUST_SIGNAL_STATE: std::sync::LazyLock<std::sync::Mutex<Option<TrustCleanupSpec>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
-
-#[cfg(unix)]
-static CLUSTER_TRUST_SIGNAL_HANDLER: std::sync::OnceLock<std::result::Result<(), String>> =
-    std::sync::OnceLock::new();
+/// Reserved built-in worker adapter for disconnected `cluster message` turns.
+/// It is intentionally language-local and byte-identical to the worker/API
+/// literal: the frozen queue contract already has an adapter slot, so no wire
+/// change is needed.
+const CLUSTER_MESSAGE_RELAY_ADAPTER: &str = "curie-cluster-message";
 
 /// The kubectl read behind `dispatcher_connected_strict`, extracted pure so the
 /// Deployment NAME is unit-testable without a cluster (#1533).
 ///
 /// `--ignore-not-found` is what makes a wrong name dangerous here: a Deployment
 /// that does not exist returns success with EMPTY output, which the caller
-/// reads as "Slack is disconnected" and acts on by widening worker Slack trust.
-/// That is a silent wrong-direction mutation, not a visible failure, so the
-/// name must be the chart-rendered one.
+/// reads as "Slack is disconnected". That is a silent wrong-direction routing
+/// decision, so the name must be the chart-rendered one.
 fn dispatcher_probe_command(namespace: &str, fullname: &crate::ops::ReleaseFullname) -> OpsCommand {
     OpsCommand::new(
         "kubectl",
@@ -500,8 +436,8 @@ fn dispatcher_probe_command(namespace: &str, fullname: &crate::ops::ReleaseFulln
 }
 
 /// Probe the connected transport without collapsing a kubectl/RBAC failure into
-/// "dispatcher absent". Trust may only be widened after absence is positively
-/// observed; an indeterminate probe therefore refuses before any mutation.
+/// "dispatcher absent". An indeterminate probe refuses before enqueue so the
+/// CLI never diverts a connected turn into the disconnected relay by guessing.
 async fn dispatcher_connected_strict(
     namespace: &str,
     fullname: &crate::ops::ReleaseFullname,
@@ -511,7 +447,7 @@ async fn dispatcher_connected_strict(
     if !ok {
         bail!(
             "could not prove that Slack is disconnected for {} in namespace \
-             {namespace}; refusing to widen worker Slack trust: {}",
+             {namespace}; refusing to guess the reply transport: {}",
             fullname.resource("dispatcher"),
             err.trim().lines().next().unwrap_or("kubectl probe failed")
         );
@@ -519,685 +455,130 @@ async fn dispatcher_connected_strict(
     Ok(!out.trim().is_empty())
 }
 
-/// The worker Deployment the temporary trust widening (#1812) patches.
-///
-/// Extracted so the NAME is unit-testable without a cluster (#1533). The chart
-/// renders `{{ include "curie.fullname" . }}-worker`; a `{release}-worker` guess
-/// patches nothing, so the stub reply never arrives and the guard's ownership
-/// annotation lands on no object.
-fn stub_trust_deployment(fullname: &crate::ops::ReleaseFullname) -> String {
-    fullname.resource("worker")
+const CLUSTER_MESSAGE_RELAY_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// One disconnected cluster turn plus the opaque API bucket the worker will
+/// write. The normal Slack binding coordinates stay intact so agent resolution
+/// does not diverge; only reply delivery selects the reserved built-in adapter.
+fn cluster_relay_turn(
+    channel: &str,
+    opts: &MessageOpts,
+    conversation_id: &str,
+) -> (QueuedTurn, uuid::Uuid) {
+    let reply_ref = uuid::Uuid::new_v4();
+    let mut turn = synthetic_turn(
+        "slack",
+        channel,
+        &opts.user,
+        &opts.text,
+        conversation_id,
+        reply_ref.hyphenated().to_string(),
+        None,
+    );
+    turn.reply_handle.adapter = Some(CLUSTER_MESSAGE_RELAY_ADAPTER.to_string());
+    (turn, reply_ref)
 }
 
-impl ClusterStubTrust {
-    /// `release` is still needed alongside `fullname`: the post-rollout wait
-    /// selects pods by `app.kubernetes.io/instance=<release>`, which is the raw
-    /// Helm release name and NOT the rendered fullname (`curie.selectorLabels`,
-    /// `charts/curie/templates/_helpers.tpl:40-44`). Only the Deployment NAME
-    /// follows `curie.fullname` (#1533).
-    async fn install(
-        namespace: &str,
-        release: &str,
-        fullname: &crate::ops::ReleaseFullname,
-        advertise_host: &str,
-    ) -> Result<Self> {
-        let deployment = stub_trust_deployment(fullname);
-        let view = read_worker_trust(namespace, &deployment).await?;
-        let prevention_wait_budget = worker_prevention_wait_budget(&view);
-        let host = if advertise_host.contains(':') && !advertise_host.starts_with('[') {
-            format!("[{advertise_host}]")
-        } else {
-            advertise_host.to_string()
-        };
-        let origin = format!("http://{host}");
-        if let Some(holder) = view.holder.as_deref() {
-            bail!(
-                "another cluster message command ({holder}) is temporarily managing worker Slack \
-                 trust on {deployment}; retry after it exits"
-            );
-        }
-        if view
-            .trust
-            .as_deref()
-            .is_some_and(|value| value.split(',').any(|entry| entry.trim() == origin))
-        {
-            return Ok(Self {
-                cleanup: TrustCleanupSpec {
-                    namespace: namespace.to_string(),
-                    deployment,
-                    origin,
-                    original: view.trust,
-                    mode: TrustMutationMode::Legacy,
-                },
-                prevention_wait_budget,
-                armed: false,
+struct ClusterRelayObservation {
+    outcome: Outcome,
+    next_cursor: usize,
+}
+
+/// Observe one ref-keyed API relay until the worker reports a semantic
+/// completion, parks for approval, or the caller's deadline expires.
+///
+/// A valid bucket may not exist during the enqueue-to-first-event race; the API
+/// client exposes that 404 as `None`, which is retried within the same bounded
+/// poll. No stream/PENDING read is used as completion: the worker's relay event
+/// is the reply-delivery outcome, while XACK remains worker-owned and continues
+/// even if this CLI exits.
+async fn await_cluster_relay(
+    api: &ApiClient,
+    reply_ref: &uuid::Uuid,
+    mut cursor: usize,
+    timeout: Duration,
+    observer: &mut impl FnMut(&str),
+) -> Result<ClusterRelayObservation> {
+    let deadline = Instant::now() + timeout;
+    let mut latest: Option<String> = None;
+    loop {
+        if Instant::now() >= deadline {
+            return Ok(ClusterRelayObservation {
+                outcome: Outcome::TimedOut,
+                next_cursor: cursor,
             });
         }
-        let original = view.trust.clone();
-        let temporary = match original.as_deref().filter(|value| !value.is_empty()) {
-            Some(value) => format!("{value},{origin}"),
-            None => origin.clone(),
-        };
-        let (mode, apply) = match view.resource_version.as_deref() {
-            Some(_) => {
-                let holder = uuid::Uuid::new_v4().to_string();
-                let patch = trust_patch(&view, Some(&temporary), Some(&holder), false)?;
-                (
-                    TrustMutationMode::Cas {
-                        holder,
-                        temporary: temporary.clone(),
-                    },
-                    worker_patch_command(namespace, &deployment, patch),
-                )
-            }
-            None => (
-                TrustMutationMode::Legacy,
-                worker_set_env_command(namespace, &deployment, Some(&temporary)),
-            ),
-        };
-        let cleanup = TrustCleanupSpec {
-            namespace: namespace.to_string(),
-            deployment,
-            origin: origin.clone(),
-            original,
-            mode,
-        };
-        register_cluster_trust_signal_cleanup(cleanup.clone())?;
-        // Arm before invoking kubectl: even an unusual nonzero result after the
-        // API accepted the mutation must run restoration.
-        let guard = Self {
-            cleanup,
-            prevention_wait_budget,
-            armed: true,
-        };
-        crate::ui::ui().note(&format!(
-            "temporarily updating worker reply trust; allowing up to {}s for the worker rollout and prior worker drain before enqueue (separate from --timeout-secs)",
-            guard.prevention_wait_budget.as_secs()
-        ));
-        let (ok, _, err) = run_capture(&apply).await?;
-        if !ok {
-            bail!(
-                "temporarily trusting cluster-message stub origin {origin}: {}",
-                err.trim()
-            );
-        }
 
-        let rollout = guard.prevention_rollout_command();
-        let (ok, _, err) = run_capture(&rollout).await?;
-        if !ok {
-            if rollout_timed_out(&err) {
-                return Err(worker_prevention_timeout_error(
-                    release,
-                    namespace,
-                    guard.prevention_wait_budget,
-                ));
-            }
-            bail!(
-                "waiting for the worker to trust cluster-message stub origin {origin}: {}",
-                err.trim()
-            );
-        }
-        // rollout status returns once the new replica is Ready. The outgoing
-        // pod can still be Terminating and still blocked in XREADGROUP, which
-        // is how the first cluster message strands its own turn (#1532).
-        crate::ui::ui().note(
-            "worker replacement is ready; waiting for every prior worker to stop claiming before enqueue",
-        );
-        wait_for_worker_pods_to_release_claimers(namespace, release, guard.prevention_wait_budget)
-            .await?;
-        Ok(guard)
-    }
-
-    async fn restore(&mut self) -> Result<()> {
-        if !self.armed {
-            return Ok(());
-        }
-        restore_cluster_trust(&self.cleanup).await?;
-        let (ok, _, err) = run_capture(&self.restore_rollout_command()).await?;
-        if !ok {
-            bail!(
-                "waiting for the worker to restore its prior Slack trust: {}",
-                err.trim()
-            );
-        }
-        self.armed = false;
-        clear_cluster_trust_signal_cleanup(&self.cleanup);
-        Ok(())
-    }
-
-    fn prevention_rollout_command(&self) -> OpsCommand {
-        worker_rollout_command(
-            &self.cleanup.namespace,
-            &self.cleanup.deployment,
-            self.prevention_wait_budget,
-        )
-    }
-
-    /// Restoring operator state is cleanup, not part of the no-lost-turn gate.
-    /// Keep it short so a completed message never blocks for a full graceful
-    /// drain interval while the deployment rolls back its temporary trust.
-    fn restore_rollout_command(&self) -> OpsCommand {
-        worker_rollout_command(
-            &self.cleanup.namespace,
-            &self.cleanup.deployment,
-            WORKER_TRUST_RESTORE_ROLLOUT_TIMEOUT,
-        )
-    }
-}
-
-const DEFAULT_WORKER_TERMINATION_GRACE_PERIOD: Duration = Duration::from_secs(30);
-const WORKER_PREVENTION_MARGIN: Duration = Duration::from_secs(30);
-const WORKER_TRUST_RESTORE_ROLLOUT_TIMEOUT: Duration = Duration::from_secs(120);
-const WORKER_POD_SETTLE_POLL: Duration = Duration::from_millis(500);
-
-/// The safe pre-enqueue budget covers the Deployment's own configured drain
-/// window plus scheduling/control-plane slack. Kubernetes defaults an omitted
-/// `terminationGracePeriodSeconds` to 30 seconds, but a chart/operator value
-/// (notably Curie's 1800 second default) wins when present.
-fn worker_prevention_wait_budget(view: &WorkerTrustView) -> Duration {
-    view.termination_grace_period
-        .saturating_add(WORKER_PREVENTION_MARGIN)
-}
-
-fn worker_rollout_command(namespace: &str, deployment: &str, timeout: Duration) -> OpsCommand {
-    let timeout_secs = timeout.as_secs().max(1);
-    OpsCommand::new(
-        "kubectl",
-        vec![
-            plain("-n"),
-            plain(namespace),
-            plain("rollout"),
-            plain("status"),
-            plain(format!("deployment/{deployment}")),
-            plain(format!("--timeout={timeout_secs}s")),
-        ],
-    )
-}
-
-fn rollout_timed_out(stderr: &str) -> bool {
-    stderr
-        .to_ascii_lowercase()
-        .contains("timed out waiting for the condition")
-}
-
-fn worker_prevention_timeout_error(
-    release: &str,
-    namespace: &str,
-    budget: Duration,
-) -> anyhow::Error {
-    anyhow::Error::from(
-        crate::exit::CliError::transient(format!(
-            "worker rollout or prior worker drain for release {release} in namespace {namespace} did not settle within {}s; no turn was enqueued, so retry is safe",
-            budget.as_secs()
-        ))
-        .with_fix(format!(
-            "wait for `kubectl -n {namespace} get pods -l app.kubernetes.io/instance={release},app.kubernetes.io/component=worker` to show only Ready, non-terminating pods, then retry `curie cluster message`"
-        )),
-    )
-}
-
-fn worker_pods_command(namespace: &str, release: &str) -> OpsCommand {
-    OpsCommand::new(
-        "kubectl",
-        vec![
-            plain("-n"),
-            plain(namespace),
-            plain("get"),
-            plain("pods"),
-            plain("-l"),
-            plain(format!(
-                "app.kubernetes.io/instance={release},app.kubernetes.io/component=worker"
-            )),
-            plain("-o"),
-            plain("json"),
-        ],
-    )
-}
-
-fn pod_is_ready(pod: &serde_json::Value) -> bool {
-    if pod
-        .pointer("/status/phase")
-        .and_then(serde_json::Value::as_str)
-        != Some("Running")
-    {
-        return false;
-    }
-    pod.pointer("/status/conditions")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .any(|condition| {
-            condition.get("type").and_then(serde_json::Value::as_str) == Some("Ready")
-                && condition.get("status").and_then(serde_json::Value::as_str) == Some("True")
-        })
-}
-
-fn worker_pods_allow_enqueue(pods_json: &str) -> Result<bool> {
-    let value: serde_json::Value = serde_json::from_str(pods_json)
-        .context("parsing worker pods while waiting out a callback-trust rollout")?;
-    let items = value
-        .get("items")
-        .and_then(serde_json::Value::as_array)
-        .context("worker pod list has no items array")?;
-    if items.is_empty() {
-        return Ok(false);
-    }
-    for pod in items {
-        if pod
-            .pointer("/metadata/deletionTimestamp")
-            .is_some_and(|stamp| !stamp.is_null())
-        {
-            return Ok(false);
-        }
-        if !pod_is_ready(pod) {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-async fn wait_for_worker_pods_to_release_claimers(
-    namespace: &str,
-    release: &str,
-    budget: Duration,
-) -> Result<()> {
-    let deadline = Instant::now() + budget;
-    loop {
-        let (ok, out, err) = run_capture(&worker_pods_command(namespace, release)).await?;
-        if !ok {
-            bail!(
-                "listing worker pods for release {release} in namespace {namespace}: {}",
-                err.trim()
-            );
-        }
-        if worker_pods_allow_enqueue(&out)? {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(worker_prevention_timeout_error(release, namespace, budget));
-        }
-        tokio::time::sleep(WORKER_POD_SETTLE_POLL).await;
-    }
-}
-
-impl Drop for ClusterStubTrust {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        if restore_cluster_trust_sync(&self.cleanup).is_err() {
-            crate::ui::ui().warn("could not restore the worker's prior Slack trust");
-            return;
-        }
-        let rollout = self.restore_rollout_command();
-        let rollout = std::process::Command::new(&rollout.program)
-            .args(rollout.argv())
-            .output();
-        if !matches!(rollout, Ok(output) if output.status.success()) {
-            crate::ui::ui().warn("worker did not finish restoring its prior Slack trust posture");
-        }
-        clear_cluster_trust_signal_cleanup(&self.cleanup);
-    }
-}
-
-fn worker_trust_view(deployment_json: &str) -> Result<WorkerTrustView> {
-    let deployment: serde_json::Value = serde_json::from_str(deployment_json)
-        .context("parsing the worker Deployment while snapshotting Slack trust")?;
-    let containers = deployment
-        .pointer("/spec/template/spec/containers")
-        .and_then(serde_json::Value::as_array)
-        .context("worker Deployment has no pod containers")?;
-    let (worker_index, worker) = containers
-        .iter()
-        .enumerate()
-        .find(|(_, container)| {
-            container.get("name").and_then(serde_json::Value::as_str) == Some("worker")
-        })
-        .context("worker Deployment has no container named worker")?;
-    let env_present = worker.get("env").is_some();
-    let env = worker
-        .get("env")
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let trust_entry = env
-        .iter()
-        .find(|entry| entry.get("name").and_then(serde_json::Value::as_str) == Some(TRUST_ENV));
-    let trust = match trust_entry {
-        Some(entry) => Some(
-            entry
-                .get("value")
-                .and_then(serde_json::Value::as_str)
-                .context("CURIE_SLACK_TRUSTED_ORIGINS is not a literal environment value")?
-                .to_string(),
-        ),
-        None => None,
-    };
-    let annotations = deployment.pointer("/metadata/annotations");
-    let termination_grace_period = deployment
-        .pointer("/spec/template/spec/terminationGracePeriodSeconds")
-        .and_then(serde_json::Value::as_u64)
-        .map(Duration::from_secs)
-        .unwrap_or(DEFAULT_WORKER_TERMINATION_GRACE_PERIOD);
-    Ok(WorkerTrustView {
-        resource_version: deployment
-            .pointer("/metadata/resourceVersion")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string),
-        annotations_present: annotations.is_some_and(serde_json::Value::is_object),
-        holder: annotations
-            .and_then(|value| value.get(TRUST_HOLDER_ANNOTATION))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string),
-        worker_index,
-        env_present,
-        env,
-        trust,
-        termination_grace_period,
-    })
-}
-
-fn worker_get_command(namespace: &str, deployment: &str) -> OpsCommand {
-    OpsCommand::new(
-        "kubectl",
-        vec![
-            plain("-n"),
-            plain(namespace),
-            plain("get"),
-            plain("deployment"),
-            plain(deployment),
-            plain("-o"),
-            plain("json"),
-        ],
-    )
-}
-
-async fn read_worker_trust(namespace: &str, deployment: &str) -> Result<WorkerTrustView> {
-    let (ok, out, err) = run_capture(&worker_get_command(namespace, deployment)).await?;
-    if !ok {
-        bail!("reading worker Deployment {deployment}: {}", err.trim());
-    }
-    worker_trust_view(&out)
-}
-
-fn env_with_trust(view: &WorkerTrustView, target: Option<&str>) -> Vec<serde_json::Value> {
-    let mut env = view.env.clone();
-    let position = env
-        .iter()
-        .position(|entry| entry.get("name").and_then(serde_json::Value::as_str) == Some(TRUST_ENV));
-    match (position, target) {
-        (Some(index), Some(value)) => {
-            env[index] = serde_json::json!({"name": TRUST_ENV, "value": value});
-        }
-        (Some(index), None) => {
-            env.remove(index);
-        }
-        (None, Some(value)) => {
-            env.push(serde_json::json!({"name": TRUST_ENV, "value": value}));
-        }
-        (None, None) => {}
-    }
-    env
-}
-
-fn trust_patch(
-    view: &WorkerTrustView,
-    target: Option<&str>,
-    acquire_holder: Option<&str>,
-    release_holder: bool,
-) -> Result<String> {
-    let resource_version = view
-        .resource_version
-        .as_deref()
-        .context("worker Deployment omitted metadata.resourceVersion")?;
-    let mut operations = vec![serde_json::json!({
-        "op": "test",
-        "path": "/metadata/resourceVersion",
-        "value": resource_version,
-    })];
-    if let Some(holder) = acquire_holder {
-        if !view.annotations_present {
-            operations.push(serde_json::json!({
-                "op": "add",
-                "path": "/metadata/annotations",
-                "value": {},
-            }));
-        }
-        operations.push(serde_json::json!({
-            "op": "add",
-            "path": TRUST_HOLDER_JSON_PATH,
-            "value": holder,
-        }));
-    }
-    let env_path = format!("/spec/template/spec/containers/{}/env", view.worker_index);
-    operations.push(serde_json::json!({
-        "op": if view.env_present { "replace" } else { "add" },
-        "path": env_path,
-        "value": env_with_trust(view, target),
-    }));
-    if release_holder {
-        operations.push(serde_json::json!({
-            "op": "remove",
-            "path": TRUST_HOLDER_JSON_PATH,
-        }));
-    }
-    serde_json::to_string(&operations).context("serializing worker trust JSON Patch")
-}
-
-fn worker_patch_command(namespace: &str, deployment: &str, patch: String) -> OpsCommand {
-    OpsCommand::new(
-        "kubectl",
-        vec![
-            plain("-n"),
-            plain(namespace),
-            plain("patch"),
-            plain("deployment"),
-            plain(deployment),
-            plain("--type=json"),
-            plain("-p"),
-            plain(patch),
-        ],
-    )
-}
-
-fn worker_set_env_command(namespace: &str, deployment: &str, target: Option<&str>) -> OpsCommand {
-    let assignment = target
-        .map(|value| format!("{TRUST_ENV}={value}"))
-        .unwrap_or_else(|| format!("{TRUST_ENV}-"));
-    OpsCommand::new(
-        "kubectl",
-        vec![
-            plain("-n"),
-            plain(namespace),
-            plain("set"),
-            plain("env"),
-            plain(format!("deployment/{deployment}")),
-            plain(assignment),
-        ],
-    )
-}
-
-fn cleanup_target(current: Option<&str>, cleanup: &TrustCleanupSpec) -> Option<String> {
-    let TrustMutationMode::Cas { temporary, .. } = &cleanup.mode else {
-        return cleanup.original.clone();
-    };
-    if current == Some(temporary.as_str()) {
-        return cleanup.original.clone();
-    }
-    current.map(|value| {
-        value
-            .split(',')
-            .filter(|entry| entry.trim() != cleanup.origin)
-            .collect::<Vec<_>>()
-            .join(",")
-    })
-}
-
-async fn restore_cluster_trust(cleanup: &TrustCleanupSpec) -> Result<()> {
-    if matches!(&cleanup.mode, TrustMutationMode::Legacy) {
-        let (ok, _, err) = run_capture(&worker_set_env_command(
-            &cleanup.namespace,
-            &cleanup.deployment,
-            cleanup.original.as_deref(),
-        ))
-        .await?;
-        if !ok {
-            bail!("restoring worker Slack trust: {}", err.trim());
-        }
-        return Ok(());
-    }
-    let TrustMutationMode::Cas { holder, .. } = &cleanup.mode else {
-        unreachable!()
-    };
-    for _ in 0..5 {
-        let view = read_worker_trust(&cleanup.namespace, &cleanup.deployment).await?;
-        if view.holder.as_deref() != Some(holder) {
-            if view.holder.is_none()
-                && !view.trust.as_deref().is_some_and(|value| {
-                    value
-                        .split(',')
-                        .any(|entry| entry.trim() == cleanup.origin.as_str())
-                })
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let page =
+            match tokio::time::timeout(remaining, api.cluster_message_replies(reply_ref, cursor))
+                .await
             {
-                return Ok(());
-            }
-            bail!("temporary worker trust ownership changed; refusing a stale restoration");
-        }
-        let target = cleanup_target(view.trust.as_deref(), cleanup);
-        let patch = trust_patch(&view, target.as_deref(), None, true)?;
-        let (ok, _, err) = run_capture(&worker_patch_command(
-            &cleanup.namespace,
-            &cleanup.deployment,
-            patch,
-        ))
-        .await?;
-        if ok {
-            return Ok(());
-        }
-        let lower = err.to_lowercase();
-        if !(lower.contains("conflict")
-            || lower.contains("test failed")
-            || lower.contains("object has been modified"))
-        {
-            bail!("restoring worker Slack trust: {}", err.trim());
-        }
-    }
-    bail!("worker Deployment kept changing while restoring temporary Slack trust")
-}
-
-fn run_sync_capture(command: &OpsCommand) -> Result<(bool, String, String)> {
-    let output = std::process::Command::new(&command.program)
-        .args(command.argv())
-        .output()
-        .with_context(|| format!("invoking {} during signal cleanup", command.program))?;
-    Ok((
-        output.status.success(),
-        String::from_utf8_lossy(&output.stdout).to_string(),
-        String::from_utf8_lossy(&output.stderr).to_string(),
-    ))
-}
-
-fn restore_cluster_trust_sync(cleanup: &TrustCleanupSpec) -> Result<()> {
-    if matches!(&cleanup.mode, TrustMutationMode::Legacy) {
-        let (ok, _, err) = run_sync_capture(&worker_set_env_command(
-            &cleanup.namespace,
-            &cleanup.deployment,
-            cleanup.original.as_deref(),
-        ))?;
-        if !ok {
-            bail!("restoring worker Slack trust: {}", err.trim());
-        }
-        return Ok(());
-    }
-    let TrustMutationMode::Cas { holder, .. } = &cleanup.mode else {
-        unreachable!()
-    };
-    for _ in 0..5 {
-        let (ok, out, err) =
-            run_sync_capture(&worker_get_command(&cleanup.namespace, &cleanup.deployment))?;
-        if !ok {
-            bail!("reading worker during signal cleanup: {}", err.trim());
-        }
-        let view = worker_trust_view(&out)?;
-        if view.holder.as_deref() != Some(holder) {
-            return Ok(());
-        }
-        let target = cleanup_target(view.trust.as_deref(), cleanup);
-        let patch = trust_patch(&view, target.as_deref(), None, true)?;
-        let (ok, _, err) = run_sync_capture(&worker_patch_command(
-            &cleanup.namespace,
-            &cleanup.deployment,
-            patch,
-        ))?;
-        if ok {
-            return Ok(());
-        }
-        let lower = err.to_lowercase();
-        if !(lower.contains("conflict")
-            || lower.contains("test failed")
-            || lower.contains("object has been modified"))
-        {
-            bail!("restoring worker Slack trust: {}", err.trim());
-        }
-    }
-    bail!("worker Deployment kept changing during signal cleanup")
-}
-
-#[cfg(unix)]
-fn register_cluster_trust_signal_cleanup(cleanup: TrustCleanupSpec) -> Result<()> {
-    match CLUSTER_TRUST_SIGNAL_HANDLER.get_or_init(|| {
-        let mut signals = signal_hook::iterator::Signals::new([
-            signal_hook::consts::signal::SIGINT,
-            signal_hook::consts::signal::SIGTERM,
-        ])
-        .map_err(|error| error.to_string())?;
-        std::thread::Builder::new()
-            .name("curie-cluster-trust-cleanup".to_string())
-            .spawn(move || {
-                if let Some(signal) = signals.forever().next() {
-                    let cleanup = CLUSTER_TRUST_SIGNAL_STATE
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .clone();
-                    if let Some(cleanup) = cleanup {
-                        let _ = restore_cluster_trust_sync(&cleanup);
-                    }
-                    let _ = signal_hook::low_level::emulate_default_handler(signal);
-                    signal_hook::low_level::exit(128 + signal);
+                Ok(page) => page?,
+                Err(_) => {
+                    return Ok(ClusterRelayObservation {
+                        outcome: Outcome::TimedOut,
+                        next_cursor: cursor,
+                    });
                 }
-            })
-            .map_err(|error| error.to_string())?;
-        Ok(())
-    }) {
-        Ok(()) => {
-            *CLUSTER_TRUST_SIGNAL_STATE
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(cleanup);
-            Ok(())
+            };
+        if let Some(page) = page {
+            if page.next_cursor < cursor {
+                bail!(
+                    "cluster-message reply cursor moved backwards from {cursor} to {}",
+                    page.next_cursor
+                );
+            }
+            let mut awaiting_approval = false;
+            let mut completed = false;
+            for event in page.events {
+                match event.kind.as_str() {
+                    "turn.status" => {
+                        if let Some(status) = event.status.as_deref() {
+                            observer(status);
+                        }
+                    }
+                    "reply.update" => {
+                        if let Some(text) = event.text {
+                            if latest.as_deref() != Some(text.as_str()) {
+                                observer(&text);
+                                latest = Some(text);
+                            }
+                        }
+                    }
+                    "reply.post" => {}
+                    "turn.completed" => match event.outcome.as_deref() {
+                        Some("awaiting-approval") => awaiting_approval = true,
+                        Some("delivered" | "dropped" | "escalated") => {
+                            awaiting_approval = false;
+                            completed = true;
+                        }
+                        Some(outcome) => {
+                            bail!("cluster-message relay returned unknown outcome {outcome:?}")
+                        }
+                        None => bail!("cluster-message completion omitted its outcome"),
+                    },
+                    _ => {}
+                }
+            }
+            cursor = page.next_cursor;
+            if completed || page.terminal {
+                return Ok(ClusterRelayObservation {
+                    outcome: latest.map_or(Outcome::CompletedNoEdit, Outcome::Replied),
+                    next_cursor: cursor,
+                });
+            }
+            if awaiting_approval {
+                return Ok(ClusterRelayObservation {
+                    outcome: Outcome::AwaitingApproval(latest),
+                    next_cursor: cursor,
+                });
+            }
         }
-        Err(error) => bail!("installing cluster trust signal cleanup: {error}"),
-    }
-}
 
-#[cfg(not(unix))]
-fn register_cluster_trust_signal_cleanup(_cleanup: TrustCleanupSpec) -> Result<()> {
-    Ok(())
-}
-
-fn clear_cluster_trust_signal_cleanup(cleanup: &TrustCleanupSpec) {
-    #[cfg(unix)]
-    {
-        let mut current = CLUSTER_TRUST_SIGNAL_STATE
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if current.as_ref().is_some_and(|registered| {
-            registered.deployment == cleanup.deployment && registered.namespace == cleanup.namespace
-        }) {
-            *current = None;
-        }
+        let wake = (Instant::now() + CLUSTER_MESSAGE_RELAY_POLL_INTERVAL).min(deadline);
+        tokio::time::sleep_until(tokio::time::Instant::from_std(wake)).await;
     }
-    #[cfg(not(unix))]
-    let _ = cleanup;
 }
 
 /// Local mode: the Valkey URL the CLI enqueues onto -- the compose Valkey on its
@@ -1301,7 +682,7 @@ pub fn server_host_and_port(server: &str) -> Option<(String, u16)> {
 /// real run would execute, for `--dry-run`. Pure so the rendering is testable.
 /// The reply routes back to the stub via the per-turn endpoint on the queue
 /// payload (issue #19), so there is no worker-global `helm upgrade` to render.
-pub fn dry_run_lines(opts: &MessageOpts, advertise_host: &str) -> Vec<String> {
+pub fn dry_run_lines(opts: &MessageOpts, _advertise_host: &str) -> Vec<String> {
     // Offline by contract: a dry run contacts no cluster, so it renders the
     // chart's no-override `curie.fullname` rule rather than discovering the
     // rendered name (#1533). Under `nameOverride`/`fullnameOverride` the printed
@@ -1314,25 +695,26 @@ pub fn dry_run_lines(opts: &MessageOpts, advertise_host: &str) -> Vec<String> {
         opts.valkey_local_port,
         VALKEY_REMOTE_PORT,
     )];
-    if opts.channel.is_none() {
-        cmds.push(port_forward_command(
-            &opts.namespace,
-            &fullname,
-            "api",
-            opts.api_local_port,
-            API_REMOTE_PORT,
-        ));
-    }
-    let url = advertised_url(advertise_host, opts.listen_port);
+    cmds.push(port_forward_command(
+        &opts.namespace,
+        &fullname,
+        "api",
+        opts.api_local_port,
+        API_REMOTE_PORT,
+    ));
+    let poll_url = format!(
+        "http://127.0.0.1:{}/cluster-message-replies/<uuid-v4>",
+        opts.api_local_port
+    );
     let mut lines: Vec<String> = cmds.iter().map(OpsCommand::display).collect();
-    lines.push(format!("stub advertised at {url}"));
+    lines.push(format!("poll replies at {poll_url}"));
     let channel = opts
         .channel
         .clone()
         .unwrap_or_else(|| "<the sole bound (agent, Slack channel) pair>".to_string());
     lines.push(format!(
-        "enqueue a synthetic QueuedTurn (reply endpoint {url}) for channel {channel} \
-         on stream {}",
+        "enqueue a synthetic QueuedTurn (adapter {CLUSTER_MESSAGE_RELAY_ADAPTER}, no reply \
+         endpoint, UUIDv4 reply ref) for channel {channel} on stream {}",
         opts.stream
     ));
     lines.push(connected_transport_dry_run_note());
@@ -1412,7 +794,7 @@ pub fn message_dry_run_json(
     target: &str,
     stream: &str,
     channel: Option<&str>,
-    reply_endpoint: &str,
+    reply_endpoint: Option<&str>,
 ) -> serde_json::Value {
     serde_json::json!({
         "dry_run": true,
@@ -1440,7 +822,7 @@ struct MessageDryRunOutput {
     target: &'static str,
     stream: String,
     channel: Option<String>,
-    reply_endpoint: String,
+    reply_endpoint: Option<String>,
     human_lines: Vec<String>,
 }
 
@@ -1450,7 +832,7 @@ impl crate::ui::CliOutput for MessageDryRunOutput {
             self.target,
             &self.stream,
             self.channel.as_deref(),
-            &self.reply_endpoint,
+            self.reply_endpoint.as_deref(),
         )
     }
 
@@ -2236,7 +1618,7 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
             target: "local",
             stream: opts.stream.clone(),
             channel: opts.channel.clone(),
-            reply_endpoint,
+            reply_endpoint: Some(reply_endpoint),
             human_lines,
         });
         return Ok(());
@@ -2941,6 +2323,115 @@ async fn resume_after_approval(
     ResumeExit::Transient
 }
 
+/// Keep polling the same API relay bucket after an approval parks the turn.
+/// The resume queue preserves the original reply handle, so neither a new
+/// callback destination nor a stream scan is needed: resumed and nested-gate
+/// events append under the same opaque ref.
+#[allow(clippy::too_many_arguments)]
+async fn resume_cluster_after_approval(
+    opts: &MessageOpts,
+    api: &ApiClient,
+    reply_ref: &uuid::Uuid,
+    mut cursor: usize,
+    id: &str,
+    thread_ts: &str,
+    channel: &str,
+    agent: Option<&str>,
+    awaiting_reply: Option<String>,
+    remaining: Duration,
+) -> Result<ResumeExit> {
+    let ui = crate::ui::ui();
+    let deadline = Instant::now() + remaining;
+    const MAX_NESTED_GATES: usize = 64;
+    let mut current_id = id.to_string();
+    let mut last_reply = awaiting_reply;
+    let mut last_hint_channel = channel.to_string();
+
+    for _ in 0..MAX_NESTED_GATES {
+        if Instant::now() >= deadline {
+            break;
+        }
+        last_hint_channel = if ui.json() {
+            channel.to_string()
+        } else {
+            hint_channel(opts, TurnVerb::Cluster, channel, &current_id, deadline).await
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        ui.note(&format!(
+            "resolve it with: {}",
+            approval_resolve_command(
+                tier_str(TurnVerb::Cluster),
+                agent,
+                &last_hint_channel,
+                &current_id,
+            )
+        ));
+        ui.note(
+            "waiting for the approval to be resolved; the resumed reply lands here if it is \
+             resolved before --timeout-secs elapses...",
+        );
+        let cl = ui.checklist();
+        let step = cl.step("waiting for resumed worker reply");
+        let observed = {
+            let mut observe_update = |text: &str| {
+                if let Some(line) = text.lines().rev().find(|line| !line.trim().is_empty()) {
+                    step.tick_detail(line.trim());
+                }
+            };
+            await_cluster_relay(api, reply_ref, cursor, remaining, &mut observe_update).await?
+        };
+        step.clear();
+        cursor = observed.next_cursor;
+        match observed.outcome {
+            Outcome::Replied(reply) => {
+                ui.emit(&MessageOutcomeOutput::Replied {
+                    thread: thread_ts.to_string(),
+                    reply,
+                });
+                persist_and_hint(opts, TurnVerb::Cluster, channel, thread_ts);
+                return Ok(ResumeExit::Done);
+            }
+            Outcome::CompletedNoEdit => {
+                ui.emit(&MessageOutcomeOutput::NoEdit {
+                    thread: thread_ts.to_string(),
+                });
+                persist_and_hint(opts, TurnVerb::Cluster, channel, thread_ts);
+                return Ok(ResumeExit::Done);
+            }
+            Outcome::AwaitingApproval(new_reply) => {
+                if let Some(new_id) = parse_approval_id(new_reply.as_deref().unwrap_or_default()) {
+                    current_id = new_id;
+                    last_reply = new_reply;
+                    continue;
+                }
+                ui.emit(&MessageOutcomeOutput::AwaitingApproval {
+                    thread: thread_ts.to_string(),
+                    reply: new_reply,
+                    tier: tier_str(TurnVerb::Cluster),
+                    agent: agent.map(str::to_string),
+                    channel: channel.to_string(),
+                });
+                persist_and_hint(opts, TurnVerb::Cluster, channel, thread_ts);
+                return Ok(ResumeExit::Transient);
+            }
+            Outcome::TimedOut => break,
+        }
+    }
+
+    ui.emit(&MessageOutcomeOutput::AwaitingApproval {
+        thread: thread_ts.to_string(),
+        reply: last_reply,
+        tier: tier_str(TurnVerb::Cluster),
+        agent: agent.map(str::to_string),
+        channel: last_hint_channel,
+    });
+    persist_and_hint(opts, TurnVerb::Cluster, channel, thread_ts);
+    Ok(ResumeExit::Transient)
+}
+
 /// The shared target noun message handler.
 /// The local stub's sentinel bot token (`comms::LOCAL_SLACK_STUB_BOT_TOKEN`).
 /// `local comms --disconnect` restores this value, so seeing it means the compose
@@ -3384,16 +2875,16 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
     }
     let ui = crate::ui::ui();
     if opts.dry_run {
-        let host = opts
-            .listen_host
-            .clone()
-            .unwrap_or_else(|| "<auto-detected-local-ip>".to_string());
+        let relay_poll = format!(
+            "http://127.0.0.1:{}/cluster-message-replies/<uuid-v4>",
+            opts.api_local_port
+        );
         ui.emit(&MessageDryRunOutput {
             target: "cluster",
             stream: opts.stream.clone(),
             channel: opts.channel.clone(),
-            reply_endpoint: advertised_url(&host, opts.listen_port),
-            human_lines: dry_run_lines(&opts, &host),
+            reply_endpoint: None,
+            human_lines: dry_run_lines(&opts, &relay_poll),
         });
         return Ok(());
     }
@@ -3408,31 +2899,14 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
     // Connected-transport path (#770/ADR-0078): when a real workspace is
     // connected (a running dispatcher), post a real placeholder and enqueue
     // against its ts with no per-turn endpoint, so the approval card and any
-    // resumed reply ride the connected transport -- no throwaway stub. A kubectl
-    // failure reads as NOT connected, so this falls through to the stub path.
+    // resumed reply ride the connected transport. A kubectl failure remains
+    // fail-closed; only positively observed absence selects the built-in relay.
     if dispatcher_connected_strict(&opts.namespace, &fullname).await? {
         return message_connected(opts, &fullname).await;
     }
 
-    // Advertise a host the in-cluster worker can reach, then bind the stub on
-    // 0.0.0.0 so it is reachable off-box. Take the URL from the started stub so an
-    // ephemeral --listen-port 0 still yields the real bound port.
-    let advertise_host = resolve_advertise_host(opts.listen_host.as_deref()).await?;
-    let mut stub = SlackStub::start("0.0.0.0", opts.listen_port, &advertise_host).await?;
-    let url = stub.base_api_url().to_string();
-    ui.plumbing(&format!(
-        "slack stub listening; the worker will post to {url}"
-    ));
-
-    // Install the portless exact host origin before any enqueue plumbing. The
-    // connected-dispatcher branch returned above, so this never widens a
-    // Slack-connected release. The guard restores the default closed posture on
-    // every normal/error return and is moved into non-unwinding exits below.
-    let mut stub_trust =
-        ClusterStubTrust::install(&opts.namespace, &opts.release, &fullname, &advertise_host)
-            .await?;
-
-    // Valkey port-forward for the enqueue (killed on drop at fn end).
+    // Valkey remains the enqueue transport. Replies use a separate API
+    // port-forward below; neither path mutates any Deployment or replaces pods.
     let (_valkey_pf, valkey_local_port) = start_port_forward(
         &port_forward_command(
             &opts.namespace,
@@ -3451,27 +2925,31 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
     let (channel, agent_hint) = resolve_cluster_channel(&opts, &fullname).await?;
     ui.plumbing(&format!("routing to channel {channel}"));
 
-    // Enqueue the exact event the dispatcher would produce and wait for the ack.
-    // The turn carries its reply endpoint (this stub's advertised URL) on the
-    // payload (issue #19), so the in-cluster worker posts THIS turn's reply back
-    // to the stub without a worker-global `helm upgrade`; a real workspace on the
-    // same worker keeps replying to real Slack.
+    // The worker self-dials the in-cluster API; this distinct loopback tunnel is
+    // read-only and exists only for the CLI's ref-keyed polling.
+    let (_api_pf, api_local_port) = start_port_forward(
+        &port_forward_command(
+            &opts.namespace,
+            &fullname,
+            "api",
+            opts.api_local_port,
+            API_REMOTE_PORT,
+        ),
+        opts.api_local_port,
+        "api",
+    )
+    .await?;
+    let api = ApiClient::new(&format!("http://127.0.0.1:{api_local_port}"), &opts.api_key)?;
+
+    // Enqueue the exact Slack binding coordinates the dispatcher would produce,
+    // with only the reserved adapter/ref selecting the built-in relay.
     let valkey_url = format!(
         "redis://:{}@127.0.0.1:{valkey_local_port}",
         opts.valkey_password
     );
     let mut conn = connect(&valkey_url).await?;
-    let (channel, thread_ts, placeholder_ts) =
-        resolve_targets(Some(&channel), opts.thread.as_deref());
-    let event = synthetic_turn(
-        "slack",
-        &channel,
-        &opts.user,
-        &opts.text,
-        &thread_ts,
-        &placeholder_ts,
-        Some(url),
-    );
+    let (channel, thread_ts, _) = resolve_targets(Some(&channel), opts.thread.as_deref());
+    let (event, reply_ref) = cluster_relay_turn(&channel, &opts, &thread_ts);
     let stream_id = xadd(&mut conn, &opts.stream, &event).await?;
     ui.plumbing(&format!(
         "enqueued {} on {} as {stream_id}",
@@ -3485,25 +2963,23 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
     let cl = ui.checklist();
     let step = cl.step("waiting for worker reply");
     let wait_started = Instant::now();
-    let outcome = {
+    let observed = {
         let mut observe_update = |text: &str| {
             if let Some(line) = text.lines().rev().find(|line| !line.trim().is_empty()) {
                 step.tick_detail(line.trim());
             }
         };
-        await_reply(
-            &mut stub,
-            &mut conn,
-            &opts.stream,
-            &stream_id,
-            &placeholder_ts,
+        await_cluster_relay(
+            &api,
+            &reply_ref,
+            0,
             Duration::from_secs(opts.timeout_secs),
             &mut observe_update,
         )
-        .await
+        .await?
     };
 
-    match outcome {
+    match observed.outcome {
         Outcome::Replied(reply) => {
             step.done("");
             ui.emit(&MessageOutcomeOutput::Replied {
@@ -3511,7 +2987,6 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
                 reply,
             });
             persist_and_hint(&opts, TurnVerb::Cluster, &channel, &thread_ts);
-            stub_trust.restore().await?;
             Ok(())
         }
         Outcome::CompletedNoEdit => {
@@ -3520,7 +2995,6 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
                 thread: thread_ts.clone(),
             });
             persist_and_hint(&opts, TurnVerb::Cluster, &channel, &thread_ts);
-            stub_trust.restore().await?;
             Ok(())
         }
         Outcome::AwaitingApproval(reply) => {
@@ -3530,56 +3004,31 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
             // `message --continue` can recover (#766). Terminal paths re-persist
             // the identical context and print the continue hint once.
             persist_turn_quietly(&opts, TurnVerb::Cluster, &channel, &thread_ts);
-            // Keep the stub alive and wait for the resumed reply instead of
-            // exiting and stranding it (#766). The resume scan itself observes
-            // the resume turn on the runs stream over the Valkey connection
-            // already open for the enqueue, so it needs no API port-forward. The
-            // per-id resolve-hint channel lookup DOES open one (`hint_channel`,
-            // #1531), but it is short-lived: bounded by
-            // `HINT_CHANNEL_LOOKUP_BUDGET` and dropped before the wait is
-            // entered, so no forward child is held across it. If we cannot parse
-            // an approval id, fall back to the awaiting-approval terminal rather
-            // than hanging.
+            // The API resume queue preserves this turn's reply handle, so keep
+            // polling the same opaque bucket through any approval resolution.
             match parse_approval_id(reply.as_deref().unwrap_or_default()) {
                 Some(id) => {
                     let remaining = Duration::from_secs(opts.timeout_secs)
                         .saturating_sub(wait_started.elapsed());
-                    // `_valkey_pf` stays alive across this await, which is what
-                    // keeps `conn` usable for the resume scan.
-                    match resume_after_approval(
+                    match resume_cluster_after_approval(
                         &opts,
-                        TurnVerb::Cluster,
-                        &mut conn,
+                        &api,
+                        &reply_ref,
+                        observed.next_cursor,
                         &id,
-                        &mut stub,
-                        &stream_id,
-                        &placeholder_ts,
                         &thread_ts,
                         &channel,
                         agent_hint.as_deref(),
                         reply,
                         remaining,
                     )
-                    .await
+                    .await?
                     {
-                        ResumeExit::Done => {
-                            stub_trust.restore().await?;
-                            Ok(())
-                        }
-                        ResumeExit::Transient => {
-                            // Drop the Slack stub AND the Valkey port-forward first:
-                            // `process::exit` does not unwind, so without dropping
-                            // them explicitly here neither the stub's listener nor
-                            // the `kill_on_drop` port-forward child guard would ever
-                            // run, leaking the stub's bound port (#751) and
-                            // orphaning the `kubectl port-forward` child to init
-                            // (#766).
-                            stub_trust.restore().await?;
-                            crate::exit::exit_after_drop(
-                                crate::exit::ExitClass::Transient,
-                                (stub, _valkey_pf, stub_trust),
-                            );
-                        }
+                        ResumeExit::Done => Ok(()),
+                        ResumeExit::Transient => crate::exit::exit_after_drop(
+                            crate::exit::ExitClass::Transient,
+                            (_api_pf, _valkey_pf),
+                        ),
                     }
                 }
                 None => {
@@ -3597,21 +3046,15 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
                         channel: channel.clone(),
                     });
                     persist_and_hint(&opts, TurnVerb::Cluster, &channel, &thread_ts);
-                    stub_trust.restore().await?;
                     crate::exit::exit_after_drop(
                         crate::exit::ExitClass::Transient,
-                        (stub, _valkey_pf, stub_trust),
+                        (_api_pf, _valkey_pf),
                     );
                 }
             }
         }
         Outcome::TimedOut => {
             step.fail(&format!("timed out after {}s", opts.timeout_secs));
-            // Drop the Slack stub's listener IMMEDIATELY on timeout, before the
-            // diagnostics gather below -- same reasoning as `message_local`'s
-            // TimedOut arm (#751). The Valkey port-forward (`_valkey_pf`) must
-            // stay alive a bit longer: `diagnostics` still needs it for `conn`.
-            drop(stub);
             // Gather diagnostics only on the human path; under `--json` the
             // timeout object carries no diagnostics, so skip the extra Valkey read.
             let diag = if ui.json() {
@@ -3623,15 +3066,9 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
                 diagnostics: diag,
                 resume_note: None,
             });
-            // A timeout is retryable (the worker may still be working, or a
-            // transient stall), so it maps to the transient exit code, not
-            // failure. Drop the Valkey port-forward now, for the same
-            // non-unwinding reason as the stub above (#766).
-            stub_trust.restore().await?;
-            crate::exit::exit_after_drop(
-                crate::exit::ExitClass::Transient,
-                (_valkey_pf, stub_trust),
-            );
+            // A timeout is retryable. Drop both process-owned port-forwards
+            // before the non-unwinding transient exit.
+            crate::exit::exit_after_drop(crate::exit::ExitClass::Transient, (_api_pf, _valkey_pf));
         }
     }
 }
@@ -6404,24 +5841,6 @@ mod tests {
         );
     }
 
-    /// #1533 (S16): the temporary trust widening (#1812) patches the release's
-    /// worker Deployment. A wrong name means the patch targets nothing, the
-    /// stub reply never arrives, and the guard's ownership annotation lands on
-    /// no object.
-    #[test]
-    fn stub_trust_targets_the_chart_rendered_worker() {
-        assert_eq!(
-            stub_trust_deployment(&crate::ops::chart_fullname("platform")),
-            "platform-curie-worker"
-        );
-
-        // Negative control.
-        assert_eq!(
-            stub_trust_deployment(&crate::ops::chart_fullname("curie")),
-            "curie-worker"
-        );
-    }
-
     /// #1533 (S34): `cluster eval --release platform` used to read
     /// `deployment/platform-worker` and fail before a single eval case ran.
     #[test]
@@ -7162,9 +6581,8 @@ mod tests {
     }
 
     #[test]
-    fn dry_run_lists_the_valkey_forward_and_the_enqueue_with_the_reply_endpoint() {
+    fn dry_run_lists_distinct_valkey_and_api_forwards_without_a_callback_endpoint() {
         let lines = dry_run_lines(&opts(Some("C123")), "10.1.2.3");
-        // Explicit channel -> only the Valkey forward, no API forward.
         assert!(
             lines
                 .iter()
@@ -7172,8 +6590,10 @@ mod tests {
             "{lines:?}"
         );
         assert!(
-            !lines.iter().any(|l| l.contains("svc/curie-api")),
-            "explicit channel needs no api forward: {lines:?}"
+            lines
+                .iter()
+                .any(|l| l == "kubectl -n curie port-forward svc/curie-api 8123:8000"),
+            "reply polling always needs its own api forward: {lines:?}"
         );
         // Issue #19: the reply routes per turn, so there is no worker-global
         // helm upgrade / rollout / dispatcher guard in the plan.
@@ -7186,20 +6606,18 @@ mod tests {
             "no rollout wait: {lines:?}"
         );
         assert!(
-            !lines.iter().any(|l| l.contains("dispatcher")),
-            "no dispatcher guard: {lines:?}"
-        );
-        assert!(
             lines
                 .iter()
-                .any(|l| l == "stub advertised at http://10.1.2.3:8155/api/"),
+                .any(|l| l
+                    == "poll replies at http://127.0.0.1:8123/cluster-message-replies/<uuid-v4>"),
             "{lines:?}"
         );
-        // The enqueue line names the channel and the per-turn reply endpoint.
         assert!(
             lines.iter().any(|l| l.contains("enqueue")
                 && l.contains("C123")
-                && l.contains("reply endpoint http://10.1.2.3:8155/api/")),
+                && l.contains("adapter curie-cluster-message")
+                && l.contains("no reply endpoint")
+                && l.contains("UUIDv4 reply ref")),
             "{lines:?}"
         );
     }
@@ -7232,82 +6650,6 @@ mod tests {
         assert!(v.get("thread").is_none(), "timeout carries no thread: {v}");
     }
 
-    fn ready_pod(name: &str) -> serde_json::Value {
-        serde_json::json!({
-            "metadata": {"name": name},
-            "status": {
-                "phase": "Running",
-                "conditions": [{"type": "Ready", "status": "True"}]
-            }
-        })
-    }
-
-    fn terminating_pod(name: &str) -> serde_json::Value {
-        serde_json::json!({
-            "metadata": {
-                "name": name,
-                "deletionTimestamp": "2026-08-23T00:00:00Z"
-            },
-            "status": {
-                "phase": "Running",
-                "conditions": [{"type": "Ready", "status": "True"}]
-            }
-        })
-    }
-
-    fn pods_list(items: Vec<serde_json::Value>) -> String {
-        serde_json::json!({"items": items}).to_string()
-    }
-
-    #[test]
-    fn worker_pods_allow_enqueue_when_the_replacement_is_ready_and_nobody_is_terminating() {
-        assert!(
-            worker_pods_allow_enqueue(&pods_list(vec![ready_pod("curie-worker-new")])).unwrap()
-        );
-    }
-
-    #[test]
-    fn worker_pods_refuse_enqueue_while_a_terminating_worker_can_still_claim() {
-        // #1532: kubectl rollout status can return while the outgoing pod is
-        // still Terminating and still blocked in XREADGROUP.
-        assert!(!worker_pods_allow_enqueue(&pods_list(vec![
-            ready_pod("curie-worker-new"),
-            terminating_pod("curie-worker-old"),
-        ]))
-        .unwrap());
-        assert!(!worker_pods_allow_enqueue(&pods_list(vec![])).unwrap());
-        assert!(
-            !worker_pods_allow_enqueue(&pods_list(vec![serde_json::json!({
-                "metadata": {"name": "curie-worker-booting"},
-                "status": {
-                    "phase": "Running",
-                    "conditions": [{"type": "Ready", "status": "False"}]
-                }
-            })]))
-            .unwrap()
-        );
-    }
-
-    #[test]
-    fn worker_pod_settle_budget_covers_chart_default_termination_grace() {
-        let chart_grace = Duration::from_secs(1800);
-        let view = WorkerTrustView {
-            resource_version: None,
-            annotations_present: false,
-            holder: None,
-            worker_index: 0,
-            env_present: false,
-            env: Vec::new(),
-            trust: None,
-            termination_grace_period: chart_grace,
-        };
-        assert_eq!(
-            worker_prevention_wait_budget(&view),
-            chart_grace + WORKER_PREVENTION_MARGIN,
-            "the CLI settle wait must cover worker.terminationGracePeriodSeconds=1800"
-        );
-    }
-
     #[test]
     fn message_dry_run_json_carries_the_planned_action() {
         // Explicit channel passes through verbatim.
@@ -7315,7 +6657,7 @@ mod tests {
             "local",
             "curie:turns",
             Some("C123"),
-            "http://localhost:8155/api/",
+            Some("http://localhost:8155/api/"),
         );
         assert_eq!(v["dry_run"], serde_json::json!(true));
         assert_eq!(v["target"], serde_json::json!("local"));
@@ -7326,7 +6668,7 @@ mod tests {
             serde_json::json!("http://localhost:8155/api/")
         );
         // Omitted channel is JSON null, not a placeholder string.
-        let v = message_dry_run_json("cluster", "s", None, "http://10.1.2.3:8155/api/");
+        let v = message_dry_run_json("cluster", "s", None, None);
         assert!(v["channel"].is_null(), "{v}");
         assert_eq!(v["target"], serde_json::json!("cluster"));
     }
