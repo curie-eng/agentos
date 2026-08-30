@@ -1,9 +1,30 @@
-"""The soak and chaos scenario against a standing curie cluster.
+"""Sandbox-substrate resilience E2E against a standing Curie cluster.
 
-Gated behind ``CURIE_SOAK=1`` (plus a reachable cluster and the dev-stack
-Valkey). Parametrized over ``range(runs)`` so ``CURIE_SOAK_RUNS=3`` runs the
-whole scenario three consecutive times in one invocation, matching the
-definition-of-done "must pass three consecutive runs".
+The scenario drives the worker's ``SandboxSubstrate`` plus Valkey plus
+``kubectl`` directly, mirroring ``apps/worker/tests/sandbox/test_e2e_k8scratch.py``.
+There is no REST thread or message API to drive: a turn is a ``kubectl
+port-forward`` to the sandbox pod followed by ``POST /v1/event`` (NDJSON frames
+ending in a ``final``).
+
+It is opt-in: the sandbox collector excludes this module unless
+``CURIE_SANDBOX_E2E=1`` and the module retains the same guard for direct
+collection. The offline helpers in ``test_resilience_harness_unit.py`` remain in
+the normal ``apps/worker/tests`` collection and need neither a cluster nor a dev
+stack. To run the scenario three consecutive times against a standing cluster
+and dev-stack Valkey:
+
+``CURIE_SANDBOX_E2E=1 CURIE_SANDBOX_E2E_RUNS=3 uv run pytest
+apps/worker/tests/sandbox/test_e2e_resilience.py -q``
+
+Size the warm pool to at least ``CURIE_SANDBOX_E2E_CONCURRENCY +
+CURIE_SANDBOX_E2E_BATCH`` ready replicas. ``pool_ready`` blocks until the pool
+reports that capacity, so the concurrent claims and batch burst do not starve.
+``CURIE_SANDBOX_E2E_NAMESPACE`` and ``CURIE_SANDBOX_E2E_POOL`` select the
+standing-cluster resources; the namespace/pool and Valkey defaults match the
+sandbox E2E template. With a live Claude credential, reply-content isolation
+assertions and the cache-token probe are also enabled. Without one, the
+fake-model runner still proves every structural property but does not echo
+markers, so content-level cross-talk assertions do not run.
 
 Four phases share the module-scoped substrate and a set of held claims:
 
@@ -20,23 +41,86 @@ Four phases share the module-scoped substrate and a set of held claims:
 
 A cache-warmth proxy asserts pod-UID affinity across consecutive turns (the
 ADR-0003 "same pod across turns" property that enables prompt-cache reuse); see
-the README for why the direct ``cache_read_input_tokens`` signal is not
-cluster-observable today.
+the documented assumptions below for why the direct
+``cache_read_input_tokens`` signal is not cluster-observable today.
+
+Documented assumptions and gaps:
+
+1. **"Batch job" is interpreted as a concurrent burst under sustained load.**
+   The batch phase launches ``CURIE_SANDBOX_E2E_BATCH`` additional threads while
+   the Phase-A threads are still held claimed, and asserts the batch turns
+   complete without disturbing the held threads. An alternative reading of
+   "batch job" is an eval fan-out (an ``XADD`` to the ``curie:evals`` stream
+   consumed by a separate consumer group). That path is not part of the sandbox
+   substrate this scenario drives, so it is noted here as an alternative rather
+   than exercised.
+
+2. **"No duplicate side effects" is asserted at the substrate level (one live
+   claim survives a kill), not as end-to-end side-effect idempotency.** The
+   semantic invariant, a failed run that emitted a side effect escalates to a
+   human instead of auto-retrying, is the kernel's fourth rule in
+   ``apps/worker/CLAUDE.md`` and already has a provoking integration test in
+   ``apps/worker/tests/kernel``. This scenario drives the ``SandboxSubstrate``
+   seam directly, mirroring ``test_e2e_k8scratch.py``, and therefore asserts the
+   observable substrate-level proxy: after an unclean kill and re-claim, exactly
+   one live ``SandboxClaim`` remains for the thread hash (no orphaned or
+   duplicated claim). Re-driving turns through the kernel path (a Valkey
+   ``curie:runs`` producer plus a fake Slack sink plus the in-cluster consumer)
+   to count actual side-effect executions is deliberately outside this
+   footprint: it would duplicate the kernel suite's existing coverage and pull
+   this scenario away from the substrate seam it is meant to stress.
+
+3. **``cache_read_input_tokens`` is not observable at the cluster level, so the
+   scenario asserts pod-UID affinity as the cache-warmth proxy.** The runner's
+   OTel export (``runner/src/curie_runner/otel.py``,
+   ``_GenerationSpan.record_usage``) exports only
+   ``gen_ai.usage.input_tokens`` and ``output_tokens`` and drops the cache-token
+   fields, so Langfuse never records ``cache_read_input_tokens``. It is asserted
+   only at the SDK layer in ``runner/tests/test_live.py``. The scenario therefore
+   asserts the cluster-observable property that enables cache reuse: the same
+   pod (same pod UID) serves consecutive turns on a thread (ADR-0003 "same pod
+   across turns"). The single ``xfail`` probe, ``test_cache_read_tokens_probe``,
+   reads per-trace usage from Langfuse and would turn green if the OTel export is
+   later extended.
+
+Follow-ups outside this footprint:
+
+- Extend ``runner/src/curie_runner/otel.py`` to export
+  ``cache_read_input_tokens`` and ``cache_creation_input_tokens``; the ``xfail``
+  probe becomes a real assertion then.
+- Add an end-to-end side-effect-idempotency resilience scenario that drives
+  turns through the kernel path (a Valkey ``curie:runs`` producer plus a fake
+  Slack sink plus the in-cluster consumer), kills a sandbox after a
+  side-effecting tool call fires, re-drives, and asserts the effect executed
+  exactly once.
+- If an eval-fanout batch interpretation is wanted, add a phase that drives the
+  ``curie:evals`` stream and its consumer group.
 """
 
 from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
-from harness import (
-    SoakConfig,
+
+# importlib import mode does not add this test directory to sys.path.
+sys.path.insert(0, str(Path(__file__).parent))
+
+from resilience_fixtures import (  # noqa: E402, F401
+    resilience_cfg,
+    resilience_pool_ready,
+    resilience_substrate,
+)
+from resilience_harness import (  # noqa: E402
+    ResilienceConfig,
     collected_text,
     detect_cross_talk,
     final_frame,
@@ -52,17 +136,20 @@ from harness import (
 )
 
 pytestmark = pytest.mark.skipif(
-    os.environ.get("CURIE_SOAK") != "1",
-    reason="soak/chaos suite; set CURIE_SOAK=1 with a standing cluster + dev stack",
+    os.environ.get("CURIE_SANDBOX_E2E") != "1",
+    reason=(
+        "sandbox-substrate resilience E2E; set CURIE_SANDBOX_E2E=1 with a "
+        "standing cluster + dev stack"
+    ),
 )
 
-# Evaluated at import so the parametrization reflects CURIE_SOAK_RUNS. When the
-# suite is skipped (CURIE_SOAK unset) this still yields a single skipped param.
-_RUNS = SoakConfig.from_env().runs
+# Evaluated at import so parametrization reflects CURIE_SANDBOX_E2E_RUNS. When
+# explicitly collected without the gate, this still yields a single skipped param.
+_RUNS = ResilienceConfig.from_env().runs
 
 
 def _drive_turn(
-    cfg: SoakConfig,
+    cfg: ResilienceConfig,
     sandbox_name: str,
     port: int,
     text: str,
@@ -83,7 +170,7 @@ def _assert_final(frames: Sequence[dict[str, object]]) -> None:
     assert final is not None, f"turn did not end in a final frame: {types}"
 
 
-def _wait_pod_gone(cfg: SoakConfig, sandbox_name: str, timeout: float = 90.0) -> None:
+def _wait_pod_gone(cfg: ResilienceConfig, sandbox_name: str, timeout: float = 90.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
@@ -95,11 +182,13 @@ def _wait_pod_gone(cfg: SoakConfig, sandbox_name: str, timeout: float = 90.0) ->
 
 
 @pytest.mark.parametrize("run", range(_RUNS))
-def test_soak_resilience(run: int, substrate: object, cfg: SoakConfig, pool_ready: None) -> None:
+def test_e2e_resilience(
+    run: int, substrate: object, cfg: ResilienceConfig, pool_ready: None
+) -> None:
     from curie_worker.sandbox import HISTORY_ENV, SandboxHandle, SandboxSubstrate
 
     assert isinstance(substrate, SandboxSubstrate)
-    print(f"\nEVIDENCE soak_run={run} concurrency={cfg.concurrency} batch={cfg.batch}")
+    print(f"\nEVIDENCE resilience_run={run} concurrency={cfg.concurrency} batch={cfg.batch}")
 
     a_keys = [f"soak-a-{run}-{i}" for i in range(cfg.concurrency)]
     batch_keys = [f"soak-batch-{run}-{j}" for j in range(cfg.batch)]
@@ -156,7 +245,7 @@ def test_soak_resilience(run: int, substrate: object, cfg: SoakConfig, pool_read
         # "batch job" is interpreted as a burst of concurrent threads launched
         # while the Phase-A threads are still held claimed. (An alternative
         # reading, an eval fan-out XADD to curie:evals, is a separate consumer
-        # group not exercised by the sandbox substrate; see the README.)
+        # group not exercised by the sandbox substrate; see the module docstring.)
         def _batch_turn(key: str) -> tuple[str, list[dict[str, object]]]:
             handle = substrate.claim(key)
             claimed[key] = handle
@@ -294,7 +383,7 @@ def test_soak_resilience(run: int, substrate: object, cfg: SoakConfig, pool_read
     not (os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or os.environ.get("ANTHROPIC_API_KEY")),
     reason="cache-token probe needs live creds so a real model reports usage",
 )
-def test_cache_read_tokens_probe(cfg: SoakConfig) -> None:
+def test_cache_read_tokens_probe(cfg: ResilienceConfig) -> None:
     """Probe: assert a per-trace ``cache_read_input_tokens`` is observable.
 
     This lights up green only if the runner's OTel export is later extended to
