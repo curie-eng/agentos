@@ -72,16 +72,32 @@ mod schema_inventory;
 
 fn cli_srcs() -> Vec<(String, String)> {
     let dir = format!("{}/src", env!("CARGO_MANIFEST_DIR"));
+    let mut paths = Vec::new();
+    collect_rs_paths(std::path::Path::new(&dir), &mut paths);
+    paths.sort();
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(&dir).expect("read cli/src") {
-        let path = entry.expect("dir entry").path();
-        if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-            let name = path.file_name().unwrap().to_string_lossy().to_string();
-            out.push((name, std::fs::read_to_string(&path).expect("read source")));
-        }
+    for path in paths {
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        out.push((name, std::fs::read_to_string(&path).expect("read source")));
     }
     assert!(!out.is_empty(), "cli/src must contain .rs sources");
     out
+}
+
+/// Recursively collect every `.rs` file under `dir`, subdirectories included
+/// (`cli/src/ops/*.rs` since the ops module split).
+fn collect_rs_paths(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    for entry in
+        std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()))
+    {
+        let entry = entry.unwrap_or_else(|e| panic!("read_dir entry in {}: {e}", dir.display()));
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rs_paths(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            out.push(path);
+        }
+    }
 }
 
 /// Every `impl CliOutput for T` where T is declared as an `enum`, mapped to its
