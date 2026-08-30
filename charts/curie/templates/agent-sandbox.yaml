@@ -26,6 +26,9 @@ the worker claims from, plus (optionally) the vendored upstream controller.
   behavior would otherwise silently widen (not be narrowed by) Rail 1's
   default-deny + allowlist in security-networkpolicy.yaml.
 */}}
+{{- if .Values.agentSandbox.runner.liteLLM.enabled }}
+{{- fail "agentSandbox.runner.liteLLM.enabled is unsupported by ADR-0037: in-path LiteLLM gateways are unsupported; remove or disable agentSandbox.runner.liteLLM.enabled and use direct session-pinned provider routing." }}
+{{- end }}
 {{- if .Values.agentSandbox.controller.deploy }}
 {{/*
 ADR-0059 decision 5 / issue #816: the vendored controller carries no
@@ -243,21 +246,8 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       {{- end }}
-      {{- if or $bf.enabled $wf.enabled $runner.hardening.enabled $runner.liteLLM.enabled }}
+      {{- if or $bf.enabled $wf.enabled $runner.hardening.enabled }}
       volumes:
-        {{- if $runner.liteLLM.enabled }}
-        # LiteLLM proxy config (model_list + router/fallback), mounted read-only
-        # into the sidecar. Sourced from the operator-provided Secret so provider
-        # keys referenced by the config are never inlined into a manifest.
-        - name: litellm-config
-          secret:
-            secretName: {{ $runner.liteLLM.configExistingSecret | quote }}
-            # Map the config key onto the fixed filename the sidecar reads,
-            # regardless of how the operator named it in the Secret.
-            items:
-              - key: {{ $runner.liteLLM.configKey | quote }}
-                path: config.yaml
-        {{- end }}
         {{- if $bf.enabled }}
         # Shared bundle volume: the init pair populates <mountPath>/current, the
         # runner reads it as CURIE_PLUGIN_DIR. sizeLimit is ADR-0059 decision
@@ -530,39 +520,6 @@ spec:
         {{- end }}
       {{- end }}
       containers:
-        {{- if $runner.liteLLM.enabled }}
-        # BYO model (#24): LiteLLM Anthropic-format proxy sidecar. Off by default;
-        # enabled only for genuine multi-model routing/fallback. Serves the
-        # Anthropic API shape on localhost:<port>, which the runner targets via
-        # ANTHROPIC_BASE_URL above. Config (model_list, router/fallback) comes from
-        # the operator-provided Secret; provider keys come from liteLLM.extraEnv.
-        - name: litellm
-          image: {{ $runner.liteLLM.image | quote }}
-          imagePullPolicy: {{ $runner.liteLLM.imagePullPolicy }}
-          {{- if $runner.hardening.enabled }}
-          # Same container-level lockdown as the runner: the proxy only reads its
-          # mounted config and talks upstream, so a read-only rootfs is safe.
-          {{- include "curie.sandboxHardening.securityContext" . | nindent 10 }}
-          {{- end }}
-          args:
-            - --config
-            - /etc/litellm/config.yaml
-            - --port
-            - {{ $runner.liteLLM.port | quote }}
-          ports:
-            - name: litellm
-              containerPort: {{ $runner.liteLLM.port }}
-          {{- with $runner.liteLLM.extraEnv }}
-          env:
-            {{- toYaml . | nindent 12 }}
-          {{- end }}
-          volumeMounts:
-            - name: litellm-config
-              mountPath: /etc/litellm
-              readOnly: true
-          resources:
-            {{- toYaml $runner.liteLLM.resources | nindent 12 }}
-        {{- end }}
         - name: runner
           image: {{ include "curie.image" (dict "repository" $runner.image "tag" $runner.tag "digest" $runner.digest "defaultTag" .Chart.AppVersion) | quote }}
           imagePullPolicy: {{ $runner.imagePullPolicy }}
@@ -607,13 +564,6 @@ spec:
             # non-zero.
             - name: CURIE_MODEL
               value: {{ $runner.model | quote }}
-            {{- end }}
-            {{- if and $runner.liteLLM.enabled (not .Values.inference.deploy) }}
-            # BYO model (#24): route through the in-pod LiteLLM sidecar, which
-            # serves the Anthropic API shape on localhost. Multi-model routing /
-            # fallback lives in the sidecar's config; the runner just points at it.
-            - name: ANTHROPIC_BASE_URL
-              value: http://localhost:{{ $runner.liteLLM.port }}
             {{- end }}
             {{- if or $runner.credentials $runner.credentialsExistingSecret }}
             # Warm-pod fallback credential; the worker's per-claim Overrides
