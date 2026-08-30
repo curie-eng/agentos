@@ -37,7 +37,7 @@
       "result": "ChannelsOutput",
       "kind": "CliOutput",
       "schema": "surfaces.schema.json",
-      "version": "1.0"
+      "version": "1.1"
     },
     {
       "result": "ChartCheckOutput",
