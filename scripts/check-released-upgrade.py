@@ -511,13 +511,19 @@ def _run_readback(
         arguments.extend(("--expect-address", agent.address))
 
     legacy_state = seed_metadata.legacy_state
-    if legacy_state is not None and _candidate_supports_legacy_state(tree):
-        arguments.extend(("--expect-state-owner", legacy_state.owner_name))
-        arguments.extend(("--expect-state-namespace", legacy_state.namespace))
-        arguments.extend(("--expect-state-key", legacy_state.key))
-        arguments.extend(
-            ("--expect-state-value", json.dumps(legacy_state.value, sort_keys=True))
-        )
+    if _candidate_supports_legacy_state(tree):
+        if legacy_state is None:
+            print(
+                "Skipping released-state sentinel: released schema predates "
+                "workflow_state_entries."
+            )
+        else:
+            arguments.extend(("--expect-state-owner", legacy_state.owner_name))
+            arguments.extend(("--expect-state-namespace", legacy_state.namespace))
+            arguments.extend(("--expect-state-key", legacy_state.key))
+            arguments.extend(
+                ("--expect-state-value", json.dumps(legacy_state.value, sort_keys=True))
+            )
 
     return _run_in_tree(
         _readback_command(tree, *arguments),

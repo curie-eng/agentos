@@ -815,6 +815,51 @@ def test_released_state_readback_arguments_are_enabled_only_by_exact_0037(
     )
 
 
+def test_released_state_readback_names_pre_table_skip_for_a_0037_candidate(
+    gate: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    metadata = dataclasses.replace(
+        _metadata_with_released_state(gate),
+        legacy_state=None,
+    )
+    captured: dict[str, list[str]] = {}
+
+    def _fake_run_in_tree(command: list[str], **_kwargs: Any) -> Any:
+        captured["command"] = command
+        return gate.CommandResult(0, "ok")
+
+    monkeypatch.setattr(gate, "_run_in_tree", _fake_run_in_tree)
+    candidate_tree = _fake_released_tree(
+        tmp_path,
+        revisions=("0037_multibinding_state_identity.py",),
+    )
+
+    result = gate._run_readback(
+        candidate_tree,
+        database_url="postgresql+asyncpg://gate/test",
+        phase=gate.READBACK_PHASE,
+        ref="candidate",
+        commit="0" * 40,
+        seed_metadata=metadata,
+    )
+
+    assert result.returncode == 0
+    state_options = {
+        "--expect-state-owner",
+        "--expect-state-namespace",
+        "--expect-state-key",
+        "--expect-state-value",
+    }
+    assert state_options.isdisjoint(captured["command"])
+    output = capsys.readouterr().out.lower()
+    assert "skip" in output
+    assert "released schema predates" in output
+    assert "workflow_state_entries" in output
+
+
 def test_seed_released_database_returns_the_exact_released_state_metadata(
     gate: ModuleType,
     monkeypatch: pytest.MonkeyPatch,

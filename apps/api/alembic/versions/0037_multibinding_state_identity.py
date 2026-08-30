@@ -3,8 +3,13 @@
 Revision 0031 added ``binding_scope`` and defaulted every agent to
 ``memory=false``.  Rows written before that revision correctly retained NULL --
 they were agent-wide -- but their owners then routed general-state requests to
-a binding-specific scope and could no longer see those rows.  This repair turns
-only unambiguous owners of legacy general state back to the shared posture.
+a binding-specific scope and could no longer see those rows.  PostgreSQL stores
+no provenance that distinguishes those legacy NULL rows from a later,
+operator- or platform-key-written unscoped row.  For a ``memory=false`` owner
+whose non-reserved general state is NULL-only, the lossless default is therefore
+to preserve it as shared state and set ``memory=true``.  Owners with both NULL
+and non-NULL general state still refuse migration: their competing shared and
+isolated postures require an explicit operator decision.
 
 PostgreSQL's ordinary unique constraints treat every NULL as distinct, so the
 four-column state identity added by 0031 also allowed concurrent creators to
@@ -159,8 +164,11 @@ def upgrade() -> None:
     _refuse_ambiguous_state(duplicates, mixed_scope)
 
     # A NULL row in memory/transcript is permanently shared and must not change
-    # an agent's general-state policy.  Only a false owner of NULL non-reserved
-    # state has the unambiguous pre-0031 shape this migration repairs.
+    # an agent's general-state policy.  PostgreSQL cannot tell pre-0031 legacy
+    # NULL general state from a later operator/platform-key unscoped write, so
+    # a false owner with NULL-only non-reserved state takes the lossless shared
+    # preservation default.  Mixed scoped+NULL candidates refused above still
+    # need an explicit policy choice.
     op.get_bind().execute(
         sa.text(
             f"""

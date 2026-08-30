@@ -278,6 +278,86 @@ def test_legacy_state_runner_url_and_value_survive_upgrade(
     assert visible.json()["value"] == legacy_value
 
 
+def test_legacy_unscoped_general_state_deliberately_flips_when_provenance_is_ambiguous(
+    isolated_migration_db: None,
+) -> None:
+    cfg = _alembic_config()
+    command.upgrade(cfg, BELOW)
+    agent_id = _seed_agent("ambiguous-provenance-owner", memory=False)
+    original_value = {"policy": "operator-or-legacy", "sequence": [3, 1, 4]}
+    _seed_state(
+        agent_id,
+        "workflow",
+        "ambiguous-key",
+        original_value,
+        binding_scope=None,
+    )
+    before = _state_rows(agent_id)
+
+    command.upgrade(cfg, REVISION)
+
+    assert _memory_by_name() == {"ambiguous-provenance-owner": True}
+    assert _state_rows(agent_id) == before
+    visible = _api_get(
+        f"http://migration-api.test/agents/{agent_id}/state/workflow/ambiguous-key"
+    )
+    assert visible.status_code == 200, visible.text
+    assert visible.json()["value"] == original_value
+
+
+def test_downgrade_keeps_repaired_memory_and_restores_null_distinct_identity(
+    isolated_migration_db: None,
+) -> None:
+    cfg = _alembic_config()
+    command.upgrade(cfg, "0030")
+    agent_id = _seed_agent("downgrade-repaired-owner")
+    original_value = {"survives": "forward-and-back"}
+    _seed_state(
+        agent_id,
+        "workflow",
+        "durable-key",
+        original_value,
+    )
+    command.upgrade(cfg, BELOW)
+    assert _memory_by_name() == {"downgrade-repaired-owner": False}
+    before = _state_rows(agent_id)
+
+    command.upgrade(cfg, REVISION)
+    assert _memory_by_name() == {"downgrade-repaired-owner": True}
+
+    command.downgrade(cfg, BELOW)
+
+    assert _stamped_revision() == BELOW
+    assert _memory_by_name() == {"downgrade-repaired-owner": True}
+    assert _state_rows(agent_id) == before
+    assert _sql(
+        """
+        SELECT backing_index.indnullsnotdistinct
+        FROM pg_constraint AS catalog_constraint
+        JOIN pg_class AS relation ON relation.oid = catalog_constraint.conrelid
+        JOIN pg_index AS backing_index
+          ON backing_index.indexrelid = catalog_constraint.conindid
+        JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+        WHERE namespace.nspname = 'curie'
+          AND relation.relname = 'workflow_state_entries'
+          AND catalog_constraint.conname = 'uq_state_agent_scope_ns_key'
+        """
+    ) == [(False,)]
+    _seed_state(
+        agent_id,
+        "workflow",
+        "durable-key",
+        {"second-null-row": True},
+        binding_scope=None,
+    )
+    assert _sql(
+        "SELECT count(*) FROM curie.workflow_state_entries "
+        "WHERE agent_id = :agent_id AND binding_scope IS NULL "
+        "AND namespace = 'workflow' AND key = 'durable-key'",
+        {"agent_id": agent_id},
+    ) == [(2,)]
+
+
 def test_reserved_only_legacy_state_does_not_flip_memory(
     isolated_migration_db: None,
 ) -> None:
