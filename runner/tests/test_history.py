@@ -11,12 +11,18 @@ import anyio
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
+from curie_runner.adapter import build_structured_resume
 from curie_runner.history import (
+    ApprovalContext,
+    ConversationMessage,
+    ConversationReplay,
     HistoryError,
     NullTranscriptStore,
     StateApiTranscriptStore,
+    SummaryRecord,
     TranscriptStore,
     TurnRecord,
+    build_conversation_replay,
     format_conversation_preamble,
     resolve_history,
 )
@@ -52,6 +58,169 @@ def test_turn_record_round_trip() -> None:
         user="what changed?", assistant="the deploy bumped v3", ts="2026-07-14T00:00:00+00:00"
     )
     assert TurnRecord.from_dict(rec.to_dict()) == rec
+
+
+def test_structured_turn_round_trip_preserves_tools_and_approval_context() -> None:
+    record = TurnRecord(
+        user="deploy release",
+        assistant="approval required",
+        ts="2026-08-30T00:00:00Z",
+        status="awaiting_approval",
+        messages=(
+            ConversationMessage(role="user", content="deploy release"),
+            ConversationMessage(
+                role="assistant",
+                content=[
+                    {
+                        "type": "tool_use",
+                        "id": "call-1",
+                        "name": "Bash",
+                        "input": {"command": "deploy --release"},
+                    }
+                ],
+            ),
+            ConversationMessage(
+                role="user",
+                content=[
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call-1",
+                        "content": "permission denied",
+                        "is_error": True,
+                    }
+                ],
+            ),
+        ),
+        approval=ApprovalContext(
+            summary="Deploy release",
+            route="release-managers",
+            gate_kind="permission",
+            granted_tool="Bash",
+            decision=None,
+        ),
+    )
+
+    loaded = TurnRecord.from_dict(record.to_dict())
+
+    assert loaded == record
+    assert [message.role for message in loaded.messages] == ["user", "assistant", "user"]
+    assert loaded.messages[1].content[0]["type"] == "tool_use"
+    assert loaded.messages[2].content[0]["type"] == "tool_result"
+    assert loaded.approval == record.approval
+
+
+def test_legacy_turn_becomes_structured_user_assistant_messages() -> None:
+    record = TurnRecord.from_dict(
+        {"user": "old question", "assistant": "old answer", "ts": "2026-07-14T00:00:00Z"}
+    )
+
+    assert record.messages == (
+        ConversationMessage(role="user", content="old question"),
+        ConversationMessage(
+            role="assistant", content=[{"type": "text", "text": "old answer"}]
+        ),
+    )
+
+
+def test_long_history_compacts_once_then_keeps_prefix_stable_until_next_boundary() -> None:
+    records = [
+        TurnRecord(user=f"u{i}", assistant=f"a{i}", ts=f"2026-08-30T00:00:0{i}Z")
+        for i in range(6)
+    ]
+
+    replay, summary = build_conversation_replay(records, max_turns=4, max_bytes=None)
+
+    assert summary is not None
+    assert summary.source_turns == 4
+    assert replay.summary_digest == summary.digest
+    assert replay.messages[0].role == "user"
+    assert "Durable conversation summary" in str(replay.messages[0].content)
+    assert replay.messages[-2:] == records[-1].messages
+
+    persisted = [*records, summary]
+    with_one_more = [
+        *persisted,
+        TurnRecord(user="u6", assistant="a6", ts="2026-08-30T00:00:06Z"),
+    ]
+    replay_after, next_summary = build_conversation_replay(
+        with_one_more, max_turns=4, max_bytes=None
+    )
+
+    assert next_summary is None
+    assert replay_after.messages[: len(replay.messages)] == replay.messages
+
+
+def test_changed_compacted_prefix_changes_summary_digest() -> None:
+    records = [TurnRecord(user=f"u{i}", assistant=f"a{i}") for i in range(6)]
+    _, original = build_conversation_replay(records, max_turns=4, max_bytes=None)
+    changed = list(records)
+    changed[0] = TurnRecord(user="changed-u0", assistant="a0")
+    _, different = build_conversation_replay(changed, max_turns=4, max_bytes=None)
+
+    assert original is not None
+    assert different is not None
+    assert different.digest != original.digest
+
+
+def test_structured_resume_materializes_ordered_sdk_entries_without_rendering_text(
+    tmp_path,
+) -> None:
+    messages = (
+        ConversationMessage(role="user", content="run it"),
+        ConversationMessage(
+            role="assistant",
+            content=[
+                {
+                    "type": "tool_use",
+                    "id": "call-1",
+                    "name": "Bash",
+                    "input": {"command": "echo ok"},
+                }
+            ],
+        ),
+        ConversationMessage(
+            role="user",
+            content=[
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "call-1",
+                    "content": "ok",
+                }
+            ],
+        ),
+        ConversationMessage(
+            role="assistant", content=[{"type": "text", "text": "done"}]
+        ),
+    )
+
+    first = build_structured_resume(
+        messages, curie_session_id="curie-thread-1", cwd=str(tmp_path)
+    )
+    second = build_structured_resume(
+        messages, curie_session_id="curie-thread-1", cwd=str(tmp_path)
+    )
+
+    assert first.resume == first.session_id
+    assert first.session_id == second.session_id
+    assert first.session_store is not None
+    entries = anyio.run(first.session_store.load, first.session_key)
+    assert entries is not None
+    assert [entry["message"]["role"] for entry in entries] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+    ]
+    assert entries[1]["message"]["content"][0]["type"] == "tool_use"
+    assert entries[2]["message"]["content"][0]["type"] == "tool_result"
+    assert [entry["parentUuid"] for entry in entries][1:] == [
+        entry["uuid"] for entry in entries[:-1]
+    ]
+
+    fresh = build_structured_resume((), curie_session_id="curie-thread-1", cwd=str(tmp_path))
+    assert fresh.resume is None
+    assert fresh.session_store is None
+    assert fresh.session_id == first.session_id
 
 
 def test_resolve_absent_ref_is_null_store() -> None:
@@ -259,6 +428,22 @@ def test_successful_turn_is_appended_to_the_transcript() -> None:
     # default_turn's terminal result text.
     assert store.turns[0].assistant == "all done"
     assert store.turns[0].ts  # a timestamp was stamped
+    assert [message.role for message in store.turns[0].messages] == [
+        "user",
+        "assistant",
+        "assistant",
+        "user",
+    ]
+    assert any(
+        isinstance(message.content, list)
+        and any(block.get("type") == "tool_use" for block in message.content)
+        for message in store.turns[0].messages
+    )
+    assert any(
+        isinstance(message.content, list)
+        and any(block.get("type") == "tool_result" for block in message.content)
+        for message in store.turns[0].messages
+    )
 
 
 def test_synthetic_done_after_incomplete_turn_is_not_appended_to_the_transcript() -> None:
