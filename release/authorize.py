@@ -68,6 +68,27 @@ PASSING_CONCLUSIONS = {"success", "neutral"}
 # runtime. It is the simpler of the two options ADR-0058 left open (issue
 # #733). Tests pin its required names to jobs in both workflows, so a job
 # rename or removal requires a matching edit here.
+#
+# EVERY first-party connector image build is required here, not just the
+# bundle's read-only `tempo` server (issue #1951). The `examples/` rows of
+# ci.yaml's `images` job are release-load-bearing in a way the one-sided
+# version of this list could not see. `release.yaml`'s `build` matrix rebuilds
+# those same Dockerfiles for real, and its `merge` job -- the job that
+# assembles the multi-arch manifest every published tag actually resolves to --
+# is gated `if: always() && needs.build.result == 'success'`. So one connector
+# image going red on `next` and not named here authorizes the tag, fails a
+# single `build` leg, and takes the manifest merge for EVERY image down with
+# it, while the CLI binaries and the GitHub Release -- which hang off
+# `authorize-release` alone -- publish regardless. The release ships binaries
+# whose images have per-arch blobs pushed by digest and no pullable manifest
+# tag anywhere.
+#
+# The subset test below cannot see that direction: it asserts every required
+# name is a real job, so ADDING a connector build to ci.yaml and forgetting it
+# here leaves the subset perfectly intact. That direction is now pinned by
+# `test_every_connector_image_build_is_a_required_check`, which derives the
+# connector rows from ci.yaml itself -- a new connector image is guarded by a
+# failing test, not by whoever remembers to read this comment.
 REQUIRED_CHECK_NAMES = frozenset(
     {
         "Python (ruff + mypy + pytest)",
@@ -81,6 +102,9 @@ REQUIRED_CHECK_NAMES = frozenset(
         "Build worker image (no push)",
         "Build ui image (no push)",
         "Build sre-bot-tempo image (no push)",
+        "Build sre-bot-k8s-write image (no push)",
+        "Build sre-bot-k8s-scale image (no push)",
+        "Build sre-bot-self-upgrade image (no push)",
         "Build worker-local overlay image (no push)",
         "Dispatcher image imports resolve",
         "Eval falsifiability gate (fake model, offline)",
