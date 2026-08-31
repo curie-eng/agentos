@@ -297,6 +297,8 @@ def test_publish_tool_description_carries_coding_and_approval_safety_protocol() 
 
     description = anyio.run(listed_description)
 
+    assert "when a managed repository is mounted" in description
+    assert "work only in /workspace" in description
     assert "/workspace" in description
     assert "do not push" in description
     assert "preserve existing changes" in description

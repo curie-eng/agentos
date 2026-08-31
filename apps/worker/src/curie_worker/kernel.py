@@ -2669,7 +2669,7 @@ class Kernel:
         if workspace_deployment_id is not None:
             if self._workspace is None:
                 raise WorkspacePreparationError(
-                    "wiring", "workspace-enabled deployment has no trusted preparer"
+                    "wiring", "selected workspace has no trusted claim-time preparer"
                 )
             existing = await asyncio.to_thread(self._substrate.adopt, thread_key)
             if existing is not None and existing.workspace_repo == workspace_repo:

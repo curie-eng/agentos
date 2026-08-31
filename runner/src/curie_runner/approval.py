@@ -216,7 +216,7 @@ _PUBLISH_TOOL = "publish_changes"
 PUBLISH_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__{_PUBLISH_TOOL}"
 
 _PUBLISH_DESCRIPTION = (
-    "Work only in the managed repository mounted at /workspace and preserve"
+    "When a managed repository is mounted, work only in /workspace and preserve"
     " existing changes. Do not push with git. When the changes are ready, use"
     " this tool to request human approval for publication. The platform will"
     " capture the patch, ask for approval in the requesting thread, and publish"
