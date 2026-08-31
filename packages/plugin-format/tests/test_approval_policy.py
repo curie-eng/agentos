@@ -136,6 +136,10 @@ def test_sre_bot_declares_gated_write_connector_and_validates(tmp_path: Path) ->
             "gate": "mcp__self-upgrade__upgrade_self",
             "route": "sre-approvals",
         },
+        {
+            "gate": "mcp__self-upgrade__upgrade_platform",
+            "route": "sre-approvals",
+        },
     ]
     assert connectors["connectors"]["k8s-write"]["build"] == {
         "context": "connectors/k8s-write",
