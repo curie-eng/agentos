@@ -12,7 +12,7 @@ use curie::exit;
 use curie::message::{message_dry_run_json, MessageOutcomeOutput};
 use curie::observability::{local_endpoints, Endpoint, ObservabilityOutput};
 use curie::ui::{CliOutput, DryRunPlan};
-use curie_aci_protocol::SessionStatus;
+use curie_aci_protocol::{OutboundEvent, SessionStatus, PROTOCOL_VERSION};
 
 fn load_schema(name: &str) -> serde_json::Value {
     let path = format!("{}/schema/{}", env!("CARGO_MANIFEST_DIR"), name);
@@ -1156,13 +1156,111 @@ fn bump_version_output_validates() {
 }
 
 #[test]
-fn skill_message_output_validates() {
-    let out = SkillMessageOutput {
-        reply: "the answer is 42".to_string(),
-        status: "done".to_string(),
-        finalized: true,
+fn skill_message_awaiting_approval_output_preserves_final_approval_fields() {
+    let final_frame = OutboundEvent::Final {
+        version: PROTOCOL_VERSION.to_string(),
+        text: "the answer is 42".to_string(),
+        status: SessionStatus::AwaitingApproval,
+        approval_summary: Some("Approve the proposed operation".to_string()),
+        approval_route: Some("reviewers".to_string()),
+        approval_gate_kind: Some("permission".to_string()),
+        approval_granted_tool: Some("ExampleTool".to_string()),
+        input_tokens: Some(10),
+        output_tokens: Some(5),
     };
-    assert_valid("skill-message.schema.json", &out.to_json());
+    let out = SkillMessageOutput::from_final("the answer is 42".to_string(), &final_frame)
+        .expect("a final frame produces skill message output");
+    let value = out.to_json();
+    assert_valid("skill-message.schema.json", &value);
+    assert_eq!(value["reply"], serde_json::json!("the answer is 42"));
+    assert_eq!(value["status"], serde_json::json!("awaiting-approval"));
+    assert_eq!(value["finalized"], serde_json::json!(false));
+    assert_eq!(
+        value["approval_summary"],
+        serde_json::json!("Approve the proposed operation")
+    );
+    assert_eq!(value["approval_route"], serde_json::json!("reviewers"));
+    assert_eq!(value["approval_gate_kind"], serde_json::json!("permission"));
+    assert_eq!(
+        value["approval_granted_tool"],
+        serde_json::json!("ExampleTool")
+    );
+}
+
+#[test]
+fn skill_message_awaiting_approval_output_is_not_finalized() {
+    let final_frame = OutboundEvent::Final {
+        version: PROTOCOL_VERSION.to_string(),
+        text: "I need approval before continuing".to_string(),
+        status: SessionStatus::AwaitingApproval,
+        approval_summary: Some("Approve the proposed operation".to_string()),
+        approval_route: Some("reviewers".to_string()),
+        approval_gate_kind: Some("policy".to_string()),
+        approval_granted_tool: None,
+        input_tokens: None,
+        output_tokens: None,
+    };
+    let out = SkillMessageOutput::from_final(
+        "I need approval before continuing".to_string(),
+        &final_frame,
+    )
+    .expect("an awaiting-approval final frame produces skill message output");
+    let value = out.to_json();
+    assert_valid("skill-message.schema.json", &value);
+    assert_eq!(value["status"], serde_json::json!("awaiting-approval"));
+    assert_eq!(value["finalized"], serde_json::json!(false));
+    assert_eq!(
+        value["approval_summary"],
+        serde_json::json!("Approve the proposed operation")
+    );
+    assert_eq!(value["approval_route"], serde_json::json!("reviewers"));
+    assert_eq!(value["approval_gate_kind"], serde_json::json!("policy"));
+    assert_eq!(value["approval_granted_tool"], serde_json::Value::Null);
+}
+
+#[test]
+fn skill_message_only_marks_awaiting_approval_as_not_finalized() {
+    for status in [
+        SessionStatus::Done,
+        SessionStatus::IdleAwaitingInput,
+        SessionStatus::ClassifiedFailure,
+    ] {
+        let final_frame = OutboundEvent::Final {
+            version: PROTOCOL_VERSION.to_string(),
+            text: String::new(),
+            status,
+            approval_summary: None,
+            approval_route: None,
+            approval_gate_kind: None,
+            approval_granted_tool: None,
+            input_tokens: None,
+            output_tokens: None,
+        };
+        let out = SkillMessageOutput::from_final(String::new(), &final_frame)
+            .expect("a final frame produces skill message output");
+        assert!(
+            out.finalized,
+            "non-parked status must be finalized: {out:?}"
+        );
+        let json = out.to_json();
+        assert_valid("skill-message.schema.json", &json);
+        assert!(json["approval_summary"].is_null());
+        assert!(json["approval_route"].is_null());
+        assert!(json["approval_gate_kind"].is_null());
+        assert!(json["approval_granted_tool"].is_null());
+    }
+}
+
+#[test]
+fn skill_message_v1_payload_without_approval_metadata_remains_valid() {
+    assert_valid(
+        "skill-message.schema.json",
+        &serde_json::json!({
+            "reply": "done",
+            "status": "done",
+            "finalized": true
+        }),
+    );
 }
 
 #[test]

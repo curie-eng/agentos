@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/skill-message/v1.json",
+  "$id": "https://schemas.curietech.ai/cli/skill-message/v1.1.json",
   "title": "curie skill message --json",
-  "description": "The agent-facing payload of `curie skill message` under `--json`: the full buffered model reply and the final ACI session status (the human path streams tokens live and never builds this).",
+  "description": "The agent-facing payload of `curie skill message` under `--json`: the full buffered model reply, final ACI session status, and approval metadata from the final frame (the human path streams tokens live and never builds this).",
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -13,7 +13,24 @@
       "type": "string"
     },
     "finalized": {
-      "type": "boolean"
+      "type": "boolean",
+      "description": "Whether the turn is terminal. This is false for an awaiting-approval park, which can resume after an approval decision, and true for every other final-frame status."
+    },
+    "approval_summary": {
+      "type": ["string", "null"],
+      "description": "The runner-provided human-readable approval request summary, or null when the final frame carries no approval request."
+    },
+    "approval_route": {
+      "type": ["string", "null"],
+      "description": "The runner-provided approval route name, or null when no route applies."
+    },
+    "approval_gate_kind": {
+      "type": ["string", "null"],
+      "description": "The runner-provided kind of approval gate that parked or governed the turn, or null when no gate applies."
+    },
+    "approval_granted_tool": {
+      "type": ["string", "null"],
+      "description": "The runner-provided tool name associated with a permission approval request, or null when no tool-specific approval applies."
     }
   },
   "required": [

@@ -3336,16 +3336,15 @@ pub async fn send(
         step.clear();
     }
 
-    if let Some(OutboundEvent::Final { status, .. }) = events.last() {
-        // Under `--json`, emit the one buffered turn object (reply + final
-        // status) rather than the streamed/human trailer (#485). Emit BEFORE any
-        // exit so a classified failure still carries its data to the consumer.
+    if let Some(final_event @ OutboundEvent::Final { status, .. }) = events.last() {
+        // Under `--json`, project the real final frame into one buffered turn
+        // object (reply, status, and approval metadata) rather than the
+        // streamed/human trailer (#485, #2108). Emit BEFORE any exit so a
+        // classified failure still carries its data to the consumer.
         if json {
-            ui.emit(&SkillMessageOutput {
-                reply: std::mem::take(&mut reply),
-                status: status_str(status).to_string(),
-                finalized: true,
-            });
+            let output = SkillMessageOutput::from_final(std::mem::take(&mut reply), final_event)
+                .expect("the matched outbound event is final");
+            ui.emit(&output);
             return Ok(*status == SessionStatus::ClassifiedFailure);
         }
         // Close the streamed answer on stdout only if the last thing written was
@@ -3361,14 +3360,48 @@ pub async fn send(
     Ok(false)
 }
 
-/// Output of `skill message` under `--json`: the full buffered reply plus the
-/// final session status. The human path streams tokens live and never builds
-/// this; it exists so `--json` emits one object instead of empty stdout (#485).
+/// Output of `skill message` under `--json`: the full buffered reply, final
+/// session status, and approval metadata copied from the runner's final frame.
+/// The human path streams tokens live and never builds this; it exists so
+/// `--json` emits one complete object instead of empty stdout (#485, #2108).
 #[derive(Debug)]
 pub struct SkillMessageOutput {
     pub reply: String,
     pub status: String,
     pub finalized: bool,
+    pub approval_summary: Option<String>,
+    pub approval_route: Option<String>,
+    pub approval_gate_kind: Option<String>,
+    pub approval_granted_tool: Option<String>,
+}
+
+impl SkillMessageOutput {
+    /// Project a runner final frame into the agent-facing result without
+    /// inventing terminal state. An approval park is resumable, so it is the
+    /// only final-frame status for which `finalized` is false.
+    pub fn from_final(reply: String, event: &OutboundEvent) -> Option<Self> {
+        let OutboundEvent::Final {
+            status,
+            approval_summary,
+            approval_route,
+            approval_gate_kind,
+            approval_granted_tool,
+            ..
+        } = event
+        else {
+            return None;
+        };
+
+        Some(Self {
+            reply,
+            status: status_str(status).to_string(),
+            finalized: !matches!(status, SessionStatus::AwaitingApproval),
+            approval_summary: approval_summary.clone(),
+            approval_route: approval_route.clone(),
+            approval_gate_kind: approval_gate_kind.clone(),
+            approval_granted_tool: approval_granted_tool.clone(),
+        })
+    }
 }
 
 fn editable_bundle_warning(saved: Option<&state::RunnerState>, url: &str) -> Option<String> {
@@ -3398,12 +3431,14 @@ impl crate::ui::CliOutput for SkillMessageOutput {
             "reply": self.reply,
             "status": self.status,
             "finalized": self.finalized,
+            "approval_summary": self.approval_summary,
+            "approval_route": self.approval_route,
+            "approval_gate_kind": self.approval_gate_kind,
+            "approval_granted_tool": self.approval_granted_tool,
         })
     }
 
     fn render(&self, ui: &crate::ui::Ui) {
-        // Only reached if a caller routes this through the human path; mirror the
-        // streamed output as a single block for completeness.
         ui.answer(&self.reply);
         ui.note(&format!("-- final ({})", self.status));
     }
