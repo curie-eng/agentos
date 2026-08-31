@@ -192,6 +192,11 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/otel-collector-langfuse-secret-assertions.sh
 
+      - name: helm render assertions (BYO Langfuse host)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/langfuse-byo-assertions.sh
+
       # Prove Langfuse startup is gated on ClickHouse being up (issue #2009). A
       # Helm upgrade that recreates the ClickHouse Service otherwise lets the new
       # Langfuse pods start their migrations against an unresolvable name, so the
