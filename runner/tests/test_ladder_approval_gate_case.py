@@ -203,8 +203,18 @@ def test_case_asserts_the_parked_status_and_the_unrun_canary() -> None:
         "the expected parked shape must never be assigned to the variable the "
         f"case compares; got assignments: {parked_shape_assignments}"
     )
-    assert 'payload.get("finalized") is False' in body
-    assert 'isinstance(payload.get("approval_summary"), str)' in body
+    assert re.search(
+        r'parked_shape\s*=\s*\(\s*"valid"\s*if\s*'
+        r'payload\.get\("finalized"\)\s+is\s+False\s+and\s*'
+        r'isinstance\(payload\.get\("approval_summary"\),\s*str\)\s*'
+        r'else\s*"invalid"\s*\)',
+        body,
+    ), "parked_shape must be computed from finalized=false and approval_summary"
+    assert re.search(
+        r'\[\[\s*"\$\{?status\}?"\s*==\s*"awaiting-approval"\s*'
+        r'&&\s*"\$\{?parked_shape\}?"\s*==\s*"valid"\s*\]\]',
+        body,
+    ), "the success branch must require both the parked status and JSON shape"
 
     # --- (c) unrun --------------------------------------------------------
     # Neutering shape 3: drop the in-container probe, or stop asking it a

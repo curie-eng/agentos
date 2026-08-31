@@ -1242,6 +1242,12 @@ fn skill_message_only_marks_awaiting_approval_as_not_finalized() {
             out.finalized,
             "non-parked status must be finalized: {out:?}"
         );
+        let json = out.to_json();
+        assert_valid("skill-message.schema.json", &json);
+        assert!(json["approval_summary"].is_null());
+        assert!(json["approval_route"].is_null());
+        assert!(json["approval_gate_kind"].is_null());
+        assert!(json["approval_granted_tool"].is_null());
     }
 }
 

@@ -30,7 +30,7 @@
     },
     "approval_granted_tool": {
       "type": ["string", "null"],
-      "description": "The runner-provided tool name associated with a granted approval, or null when no tool grant applies."
+      "description": "The runner-provided tool name associated with a permission approval request, or null when no tool-specific approval applies."
     }
   },
   "required": [
