@@ -73,6 +73,8 @@ async def _seed_agent(
     secrets: dict | None = None,
     schema: str = _SCHEMA,
     kind: str = "slack",
+    endpoint: str | None = None,
+    adapter: str | None = None,
 ) -> uuid.UUID:
     """Seed one agent and its single channel binding (ADR-0096, #1459).
 
@@ -109,14 +111,17 @@ async def _seed_agent(
         )
         await conn.execute(
             text(
-                f"INSERT INTO {schema}.agent_channels (id, agent_id, kind, address) "
-                "VALUES (:id, :agent_id, :kind, :address)"
+                f"INSERT INTO {schema}.agent_channels "
+                "(id, agent_id, kind, address, endpoint, adapter) "
+                "VALUES (:id, :agent_id, :kind, :address, :endpoint, :adapter)"
             ),
             {
                 "id": uuid.uuid4(),
                 "agent_id": agent_id,
                 "kind": kind,
                 "address": channel,
+                "endpoint": endpoint,
+                "adapter": adapter,
             },
         )
     return agent_id
@@ -413,12 +418,19 @@ def test_bound_agent_without_active_deployment_is_identified() -> None:
                 name=f"undeployed-{token}",
                 max_usd=None,
                 max_tokens=None,
+                endpoint="https://adapter.example.com/replies",
+                adapter="mail",
             )
             try:
                 resolver = _resolver(engine)
                 assert await resolver.resolve("slack", channel) is None
                 binding = await resolver.undeployed_binding("slack", channel)
-                assert binding == BoundAgent(agent_id=agent_id, agent_name=f"undeployed-{token}")
+                assert binding == BoundAgent(
+                    agent_id=agent_id,
+                    agent_name=f"undeployed-{token}",
+                    endpoint="https://adapter.example.com/replies",
+                    adapter="mail",
+                )
                 # The kind remains part of the lookup; this is not an address-only
                 # fallback that could surface another channel's agent.
                 assert await resolver.undeployed_binding("email", channel) is None

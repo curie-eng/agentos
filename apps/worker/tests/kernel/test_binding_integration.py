@@ -24,6 +24,7 @@ from curie_worker.binding import (
 )
 from curie_worker.config import WorkerConfig
 from curie_worker.killswitch import kill_key
+from curie_worker.reply_sink import TargetRoute
 
 DONE = SessionStatus.DONE
 IDLE = SessionStatus.IDLE_AWAITING_INPUT
@@ -168,7 +169,10 @@ def test_bound_channel_without_deployment_replies_and_logs_loudly(make_harness, 
             {},
             undeployed={
                 ("slack", "C-bound"): SimpleNamespace(
-                    agent_id=agent_id, agent_name="test-agent", endpoint=None, adapter=None
+                    agent_id=agent_id,
+                    agent_name="test-agent",
+                    endpoint="https://adapter.example.com/replies",
+                    adapter="mail",
                 )
             },
         )
@@ -180,11 +184,36 @@ def test_bound_channel_without_deployment_replies_and_logs_loudly(make_harness, 
             assert h.runner.opened == []
             assert h.sink.last_text is not None
             assert "active deployment" in h.sink.last_text.lower()
+            assert h.sink.routes_for("reply.update") == [
+                TargetRoute(
+                    endpoint="https://adapter.example.com/replies",
+                    adapter="mail",
+                )
+            ]
             assert await h.async_redis.exists(h.config.done_key(ev.event_id))
             assert any(
                 "undeployed agent turn" in message and "test-agent" in message
                 for message in caplog.messages
             )
+
+    asyncio.run(go())
+
+
+def test_unmapped_channel_with_legacy_binding_double_is_a_polite_drop(make_harness) -> None:
+    """Older binding doubles need not implement the diagnostic lookup."""
+
+    class LegacyBinding:
+        async def resolve(self, kind: str, address: str) -> None:
+            return None
+
+    async def go() -> None:
+        async with make_harness(binding=LegacyBinding()) as h:
+            ev = _qevent("hello", channel="C-unknown")
+            await h.kernel.process_event(ev)
+
+            assert h.runner.opened == []
+            assert h.sink.last_text is not None and "no agent" in h.sink.last_text.lower()
+            assert await h.async_redis.exists(h.config.done_key(ev.event_id))
 
     asyncio.run(go())
 
