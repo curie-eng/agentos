@@ -32,10 +32,10 @@ destination.
 
 The Collector is the ownership boundary for backend authentication, retry, queueing, and
 signal routing. Swapping a backend means changing a collector exporter and pipeline, not
-application code. The runner's opinionated `agent.run` → `llm.generation` →
-`execute_tool` tree remains a narrower contract inside that platform-wide path: since
-ADR-0076 its attributes are a closed, versioned key set rather than an open bag of
-`gen_ai.*` names.
+application code. The runner's opinionated `agent.run` root with sibling
+`llm.generation` and `execute_tool` intervals remains a narrower contract inside that
+platform-wide path: since ADR-0076 its attributes are a closed, versioned key set rather
+than an open bag of `gen_ai.*` names.
 
 ## Current contract
 
@@ -100,9 +100,14 @@ keys:
   `gen_ai.usage.input_tokens` / `output_tokens` / `cache_read_input_tokens` /
   `cache_creation_input_tokens`, `gen_ai.tool.name`, `gen_ai.operation.name`, plus the
   resource keys `service.name` and `schema.version`, plus the root-span correlation keys
-  `curie.session_id` and `curie.sandbox_id`. `SPAN_ATTRIBUTE_VALUE_TYPES`
+  `curie.session_id` and `curie.sandbox_id`. Phase telemetry adds nine optional v1 keys:
+  `curie.phase`, `curie.phase.start_kind`, `curie.phase.end_kind`,
+  `curie.terminal.cause`, `curie.terminal.status`, `curie.generation.ttft_ms`,
+  `curie.generation.round`, `curie.tool.call.index`, and `curie.tool.outcome`.
+  `SPAN_ATTRIBUTE_VALUE_TYPES`
   (`runner/src/curie_runner/otel.py::SPAN_ATTRIBUTE_VALUE_TYPES`) declares each key's
-  value type (the four usage counts are `int`, every other key is `str`).
+  value type: the four usage counts, generation TTFT, generation round, and bounded tool
+  call index are `int`; every other key is `str`.
 - **The schema is versioned.** `SCHEMA_VERSION`
   (`runner/src/curie_runner/otel.py::SCHEMA_VERSION`) is `v1`, stamped on the resource as
   `schema.version`, and bumps only when a key is removed, renamed, or retyped; a new
@@ -128,19 +133,46 @@ keys:
   precedence as the shared bootstrap; `SessionConfig.otel` is the typed runner view of
   those variables.
 - `RunTracer.run_span` (`runner/src/curie_runner/otel.py::RunTracer.run_span`) takes
-  `(trace_name, model, session_id=None, user_id=None, approval_decision=None)`, opens the
-  root `agent.run` (`SpanKind.SERVER`) and a child `llm.generation` span. It always stamps
-  `langfuse.trace.name` on the root, and stamps `langfuse.session.id`, `langfuse.user.id`
-  and `gen_ai.approval.decision` only when the corresponding value is non-empty (the
-  approval decision is present only on a turn resuming a resolved approval).
-- On the generation span, `_GenerationSpan.record_model`
-  (`runner/src/curie_runner/otel.py::_GenerationSpan.record_model`) stamps both
-  `gen_ai.request.model` and the bare `model`, once, first non-empty value winning;
-  `record_usage` (`runner/src/curie_runner/otel.py::_GenerationSpan.record_usage`) stamps
-  up to four int attributes, the plain input/output counts plus the two prompt-cache
-  counts, skipping any field the SDK usage mapping omits or reports as a non-int; and
-  `tool_span` (`runner/src/curie_runner/otel.py::_GenerationSpan.tool_span`) emits an
-  `execute_tool` child carrying `gen_ai.tool.name` and `gen_ai.operation.name`.
+  `(trace_name, model, session_id=None, user_id=None, approval_decision=None)`, opens only
+  the root `agent.run` (`SpanKind.SERVER`), and yields a lazy turn-local phase manager. It
+  always stamps `langfuse.trace.name` on the root, and stamps `langfuse.session.id`,
+  `langfuse.user.id` and `gen_ai.approval.decision` only when the corresponding value is
+  non-empty (the approval decision is present only on a turn resuming a resolved
+  approval).
+- **The canonical tree records real intervals.** Each provider wait/model round opens one
+  lazy `llm.generation` direct child of `agent.run`, numbered from one with
+  `curie.generation.round`; it ends at the observed tool-use or result boundary. A
+  matching tool result starts the next round only after all active tool waits have ended.
+  Every `execute_tool` interval is also a direct child of `agent.run`, never a generation
+  child, so provider and tool phases are root siblings rather than a legacy monolithic
+  generation containing zero-duration tool markers.
+- **Generation data belongs to its round.** The configured model, or the first non-empty
+  model reported by an `AssistantMessage`, stamps `gen_ai.request.model` and the bare
+  `model` once on that generation. The four usage attributes accumulate only the
+  non-negative integer increments on `AssistantMessage` objects in that round;
+  `ResultMessage.usage` is a whole-turn total and is never copied onto the final
+  generation. When the real SDK supplies an allowlisted `message_start` or
+  `content_block_start` partial boundary, the adapter strips it to payload-free evidence
+  and the active generation records `curie.generation.ttft_ms` once. TTFT is omitted when
+  no such boundary is available; partial bodies, arguments, provider identifiers, and
+  results never enter telemetry.
+- **Boundary confidence is explicit.** Generation start kinds are `query_observed` or
+  `tool_result_inferred`; end kinds are `tool_use_observed`, `result_observed`, or
+  `terminal_inferred`. An `execute_tool` span starts at an SDK tool-use block with
+  `curie.phase.start_kind=tool_use_inferred` and ends on the matching tool result with
+  `curie.phase.end_kind=tool_result_inferred`, or at terminal cleanup with
+  `terminal_inferred`. Matching uses the SDK call id only inside the process. The id is
+  never exported; `curie.tool.call.index` is the bounded numeric correlation value, while
+  `gen_ai.tool.name` and `gen_ai.operation.name=execute_tool` describe the operation.
+- **Terminal state is truthful and bounded.** `curie.phase` marks each interval as
+  `provider_wait` or `tool_wait`, and on `agent.run` retains the last active phase.
+  Terminal cause/status pairs are `completed`/`succeeded`,
+  `classified_failure`/`failed`, `interrupt_requested`/`cancelled`, either SDK abort
+  (`aborted_streaming` or `aborted_tools`)/`cancelled`, and `abandoned`/`abandoned`.
+  OTel status matches: success and intentional cancellation are `OK`; classified failure
+  and abandonment are `ERROR`. Tool results close with `curie.tool.outcome` `success` or
+  `error`; any tool still active at terminal cleanup closes as `cancelled`, with its real
+  duration preserved.
 
 ### Collector delivery
 
