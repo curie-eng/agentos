@@ -386,6 +386,7 @@ check_runner_env "$CHART" "default values" \
 check_runner_env "$CHART" "credentials + in-cluster inference" \
   --set agentSandbox.runner.credentials=dummy \
   --set inference.deploy=true \
+  --set inference.persistence.enabled=true \
   || fail "widened render carries a runner env name that is not a declared boot-env key."
 
 echo "=== Assertion 7: negative control -- a misspelled runner env name FAILS ==="
@@ -1069,6 +1070,7 @@ PLACEMENT_HELM_ARGS=(
   --set dispatcher.slack.appToken=xapp-placement-render
   --set dispatcher.slack.botToken=xoxb-placement-render
   --set inference.deploy=true
+  --set inference.persistence.enabled=true
   --set security.gvisor.mode=require
 )
 
