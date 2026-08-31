@@ -15,6 +15,7 @@ this boundary and nothing above it is. ``aci-protocol`` is never mocked.
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any, Protocol, cast
@@ -145,21 +146,23 @@ class ClaudeAgentSession:
 
     def receive_turn(self) -> AsyncIterator[Any]:
         async def normalized() -> AsyncIterator[Any]:
-            async for message in self._client.receive_response():
-                if isinstance(message, StreamEvent):
-                    event_type = (
-                        message.event.get("type")
-                        if isinstance(message.event, dict)
-                        else None
-                    )
-                    if event_type in _ALLOWED_PARTIAL_BOUNDARY_TYPES:
-                        # Do not forward the StreamEvent object: its event body,
-                        # uuid, SDK session id, and parent tool id are all
-                        # provider payload. Only this bounded type survives the
-                        # adapter seam into session telemetry.
-                        yield PartialMessageBoundary(event_type=event_type)
-                    continue
-                yield message
+            response = cast("Any", self._client.receive_response())
+            async with contextlib.aclosing(response):
+                async for message in response:
+                    if isinstance(message, StreamEvent):
+                        event_type = (
+                            message.event.get("type")
+                            if isinstance(message.event, dict)
+                            else None
+                        )
+                        if event_type in _ALLOWED_PARTIAL_BOUNDARY_TYPES:
+                            # Do not forward the StreamEvent object: its event body,
+                            # uuid, SDK session id, and parent tool id are all
+                            # provider payload. Only this bounded type survives the
+                            # adapter seam into session telemetry.
+                            yield PartialMessageBoundary(event_type=event_type)
+                        continue
+                    yield message
 
         return normalized()
 

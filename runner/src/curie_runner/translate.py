@@ -49,6 +49,7 @@ from .side_effects import SideEffectClassifier
 # it. A prior-state snapshot of a Kubernetes object is tens of kilobytes, so this
 # is set to clear a realistic snapshot and refuse a blob.
 RESULT_MAX_BYTES = 64_000
+_SDK_ABORT_TERMINAL_REASONS = frozenset(("aborted_streaming", "aborted_tools"))
 
 
 @dataclass
@@ -307,6 +308,14 @@ def _translate_result(
     message: ResultMessage,
     state: TurnState,
 ) -> list[OutboundEvent]:
+    if getattr(message, "terminal_reason", None) in _SDK_ABORT_TERMINAL_REASONS:
+        return [
+            Final(
+                text="run interrupted",
+                status=SessionStatus.IDLE_AWAITING_INPUT,
+            )
+        ]
+
     subtype = message.subtype or ""
     if message.is_error or subtype.startswith("error"):
         text = message.result or "run failed"

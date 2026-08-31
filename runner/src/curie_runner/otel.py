@@ -544,7 +544,6 @@ class _GenerationSpan:
         """
 
         self._ensure_compat_generation()
-        self.record_first_response_boundary()
         self._record_usage(usage)
 
     def tool_use(self, call_id: str, tool_name: str) -> None:
@@ -591,7 +590,16 @@ class _GenerationSpan:
 
         call_id = f"compat:{self._tool_call_index + 1}"
         self.tool_use(call_id, tool_name)
-        self.tool_result(call_id, failed=False)
+        pending = self._active_tools.pop(call_id, None)
+        if pending is None:
+            return
+        tool, _index = pending
+        self._end_tool(
+            tool,
+            end_kind="tool_result_inferred",
+            outcome="success",
+            failed=False,
+        )
 
     def _ensure_compat_generation(self) -> None:
         if self._active_generation is None and not self._active_tools and not self._terminal:

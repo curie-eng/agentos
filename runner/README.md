@@ -20,8 +20,9 @@ locally in Docker.
 - Emits `side_effect_flag` when a non-idempotent tool executes (read-only
   allowlist, deny-by-default; see `side_effects.py`).
 - Loads and validates the mounted plugin bundle via `plugin_format.validate_bundle`.
-- Exports gen_ai OTel spans (`agent.run` -> `llm.generation` -> `execute_tool`)
-  via OTLP-HTTP (the OpenTelemetry Protocol over HTTP) to the collector, which
+- Exports gen_ai OTel spans: an `agent.run` root with duration-bearing
+  `llm.generation` provider-wait and `execute_tool` tool-wait siblings, via
+  OTLP-HTTP (the OpenTelemetry Protocol over HTTP) to the collector, which
   forwards to Langfuse.
 - Rehydrates from a history ref on start (`resume`), stateless-first
   (ADR-0003, an Architecture Decision Record).

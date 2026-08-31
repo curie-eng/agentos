@@ -24,6 +24,7 @@ from claude_agent_sdk import (
 )
 from claude_agent_sdk.types import CanUseTool, PermissionResultDeny, ToolPermissionContext
 
+from .adapter import PartialMessageBoundary
 from .approval import APPROVAL_TOOL_NAME, ApprovalGate, process_approval_request
 
 
@@ -164,6 +165,10 @@ class FakeModelSession:
     set it False to model the other real shape, where the SDK still delivers a
     terminal error result after the interrupt.
 
+    ``emit_partial_boundaries`` is an opt-in telemetry fixture. When enabled, a
+    payload-free message-start boundary immediately precedes each scripted
+    assistant message. The default remains the historical exact script replay.
+
     ``can_use_tool`` (the #245 permission gate) lets the offline path exercise the
     same intercept the SDK applies: before each scripted ``ToolUseBlock`` is
     yielded, the permission callback runs and its DECISION is honored -- a gated
@@ -185,10 +190,12 @@ class FakeModelSession:
         truncate_on_interrupt: bool = True,
         can_use_tool: CanUseTool | None = None,
         approval_gate: ApprovalGate | None = None,
+        emit_partial_boundaries: bool = False,
     ) -> None:
         self._script_factory = script_factory or self._default_script
         self._truncate_on_interrupt = truncate_on_interrupt
         self._can_use_tool = can_use_tool
+        self._emit_partial_boundaries = emit_partial_boundaries
         # The shared policy gate (#561): a scripted request_approval block must
         # run the SAME route-resolution decision table the real MCP tool does, or
         # the fake tier omits the sole-route auto-bind / unknown-route refusal and
@@ -239,6 +246,8 @@ class FakeModelSession:
             if self._interrupted and self._truncate_on_interrupt:
                 return
             await self._apply_gate(message)
+            if self._emit_partial_boundaries and isinstance(message, AssistantMessage):
+                yield PartialMessageBoundary(event_type="message_start")
             yield message
             if self._halted:
                 # The denied ToolUseBlock above IS delivered (the real SDK emits

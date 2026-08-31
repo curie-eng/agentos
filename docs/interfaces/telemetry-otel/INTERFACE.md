@@ -139,13 +139,15 @@ keys:
   `langfuse.user.id` and `gen_ai.approval.decision` only when the corresponding value is
   non-empty (the approval decision is present only on a turn resuming a resolved
   approval).
-- **The canonical tree records real intervals.** Each provider wait/model round opens one
-  lazy `llm.generation` direct child of `agent.run`, numbered from one with
-  `curie.generation.round`; it ends at the observed tool-use or result boundary. A
-  matching tool result starts the next round only after all active tool waits have ended.
-  Every `execute_tool` interval is also a direct child of `agent.run`, never a generation
-  child, so provider and tool phases are root siblings rather than a legacy monolithic
-  generation containing zero-duration tool markers.
+- **The canonical tree records real intervals.** Each observable provider wait/model
+  round opens one lazy `llm.generation` direct child of `agent.run`, numbered from one
+  with `curie.generation.round`; it ends at the observed SDK tool-use or result boundary.
+  This is the provider wait visible through SDK events, not a claim that each interval
+  maps one-to-one to an underlying provider API call. A matching tool result starts the
+  next round only after all active tool waits have ended. Every `execute_tool` interval
+  is also a direct child of `agent.run`, never a generation child, so provider and tool
+  phases are root siblings rather than a legacy monolithic generation containing
+  zero-duration tool markers.
 - **Generation data belongs to its round.** The configured model, or the first non-empty
   model reported by an `AssistantMessage`, stamps `gen_ai.request.model` and the bare
   `model` once on that generation. The four usage attributes accumulate only the
@@ -154,8 +156,9 @@ keys:
   generation. When the real SDK supplies an allowlisted `message_start` or
   `content_block_start` partial boundary, the adapter strips it to payload-free evidence
   and the active generation records `curie.generation.ttft_ms` once. TTFT is omitted when
-  no such boundary is available; partial bodies, arguments, provider identifiers, and
-  results never enter telemetry.
+  no such boundary is available: direct compatibility setters may populate model or
+  usage attributes, but never claim TTFT without that allowlisted partial boundary.
+  Partial bodies, arguments, provider identifiers, and results never enter telemetry.
 - **Boundary confidence is explicit.** Generation start kinds are `query_observed` or
   `tool_result_inferred`; end kinds are `tool_use_observed`, `result_observed`, or
   `terminal_inferred`. An `execute_tool` span starts at an SDK tool-use block with
