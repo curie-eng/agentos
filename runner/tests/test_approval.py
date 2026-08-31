@@ -19,6 +19,7 @@ from claude_agent_sdk.types import (
     PermissionResultDeny,
     ToolPermissionContext,
 )
+from curie_runner import approval as approval_module
 from curie_runner.adapter import build_options
 from curie_runner.approval import (
     APPROVAL_SUMMARY_PREFIX,
@@ -236,7 +237,7 @@ def test_approval_server_config_shape() -> None:
     assert APPROVAL_TOOL_NAME == "mcp__curie__request_approval"
 
 
-def test_publish_tool_exists_only_for_a_managed_workspace() -> None:
+def test_publish_tool_is_always_listed_but_unmounted_invocation_refuses() -> None:
     async def names(server: object) -> set[str]:
         handler = server["instance"].request_handlers[mcp_types.ListToolsRequest]  # type: ignore[index]
         result = await handler(mcp_types.ListToolsRequest(method="tools/list"))
@@ -244,12 +245,57 @@ def test_publish_tool_exists_only_for_a_managed_workspace() -> None:
         return {str(item["name"]) for item in payload["tools"]}
 
     async def go() -> None:
-        assert "publish_changes" not in await names(build_approval_server())
-        assert "publish_changes" in await names(
-            build_approval_server(managed_workspace=True)
+        unmounted = build_approval_server()
+        mounted = build_approval_server(managed_workspace=True)
+        assert "publish_changes" in await names(unmounted)
+        assert "publish_changes" in await names(mounted)
+
+        # Discovery is unconditional so the model knows how publication works,
+        # but authority remains mount-keyed: an unmounted session has no gate.
+        assert (
+            build_approval_gate(
+                operator_tools=None, policy_routes={}, managed_workspace=False
+            )
+            is None
         )
+        mounted_gate = build_approval_gate(
+            operator_tools=None, policy_routes={}, managed_workspace=True
+        )
+        assert mounted_gate is not None
+        assert mounted_gate.required == frozenset({PUBLISH_TOOL_NAME})
+
+        # Defence in depth is also unconditional. Calling the discoverable
+        # tool without a mounted checkout must fail usefully, never fabricate a
+        # publication request or silently succeed.
+        handler = unmounted["instance"].request_handlers[mcp_types.CallToolRequest]
+        direct = await handler(
+            mcp_types.CallToolRequest(
+                method="tools/call",
+                params=mcp_types.CallToolRequestParams(
+                    name="publish_changes",
+                    arguments={"title": "Ship changes"},
+                ),
+            )
+        )
+        payload = direct.model_dump()
+        assert payload.get("isError") is True
+        message = " ".join(
+            str(item.get("text") or "") for item in payload.get("content") or []
+        ).lower()
+        assert "no managed repository workspace" in message
 
     anyio.run(go)
+
+
+def test_publish_tool_description_carries_coding_and_approval_safety_protocol() -> None:
+    description = approval_module._PUBLISH_DESCRIPTION.lower()  # noqa: SLF001
+
+    assert "/workspace" in description
+    assert "do not push" in description
+    assert "preserve existing changes" in description
+    assert "human approval" in description
+    assert "end your turn" in description
+    assert "pending" in description
 
 
 # --- the permission gate (#245): canUseTool over approval-required tools --------
@@ -385,6 +431,7 @@ def test_policy_gate_summary_outranks_gate_block() -> None:
 def test_build_options_permission_posture() -> None:
     # Without a callback the historical bypass posture is preserved verbatim;
     # with one, the session runs in default mode and the callback decides.
+    hooks = {"PreToolUse": []}
     plain = build_options(
         plugins=[],
         model=None,
@@ -392,9 +439,15 @@ def test_build_options_permission_posture() -> None:
         max_turns=1,
         max_budget_usd=None,
         resume=None,
+        cwd="/workspace",
+        hooks=hooks,
     )
+    assert plain.tools == {"type": "preset", "preset": "claude_code"}
+    assert plain.allowed_tools == []
     assert plain.permission_mode == "bypassPermissions"
     assert plain.can_use_tool is None
+    assert plain.cwd == "/workspace"
+    assert plain.hooks == hooks
 
     gate = ApprovalGate(required=frozenset({"Bash"}))
     gated = build_options(
@@ -405,9 +458,15 @@ def test_build_options_permission_posture() -> None:
         max_budget_usd=None,
         resume=None,
         can_use_tool=build_can_use_tool(gate),
+        cwd="/workspace",
+        hooks=hooks,
     )
+    assert gated.tools == {"type": "preset", "preset": "claude_code"}
+    assert gated.allowed_tools == []
     assert gated.permission_mode == "default"
     assert gated.can_use_tool is not None
+    assert gated.cwd == "/workspace"
+    assert gated.hooks == hooks
 
 
 def test_runner_config_parses_approval_required_tools() -> None:
@@ -797,7 +856,7 @@ def test_an_overlapping_bundle_route_is_logged_not_fatal(caplog) -> None:
 
 
 def test_no_declared_gate_without_workspace_preserves_historical_bypass() -> None:
-    """A non-workspace boot has neither a permission callback nor publish."""
+    """A non-workspace boot has no permission callback or publication authority."""
 
     gate = build_approval_gate(operator_tools=None, policy_routes={})
     assert gate is None

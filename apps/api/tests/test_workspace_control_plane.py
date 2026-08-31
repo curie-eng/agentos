@@ -249,6 +249,46 @@ def test_workspace_capability_without_repo_remains_an_unselected_generic_thread(
     assert _selection_rows() == []
 
 
+def test_no_url_and_no_durable_selection_returns_null_without_redemption(
+    worker_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ordinary non-coding turn neither persists a repo nor resolves auth."""
+
+    def unexpected_credential_resolution(*_args: object) -> tuple[str, str]:
+        raise AssertionError("selection absence must not resolve a repository credential")
+
+    monkeypatch.setattr(
+        "curie_api.routers.workspaces.resolve_repository_credential",
+        unexpected_credential_resolution,
+    )
+    agent_id, version_id = _create_agent_version(worker_client, auth_headers)
+    deployment = _deploy(
+        worker_client,
+        auth_headers,
+        agent_id,
+        version_id,
+        workspace=False,
+    )
+
+    response = worker_client.post(
+        f"/v1/internal/workspaces/{deployment['id']}/selection",
+        json={
+            "conversation_id": "thread-no-repository",
+            "author": "U0REQUEST1",
+            "repo_full_name": None,
+        },
+        headers=WORKER_HEADERS,
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"repo_full_name": None}
+    assert _selection_rows() == []
+    assert _audit_rows() == []
+
+
 def test_selection_survives_redeployment_for_the_same_agent_thread(
     worker_client: TestClient,
     auth_headers: dict[str, str],
@@ -574,7 +614,7 @@ def test_workspace_credential_prefers_app_installation_token_over_pat(
     assert mint == {"repositories": ["acme-bot"]}
 
 
-def test_workspace_credential_requires_a_workspace_enabled_deployment(
+def test_workspace_selection_and_credential_ignore_the_deployment_feature_flag(
     worker_client: TestClient,
     auth_headers: dict[str, str],
     clean_db: None,
@@ -582,15 +622,27 @@ def test_workspace_credential_requires_a_workspace_enabled_deployment(
     agent_id, version_id = _create_agent_version(worker_client, auth_headers)
     deployment = _deploy(worker_client, auth_headers, agent_id, version_id, workspace=False)
 
+    selected = worker_client.post(
+        f"/v1/internal/workspaces/{deployment['id']}/selection",
+        json={
+            "conversation_id": "thread-disabled",
+            "author": "U0REQUEST1",
+            "repo_full_name": REPO,
+        },
+        headers=WORKER_HEADERS,
+    )
     response = worker_client.post(
         f"/v1/internal/workspaces/{deployment['id']}/credential",
         json={"conversation_id": "thread-disabled"},
         headers=WORKER_HEADERS,
     )
-    assert response.status_code == 409
+
+    assert selected.status_code == 200, selected.text
+    assert selected.json() == {"repo_full_name": REPO}
+    assert response.status_code == 200, response.text
     assert response.headers["cache-control"] == "no-store"
-    assert "workspace" in response.json()["detail"].lower()
+    assert response.json()["repo_full_name"] == REPO
     audit = _audit_rows()
     assert len(audit) == 1
-    assert audit[0]["outcome"] == "refused"
+    assert audit[0]["outcome"] == "issued"
     assert str(audit[0]["deployment_id"]) == deployment["id"]

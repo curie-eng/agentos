@@ -71,6 +71,7 @@ def _create_deployment(
     *,
     name: str | None = None,
     channel: str = "C0EXAMPLE1",
+    workspace_enabled: bool = True,
 ) -> dict[str, Any]:
     suffix = uuid.uuid4().hex[:8]
     agent_response = client.post(
@@ -96,7 +97,7 @@ def _create_deployment(
             "agent_id": agent_id,
             "version_id": version_response.json()["id"],
             "environment": "dev",
-            "workspace_enabled": True,
+            "workspace_enabled": workspace_enabled,
         },
         headers=auth_headers,
     )
@@ -1531,6 +1532,45 @@ def test_publication_credential_is_approved_only_server_derived_and_audited(
     assert all(str(row["deployment_id"]) == deployment["id"] for row in audit)
     assert all(row["repo_full_name"] == REPO for row in audit)
     assert "ghp_publication_operator" not in json.dumps(audit, default=str)
+
+
+def test_disabled_deployment_flag_still_allows_authorized_publication(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    """Selection plus approval and allowlist, not the legacy flag, gate publish."""
+
+    client, _ = publication_stack
+    deployment = _create_deployment(
+        client,
+        auth_headers,
+        workspace_enabled=False,
+    )
+    _, publication = _create_publication(
+        client,
+        _publication_payload(
+            deployment["id"],
+            dedupe_key="disabled-flag-publication",
+        ),
+    )
+    approved = _resolve(client, auth_headers, publication["approval_id"])
+    assert approved.status_code == 200, approved.text
+
+    credential = client.post(
+        f"/v1/internal/publications/{publication['id']}/credential",
+        headers=WORKER_HEADERS,
+    )
+
+    assert credential.status_code == 200, credential.text
+    assert credential.headers["cache-control"] == "no-store"
+    assert credential.json()["repo_full_name"] == REPO
+    audit = _rows(
+        "SELECT purpose, outcome FROM curie.credential_redemption_audit_entries "
+        "WHERE publication_id = :id ORDER BY created_at, id",
+        {"id": publication["id"]},
+    )
+    assert audit == [{"purpose": "publication_push", "outcome": "issued"}]
 
 
 def test_allowlist_revocation_stops_an_approved_publication_credential(

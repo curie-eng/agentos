@@ -429,7 +429,7 @@ fn deploy_args(manifest: &Value, tier: &str) -> Vec<Value> {
 }
 
 #[test]
-fn command_manifests_expose_both_workspace_intent_flags_on_both_tiers() {
+fn workspace_flags_remain_accepted_as_deprecated_compatibility_noops_in_every_manifest() {
     let live_output = Command::new(bin())
         .arg("schema")
         .output()
@@ -441,25 +441,54 @@ fn command_manifests_expose_both_workspace_intent_flags_on_both_tiers() {
         &fs::read_to_string(committed_path).expect("committed command manifest"),
     )
     .expect("committed manifest JSON");
-
-    for manifest in [&live, &committed] {
-        for tier in ["local", "cluster"] {
-            let args = deploy_args(manifest, tier);
-            for (id, long) in [("workspace", "workspace"), ("no_workspace", "no-workspace")] {
-                let arg = args
-                    .iter()
-                    .find(|arg| arg["id"] == id)
-                    .unwrap_or_else(|| panic!("{tier} deploy missing --{long}"));
-                assert_eq!(arg["long"], long);
-                assert_eq!(arg["required"], false);
-            }
-        }
-    }
-
     let ui_manifest =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../apps/ui/src/generated/commandManifest.ts");
     let ui = fs::read_to_string(ui_manifest).expect("committed UI command manifest");
-    assert!(ui.contains("\"id\": \"workspace\""));
-    assert!(ui.contains("\"id\": \"no_workspace\""));
-    assert!(ui.contains("\"long\": \"no-workspace\""));
+
+    for tier in ["local", "cluster"] {
+        let live_args = deploy_args(&live, tier);
+        let committed_args = deploy_args(&committed, tier);
+        for (id, long) in [("workspace", "workspace"), ("no_workspace", "no-workspace")] {
+            // Compatibility means old invocations still parse even though the
+            // capability is now present independently of either flag.
+            let accepted = Command::new(bin())
+                .args([tier, "deploy", &format!("--{long}"), "--help"])
+                .output()
+                .expect("run deploy help with compatibility flag");
+            assert!(
+                accepted.status.success(),
+                "{tier} deploy rejected compatibility flag --{long}: {}",
+                String::from_utf8_lossy(&accepted.stderr)
+            );
+
+            let live_arg = live_args
+                .iter()
+                .find(|arg| arg["id"] == id)
+                .unwrap_or_else(|| panic!("live {tier} deploy missing --{long}"));
+            let committed_arg = committed_args
+                .iter()
+                .find(|arg| arg["id"] == id)
+                .unwrap_or_else(|| panic!("committed {tier} deploy missing --{long}"));
+            assert_eq!(
+                live_arg, committed_arg,
+                "committed manifest drifted from live {tier} deploy --{long}"
+            );
+            assert_eq!(live_arg["long"], long);
+            assert_eq!(live_arg["required"], false);
+
+            let help = live_arg["help"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{tier} deploy --{long} needs help text"));
+            assert!(
+                help.to_ascii_lowercase()
+                    .contains("deprecated compatibility no-op"),
+                "{tier} deploy --{long} must describe its retained semantics as a deprecated compatibility no-op: {help}"
+            );
+            let rendered_help = serde_json::to_string(help).expect("serialize flag help");
+            assert!(
+                ui.contains(&rendered_help),
+                "generated UI manifest is missing {tier} deploy --{long} help: {help}"
+            );
+        }
+    }
 }
