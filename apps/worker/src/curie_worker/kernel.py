@@ -987,11 +987,11 @@ class Kernel:
         """
         event_id = qevent.event_id
         thread_key = _thread_key_for(qevent)
-        # The turn's route starts as the one the server minted onto the wire and
-        # is REPLACED by the binding row's once this turn resolves (EB-B2's two
-        # sanctioned sources, in precedence order). Everything before resolution
-        # -- the prior-side-effect escalation, the unmapped-address drop -- can
-        # only reach the handle's, which is the point of it being carried.
+        # The turn's route starts as the one the server minted onto the wire. A
+        # bound route replaces it either when the turn resolves or, solely for a
+        # bound-but-undeployed status reply, when the diagnostic binding lookup
+        # supplies the server-controlled endpoint. Other pre-resolution paths
+        # can only reach the handle's route, which is why it travels on the wire.
         route = _route_from_handle(qevent)
 
         # Acquire the per-thread order lock BEFORE any await, so concurrent
@@ -1108,6 +1108,39 @@ class Kernel:
                     qevent.reply_handle.kind, qevent.reply_handle.channel
                 )
                 if resolved is None:
+                    # Binding doubles predate the diagnostic lookup; keep a miss
+                    # on those doubles on the established polite-drop path.
+                    undeployed_lookup = getattr(
+                        self._binding, "undeployed_binding", None
+                    )
+                    undeployed = (
+                        await undeployed_lookup(
+                            qevent.reply_handle.kind, qevent.reply_handle.channel
+                        )
+                        if undeployed_lookup is not None
+                        else None
+                    )
+                    if undeployed is not None:
+                        # A bound non-Slack route may carry the only endpoint the
+                        # platform can use to deliver this status reply.
+                        route = TargetRoute(
+                            endpoint=undeployed.endpoint or qevent.reply_handle.endpoint,
+                            adapter=undeployed.adapter or qevent.reply_handle.adapter,
+                        )
+                        logger.warning(
+                            "undeployed agent turn dropped for agent=%s route=%s:%s",
+                            undeployed.agent_name,
+                            qevent.reply_handle.kind,
+                            qevent.reply_handle.channel,
+                        )
+                        await self._drop_with_message(
+                            qevent,
+                            route,
+                            "This agent does not have an active deployment yet. "
+                            "Deploy it, then try again.",
+                            lease=lease,
+                        )
+                        return
                     # Name BOTH halves: since the kind routes, a kind typo is a
                     # newly reachable drop, and a message naming only the address
                     # sends an operator hunting a binding that is right there.
@@ -1120,8 +1153,8 @@ class Kernel:
                         lease=lease,
                     )
                     return
-                # The FIRST sanctioned route source, and the normal path: once a
-                # turn has resolved, its egress target is the binding row's,
+                # The normal route source: once a turn has resolved, its egress
+                # target is the binding row's,
                 # because endpoints are server-controlled (D4.1). A row that
                 # names none leaves the server-minted handle standing -- the
                 # dispatcher and CLI bind no endpoint of their own.
