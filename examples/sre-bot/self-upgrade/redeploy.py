@@ -462,6 +462,32 @@ def deploy(
     return version_id
 
 
+def upgrade_disposition(current: str | None, version_id: str | None) -> str:
+    """What to do about a deployed version, given what is known about it.
+
+    Two different absences, and only one is fatal:
+
+    - No VERSION means nothing to read the running connector env off, so a deploy
+      would ship the bundle's placeholder allowlists and produce a bot that
+      refuses every write while looking healthy. Refuse.
+    - No COMMIT means only the comparison is lost. "Am I behind?" becomes
+      unanswerable; "can I deploy?" does not.
+
+    Refusing on a missing commit was wrong, and stuck: `curie example sre-bot
+    install` creates versions with no commit, so an install deployed the
+    supported way could never be upgraded by this job again -- and the refusal
+    advised deploying through the installer, which is what caused it (#2128).
+
+    Returns one of ``refuse``, ``deploy-unknown``, ``deploy``.
+    """
+
+    if not version_id:
+        return "refuse"
+    if not current:
+        return "deploy-unknown"
+    return "deploy"
+
+
 def main() -> int:
     repo = os.environ.get("CURIE_SELF_UPGRADE_REPO", "curie-eng/curie")
     branch = os.environ.get("CURIE_SELF_UPGRADE_BRANCH", "main")
@@ -497,14 +523,37 @@ def main() -> int:
         print("dry run: would deploy the bundle at the tip", flush=True)
         return 0
 
-    if not current or not version_id:
+    # Two different absences, and only one of them is fatal.
+    #
+    # Without a VERSION there is nothing to read the running connector env off,
+    # so a deploy would ship the bundle's placeholder allowlists and produce a
+    # bot that refuses every write while looking healthy. That is worth refusing.
+    #
+    # Without a COMMIT the only thing lost is the comparison -- "am I behind?"
+    # becomes unanswerable, not "I cannot deploy". Refusing there was wrong, and
+    # wrong in a way that stuck: `curie example sre-bot install` creates versions
+    # with no commit, so an install deployed the supported way could never be
+    # upgraded by this job again, and the message told the reader to do the very
+    # thing that caused it (#2128).
+    #
+    # Deploying the tip is the safe answer to an unknown current: it is where the
+    # repository is, and the alternative is an install that can never move.
+    disposition = upgrade_disposition(current, version_id)
+    if disposition == "refuse":
         print(
-            "the deployed version records no commit, so there is nothing to compare "
-            "against and no connector declaration to carry forward. Deploy once "
-            "through the installer first.",
+            "the deployed version cannot be identified, so there is no connector "
+            "declaration to carry forward and a deploy would ship the bundle's "
+            "placeholder ceilings. Refusing.",
             flush=True,
         )
         return 1
+    if disposition == "deploy-unknown":
+        print(
+            "the deployed version records no commit, so whether this install is "
+            "behind cannot be determined. Deploying the tip, which is the only "
+            "answer that leaves it somewhere known.",
+            flush=True,
+        )
 
     try:
         archive = _get(
