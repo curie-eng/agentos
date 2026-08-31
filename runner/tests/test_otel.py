@@ -432,6 +432,111 @@ def test_ttft_is_first_boundary_once_and_is_measured_from_each_round_start(
     ] == [7, 11]
 
 
+def test_steer_during_provider_wait_preserves_generation_and_ttft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timestamps = (
+        1_000_000_000,
+        1_013_000_000,
+        # A steer that restarts the phase would consume these deliberately
+        # different values and make both the call-count and span assertions fail.
+        50_000_000_000,
+        50_029_000_000,
+    )
+    observed_timestamps: list[int] = []
+
+    def monotonic_ns() -> int:
+        value = timestamps[len(observed_timestamps)]
+        observed_timestamps.append(value)
+        return value
+
+    monkeypatch.setattr(otel_module.time, "monotonic_ns", monotonic_ns)
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+
+    class BlockingSteerSession:
+        def __init__(self) -> None:
+            self.queries: list[str] = []
+            self.waiting_after_boundary = anyio.Event()
+            self.release = anyio.Event()
+
+        async def connect(self) -> None:
+            return None
+
+        async def query(self, text: str) -> None:
+            self.queries.append(text)
+
+        def receive_turn(self) -> AsyncIterator[object]:
+            async def messages() -> AsyncIterator[object]:
+                # This is the same payload-free, allowlisted adapter boundary the
+                # real SessionRunner sees; provider content never enters the test.
+                yield PartialMessageBoundary(event_type="message_start")
+                self.waiting_after_boundary.set()
+                await self.release.wait()
+                yield AssistantMessage(
+                    content=[TextBlock(text="completed after steer")],
+                    model="observed-model",
+                )
+                yield _result(text="completed after steer")
+
+            return messages()
+
+        async def interrupt(self) -> None:
+            self.release.set()
+
+        async def close(self) -> None:
+            return None
+
+    async def go() -> tuple[list[object], BlockingSteerSession]:
+        session = BlockingSteerSession()
+        runner = SessionRunner(
+            session_factory=lambda: session,
+            ceiling=0,
+            tracer=RunTracer(provider),
+            classifier=SideEffectClassifier(),
+            trace_name="curie-run:steer-telemetry",
+            model="configured-model",
+        )
+        lines: list[str] = []
+
+        async def consume() -> None:
+            async for line in runner.run_turn(
+                Event(type="message", text="initial", user="U0EXAMPLE1", ts="1")
+            ):
+                lines.append(line)
+
+        await runner.start()
+        try:
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(consume)
+                await session.waiting_after_boundary.wait()
+                assert runner.turn_active
+                assert session.queries == ["initial"]
+                assert await runner.steer("steered follow-up") is True
+                session.release.set()
+        finally:
+            await runner.close()
+        return parse_ndjson("".join(lines)), session
+
+    events, session = anyio.run(go)
+    assert session.queries == ["initial", "steered follow-up"]
+    assert isinstance(events[-1], Final)
+    assert events[-1].status is SessionStatus.DONE
+
+    spans = _spans_by_name(list(exporter.get_finished_spans()))
+    generations = spans["llm.generation"]
+    assert len(generations) == 1
+    assert generations[0].attributes["curie.generation.round"] == 1
+    assert generations[0].attributes["curie.generation.ttft_ms"] == 13
+    assert observed_timestamps == list(timestamps[:2])
+
+    root = spans["agent.run"][0]
+    assert root.attributes["curie.terminal.cause"] == "completed"
+    assert root.attributes["curie.terminal.status"] == "succeeded"
+    assert root.status.status_code is StatusCode.OK
+
+
 def test_fake_partial_boundaries_are_opt_in_payload_free_and_precede_each_assistant() -> None:
     script: list[object] = [
         AssistantMessage(
