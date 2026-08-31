@@ -681,6 +681,9 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
     for command in &stack_commands {
         run_install_command(command, &workspace, &chart).await?;
     }
+    // Before the apply, not after: the point is to refuse while the credential
+    // still exists.
+    refuse_to_drop_a_recorded_model_credential(&identity).await?;
     apply_curie_platform(&chart, false, &identity).await?;
     run_install_command(&integration_command, &workspace, &chart).await?;
     run_install_command(&read_access_command, &workspace, &chart).await?;
@@ -805,6 +808,69 @@ async fn apply_upgrade_path(
         run_install_command(&command, workspace, chart).await?;
     }
     connector_kubeconfig(UPGRADER_IDENTITY, UPGRADER_TOKEN_SECRET, namespace).await
+}
+
+/// Stop rather than silently reset a model credential this installer will drop.
+///
+/// `apply_curie_platform` goes through the declarative path with
+/// `Credentials::default()`, and that path's contract is deliberate: a
+/// configuration naming no model credential really does clear one, and `curie
+/// diff` reports it as a reset because that is what happens
+/// (`without_a_declared_model_credential_those_keys_are_resets`). The contract is
+/// right; using it from an installer that declares nothing is not.
+///
+/// Run against a live install, that combination removed
+/// `agentSandbox.runner.credentials` and left the release on the chart's
+/// `fakeModel` default. Nothing looked wrong: helm reported success, every pod
+/// stayed healthy, and the bot kept answering -- in three milliseconds, from the
+/// fake model, "all done" (#2129).
+///
+/// So the installer asks first. Refusing costs a re-run with the credential
+/// named; not refusing costs the credential, and there is no signal on the way
+/// out that it went.
+/// Does this release's recorded values carry a model credential?
+///
+/// Split out so the decision is testable without a cluster: the read is the part
+/// that needs one, and the read is not what was wrong.
+fn records_a_model_credential(existing: &serde_json::Value) -> bool {
+    existing
+        .pointer("/agentSandbox/runner/credentials")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|recorded| !recorded.trim().is_empty())
+}
+
+async fn refuse_to_drop_a_recorded_model_credential(identity: &InstallIdentity) -> Result<()> {
+    let opts = crate::ops::CommonOpts {
+        namespace: identity.namespace.clone(),
+        release: identity.release.clone(),
+        dry_run: false,
+    };
+    let Some(existing) = crate::ops::fetch_release_values(&opts).await? else {
+        // No release yet: a fresh install has nothing to drop.
+        return Ok(());
+    };
+    if !records_a_model_credential(&existing) {
+        return Ok(());
+    }
+    Err(crate::exit::usage(format!(
+        "release {} in namespace {} records a model credential, and this installer \
+         would clear it.\n\n\
+         It applies the declarative path with no credential declared, and that path \
+         removes what it does not name -- so re-running here would leave the install \
+         on the chart's fakeModel default, healthy in every way except that the agent \
+         is no longer a model. That state is hard to see: pods stay Ready and turns \
+         still answer.\n\n\
+         Preserve it first, then re-run:\n\n    \
+         helm get values {} -n {} -o yaml > /tmp/values.yaml\n    \
+         # keep the agentSandbox block, then after this installer finishes:\n    \
+         helm upgrade {} <chart> -n {} --reuse-values -f /tmp/values.yaml",
+        identity.release,
+        identity.namespace,
+        identity.release,
+        identity.namespace,
+        identity.release,
+        identity.namespace,
+    )))
 }
 
 async fn apply_curie_platform(
@@ -2765,6 +2831,30 @@ mod tests {
             .map(|gate| gate["gate"].as_str().unwrap())
             .collect();
         assert_eq!(gates, vec![UPGRADE_GATE, PLATFORM_UPGRADE_GATE]);
+    }
+
+    #[test]
+    fn a_release_recording_a_model_credential_is_refused() {
+        // The shape `helm get values -o json` returns for an install that has
+        // one. This is the case that cost a credential.
+        let existing = serde_json::json!({
+            "agentSandbox": {"runner": {"credentials": "sk-ant-EXAMPLE", "fakeModel": false}}
+        });
+        assert!(records_a_model_credential(&existing));
+    }
+
+    #[test]
+    fn a_release_without_one_is_not_refused() {
+        for existing in [
+            serde_json::json!({}),
+            serde_json::json!({"agentSandbox": {}}),
+            serde_json::json!({"agentSandbox": {"runner": {}}}),
+            // Empty is not "present": an operator who cleared it did so
+            // deliberately, and refusing would block them from re-running.
+            serde_json::json!({"agentSandbox": {"runner": {"credentials": ""}}}),
+        ] {
+            assert!(!records_a_model_credential(&existing), "{existing}");
+        }
     }
 
     fn platform_role_source() -> &'static [u8] {
