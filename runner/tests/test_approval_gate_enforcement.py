@@ -742,6 +742,10 @@ def _options_from_boot(monkeypatch: pytest.MonkeyPatch, config: RunnerConfig) ->
     monkeypatch.setattr(boot, "ClaudeAgentSession", _CapturedSession)
     runner = build_runner(config)
     session = runner._factory()
+    if isinstance(session, _CapturedSession):
+        # Pre-deferred boot shape retained so verify-fix-pin reaches the
+        # capability assertion after reversing the product change.
+        return session.options
     anyio.run(session.connect)
     captured = session._session
     assert isinstance(captured, _CapturedSession)
