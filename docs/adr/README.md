@@ -165,4 +165,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0133 | [The control agent renders screens; a human presses the buttons](0133-the-control-agent-renders-screens-a-human-presses.md) | Draft |
 | 0134 | [A hook shares one thread per partition](0134-a-hook-shares-one-thread-per-partition.md) | Draft |
 | 0135 | [A skill bundle has two conformance profiles](0135-a-skill-bundle-has-two-conformance-profiles.md) | Draft |
+| 0136 | [A late workspace handoff replaces the sandbox at a fenced turn boundary](0136-a-late-workspace-handoff-replaces-the-sandbox-at-a-fenced-turn-boundary.md) | Accepted |
 <!-- END GENERATED: adr-index -->
