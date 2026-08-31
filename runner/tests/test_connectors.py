@@ -9,13 +9,16 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+from typing import Any
 
 import pytest
 from aci_protocol import BootEnv, Budget
 from curie_runner import RunnerConfig
+from curie_runner import __main__ as boot
 from curie_runner.__main__ import build_runner
 from curie_runner.approval import APPROVAL_SERVER_NAME
 from curie_runner.connectors import build_mcp_servers, derive_mcp_servers
+from curie_runner.mcp_tool_capability import McpToolCapabilityProbe
 from curie_runner.plugin import PluginBundleError
 from curie_runner.state import STATE_SERVER_NAME
 from plugin_format.connectors import RESERVED_CONNECTOR_NAMES
@@ -24,6 +27,47 @@ HOSTED = "connectors:\n  grafana:\n    image: grafana/mcp-grafana:0.17.2\n    se
 REMOTE = "connectors:\n  internal:\n    url: https://mcp.internal/mcp\n"
 
 SCOPE = {"release": "curie", "agent": "acme-dev", "namespace": "curie"}
+
+
+class _CapturedSession:
+    def __init__(self, options: Any) -> None:
+        self.options = options
+
+    async def connect(self) -> None:
+        return None
+
+    async def query(self, _text: str) -> None:
+        return None
+
+    async def interrupt(self) -> None:
+        return None
+
+    async def close(self) -> None:
+        return None
+
+    async def receive_turn(self):
+        if False:
+            yield None
+
+
+def _boot_options(
+    monkeypatch: pytest.MonkeyPatch,
+    config: RunnerConfig,
+    *,
+    potential_write: bool,
+) -> Any:
+    async def probe(*_args: Any, **_kwargs: Any) -> McpToolCapabilityProbe:
+        return McpToolCapabilityProbe(
+            complete=True,
+            has_potential_write_tool=potential_write,
+            tool_count=1 if potential_write else 0,
+        )
+
+    monkeypatch.setattr(boot, "probe_mcp_tool_capability", probe)
+    monkeypatch.setattr(boot, "ClaudeAgentSession", _CapturedSession)
+    session = build_runner(config, fake_model=False)._factory()
+    assert isinstance(session, _CapturedSession)
+    return session.options
 
 
 def _bundle(root: Path, connectors: str | None = None, mcp: dict | None = None) -> Path:
@@ -393,16 +437,19 @@ def test_every_platform_mcp_server_the_boot_path_mounts_is_reserved(tmp_path, mo
     env = _boot_env(monkeypatch, tmp_path, "pin")
     # fake_model=False: the fake branch never builds mcp_servers at all, so a
     # fake boot would pin nothing.
-    runner = build_runner(RunnerConfig.from_env(env), fake_model=False)
-    mounted = runner._factory()._options.mcp_servers
+    mounted = _boot_options(
+        monkeypatch,
+        RunnerConfig.from_env(env),
+        potential_write=True,
+    ).mcp_servers
 
-    assert APPROVAL_SERVER_NAME in mounted
-    assert STATE_SERVER_NAME in mounted
-    # The bundle declares no connectors, so every remaining key is a platform
-    # key by construction. A third platform server added later reddens this
-    # until it is reserved -- which is why the fence is two exact names and not
-    # the `curie-` prefix.
-    assert set(mounted) == RESERVED_CONNECTOR_NAMES
+    # The bundle declares no connectors, so every key is a platform key by
+    # construction. A third platform server added later reddens this until it
+    # is reserved -- which is why the fence is two exact names and not the
+    # `curie-` prefix. The write-capable probe is load-bearing: it keeps the pin
+    # able to see the conditionally mounted approval server.
+    assert set(mounted) == {APPROVAL_SERVER_NAME, STATE_SERVER_NAME}
+    assert set(mounted) <= RESERVED_CONNECTOR_NAMES
 
 
 def test_the_boot_path_mounts_the_platform_approval_server_over_a_colliding_connector(
@@ -430,8 +477,11 @@ def test_the_boot_path_mounts_the_platform_approval_server_over_a_colliding_conn
         lambda *a, **k: {APPROVAL_SERVER_NAME: impostor, "grafana": grafana},
     )
     env = _boot_env(monkeypatch, tmp_path, "collide")
-    runner = build_runner(RunnerConfig.from_env(env), fake_model=False)
-    mounted = runner._factory()._options.mcp_servers
+    mounted = _boot_options(
+        monkeypatch,
+        RunnerConfig.from_env(env),
+        potential_write=True,
+    ).mcp_servers
 
     assert mounted[APPROVAL_SERVER_NAME] is not impostor
     # Positive identification, not merely "not the impostor": the platform's
@@ -508,7 +558,7 @@ def test_the_boot_path_mounts_nothing_for_a_third_party_mcp_json_entry(
     monkeypatch.delenv("CURIE_STATE_URL", raising=False)
     root = _bundle(tmp_path, HOSTED, mcp=UPSTREAM_MCP_JSON)
     config = _config_for(root, release="curie", agent="acme-dev", namespace="curie")
-    options = build_runner(config, fake_model=False)._factory()._options
+    options = _boot_options(monkeypatch, config, potential_write=True)
 
     mounted = options.mcp_servers
     # Exact, not `"github-upstream" not in mounted`: an extra key of any name is

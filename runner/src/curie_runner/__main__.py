@@ -15,13 +15,18 @@ from pathlib import Path
 import anyio
 from aci_protocol import BootEnv
 from aiohttp import web
-from claude_agent_sdk import HookMatcher
+from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
 from curie_telemetry import bootstrap_service_telemetry
 
 from . import __version__
-from .adapter import ClaudeAgentSession, ModelSession, build_options
+from .adapter import (
+    ClaudeAgentSession,
+    ModelSession,
+    build_options,
+)
 from .approval import (
     APPROVAL_SERVER_NAME,
+    PUBLISH_TOOL_NAME,
     ApprovalPolicyError,
     assert_gates_not_shadowed,
     build_approval_gate,
@@ -48,6 +53,7 @@ from .history import (
     resolve_history,
 )
 from .hooks import load_bundle_hooks
+from .mcp_tool_capability import probe_mcp_tool_capability
 from .memory import MemoryRecord, MemoryStore, format_memory_preamble, resolve_memory
 from .otel import RunTracer, build_tracer_provider
 from .redact import install_stdout_redaction
@@ -258,26 +264,76 @@ def build_runner(
     # state server is mounted and the agent simply sees no state tools.
     state_client = resolve_state_client(os.environ)
     workspace_cwd = str(mounted_workspace) if mounted_workspace is not None else None
+    derived_mcp_servers = derive_mcp_servers(
+        config.session.plugin_dir,
+        release=config.connector_release,
+        agent=config.connector_agent,
+        namespace=config.connector_namespace,
+    )
 
-    def factory() -> ModelSession:
-        if fake_model:
-            # The offline fake honors the same permission gate (#245) the real
-            # session does, using the shared approval_gate instance so a blocked
-            # call flips the turn to awaiting-approval exactly as the SDK path
-            # would. Bundle PreToolUse command hooks (#272) are NOT wired here:
-            # they shell out and would break the fake's offline no-op guarantee
-            # (the can_use_tool gate is a pure membership check, so it is safe).
-            return FakeModelSession(
-                can_use_tool=(
-                    build_can_use_tool(approval_gate) if approval_gate is not None else None
-                ),
-                # Share the same gate so a scripted request_approval resolves its
-                # route through the real decision table on the offline tier (#561).
-                approval_gate=approval_gate,
+    # A configured permission gate is already positive evidence that the
+    # session carries an actionable approval boundary. Publication is excluded:
+    # its dedicated tool already raises its own approval and the sandbox cannot
+    # execute publication itself, so adding the generic pager beside it would
+    # recreate #1444 under a different tool name.
+    carries_explicit_action_gate = approval_gate is not None and bool(
+        approval_gate.required - {PUBLISH_TOOL_NAME}
+    )
+
+    real_options: ClaudeAgentOptions | None = None
+    if not fake_model:
+        # An actionable explicit gate already proves the generic pager is
+        # required, so avoid spawning or dialing every MCP server merely to
+        # reach the same conclusion. A publication-only gate deliberately does
+        # not take this shortcut: it has its own tool and still needs the MCP
+        # surface decision below.
+        carries_request_approval = carries_explicit_action_gate
+        if not carries_explicit_action_gate:
+            # The bundle's live MCP ``tools/list`` response is the actual
+            # advertised MCP surface. Only a complete response where every
+            # observed tool says readOnlyHint=true -- including a complete
+            # surface with zero MCP tools -- proves that this generic MCP pager
+            # cannot unlock an action. Built-in Claude tools are outside this
+            # capability decision. Missing hints, uninspectable declarations,
+            # and probe failures preserve the historical tool. The annotation
+            # remains a non-authoritative hint: it never authorizes or denies
+            # tool execution.
+            capability = anyio.run(
+                probe_mcp_tool_capability,
+                config.session.plugin_dir,
+                derived_mcp_servers,
+                sdk_env,
             )
-        plugins = compiled.plugins
-        options = build_options(
-            plugins=plugins,
+            carries_request_approval = capability.has_potential_write_tool
+            if not carries_request_approval:
+                logger.info(
+                    "request_approval omitted: observed MCP surface has no actionable"
+                    " tools tool_count=%d probe_complete=%s failures=%d",
+                    capability.tool_count,
+                    capability.complete,
+                    len(capability.failures),
+                )
+
+        platform_servers = {
+            **(
+                {
+                    APPROVAL_SERVER_NAME: build_approval_server(
+                        approval_gate,
+                        managed_workspace=mounted_workspace is not None,
+                        include_request_approval=carries_request_approval,
+                    )
+                }
+                if carries_request_approval or mounted_workspace is not None
+                else {}
+            ),
+            **(
+                {STATE_SERVER_NAME: build_state_server(state_client)}
+                if state_client is not None
+                else {}
+            ),
+        }
+        real_options = build_options(
+            plugins=compiled.plugins,
             model=config.model,
             system_prompt=system_prompt,
             max_turns=config.max_turns,
@@ -298,42 +354,35 @@ def build_runner(
             # 1932-1948), and a skill's allowed-tools frontmatter is exactly
             # such a rule, so the hook is the only layer that sees every call.
             hooks=session_hooks,
-            # Every session carries the in-process approval-request tool, so a
-            # skill can raise a policy gate (ADR-0010) without the bundle
-            # shipping its own MCP server for it. The ``curie-state`` server
-            # (#249) joins it whenever a state store is configured, so a skill
-            # reads/writes durable state the same way -- no bundle-shipped server.
+            # Platform tools and connectors share the SDK MCP channel. The
+            # generic policy pager is present only on an actionable surface;
+            # state and publication remain independent platform capabilities.
             mcp_servers=build_mcp_servers(
-                platform={
-                    APPROVAL_SERVER_NAME: build_approval_server(
-                        approval_gate, managed_workspace=mounted_workspace is not None
-                    ),
-                    **(
-                        {STATE_SERVER_NAME: build_state_server(state_client)}
-                        if state_client is not None
-                        else {}
-                    ),
-                },
-                # Connectors the bundle DECLARED and Curie hosts (ADR-0086,
-                # #1118). Platform-supplied, exactly like the two above, so they
-                # ride the same channel -- nothing rewrites the read-only
-                # bundle. The URL derives from the Service Curie created via the
-                # same function that rendered it, so the two cannot disagree. A
-                # name clashing with the bundle's own MCP config is a deploy-time
-                # error (#1118/#1149), a name clashing with a platform server is
-                # a deploy-time error (#1200), and build_mcp_servers resolves any
-                # residual collision toward the platform.
-                derived=derive_mcp_servers(
-                    config.session.plugin_dir,
-                    release=config.connector_release,
-                    agent=config.connector_agent,
-                    namespace=config.connector_namespace,
-                ),
+                platform=platform_servers,
+                derived=derived_mcp_servers,
             ),
             can_use_tool=(build_can_use_tool(approval_gate) if approval_gate is not None else None),
             cwd=workspace_cwd,
         )
-        return ClaudeAgentSession(options)
+
+    def factory() -> ModelSession:
+        if fake_model:
+            # The offline fake honors the same permission gate (#245) the real
+            # session does, using the shared approval_gate instance so a blocked
+            # call flips the turn to awaiting-approval exactly as the SDK path
+            # would. Bundle PreToolUse command hooks (#272) are NOT wired here:
+            # they shell out and would break the fake's offline no-op guarantee
+            # (the can_use_tool gate is a pure membership check, so it is safe).
+            return FakeModelSession(
+                can_use_tool=(
+                    build_can_use_tool(approval_gate) if approval_gate is not None else None
+                ),
+                # Share the same gate so a scripted request_approval resolves its
+                # route through the real decision table on the offline tier (#561).
+                approval_gate=approval_gate,
+            )
+        assert real_options is not None
+        return ClaudeAgentSession(real_options)
 
     provider = build_tracer_provider(
         config.session.otel,

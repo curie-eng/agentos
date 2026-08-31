@@ -8,8 +8,9 @@ bundle shipping its own MCP server or a datastore of its own:
 
 - **The auto-mounted ``curie-state`` MCP server.** ``build_state_server``
   returns an in-process SDK MCP server carrying get / set / list / delete /
-  append tools, wired into every session by the runner exactly like the
-  approval-request server (ADR-0010). A skill reads and writes state by calling
+  append tools, wired by the runner when the state boot environment is present.
+  Like the conditionally applicable approval server (ADR-0010), it is a
+  platform-supplied server rather than bundle content. A skill reads and writes state by calling
   ``mcp__curie-state__*`` -- and because the backing is Postgres JSONB outside
   the sandbox (ADR-0003, stateless-first), the data survives a suspend/resume.
 - **The ``CURIE_STATE_URL`` / ``CURIE_STATE_TOKEN`` env pair** for a bundle
@@ -334,8 +335,8 @@ async def op_delete(client: StateApiClient, args: dict[str, Any]) -> dict[str, A
 def build_state_server(client: StateApiClient) -> McpSdkServerConfig:
     """The in-process ``curie-state`` MCP server bound to ``client``.
 
-    Auto-mounted into every session (like the approval-request server) so a
-    bundle skill reads and writes durable, suspend/resume-surviving state without
+    Auto-mounted whenever the state boot environment is present so a bundle
+    skill reads and writes durable, suspend/resume-surviving state without
     shipping its own MCP server. Each tool delegates to a module-level op handler
     that validates the namespace against the reserved set and turns a
     transport/store failure into an ``is_error`` result the model can recover

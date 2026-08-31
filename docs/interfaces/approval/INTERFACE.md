@@ -61,9 +61,17 @@ in code now:
   fields (ADR-0036) and are persisted as the `gate_kind`/`granted_tool` columns on the
   `Approval` record (migration `0015_approval_gate_provenance`). They replace the old
   summary-prefix sniff as the durable source of grant provenance — see the #430 bullet below.
-- **The lifecycle (landed, #244).** A skill raises a policy gate through the runner's
-  in-process `mcp__curie__request_approval` tool (`runner/src/curie_runner/approval.py`);
-  the turn ends `awaiting-approval`, the worker persists the record and suspends the sandbox
+- **The lifecycle (landed, #244; pager advertisement narrowed, #1444).** A skill raises a
+  policy gate through the runner's in-process `mcp__curie__request_approval` tool
+  (`runner/src/curie_runner/approval.py`) when that tool is present. The runner advertises
+  this generic pager only when the observed MCP surface has an action that may write — a
+  tool not explicitly `readOnlyHint=true`, including an unknown or unreachable surface — or
+  when an explicit actionable approval gate exists. A surface with no MCP tools or only
+  explicitly read-only tools carries no generic pager, because approval cannot unlock an
+  action it cannot perform. `readOnlyHint` makes this advertisement decision only: it is not
+  authorization and does not change gates or tool execution. Publication's dedicated
+  approval flow and state tools remain independent. When the pager is used, the turn ends
+  `awaiting-approval`, the worker persists the record and suspends the sandbox
   (`kernel._pause_for_approval` — the first live use of the dormant ADR-0003 suspend path);
   resolution enqueues a resume turn onto the ordinary runs stream
   (`apps/api/src/curie_api/resumequeue.py`), and the kernel's claim path rehydrates the

@@ -44,11 +44,14 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
+import sys
 import typing
 from pathlib import Path
 from typing import Any
 
 import anyio
+import mcp.types as mcp_types
 import pytest
 from aci_protocol import Event, SessionStatus, parse_ndjson
 from claude_agent_sdk import (
@@ -69,6 +72,7 @@ from curie_runner import __main__ as boot
 from curie_runner.__main__ import build_runner
 from curie_runner.approval import (
     _DENY_MESSAGE,
+    APPROVAL_SERVER_NAME,
     APPROVAL_SUMMARY_PREFIX,
     ApprovalGate,
     ApprovalPolicyError,
@@ -82,6 +86,7 @@ from curie_runner.session import SessionRunner
 from curie_runner.side_effects import SideEffectClassifier
 
 _BUDGET = '{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}'
+_CAPABILITY_SERVER = Path(__file__).parent / "fixtures" / "mcp_tool_capability_server.py"
 
 
 # --- fixtures: a realistic plugin bundle, not a stub ----------------------------
@@ -718,13 +723,59 @@ class _CapturedSession:
     def __init__(self, options: Any) -> None:
         self.options = options
 
+    async def connect(self) -> None:
+        return None
 
-def _options_from_boot(monkeypatch: pytest.MonkeyPatch, config: RunnerConfig) -> Any:
+    async def query(self, _text: str) -> None:
+        return None
+
+    async def interrupt(self) -> None:
+        return None
+
+    async def close(self) -> None:
+        return None
+
+    async def receive_turn(self) -> typing.AsyncIterator[Any]:
+        if False:
+            yield None
+
+
+def _options_from_boot(
+    monkeypatch: pytest.MonkeyPatch,
+    config: RunnerConfig,
+    *,
+    workspace_path: Path | None = None,
+) -> Any:
     monkeypatch.setattr(boot, "ClaudeAgentSession", _CapturedSession)
-    runner = build_runner(config)
+    runner = build_runner(config, workspace_path=workspace_path)
     session = runner._factory()
     assert isinstance(session, _CapturedSession)
     return session.options
+
+
+async def _mcp_tool_names(server: Any) -> set[str]:
+    handler = server["instance"].request_handlers.get(mcp_types.ListToolsRequest)
+    if handler is None:
+        return set()
+    result = await handler(mcp_types.ListToolsRequest(method="tools/list"))
+    return {tool.name for tool in result.root.tools}
+
+
+def _add_capability_server(plugin_dir: str, mode: str) -> None:
+    Path(plugin_dir, ".mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "operations": {
+                        "command": sys.executable,
+                        "args": [str(_CAPABILITY_SERVER)],
+                        "env": {"CURIE_TEST_TOOL_MODE": mode},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 _BUNDLE_HOOKS = {
@@ -781,6 +832,90 @@ def test_boot_adds_no_approval_matcher_when_nothing_is_gated(
 
     assert [m.matcher for m in options.hooks["PreToolUse"]] == ["Bash"]
     assert options.can_use_tool is None
+
+
+def test_boot_omits_request_approval_for_an_observed_read_only_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    plugin_dir = _bundle(tmp_path)
+    _add_capability_server(plugin_dir, "read-only")
+    caplog.set_level(logging.INFO, logger="curie_runner")
+
+    options = _options_from_boot(monkeypatch, _config(plugin_dir))
+
+    assert APPROVAL_SERVER_NAME not in options.mcp_servers
+    assert "operations" not in options.mcp_servers  # plugin-loaded, not platform-mounted
+    assert any(
+        "request_approval omitted" in message
+        and "tool_count=1" in message
+        and "probe_complete=True" in message
+        for message in caplog.messages
+    )
+
+
+def test_boot_omits_request_approval_for_a_complete_empty_mcp_surface(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plugin_dir = _bundle(tmp_path)
+
+    options = _options_from_boot(monkeypatch, _config(plugin_dir))
+
+    # Built-in Claude tools are not MCP actions and do not make Curie's generic
+    # MCP pager useful. An explicit gate on one is the separate override pinned
+    # below; with no MCP tools and no gate, there is nothing a human can unlock.
+    assert APPROVAL_SERVER_NAME not in options.mcp_servers
+
+
+def test_boot_keeps_request_approval_for_an_observed_write_capable_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plugin_dir = _bundle(tmp_path)
+    _add_capability_server(plugin_dir, "write")
+
+    options = _options_from_boot(monkeypatch, _config(plugin_dir))
+
+    assert APPROVAL_SERVER_NAME in options.mcp_servers
+    assert options.mcp_servers[APPROVAL_SERVER_NAME]["name"] == APPROVAL_SERVER_NAME
+
+
+def test_boot_keeps_request_approval_for_an_explicit_gate_on_a_read_only_surface(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plugin_dir = _bundle(tmp_path, gates=["Bash"])
+    _add_capability_server(plugin_dir, "read-only")
+
+    async def unexpected_probe(*_args: Any, **_kwargs: Any) -> typing.NoReturn:
+        raise AssertionError("an actionable explicit gate must skip the MCP probe")
+
+    monkeypatch.setattr(boot, "probe_mcp_tool_capability", unexpected_probe)
+
+    options = _options_from_boot(monkeypatch, _config(plugin_dir))
+
+    assert APPROVAL_SERVER_NAME in options.mcp_servers
+    assert "request_approval" in anyio.run(
+        _mcp_tool_names, options.mcp_servers[APPROVAL_SERVER_NAME]
+    )
+
+
+def test_publish_only_gate_does_not_recreate_the_generic_pager(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plugin_dir = _bundle(tmp_path / "bundle")
+    _add_capability_server(plugin_dir, "read-only")
+    workspace = tmp_path / "workspace"
+    (workspace / ".git").mkdir(parents=True)
+
+    options = _options_from_boot(
+        monkeypatch,
+        _config(plugin_dir),
+        workspace_path=workspace,
+    )
+
+    assert anyio.run(
+        _mcp_tool_names, options.mcp_servers[APPROVAL_SERVER_NAME]
+    ) == {"publish_changes"}
 
 
 # --- J. fake-tier parity: a deny with interrupt=True stops the replay ------------
