@@ -47,12 +47,29 @@ fn stamp_repo_commit() {
         );
     }
 
+    // The embedded installer is built from the checkout's working files, so
+    // only claim HEAD provenance when those files match it. This keeps the
+    // build-time override aligned with ordinary deploy provenance discovery.
+    if !git_worktree_is_clean(manifest_dir) {
+        return;
+    }
+
     let Some(commit) = git_output(manifest_dir, &["rev-parse", "--verify", "HEAD"]) else {
         return;
     };
     if commit.len() == 40 && commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         println!("cargo:rustc-env=CURIE_BUILD_COMMIT={commit}");
     }
+}
+
+fn git_worktree_is_clean(current_dir: &Path) -> bool {
+    Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(current_dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .output()
+        .is_ok_and(|output| output.status.success() && output.stdout.is_empty())
 }
 
 fn git_output(current_dir: &Path, args: &[&str]) -> Option<String> {

@@ -1549,13 +1549,26 @@ fn install_records_the_current_commit_sha_on_the_created_version() {
         .expect("the installer must create a version");
     let body: Value = serde_json::from_slice(&version_request.body)
         .expect("the version-create request body must be valid JSON");
-    let commit_sha = body["commit_sha"]
-        .as_str()
-        .expect("the version-create request must record the installer commit SHA");
-    assert!(
-        commit_sha.len() == 40 && commit_sha.bytes().all(|byte| byte.is_ascii_hexdigit()),
-        "the recorded commit SHA must be a 40-character ASCII hex value: {commit_sha:?}"
-    );
+    match option_env!("CURIE_BUILD_COMMIT") {
+        Some(expected_commit_sha) => {
+            let commit_sha = body["commit_sha"]
+                .as_str()
+                .expect("the version-create request must record the installer commit SHA");
+            assert_eq!(
+                commit_sha, expected_commit_sha,
+                "the installer must forward this binary's build commit"
+            );
+            assert!(
+                commit_sha.len() == 40 && commit_sha.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                "the recorded commit SHA must be a 40-character ASCII hex value: {commit_sha:?}"
+            );
+        }
+        None => assert_eq!(
+            body.get("commit_sha"),
+            Some(&Value::Null),
+            "a binary built without Git provenance must send a JSON null commit SHA"
+        ),
+    }
 }
 
 #[test]
