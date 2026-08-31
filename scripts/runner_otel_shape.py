@@ -237,6 +237,8 @@ def _check_sequential_indices(
 
 def canonical_runner_shape_violations(
     trace_spans: Iterable[tuple[Mapping[str, object], Mapping[str, object]]],
+    *,
+    require_multi_round_tool: bool = False,
 ) -> list[str]:
     """Return privacy-safe violations of the canonical runner phase tree.
 
@@ -280,12 +282,14 @@ def canonical_runner_shape_violations(
         violations.add(
             f"agent.run expected 1; found {_bounded_count(len(roots))}"
         )
-    if len(generations) < 2:
+    if not generations:
+        violations.add("llm.generation expected 1 or more; found 0")
+    elif require_multi_round_tool and len(generations) < 2:
         violations.add(
             "llm.generation expected 2 or more; "
             f"found {_bounded_count(len(generations))}"
         )
-    if not tools:
+    if require_multi_round_tool and not tools:
         violations.add("execute_tool expected 1 or more; found 0")
 
     root_span_id: object = roots[0][0].get("spanId") if len(roots) == 1 else _INVALID

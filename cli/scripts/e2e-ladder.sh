@@ -2320,14 +2320,15 @@ stop_local_otel_sink() {
 local_otel_query() {
     local mode="$1" baseline="${2:-}"
     python3 - "$mode" "$WORKDIR/otel-sink" "$baseline" "$PROMPT" \
-        "$OTEL_E2E_SECRET_SENTINEL" "$REPO_ROOT" <<'PY'
+        "$OTEL_E2E_SECRET_SENTINEL" "$REPO_ROOT" "$LIVE" <<'PY'
 import importlib.util
 import json
 import pathlib
 import sys
 
-mode, root_raw, baseline_raw, prompt, sentinel, repo_root_raw = sys.argv[1:]
+mode, root_raw, baseline_raw, prompt, sentinel, repo_root_raw, live_raw = sys.argv[1:]
 root = pathlib.Path(root_raw)
+require_multi_round_tool = live_raw != "1"
 
 shape_helper_path = pathlib.Path(repo_root_raw) / "scripts" / "runner_otel_shape.py"
 shape_helper_spec = importlib.util.spec_from_file_location(
@@ -2496,7 +2497,10 @@ if mode == "healthy":
     )
     for trace_id in new_healthy:
         trace_spans = by_trace[trace_id]
-        shape_violations = canonical_runner_shape_violations(trace_spans)
+        shape_violations = canonical_runner_shape_violations(
+            trace_spans,
+            require_multi_round_tool=require_multi_round_tool,
+        )
         assert not shape_violations, (
             f"healthy trace {trace_id} violates canonical runner shape: "
             + "; ".join(shape_violations)

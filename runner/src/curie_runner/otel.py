@@ -502,10 +502,14 @@ class _GenerationSpan:
 
         if interrupt_requested:
             self._finish("interrupt_requested", "cancelled", failed=False)
+        elif classified_failure:
+            self._finish(
+                self._result_abort_cause or "classified_failure",
+                "failed",
+                failed=True,
+            )
         elif self._result_abort_cause is not None:
             self._finish(self._result_abort_cause, "cancelled", failed=False)
-        elif classified_failure:
-            self.set_failed()
         elif self._result_observed or completed_without_result:
             self.set_succeeded()
         else:
