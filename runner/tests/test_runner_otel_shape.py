@@ -21,6 +21,15 @@ _RUNNER_RESOURCE: dict[str, object] = {
     "service.name": "curie-runner",
     "schema.version": "v1",
 }
+_TERMINAL_OUTCOMES = (
+    ("completed", "succeeded", 1),
+    ("interrupt_requested", "cancelled", 1),
+    ("approval_required", "paused", 1),
+    ("aborted_streaming", "failed", 2),
+    ("aborted_tools", "failed", 2),
+    ("classified_failure", "failed", 2),
+    ("abandoned", "abandoned", 2),
+)
 
 
 def _load_helper() -> ModuleType:
@@ -230,6 +239,12 @@ def _set_attribute(span: dict[str, object], key: str, value: str | int) -> None:
     attributes.append({"key": key, "value": _otlp_value(value)})
 
 
+def _set_otel_status(span: dict[str, object], code: int) -> None:
+    status = span["status"]
+    assert isinstance(status, dict)
+    status["code"] = code
+
+
 def _mentions(violations: list[str], *fragments: str) -> bool:
     wanted = tuple(fragment.casefold() for fragment in fragments)
     return any(
@@ -246,6 +261,72 @@ def test_canonical_runner_otlp_json_shape_has_no_violations() -> None:
         trace_spans,
         require_multi_round_tool=True,
     ) == []
+
+
+@pytest.mark.parametrize(
+    ("cause", "terminal_status", "otel_status"),
+    _TERMINAL_OUTCOMES,
+)
+def test_root_terminal_closed_mapping_is_accepted(
+    cause: str,
+    terminal_status: str,
+    otel_status: int,
+) -> None:
+    trace_spans = deepcopy(_canonical_trace_spans())
+    root = trace_spans[0][0]
+    _set_attribute(root, "curie.terminal.cause", cause)
+    _set_attribute(root, "curie.terminal.status", terminal_status)
+    _set_otel_status(root, otel_status)
+
+    assert canonical_runner_shape_violations(trace_spans) == []
+
+
+@pytest.mark.parametrize(
+    ("cause", "wrong_terminal_status"),
+    (
+        ("completed", "cancelled"),
+        ("interrupt_requested", "succeeded"),
+        ("approval_required", "cancelled"),
+        ("aborted_streaming", "abandoned"),
+        ("aborted_tools", "succeeded"),
+        ("classified_failure", "paused"),
+        ("abandoned", "failed"),
+        ("unknown_terminal", "succeeded"),
+        ("completed", "unknown_status"),
+    ),
+)
+def test_root_terminal_cause_and_status_must_be_a_closed_pair(
+    cause: str,
+    wrong_terminal_status: str,
+) -> None:
+    trace_spans = deepcopy(_canonical_trace_spans())
+    root = trace_spans[0][0]
+    _set_attribute(root, "curie.terminal.cause", cause)
+    _set_attribute(root, "curie.terminal.status", wrong_terminal_status)
+
+    violations = canonical_runner_shape_violations(trace_spans)
+
+    assert _mentions(violations, "agent.run", "terminal", "cause/status", "not closed")
+
+
+@pytest.mark.parametrize(
+    ("cause", "terminal_status", "correct_otel_status"),
+    _TERMINAL_OUTCOMES,
+)
+def test_root_otel_status_must_match_the_terminal_mapping(
+    cause: str,
+    terminal_status: str,
+    correct_otel_status: int,
+) -> None:
+    trace_spans = deepcopy(_canonical_trace_spans())
+    root = trace_spans[0][0]
+    _set_attribute(root, "curie.terminal.cause", cause)
+    _set_attribute(root, "curie.terminal.status", terminal_status)
+    _set_otel_status(root, 2 if correct_otel_status == 1 else 1)
+
+    violations = canonical_runner_shape_violations(trace_spans)
+
+    assert _mentions(violations, "agent.run", "OTel status", "does not match")
 
 
 def test_single_round_tool_free_trace_is_valid_by_default_and_strictly_rejected() -> None:

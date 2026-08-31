@@ -475,31 +475,54 @@ class SessionRunner:
                         metric_outcome = self._metric_outcome(tracker)
                     except Exception as exc:  # noqa: BLE001 - the ACI stream must
                         # always terminate in a final; a raised SDK/transport error
-                        # (CLI disconnect, auth expiry, model error) becomes a
-                        # classified failure rather than a truncated, final-less
-                        # stream. GeneratorExit (consumer disconnect) is a
-                        # BaseException and is intentionally not caught here -- the
-                        # finally handles that abandonment case.
-                        logger.error(
-                            "turn failed session=%s error_class=%s: %s duration_ms=%d",
-                            self._session_id,
-                            type(exc).__name__,
-                            exc,
-                            int((time.monotonic() - start) * 1000),
-                        )
+                        # becomes a classified failure unless a requested interrupt
+                        # released the iterator, in which case it is cancellation.
+                        # GeneratorExit (consumer disconnect) is a BaseException and
+                        # is intentionally not caught here -- the finally handles
+                        # that abandonment case.
                         self._turn_open = False
-                        self._status = SessionStatus.CLASSIFIED_FAILURE
-                        metric_outcome = self._metric_outcome(tracker)
-                        gen.set_failed()
-                        yield to_ndjson_line(
-                            ErrorEvent(
-                                message=f"runner error: {exc}",
-                                classification="runner-error",
+                        if self._interrupt_requested:
+                            # Some SDK iterators surface the runner-requested
+                            # interrupt as an exception instead of a terminal
+                            # ResultMessage. The interrupt remains authoritative:
+                            # do not expose or log the implementation exception as
+                            # a model failure, and close every active phase as an
+                            # intentional cancellation.
+                            self._status = SessionStatus.IDLE_AWAITING_INPUT
+                            metric_outcome = "interrupted"
+                            gen.finish_turn(
+                                interrupt_requested=True,
+                                classified_failure=False,
                             )
-                        )
-                        yield to_ndjson_line(
-                            Final(text="run failed", status=SessionStatus.CLASSIFIED_FAILURE)
-                        )
+                            yield to_ndjson_line(
+                                Final(
+                                    text="run interrupted",
+                                    status=SessionStatus.IDLE_AWAITING_INPUT,
+                                )
+                            )
+                        else:
+                            logger.error(
+                                "turn failed session=%s error_class=%s: %s duration_ms=%d",
+                                self._session_id,
+                                type(exc).__name__,
+                                exc,
+                                int((time.monotonic() - start) * 1000),
+                            )
+                            self._status = SessionStatus.CLASSIFIED_FAILURE
+                            metric_outcome = self._metric_outcome(tracker)
+                            gen.set_failed()
+                            yield to_ndjson_line(
+                                ErrorEvent(
+                                    message=f"runner error: {exc}",
+                                    classification="runner-error",
+                                )
+                            )
+                            yield to_ndjson_line(
+                                Final(
+                                    text="run failed",
+                                    status=SessionStatus.CLASSIFIED_FAILURE,
+                                )
+                            )
                     finally:
                         # If the turn never reached a terminal final (_turn_open still
                         # set), the consumer abandoned the stream mid-run (client

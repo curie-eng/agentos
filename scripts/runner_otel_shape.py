@@ -37,6 +37,18 @@ _GENERATION_END_KINDS = frozenset(
 _TOOL_START_KINDS = frozenset(("tool_use_inferred",))
 _TOOL_END_KINDS = frozenset(("tool_result_inferred", "terminal_inferred"))
 _TOOL_OUTCOMES = frozenset(("success", "error", "cancelled"))
+_ROOT_PHASES = frozenset(("provider_wait", "tool_wait"))
+_OTEL_STATUS_OK = 1
+_OTEL_STATUS_ERROR = 2
+_TERMINAL_OUTCOMES = {
+    ("interrupt_requested", "cancelled"): _OTEL_STATUS_OK,
+    ("approval_required", "paused"): _OTEL_STATUS_OK,
+    ("aborted_streaming", "failed"): _OTEL_STATUS_ERROR,
+    ("aborted_tools", "failed"): _OTEL_STATUS_ERROR,
+    ("classified_failure", "failed"): _OTEL_STATUS_ERROR,
+    ("completed", "succeeded"): _OTEL_STATUS_OK,
+    ("abandoned", "abandoned"): _OTEL_STATUS_ERROR,
+}
 
 
 def _committed_attribute_types() -> dict[str, str]:
@@ -202,7 +214,7 @@ def _resource_service_name(resource: object) -> object:
 def _positive_duration(span: Mapping[str, object]) -> bool | None:
     start = _parse_decimal(span.get("startTimeUnixNano"), signed=False)
     end = _parse_decimal(span.get("endTimeUnixNano"), signed=False)
-    if start is _INVALID or end is _INVALID:
+    if type(start) is not int or type(end) is not int:
         return None
     return bool(end > start)
 
@@ -215,6 +227,21 @@ def _is_root_sibling(span: Mapping[str, object], root_span_id: object) -> bool:
         and isinstance(parent_span_id, str)
         and parent_span_id == root_span_id
     )
+
+
+def _otel_status_code(span: Mapping[str, object]) -> int | object:
+    """Return a closed OK/ERROR OTLP status code without retaining its payload."""
+
+    status = span.get("status")
+    if not isinstance(status, Mapping):
+        return _INVALID
+    raw_code = status.get("code")
+    if raw_code == "STATUS_CODE_OK":
+        return _OTEL_STATUS_OK
+    if raw_code == "STATUS_CODE_ERROR":
+        return _OTEL_STATUS_ERROR
+    code = _parse_decimal(raw_code, signed=False)
+    return code if code in (_OTEL_STATUS_OK, _OTEL_STATUS_ERROR) else _INVALID
 
 
 def _check_sequential_indices(
@@ -293,6 +320,27 @@ def canonical_runner_shape_violations(
         violations.add("execute_tool expected 1 or more; found 0")
 
     root_span_id: object = roots[0][0].get("spanId") if len(roots) == 1 else _INVALID
+
+    if len(roots) == 1:
+        root_span, root_attributes = roots[0]
+        if root_attributes.get("curie.phase") not in _ROOT_PHASES:
+            violations.add("agent.run curie.phase is not closed")
+
+        terminal_cause = root_attributes.get("curie.terminal.cause")
+        terminal_status = root_attributes.get("curie.terminal.status")
+        expected_otel_status = (
+            _TERMINAL_OUTCOMES.get((terminal_cause, terminal_status))
+            if isinstance(terminal_cause, str) and isinstance(terminal_status, str)
+            else None
+        )
+        if expected_otel_status is None:
+            violations.add("agent.run terminal cause/status combination is not closed")
+
+        otel_status = _otel_status_code(root_span)
+        if otel_status is _INVALID:
+            violations.add("agent.run OTel status is missing, malformed, or not closed")
+        elif expected_otel_status is not None and otel_status != expected_otel_status:
+            violations.add("agent.run OTel status does not match terminal cause/status")
 
     for span, attributes in generations:
         if not _is_root_sibling(span, root_span_id):
