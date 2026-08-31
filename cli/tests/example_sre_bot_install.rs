@@ -1524,6 +1524,41 @@ fn successful_install_uploads_only_the_resolved_tempo_index_digest() {
 }
 
 #[test]
+fn install_records_the_current_commit_sha_on_the_created_version() {
+    let fixture = Fixture::with_modes(
+        nodes(vec![node("node-a", "4Gi", true)]),
+        pods(vec![]),
+        "success",
+        "success",
+        "success",
+    );
+    let output = fixture.run(&[]);
+    let text = shown(&output);
+    assert!(
+        output.status.success(),
+        "full install fixture must deploy: {text}"
+    );
+
+    let version_request = fixture
+        .api
+        .recorded()
+        .into_iter()
+        .find(|request| {
+            request.method == "POST" && request.path == format!("/agents/{AGENT_ID}/versions")
+        })
+        .expect("the installer must create a version");
+    let body: Value = serde_json::from_slice(&version_request.body)
+        .expect("the version-create request body must be valid JSON");
+    let commit_sha = body["commit_sha"]
+        .as_str()
+        .expect("the version-create request must record the installer commit SHA");
+    assert!(
+        commit_sha.len() == 40 && commit_sha.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "the recorded commit SHA must be a 40-character ASCII hex value: {commit_sha:?}"
+    );
+}
+
+#[test]
 fn released_binary_path_uses_cached_chart_and_embedded_assets_outside_checkout() {
     let fixture = Fixture::with_modes(
         nodes(vec![node("node-a", "4Gi", true)]),
