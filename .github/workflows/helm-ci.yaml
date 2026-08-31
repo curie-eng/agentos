@@ -181,6 +181,12 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/otel-collector-checksum-assertions.sh
 
+      # Metadata only chart and app bumps must not recycle stateful backing stores.
+      - name: helm render assertions (stateful metadata rollout isolation)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/statefulset-metadata-rollout-assertions.sh
+
       - name: helm render assertions (otel collector durable delivery)
         run: |
           set -euo pipefail
