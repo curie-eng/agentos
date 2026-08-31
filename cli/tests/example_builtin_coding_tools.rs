@@ -77,8 +77,16 @@ fn coder_example_is_a_valid_skill_less_bundle() {
         .unwrap_or_else(|| panic!("bundle validator returned no result: {stderr}"));
     let result: Value = serde_json::from_str(reported)
         .unwrap_or_else(|error| panic!("validator output is not JSON ({error}): {reported}"));
-    assert_eq!(result["errors"], json!([]), "invalid coder bundle: {reported}");
-    assert_eq!(result["valid"], json!(true), "invalid coder bundle: {reported}");
+    assert_eq!(
+        result["errors"],
+        json!([]),
+        "invalid coder bundle: {reported}"
+    );
+    assert_eq!(
+        result["valid"],
+        json!(true),
+        "invalid coder bundle: {reported}"
+    );
 }
 
 #[test]
