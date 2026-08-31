@@ -11,6 +11,7 @@ from .approval_policy import (
     connector_tool_prefix,
     declared_mcp_server_names,
     effective_operator_gates,
+    effective_tool_prefix,
     grantable_routes,
 )
 from .archive import (
@@ -83,6 +84,7 @@ __all__ = [
     "declared_mcp_server_names",
     "connector_server_names",
     "connector_tool_prefix",
+    "effective_tool_prefix",
     "effective_operator_gates",
     "TOOL_POLICY_ENFORCEMENT",
     "ToolPolicyDecision",

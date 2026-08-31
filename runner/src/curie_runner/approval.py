@@ -50,8 +50,10 @@ from plugin_format import (
     ApprovalPolicy,
     PluginManifest,
     connector_server_names,
+    connector_tool_prefix,
     declared_mcp_server_names,
     effective_operator_gates,
+    effective_tool_prefix,
     grantable_routes,
     parse_allowed_tools,
     resolve_manifest,
@@ -909,6 +911,73 @@ class ApprovalPolicyError(RuntimeError):
     and for the same reason: booting anyway answers with the wrong (here,
     empty) authority set.
     """
+
+
+def is_mcp_tool(live_tool_name: str) -> bool:
+    """Is this live SDK name an MCP tool rather than a built-in?
+
+    `toolPolicy` patterns are `"<server>/<tool>"` globs, so a built-in (`Bash`,
+    `Read`) cannot be written down in one and is therefore not governed by a
+    policy at all. Asking this first is what keeps the documented
+    unclassified-is-denied default from silently revoking `Bash` from every
+    bundle that ships a policy about its connectors.
+    """
+
+    return live_tool_name.startswith("mcp__")
+
+
+def canonical_tool_name(
+    live_tool_name: str,
+    *,
+    bundle_name: str | None,
+    mcp_servers: set[str] | None,
+    connector_servers: set[str] | None,
+) -> str | None:
+    """The `"<server>/<tool>"` a policy pattern is written against, or `None`.
+
+    The piece `plugin_format.tool_policy` deliberately left to this lane: "Mapping
+    canonical -> live SDK name is the runtime lane's job and is out of scope
+    here." This is that mapping, run backwards -- the hook sees the live name and
+    the policy speaks canonical.
+
+    `None` means the name could not be attributed to a declared server, and the
+    caller must treat that as a REFUSAL rather than as "ungoverned". An `mcp__`
+    tool from a server this bundle does not declare is precisely the drift the
+    unclassified default exists to catch; returning `None` for both "unknown" and
+    "not MCP" would collapse the two and fail open, which is why `is_mcp_tool`
+    is a separate question asked first.
+
+    Two mount shapes, and the known-server sets are what disambiguate them
+    (`approval_policy`'s own prefix builders, shared with the deploy validator so
+    the format cannot drift):
+
+    - `connectors.yaml` -> `mcp__<server>__<tool>`
+    - plugin `mcpServers`  -> `mcp__plugin_<bundle>_<server>__<tool>`
+
+    Neither can be parsed by splitting on `__`, because a server name may contain
+    underscores. Connectors are matched first: a connector literally named
+    `plugin_<something>` would otherwise be readable as either shape, and
+    resolving that toward the bare form keeps the answer deterministic.
+
+    A `None` server set is the `declared_mcp_server_names` poison -- unknowable
+    rather than empty -- so it contributes no matches and the name falls through
+    to the refusal above.
+    """
+
+    if not is_mcp_tool(live_tool_name):
+        return None
+    for server in sorted(connector_servers or ()):
+        prefix = connector_tool_prefix(server)
+        if live_tool_name.startswith(prefix):
+            tool = live_tool_name[len(prefix) :]
+            return f"{server}/{tool}" if tool else None
+    if bundle_name:
+        for server in sorted(mcp_servers or ()):
+            prefix = effective_tool_prefix(bundle_name, server)
+            if live_tool_name.startswith(prefix):
+                tool = live_tool_name[len(prefix) :]
+                return f"{server}/{tool}" if tool else None
+    return None
 
 
 @dataclass(frozen=True)
