@@ -118,6 +118,15 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/litellm-sidecar-assertions.sh
 
+      # Prove cluster-local inference cannot silently download model weights
+      # into an emptyDir (issue #1779): the unsafe pull+ephemeral combination
+      # fails with both recovery paths, while durable pulls and explicitly
+      # pre-provisioned/no-pull ephemeral models retain their intended shapes.
+      - name: helm render assertions (inference download guard)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/inference-download-guard-assertions.sh
+
       # Prove the direct-passthrough existingSecret escape (issue #1759): the
       # eight keys that previously had none now resolve to the chart's own
       # Secret by default and to an operator-named Secret when
