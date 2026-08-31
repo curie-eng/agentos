@@ -2103,11 +2103,8 @@ class Kernel:
         workspace start failure -- a clone, an archive, an upload, a missing
         coordinator -- falls into ``_attempt``'s broad start-failure clause,
         which used to log an event id and an anonymous ``repr``: naming neither
-        the agent, nor the deployment, nor the repository. A binding carrying no
-        deployment id is different again: it never reaches that clause at all,
-        because it is raised earlier, in ``_process_event``, before ``_attempt``
-        runs -- and had no log of its own before this ticket. The reported
-        symptom is what both cost -- the turn acks, creates no sandbox, and an
+        the agent, nor the deployment, nor the repository. The reported symptom
+        is what those faults cost -- the turn acks, creates no sandbox, and an
         operator has nothing to search on.
 
         So this emits one WARNING carrying everything needed to find the
@@ -2119,11 +2116,8 @@ class Kernel:
         decision the feature made on purpose, a preparation failure is a fault
         nobody chose.
 
-        It takes the turn TEXT rather than an ``Event`` because the earliest
-        workspace failure -- a workspace-enabled deployment carrying no
-        deployment id -- is raised before ``_attempt`` has built one, and a
-        failure this helper cannot be called from is exactly the silence #2004
-        is about.
+        It takes the turn TEXT rather than an ``Event`` so it can name the
+        repository fact independently of where preparation failed.
         """
         # Total by construction: parse_github_repo_fact RAISES
         # WorkspaceSelectionRefused on a multi-repository message. That refusal

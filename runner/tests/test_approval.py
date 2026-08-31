@@ -19,7 +19,6 @@ from claude_agent_sdk.types import (
     PermissionResultDeny,
     ToolPermissionContext,
 )
-from curie_runner import approval as approval_module
 from curie_runner.adapter import build_options
 from curie_runner.approval import (
     APPROVAL_SUMMARY_PREFIX,
@@ -288,7 +287,15 @@ def test_publish_tool_is_always_listed_but_unmounted_invocation_refuses() -> Non
 
 
 def test_publish_tool_description_carries_coding_and_approval_safety_protocol() -> None:
-    description = approval_module._PUBLISH_DESCRIPTION.lower()  # noqa: SLF001
+    async def listed_description() -> str:
+        server = build_approval_server()
+        handler = server["instance"].request_handlers[mcp_types.ListToolsRequest]
+        result = await handler(mcp_types.ListToolsRequest(method="tools/list"))
+        tools = result.model_dump()["tools"]
+        publish = next(tool for tool in tools if tool["name"] == "publish_changes")
+        return str(publish["description"]).lower()
+
+    description = anyio.run(listed_description)
 
     assert "/workspace" in description
     assert "do not push" in description

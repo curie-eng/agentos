@@ -155,10 +155,10 @@ def worker_client(_disposable_db: Any, monkeypatch: pytest.MonkeyPatch) -> Itera
     get_settings.cache_clear()
 
 
-def test_deployment_workspace_capability_is_sticky_and_explicit_false_disables_it(
+def test_legacy_deployment_workspace_field_preserves_explicit_values(
     client: TestClient, auth_headers: dict[str, str], clean_db: None
 ) -> None:
-    """Omitted, enabled, and disabled are three distinct deployment writes."""
+    """The deprecated field remains round-trip compatible for existing clients."""
 
     agent_id, version_id = _create_agent_version(client, auth_headers)
 
@@ -253,17 +253,8 @@ def test_no_url_and_no_durable_selection_returns_null_without_redemption(
     worker_client: TestClient,
     auth_headers: dict[str, str],
     clean_db: None,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An ordinary non-coding turn neither persists a repo nor resolves auth."""
-
-    def unexpected_credential_resolution(*_args: object) -> tuple[str, str]:
-        raise AssertionError("selection absence must not resolve a repository credential")
-
-    monkeypatch.setattr(
-        "curie_api.routers.workspaces.resolve_repository_credential",
-        unexpected_credential_resolution,
-    )
+    """An ordinary non-coding turn creates neither selection nor credential audit state."""
     agent_id, version_id = _create_agent_version(worker_client, auth_headers)
     deployment = _deploy(
         worker_client,
@@ -614,7 +605,7 @@ def test_workspace_credential_prefers_app_installation_token_over_pat(
     assert mint == {"repositories": ["acme-bot"]}
 
 
-def test_workspace_selection_and_credential_ignore_the_deployment_feature_flag(
+def test_legacy_deployment_workspace_field_does_not_gate_selection_or_credential(
     worker_client: TestClient,
     auth_headers: dict[str, str],
     clean_db: None,

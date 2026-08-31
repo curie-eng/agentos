@@ -128,7 +128,7 @@ fn deployment_bodies(server: &MockServer) -> Vec<Value> {
 }
 
 #[test]
-fn workspace_enable_is_independent_of_git_flow_repo_binding() {
+fn legacy_workspace_true_is_serialized_independently_of_git_flow_repo_binding() {
     let (output, server) = run_local(
         ExistingAgent::None,
         &["--workspace", "--repo", "acme-corp/acme-bot"],
@@ -145,7 +145,7 @@ fn workspace_enable_is_independent_of_git_flow_repo_binding() {
 }
 
 #[test]
-fn workspace_enable_with_existing_git_flow_binding_still_sends_capability_only() {
+fn legacy_workspace_true_with_existing_git_flow_binding_is_still_serialized() {
     let (output, server) = run_local(ExistingAgent::Bound("acme-corp/acme-bot"), &["--workspace"]);
     assert!(output.status.success());
     assert_eq!(
@@ -169,7 +169,7 @@ fn no_workspace_sends_explicit_false_while_omission_preserves_server_state() {
 }
 
 #[test]
-fn workspace_enable_needs_no_preconfigured_repository() {
+fn legacy_workspace_true_needs_no_preconfigured_repository() {
     let (output, server) = run_local(ExistingAgent::Unbound, &["--workspace"]);
     assert!(
         output.status.success(),
@@ -361,7 +361,7 @@ fn run_fanout(
 }
 
 #[test]
-fn all_targets_enables_runtime_workspace_selection_independently() {
+fn all_targets_serialize_legacy_workspace_true_independently() {
     let (output, server) = run_fanout(
         Some("acme-corp/acme-dev"),
         Some("acme-corp/acme-prod"),
@@ -394,7 +394,7 @@ fn all_targets_needs_no_repo_binding_on_either_target() {
 }
 
 #[test]
-fn all_targets_applies_disable_to_each_target_and_omission_to_none() {
+fn all_targets_serialize_explicit_false_and_omit_unspecified() {
     let (disabled, disabled_server) = run_fanout(None, None, Some(false));
     assert!(disabled.status.success());
     let disabled_bodies = deployment_bodies(&disabled_server);
