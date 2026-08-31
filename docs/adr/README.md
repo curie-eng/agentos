@@ -135,7 +135,7 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0103 | [Previous schema shape gate](0103-previous-schema-shape-gate.md) | Accepted |
 | 0104 | [A named security posture is computed from the layers that exist, never configured](0104-a-named-security-posture-is-computed-not-configured.md) | Accepted |
 | 0105 | [External native session checkpoints are a harness capability](0105-external-native-session-checkpoints.md) | Draft |
-| 0106 | [An approver is an authenticated principal, never a caller-asserted string](0106-an-approver-is-an-authenticated-principal.md) | Draft |
+| 0106 | [An approver is an authenticated principal, never a caller-asserted string](0106-an-approver-is-an-authenticated-principal.md) | Accepted |
 | 0107 | [An agent reads its own runs through a first-party surface, scoped by structured identity](0107-an-agent-reads-its-own-runs-through-a-first-party-scoped-surface.md) | Draft |
 | 0108 | [A deploy target carries its environment's values](0108-a-deploy-target-carries-its-environments-values.md) | Draft |
 | 0109 | [Retention, capacity, and back pressure are one policy: a claim is admitted, not discovered](0109-retention-capacity-and-back-pressure-are-one-policy.md) | Draft |
