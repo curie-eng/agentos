@@ -1,3 +1,6 @@
+{{- if and .Values.inference.deploy .Values.inference.pullModel (not .Values.inference.persistence.enabled) }}
+{{- fail "inference.deploy=true with inference.pullModel=true would implicitly download model weights into an ephemeral emptyDir; enable durable storage with inference.persistence.enabled=true, or pre-provision the model and set inference.pullModel=false." }}
+{{- end }}
 {{- if .Values.inference.deploy }}
 {{- if .Values.inference.persistence.enabled }}
 apiVersion: v1
