@@ -53,6 +53,52 @@ const UPGRADE_GATE: &str = "mcp__self-upgrade__upgrade_self";
 // its Job, its identity and its CronJob are all absent by default, so shipping
 // the gate without them would validate and never fire.
 const PLATFORM_UPGRADE_GATE: &str = "mcp__self-upgrade__upgrade_platform";
+// The platform-upgrade objects this installer renders. Names are fixed rather
+// than configurable: the connector is told the CronJob's name through its own
+// env, and two places free to disagree is how a tool ends up refusing every call
+// with nothing wrong in either file.
+// The CONNECTOR's identity -- `create jobs`, so it can press the button. Distinct
+// from PLATFORM_UPGRADER_IDENTITY below, which is what the Job itself runs as and
+// is the one that can rewrite the release. Two identities on purpose: the thing
+// that starts an upgrade and the thing that performs one should not be the same
+// credential, or the connector would hold namespace-admin for the life of its pod.
+const UPGRADER_IDENTITY: &str = "sre-bot-upgrader";
+const UPGRADER_TOKEN_SECRET: &str = "sre-bot-upgrader-token";
+const SELF_UPGRADE_KUBECONFIG_SECRET_KEY: &str = "SELF_UPGRADE_KUBECONFIG";
+const PLATFORM_UPGRADER_IDENTITY: &str = "curie-platform-upgrader";
+const PLATFORM_UPGRADE_CRONJOB_NAME: &str = "platform-upgrade";
+const SELF_UPGRADE_CRONJOB_NAME: &str = "sre-bot-self-upgrade";
+const PLATFORM_UPGRADE_CONFIGMAP: &str = "platform-upgrade";
+// The project whose releases define "newest" for the platform upgrade. Fixed
+// rather than a flag: this installer installs THIS project's example, and an
+// upgrade pointed at a different repository is a different thing entirely.
+const PLATFORM_UPGRADE_SOURCE_REPO: &str = "curie-eng/curie";
+const PLATFORM_UPGRADE_CRONJOB_ENV: &str = "PLATFORM_UPGRADE_CRONJOB";
+const SELF_UPGRADE_CRONJOB_ENV: &str = "SELF_UPGRADE_CRONJOB";
+// The rule shape this build knows how to render, asserted against the shipped
+// manifest exactly as the write Role's is. The manifest is edited far more often
+// than this file, so a widened grant must stop the install rather than ship in
+// it -- and this is the widest grant the bundle has.
+const PLATFORM_RULE_SHAPE: [(&str, &[&str]); 6] = [
+    (
+        "",
+        &[
+            "secrets",
+            "configmaps",
+            "services",
+            "serviceaccounts",
+            "persistentvolumeclaims",
+        ],
+    ),
+    (
+        "apps",
+        &["deployments", "statefulsets", "daemonsets", "replicasets"],
+    ),
+    ("batch", &["jobs", "cronjobs"]),
+    ("networking.k8s.io", &["networkpolicies", "ingresses"]),
+    ("rbac.authorization.k8s.io", &["roles", "rolebindings"]),
+    ("", &["pods", "events"]),
+];
 // The one grant the write path may carry. Read from the shipped manifest and
 // asserted rather than assumed, so editing that file to widen the verb set stops
 // the install instead of shipping in it -- the same posture the connector and
@@ -69,6 +115,11 @@ const KUBECONFIG_SECRET_KEY: &str = "K8S_READONLY_KUBECONFIG";
 // release publishes one.
 const K8S_WRITE_IMAGE_REPOSITORY: &str = "ghcr.io/curie-eng/curie-sre-bot-k8s-write";
 const K8S_WRITE_IMAGE_TAG: &str = "sha-0fb841432db69f67591648eedf96f278aa87bd2c";
+// The self-upgrade connector's published image. Same reasoning as the write
+// connector's above: a `sha-<commit>` tag because no tagged release carries this
+// connector yet, and an immutable one because `latest` is not.
+const SELF_UPGRADE_IMAGE_REPOSITORY: &str = "ghcr.io/curie-eng/curie-sre-bot-self-upgrade";
+const SELF_UPGRADE_IMAGE_TAG: &str = "sha-a391c48b591cf4bf9637ce816964031288151f8e";
 const TEMPO_IMAGE_REPOSITORY: &str = "ghcr.io/curie-eng/curie-sre-bot-tempo";
 const TEMPO_IMAGE_TAG: &str = "0.8.0";
 const TEMPO_TAGGED_IMAGE: &str = "ghcr.io/curie-eng/curie-sre-bot-tempo:0.8.0";
@@ -130,10 +181,26 @@ const BUNDLE_FILES: &[(&str, &[u8])] = &[
         include_bytes!("../../examples/sre-bot/manifests/write-role.yaml"),
     ),
     (
+        "manifests/upgrade-role.yaml",
+        include_bytes!("../../examples/sre-bot/manifests/upgrade-role.yaml"),
+    ),
+    (
+        "manifests/platform-upgrade-role.yaml",
+        include_bytes!("../../examples/sre-bot/manifests/platform-upgrade-role.yaml"),
+    ),
+    (
         "skills/sre-bot/SKILL.md",
         include_bytes!("../../examples/sre-bot/skills/sre-bot/SKILL.md"),
     ),
 ];
+
+/// The platform-upgrade Job's template and the script it runs. Not in
+/// `BUNDLE_FILES`: they are cluster objects this installer renders and applies,
+/// not files the agent bundle carries.
+const PLATFORM_UPGRADE_CRONJOB_YAML: &[u8] =
+    include_bytes!("../../examples/sre-bot/platform-upgrade/cronjob.yaml");
+const PLATFORM_UPGRADE_SCRIPT: &[u8] =
+    include_bytes!("../../examples/sre-bot/platform-upgrade/upgrade.sh");
 
 pub struct SreBotInstallOpts {
     pub observability: bool,
@@ -145,6 +212,11 @@ pub struct SreBotInstallOpts {
     pub write_allowlist: Option<String>,
     /// Leave the write connector out entirely, as absence used to.
     pub no_write: bool,
+    /// Install the upgrade path: the self-upgrade connector, the platform
+    /// upgrade Job and the two identities behind them. Absent, the connector is
+    /// stripped exactly as it was before this flag existed, so an install that
+    /// does not ask for it is unchanged.
+    pub platform_upgrade: bool,
     pub namespace: String,
     pub release: String,
     pub observability_namespace: String,
@@ -551,11 +623,21 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
         }
         None => None,
     };
+    // Resolved before the workspace renders, like the other two: `build:` records
+    // a LOCAL image id the cluster tier refuses, so a kept connector with no
+    // resolved digest is one that can never start.
+    let upgrade_digest = match opts.platform_upgrade {
+        true => {
+            Some(resolve_index_digest(SELF_UPGRADE_IMAGE_REPOSITORY, SELF_UPGRADE_IMAGE_TAG).await?)
+        }
+        false => None,
+    };
     let workspace = EmbeddedWorkspace::create(
         &tempo_digest,
         write_digest.as_deref(),
         write_targets,
         &identity,
+        upgrade_digest.as_deref(),
     )?;
     ensure_grafana_admin_secret(&identity.observability_namespace).await?;
     for command in &stack_commands {
@@ -625,9 +707,27 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
                 .await?,
         );
     }
+    // ALWAYS after the deploy, never before. `install_sre_bot` orders privileged
+    // identities by direction -- never create a NEW one before the deploy -- and
+    // both of these are new every time: unlike the write Role there is no
+    // allowlist here to NARROW, so the "tighten an existing one early" case that
+    // justifies the pre-deploy apply simply does not arise. Creating them any
+    // sooner would leave the widest credential this installer can create standing
+    // for the whole length of a deploy that may still fail.
+    let mut upgrade_kubeconfig = None;
+    if opts.platform_upgrade {
+        upgrade_kubeconfig =
+            Some(apply_upgrade_path(&workspace, &chart, &identity.namespace).await?);
+    }
     let mut secret_overrides = BTreeMap::from([(KUBECONFIG_SECRET_KEY.to_string(), kubeconfig)]);
     if let Some(write_kubeconfig) = write_kubeconfig {
         secret_overrides.insert(WRITE_KUBECONFIG_SECRET_KEY.to_string(), write_kubeconfig);
+    }
+    if let Some(upgrade_kubeconfig) = upgrade_kubeconfig {
+        secret_overrides.insert(
+            SELF_UPGRADE_KUBECONFIG_SECRET_KEY.to_string(),
+            upgrade_kubeconfig,
+        );
     }
     crate::connectors::sync_deployed_version(
         &connection.api_url,
@@ -639,6 +739,34 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
     )
     .await?;
     Ok(SreBotInstallResult::Installed(Box::new(deployed)))
+}
+
+/// Apply the upgrade path's objects and mint the connector's kubeconfig.
+///
+/// Order within this function matters: the identities come first, then the
+/// script, then the CronJob that references both. Applying the CronJob first
+/// would leave a template naming a ServiceAccount that does not exist, which
+/// Kubernetes accepts and which fails only when a Job is finally created from it
+/// -- after a human has approved an upgrade.
+async fn apply_upgrade_path(
+    workspace: &EmbeddedWorkspace,
+    chart: &Path,
+    namespace: &str,
+) -> Result<String> {
+    for file in [
+        "manifests/upgrade-role.yaml",
+        "manifests/platform-upgrade-role.yaml",
+        "manifests/platform-upgrade-configmap.yaml",
+        "manifests/platform-upgrade-cronjob.yaml",
+    ] {
+        let command = InstallCommand {
+            program: "kubectl",
+            args: vec![plain("apply"), plain("-f"), CommandArg::BundleFile(file)],
+            helm_target: None,
+        };
+        run_install_command(&command, workspace, chart).await?;
+    }
+    connector_kubeconfig(UPGRADER_IDENTITY, UPGRADER_TOKEN_SECRET, namespace).await
 }
 
 async fn apply_curie_platform(
@@ -1391,6 +1519,7 @@ impl EmbeddedWorkspace {
         write_digest: Option<&str>,
         write_targets: Option<&[WriteTarget]>,
         identity: &InstallIdentity,
+        upgrade_digest: Option<&str>,
     ) -> Result<Self> {
         let root = std::env::temp_dir().join(format!(
             "curie-sre-bot-install-{}-{}",
@@ -1413,10 +1542,15 @@ impl EmbeddedWorkspace {
                     write_digest,
                     write_targets,
                     &identity.observability_namespace,
+                    upgrade_digest,
                 )?;
                 workspace.write(&Path::new("bundle").join(name), &runtime)?;
             } else if *name == ".claude-plugin/plugin.json" {
-                let runtime = runtime_plugin_manifest(contents, write_targets.is_some())?;
+                let runtime = runtime_plugin_manifest(
+                    contents,
+                    write_targets.is_some(),
+                    upgrade_digest.is_some(),
+                )?;
                 workspace.write(&Path::new("bundle").join(name), &runtime)?;
             } else if *name == "manifests/write-role.yaml" {
                 // Rendered from the allowlist when the write path is opted into,
@@ -1431,12 +1565,46 @@ impl EmbeddedWorkspace {
                     }
                     None => continue,
                 }
+            } else if *name == "manifests/upgrade-role.yaml" {
+                // Both upgrade identities are written only when the path is
+                // opted into. Writing them otherwise would leave manifests
+                // describing grants this install deliberately did not create,
+                // next to ones it did -- the same trap the write Role avoids.
+                if upgrade_digest.is_none() {
+                    continue;
+                }
+                let rendered = render_upgrade_role(contents, &identity.namespace)?;
+                workspace.write(&Path::new("bundle").join(name), &rendered)?;
+            } else if *name == "manifests/platform-upgrade-role.yaml" {
+                if upgrade_digest.is_none() {
+                    continue;
+                }
+                let rendered = render_platform_upgrade_role(contents, &identity.namespace)?;
+                workspace.write(&Path::new("bundle").join(name), &rendered)?;
             } else if *name == "manifests/read-access.yaml" {
                 let rendered = render_read_access(contents, &identity.namespace)?;
                 workspace.write(&Path::new("bundle").join(name), &rendered)?;
             } else {
                 workspace.write(&Path::new("bundle").join(name), contents)?;
             }
+        }
+        if upgrade_digest.is_some() {
+            // Not bundle files: cluster objects this installer renders and
+            // applies. They live beside the bundle in the workspace so a failed
+            // install leaves exactly what was about to be applied on disk.
+            workspace.write(
+                Path::new("bundle/manifests/platform-upgrade-configmap.yaml"),
+                &render_platform_upgrade_configmap(PLATFORM_UPGRADE_SCRIPT, &identity.namespace)?,
+            )?;
+            workspace.write(
+                Path::new("bundle/manifests/platform-upgrade-cronjob.yaml"),
+                &render_platform_cronjob(
+                    PLATFORM_UPGRADE_CRONJOB_YAML,
+                    &identity.namespace,
+                    &identity.release,
+                    PLATFORM_UPGRADE_SOURCE_REPO,
+                )?,
+            )?;
         }
         Ok(workspace)
     }
@@ -1605,6 +1773,53 @@ fn render_read_access(source: &[u8], namespace: &str) -> Result<Vec<u8>> {
     Ok(rendered.into_bytes())
 }
 
+/// The CONNECTOR's upgrade identity, in the install's namespace.
+///
+/// A namespace rewrite and nothing else: unlike the write Role, its grant is
+/// fixed rather than derived from operator input, so there is no allowlist to
+/// render and nothing for this to get wrong beyond the namespace.
+fn render_upgrade_role(source: &[u8], namespace: &str) -> Result<Vec<u8>> {
+    if namespace == CURIE_NAMESPACE {
+        return Ok(source.to_vec());
+    }
+    let source =
+        std::str::from_utf8(source).context("embedded SRE bot upgrade-role.yaml is not UTF-8")?;
+    let mut rendered = String::new();
+    for document in serde_norway::Deserializer::from_str(source) {
+        let mut value: serde_json::Value = serde::Deserialize::deserialize(document)
+            .context("parsing embedded SRE bot upgrade-role.yaml")?;
+        rewrite_manifest_namespace(&mut value, namespace);
+        rendered.push_str("---\n");
+        rendered.push_str(
+            &serde_norway::to_string(&value)
+                .context("serializing the rendered SRE bot upgrade identity")?,
+        );
+    }
+    Ok(rendered.into_bytes())
+}
+
+/// The ConfigMap carrying the upgrade script the Job runs.
+///
+/// Rendered rather than `kubectl create configmap --from-file`, so the whole
+/// install is one stream of `kubectl apply` over files this process wrote --
+/// idempotent on a re-install, and inspectable in the workspace when it fails.
+fn render_platform_upgrade_configmap(script: &[u8], namespace: &str) -> Result<Vec<u8>> {
+    let script = std::str::from_utf8(script)
+        .context("embedded SRE bot platform upgrade script is not UTF-8")?;
+    let document = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {"name": PLATFORM_UPGRADE_CONFIGMAP, "namespace": namespace},
+        "data": {"upgrade.sh": script},
+    });
+    let mut rendered = String::from("---\n");
+    rendered.push_str(
+        &serde_norway::to_string(&document)
+            .context("serializing the SRE bot platform upgrade ConfigMap")?,
+    );
+    Ok(rendered.into_bytes())
+}
+
 fn render_write_role(
     source: &[u8],
     targets: &[WriteTarget],
@@ -1713,12 +1928,204 @@ fn render_write_role(
     Ok(rendered.into_bytes())
 }
 
+/// The platform-upgrade identity, rendered into the release's namespace.
+///
+/// Mirrors `render_write_role`, including the part that matters most: the
+/// shipped manifest's rules are ASSERTED against what this build knows how to
+/// render before anything is emitted. This is the widest grant in the bundle --
+/// namespace-admin in all but name -- so a manifest that grows a rule must stop
+/// the install rather than have the installer grant it silently.
+fn render_platform_upgrade_role(source: &[u8], curie_namespace: &str) -> Result<Vec<u8>> {
+    let source = std::str::from_utf8(source)
+        .context("embedded SRE bot platform-upgrade-role.yaml is not UTF-8")?;
+    let mut rules: Option<Vec<serde_json::Value>> = None;
+    for document in serde_norway::Deserializer::from_str(source) {
+        let value: serde_json::Value = serde::Deserialize::deserialize(document)
+            .context("parsing embedded SRE bot platform-upgrade-role.yaml")?;
+        if value.get("kind").and_then(serde_json::Value::as_str) != Some("Role") {
+            continue;
+        }
+        rules = Some(
+            value
+                .get("rules")
+                .and_then(serde_json::Value::as_array)
+                .context("the embedded platform-upgrade Role declares no rules")?
+                .clone(),
+        );
+    }
+    let rules = rules.context("the embedded platform-upgrade-role.yaml declares no Role")?;
+    if rules.len() != PLATFORM_RULE_SHAPE.len() {
+        bail!(
+            "the embedded platform-upgrade Role declares {} rules; this build renders exactly \
+             {}. Widening the grant needs a matching change here, because this installer is \
+             what creates it.",
+            rules.len(),
+            PLATFORM_RULE_SHAPE.len()
+        );
+    }
+    for (index, (group, resources)) in PLATFORM_RULE_SHAPE.iter().enumerate() {
+        let rule = &rules[index];
+        let groups: Vec<&str> = rule
+            .get("apiGroups")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| items.iter().filter_map(serde_json::Value::as_str).collect())
+            .unwrap_or_default();
+        let actual: Vec<&str> = rule
+            .get("resources")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| items.iter().filter_map(serde_json::Value::as_str).collect())
+            .unwrap_or_default();
+        if groups != [*group] || actual != *resources {
+            bail!(
+                "the embedded platform-upgrade Role's rule {index} is {groups:?}/{actual:?}, but \
+                 this build only knows how to render {:?}/{resources:?}",
+                [group]
+            );
+        }
+    }
+
+    let mut documents: Vec<serde_json::Value> = vec![
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ServiceAccount",
+            "metadata": {"name": PLATFORM_UPGRADER_IDENTITY, "namespace": curie_namespace},
+        }),
+        serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "Role",
+            "metadata": {"name": PLATFORM_UPGRADER_IDENTITY, "namespace": curie_namespace},
+            "rules": rules,
+        }),
+        serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "RoleBinding",
+            "metadata": {"name": PLATFORM_UPGRADER_IDENTITY, "namespace": curie_namespace},
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "Role",
+                "name": PLATFORM_UPGRADER_IDENTITY,
+            },
+            "subjects": [{
+                "kind": "ServiceAccount",
+                "name": PLATFORM_UPGRADER_IDENTITY,
+                "namespace": curie_namespace,
+            }],
+        }),
+    ];
+    // No static token Secret, unlike the reader and writer identities. This one
+    // is a Job's ServiceAccount: Kubernetes projects its token into the pod for
+    // the ninety seconds the upgrade runs. A static token would be a
+    // namespace-admin credential sitting in a Secret forever, which is exactly
+    // what this shape exists to avoid.
+    let mut rendered = String::new();
+    for document in documents.drain(..) {
+        rendered.push_str("---\n");
+        rendered.push_str(
+            &serde_norway::to_string(&document)
+                .context("serializing the rendered SRE bot platform upgrade identity")?,
+        );
+    }
+    Ok(rendered.into_bytes())
+}
+
+/// The platform-upgrade CronJob, pointed at this install.
+///
+/// The shipped file carries `CHANGE ME` placeholders for the namespace, the
+/// release and the repository. Rewriting them here is the whole reason this flag
+/// exists: an operator editing four values across two files gets one of them
+/// wrong, and the failure is a tool that refuses every call with nothing visibly
+/// wrong in either file.
+fn render_platform_cronjob(
+    source: &[u8],
+    curie_namespace: &str,
+    release: &str,
+    repo: &str,
+) -> Result<Vec<u8>> {
+    let source = std::str::from_utf8(source)
+        .context("embedded SRE bot platform-upgrade cronjob.yaml is not UTF-8")?;
+    let mut cronjob: Option<serde_json::Value> = None;
+    for document in serde_norway::Deserializer::from_str(source) {
+        let value: serde_json::Value = serde::Deserialize::deserialize(document)
+            .context("parsing embedded SRE bot platform-upgrade cronjob.yaml")?;
+        if value.get("kind").and_then(serde_json::Value::as_str) == Some("CronJob") {
+            cronjob = Some(value);
+        }
+    }
+    let mut cronjob =
+        cronjob.context("the embedded platform-upgrade cronjob.yaml has no CronJob")?;
+
+    let metadata = cronjob
+        .get_mut("metadata")
+        .and_then(serde_json::Value::as_object_mut)
+        .context("the embedded platform-upgrade CronJob has no metadata")?;
+    metadata.insert(
+        "namespace".to_string(),
+        serde_json::Value::String(curie_namespace.to_string()),
+    );
+    // The name the connector is told about. Asserted rather than trusted: if the
+    // shipped file is renamed, the connector's env would point at a CronJob that
+    // does not exist and every call would refuse.
+    let name = metadata
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if name != PLATFORM_UPGRADE_CRONJOB_NAME {
+        bail!(
+            "the embedded platform-upgrade CronJob is named {name:?}, but this build tells the \
+             connector to start {PLATFORM_UPGRADE_CRONJOB_NAME:?}"
+        );
+    }
+    // Suspended is not negotiable here. This installer's contract is that the
+    // upgrade happens when a human approves one, never on a timer nobody chose.
+    cronjob
+        .pointer_mut("/spec")
+        .and_then(serde_json::Value::as_object_mut)
+        .context("the embedded platform-upgrade CronJob has no spec")?
+        .insert("suspend".to_string(), serde_json::Value::Bool(true));
+
+    let env = cronjob
+        .pointer_mut("/spec/jobTemplate/spec/template/spec/containers/0/env")
+        .and_then(serde_json::Value::as_array_mut)
+        .context("the embedded platform-upgrade CronJob container declares no env")?;
+    let mut seen = 0usize;
+    for entry in env.iter_mut() {
+        let Some(object) = entry.as_object_mut() else {
+            continue;
+        };
+        let replacement = match object.get("name").and_then(serde_json::Value::as_str) {
+            Some("PLATFORM_UPGRADE_NAMESPACE") => curie_namespace,
+            Some("PLATFORM_UPGRADE_RELEASE") => release,
+            Some("PLATFORM_UPGRADE_REPO") => repo,
+            _ => continue,
+        };
+        object.insert(
+            "value".to_string(),
+            serde_json::Value::String(replacement.to_string()),
+        );
+        seen += 1;
+    }
+    if seen != 3 {
+        bail!(
+            "the embedded platform-upgrade CronJob carries {seen} of the 3 values this build \
+             rewrites (namespace, release, repository); the rest would keep their placeholders"
+        );
+    }
+
+    let mut rendered = String::from("---\n");
+    rendered.push_str(
+        &serde_norway::to_string(&cronjob)
+            .context("serializing the rendered SRE bot platform upgrade CronJob")?,
+    );
+    Ok(rendered.into_bytes())
+}
+
 fn runtime_connector_declaration(
     source: &[u8],
     tempo_digest: &str,
     write_digest: Option<&str>,
     write_targets: Option<&[WriteTarget]>,
     observability_namespace: &str,
+    upgrade_digest: Option<&str>,
 ) -> Result<Vec<u8>> {
     let source =
         std::str::from_utf8(source).context("embedded SRE bot connectors.yaml is not UTF-8")?;
@@ -1763,17 +2170,64 @@ fn runtime_connector_declaration(
     // platform API key (see manifests/upgrade-role.yaml). A grant that wide is
     // an operator's decision made while reading that file, never a side effect
     // of running an installer.
-    if connectors.remove("self-upgrade").is_none() {
-        bail!("embedded SRE bot must declare connectors.self-upgrade");
+    match upgrade_digest {
+        // Kept, with both CronJob names filled in. The bundle ships
+        // PLATFORM_UPGRADE_CRONJOB empty and SELF_UPGRADE_CRONJOB defaulted, and
+        // an install that hand-edits either finds the worker's connector
+        // reconciler putting the declaration back within the minute -- so the
+        // installer is the only thing that can make these real.
+        Some(digest) => {
+            let upgrade = connectors
+                .get_mut("self-upgrade")
+                .and_then(serde_json::Value::as_object_mut)
+                .context("embedded SRE bot must declare connectors.self-upgrade")?;
+            if upgrade.remove("build").is_none() || upgrade.contains_key("image") {
+                bail!(
+                    "embedded SRE bot self-upgrade connector must declare one build source and \
+                     no image before immutable resolution"
+                );
+            }
+            upgrade.insert(
+                "image".to_string(),
+                serde_json::Value::String(format!("{SELF_UPGRADE_IMAGE_REPOSITORY}@{digest}")),
+            );
+            let env = upgrade
+                .entry("env")
+                .or_insert_with(|| serde_json::Value::Object(Default::default()))
+                .as_object_mut()
+                .context("embedded SRE bot self-upgrade connector env is not a mapping")?;
+            env.insert(
+                PLATFORM_UPGRADE_CRONJOB_ENV.to_string(),
+                serde_json::Value::String(PLATFORM_UPGRADE_CRONJOB_NAME.to_string()),
+            );
+            env.insert(
+                SELF_UPGRADE_CRONJOB_ENV.to_string(),
+                serde_json::Value::String(SELF_UPGRADE_CRONJOB_NAME.to_string()),
+            );
+        }
+        // Stripped exactly as before this flag existed: inert without the Job,
+        // and its identity is an operator's decision, never an installer's.
+        None => {
+            if connectors.remove("self-upgrade").is_none() {
+                bail!("embedded SRE bot must declare connectors.self-upgrade");
+            }
+        }
     }
     // Fail closed on a connector this build does not know about. Removing the
     // write connectors by name is only as narrow as intended if the bundle has no
     // third one -- and the bundle is edited far more often than this file, so an
     // unrecognized connector must stop the install rather than ship in it.
-    let known: &[&str] = if write_targets.is_some() {
-        &["kubernetes", "grafana", "tempo", "k8s-write"]
-    } else {
-        &["kubernetes", "grafana", "tempo"]
+    let known: &[&str] = match (write_targets.is_some(), upgrade_digest.is_some()) {
+        (true, true) => &[
+            "kubernetes",
+            "grafana",
+            "tempo",
+            "k8s-write",
+            "self-upgrade",
+        ],
+        (true, false) => &["kubernetes", "grafana", "tempo", "k8s-write"],
+        (false, true) => &["kubernetes", "grafana", "tempo", "self-upgrade"],
+        (false, false) => &["kubernetes", "grafana", "tempo"],
     };
     if let Some(unexpected) = connectors
         .keys()
@@ -1830,7 +2284,11 @@ fn runtime_connector_declaration(
     ))
 }
 
-fn runtime_plugin_manifest(source: &[u8], write_enabled: bool) -> Result<Vec<u8>> {
+fn runtime_plugin_manifest(
+    source: &[u8],
+    write_enabled: bool,
+    upgrade_enabled: bool,
+) -> Result<Vec<u8>> {
     let mut manifest: serde_json::Value =
         serde_json::from_slice(source).context("parsing embedded SRE bot plugin.json")?;
     // Pinned, not merely present. This install strips approvalPolicy entirely
@@ -1851,7 +2309,19 @@ fn runtime_plugin_manifest(source: &[u8], write_enabled: bool) -> Result<Vec<u8>
     let manifest = manifest
         .as_object_mut()
         .context("embedded SRE bot plugin.json must be an object")?;
+    // Keep exactly the gates whose connectors survived, and no others. A gate
+    // naming a stripped connector fails bundle validation for everyone; a kept
+    // connector with no gate is the ungated write this whole path exists to
+    // avoid. Both halves are decided here, from the same two conditions.
+    let mut kept: Vec<serde_json::Value> = Vec::new();
     if write_enabled {
+        kept.push(serde_json::json!({"gate": WRITE_GATE, "route": "sre-approvals"}));
+    }
+    if upgrade_enabled {
+        kept.push(serde_json::json!({"gate": UPGRADE_GATE, "route": "sre-approvals"}));
+        kept.push(serde_json::json!({"gate": PLATFORM_UPGRADE_GATE, "route": "sre-approvals"}));
+    }
+    if !kept.is_empty() {
         // Keep exactly the gate for the connector that stayed. A gate naming a
         // connector this install removed fails bundle validation for everyone,
         // and a connector kept without its gate is the ungated write this whole
@@ -1859,9 +2329,7 @@ fn runtime_plugin_manifest(source: &[u8], write_enabled: bool) -> Result<Vec<u8>
         // condition.
         manifest.insert(
             "approvalPolicy".to_string(),
-            serde_json::json!({
-                "gates": [{"gate": WRITE_GATE, "route": "sre-approvals"}]
-            }),
+            serde_json::json!({"gates": kept}),
         );
         manifest.insert(
             "description".to_string(),
@@ -2189,6 +2657,171 @@ mod tests {
         assert_eq!(parse_memory_quantity("1e6").unwrap(), 1_000_000);
     }
 
+    #[test]
+    fn the_upgrade_path_off_strips_the_connector_and_its_gates() {
+        // The behaviour before this flag existed, pinned so the flag cannot
+        // change what an install that did not ask for it receives.
+        let connectors = runtime_connector_declaration(
+            bundle_file("connectors.yaml"),
+            "sha256:tempo",
+            None,
+            None,
+            OBSERVABILITY_NAMESPACE,
+            None,
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_norway::from_slice(&connectors).unwrap();
+        assert!(parsed["connectors"].get("self-upgrade").is_none());
+
+        let manifest =
+            runtime_plugin_manifest(bundle_file(".claude-plugin/plugin.json"), false, false)
+                .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
+        assert!(parsed.get("approvalPolicy").is_none());
+    }
+
+    #[test]
+    fn the_upgrade_path_on_fills_in_both_cronjob_names() {
+        // The whole reason this flag exists. The bundle ships
+        // PLATFORM_UPGRADE_CRONJOB empty, and the worker's connector reconciler
+        // puts that declaration back within the minute over anything set by
+        // hand -- so if the installer does not render a real value, nothing can.
+        let connectors = runtime_connector_declaration(
+            bundle_file("connectors.yaml"),
+            "sha256:tempo",
+            None,
+            None,
+            OBSERVABILITY_NAMESPACE,
+            Some("sha256:upgrade"),
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_norway::from_slice(&connectors).unwrap();
+        let env = &parsed["connectors"]["self-upgrade"]["env"];
+        assert_eq!(
+            env[PLATFORM_UPGRADE_CRONJOB_ENV],
+            PLATFORM_UPGRADE_CRONJOB_NAME
+        );
+        assert_eq!(env[SELF_UPGRADE_CRONJOB_ENV], SELF_UPGRADE_CRONJOB_NAME);
+        // `build:` records a LOCAL image id the cluster tier refuses, so a kept
+        // connector without a resolved digest is one that can never start.
+        assert!(parsed["connectors"]["self-upgrade"].get("build").is_none());
+        assert_eq!(
+            parsed["connectors"]["self-upgrade"]["image"],
+            format!("{SELF_UPGRADE_IMAGE_REPOSITORY}@sha256:upgrade")
+        );
+    }
+
+    #[test]
+    fn a_kept_upgrade_connector_keeps_exactly_its_two_gates() {
+        // A gate naming a stripped connector fails validation for everyone; a
+        // kept connector with no gate is an ungated write. Both are decided from
+        // the same condition, so both are asserted here.
+        let manifest =
+            runtime_plugin_manifest(bundle_file(".claude-plugin/plugin.json"), false, true)
+                .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
+        let gates: Vec<&str> = parsed["approvalPolicy"]["gates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|gate| gate["gate"].as_str().unwrap())
+            .collect();
+        assert_eq!(gates, vec![UPGRADE_GATE, PLATFORM_UPGRADE_GATE]);
+    }
+
+    fn platform_role_source() -> &'static [u8] {
+        bundle_file("manifests/platform-upgrade-role.yaml")
+    }
+
+    #[test]
+    fn the_platform_role_lands_in_the_release_namespace_with_no_static_token() {
+        let rendered = render_platform_upgrade_role(platform_role_source(), "curie-prod").unwrap();
+        let text = String::from_utf8(rendered).unwrap();
+        assert!(text.contains("namespace: curie-prod"));
+        assert!(!text.contains("namespace: curie\n"));
+        // The reader and writer identities ship a static token Secret; this one
+        // must not. A namespace-admin-equivalent token that outlives its Job is
+        // the thing this shape exists to avoid.
+        assert!(
+            !text.contains("service-account-token"),
+            "the platform upgrade identity must not get a static token: {text}"
+        );
+    }
+
+    #[test]
+    fn a_widened_platform_role_stops_the_install() {
+        // The manifest is edited far more often than this file. A rule appended
+        // there must fail here rather than be granted silently -- this is the
+        // widest credential the bundle creates.
+        let source = String::from_utf8(platform_role_source().to_vec()).unwrap();
+        let widened = source.replace(
+            "  - apiGroups: [\"\"]\n    resources: [\"pods\", \"events\"]\n    verbs: [\"get\", \"list\", \"watch\"]",
+            "  - apiGroups: [\"\"]\n    resources: [\"pods\", \"events\"]\n    verbs: [\"get\", \"list\", \"watch\"]\n  \
+             - apiGroups: [\"*\"]\n    resources: [\"*\"]\n    verbs: [\"*\"]",
+        );
+        assert_ne!(
+            widened, source,
+            "the fixture no longer matches the manifest"
+        );
+        let error = render_platform_upgrade_role(widened.as_bytes(), "curie-prod").unwrap_err();
+        assert!(
+            error.to_string().contains("rules"),
+            "a widened Role must be refused by name: {error}"
+        );
+    }
+
+    #[test]
+    fn the_platform_cronjob_is_pointed_at_this_install() {
+        let rendered = render_platform_cronjob(
+            PLATFORM_UPGRADE_CRONJOB_YAML,
+            "curie-prod",
+            "curie-prod-release",
+            "acme/widget",
+        )
+        .unwrap();
+        let text = String::from_utf8(rendered).unwrap();
+        assert!(text.contains("namespace: curie-prod"));
+        assert!(text.contains("curie-prod-release"));
+        assert!(text.contains("acme/widget"));
+        // The placeholders the shipped file carries must all be gone; one left
+        // behind is a tool that refuses every call with nothing visibly wrong.
+        assert!(
+            !text.contains("curie-eng/curie"),
+            "the repository placeholder survived: {text}"
+        );
+    }
+
+    #[test]
+    fn the_rendered_cronjob_is_suspended() {
+        // The installer's contract: an upgrade happens when a human approves
+        // one, never on a timer nobody chose.
+        let rendered = render_platform_cronjob(
+            PLATFORM_UPGRADE_CRONJOB_YAML,
+            "curie-prod",
+            "release",
+            "acme/widget",
+        )
+        .unwrap();
+        let text = String::from_utf8(rendered).unwrap();
+        assert!(text.contains("suspend: true"), "{text}");
+    }
+
+    #[test]
+    fn a_renamed_cronjob_stops_the_install() {
+        // The connector is told this name through its own env. Two places free
+        // to disagree is how a verb ends up refusing every call.
+        let source = String::from_utf8(PLATFORM_UPGRADE_CRONJOB_YAML.to_vec()).unwrap();
+        let renamed = source.replace("name: platform-upgrade", "name: something-else");
+        assert_ne!(
+            renamed, source,
+            "the fixture no longer matches the manifest"
+        );
+        let error =
+            render_platform_cronjob(renamed.as_bytes(), "curie-prod", "release", "acme/widget")
+                .unwrap_err();
+        assert!(error.to_string().contains("platform-upgrade"), "{error}");
+    }
+
     fn bundle_file(name: &str) -> &'static [u8] {
         BUNDLE_FILES
             .iter()
@@ -2262,6 +2895,7 @@ mod tests {
             Some("sha256:writefixture"),
             Some(&parsed),
             OBSERVABILITY_NAMESPACE,
+            None,
         )
         .expect("connector declaration renders");
         let declaration: serde_json::Value =
@@ -2323,6 +2957,7 @@ mod tests {
             Some("sha256:writefixture"),
             Some(&[]),
             OBSERVABILITY_NAMESPACE,
+            None,
         )
         .expect("connector declaration renders with no targets");
         let declaration: serde_json::Value =
@@ -2348,6 +2983,7 @@ mod tests {
             None,
             None,
             OBSERVABILITY_NAMESPACE,
+            None,
         )
         .expect("connector declaration renders with the write path out");
         let declaration: serde_json::Value =
@@ -2411,8 +3047,9 @@ mod tests {
 
     #[test]
     fn write_opt_in_keeps_only_the_restart_gate() {
-        let manifest = runtime_plugin_manifest(bundle_file(".claude-plugin/plugin.json"), true)
-            .expect("write manifest renders");
+        let manifest =
+            runtime_plugin_manifest(bundle_file(".claude-plugin/plugin.json"), true, false)
+                .expect("write manifest renders");
         let manifest: serde_json::Value =
             serde_json::from_slice(&manifest).expect("rendered manifest parses");
         let gates = manifest["approvalPolicy"]["gates"].as_array().unwrap();
@@ -2431,6 +3068,7 @@ mod tests {
             Some("sha256:writefixture"),
             Some(&parsed),
             OBSERVABILITY_NAMESPACE,
+            None,
         )
         .expect("connector declaration renders");
         let declaration: serde_json::Value = serde_norway::from_slice(&connectors).unwrap();
@@ -2442,7 +3080,8 @@ mod tests {
         );
 
         let manifest =
-            runtime_plugin_manifest(bundle_file(".claude-plugin/plugin.json"), true).unwrap();
+            runtime_plugin_manifest(bundle_file(".claude-plugin/plugin.json"), true, false)
+                .unwrap();
         let manifest: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
         for gate in manifest["approvalPolicy"]["gates"].as_array().unwrap() {
             let gate = gate["gate"].as_str().unwrap();
@@ -2462,6 +3101,7 @@ mod tests {
             None,
             None,
             OBSERVABILITY_NAMESPACE,
+            None,
         )
         .expect("read only declaration renders");
         let declaration: serde_json::Value = serde_norway::from_slice(&connectors).unwrap();
@@ -2470,7 +3110,8 @@ mod tests {
         assert!(!connectors.contains_key("k8s-scale"));
 
         let manifest =
-            runtime_plugin_manifest(bundle_file(".claude-plugin/plugin.json"), false).unwrap();
+            runtime_plugin_manifest(bundle_file(".claude-plugin/plugin.json"), false, false)
+                .unwrap();
         let manifest: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
         assert!(manifest.get("approvalPolicy").is_none());
     }
@@ -2484,6 +3125,7 @@ mod tests {
             Some("sha256:writefixture"),
             Some(&targets("curie/api")),
             OBSERVABILITY_NAMESPACE,
+            None,
         )
         .expect_err("an unclassified connector must stop the install");
         assert!(error.to_string().contains("mystery"), "{error:#}");
@@ -2498,6 +3140,7 @@ mod tests {
             None,
             None,
             OBSERVABILITY_NAMESPACE,
+            None,
         )
         .expect_err("missing k8s-write must be refused");
         assert!(
@@ -2575,7 +3218,7 @@ mod tests {
 
         for (case, manifest) in cases {
             let source = serde_json::to_vec(&manifest).expect("serialize fixture manifest");
-            let error = match runtime_plugin_manifest(&source, false) {
+            let error = match runtime_plugin_manifest(&source, false, false) {
                 Ok(_) => panic!("{case} must be refused"),
                 Err(error) => error,
             };

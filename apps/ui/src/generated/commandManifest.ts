@@ -4891,6 +4891,18 @@ export const commandManifest = {
                   "required": false
                 },
                 {
+                  "global": false,
+                  "help": "Install the upgrade path: the self-upgrade connector, the platform upgrade Job, and the two identities behind them",
+                  "id": "platform_upgrade",
+                  "long": "platform-upgrade",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                },
+                {
                   "default_values": [
                     "curie"
                   ],
