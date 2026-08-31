@@ -1220,7 +1220,9 @@ def test_sdk_abort_without_runner_interrupt_is_a_classified_failure(reason: str)
     assert isinstance(terminal, Final)
     assert terminal.status is SessionStatus.CLASSIFIED_FAILURE
     root = spans["agent.run"][0]
+    generation = spans["llm.generation"][0]
     assert root.status.status_code is StatusCode.ERROR
+    assert generation.status.status_code is StatusCode.ERROR
     assert root.attributes["curie.phase"] == "provider_wait"
     assert root.attributes["curie.terminal.cause"] == reason
     assert root.attributes["curie.terminal.status"] == "failed"
@@ -1260,8 +1262,11 @@ def test_interrupt_requested_wins_over_error_result_and_sdk_abort_reason() -> No
     terminal = events[-1]
     assert isinstance(terminal, Final)
     assert terminal.status is SessionStatus.IDLE_AWAITING_INPUT
-    root = _spans_by_name(list(exporter.get_finished_spans()))["agent.run"][0]
+    spans = _spans_by_name(list(exporter.get_finished_spans()))
+    root = spans["agent.run"][0]
+    generation = spans["llm.generation"][0]
     assert root.status.status_code is StatusCode.OK
+    assert generation.status.status_code is StatusCode.OK
     assert root.attributes["curie.terminal.cause"] == "interrupt_requested"
     assert root.attributes["curie.terminal.status"] == "cancelled"
 
