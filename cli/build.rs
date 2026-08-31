@@ -1,5 +1,6 @@
 use std::fmt::Write as _;
 use std::path::Path;
+use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-env-changed=CURIE_BUILD_CHANNEL");
@@ -10,7 +11,82 @@ fn main() {
     }
     println!("cargo:rustc-env=CURIE_BUILD_CHANNEL={channel}");
 
+    stamp_repo_commit();
     embed_result_schemas();
+}
+
+/// Stamp the repository HEAD into binaries built from a Git checkout. Source
+/// archives and other no-Git builds deliberately carry no commit provenance.
+fn stamp_repo_commit() {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+    let manifest_dir = Path::new(&manifest_dir);
+
+    // Cargo otherwise has no reason to rerun this build script when only HEAD
+    // moves. Watch both the worktree HEAD and its loose branch ref; packed-refs
+    // covers checkouts whose branch has not been materialized as a loose ref.
+    if let Some(git_dir) = git_output(manifest_dir, &["rev-parse", "--absolute-git-dir"]) {
+        println!("cargo:rerun-if-changed={git_dir}/HEAD");
+    }
+    if let (Some(common_dir), Some(head_ref)) = (
+        git_output(manifest_dir, &["rev-parse", "--git-common-dir"]),
+        git_output(manifest_dir, &["symbolic-ref", "-q", "HEAD"]),
+    ) {
+        let common_dir = Path::new(&common_dir);
+        let common_dir = if common_dir.is_absolute() {
+            common_dir.to_path_buf()
+        } else {
+            manifest_dir.join(common_dir)
+        };
+        println!(
+            "cargo:rerun-if-changed={}",
+            common_dir.join(head_ref).display()
+        );
+        println!(
+            "cargo:rerun-if-changed={}",
+            common_dir.join("packed-refs").display()
+        );
+    }
+
+    // The embedded installer is built from the checkout's working files, so
+    // only claim HEAD provenance when those files match it. This keeps the
+    // build-time override aligned with ordinary deploy provenance discovery.
+    if !git_worktree_is_clean(manifest_dir) {
+        return;
+    }
+
+    let Some(commit) = git_output(manifest_dir, &["rev-parse", "--verify", "HEAD"]) else {
+        return;
+    };
+    if commit.len() == 40 && commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        println!("cargo:rustc-env=CURIE_BUILD_COMMIT={commit}");
+    }
+}
+
+fn git_worktree_is_clean(current_dir: &Path) -> bool {
+    Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(current_dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .output()
+        .is_ok_and(|output| output.status.success() && output.stdout.is_empty())
+}
+
+fn git_output(current_dir: &Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(current_dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 /// Embed every committed CLI result JSON Schema (issue #634) into the binary so a
