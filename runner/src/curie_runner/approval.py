@@ -5,10 +5,12 @@ trigger types, and this module is the runner half of both:
 
 - **Policy gate** (#244): the agent's own logic decides something needs a
   human decision. An in-process SDK MCP tool
-  (``mcp__curie__request_approval``) is carried by every session, so a
-  skill instructs the model to call it with a one-line summary. The call
-  executes no real-world action; it only marks the turn, and the session
-  emits its terminal ``final`` with ``status=awaiting-approval``.
+  (``mcp__curie__request_approval``) is carried when the live MCP surface has
+  a potentially mutating tool or an explicit approval gate. A fully observed
+  surface whose tools all declare ``readOnlyHint=true`` omits it, so a model
+  cannot page a human for an action the session cannot perform. The call
+  executes no real-world action; it only marks the turn, and the session emits
+  its terminal ``final`` with ``status=awaiting-approval``.
 - **Permission gate** (#245): configuration marks a tool as
   approval-required, and the runner intercepts the model-initiated call
   proactively through the SDK ``can_use_tool`` callback -- the replacement
@@ -300,9 +302,12 @@ def _distinct_routes(gate: ApprovalGate | None) -> list[str]:
 
 
 def build_approval_server(
-    gate: ApprovalGate | None = None, *, managed_workspace: bool = False
+    gate: ApprovalGate | None = None,
+    *,
+    managed_workspace: bool = False,
+    include_request_approval: bool = True,
 ) -> McpSdkServerConfig:
-    """The in-process MCP server carrying the approval-request tool.
+    """Build the in-process MCP server carrying applicable approval tools.
 
     Per-gate (#544, Decision B): the tool closes over ``gate`` so it can
     validate the model-supplied ``route`` against the manifest routes the gate
@@ -317,13 +322,17 @@ def build_approval_server(
     ``.strip()``) before comparison so a route that validates green at deploy
     can never fail to match at runtime (#453, the validator/runtime split that
     shipped two silent fail-opens).
+
+    ``include_request_approval=False`` omits only the generic policy gate. A
+    managed workspace still carries ``publish_changes``, whose separate
+    permission gate corresponds to an action the platform can actually perform.
     """
 
     @tool(_TOOL_NAME, _TOOL_DESCRIPTION, _TOOL_SCHEMA)
     async def request_approval(args: dict[str, Any]) -> dict[str, Any]:
         return process_approval_request(gate, args)
 
-    tools = [request_approval]
+    tools = [request_approval] if include_request_approval else []
     if managed_workspace:
 
         @tool(_PUBLISH_TOOL, _PUBLISH_DESCRIPTION, _PUBLISH_SCHEMA)

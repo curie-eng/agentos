@@ -435,7 +435,7 @@ def test_build_runner_forwards_configured_model_to_session_prompt(tmp_path) -> N
         }
     )
     runner = build_runner(config, fake_model=False)
-    options = runner._factory()._options
+    options = anyio.run(runner._factory()._options_factory)
 
     assert options.system_prompt == "Configured model: z-ai/glm-5.2"
 

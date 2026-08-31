@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import sys
 import typing
 from pathlib import Path
 from typing import Any
@@ -69,6 +70,7 @@ from curie_runner import __main__ as boot
 from curie_runner.__main__ import build_runner
 from curie_runner.approval import (
     _DENY_MESSAGE,
+    APPROVAL_SERVER_NAME,
     APPROVAL_SUMMARY_PREFIX,
     ApprovalGate,
     ApprovalPolicyError,
@@ -82,6 +84,7 @@ from curie_runner.session import SessionRunner
 from curie_runner.side_effects import SideEffectClassifier
 
 _BUDGET = '{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}'
+_CAPABILITY_SERVER = Path(__file__).parent / "fixtures" / "mcp_tool_capability_server.py"
 
 
 # --- fixtures: a realistic plugin bundle, not a stub ----------------------------
@@ -718,13 +721,48 @@ class _CapturedSession:
     def __init__(self, options: Any) -> None:
         self.options = options
 
+    async def connect(self) -> None:
+        return None
+
+    async def query(self, _text: str) -> None:
+        return None
+
+    async def interrupt(self) -> None:
+        return None
+
+    async def close(self) -> None:
+        return None
+
+    async def receive_turn(self) -> typing.AsyncIterator[Any]:
+        if False:
+            yield None
+
 
 def _options_from_boot(monkeypatch: pytest.MonkeyPatch, config: RunnerConfig) -> Any:
     monkeypatch.setattr(boot, "ClaudeAgentSession", _CapturedSession)
     runner = build_runner(config)
     session = runner._factory()
-    assert isinstance(session, _CapturedSession)
-    return session.options
+    anyio.run(session.connect)
+    captured = session._session
+    assert isinstance(captured, _CapturedSession)
+    return captured.options
+
+
+def _add_capability_server(plugin_dir: str, mode: str) -> None:
+    Path(plugin_dir, ".mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "operations": {
+                        "command": sys.executable,
+                        "args": [str(_CAPABILITY_SERVER)],
+                        "env": {"CURIE_TEST_TOOL_MODE": mode},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 _BUNDLE_HOOKS = {
@@ -781,6 +819,30 @@ def test_boot_adds_no_approval_matcher_when_nothing_is_gated(
 
     assert [m.matcher for m in options.hooks["PreToolUse"]] == ["Bash"]
     assert options.can_use_tool is None
+
+
+def test_boot_omits_request_approval_for_an_observed_read_only_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plugin_dir = _bundle(tmp_path)
+    _add_capability_server(plugin_dir, "read-only")
+
+    options = _options_from_boot(monkeypatch, _config(plugin_dir))
+
+    assert APPROVAL_SERVER_NAME not in options.mcp_servers
+    assert "operations" not in options.mcp_servers  # plugin-loaded, not platform-mounted
+
+
+def test_boot_keeps_request_approval_for_an_observed_write_capable_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plugin_dir = _bundle(tmp_path)
+    _add_capability_server(plugin_dir, "write")
+
+    options = _options_from_boot(monkeypatch, _config(plugin_dir))
+
+    assert APPROVAL_SERVER_NAME in options.mcp_servers
+    assert options.mcp_servers[APPROVAL_SERVER_NAME]["name"] == APPROVAL_SERVER_NAME
 
 
 # --- J. fake-tier parity: a deny with interrupt=True stops the replay ------------

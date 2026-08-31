@@ -837,6 +837,7 @@ dependencies = [
     { name = "claude-agent-sdk" },
     { name = "curie-telemetry" },
     { name = "curie-telemetry-schema" },
+    { name = "mcp" },
     { name = "opentelemetry-sdk" },
     { name = "plugin-format" },
 ]
@@ -849,6 +850,7 @@ requires-dist = [
     { name = "claude-agent-sdk", specifier = ">=0.2.135" },
     { name = "curie-telemetry", editable = "packages/telemetry" },
     { name = "curie-telemetry-schema", editable = "packages/telemetry-schema" },
+    { name = "mcp", specifier = ">=1.28.1" },
     { name = "opentelemetry-sdk", specifier = ">=1.44.0" },
     { name = "plugin-format", editable = "packages/plugin-format" },
 ]
