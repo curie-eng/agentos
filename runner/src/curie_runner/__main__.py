@@ -234,6 +234,7 @@ def build_runner(
             mcp_servers=resolution.mcp_servers,
             connector_servers=resolution.connector_servers,
             managed_workspace=mounted_workspace is not None,
+            tool_policy=resolution.tool_policy,
         )
         # The third fail-closed boot check (#1852). The two above refuse a policy
         # that cannot be armed as declared; this one refuses a policy that WOULD
