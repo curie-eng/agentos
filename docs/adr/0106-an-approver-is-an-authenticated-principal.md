@@ -10,10 +10,13 @@ and 2) and by the 2026-08-14 comment on
 
 Extends [ADR 0010](0010-approval-gates-and-human-in-the-loop.md) and
 [ADR 0034](0034-approval-authorizers-resolve-membership-in-the-api.md) on the
-one axis neither of them settles. ADR 0010 decided **where** the approval
+identity axis neither of them settles. ADR 0010 decided **where** the approval
 decision runs (server side, at resolution time). ADR 0034 decided **which set**
 answers "is this actor a member". Neither decides **what an actor is**, and the
-whole authorizer stands on that unanswered question.
+whole authorizer stands on that unanswered question. This ADR also supersedes
+ADR 0034's universal self-approval prohibition: set membership remains the
+authorization boundary, but requester inequality is no longer a global
+precondition.
 
 Consumes the canonical principal that
 [Discussion 1049](https://github.com/curie-eng/curie/discussions/1049)
@@ -92,19 +95,19 @@ who authorized a production change, and it records it as a string someone typed.
 #1531 finding 1 reports the other end of the same defect. Self-approval is
 blocked structurally and deliberately: the actor who authored the turn may not
 resolve it, whatever channel they click from, under every approver set, and no
-set is ever asked (`authorizer.py`, the AC2 design). That is correct. But in a
-workspace where the requester is the only human in the channel, **no card can
-ever be approved and there is no override**. Single operator is the common dev
-and homelab shape, so the write path is unusable there out of the box.
+set is ever asked (`authorizer.py`, the AC2 design). That treats every approval
+as a two-person separation-of-duties control. Curie's ordinary approval gate is
+instead an explicit confirmation: an authenticated requester who belongs to the
+configured approver set is authorized to confirm the action. In a workspace
+where the requester is the only human in the channel, the current ordering makes
+the write path unusable despite that authorization.
 
-The two findings are one defect seen from opposite ends. The reporter got past
-the dead end in every approval of that test by resolving through the CLI as a
-second actor. There was no second actor. The assertion hole is the only reason
-the dead end has a workaround, and using the workaround is precisely what turns
-the audit trail into a record of what someone typed. **Fixing either one alone
-makes the other worse**: close the assertion hole and the dead end becomes a
-hard stop, relieve the dead end with an override and the trail stops meaning
-anything at all.
+The reporter got past the dead end by resolving through the CLI as a second
+actor. There was no second actor. That assertion hole turns the audit trail into
+a record of what someone typed. The correct repair separates identity from
+policy: authenticate the principal, then ask the configured approver set whether
+that principal may approve. Requester equality neither grants nor denies that
+membership.
 
 ### What this ADR does not decide
 
@@ -144,7 +147,7 @@ decision: today it resolves anything, as anyone.
 
 **`actor_channel` follows the same rule, or the hole simply moves.** It is
 membership evidence, so an asserted channel defeats a channel bound approver set
-just as an asserted name defeats the self-approval block. A `chat` principal's
+just as an asserted name defeats the identity boundary. A `chat` principal's
 channel is attested by the dispatcher alongside its user id. An `operator`
 principal **asserts no channel at all** and is authorized only by appearing in a
 route's explicit approver list (`ExplicitUsers`, ADR 0034), never by claiming to
@@ -156,28 +159,20 @@ Rows written before this decision migrate as `authenticated: false` with a null
 kind. They are not retro-labeled as anything, because what they actually record
 is an assertion and the trail should keep saying so.
 
-### The single operator dead end is made loud, not opened
+### An authorized requester may approve
 
-**A two party gate cannot be satisfied by one human, and this ADR does not
-pretend otherwise.** No self-approval override flag, no "solo mode" that lets an
-author resolve their own request. What changes is that the platform stops
-accepting a gate it can never satisfy:
+**The approver set is the authorization boundary.** The authorizer always asks
+the selected set whether the authenticated principal may approve, including
+when that principal requested the turn. Membership permits the approval;
+requester equality does not bypass membership and does not veto it. The audit
+row records the same authenticated principal as requester and approver when that
+is what happened.
 
-- **Arming fails at arm time**, with a named reason, when a route's approver set
-  can resolve to no principal other than the agent's own requesters. Today the
-  gate arms cleanly and every card it produces is stranded, which is the worst
-  available ordering: the operator learns the gate is unusable only after a real
-  turn is suspended behind it.
-- **The refusal names the two real answers**: remove the gate, or add a second
-  principal. Under this decision "add a second principal" is a genuine, cheap
-  option (mint a second operator credential for a colleague) rather than the
-  fiction of typing a different name.
-- **A solo operator who holds both a `chat` and an `operator` credential is
-  still one human**, and where the platform knows two principals map to the same
-  person it must treat them as the same actor for the self-approval check.
-  Where it cannot know, the pair of audit rows (`chat` author, `operator`
-  resolver, both authenticated) at least records what happened truthfully, which
-  is strictly more than today's single fabricated name.
+This supersedes only ADR 0034's rule that the self-approval check runs before
+the set is consulted. Its set-selection precedence, fail-closed membership
+resolution, and server-side placement remain unchanged. A deployment that needs
+two-person separation of duties must declare that as a distinct policy; it is
+not implied by an ordinary approval gate and is not introduced by this ADR.
 
 ## Consequences
 
@@ -199,12 +194,11 @@ it under any name preserves the finding. The replacement (mint an operator
 credential once, then resolve without naming yourself) is a strictly smaller
 thing to type.
 
-**Solo installs get a worse first run and an honest one.** A dev who arms a gate
-in a one person workspace now gets a refusal at arm time instead of a card that
-looks approvable. That is a real regression in the demo path and it is the
-correct one: the alternative is a demo that works because the audit trail is
-fiction. The onboarding docs and `curie init` templates should stop arming a
-gate by default on the solo tier.
+**Solo installs remain usable without fictional identities.** A single operator
+who is an authenticated member of the configured approver set may request and
+approve an action. The audit trail says plainly that the same principal did
+both; it does not manufacture a second actor or silently claim two-person
+review.
 
 **Skill tier is unaffected and stays unaffected.** ADR 0077 already holds that
 durable approvals are unavailable there, so there is no principal to invent for
@@ -248,15 +242,12 @@ treating it as a compromise. An approval gate whose trail cannot be trusted is a
 compliance artifact, not a control, and it is worse than no gate because it
 reads as one.
 
-**Add a self-approval override for single operator installs.** A flag, or a
-"solo" install posture, letting the author resolve their own request. Rejected,
-and this is the alternative most likely to be proposed again, because it fixes
-the reported symptom in about ten lines. It is the assertion hole with a nicer
-name: it makes the two party property configurable by the party it constrains,
-and the installs that would enable it are exactly the ones whose operators later
-grow a team and forget it is on. ADR 0034 already refused to let a set skip the
-self-approval check, on the grounds that a convention is not a mechanism; a flag
-is a convention with a config key.
+**Add a solo-mode bypass around the approver set.** Rejected. Authorized
+self-approval is not an override: the requester passes the same authenticated
+membership check as every other approver. A flag that skips that check would
+recreate the assertion hole with a nicer name. Two-person separation of duties,
+when required, belongs in an explicit policy rather than an install-wide bypass
+or an unconditional rule for every gate.
 
 **Bind approvers to Slack identity in the API and drop the concept of a
 principal.** Store Slack user ids as the identity type and have the API verify
