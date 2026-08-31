@@ -605,6 +605,44 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
                     .to_string(),
             );
         }
+        if opts.platform_upgrade {
+            // The widest grant this installer can create, and the reason someone
+            // runs --dry-run at all. Omitting it was the first version of this
+            // flag: the live path applied these four objects and the plan said
+            // nothing, so an operator deciding whether to accept a
+            // namespace-admin-equivalent identity could not see it in the one
+            // output built for that decision.
+            lines.push(format!(
+                "kubectl apply -f examples/sre-bot/manifests/upgrade-role.yaml -- the CONNECTOR's \
+                 identity ({UPGRADER_IDENTITY}): create on jobs, so it can start an upgrade"
+            ));
+            lines.push(format!(
+                "kubectl apply -f examples/sre-bot/manifests/platform-upgrade-role.yaml -- the \
+                 JOB's identity ({PLATFORM_UPGRADER_IDENTITY}) in namespace {}: namespace-admin \
+                 in all but name, because `helm upgrade` rewrites nearly every object the release \
+                 owns. READ THAT FILE. It exists for the ~90s an upgrade runs and the sandbox \
+                 never sees it",
+                identity.namespace
+            ));
+            lines.push(format!(
+                "kubectl apply -f <rendered ConfigMap {PLATFORM_UPGRADE_CONFIGMAP}> -- the upgrade \
+                 script the Job runs, from examples/sre-bot/platform-upgrade/upgrade.sh"
+            ));
+            lines.push(format!(
+                "kubectl apply -f <rendered CronJob {PLATFORM_UPGRADE_CRONJOB_NAME}, suspend: \
+                 true> -- never fires on its own; the gated {PLATFORM_UPGRADE_GATE} creates a Job \
+                 from it when a human approves one"
+            ));
+            lines.push(format!(
+                "kubectl wait --namespace {} --for=jsonpath={{.data.token}} \
+                 secret/{UPGRADER_TOKEN_SECRET} --timeout={READER_TOKEN_TIMEOUT}",
+                identity.namespace
+            ));
+            lines.push(
+                "build the self-upgrade connector kubeconfig in memory from the ServiceAccount token"
+                    .to_string(),
+            );
+        }
         lines.push(
             "render and reconcile the deployed version connectors with the owned Kubernetes kubeconfig Secret override"
                 .to_string(),
