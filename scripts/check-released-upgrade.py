@@ -143,6 +143,23 @@ class SeedAgent:
     approval_route_address: str | None
 
 
+@dataclass(frozen=True)
+class LegacyStateSeed:
+    """The released-shaped general-state row carried through the upgrade."""
+
+    owner_name: str
+    namespace: str
+    key: str
+    value: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class SeedMetadata:
+    """Exact optional rows represented by a rendered seed plan."""
+
+    legacy_state: LegacyStateSeed | None
+
+
 # Three agents, one binding each. The names are prefixed `gate-` so they are
 # unmistakably synthetic, and all three names and all three addresses are
 # distinct so neither the seed nor 0021's backfill can trip
@@ -179,6 +196,16 @@ SEED_FIXTURE: tuple[SeedAgent, ...] = (
         legacy=False,
         approval_route_address=None,
     ),
+)
+
+# One pre-0031 general-state row. Its non-reserved namespace is load-bearing:
+# `memory` and `transcript` are permanently shared reserved state and therefore
+# do not prove that migration 0037 repaired a legacy general-state owner.
+LEGACY_STATE_SEED = LegacyStateSeed(
+    owner_name="gate-valid",
+    namespace="upgrade-gate",
+    key="legacy-shared-state",
+    value={"survived": "released-upgrade"},
 )
 
 
@@ -474,6 +501,7 @@ def _run_readback(
     phase: str,
     ref: str,
     commit: str,
+    seed_metadata: SeedMetadata,
 ) -> CommandResult:
     arguments: list[str] = []
     for agent in SEED_FIXTURE:
@@ -481,6 +509,21 @@ def _run_readback(
         # per agent builds the same two lists a pass per option would.
         arguments.extend(("--expect-agent", agent.name))
         arguments.extend(("--expect-address", agent.address))
+
+    legacy_state = seed_metadata.legacy_state
+    if _candidate_supports_legacy_state(tree):
+        if legacy_state is None:
+            print(
+                "Skipping released-state sentinel: released schema predates "
+                "workflow_state_entries."
+            )
+        else:
+            arguments.extend(("--expect-state-owner", legacy_state.owner_name))
+            arguments.extend(("--expect-state-namespace", legacy_state.namespace))
+            arguments.extend(("--expect-state-key", legacy_state.key))
+            arguments.extend(
+                ("--expect-state-value", json.dumps(legacy_state.value, sort_keys=True))
+            )
 
     return _run_in_tree(
         _readback_command(tree, *arguments),
@@ -515,11 +558,12 @@ def _introspect_columns(database_name: str) -> tuple[ColumnInfo, ...]:
         "SELECT table_name, column_name, is_nullable, "
         "coalesce(column_default, '') FROM information_schema.columns "
         "WHERE table_schema = 'curie' "
-        # The two tables the fixture can write. Narrowing here rather than in the
+        # The tables the fixture can write. Narrowing here rather than in the
         # consumers keeps `_verify_mandatory_columns` honest: it only reports a
         # mandatory column for a table the branch actually fills, so every other
         # table's rows were dead weight the caller had to filter back out.
-        "AND table_name IN ('agents', 'agent_channels') "
+        "AND table_name IN "
+        "('agents', 'agent_channels', 'workflow_state_entries') "
         "ORDER BY table_name, ordinal_position",
     )
     columns: list[ColumnInfo] = []
@@ -618,6 +662,18 @@ def _detect_approval_route_era(released_tree: Path) -> str:
     return APPROVAL_ROUTE_ERA_LEGACY
 
 
+def _candidate_supports_legacy_state(candidate_tree: Path) -> bool:
+    """Whether the candidate contains the exact 0037 repair capability.
+
+    Older candidates used by the pinned self-test must never be asked to import
+    or inspect the newer state model. The revision filename is authoritative:
+    an arbitrary filename beginning with ``0037`` is not the repair.
+    """
+
+    versions = candidate_tree / "apps" / "api" / "alembic" / "versions"
+    return any(path.is_file() for path in versions.glob("0037_*.py"))
+
+
 def _route_literal(agent: SeedAgent, era: str) -> str:
     """Render one `agents.approval_routes` value in `era`'s storage shape.
 
@@ -650,8 +706,9 @@ def _plan_seed_statements(
     columns: tuple[ColumnInfo, ...],
     *,
     approval_route_era: str,
-) -> tuple[str, ...]:
-    """Render the SQL that writes `SEED_FIXTURE` into the released schema.
+    released_state_repaired: bool = False,
+) -> tuple[tuple[str, ...], SeedMetadata]:
+    """Render released-shaped SQL and exact metadata for optional seeded rows.
 
     Branches on `agents.slack_channel` -- the pre/post-0021 discriminator -- for
     the channel binding, and on `approval_route_era` for the route shape. The two
@@ -661,6 +718,12 @@ def _plan_seed_statements(
 
     `approval_route_era` is a required keyword with NO default on purpose. A
     default is a silent wrong-era guess, and a silent wrong-era guess is the bug.
+
+    `released_state_repaired` distinguishes the first upgrade that applies 0037
+    from a later stable-to-candidate direction where the released line already
+    contains it. In the latter direction the sentinel owner is seeded with
+    memory enabled up front: a post-0037 released database could legitimately
+    contain that shared identity, but not under a memory-disabled owner.
 
     Raises `GateError` rather than returning an empty plan when neither binding
     location exists. A seed that no-ops turns the read-back into a vacuous pass,
@@ -680,6 +743,13 @@ def _plan_seed_statements(
     present = {(column.table_name, column.column_name) for column in columns}
     statements: list[str] = []
 
+    if released_state_repaired and ("agents", "memory") not in present:
+        raise GateError(
+            "the released tree contains the 0037 state repair but the released "
+            "schema has no agents.memory column; refusing to fabricate an "
+            "impossible repaired-state seed"
+        )
+
     if ("agents", "slack_channel") in present:
         _verify_mandatory_columns(
             columns,
@@ -692,15 +762,22 @@ def _plan_seed_statements(
             # the era. The legacy era is therefore passed as a constant, NOT
             # forwarded from `approval_route_era`.
             route = _route_literal(agent, APPROVAL_ROUTE_ERA_LEGACY)
-            statements.append(
-                "INSERT INTO curie.agents (id, name, slack_channel, "
-                "approval_routes)\n"
-                f"VALUES (gen_random_uuid(), {_sql_literal(agent.name)}, "
-                f"{_sql_literal(agent.address)}, {route})"
+            insert_columns = "id, name, slack_channel, approval_routes"
+            insert_values = (
+                f"gen_random_uuid(), {_sql_literal(agent.name)}, "
+                f"{_sql_literal(agent.address)}, {route}"
             )
-        return tuple(statements)
-
-    if ("agent_channels", "address") in present:
+            if (
+                released_state_repaired
+                and agent.name == LEGACY_STATE_SEED.owner_name
+            ):
+                insert_columns += ", memory"
+                insert_values += ", TRUE"
+            statements.append(
+                f"INSERT INTO curie.agents ({insert_columns})\n"
+                f"VALUES ({insert_values})"
+            )
+    elif ("agent_channels", "address") in present:
         _verify_mandatory_columns(
             columns,
             filled={
@@ -717,6 +794,14 @@ def _plan_seed_statements(
             # fixture the released code could never have produced, and the
             # candidate's 0034 rejects it as an unknown legacy key (#2098).
             route = _route_literal(agent, approval_route_era)
+            insert_columns = "id, name, approval_routes"
+            insert_values = f"gen_random_uuid(), {_sql_literal(agent.name)}, {route}"
+            if (
+                released_state_repaired
+                and agent.name == LEGACY_STATE_SEED.owner_name
+            ):
+                insert_columns += ", memory"
+                insert_values += ", TRUE"
             # One statement per agent, so the binding is written in the same
             # transaction as the row it belongs to and the new id never has to be
             # round-tripped back through psql. `endpoint` / `adapter` are left
@@ -724,9 +809,8 @@ def _plan_seed_statements(
             # and the one 0024 backfills existing rows to.
             statements.append(
                 "WITH seeded AS (\n"
-                "    INSERT INTO curie.agents (id, name, approval_routes)\n"
-                f"    VALUES (gen_random_uuid(), {_sql_literal(agent.name)}, "
-                f"{route})\n"
+                f"    INSERT INTO curie.agents ({insert_columns})\n"
+                f"    VALUES ({insert_values})\n"
                 "    RETURNING id\n"
                 ")\n"
                 "INSERT INTO curie.agent_channels (id, agent_id, kind, address)\n"
@@ -734,14 +818,53 @@ def _plan_seed_statements(
                 f"{_sql_literal(agent.kind)}, {_sql_literal(agent.address)}\n"
                 "FROM seeded"
             )
-        return tuple(statements)
+    else:
+        raise GateError(
+            "the released schema has neither agents.slack_channel nor an "
+            "agent_channels.address column, so the seed has nowhere to write a "
+            "channel binding; refusing to run a read-back that would pass "
+            "vacuously"
+        )
 
-    raise GateError(
-        "the released schema has neither agents.slack_channel nor an "
-        "agent_channels.address column, so the seed has nowhere to write a "
-        "channel binding; refusing to run a read-back that would pass "
-        "vacuously"
-    )
+    legacy_state: LegacyStateSeed | None = None
+    if any(table == "workflow_state_entries" for table, _column in present):
+        state_filled = {"id", "agent_id", "namespace", "key", "value"}
+        has_binding_scope = (
+            "workflow_state_entries",
+            "binding_scope",
+        ) in present
+        if has_binding_scope:
+            state_filled.add("binding_scope")
+        _verify_mandatory_columns(
+            columns,
+            filled={"workflow_state_entries": state_filled},
+        )
+
+        legacy_state = LEGACY_STATE_SEED
+        insert_columns = "id, agent_id, namespace, key, value"
+        select_values = (
+            "gen_random_uuid(), id, "
+            f"{_sql_literal(legacy_state.namespace)}, "
+            f"{_sql_literal(legacy_state.key)}, "
+            f"{_json_literal(legacy_state.value)}"
+        )
+        if has_binding_scope:
+            insert_columns = "id, agent_id, binding_scope, namespace, key, value"
+            select_values = (
+                "gen_random_uuid(), id, NULL, "
+                f"{_sql_literal(legacy_state.namespace)}, "
+                f"{_sql_literal(legacy_state.key)}, "
+                f"{_json_literal(legacy_state.value)}"
+            )
+        statements.append(
+            "INSERT INTO curie.workflow_state_entries "
+            f"({insert_columns})\n"
+            f"SELECT {select_values}\n"
+            "FROM curie.agents\n"
+            f"WHERE name = {_sql_literal(legacy_state.owner_name)}"
+        )
+
+    return tuple(statements), SeedMetadata(legacy_state=legacy_state)
 
 
 def _seed_released_database(
@@ -749,7 +872,8 @@ def _seed_released_database(
     *,
     phase: str,
     approval_route_era: str,
-) -> None:
+    released_state_repaired: bool = False,
+) -> SeedMetadata:
     """Write the fixture into the released database, between the two upgrades.
 
     Every failure in here is a SETUP fault, not a gate verdict: it raises
@@ -760,9 +884,25 @@ def _seed_released_database(
 
     print(f"=== {phase}: {database_name} ===", flush=True)
     columns = _introspect_columns(database_name)
-    statements = _plan_seed_statements(
-        columns, approval_route_era=approval_route_era
+    statements, metadata = _plan_seed_statements(
+        columns,
+        approval_route_era=approval_route_era,
+        released_state_repaired=released_state_repaired,
     )
+    state_capable = any(
+        column.table_name == "workflow_state_entries" for column in columns
+    )
+    state_statement_planned = any(
+        "curie.workflow_state_entries" in statement for statement in statements
+    )
+    if state_capable and (
+        metadata.legacy_state is None or not state_statement_planned
+    ):
+        raise GateError(
+            "the released schema contains workflow_state_entries but the seed "
+            "planner produced no legacy-state sentinel; refusing a vacuous "
+            "released-state upgrade check"
+        )
     # One psql invocation for the whole plan, not one per row. psql runs a
     # multi-statement simple query inside a single implicit transaction, so the
     # fixture now lands whole or not at all -- and a PARTIAL seed is worse than
@@ -772,9 +912,10 @@ def _seed_released_database(
         description=f"seeding the released database {database_name}",
     )
     print(
-        f"Seeded {len(statements)} released-shaped agent rows into "
+        f"Seeded {len(statements)} released-shaped rows into "
         f"{database_name}."
     )
+    return metadata
 
 
 def _upgrade_pair(
@@ -854,10 +995,11 @@ def _upgrade_pair(
     # The route era is detected HERE, from the released tree, and not from the
     # schema the seed introspects: the 0021 and 0034 eras are independent and a
     # released ref can sit between them (#2098).
-    _seed_released_database(
+    seed_metadata = _seed_released_database(
         database_name,
         phase=SEED_PHASE,
         approval_route_era=_detect_approval_route_era(released_tree),
+        released_state_repaired=_candidate_supports_legacy_state(released_tree),
     )
 
     failure = _walk(candidate_phases)
@@ -870,6 +1012,7 @@ def _upgrade_pair(
         phase=READBACK_PHASE,
         ref=candidate_ref,
         commit=candidate_commit,
+        seed_metadata=seed_metadata,
     )
     return PairResult(READBACK_PHASE, readback.returncode, readback.output)
 

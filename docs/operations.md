@@ -567,6 +567,47 @@ A chart upgrade is a **full** upgrade: anything the new chart does not render is
 deleted. For a Deployment that means a restart. For a StatefulSet it means the
 data too.
 
+### State-identity migration (Alembic revision 0037)
+
+Before upgrading to a release containing revision 0037, take a
+transaction-consistent database backup. The revision restores the shared posture
+for unambiguous legacy general state and makes a NULL `binding_scope` a single
+state identity. Run these **read-only** preflights against the target database
+immediately before the upgrade:
+
+```sql
+-- Every duplicate shared identity, including reserved namespaces.
+SELECT agent_id, namespace, key, count(*) AS row_count
+FROM curie.workflow_state_entries
+WHERE binding_scope IS NULL
+GROUP BY agent_id, namespace, key
+HAVING count(*) > 1
+ORDER BY agent_id, namespace, key;
+
+-- memory=false owners that 0037 would promote, but whose general state is
+-- already split between shared and binding-scoped rows.
+SELECT agents.id AS agent_id,
+       count(*) FILTER (WHERE state.binding_scope IS NULL) AS shared_rows,
+       count(*) FILTER (WHERE state.binding_scope IS NOT NULL) AS isolated_rows
+FROM curie.agents AS agents
+JOIN curie.workflow_state_entries AS state ON state.agent_id = agents.id
+WHERE agents.memory = false
+  AND state.namespace NOT IN ('memory', 'transcript')
+GROUP BY agents.id
+HAVING bool_or(state.binding_scope IS NULL)
+   AND bool_or(state.binding_scope IS NOT NULL)
+ORDER BY agents.id;
+```
+
+Both result sets must be empty. Do not auto-merge a reported row: the database
+cannot choose between state values or versions, nor infer whether a mixed
+agent's general state should be shared or isolated. For each duplicate, inspect
+its values and versions, then explicitly merge or delete until one row remains.
+For each mixed `memory=false` agent, choose shared or isolated policy and
+move/merge every general-state row into that one shape. Re-run the preflights,
+then the upgrade. On any refusal, the whole 0037 transaction rolls back: agent
+flags, state rows, the constraint, and the Alembic revision stay unchanged.
+
 ### Before you upgrade, check what would be removed
 
 ```bash
