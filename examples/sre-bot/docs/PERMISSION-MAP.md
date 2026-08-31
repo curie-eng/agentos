@@ -315,9 +315,21 @@ read as if it had.
 ### Prerequisite, stated rather than worked around
 
 Curie today has approval-required gates and **allow-by-omission**: a published
-tool no gate names is callable, and nothing reports the omission. There is no
-builder-owned deny / approval-required / allow contract with unclassified
-denied by default.
+tool no gate names is callable, and nothing reports the omission.
+
+The builder-owned deny / approval-required / allow contract now EXISTS as a
+bundle format -- `toolPolicy` in `plugin-format`, with class precedence
+(`deny` > `approvalRequired` > `allow`), a versioned `enforcement`
+discriminator, and a docstring stating that a tool no collection matches is
+denied. What is missing is the wiring: nothing outside that package calls
+`classify_tool`, the runner has no reference to it, and the only bundle
+declaring one is a test fixture (curie#2119).
+
+So the prerequisite is half built, and the half that is missing is the half
+that binds. Until something applies the classification where tools are offered
+to the model, the live behaviour is still allow-by-omission and the paragraph
+below still holds -- but the remaining work is wiring an existing contract,
+not designing one.
 
 For entry 1 that gap is survivable, because a repository lint can compare a
 small set of source-carried connectors against the declared gates. For this
