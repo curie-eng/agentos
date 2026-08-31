@@ -244,6 +244,9 @@ impl Installation {
         }
         if let Some(inference) = self.platform.inference {
             out.push(format!("inference.deploy={inference}"));
+            if inference {
+                out.push("inference.persistence.enabled=true".to_string());
+            }
         }
         out
     }
