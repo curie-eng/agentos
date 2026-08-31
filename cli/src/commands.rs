@@ -4534,6 +4534,17 @@ impl PreparedDeploy {
 }
 
 pub async fn prepare_deploy(opts: DeployOpts) -> Result<PreparedDeploy> {
+    prepare_deploy_with_commit_sha(opts, None).await
+}
+
+/// Prepare a deploy with commit provenance supplied by an installer binary.
+/// Ordinary deploys pass no override and continue discovering the clean bundle
+/// checkout's HEAD. The override is deliberately crate-private: it is not a
+/// user-facing way to claim arbitrary provenance.
+async fn prepare_deploy_with_commit_sha(
+    opts: DeployOpts,
+    installer_commit_sha: Option<&str>,
+) -> Result<PreparedDeploy> {
     let plugin_dir = opts
         .plugin_dir
         .canonicalize()
@@ -4600,41 +4611,11 @@ pub async fn prepare_deploy(opts: DeployOpts) -> Result<PreparedDeploy> {
         validate_channel_binding("slack", channel)?;
     }
     let archive = pack_tar_gz(&plugin_dir)?;
-    let git_prefix = tokio::process::Command::new("git")
-        .args(["rev-parse", "--show-prefix"])
-        .current_dir(&plugin_dir)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .output()
-        .await
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|prefix| PathBuf::from(prefix.trim_end_matches(['\r', '\n'])));
-    let git_status = tokio::process::Command::new("git")
-        .args([
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--no-renames",
-            "--untracked-files=all",
-            "--ignored=matching",
-            "--",
-            ".",
-        ])
-        .current_dir(&plugin_dir)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .output()
-        .await
-        .ok();
-    let commit_sha = match (git_prefix, git_status) {
-        (Some(prefix), Some(output))
-            if output.status.success()
-                && git_status_is_clean_for_pack(&plugin_dir, &prefix, &output.stdout) =>
-        {
-            tokio::process::Command::new("git")
-                .args(["rev-parse", "HEAD"])
+    let commit_sha = match installer_commit_sha {
+        Some(commit_sha) => Some(commit_sha.to_string()),
+        None => {
+            let git_prefix = tokio::process::Command::new("git")
+                .args(["rev-parse", "--show-prefix"])
                 .current_dir(&plugin_dir)
                 .env_remove("GIT_DIR")
                 .env_remove("GIT_WORK_TREE")
@@ -4643,10 +4624,45 @@ pub async fn prepare_deploy(opts: DeployOpts) -> Result<PreparedDeploy> {
                 .ok()
                 .filter(|output| output.status.success())
                 .and_then(|output| String::from_utf8(output.stdout).ok())
-                .map(|sha| sha.trim().to_string())
-                .filter(|sha| !sha.is_empty())
+                .map(|prefix| PathBuf::from(prefix.trim_end_matches(['\r', '\n'])));
+            let git_status = tokio::process::Command::new("git")
+                .args([
+                    "status",
+                    "--porcelain=v1",
+                    "-z",
+                    "--no-renames",
+                    "--untracked-files=all",
+                    "--ignored=matching",
+                    "--",
+                    ".",
+                ])
+                .current_dir(&plugin_dir)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .output()
+                .await
+                .ok();
+            match (git_prefix, git_status) {
+                (Some(prefix), Some(output))
+                    if output.status.success()
+                        && git_status_is_clean_for_pack(&plugin_dir, &prefix, &output.stdout) =>
+                {
+                    tokio::process::Command::new("git")
+                        .args(["rev-parse", "HEAD"])
+                        .current_dir(&plugin_dir)
+                        .env_remove("GIT_DIR")
+                        .env_remove("GIT_WORK_TREE")
+                        .output()
+                        .await
+                        .ok()
+                        .filter(|output| output.status.success())
+                        .and_then(|output| String::from_utf8(output.stdout).ok())
+                        .map(|sha| sha.trim().to_string())
+                        .filter(|sha| !sha.is_empty())
+                }
+                _ => None,
+            }
         }
-        _ => None,
     };
     let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
     // Resolve a declared target, if one was named (ADR-0089). The file is sent
@@ -4957,7 +4973,17 @@ pub async fn deploy_prepared(prepared: PreparedDeploy) -> Result<DeployOutput> {
 }
 
 pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
-    deploy_prepared(prepare_deploy(opts).await?).await
+    deploy_with_commit_sha(opts, None).await
+}
+
+/// Installer-only deploy entry point. A stamped binary commit takes precedence
+/// over bundle-directory Git discovery; `None` preserves ordinary deploy
+/// behavior for no-Git builds.
+pub(crate) async fn deploy_with_commit_sha(
+    opts: DeployOpts,
+    installer_commit_sha: Option<&str>,
+) -> Result<DeployOutput> {
+    deploy_prepared(prepare_deploy_with_commit_sha(opts, installer_commit_sha).await?).await
 }
 
 /// Output of `<tier> deploy`: the deployed agent/version/channel/bundle/deployment

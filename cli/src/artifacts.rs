@@ -51,6 +51,14 @@ pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+/// The full repository commit stamped by `build.rs`, when this binary was
+/// built from a Git checkout. Source archives and other no-Git builds return
+/// `None` rather than inventing provenance.
+pub fn commit_sha() -> Option<&'static str> {
+    option_env!("CURIE_BUILD_COMMIT")
+        .filter(|commit| commit.len() == 40 && commit.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
 /// XDG_CACHE_HOME or $HOME/.cache, joined with "curie". Err (never panic) when
 /// neither env var is set, with a message naming the vars + the override flags.
 pub fn cache_root() -> Result<PathBuf> {
