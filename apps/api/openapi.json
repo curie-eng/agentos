@@ -1881,6 +1881,50 @@
         "title": "ChannelTokenRequest",
         "type": "object"
       },
+      "ClusterMessageReplyAck": {
+        "additionalProperties": false,
+        "description": "Acknowledgement for one idempotently stored relay event.",
+        "properties": {
+          "ref": {
+            "title": "Ref",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ref"
+        ],
+        "title": "ClusterMessageReplyAck",
+        "type": "object"
+      },
+      "ClusterMessageReplyPage": {
+        "additionalProperties": false,
+        "description": "Cursor page read by one disconnected ``cluster message`` caller.",
+        "properties": {
+          "events": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Events",
+            "type": "array"
+          },
+          "next_cursor": {
+            "title": "Next Cursor",
+            "type": "integer"
+          },
+          "terminal": {
+            "title": "Terminal",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "events",
+          "next_cursor",
+          "terminal"
+        ],
+        "title": "ClusterMessageReplyPage",
+        "type": "object"
+      },
       "ConnectorManifests": {
         "description": "Kubernetes objects derived from a version's ``connectors.yaml``.\n\nThe API renders; the caller applies. Rendering is a pure function of the\nbundle plus the deployment context the caller supplies, so producing this\nneeds no cluster access and the API's read-only RBAC is untouched\n(ADR-0086, #1063).",
         "properties": {
@@ -8197,6 +8241,75 @@
         ]
       }
     },
+    "/cluster-message-replies/{reply_ref}": {
+      "get": {
+        "operationId": "get_cluster_message_replies_cluster_message_replies__reply_ref__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "reply_ref",
+            "required": true,
+            "schema": {
+              "title": "Reply Ref",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "minimum": 0,
+              "title": "After",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClusterMessageReplyPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Cluster Message Replies",
+        "tags": [
+          "cluster-message-replies"
+        ]
+      }
+    },
     "/config": {
       "get": {
         "operationId": "get_config_config_get",
@@ -9864,6 +9977,76 @@
         "summary": "Get Publication",
         "tags": [
           "publications"
+        ]
+      }
+    },
+    "/v1/internal/cluster-message-replies/{reply_ref}": {
+      "post": {
+        "operationId": "append_cluster_message_reply_v1_internal_cluster_message_replies__reply_ref__post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "reply_ref",
+            "required": true,
+            "schema": {
+              "title": "Reply Ref",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Adapter-Secret",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Adapter-Secret"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "title": "Event",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClusterMessageReplyAck"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Append Cluster Message Reply",
+        "tags": [
+          "internal-cluster-message-replies"
         ]
       }
     },

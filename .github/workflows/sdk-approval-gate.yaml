@@ -1,0 +1,198 @@
+name: SDK approval-gate live proof
+
+# The approval gate has escaped to production three times (#245, #453, #1852).
+# Every automated proof in the tree -- runner/tests/test_approval_gate_enforcement.py,
+# runner/tests/test_gate_shadowing.py, and (as of #2094) the live ladder case
+# case_live_approval_gate_denies -- sits behind FakeModelSession or, for the
+# live case, behind the nightly's cron trigger. None of them re-run on the
+# event that actually produces the regression class #1852 fixed: a bump of
+# `claude-agent-sdk`, the third-party dependency that owns how the real Claude
+# Agent SDK dispatches permission rules against a real model. FakeModelSession
+# cannot exhibit either failure mode (the prose-only-deny hang, or the
+# executed-anyway race) because both are properties of the real SDK's
+# scheduling against a real model, not of anything this repo's code decides.
+#
+# `runner/pyproject.toml` declares `claude-agent-sdk>=0.2.135` -- a floor, not
+# a pin -- and Dependabot groups every Python bump into one weekly PR whose
+# only gate is the offline fake suite above. So today, a `claude-agent-sdk`
+# bump that reintroduces #1852 merges on green CI and is only caught by the
+# next 08:00 UTC nightly, or by a human noticing in production.
+#
+# This workflow closes that gap without paying live-model cost on every PR:
+# `detect` (job below) is a cheap, no-build TOML diff that fires only when the
+# `claude-agent-sdk` entry in `uv.lock` actually changed (tools/sdk-lock-gate);
+# the live job runs the SAME skill-tier ladder case the nightly runs, live,
+# but only when `detect` says so. See the plan at
+# .projects/plans/task-2094-live-approval-gate.md for the full design record.
+
+on:
+  pull_request:
+    branches: [main, next]
+    paths:
+      - "uv.lock"
+      - ".github/workflows/sdk-approval-gate.yaml"
+      - "tools/sdk-lock-gate/**"
+
+permissions:
+  contents: read
+
+jobs:
+  # Cheap and cacheless: no build, no Docker, no credential. Materializes the
+  # base and head uv.lock and asks the pure detector in tools/sdk-lock-gate
+  # whether the resolved claude-agent-sdk entry (or any other line naming it)
+  # actually changed. Fails open (reports changed=true) on anything it cannot
+  # parse -- a missing base file, malformed TOML -- because this gate must
+  # never silently go dark; over-triggering only costs one live run.
+  detect:
+    name: Detect a claude-agent-sdk lock change
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      changed: ${{ steps.detect.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # fetch-depth: 0 pulls this PR's own ref history; the base branch tip
+      # is not guaranteed to be present locally until fetched explicitly.
+      - name: Fetch the base ref
+        run: git fetch origin "${{ github.base_ref }}"
+      # git show can fail legitimately (uv.lock did not exist on the base --
+      # e.g. it was just added). Do not let that fail the step: leave old.lock
+      # absent and let the detector's own fail-open rule (old_text is None ->
+      # changed=true) decide, per tools/sdk-lock-gate's contract.
+      - name: Materialize the base and head uv.lock
+        run: |
+          set -euo pipefail
+          if git show "origin/${{ github.base_ref }}:uv.lock" > old.lock 2>/dev/null; then
+            echo "base uv.lock materialized"
+          else
+            rm -f old.lock
+            echo "uv.lock is absent on the base ref; the detector treats this as a change (fail-open)"
+          fi
+      - id: detect
+        name: Compare the claude-agent-sdk lock entry
+        run: python3 tools/sdk-lock-gate/detect.py --old-file old.lock --new-file uv.lock
+
+  # Runs the SAME skill-tier live case the nightly runs
+  # (case_live_approval_gate_denies in cli/scripts/e2e-ladder.sh, #2094), on
+  # demand, only when detect says the claude-agent-sdk entry actually moved.
+  # Gated on BOTH `needs: [detect]` and the `if:` below -- needs alone still
+  # runs this job (skipped or not) on every uv.lock touch; the if: alone,
+  # without needs, would evaluate before detect's output exists.
+  live-approval-gate:
+    name: Live approval-gate proof (claude-agent-sdk changed)
+    needs: [detect]
+    if: needs.detect.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # No credential means NO PROOF, and no proof must never read as a pass.
+      #
+      # Two routes reach this branch, and neither can be fixed by re-running
+      # the same event: a fork PR, whose `pull_request` run is issued a
+      # GITHUB_TOKEN that cannot read repository secrets at all, and -- the
+      # case this workflow was actually built for -- a Dependabot PR, whose
+      # `pull_request` runs read the separate Dependabot secret store rather
+      # than the regular `secrets.*` one. The ticket's own motivating scenario
+      # is "Dependabot groups every Python bump into one weekly PR", so the
+      # primary trigger for this gate is exactly the one that arrives without
+      # OPENROUTER_API_KEY.
+      #
+      # An earlier revision reported-and-passed here (summary notice, exit 0).
+      # That is the precise defect class this workflow exists to close: a green
+      # check that proved nothing, which is how #1852 shipped in the first
+      # place. A skipped live proof that still reports success lets a
+      # claude-agent-sdk bump merge on a vacuous green, so this step FAILS.
+      # The GITHUB_STEP_SUMMARY notice stays -- it is what tells a maintainer
+      # which trusted path re-establishes the proof -- but the check goes red
+      # until one of them actually runs. Deliberately NOT solved with
+      # `pull_request_target`: that would run untrusted PR code with the live
+      # credential in scope, trading a vacuous green for a secret-exfiltration
+      # vector.
+      #
+      # Because this step FAILS rather than skipping, every later step in this
+      # job is skipped by the implicit `success()` condition: the expensive
+      # build and the live ladder never execute without a credential, and no
+      # per-step condition is needed to arrange that. (An action's own post
+      # step still runs -- those default to `always()` -- which is checkout
+      # cleanup, not proof work.) A step guard here would be unreachable, and
+      # an unreachable guard reads as load-bearing to the next editor.
+      - id: fork_guard
+        name: Require a usable model credential (no credential == no proof, fail)
+        run: |
+          set -euo pipefail
+          if [[ -z "${{ secrets.OPENROUTER_API_KEY }}" ]]; then
+            {
+              echo "### SDK approval-gate live proof DID NOT RUN -- this check is red on purpose"
+              echo ""
+              echo "This PR changes the \`claude-agent-sdk\` entry in \`uv.lock\`. That dependency owns how the real Claude Agent SDK dispatches permission rules against a real model, so it is the one change that can reintroduce the approval-gate escapes of #245, #453 and #1852 -- and no offline fake-model test in this repo can detect either failure mode."
+              echo ""
+              echo "The live approval-gate proof could not run: **no model credential was available to this run**. \`OPENROUTER_API_KEY\` is empty here, which happens for a fork PR (a \`pull_request\` run from a fork is never issued repository secrets) and for a Dependabot PR (those runs read the separate Dependabot secret store). Re-running this same workflow will not change that."
+              echo ""
+              echo "A maintainer must establish the proof by one of:"
+              echo ""
+              echo "1. Run the **Nightly graded parity ladder** workflow (\`.github/workflows/nightly-graded-ladder.yaml\`) manually -- Actions -> Nightly graded parity ladder -> Run workflow -- against this PR's merge result. Its \`default\` matrix leg runs the same skill-tier ladder live (\`CURIE_E2E_LIVE=1\`) and so executes \`case_live_approval_gate_denies\`; the \`model\` input selects the OpenRouter route."
+              echo "2. Push this branch to a branch **in this repository** rather than a fork, and open the PR from there, so this workflow's \`pull_request\` run receives \`OPENROUTER_API_KEY\` and proves the gate itself."
+              echo ""
+              echo "Do not merge on this red check without one of the above. See #2094, #1852, #2068."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error title=Live approval-gate proof did not run::No OPENROUTER_API_KEY is available to this run, so the live claude-agent-sdk approval-gate proof could not execute. Failing rather than reporting a green check that proved nothing -- see the job summary for the two trusted ways to run it." >&2
+            exit 1
+          fi
+      - name: Toolchain
+        working-directory: cli
+        run: rustc --version
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: cli
+      - name: Release build
+        working-directory: cli
+        run: cargo build --release --locked
+      # Image build mirrors nightly-graded-ladder.yaml's ladder-skill-local job
+      # exactly: a named cache-only buildx builder that is NOT made the
+      # default (`use: false`) so the compose-triggered worker-local overlay
+      # build still resolves `:ci-local` FROM bases from the plain docker
+      # builder's daemon store (#697/#791/#803). Only the runner image is
+      # needed -- CURIE_E2E_TIERS=skill boots a bare runner container, not the
+      # compose stack, so no api/worker/ui build here.
+      - name: Set up a cache-only buildx builder (named, NOT the default -- preserves compose FROM, #803)
+        id: laddercache
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          use: false
+      - name: Build the runner image locally (gha layer cache)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: runner/Dockerfile
+          builder: ${{ steps.laddercache.outputs.name }}
+          tags: curie-runner
+          push: false
+          load: true
+          cache-from: type=gha,scope=ladder-runner
+          cache-to: type=gha,mode=max,scope=ladder-runner
+      # Live grading: CURIE_E2E_LIVE drops the fake fixture and the ladder
+      # reads the OpenRouter credential from CURIE_CREDENTIALS (the one env
+      # key the CLI reads; an sk-or- key auto-selects OPENROUTER_BASE_URL).
+      # The secret travels only as this env mapping, never on a run: or argv
+      # line.
+      #
+      # CURIE_E2E_LIVE: "1" is the single most important line in this file --
+      # without it, case_live_approval_gate_denies prints its skip line and
+      # this job runs sealed and green forever while proving nothing about
+      # #1852/#2068.
+      - name: Live approval-gate ladder case (skill rung)
+        env:
+          CURIE_BIN: cli/target/release/curie
+          CURIE_BASE_TAG: ci-local
+          CURIE_E2E_TIERS: skill
+          CURIE_E2E_LIVE: "1"
+          CURIE_CREDENTIALS: ${{ secrets.OPENROUTER_API_KEY }}
+          CURIE_MODEL: z-ai/glm-5.2
+        run: bash cli/scripts/e2e-ladder.sh

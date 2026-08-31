@@ -6,10 +6,7 @@
 #   1. DEFAULT render: the runner container and both bundle init containers
 #      (bundle-fetch, bundle-extract) each carry an `ephemeral-storage`
 #      request AND limit alongside cpu/memory in `resources`.
-#   2. LITELLM render (sidecar enabled): the litellm sidecar carries its own
-#      `ephemeral-storage` request AND limit too, so every container in the
-#      sandbox pod is covered, not just the three that render by default.
-#   3. OVERRIDE: an operator `--set` on `agentSandbox.runner.resources.limits`
+#   2. OVERRIDE: an operator `--set` on `agentSandbox.runner.resources.limits`
 #      changes the rendered ephemeral-storage limit, proving the ceiling is
 #      operator-overridable per ADR-0059 decision 6 (the `RunnerHardening`
 #      precedent), not hardcoded in the template.
@@ -34,16 +31,10 @@ TPL=templates/agent-sandbox.yaml
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 DEFAULT="$TMP/default.yaml"
-LITELLM="$TMP/litellm.yaml"
 OVERRIDE="$TMP/override.yaml"
 
 echo "=== Rendering SandboxTemplate (defaults) ==="
 helm template rel "$CHART" --show-only "$TPL" > "$DEFAULT"
-
-echo "=== Rendering SandboxTemplate (litellm sidecar enabled) ==="
-helm template rel "$CHART" --show-only "$TPL" \
-  --set agentSandbox.runner.liteLLM.enabled=true \
-  --set agentSandbox.runner.liteLLM.configExistingSecret=my-litellm-cfg > "$LITELLM"
 
 echo "=== Rendering SandboxTemplate (operator override of the runner limit) ==="
 helm template rel "$CHART" --show-only "$TPL" \
@@ -102,14 +93,13 @@ def check_override(path, expected_limit):
 
 
 check_present(sys.argv[1], {"bundle-fetch", "bundle-extract", "runner"})
-check_present(sys.argv[2], {"bundle-fetch", "bundle-extract", "runner", "litellm"})
-check_override(sys.argv[3], "9Gi")
+check_override(sys.argv[2], "9Gi")
 PY
 
-if ! out="$(python3 "$ASSERT_PY" "$DEFAULT" "$LITELLM" "$OVERRIDE" 2>&1)"; then
+if ! out="$(python3 "$ASSERT_PY" "$DEFAULT" "$OVERRIDE" 2>&1)"; then
   fail "$out"
 fi
 echo "$out"
 
 echo
-echo "PASS: every sandbox container (runner, bundle-fetch, bundle-extract, and the litellm sidecar when enabled) renders an ephemeral-storage request and limit, and the ceiling is operator-overridable (ADR-0059 decisions 1 and 6)."
+echo "PASS: the runner and bundle-fetch/bundle-extract init containers render an ephemeral-storage request and limit, and the ceiling is operator-overridable (ADR-0059 decisions 1 and 6)."

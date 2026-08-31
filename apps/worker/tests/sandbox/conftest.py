@@ -9,10 +9,12 @@ client is exercised by the env-gated k8scratch e2e in ``test_e2e_k8scratch.py``.
 
 from __future__ import annotations
 
+import os
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 import redis
@@ -27,6 +29,15 @@ from curie_worker.sandbox import (
     SubstrateConfig,
 )
 from curie_worker.sandbox.docker import DockerSandboxClient
+
+
+def pytest_ignore_collect(collection_path: Path, config: pytest.Config) -> bool:
+    """Keep the cluster-only resilience scenario out of default collection."""
+
+    return (
+        collection_path.name == "test_e2e_resilience.py"
+        and os.environ.get("CURIE_SANDBOX_E2E") != "1"
+    )
 
 
 class _FakeBundleStore:

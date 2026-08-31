@@ -1,12 +1,22 @@
-//! Regression for #1812: the no-Slack cluster-message stub must be trusted only
-//! for the lifetime of that command.  These tests drive the real CLI entrypoint;
-//! the fake cluster records mutations and deliberately fails the Valkey tunnel
-//! so the cleanup-on-error path is deterministic and needs no live cluster.
+//! Process-level regression coverage for #2096.
+//!
+//! The compiled CLI talks to fake external cluster boundaries: kubectl owns
+//! real loopback port-forwards, a tiny RESP server records XADD payloads, and a
+//! tiny HTTP server serves the ref-keyed API relay.  The assertions are all on
+//! executable behavior and external state, not private Rust helpers.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::{Duration, Instant};
+
+mod support;
+use support::{serve, Response};
+
+const CHANNEL: &str = "C0EXAMPLE1";
+const API_KEY: &str = "fixture-platform-key";
+const RELAY_ADAPTER: &str = "curie-cluster-message";
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_curie")
@@ -14,78 +24,286 @@ fn bin() -> &'static str {
 
 fn write_tool(dir: &Path, name: &str) -> PathBuf {
     let path = dir.join(name);
-    let body = r#"#!/usr/bin/env python3
+    let body = r###"#!/usr/bin/env python3
+import fcntl
 import json
 import os
+import shlex
+import socket
 import sys
+import threading
+from urllib.parse import parse_qs, urlparse
 
-args = " ".join(sys.argv[1:])
-with open(os.environ["CURIE_TEST_CLUSTER_LOG"], "a", encoding="utf-8") as log:
-    log.write(os.path.basename(sys.argv[0]) + " " + args + "\n")
-
+args = sys.argv[1:]
+tool = os.path.basename(sys.argv[0])
 state_path = os.environ["CURIE_TEST_CLUSTER_STATE"]
-try:
+log_path = os.environ["CURIE_TEST_CLUSTER_LOG"]
+
+with open(log_path, "a", encoding="utf-8") as log:
+    fcntl.flock(log, fcntl.LOCK_EX)
+    log.write(tool + " " + shlex.join(args) + "\n")
+
+def read_state():
     with open(state_path, encoding="utf-8") as state_file:
+        fcntl.flock(state_file, fcntl.LOCK_SH)
+        return json.load(state_file)
+
+def update_state(change):
+    with open(state_path, "r+", encoding="utf-8") as state_file:
+        fcntl.flock(state_file, fcntl.LOCK_EX)
         state = json.load(state_file)
-except FileNotFoundError:
-    state = {"trust": os.environ.get("CURIE_TEST_EXISTING_TRUST"), "holder": None, "version": 1}
-
-def save():
-    with open(state_path, "w", encoding="utf-8") as state_file:
+        result = change(state)
+        state_file.seek(0)
         json.dump(state, state_file)
+        state_file.truncate()
+        return result
 
-if "get deployment curie-dispatcher" in args:
+def read_resp(stream):
+    prefix = stream.read(1)
+    if not prefix:
+        return None
+    line = stream.readline().rstrip(b"\r\n")
+    if prefix == b"*":
+        return [read_resp(stream) for _ in range(int(line))]
+    if prefix == b"$":
+        length = int(line)
+        if length < 0:
+            return None
+        value = stream.read(length)
+        stream.read(2)
+        return value
+    if prefix in (b"+", b":"):
+        return line
+    return None
+
+def bulk(value):
+    value = value.encode("utf-8")
+    return b"$" + str(len(value)).encode() + b"\r\n" + value + b"\r\n"
+
+def redis_reply(command):
+    words = [part.decode("utf-8") if isinstance(part, bytes) else str(part) for part in command]
+    verb = words[0].upper()
+    if verb == "PING":
+        return b"+PONG\r\n"
+    if verb in ("AUTH", "SELECT") or verb == "CLIENT":
+        return b"+OK\r\n"
+    if verb == "XADD":
+        payload = words[words.index("payload") + 1]
+        def append(state):
+            state["next_stream"] += 1
+            stream_id = f'{state["next_stream"]}-0'
+            state["turns"].append({
+                "stream_id": stream_id,
+                "payload": json.loads(payload),
+                "pending": True,
+                "acked": False,
+            })
+            return stream_id
+        return bulk(update_state(append))
+    if verb == "XACK":
+        entry_ids = words[3:]
+        def acknowledge(state):
+            changed = 0
+            for turn in state["turns"]:
+                if turn["stream_id"] in entry_ids and turn["pending"]:
+                    turn["pending"] = False
+                    turn["acked"] = True
+                    changed += 1
+            state["xack_commands"].append(entry_ids)
+            return changed
+        return b":" + str(update_state(acknowledge)).encode() + b"\r\n"
+    if verb == "XINFO" and len(words) > 1 and words[1].upper() == "GROUPS":
+        state = read_state()
+        stream_id = state["turns"][-1]["stream_id"] if state["turns"] else "0-0"
+        pending = sum(1 for turn in state["turns"] if turn["pending"])
+        pairs = [
+            ("name", "curie-workers"),
+            ("consumers", 1),
+            ("pending", pending),
+            ("last-delivered-id", stream_id),
+            ("entries-read", len(state["turns"])),
+            ("lag", 0),
+        ]
+        reply = b"*1\r\n*12\r\n"
+        for key, value in pairs:
+            reply += bulk(key)
+            reply += (b":" + str(value).encode() + b"\r\n") if isinstance(value, int) else bulk(value)
+        return reply
+    if verb == "XPENDING":
+        state = read_state()
+        pending = [turn for turn in state["turns"] if turn["pending"]]
+        if len(words) > 3:
+            reply = b"*" + str(len(pending)).encode() + b"\r\n"
+            for turn in pending:
+                reply += b"*4\r\n" + bulk(turn["stream_id"]) + bulk("worker-fixture") + b":0\r\n:1\r\n"
+            return reply
+        reply = b"*4\r\n:" + str(len(pending)).encode() + b"\r\n"
+        if pending:
+            reply += bulk(pending[0]["stream_id"]) + bulk(pending[-1]["stream_id"])
+            reply += b"*1\r\n*2\r\n" + bulk("worker-fixture") + b":" + str(len(pending)).encode() + b"\r\n"
+        else:
+            reply += b"$-1\r\n$-1\r\n*0\r\n"
+        return reply
+    if verb == "XRANGE":
+        return b"*0\r\n"
+    if verb == "XLEN":
+        return b":1\r\n"
+    if verb == "QUIT":
+        return b"+OK\r\n"
+    return b"-ERR unsupported fixture command " + verb.encode() + b"\r\n"
+
+def serve_redis(client):
+    try:
+        stream = client.makefile("rb")
+        while True:
+            command = read_resp(stream)
+            if command is None:
+                return
+            client.sendall(redis_reply(command))
+    finally:
+        client.close()
+
+def reply_text(payload):
+    if payload["text"] == "alpha":
+        return "reply-alpha"
+    if payload["text"] == "beta":
+        return "reply-beta"
+    return "reply-" + payload["text"]
+
+def relay_body(reply_ref, after):
+    state = read_state()
+    turn = next((item for item in state["turns"] if item["payload"]["reply_handle"].get("placeholder") == reply_ref), None)
+    if turn is None or os.environ.get("CURIE_TEST_RELAY_MODE") == "timeout":
+        return {"events": [], "next_cursor": after, "terminal": False}
+    # The worker owns XACK. Model its terminal ordering explicitly: delivery to
+    # the relay succeeds, then worker ownership leaves the PEL. This is not a
+    # Redis command from the CLI; those are recorded separately above.
+    def worker_xack(state):
+        live = next(item for item in state["turns"] if item["payload"]["reply_handle"].get("placeholder") == reply_ref)
+        if live["pending"]:
+            live["pending"] = False
+            live["acked"] = True
+            state["worker_xacks"].append(live["stream_id"])
+    update_state(worker_xack)
+    payload = turn["payload"]
+    handle = payload["reply_handle"]
+    target = {
+        "kind": handle["kind"],
+        "address": handle["channel"],
+        "conversation_id": payload["conversation_id"],
+        "reply_ref": reply_ref,
+    }
+    events = [
+        {
+            "version": "1.0",
+            "event": "reply.update",
+            "target": target,
+            "text": reply_text(payload),
+            "message": None,
+            "settled": None,
+            "nav": None,
+        },
+        {
+            "version": "1.0",
+            "event": "turn.completed",
+            "target": target,
+            "event_id": payload["event_id"],
+            "outcome": "delivered",
+        },
+    ]
+    return {"events": events[after:], "next_cursor": len(events), "terminal": True}
+
+def serve_http(client):
+    try:
+        stream = client.makefile("rb")
+        request_line = stream.readline().decode("latin1").strip()
+        if not request_line:
+            return
+        method, raw_path, _ = request_line.split(" ", 2)
+        headers = {}
+        while True:
+            line = stream.readline().decode("latin1").rstrip("\r\n")
+            if not line:
+                break
+            key, value = line.split(":", 1)
+            headers[key.lower()] = value.strip()
+        parsed = urlparse(raw_path)
+        prefix = "/cluster-message-replies/"
+        if method == "GET" and parsed.path.startswith(prefix):
+            reply_ref = parsed.path[len(prefix):]
+            after = int(parse_qs(parsed.query).get("after", ["0"])[0])
+            mode = os.environ.get("CURIE_TEST_RELAY_MODE", "reply")
+            def record(state):
+                attempt = state["relay_attempts"].get(reply_ref, 0) + 1
+                state["relay_attempts"][reply_ref] = attempt
+                state["http_gets"].append({
+                    "path": raw_path,
+                    "api_key": headers.get("x-api-key"),
+                    "attempt": attempt,
+                })
+                return attempt
+            attempt = update_state(record)
+            if mode == "404":
+                status = "404 Not Found"
+                body = b'{"detail":"Not Found"}'
+            elif mode == "503_once" and attempt == 1:
+                status = "503 Service Unavailable"
+                body = b'{"detail":"relay temporarily unavailable"}'
+            else:
+                status = "200 OK"
+                body = json.dumps(relay_body(reply_ref, after)).encode("utf-8")
+        else:
+            status = "404 Not Found"
+            body = b'{"detail":"unexpected fixture route"}'
+        client.sendall(
+            f"HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode("ascii") + body
+        )
+    finally:
+        client.close()
+
+def serve_port_forward(component):
+    requested, remote = args[-1].split(":", 1)
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", int(requested)))
+    listener.listen()
+    print(f"Forwarding from 127.0.0.1:{listener.getsockname()[1]} -> {remote}", flush=True)
+    handler = serve_redis if component == "valkey" else serve_http
+    while True:
+        client, _ = listener.accept()
+        threading.Thread(target=handler, args=(client,), daemon=True).start()
+
+if tool == "helm":
+    sys.exit(0)
+
+joined = " ".join(args)
+if "port-forward" in args:
+    serve_port_forward("valkey" if "valkey" in joined else "api")
+
+# Live fullname discovery: the release's labelled API Service exists.
+if "get" in args and "app.kubernetes.io/component=api" in joined:
+    print("acme-release-curie-api", end="")
+    sys.exit(0)
+
+if "get deployment acme-release-curie-dispatcher" in joined:
     if os.environ.get("CURIE_TEST_DISPATCHER_PROBE_FAIL") == "1":
         print("intentional dispatcher probe failure", file=sys.stderr)
         sys.exit(1)
     if os.environ.get("CURIE_TEST_CONNECTED") == "1":
-        print("deployment.apps/curie-dispatcher")
+        print("deployment.apps/acme-release-curie-dispatcher")
     sys.exit(0)
 
-# Model the Deployment snapshot and resourceVersion JSON Patch used by #1812.
-if "get deployment curie-worker" in args and "-o json" in args:
-    env = [] if state["trust"] is None else [{"name":"CURIE_SLACK_TRUSTED_ORIGINS", "value":state["trust"]}]
-    annotations = {} if state["holder"] is None else {"curie.dev/cluster-message-trust-holder":state["holder"]}
-    print(json.dumps({"metadata":{"resourceVersion":str(state["version"]), "annotations":annotations}, "spec":{"template":{"spec":{"containers":[{"name":"worker", "env":env}]}}}}))
-    sys.exit(0)
-if "patch deployment curie-worker" in args:
-    patch = json.loads(sys.argv[sys.argv.index("-p") + 1])
-    for operation in patch:
-        path = operation["path"].replace("~1", "/").replace("~0", "~")
-        if path.endswith("/env"):
-            state["trust"] = next((entry["value"] for entry in operation["value"] if entry.get("name") == "CURIE_SLACK_TRUSTED_ORIGINS"), None)
-        elif path.endswith("/cluster-message-trust-holder"):
-            state["holder"] = operation.get("value") if operation["op"] != "remove" else None
-    state["version"] += 1
-    save()
+# Connected mode reads the worker's configured Slack origin. This read is not a
+# rollout/trust read and must remain on the connected branch.
+if "get deployment" in joined and "app.kubernetes.io/component=worker" in joined and "jsonpath=" in joined:
+    print(os.environ["CURIE_TEST_SLACK_BASE"])
     sys.exit(0)
 
-if "rollout status" in args:
-    sys.exit(0)
-
-if "get pods" in args and "-o json" in args:
-    polls = int(state.get("pod_polls") or 0) + 1
-    state["pod_polls"] = polls
-    save()
-    new_pod = {
-        "metadata": {"name": "curie-worker-new"},
-        "status": {"phase": "Running", "conditions": [{"type": "Ready", "status": "True"}]},
-    }
-    old_pod = {
-        "metadata": {"name": "curie-worker-old", "deletionTimestamp": "2026-08-23T00:00:00Z"},
-        "status": {"phase": "Running", "conditions": [{"type": "Ready", "status": "True"}]},
-    }
-    items = [new_pod, old_pod] if os.environ.get("CURIE_TEST_TERMINATING_WORKER") == "1" and polls == 1 else [new_pod]
-    print(json.dumps({"items": items}))
-    sys.exit(0)
-
-# The Valkey forward fails after temporary trust should have been installed.
-if "port-forward" in args and "valkey" in args:
-    print("intentional Valkey tunnel failure", file=sys.stderr)
-    sys.exit(1)
-
-sys.exit(0)
-"#;
+# Any other call is deliberately refused. In particular, old main's worker
+# Deployment trust read reaches this branch and makes the regression red.
+print("unexpected fake kubectl invocation: " + joined, file=sys.stderr)
+sys.exit(64)
+"###;
     fs::write(&path, body).expect("write fake cluster tool");
     let mut permissions = fs::metadata(&path).expect("stat fake tool").permissions();
     permissions.set_mode(0o755);
@@ -93,229 +311,541 @@ sys.exit(0)
     path
 }
 
-fn run_cluster_message(
-    connected: bool,
-    existing_trust: Option<&str>,
-    dispatcher_probe_fails: bool,
-) -> (Output, Vec<String>, serde_json::Value) {
-    run_cluster_message_with(connected, existing_trust, dispatcher_probe_fails, false)
+struct Fixture {
+    _tools: tempfile::TempDir,
+    state_home: tempfile::TempDir,
+    path: std::ffi::OsString,
+    state_path: PathBuf,
+    log_path: PathBuf,
 }
 
-fn run_cluster_message_with(
-    connected: bool,
-    existing_trust: Option<&str>,
-    dispatcher_probe_fails: bool,
-    terminating_worker: bool,
-) -> (Output, Vec<String>, serde_json::Value) {
-    let tools = tempfile::tempdir().expect("create fake tool directory");
-    write_tool(tools.path(), "kubectl");
-    write_tool(tools.path(), "helm");
-    let log_path = tools.path().join("cluster.log");
-    let state_path = tools.path().join("cluster-state.json");
-    fs::write(
-        &state_path,
-        serde_json::json!({"trust": existing_trust, "holder": null, "version": 1}).to_string(),
-    )
-    .expect("seed fake cluster state");
-    let inherited_path = std::env::var("PATH").unwrap_or_default();
-    let path = format!("{}:{inherited_path}", tools.path().display());
+impl Fixture {
+    fn new() -> Self {
+        let tools = tempfile::tempdir().expect("create fake cluster tool directory");
+        write_tool(tools.path(), "kubectl");
+        write_tool(tools.path(), "helm");
+        let state_home = tempfile::tempdir().expect("create isolated turn-state directory");
+        let state_path = tools.path().join("cluster-state.json");
+        let log_path = tools.path().join("cluster.log");
+        fs::write(
+            &state_path,
+            serde_json::json!({
+                "generation": 41,
+                "pods": ["worker-stable-a", "worker-stable-b"],
+                "next_stream": 100,
+                "turns": [],
+                "http_gets": [],
+                "relay_attempts": {},
+                "xack_commands": [],
+                "worker_xacks": [],
+            })
+            .to_string(),
+        )
+        .expect("seed fake cluster state");
+        fs::write(&log_path, "").expect("seed fake cluster log");
+        let mut paths = vec![tools.path().to_path_buf()];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        Self {
+            _tools: tools,
+            state_home,
+            path: std::env::join_paths(paths).expect("join fake cluster PATH"),
+            state_path,
+            log_path,
+        }
+    }
 
-    let mut command = Command::new(bin());
-    command
+    fn command(&self, cwd: &Path, text: &str, continue_turn: bool) -> Command {
+        let mut command = Command::new(bin());
+        command
+            .args(["cluster", "message", text])
+            .args([
+                "--channel",
+                CHANNEL,
+                "--namespace",
+                "acme-system",
+                "--release",
+                "acme-release",
+                "--chart",
+                "charts/curie",
+                "--listen-host",
+                "127.0.0.1",
+                "--valkey-local-port",
+                "0",
+                "--api-local-port",
+                "0",
+                "--api-key",
+                API_KEY,
+                "--valkey-password",
+                "fixture-valkey-password",
+                "--stream",
+                "curie:test:cluster-message-2096",
+                "--timeout-secs",
+                "3",
+                "--json",
+            ])
+            .current_dir(cwd)
+            .env("PATH", &self.path)
+            .env("CURIE_TEST_CLUSTER_LOG", &self.log_path)
+            .env("CURIE_TEST_CLUSTER_STATE", &self.state_path)
+            .env_remove("CURIE_API_KEY")
+            .env_remove("CURIE_VALKEY_PASSWORD")
+            .env_remove("CURIE_SLACK_BOT_TOKEN");
+        if continue_turn {
+            command.arg("--continue");
+        }
+        command
+    }
+
+    fn run(&self, text: &str, continue_turn: bool) -> Output {
+        self.command(self.state_home.path(), text, continue_turn)
+            .output()
+            .expect("run cluster message")
+    }
+
+    fn state(&self) -> serde_json::Value {
+        serde_json::from_str(
+            &fs::read_to_string(&self.state_path).expect("read fake cluster state"),
+        )
+        .expect("parse fake cluster state")
+    }
+
+    fn log(&self) -> String {
+        fs::read_to_string(&self.log_path).expect("read fake cluster log")
+    }
+}
+
+fn describe(output: &Output) -> String {
+    format!(
+        "status: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+fn json_output(output: &Output) -> serde_json::Value {
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "stdout is not one JSON object ({error}): {}",
+            describe(output)
+        )
+    })
+}
+
+fn assert_canonical_uuid_v4(value: &str) {
+    let parsed = uuid::Uuid::parse_str(value)
+        .unwrap_or_else(|error| panic!("relay ref is not a UUID ({error}): {value}"));
+    assert_eq!(value, parsed.hyphenated().to_string());
+    assert_eq!(value.len(), 36);
+    assert_eq!(value.as_bytes()[14], b'4', "relay ref must be UUIDv4");
+    assert!(
+        value
+            .bytes()
+            .all(|byte| byte == b'-' || byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "relay ref is not canonical lowercase hex: {value}"
+    );
+}
+
+fn assert_relay_turn<'a>(turn: &'a serde_json::Value, expected_text: &str) -> &'a str {
+    assert_eq!(turn["text"], expected_text);
+    let handle = &turn["reply_handle"];
+    assert_eq!(handle["kind"], "slack", "binding kind must remain Slack");
+    assert_eq!(
+        handle["channel"], CHANNEL,
+        "binding address must remain exact"
+    );
+    assert_eq!(handle["adapter"], RELAY_ADAPTER);
+    assert!(
+        handle["endpoint"].is_null(),
+        "worker callback URL must never be serialized: {handle}"
+    );
+    let reply_ref = handle["placeholder"]
+        .as_str()
+        .expect("relay turn carries placeholder/ref");
+    assert_canonical_uuid_v4(reply_ref);
+    reply_ref
+}
+
+fn assert_no_worker_rollout(log: &str, state: &serde_json::Value) {
+    let forbidden: Vec<&str> = log
+        .lines()
+        .filter(|line| {
+            (line.contains("get deployment") && line.contains("worker"))
+                || (line.contains("patch deployment") && line.contains("worker"))
+                || (line.contains("set env") && line.contains("worker"))
+                || (line.contains("rollout status") && line.contains("worker"))
+                || (line.contains("get pods") && line.contains("component=worker"))
+                || (line.starts_with("helm ") && line.contains("worker"))
+        })
+        .collect();
+    assert!(
+        forbidden.is_empty(),
+        "cluster message touched worker rollout state: {forbidden:#?}\n{log}"
+    );
+    assert_eq!(state["generation"], 41, "Deployment generation changed");
+    assert_eq!(
+        state["pods"],
+        serde_json::json!(["worker-stable-a", "worker-stable-b"]),
+        "worker pod identities changed"
+    );
+}
+
+fn assert_no_worker_mutation(log: &str, state: &serde_json::Value) {
+    let forbidden: Vec<&str> = log
+        .lines()
+        .filter(|line| {
+            (line.contains("patch deployment") && line.contains("worker"))
+                || (line.contains("set env") && line.contains("worker"))
+                || (line.contains("rollout status") && line.contains("worker"))
+                || (line.contains("get pods") && line.contains("component=worker"))
+                || (line.starts_with("helm ") && line.contains("worker"))
+        })
+        .collect();
+    assert!(
+        forbidden.is_empty(),
+        "connected cluster message mutated worker rollout state: {forbidden:#?}\n{log}"
+    );
+    assert_eq!(state["generation"], 41);
+    assert_eq!(
+        state["pods"],
+        serde_json::json!(["worker-stable-a", "worker-stable-b"])
+    );
+}
+
+#[test]
+fn two_consecutive_disconnected_turns_reply_without_worker_rollout_or_replacement() {
+    let fixture = Fixture::new();
+    let first = fixture.run("alpha", false);
+    assert!(
+        first.status.success(),
+        "first turn failed: {}",
+        describe(&first)
+    );
+    let first_json = json_output(&first);
+    assert_eq!(first_json["reply"], "reply-alpha");
+
+    let second = fixture.run("beta", true);
+    assert!(
+        second.status.success(),
+        "continued turn failed: {}",
+        describe(&second)
+    );
+    let second_json = json_output(&second);
+    assert_eq!(second_json["reply"], "reply-beta");
+    assert_eq!(second_json["thread"], first_json["thread"]);
+
+    let state = fixture.state();
+    let turns = state["turns"].as_array().expect("recorded turns");
+    assert_eq!(turns.len(), 2, "one XADD per command: {turns:#?}");
+    let first_ref = assert_relay_turn(&turns[0]["payload"], "alpha").to_string();
+    let second_ref = assert_relay_turn(&turns[1]["payload"], "beta").to_string();
+    assert_ne!(first_ref, second_ref, "commands shared a callback ref");
+    assert!(turns
+        .iter()
+        .all(|turn| turn["acked"] == true && turn["pending"] == false));
+    assert_eq!(
+        state["worker_xacks"].as_array().map(Vec::len),
+        Some(2),
+        "only terminal worker delivery clears each PEL owner: {state}"
+    );
+    assert_eq!(
+        state["xack_commands"],
+        serde_json::json!([]),
+        "the CLI must never issue XACK"
+    );
+
+    let gets = state["http_gets"].as_array().expect("recorded relay GETs");
+    assert_eq!(gets.len(), 2, "one terminal poll per ref: {gets:#?}");
+    for (get, reply_ref) in gets.iter().zip([&first_ref, &second_ref]) {
+        assert_eq!(
+            get["path"],
+            format!("/cluster-message-replies/{reply_ref}?after=0")
+        );
+        assert_eq!(get["api_key"], API_KEY);
+    }
+    let log = fixture.log();
+    assert_eq!(
+        log.lines()
+            .filter(|line| line.contains("port-forward") && line.contains("-api"))
+            .count(),
+        2,
+        "each turn must poll through an API loopback port-forward: {log}"
+    );
+    assert_no_worker_rollout(&log, &state);
+}
+
+#[test]
+fn concurrent_commands_receive_only_their_own_ref_and_reply() {
+    let fixture = Fixture::new();
+    let alpha_home = tempfile::tempdir().expect("alpha turn state");
+    let beta_home = tempfile::tempdir().expect("beta turn state");
+    let (alpha, beta) = std::thread::scope(|scope| {
+        let alpha = scope.spawn(|| {
+            fixture
+                .command(alpha_home.path(), "alpha", false)
+                .output()
+                .expect("run alpha")
+        });
+        let beta = scope.spawn(|| {
+            fixture
+                .command(beta_home.path(), "beta", false)
+                .output()
+                .expect("run beta")
+        });
+        (
+            alpha.join().expect("alpha thread"),
+            beta.join().expect("beta thread"),
+        )
+    });
+    assert!(alpha.status.success(), "alpha failed: {}", describe(&alpha));
+    assert!(beta.status.success(), "beta failed: {}", describe(&beta));
+    assert_eq!(json_output(&alpha)["reply"], "reply-alpha");
+    assert_eq!(json_output(&beta)["reply"], "reply-beta");
+
+    let state = fixture.state();
+    let turns = state["turns"].as_array().expect("concurrent turns");
+    let alpha_turn = turns
+        .iter()
+        .find(|turn| turn["payload"]["text"] == "alpha")
+        .expect("alpha payload");
+    let beta_turn = turns
+        .iter()
+        .find(|turn| turn["payload"]["text"] == "beta")
+        .expect("beta payload");
+    assert_ne!(
+        assert_relay_turn(&alpha_turn["payload"], "alpha"),
+        assert_relay_turn(&beta_turn["payload"], "beta"),
+        "concurrent commands shared callback ownership"
+    );
+    assert_no_worker_rollout(&fixture.log(), &state);
+}
+
+#[test]
+fn dispatcher_probe_failure_refuses_before_enqueue_or_mutation() {
+    let fixture = Fixture::new();
+    let output = fixture
+        .command(fixture.state_home.path(), "probe", false)
+        .env("CURIE_TEST_DISPATCHER_PROBE_FAIL", "1")
+        .output()
+        .expect("run failed dispatcher probe");
+    assert!(
+        !output.status.success(),
+        "indeterminate probe must fail closed"
+    );
+    let state = fixture.state();
+    assert_eq!(state["turns"], serde_json::json!([]));
+    assert_eq!(state["http_gets"], serde_json::json!([]));
+    assert_no_worker_rollout(&fixture.log(), &state);
+}
+
+#[test]
+fn nonterminal_relay_timeout_keeps_the_semantic_json_and_needs_no_restore() {
+    let fixture = Fixture::new();
+    let output = fixture
+        .command(fixture.state_home.path(), "timeout", false)
+        .env("CURIE_TEST_RELAY_MODE", "timeout")
+        .output()
+        .expect("run relay timeout");
+    assert_eq!(output.status.code(), Some(3), "{}", describe(&output));
+    assert_eq!(
+        json_output(&output),
+        serde_json::json!({"reply": null, "finalized": false, "timed_out": true})
+    );
+    let state = fixture.state();
+    assert_eq!(state["turns"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        state["turns"][0]["acked"], false,
+        "XADD is not an acknowledgement"
+    );
+    assert_eq!(
+        state["turns"][0]["pending"], true,
+        "timeout leaves worker ownership pending"
+    );
+    assert_eq!(state["worker_xacks"], serde_json::json!([]));
+    assert_eq!(
+        state["xack_commands"],
+        serde_json::json!([]),
+        "process exit must not let the CLI steal worker-owned XACK"
+    );
+    assert_no_worker_rollout(&fixture.log(), &state);
+}
+
+#[test]
+fn generic_fastapi_404_fails_immediately_as_a_stale_platform() {
+    let fixture = Fixture::new();
+    let started = Instant::now();
+    let output = fixture
+        .command(fixture.state_home.path(), "stale", false)
+        .env("CURIE_TEST_RELAY_MODE", "404")
+        .output()
+        .expect("run against an API without the relay route");
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "an unrouted FastAPI 404 is a permanent stale-platform failure, not exit 3 timeout: {}",
+        describe(&output)
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "unrouted 404 must fail before the 3s reply deadline, elapsed {elapsed:?}: {}",
+        describe(&output)
+    );
+    let rendered = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        rendered.to_ascii_lowercase().contains("upgrade")
+            && rendered.contains("cluster-message-replies"),
+        "the error must identify the missing route and tell the operator to upgrade: {rendered}"
+    );
+    let state = fixture.state();
+    assert_eq!(state["turns"].as_array().map(Vec::len), Some(1));
+    assert_eq!(state["turns"][0]["pending"], true);
+    assert_eq!(state["xack_commands"], serde_json::json!([]));
+    assert_no_worker_rollout(&fixture.log(), &state);
+}
+
+#[test]
+fn transient_relay_503_retries_without_duplicate_enqueue_then_replies() {
+    let fixture = Fixture::new();
+    let output = fixture
+        .command(fixture.state_home.path(), "alpha", false)
+        .env("CURIE_TEST_RELAY_MODE", "503_once")
+        .output()
+        .expect("run through one transient relay failure");
+    assert!(
+        output.status.success(),
+        "one transient relay read must recover: {}",
+        describe(&output)
+    );
+    assert_eq!(json_output(&output)["reply"], "reply-alpha");
+
+    let state = fixture.state();
+    assert_eq!(
+        state["turns"].as_array().map(Vec::len),
+        Some(1),
+        "retrying a GET must never repeat XADD: {state}"
+    );
+    assert_eq!(
+        state["http_gets"].as_array().map(Vec::len),
+        Some(2),
+        "the first 503 must be followed by exactly one successful GET: {state}"
+    );
+    assert_eq!(state["http_gets"][0]["attempt"], 1);
+    assert_eq!(state["http_gets"][1]["attempt"], 2);
+    assert_eq!(state["turns"][0]["acked"], true);
+    assert_eq!(state["worker_xacks"].as_array().map(Vec::len), Some(1));
+    assert_eq!(state["xack_commands"], serde_json::json!([]));
+    assert_no_worker_rollout(&fixture.log(), &state);
+}
+
+#[test]
+fn connected_dispatcher_uses_slack_placeholder_and_never_the_relay() {
+    const PLACEHOLDER_TS: &str = "1717171717.000900";
+    let fixture = Fixture::new();
+    let slack = serve(|_request| {
+        Response::json(
+            200,
+            r#"{"ok":true,"ts":"1717171717.000900","channel":"C0EXAMPLE1"}"#,
+        )
+    });
+    let output = fixture
+        .command(fixture.state_home.path(), "connected", false)
+        .env("CURIE_TEST_CONNECTED", "1")
+        .env("CURIE_TEST_SLACK_BASE", &slack.base_url)
+        .env("CURIE_SLACK_BOT_TOKEN", "xoxb-example")
+        .output()
+        .expect("run connected cluster message branch");
+    assert!(output.status.success(), "{}", describe(&output));
+    let emitted = json_output(&output);
+    assert_eq!(emitted["status"], "enqueued");
+    assert_eq!(emitted["channel"], CHANNEL);
+    assert_eq!(emitted["thread"], PLACEHOLDER_TS);
+
+    let posts = slack.recorded();
+    assert_eq!(posts.len(), 1, "connected mode posts one real placeholder");
+    assert_eq!(posts[0].path, "/chat.postMessage");
+    let body: serde_json::Value = serde_json::from_slice(&posts[0].body).expect("Slack JSON body");
+    assert_eq!(body["channel"], CHANNEL);
+
+    let state = fixture.state();
+    assert_eq!(state["turns"].as_array().map(Vec::len), Some(1));
+    let handle = &state["turns"][0]["payload"]["reply_handle"];
+    assert!(
+        handle["adapter"].is_null(),
+        "connected turn selected relay: {handle}"
+    );
+    assert!(
+        handle["endpoint"].is_null(),
+        "connected turn carried callback endpoint: {handle}"
+    );
+    assert_eq!(handle["placeholder"], PLACEHOLDER_TS);
+    assert_eq!(
+        state["http_gets"],
+        serde_json::json!([]),
+        "connected mode must issue zero relay GETs"
+    );
+    let log = fixture.log();
+    assert!(
+        !log.lines()
+            .any(|line| line.contains("port-forward") && line.contains("-api")),
+        "connected mode must not open a relay API tunnel: {log}"
+    );
+    assert_no_worker_mutation(&log, &state);
+}
+
+#[test]
+fn cluster_json_dry_run_hides_callback_endpoint_but_human_plan_names_poll_url() {
+    let json = Command::new(bin())
         .args([
             "cluster",
             "message",
             "hello",
             "--channel",
-            "C0EXAMPLE1",
-            "--chart",
-            "charts/curie",
-            "--listen-host",
-            "10.20.30.40",
-            "--listen-port",
-            "0",
-            "--valkey-local-port",
-            "0",
-            "--api-key",
-            "example-api-key",
-            "--valkey-password",
-            "example-valkey-password",
-            "--timeout-secs",
-            "1",
+            CHANNEL,
+            "--api-local-port",
+            "18157",
+            "--dry-run",
+            "--json",
         ])
         .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/.."))
-        .env("PATH", path)
-        .env("CURIE_TEST_CLUSTER_LOG", &log_path)
-        .env("CURIE_TEST_CLUSTER_STATE", &state_path)
-        .env_remove("CURIE_API_KEY")
-        .env_remove("CURIE_VALKEY_PASSWORD");
-    if connected {
-        command
-            .env("CURIE_TEST_CONNECTED", "1")
-            .env("CURIE_SLACK_BOT_TOKEN", "xoxb-example");
-    }
-    if let Some(existing_trust) = existing_trust {
-        command.env("CURIE_TEST_EXISTING_TRUST", existing_trust);
-    }
-    if dispatcher_probe_fails {
-        command.env("CURIE_TEST_DISPATCHER_PROBE_FAIL", "1");
-    }
-    if terminating_worker {
-        command.env("CURIE_TEST_TERMINATING_WORKER", "1");
-    }
-    let output = command.output().expect("run cluster message");
-    let lines = fs::read_to_string(log_path)
-        .expect("read fake cluster log")
-        .lines()
-        .map(str::to_owned)
-        .collect();
-    let state =
-        serde_json::from_str(&fs::read_to_string(state_path).expect("read fake cluster state"))
-            .expect("parse fake cluster state");
-    (output, lines, state)
-}
-
-fn trust_mutations(lines: &[String]) -> Vec<(usize, &str)> {
-    lines
-        .iter()
-        .enumerate()
-        .filter(|(_, line)| {
-            (line.contains("set env") || line.contains("patch") || line.contains("upgrade"))
-                && (line.contains("CURIE_SLACK_TRUSTED_ORIGINS")
-                    || line.contains("worker.slackTrustedOrigins")
-                    || line.contains("cluster-message-trust-holder"))
-        })
-        .map(|(index, line)| (index, line.as_str()))
-        .collect()
-}
-
-#[test]
-fn disconnected_cluster_message_temporarily_trusts_portless_stub_and_restores_on_error() {
-    let (output, lines, state) = run_cluster_message(false, None, false);
+        .output()
+        .expect("run JSON cluster message dry-run");
+    assert!(json.status.success(), "{}", describe(&json));
+    let payload = json_output(&json);
     assert!(
-        !output.status.success(),
-        "fixture must reach its forced tunnel error"
+        payload["reply_endpoint"].is_null(),
+        "the queue carries no callback endpoint, so JSON must not describe the poll URL as one: {payload}"
     );
 
-    let mutations = trust_mutations(&lines);
-    assert!(
-        mutations.len() >= 2,
-        "stub trust must be installed then restored even when plumbing fails: {lines:#?}"
-    );
-    let (apply_index, apply) = mutations[0];
-    assert!(
-        apply.contains("http://10.20.30.40"),
-        "temporary trust must use the advertised stub host: {apply}"
-    );
-    assert!(
-        !apply.contains("http://10.20.30.40:"),
-        "trusted origins are portless, including for an ephemeral stub port: {apply}"
-    );
-    let forward_index = lines
-        .iter()
-        .position(|line| line.contains("port-forward") && line.contains("valkey"))
-        .expect("message must attempt its Valkey tunnel");
-    let restore_index = mutations.last().expect("restore mutation").0;
-    assert!(
-        apply_index < forward_index,
-        "trust must precede enqueue plumbing: {lines:#?}"
+    let human = Command::new(bin())
+        .args([
+            "cluster",
+            "message",
+            "hello",
+            "--channel",
+            CHANNEL,
+            "--api-local-port",
+            "18157",
+            "--dry-run",
+        ])
+        .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/.."))
+        .output()
+        .expect("run human cluster message dry-run");
+    assert!(human.status.success(), "{}", describe(&human));
+    let plan = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&human.stdout),
+        String::from_utf8_lossy(&human.stderr)
     );
     assert!(
-        restore_index > forward_index,
-        "trust must be restored on error: {lines:#?}"
-    );
-    assert!(
-        state["trust"].is_null(),
-        "the default release must finish with no stub trust env at all: {state}"
-    );
-    assert!(
-        state["holder"].is_null(),
-        "the temporary ownership marker must also be removed: {state}"
-    );
-}
-
-#[test]
-fn disconnected_cluster_message_restores_a_preexisting_trusted_origin() {
-    let original = "https://trusted.example.com";
-    let (output, lines, state) = run_cluster_message(false, Some(original), false);
-    assert!(
-        !output.status.success(),
-        "fixture must reach its forced tunnel error"
-    );
-    assert!(
-        trust_mutations(&lines).len() >= 2,
-        "fixture must exercise apply and cleanup: {lines:#?}"
-    );
-    assert_eq!(
-        state["trust"], original,
-        "cleanup must preserve trust that predated this command"
-    );
-}
-
-#[test]
-fn connected_or_unprobeable_dispatcher_never_mutates_worker_stub_trust() {
-    let (output, lines, state) = run_cluster_message(true, None, false);
-    assert!(
-        !output.status.success(),
-        "fixture must reach its forced tunnel error"
-    );
-    assert!(
-        trust_mutations(&lines).is_empty(),
-        "a Slack-connected release must not receive temporary stub trust: {lines:#?}"
-    );
-    assert!(state["trust"].is_null());
-
-    let (output, lines, state) = run_cluster_message(false, None, true);
-    assert!(
-        !output.status.success(),
-        "fixture must reach its forced tunnel error"
-    );
-    assert!(
-        trust_mutations(&lines).is_empty(),
-        "a failed dispatcher probe is not proof it is safe to mutate worker trust: {lines:#?}"
-    );
-    assert!(state["trust"].is_null());
-}
-
-#[test]
-fn disconnected_cluster_message_waits_out_a_terminating_worker_before_enqueue() {
-    // #1532: the first cluster message rolls the worker to install stub trust.
-    // Enqueue must wait until the outgoing pod is gone, otherwise that
-    // consumer can claim the turn during SIGTERM and strand it for 15 minutes.
-    let (output, lines, state) = run_cluster_message_with(false, None, false, true);
-    assert!(
-        !output.status.success(),
-        "fixture must reach its forced tunnel error"
-    );
-
-    let rollout_index = lines
-        .iter()
-        .position(|line| line.contains("rollout status"))
-        .expect("trust install waits for rollout status");
-    let pod_indices: Vec<usize> = lines
-        .iter()
-        .enumerate()
-        .filter(|(_, line)| line.contains("get pods"))
-        .map(|(index, _)| index)
-        .collect();
-    assert!(
-        pod_indices.len() >= 2,
-        "a terminating worker must be polled until it disappears: {lines:#?}"
-    );
-    let forward_index = lines
-        .iter()
-        .position(|line| line.contains("port-forward") && line.contains("valkey"))
-        .expect("message must attempt its Valkey tunnel");
-    assert!(
-        rollout_index < pod_indices[0],
-        "pod wait follows rollout status: {lines:#?}"
-    );
-    assert!(
-        *pod_indices.last().expect("pod wait") < forward_index,
-        "enqueue plumbing must not start while a terminating worker remains: {lines:#?}"
-    );
-    assert!(
-        state["pod_polls"].as_u64().unwrap_or(0) >= 2,
-        "the terminating snapshot must have been replaced before enqueue: {state}"
+        plan.contains("poll replies at http://127.0.0.1:18157/cluster-message-replies/<uuid-v4>"),
+        "human plan must still explain the separate loopback poll URL: {plan}"
     );
 }

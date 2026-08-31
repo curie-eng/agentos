@@ -29,6 +29,15 @@
 #      mistake was made while developing this change, so it is asserted.
 #   8. `clickhouse.deploy=false` renders nothing, and `persistence.enabled=false`
 #      still gets its `data` emptyDir alongside the new `config` volume.
+#   9. `clickhouse.existingSecret` reaches Langfuse, not just the in-chart
+#      server. Both langfuse containers' CLICKHOUSE_PASSWORD and the StatefulSet's
+#      own must resolve to the SAME named Secret, with the default render still
+#      resolving to the chart's own. Langfuse hardcoded the chart Secret (#2052),
+#      which fails silently in two directions: with `deploy=false` + `host` +
+#      `existingSecret` only Langfuse authenticated against the wrong password,
+#      and with `deploy=true` + `existingSecret` the in-chart server and Langfuse
+#      disagreed about the password entirely (split-brain auth). Either way the
+#      release comes up green and trace ingestion is simply gone.
 #
 # Why this is worth a gate: stock ClickHouse config is sized for a dedicated
 # analytics box, and the chart runs it as an embedded store for kilobytes of
@@ -74,6 +83,7 @@ manifest_for() {
 echo "=== Rendering ClickHouse (defaults) ==="
 render default "$CHART"
 DEFAULT="$(manifest_for "$RENDER_DIR")"
+DEFAULT_TEMPLATES="$RENDER_DIR/curie/templates"
 
 echo "=== Rendering ClickHouse (systemLogs.enabled=true, retentionDays=7) ==="
 render verbose "$CHART" \
@@ -90,6 +100,10 @@ render off "$CHART" \
   --set clickhouse.deploy=false \
   --set clickhouse.host=clickhouse.example.com
 OFF="$RENDER_DIR"
+
+echo "=== Rendering ClickHouse (existingSecret=acme-ch) ==="
+render existing-secret "$CHART" --set clickhouse.existingSecret=acme-ch
+EXISTING_SECRET_TEMPLATES="$RENDER_DIR/curie/templates"
 
 CHECKSUM_VALUES=(
   --set clickhouse.logLevel=warning
@@ -273,6 +287,97 @@ if [[ -d "$OFF" ]] && [[ -n "$(find "$OFF" -type f -path "*/templates/clickhouse
   fail "clickhouse.deploy=false still rendered the ClickHouse manifest"
 fi
 echo "  clickhouse.deploy=false renders no ClickHouse manifest: OK"
+
+# ------------------------------------------------------------------------ 9
+# clickhouse.existingSecret must reach EVERY consumer of the password, not just
+# the in-chart server. Structural check via PyYAML rather than grep: a
+# line-oriented reader silently mis-reads a requoted value or a reordered key.
+DEFAULT_TEMPLATES="$DEFAULT_TEMPLATES" \
+EXISTING_SECRET_TEMPLATES="$EXISTING_SECRET_TEMPLATES" \
+python3 <<'PY'
+import os, sys, yaml
+
+DEFAULT_TEMPLATES = os.environ["DEFAULT_TEMPLATES"]
+BYO_TEMPLATES = os.environ["EXISTING_SECRET_TEMPLATES"]
+
+# `helm template rel <chart>` -> fullname `rel-curie`.
+CHART_SECRET_NAME = "rel-curie-secrets"
+BYO_SECRET_NAME = "acme-ch"
+KEY = "clickhousePassword"
+
+failures = []
+
+
+def containers(obj, acc):
+    if isinstance(obj, dict):
+        if isinstance(obj.get("containers"), list):
+            acc.extend(obj["containers"])
+        for v in obj.values():
+            containers(v, acc)
+    elif isinstance(obj, list):
+        for item in obj:
+            containers(item, acc)
+
+
+def check(aid, manifest, container, expected, ctx):
+    if not os.path.isfile(manifest):
+        failures.append(f"[{aid}] {ctx}: {manifest} did not render")
+        return
+    with open(manifest) as f:
+        docs = [d for d in yaml.safe_load_all(f) if d]
+    found = []
+    containers(docs, found)
+    matched = [c for c in found if isinstance(c, dict) and c.get("name") == container]
+    entries = [e for c in matched for e in (c.get("env") or [])
+               if e.get("name") == "CLICKHOUSE_PASSWORD"]
+    if len(entries) != 1:
+        failures.append(f"[{aid}] {ctx}: CLICKHOUSE_PASSWORD rendered {len(entries)} times "
+                        f"on container {container!r}, expected exactly 1")
+        return
+    ref = (entries[0].get("valueFrom") or {}).get("secretKeyRef")
+    if not ref:
+        failures.append(f"[{aid}] {ctx}: CLICKHOUSE_PASSWORD has no valueFrom.secretKeyRef "
+                        "(an inline value would put the password in the manifest)")
+        return
+    if ref.get("name") != expected:
+        failures.append(f"[{aid}] {ctx}: CLICKHOUSE_PASSWORD secretKeyRef.name = "
+                        f"{ref.get('name')!r}, expected {expected!r}")
+    if ref.get("key") != KEY:
+        failures.append(f"[{aid}] {ctx}: CLICKHOUSE_PASSWORD secretKeyRef.key = "
+                        f"{ref.get('key')!r}, expected {KEY!r}")
+
+
+# 9a/9b: no-regression -- the default render still resolves to the chart Secret,
+# so the escape does not repoint an install that never set existingSecret.
+for i, c in enumerate(("langfuse-web", "langfuse-worker")):
+    check(f"9a{i}", f"{DEFAULT_TEMPLATES}/langfuse.yaml", c, CHART_SECRET_NAME,
+          f"default render, {c}")
+
+# 9c/9d: both langfuse Deployments include the shared env helper separately, so
+# a fix applied to one include site and not the other renders half a release.
+for i, c in enumerate(("langfuse-web", "langfuse-worker")):
+    check(f"9c{i}", f"{BYO_TEMPLATES}/langfuse.yaml", c, BYO_SECRET_NAME,
+          f"clickhouse.existingSecret set, {c}")
+
+# 9e: the in-chart server in the SAME render. With deploy=true + existingSecret,
+# the server and Langfuse reading different Secrets is split-brain auth -- both
+# sides are asserted together so a future edit cannot "fix" the split by
+# breaking the server instead.
+check("9e", f"{BYO_TEMPLATES}/clickhouse.yaml", "clickhouse", BYO_SECRET_NAME,
+      "clickhouse.existingSecret set, in-chart StatefulSet")
+
+if failures:
+    for msg in failures:
+        print(f"FAIL {msg}", file=sys.stderr)
+    print(f"{len(failures)} of 5 assertion-9 checks failed. See #2052: Langfuse "
+          "hardcoded the chart Secret while every other consumer honoured "
+          "clickhouse.existingSecret, so trace ingestion died with the release green.",
+          file=sys.stderr)
+    sys.exit(1)
+
+print("  clickhouse.existingSecret reaches langfuse web+worker and the StatefulSet, "
+      "default unchanged: OK")
+PY
 
 echo
 echo "PASS: ClickHouse self-telemetry defaults are bounded."

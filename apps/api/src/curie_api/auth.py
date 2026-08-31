@@ -55,3 +55,24 @@ async def require_internal_worker_token(
             detail="missing or invalid internal worker token",
             headers={"Cache-Control": "no-store"},
         )
+
+
+async def require_internal_adapter_secret(
+    x_curie_adapter_secret: Annotated[
+        str | None, Header(alias="X-Curie-Adapter-Secret")
+    ] = None,
+) -> None:
+    """Authenticate the built-in reply relay on its adapter-shaped header.
+
+    The credential value is the internal worker token, but the header is
+    deliberately distinct from both the public platform key and credential
+    redemption's worker header.  A caller holding only either public key or a
+    channel-scoped token therefore cannot write synthetic replies.
+    """
+
+    if not verify_internal_worker_token(x_curie_adapter_secret):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="missing or invalid internal adapter secret",
+            headers={"Cache-Control": "no-store"},
+        )

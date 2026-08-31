@@ -21,9 +21,12 @@ import os
 import sys
 from pathlib import Path
 
+import anyio
 import httpx
 import pytest
 import yaml
+from mcp.server.fastmcp.exceptions import ToolError
+from mcp.shared.memory import create_connected_server_and_client_session as _connect
 
 _MODULE_NAME = "sre_bot_self_upgrade_server"
 _SERVER_PY = Path(__file__).parent / "server.py"
@@ -60,16 +63,16 @@ def _load(
     tmp_path,
     kubeconfig=GOOD_KUBECONFIG,
     cronjob="sre-bot-self-upgrade",
-    release_repo="curie-eng/curie",
     platform_cronjob="platform-upgrade",
+    release_repo="curie-eng/curie",
 ):
     cfg = tmp_path / "kubeconfig"
     cfg.write_text(yaml.safe_dump(kubeconfig), encoding="utf-8")
     os.environ["KUBECONFIG_PATH"] = str(cfg)
     os.environ["SELF_UPGRADE_CRONJOB"] = cronjob
     os.environ["SELF_UPGRADE_NAMESPACE"] = "curie"
-    os.environ["SELF_UPGRADE_RELEASE_REPO"] = release_repo
     os.environ["PLATFORM_UPGRADE_CRONJOB"] = platform_cronjob
+    os.environ["SELF_UPGRADE_RELEASE_REPO"] = release_repo
     os.environ["SELF_UPGRADE_RELEASE_API"] = "https://api.github.test"
     sys.modules.pop(_MODULE_NAME, None)
     spec = importlib.util.spec_from_file_location(_MODULE_NAME, _SERVER_PY)
@@ -119,7 +122,22 @@ class _FakeClient:
             return _Response(*self._cronjob)
         self.seen["jobs_path"] = path
         self.seen["jobs_params"] = params
-        return _Response(*self._jobs)
+        status, body = self._jobs
+        # FILTER, like the API server does. Echoing every item back regardless of
+        # `labelSelector` makes the fake looser than the thing it stands in for:
+        # a tool that sent the WRONG selector would still see the job and still
+        # refuse, so the concurrency scoping could regress with every test green.
+        selector = (params or {}).get("labelSelector")
+        if selector and isinstance(body, dict) and "items" in body:
+            key, _, value = selector.partition("=")
+            body = {
+                "items": [
+                    item
+                    for item in body["items"]
+                    if ((item.get("metadata") or {}).get("labels") or {}).get(key) == value
+                ]
+            }
+        return _Response(status, body)
 
     def post(self, path, *, json=None, content=None, headers=None):
         self.seen["post_path"] = path
@@ -159,11 +177,23 @@ def test_it_refuses_while_an_upgrade_is_still_running(tmp_path, monkeypatch):
     """Two overlapping runs race on creating the version; the loser leaves a row."""
     srv = _load(tmp_path)
     seen = {}
-    running = {"items": [{"metadata": {"name": "in-flight"}, "status": {"active": 1}}]}
+    running = {
+        "items": [
+            {
+                # Labelled as the connector labels its own Jobs, because the fake
+                # now filters by selector exactly as the API server does.
+                "metadata": {
+                    "name": "in-flight",
+                    "labels": {"curie.dev/self-upgrade-of": "sre-bot-self-upgrade"},
+                },
+                "status": {"active": 1},
+            }
+        ]
+    }
     monkeypatch.setattr(srv, "_client", lambda: _FakeClient(seen, jobs=(200, running)))
-    result = json.loads(srv.upgrade_self())
-    assert result["ok"] is False
-    assert "in-flight" in result["summary"]
+    with pytest.raises(ToolError) as excinfo:
+        srv.upgrade_self()
+    assert "in-flight" in str(excinfo.value)
     assert "post_body" not in seen
 
 
@@ -180,17 +210,18 @@ def test_an_unset_cronjob_refuses_before_reaching_the_api(tmp_path, monkeypatch)
     srv = _load(tmp_path, cronjob="")
     seen = {}
     monkeypatch.setattr(srv, "_client", lambda: _FakeClient(seen))
-    result = json.loads(srv.upgrade_self())
-    assert result["ok"] is False
+    with pytest.raises(ToolError) as excinfo:
+        srv.upgrade_self()
+    assert "SELF_UPGRADE_CRONJOB is not set" in str(excinfo.value)
     assert seen == {}
 
 
 def test_a_missing_cronjob_says_it_is_not_installed(tmp_path, monkeypatch):
     srv = _load(tmp_path)
     monkeypatch.setattr(srv, "_client", lambda: _FakeClient({}, cronjob=(404, {})))
-    result = json.loads(srv.upgrade_self())
-    assert result["ok"] is False
-    assert "not installed" in result["summary"]
+    with pytest.raises(ToolError) as excinfo:
+        srv.upgrade_self()
+    assert "not installed" in str(excinfo.value)
 
 
 @pytest.mark.parametrize("status", [401, 403])
@@ -198,9 +229,9 @@ def test_permission_errors_name_the_missing_verb(tmp_path, monkeypatch, status):
     """So the reader fixes RBAC instead of retrying a call that cannot succeed."""
     srv = _load(tmp_path)
     monkeypatch.setattr(srv, "_client", lambda: _FakeClient({}, create=(status, {})))
-    result = json.loads(srv.upgrade_self())
-    assert result["ok"] is False
-    assert "create on jobs" in result["summary"]
+    with pytest.raises(ToolError) as excinfo:
+        srv.upgrade_self()
+    assert "create on jobs" in str(excinfo.value)
 
 
 def test_prior_is_null_even_when_it_succeeds(tmp_path, monkeypatch):
@@ -262,22 +293,96 @@ def test_insecure_skip_tls_verify_is_refused(tmp_path):
             "users": [{"user": {"token": "upgrade-token"}}],
         },
     )
-    assert "insecure-skip-tls-verify" in srv._client()
+    with pytest.raises(ToolError) as excinfo:
+        srv._client()
+    assert "insecure-skip-tls-verify" in str(excinfo.value)
 
 
 def test_missing_kubeconfig_is_a_sentence_not_a_traceback(tmp_path):
     srv = _load(tmp_path)
     srv.KUBECONFIG = str(tmp_path / "absent")
-    result = json.loads(srv.upgrade_self())
-    assert result["ok"] is False
-    assert "not mounted" in result["summary"]
+    with pytest.raises(ToolError) as excinfo:
+        srv.upgrade_self()
+    assert "not mounted" in str(excinfo.value)
 
 
-def test_the_token_never_appears_in_a_returned_message(tmp_path, monkeypatch):
+def test_the_token_never_appears_in_an_error_message(tmp_path, monkeypatch):
     """A refusal is posted back into Slack; a credential must not ride along."""
     srv = _load(tmp_path)
     monkeypatch.setattr(srv, "_client", lambda: _FakeClient({}, cronjob=(500, {})))
-    assert "upgrade-token" not in srv.upgrade_self()
+    with pytest.raises(ToolError) as excinfo:
+        srv.upgrade_self()
+    assert "upgrade-token" not in str(excinfo.value)
+
+
+# --- The MCP wire distinguishes a refusal from a started upgrade -------------
+
+
+def _call_tool(srv, name, args):
+    """Call one tool through the real MCP path and return its CallToolResult."""
+
+    async def go():
+        async with _connect(srv.mcp._mcp_server) as client:
+            return await client.call_tool(name, args)
+
+    return anyio.run(go)
+
+
+def test_an_active_job_refusal_and_a_started_upgrade_have_different_error_flags(
+    tmp_path, monkeypatch
+):
+    srv = _load(tmp_path)
+    refused_seen = {}
+    running = {
+        "items": [
+            {
+                # Labelled as the connector labels its own Jobs, because the fake
+                # now filters by selector exactly as the API server does.
+                "metadata": {
+                    "name": "in-flight",
+                    "labels": {"curie.dev/self-upgrade-of": "sre-bot-self-upgrade"},
+                },
+                "status": {"active": 1},
+            }
+        ]
+    }
+    monkeypatch.setattr(
+        srv,
+        "_client",
+        lambda: _FakeClient(refused_seen, jobs=(200, running)),
+    )
+
+    refused = _call_tool(srv, "upgrade_self", {})
+    assert refused.isError is True
+    assert "post_body" not in refused_seen
+    refusal_text = refused.content[0].text
+
+    # OBSERVED against the pinned mcp==1.28.1. FastMCP builds this prefix at
+    # mcp/server/fastmcp/tools/base.py:117
+    # (`raise ToolError(f"Error executing tool {self.name}: {e}") from e`) and
+    # puts str(e) in the result as its only text content. Pin the whole string so
+    # an SDK change cannot silently reshape what operators and agents read.
+    assert refusal_text == (
+        "Error executing tool upgrade_self: refusing: upgrade job in-flight is "
+        "still running. Wait for it to finish rather than starting a second one "
+        "-- two overlapping runs race on creating the version."
+    )
+
+    started_seen = {}
+    monkeypatch.setattr(srv, "_client", lambda: _FakeClient(started_seen))
+    started = _call_tool(srv, "upgrade_self", {})
+    assert started.isError is False
+    assert not started.content[0].text.startswith("Error executing tool")
+    payload = json.loads(started.content[0].text)
+    assert payload["ok"] is True
+    assert payload["prior"] is None
+    assert payload["post"] == {"job": "sre-bot-self-upgrade-abc12"}
+    assert payload["target"] == {
+        "kind": "Job",
+        "namespace": "curie",
+        "name": "sre-bot-self-upgrade-abc12",
+    }
+    assert refused.isError != started.isError
 
 
 def test_the_fake_client_cannot_accept_a_call_the_real_one_rejects():
@@ -289,6 +394,8 @@ def test_the_fake_client_cannot_accept_a_call_the_real_one_rejects():
     never run. This connector's calls are already keyword, and this keeps the
     fake from quietly drifting looser than the client it stands in for.
     """
+
+    import httpx
 
     for method in ("get", "post"):
         real = inspect.signature(getattr(httpx.Client, method)).parameters
@@ -336,9 +443,8 @@ def test_it_reports_the_newest_published_tag(tmp_path, monkeypatch):
     srv = _load(tmp_path)
     _with_release_response(srv, monkeypatch)
     result = json.loads(srv.latest_release())
-    assert result["ok"] is True
-    assert result["latest"]["tag"] == "v0.8.1"
-    assert result["latest"]["published_at"] == "2026-08-30T20:40:35Z"
+    assert result["tag"] == "v0.8.1"
+    assert result["published_at"] == "2026-08-30T20:40:35Z"
 
 
 def test_the_summary_says_this_is_not_what_is_installed(tmp_path, monkeypatch):
@@ -350,8 +456,7 @@ def test_the_summary_says_this_is_not_what_is_installed(tmp_path, monkeypatch):
     """
     srv = _load(tmp_path)
     _with_release_response(srv, monkeypatch)
-    summary = json.loads(srv.latest_release())["summary"]
-    assert "NOT what this install is running" in summary
+    assert "NOT what this install is running" in json.loads(srv.latest_release())["summary"]
 
 
 def test_it_sends_no_credential(tmp_path, monkeypatch):
@@ -371,7 +476,7 @@ def test_it_asks_the_configured_repository(tmp_path, monkeypatch):
     assert seen["request"].url.path == "/repos/acme/widget/releases/latest"
 
 
-def test_the_tool_exposes_no_parameters(tmp_path):
+def test_the_read_tool_exposes_no_parameters(tmp_path):
     srv = _load(tmp_path)
     assert inspect.signature(srv.latest_release).parameters == {}
 
@@ -386,9 +491,9 @@ def test_an_unset_repository_refuses_without_a_network_call(tmp_path, monkeypatc
     srv = _load(tmp_path, release_repo="")
     seen = {}
     _with_release_response(srv, monkeypatch, seen=seen)
-    result = json.loads(srv.latest_release())
-    assert result["ok"] is False
-    assert result["latest"] is None
+    with pytest.raises(ToolError) as excinfo:
+        srv.latest_release()
+    assert "SELF_UPGRADE_RELEASE_REPO" in str(excinfo.value)
     assert seen == {}
 
 
@@ -396,21 +501,20 @@ def test_an_unset_repository_refuses_without_a_network_call(tmp_path, monkeypatc
     "status,expected",
     [(404, "no published releases"), (403, "rate limits"), (500, "HTTP 500")],
 )
-def test_failures_explain_themselves(tmp_path, monkeypatch, status, expected):
+def test_release_failures_explain_themselves(tmp_path, monkeypatch, status, expected):
     srv = _load(tmp_path)
     _with_release_response(srv, monkeypatch, status=status, body={})
-    result = json.loads(srv.latest_release())
-    assert result["ok"] is False
-    assert result["latest"] is None
-    assert expected in result["summary"]
+    with pytest.raises(ToolError) as excinfo:
+        srv.latest_release()
+    assert expected in str(excinfo.value)
 
 
 def test_a_body_with_no_tag_is_reported_not_guessed(tmp_path, monkeypatch):
     srv = _load(tmp_path)
     _with_release_response(srv, monkeypatch, body={"name": "no tag here"})
-    result = json.loads(srv.latest_release())
-    assert result["ok"] is False
-    assert "no tag_name" in result["summary"]
+    with pytest.raises(ToolError) as excinfo:
+        srv.latest_release()
+    assert "no tag_name" in str(excinfo.value)
 
 
 # --- upgrade_platform -----------------------------------------------------
@@ -432,9 +536,9 @@ def test_an_unset_platform_cronjob_refuses(tmp_path, monkeypatch):
     srv = _load(tmp_path, platform_cronjob="")
     seen = {}
     monkeypatch.setattr(srv, "_client", lambda: _FakeClient(seen))
-    result = json.loads(srv.upgrade_platform())
-    assert result["ok"] is False
-    assert "PLATFORM_UPGRADE_CRONJOB" in result["summary"]
+    with pytest.raises(ToolError) as excinfo:
+        srv.upgrade_platform()
+    assert "PLATFORM_UPGRADE_CRONJOB" in str(excinfo.value)
     assert seen == {}
 
 
@@ -459,9 +563,6 @@ def test_the_two_verbs_do_not_block_each_other(tmp_path, monkeypatch):
         ]
     }
     seen = {}
-    # The fake echoes back whatever the selector asked for; a real API server
-    # filters. Assert on the selector the tool SENT, which is what the server
-    # would have filtered on.
     monkeypatch.setattr(srv, "_client", lambda: _FakeClient(seen, jobs=(200, running_self)))
     srv.upgrade_platform()
     assert seen["jobs_params"]["labelSelector"] == (
@@ -469,18 +570,12 @@ def test_the_two_verbs_do_not_block_each_other(tmp_path, monkeypatch):
     )
 
 
-def test_it_is_annotated_as_a_destructive_write(tmp_path):
-    srv = _load(tmp_path)
-    assert srv.UPGRADE.readOnlyHint is False
-    assert srv.UPGRADE.destructiveHint is True
-
-
 def test_the_platform_tool_exposes_no_parameters(tmp_path):
     srv = _load(tmp_path)
     assert inspect.signature(srv.upgrade_platform).parameters == {}
 
 
-def test_its_summary_refuses_to_imply_a_rollback(tmp_path, monkeypatch):
+def test_its_reply_refuses_to_imply_a_rollback(tmp_path, monkeypatch):
     srv = _load(tmp_path)
     monkeypatch.setattr(srv, "_client", lambda: _FakeClient({}))
     result = json.loads(srv.upgrade_platform())

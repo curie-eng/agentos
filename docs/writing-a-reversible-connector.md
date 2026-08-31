@@ -59,12 +59,13 @@ prevent.
 
 **Read before you write, and refuse if you cannot.** An action that happened and
 cannot be undone is worse than one that did not: it leaves the platform holding a
-record it cannot act on. If the read fails, return `ok: false` and do not write.
+record it cannot act on. If the read fails, raise `ToolError` and do not
+write; the MCP response must report the refusal with `isError: true`.
 
-**A refusal reports neither state.** Keep `prior` and `post` null on every
-failure path, so a failed read can never be mistaken for a captured snapshot.
-Return the same shape every time; a caller should never have to guess which keys
-are present.
+**A refusal is an error, not a snapshot.** Raise `ToolError` on every refusal or
+failure path so the MCP response reports `isError: true`; do not return
+`ok: false` JSON or include `prior` or `post`. A successful reversible action
+returns the structured JSON above, including `prior`, `post`, and `target`.
 
 **Never derive the reversal from the forward arguments.** Undoing
 `scale_deployment(replicas=10)` needs the count from *before* the call, which no

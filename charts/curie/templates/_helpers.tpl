@@ -899,10 +899,18 @@ livenessProbe:
   value: http://{{ include "curie.clickhouse.host" . }}:{{ .Values.clickhouse.httpPort }}
 - name: CLICKHOUSE_USER
   value: {{ .Values.clickhouse.auth.username | quote }}
+{{- /* Both of these honour the store's own existingSecret, the same escape
+       clickhouse.yaml:101 and curie.env.valkey already use. They were pinned to
+       the chart Secret while every other consumer read the BYO one, so a
+       `deploy=false` + `host` + `existingSecret` install left Langfuse alone
+       authenticating with the chart-generated password and trace ingestion died
+       silently with the rest of the release healthy. With clickhouse.deploy=true
+       and clickhouse.existingSecret set it was worse: the in-chart server and
+       Langfuse disagreed on the same password (split-brain auth). See #2052. */}}
 - name: CLICKHOUSE_PASSWORD
   valueFrom:
     secretKeyRef:
-      name: {{ include "curie.secretName" . }}
+      name: {{ .Values.clickhouse.existingSecret | default (include "curie.secretName" .) }}
       key: clickhousePassword
 - name: CLICKHOUSE_CLUSTER_ENABLED
   value: {{ .Values.clickhouse.clusterEnabled | quote }}
@@ -913,7 +921,7 @@ livenessProbe:
 - name: REDIS_AUTH
   valueFrom:
     secretKeyRef:
-      name: {{ include "curie.secretName" . }}
+      name: {{ .Values.valkey.existingSecret | default (include "curie.secretName" .) }}
       key: valkeyPassword
 - name: LANGFUSE_S3_EVENT_UPLOAD_BUCKET
   value: {{ .Values.rustfs.bucket | quote }}
@@ -1097,7 +1105,8 @@ true
 
 {{/* ---- Sandbox container hardening (Rail 3) ----
      The identical container-level lockdown applied to the runner and every
-     helper container in the sandbox pod (bundle-fetch, bundle-extract, litellm).
+     helper container in the sandbox pod (bundle-fetch, bundle-extract,
+     workspace-init).
      Extracted so the four copies cannot drift (#493); callers keep their own
      `{{- if $runner.hardening.enabled }}` guard and apply `nindent 10`. This is
      the container securityContext only -- the pod-level securityContext

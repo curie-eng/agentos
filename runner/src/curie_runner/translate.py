@@ -86,10 +86,10 @@ class TurnState:
     # leaves ``side_effect_emitted`` False, so this counter -- not that flag -- is
     # the right "did any tool run" signal.
     tool_call_count: int = 0
-    # The delivered text of the terminal ``final`` for a successful turn, set by
-    # the session loop when a DONE/idle final is produced. It is the assistant
-    # reply recorded into the conversation transcript (#20); left None on a
-    # failure/budget/auth final so those turns are not persisted as history.
+    # The delivered text of a clean DONE terminal ``final``, set by the session
+    # loop. It is the assistant reply recorded into the conversation transcript
+    # (#20); left None for failure, budget, auth, awaiting-approval, and idle
+    # outcomes so those turns are not persisted as history.
     final_text: str | None = None
     # Call id -> tool name, for side-effecting calls whose result has not arrived
     # yet. A tool result lands on a LATER message, so the name has to be

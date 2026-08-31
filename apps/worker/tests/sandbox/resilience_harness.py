@@ -1,10 +1,10 @@
-"""Reusable helpers for the soak and chaos scenario.
+"""Reusable helpers for the sandbox-substrate resilience E2E scenario.
 
 Two layers live here:
 
 - **Pure helpers** (``thread_hash``, ``unique_marker``, ``final_frame``,
   ``collected_text``, ``detect_cross_talk``) have no cluster or subprocess
-  dependency and are unit-tested offline in ``test_harness_unit.py``.
+  dependency and are unit-tested offline in ``test_resilience_harness_unit.py``.
 - **Cluster helpers** (``kubectl``, ``pod_of_sandbox``, ``pod_uid``,
   ``port_forward``, ``get_json``, ``post_event``, ``final_frame`` consumers,
   ``live_sandboxclaims``) mirror ``apps/worker/tests/sandbox/test_e2e_k8scratch.py``
@@ -28,8 +28,8 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
-class SoakConfig:
-    """Frozen knobs for one soak invocation, built from the environment.
+class ResilienceConfig:
+    """Frozen knobs for one resilience E2E invocation, built from the environment.
 
     The namespace, pool, and Valkey defaults match the sandbox e2e template so
     the two suites can share a standing cluster and dev stack.
@@ -46,7 +46,7 @@ class SoakConfig:
     live_creds: bool
 
     @classmethod
-    def from_env(cls) -> SoakConfig:
+    def from_env(cls) -> ResilienceConfig:
         password = os.environ.get("TEST_VALKEY_PW", "valkeypass") or None
         live = bool(
             os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or os.environ.get("ANTHROPIC_API_KEY")
@@ -57,9 +57,9 @@ class SoakConfig:
             valkey_host=os.environ.get("TEST_VALKEY_HOST", "localhost"),
             valkey_port=int(os.environ.get("TEST_VALKEY_PORT", "26379")),
             valkey_password=password,
-            concurrency=int(os.environ.get("CURIE_SOAK_CONCURRENCY", "5")),
-            batch=int(os.environ.get("CURIE_SOAK_BATCH", "3")),
-            runs=int(os.environ.get("CURIE_SOAK_RUNS", "1")),
+            concurrency=int(os.environ.get("CURIE_SANDBOX_E2E_CONCURRENCY", "5")),
+            batch=int(os.environ.get("CURIE_SANDBOX_E2E_BATCH", "3")),
+            runs=int(os.environ.get("CURIE_SANDBOX_E2E_RUNS", "1")),
             live_creds=live,
         )
 
@@ -71,7 +71,7 @@ def thread_hash(thread_key: str) -> str:
     """The sha256[:10] thread hash the worker stamps on claim names and labels.
 
     Mirrors ``SubstrateConfig.claim_name_for`` and the ``curietech.ai/thread-hash``
-    label so the soak can select a thread's cluster-side resources by label.
+    label so the scenario can select a thread's cluster-side resources by label.
     """
 
     return hashlib.sha256(thread_key.encode("utf-8")).hexdigest()[:10]
@@ -125,7 +125,7 @@ def detect_cross_talk(marker: str, other_markers: Sequence[str], text: str) -> b
 # -- cluster helpers (require a configured cluster) --------------------------
 
 
-def kubectl(cfg: SoakConfig, *args: str) -> str:
+def kubectl(cfg: ResilienceConfig, *args: str) -> str:
     """Run a namespaced ``kubectl`` command and return stdout."""
 
     result = subprocess.run(
@@ -138,7 +138,7 @@ def kubectl(cfg: SoakConfig, *args: str) -> str:
     return result.stdout
 
 
-def pod_of_sandbox(cfg: SoakConfig, name: str) -> dict[str, object]:
+def pod_of_sandbox(cfg: ResilienceConfig, name: str) -> dict[str, object]:
     """The pod object for a sandbox (pod name == sandbox name)."""
 
     raw = kubectl(cfg, "get", "pod", name, "-o", "json")
@@ -156,7 +156,7 @@ def pod_uid(pod: dict[str, object]) -> str:
 
 
 @contextlib.contextmanager
-def port_forward(cfg: SoakConfig, pod: str, remote_port: int) -> Iterator[str]:
+def port_forward(cfg: ResilienceConfig, pod: str, remote_port: int) -> Iterator[str]:
     """Port-forward to a sandbox pod and yield the local base URL."""
 
     with socket.socket() as probe:
@@ -208,7 +208,9 @@ def post_event(
         return [json.loads(line) for line in resp.read().splitlines() if line.strip()]
 
 
-def live_sandboxclaims(cfg: SoakConfig, thread_hash_value: str) -> list[dict[str, object]]:
+def live_sandboxclaims(
+    cfg: ResilienceConfig, thread_hash_value: str
+) -> list[dict[str, object]]:
     """SandboxClaim objects tagged with the given thread hash label.
 
     Used to assert exactly one live claim survives a chaos kill and re-claim

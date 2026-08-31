@@ -50,6 +50,7 @@ from typing import Any
 import httpx
 import yaml
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 log = logging.getLogger("k8s-scale-mcp")
@@ -89,7 +90,7 @@ SCALE = ToolAnnotations(
 
 
 def _reply(ok, summary, prior=None, post=None, target=None):
-    """Every return path is this shape, so a caller never has to guess.
+    """Return the successful reversible-snapshot contract as structured JSON.
 
     `prior` is what a restore puts back. `post` is what a restore is checked
     AGAINST -- the platform refuses to restore when the live resource no longer
@@ -97,8 +98,8 @@ def _reply(ok, summary, prior=None, post=None, target=None):
     interchangeable: comparing against `prior` would refuse every undo that is
     safe and permit exactly the one that is not.
 
-    A refusal carries neither, so a failed call can never be mistaken for a
-    captured snapshot.
+    Refusals raise `ToolError` instead, so a failed call cannot be mistaken for
+    a captured snapshot and carries `isError: true` on the MCP wire.
     """
     return json.dumps(
         {"ok": ok, "summary": summary, "prior": prior, "post": post, "target": target},
@@ -106,8 +107,8 @@ def _reply(ok, summary, prior=None, post=None, target=None):
     )
 
 
-def _client() -> Any:
-    """Build an httpx client from the mounted kubeconfig, or return a string.
+def _client() -> httpx.Client:
+    """Build an httpx client from the mounted kubeconfig, or raise `ToolError`.
 
     The kubeconfig is a static one built for this identity (the bundle README's
     write-path section has the assembly steps).
@@ -119,9 +120,11 @@ def _client() -> Any:
         with open(KUBECONFIG, encoding="utf-8") as fh:
             cfg = yaml.safe_load(fh)
     except FileNotFoundError:
-        return f"no kubeconfig at {KUBECONFIG}: the write credential is not mounted"
+        raise ToolError(
+            f"no kubeconfig at {KUBECONFIG}: the write credential is not mounted"
+        ) from None
     except (OSError, yaml.YAMLError) as exc:
-        return f"could not read the kubeconfig at {KUBECONFIG}: {exc}"
+        raise ToolError(f"could not read the kubeconfig at {KUBECONFIG}: {exc}") from exc
 
     try:
         cluster = cfg["clusters"][0]["cluster"]
@@ -129,7 +132,7 @@ def _client() -> Any:
         server = cluster["server"]
         token = user["token"]
     except (KeyError, IndexError, TypeError):
-        return "kubeconfig is missing a cluster server or a user token"
+        raise ToolError("kubeconfig is missing a cluster server or a user token") from None
 
     # Both CA shapes, because a kubeconfig may carry either and getting this
     # wrong fails as CERTIFICATE_VERIFY_FAILED -- which reads like a cluster
@@ -151,19 +154,23 @@ def _client() -> Any:
         try:
             pem = base64.b64decode(ca_data).decode("ascii")
         except (ValueError, TypeError, UnicodeDecodeError) as exc:
-            return f"kubeconfig certificate-authority-data is not a valid base64 PEM: {exc}"
+            raise ToolError(
+                f"kubeconfig certificate-authority-data is not a valid base64 PEM: {exc}"
+            ) from exc
         ctx = ssl.create_default_context()
         try:
             ctx.load_verify_locations(cadata=pem)
         except ssl.SSLError as exc:
-            return f"kubeconfig certificate-authority-data is not a usable CA certificate: {exc}"
+            raise ToolError(
+                f"kubeconfig certificate-authority-data is not a usable CA certificate: {exc}"
+            ) from exc
         verify = ctx
     elif ca_path:
         verify = ca_path
     elif cluster.get("insecure-skip-tls-verify"):
         # Never silently. A write path that skips verification is a write path
         # that can be pointed at an impostor API server.
-        return (
+        raise ToolError(
             "kubeconfig sets insecure-skip-tls-verify; refusing to write over an "
             "unverified connection"
         )
@@ -190,41 +197,36 @@ def scale_deployment(namespace: str, name: str, replicas: int) -> str:
     REVERSIBLE. The reply carries `prior`, the replica count read immediately
     before the patch. Scaling back to that number restores what was there.
 
-    The reply is a JSON object: `ok`, `summary`, `prior`, `post`, `target`.
-    `prior` is what putting this back means; `post` is what the platform compares
-    the live Deployment against before allowing that. A refusal is the same shape
-    with `ok` false and both states null, so a failed read never looks like a
-    snapshot.
+    On success, the reply is a JSON object: `ok`, `summary`, `prior`, `post`,
+    `target`. `prior` is what putting this back means; `post` is what the platform
+    compares the live Deployment against before allowing that. A refusal is a
+    tool error instead, so a failed read never looks like a snapshot.
     """
 
     namespace = (namespace or "").strip()
     name = (name or "").strip()
     if not namespace or not name:
-        return _reply(False, "both namespace and name are required")
+        raise ToolError("both namespace and name are required")
     if isinstance(replicas, bool) or not isinstance(replicas, int):
-        return _reply(False, "replicas must be an integer")
+        raise ToolError("replicas must be an integer")
     if replicas < 0:
-        return _reply(False, "replicas must not be negative")
+        raise ToolError("replicas must not be negative")
     if replicas > MAX_REPLICAS:
-        return _reply(
-            False,
+        raise ToolError(
             f"refusing: {replicas} exceeds this connector's ceiling of "
-            f"{MAX_REPLICAS}. Raising it is an operator change.",
+            f"{MAX_REPLICAS}. Raising it is an operator change."
         )
 
     target = f"{namespace}/{name}"
     if target not in ALLOWLIST:
         permitted = ", ".join(sorted(ALLOWLIST)) or "(none configured)"
-        return _reply(
-            False,
+        raise ToolError(
             f"refusing: {target} is not in this connector's allowlist. "
             f"Permitted: {permitted}. This is a deliberate ceiling -- widening it "
-            "is an operator change, not something to work around.",
+            "is an operator change, not something to work around."
         )
 
     client = _client()
-    if isinstance(client, str):
-        return _reply(False, client)
 
     # The scale subresource, not the Deployment. This is the narrow grant.
     path = f"/apis/apps/v1/namespaces/{namespace}/deployments/{name}/scale"
@@ -232,19 +234,17 @@ def scale_deployment(namespace: str, name: str, replicas: int) -> str:
         with client:
             existing = client.get(path)
             if existing.status_code == 404:
-                return _reply(
-                    False,
-                    f"no Deployment {target}. Check the name with the read-only tools.",
+                raise ToolError(
+                    f"no Deployment {target}. Check the name with the read-only tools."
                 )
             if existing.status_code in (401, 403):
-                return _reply(
-                    False,
+                raise ToolError(
                     f"the write identity may not read the scale of {target} "
-                    f"({existing.status_code}). It needs get on deployments/scale.",
+                    f"({existing.status_code}). It needs get on deployments/scale."
                 )
             if existing.status_code >= 400:
-                return _reply(
-                    False, f"could not read the scale of {target}: {existing.status_code}"
+                raise ToolError(
+                    f"could not read the scale of {target}: {existing.status_code}"
                 )
             try:
                 prior_replicas = (existing.json().get("spec") or {}).get("replicas")
@@ -254,10 +254,9 @@ def scale_deployment(namespace: str, name: str, replicas: int) -> str:
                 # No trustworthy prior state means no snapshot. Refusing here
                 # rather than writing anyway keeps "the action happened" and
                 # "we know how to undo it" from drifting apart.
-                return _reply(
-                    False,
+                raise ToolError(
                     f"could not read a replica count for {target}; refusing to "
-                    "scale without a prior state to restore",
+                    "scale without a prior state to restore"
                 )
 
             # KEYWORD arguments. `httpx.Client.patch` is
@@ -278,15 +277,14 @@ def scale_deployment(namespace: str, name: str, replicas: int) -> str:
                 headers={"Content-Type": "application/merge-patch+json"},
             )
             if patched.status_code in (401, 403):
-                return _reply(
-                    False,
+                raise ToolError(
                     f"the write identity may not scale {target} "
-                    f"({patched.status_code}). It needs patch on deployments/scale.",
+                    f"({patched.status_code}). It needs patch on deployments/scale."
                 )
             if patched.status_code >= 400:
-                return _reply(False, f"scale refused for {target}: {patched.status_code}")
+                raise ToolError(f"scale refused for {target}: {patched.status_code}")
     except httpx.HTTPError as exc:
-        return _reply(False, f"could not reach the API server for {target}: {exc}")
+        raise ToolError(f"could not reach the API server for {target}: {exc}") from exc
 
     return _reply(
         True,

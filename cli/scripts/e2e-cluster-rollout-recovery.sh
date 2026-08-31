@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# QA4-02: first-message rollout ordering plus dead-consumer PEL recovery.
+# QA4-02: rollout-free first message plus dead-consumer PEL recovery.
 #
 # This deployed test drives the public CLI, worker Deployment, a namespaced
 # SandboxTemplate/SandboxClaim, Valkey PEL, and the reply stub. It never mutates
@@ -7,7 +7,7 @@
 #
 # This is intentionally a CI-owned script rather than another public `curie
 # dev` verb: it requires a preinstalled disposable release plus test-only live
-# Deployment/SandboxTemplate mutations. `curie dev e2e-ladder` remains the
+# Deployment/SandboxTemplate mutations for the recovery phase. `curie dev e2e-ladder` remains the
 # stable contributor-facing cluster surface and CI owns this narrow phase.
 #
 # Optional red-on-revert knobs (normal CI leaves these unset):
@@ -38,14 +38,12 @@ SANDBOX_HOLD_VALUE="blocked"
 STAGING_BUDGET_SECONDS=120
 MESSAGE_TIMEOUT_SECONDS=300
 RECOVERY_BUDGET_SECONDS=180
-PRE_ENQUEUE_OBSERVATION_SECONDS=20
 WORKDIR="$(mktemp -d)"
 ORIGINAL_TEMPLATE_FILE="$WORKDIR/sandbox-template.original.json"
 CLAIMS_BEFORE_FILE="$WORKDIR/claims.before"
 SANDBOXES_BEFORE_FILE="$WORKDIR/sandboxes.before"
 FIRST_PID=""
 SECOND_PID=""
-GATEKEEPER_PID=""
 TRANSFER_WATCHER_PID=""
 BLOCKED_CLAIM=""
 DEPLOYMENT_PATCHED=0
@@ -156,8 +154,6 @@ restore_worker_deployment() {
     done < <(kubectl -n "$NAMESPACE" get pods \
         -l "app.kubernetes.io/instance=$RELEASE,app.kubernetes.io/component=worker" \
         -o name 2>/dev/null | sed 's#^pod/##')
-    stop_pid "$GATEKEEPER_PID"
-    GATEKEEPER_PID=""
     kubectl -n "$NAMESPACE" rollout undo "deployment/$WORKER_DEPLOYMENT" \
         --to-revision="$ORIGINAL_REVISION" >/dev/null
     kubectl -n "$NAMESPACE" rollout status "deployment/$WORKER_DEPLOYMENT" \
@@ -222,7 +218,6 @@ cleanup() {
             --ignore-not-found --wait=false >/dev/null 2>&1 || true
     fi
     restore_worker_deployment || true
-    stop_pid "$GATEKEEPER_PID"
     kubectl -n "$NAMESPACE" delete configmap "$GATE_CONFIGMAP" \
         --ignore-not-found >/dev/null 2>&1 || true
     rm -rf -- "$WORKDIR"
@@ -359,22 +354,59 @@ for pod in json.load(sys.stdin).get("items",[]):
     return 1
 }
 
-wait_for_new_worker_pod() {
-    local old="$1" budget="$2" started=$SECONDS pod
-    while (( SECONDS - started < budget )); do
-        pod="$(worker_pods_json | python3 -c '
-import json,sys
-old=sys.argv[1]
-for pod in json.load(sys.stdin).get("items",[]):
-    name=pod["metadata"]["name"]
-    if name != old and not pod["metadata"].get("deletionTimestamp"):
-        print(name); break
-' "$old")"
-        if [[ -n "$pod" ]]; then printf '%s\n' "$pod"; return 0; fi
+wait_worker_pod_gone() {
+    local pod="$1" budget="$2" started=$SECONDS resource
+    while true; do
+        if ! resource="$(kubectl -n "$NAMESPACE" get pod "$pod" \
+            --ignore-not-found -o name)"; then
+            echo "error: could not observe worker pod $pod during rollout" >&2
+            return 1
+        fi
+        [[ -n "$resource" ]] || return 0
+        if (( SECONDS - started >= budget )); then
+            echo "error: worker pod $pod remained after its stop gate opened" >&2
+            return 1
+        fi
         sleep 0.25
     done
-    echo "error: cluster message did not trigger a worker Deployment rollout" >&2
-    return 1
+}
+
+worker_generation() {
+    kubectl -n "$NAMESPACE" get deployment "$WORKER_DEPLOYMENT" \
+        -o jsonpath='{.metadata.generation}'
+}
+
+worker_observed_generation() {
+    kubectl -n "$NAMESPACE" get deployment "$WORKER_DEPLOYMENT" \
+        -o jsonpath='{.status.observedGeneration}'
+}
+
+worker_pod_identity() {
+    worker_pods_json | python3 -c '
+import json,sys
+pods=[]
+for pod in json.load(sys.stdin).get("items",[]):
+    meta=pod.get("metadata",{})
+    ready=any(c.get("type") == "Ready" and c.get("status") == "True"
+              for c in pod.get("status",{}).get("conditions",[]))
+    pods.append((meta.get("name"),meta.get("uid"),meta.get("deletionTimestamp"),ready))
+print(json.dumps(sorted(pods),separators=(",",":")))
+'
+}
+
+assert_worker_identity_unchanged() {
+    local label="$1" generation="$2" observed="$3" pods="$4"
+    local actual_generation actual_observed actual_pods
+    actual_generation="$(worker_generation)"
+    actual_observed="$(worker_observed_generation)"
+    actual_pods="$(worker_pod_identity)"
+    if [[ "$actual_generation" != "$generation" || \
+          "$actual_observed" != "$observed" || "$actual_pods" != "$pods" ]]; then
+        echo "error: $label mutated worker identity" >&2
+        echo "expected generation=$generation observedGeneration=$observed pods=$pods" >&2
+        echo "actual generation=$actual_generation observedGeneration=$actual_observed pods=$actual_pods" >&2
+        return 1
+    fi
 }
 
 wait_exec_touch() {
@@ -555,64 +587,27 @@ for _ in $(seq 1 360); do
     sleep 0.5
 done
 kubectl -n "$NAMESPACE" exec "$OLD_POD" -- grep -qx hold /var/run/curie-e2e-gate/ready
-BASE_XLEN="$(valkey_json XLEN "$STREAM" | json_int)"
+BASE_GENERATION="$(worker_generation)"
+BASE_OBSERVED_GENERATION="$(worker_observed_generation)"
+BASE_POD_IDENTITY="$(worker_pod_identity)"
 
-echo "=== first invocation: rollout must finish before enqueue ==="
+echo "=== first invocation: reply without worker rollout or pod replacement ==="
 "$PHASE1_BIN" --json cluster message "What is the weather?" \
     --namespace "$NAMESPACE" --release "$RELEASE" \
     --listen-host "$CURIE_E2E_LISTEN_HOST" --timeout-secs "$MESSAGE_TIMEOUT_SECONDS" \
     >"$WORKDIR/first.json" 2>"$WORKDIR/first.err" &
 FIRST_PID=$!
-NEW_POD="$(wait_for_new_worker_pod "$OLD_POD" "$STAGING_BUDGET_SECONDS")"
-echo "observed outgoing worker $OLD_POD and rollout worker $NEW_POD"
-wait_exec_touch "$NEW_POD" /tmp/curie-e2e-ready 60
-kubectl -n "$NAMESPACE" wait --for=condition=Ready "pod/$NEW_POD" --timeout=60s >/dev/null
-for _ in $(seq 1 480); do
-    deleting="$(kubectl -n "$NAMESPACE" get pod "$OLD_POD" \
-        -o jsonpath='{.metadata.deletionTimestamp}' 2>/dev/null || true)"
-    [[ -n "$deleting" ]] && break
-    kill -0 "$FIRST_PID" 2>/dev/null || break
-    sleep 0.25
-done
-[[ -n "${deleting:-}" ]] || {
-    cat "$WORKDIR/first.err" >&2 || true
-    echo "error: old worker never entered outgoing termination" >&2
-    exit 1
-}
-OBSERVATION_STARTED=$SECONDS
-while (( SECONDS - OBSERVATION_STARTED < PRE_ENQUEUE_OBSERVATION_SECONDS )); do
-    kill -0 "$FIRST_PID" 2>/dev/null || {
+FIRST_STARTED=$SECONDS
+while kill -0 "$FIRST_PID" 2>/dev/null; do
+    if (( SECONDS - FIRST_STARTED >= MESSAGE_TIMEOUT_SECONDS )); then
         cat "$WORKDIR/first.err" >&2 || true
-        echo "error: phase 1 invocation returned while outgoing worker $OLD_POD was still held in preStop" >&2
-        exit 1
-    }
-    if [[ "$(valkey_json XLEN "$STREAM" | json_int)" != "$BASE_XLEN" ]]; then
-        echo "error: phase 1 red-on-revert assertion failed against $BASE_REF: invocation enqueued while outgoing worker $OLD_POD existed" >&2
+        echo "error: first cluster message exceeded ${MESSAGE_TIMEOUT_SECONDS}s" >&2
         exit 1
     fi
-    old_pending="$(consumer_info_pending "$OLD_CONSUMER")"
-    if [[ "$old_pending" != "0" && "$old_pending" != "missing" ]]; then
-        echo "error: phase 1 red-on-revert assertion failed against $BASE_REF: outgoing XINFO consumer $OLD_CONSUMER claimed the invocation" >&2
-        exit 1
-    fi
+    assert_worker_identity_unchanged "first invocation in flight" \
+        "$BASE_GENERATION" "$BASE_OBSERVED_GENERATION" "$BASE_POD_IDENTITY"
     sleep 0.25
 done
-echo "outgoing worker held in preStop for ${PRE_ENQUEUE_OBSERVATION_SECONDS}s; stream stayed unchanged and exact XINFO consumer $OLD_CONSUMER owned no PEL entry"
-
-(
-    while true; do
-        while read -r pod; do
-            kubectl -n "$NAMESPACE" exec "$pod" -- \
-                touch /tmp/curie-e2e-ready /tmp/curie-e2e-stop >/dev/null 2>&1 || true
-        done < <(kubectl -n "$NAMESPACE" get pods \
-            -l "app.kubernetes.io/instance=$RELEASE,app.kubernetes.io/component=worker" \
-            -o name 2>/dev/null | sed 's#^pod/##')
-        sleep 0.25
-    done
-) &
-GATEKEEPER_PID=$!
-wait_exec_touch "$OLD_POD" /tmp/curie-e2e-stop 30
-kubectl -n "$NAMESPACE" wait --for=delete "pod/$OLD_POD" --timeout=120s >/dev/null
 if wait_for_pid "$FIRST_PID" "$MESSAGE_TIMEOUT_SECONDS"; then
     :
 else
@@ -622,15 +617,25 @@ else
     exit 1
 fi
 FIRST_PID=""
-kubectl -n "$NAMESPACE" rollout status "deployment/$WORKER_DEPLOYMENT" --timeout=300s >/dev/null
+assert_worker_identity_unchanged "completed first invocation" \
+    "$BASE_GENERATION" "$BASE_OBSERVED_GENERATION" "$BASE_POD_IDENTITY"
 assert_reply "first invocation" "$WORKDIR/first.json"
 assert_pel_empty "first invocation" "$OLD_CONSUMER"
+echo "first invocation kept worker generation=$BASE_GENERATION observedGeneration=$BASE_OBSERVED_GENERATION pods=$BASE_POD_IDENTITY"
 
 echo "=== deliberate termination: recover a real PEL entry promptly ==="
+kubectl -n "$NAMESPACE" patch configmap "$GATE_CONFIGMAP" --type=merge \
+    -p '{"data":{"ready":"open","stop":"open"}}' >/dev/null
+# The projected ConfigMap can lag behind the Deployment update. Open the old
+# pod's stop gate directly so it cannot keep consuming during preStop after the
+# intentional rollout, then wait for that exact pod to disappear before
+# selecting the recovery consumer.
+wait_exec_touch "$OLD_POD" /tmp/curie-e2e-stop 30
 TRUST_ORIGIN="http://${CURIE_E2E_LISTEN_HOST}"
 kubectl -n "$NAMESPACE" set env "deployment/$WORKER_DEPLOYMENT" \
     "CURIE_SLACK_TRUSTED_ORIGINS=$TRUST_ORIGIN" >/dev/null
 kubectl -n "$NAMESPACE" rollout status "deployment/$WORKER_DEPLOYMENT" --timeout=300s >/dev/null
+wait_worker_pod_gone "$OLD_POD" 120
 if [[ -n "$PRE_FIX_WORKER_IMAGE" ]]; then
     kubectl -n "$NAMESPACE" set image "deployment/$WORKER_DEPLOYMENT" \
         "worker=${PRE_FIX_WORKER_IMAGE}:${PRE_FIX_WORKER_TAG}" >/dev/null
@@ -786,4 +791,4 @@ BLOCKED_CLAIM=""
 restore_worker_deployment
 kubectl -n "$NAMESPACE" delete configmap "$GATE_CONFIGMAP" --ignore-not-found >/dev/null
 assert_release_healthy
-echo "QA4-02 ROLLOUT/PEL RECOVERY PASS"
+echo "QA4-02 ROLLOUT-FREE/PEL RECOVERY PASS"

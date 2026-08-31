@@ -187,13 +187,13 @@
       "result": "MessageDryRunOutput",
       "kind": "CliOutput",
       "schema": "message.schema.json",
-      "version": "1.1"
+      "version": "1.2"
     },
     {
       "result": "MessageOutcomeOutput",
       "kind": "CliOutput",
       "schema": "message.schema.json",
-      "version": "1.1"
+      "version": "1.2"
     },
     {
       "result": "MigrateStoreOutput",
@@ -301,31 +301,31 @@
       "result": "message_awaiting_approval_json",
       "kind": "builder",
       "schema": "message.schema.json",
-      "version": "1.1"
+      "version": "1.2"
     },
     {
       "result": "message_dry_run_json",
       "kind": "builder",
       "schema": "message.schema.json",
-      "version": "1.1"
+      "version": "1.2"
     },
     {
       "result": "message_enqueued_json",
       "kind": "builder",
       "schema": "message.schema.json",
-      "version": "1.1"
+      "version": "1.2"
     },
     {
       "result": "message_reply_json",
       "kind": "builder",
       "schema": "message.schema.json",
-      "version": "1.1"
+      "version": "1.2"
     },
     {
       "result": "message_timeout_json",
       "kind": "builder",
       "schema": "message.schema.json",
-      "version": "1.1"
+      "version": "1.2"
     },
     {
       "result": "status_json",

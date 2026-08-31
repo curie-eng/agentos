@@ -1742,45 +1742,11 @@ agentSandbox:
     # Per-workload OTEL_EXPORTER_OTLP_* overrides still win over the
     # chart-owned collector endpoint.
     extraEnv: []
-    # --- BYO model: LiteLLM Anthropic-format sidecar (part of #24) ---
-    # Off by default. Enable ONLY for genuine multi-model routing/fallback: a
-    # LiteLLM proxy runs as a sidecar in the sandbox pod, serving the Anthropic
-    # API shape on localhost, and the runner's ANTHROPIC_BASE_URL is repointed at
-    # it (http://localhost:<port>). For a single model per agent prefer the
-    # OpenRouter / provider-native path (leave this off and set runner.model +
-    # runner.credentials, or a per-agent credential) -- a sidecar per sandbox pod
-    # is pure overhead when no routing is needed. Ignored while local
-    # inference.deploy is on (that path already binds ANTHROPIC_BASE_URL to the
-    # in-cluster Ollama endpoint).
+    # Compatibility tombstone: ADR-0037 refuses any truthy `enabled` value.
+    # Disabled forms may be absent, null, or boolean false. Direct provider
+    # routing remains session-pinned at claim time.
     liteLLM:
       enabled: false
-      image: ghcr.io/berriai/litellm:main-stable
-      imagePullPolicy: IfNotPresent
-      # Port the proxy listens on inside the pod; the runner reaches it over
-      # localhost, so it is never exposed as a Service.
-      port: 4000
-      # Name of a pre-created Secret (or ConfigMap-shaped Secret) holding the
-      # LiteLLM config.yaml -- the model_list and router/fallback settings. It is
-      # mounted read-only at /etc/litellm/config.yaml and passed to the proxy via
-      # --config. REQUIRED when enabled; provider API keys the config references
-      # are supplied through extraEnv (secretKeyRef), never inlined here.
-      configExistingSecret: ""
-      # Key within that Secret that carries the config file body.
-      configKey: config.yaml
-      # Extra env for the sidecar, list of {name, value} (or full env entries with
-      # valueFrom.secretKeyRef for provider credentials, e.g. OPENAI_API_KEY).
-      extraEnv: []
-      # ephemeral-storage alongside cpu/memory (ADR-0059 decision 1): the sidecar
-      # only reads its mounted config and proxies to an upstream model API, with
-      # no bundle/writable-path volume of its own, so its own disk footprint is
-      # just its writable layer and logs -- a small, fixed ceiling is enough.
-      # Both request (the scheduling-time floor that keeps the node from being
-      # overcommitted) and limit (the periodic-measurement backstop) are
-      # required and do different jobs (decision 2); override either for a
-      # heavier sidecar image.
-      resources:
-        requests: { cpu: 50m, memory: 128Mi, ephemeral-storage: 64Mi }
-        limits: { cpu: "1", memory: 512Mi, ephemeral-storage: 256Mi }
     # --- Bundle-fetch provisioning ---
     # CURIE_BUNDLE_REF is an S3 object key the substrate injects per claim.
     # (bound sandboxes carry it; warm/unbound pods do not). Before the runner

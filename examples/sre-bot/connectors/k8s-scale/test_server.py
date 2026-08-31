@@ -13,9 +13,12 @@ import os
 import sys
 from pathlib import Path
 
+import anyio
 import httpx
 import pytest
 import yaml
+from mcp.server.fastmcp.exceptions import ToolError
+from mcp.shared.memory import create_connected_server_and_client_session as _connect
 
 _MODULE_NAME = "sre_bot_k8s_scale_server"
 _SERVER_PY = Path(__file__).parent / "server.py"
@@ -119,9 +122,9 @@ def test_a_failed_read_refuses_instead_of_scaling(tmp_path, monkeypatch):
     srv = _load(tmp_path)
     seen = {}
     monkeypatch.setattr(srv, "_client", lambda: _FakeClient(seen, get=(403, {})))
-    result = json.loads(srv.scale_deployment("public", "api", 10))
-    assert result["ok"] is False
-    assert result["prior"] is None
+    with pytest.raises(ToolError) as excinfo:
+        srv.scale_deployment("public", "api", 10)
+    assert "get on deployments/scale" in str(excinfo.value)
     assert "patch_content" not in seen
 
 
@@ -129,66 +132,70 @@ def test_a_read_with_no_replica_count_refuses(tmp_path, monkeypatch):
     srv = _load(tmp_path)
     seen = {}
     monkeypatch.setattr(srv, "_client", lambda: _FakeClient(seen, get=(200, {"spec": {}})))
-    result = json.loads(srv.scale_deployment("public", "api", 10))
-    assert result["ok"] is False
-    assert "prior state" in result["summary"]
+    with pytest.raises(ToolError) as excinfo:
+        srv.scale_deployment("public", "api", 10)
+    assert "prior state" in str(excinfo.value)
     assert "patch_content" not in seen
 
 
 @pytest.mark.parametrize("ns,name", [("public", "not-listed"), ("platform", "api")])
 def test_a_target_outside_the_allowlist_never_reaches_the_api(tmp_path, monkeypatch, ns, name):
     srv = _load(tmp_path)
+
     def explode():
         raise AssertionError("a client must never be built for a refused target")
+
     monkeypatch.setattr(srv, "_client", explode)
-    result = json.loads(srv.scale_deployment(ns, name, 10))
-    assert result["ok"] is False
-    assert "allowlist" in result["summary"]
+    with pytest.raises(ToolError) as excinfo:
+        srv.scale_deployment(ns, name, 10)
+    assert "allowlist" in str(excinfo.value)
 
 
 def test_the_ceiling_refuses_before_a_client_is_built(tmp_path, monkeypatch):
     """Scale to ten thousand is a denial of service with an approval on it."""
     srv = _load(tmp_path, ceiling="50")
+
     def explode():
         raise AssertionError("a client must never be built for a refused target")
+
     monkeypatch.setattr(srv, "_client", explode)
-    result = json.loads(srv.scale_deployment("public", "api", 10_000))
-    assert result["ok"] is False
-    assert "ceiling" in result["summary"]
+    with pytest.raises(ToolError) as excinfo:
+        srv.scale_deployment("public", "api", 10_000)
+    assert "ceiling" in str(excinfo.value)
 
 
 @pytest.mark.parametrize("bad", [True, "3", 3.5, None])
 def test_a_non_integer_replica_count_is_refused(tmp_path, monkeypatch, bad):
     """bool is an int in Python; a caller passing True must not scale to 1."""
     srv = _load(tmp_path)
+
     def explode():
         raise AssertionError("a client must never be built for a refused target")
+
     monkeypatch.setattr(srv, "_client", explode)
-    result = json.loads(srv.scale_deployment("public", "api", bad))
-    assert result["ok"] is False
-    assert "integer" in result["summary"]
+    with pytest.raises(ToolError) as excinfo:
+        srv.scale_deployment("public", "api", bad)
+    assert "integer" in str(excinfo.value)
 
 
-def test_every_return_path_is_the_same_shape(tmp_path, monkeypatch):
-    """A caller never has to guess which keys are present."""
-    srv = _load(tmp_path)
-    seen = {}
-    monkeypatch.setattr(srv, "_client", lambda: _FakeClient(seen))
-    ok = json.loads(srv.scale_deployment("public", "api", 4))
-    monkeypatch.setattr(srv, "_client", lambda: _FakeClient(seen, get=(500, {})))
-    bad = json.loads(srv.scale_deployment("public", "api", 4))
-    assert set(ok) == set(bad) == {"ok", "summary", "prior", "post", "target"}
-
-
-def test_insecure_skip_tls_verify_is_refused(tmp_path, monkeypatch):
-    srv = _load(tmp_path, kubeconfig={
-        "clusters": [{"cluster": {"server": "https://k8s.example:6443",
-                                  "insecure-skip-tls-verify": True}}],
-        "users": [{"user": {"token": "scale-token"}}],
-    })
-    result = json.loads(srv.scale_deployment("public", "api", 3))
-    assert result["ok"] is False
-    assert "insecure-skip-tls-verify" in result["summary"]
+def test_insecure_skip_tls_verify_is_refused(tmp_path):
+    srv = _load(
+        tmp_path,
+        kubeconfig={
+            "clusters": [
+                {
+                    "cluster": {
+                        "server": "https://k8s.example:6443",
+                        "insecure-skip-tls-verify": True,
+                    }
+                }
+            ],
+            "users": [{"user": {"token": "scale-token"}}],
+        },
+    )
+    with pytest.raises(ToolError) as excinfo:
+        srv.scale_deployment("public", "api", 3)
+    assert "insecure-skip-tls-verify" in str(excinfo.value)
 
 
 # --- What the reply has to carry for the platform to rule on an undo ----------
@@ -226,16 +233,73 @@ def test_the_target_names_its_kind(tmp_path, monkeypatch):
     assert reply["target"] == {"kind": "Deployment", "namespace": "public", "name": "api"}
 
 
-def test_a_refusal_reports_neither_state(tmp_path, monkeypatch):
-    """A failed call must never look like a captured snapshot."""
+def test_a_missing_deployment_is_an_error_without_a_write(tmp_path, monkeypatch):
+    """A missing target is a refusal, and it must never reach the patch."""
     srv = _load(tmp_path)
-    monkeypatch.setattr(srv, "_client", lambda: _FakeClient({}, get=(404, {})))
+    seen = {}
+    monkeypatch.setattr(srv, "_client", lambda: _FakeClient(seen, get=(404, {})))
 
-    reply = json.loads(srv.scale_deployment("public", "api", 10))
+    with pytest.raises(ToolError) as excinfo:
+        srv.scale_deployment("public", "api", 10)
 
-    assert reply["ok"] is False
-    assert reply["prior"] is None
-    assert reply["post"] is None
+    assert "no Deployment public/api" in str(excinfo.value)
+    assert "patch_content" not in seen
+
+
+# --- The MCP wire distinguishes a refusal from a completed scale -------------
+
+
+def _call_tool(srv, name, args):
+    """Call one tool through the real MCP path and return its CallToolResult."""
+
+    async def go():
+        async with _connect(srv.mcp._mcp_server) as client:
+            return await client.call_tool(name, args)
+
+    return anyio.run(go)
+
+
+def test_a_refusal_and_a_scale_carry_different_is_error_flags(tmp_path, monkeypatch):
+    srv = _load(tmp_path)
+    monkeypatch.setattr(srv, "_client", lambda: _FakeClient({}))
+
+    refused = _call_tool(
+        srv,
+        "scale_deployment",
+        {"namespace": "platform", "name": "api", "replicas": 10},
+    )
+    assert refused.isError is True
+    refusal_text = refused.content[0].text
+
+    # OBSERVED against the pinned mcp==1.28.1. FastMCP builds this prefix at
+    # mcp/server/fastmcp/tools/base.py:117
+    # (`raise ToolError(f"Error executing tool {self.name}: {e}") from e`) and
+    # puts str(e) in the result as its only text content. Pin the whole string so
+    # an SDK change cannot silently reshape what operators and agents read.
+    assert refusal_text == (
+        "Error executing tool scale_deployment: refusing: platform/api is not "
+        "in this connector's allowlist. Permitted: public/api. This is a "
+        "deliberate ceiling -- widening it is an operator change, not something "
+        "to work around."
+    )
+
+    scaled = _call_tool(
+        srv,
+        "scale_deployment",
+        {"namespace": "public", "name": "api", "replicas": 10},
+    )
+    assert scaled.isError is False
+    assert not scaled.content[0].text.startswith("Error executing tool")
+    payload = json.loads(scaled.content[0].text)
+    assert payload["ok"] is True
+    assert payload["prior"] == {"spec": {"replicas": 3}}
+    assert payload["post"] == {"spec": {"replicas": 10}}
+    assert payload["target"] == {
+        "kind": "Deployment",
+        "namespace": "public",
+        "name": "api",
+    }
+    assert refused.isError != scaled.isError
 
 
 def test_streamable_http_is_mounted_at_curie_connector_path(tmp_path):
