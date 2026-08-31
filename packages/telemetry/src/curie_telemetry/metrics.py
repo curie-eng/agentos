@@ -58,6 +58,11 @@ _TURN_COMPLETED_ATTRIBUTES = {
     "source": _TURN_SOURCES,
     "outcome": _TURN_OUTCOMES,
 }
+_HISTORY_CACHE_ATTRIBUTES = {
+    "service.name": ["curie-runner"],
+    "source": ["runner"],
+    "cache_hit": ["true", "false"],
+}
 _QUEUE_ATTRIBUTES = {
     "service.name": ["curie-api", "curie-dispatcher", "curie-worker"],
     "source": ["api", "dispatcher", "worker", "local", "eval"],
@@ -255,6 +260,13 @@ _METRICS: dict[str, dict[str, Any]] = {
     ),
     "curie.turn.duration": _definition(
         "histogram", "s", "End to end turn duration.", False, _TURN_COMPLETED_ATTRIBUTES
+    ),
+    "curie.history.resume.cache_read": _definition(
+        "histogram",
+        "{token}",
+        "Provider cache read input tokens on the first turn after structured replay.",
+        False,
+        _HISTORY_CACHE_ATTRIBUTES,
     ),
     "curie.queue.enqueue": _definition(
         "counter", "{message}", "Messages enqueued.", True, _QUEUE_ATTRIBUTES

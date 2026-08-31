@@ -39,10 +39,18 @@ from claude_agent_sdk import AssistantMessage, ResultMessage
 from curie_telemetry import record_metric
 from opentelemetry.context import Context
 
-from .adapter import ModelSession
+from .adapter import ModelSession, model_message_to_conversation
 from .approval import ApprovalGate
 from .budget import BUDGET_CLASSIFICATION, BudgetTracker
-from .history import NullTranscriptStore, TranscriptStore, TurnRecord
+from .history import (
+    ApprovalContext,
+    ConversationMessage,
+    HarnessReplayState,
+    NullTranscriptStore,
+    TranscriptStore,
+    TurnRecord,
+    close_suspended_tool_calls,
+)
 from .memory import (
     ConsolidationResult,
     MemoryRecord,
@@ -187,6 +195,7 @@ class SessionRunner:
         approval_resumed_kind: str | None = None,
         approval_decision: str | None = None,
         false_completion_check: bool = False,
+        history_resumed: bool = False,
     ) -> None:
         self._factory = session_factory
         self._ceiling = ceiling
@@ -200,9 +209,9 @@ class SessionRunner:
         # (append + provenance). NullMemoryStore when no CURIE_MEMORY_REF.
         self._memory: MemoryStore = memory_store or NullMemoryStore()
         # The conversation-history port (#20). Prior turns are loaded at boot and
-        # delivered via the system prompt; this store is the write side, appended
-        # once per successful turn so a restarted sandbox rehydrates the thread.
-        # NullTranscriptStore when no CURIE_HISTORY_REF.
+        # reconstructed as the harness's structured prefix; this store is the
+        # write side, appended once per terminal turn so a restarted sandbox
+        # rehydrates the thread. NullTranscriptStore when no CURIE_HISTORY_REF.
         self._history: TranscriptStore = history_store or NullTranscriptStore()
         # The permission gate (#245): the can_use_tool callback records a
         # blocked approval-required call here, and the turn's final is flipped
@@ -220,6 +229,8 @@ class SessionRunner:
         # Opt-in, observe-only false-completion check (#517): warn when a turn
         # ends DONE with a substantive answer but zero tool calls. Off by default.
         self._false_completion_check = false_completion_check
+        self._history_resumed = history_resumed
+        self._resume_cache_metric_recorded = False
 
         self._session: ModelSession | None = None
         # One turn consumes the SDK generator at a time. This MUST be a
@@ -289,22 +300,65 @@ class SessionRunner:
     async def _record_turn(self, event: Event, state: TurnState) -> None:
         """Append one completed turn to the durable conversation transcript (#20).
 
-        Only a successful DONE terminal final sets ``state.final_text``; failed,
-        budget-halted, auth-halted, awaiting-approval, and idle turns leave it
-        None and are not persisted, so the transcript holds the delivered
-        exchange, not error stubs. Best-effort:
+        A successful DONE terminal final or an AWAITING_APPROVAL suspension sets
+        ``state.final_text``. Failed, budget-halted, auth-halted, and idle turns
+        leave it None and are not persisted, so the transcript holds delivered
+        exchanges and resumable approval context, not error stubs. Best-effort:
         a transient store failure is logged and never propagated -- recording
         history must not fail a turn the user already received an answer to.
         """
 
         if state.final_text is None:
             return
+        messages = (
+            ConversationMessage(role="user", content=event.text),
+            *state.history_messages,
+        )
+        if (
+            self._status is SessionStatus.AWAITING_APPROVAL
+            and state.approval_gate_kind == "permission"
+        ):
+            messages = close_suspended_tool_calls(messages)
+        harness_replay: HarnessReplayState | None = None
+        exporter = getattr(self._session, "export_replay_state", None)
+        if callable(exporter):
+            try:
+                harness_replay = await exporter()
+            except Exception as exc:  # noqa: BLE001 - portable replay remains valid
+                logger.warning(
+                    "harness replay export failed session=%s error_class=%s: %s",
+                    self._session_id,
+                    type(exc).__name__,
+                    exc,
+                )
         try:
             await self._history.append(
                 TurnRecord(
                     user=event.text,
                     assistant=state.final_text,
                     ts=utcnow_iso(),
+                    messages=messages,
+                    status=self._status.value,
+                    approval=(
+                        ApprovalContext(
+                            summary=state.approval_summary,
+                            route=state.approval_route,
+                            gate_kind=state.approval_gate_kind,
+                            granted_tool=state.approval_granted_tool,
+                            decision=self._approval_decision,
+                        )
+                        if any(
+                            (
+                                state.approval_summary,
+                                state.approval_route,
+                                state.approval_gate_kind,
+                                state.approval_granted_tool,
+                                self._approval_decision,
+                            )
+                        )
+                        else None
+                    ),
+                    harness_replay=harness_replay,
                 )
             )
         except Exception as exc:  # noqa: BLE001 - best-effort; never fail a completed turn
@@ -357,8 +411,8 @@ class SessionRunner:
         tears down the current SDK session and reconnects a new one from the same
         factory, so the next turn starts with no accumulated conversation; a
         thread with a durable ``CURIE_HISTORY_REF`` still rehydrates its own
-        history preamble on reconnect (that is the thread's real history, not a
-        cross-case leak), while an eval runner (no history ref) comes up empty.
+        structured replay on reconnect (that is the thread's real history, not
+        a cross-case leak), while an eval runner (no history ref) comes up empty.
 
         This is a deliberate, explicit control -- NOT per-turn session churn. The
         one-long-lived-session-per-process invariant (prompt-cache affinity
@@ -562,12 +616,44 @@ class SessionRunner:
                 for line in self._auth_halt_lines():
                     yield line
                 return
+            history_message = model_message_to_conversation(message)
+            if history_message is not None:
+                # Some harness streams echo the submitted user prompt before
+                # assistant output. The durable turn already prepends the exact
+                # inbound event, so drop only that leading duplicate.
+                if not (
+                    not state.history_messages
+                    and history_message.role == "user"
+                    and history_message.content == event.text
+                ):
+                    state.history_messages.append(history_message)
             usage = getattr(message, "usage", None)
             # The terminal result carries the authoritative turn total; streaming
             # assistant messages carry per-message output. Fold them differently
             # so the same tokens are not counted twice (see BudgetTracker).
             if isinstance(message, ResultMessage):
                 tracker.set_total(usage)
+                if self._history_resumed and not self._resume_cache_metric_recorded:
+                    cache_read = (
+                        int(usage.get("cache_read_input_tokens") or 0)
+                        if isinstance(usage, dict)
+                        else 0
+                    )
+                    record_metric(
+                        "curie.history.resume.cache_read",
+                        cache_read,
+                        attributes={
+                            "service.name": "curie-runner",
+                            "source": "runner",
+                            "cache_hit": "true" if cache_read > 0 else "false",
+                        },
+                    )
+                    logger.info(
+                        "history resume cache observed session=%s cache_read_input_tokens=%d",
+                        self._session_id,
+                        cache_read,
+                    )
+                    self._resume_cache_metric_recorded = True
             else:
                 tracker.add_increment(usage)
             budget_hit = tracker.exceeded
@@ -595,10 +681,12 @@ class SessionRunner:
                         yield line
                     self._status = final.status
                     self._turn_open = False
-                    # Only a clean DONE reply belongs in the conversation
-                    # transcript. Classified failures and approval pauses are
-                    # terminal delivery outcomes, not assistant answers (#20).
-                    if final.status is SessionStatus.DONE:
+                    # Persist clean replies and resumable approval suspensions;
+                    # classified failures remain delivery outcomes, not history.
+                    if final.status in {
+                        SessionStatus.DONE,
+                        SessionStatus.AWAITING_APPROVAL,
+                    }:
                         state.final_text = final.text
                     yield to_ndjson_line(final)
                     return
@@ -628,6 +716,11 @@ class SessionRunner:
             yield line
         self._status = final.status
         self._turn_open = False
+        # A missing provider ResultMessage is still incomplete for a nominal
+        # DONE turn. The one resumable exception is a runner-owned approval
+        # halt: its structured tool call and gate context must cross runners.
+        if final.status is SessionStatus.AWAITING_APPROVAL:
+            state.final_text = final.text or state.assistant_text
         yield to_ndjson_line(final)
 
     def _approval_not_acted_lines(self, state: TurnState, final: Final) -> list[str]:

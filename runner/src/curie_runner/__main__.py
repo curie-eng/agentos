@@ -19,7 +19,12 @@ from claude_agent_sdk import HookMatcher
 from curie_telemetry import bootstrap_service_telemetry
 
 from . import __version__
-from .adapter import ClaudeAgentSession, ModelSession, build_options
+from .adapter import (
+    ClaudeAgentSession,
+    ModelSession,
+    build_options,
+    build_structured_resume,
+)
 from .approval import (
     APPROVAL_SERVER_NAME,
     ApprovalPolicyError,
@@ -40,11 +45,13 @@ from .harness.registry import (
     resolve_harness,
 )
 from .history import (
-    DEFAULT_PREAMBLE_MAX_BYTES,
-    DEFAULT_PREAMBLE_MAX_TURNS,
+    DEFAULT_REPLAY_MAX_BYTES,
+    DEFAULT_REPLAY_MAX_TURNS,
+    ConversationReplay,
+    HistoryError,
+    StructuredReplayUnsupported,
     TranscriptStore,
-    TurnRecord,
-    format_conversation_preamble,
+    build_conversation_replay,
     resolve_history,
 )
 from .hooks import load_bundle_hooks
@@ -93,21 +100,17 @@ def _resolve_harness(name: str = DEFAULT_HARNESS) -> HarnessContribution:
 def _compose_system_prompt(
     base: str | None,
     memory_preamble: str | None,
-    conversation_preamble: str | None = None,
     *,
     model: str | None,
 ) -> str | None:
-    """Compose the system prompt with recovered context and model identity.
+    """Compose durable memory, bundle instructions, and model identity.
 
-    State delivered from outside the sandbox becomes durable model context by
-    leading the system prompt: durable memory (ADR-0025) first, then this thread's
-    recovered conversation (ADR-0029), then the bundle/env system prompt. The
-    configured model identity follows the bundle prompt when present. Any part
-    may be absent.
+    Conversation history is deliberately absent: ADR-0119 requires it to cross
+    the harness boundary as ordered messages, never rendered system text.
     """
 
     model_preamble = f"Configured model: {model}" if model else None
-    parts = [p for p in (memory_preamble, conversation_preamble, base, model_preamble) if p]
+    parts = [p for p in (memory_preamble, base, model_preamble) if p]
     return "\n\n".join(parts) if parts else None
 
 
@@ -148,7 +151,7 @@ def build_runner(
     memory_store: MemoryStore | None = None,
     memory_preamble: str | None = None,
     history_store: TranscriptStore | None = None,
-    conversation_preamble: str | None = None,
+    conversation_replay: ConversationReplay | None = None,
     harness: HarnessContribution | None = None,
     workspace_path: Path | None = None,
 ) -> SessionRunner:
@@ -169,6 +172,12 @@ def build_runner(
     # compiles into session inputs, replacing the direct module imports these
     # used to be. Defaults to the built-in Claude harness.
     harness = harness or _resolve_harness()
+    conversation_replay = conversation_replay or ConversationReplay()
+    if conversation_replay.present and not harness.supports_structured_replay and not fake_model:
+        raise StructuredReplayUnsupported(
+            f"harness {harness.name!r} declares structured replay absent; "
+            "refusing recovered history instead of rendering a prompt preamble"
+        )
     # The bundle compiles once into this harness's native inputs (compile_bundle):
     # the ``systemPrompt`` shipped in the manifest (versioned with the agent, epic
     # #30) is the declared surface and always wins -- an env override let an
@@ -176,14 +185,13 @@ def build_runner(
     # bundle's plugins feed the session factory below.
     compiled = harness.compile_bundle(config.session.plugin_dir)
     system_prompt = compiled.system_prompt
-    # Prior memory (#264) and this thread's recovered conversation (#20), both
-    # loaded from outside the sandbox, lead the system prompt so the model sees
-    # learned lessons and the prior exchange as durable context. The configured
-    # model identity is appended after the bundle prompt.
+    # Prior memory (#264) still leads the system prompt. Conversation history
+    # (#20) deliberately does not: ADR-0119 sends its ordered messages through
+    # the harness adapter below. The configured model identity is appended after
+    # the bundle prompt.
     system_prompt = _compose_system_prompt(
         system_prompt,
         memory_preamble,
-        conversation_preamble,
         model=config.model,
     )
     # In-bundle PreToolUse guardrails declared in the manifest hooks field (#272),
@@ -274,19 +282,28 @@ def build_runner(
                 # Share the same gate so a scripted request_approval resolves its
                 # route through the real decision table on the offline tier (#561).
                 approval_gate=approval_gate,
+                replay_messages=conversation_replay.messages,
             )
         plugins = compiled.plugins
+        structured_resume = build_structured_resume(
+            conversation_replay.messages,
+            curie_session_id=config.session.session_id,
+            cwd=workspace_cwd,
+            harness_replay=conversation_replay.harness_replay,
+        )
         options = build_options(
             plugins=plugins,
             model=config.model,
             system_prompt=system_prompt,
             max_turns=config.max_turns,
             max_budget_usd=config.max_usd_per_day,
-            # History is rehydrated harness-agnostically as a conversation preamble
-            # (ADR-0029), not through the SDK-specific resume path, so history_ref
-            # no longer feeds resume. build_options keeps the param for an explicit
-            # caller; the boot path passes None.
-            resume=None,
+            # Curie's durable contract is ordered role/content messages. The
+            # Claude adapter prefers its optional opaque checkpoint to preserve
+            # native cache shape, and otherwise materializes a deterministic
+            # process-local SDK resume envelope from the portable messages.
+            resume=structured_resume.resume,
+            session_id=structured_resume.session_id,
+            session_store=structured_resume.session_store,
             # Operator-set thinking depth (#1182, ADR-0098); None omits the SDK
             # option entirely rather than defaulting it.
             thinking=config.thinking,
@@ -354,6 +371,7 @@ def build_runner(
         approval_resumed_kind=config.approval_resumed_kind,
         approval_decision=config.approval_decision,
         false_completion_check=config.false_completion_check,
+        history_resumed=conversation_replay.present,
     )
 
 
@@ -385,18 +403,16 @@ def _load_memory(config: RunnerConfig) -> tuple[MemoryStore, str | None]:
     return store, format_memory_preamble(records)
 
 
-def _load_history(config: RunnerConfig) -> tuple[TranscriptStore, str | None]:
-    """Resolve CURIE_HISTORY_REF and load this thread's transcript into a preamble.
+def _load_history(config: RunnerConfig) -> tuple[TranscriptStore, ConversationReplay]:
+    """Resolve, compact when needed, and load the structured replay prefix.
 
-    Mirrors ``_load_memory`` (ADR-0029): runs synchronously at boot so a bad ref
-    fails the process visibly, but a transient load failure degrades to "no
-    history" rather than blocking boot -- a thread must still run when its
-    transcript store is briefly unavailable (the answer just lacks prior context).
+    A configured history ref is continuity-critical. Failure is fatal: silently
+    answering without the prior tool/approval context can duplicate an operation.
 
-    The delivered preamble is windowed to a recent tail so a long thread does not
-    balloon the boot prompt; the operator's window knobs override the sane
-    defaults. They arrive through the declared boot env (parsed defensively, so a
-    typo degrades to the default rather than failing boot), which is why the
+    The replay is windowed to a recent structured tail so a long thread does not
+    balloon provider context; the operator's window knobs override the sane
+    defaults. They arrive through the declared boot env (parsed defensively, so
+    a typo degrades to the default rather than failing boot), which is why the
     defaults are applied here rather than read off the process env at this call.
     """
 
@@ -404,29 +420,41 @@ def _load_history(config: RunnerConfig) -> tuple[TranscriptStore, str | None]:
     max_turns = (
         config.history_max_turns
         if config.history_max_turns is not None
-        else DEFAULT_PREAMBLE_MAX_TURNS
+        else DEFAULT_REPLAY_MAX_TURNS
     )
     max_bytes = (
         config.history_max_bytes
         if config.history_max_bytes is not None
-        else DEFAULT_PREAMBLE_MAX_BYTES
+        else DEFAULT_REPLAY_MAX_BYTES
     )
 
-    async def _load() -> list[TurnRecord]:
-        return await store.load()
+    async def _load() -> tuple[ConversationReplay, int, bool]:
+        records = await store.load()
+        replay, summary = build_conversation_replay(
+            records, max_turns=max_turns, max_bytes=max_bytes
+        )
+        if summary is not None:
+            await store.append(summary)
+        return replay, len(records), summary is not None
 
     try:
-        turns = anyio.run(_load)
-    except Exception as exc:  # noqa: BLE001 - degrade to no-history, never fail boot
-        logger.warning(
-            "history load failed session=%s error_class=%s: %s (booting without history)",
+        replay, record_count, compacted = anyio.run(_load)
+    except Exception as exc:  # noqa: BLE001 - translate loader failures consistently
+        logger.error(
+            "history load failed session=%s error_class=%s: %s",
             config.session.session_id,
             type(exc).__name__,
             exc,
         )
-        return store, None
-    logger.info("history loaded session=%s turns=%d", config.session.session_id, len(turns))
-    return store, format_conversation_preamble(turns, max_turns=max_turns, max_bytes=max_bytes)
+        raise HistoryError("configured structured history could not be loaded") from exc
+    logger.info(
+        "history loaded session=%s records=%d messages=%d compacted=%s",
+        config.session.session_id,
+        record_count,
+        len(replay.messages),
+        compacted,
+    )
+    return store, replay
 
 
 def _serve() -> None:
@@ -468,7 +496,7 @@ def _serve() -> None:
             logger.error("credential resolution failed: %s", exc)
             raise
     memory_store, memory_preamble = _load_memory(config)
-    history_store, conversation_preamble = _load_history(config)
+    history_store, conversation_replay = _load_history(config)
     workspace_candidate = Path("/workspace")
     workspace_path: Path | None = (
         workspace_candidate
@@ -482,7 +510,7 @@ def _serve() -> None:
         memory_store=memory_store,
         memory_preamble=memory_preamble,
         history_store=history_store,
-        conversation_preamble=conversation_preamble,
+        conversation_replay=conversation_replay,
         harness=harness,
         workspace_path=workspace_path,
     )

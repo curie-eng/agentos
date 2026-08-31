@@ -15,17 +15,243 @@ this boundary and nothing above it is. ``aci-protocol`` is never mocked.
 
 from __future__ import annotations
 
+import json
+import os
+import uuid
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol, cast
 
 from claude_agent_sdk import (
+    AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKClient,
     HookMatcher,
     SdkPluginConfig,
+    ServerToolResultBlock,
+    ServerToolUseBlock,
     TaskBudget,
+    TextBlock,
+    ThinkingBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+    UserMessage,
 )
-from claude_agent_sdk.types import CanUseTool, McpSdkServerConfig, PermissionMode
+from claude_agent_sdk._cli_version import __cli_version__
+from claude_agent_sdk._internal.session_store import project_key_for_directory
+from claude_agent_sdk.types import (
+    CanUseTool,
+    McpSdkServerConfig,
+    PermissionMode,
+    SessionKey,
+    SessionStore,
+    SessionStoreEntry,
+)
+
+from .history import ConversationMessage, HarnessReplayState
+
+_SDK_SESSION_NAMESPACE = uuid.UUID("83efb74f-f09e-4db6-b898-9ed8d7084ba8")
+
+
+class _SeededSessionStore:
+    """SDK mirror seeded from portable messages or an optional native checkpoint."""
+
+    def __init__(
+        self,
+        key: SessionKey,
+        entries: list[SessionStoreEntry],
+        *,
+        checkpoint_required: bool,
+    ) -> None:
+        self._key = key
+        self._entries = json.loads(json.dumps(entries))
+        self._exported_from = len(entries)
+        self._checkpoint_required = checkpoint_required
+
+    async def append(self, key: SessionKey, entries: list[SessionStoreEntry]) -> None:
+        if key == self._key:
+            self._entries.extend(json.loads(json.dumps(entries)))
+
+    async def load(self, key: SessionKey) -> list[SessionStoreEntry] | None:
+        return (
+            cast("list[SessionStoreEntry]", json.loads(json.dumps(self._entries)))
+            if key == self._key and self._entries
+            else None
+        )
+
+    async def export_replay_state(self) -> HarnessReplayState | None:
+        """Return a full checkpoint once, then only newly mirrored SDK entries."""
+
+        if self._checkpoint_required:
+            kind = "checkpoint"
+            selected = self._entries
+        else:
+            kind = "delta"
+            selected = self._entries[self._exported_from :]
+        self._checkpoint_required = False
+        self._exported_from = len(self._entries)
+        if not selected:
+            return None
+        return HarnessReplayState(
+            harness="claude",
+            kind=kind,
+            entries=tuple(json.loads(json.dumps(selected))),
+        )
+
+
+@dataclass(frozen=True)
+class StructuredResume:
+    """Claude SDK options needed to reconstruct one portable prefix."""
+
+    session_id: str
+    resume: str | None
+    session_store: SessionStore | None
+    session_key: SessionKey
+
+
+def build_structured_resume(
+    messages: tuple[ConversationMessage, ...],
+    *,
+    curie_session_id: str,
+    cwd: str | None,
+    harness_replay: HarnessReplayState | None = None,
+) -> StructuredResume:
+    """Materialize portable messages into the SDK's ephemeral resume envelope.
+
+    Portable role/content is always sufficient. When the matching harness left
+    an opaque native checkpoint, it is preferred to retain the SDK's exact
+    cache-breakpoint shape; otherwise UUIDs and the local JSONL envelope are
+    deterministic adapter details reconstructed on this runner. Native entries
+    are an optional optimization, never Curie's portable persistence contract.
+    """
+
+    session_id = str(uuid.uuid5(_SDK_SESSION_NAMESPACE, curie_session_id))
+    key: SessionKey = {
+        "project_key": project_key_for_directory(cwd),
+        "session_id": session_id,
+    }
+    if (
+        harness_replay is not None
+        and harness_replay.harness == "claude"
+        and harness_replay.kind == "checkpoint"
+        and harness_replay.entries
+    ):
+        native_entries = cast(
+            "list[SessionStoreEntry]",
+            json.loads(json.dumps(harness_replay.entries)),
+        )
+        store = _SeededSessionStore(
+            key,
+            native_entries,
+            checkpoint_required=False,
+        )
+        return StructuredResume(
+            session_id=session_id,
+            resume=session_id,
+            session_store=cast("SessionStore", store),
+            session_key=key,
+        )
+
+    if not messages:
+        store = _SeededSessionStore(key, [], checkpoint_required=True)
+        return StructuredResume(
+            session_id=session_id,
+            resume=None,
+            session_store=cast("SessionStore", store),
+            session_key=key,
+        )
+
+    effective_cwd = str(Path(cwd).resolve()) if cwd is not None else os.getcwd()
+    entries: list[SessionStoreEntry] = []
+    parent_uuid: str | None = None
+    for index, message in enumerate(messages):
+        canonical = json.dumps(message.to_dict(), separators=(",", ":"), sort_keys=True)
+        entry_uuid = str(uuid.uuid5(uuid.UUID(session_id), f"{index}:{canonical}"))
+        entry = cast(
+            "SessionStoreEntry",
+            {
+                "parentUuid": parent_uuid,
+                "isSidechain": False,
+                "userType": "external",
+                "cwd": effective_cwd,
+                "sessionId": session_id,
+                "version": __cli_version__,
+                "gitBranch": "",
+                "type": message.role,
+                "message": message.to_dict(),
+                "uuid": entry_uuid,
+                # This is adapter envelope metadata, not conversation time. Keep it
+                # stable so separate runners materialize identical local transcripts.
+                "timestamp": "1970-01-01T00:00:00.000Z",
+            },
+        )
+        entries.append(entry)
+        parent_uuid = entry_uuid
+    store = _SeededSessionStore(key, entries, checkpoint_required=True)
+    return StructuredResume(
+        session_id=session_id,
+        resume=session_id,
+        session_store=cast("SessionStore", store),
+        session_key=key,
+    )
+
+
+def _content_block_to_dict(block: object) -> dict[str, Any] | None:
+    if isinstance(block, TextBlock):
+        return {"type": "text", "text": block.text}
+    if isinstance(block, ThinkingBlock):
+        return {"type": "thinking", "thinking": block.thinking, "signature": block.signature}
+    if isinstance(block, ToolUseBlock):
+        return {"type": "tool_use", "id": block.id, "name": block.name, "input": block.input}
+    if isinstance(block, ToolResultBlock):
+        result: dict[str, Any] = {
+            "type": "tool_result",
+            "tool_use_id": block.tool_use_id,
+            "content": block.content,
+        }
+        if block.is_error is not None:
+            result["is_error"] = block.is_error
+        return result
+    if isinstance(block, ServerToolUseBlock):
+        return {
+            "type": "server_tool_use",
+            "id": block.id,
+            "name": block.name,
+            "input": block.input,
+        }
+    if isinstance(block, ServerToolResultBlock):
+        return {
+            "type": "server_tool_result",
+            "tool_use_id": block.tool_use_id,
+            "content": block.content,
+        }
+    return None
+
+
+def model_message_to_conversation(message: object) -> ConversationMessage | None:
+    """Project one SDK message into Curie's portable role/content shape."""
+
+    if isinstance(message, UserMessage):
+        if isinstance(message.content, str):
+            content: str | list[dict[str, Any]] = message.content
+        else:
+            content = [
+                projected
+                for block in message.content
+                if (projected := _content_block_to_dict(block)) is not None
+            ]
+        return ConversationMessage(role="user", content=content)
+    if isinstance(message, AssistantMessage):
+        return ConversationMessage(
+            role="assistant",
+            content=[
+                projected
+                for block in message.content
+                if (projected := _content_block_to_dict(block)) is not None
+            ],
+        )
+    return None
 
 
 class ModelSession(Protocol):
@@ -60,6 +286,8 @@ def build_options(
     max_turns: int,
     max_budget_usd: float | None,
     resume: str | None,
+    session_id: str | None = None,
+    session_store: SessionStore | None = None,
     thinking: dict[str, Any] | None = None,
     task_budget_hint: int | None = None,
     env: dict[str, str] | None = None,
@@ -70,10 +298,10 @@ def build_options(
 ) -> ClaudeAgentOptions:
     """Assemble ClaudeAgentOptions for the session.
 
-    ``resume`` is the rehydrate path (ADR-0003, stateless-first): when a history
-    ref is supplied it is passed as the SDK ``resume`` session id so a resumed
-    thread reconstructs its history from the store rather than assuming a
-    surviving in-RAM process.
+    ``resume`` is the provider-native rehydrate path (ADR-0003,
+    stateless-first). For Curie's portable history it names an ephemeral SDK
+    session envelope rebuilt by :func:`build_structured_resume`; it never points
+    the provider at Curie's durable state URL or assumes surviving local state.
 
     The three ACI budget fields map to distinct SDK controls: ``max_budget_usd``
     is the daily USD cap enforced natively; ``task_budget_hint`` becomes the SDK
@@ -105,6 +333,9 @@ def build_options(
         max_turns=max_turns,
         max_budget_usd=max_budget_usd,
         resume=resume,
+        session_id=session_id if resume is None else None,
+        session_store=session_store,
+        session_store_flush="eager" if session_store is not None else "batched",
         task_budget=task_budget,
         permission_mode=permission_mode,
         can_use_tool=can_use_tool,
@@ -139,3 +370,11 @@ class ClaudeAgentSession:
 
     async def close(self) -> None:
         await self._client.disconnect()
+
+    async def export_replay_state(self) -> HarnessReplayState | None:
+        """Export the provider transcript checkpoint/delta mirrored this turn."""
+
+        store = self._options.session_store
+        if isinstance(store, _SeededSessionStore):
+            return await store.export_replay_state()
+        return None

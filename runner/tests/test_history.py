@@ -1,4 +1,4 @@
-"""The conversation-history port: resolution, turn shape, preamble, the state-API
+"""The conversation-history port: resolution, structured replay, the state-API
 store, and the per-turn append that persists a thread's transcript (#20).
 
 The StateApiTranscriptStore is exercised against a tiny in-memory fake of the
@@ -11,13 +11,17 @@ import anyio
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
+from curie_runner.adapter import ClaudeAgentSession, build_options, build_structured_resume
 from curie_runner.history import (
+    ApprovalContext,
+    ConversationMessage,
+    HarnessReplayState,
     HistoryError,
     NullTranscriptStore,
     StateApiTranscriptStore,
     TranscriptStore,
     TurnRecord,
-    format_conversation_preamble,
+    build_conversation_replay,
     resolve_history,
 )
 
@@ -54,6 +58,289 @@ def test_turn_record_round_trip() -> None:
     assert TurnRecord.from_dict(rec.to_dict()) == rec
 
 
+def test_structured_turn_round_trip_preserves_tools_and_approval_context() -> None:
+    record = TurnRecord(
+        user="deploy release",
+        assistant="approval required",
+        ts="2026-08-30T00:00:00Z",
+        status="awaiting_approval",
+        messages=(
+            ConversationMessage(role="user", content="deploy release"),
+            ConversationMessage(
+                role="assistant",
+                content=[
+                    {
+                        "type": "tool_use",
+                        "id": "call-1",
+                        "name": "Bash",
+                        "input": {"command": "deploy --release"},
+                    }
+                ],
+            ),
+            ConversationMessage(
+                role="user",
+                content=[
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call-1",
+                        "content": "permission denied",
+                        "is_error": True,
+                    }
+                ],
+            ),
+        ),
+        approval=ApprovalContext(
+            summary="Deploy release",
+            route="release-managers",
+            gate_kind="permission",
+            granted_tool="Bash",
+            decision=None,
+        ),
+        harness_replay=HarnessReplayState(
+            harness="claude",
+            kind="checkpoint",
+            entries=({"type": "user", "uuid": "entry-1"},),
+        ),
+    )
+
+    loaded = TurnRecord.from_dict(record.to_dict())
+
+    assert loaded == record
+    assert [message.role for message in loaded.messages] == ["user", "assistant", "user"]
+    assert loaded.messages[1].content[0]["type"] == "tool_use"
+    assert loaded.messages[2].content[0]["type"] == "tool_result"
+    assert loaded.approval == record.approval
+
+
+def test_legacy_turn_becomes_structured_user_assistant_messages() -> None:
+    record = TurnRecord.from_dict(
+        {"user": "old question", "assistant": "old answer", "ts": "2026-07-14T00:00:00Z"}
+    )
+
+    assert record.messages == (
+        ConversationMessage(role="user", content="old question"),
+        ConversationMessage(
+            role="assistant", content=[{"type": "text", "text": "old answer"}]
+        ),
+    )
+
+
+def test_malformed_structured_turn_is_rejected_instead_of_falling_back_to_legacy() -> None:
+    with pytest.raises(HistoryError, match="structured conversation messages"):
+        TurnRecord.from_dict(
+            {
+                "user": "must not silently survive",
+                "assistant": "legacy fallback",
+                "messages": [42],
+            }
+        )
+
+def test_long_history_compacts_once_then_keeps_prefix_stable_until_next_boundary() -> None:
+    records = [
+        TurnRecord(user=f"u{i}", assistant=f"a{i}", ts=f"2026-08-30T00:00:0{i}Z")
+        for i in range(6)
+    ]
+
+    replay, summary = build_conversation_replay(records, max_turns=4, max_bytes=None)
+
+    assert summary is not None
+    assert summary.source_turns == 4
+    assert all(turn.harness_replay is None for turn in summary.tail)
+    assert replay.summary_digest == summary.digest
+    assert replay.messages[0].role == "user"
+    assert "Durable conversation summary" in str(replay.messages[0].content)
+    assert replay.messages[-2:] == records[-1].messages
+
+    persisted = [*records, summary]
+    with_one_more = [
+        *persisted,
+        TurnRecord(user="u6", assistant="a6", ts="2026-08-30T00:00:06Z"),
+    ]
+    replay_after, next_summary = build_conversation_replay(
+        with_one_more, max_turns=4, max_bytes=None
+    )
+
+    assert next_summary is None
+    assert replay_after.messages[: len(replay.messages)] == replay.messages
+
+
+def test_changed_compacted_prefix_changes_summary_digest() -> None:
+    records = [TurnRecord(user=f"u{i}", assistant=f"a{i}") for i in range(6)]
+    _, original = build_conversation_replay(records, max_turns=4, max_bytes=None)
+    changed = list(records)
+    changed[0] = TurnRecord(user="changed-u0", assistant="a0")
+    _, different = build_conversation_replay(changed, max_turns=4, max_bytes=None)
+
+    assert original is not None
+    assert different is not None
+    assert different.digest != original.digest
+
+
+def test_summary_digest_ignores_optional_harness_checkpoint_metadata() -> None:
+    def records(entry_uuid: str) -> list[TurnRecord]:
+        return [
+            TurnRecord(
+                user=f"u{i}",
+                assistant=f"a{i}",
+                harness_replay=HarnessReplayState(
+                    harness="claude",
+                    kind="checkpoint" if i == 0 else "delta",
+                    entries=({"uuid": f"{entry_uuid}-{i}"},),
+                ),
+            )
+            for i in range(4)
+        ]
+
+    _, first = build_conversation_replay(records("runner-a"), max_turns=2)
+    _, second = build_conversation_replay(records("runner-b"), max_turns=2)
+
+    assert first is not None
+    assert second is not None
+    assert first.digest == second.digest
+
+
+def test_structured_resume_materializes_ordered_sdk_entries_without_rendering_text(
+    tmp_path,
+) -> None:
+    messages = (
+        ConversationMessage(role="user", content="run it"),
+        ConversationMessage(
+            role="assistant",
+            content=[
+                {
+                    "type": "tool_use",
+                    "id": "call-1",
+                    "name": "Bash",
+                    "input": {"command": "echo ok"},
+                }
+            ],
+        ),
+        ConversationMessage(
+            role="user",
+            content=[
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "call-1",
+                    "content": "ok",
+                }
+            ],
+        ),
+        ConversationMessage(
+            role="assistant", content=[{"type": "text", "text": "done"}]
+        ),
+    )
+
+    first = build_structured_resume(
+        messages, curie_session_id="curie-thread-1", cwd=str(tmp_path)
+    )
+    second = build_structured_resume(
+        messages, curie_session_id="curie-thread-1", cwd=str(tmp_path)
+    )
+
+    assert first.resume == first.session_id
+    assert first.session_id == second.session_id
+    assert first.session_store is not None
+    entries = anyio.run(first.session_store.load, first.session_key)
+    assert entries is not None
+    assert [entry["message"]["role"] for entry in entries] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+    ]
+    assert entries[1]["message"]["content"][0]["type"] == "tool_use"
+    assert entries[2]["message"]["content"][0]["type"] == "tool_result"
+    assert [entry["parentUuid"] for entry in entries][1:] == [
+        entry["uuid"] for entry in entries[:-1]
+    ]
+
+    fresh = build_structured_resume((), curie_session_id="curie-thread-1", cwd=str(tmp_path))
+    assert fresh.resume is None
+    assert fresh.session_store is not None
+    assert anyio.run(fresh.session_store.load, fresh.session_key) is None
+    assert fresh.session_id == first.session_id
+
+
+def test_claude_native_checkpoint_is_restored_and_then_exports_only_a_delta(tmp_path) -> None:
+    checkpoint = HarnessReplayState(
+        harness="claude",
+        kind="checkpoint",
+        entries=(
+            {
+                "type": "user",
+                "uuid": "entry-1",
+                "timestamp": "1970-01-01T00:00:00.000Z",
+                "message": {"role": "user", "content": "prior"},
+            },
+        ),
+    )
+    resume = build_structured_resume(
+        (ConversationMessage(role="user", content="prior"),),
+        curie_session_id="curie-thread-native",
+        cwd=str(tmp_path),
+        harness_replay=checkpoint,
+    )
+    assert resume.session_store is not None
+    assert anyio.run(resume.session_store.load, resume.session_key) == list(
+        checkpoint.entries
+    )
+
+    options = build_options(
+        plugins=[],
+        model=None,
+        system_prompt=None,
+        max_turns=2,
+        max_budget_usd=1.0,
+        resume=resume.resume,
+        session_id=resume.session_id,
+        session_store=resume.session_store,
+    )
+    session = ClaudeAgentSession(options)
+    delta_entry = {"type": "assistant", "uuid": "entry-2"}
+    anyio.run(resume.session_store.append, resume.session_key, [delta_entry])
+
+    exported = anyio.run(session.export_replay_state)
+
+    assert exported == HarnessReplayState(
+        harness="claude", kind="delta", entries=(delta_entry,)
+    )
+
+
+def test_replay_folds_native_checkpoint_and_deltas_but_drops_them_at_compaction() -> None:
+    turns = [
+        TurnRecord(
+            user="u0",
+            assistant="a0",
+            harness_replay=HarnessReplayState(
+                harness="claude", kind="checkpoint", entries=({"uuid": "one"},)
+            ),
+        ),
+        TurnRecord(
+            user="u1",
+            assistant="a1",
+            harness_replay=HarnessReplayState(
+                harness="claude", kind="delta", entries=({"uuid": "two"},)
+            ),
+        ),
+    ]
+
+    replay, summary = build_conversation_replay(turns, max_turns=4, max_bytes=None)
+    assert summary is None
+    assert replay.harness_replay == HarnessReplayState(
+        harness="claude",
+        kind="checkpoint",
+        entries=({"uuid": "one"}, {"uuid": "two"}),
+    )
+
+    compacted, summary = build_conversation_replay(
+        [*turns, TurnRecord(user="u2", assistant="a2")],
+        max_turns=2,
+        max_bytes=None,
+    )
+    assert summary is not None
+    assert compacted.harness_replay is None
+
+
 def test_resolve_absent_ref_is_null_store() -> None:
     store = resolve_history(None, {})
     assert isinstance(store, NullTranscriptStore)
@@ -74,77 +361,6 @@ def test_resolve_unsupported_scheme_raises() -> None:
         resolve_history("sdk-session-abc123", {})
     with pytest.raises(HistoryError):
         resolve_history("s3://bucket/hist", {})
-
-
-def test_preamble_empty_is_none() -> None:
-    assert format_conversation_preamble([]) is None
-
-
-def test_preamble_includes_user_and_assistant_text_oldest_first() -> None:
-    turns = [
-        TurnRecord(user="deploy the app", assistant="pushed to dev"),
-        TurnRecord(user="and prod?", assistant="promoted to prod"),
-    ]
-    preamble = format_conversation_preamble(turns)
-    assert preamble is not None
-    assert "deploy the app" in preamble
-    assert "pushed to dev" in preamble
-    assert "and prod?" in preamble
-    assert "promoted to prod" in preamble
-    # Oldest first: the first turn's user text precedes the second turn's.
-    assert preamble.index("deploy the app") < preamble.index("and prod?")
-
-
-# --- preamble windowing (the preamble must be bounded) ---------------------------
-
-
-def test_preamble_windows_by_max_turns_keeping_the_tail() -> None:
-    # A long thread must not render an unbounded preamble: with an explicit small
-    # max_turns, only the most-recent turns survive and an elision note flags that
-    # earlier turns were dropped.
-    turns = [
-        TurnRecord(user=f"user-msg-{i}", assistant=f"assistant-msg-{i}") for i in range(50)
-    ]
-    preamble = format_conversation_preamble(turns, max_turns=5)
-    assert preamble is not None
-    # The newest turn's content is kept; an old (dropped) turn's is not.
-    assert "user-msg-49" in preamble
-    assert "user-msg-0" not in preamble
-    # The truncation is announced.
-    assert "elided" in preamble
-
-
-def test_preamble_windows_by_max_bytes_keeping_the_tail() -> None:
-    # A tiny byte budget caps the rendered size: the oldest turns are dropped, the
-    # most-recent kept, and the elision note appears. Driven by an explicit
-    # max_bytes so the test does not depend on the default's exact value.
-    turns = [TurnRecord(user=f"u{i}", assistant=f"a{i}") for i in range(50)]
-    unbounded = format_conversation_preamble(turns, max_turns=None, max_bytes=None)
-    assert unbounded is not None
-    preamble = format_conversation_preamble(turns, max_bytes=400)
-    assert preamble is not None
-    assert "elided" in preamble
-    # Most-recent kept, oldest dropped.
-    assert "u49" in preamble
-    assert "u0" not in preamble
-    # Truncation actually shrank the output and stayed near the budget.
-    assert len(preamble.encode("utf-8")) < len(unbounded.encode("utf-8"))
-    assert len(preamble.encode("utf-8")) <= 2 * 400
-
-
-def test_preamble_short_transcript_is_byte_identical_and_unnoted() -> None:
-    # Backward-compat: a small transcript under the defaults renders with NO
-    # elision note and is byte-identical to the uncapped (max_turns=None,
-    # max_bytes=None) output for the same records.
-    turns = [
-        TurnRecord(user="deploy the app", assistant="pushed to dev"),
-        TurnRecord(user="and prod?", assistant="promoted to prod"),
-    ]
-    uncapped = format_conversation_preamble(turns, max_turns=None, max_bytes=None)
-    defaulted = format_conversation_preamble(turns)
-    assert defaulted == uncapped
-    assert defaulted is not None
-    assert "elided" not in defaulted
 
 
 def test_state_store_load_empty_is_empty() -> None:
@@ -195,6 +411,26 @@ def test_state_store_load_rejects_non_array() -> None:
             url = str(server.make_url("/agents/A/state/transcript/t1"))
             store = StateApiTranscriptStore(url, token=None)
             with pytest.raises(HistoryError):
+                await store.load()
+
+    anyio.run(go)
+
+
+def test_state_store_load_rejects_malformed_log_entry() -> None:
+    app = web.Application()
+
+    async def get_key(_request: web.Request) -> web.Response:
+        return web.json_response(
+            {"namespace": "transcript", "key": "t1", "value": [42], "version": 1}
+        )
+
+    app.router.add_get("/agents/A/state/transcript/t1", get_key)
+
+    async def go() -> None:
+        async with TestServer(app) as server:
+            url = str(server.make_url("/agents/A/state/transcript/t1"))
+            store = StateApiTranscriptStore(url, token=None)
+            with pytest.raises(HistoryError, match="invalid transcript record"):
                 await store.load()
 
     anyio.run(go)
@@ -259,6 +495,23 @@ def test_successful_turn_is_appended_to_the_transcript() -> None:
     # default_turn's terminal result text.
     assert store.turns[0].assistant == "all done"
     assert store.turns[0].ts  # a timestamp was stamped
+    assert [message.role for message in store.turns[0].messages] == [
+        "user",
+        "assistant",
+        "assistant",
+        "user",
+        "assistant",
+    ]
+    assert any(
+        isinstance(message.content, list)
+        and any(block.get("type") == "tool_use" for block in message.content)
+        for message in store.turns[0].messages
+    )
+    assert any(
+        isinstance(message.content, list)
+        and any(block.get("type") == "tool_result" for block in message.content)
+        for message in store.turns[0].messages
+    )
 
 
 def test_synthetic_done_after_incomplete_turn_is_not_appended_to_the_transcript() -> None:
@@ -355,7 +608,7 @@ def test_budget_halted_turn_is_not_appended_to_the_transcript() -> None:
     assert store.turns == []
 
 
-def test_awaiting_approval_turn_is_not_appended_to_the_transcript() -> None:
+def test_awaiting_approval_turn_is_appended_with_suspend_context() -> None:
     from aci_protocol import Event, SessionStatus
     from curie_runner.fake import approval_turn
 
@@ -366,7 +619,11 @@ def test_awaiting_approval_turn_is_not_appended_to_the_transcript() -> None:
     )
 
     assert final.status is SessionStatus.AWAITING_APPROVAL
-    assert store.turns == []
+    assert len(store.turns) == 1
+    assert store.turns[0].status == SessionStatus.AWAITING_APPROVAL.value
+    assert store.turns[0].approval is not None
+    assert store.turns[0].approval.gate_kind == "policy"
+    assert store.turns[0].approval.summary == "Approve the action"
 
 
 def test_interrupted_turn_is_not_appended_to_the_transcript() -> None:
@@ -394,23 +651,22 @@ def test_interrupted_turn_is_not_appended_to_the_transcript() -> None:
     assert store.turns == []
 
 
-def test_compose_system_prompt_orders_memory_then_conversation_then_base() -> None:
-    # Boot delivery (ADR-0029): durable memory leads, then this thread's recovered
-    # conversation, then the bundle/env system prompt. Any part may be absent.
+def test_compose_system_prompt_excludes_conversation_history() -> None:
+    # ADR-0119: only memory and bundle instructions belong in the system prompt;
+    # conversation history crosses as structured messages.
     from curie_runner.__main__ import _compose_system_prompt
 
-    assert _compose_system_prompt("BASE", "MEM", "CONV", model=None) == "MEM\n\nCONV\n\nBASE"
-    assert _compose_system_prompt("BASE", None, "CONV", model=None) == "CONV\n\nBASE"
-    assert _compose_system_prompt("BASE", "MEM", None, model=None) == "MEM\n\nBASE"
-    assert _compose_system_prompt(None, None, None, model=None) is None
+    assert _compose_system_prompt("BASE", "MEM", model=None) == "MEM\n\nBASE"
+    assert _compose_system_prompt("BASE", None, model=None) == "BASE"
+    assert _compose_system_prompt(None, None, model=None) is None
 
 
 def test_compose_system_prompt_appends_configured_model() -> None:
     from curie_runner.__main__ import _compose_system_prompt
 
     assert (
-        _compose_system_prompt("BASE", "MEM", "CONV", model="z-ai/glm-5.2")
-        == "MEM\n\nCONV\n\nBASE\n\nConfigured model: z-ai/glm-5.2"
+        _compose_system_prompt("BASE", "MEM", model="z-ai/glm-5.2")
+        == "MEM\n\nBASE\n\nConfigured model: z-ai/glm-5.2"
     )
 
 

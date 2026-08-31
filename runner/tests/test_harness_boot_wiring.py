@@ -22,6 +22,7 @@ from curie_runner.harness.registry import (
     MalformedHarnessContributionError,
     UnknownHarnessError,
 )
+from curie_runner.history import ConversationMessage, ConversationReplay
 
 _BUDGET = '{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}'
 
@@ -57,6 +58,40 @@ def _harness(**overrides) -> HarnessContribution:
     )
     defaults.update(overrides)
     return HarnessContribution(**defaults)
+
+
+def test_harness_without_structured_replay_refuses_recovered_history(tmp_path) -> None:
+    from curie_runner.history import StructuredReplayUnsupported
+
+    replay = ConversationReplay(
+        messages=(ConversationMessage(role="user", content="prior turn"),),
+        source_turns=1,
+    )
+    harness = _harness(supports_structured_replay=False)
+
+    with pytest.raises(StructuredReplayUnsupported, match="declares structured replay absent"):
+        build_runner(_config(tmp_path), conversation_replay=replay, harness=harness)
+
+
+def test_claude_runner_materializes_history_without_system_prompt_preamble(tmp_path) -> None:
+    config = _config(tmp_path)
+    replay = ConversationReplay(
+        messages=(
+            ConversationMessage(role="user", content="prior question"),
+            ConversationMessage(
+                role="assistant", content=[{"type": "text", "text": "prior answer"}]
+            ),
+        ),
+        source_turns=1,
+    )
+
+    runner = build_runner(config, conversation_replay=replay)
+    options = runner._factory()._options
+
+    assert options.system_prompt is None
+    assert options.resume is not None
+    assert options.session_store is not None
+    assert runner._history_resumed is True
 
 
 def test_build_runner_uses_the_harness_readonly_set(tmp_path) -> None:

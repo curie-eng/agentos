@@ -10,16 +10,40 @@ A third live test covers the OpenRouter path, gated on ``OPENROUTER_API_KEY``.
 """
 
 import os
+import shlex
+from typing import Any
 
 import anyio
 import pytest
-from aci_protocol import Event, SessionStatus, parse_ndjson
+from aci_protocol import Event, Final, SessionStatus, parse_ndjson, parse_ndjson_line
 from curie_runner import RunTracer, SideEffectClassifier, build_options
-from curie_runner.adapter import ClaudeAgentSession
+from curie_runner.adapter import (
+    ClaudeAgentSession,
+    build_structured_resume,
+    model_message_to_conversation,
+)
+from curie_runner.history import (
+    ConversationMessage,
+    HarnessReplayState,
+    TurnRecord,
+    build_conversation_replay,
+)
 from curie_runner.session import SessionRunner
 
 _HAS_CRED = bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or os.environ.get("ANTHROPIC_API_KEY"))
 _OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+_LIVE_REQUESTED = os.environ.get("CURIE_E2E_LIVE") == "1"
+
+
+class _LiveTranscriptStore:
+    def __init__(self) -> None:
+        self.records: list[TurnRecord] = []
+
+    async def load(self) -> list[TurnRecord]:
+        return list(self.records)
+
+    async def append(self, record: TurnRecord) -> None:
+        self.records.append(record)
 
 
 @pytest.mark.skipif(
@@ -230,3 +254,319 @@ def test_live_permission_gate_pauses_awaiting_approval() -> None:
     # The blocked command never executed and never produced output text
     # claiming it ran; the summary records what WOULD have run.
     assert "echo curie-gate-live" in final.approval_summary
+
+
+@pytest.mark.skipif(
+    not _LIVE_REQUESTED,
+    reason="set CURIE_E2E_LIVE=1 for disposable structured-replay provider evidence",
+)
+def test_live_structured_replay_cache_hit_and_changed_prefix_negative(tmp_path) -> None:
+    """Fresh SDK clients hit only for an identical native history checkpoint.
+
+    The provider behavior behind this test was observed with the pinned SDK and
+    is recorded with version/output evidence in
+    ``docs/spikes/1902-claude-agent-sdk-structured-replay.md``. Portable
+    role/content stays authoritative; the matching Claude harness additionally
+    persists an opaque checkpoint so the provider's own cache-breakpoint shape
+    survives the runner boundary.
+    """
+
+    from claude_agent_sdk import (
+        AssistantMessage,
+        ClaudeSDKClient,
+        ResultMessage,
+        TextBlock,
+    )
+
+    marker = f"native-cache-marker-{tmp_path.name}"
+    source_prompt = f"Use Bash to run exactly `printf '{marker}\\n'`, then report its output."
+    system_prompt = (
+        "You are a deterministic test agent. Use Bash exactly when asked, then "
+        "answer tersely and do not repeat a tool call."
+    )
+
+    async def source_checkpoint() -> tuple[
+        tuple[ConversationMessage, ...], HarnessReplayState
+    ]:
+        seeded = build_structured_resume(
+            (), curie_session_id="live-cache-prefix-1902", cwd=str(tmp_path)
+        )
+        options = build_options(
+            plugins=[],
+            model=None,
+            system_prompt=system_prompt,
+            max_turns=4,
+            max_budget_usd=1.0,
+            resume=seeded.resume,
+            session_id=seeded.session_id,
+            session_store=seeded.session_store,
+            cwd=str(tmp_path),
+        )
+        session = ClaudeAgentSession(options)
+        portable: list[ConversationMessage] = [
+            ConversationMessage(role="user", content=source_prompt)
+        ]
+        await session.connect()
+        try:
+            await session.query(source_prompt)
+            async for message in session.receive_turn():
+                projected = model_message_to_conversation(message)
+                if projected is not None:
+                    portable.append(projected)
+                if isinstance(message, ResultMessage):
+                    break
+            checkpoint = await session.export_replay_state()
+        finally:
+            await session.close()
+        assert checkpoint is not None
+        assert checkpoint.kind == "checkpoint"
+        return tuple(portable), checkpoint
+
+    async def run_checkpoint(
+        messages: tuple[ConversationMessage, ...],
+        checkpoint: HarnessReplayState,
+    ) -> tuple[dict[str, Any], str]:
+        resume = build_structured_resume(
+            messages,
+            curie_session_id="live-cache-prefix-1902",
+            cwd=str(tmp_path),
+            harness_replay=checkpoint,
+        )
+        options = build_options(
+            plugins=[],
+            model=None,
+            system_prompt=system_prompt,
+            max_turns=2,
+            max_budget_usd=1.0,
+            resume=resume.resume,
+            session_id=resume.session_id,
+            session_store=resume.session_store,
+            cwd=str(tmp_path),
+        )
+        async with ClaudeSDKClient(options) as client:
+            await client.query(
+                "What exact output did the prior Bash call produce? Do not use tools."
+            )
+            texts: list[str] = []
+            async for message in client.receive_response():
+                if isinstance(message, AssistantMessage):
+                    texts.extend(
+                        block.text for block in message.content if isinstance(block, TextBlock)
+                    )
+                if isinstance(message, ResultMessage):
+                    usage = message.usage if isinstance(message.usage, dict) else {}
+                    return usage, "".join(texts)
+        raise AssertionError("live SDK response had no terminal result")
+
+    async def go() -> tuple[dict[str, Any], dict[str, Any], str, dict[str, Any]]:
+        messages, checkpoint = await source_checkpoint()
+        # Negative arm: keep portable recovery identical but change one message
+        # in the optional native checkpoint. Exact provider prefix matching must
+        # invalidate that layer.
+        changed_payload = checkpoint.to_dict()
+        changed_one = False
+        for entry in changed_payload["entries"]:
+            message = entry.get("message")
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            content = message.get("content")
+            if isinstance(content, str):
+                message["content"] = f"changed-prefix {content}"
+                changed_one = True
+                break
+        assert changed_one, "captured SDK checkpoint had no mutable user message"
+        changed = HarnessReplayState.from_dict(changed_payload)
+        primed, _ = await run_checkpoint(messages, checkpoint)
+        identical, recovered = await run_checkpoint(messages, checkpoint)
+        different, _ = await run_checkpoint(messages, changed)
+        return primed, identical, recovered, different
+
+    primed, identical, recovered, different = anyio.run(go)
+    identical_read = int(identical.get("cache_read_input_tokens") or 0)
+    different_read = int(different.get("cache_read_input_tokens") or 0)
+    identical_create = int(identical.get("cache_creation_input_tokens") or 0)
+    different_create = int(different.get("cache_creation_input_tokens") or 0)
+
+    assert marker in recovered
+    assert (
+        int(primed.get("cache_read_input_tokens") or 0)
+        + int(primed.get("cache_creation_input_tokens") or 0)
+        > 0
+    )
+    assert identical_read > 0
+    assert different_read < identical_read or different_create > identical_create, (
+        "changing the recovered native history did not invalidate its cache layer: "
+        f"identical={identical!r}, changed={different!r}"
+    )
+
+
+@pytest.mark.skipif(
+    not _LIVE_REQUESTED,
+    reason="set CURIE_E2E_LIVE=1 for disposable structured-replay provider evidence",
+)
+def test_live_cross_runner_approval_exact_once_and_cache_observable(
+    tmp_path, monkeypatch
+) -> None:
+    """A suspended real tool call resumes once, then its one-shot grant expires."""
+
+    from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
+    from curie_runner import session as session_module
+    from curie_runner.approval import (
+        ApprovalGate,
+        build_approval_hook,
+        build_can_use_tool,
+    )
+
+    metric_calls: list[tuple[str, float, dict[str, str] | None]] = []
+    real_record_metric = session_module.record_metric
+
+    def observe_metric(
+        name: str,
+        value: float = 1,
+        *,
+        attributes: dict[str, str] | None = None,
+    ) -> None:
+        metric_calls.append((name, value, attributes))
+        real_record_metric(name, value, attributes=attributes)
+
+    monkeypatch.setattr(session_module, "record_metric", observe_metric)
+
+    marker_file = tmp_path / "approval-executions.txt"
+    command = f"printf 'approved-once\\n' >> {shlex.quote(str(marker_file))}"
+    system_prompt = (
+        "You are a deterministic test agent. When explicitly asked to run a shell "
+        "command, call Bash with that exact command once and then stop."
+    )
+    store = _LiveTranscriptStore()
+
+    def options_for(
+        gate: ApprovalGate,
+        replay: tuple[ConversationMessage, ...],
+        harness_replay: HarnessReplayState | None = None,
+    ):
+        resume = build_structured_resume(
+            replay,
+            curie_session_id="live-approval-thread-1902",
+            cwd=str(tmp_path),
+            harness_replay=harness_replay,
+        )
+        return build_options(
+            plugins=[],
+            model=None,
+            system_prompt=system_prompt,
+            max_turns=4,
+            max_budget_usd=1.0,
+            resume=resume.resume,
+            session_id=resume.session_id,
+            session_store=resume.session_store,
+            hooks=build_approval_hook(gate),
+            can_use_tool=build_can_use_tool(gate),
+            cwd=str(tmp_path),
+        )
+
+    async def drive(runner: SessionRunner, text: str) -> Final:
+        await runner.start()
+        final: Final | None = None
+        try:
+            async for line in runner.run_turn(
+                Event(type="message", text=text, user="U0EXAMPLE", ts="1")
+            ):
+                event = parse_ndjson_line(line)
+                if isinstance(event, Final):
+                    final = event
+        finally:
+            await runner.close()
+        assert final is not None
+        return final
+
+    blocked_gate = ApprovalGate(required=frozenset({"Bash"}))
+    blocked = SessionRunner(
+        session_factory=lambda: ClaudeAgentSession(options_for(blocked_gate, ())),
+        ceiling=0,
+        tracer=RunTracer(None),
+        classifier=SideEffectClassifier(),
+        trace_name="live-structured-approval-block",
+        session_id="live-approval-thread-1902",
+        history_store=store,
+        approval_gate=blocked_gate,
+    )
+    first = anyio.run(drive, blocked, f"Run this exact shell command: {command}")
+    assert first.status is SessionStatus.AWAITING_APPROVAL
+    assert not marker_file.exists()
+    assert len(store.records) == 1
+    assert store.records[0].harness_replay is not None
+
+    replay, summary = build_conversation_replay(store.records)
+    assert summary is None
+    assert replay.messages[-1].role == "user"
+    assert replay.messages[-1].content[0]["type"] == "tool_result"
+
+    allowed_commands: list[str] = []
+    resumed_gate = ApprovalGate(required=frozenset({"Bash"}), grant_tool="Bash")
+    permission_callback = build_can_use_tool(resumed_gate)
+
+    async def observe_permission(tool_name, tool_input, context):
+        decision = await permission_callback(tool_name, tool_input, context)
+        if isinstance(decision, PermissionResultAllow):
+            allowed_commands.append(str(tool_input.get("command") or ""))
+        assert isinstance(decision, (PermissionResultAllow, PermissionResultDeny))
+        return decision
+
+    resumed_options = options_for(
+        resumed_gate, replay.messages, replay.harness_replay
+    )
+    # Production's PreToolUse hook spends the grant. Keep can_use_tool as an
+    # observation-only wrapper for any SDK path that reaches it.
+    resumed_options.can_use_tool = observe_permission
+    resumed = SessionRunner(
+        session_factory=lambda: ClaudeAgentSession(resumed_options),
+        ceiling=0,
+        tracer=RunTracer(None),
+        classifier=SideEffectClassifier(),
+        trace_name="live-structured-approval-resume",
+        session_id="live-approval-thread-1902",
+        approval_gate=resumed_gate,
+        approval_decision="approved",
+        history_resumed=True,
+    )
+    async def drive_resumed_turns() -> tuple[Final, Final]:
+        await resumed.start()
+        finals: list[Final] = []
+        try:
+            for text in (
+                "The prior Bash call is approved. Retry that exact call once now, then stop.",
+                "Attempt the same Bash command one more time.",
+            ):
+                final: Final | None = None
+                async for line in resumed.run_turn(
+                    Event(type="message", text=text, user="U0EXAMPLE", ts="2")
+                ):
+                    event = parse_ndjson_line(line)
+                    if isinstance(event, Final):
+                        final = event
+                assert final is not None
+                finals.append(final)
+        finally:
+            await resumed.close()
+        return finals[0], finals[1]
+
+    approved, duplicate = anyio.run(drive_resumed_turns)
+    assert approved.status is SessionStatus.DONE
+    assert marker_file.read_text().splitlines() == ["approved-once"]
+
+    # Same runner, later turn: reset() expires the one-shot grant. Asking for the
+    # action again must pause without another write.
+    assert duplicate.status is SessionStatus.AWAITING_APPROVAL
+    assert marker_file.read_text().splitlines() == ["approved-once"]
+    assert allowed_commands == []  # hook allow skips can_use_tool in the pinned SDK
+
+    cache_calls = [
+        call for call in metric_calls if call[0] == "curie.history.resume.cache_read"
+    ]
+    assert len(cache_calls) == 1
+    assert cache_calls[0][1] > 0
+    assert cache_calls[0][2] == {
+        "service.name": "curie-runner",
+        "source": "runner",
+        "cache_hit": "true",
+    }
