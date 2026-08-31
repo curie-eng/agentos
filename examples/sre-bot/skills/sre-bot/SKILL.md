@@ -146,6 +146,39 @@ not have -- skip it, and do not offer any of it.
 - **Do not answer with a dashboard link instead of a number.** Read the panel,
   say what it shows, then link it so the asker can go deeper.
 
+### One metrics source, and how to tell
+
+The Prometheus this bundle installs finds **annotation-discovered** targets
+only in its own namespace, and stamps every sample it scrapes with
+`curie_source="curie-sre-bot"`. So a capacity number here counts each Kubernetes
+object once, and you can say which stack an answer came from. Node-level jobs
+are the deliberate exception and stay cluster-wide -- they resolve one target
+per Node through the API server, so kubelet and cAdvisor metrics cover every
+node and are not namespace-isolated.
+
+- **A duplicate is a bug, not a bigger cluster.** If a query returns the same
+  workload twice -- same namespace, same pod, same container, differing only in
+  `job`, `instance` or `service` -- do not sum it. Something is feeding this
+  Prometheus a second exporter. Say the reading is unreliable and why, rather
+  than reporting the doubled figure.
+- **Qualify on `curie_source` when you are about to state a total.** A pod
+  count, a restart count, node headroom -- anything someone will act on --
+  should be read from series carrying that label.
+- **Not on `up`.** Prometheus builds `up` and the other `scrape_*` series
+  itself, after that label is applied, so they never carry it. Filtering `up` on
+  `curie_source` returns nothing, which reads exactly like a dead exporter and
+  is the fastest way to report a healthy stack as down. Qualify `up` by the
+  target instead -- `job` alone is too coarse, because one job carries every
+  annotation-discovered exporter, so add `service` or `instance` to name the one
+  you mean.
+- **The label is a fact about this install, not about Prometheus, and not about
+  its whole history.** An unstamped scraped series is usually a different
+  datasource -- but on an install that predates this boundary, retention still
+  holds unstamped series from before the upgrade, so a range query far enough
+  back can return one from this very store. Treat a missing label as a question
+  about where the data came from, check the window before concluding anything,
+  and say which datasource you used.
+
 ### Keeping queries cheap
 
 Some results are far larger than they look, and pulling them wholesale wastes
