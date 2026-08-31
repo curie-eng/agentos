@@ -109,6 +109,45 @@ bundle by removing the write connector and its matching approval gate together.
 The declared write path remains in the source bundle for the explicit Level up
 build and deploy flow below.
 
+### One source of capacity truth
+
+This Prometheus is the bot's own evidence, not a cluster-wide scrape platform.
+It discovers annotated targets **only in its own namespace** -- the one
+`--observability-namespace` names -- which is where the installer puts
+kube-state-metrics and the node exporter, and it stamps every sample it scrapes
+with `curie_source="curie-sre-bot"`.
+
+That boundary is why installing on a cluster that already runs monitoring is
+safe. The stock chart keeps any `prometheus.io/scrape` target in any namespace,
+so beside an existing stack it would ingest a second kube-state-metrics and a
+second node exporter: one restart, two series, identical workload labels, and a
+bot confidently reporting double the restarts and double the estate. Scoping
+discovery removes the second source; the stamp says which install an answer came
+from, which is what keeps it legible if this store is ever federated into or
+read beside another one.
+
+Note what the stamp does **not** cover. Prometheus synthesizes `up`,
+`scrape_duration_seconds` and the rest of the per-scrape series after metric
+relabeling, so those carry no `curie_source` -- qualify them by `job`. And the
+scope is a namespace, not a release: put a second monitoring stack in *this*
+namespace and both kube-state-metrics instances are back in scope, stamped
+identically. Give this stack a namespace of its own.
+
+What you give up is real, and it is more than application metrics. Outside this
+namespace nothing annotated is collected here any more: not app pods, not
+third-party Service exporters such as an ingress controller or a database
+exporter, and not `prometheus.io/probe` blackbox targets. So cluster-wide
+service health, error-rate and probe evidence that used to arrive through those
+annotations is gone from *this* Prometheus -- the bot still sees every
+namespace's objects through kube-state-metrics and the Kubernetes API, and every
+namespace's logs through Loki, but not those exporters' own metrics. If you want
+a shared, cluster-wide scrape platform, run one and point Grafana at it rather
+than widening this one: the moment this Prometheus holds two sources for the
+same object, every unqualified capacity answer the bot gives is wrong in a way
+nothing in the pipeline will flag. The node-level jobs are deliberately left
+cluster-wide -- they resolve one target per Node through the API server, so they
+cannot double count, and the bot would otherwise be blind to every kubelet.
+
 ---
 
 ## Talk to it in Slack
