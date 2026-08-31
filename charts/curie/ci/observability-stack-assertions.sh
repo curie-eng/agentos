@@ -105,6 +105,7 @@ assert mutation in {
     "viewer-role",
     "rotation-restart",
     "restart-scope",
+    "tempo-envelope",
 }, f"unknown mutation {mutation!r}"
 
 assets = Path(assets_path)
@@ -282,7 +283,7 @@ expected_requests = {
     "Grafana": (grafana_docs, "grafana/grafana", Decimal(128)),
     "Loki": (loki_docs, "grafana/loki", Decimal(256)),
     "Alloy": (alloy_docs, "grafana/alloy", Decimal(128)),
-    "Tempo": (tempo_docs, "grafana/tempo", Decimal(192)),
+    "Tempo": (tempo_docs, "grafana/tempo", Decimal(256)),
     "Prometheus": (prometheus_docs, "prometheus/prometheus", Decimal(512)),
     "kube-state-metrics": (prometheus_docs, "kube-state-metrics", Decimal(64)),
     "node-exporter": (prometheus_docs, "node-exporter", Decimal(32)),
@@ -293,7 +294,7 @@ for label, (docs, image, expected) in expected_requests.items():
     actual = memory_mi(at(container, "resources", "requests", "memory"))
     assert actual == expected, f"{label} request must be {expected}Mi, got {actual}Mi"
     request_total += actual
-assert request_total == 1312, f"observability request total must be 1312Mi, got {request_total}Mi"
+assert request_total == 1376, f"observability request total must be 1376Mi, got {request_total}Mi"
 
 # The chart image itself closes the Loki config and image version contract.
 _, _, loki_container = image_container(loki_docs, "grafana/loki", "Loki")
@@ -354,6 +355,154 @@ assert len(tempo_configs) == 1, f"expected one Tempo config, found {len(tempo_co
 protocols = at(tempo_configs[0], "distributor", "receivers", "otlp", "protocols")
 assert at(protocols, "grpc", "endpoint") == "0.0.0.0:4317"
 assert at(protocols, "http", "endpoint") == "0.0.0.0:4318"
+
+# --- #2059: the shipped Tempo single-pod memory and query envelope ----------
+# Tempo runs as one pod under a fixed cgroup limit, but every knob it does not
+# set explicitly keeps Tempo's DISTRIBUTED-deployment default. Each bound below
+# is a measured value from #2059, not a preference; a "cleanup" that removes one
+# restores a default sized for a fleet of queriers.
+tempo_config = tempo_configs[0]
+tempo_pod_template = at(tempo_statefulsets[0], "spec", "template")
+
+if mutation == "tempo-envelope":
+    # Negative control: reproduce the exact pre-#2059 shape (bounds absent, no
+    # GOMEMLIMIT) so every assertion below is proved to be load bearing.
+    tempo_config.get("storage", {}).get("trace", {}).pop("pool", None)
+    tempo_config.get("storage", {}).get("trace", {}).pop("search", None)
+    tempo_config.get("ingester", {}).pop("max_block_bytes", None)
+    tempo_config.get("ingester", {}).pop("complete_block_timeout", None)
+    tempo_config.pop("querier", None)
+    tempo_config.pop("query_frontend", None)
+    tempo_config.pop("overrides", None)
+    tempo_container.pop("env", None)
+
+
+def tempo_bound(path):
+    """Read a dotted path out of the shipped Tempo config."""
+    return at(tempo_config, *path.split("."))
+
+
+# Adding a knob is one line here. Values are the measured #2059 envelope.
+tempo_envelope_bounds = {
+    "ingester.max_block_bytes": 52428800,
+    "ingester.complete_block_timeout": "5m",
+    "querier.max_concurrent_queries": 4,
+    "storage.trace.pool.max_workers": 20,
+    "storage.trace.pool.queue_depth": 2000,
+    "storage.trace.search.read_buffer_count": 8,
+    "storage.trace.search.read_buffer_size_bytes": 1048576,
+    "storage.trace.search.prefetch_trace_count": 100,
+    "query_frontend.max_outstanding_per_tenant": 200,
+    "query_frontend.trace_by_id.query_shards": 8,
+    "query_frontend.search.concurrent_jobs": 40,
+    "query_frontend.search.target_bytes_per_job": 26214400,
+    "query_frontend.search.max_duration": "24h",
+    "query_frontend.search.max_result_limit": 50,
+    "overrides.defaults.global.max_bytes_per_trace": 2000000,
+    "overrides.defaults.read.max_bytes_per_tag_values_query": 1000000,
+}
+for tempo_key, tempo_expected in tempo_envelope_bounds.items():
+    tempo_actual = tempo_bound(tempo_key)
+    assert tempo_actual == tempo_expected, (
+        f"Tempo envelope (#2059): {tempo_key} must be {tempo_expected!r}, "
+        f"got {tempo_actual!r}"
+    )
+
+tempo_request_mi = memory_mi(at(tempo_container, "resources", "requests", "memory"))
+tempo_limit_mi = memory_mi(at(tempo_container, "resources", "limits", "memory"))
+tempo_limit_bytes = tempo_limit_mi * 1024 * 1024
+
+# THE ASSERTION THAT ENCODES THE DEFECT (#2059). Tempo sizes its block-read
+# buffers as max_workers * read_buffer_count * read_buffer_size_bytes. At Tempo's
+# distributed defaults that is 400 * 32 * 1MiB = 12.8 GiB of worst-case read
+# buffers against the 512Mi limit the stack shipped -- 2560% of the pod, which is
+# why ordinary operator reads OOM-killed it (exit 137). Bounded it is
+# 20 * 8 * 1MiB = 160 MiB, 15.6% of the 1Gi limit. Raising the limit alone would
+# not close this: no small-node ceiling is above 12.8 GiB, so the product must be
+# bounded RELATIVE to the limit, not merely below some fixed number.
+tempo_read_buffer_bytes = (
+    tempo_bound("storage.trace.pool.max_workers")
+    * tempo_bound("storage.trace.search.read_buffer_count")
+    * tempo_bound("storage.trace.search.read_buffer_size_bytes")
+)
+tempo_read_buffer_ceiling = tempo_limit_bytes / 4
+assert tempo_read_buffer_bytes <= tempo_read_buffer_ceiling, (
+    "Tempo worst-case read buffers (#2059) must stay within 25% of "
+    f"resources.limits.memory: max_workers * read_buffer_count * "
+    f"read_buffer_size_bytes = {tempo_read_buffer_bytes} bytes vs a ceiling of "
+    f"{tempo_read_buffer_ceiling} bytes (25% of {tempo_limit_mi}Mi), which is "
+    f"{tempo_read_buffer_bytes / tempo_limit_bytes * 100:.1f}% of the limit"
+)
+
+
+def go_memory_bytes(text):
+    """Parse a Go GOMEMLIMIT quantity (Go accepts only binary suffixes)."""
+    match = re.fullmatch(r"([0-9]+)(B|KiB|MiB|GiB|TiB)?", str(text))
+    assert match, f"unsupported GOMEMLIMIT quantity {text!r}"
+    factors = {"": 1, "B": 1, "KiB": 1024, "MiB": 1024**2,
+               "GiB": 1024**3, "TiB": 1024**4}
+    return Decimal(match.group(1)) * factors[match.group(2) or ""]
+
+
+# GOMEMLIMIT is a SOFT Go heap ceiling; the cgroup limit is the hard one. It must
+# sit below the cgroup limit with real headroom because it governs only the Go
+# heap -- goroutine stacks, runtime overhead and the mmap'd block reads Tempo
+# does on the search path are outside it. 80% is that headroom (#2059).
+tempo_env = {
+    entry.get("name"): entry.get("value")
+    for entry in tempo_container.get("env", [])
+    if isinstance(entry, dict)
+}
+assert "GOMEMLIMIT" in tempo_env, (
+    "Tempo container must set GOMEMLIMIT (#2059) so the Go GC learns the cgroup "
+    f"ceiling instead of being killed at it, env has {sorted(tempo_env)}"
+)
+tempo_gomemlimit_bytes = go_memory_bytes(tempo_env["GOMEMLIMIT"])
+assert tempo_gomemlimit_bytes < tempo_limit_bytes, (
+    f"GOMEMLIMIT {tempo_env['GOMEMLIMIT']} ({tempo_gomemlimit_bytes} bytes) must "
+    f"be strictly below resources.limits.memory ({tempo_limit_bytes} bytes)"
+)
+assert tempo_gomemlimit_bytes <= Decimal("0.80") * tempo_limit_bytes, (
+    f"GOMEMLIMIT {tempo_env['GOMEMLIMIT']} ({tempo_gomemlimit_bytes} bytes) must "
+    f"leave non-heap headroom: at most 80% of resources.limits.memory "
+    f"({Decimal('0.80') * tempo_limit_bytes} bytes), got "
+    f"{tempo_gomemlimit_bytes / tempo_limit_bytes * 100:.1f}%"
+)
+
+assert tempo_request_mi <= tempo_limit_mi, (
+    f"Tempo resources.requests.memory ({tempo_request_mi}Mi) must not exceed "
+    f"resources.limits.memory ({tempo_limit_mi}Mi)"
+)
+
+# The server-side search bound mirrors the shipped connector's own clamp, turning
+# a client-side courtesy into a boundary that also binds a direct Grafana Explore
+# query. Read the connector rather than restating 50 here: if MAX_LIMIT moves,
+# this fails instead of silently disagreeing (#2059).
+tempo_connector_source = (assets.parent / "connectors" / "tempo" / "server.py").read_text()
+tempo_max_limit_match = re.search(
+    r"^MAX_LIMIT\s*=\s*([0-9]+)\s*$", tempo_connector_source, re.MULTILINE
+)
+assert tempo_max_limit_match, (
+    "could not read MAX_LIMIT from examples/sre-bot/connectors/tempo/server.py"
+)
+tempo_connector_max_limit = int(tempo_max_limit_match.group(1))
+assert tempo_bound("query_frontend.search.max_result_limit") == tempo_connector_max_limit, (
+    "Tempo query_frontend.search.max_result_limit must equal the shipped "
+    f"connector's MAX_LIMIT ({tempo_connector_max_limit}) in "
+    "examples/sre-bot/connectors/tempo/server.py, got "
+    f"{tempo_bound('query_frontend.search.max_result_limit')} -- the two move together"
+)
+
+# kubectl apply of a changed ConfigMap updates the map and leaves the StatefulSet
+# pod running its old config. Without a changed pod-template annotation nothing
+# rolls, so every assertion above passes while the live Tempo keeps the
+# unbounded defaults: a green change that fixes nothing (#2059).
+tempo_config_checksum = at(tempo_pod_template, "metadata", "annotations", "checksum/config")
+assert tempo_config_checksum != "v1", (
+    "Tempo pod template checksum/config must be bumped off 'v1' so the "
+    "StatefulSet actually rolls onto the bounded ConfigMap (#2059)"
+)
+# --- end #2059 envelope -----------------------------------------------------
 
 datasources = []
 for _, _, parsed, _ in embedded_yaml(grafana_docs):

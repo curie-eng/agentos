@@ -23,10 +23,17 @@ const OBSERVABILITY_NAMESPACE: &str = "observability";
 const CURIE_NAMESPACE: &str = "curie";
 #[allow(dead_code)] // clap --release default; kept beside the other identity names
 const CURIE_RELEASE: &str = "curie";
-// The issue text says 1248Mi, but its seven exact appendix requests total
-// 1312Mi on one node once the enabled 64Mi kube-state-metrics request is
-// included. Alloy and node exporter add 160Mi on every Ready schedulable node.
-const FIXED_MEMORY_MIB: u128 = 1152;
+// #1765's issue text says 1248Mi, but its seven exact appendix requests totalled
+// 1312Mi on one node once the enabled 64Mi kube-state-metrics request was
+// included. #2059 then raised Tempo's own request from 192Mi to 256Mi to fit the
+// measured single-pod envelope in examples/sre-bot/observability/tempo.yaml, so
+// the one-node total is now 1376Mi. FIXED_MEMORY_MIB is the part that lands once
+// per install regardless of node count: Grafana 128 + Loki 256 + Prometheus 512
+// + kube-state-metrics 64 + Tempo 256 = 1216Mi. Alloy 128 and node exporter 32
+// are DaemonSets, so PER_READY_NODE_MEMORY_MIB adds their 160Mi on every Ready
+// schedulable node -- 1216 + 160 = 1376Mi on a single-node cluster. Move the
+// Tempo term here whenever tempo.yaml's resources.requests.memory moves.
+const FIXED_MEMORY_MIB: u128 = 1216;
 const PER_READY_NODE_MEMORY_MIB: u128 = 160;
 const MIB: u128 = 1024 * 1024;
 const HELM_TIMEOUT: &str = "10m";
@@ -2169,7 +2176,10 @@ mod tests {
     #[test]
     fn memory_quantities_cover_the_kubernetes_shapes_used_by_nodes_and_pods() {
         assert_eq!(parse_memory_quantity("1Gi").unwrap(), 1024 * 1024 * 1024);
-        assert_eq!(parse_memory_quantity("1343488Ki").unwrap(), 1312 * MIB);
+        // 1409024Ki is the exact one-node required total (FIXED_MEMORY_MIB
+        // 1216 + PER_READY_NODE_MEMORY_MIB 160 = 1376Mi) in the Ki form a node
+        // reports allocatable memory in; it moved from 1312Mi under #2059.
+        assert_eq!(parse_memory_quantity("1409024Ki").unwrap(), 1376 * MIB);
         assert_eq!(parse_memory_quantity("500M").unwrap(), 500_000_000);
         assert_eq!(parse_memory_quantity("1e6").unwrap(), 1_000_000);
     }

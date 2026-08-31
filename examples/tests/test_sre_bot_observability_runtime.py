@@ -183,7 +183,59 @@ def _render_loki_config(values: dict[str, Any]) -> str:
     return rendered
 
 
-def _tempo_config_and_image() -> tuple[str, str]:
+@dataclass(frozen=True)
+class TempoEnvelope:
+    """The memory envelope the shipped Tempo manifest declares (#2059).
+
+    Both fields are read from `examples/sre-bot/observability/tempo.yaml` and are
+    deliberately optional: the manifest is the single source of truth, so a
+    number restated here would keep the runtime regression green against a
+    reverted manifest. `None` means the manifest does not declare it, which the
+    regression asserts on by name rather than silently substituting a default.
+    """
+
+    memory_limit: str | None
+    gomemlimit: str | None
+
+
+_QUANTITY_SUFFIXES: tuple[tuple[str, int], ...] = (
+    # Longest suffix first: "Mi" must win over "M", "MiB" over "M".
+    ("KiB", 1024),
+    ("MiB", 1024**2),
+    ("GiB", 1024**3),
+    ("TiB", 1024**4),
+    ("Ki", 1024),
+    ("Mi", 1024**2),
+    ("Gi", 1024**3),
+    ("Ti", 1024**4),
+    ("B", 1),
+    ("k", 1000),
+    ("K", 1000),
+    ("M", 1000**2),
+    ("G", 1000**3),
+    ("T", 1000**4),
+)
+
+
+def _memory_bytes(value: str) -> int:
+    """Parse a Kubernetes quantity (`512Mi`) or a Go `GOMEMLIMIT` (`600MiB`).
+
+    One parser for both because the regression compares them against each other
+    and against `docker inspect`, which speaks only bytes.
+    """
+
+    text = value.strip()
+    assert text, "memory quantity must not be empty"
+    for suffix, multiplier in _QUANTITY_SUFFIXES:
+        if text.endswith(suffix):
+            digits = text[: -len(suffix)].strip()
+            assert digits.isdigit(), f"unparsable memory quantity {value!r}"
+            return int(digits) * multiplier
+    assert text.isdigit(), f"unparsable memory quantity {value!r}"
+    return int(text)
+
+
+def _tempo_config_and_image() -> tuple[str, str, TempoEnvelope]:
     documents = [
         document
         for document in yaml.safe_load_all((OBSERVABILITY / "tempo.yaml").read_text())
@@ -191,8 +243,22 @@ def _tempo_config_and_image() -> tuple[str, str]:
     ]
     config = next(document for document in documents if document["kind"] == "ConfigMap")
     stateful_set = next(document for document in documents if document["kind"] == "StatefulSet")
-    image = stateful_set["spec"]["template"]["spec"]["containers"][0]["image"]
-    return config["data"]["tempo.yaml"], image
+    container = stateful_set["spec"]["template"]["spec"]["containers"][0]
+    image = container["image"]
+    limit = container.get("resources", {}).get("limits", {}).get("memory")
+    gomemlimit = next(
+        (
+            entry.get("value")
+            for entry in container.get("env") or []
+            if entry.get("name") == "GOMEMLIMIT"
+        ),
+        None,
+    )
+    envelope = TempoEnvelope(
+        memory_limit=None if limit is None else str(limit),
+        gomemlimit=None if gomemlimit is None else str(gomemlimit),
+    )
+    return config["data"]["tempo.yaml"], image, envelope
 
 
 def _collector_config_and_image() -> tuple[dict[str, Any], str]:
@@ -211,14 +277,14 @@ def _collector_config_and_image() -> tuple[dict[str, Any], str]:
     return config, chart_values["otelCollector"]["image"]
 
 
-def _write_runtime_configs(root: Path) -> dict[str, str]:
+def _write_runtime_configs(root: Path) -> tuple[dict[str, str], TempoEnvelope]:
     root.mkdir(parents=True, exist_ok=True)
 
     loki_values = _load_yaml(OBSERVABILITY / "loki-values.yaml")
     (root / "loki.yaml").write_text(_render_loki_config(loki_values))
     (root / "loki-runtime.yaml").write_text("{}\n")
 
-    tempo_config, tempo_image = _tempo_config_and_image()
+    tempo_config, tempo_image, tempo_envelope = _tempo_config_and_image()
     (root / "tempo.yaml").write_text(tempo_config)
 
     grafana_values = _load_yaml(OBSERVABILITY / "grafana-values.yaml")
@@ -230,12 +296,13 @@ def _write_runtime_configs(root: Path) -> dict[str, str]:
 
     collector_config, collector_image = _collector_config_and_image()
     (root / "collector.yaml").write_text(yaml.safe_dump(collector_config, sort_keys=False))
-    return {
+    images = {
         "loki": f"docker.io/grafana/loki:{loki_values['loki']['image']['tag']}",
         "tempo": tempo_image,
         "grafana": f"docker.io/grafana/grafana:{grafana_values['image']['tag']}",
         "collector": collector_image,
     }
+    return images, tempo_envelope
 
 
 def _request(
@@ -316,6 +383,9 @@ class RuntimeStack:
     front_network: str
     back_network: str
     tempo_probe_container: str
+    tempo_container: str
+    tempo_url: str
+    tempo_envelope: TempoEnvelope
     grafana_url: str
     loki_url: str
     collector_url: str
@@ -383,8 +453,15 @@ def _run_container(
     named_volumes: tuple[tuple[str, str], ...] = (),
     publish: tuple[int, ...] = (),
     args: tuple[str, ...] = (),
+    memory: str | None = None,
 ) -> None:
     command = ["run", "-d", "--name", name, "--network", network]
+    if memory is not None:
+        # `--memory-swap` must be given AND equal to `--memory`: left unset the
+        # container gets swap equal to twice the limit, so it can swap instead
+        # of being OOM killed and any assertion about running "under the
+        # configured limit" becomes vacuous (#2059 edge case E8).
+        command.extend(["--memory", memory, "--memory-swap", memory])
     for alias in aliases:
         command.extend(["--network-alias", alias])
     for key in env or {}:
@@ -428,13 +505,16 @@ def _start_runtime_stack(root: Path) -> RuntimeStack:
     suffix = uuid.uuid4().hex[:10]
     front = f"curie-obs-front-{suffix}"
     back = f"curie-obs-back-{suffix}"
-    images = _write_runtime_configs(root)
+    images, tempo_envelope = _write_runtime_configs(root)
     tempo_connector_image = f"curie-sre-bot-tempo-runtime:{suffix}"
     stack = RuntimeStack(
         suffix=suffix,
         front_network=front,
         back_network=back,
         tempo_probe_container="",
+        tempo_container="",
+        tempo_url="",
+        tempo_envelope=tempo_envelope,
         grafana_url="",
         loki_url="",
         collector_url="",
@@ -502,18 +582,34 @@ def _populate_runtime_stack(stack: RuntimeStack, root: Path, images: dict[str, s
     _wait_http(f"{stack.loki_url}/ready", loki)
 
     tempo = _container_name("tempo", suffix)
+    # Run Tempo AT the envelope the shipped manifest declares (#2059). Started
+    # unbounded, this stack proves only that Tempo works, never that it works
+    # inside the cgroup it actually ships with. The values come from the
+    # manifest, never from a literal here, so a reverted manifest cannot leave
+    # this test green.
+    envelope = stack.tempo_envelope
+    tempo_env = None if envelope.gomemlimit is None else {"GOMEMLIMIT": envelope.gomemlimit}
+    tempo_memory = (
+        None if envelope.memory_limit is None else str(_memory_bytes(envelope.memory_limit))
+    )
     _run_container(
         stack,
         tempo,
         images["tempo"],
         back,
         aliases=("tempo.observability.svc.cluster.local",),
+        env=tempo_env,
         volumes=((root / "tempo.yaml", "/conf/tempo.yaml"),),
         named_volumes=((tempo_data, "/var/tempo"),),
         publish=(3200,),
         args=("-config.file=/conf/tempo.yaml",),
+        memory=tempo_memory,
     )
+    stack.tempo_container = tempo
     tempo_url = f"http://127.0.0.1:{_host_port(tempo, 3200)}"
+    stack.tempo_url = tempo_url
+    # Load bearing twice over: a config the pinned Tempo rejects never becomes
+    # ready, so this is also the version skew gate for every bound #2059 adds.
     _wait_http(f"{tempo_url}/ready", tempo)
 
     grafana = _container_name("grafana", suffix)
@@ -757,3 +853,292 @@ def test_tempo_connector_returns_a_real_curie_span_through_grafanas_uid_proxy(
         {"query": '{ resource.service.name = "curie-runtime-absent" }', "limit": 20},
     )
     assert json.loads(missing).get("traces") == []
+
+
+# #2059: the shipped Tempo ran every memory knob at Tempo's DISTRIBUTED
+# deployment defaults inside a single 512Mi pod, and ordinary ingest plus
+# bounded operator reads got the container kernel OOM killed (exit 137,
+# `Memory cgroup out of memory: Killed process (tempo)`,
+# `constraint=CONSTRAINT_MEMCG`), taking the evidence path down with it.
+#
+# Peak memory is driven by BLOCK COUNT, near independently of how much trace
+# data each block holds: search fans out over every block the ingester still
+# holds. Measured on this exact pinned image and config
+# (`.projects/plans/task-2059-tempo-query-oom.evidence.md`), two tiny traces per
+# wave with the ingester flushed between waves:
+#
+#   shipped config @512Mi, no GOMEMLIMIT, 150 blocks -> OOMKilled exit 137, 205/216 reads failed
+#   shipped config @512Mi, no GOMEMLIMIT, 290 blocks -> OOMKilled exit 137, 216/216 reads failed
+#   bounded config @1Gi + GOMEMLIMIT=600MiB, 290 blocks -> peak 549 MiB, 216/216 reads OK
+#   bounded config @1Gi + GOMEMLIMIT=600MiB, 450 blocks -> peak 685 MiB, 216/216 reads OK
+#
+# 150 is the SMALLEST measured block count that killed the unbounded shipped
+# envelope, and a wave of two ten span traces is enough to cut a block, so this
+# target stands on a load that demonstrably killed the pre-fix configuration
+# while keeping the run to a couple of minutes.
+#
+# The assertion direction is deliberate and is NOT reversible. The shipped
+# configuration is non monotonic near its ceiling -- 150 blocks died, 220 blocks
+# survived at a peak of exactly 512 MiB -- so whether it crosses is GC timing
+# dependent. A test asserting the UNBOUNDED config OOMs would be flaky; this one
+# asserts the CONFIGURED envelope SURVIVES.
+TEMPO_BLOCK_TARGET = 150
+# Each wave is two traces of ten spans. Cutting a block needs data in the head
+# block at flush time, and the collector batches, so a wave occasionally cuts
+# nothing; the cap bounds the retry rather than the target.
+TEMPO_INGEST_WAVE_CAP = TEMPO_BLOCK_TARGET * 3
+TEMPO_INGEST_DEADLINE_SECONDS = 420
+TEMPO_TRACES_PER_WAVE = 2
+TEMPO_TOOL_SPANS_PER_TRACE = 8
+# A block is only cut if the head block holds data when `/flush` arrives, and
+# the wave crosses the shipped collector, whose `batch` processor holds spans for
+# its 200ms default before exporting to Tempo. Flushing faster than that cuts
+# empty blocks: measured, 450 unpaced waves produced 16 blocks, 150 paced waves
+# produce one block each. This is the pacing, not a sleep-and-hope.
+TEMPO_COLLECTOR_SETTLE_SECONDS = 0.3
+# The read sequence an operator ran during the soak, repeated. Each round is one
+# search at the connector ceiling, three whole trace fetches, one tag listing and
+# one tag VALUES lookup -- the last is the only call that reaches
+# `overrides.defaults.read.max_bytes_per_tag_values_query`.
+TEMPO_READ_ROUNDS = 8
+TEMPO_TRACE_FETCHES_PER_ROUND = 3
+# Mirrors `examples/sre-bot/connectors/tempo/server.py:69` MAX_LIMIT. The
+# connector clamps to it, so this is the widest search an operator can drive
+# through the real MCP path.
+TEMPO_CONNECTOR_MAX_LIMIT = 50
+
+
+def _inspect(container: str) -> dict[str, Any]:
+    result = _docker("inspect", container, timeout=60)
+    payload = json.loads(result.stdout)
+    assert payload, f"docker inspect returned nothing for {container}"
+    return payload[0]
+
+
+def _tempo_block_count(container: str) -> int:
+    """Count the blocks Tempo has cut, which is what search fan out scales with.
+
+    A plain `ls | wc -l` on the tenant directory overcounts: Tempo's compactor
+    also writes tenant bookkeeping into that same directory, sibling to the
+    UUID block directories -- verified against tempo:2.9.1 as `index.json.gz`
+    plus its companion `index.pb.zst`, written by the blocklist poller on
+    every poll (including immediately at startup, not just on its 5m ticker).
+    A naive listing counts those as blocks too, so it can claim
+    TEMPO_BLOCK_TARGET blocks while one or more entries are not blocks at all.
+    That silently undershoots the real block count the regression depends on
+    -- 150 is the smallest measured count that OOM-killed the unbounded
+    config, so a false 150 no longer provably exercises that threshold. Count
+    real blocks instead: each one is a UUID-named directory holding a
+    `meta.json`, so `find -name meta.json` counts exactly the blocks with
+    metadata and can't be fooled by the tenant index or a stray file. (A
+    compacted block's metadata is `meta.compacted.json` in some Tempo versions
+    and is deliberately excluded -- it is no longer a searchable block.)
+    """
+
+    result = _docker(
+        "exec",
+        container,
+        "sh",
+        "-c",
+        "find /var/tempo/blocks/single-tenant -name meta.json 2>/dev/null | wc -l",
+        check=False,
+        timeout=60,
+    )
+    if result.returncode != 0:
+        return 0
+    digits = result.stdout.strip()
+    return int(digits) if digits.isdigit() else 0
+
+
+def _emit_trace_wave(tracer: RunTracer, marker: str, wave: int) -> None:
+    for index in range(TEMPO_TRACES_PER_WAVE):
+        with tracer.run_span(f"{marker}-{wave}-{index}", "fake-model") as generation:
+            generation.record_usage({"input_tokens": 1, "output_tokens": 1})
+            for tool in range(TEMPO_TOOL_SPANS_PER_TRACE):
+                generation.tool_span(f"probe-{tool}")
+
+
+def _read_json(stack: RuntimeStack, tool: str, arguments: dict[str, Any]) -> Any:
+    """One operator read through the real MCP connector, JSON or a failure.
+
+    The connector returns backend errors as prose rather than raising, so a dead
+    or stalled Tempo comes back as an unparsable body. Turning that into an
+    exception here is what lets the caller count it as a failed read instead of
+    silently treating a sentence as a successful answer.
+    """
+
+    text = stack.call_text("tempo", tool, arguments)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as error:
+        raise AssertionError(f"tempo.{tool} did not return JSON: {text[:400]}") from error
+
+
+def _assert_tempo_survived(stack: RuntimeStack, phase: str) -> None:
+    state = _inspect(stack.tempo_container)["State"]
+    assert state.get("OOMKilled") is False, f"Tempo was OOM killed during {phase}: {state}"
+    assert state.get("ExitCode") != 137, (
+        f"Tempo exited 137 (SIGKILL, the cgroup OOM signature) during {phase}: {state}"
+    )
+    assert state.get("Status") == "running", f"Tempo is not running after {phase}: {state}"
+    assert state.get("Restarting") is False, f"Tempo is restarting after {phase}: {state}"
+    assert _inspect(stack.tempo_container).get("RestartCount") == 0, (
+        f"Tempo restarted during {phase}, so the evidence path went away: "
+        f"{_inspect(stack.tempo_container).get('RestartCount')}"
+    )
+
+
+def test_tempo_survives_ingest_and_bounded_reads_under_its_configured_memory_limit(
+    observability_runtime: RuntimeStack,
+) -> None:
+    """#2059: ingest plus representative operator reads, under the shipped limit.
+
+    This is the regression the issue asks for: the real pinned Tempo image, the
+    shipped config, inside the cgroup the manifest declares, driven by real
+    spans through the real collector and read back through the real MCP
+    connector.
+
+    What it does NOT prove: a 24h soak. Retention is 48h and blocks are cut every
+    5m, so a real deployment reaches roughly six times this block count and also
+    runs the compactor, which none of the read path bounds cover. The soak shaped
+    assurance comes from the static read buffer product assertion in
+    `charts/curie/ci/observability-stack-assertions.sh`, not from this test.
+    """
+
+    envelope = observability_runtime.tempo_envelope
+    # Read from the manifest, never restated here: a literal copy would keep this
+    # test green against a reverted `tempo.yaml`.
+    assert envelope.memory_limit is not None, (
+        "examples/sre-bot/observability/tempo.yaml must declare "
+        "spec.template.spec.containers[0].resources.limits.memory for the tempo "
+        "container: without it there is no configured limit to run under and this "
+        "regression cannot detect #2059"
+    )
+    assert envelope.gomemlimit is not None, (
+        "examples/sre-bot/observability/tempo.yaml must set a GOMEMLIMIT env var on "
+        "the tempo container (#2059): the Go GC otherwise never learns the cgroup "
+        "ceiling and grows the heap until the kernel kills the process"
+    )
+    limit_bytes = _memory_bytes(envelope.memory_limit)
+    gomemlimit_bytes = _memory_bytes(envelope.gomemlimit)
+    assert 0 < gomemlimit_bytes < limit_bytes, (
+        f"GOMEMLIMIT {envelope.gomemlimit} must be a soft ceiling strictly below the "
+        f"hard cgroup limit {envelope.memory_limit}"
+    )
+
+    # The manifest and the container the assertions below judge must agree, or a
+    # green run proves nothing about the shipped envelope.
+    inspected = _inspect(observability_runtime.tempo_container)
+    assert inspected["HostConfig"]["Memory"] == limit_bytes, (
+        f"Tempo is not running under the manifest's {envelope.memory_limit} limit: "
+        f"docker reports HostConfig.Memory={inspected['HostConfig']['Memory']}, "
+        f"expected {limit_bytes}. A daemon that silently ignored --memory would "
+        f"otherwise make this whole test vacuous"
+    )
+    assert inspected["HostConfig"]["MemorySwap"] == limit_bytes, (
+        "Tempo's --memory-swap must equal --memory or the container can swap "
+        f"instead of being OOM killed: {inspected['HostConfig']['MemorySwap']}"
+    )
+    assert f"GOMEMLIMIT={envelope.gomemlimit}" in inspected["Config"]["Env"], (
+        f"GOMEMLIMIT={envelope.gomemlimit} never reached the Tempo container; its "
+        f"env is {inspected['Config']['Env']}. A dropped value would let a low "
+        f"pressure workload pass without ever exercising the new GC ceiling"
+    )
+
+    marker = f"curie-observability-oom-{uuid.uuid4().hex}"
+    flush_url = f"{observability_runtime.tempo_url}/flush"
+    blocks = 0
+    waves = 0
+    deadline = time.monotonic() + TEMPO_INGEST_DEADLINE_SECONDS
+    with _otel_environment(observability_runtime.collector_url):
+        provider = build_tracer_provider(
+            OtelConfig(endpoint=observability_runtime.collector_url),
+            marker,
+            "runtime-sandbox",
+        )
+        assert provider is not None
+        tracer = RunTracer(provider)
+        try:
+            while (
+                blocks < TEMPO_BLOCK_TARGET
+                and waves < TEMPO_INGEST_WAVE_CAP
+                and time.monotonic() < deadline
+            ):
+                _emit_trace_wave(tracer, marker, waves)
+                tracer.force_flush()
+                time.sleep(TEMPO_COLLECTOR_SETTLE_SECONDS)
+                # Cut a block on demand rather than waiting out
+                # `ingester.max_block_duration: 5m`. This is how a two minute
+                # test reaches the block count a multi hour deployment reaches.
+                try:
+                    _request(flush_url, method="POST", expected=(200, 204), timeout=10)
+                except Exception:  # noqa: BLE001
+                    # A refused flush means Tempo is already gone; stop ingesting
+                    # so the container assertions below name the real cause.
+                    break
+                waves += 1
+                if waves % 10 == 0:
+                    blocks = _tempo_block_count(observability_runtime.tempo_container)
+        finally:
+            tracer.shutdown()
+    blocks = _tempo_block_count(observability_runtime.tempo_container)
+
+    _assert_tempo_survived(observability_runtime, f"ingest of {waves} waves ({blocks} blocks)")
+    assert blocks >= TEMPO_BLOCK_TARGET, (
+        f"only {blocks} blocks accumulated over {waves} flushed waves, below the "
+        f"{TEMPO_BLOCK_TARGET} the measured envelope is judged against; block count "
+        f"is what drives Tempo's search fan out, so a lighter run would pass "
+        f"without exercising #2059 at all"
+    )
+
+    read_failures: list[str] = []
+    reads = 0
+    for round_index in range(TEMPO_READ_ROUNDS):
+        try:
+            found = _read_json(
+                observability_runtime,
+                "search_traces",
+                {
+                    "query": '{ resource.service.name = "curie-runner" }',
+                    "limit": TEMPO_CONNECTOR_MAX_LIMIT,
+                },
+            )
+            reads += 1
+            traces = found.get("traces") or []
+            for trace in traces[:TEMPO_TRACE_FETCHES_PER_ROUND]:
+                _read_json(observability_runtime, "get_trace", {"trace_id": trace["traceID"]})
+                reads += 1
+            _read_json(observability_runtime, "list_trace_tags", {})
+            reads += 1
+            _read_json(
+                observability_runtime,
+                "list_trace_tag_values",
+                {"tag": "resource.service.name"},
+            )
+            reads += 1
+        except Exception as error:  # noqa: BLE001
+            read_failures.append(f"round {round_index}: {error}")
+
+    _assert_tempo_survived(observability_runtime, f"{reads} bounded reads over {blocks} blocks")
+
+    # A GOMEMLIMIT GC death spiral does NOT set OOMKilled: the process stays
+    # alive and stops answering. Liveness alone would pass that, so the envelope
+    # is only safe to ship if a read still RETURNS.
+    still_serving = _read_json(
+        observability_runtime,
+        "search_traces",
+        {
+            "query": '{ resource.service.name = "curie-runner" }',
+            "limit": TEMPO_CONNECTOR_MAX_LIMIT,
+        },
+    )
+    assert still_serving.get("traces"), (
+        "Tempo is still running but no longer answering operator searches over "
+        f"{blocks} blocks: {str(still_serving)[:400]}"
+    )
+
+    assert not read_failures, (
+        f"{len(read_failures)} of the operator read sequence failed under the "
+        f"configured {envelope.memory_limit} limit over {blocks} blocks: "
+        f"{read_failures}"
+    )
