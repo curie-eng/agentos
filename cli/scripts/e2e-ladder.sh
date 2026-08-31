@@ -1271,7 +1271,7 @@ case_live_approval_gate_denies() {
             --secret CURIE_APPROVAL_REQUIRED_TOOLS
     )
 
-    local attempt out code status
+    local attempt out code status parked_shape parsed
     status=""
     # A live model may answer without calling any tool at all, which ends the
     # turn `done` and is a flake rather than a regression. One retry, then a
@@ -1293,22 +1293,39 @@ case_live_approval_gate_denies() {
         # stdout only: --json puts the payload on stdout and human text on
         # stderr, so a combined-stream parse fails intermittently and reads like
         # a product bug.
-        status="$(printf '%s' "$out" | python3 -c '
+        parsed="$(printf '%s' "$out" | python3 -c '
 import json, sys
 try:
     payload = json.loads(sys.stdin.read())
 except Exception:
-    print("unparseable")
+    print("unparseable invalid")
     sys.exit(0)
-print(payload.get("status") if isinstance(payload, dict) else "unparseable")
-' || echo "unparseable")"
+if not isinstance(payload, dict):
+    print("unparseable invalid")
+    sys.exit(0)
+status = payload.get("status")
+parked_shape = (
+    "valid"
+    if payload.get("finalized") is False
+    and isinstance(payload.get("approval_summary"), str)
+    else "invalid"
+)
+print(status, parked_shape)
+' || echo "unparseable invalid")"
+        status="${parsed%% *}"
+        parked_shape="${parsed#* }"
 
         # (b) parked. Deliberately NOT the ladder's finalized-reply helper,
-        # which treats an approval park as a failure; and deliberately not
-        # `finalized` (the skill tier hardcodes it true) nor the exit code (a
-        # parked turn exits 0).
-        if [[ "$status" == "awaiting-approval" ]]; then
+        # which treats an approval park as a failure. The runner final-frame
+        # contract requires status=awaiting-approval, finalized=false, and a
+        # non-null approval_summary; a parked turn still exits 0.
+        if [[ "$status" == "awaiting-approval" && "$parked_shape" == "valid" ]]; then
             break
+        fi
+        if [[ "$status" == "awaiting-approval" ]]; then
+            echo "the gated turn parked without finalized=false and a non-null approval_summary." >&2
+            printf '%s\n' "$out" >&2
+            return 1
         fi
         if [[ "$status" == "done" && "$attempt" == "1" ]]; then
             echo "retrying: the model answered without calling Bash"
@@ -1319,7 +1336,7 @@ print(payload.get("status") if isinstance(payload, dict) else "unparseable")
         printf '%s\n' "$out" >&2
         return 1
     done
-    echo "the gated turn parked: status=$status"
+    echo "the gated turn parked: status=$status finalized=false approval_summary=present"
 
     # (c) unrun, asserted inside the container that would have run it. Confirm
     # the runner is still up first, purely for the precise diagnostic: a dead

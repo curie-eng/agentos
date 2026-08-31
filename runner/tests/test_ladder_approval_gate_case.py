@@ -170,19 +170,41 @@ def test_case_asserts_the_parked_status_and_the_unrun_canary() -> None:
         "only in a diagnostic proves nothing about what the case enforces"
     )
 
-    # Neutering shape 2: keep the comparison, but hardcode what it reads
-    # (`status="awaiting-approval"`). So the value must come from parsing the
-    # captured turn output, and must never be assigned the expected literal.
+    # Neutering shape 2: keep the comparison, but hardcode what it reads. The
+    # parser must consume the captured turn output and derive both compared
+    # variables from that parsed result.
+    parsed_assignments = re.findall(r'^\s*parsed=(.*)$', body, flags=re.MULTILINE)
+    assert parsed_assignments, f"{CASE_NAME} must parse the captured turn output"
+    assert any('$(' in value and '"$out"' in value for value in parsed_assignments), (
+        "the parked-turn checks must be parsed out of the captured `skill message` "
+        f"payload, not synthesized; got assignments: {parsed_assignments}"
+    )
+
     status_assignments = re.findall(r'^\s*status=(.*)$', body, flags=re.MULTILINE)
     assert status_assignments, f"{CASE_NAME} must capture the turn's status"
-    assert any('$(' in value and '"$out"' in value for value in status_assignments), (
-        "the compared status must be parsed out of the captured `skill message` "
-        f"payload, not synthesized; got assignments: {status_assignments}"
+    assert any("parsed" in value for value in status_assignments), (
+        "the compared status must be derived from the parsed payload; got "
+        f"assignments: {status_assignments}"
     )
     assert not any("awaiting-approval" in value for value in status_assignments), (
         "the expected status must never be assigned to the variable the case "
         f"then compares against it; got assignments: {status_assignments}"
     )
+
+    parked_shape_assignments = re.findall(
+        r'^\s*parked_shape=(.*)$', body, flags=re.MULTILINE
+    )
+    assert parked_shape_assignments, f"{CASE_NAME} must capture the parked JSON shape"
+    assert any("parsed" in value for value in parked_shape_assignments), (
+        "the compared parked shape must be derived from the parsed payload; got "
+        f"assignments: {parked_shape_assignments}"
+    )
+    assert not any("valid" in value for value in parked_shape_assignments), (
+        "the expected parked shape must never be assigned to the variable the "
+        f"case compares; got assignments: {parked_shape_assignments}"
+    )
+    assert 'payload.get("finalized") is False' in body
+    assert 'isinstance(payload.get("approval_summary"), str)' in body
 
     # --- (c) unrun --------------------------------------------------------
     # Neutering shape 3: drop the in-container probe, or stop asking it a
