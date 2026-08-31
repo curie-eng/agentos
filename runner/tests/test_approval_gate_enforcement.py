@@ -885,10 +885,11 @@ def test_explicit_gate_keeps_pager_and_annotations_classify_receipt_actions(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(boot, "ClaudeAgentSession", _CapturedSession)
+    tool = "mcp__plugin_approval-demo_operations__inspect_or_change"
     expected_flags = {
         "read-only": [],
-        "write": ["mcp__operations__inspect_or_change"],
-        "unknown": ["mcp__operations__inspect_or_change"],
+        "write": [tool],
+        "unknown": [tool],
     }
     read_only_runner: SessionRunner | None = None
 
@@ -909,7 +910,6 @@ def test_explicit_gate_keeps_pager_and_annotations_classify_receipt_actions(
             session.options.mcp_servers[APPROVAL_SERVER_NAME],
         )
 
-        tool = "mcp__operations__inspect_or_change"
         events = translate_message(
             AssistantMessage(
                 content=[ToolUseBlock(id=f"call-{mode}", name=tool, input={})],
@@ -926,7 +926,7 @@ def test_explicit_gate_keeps_pager_and_annotations_classify_receipt_actions(
     # The annotation is exact and fail-closed: it cannot bless an unadvertised
     # tool merely because that call shares the same MCP server.
     assert read_only_runner is not None
-    unadvertised = "mcp__operations__not_advertised"
+    unadvertised = "mcp__plugin_approval-demo_operations__not_advertised"
     events = translate_message(
         AssistantMessage(
             content=[ToolUseBlock(id="call-unadvertised", name=unadvertised, input={})],

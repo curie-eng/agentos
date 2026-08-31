@@ -6,7 +6,8 @@ eventually perform. MCP already carries the relevant capability metadata on
 second bundle-format declaration that can drift from what a server publishes.
 The annotation is only a hint and is not used as an authorization decision:
 permission gates and tool execution are unchanged. It controls whether Curie's
-non-authoritative, model-invoked generic pager is advertised.
+non-authoritative, model-invoked generic pager is advertised and which exact
+runtime tool names are treated as read-only for receipts and retry safety.
 
 Only an entirely observed, explicitly read-only surface proves that the generic
 approval tool should be omitted. A complete surface with zero MCP tools also
@@ -38,6 +39,7 @@ from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared._httpx_utils import create_mcp_http_client
 from plugin_format import PluginManifest, resolve_manifest
+from plugin_format.approval_policy import connector_tool_prefix, effective_tool_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +55,7 @@ class McpToolCapabilityProbe:
     has_potential_write_tool: bool
     tool_count: int
     failures: tuple[str, ...] = ()
+    readonly_tools: frozenset[str] = frozenset()
 
 
 def _expand(value: str, env: Mapping[str, str]) -> str:
@@ -61,7 +64,9 @@ def _expand(value: str, env: Mapping[str, str]) -> str:
     return _VARIABLE.sub(lambda match: env.get(match.group(1), match.group(0)), value)
 
 
-def _bundle_server_configs(plugin_dir: Path) -> list[tuple[str, dict[str, Any]]]:
+def _bundle_server_configs(
+    plugin_dir: Path,
+) -> list[tuple[str, dict[str, Any], str]]:
     """Read both plugin MCP declaration surfaces without collapsing duplicates.
 
     Every declared server must be inspectable here. In particular, the plugin
@@ -71,7 +76,7 @@ def _bundle_server_configs(plugin_dir: Path) -> list[tuple[str, dict[str, Any]]]
     shapes raise and the caller conservatively retains ``request_approval``.
     """
 
-    def append_payload(payload: object, source: str) -> None:
+    def append_payload(payload: object, source: str, bundle_name: str) -> None:
         if not isinstance(payload, dict):
             raise ValueError(f"{source} MCP declaration is not an object")
         servers = payload.get("mcpServers", payload)
@@ -80,24 +85,35 @@ def _bundle_server_configs(plugin_dir: Path) -> list[tuple[str, dict[str, Any]]]
         for name, config in servers.items():
             if not isinstance(config, dict):
                 raise ValueError(f"{source} MCP server {name!r} is not an object")
-            configs.append((str(name), dict(config)))
+            server_name = str(name)
+            configs.append(
+                (
+                    server_name,
+                    dict(config),
+                    effective_tool_prefix(bundle_name, server_name),
+                )
+            )
 
-    configs: list[tuple[str, dict[str, Any]]] = []
+    configs: list[tuple[str, dict[str, Any], str]] = []
     manifest_path = resolve_manifest(plugin_dir)
+    bundle_name: str | None = None
     if manifest_path is not None:
         raw = json.loads(manifest_path.read_text(encoding="utf-8"))
         manifest = PluginManifest.model_validate(raw)
+        bundle_name = manifest.name
         if isinstance(manifest.mcpServers, str):
             raise ValueError(
                 "plugin manifest mcpServers path strings cannot be inspected at runtime"
             )
         if manifest.mcpServers is not None:
-            append_payload(manifest.mcpServers, "plugin manifest")
+            append_payload(manifest.mcpServers, "plugin manifest", bundle_name)
 
     root_config = plugin_dir / ".mcp.json"
     if root_config.is_file():
+        if bundle_name is None:
+            raise ValueError("bundle MCP declarations require a manifest name")
         raw = json.loads(root_config.read_text(encoding="utf-8"))
-        append_payload(raw, ".mcp.json")
+        append_payload(raw, ".mcp.json", bundle_name)
     return configs
 
 
@@ -165,13 +181,15 @@ async def _server_streams(
 async def _probe_server(
     config: Mapping[str, Any],
     *,
+    tool_prefix: str,
     plugin_dir: Path | None,
     inherited_env: Mapping[str, str],
-) -> tuple[int, bool]:
-    """Return ``(tool_count, has_potential_write_tool)`` for one MCP server."""
+) -> tuple[int, bool, frozenset[str]]:
+    """Return count, write capability, and exact read-only runtime tool names."""
 
     count = 0
     has_potential_write = False
+    readonly_tools: set[str] = set()
     with anyio.fail_after(_PROBE_TIMEOUT_SECONDS):
         async with _server_streams(
             config, plugin_dir=plugin_dir, inherited_env=inherited_env
@@ -192,10 +210,16 @@ async def _probe_server(
                         for tool in result.tools
                     ):
                         has_potential_write = True
+                    readonly_tools.update(
+                        f"{tool_prefix}{tool.name}"
+                        for tool in result.tools
+                        if tool.annotations is not None
+                        and tool.annotations.readOnlyHint is True
+                    )
                     cursor = result.nextCursor
                     if not cursor:
                         break
-    return count, has_potential_write
+    return count, has_potential_write, frozenset(readonly_tools)
 
 
 async def probe_mcp_tool_capability(
@@ -208,12 +232,13 @@ async def probe_mcp_tool_capability(
     ``derived_servers`` is the connector map already produced for the SDK. A
     failed or unreadable source is an unknown surface, which keeps
     ``request_approval`` mounted by returning ``has_potential_write_tool=True``.
+    Exact read-only names from successful sibling servers remain available.
     """
 
     root = Path(plugin_dir) if plugin_dir is not None else None
     env = {**os.environ, **dict(inherited_env or {})}
     failures: list[str] = []
-    observations: list[tuple[int, bool]] = []
+    observations: list[tuple[int, bool, frozenset[str]]] = []
 
     try:
         declared = _bundle_server_configs(root) if root is not None else []
@@ -226,8 +251,8 @@ async def probe_mcp_tool_capability(
             failures=("bundle-config",),
         )
 
-    work: list[tuple[str, Mapping[str, Any], Path | None]] = [
-        (name, config, root) for name, config in declared
+    work: list[tuple[str, Mapping[str, Any], Path | None, str]] = [
+        (name, config, root, tool_prefix) for name, config, tool_prefix in declared
     ]
     for name, config in derived_servers.items():
         if not isinstance(config, Mapping):
@@ -237,12 +262,23 @@ async def probe_mcp_tool_capability(
                 name,
             )
             continue
-        work.append((str(name), config, None))
+        server_name = str(name)
+        work.append((server_name, config, None, connector_tool_prefix(server_name)))
 
-    async def inspect(name: str, config: Mapping[str, Any], cwd: Path | None) -> None:
+    async def inspect(
+        name: str,
+        config: Mapping[str, Any],
+        cwd: Path | None,
+        tool_prefix: str,
+    ) -> None:
         try:
             observations.append(
-                await _probe_server(config, plugin_dir=cwd, inherited_env=env)
+                await _probe_server(
+                    config,
+                    tool_prefix=tool_prefix,
+                    plugin_dir=cwd,
+                    inherited_env=env,
+                )
             )
         except Exception as exc:
             failures.append(name)
@@ -253,14 +289,20 @@ async def probe_mcp_tool_capability(
             )
 
     async with anyio.create_task_group() as task_group:
-        for name, config, cwd in work:
-            task_group.start_soon(inspect, name, config, cwd)
+        for name, config, cwd, tool_prefix in work:
+            task_group.start_soon(inspect, name, config, cwd, tool_prefix)
 
-    tool_count = sum(count for count, _write in observations)
-    has_write = bool(failures) or any(write for _count, write in observations)
+    tool_count = sum(count for count, _write, _readonly in observations)
+    has_write = bool(failures) or any(write for _count, write, _readonly in observations)
+    readonly_tools = frozenset(
+        tool
+        for _count, _write, observed_readonly in observations
+        for tool in observed_readonly
+    )
     return McpToolCapabilityProbe(
         complete=not failures,
         has_potential_write_tool=has_write,
         tool_count=tool_count,
         failures=tuple(sorted(set(failures))),
+        readonly_tools=readonly_tools,
     )

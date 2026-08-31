@@ -52,7 +52,7 @@ def test_all_tools_explicitly_read_only_proves_no_write_capability(tmp_path: Pat
     assert not result.has_potential_write_tool
     assert result.tool_count == 1
     assert result.readonly_tools == frozenset(
-        {"mcp__operations__inspect_or_change"}
+        {"mcp__plugin_acme-bot_operations__inspect_or_change"}
     )
 
 
@@ -102,7 +102,7 @@ def test_mixed_read_only_and_write_tools_keep_write_capability(tmp_path: Path) -
     # Even on a mixed surface that keeps the pager, the observed read-only tool
     # remains available to the receipt classifier by its SDK-visible name.
     assert result.readonly_tools == frozenset(
-        {"mcp__inventory__inspect_or_change"}
+        {"mcp__plugin_acme-bot_inventory__inspect_or_change"}
     )
 
 

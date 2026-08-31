@@ -55,6 +55,7 @@ CLAUDE_READONLY_TOOLS: frozenset[str] = frozenset(
         "NotebookRead",
         "WebFetch",
         "WebSearch",
+        "ToolSearch",
         "TodoRead",
     }
 )
