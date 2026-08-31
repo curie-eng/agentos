@@ -502,14 +502,14 @@ class _GenerationSpan:
 
         if interrupt_requested:
             self._finish("interrupt_requested", "cancelled", failed=False)
-        elif classified_failure:
+        elif self._result_abort_cause is not None:
             self._finish(
-                self._result_abort_cause or "classified_failure",
+                self._result_abort_cause,
                 "failed",
                 failed=True,
             )
-        elif self._result_abort_cause is not None:
-            self._finish(self._result_abort_cause, "cancelled", failed=False)
+        elif classified_failure:
+            self.set_failed()
         elif self._result_observed or completed_without_result:
             self.set_succeeded()
         else:
@@ -526,7 +526,6 @@ class _GenerationSpan:
         self._result_observed = True
         if terminal_reason in self._ABORT_CAUSES:
             self._result_abort_cause = terminal_reason
-            failed = False
         self._close_generation("result_observed", failed=failed)
 
     def record_model(self, model: str | None) -> None:

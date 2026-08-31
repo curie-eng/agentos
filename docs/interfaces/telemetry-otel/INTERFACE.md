@@ -171,11 +171,12 @@ keys:
   `provider_wait` or `tool_wait`, and on `agent.run` retains the last active phase.
   Terminal cause/status pairs are `completed`/`succeeded`,
   `classified_failure`/`failed`, `interrupt_requested`/`cancelled`, either SDK abort
-  (`aborted_streaming` or `aborted_tools`)/`cancelled`, and `abandoned`/`abandoned`.
-  OTel status matches: success and intentional cancellation are `OK`; classified failure
-  and abandonment are `ERROR`. Tool results close with `curie.tool.outcome` `success` or
-  `error`; any tool still active at terminal cleanup closes as `cancelled`, with its real
-  duration preserved.
+  (`aborted_streaming` or `aborted_tools`)/`failed`, and `abandoned`/`abandoned`.
+  Bare SDK abort causes are failures with OTel `ERROR`; when the runner requested an
+  interrupt, `interrupt_requested`/`cancelled` wins and closes with OTel `OK`. Completed
+  runs are also `OK`; classified failure and abandonment are `ERROR`. Tool results close
+  with `curie.tool.outcome` `success` or `error`; any tool still active at terminal
+  cleanup closes as `cancelled`, with its real duration preserved.
 
 ### Collector delivery
 

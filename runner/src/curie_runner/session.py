@@ -574,10 +574,7 @@ class SessionRunner:
             budget_hit = tracker.exceeded
             if isinstance(message, ResultMessage):
                 terminal_reason = getattr(message, "terminal_reason", None)
-                cancelled = self._interrupt_requested or terminal_reason in {
-                    "aborted_streaming",
-                    "aborted_tools",
-                }
+                cancelled = self._interrupt_requested
                 subtype = message.subtype or ""
                 result_failed = budget_hit or (
                     not cancelled and (message.is_error or subtype.startswith("error"))
