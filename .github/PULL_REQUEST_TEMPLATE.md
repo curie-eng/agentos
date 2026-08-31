@@ -17,6 +17,7 @@ Fix pin: <supported selector>
      Supported selector forms:
      apps/*/tests/*.py::test
      packages/*/tests/*.py::test
+     runner/tests/*.py::test
      cli/tests/name.rs::test
      charts/curie/ci/name.sh
 
@@ -24,7 +25,15 @@ Fix pin: <supported selector>
      added or corrected later, the body edit automatically revalidates the
      required gate.
 
-     For a non fix pull request, leave this section empty. -->
+     REQUIRED when this pull request closes an issue labeled `bug` (a GitHub
+     closing keyword plus a same-repo #N): CI fails without a Fix pin line. If
+     there is no selector to declare (a revert, a docs-only fix, or a bug
+     closed by deletion), use the escape hatch instead, with a non-empty
+     reason:
+Fix pin: n/a - <reason>
+
+     For a non fix pull request that does not close a bug-labeled issue, leave
+     this section empty. -->
 
 ## End-to-end verification
 

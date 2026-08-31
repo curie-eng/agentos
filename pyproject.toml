@@ -169,15 +169,18 @@ testpaths = [
     "compose/tests",
     "release/tests",
     "examples/tests",
+    # The four shipped SRE-bot connectors (tempo, k8s-write, k8s-scale,
+    # self-upgrade) are built by CI and published by release.yaml, but each
+    # ships its own test_server.py outside every collection root above -- so
+    # the only CI signal on the shipped images was "the Dockerfile builds"
+    # (#2093).
+    "examples/sre-bot/connectors",
     "tools/doclint/tests",
     "tools/wire-tolerance-gate/tests",
     "tools/ci-retry-gate/tests",
     "tools/ci-workflow-paths/tests",
     "tools/e2e-ci-selection/tests",
-    # Only the offline harness unit tests -- NOT the whole tree: the cluster
-    # scenario in test_soak_resilience.py stays out of default collection and
-    # runs only under CURIE_SOAK=1 (#499).
-    "tests/soak/test_harness_unit.py",
+    "tools/sdk-lock-gate/tests",
 ]
 
 [tool.ruff]

@@ -261,7 +261,12 @@ selects rungs; `local-release` is NOT folded into `all` since it needs those
 extra images built first, so name it explicitly (e.g.
 `skill,local,local-release`). `CURIE_E2E_LIVE` (default fake, `1` for live)
 governs every named rung, including rung 1 -- `e2e.sh` reads the same env var
-directly rather than being told by the ladder. The standard pre release gate is:
+directly rather than being told by the ladder. Rung 1 also carries a
+live-only case, `case_live_approval_gate_denies` (#2094): it gates `Bash`
+through `CURIE_APPROVAL_REQUIRED_TOOLS`, runs its own runner on
+`CURIE_E2E_GATE_PORT` (default 7246), and asserts a real SDK dispatch against a
+real model denies the call and the turn parks `awaiting-approval` rather than
+running it; it skips under a fake run. The standard pre release gate is:
 ```bash
 CURIE_E2E_TIERS=all curie dev e2e-ladder
 ```

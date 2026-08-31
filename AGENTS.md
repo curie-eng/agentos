@@ -40,7 +40,6 @@ before editing there, in addition to this file.
 | `apps/ui` | React (Vite + TS) | [`apps/ui/CLAUDE.md`](apps/ui/CLAUDE.md) |
 | `cli` | Rust (clap + tokio) | [`cli/CLAUDE.md`](cli/CLAUDE.md) |
 | `charts/curie` | Helm | [`charts/curie/CLAUDE.md`](charts/curie/CLAUDE.md) |
-| `tests/soak` | Python | -- |
 
 The Python packages are one **uv workspace** (root `pyproject.toml`); ruff,
 mypy, and pytest are configured at the root and run across all members.
@@ -138,9 +137,11 @@ services (Slack, Anthropic, GitHub); NEVER mock Postgres/Valkey/Langfuse -- run
 integration tests against the dev stack below. A change that only makes tests
 pass by weakening assertions is a regression. At parity seams, include at least
 one negative or secondary-path test per AC (see the parity-seam registry).
-A fix PR changing `apps/*/tests/`, `packages/*/tests/`, `cli/tests/`, or `charts/curie/ci/` is expected to be verifiable with the exact command
+A fix PR changing `apps/*/tests/`, `packages/*/tests/`, `runner/tests/`, `cli/tests/`, or `charts/curie/ci/` is expected to be verifiable with the exact command
 `curie dev verify-fix-pin <CHANGE> <SELECTOR>`.
-A fix PR includes exactly one `Fix pin: <SELECTOR>` line in its body. A non fix PR omits it.
+A PR closing a `bug`-labeled issue includes exactly one `Fix pin: <SELECTOR>` line in its body,
+or an explicit `Fix pin: n/a - <reason>` line; CI enforces this. A PR closing no bug-labeled issue may omit
+the declaration, but a selector supplied voluntarily on any PR is still verified.
 Assertions about an external API or SDK's shape or auth must be grounded in
 provider docs or observed behavior, cited in a test comment, never in the
 implementation's own assumption. Any read-modify-write on a versioned row needs a
@@ -516,7 +517,7 @@ not carried as a note.
 
 ## Cluster verification
 
-Chart, sandbox, and soak verification need a real cluster; a disposable local
+Chart and sandbox-substrate resilience verification need a real cluster; a disposable local
 `kind` or `k3s` cluster works. The cheap default for a chart/sandbox/bundle
 change is `curie dev chart-runtime-e2e` (implemented by
 `scripts/chart-runtime-e2e.sh`): it installs a trimmed slice, runs the

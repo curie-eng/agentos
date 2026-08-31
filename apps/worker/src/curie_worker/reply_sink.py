@@ -28,6 +28,8 @@ import time
 from collections.abc import Awaitable, Callable, Mapping
 from contextvars import ContextVar
 from typing import Protocol
+from urllib.parse import quote, urlsplit, urlunsplit
+from uuid import UUID
 
 import aiohttp
 import curie_telemetry
@@ -44,6 +46,13 @@ logger = logging.getLogger(__name__)
 ADAPTER_SECRET_HEADER = "X-Curie-Adapter-Secret"
 
 SLACK_KIND = "slack"
+
+# This platform-owned adapter is selected by the disconnected ``cluster
+# message`` reply handle. It is deliberately not configurable: allowing an
+# operator binding or ``CURIE_ADAPTER_CREDENTIALS`` entry to shadow it would put
+# the worker's internal token back behind turn-controlled routing.
+CLUSTER_MESSAGE_ADAPTER = "curie-cluster-message"
+_CLUSTER_MESSAGE_REPLY_PATH = "/v1/internal/cluster-message-replies"
 
 # The most acknowledgement body the worker will read off an adapter. The ack
 # carries one optional ``ref`` string, so 64 KiB is orders of magnitude more than
@@ -353,6 +362,147 @@ class HttpReplyAdapter:
         return ReplyAck(ref=_ref_from(payload))
 
 
+class _ClusterMessageReplyAdapter:
+    """Delivers disconnected cluster replies to the platform API relay.
+
+    The route only selects this adapter. Its endpoint and credential come from
+    worker configuration, never ``TargetRoute`` or the generic adapter
+    credential map. The opaque reply ref is validated before a session is
+    created or any request is attempted, then encoded as one path segment on a
+    fixed API route.
+    """
+
+    def __init__(
+        self,
+        api_base_url: str,
+        internal_worker_token: str,
+        *,
+        timeout_s: float = 30.0,
+    ) -> None:
+        parsed = urlsplit(api_base_url)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.netloc
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError(
+                "worker API base URL must be an HTTP(S) URL without query or fragment"
+            )
+        self._api_base = parsed._replace(
+            path=parsed.path.rstrip("/"), query="", fragment=""
+        )
+        self._internal_worker_token = internal_worker_token
+        self._timeout = aiohttp.ClientTimeout(total=timeout_s)
+        self._session: aiohttp.ClientSession | None = None
+
+    def _ensure_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(timeout=self._timeout)
+        return self._session
+
+    async def aclose(self) -> None:
+        session, self._session = self._session, None
+        if session is not None and not session.closed:
+            await session.close()
+
+    def _endpoint_for(self, reply_ref: str | None) -> tuple[str, str]:
+        if reply_ref is None:
+            raise ValueError(
+                "cluster message reply_ref must be a canonical lowercase UUIDv4"
+            )
+        try:
+            parsed_ref = UUID(reply_ref)
+        except (AttributeError, ValueError) as exc:
+            raise ValueError(
+                "cluster message reply_ref must be a canonical lowercase UUIDv4"
+            ) from exc
+        canonical_ref = str(parsed_ref)
+        if parsed_ref.version != 4 or canonical_ref != reply_ref:
+            raise ValueError(
+                "cluster message reply_ref must be a canonical lowercase UUIDv4"
+            )
+        if not self._internal_worker_token:
+            raise MissingAdapterCredentialError(
+                "cluster message relay has no internal worker token; refusing to deliver"
+            )
+        path = (
+            f"{self._api_base.path}{_CLUSTER_MESSAGE_REPLY_PATH}/"
+            f"{quote(canonical_ref, safe='')}"
+        )
+        return urlunsplit(self._api_base._replace(path=path)), canonical_ref
+
+    async def emit(
+        self,
+        event: ReplyEvent,
+        *,
+        route: TargetRoute,
+        best_effort_unreachable: bool = False,
+    ) -> ReplyAck:
+        del route  # Selection only: a turn cannot supply this adapter's destination.
+        if not _REPLY_OBSERVATION_DEPTH.get():
+            return await _observe_reply(
+                event,
+                best_effort_unreachable=best_effort_unreachable,
+                call=lambda: self._emit(
+                    event,
+                    best_effort_unreachable=best_effort_unreachable,
+                ),
+            )
+        return await self._emit(
+            event,
+            best_effort_unreachable=best_effort_unreachable,
+        )
+
+    async def _emit(
+        self,
+        event: ReplyEvent,
+        *,
+        best_effort_unreachable: bool,
+    ) -> ReplyAck:
+        endpoint, reply_ref = self._endpoint_for(event.target.reply_ref)
+        headers = {
+            "Content-Type": "application/json",
+            ADAPTER_SECRET_HEADER: self._internal_worker_token,
+        }
+        session = self._ensure_session()
+        try:
+            async with session.post(
+                endpoint,
+                data=event.model_dump_json(),
+                headers=headers,
+                allow_redirects=False,
+            ) as response:
+                if 300 <= response.status < 400:
+                    raise RedirectedAdapterEndpointError(
+                        "cluster message relay answered "
+                        f"{response.status} (redirect); refusing to re-send the "
+                        "internal worker token to the redirect target"
+                    )
+                if response.status >= 400:
+                    raise RejectedAdapterResponseError(
+                        f"cluster message relay answered {response.status}; "
+                        "the delivery failed"
+                    )
+                payload = await _read_capped(response, endpoint)
+        except _UNREACHABLE_ERRORS as exc:
+            if best_effort_unreachable:
+                logger.warning(
+                    "%s: cluster message relay is unreachable (%s); completing the turn "
+                    "best-effort without delivering the event",
+                    event.event,
+                    exc,
+                )
+                return _BestEffortUnreachableAck(ref=None)
+            raise
+        ack_ref = _ref_from(payload)
+        if ack_ref != reply_ref:
+            raise RejectedAdapterResponseError(
+                "cluster message relay acknowledgement did not match the requested reply ref"
+            )
+        return ReplyAck(ref=reply_ref)
+
+
 async def _read_capped(response: aiohttp.ClientResponse, endpoint: str) -> bytes:
     """The acknowledgement body, or refuse it once it passes the cap.
 
@@ -395,9 +545,16 @@ def _ref_from(payload: bytes) -> str | None:
 class ReplySinkRouter:
     """Picks the adapter for an event's ``kind``. The ONLY switch on kind."""
 
-    def __init__(self, *, adapters: Mapping[str, ReplySink], default: ReplySink) -> None:
+    def __init__(
+        self,
+        *,
+        adapters: Mapping[str, ReplySink],
+        default: ReplySink,
+        cluster_message: ReplySink | None = None,
+    ) -> None:
         self._adapters = dict(adapters)
         self._default = default
+        self._cluster_message = cluster_message
 
     async def emit(
         self,
@@ -406,7 +563,14 @@ class ReplySinkRouter:
         route: TargetRoute,
         best_effort_unreachable: bool = False,
     ) -> ReplyAck:
-        sink = self._adapters.get(event.target.kind, self._default)
+        if route.adapter == CLUSTER_MESSAGE_ADAPTER:
+            if self._cluster_message is None:
+                raise MissingAdapterCredentialError(
+                    "cluster message relay is not configured; refusing to deliver"
+                )
+            sink = self._cluster_message
+        else:
+            sink = self._adapters.get(event.target.kind, self._default)
         return await sink.emit(event, route=route, best_effort_unreachable=best_effort_unreachable)
 
     async def aclose(self) -> None:
@@ -416,7 +580,10 @@ class ReplySinkRouter:
         not carry a teardown verb, so an adapter with nothing to release (the
         Slack one, whose SDK client owns its own transport) simply has no hook.
         """
-        for sink in (*self._adapters.values(), self._default):
+        sinks = (*self._adapters.values(), self._default)
+        if self._cluster_message is not None:
+            sinks = (*sinks, self._cluster_message)
+        for sink in sinks:
             closer = getattr(sink, "aclose", None)
             if closer is not None:
                 await closer()
@@ -433,4 +600,8 @@ def build_reply_sink(config: WorkerConfig) -> ReplySinkRouter:
             )
         },
         default=HttpReplyAdapter(config.adapter_credentials),
+        cluster_message=_ClusterMessageReplyAdapter(
+            config.api_base_url,
+            config.internal_worker_token,
+        ),
     )

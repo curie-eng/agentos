@@ -128,8 +128,16 @@ async fn cluster_message_uses_ephemeral_defaults_and_propagates_assigned_ports()
         "an omitted API local port must request zero: {plan}"
     );
     assert!(
-        plan.contains("stub advertised at http://127.0.0.1:0/api/"),
-        "an omitted listen port must request zero: {plan}"
+        plan.contains("poll replies at http://127.0.0.1:0/cluster-message-replies/<uuid-v4>"),
+        "the ephemeral API port must also shape the loopback relay poll URL: {plan}"
+    );
+    assert!(
+        plan.contains("no reply endpoint"),
+        "the queued relay handle must advertise no callback endpoint: {plan}"
+    );
+    assert!(
+        !plan.contains("stub advertised") && !plan.contains("/api/"),
+        "disconnected cluster mode must not advertise a Slack callback stub: {plan}"
     );
 
     let dir = tempfile::tempdir().expect("create fake kubectl directory");
@@ -166,15 +174,9 @@ async fn cluster_message_uses_ephemeral_defaults_and_propagates_assigned_ports()
 }
 
 #[test]
-fn cluster_message_preserves_explicit_port_overrides() {
-    let plan = cluster_message_dry_run(&[
-        "--listen-port",
-        "18155",
-        "--valkey-local-port",
-        "18156",
-        "--api-local-port",
-        "18157",
-    ]);
+fn cluster_message_preserves_explicit_tunnel_port_overrides() {
+    let plan =
+        cluster_message_dry_run(&["--valkey-local-port", "18156", "--api-local-port", "18157"]);
     assert!(
         plan.contains("kubectl -n curie port-forward svc/curie-valkey 18156:6379"),
         "the explicit Valkey local port must remain exact: {plan}"
@@ -184,8 +186,16 @@ fn cluster_message_preserves_explicit_port_overrides() {
         "the explicit API local port must remain exact: {plan}"
     );
     assert!(
-        plan.contains("stub advertised at http://127.0.0.1:18155/api/"),
-        "the explicit listen port must remain exact: {plan}"
+        plan.contains("poll replies at http://127.0.0.1:18157/cluster-message-replies/<uuid-v4>"),
+        "the explicit API port must also shape the loopback relay poll URL: {plan}"
+    );
+    assert!(
+        plan.contains("no reply endpoint"),
+        "the queued relay handle must advertise no callback endpoint: {plan}"
+    );
+    assert!(
+        !plan.contains("stub advertised") && !plan.contains("/api/"),
+        "disconnected cluster mode must not advertise a Slack callback stub: {plan}"
     );
 }
 

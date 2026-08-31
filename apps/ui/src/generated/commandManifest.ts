@@ -5575,22 +5575,16 @@ export const commandManifest = {
       "about": "Report what is set up, what is missing, and the command that fixes it",
       "args": [
         {
-          "default_values": [
-            "curie"
-          ],
           "global": false,
-          "help": "Kubernetes namespace to inspect",
+          "help": "Kubernetes namespace to inspect. Defaults to `curie.yaml`'s `install:` block when one is present in this directory, otherwise `curie`",
           "id": "namespace",
           "long": "namespace",
           "positional": false,
           "required": false
         },
         {
-          "default_values": [
-            "curie"
-          ],
           "global": false,
-          "help": "Helm release to inspect",
+          "help": "Helm release to inspect. Defaults to `curie.yaml`'s `install:` block when one is present in this directory, otherwise `curie`",
           "id": "release",
           "long": "release",
           "positional": false,

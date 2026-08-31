@@ -575,6 +575,10 @@ async fn connected_transport_enqueues_the_real_placeholder_as_the_conversation_i
         "connected mode carries no per-turn endpoint, so the reply rides the \
          workspace transport"
     );
+    assert_eq!(
+        turn.reply_handle.adapter, None,
+        "connected mode must not opt into the built-in disconnected cluster-message relay"
+    );
     assert_eq!(posts.len(), 1, "exactly one placeholder posted");
     let body: serde_json::Value = serde_json::from_slice(&posts[0].body).unwrap();
     assert_eq!(posts[0].path, "/chat.postMessage");
@@ -614,6 +618,14 @@ async fn connected_transport_enqueues_the_real_placeholder_as_the_conversation_i
         Some(IN_THREAD_TS),
         "the reply handle still points at the real message Slack created inside \
          that thread, so the worker edits the right message"
+    );
+    assert_eq!(
+        turn.reply_handle.endpoint, None,
+        "connected replies keep using the workspace transport, never a per-turn endpoint"
+    );
+    assert_eq!(
+        turn.reply_handle.adapter, None,
+        "--continue coordinates in connected mode must not acquire the disconnected relay adapter"
     );
     assert_eq!(posts.len(), 1, "exactly one placeholder posted");
     let body: serde_json::Value = serde_json::from_slice(&posts[0].body).unwrap();

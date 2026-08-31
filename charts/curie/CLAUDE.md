@@ -47,6 +47,15 @@ component and rail detail in `charts/curie/README.md`.
   BYO `host`/`port`/`auth`/`existingSecret` fields on the same block. A new
   backing store must follow this exact pattern -- do not add a store with a
   different enable/disable shape.
+  Known exceptions: in `curie.langfuse.env` (`_helpers.tpl`), `POSTGRES_PASSWORD`
+  (`postgresPassword`) still ignores `postgres.existingSecret`, and `SALT`
+  (`langfuseSalt`) / `ENCRYPTION_KEY` (`langfuseEncryptionKey`) still ignore
+  `langfuse.existingSecret` -- #2052 fixed the valkey and clickhouse half of
+  this idiom and enumerated these three as the remainder, not yet tracked by
+  an issue. Until they're fixed the invariant is aspirational for them: an
+  operator on BYO postgres or a BYO `langfuse.existingSecret` gets the
+  chart-generated value instead of theirs. `ENCRYPTION_KEY` is the sharpest --
+  a mismatched key means previously written encrypted columns stop decrypting.
 - **Values keys are camelCase, not hyphenated.** Go templates cannot
   dot-index a hyphenated key. Keep this consistent across any new values
   additions.

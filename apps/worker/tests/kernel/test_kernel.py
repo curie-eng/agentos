@@ -52,6 +52,7 @@ def _qevent(
     event_id: str | None = None,
     placeholder: str | None = "p-1",
     endpoint: str | None = None,
+    adapter: str | None = None,
     source: TurnSource = TurnSource.SLACK,
 ) -> QueuedTurn:
     return QueuedTurn(
@@ -60,7 +61,11 @@ def _qevent(
         author="U1",
         text=text,
         reply_handle=ReplyHandle(
-            kind="slack", channel="C1", placeholder=placeholder, endpoint=endpoint
+            kind="slack",
+            channel="C1",
+            placeholder=placeholder,
+            endpoint=endpoint,
+            adapter=adapter,
         ),
         received_at="2026-07-05T00:00:00+00:00",
         source=source,
@@ -1561,6 +1566,39 @@ class _TokenBinding:
 
     def packs_for(self, _resolved: object) -> BehaviorPacks:
         return BehaviorPacks()
+
+
+def test_reply_handle_adapter_survives_a_binding_without_an_adapter(
+    make_harness,
+) -> None:
+    """The existing kernel copy keeps the built-in route after binding.
+
+    ``curie cluster message`` still binds as Slack. Its deployment row normally
+    has no adapter, so the queue handle's reserved adapter must reach every sink
+    event instead of being erased during resolution. This is verify-only for
+    #2096: production kernel behavior already has the required fallback.
+    """
+
+    async def go() -> None:
+        binding = _TokenBinding("tok-route", uuid.uuid4())
+        async with make_harness(binding=binding) as h:
+            h.runner.default_script = [Final(text="done", status=DONE)]
+            await h.kernel.process_event(
+                _qevent(
+                    "hi",
+                    thread="tClusterMessageAdapter",
+                    placeholder="123e4567-e89b-42d3-a456-426614174000",
+                    adapter="curie-cluster-message",
+                )
+            )
+
+            routes = h.sink.routes_for("reply.update")
+            assert routes, "the completed turn emitted no reply update"
+            assert set(routes) == {
+                TargetRoute(endpoint=None, adapter="curie-cluster-message")
+            }
+
+    asyncio.run(go())
 
 
 def test_kernel_delivers_claim_token_as_bearer_header(make_harness) -> None:

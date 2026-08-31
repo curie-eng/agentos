@@ -98,6 +98,13 @@
 #                            provisioning. The falsifiable negative: the rung
 #                            must then fail closed on the missing credential
 #                            rather than starting a connector without it.
+#   CURIE_E2E_GATE_PORT   port for the live approval-gate case's own runner
+#                            (case_live_approval_gate_denies, #2094, rides
+#                            rung_skill). Default 7246, one above e2e.sh's own
+#                            CURIE_E2E_PORT default of 7245 so the two runners
+#                            never collide. Live-only (CURIE_E2E_LIVE=1); it
+#                            skips under a fake run since FakeModelSession
+#                            cannot exhibit the failure mode it proves absent.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -162,6 +169,12 @@ HERMETIC_RUNNER_NAME="curie-ladder-hermetic-$$"
 # could green-light an occupied 8155 and then hang on the message timeout.
 STUB_PORT=8155
 PROMPT="What is the weather in Denver right now?"
+# The live approval-gate case's turn (#2094). Deliberately explicit and
+# imperative, and deliberately NOT a weather question: the bundle's skill only
+# activates on those, so this prompt reaches the base agent's own tool set,
+# which is why it provokes `Bash` -- the one tool the case gates -- rather than
+# the skill's declared WebSearch/WebFetch.
+GATE_PROMPT="Use the Bash tool to run exactly: echo curie-2094-canary > /tmp/curie-2094-canary. Then tell me it is done."
 # The fake model's only reply (runner/src/curie_runner/fake.py). It is used
 # ONLY as a live-mode negative control -- "the reply must not be this" -- never
 # as a pass condition. Matching it to green is the #612 bypass.
@@ -253,6 +266,15 @@ SANDBOX_LABEL="curietech.ai/managed-by=curie-sandbox-substrate"
 # removes what it names.
 CONFLICT_NAME="curie-ladder-747-leftover-$$"
 CONFLICT_CREATED=0
+# The live approval-gate case (#2094) stands in a container of its own, for the
+# same reason: it removes what it names, so it must never name the default. The
+# port is one above e2e.sh's CURIE_E2E_PORT default of 7245, so this case cannot
+# collide with rung 1's own runner. $GATE_CASE_BUNDLE is filled in by the case
+# and stays empty on every run that never reaches it.
+GATE_CASE_NAME="curie-ladder-2094-gate-$$"
+GATE_CASE_CREATED=0
+GATE_CASE_PORT="${CURIE_E2E_GATE_PORT:-7246}"
+GATE_CASE_BUNDLE=""
 # The image that case creates its stand-in from. Already a requirement of the
 # ladder (rung 1 boots a real runner), so this adds no new prerequisite.
 RUNNER_IMAGE="curie-runner"
@@ -307,6 +329,12 @@ cleanup() {
     # the case itself once `skill down` has removed it.
     if (( CONFLICT_CREATED )); then
         docker rm -f "$CONFLICT_NAME" >/dev/null 2>&1
+    fi
+    # The live approval-gate case's runner (#2094), by its exact unique name for
+    # the same reason. Its bundle copy lives under $WORKDIR, which the `rm -rf`
+    # below already covers, so there is no second removal path for it here.
+    if (( GATE_CASE_CREATED )); then
+        docker rm -f "$GATE_CASE_NAME" >/dev/null 2>&1
     fi
     # Connector containers this run's own bundle started, matched by the exact
     # aliases derived from the scope a rung recorded -- never a bare sweep of
@@ -1157,6 +1185,180 @@ case_leftover_runner_container() {
     fi
     CONFLICT_CREATED=0
     echo "skill down --name cleared the leftover with no recorded state"
+}
+
+# The operator approval gate, proven against a REAL provider and the real
+# claude-agent-sdk dispatch (#1852, #2068).
+#
+# What this proves: with the gate armed on `Bash`, a turn that asks for a shell
+# command must PARK awaiting approval -- bounded, and with the command unrun.
+# Three assertions, one per observed failure mode:
+#   (a) `timeout` did not fire            -- the #1852 hang, where the deny was
+#       prose only and a real model simply spun until the caller gave up. This
+#       is what a revert of #2068 produces, so it is the negative control.
+#   (b) the terminal status is `awaiting-approval` -- the parked terminal that
+#       actually carries the approval state.
+#   (c) the canary file does not exist inside the runner -- the executed-anyway
+#       shape, judged independently of whatever the final frame claims.
+#
+# Why the fake tier structurally cannot prove this: both failure modes are
+# properties of how the real SDK dispatches permission rules against a real
+# model deciding to call a tool. `CURIE_FAKE_MODEL` makes no model call at all,
+# so it can neither spin nor choose `Bash`; every offline approval test in the
+# tree (runner/tests/test_approval_gate_enforcement.py, test_gate_shadowing.py)
+# asserts the gate's logic, and none of them exercise that dispatch. A sealed
+# run of this case would therefore be a green that proves nothing, which is why
+# it returns early rather than degrading to the fake model.
+#
+# Two traps worth naming, because both fail SILENTLY:
+#   - `--secret` takes a bare variable NAME. `--secret NAME=VALUE` is filtered
+#     out of the container environment without a word (cli/src/docker.rs), so
+#     the gate would never arm and the turn would end `done`.
+#   - `curie skill message` has no timeout of any kind, so an unbounded turn
+#     wedges the whole ladder forever instead of failing it. The `timeout` is
+#     the (a) assertion, not defensive padding.
+#
+# The case gates `Bash` and not the skill's own tools on purpose: the runner
+# refuses to boot when a gate's required set intersects a skill's declared
+# `allowed-tools` (assert_gates_not_shadowed), and this bundle's skill declares
+# WebSearch/WebFetch. `Bash` appears in no skill frontmatter here, and the
+# adapter sets no allowed_tools at all, so it is both reachable and ungated
+# until this case arms it.
+case_live_approval_gate_denies() {
+    echo
+    echo "=== case: a live gated tool call is denied and the turn parks (#2094) ==="
+    if [[ "$LIVE" != "1" ]]; then
+        echo "skipped: CURIE_E2E_LIVE is not 1. This case proves a REAL model + real SDK dispatch (#1852/#2068); the fake tier cannot exhibit either failure mode, so running it sealed would be a false green."
+        return 0
+    fi
+
+    if ! docker image inspect "$RUNNER_IMAGE" >/dev/null 2>&1; then
+        echo "error: image '$RUNNER_IMAGE' is not present, and the #2094 case boots its own runner from it." >&2
+        echo "fix: build it with \`curie build\`, then re-run." >&2
+        return 1
+    fi
+    if ! command -v timeout >/dev/null 2>&1; then
+        echo "error: \`timeout\` (coreutils) is not on PATH, and the #2094 case's bound IS its hang assertion." >&2
+        echo "fix: install coreutils, then re-run. Running this case unbounded would wedge the ladder instead of failing it." >&2
+        return 1
+    fi
+    # Same shape as assert_stub_port_free, against this case's own port.
+    if (exec 3<>"/dev/tcp/127.0.0.1/$GATE_CASE_PORT") 2>/dev/null; then
+        echo "error: port $GATE_CASE_PORT is already in use, and the #2094 case's runner must bind it." >&2
+        echo "fix: stop the process holding it (another ladder run, or a stale \`skill up\`), or set CURIE_E2E_GATE_PORT to a free port, then re-run." >&2
+        return 1
+    fi
+
+    # A COPY, never the shared parity artifact: `skill up` writes `.curie/`
+    # state into its CWD bundle, and the ladder's bundle is the artifact
+    # assert_bundle_identity compares across rungs (#1608). Perturbing it would
+    # regress that check. The copy lives under $WORKDIR, so the existing trap
+    # reaps it and this adds no cleanup path.
+    GATE_CASE_BUNDLE="$WORKDIR/gate-bundle"
+    cp -a "$WORKDIR/bundle" "$GATE_CASE_BUNDLE"
+
+    # Claim ownership BEFORE booting, the same rule the #747 case above states:
+    # a signal between the two must not strand the container, and `docker rm -f`
+    # on a name that never existed is a no-op.
+    GATE_CASE_CREATED=1
+    (
+        cd "$GATE_CASE_BUNDLE"
+        # The operator override, armed by NAME only. No sealed-model flag and
+        # no model override: the ambient credential and CURIE_MODEL govern here
+        # exactly as they do for every other live rung.
+        export CURIE_APPROVAL_REQUIRED_TOOLS=Bash
+        "$BIN" skill up --name "$GATE_CASE_NAME" --port "$GATE_CASE_PORT" \
+            --secret CURIE_APPROVAL_REQUIRED_TOOLS
+    )
+
+    local attempt out code status
+    status=""
+    # A live model may answer without calling any tool at all, which ends the
+    # turn `done` and is a flake rather than a regression. One retry, then a
+    # failure that names the model and the prompt so a maintainer can tell the
+    # two apart. Only this shape is retried: a timeout or a run canary is a real
+    # failure and is never retried.
+    for attempt in 1 2; do
+        out="$(cd "$GATE_CASE_BUNDLE" && timeout 240 "$BIN" --json skill message \
+            --url "http://127.0.0.1:$GATE_CASE_PORT" "$GATE_PROMPT")" && code=0 || code=$?
+
+        # (a) bounded. `timeout` exiting 124 IS the #1852 hang: the deny reached
+        # the model as prose only, the model never ended its turn, and the
+        # caller spun with the stream entry pending and no approval record.
+        if (( code == 124 )); then
+            echo "the gated turn never ended: \`timeout\` fired at 240s. This is the #1852 hang -- the deny did not stop the turn -- and is what a revert of #2068's PreToolUse wiring produces." >&2
+            return 1
+        fi
+
+        # stdout only: --json puts the payload on stdout and human text on
+        # stderr, so a combined-stream parse fails intermittently and reads like
+        # a product bug.
+        status="$(printf '%s' "$out" | python3 -c '
+import json, sys
+try:
+    payload = json.loads(sys.stdin.read())
+except Exception:
+    print("unparseable")
+    sys.exit(0)
+print(payload.get("status") if isinstance(payload, dict) else "unparseable")
+' || echo "unparseable")"
+
+        # (b) parked. Deliberately NOT the ladder's finalized-reply helper,
+        # which treats an approval park as a failure; and deliberately not
+        # `finalized` (the skill tier hardcodes it true) nor the exit code (a
+        # parked turn exits 0).
+        if [[ "$status" == "awaiting-approval" ]]; then
+            break
+        fi
+        if [[ "$status" == "done" && "$attempt" == "1" ]]; then
+            echo "retrying: the model answered without calling Bash"
+            continue
+        fi
+        echo "the gated turn ended '$status', expected 'awaiting-approval'. Model: ${CURIE_MODEL:-<sdk default>}. Prompt: $GATE_PROMPT" >&2
+        echo "a 'done' here twice running means the model declined to call Bash on both attempts (a flake); any other status means the gate did not park the turn (a regression)." >&2
+        printf '%s\n' "$out" >&2
+        return 1
+    done
+    echo "the gated turn parked: status=$status"
+
+    # (c) unrun, asserted inside the container that would have run it. Confirm
+    # the runner is still up first, purely for the precise diagnostic: a dead
+    # container is a distinct, nameable cause, and saying so beats the generic
+    # probe-failure message below.
+    if [[ -z "$(docker ps -q --filter "name=^${GATE_CASE_NAME}$")" ]]; then
+        echo "the gate case's runner '$GATE_CASE_NAME' is no longer running, so the side-effect assertion cannot be trusted." >&2
+        return 1
+    fi
+    # THREE outcomes, never two. `docker exec` exits non-zero both when the
+    # canary is absent AND when it could not run the command at all (the
+    # container died in the gap above, the daemon errored), so a bare
+    # `docker exec ... test -e` lets an infrastructure failure read as proof
+    # that the gate held -- a false pass on the one thing this case exists to
+    # prove. So the container prints a definite token, and ONLY a clean exit
+    # whose output is exactly the absent token is accepted as the pass.
+    local canary_out canary_code
+    canary_out="$(docker exec "$GATE_CASE_NAME" sh -c \
+        'if [ -e /tmp/curie-2094-canary ]; then echo CANARY_PRESENT; else echo CANARY_ABSENT; fi' 2>&1)" \
+        && canary_code=0 || canary_code=$?
+    if (( canary_code == 0 )) && [[ "$canary_out" == "CANARY_PRESENT" ]]; then
+        echo "the gated Bash command RAN: /tmp/curie-2094-canary exists inside '$GATE_CASE_NAME'. The gate reported a park but did not stop the tool call (#1852's executed-anyway shape)." >&2
+        return 1
+    fi
+    if (( canary_code != 0 )) || [[ "$canary_out" != "CANARY_ABSENT" ]]; then
+        echo "the side-effect probe could not run inside '$GATE_CASE_NAME' (exit $canary_code, output: ${canary_out:-<empty>}), so this assertion cannot be trusted. This is NOT evidence that the gate held; the canary was never read." >&2
+        return 1
+    fi
+    echo "the gated command did not run: /tmp/curie-2094-canary is absent"
+
+    # `skill down` takes no --plugin-dir and acts on the CWD bundle.
+    (cd "$GATE_CASE_BUNDLE" && "$BIN" skill down)
+    # Exact-name filter, never a substring: `name=curie` is host-wide and would
+    # report another session's runner as this case's failure.
+    if [[ -n "$(docker ps -aq --filter "name=^${GATE_CASE_NAME}$")" ]]; then
+        echo "skill down left '$GATE_CASE_NAME' behind." >&2
+        return 1
+    fi
+    GATE_CASE_CREATED=0
 }
 
 # ---------------------------------------------------------------------------
@@ -2672,6 +2874,7 @@ rung_skill() {
     assert_bundle_identity "skill" "$digest"
 
     case_leftover_runner_container
+    case_live_approval_gate_denies
 
     if connector_mode; then
         case_connector_hosting_skill

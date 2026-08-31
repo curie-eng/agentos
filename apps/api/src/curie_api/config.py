@@ -313,6 +313,28 @@ class Settings(BaseSettings):
     # creating a NEW namespace past the cap is refused; existing-namespace writes
     # are unaffected.
     state_max_namespaces: int = 256
+    # Disconnected ``curie cluster message`` replies are a short-lived handoff,
+    # not a transcript store.  Bound every bucket on all three axes so a worker
+    # retry storm or a chatty turn cannot turn the relay into durable unbounded
+    # state.  Operators may tighten these without changing the reply protocol.
+    cluster_message_replies_ttl_s: int = Field(
+        default=3600,
+        gt=0,
+        le=86400,
+        validation_alias="CLUSTER_MESSAGE_REPLIES_TTL_S",
+    )
+    cluster_message_replies_max_events: int = Field(
+        default=512,
+        gt=0,
+        le=4096,
+        validation_alias="CLUSTER_MESSAGE_REPLIES_MAX_EVENTS",
+    )
+    cluster_message_replies_max_bytes: int = Field(
+        default=2 * 1024 * 1024,
+        gt=0,
+        le=16 * 1024 * 1024,
+        validation_alias="CLUSTER_MESSAGE_REPLIES_MAX_BYTES",
+    )
     # The namespace the runner sandboxes run in, and the label selector that
     # identifies them (the chart labels sandbox pods
     # app.kubernetes.io/component=runner-sandbox). Used by the pod-list endpoint

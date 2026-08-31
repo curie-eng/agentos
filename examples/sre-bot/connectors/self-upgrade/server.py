@@ -1,11 +1,4 @@
-"""Two gated upgrade buttons and one read. None of them takes an argument.
-
-`upgrade_self` redeploys this bot's own bundle. `upgrade_platform` moves the
-Curie release underneath it. `latest_release` says what version is available.
-
-The two writes are the same mechanism pointed at different operator-written
-CronJob templates, which is why they share `_start_job_from` rather than being
-two files kept in step.
+"""A write connector that can do exactly one thing: start this bot's upgrade.
 
 Why the bot cannot just do the upgrade itself
 ---------------------------------------------
@@ -25,28 +18,11 @@ Why a separate server, and why zero arguments
 ----------------------------------------------
 `k8s-write`'s docstring is the standing argument: it exposes ONE tool, so there
 is no second thing for a gate to miss, and "there is no parameter through which a
-caller could reach an image, an env var, a command". `upgrade_self` goes one step
+caller could reach an image, an env var, a command". This tool goes one step
 further and takes NO arguments at all. The repository, the branch, the agent
 name, the image and the command all come from the CronJob's own `jobTemplate`,
 read from the cluster at call time. There is no field a caller can influence, so
 there is nothing to validate and nothing to escape.
-
-There are three tools here now, and the "nothing for a gate to miss" argument
-holds differently than it did with one. Both writes are gated, and both are
-zero-argument buttons that copy a template verbatim -- so the property that
-matters is not the COUNT of tools but that no tool takes caller input. A gate
-cannot be missed here because there is no unclassified verb: two writes, two
-gates, one read that changes nothing and holds no credential.
-
-What would break it is a tool growing a parameter. That is the line, and it is
-worth restating because the obvious next request -- "let me name the version" --
-is exactly that.
-
-It lives here rather than in its own connector because it answers the same
-question from the other side. "What version is available" is what a person asks
-immediately before "can we upgrade", and splitting them across two images, two
-publish jobs and two declarations buys separation between a read and a write
-that share a repository, a domain, and no credential at all.
 
 The grant RBAC cannot narrow, and what stands in for it
 --------------------------------------------------------
@@ -93,6 +69,7 @@ from typing import Any
 import httpx
 import yaml
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 log = logging.getLogger("self-upgrade-mcp")
@@ -108,15 +85,15 @@ CRONJOB = os.environ.get("SELF_UPGRADE_CRONJOB", "").strip()
 # this defaults to the one the ServiceAccount is bound to when set.
 NAMESPACE = os.environ.get("SELF_UPGRADE_NAMESPACE", "").strip()
 
-# The repository whose published releases answer "what is the newest version".
-# Read-only and public: no credential, and none is added here on purpose -- see
-# `latest_release`. Empty disables that tool's answer rather than guessing a repo.
-RELEASE_REPO = os.environ.get("SELF_UPGRADE_RELEASE_REPO", "").strip()
-
 # The CronJob that upgrades the PLATFORM, as distinct from this bot's bundle.
 # Empty means `upgrade_platform` refuses -- an install that has not decided to
 # grant a platform upgrade should not get one by default.
 PLATFORM_CRONJOB = os.environ.get("PLATFORM_UPGRADE_CRONJOB", "").strip()
+
+# The repository whose published releases answer "what is the newest version".
+# Read-only and public: no credential, and none is added here on purpose -- see
+# `latest_release`. Empty disables that tool's answer rather than guessing a repo.
+RELEASE_REPO = os.environ.get("SELF_UPGRADE_RELEASE_REPO", "").strip()
 RELEASE_API = os.environ.get("SELF_UPGRADE_RELEASE_API", "https://api.github.com").rstrip("/")
 RELEASE_TIMEOUT = float(os.environ.get("SELF_UPGRADE_RELEASE_TIMEOUT_SECONDS", "15"))
 
@@ -150,11 +127,11 @@ UPGRADE = ToolAnnotations(
 
 
 def _reply(ok, summary, prior=None, post=None, target=None):
-    """Every return path is this shape, so a caller never has to guess.
+    """Return the successful Job-start result as structured JSON.
 
     Matches the scale connector's reply so a reader of either learns one shape.
-    `prior` is null on every path here, including the successful one, because
-    this action has no recorded prior state to restore.
+    `prior` is null because this action has no recorded prior state to restore.
+    Refusals raise `ToolError` and carry `isError: true` on the MCP wire.
     """
     return json.dumps(
         {"ok": ok, "summary": summary, "prior": prior, "post": post, "target": target},
@@ -162,8 +139,8 @@ def _reply(ok, summary, prior=None, post=None, target=None):
     )
 
 
-def _client() -> Any:
-    """Build an httpx client from the mounted kubeconfig, or return a string.
+def _client() -> httpx.Client:
+    """Build an httpx client from the mounted kubeconfig, or raise `ToolError`.
 
     Parsed here rather than pulling in the full Kubernetes client, so the failure
     modes are ones this file can explain. Kept deliberately identical to the
@@ -175,9 +152,11 @@ def _client() -> Any:
         with open(KUBECONFIG, encoding="utf-8") as fh:
             cfg = yaml.safe_load(fh)
     except FileNotFoundError:
-        return f"no kubeconfig at {KUBECONFIG}: the upgrade credential is not mounted"
+        raise ToolError(
+            f"no kubeconfig at {KUBECONFIG}: the upgrade credential is not mounted"
+        ) from None
     except (OSError, yaml.YAMLError) as exc:
-        return f"could not read the kubeconfig at {KUBECONFIG}: {exc}"
+        raise ToolError(f"could not read the kubeconfig at {KUBECONFIG}: {exc}") from exc
 
     try:
         cluster = cfg["clusters"][0]["cluster"]
@@ -185,7 +164,7 @@ def _client() -> Any:
         server = cluster["server"]
         token = user["token"]
     except (KeyError, IndexError, TypeError):
-        return "kubeconfig is missing a cluster server or a user token"
+        raise ToolError("kubeconfig is missing a cluster server or a user token") from None
 
     # Both CA shapes. Handling only the file-path form left `verify` silently
     # True, so httpx checked the cluster certificate against the system trust
@@ -200,17 +179,21 @@ def _client() -> Any:
         try:
             pem = base64.b64decode(ca_data).decode("ascii")
         except (ValueError, TypeError, UnicodeDecodeError) as exc:
-            return f"kubeconfig certificate-authority-data is not a valid base64 PEM: {exc}"
+            raise ToolError(
+                f"kubeconfig certificate-authority-data is not a valid base64 PEM: {exc}"
+            ) from exc
         ctx = ssl.create_default_context()
         try:
             ctx.load_verify_locations(cadata=pem)
         except ssl.SSLError as exc:
-            return f"kubeconfig certificate-authority-data is not a usable CA certificate: {exc}"
+            raise ToolError(
+                f"kubeconfig certificate-authority-data is not a usable CA certificate: {exc}"
+            ) from exc
         verify = ctx
     elif ca_path:
         verify = ca_path
     elif cluster.get("insecure-skip-tls-verify"):
-        return (
+        raise ToolError(
             "kubeconfig sets insecure-skip-tls-verify; refusing to write over an "
             "unverified connection"
         )
@@ -295,6 +278,7 @@ def upgrade_self() -> str:
 
     The reply is a JSON object: `ok`, `summary`, `prior`, `post`, `target`.
     `prior` is always null, because this action has no prior state to restore.
+    Refusals are tool errors rather than successful JSON replies.
     """
 
     return _start_job_from(CRONJOB, "SELF_UPGRADE_CRONJOB")
@@ -312,10 +296,9 @@ def upgrade_platform() -> str:
     Starts an upgrade Job an operator installed. That Job reads the newest
     published release itself, fetches its chart, and runs the Helm upgrade with
     the values this install is already using. This tool takes no arguments: you
-    cannot choose the version, the chart or the values, and there is no way to
-    ask for a specific release through it. If someone names a version, say that
-    what runs is "the newest published release" and let them decide whether that
-    is what they wanted.
+    cannot choose the version, the chart or the values. If someone names a
+    version, say that what runs is "the newest published release" and let them
+    decide whether that is what they wanted.
 
     This is a WRITE, it is gated, and it is the widest one you have. Before
     calling it, say plainly which version is installed now, which is newest, and
@@ -331,64 +314,137 @@ def upgrade_platform() -> str:
     it with the read-only Kubernetes tools and report what it actually did. Your
     own sandbox may be replaced while it runs -- that is the upgrade working.
 
-    The reply is a JSON object: `ok`, `summary`, `prior`, `post`, `target`.
-    `prior` is always null, because this action has no prior state you can
-    restore.
+    Refusals are tool errors rather than successful JSON replies.
     """
 
     return _start_job_from(PLATFORM_CRONJOB, "PLATFORM_UPGRADE_CRONJOB")
 
 
+@mcp.tool(annotations=READ)
+def latest_release() -> str:
+    """The newest published release of the platform this bot runs on.
+
+    Answers "what is the latest available version" -- the question a person asks
+    right before "can we upgrade". It reads the repository's published releases
+    and reports the newest tag; it changes nothing and needs no approval.
+
+    THIS IS NOT WHAT THIS BOT IS RUNNING. The installed platform version is a
+    property of the cluster, readable from `app.kubernetes.io/version` on the
+    platform's own objects with the read-only Kubernetes tools. Report both and
+    say which is which; a newer tag here does not mean anything was upgraded.
+
+    Nor is it your own bundle's version, which moves independently.
+
+    The reply is a JSON object with `tag`, `name`, `url` and `published_at`.
+    Refusals are tool errors rather than successful JSON replies.
+    """
+
+    if not RELEASE_REPO:
+        raise ToolError(
+            "refusing: SELF_UPGRADE_RELEASE_REPO is not set, so this connector "
+            "does not know which project's releases to read. Setting it is an "
+            "operator change."
+        )
+
+    url = f"{RELEASE_API}/repos/{RELEASE_REPO}/releases/latest"
+    try:
+        # No credential, deliberately. A public repository needs none, and a
+        # token here would put a credential in a connector whose whole job is to
+        # answer one read -- the thing the read-only Kubernetes connector drops
+        # `configuration_view` to avoid. The cost is GitHub's unauthenticated
+        # rate limit, which a question asked a few times a day does not reach.
+        with httpx.Client(timeout=RELEASE_TIMEOUT) as client:
+            response = client.get(
+                url,
+                headers={
+                    "Accept": "application/vnd.github+json",
+                    "User-Agent": "curie-sre-bot-self-upgrade",
+                },
+            )
+    except httpx.HTTPError as exc:
+        raise ToolError(f"could not reach {RELEASE_API}: {exc}") from exc
+
+    if response.status_code == 404:
+        raise ToolError(
+            f"{RELEASE_REPO} has no published releases, or is not visible without "
+            "a credential this connector deliberately does not hold."
+        )
+    if response.status_code == 403:
+        raise ToolError(
+            "the releases API refused this read (403). Unauthenticated rate "
+            "limits are the usual cause; it clears on its own."
+        )
+    if response.status_code >= 400:
+        raise ToolError(f"the releases API returned HTTP {response.status_code}")
+
+    try:
+        payload = response.json()
+        tag = payload["tag_name"]
+    except (ValueError, KeyError, TypeError) as exc:
+        raise ToolError(
+            "the releases API returned a body with no tag_name"
+        ) from exc
+
+    return json.dumps(
+        {
+            "summary": (
+                f"the newest published release of {RELEASE_REPO} is {tag}. This is "
+                "what is available, NOT what this install is running -- read the "
+                "installed version from the platform's own Kubernetes objects."
+            ),
+            "tag": tag,
+            "name": payload.get("name"),
+            "url": payload.get("html_url"),
+            "published_at": payload.get("published_at"),
+        },
+        sort_keys=True,
+    )
+
+
 def _start_job_from(cronjob: str, env_name: str) -> str:
-    """Create a Job from `cronjob`'s template, or say why not.
+    """Create a Job from `cronjob`'s template, or raise saying why not.
 
     Shared by both upgrade verbs because they differ in exactly one thing: which
     operator-written template runs. Everything the security argument rests on --
     no caller input, the template copied verbatim, one at a time -- is a property
     of this function, so it holds for both by construction rather than by two
-    files being kept in step.
+    call sites being kept in step.
     """
 
     if not cronjob:
-        return _reply(
-            False,
+        raise ToolError(
             f"refusing: {env_name} is not set, so this connector does not "
-            "know which upgrade to start. Setting it is an operator change.",
+            "know which upgrade to start. Setting it is an operator change."
         )
 
     namespace = _namespace()
     if not namespace:
-        return _reply(
-            False,
+        raise ToolError(
             "refusing: could not determine a namespace to act in. Set "
-            "SELF_UPGRADE_NAMESPACE.",
+            "SELF_UPGRADE_NAMESPACE."
         )
 
     client = _client()
-    if isinstance(client, str):
-        return _reply(False, client)
 
     with client:
         path = f"/apis/batch/v1/namespaces/{namespace}/cronjobs/{cronjob}"
         try:
             existing = client.get(path)
         except httpx.HTTPError as exc:
-            return _reply(False, f"could not reach the API server: {exc}")
+            raise ToolError(f"could not reach the API server: {exc}") from exc
         if existing.status_code == 404:
-            return _reply(
-                False,
+            raise ToolError(
                 f"no CronJob {namespace}/{cronjob}. The upgrade job is not installed "
-                "on this cluster; installing it is an operator change.",
+                "on this cluster; installing it is an operator change."
             )
         if existing.status_code in (401, 403):
-            return _reply(
-                False,
+            raise ToolError(
                 f"the upgrade identity may not read {namespace}/{cronjob} "
-                f"({existing.status_code}). It needs get on that cronjob.",
+                f"({existing.status_code}). It needs get on that cronjob."
             )
         if existing.status_code >= 400:
-            return _reply(
-                False, f"could not read {namespace}/{cronjob}: {existing.status_code}"
+            raise ToolError(
+                f"could not read {namespace}/{cronjob}: {existing.status_code}"
             )
 
         try:
@@ -397,19 +453,17 @@ def _start_job_from(cronjob: str, env_name: str) -> str:
             template = {}
         job_spec = template.get("spec")
         if not job_spec:
-            return _reply(
-                False,
+            raise ToolError(
                 f"{namespace}/{cronjob} has no jobTemplate.spec to run; the CronJob "
-                "is malformed.",
+                "is malformed."
             )
 
         running = _active_job(client, namespace, cronjob)
         if running:
-            return _reply(
-                False,
+            raise ToolError(
                 f"refusing: upgrade job {running} is still running. Wait for it to "
                 "finish rather than starting a second one -- two overlapping runs "
-                "race on creating the version.",
+                "race on creating the version."
             )
 
         # generateName, so the server picks a unique suffix and two approvals
@@ -446,17 +500,14 @@ def _start_job_from(cronjob: str, env_name: str) -> str:
                 f"/apis/batch/v1/namespaces/{namespace}/jobs", json=body
             )
         except httpx.HTTPError as exc:
-            return _reply(False, f"could not reach the API server: {exc}")
+            raise ToolError(f"could not reach the API server: {exc}") from exc
         if created.status_code in (401, 403):
-            return _reply(
-                False,
+            raise ToolError(
                 f"the upgrade identity may not create Jobs in {namespace} "
-                f"({created.status_code}). It needs create on jobs.",
+                f"({created.status_code}). It needs create on jobs."
             )
         if created.status_code >= 400:
-            return _reply(
-                False, f"the upgrade job was refused: {created.status_code}"
-            )
+            raise ToolError(f"the upgrade job was refused: {created.status_code}")
         try:
             name = (created.json().get("metadata") or {}).get("name") or "(unnamed)"
         except (ValueError, AttributeError):
@@ -473,130 +524,6 @@ def _start_job_from(cronjob: str, env_name: str) -> str:
         prior=None,
         post={"job": name},
         target={"kind": "Job", "namespace": namespace, "name": name},
-    )
-
-
-@mcp.tool(annotations=READ)
-def latest_release() -> str:
-    """The newest published release of the platform this bot runs on.
-
-    Answers "what is the latest available version" -- the question a person asks
-    right before "can we upgrade". It reads the repository's published releases
-    and reports the newest tag; it changes nothing and needs no approval.
-
-    THIS IS NOT WHAT THIS BOT IS RUNNING. The installed platform version is a
-    property of the cluster, readable from `app.kubernetes.io/version` on the
-    platform's own objects with the read-only Kubernetes tools. Report both and
-    say which is which; a newer tag here does not mean anything was upgraded.
-
-    Nor is it your own bundle's version, which moves independently.
-
-    The reply is a JSON object: `ok`, `summary`, and `latest` (tag, name, url,
-    published_at) when the read succeeded.
-    """
-
-    if not RELEASE_REPO:
-        return json.dumps(
-            {
-                "ok": False,
-                "summary": (
-                    "refusing: SELF_UPGRADE_RELEASE_REPO is not set, so this "
-                    "connector does not know which project's releases to read. "
-                    "Setting it is an operator change."
-                ),
-                "latest": None,
-            },
-            sort_keys=True,
-        )
-
-    url = f"{RELEASE_API}/repos/{RELEASE_REPO}/releases/latest"
-    try:
-        # No credential, deliberately. A public repository needs none, and a
-        # token here would put a credential in a connector whose whole job is to
-        # answer one read -- the thing the read-only Kubernetes connector drops
-        # `configuration_view` to avoid. The cost is GitHub's unauthenticated
-        # rate limit, which a question asked a few times a day does not reach.
-        with httpx.Client(timeout=RELEASE_TIMEOUT) as client:
-            response = client.get(
-                url,
-                headers={
-                    "Accept": "application/vnd.github+json",
-                    "User-Agent": "curie-sre-bot-self-upgrade",
-                },
-            )
-    except httpx.HTTPError as exc:
-        return json.dumps(
-            {
-                "ok": False,
-                "summary": f"could not reach {RELEASE_API}: {exc}",
-                "latest": None,
-            },
-            sort_keys=True,
-        )
-
-    if response.status_code == 404:
-        return json.dumps(
-            {
-                "ok": False,
-                "summary": (
-                    f"{RELEASE_REPO} has no published releases, or is not visible "
-                    "without a credential this connector deliberately does not hold."
-                ),
-                "latest": None,
-            },
-            sort_keys=True,
-        )
-    if response.status_code == 403:
-        return json.dumps(
-            {
-                "ok": False,
-                "summary": (
-                    "the releases API refused this read (403). Unauthenticated "
-                    "rate limits are the usual cause; it clears on its own."
-                ),
-                "latest": None,
-            },
-            sort_keys=True,
-        )
-    if response.status_code >= 400:
-        return json.dumps(
-            {
-                "ok": False,
-                "summary": f"the releases API returned HTTP {response.status_code}",
-                "latest": None,
-            },
-            sort_keys=True,
-        )
-
-    try:
-        payload = response.json()
-        tag = payload["tag_name"]
-    except (ValueError, KeyError, TypeError):
-        return json.dumps(
-            {
-                "ok": False,
-                "summary": "the releases API returned a body with no tag_name",
-                "latest": None,
-            },
-            sort_keys=True,
-        )
-
-    return json.dumps(
-        {
-            "ok": True,
-            "summary": (
-                f"the newest published release of {RELEASE_REPO} is {tag}. This is "
-                "what is available, NOT what this install is running -- read the "
-                "installed version from the platform's own Kubernetes objects."
-            ),
-            "latest": {
-                "tag": tag,
-                "name": payload.get("name"),
-                "url": payload.get("html_url"),
-                "published_at": payload.get("published_at"),
-            },
-        },
-        sort_keys=True,
     )
 
 

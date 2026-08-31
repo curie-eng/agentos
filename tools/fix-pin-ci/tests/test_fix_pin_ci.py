@@ -48,10 +48,27 @@ def _write_event(
     return event_path
 
 
-def _write_fake_curie(tmp_path: Path) -> tuple[Path, Path]:
-    call_log = tmp_path / "curie-argv.json"
-    fake_curie = tmp_path / "curie"
-    fake_curie.write_text(
+def _write_fake_binary(
+    tmp_path: Path,
+    name: str,
+    *,
+    call_log_environment: str,
+    output_environment: str,
+    exit_environment: str,
+    subdirectory: str | None = None,
+    default_output: str = "",
+    print_end: str = "\n",
+) -> tuple[Path, Path]:
+    """Write a fake executable that logs its argv and echoes a scripted result.
+
+    Returns ``(directory_or_binary_path, call_log_path)``: the binary's own path
+    when ``subdirectory`` is ``None``, otherwise the directory it was written into.
+    """
+    directory = tmp_path / subdirectory if subdirectory is not None else tmp_path
+    directory.mkdir(exist_ok=True)
+    call_log = tmp_path / f"{name}-argv.json"
+    fake_binary = directory / name
+    fake_binary.write_text(
         "\n".join(
             [
                 f"#!{sys.executable}",
@@ -59,16 +76,44 @@ def _write_fake_curie(tmp_path: Path) -> tuple[Path, Path]:
                 "import os",
                 "from pathlib import Path",
                 "import sys",
-                "Path(os.environ['FIX_PIN_CALL_LOG']).write_text(json.dumps(sys.argv[1:]))",
-                "print(os.environ.get('FIX_PIN_OUTPUT', ''), end='')",
-                "raise SystemExit(int(os.environ.get('FIX_PIN_EXIT', '0')))",
+                f"Path(os.environ['{call_log_environment}']).write_text("
+                "json.dumps(sys.argv[1:]))",
+                f"print(os.environ.get('{output_environment}', {default_output!r}), "
+                f"end={print_end!r})",
+                f"raise SystemExit(int(os.environ.get('{exit_environment}', '0')))",
                 "",
             ]
         ),
         encoding="utf-8",
     )
-    fake_curie.chmod(0o755)
-    return fake_curie, call_log
+    fake_binary.chmod(0o755)
+    return (fake_binary if subdirectory is None else directory), call_log
+
+
+def _write_fake_curie(tmp_path: Path) -> tuple[Path, Path]:
+    return _write_fake_binary(
+        tmp_path,
+        "curie",
+        call_log_environment="FIX_PIN_CALL_LOG",
+        output_environment="FIX_PIN_OUTPUT",
+        exit_environment="FIX_PIN_EXIT",
+        default_output="",
+        print_end="",
+    )
+
+
+def _write_fake_gh(tmp_path: Path) -> tuple[Path, Path]:
+    """Install a fake ``gh`` in its own directory so PATH shadows nothing else."""
+    return _write_fake_binary(
+        tmp_path,
+        "gh",
+        call_log_environment="FIX_PIN_GH_CALL_LOG",
+        output_environment="FIX_PIN_GH_LABELS",
+        exit_environment="FIX_PIN_GH_EXIT",
+        subdirectory="gh-bin",
+        default_output="[]",
+        print_end="\n",
+    )
 
 
 def _run_checker(
@@ -80,14 +125,25 @@ def _run_checker(
     verifier_exit: int = 0,
     verifier_stdout: str = "PINNED\n",
     timeout: float | None = None,
+    gh_labels: str = "[]",
+    gh_exit: int = 0,
+    gh_on_path: bool = True,
 ) -> tuple[subprocess.CompletedProcess[str], Path]:
     event_path = _write_event(tmp_path, body, action=action, include_body=include_body)
     curie, call_log = _write_fake_curie(tmp_path)
+    binaries, gh_call_log = _write_fake_gh(tmp_path)
     environment = {
         **os.environ,
         "FIX_PIN_CALL_LOG": str(call_log),
         "FIX_PIN_EXIT": str(verifier_exit),
         "FIX_PIN_OUTPUT": verifier_stdout,
+        "FIX_PIN_GH_CALL_LOG": str(gh_call_log),
+        "FIX_PIN_GH_LABELS": gh_labels,
+        "FIX_PIN_GH_EXIT": str(gh_exit),
+        "GITHUB_REPOSITORY": "curie-eng/curie",
+        # An empty PATH is how "gh is not installed" is expressed; the checker
+        # reaches curie by absolute path, so nothing else needs PATH here.
+        "PATH": f"{binaries}{os.pathsep}{os.environ.get('PATH', '')}" if gh_on_path else "",
     }
     completed = subprocess.run(
         [
@@ -108,6 +164,10 @@ def _run_checker(
         timeout=timeout,
     )
     return completed, call_log
+
+
+def _gh_call_log(tmp_path: Path) -> Path:
+    return tmp_path / "gh-argv.json"
 
 
 @pytest.mark.parametrize(
@@ -145,6 +205,8 @@ def test_exact_declaration_calls_the_verifier_with_one_argv_selector(tmp_path: P
     "selector",
     [
         "apps/worker/tests/kernel/test_consumer.py::test_consumes_stream_entry_end_to_end_and_acks",
+        "runner/tests/test_history.py::test_example",
+        "runner/tests/history/test_history.py::test_example",
         (
             "apps/api/tests/test_config_parity.py::"
             "TestResumeDeadLetterStreamCoherence::"
@@ -472,6 +534,14 @@ def test_ci_keeps_the_required_python_status_and_calls_fix_pin_after_pytest() ->
     assert job.get("name") == "Python (ruff + mypy + pytest)"
     assert "needs" not in job, "the required Python check must not be skippable"
 
+    # A job-level permissions block replaces the workflow-level one, so the job
+    # must grant both the checkout scope and the Issues scope the gate reads
+    # closed issue labels with.
+    permissions = job.get("permissions")
+    assert isinstance(permissions, dict), "the Python job must declare job level permissions"
+    assert permissions.get("contents") == "read"
+    assert permissions.get("issues") == "read"
+
     checkout_index = _single_step_index(
         steps,
         lambda step: _string(step, "uses") == "actions/checkout@v7",
@@ -510,6 +580,7 @@ def test_ci_keeps_the_required_python_status_and_calls_fix_pin_after_pytest() ->
     gate_environment = gate.get("env")
     assert isinstance(gate_environment, dict)
     assert gate_environment.get("CARGO_TARGET_DIR") == "${{ github.workspace }}/cli/target"
+    assert gate_environment.get("GH_TOKEN"), "the gate needs a token to read issue labels"
     assert shlex.split(_string(gate, "run")) == [
         "python3",
         "tools/fix-pin-ci/check.py",
@@ -558,7 +629,7 @@ def test_ci_keeps_the_required_python_status_and_calls_fix_pin_after_pytest() ->
     assert gate_index < diagnostic_index
 
 
-def test_pull_request_template_documents_the_opt_in_declaration() -> None:
+def test_pull_request_template_documents_the_required_declaration() -> None:
     template = PR_TEMPLATE.read_text(encoding="utf-8")
 
     assert "## Fix pin verification" in template
@@ -566,9 +637,189 @@ def test_pull_request_template_documents_the_opt_in_declaration() -> None:
     for selector_shape in (
         "apps/*/tests/*.py::test",
         "packages/*/tests/*.py::test",
+        "runner/tests/*.py::test",
         "cli/tests/name.rs::test",
         "charts/curie/ci/name.sh",
     ):
         assert selector_shape in template
-    assert re.search(r"non.fix.*leave.*empty", template, flags=re.IGNORECASE | re.DOTALL)
+    assert re.search(
+        r"non.fix.*does not close.*bug.*leave.*empty", template, flags=re.IGNORECASE | re.DOTALL
+    )
     assert re.search(r"one.*selector.*changed", template, flags=re.IGNORECASE | re.DOTALL)
+    assert re.search(r"REQUIRED.*closes.*bug", template, flags=re.IGNORECASE | re.DOTALL)
+    assert "Fix pin: n/a - <reason>" in template
+    # The template must state that the reason is mandatory, not merely mention
+    # the word "reason" somewhere.
+    assert re.search(r"non.empty\s+reason", template, flags=re.IGNORECASE)
+
+
+BUG_LABELS = '["bug"]'
+
+# Split across the slash so this repo's gitleaks `cross-repo-issue-ref` rule does not read the
+# fixture as a real cross-repo citation. The checker must still see the joined form, because
+# rejecting an owner-qualified reference is exactly what this case asserts.
+CROSS_REPO_REFERENCE = "Closes another-owner" + "/some-repo#12"
+
+
+def test_closing_a_bug_issue_without_a_declaration_fails_and_names_the_issue(
+    tmp_path: Path,
+) -> None:
+    completed, call_log = _run_checker(
+        tmp_path, "Fixes a crash.\n\nCloses #12\n", gh_labels=BUG_LABELS
+    )
+    shown = f"{completed.stdout}\n{completed.stderr}"
+
+    assert completed.returncode != 0, shown
+    assert "#12" in completed.stderr, shown
+    assert "Fix pin" in completed.stderr, shown
+    assert "SKIPPED: no Fix pin declaration" not in completed.stdout, shown
+    assert not call_log.exists(), "a missing declaration must not reach curie"
+    assert json.loads(_gh_call_log(tmp_path).read_text(encoding="utf-8")) == [
+        "api",
+        "repos/curie-eng/curie/issues/12",
+        "--jq",
+        "[.labels[].name]",
+    ]
+
+
+def test_closing_a_bug_issue_with_an_explicit_not_applicable_reason_passes(
+    tmp_path: Path,
+) -> None:
+    completed, call_log = _run_checker(
+        tmp_path,
+        "Closes #12\n\nFix pin: n/a - the fix is a chart template with no test surface\n",
+        gh_labels=BUG_LABELS,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.startswith("SKIPPED: Fix pin declared not applicable")
+    assert "chart template with no test surface" in completed.stdout
+    assert not call_log.exists(), "an excused declaration must not run curie"
+
+
+@pytest.mark.parametrize("dash", ["\u2014", "\u2013", "-"])
+def test_not_applicable_accepts_every_supported_dash(tmp_path: Path, dash: str) -> None:
+    completed, call_log = _run_checker(
+        tmp_path, f"Closes #12\n\nFix pin: n/A {dash} documentation only\n", gh_labels=BUG_LABELS
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "documentation only" in completed.stdout
+    assert not call_log.exists(), "an excused declaration must not run curie"
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    ["Fix pin: n/a", "Fix pin: n/a \u2014", "Fix pin: n/a \u2014 "],
+)
+def test_not_applicable_without_a_reason_fails_closed_without_calling_curie(
+    tmp_path: Path, declaration: str
+) -> None:
+    completed, call_log = _run_checker(
+        tmp_path, f"Closes #12\n\n{declaration}\n", gh_labels=BUG_LABELS
+    )
+
+    assert completed.returncode != 0
+    assert "Fix pin declaration error" in completed.stderr
+    assert not call_log.exists(), "an unexplained escape must not reach curie"
+
+
+def test_bug_label_is_found_anywhere_in_the_label_list(tmp_path: Path) -> None:
+    """The gate tests membership, not the first or only label."""
+    completed, call_log = _run_checker(
+        tmp_path, "Closes #12\n", gh_labels='["priority", "bug"]'
+    )
+
+    assert completed.returncode != 0, f"{completed.stdout}\n{completed.stderr}"
+    assert "#12" in completed.stderr
+    assert not call_log.exists(), "a missing declaration must not reach curie"
+
+
+def test_not_applicable_reason_without_a_dash_fails_closed_without_calling_curie(
+    tmp_path: Path,
+) -> None:
+    completed, call_log = _run_checker(
+        tmp_path,
+        "Closes #12\n\nFix pin: n/a documentation only\n",
+        gh_labels=BUG_LABELS,
+    )
+
+    assert completed.returncode != 0, f"{completed.stdout}\n{completed.stderr}"
+    assert "Fix pin declaration error" in completed.stderr
+    assert not call_log.exists(), "a dashless escape must not reach curie"
+
+
+def test_closing_a_non_bug_issue_without_a_declaration_keeps_the_existing_skip(
+    tmp_path: Path,
+) -> None:
+    completed, call_log = _run_checker(
+        tmp_path, "Closes #12\n", gh_labels='["enhancement"]'
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "SKIPPED: no Fix pin declaration"
+    assert not call_log.exists(), "a non bug pull request must not run curie"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Closes #12",
+        "closes #12",
+        "Close #12",
+        "Closed #12",
+        "Closes: #12",
+        "Fixes #12",
+        "Fixed #12",
+        "Fix #12",
+        "Resolves #12",
+        "Resolve #12",
+        "Resolved #12",
+        "Closes #12, #13",
+        "Closes #12 and #13",
+    ],
+)
+def test_closing_keyword_variants_all_require_a_declaration(tmp_path: Path, body: str) -> None:
+    completed, call_log = _run_checker(tmp_path, body, gh_labels=BUG_LABELS)
+
+    assert completed.returncode != 0, f"{completed.stdout}\n{completed.stderr}"
+    assert "#12" in completed.stderr
+    assert _gh_call_log(tmp_path).exists(), "a same repository closure must be looked up"
+    assert not call_log.exists(), "a missing declaration must not reach curie"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        CROSS_REPO_REFERENCE,
+        "Closes https://github.com/owner/repo/issues/12",
+        "See #12 for background",
+        "<!-- Closes #12 -->",
+        "Closes #",
+    ],
+)
+def test_non_closing_references_are_not_looked_up_and_still_skip(
+    tmp_path: Path, body: str
+) -> None:
+    completed, call_log = _run_checker(tmp_path, body, gh_labels=BUG_LABELS)
+
+    assert completed.returncode == 0, f"{completed.stdout}\n{completed.stderr}"
+    assert completed.stdout.strip() == "SKIPPED: no Fix pin declaration"
+    assert not _gh_call_log(tmp_path).exists(), "only same repository closures may be looked up"
+    assert not call_log.exists(), "a non closing reference must not run curie"
+
+
+def test_label_lookup_failure_fails_closed_without_calling_curie(tmp_path: Path) -> None:
+    completed, call_log = _run_checker(tmp_path, "Closes #12", gh_exit=1)
+
+    assert completed.returncode != 0
+    assert "#12" in completed.stderr
+    assert not call_log.exists(), "an unreadable label API must not open the gate"
+
+
+def test_missing_gh_fails_closed_without_calling_curie(tmp_path: Path) -> None:
+    completed, call_log = _run_checker(tmp_path, "Closes #12", gh_on_path=False)
+
+    assert completed.returncode != 0
+    assert "#12" in completed.stderr
+    assert not call_log.exists(), "an unavailable label API must not open the gate"
