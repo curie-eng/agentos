@@ -91,8 +91,6 @@ async def _require_current_publication_workspace(
     deployment = await get_deployment(session, data.deployment_id)
     if deployment is None:
         raise LookupError("deployment not found")
-    if not deployment.workspace_enabled:
-        raise ValueError("deployment does not declare a repository workspace")
     thread_workspace = await get_thread_workspace(
         session,
         agent_id=deployment.agent_id,

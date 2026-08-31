@@ -1159,30 +1159,13 @@ class Kernel:
                     thread_key,
                     **boot_env_kwargs,
                 )
-                if getattr(resolved, "workspace_enabled", False):
-                    workspace_deployment_id = getattr(resolved, "deployment_id", None)
-                    if workspace_deployment_id is None:
-                        # Outside _attempt's handlers, so this one has to name
-                        # itself: deployment_id is legitimately optional on a
-                        # resolved binding, making this a reachable
-                        # misconfiguration that would otherwise reach the
-                        # consumer as an anonymous processing exception (#2004).
-                        # Log first so the failure names the agent, then let the
-                        # raise stand unchanged: it leaves the stream entry
-                        # pending for reclaim rather than settling it -- only
-                        # the visibility changed here.
-                        binding_failure = WorkspacePreparationError(
-                            "binding", "workspace-enabled deployment has no deployment id"
-                        )
-                        self._log_workspace_start_failure(
-                            qevent,
-                            qevent.text,
-                            binding_failure,
-                            agent_id=agent_id,
-                            agent_name=agent_name,
-                            workspace_deployment_id=None,
-                        )
-                        raise binding_failure
+                # The deployment id is the server-side authority used to select
+                # and redeem a repository at initial claim time.  The legacy
+                # per-deployment workspace_enabled bit is deliberately not a
+                # runtime coding gate: the worker-wide coordinator switch is the
+                # operational kill switch, while a missing deployment id simply
+                # leaves this turn on the generic claim path.
+                workspace_deployment_id = getattr(resolved, "deployment_id", None)
                 # One-shot post-approval allowance (#430, ADR-0035): when THIS turn is the
                 # resume of a genuinely-approved permission-gate approval, deliver a single
                 # gated-tool grant so the approved action completes once; the gate re-arms

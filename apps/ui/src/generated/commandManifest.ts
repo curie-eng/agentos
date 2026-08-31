@@ -1507,7 +1507,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Let each new session select an allowed GitHub repository from the opening message and materialize it as managed /workspace",
+              "help": "Deprecated compatibility no-op: coding tools are built in, and an allowed root GitHub URL in the opening message drives managed /workspace acquisition",
               "id": "workspace",
               "long": "workspace",
               "positional": false,
@@ -1519,7 +1519,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Explicitly disable a previously configured managed workspace",
+              "help": "Deprecated compatibility no-op: coding tools are built in, and an allowed root GitHub URL in the opening message drives managed /workspace acquisition",
               "id": "no_workspace",
               "long": "no-workspace",
               "positional": false,
@@ -3833,7 +3833,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Let sessions on each deployment select an allowed GitHub repository from the opening message and materialize it as managed /workspace",
+              "help": "Deprecated compatibility no-op: coding tools are built in, and an allowed root GitHub URL in the opening message drives managed /workspace acquisition",
               "id": "workspace",
               "long": "workspace",
               "positional": false,
@@ -3845,7 +3845,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Explicitly disable a previously configured managed workspace",
+              "help": "Deprecated compatibility no-op: coding tools are built in, and an allowed root GitHub URL in the opening message drives managed /workspace acquisition",
               "id": "no_workspace",
               "long": "no-workspace",
               "positional": false,

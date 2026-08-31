@@ -28,14 +28,6 @@ async def _workspace_deployment(
     deployment = await crud.get_deployment(session, deployment_id)
     if deployment is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "deployment not found")
-    if not deployment.workspace_enabled:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            {
-                "code": "workspace.deployment_disabled",
-                "message": "This deployment does not enable repository workspaces.",
-            },
-        )
     return deployment
 
 
@@ -120,21 +112,6 @@ async def redeem_workspace_credential(
         raise HTTPException(
             status.HTTP_404_NOT_FOUND,
             "deployment not found",
-            headers={"Cache-Control": "no-store"},
-        )
-    if not deployment.workspace_enabled:
-        await crud.append_credential_redemption_audit(
-            session,
-            purpose="workspace_clone",
-            outcome="refused",
-            deployment_id=deployment.id,
-            publication_id=None,
-            repo_full_name=None,
-            detail="deployment does not enable repository workspaces",
-        )
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            "deployment does not enable repository workspaces",
             headers={"Cache-Control": "no-store"},
         )
     selected = await crud.get_thread_workspace(

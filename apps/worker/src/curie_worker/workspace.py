@@ -35,7 +35,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Protocol, cast
+from typing import Any, Protocol
 from urllib.parse import urlsplit
 
 WORKSPACE_REF_ENV = "CURIE_WORKSPACE_REF"

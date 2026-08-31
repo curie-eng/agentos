@@ -216,10 +216,13 @@ _PUBLISH_TOOL = "publish_changes"
 PUBLISH_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__{_PUBLISH_TOOL}"
 
 _PUBLISH_DESCRIPTION = (
-    "Request publication of the current repository changes. The platform will"
-    " capture the patch, ask for human approval in the requesting thread, and"
-    " publish it from a separate trusted job only after approval. This tool"
-    " never publishes changes itself."
+    "Work only in the managed repository mounted at /workspace and preserve"
+    " existing changes. Do not push with git. When the changes are ready, use"
+    " this tool to request human approval for publication. The platform will"
+    " capture the patch, ask for approval in the requesting thread, and publish"
+    " it from a separate trusted job only after approval. This tool never"
+    " publishes changes itself. After calling it, end your turn and tell the"
+    " user the publication request is pending."
 )
 _PUBLISH_SCHEMA = {
     "type": "object",
@@ -324,20 +327,26 @@ def build_approval_server(
     async def request_approval(args: dict[str, Any]) -> dict[str, Any]:
         return process_approval_request(gate, args)
 
-    tools = [request_approval]
-    if managed_workspace:
-
-        @tool(_PUBLISH_TOOL, _PUBLISH_DESCRIPTION, _PUBLISH_SCHEMA)
-        async def publish_changes(_args: dict[str, Any]) -> dict[str, Any]:
-            # Defence in depth: the permission callback must deny the call before
-            # execution. If a harness bypasses that callback, the in-process tool
-            # still performs no action and grants no capability.
+    @tool(_PUBLISH_TOOL, _PUBLISH_DESCRIPTION, _PUBLISH_SCHEMA)
+    async def publish_changes(_args: dict[str, Any]) -> dict[str, Any]:
+        # Discovery is unconditional so every session carries the publication
+        # protocol. Authority is still mount-keyed in ``build_approval_gate``:
+        # an unmounted session cannot create a publication approval, and a
+        # direct invocation fails without mutating gate state.
+        if not managed_workspace:
             return _approval_error(
-                "Publication is performed only by the platform after human approval; "
-                "this sandbox tool cannot execute it directly."
+                "No managed repository workspace is mounted at /workspace; "
+                "publication cannot be requested from this session."
             )
+        # Defence in depth: the permission callback must deny the call before
+        # execution. If a harness bypasses that callback, the in-process tool
+        # still performs no action and grants no capability.
+        return _approval_error(
+            "Publication is performed only by the platform after human approval; "
+            "this sandbox tool cannot execute it directly."
+        )
 
-        tools.append(publish_changes)
+    tools = [request_approval, publish_changes]
 
     return create_sdk_mcp_server(
         name=APPROVAL_SERVER_NAME,
