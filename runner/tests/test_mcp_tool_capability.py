@@ -8,6 +8,7 @@ from pathlib import Path
 
 import anyio
 from curie_runner.mcp_tool_capability import probe_mcp_tool_capability
+from plugin_format.approval_policy import connector_tool_prefix
 
 _SERVER = Path(__file__).parent / "fixtures" / "mcp_tool_capability_server.py"
 
@@ -103,6 +104,61 @@ def test_mixed_read_only_and_write_tools_keep_write_capability(tmp_path: Path) -
     # remains available to the receipt classifier by its SDK-visible name.
     assert result.readonly_tools == frozenset(
         {"mcp__plugin_acme-bot_inventory__inspect_or_change"}
+    )
+
+
+def test_successful_read_only_names_survive_a_sibling_probe_failure(
+    tmp_path: Path,
+) -> None:
+    root = _bundle(tmp_path, mode="read-only")
+    (root / ".mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "inventory": {
+                        "command": sys.executable,
+                        "args": [str(_SERVER)],
+                        "env": {"CURIE_TEST_TOOL_MODE": "read-only"},
+                    },
+                    "operations": {"command": str(root / "missing-server")},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = _probe(root)
+
+    assert not result.complete
+    assert result.has_potential_write_tool
+    assert result.tool_count == 1
+    assert result.failures == ("operations",)
+    assert result.readonly_tools == frozenset(
+        {"mcp__plugin_acme-bot_inventory__inspect_or_change"}
+    )
+
+
+def test_derived_connector_read_only_tool_uses_connector_runtime_prefix(
+    tmp_path: Path,
+) -> None:
+    root = _bundle(tmp_path, mode="read-only")
+    (root / ".mcp.json").unlink()
+    connector_name = "inventory"
+    derived = {
+        connector_name: {
+            "command": sys.executable,
+            "args": [str(_SERVER)],
+            "env": {"CURIE_TEST_TOOL_MODE": "read-only"},
+        }
+    }
+
+    result = anyio.run(probe_mcp_tool_capability, root, derived)
+
+    assert result.complete
+    assert not result.has_potential_write_tool
+    assert result.tool_count == 1
+    assert result.readonly_tools == frozenset(
+        {f"{connector_tool_prefix(connector_name)}inspect_or_change"}
     )
 
 

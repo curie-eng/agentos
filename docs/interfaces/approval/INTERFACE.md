@@ -68,9 +68,13 @@ in code now:
   tool not explicitly `readOnlyHint=true`, including an unknown or unreachable surface — or
   when an explicit actionable approval gate exists. A surface with no MCP tools or only
   explicitly read-only tools carries no generic pager, because approval cannot unlock an
-  action it cannot perform. `readOnlyHint` makes this advertisement decision only: it is not
-  authorization and does not change gates or tool execution. Publication's dedicated
-  approval flow and state tools remain independent. When the pager is used, the turn ends
+  action it cannot perform. `readOnlyHint` is not authorization and does not change gates
+  or tool execution. A live probe that explicitly reports `readOnlyHint=true` also feeds
+  the MCP tool's SDK-visible name to the read-only classifier, suppressing the side-effect
+  flag, no-retry-after-side-effects classification, and therefore its receipt line. A
+  missing or `false` hint, an unknown surface, or a failed probe remains potentially
+  write-capable and is classified conservatively. Publication's dedicated approval flow
+  and state tools remain independent. When the pager is used, the turn ends
   `awaiting-approval`, the worker persists the record and suspends the sandbox
   (`kernel._pause_for_approval` — the first live use of the dormant ADR-0003 suspend path);
   resolution enqueues a resume turn onto the ordinary runs stream
