@@ -886,6 +886,11 @@ def test_boot_keeps_request_approval_for_an_explicit_gate_on_a_read_only_surface
     plugin_dir = _bundle(tmp_path, gates=["Bash"])
     _add_capability_server(plugin_dir, "read-only")
 
+    async def unexpected_probe(*_args: Any, **_kwargs: Any) -> typing.NoReturn:
+        raise AssertionError("an actionable explicit gate must skip the MCP probe")
+
+    monkeypatch.setattr(boot, "probe_mcp_tool_capability", unexpected_probe)
+
     options = _options_from_boot(monkeypatch, _config(plugin_dir))
 
     assert APPROVAL_SERVER_NAME in options.mcp_servers

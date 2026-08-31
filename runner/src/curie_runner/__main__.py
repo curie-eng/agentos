@@ -282,31 +282,37 @@ def build_runner(
 
     real_options: ClaudeAgentOptions | None = None
     if not fake_model:
-        # The bundle's live MCP ``tools/list`` response is the actual advertised
-        # MCP surface. Only a complete response where every observed tool says
-        # readOnlyHint=true -- including a complete surface with zero MCP tools --
-        # proves that this generic MCP pager cannot unlock an action. Built-in
-        # Claude tools are outside this capability decision; an explicit gate on
-        # one still retains the pager. Missing hints, uninspectable declarations,
-        # and probe failures preserve the historical tool. The annotation remains
-        # a non-authoritative hint: it never authorizes or denies tool execution.
-        capability = anyio.run(
-            probe_mcp_tool_capability,
-            config.session.plugin_dir,
-            derived_mcp_servers,
-            sdk_env,
-        )
-        carries_request_approval = (
-            carries_explicit_action_gate or capability.has_potential_write_tool
-        )
-        if not carries_request_approval:
-            logger.info(
-                "request_approval omitted: observed MCP surface has no actionable"
-                " tools tool_count=%d probe_complete=%s failures=%d",
-                capability.tool_count,
-                capability.complete,
-                len(capability.failures),
+        # An actionable explicit gate already proves the generic pager is
+        # required, so avoid spawning or dialing every MCP server merely to
+        # reach the same conclusion. A publication-only gate deliberately does
+        # not take this shortcut: it has its own tool and still needs the MCP
+        # surface decision below.
+        carries_request_approval = carries_explicit_action_gate
+        if not carries_explicit_action_gate:
+            # The bundle's live MCP ``tools/list`` response is the actual
+            # advertised MCP surface. Only a complete response where every
+            # observed tool says readOnlyHint=true -- including a complete
+            # surface with zero MCP tools -- proves that this generic MCP pager
+            # cannot unlock an action. Built-in Claude tools are outside this
+            # capability decision. Missing hints, uninspectable declarations,
+            # and probe failures preserve the historical tool. The annotation
+            # remains a non-authoritative hint: it never authorizes or denies
+            # tool execution.
+            capability = anyio.run(
+                probe_mcp_tool_capability,
+                config.session.plugin_dir,
+                derived_mcp_servers,
+                sdk_env,
             )
+            carries_request_approval = capability.has_potential_write_tool
+            if not carries_request_approval:
+                logger.info(
+                    "request_approval omitted: observed MCP surface has no actionable"
+                    " tools tool_count=%d probe_complete=%s failures=%d",
+                    capability.tool_count,
+                    capability.complete,
+                    len(capability.failures),
+                )
 
         platform_servers = {
             **(

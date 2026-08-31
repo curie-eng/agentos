@@ -440,18 +440,15 @@ def test_every_platform_mcp_server_the_boot_path_mounts_is_reserved(tmp_path, mo
     mounted = _boot_options(
         monkeypatch,
         RunnerConfig.from_env(env),
-        potential_write=False,
+        potential_write=True,
     ).mcp_servers
 
-    # #1444: an observed empty/read-only action surface omits the generic
-    # approval pager. The independently useful state server still mounts.
-    assert APPROVAL_SERVER_NAME not in mounted
-    assert STATE_SERVER_NAME in mounted
-    # The bundle declares no connectors, so every remaining key is a platform
-    # key by construction. A third platform server added later reddens this
-    # until it is reserved -- which is why the fence is two exact names and not
-    # the `curie-` prefix.
-    assert set(mounted) == {STATE_SERVER_NAME}
+    # The bundle declares no connectors, so every key is a platform key by
+    # construction. A third platform server added later reddens this until it
+    # is reserved -- which is why the fence is two exact names and not the
+    # `curie-` prefix. The write-capable probe is load-bearing: it keeps the pin
+    # able to see the conditionally mounted approval server.
+    assert set(mounted) == {APPROVAL_SERVER_NAME, STATE_SERVER_NAME}
     assert set(mounted) <= RESERVED_CONNECTOR_NAMES
 
 
