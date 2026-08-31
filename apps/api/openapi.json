@@ -4317,8 +4317,15 @@
       "WorkspaceSelectionOut": {
         "properties": {
           "repo_full_name": {
-            "title": "Repo Full Name",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Repo Full Name"
           }
         },
         "required": [

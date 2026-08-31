@@ -128,6 +128,9 @@ class SandboxHandle:
     # (written before the token existed) with token == "" -- no header is sent
     # for those and the pre-token runner enforces nothing, so they keep working.
     token: str = ""
+    # Worker-internal late-acquisition fence. These facts never cross ACI.
+    workspace_repo: str | None = None
+    generation: int = 0
 
     @property
     def sandbox_id(self) -> str:

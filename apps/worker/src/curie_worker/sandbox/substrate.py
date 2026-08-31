@@ -132,6 +132,7 @@ class SandboxSubstrate:
         *,
         env: dict[str, str] | None = None,
         agent_name: str | None = None,
+        workspace_repo: str | None = None,
     ) -> SandboxHandle:
         """Return the thread's live sandbox, claiming a warm one if needed.
 
@@ -165,7 +166,11 @@ class SandboxSubstrate:
                         self._evict_stale(thread_key, record)
                 if handle is None:
                     handle = self._claim_fresh(
-                        thread_key, env=env, state=RouteState.LIVE, agent_name=agent_name
+                        thread_key,
+                        env=env,
+                        state=RouteState.LIVE,
+                        agent_name=agent_name,
+                        workspace_repo=workspace_repo,
                     )
                     outcome = "claimed"
             except Exception as exc:
@@ -239,6 +244,54 @@ class SandboxSubstrate:
         if not self._affinity.touch(thread_key, self._config.route_ttl_seconds):
             return None
         return record.handle
+
+    def handoff(
+        self,
+        thread_key: str,
+        *,
+        expected: SandboxHandle,
+        env: dict[str, str],
+        workspace_repo: str,
+        agent_name: str | None = None,
+    ) -> SandboxHandle:
+        """Cold-create a workspace runner, then CAS it over one generic route.
+
+        The old route remains authoritative while the candidate binds. Losing
+        the claim+generation fence deletes only the unexposed candidate. After
+        a successful swap the old claim is cleanup-only; a failed deletion is
+        intentionally recoverable by the ordinary orphan reaper.
+        """
+
+        boot = dict(env)
+        boot[SESSION_ENV] = expected.session_id
+        if expected.history_ref is not None:
+            boot[HISTORY_ENV] = expected.history_ref
+        candidate = self._claim_fresh(
+            thread_key,
+            env=boot,
+            state=RouteState.LIVE,
+            session_id=expected.session_id,
+            history_ref=expected.history_ref,
+            agent_name=agent_name,
+            workspace_repo=workspace_repo,
+            generation=expected.generation + 1,
+            publish=False,
+        )
+        record = RouteRecord(handle=candidate, state=RouteState.LIVE)
+        if not self._affinity.replace_if_generation(
+            thread_key,
+            expected_claim=expected.claim_name,
+            expected_generation=expected.generation,
+            record=record,
+            ttl_seconds=self._config.route_ttl_seconds,
+        ):
+            self._k8s.delete_claim(candidate.claim_name)
+            raise NoRouteError(f"late workspace handoff lost its route fence for {thread_key}")
+        try:
+            self._k8s.delete_claim(expected.claim_name)
+        except Exception:  # noqa: BLE001 - route already swapped; reaper owns cleanup
+            logger.exception("late workspace handoff left old claim for orphan reaping")
+        return candidate
 
     # -- suspend / resume -------------------------------------------------------
 
@@ -336,6 +389,8 @@ class SandboxSubstrate:
                     session_id=old.session_id,
                     history_ref=old.history_ref,
                     agent_name=agent_name,
+                    workspace_repo=old.workspace_repo,
+                    generation=old.generation + 1,
                 )
             except Exception as exc:
                 error = exc
@@ -538,6 +593,9 @@ class SandboxSubstrate:
         session_id: str | None = None,
         history_ref: str | None = None,
         agent_name: str | None = None,
+        workspace_repo: str | None = None,
+        generation: int = 0,
+        publish: bool = True,
     ) -> SandboxHandle:
         config = self._config
         nonce = uuid.uuid4().hex[:6]
@@ -571,7 +629,11 @@ class SandboxSubstrate:
             session_id=session_id or f"thread-{thread_hash}",
             history_ref=history_ref,
             token=(env or {}).get(RUNNER_TOKEN_ENV, ""),
+            workspace_repo=workspace_repo,
+            generation=generation,
         )
+        if not publish:
+            return handle
         record = RouteRecord(handle=handle, state=state)
         for _ in range(3):
             if self._affinity.put_if_absent(thread_key, record, config.route_ttl_seconds):

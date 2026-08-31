@@ -93,6 +93,60 @@ def test_adopt_reuses_only_a_ready_route_and_never_cold_claims(
     assert fake_k8s.created == created_before_adoption
 
 
+def test_handoff_cold_claims_then_atomically_replaces_and_retires_old_route(
+    substrate: SandboxSubstrate,
+    fake_k8s: FakeSandboxClient,
+    affinity: AffinityStore,
+) -> None:
+    old = substrate.claim("T1", env={SESSION_ENV: "logical-session"})
+
+    replacement = substrate.handoff(
+        "T1",
+        expected=old,
+        env={SESSION_ENV: old.session_id, "CURIE_WORKSPACE_REF": "private/ref"},
+        workspace_repo="acme-corp/acme-bot",
+    )
+
+    assert replacement.claim_name != old.claim_name
+    assert replacement.session_id == old.session_id
+    assert replacement.workspace_repo == "acme-corp/acme-bot"
+    assert replacement.generation == 1
+    assert affinity.get("T1") == RouteRecord(handle=replacement)
+    assert old.claim_name in fake_k8s.deleted
+    assert replacement.claim_name not in fake_k8s.deleted
+
+
+def test_handoff_route_survives_old_claim_delete_failure_and_reaper_finishes_cleanup(
+    substrate: SandboxSubstrate,
+    fake_k8s: FakeSandboxClient,
+    affinity: AffinityStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old = substrate.claim("T1")
+    real_delete = fake_k8s.delete_claim
+    failed_once = False
+
+    def fail_old_once(name: str) -> None:
+        nonlocal failed_once
+        if name == old.claim_name and not failed_once:
+            failed_once = True
+            raise RuntimeError("injected post-CAS cleanup failure")
+        real_delete(name)
+
+    monkeypatch.setattr(fake_k8s, "delete_claim", fail_old_once)
+    replacement = substrate.handoff(
+        "T1",
+        expected=old,
+        env={"CURIE_WORKSPACE_REF": "private/ref"},
+        workspace_repo="acme-corp/acme-bot",
+    )
+
+    assert affinity.get("T1") == RouteRecord(handle=replacement)
+    assert old.claim_name in fake_k8s.claims
+    fake_k8s.claims[old.claim_name].created_at = datetime.now(UTC) - timedelta(seconds=33)
+    assert substrate.reap_orphans() == [old.claim_name]
+    assert old.claim_name not in fake_k8s.claims
+
 def test_claim_timeout_cleans_up_claim(
     fake_k8s: FakeSandboxClient, affinity: AffinityStore, config: SubstrateConfig
 ) -> None:

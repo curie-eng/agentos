@@ -266,7 +266,7 @@ def test_workspace_clone_strips_authenticated_remote_before_first_turn(
 
 
 def test_clone_credential_is_absent_from_argv_archive_config_and_claim_env(
-    workspace: Any, tmp_path: Path
+    workspace: Any, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     preparer, commands, objects = _preparer(workspace, tmp_path)
     prepared = _prepare(preparer)
@@ -279,6 +279,8 @@ def test_clone_credential_is_absent_from_argv_archive_config_and_claim_env(
     assert b"redeemed-credential-value" not in payload
     assert b"redeemed-credential-value" not in config
     assert all("redeemed-credential-value" not in value for value in claim_env.values())
+    assert "redeemed-credential-value" not in "\n".join(commands.events)
+    assert "redeemed-credential-value" not in caplog.text
     assert set(claim_env) == {"CURIE_WORKSPACE_REF", "CURIE_WORKSPACE_SHA256"}
 
 
@@ -428,6 +430,25 @@ def test_internal_workspace_selection_sends_author_thread_and_optional_repo(
         "author": "U0REQUEST1",
         "repo_full_name": "acme-corp/acme-bot",
     }
+
+
+def test_internal_workspace_selection_accepts_explicit_unselected_response(
+    workspace: Any,
+) -> None:
+    def transport(**_request: Any) -> Any:
+        return SimpleNamespace(
+            status=200,
+            headers={},
+            body=b'{"repo_full_name":null}',
+        )
+
+    client = workspace.WorkspaceCredentialClient(
+        api_url="https://api.example.com",
+        worker_token=WORKER_AUTH,
+        transport=transport,
+    )
+
+    assert client.select(DEPLOYMENT_ID, "thread-generic", "U0REQUEST1", None) is None
 
 
 @pytest.mark.parametrize(

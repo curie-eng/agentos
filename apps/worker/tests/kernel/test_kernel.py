@@ -289,7 +289,7 @@ def test_conflicting_runtime_repo_is_terminal_before_claim_or_model(
             kind: str | None = None,
             address: str | None = None,
         ) -> dict[str, str]:
-            return {}
+            return {"CURIE_RUNNER_TOKEN": "workspace-test-token"}
 
         def packs_for(self, _resolved: object) -> BehaviorPacks:
             return BehaviorPacks()
@@ -354,7 +354,9 @@ def test_conflicting_runtime_repo_is_terminal_before_claim_or_model(
     asyncio.run(go())
 
 
-def test_workspace_selection_precedes_fresh_thread_greeting(make_harness) -> None:
+def test_workspace_capability_without_selection_keeps_fresh_thread_generic(
+    make_harness,
+) -> None:
     class WorkspaceResolved(_FakeResolved):
         def __init__(self) -> None:
             super().__init__(uuid.uuid4())
@@ -389,20 +391,196 @@ def test_workspace_selection_precedes_fresh_thread_greeting(make_harness) -> Non
     async def go() -> None:
         async with make_harness(binding=WorkspaceBinding()) as h:
             class WorkspaceProbe:
-                def select_repository(self, **kwargs: object) -> str:
+                def select_repository(self, **kwargs: object) -> None:
                     assert kwargs["repo_full_name"] is None
-                    raise WorkspaceSelectionRefused(
-                        "Name an allowed GitHub repository in the opening message."
-                    )
+                    return None
 
             h.kernel._workspace = WorkspaceProbe()  # type: ignore[assignment]
             await h.kernel.process_event(_qevent("hi", thread="tGreetingRepo"))
 
-            assert h.sink.last_text == (
-                "Name an allowed GitHub repository in the opening message."
-            )
+            assert h.sink.last_text == "Hello from the greeting pack."
             assert h.runner.opened == []
             assert h.fake_k8s.claim_envs == []
+
+    asyncio.run(go())
+
+
+def test_late_workspace_selection_replaces_generic_sandbox_and_stays_sticky(
+    make_harness,
+) -> None:
+    deployment_id = uuid.uuid4()
+
+    async def go() -> None:
+        async with make_harness(binding=_workspace_binding(deployment_id)) as h:
+            class WorkspaceProbe:
+                selected: str | None = None
+                handoffs = 0
+                touches = 0
+
+                def select_repository(self, **kwargs: object) -> str | None:
+                    requested = kwargs["repo_full_name"]
+                    if requested is not None:
+                        self.selected = str(requested)
+                    return self.selected
+
+                def claim_or_resume_with_handle(self, **kwargs: object) -> object:
+                    self.handoffs += 1
+                    old = kwargs["replace_handle"]
+                    assert old is not None
+                    handle = h.substrate.handoff(
+                        _thread_key("tLateWorkspace"),
+                        expected=old,
+                        env={"CURIE_WORKSPACE_REF": "workspace/private-base"},
+                        workspace_repo=str(kwargs["repo_full_name"]),
+                    )
+                    return SimpleNamespace(handle=handle, prepared=None)
+
+                def touch(self, _thread_key: str, *, ttl_seconds: int) -> bool:
+                    self.touches += 1
+                    return ttl_seconds > 0
+
+            probe = WorkspaceProbe()
+            h.kernel._workspace = probe  # type: ignore[assignment]
+
+            await h.kernel.process_event(_qevent("hello", thread="tLateWorkspace"))
+            generic = h.substrate.lookup(_thread_key("tLateWorkspace"))
+            assert generic is not None and generic.workspace_repo is None
+
+            await h.kernel.process_event(
+                _qevent(
+                    "Use https://github.com/acme-corp/acme-bot",
+                    thread="tLateWorkspace",
+                )
+            )
+            workspace = h.substrate.lookup(_thread_key("tLateWorkspace"))
+            assert workspace is not None
+            assert workspace.claim_name != generic.claim_name
+            assert workspace.session_id == generic.session_id
+            assert workspace.workspace_repo == "acme-corp/acme-bot"
+            assert workspace.generation == generic.generation + 1
+
+            await h.kernel.process_event(
+                _qevent("continue in the repository", thread="tLateWorkspace")
+            )
+            assert probe.handoffs == 1
+            assert probe.touches == 1
+            assert h.runner.steers == []
+            assert h.runner.opened == [
+                "hello",
+                "Use https://github.com/acme-corp/acme-bot",
+                "continue in the repository",
+            ]
+            claim_env = h.fake_k8s.claim_envs[-1] or {}
+            assert claim_env["CURIE_WORKSPACE_REF"] == "workspace/private-base"
+            assert not any(
+                marker in f"{name}={value}".upper()
+                for name, value in claim_env.items()
+                for marker in ("AUTHORIZATION", "PASSWORD", "TOKEN", "SECRET")
+            )
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    ("turn_active", "history_durable", "status", "authenticated"),
+    [
+        (True, True, "idle-awaiting-input", True),
+        (False, False, "idle-awaiting-input", True),
+        (False, True, "awaiting-approval", True),
+        (False, True, "idle-awaiting-input", False),
+    ],
+)
+def test_late_workspace_selection_defers_without_steering_until_boundary_is_safe(
+    make_harness,
+    turn_active: bool,
+    history_durable: bool,
+    status: str,
+    authenticated: bool,
+) -> None:
+    deployment_id = uuid.uuid4()
+
+    async def go() -> None:
+        async with make_harness(binding=_workspace_binding(deployment_id)) as h:
+            old = h.substrate.claim(
+                _thread_key("tUnsafeHandoff"),
+                env=(
+                    {"CURIE_RUNNER_TOKEN": "workspace-test-token"}
+                    if authenticated
+                    else {}
+                ),
+            )
+            h.runner.turn_active = turn_active
+            h.runner.history_durable = history_durable
+            h.runner.session_status = status
+
+            class WorkspaceProbe:
+                claims = 0
+
+                def select_repository(self, **_kwargs: object) -> str:
+                    return "acme-corp/acme-bot"
+
+                def claim_or_resume_with_handle(self, **_kwargs: object) -> object:
+                    self.claims += 1
+                    raise AssertionError("unsafe boundary must not prepare or claim")
+
+            probe = WorkspaceProbe()
+            h.kernel._workspace = probe  # type: ignore[assignment]
+
+            with pytest.raises(ThreadBusyError):
+                await h.kernel.process_event(
+                    _qevent(
+                        "Use https://github.com/acme-corp/acme-bot",
+                        thread="tUnsafeHandoff",
+                    )
+                )
+
+            assert h.substrate.lookup(_thread_key("tUnsafeHandoff")) == old
+            assert probe.claims == 0
+            assert h.runner.steers == []
+            assert len(h.fake_k8s.claim_envs) == 1
+
+    asyncio.run(go())
+
+
+def test_workspace_route_metadata_mismatch_fails_closed_without_claim_or_model(
+    make_harness,
+) -> None:
+    deployment_id = uuid.uuid4()
+
+    async def go() -> None:
+        async with make_harness(
+            binding=_workspace_binding(deployment_id), max_attempts=1
+        ) as h:
+            existing = h.substrate.claim(
+                _thread_key("tMismatchedWorkspace"),
+                env={},
+                workspace_repo="acme-corp/acme-bot",
+            )
+
+            class WorkspaceProbe:
+                claims = 0
+
+                def select_repository(self, **_kwargs: object) -> str:
+                    return "acme-corp/acme-api"
+
+                def claim_or_resume_with_handle(self, **_kwargs: object) -> object:
+                    self.claims += 1
+                    raise AssertionError("mismatched route must not be adopted or replaced")
+
+            probe = WorkspaceProbe()
+            h.kernel._workspace = probe  # type: ignore[assignment]
+            await h.kernel.process_event(
+                _qevent(
+                    "continue",
+                    thread="tMismatchedWorkspace",
+                )
+            )
+
+            assert h.substrate.lookup(_thread_key("tMismatchedWorkspace")) == existing
+            assert probe.claims == 0
+            assert h.runner.opened == []
+            assert h.runner.steers == []
+            assert len(h.fake_k8s.claim_envs) == 1
 
     asyncio.run(go())
 
@@ -512,7 +690,7 @@ def _workspace_binding(deployment_id: uuid.UUID | None) -> object:
             kind: str | None = None,
             address: str | None = None,
         ) -> dict[str, str]:
-            return {}
+            return {"CURIE_RUNNER_TOKEN": "workspace-test-token"}
 
         def packs_for(self, _resolved: object) -> BehaviorPacks:
             return BehaviorPacks()

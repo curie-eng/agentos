@@ -488,6 +488,7 @@ def test_successful_turn_is_appended_to_the_transcript() -> None:
     )
 
     assert final.status is SessionStatus.DONE
+    assert runner.history_durable is True
     # The fully delivered DONE final records its reply once, not once per
     # translated frame or once per store retry.
     assert len(store.turns) == 1
@@ -512,6 +513,52 @@ def test_successful_turn_is_appended_to_the_transcript() -> None:
         and any(block.get("type") == "tool_result" for block in message.content)
         for message in store.turns[0].messages
     )
+
+
+def test_failed_transcript_append_fails_closed_for_runner_replacement() -> None:
+    from aci_protocol import Event, SessionStatus
+
+    class FailingStore(_RecordingStore):
+        async def append(self, record: TurnRecord) -> None:
+            del record
+            raise HistoryError("injected append failure")
+
+    runner = _recording_runner(FailingStore())
+    final = _run_recording_turn(
+        runner, Event(type="message", text="what changed?", user="U", ts="1")
+    )
+
+    assert final.status is SessionStatus.DONE
+    assert runner.turn_active is False
+    assert runner.history_durable is False
+
+
+def test_accepted_steer_is_persisted_in_ordered_structured_history() -> None:
+    from aci_protocol import Event
+
+    store = _RecordingStore()
+    runner = _recording_runner(store)
+
+    async def go() -> None:
+        await runner.start()
+        stream = runner.run_turn(
+            Event(type="message", text="first request", user="U", ts="1")
+        )
+        await stream.__anext__()
+        assert await runner.steer("authorized steering state") is True
+        async for _ in stream:
+            pass
+
+    anyio.run(go)
+
+    assert len(store.turns) == 1
+    messages = store.turns[0].messages
+    steers = [
+        message
+        for message in messages
+        if message.role == "user" and message.content == "authorized steering state"
+    ]
+    assert len(steers) == 1
 
 
 def test_synthetic_done_after_incomplete_turn_is_not_appended_to_the_transcript() -> None:
