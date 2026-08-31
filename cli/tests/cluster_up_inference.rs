@@ -39,6 +39,7 @@ struct Fixture {
     _temp: tempfile::TempDir,
     bin_dir: PathBuf,
     helm_log: PathBuf,
+    kubectl_log: PathBuf,
     upgrade_log: PathBuf,
     existing_values: String,
 }
@@ -49,6 +50,7 @@ impl Fixture {
         let bin_dir = temp.path().join("bin");
         fs::create_dir(&bin_dir).expect("create fake binary directory");
         let helm_log = temp.path().join("helm.log");
+        let kubectl_log = temp.path().join("kubectl.log");
         let upgrade_log = temp.path().join("upgrades.log");
 
         write_exec(
@@ -95,6 +97,8 @@ exit 64
             &bin_dir,
             "kubectl",
             r#"#!/bin/sh
+printf '%s\n' "$*" >> "$CURIE_TEST_KUBECTL_LOG"
+
 if [ "$1" = "get" ] && [ "$2" = "namespace" ]; then
     exit 0
 fi
@@ -120,6 +124,7 @@ exit 64
             _temp: temp,
             bin_dir,
             helm_log,
+            kubectl_log,
             upgrade_log,
             existing_values: existing_values.to_string(),
         }
@@ -165,6 +170,7 @@ exit 64
             .env("TERM", "dumb")
             .env("NO_COLOR", "1")
             .env("CURIE_TEST_HELM_LOG", &self.helm_log)
+            .env("CURIE_TEST_KUBECTL_LOG", &self.kubectl_log)
             .env("CURIE_TEST_UPGRADE_LOG", &self.upgrade_log)
             .env("CURIE_TEST_EXISTING_VALUES", &self.existing_values)
             .env("CURIE_TEST_PROVIDER_EGRESS_JSON", resolver)
@@ -185,6 +191,10 @@ exit 64
 
     fn upgrade_log(&self) -> String {
         fs::read_to_string(&self.upgrade_log).unwrap_or_default()
+    }
+
+    fn kubectl_log(&self) -> String {
+        fs::read_to_string(&self.kubectl_log).unwrap_or_default()
     }
 
     fn upgrade_count(&self) -> usize {
@@ -534,6 +544,95 @@ fn inference_uses_the_effective_credential_precedence() {
     assert_success(&preserved, &output);
     assert!(preserved.upgrade_log().contains("1.1.1.1/32"));
     assert_inference_once(&stderr(&output), "--allow-egress-host openrouter");
+}
+
+#[test]
+fn local_model_without_an_explicit_asset_policy_refuses_before_cluster_access() {
+    let fixture = Fixture::new("");
+    let output = fixture.run(&[], VALID_RESOLVER, &["--local-model", "qwen3:4b"]);
+    let shown = all_output(&output);
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "an ambiguous local-model asset policy is a usage error: {shown}"
+    );
+    for recovery in [
+        "--set inference.persistence.enabled=true",
+        "--set inference.pullModel=false",
+    ] {
+        assert!(
+            shown.contains(recovery),
+            "the refusal must include both runnable recovery choices ({recovery}): {shown}"
+        );
+    }
+    assert!(
+        fixture.helm_log().is_empty(),
+        "the asset-policy refusal must precede every Helm read or mutation: {}",
+        fixture.helm_log()
+    );
+    assert!(
+        fixture.kubectl_log().is_empty(),
+        "the asset-policy refusal must precede every cluster interaction: {}",
+        fixture.kubectl_log()
+    );
+}
+
+#[test]
+fn local_model_accepts_each_explicit_typed_asset_policy() {
+    for policy in [
+        "inference.persistence.enabled=true",
+        "inference.pullModel=false",
+    ] {
+        let fixture = Fixture::new("");
+        let output = fixture.run(
+            &[],
+            VALID_RESOLVER,
+            &["--local-model", "qwen3:4b", "--set", policy],
+        );
+        assert_success(&fixture, &output);
+
+        let upgrade = fixture.upgrade_log();
+        for expected in ["inference.deploy=true", "inference.model=qwen3:4b", policy] {
+            assert!(
+                upgrade.contains(&format!("--set {expected}")),
+                "the accepted local-model policy must stay in Helm's typed lane ({expected}): {upgrade}"
+            );
+        }
+        assert!(
+            !upgrade.contains(&format!("--set-string {policy}")),
+            "a modeled boolean policy must never be passed as a Helm string: {upgrade}"
+        );
+    }
+}
+
+#[test]
+fn string_false_is_not_a_valid_no_pull_recovery() {
+    let fixture = Fixture::new("");
+    let output = fixture.run(
+        &[],
+        VALID_RESOLVER,
+        &[
+            "--local-model",
+            "qwen3:4b",
+            "--set-string",
+            "inference.pullModel=false",
+        ],
+    );
+    let shown = all_output(&output);
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a Helm string false is truthy and must not satisfy no-pull: {shown}"
+    );
+    assert_eq!(fixture.upgrade_count(), 0, "string false must not install");
+    assert!(
+        fixture.helm_log().is_empty() && fixture.kubectl_log().is_empty(),
+        "string false must be rejected before cluster access; helm: {}; kubectl: {}",
+        fixture.helm_log(),
+        fixture.kubectl_log()
+    );
 }
 
 /// #1145, through the real consumer path: `curie cluster up --dev` against a

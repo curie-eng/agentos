@@ -1091,7 +1091,7 @@ fn live_both_store_statefulsets() -> String {
 }
 
 fn installation_with_effective_values() -> &'static str {
-    "version: 1\ninstall:\n  namespace: parity\n  release: parity\ncredentials:\n  model: CURIE_APPLY_TEST_MODEL_KEY\n  github_token: CURIE_APPLY_TEST_GITHUB_TOKEN\nplatform:\n  ui: false\n  inference: true\nset:\n  example.mode: disabled\n  worker.replicas: \"3\"\n"
+    "version: 1\ninstall:\n  namespace: parity\n  release: parity\ncredentials:\n  model: CURIE_APPLY_TEST_MODEL_KEY\n  github_token: CURIE_APPLY_TEST_GITHUB_TOKEN\nplatform:\n  ui: false\n  inference: true\n  inference_persistence: true\nset:\n  example.mode: disabled\n  worker.replicas: \"3\"\n"
 }
 
 fn installation_with_provider_contradiction() -> &'static str {
@@ -2067,6 +2067,42 @@ fn cluster_up_fresh_release_without_credentials_stays_fake() {
 }
 
 #[test]
+fn apply_and_diff_refuse_inference_without_an_explicit_asset_policy_before_helm() {
+    let config = "version: 1\ninstall:\n  namespace: parity\n  release: parity\nplatform:\n  inference: true\n";
+
+    for verb in ["apply", "diff"] {
+        let fixture = HelmFixture::new(config, HelmValuesResponse::Absent);
+        let output = match verb {
+            "apply" => fixture.apply_dry_run(&[]),
+            "diff" => fixture.diff(&[]),
+            _ => unreachable!(),
+        };
+
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "an ambiguous inference asset policy is a usage error for {verb}"
+        );
+        let error = json_error(output, verb);
+        let guidance = format!("{} {}", error["error"], error["fix"]);
+        for recovery in [
+            "inference_persistence: true",
+            "inference_pull_model: false",
+        ] {
+            assert!(
+                guidance.contains(recovery),
+                "{verb} must give both explicit curie.yaml recovery choices ({recovery}): {error}"
+            );
+        }
+        assert!(
+            fixture.calls().is_empty(),
+            "{verb} must refuse before reading or mutating Helm state: {}",
+            fixture.calls()
+        );
+    }
+}
+
+#[test]
 fn absent_release_diff_matches_apply_dry_run_for_effective_installation_values() {
     let fixture = HelmFixture::new(
         installation_with_effective_values(),
@@ -2138,6 +2174,90 @@ fn absent_release_diff_matches_apply_dry_run_for_effective_installation_values()
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
     assert_eq!(diff_keys, apply_keys, "apply plan: {apply}; diff: {diff}");
+}
+
+#[test]
+fn explicit_no_pull_inference_policy_matches_apply_and_diff_typed_plans() {
+    let fixture = HelmFixture::new(
+        "version: 1\ninstall:\n  namespace: parity\n  release: parity\nplatform:\n  inference: true\n  inference_pull_model: false\n",
+        HelmValuesResponse::Absent,
+    );
+
+    let apply = plan(fixture.apply_dry_run(&[]));
+    let diff = json_output(fixture.diff(&[]), "diff");
+    for (key, value) in [
+        ("inference.deploy", "true"),
+        ("inference.pullModel", "false"),
+    ] {
+        let typed = format!("--set {key}={value}");
+        assert!(
+            apply.contains(&typed),
+            "apply must plan the modeled inference value through Helm's typed lane: {apply}"
+        );
+        assert_added(&diff, key, value);
+    }
+    assert!(
+        !apply.contains("--set-string inference.pullModel=false"),
+        "a string false is truthy to Helm and must not represent no-pull: {apply}"
+    );
+}
+
+#[test]
+fn inference_absent_or_false_needs_no_asset_policy_and_keeps_prior_plans() {
+    for (label, config, expected_deploy) in [
+        (
+            "absent",
+            "version: 1\ninstall:\n  namespace: parity\n  release: parity\nplatform:\n  ui: false\n",
+            None,
+        ),
+        (
+            "false",
+            "version: 1\ninstall:\n  namespace: parity\n  release: parity\nplatform:\n  inference: false\n",
+            Some("false"),
+        ),
+    ] {
+        let fixture = HelmFixture::new(config, HelmValuesResponse::Absent);
+        let apply = plan(fixture.apply_dry_run(&[]));
+        let diff = json_output(fixture.diff(&[]), "diff");
+
+        match expected_deploy {
+            Some(value) => {
+                assert!(
+                    apply.contains(&format!("--set inference.deploy={value}")),
+                    "explicit inference=false must retain its typed apply value: {apply}"
+                );
+                assert_added(&diff, "inference.deploy", value);
+            }
+            None => {
+                assert!(
+                    !apply.contains("inference.deploy"),
+                    "absent inference must continue to leave the chart default alone: {apply}"
+                );
+                assert!(
+                    diff["entries"]
+                        .as_array()
+                        .expect("diff entries array")
+                        .iter()
+                        .all(|entry| entry["key"] != "inference.deploy"),
+                    "absent inference must not appear in diff: {diff}"
+                );
+            }
+        }
+        for policy_key in ["inference.persistence.enabled", "inference.pullModel"] {
+            assert!(
+                !apply.contains(policy_key),
+                "inference {label} must not invent {policy_key}: {apply}"
+            );
+            assert!(
+                diff["entries"]
+                    .as_array()
+                    .expect("diff entries array")
+                    .iter()
+                    .all(|entry| entry["key"] != policy_key),
+                "inference {label} must not invent {policy_key}: {diff}"
+            );
+        }
+    }
 }
 
 #[test]
