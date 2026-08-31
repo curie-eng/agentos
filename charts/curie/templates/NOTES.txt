@@ -3,6 +3,8 @@ Curie umbrella chart installed as release "{{ .Release.Name }}" in namespace "{{
 Components deployed:
 {{- if .Values.langfuse.deploy }}
   - Langfuse web + worker (v{{ .Values.langfuse.image.tag }})
+{{- else }}
+  - Langfuse: BYO at http://{{ include "curie.langfuse.webHost" . }}:{{ .Values.langfuse.web.service.port }}
 {{- end }}
 {{- if .Values.postgres.deploy }}
   - Postgres ({{ .Values.postgres.image }})

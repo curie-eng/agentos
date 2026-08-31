@@ -270,7 +270,11 @@ true
 {{- end -}}
 
 {{- define "curie.langfuse.webHost" -}}
+{{- if .Values.langfuse.deploy -}}
 {{- printf "%s-langfuse-web" (include "curie.fullname" .) -}}
+{{- else -}}
+{{- required "langfuse.deploy is false: set langfuse.host to your external Langfuse hostname" .Values.langfuse.host -}}
+{{- end -}}
 {{- end -}}
 
 {{/* Base URL of the platform API for a first-party service that calls it. Call

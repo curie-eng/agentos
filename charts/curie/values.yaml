@@ -103,6 +103,9 @@ priorityClasses:
 # ---------------------------------------------------------------------------
 langfuse:
   deploy: true
+  # Bare external hostname required only when deploy is false. Consumers append
+  # langfuse.web.service.port; do not include a scheme or port here.
+  host: ""
   image:
     web: langfuse/langfuse
     worker: langfuse/langfuse-worker
