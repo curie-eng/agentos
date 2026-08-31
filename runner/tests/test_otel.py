@@ -51,7 +51,6 @@ from opentelemetry.trace import (
     set_span_in_context,
 )
 
-
 _STREAM_BODY = "private-partial-body-PLACEHOLDER"
 _STREAM_ARGUMENT = "private-partial-argument-PLACEHOLDER"
 _TOOL_ARGUMENT = "private-tool-argument-PLACEHOLDER"

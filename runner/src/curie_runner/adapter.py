@@ -16,6 +16,7 @@ this boundary and nothing above it is. ``aci-protocol`` is never mocked.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from typing import Any, Protocol, cast
 
 from claude_agent_sdk import (
@@ -23,9 +24,19 @@ from claude_agent_sdk import (
     ClaudeSDKClient,
     HookMatcher,
     SdkPluginConfig,
+    StreamEvent,
     TaskBudget,
 )
 from claude_agent_sdk.types import CanUseTool, McpSdkServerConfig, PermissionMode
+
+_ALLOWED_PARTIAL_BOUNDARY_TYPES = frozenset(("message_start", "content_block_start"))
+
+
+@dataclass(frozen=True, slots=True)
+class PartialMessageBoundary:
+    """Payload-free evidence that the provider began returning a message."""
+
+    event_type: str
 
 
 class ModelSession(Protocol):
@@ -40,7 +51,7 @@ class ModelSession(Protocol):
         ...
 
     def receive_turn(self) -> AsyncIterator[Any]:
-        """Yield SDK messages for the current turn, ending at its terminal result."""
+        """Yield SDK messages or stripped boundaries through the terminal result."""
         ...
 
     async def interrupt(self) -> None:
@@ -115,6 +126,7 @@ def build_options(
         hooks=cast("Any", hooks),
         # In-process platform tools (the approval-request gate, ADR-0010).
         mcp_servers=cast("Any", mcp_servers or {}),
+        include_partial_messages=True,
     )
 
 
@@ -132,7 +144,24 @@ class ClaudeAgentSession:
         await self._client.query(text)
 
     def receive_turn(self) -> AsyncIterator[Any]:
-        return self._client.receive_response()
+        async def normalized() -> AsyncIterator[Any]:
+            async for message in self._client.receive_response():
+                if isinstance(message, StreamEvent):
+                    event_type = (
+                        message.event.get("type")
+                        if isinstance(message.event, dict)
+                        else None
+                    )
+                    if event_type in _ALLOWED_PARTIAL_BOUNDARY_TYPES:
+                        # Do not forward the StreamEvent object: its event body,
+                        # uuid, SDK session id, and parent tool id are all
+                        # provider payload. Only this bounded type survives the
+                        # adapter seam into session telemetry.
+                        yield PartialMessageBoundary(event_type=event_type)
+                    continue
+                yield message
+
+        return normalized()
 
     async def interrupt(self) -> None:
         await self._client.interrupt()

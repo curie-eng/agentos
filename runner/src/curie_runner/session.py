@@ -39,7 +39,7 @@ from claude_agent_sdk import AssistantMessage, ResultMessage
 from curie_telemetry import record_metric
 from opentelemetry.context import Context
 
-from .adapter import ModelSession
+from .adapter import ModelSession, PartialMessageBoundary
 from .approval import ApprovalGate
 from .budget import BUDGET_CLASSIFICATION, BudgetTracker
 from .history import NullTranscriptStore, TranscriptStore, TurnRecord
@@ -463,10 +463,6 @@ class SessionRunner:
                                 # without requesting the generator's next item.
                                 metric_outcome = self._metric_outcome(tracker)
                             yield line
-                        if self._status is SessionStatus.CLASSIFIED_FAILURE:
-                            gen.set_failed()
-                        else:
-                            gen.set_succeeded()
                         logger.info(
                             "turn end session=%s status=%s duration_ms=%d",
                             self._session_id,
@@ -547,8 +543,12 @@ class SessionRunner:
         """Drive one turn to a terminal final (budget/interrupt overrides applied)."""
 
         assert self._session is not None
+        gen.query_observed()
         await self._session.query(event.text)
         async for message in self._session.receive_turn():
+            if isinstance(message, PartialMessageBoundary):
+                gen.record_first_response_boundary()
+                continue
             if _is_auth_rejection(message):
                 # A rejected model credential is terminal: stop the live session
                 # so the SDK/CLI does not keep retrying with backoff to the wall,
@@ -559,6 +559,7 @@ class SessionRunner:
                 # terminal ``model-credential-rejected`` error is emitted regardless.
                 with contextlib.suppress(Exception):
                     await self._session.interrupt()
+                gen.set_failed()
                 for line in self._auth_halt_lines():
                     yield line
                 return
@@ -571,6 +572,20 @@ class SessionRunner:
             else:
                 tracker.add_increment(usage)
             budget_hit = tracker.exceeded
+            if isinstance(message, ResultMessage):
+                terminal_reason = getattr(message, "terminal_reason", None)
+                cancelled = self._interrupt_requested or terminal_reason in {
+                    "aborted_streaming",
+                    "aborted_tools",
+                }
+                subtype = message.subtype or ""
+                result_failed = budget_hit or (
+                    not cancelled and (message.is_error or subtype.startswith("error"))
+                )
+                gen.result_boundary_observed(
+                    failed=result_failed,
+                    terminal_reason=terminal_reason,
+                )
             events = translate_message(message, state, self._classifier, gen)
 
             for outbound in events:
@@ -584,6 +599,7 @@ class SessionRunner:
                     )
                 if isinstance(outbound, Final):
                     if budget_hit:
+                        gen.set_failed()
                         for line in self._budget_halt_lines():
                             yield line
                         return
@@ -595,6 +611,13 @@ class SessionRunner:
                         yield line
                     self._status = final.status
                     self._turn_open = False
+                    gen.finish_turn(
+                        interrupt_requested=self._interrupt_requested,
+                        classified_failure=final.status
+                        is SessionStatus.CLASSIFIED_FAILURE,
+                        completed_without_result=final.status
+                        is SessionStatus.AWAITING_APPROVAL,
+                    )
                     # Only a clean DONE reply belongs in the conversation
                     # transcript. Classified failures and approval pauses are
                     # terminal delivery outcomes, not assistant answers (#20).
@@ -608,6 +631,7 @@ class SessionRunner:
                 # Budget crossed on a non-terminal message: stop the live run,
                 # then emit the same error+final pair.
                 await self._session.interrupt()
+                gen.set_failed()
                 for line in self._budget_halt_lines():
                     yield line
                 return
@@ -628,6 +652,11 @@ class SessionRunner:
             yield line
         self._status = final.status
         self._turn_open = False
+        gen.finish_turn(
+            interrupt_requested=self._interrupt_requested,
+            classified_failure=final.status is SessionStatus.CLASSIFIED_FAILURE,
+            completed_without_result=final.status is SessionStatus.AWAITING_APPROVAL,
+        )
         yield to_ndjson_line(final)
 
     def _approval_not_acted_lines(self, state: TurnState, final: Final) -> list[str]:
