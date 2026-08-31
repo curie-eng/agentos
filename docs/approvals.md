@@ -35,9 +35,13 @@ that may write — any tool not explicitly `readOnlyHint=true`, including an unk
 unreachable surface — or when an explicit actionable approval gate exists. A bundle with
 no MCP tools, or only explicitly read-only MCP tools and no actionable gate, does not
 carry it: explain that the bundle cannot perform the action instead of fabricating a
-remediation request. `readOnlyHint` controls this tool advertisement only; it is not
-authorization and does not change gates or tool execution. Publication's dedicated
-approval flow and the state tools remain independent.
+remediation request. `readOnlyHint` is not authorization and does not change gates or
+tool execution. When a live probe explicitly reports it as `true`, Curie also adds that
+MCP tool's SDK-visible name to the read-only classifier: it emits no side-effect flag,
+does not take the no-retry-after-side-effects path, and creates no receipt line. A
+missing or `false` hint, an unknown surface, or a failed probe remains potentially
+write-capable and is classified conservatively. Publication's dedicated approval flow
+and the state tools remain independent.
 
 **Permission gate.** Configuration marks a tool approval-required, and the runner denies
 the call through the SDK's `can_use_tool` callback before it runs. The denied call never

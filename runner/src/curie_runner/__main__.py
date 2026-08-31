@@ -281,38 +281,33 @@ def build_runner(
     )
 
     real_options: ClaudeAgentOptions | None = None
+    observed_readonly_tools: frozenset[str] = frozenset()
     if not fake_model:
-        # An actionable explicit gate already proves the generic pager is
-        # required, so avoid spawning or dialing every MCP server merely to
-        # reach the same conclusion. A publication-only gate deliberately does
-        # not take this shortcut: it has its own tool and still needs the MCP
-        # surface decision below.
-        carries_request_approval = carries_explicit_action_gate
-        if not carries_explicit_action_gate:
-            # The bundle's live MCP ``tools/list`` response is the actual
-            # advertised MCP surface. Only a complete response where every
-            # observed tool says readOnlyHint=true -- including a complete
-            # surface with zero MCP tools -- proves that this generic MCP pager
-            # cannot unlock an action. Built-in Claude tools are outside this
-            # capability decision. Missing hints, uninspectable declarations,
-            # and probe failures preserve the historical tool. The annotation
-            # remains a non-authoritative hint: it never authorizes or denies
-            # tool execution.
-            capability = anyio.run(
-                probe_mcp_tool_capability,
-                config.session.plugin_dir,
-                derived_mcp_servers,
-                sdk_env,
+        # The bundle's live MCP ``tools/list`` response is the actual advertised
+        # MCP surface. Probe even when an explicit gate already requires the
+        # generic pager: exact readOnlyHint=true observations also drive receipt
+        # and retry classification. Missing hints, uninspectable declarations,
+        # and probe failures preserve the historical fail-closed behavior. The
+        # annotation remains a non-authoritative hint: it never authorizes or
+        # denies tool execution.
+        capability = anyio.run(
+            probe_mcp_tool_capability,
+            config.session.plugin_dir,
+            derived_mcp_servers,
+            sdk_env,
+        )
+        observed_readonly_tools = capability.readonly_tools
+        carries_request_approval = (
+            carries_explicit_action_gate or capability.has_potential_write_tool
+        )
+        if not carries_request_approval:
+            logger.info(
+                "request_approval omitted: observed MCP surface has no actionable"
+                " tools tool_count=%d probe_complete=%s failures=%d",
+                capability.tool_count,
+                capability.complete,
+                len(capability.failures),
             )
-            carries_request_approval = capability.has_potential_write_tool
-            if not carries_request_approval:
-                logger.info(
-                    "request_approval omitted: observed MCP surface has no actionable"
-                    " tools tool_count=%d probe_complete=%s failures=%d",
-                    capability.tool_count,
-                    capability.complete,
-                    len(capability.failures),
-                )
 
         platform_servers = {
             **(
@@ -393,7 +388,14 @@ def build_runner(
         session_factory=factory,
         ceiling=config.ceiling,
         tracer=RunTracer(provider),
-        classifier=SideEffectClassifier(readonly_tools=harness.readonly_tools),
+        classifier=SideEffectClassifier(
+            readonly_tools=harness.readonly_tools
+            | (
+                observed_readonly_tools - approval_gate.required
+                if approval_gate is not None
+                else observed_readonly_tools
+            )
+        ),
         trace_name=f"curie-run:{config.session.session_id}",
         session_id=config.session.session_id,
         model=config.model,
