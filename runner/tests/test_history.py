@@ -417,6 +417,7 @@ def test_compose_system_prompt_appends_configured_model() -> None:
 def test_build_runner_forwards_configured_model_to_session_prompt(tmp_path) -> None:
     from curie_runner import RunnerConfig
     from curie_runner.__main__ import build_runner
+    from curie_runner.adapter import ClaudeAgentSession
 
     plugin_dir = tmp_path / ".claude-plugin"
     plugin_dir.mkdir()
@@ -435,7 +436,9 @@ def test_build_runner_forwards_configured_model_to_session_prompt(tmp_path) -> N
         }
     )
     runner = build_runner(config, fake_model=False)
-    options = anyio.run(runner._factory()._options_factory)
+    session = runner._factory()
+    assert isinstance(session, ClaudeAgentSession)
+    options = session._options
 
     assert options.system_prompt == "Configured model: z-ai/glm-5.2"
 

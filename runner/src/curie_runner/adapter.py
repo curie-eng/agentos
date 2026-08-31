@@ -15,7 +15,7 @@ this boundary and nothing above it is. ``aci-protocol`` is never mocked.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator
 from typing import Any, Protocol, cast
 
 from claude_agent_sdk import (
@@ -139,50 +139,3 @@ class ClaudeAgentSession:
 
     async def close(self) -> None:
         await self._client.disconnect()
-
-
-class DeferredClaudeAgentSession:
-    """Build the SDK options asynchronously immediately before connecting.
-
-    MCP tool annotations are available only by connecting to the servers. The
-    runner therefore cannot decide whether to mount its generic approval tool
-    while assembling the synchronous ``SessionRunner``. This adapter preserves
-    the one-session-per-process invariant while moving only option construction
-    to ``connect()``, before the real SDK client exists or sees a tool list.
-    """
-
-    def __init__(
-        self,
-        options_factory: Callable[[], Awaitable[ClaudeAgentOptions]],
-        *,
-        session_factory: Callable[[ClaudeAgentOptions], ModelSession] = ClaudeAgentSession,
-    ) -> None:
-        self._options_factory = options_factory
-        self._session_factory = session_factory
-        self._session: ModelSession | None = None
-
-    def _connected_session(self) -> ModelSession:
-        if self._session is None:
-            raise RuntimeError("model session has not connected")
-        return self._session
-
-    async def connect(self) -> None:
-        if self._session is not None:
-            raise RuntimeError("model session already connected")
-        options = await self._options_factory()
-        session = self._session_factory(options)
-        self._session = session
-        await session.connect()
-
-    async def query(self, text: str) -> None:
-        await self._connected_session().query(text)
-
-    def receive_turn(self) -> AsyncIterator[Any]:
-        return self._connected_session().receive_turn()
-
-    async def interrupt(self) -> None:
-        await self._connected_session().interrupt()
-
-    async def close(self) -> None:
-        if self._session is not None:
-            await self._session.close()

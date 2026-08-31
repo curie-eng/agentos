@@ -26,10 +26,18 @@ trusted from inside the sandbox, and nothing holds a worker slot while a human t
 Both end the turn with the same status and share the entire downstream lifecycle
 (`runner/src/curie_runner/approval.py`).
 
-**Policy gate.** The agent decides something needs sign-off and calls the built-in
-`request_approval` tool, which the SDK exposes as `mcp__curie__request_approval`. It
-takes a one-line `summary` and an optional `route`. The call executes nothing; it marks
-the turn. Your skill should call it, then say the request is pending and end the turn.
+**Policy gate.** When the session exposes the built-in `request_approval` tool (the SDK
+name is `mcp__curie__request_approval`), the agent may use it for a step that genuinely
+needs sign-off. It takes a one-line `summary` and an optional `route`. The call executes
+nothing; it marks the turn. The skill should say the request is pending and end the turn.
+The runner advertises this generic pager only when the observed MCP surface has an action
+that may write — any tool not explicitly `readOnlyHint=true`, including an unknown or
+unreachable surface — or when an explicit actionable approval gate exists. A bundle with
+no MCP tools, or only explicitly read-only MCP tools and no actionable gate, does not
+carry it: explain that the bundle cannot perform the action instead of fabricating a
+remediation request. `readOnlyHint` controls this tool advertisement only; it is not
+authorization and does not change gates or tool execution. Publication's dedicated
+approval flow and the state tools remain independent.
 
 **Permission gate.** Configuration marks a tool approval-required, and the runner denies
 the call through the SDK's `can_use_tool` callback before it runs. The denied call never

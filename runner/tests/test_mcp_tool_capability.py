@@ -67,6 +67,64 @@ def test_missing_read_only_hint_is_conservatively_write_capable(tmp_path: Path) 
     assert result.has_potential_write_tool
 
 
+def test_mixed_read_only_and_write_tools_keep_write_capability(tmp_path: Path) -> None:
+    root = _bundle(tmp_path, mode="read-only")
+    (root / ".mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "inventory": {
+                        "command": sys.executable,
+                        "args": [str(_SERVER)],
+                        "env": {"CURIE_TEST_TOOL_MODE": "read-only"},
+                    },
+                    "operations": {
+                        "command": sys.executable,
+                        "args": [str(_SERVER)],
+                        "env": {"CURIE_TEST_TOOL_MODE": "write"},
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = _probe(root)
+
+    assert result.complete
+    assert result.has_potential_write_tool
+    assert result.tool_count == 2
+
+
+def test_manifest_mcp_path_string_is_an_unknown_surface(tmp_path: Path) -> None:
+    root = _bundle(tmp_path, mode="read-only")
+    manifest = root / ".claude-plugin" / "plugin.json"
+    manifest.write_text(
+        json.dumps({"name": "acme-bot", "mcpServers": "config/servers.json"}),
+        encoding="utf-8",
+    )
+
+    result = _probe(root)
+
+    assert not result.complete
+    assert result.has_potential_write_tool
+    assert result.failures == ("bundle-config",)
+
+
+def test_malformed_server_entry_is_an_unknown_surface(tmp_path: Path) -> None:
+    root = _bundle(tmp_path, mode="read-only")
+    (root / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"operations": "config/operations.json"}}),
+        encoding="utf-8",
+    )
+
+    result = _probe(root)
+
+    assert not result.complete
+    assert result.has_potential_write_tool
+    assert result.failures == ("bundle-config",)
+
+
 def test_unreachable_server_cannot_be_mistaken_for_read_only(tmp_path: Path) -> None:
     root = _bundle(tmp_path, mode="read-only")
     (root / ".mcp.json").write_text(

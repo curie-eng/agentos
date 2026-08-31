@@ -225,14 +225,18 @@ pub fn primer() -> Primer {
             facts: vec![
                 ApprovalFact {
                     title: "Raising one from a skill",
-                    detail: "Call the built-in request_approval tool (it appears as \
-                             mcp__curie__request_approval) with a one-line summary and, when \
-                             your instructions name one, a route. It executes nothing: it marks \
-                             the turn, which then ends awaiting-approval. Tell the user the \
-                             request is pending and end your turn. The other trigger is \
-                             configuration rather than the model: a tool named in the bundle's \
-                             approvalPolicy is denied before it runs and ends the turn the same \
-                             way.",
+                    detail: "Call the built-in request_approval tool only when it is available \
+                             (it appears as mcp__curie__request_approval) and a step genuinely \
+                             needs sign-off. It takes a one-line summary and, when your \
+                             instructions name one, a route. It executes nothing: it marks the \
+                             turn, which then ends awaiting-approval. If the tool is absent, \
+                             explain that the bundle cannot perform the action; do not fabricate \
+                             a remediation request. The runner omits it for a surface with no MCP \
+                             tools or only tools explicitly readOnlyHint=true, unless an actionable \
+                             approval gate exists. readOnlyHint controls advertisement only, not \
+                             authorization or tool execution. The other trigger is configuration \
+                             rather than the model: a tool named in the bundle's approvalPolicy is \
+                             denied before it runs and ends the turn the same way.",
                 },
                 ApprovalFact {
                     title: "Declaring a route, then binding it",

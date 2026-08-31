@@ -9,9 +9,13 @@ permission gates and tool execution are unchanged. It controls whether Curie's
 non-authoritative, model-invoked generic pager is advertised.
 
 Only an entirely observed, explicitly read-only surface proves that the generic
-approval tool should be omitted. An absent hint and any probe failure are both
-treated as potentially write-capable, preserving the existing tool on unknown
-surfaces rather than silently removing a capability.
+approval tool should be omitted. A complete surface with zero MCP tools also
+proves omission: there is no MCP action for a human to unlock. Built-in Claude
+tools are deliberately outside this MCP capability decision; an explicit
+approval gate on one is handled separately by the boot path and retains the
+pager. An absent hint, an uninspectable declaration, and any probe failure are
+all treated as potentially write-capable, preserving the existing tool on
+unknown surfaces rather than silently removing a capability.
 """
 
 from __future__ import annotations
@@ -58,29 +62,42 @@ def _expand(value: str, env: Mapping[str, str]) -> str:
 
 
 def _bundle_server_configs(plugin_dir: Path) -> list[tuple[str, dict[str, Any]]]:
-    """Read both plugin MCP declaration surfaces without collapsing duplicates."""
+    """Read both plugin MCP declaration surfaces without collapsing duplicates.
+
+    Every declared server must be inspectable here. In particular, the plugin
+    format accepts an ``mcpServers`` path string even though Curie's runtime
+    loader does not follow it. Ignoring that or a malformed server entry would
+    turn an unknown surface into a false all-read-only conclusion, so these
+    shapes raise and the caller conservatively retains ``request_approval``.
+    """
+
+    def append_payload(payload: object, source: str) -> None:
+        if not isinstance(payload, dict):
+            raise ValueError(f"{source} MCP declaration is not an object")
+        servers = payload.get("mcpServers", payload)
+        if not isinstance(servers, dict):
+            raise ValueError(f"{source} mcpServers declaration is not an object")
+        for name, config in servers.items():
+            if not isinstance(config, dict):
+                raise ValueError(f"{source} MCP server {name!r} is not an object")
+            configs.append((str(name), dict(config)))
 
     configs: list[tuple[str, dict[str, Any]]] = []
     manifest_path = resolve_manifest(plugin_dir)
     if manifest_path is not None:
         raw = json.loads(manifest_path.read_text(encoding="utf-8"))
         manifest = PluginManifest.model_validate(raw)
-        if isinstance(manifest.mcpServers, dict):
-            payload = manifest.mcpServers
-            if "mcpServers" in payload and isinstance(payload["mcpServers"], dict):
-                payload = payload["mcpServers"]
-            for name, config in payload.items():
-                if isinstance(config, dict):
-                    configs.append((str(name), dict(config)))
+        if isinstance(manifest.mcpServers, str):
+            raise ValueError(
+                "plugin manifest mcpServers path strings cannot be inspected at runtime"
+            )
+        if manifest.mcpServers is not None:
+            append_payload(manifest.mcpServers, "plugin manifest")
 
     root_config = plugin_dir / ".mcp.json"
     if root_config.is_file():
         raw = json.loads(root_config.read_text(encoding="utf-8"))
-        payload = raw.get("mcpServers", raw) if isinstance(raw, dict) else {}
-        if isinstance(payload, dict):
-            for name, config in payload.items():
-                if isinstance(config, dict):
-                    configs.append((str(name), dict(config)))
+        append_payload(raw, ".mcp.json")
     return configs
 
 
@@ -212,7 +229,15 @@ async def probe_mcp_tool_capability(
     work: list[tuple[str, Mapping[str, Any], Path | None]] = [
         (name, config, root) for name, config in declared
     ]
-    work.extend((str(name), config, None) for name, config in derived_servers.items())
+    for name, config in derived_servers.items():
+        if not isinstance(config, Mapping):
+            failures.append(str(name))
+            logger.warning(
+                "cannot inspect derived MCP declaration server=%s; keeping approval tool",
+                name,
+            )
+            continue
+        work.append((str(name), config, None))
 
     async def inspect(name: str, config: Mapping[str, Any], cwd: Path | None) -> None:
         try:

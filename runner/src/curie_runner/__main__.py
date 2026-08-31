@@ -21,7 +21,6 @@ from curie_telemetry import bootstrap_service_telemetry
 from . import __version__
 from .adapter import (
     ClaudeAgentSession,
-    DeferredClaudeAgentSession,
     ModelSession,
     build_options,
 )
@@ -281,12 +280,18 @@ def build_runner(
         approval_gate.required - {PUBLISH_TOOL_NAME}
     )
 
-    async def real_options() -> ClaudeAgentOptions:
+    real_options: ClaudeAgentOptions | None = None
+    if not fake_model:
         # The bundle's live MCP ``tools/list`` response is the actual advertised
-        # surface. Only a complete response where every tool says
-        # readOnlyHint=true proves that paging a human cannot unlock an action.
-        # Missing hints and probe failures preserve the historical tool.
-        capability = await probe_mcp_tool_capability(
+        # MCP surface. Only a complete response where every observed tool says
+        # readOnlyHint=true -- including a complete surface with zero MCP tools --
+        # proves that this generic MCP pager cannot unlock an action. Built-in
+        # Claude tools are outside this capability decision; an explicit gate on
+        # one still retains the pager. Missing hints, uninspectable declarations,
+        # and probe failures preserve the historical tool. The annotation remains
+        # a non-authoritative hint: it never authorizes or denies tool execution.
+        capability = anyio.run(
+            probe_mcp_tool_capability,
             config.session.plugin_dir,
             derived_mcp_servers,
             sdk_env,
@@ -294,6 +299,14 @@ def build_runner(
         carries_request_approval = (
             carries_explicit_action_gate or capability.has_potential_write_tool
         )
+        if not carries_request_approval:
+            logger.info(
+                "request_approval omitted: observed MCP surface has no actionable"
+                " tools tool_count=%d probe_complete=%s failures=%d",
+                capability.tool_count,
+                capability.complete,
+                len(capability.failures),
+            )
 
         platform_servers = {
             **(
@@ -313,7 +326,7 @@ def build_runner(
                 else {}
             ),
         }
-        return build_options(
+        real_options = build_options(
             plugins=compiled.plugins,
             model=config.model,
             system_prompt=system_prompt,
@@ -362,10 +375,8 @@ def build_runner(
                 # route through the real decision table on the offline tier (#561).
                 approval_gate=approval_gate,
             )
-        return DeferredClaudeAgentSession(
-            real_options,
-            session_factory=ClaudeAgentSession,
-        )
+        assert real_options is not None
+        return ClaudeAgentSession(real_options)
 
     provider = build_tracer_provider(
         config.session.otel,

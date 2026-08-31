@@ -11,7 +11,6 @@ import logging
 from pathlib import Path
 from typing import Any
 
-import anyio
 import pytest
 from aci_protocol import BootEnv, Budget
 from curie_runner import RunnerConfig
@@ -67,9 +66,8 @@ def _boot_options(
     monkeypatch.setattr(boot, "probe_mcp_tool_capability", probe)
     monkeypatch.setattr(boot, "ClaudeAgentSession", _CapturedSession)
     session = build_runner(config, fake_model=False)._factory()
-    anyio.run(session.connect)
-    assert isinstance(session._session, _CapturedSession)
-    return session._session.options
+    assert isinstance(session, _CapturedSession)
+    return session.options
 
 
 def _bundle(root: Path, connectors: str | None = None, mcp: dict | None = None) -> Path:
