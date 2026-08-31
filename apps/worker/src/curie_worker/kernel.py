@@ -1108,6 +1108,28 @@ class Kernel:
                     qevent.reply_handle.kind, qevent.reply_handle.channel
                 )
                 if resolved is None:
+                    undeployed = await self._binding.undeployed_binding(
+                        qevent.reply_handle.kind, qevent.reply_handle.channel
+                    )
+                    if undeployed is not None:
+                        route = TargetRoute(
+                            endpoint=undeployed.endpoint or qevent.reply_handle.endpoint,
+                            adapter=undeployed.adapter or qevent.reply_handle.adapter,
+                        )
+                        logger.warning(
+                            "undeployed agent turn dropped for agent=%s route=%s:%s",
+                            undeployed.agent_name,
+                            qevent.reply_handle.kind,
+                            qevent.reply_handle.channel,
+                        )
+                        await self._drop_with_message(
+                            qevent,
+                            route,
+                            "This agent does not have an active deployment yet. "
+                            "Deploy it, then try again.",
+                            lease=lease,
+                        )
+                        return
                     # Name BOTH halves: since the kind routes, a kind typo is a
                     # newly reachable drop, and a message naming only the address
                     # sends an operator hunting a binding that is right there.

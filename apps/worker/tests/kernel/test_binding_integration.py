@@ -6,9 +6,12 @@ the kernel behaviors are exercised deterministically."""
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 import uuid
 from collections.abc import Callable
+from types import SimpleNamespace
+from typing import Any
 
 from aci_protocol import Final, QueuedTurn, ReplyHandle, SessionStatus, TextDelta
 from curie_worker.behaviorpacks import BehaviorPacks
@@ -35,11 +38,20 @@ class StubBinding:
     misroute the pair predicate exists to close.
     """
 
-    def __init__(self, by_route: dict[tuple[str, str], ResolvedDeployment]) -> None:
+    def __init__(
+        self,
+        by_route: dict[tuple[str, str], ResolvedDeployment],
+        *,
+        undeployed: dict[tuple[str, str], Any] | None = None,
+    ) -> None:
         self._by_route = by_route
+        self._undeployed = undeployed or {}
 
     async def resolve(self, kind: str, address: str) -> ResolvedDeployment | None:
         return self._by_route.get((kind, address))
+
+    async def undeployed_binding(self, kind: str, address: str) -> Any | None:
+        return self._undeployed.get((kind, address))
 
     def boot_env(
         self,
@@ -143,6 +155,36 @@ def test_unmapped_channel_is_a_polite_drop(make_harness) -> None:
             assert h.runner.opened == []  # no turn ever opened
             assert h.sink.last_text is not None and "no agent" in h.sink.last_text.lower()
             assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+
+    asyncio.run(go())
+
+
+def test_bound_channel_without_deployment_replies_and_logs_loudly(make_harness, caplog) -> None:
+    """#1522: an undeployed binding is visible, not a silent acknowledged turn."""
+
+    async def go() -> None:
+        agent_id = uuid.uuid4()
+        binding = StubBinding(
+            {},
+            undeployed={
+                ("slack", "C-bound"): SimpleNamespace(
+                    agent_id=agent_id, agent_name="test-agent", endpoint=None, adapter=None
+                )
+            },
+        )
+        async with make_harness(binding=binding) as h:
+            ev = _qevent("hello", channel="C-bound")
+            with caplog.at_level(logging.WARNING, logger="curie_worker.kernel"):
+                await h.kernel.process_event(ev)
+
+            assert h.runner.opened == []
+            assert h.sink.last_text is not None
+            assert "active deployment" in h.sink.last_text.lower()
+            assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+            assert any(
+                "undeployed agent turn" in message and "test-agent" in message
+                for message in caplog.messages
+            )
 
     asyncio.run(go())
 

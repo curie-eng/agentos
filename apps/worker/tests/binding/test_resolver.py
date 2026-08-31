@@ -45,6 +45,7 @@ from curie_worker.binding import (
     HISTORY_TOKEN_ENV,
     MEMORY_TOKEN_ENV,
     BindingResolver,
+    BoundAgent,
     ResolvedDeployment,
     warn_if_multiple_agents_bound,
 )
@@ -386,6 +387,43 @@ def test_two_agents_share_one_address_under_different_kinds() -> None:
                 assert by_email.bundle_ref == f"bundles/email-{token}.zip"
             finally:
                 await _cleanup(engine, [slack_agent, email_agent])
+        finally:
+            await engine.dispose()
+
+    asyncio.run(go())
+
+
+def test_bound_agent_without_active_deployment_is_identified() -> None:
+    """#1522: distinguish a bound channel that cannot start a sandbox yet."""
+
+    async def go() -> None:
+        engine = create_async_engine(_DB_URL)
+        try:
+            try:
+                async with engine.connect():
+                    pass
+            except SQLAlchemyError as exc:
+                pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+
+            token = uuid.uuid4().hex[:8]
+            channel = f"C0EXAMPLE1-{token}"
+            agent_id = await _seed_agent(
+                engine,
+                channel=channel,
+                name=f"undeployed-{token}",
+                max_usd=None,
+                max_tokens=None,
+            )
+            try:
+                resolver = _resolver(engine)
+                assert await resolver.resolve("slack", channel) is None
+                binding = await resolver.undeployed_binding("slack", channel)
+                assert binding == BoundAgent(agent_id=agent_id, agent_name=f"undeployed-{token}")
+                # The kind remains part of the lookup; this is not an address-only
+                # fallback that could surface another channel's agent.
+                assert await resolver.undeployed_binding("email", channel) is None
+            finally:
+                await _cleanup(engine, [agent_id])
         finally:
             await engine.dispose()
 
