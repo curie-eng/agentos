@@ -28,7 +28,7 @@ from claude_agent_sdk import (
 from curie_runner import RunTracer, SideEffectClassifier, build_tracer_provider
 from curie_runner import otel as otel_module
 from curie_runner import session as session_module
-from curie_runner.adapter import ClaudeAgentSession
+from curie_runner.adapter import ClaudeAgentSession, PartialMessageBoundary
 from curie_runner.fake import FakeModelSession
 from curie_runner.otel import _SchemaValidatingSpanProcessor
 from curie_runner.session import SessionRunner
@@ -175,6 +175,37 @@ def _adapter_session_factory(script: list[object]) -> Callable[[], ClaudeAgentSe
         return session
 
     return factory
+
+
+def test_adapter_aclose_closes_the_inner_sdk_stream_on_the_driving_task() -> None:
+    finalizer_task_ids: list[int] = []
+
+    class FinalizingSDKClient:
+        def receive_response(self) -> AsyncIterator[object]:
+            async def messages() -> AsyncIterator[object]:
+                try:
+                    yield AssistantMessage(
+                        content=[TextBlock(text="first response")],
+                        model="observed-model",
+                    )
+                    await anyio.sleep_forever()
+                finally:
+                    finalizer_task_ids.append(anyio.get_current_task().id)
+
+            return messages()
+
+    async def go() -> None:
+        session = ClaudeAgentSession.__new__(ClaudeAgentSession)
+        session._client = FinalizingSDKClient()  # type: ignore[attr-defined]
+        response: Any = session.receive_turn()
+        driving_task_id = anyio.get_current_task().id
+
+        assert isinstance(await anext(response), AssistantMessage)
+        await response.aclose()
+
+        assert finalizer_task_ids == [driving_task_id]
+
+    anyio.run(go)
 
 
 def _partial_boundary(event_type: str, *, second: bool = False) -> StreamEvent:
@@ -342,6 +373,123 @@ def test_generation_omits_ttft_without_an_allowlisted_partial_boundary() -> None
     assert all("curie.generation.ttft_ms" not in span.attributes for span in generations)
 
 
+def test_unallowlisted_stream_event_produces_no_boundary_ttft_or_private_material() -> None:
+    raw_event = _partial_boundary("content_block_delta", second=True)
+
+    async def collect_adapter_output() -> list[object]:
+        session = _adapter_session_factory([raw_event])()
+        return [message async for message in session.receive_turn()]
+
+    assert anyio.run(collect_adapter_output) == []
+
+    script = [
+        raw_event,
+        AssistantMessage(
+            content=[TextBlock(text="visible response")],
+            model="observed-model",
+        ),
+        _result(),
+    ]
+    _, finished = _export_turn(_adapter_session_factory(script))
+    generation = _spans_by_name(finished)["llm.generation"][0]
+
+    assert "curie.generation.ttft_ms" not in generation.attributes
+    material = _span_wire_material(finished)
+    for private_value in (
+        _STREAM_BODY,
+        _STREAM_ARGUMENT,
+        _STREAM_UUID,
+        _STREAM_SESSION_ID,
+        _PARENT_TOOL_ID,
+    ):
+        assert private_value not in material
+
+
+def test_ttft_is_first_boundary_once_and_is_measured_from_each_round_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timestamps = (
+        1_000_000_000,
+        1_007_000_000,
+        10_000_000_000,
+        10_011_000_000,
+    )
+    observed_timestamps: list[int] = []
+
+    def monotonic_ns() -> int:
+        value = timestamps[len(observed_timestamps)]
+        observed_timestamps.append(value)
+        return value
+
+    monkeypatch.setattr(otel_module.time, "monotonic_ns", monotonic_ns)
+    _, finished = _export_turn(_adapter_session_factory(_two_round_script()))
+    generations = _spans_by_name(finished)["llm.generation"]
+
+    assert observed_timestamps == list(timestamps)
+    assert [
+        generation.attributes["curie.generation.ttft_ms"]
+        for generation in generations
+    ] == [7, 11]
+
+
+def test_fake_partial_boundaries_are_opt_in_payload_free_and_precede_each_assistant() -> None:
+    script: list[object] = [
+        AssistantMessage(
+            content=[TextBlock(text=_STREAM_BODY)],
+            model="fake-model",
+        ),
+        _tool_result("fake-result-call-PLACEHOLDER"),
+        AssistantMessage(
+            content=[
+                ToolUseBlock(
+                    id="fake-call-PLACEHOLDER",
+                    name="Read",
+                    input={"path": _STREAM_ARGUMENT},
+                )
+            ],
+            model="fake-model",
+        ),
+        _result(),
+    ]
+
+    async def replay(session: FakeModelSession) -> list[object]:
+        await session.connect()
+        await session.query("go")
+        try:
+            return [message async for message in session.receive_turn()]
+        finally:
+            await session.close()
+
+    default_messages = anyio.run(replay, FakeModelSession(lambda: script))
+    assert default_messages == script
+    assert not any(
+        isinstance(message, PartialMessageBoundary) for message in default_messages
+    )
+
+    boundary_messages = anyio.run(
+        replay,
+        FakeModelSession(lambda: script, emit_partial_boundaries=True),
+    )
+    assistant_positions = [
+        index
+        for index, message in enumerate(boundary_messages)
+        if isinstance(message, AssistantMessage)
+    ]
+    boundaries = [
+        boundary_messages[index - 1]
+        for index in assistant_positions
+        if index > 0
+    ]
+
+    assert len(assistant_positions) == 2
+    assert boundaries == [
+        PartialMessageBoundary(event_type="message_start"),
+        PartialMessageBoundary(event_type="message_start"),
+    ]
+    assert _STREAM_BODY not in repr(boundaries)
+    assert _STREAM_ARGUMENT not in repr(boundaries)
+
+
 def test_raw_stream_tool_payloads_and_provider_ids_never_reach_otel() -> None:
     _, finished = _export_turn(_adapter_session_factory(_two_round_script()))
     material = _span_wire_material(finished)
@@ -413,6 +561,47 @@ def test_tool_use_result_is_a_duration_bearing_agent_run_sibling(
     assert tool.attributes["curie.tool.call.index"] == 1
     assert tool.status.status_code is expected_status
     assert _TOOL_CALL_ID not in _span_wire_material(finished)
+
+
+def test_parallel_tools_are_root_siblings_and_reopen_provider_after_both_results() -> None:
+    first_call_id = "parallel-call-one-PLACEHOLDER"
+    second_call_id = "parallel-call-two-PLACEHOLDER"
+    script = [
+        AssistantMessage(
+            content=[
+                ToolUseBlock(id=first_call_id, name="Read", input={}),
+                ToolUseBlock(id=second_call_id, name="Grep", input={}),
+            ],
+            model="observed-model",
+        ),
+        _tool_result(first_call_id),
+        _tool_result(second_call_id),
+        AssistantMessage(
+            content=[TextBlock(text="done")],
+            model="observed-model",
+        ),
+        _result(),
+    ]
+    _, finished = _export_turn(lambda: FakeModelSession(lambda: script))
+    spans = _spans_by_name(finished)
+    root = spans["agent.run"][0]
+    generations = spans["llm.generation"]
+    tools = spans["execute_tool"]
+
+    assert len(generations) == 2
+    assert len(tools) == 2
+    assert [tool.attributes["curie.tool.call.index"] for tool in tools] == [1, 2]
+    assert root.context is not None
+    assert all(
+        tool.parent is not None and tool.parent.span_id == root.context.span_id
+        for tool in tools
+    )
+    second_tool = next(
+        tool for tool in tools if tool.attributes["gen_ai.tool.name"] == "Grep"
+    )
+    assert generations[1].start_time is not None
+    assert second_tool.end_time is not None
+    assert generations[1].start_time >= second_tool.end_time
 
 
 def test_unmatched_tool_result_creates_no_tool_span() -> None:
@@ -812,6 +1001,28 @@ def test_empty_run_span_is_lazy_and_exports_the_root_only() -> None:
     assert [span.name for span in spans] == ["agent.run"]
 
 
+def test_direct_compat_usage_and_tools_do_not_fabricate_ttft_or_generations() -> None:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+
+    with RunTracer(provider).run_span("curie-run:test", "fake-model") as span:
+        span.record_usage({"input_tokens": 3, "output_tokens": 2})
+        span.tool_span("Read")
+        span.tool_span("Grep")
+
+    spans = _spans_by_name(list(exporter.get_finished_spans()))
+    generations = spans["llm.generation"]
+    tools = spans["execute_tool"]
+
+    assert len(generations) == 1
+    assert "curie.generation.ttft_ms" not in generations[0].attributes
+    assert generations[0].attributes["gen_ai.usage.input_tokens"] == 3
+    assert generations[0].attributes["gen_ai.usage.output_tokens"] == 2
+    assert len(tools) == 2
+    assert [tool.attributes["curie.tool.call.index"] for tool in tools] == [1, 2]
+
+
 def test_run_span_with_missing_parent_starts_a_safe_root() -> None:
     exporter = InMemorySpanExporter()
     provider = TracerProvider()
@@ -893,11 +1104,15 @@ def test_classified_failure_uses_bounded_cause_without_raw_provider_reason() -> 
 
 @pytest.mark.parametrize("reason", ("aborted_streaming", "aborted_tools"))
 def test_sdk_abort_is_intentional_cancellation_with_ok_otel_status(reason: str) -> None:
-    _, spans = _run_and_export(
+    events, spans = _run_and_export(
         lambda: FakeModelSession(
             lambda: [_result(is_error=True, terminal_reason=reason)]
         )
     )
+    assert [event.type for event in events] == ["final"]
+    terminal = events[0]
+    assert isinstance(terminal, Final)
+    assert terminal.status is SessionStatus.IDLE_AWAITING_INPUT
     root = spans["agent.run"][0]
     assert root.status.status_code is StatusCode.OK
     assert root.attributes["curie.phase"] == "provider_wait"
