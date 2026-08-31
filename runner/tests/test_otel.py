@@ -930,7 +930,11 @@ def test_run_omits_approval_decision_on_an_ordinary_turn() -> None:
 
 
 @pytest.mark.parametrize("otel", (OtelConfig(), OtelConfig(endpoint="")))
-def test_tracer_provider_none_without_endpoint(otel: OtelConfig) -> None:
+def test_tracer_provider_none_without_endpoint(
+    otel: OtelConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", raising=False)
     assert build_tracer_provider(otel, "s1") is None
 
 
