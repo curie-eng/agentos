@@ -42,6 +42,10 @@
       {
         "gate": "mcp__self-upgrade__upgrade_self",
         "route": "sre-approvals"
+      },
+      {
+        "gate": "mcp__self-upgrade__upgrade_platform",
+        "route": "sre-approvals"
       }
     ]
   }

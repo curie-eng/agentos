@@ -73,6 +73,10 @@ rules:
       # purpose, so a ceiling stated once cannot move when someone edits the
       # other place.
       - sre-bot-self-upgrade
+      # The platform upgrade's template, if you installed it. Harmless to list
+      # when that CronJob does not exist: `resourceNames` grants nothing for a
+      # name with no object behind it.
+      - platform-upgrade
     verbs: ["get"]
   - apiGroups: ["batch"]
     resources: ["jobs"]

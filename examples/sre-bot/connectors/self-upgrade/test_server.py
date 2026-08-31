@@ -61,6 +61,7 @@ def _load(
     kubeconfig=GOOD_KUBECONFIG,
     cronjob="sre-bot-self-upgrade",
     release_repo="curie-eng/curie",
+    platform_cronjob="platform-upgrade",
 ):
     cfg = tmp_path / "kubeconfig"
     cfg.write_text(yaml.safe_dump(kubeconfig), encoding="utf-8")
@@ -68,6 +69,7 @@ def _load(
     os.environ["SELF_UPGRADE_CRONJOB"] = cronjob
     os.environ["SELF_UPGRADE_NAMESPACE"] = "curie"
     os.environ["SELF_UPGRADE_RELEASE_REPO"] = release_repo
+    os.environ["PLATFORM_UPGRADE_CRONJOB"] = platform_cronjob
     os.environ["SELF_UPGRADE_RELEASE_API"] = "https://api.github.test"
     sys.modules.pop(_MODULE_NAME, None)
     spec = importlib.util.spec_from_file_location(_MODULE_NAME, _SERVER_PY)
@@ -409,3 +411,78 @@ def test_a_body_with_no_tag_is_reported_not_guessed(tmp_path, monkeypatch):
     result = json.loads(srv.latest_release())
     assert result["ok"] is False
     assert "no tag_name" in result["summary"]
+
+
+# --- upgrade_platform -----------------------------------------------------
+
+
+def test_it_starts_the_platform_template_not_the_bundle_one(tmp_path, monkeypatch):
+    """The two verbs must not be able to run each other's template."""
+    srv = _load(tmp_path)
+    seen = {}
+    monkeypatch.setattr(srv, "_client", lambda: _FakeClient(seen))
+    result = json.loads(srv.upgrade_platform())
+    assert result["ok"] is True
+    assert seen["cronjob_path"].endswith("/cronjobs/platform-upgrade")
+    assert seen["post_body"]["metadata"]["generateName"].startswith("platform-upgrade")
+
+
+def test_an_unset_platform_cronjob_refuses(tmp_path, monkeypatch):
+    """An install that has not opted in does not get a platform upgrade."""
+    srv = _load(tmp_path, platform_cronjob="")
+    seen = {}
+    monkeypatch.setattr(srv, "_client", lambda: _FakeClient(seen))
+    result = json.loads(srv.upgrade_platform())
+    assert result["ok"] is False
+    assert "PLATFORM_UPGRADE_CRONJOB" in result["summary"]
+    assert seen == {}
+
+
+def test_the_two_verbs_do_not_block_each_other(tmp_path, monkeypatch):
+    """A running bundle redeploy must not refuse a platform upgrade.
+
+    They run different templates against different credentials and are
+    independent. The concurrency guard is scoped to the CronJob being started,
+    so a Job labelled for one does not look active to the other -- if that
+    scoping regresses, one in-flight upgrade silently blocks the unrelated verb.
+    """
+    srv = _load(tmp_path)
+    running_self = {
+        "items": [
+            {
+                "metadata": {
+                    "name": "in-flight",
+                    "labels": {"curie.dev/self-upgrade-of": "sre-bot-self-upgrade"},
+                },
+                "status": {"active": 1},
+            }
+        ]
+    }
+    seen = {}
+    # The fake echoes back whatever the selector asked for; a real API server
+    # filters. Assert on the selector the tool SENT, which is what the server
+    # would have filtered on.
+    monkeypatch.setattr(srv, "_client", lambda: _FakeClient(seen, jobs=(200, running_self)))
+    srv.upgrade_platform()
+    assert seen["jobs_params"]["labelSelector"] == (
+        "curie.dev/self-upgrade-of=platform-upgrade"
+    )
+
+
+def test_it_is_annotated_as_a_destructive_write(tmp_path):
+    srv = _load(tmp_path)
+    assert srv.UPGRADE.readOnlyHint is False
+    assert srv.UPGRADE.destructiveHint is True
+
+
+def test_the_platform_tool_exposes_no_parameters(tmp_path):
+    srv = _load(tmp_path)
+    assert inspect.signature(srv.upgrade_platform).parameters == {}
+
+
+def test_its_summary_refuses_to_imply_a_rollback(tmp_path, monkeypatch):
+    srv = _load(tmp_path)
+    monkeypatch.setattr(srv, "_client", lambda: _FakeClient({}))
+    result = json.loads(srv.upgrade_platform())
+    assert result["prior"] is None
+    assert "no undo" in result["summary"]
