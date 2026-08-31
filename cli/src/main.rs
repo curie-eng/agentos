@@ -943,6 +943,16 @@ enum SreBotAction {
         /// Leave the gated write connector out of the install entirely.
         #[arg(long)]
         no_write: bool,
+        /// Install the upgrade path: the self-upgrade connector, the platform
+        /// upgrade Job, and the two identities behind them.
+        ///
+        /// CREATES A NAMESPACE-ADMIN-EQUIVALENT IDENTITY for the Job that runs
+        /// `helm upgrade`. Read examples/sre-bot/manifests/platform-upgrade-role.yaml
+        /// before using this: it enumerates exactly what that grant covers and
+        /// what does and does not bound it. Omit the flag and nothing about the
+        /// install changes.
+        #[arg(long)]
+        platform_upgrade: bool,
         /// Kubernetes namespace of the Curie release. Default: curie.
         #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
         namespace: String,
@@ -2853,6 +2863,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                             slack_channel,
                             write_allowlist,
                             no_write,
+                            platform_upgrade,
                             namespace,
                             release,
                             observability_namespace,
@@ -2864,6 +2875,7 @@ async fn run(command: Option<Command>) -> Result<()> {
             slack_channel,
             write_allowlist,
             no_write,
+            platform_upgrade,
             namespace,
             release,
             observability_namespace,
