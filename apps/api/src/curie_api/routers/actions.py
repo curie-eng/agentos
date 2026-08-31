@@ -148,10 +148,12 @@ async def _authorize_undo(
     authorizer of that same route, resolved against membership the way ADR-0034
     resolves an approver -- someone who could have permitted the change.
 
-    The self-approval refusal (#246) is deliberately not inherited. It stops a
-    requester approving their own REQUEST; an undo is not a request, so applying
-    it here would demand MORE authorization than the forward action needed, which
-    decision 3 rules out in the same sentence that requires the route.
+    ADR-0106's authenticated-principal contract applies to approval resolution,
+    not this ADR-0117 action-undo seam. This path preserves ADR-0117's existing
+    approver-set check over ``data.actor`` and ``data.actor_channel`` and adds no
+    distinct-requester rule; adding one would demand MORE authorization than the
+    forward action needed, which decision 3 rules out in the same sentence that
+    requires the route.
     """
 
     if action.gate_approval_id is None:

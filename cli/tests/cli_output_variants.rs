@@ -300,6 +300,20 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 truncated: false,
             },
             "Resolved" => ApprovalsOutput::Resolved { record: approval_record() },
+            "OperatorPrincipal" => ApprovalsOutput::OperatorPrincipal {
+                delivery: curie::api::OperatorPrincipalDelivery {
+                    token: "operator-token".to_string(),
+                    subject: "operator@example.com".to_string(),
+                    expires_at: "2026-08-31T12:00:00Z".to_string(),
+                },
+            },
+            "ConsoleLoginCode" => ApprovalsOutput::ConsoleLoginCode {
+                delivery: curie::api::ConsoleLoginCodeDelivery {
+                    code: "console-login-code".to_string(),
+                    subject: "operator@example.com".to_string(),
+                    expires_at: "2026-08-31T12:00:00Z".to_string(),
+                },
+            },
             // Both binding shapes in one sample so the schema gate sees the
             // resolution/notification split and the optional approvers block.
             // Response deserialization is deliberate: transport fields are

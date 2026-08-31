@@ -27,7 +27,7 @@ import redis.asyncio as aioredis
 from aci_protocol import QueuedTurn
 from alembic import command
 from alembic.config import Config
-from curie_api import crud
+from curie_api import approval_principal, crud
 from curie_api import sweeper as sweeper_module
 from curie_api.config import get_settings
 from curie_api.deps import get_approver_sets
@@ -129,6 +129,40 @@ def _payload(**overrides: Any) -> dict[str, Any]:
     }
     base.update(overrides)
     return base
+
+
+def _chat_resolve_headers(
+    approval_id: str,
+    actor: str,
+    actor_channel: str,
+    *,
+    base: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """A dispatcher-attested identity/channel bound to this approval."""
+
+    token = approval_principal.mint(
+        get_settings().approval_chat_attester_secret,
+        subject=actor,
+        kind="chat",
+        actor_channel=actor_channel,
+        approval_id=approval_id,
+        scope=approval_principal.APPROVE_SCOPE,
+        exp=int(time.time()) + 60,
+    )
+    return {**dict(base or {}), "X-Curie-Approval-Principal": token}
+
+
+def _operator_resolve_headers(
+    actor: str, *, base: Mapping[str, str] | None = None
+) -> dict[str, str]:
+    token = approval_principal.mint(
+        get_settings().api_key,
+        subject=actor,
+        kind="operator",
+        scope=approval_principal.APPROVE_SCOPE,
+        exp=int(time.time()) + 60,
+    )
+    return {**dict(base or {}), "X-Curie-Approval-Principal": token}
 
 
 def _seed_raw_approval(approval_id: uuid.UUID, summary: str) -> None:
@@ -282,8 +316,8 @@ def test_resolve_endpoint_stays_200_when_enqueue_fails(
 
     resolved = approvals_client.post(
         f"/approvals/{created['id']}/resolve",
-        json={"decision": "approved", "resolved_by": "U9", "actor_channel": "C1"},
-        headers=auth_headers,
+        json={"decision": "approved"},
+        headers=_chat_resolve_headers(created["id"], "U9", "C1", base=auth_headers),
     )
     assert resolved.status_code == 200, resolved.text
     assert resolved.json()["status"] == "approved"
@@ -295,8 +329,8 @@ def test_resolve_endpoint_stays_200_when_enqueue_fails(
     # The CAS is untouched: a retry loses as a normal race, it does not re-enqueue.
     retry = approvals_client.post(
         f"/approvals/{created['id']}/resolve",
-        json={"decision": "approved", "resolved_by": "U2", "actor_channel": "C1"},
-        headers=auth_headers,
+        json={"decision": "approved"},
+        headers=_chat_resolve_headers(created["id"], "U2", "C1", base=auth_headers),
     )
     assert retry.status_code == 409
     assert valkey.xrange(runs_stream) == []
@@ -352,8 +386,8 @@ def test_resolve_reraises_when_reconciler_disabled(
 
     resolved = reconciler_disabled_client.post(
         f"/approvals/{created['id']}/resolve",
-        json={"decision": "approved", "resolved_by": "U9", "actor_channel": "C1"},
-        headers=auth_headers,
+        json={"decision": "approved"},
+        headers=_chat_resolve_headers(created["id"], "U9", "C1", base=auth_headers),
     )
     assert resolved.status_code == 500, resolved.text
 
@@ -384,8 +418,8 @@ def test_happy_path_resolve_marks_resumed(
 
     resolved = approvals_client.post(
         f"/approvals/{created['id']}/resolve",
-        json={"decision": "approved", "resolved_by": "U9", "actor_channel": "C1"},
-        headers=auth_headers,
+        json={"decision": "approved"},
+        headers=_chat_resolve_headers(created["id"], "U9", "C1", base=auth_headers),
     )
     assert resolved.status_code == 200, resolved.text
 
@@ -417,12 +451,10 @@ def test_resume_queue_injects_traceparent_adjacent_to_unchanged_payload(
             return await asyncio.to_thread(
                 approvals_client.post,
                 f"/approvals/{created['id']}/resolve",
-                json={
-                    "decision": "approved",
-                    "resolved_by": "U9",
-                    "actor_channel": "C1",
-                },
-                headers=auth_headers,
+                json={"decision": "approved"},
+                headers=_chat_resolve_headers(
+                    created["id"], "U9", "C1", base=auth_headers
+                ),
             )
 
     resolved = asyncio.run(_resolve_with_parent())
@@ -562,13 +594,8 @@ def test_resolve_once_and_enqueue_resume_turn(
 
     resolved = approvals_client.post(
         f"/approvals/{created['id']}/resolve",
-        json={
-            "decision": "approved",
-            "resolved_by": "U9",
-            "note": "ship it",
-            "actor_channel": "C1",
-        },
-        headers=auth_headers,
+        json={"decision": "approved", "note": "ship it"},
+        headers=_chat_resolve_headers(created["id"], "U9", "C1", base=auth_headers),
     )
     assert resolved.status_code == 200, resolved.text
     body = resolved.json()
@@ -593,8 +620,8 @@ def test_resolve_once_and_enqueue_resume_turn(
     # The loser of the claim race is told who resolved it.
     second = approvals_client.post(
         f"/approvals/{created['id']}/resolve",
-        json={"decision": "rejected", "resolved_by": "U2", "actor_channel": "C1"},
-        headers=auth_headers,
+        json={"decision": "rejected"},
+        headers=_chat_resolve_headers(created["id"], "U2", "C1", base=auth_headers),
     )
     assert second.status_code == 409
     assert "already resolved by U9" in second.json()["detail"]
@@ -616,13 +643,13 @@ def test_concurrent_resolvers_yield_exactly_one_winner(
     def attempt(actor: str) -> int:
         response = approvals_client.post(
             f"/approvals/{created['id']}/resolve",
-            json={"decision": "approved", "resolved_by": actor, "actor_channel": "C1"},
-            headers=auth_headers,
+            json={"decision": "approved"},
+            headers=_chat_resolve_headers(created["id"], actor, "C1", base=auth_headers),
         )
         return response.status_code
 
-    # Actors distinct from the record's author (U1), so none is blocked as
-    # self-approval and the race is purely over the pending claim.
+    # Actors distinct from the record's author (U1), so the race is purely over
+    # the pending claim rather than testing the membership edge.
     with ThreadPoolExecutor(max_workers=4) as pool:
         codes = list(pool.map(attempt, [f"U_race_{i}" for i in range(4)]))
 
@@ -646,8 +673,8 @@ def test_expired_approval_resolve_returns_410_and_resumes(
 
     resolved = approvals_client.post(
         f"/approvals/{created['id']}/resolve",
-        json={"decision": "approved", "resolved_by": "U9", "actor_channel": "C1"},
-        headers=auth_headers,
+        json={"decision": "approved"},
+        headers=_chat_resolve_headers(created["id"], "U9", "C1", base=auth_headers),
     )
     assert resolved.status_code == 410
     got = approvals_client.get(f"/approvals/{created['id']}", headers=auth_headers)
@@ -678,10 +705,11 @@ def test_expired_approval_resolve_returns_410_and_resumes(
 def test_unknown_approval_is_404(
     approvals_client: TestClient, auth_headers: dict[str, str], clean_db: None
 ) -> None:
+    missing_id = str(uuid.uuid4())
     missing = approvals_client.post(
-        f"/approvals/{uuid.uuid4()}/resolve",
-        json={"decision": "approved", "resolved_by": "U9", "actor_channel": "C1"},
-        headers=auth_headers,
+        f"/approvals/{missing_id}/resolve",
+        json={"decision": "approved"},
+        headers=_operator_resolve_headers("U9", base=auth_headers),
     )
     assert missing.status_code == 404
 
@@ -717,7 +745,7 @@ def test_scoped_state_token_cannot_resolve_an_approval(
     )
     denied = approvals_client.post(
         resolve_url,
-        json={"decision": "approved", "resolved_by": "U9", "actor_channel": "C1"},
+        json={"decision": "approved"},
         headers={"X-API-Key": scoped},
     )
     assert denied.status_code == 401, denied.text
@@ -727,25 +755,27 @@ def test_scoped_state_token_cannot_resolve_an_approval(
     )
     assert record.json()["status"] == "pending"
 
-    # The platform key still resolves it (no regression).
+    # A dedicated principal still resolves it; the platform key alone cannot.
     ok = approvals_client.post(
         resolve_url,
-        json={"decision": "approved", "resolved_by": "U9", "actor_channel": "C1"},
-        headers=auth_headers,
+        json={"decision": "approved"},
+        headers=_chat_resolve_headers(created["id"], "U9", "C1", base=auth_headers),
     )
     assert ok.status_code == 200, ok.text
 
 
-def test_authorizer_blocks_non_member_and_self_approval(
+def test_authorizer_blocks_non_member_but_admits_authorized_requester(
     approvals_client: TestClient,
     auth_headers: dict[str, str],
     clean_db: None,
     valkey: redis.Redis,
     runs_stream: str,
 ) -> None:
-    """The server-side authorizer (#246): channel membership is proven by the
-    attempt's channel, self-approval is blocked unconditionally, and a denied
-    attempt neither resolves the record nor enqueues a resume turn."""
+    """Membership is the boundary, including for the request author.
+
+    A wrong authenticated channel is denied without a wake; the same
+    authenticated requester is admitted from the card channel.
+    """
 
     created = approvals_client.post(
         "/approvals", json=_payload(), headers=auth_headers
@@ -755,42 +785,23 @@ def test_authorizer_blocks_non_member_and_self_approval(
     # Wrong channel: not an approver.
     wrong_channel = approvals_client.post(
         resolve_url,
-        json={"decision": "approved", "resolved_by": "U9", "actor_channel": "C_OTHER"},
-        headers=auth_headers,
+        json={"decision": "approved"},
+        headers=_chat_resolve_headers(
+            created["id"], "U9", "C_OTHER", base=auth_headers
+        ),
     )
     assert wrong_channel.status_code == 403
     assert "not an approver" in wrong_channel.json()["detail"]
 
-    # No channel evidence at all: not an approver.
-    no_channel = approvals_client.post(
-        resolve_url,
-        json={"decision": "approved", "resolved_by": "U9"},
-        headers=auth_headers,
-    )
-    assert no_channel.status_code == 403
-
-    # Self-approval: blocked even from the right channel (the record's author
-    # is U1, see _payload).
+    # The author (U1 in _payload) is a member because the authenticated chat
+    # principal attests the same channel that carries the card.
     self_approval = approvals_client.post(
         resolve_url,
-        json={"decision": "approved", "resolved_by": "U1", "actor_channel": "C1"},
-        headers=auth_headers,
+        json={"decision": "approved"},
+        headers=_chat_resolve_headers(created["id"], "U1", "C1", base=auth_headers),
     )
-    assert self_approval.status_code == 403
-    assert "self-approval" in self_approval.json()["detail"]
-
-    # The record is still pending and nothing was enqueued.
-    record = approvals_client.get(f"/approvals/{created['id']}", headers=auth_headers)
-    assert record.json()["status"] == "pending"
-    assert valkey.xrange(runs_stream) == []
-
-    # An authorized member still resolves it afterwards.
-    ok = approvals_client.post(
-        resolve_url,
-        json={"decision": "approved", "resolved_by": "U9", "actor_channel": "C1"},
-        headers=auth_headers,
-    )
-    assert ok.status_code == 200
+    assert self_approval.status_code == 200, self_approval.text
+    assert self_approval.json()["resolved_by"] == "U1"
     assert len(valkey.xrange(runs_stream)) == 1
 
 
@@ -852,12 +863,10 @@ def test_bound_approver_is_accepted_and_requesting_channel_is_not(
     # This is the widening #544 is about -- today this is the path that succeeds.
     requesting = approvals_client.post(
         resolve_url,
-        json={
-            "decision": "approved",
-            "resolved_by": "U0LOCAL01",
-            "actor_channel": "C0LOCALDEV",
-        },
-        headers=auth_headers,
+        json={"decision": "approved"},
+        headers=_chat_resolve_headers(
+            created["id"], "U0LOCAL01", "C0LOCALDEV", base=auth_headers
+        ),
     )
     assert requesting.status_code == 403, (
         "authority must never widen to the requesting channel when the manifest "
@@ -871,12 +880,10 @@ def test_bound_approver_is_accepted_and_requesting_channel_is_not(
     # The BOUND approver, from the bound channel: accepted.
     bound = approvals_client.post(
         resolve_url,
-        json={
-            "decision": "approved",
-            "resolved_by": "U0BOUND01",
-            "actor_channel": "C0EXAMPLE1",
-        },
-        headers=auth_headers,
+        json={"decision": "approved"},
+        headers=_chat_resolve_headers(
+            created["id"], "U0BOUND01", "C0EXAMPLE1", base=auth_headers
+        ),
     )
     assert bound.status_code == 200, (
         f"the manifest's declared approver must be able to approve: {bound.text}"
@@ -1072,8 +1079,8 @@ def test_route_bound_approval_with_no_agent_resolves_through_neither_channel(
     # The requesting channel (C1) is still not the approvers' channel.
     from_requesting = approvals_client.post(
         resolve_url,
-        json={"decision": "approved", "resolved_by": "U9", "actor_channel": "C1"},
-        headers=auth_headers,
+        json={"decision": "approved"},
+        headers=_chat_resolve_headers(created["id"], "U9", "C1", base=auth_headers),
     )
     assert from_requesting.status_code == 403
     assert "no longer bound" in from_requesting.json()["detail"]
@@ -1081,8 +1088,10 @@ def test_route_bound_approval_with_no_agent_resolves_through_neither_channel(
     # And the card channel is no longer enough either: this was the 200.
     from_card = approvals_client.post(
         resolve_url,
-        json={"decision": "approved", "resolved_by": "U9", "actor_channel": "C_MGRS"},
-        headers=auth_headers,
+        json={"decision": "approved"},
+        headers=_chat_resolve_headers(
+            created["id"], "U9", "C_MGRS", base=auth_headers
+        ),
     )
     assert from_card.status_code == 403, from_card.text
     assert "no longer bound" in from_card.json()["detail"]
@@ -1112,20 +1121,24 @@ def test_audit_log_records_attempts_with_authorizer_snapshots(
 
     denied = approvals_client.post(
         resolve_url,
-        json={"decision": "approved", "resolved_by": "U_OUT", "actor_channel": "C_X"},
-        headers=auth_headers,
+        json={"decision": "approved"},
+        headers=_chat_resolve_headers(
+            created["id"], "U_OUT", "C_X", base=auth_headers
+        ),
     )
     assert denied.status_code == 403
     resolved = approvals_client.post(
         resolve_url,
-        json={"decision": "approved", "resolved_by": "U9", "actor_channel": "C1"},
-        headers=auth_headers,
+        json={"decision": "approved"},
+        headers=_chat_resolve_headers(created["id"], "U9", "C1", base=auth_headers),
     )
     assert resolved.status_code == 200
     late = approvals_client.post(
         resolve_url,
-        json={"decision": "rejected", "resolved_by": "U_LATE", "actor_channel": "C1"},
-        headers=auth_headers,
+        json={"decision": "rejected"},
+        headers=_chat_resolve_headers(
+            created["id"], "U_LATE", "C1", base=auth_headers
+        ),
     )
     assert late.status_code == 409
 
@@ -1260,6 +1273,8 @@ def test_sweeper_expires_lapsed_pending_and_enqueues_resume_turn(
     assert row["authorizer"] == "ExpirySweeper"
     assert row["authorized"] is True
     assert row["decision"] == ""
+    assert row["principal_kind"] is None
+    assert row["authenticated"] is False
 
     # #418: the wake reached the stream, so the sweeper marked the record resumed.
     assert _read_resumed_at(created["id"]) is not None
@@ -1360,8 +1375,8 @@ def test_sweeper_skips_already_resolved_records(
     # Resolve it via the normal path BEFORE the SLA lapses (approver from C1).
     resolved = approvals_client.post(
         f"/approvals/{created['id']}/resolve",
-        json={"decision": "approved", "resolved_by": "U9", "actor_channel": "C1"},
-        headers=auth_headers,
+        json={"decision": "approved"},
+        headers=_chat_resolve_headers(created["id"], "U9", "C1", base=auth_headers),
     )
     assert resolved.status_code == 200
     assert len(valkey.xrange(runs_stream)) == 1  # the resolve turn
@@ -1439,8 +1454,8 @@ def test_resolve_path_expiry_returns_410_even_if_enqueue_fails(
 
     resolved = approvals_client.post(
         f"/approvals/{created['id']}/resolve",
-        json={"decision": "approved", "resolved_by": "U9", "actor_channel": "C1"},
-        headers=auth_headers,
+        json={"decision": "approved"},
+        headers=_chat_resolve_headers(created["id"], "U9", "C1", base=auth_headers),
     )
     # RED today: the unguarded enqueue raises, so the endpoint 500s (or the
     # RuntimeError propagates) instead of returning the 410 the SLA lapse owes.
@@ -1513,8 +1528,8 @@ def test_resolve_path_expiry_returns_410_when_the_resumed_mark_fails(
 
     resolved = approvals_client.post(
         f"/approvals/{created['id']}/resolve",
-        json={"decision": "approved", "resolved_by": "U9", "actor_channel": "C1"},
-        headers=auth_headers,
+        json={"decision": "approved"},
+        headers=_chat_resolve_headers(created["id"], "U9", "C1", base=auth_headers),
     )
     assert resolved.status_code == 410, resolved.text
 
@@ -1793,12 +1808,14 @@ def _resolve(
     headers: dict[str, str],
     approval_id: str,
     actor: str,
-    channel: str | None = _BROAD,
+    channel: str = _BROAD,
 ) -> Any:
     return client.post(
         f"/approvals/{approval_id}/resolve",
-        json={"decision": "approved", "resolved_by": actor, "actor_channel": channel},
-        headers=headers,
+        json={"decision": "approved"},
+        headers=_chat_resolve_headers(
+            approval_id, actor, channel, base=headers
+        ),
     )
 
 
@@ -1998,23 +2015,17 @@ def test_explicit_user_list_wins_over_the_group_binding(
     assert calls == []
 
 
-# --- AC2: no self-approval under ANY authorizer --------------------------------
+# --- ADR-0106: requester equality neither grants nor vetoes membership --------
 
 
-def test_requester_cannot_self_approve_under_the_group_authorizer(
+def test_requester_can_self_approve_when_the_group_admits_them(
     approvals_client: TestClient,
     auth_headers: dict[str, str],
     clean_db: None,
     valkey: redis.Redis,
     runs_stream: str,
 ) -> None:
-    """AC2: the author IS a member of the approver group and still cannot resolve
-    their own request.
-
-    The zero-call assertion pins the guard's ORDERING, not just its verdict: the
-    self-approval check runs before any Slack fetch, so a self-attempt spends no
-    rate-limit budget and cannot be used to probe group membership.
-    """
+    """The authenticated author is treated like every other group member."""
 
     calls: list[httpx.Request] = []
     _fake_slack(approvals_client, [_APPROVER], calls=calls)
@@ -2029,24 +2040,21 @@ def test_requester_cannot_self_approve_under_the_group_authorizer(
         headers=auth_headers,
     ).json()
 
-    denied = _resolve(approvals_client, auth_headers, created["id"], _APPROVER)
-    assert denied.status_code == 403, denied.text
-    assert "self-approval" in denied.json()["detail"]
-    assert calls == []
-
-    record = approvals_client.get(f"/approvals/{created['id']}", headers=auth_headers)
-    assert record.json()["status"] == "pending"
-    assert valkey.xrange(runs_stream) == []
+    resolved = _resolve(approvals_client, auth_headers, created["id"], _APPROVER)
+    assert resolved.status_code == 200, resolved.text
+    assert resolved.json()["resolved_by"] == _APPROVER
+    assert len(calls) == 1
+    assert len(valkey.xrange(runs_stream)) == 1
 
 
-def test_requester_cannot_self_approve_under_the_user_list_authorizer(
+def test_requester_can_self_approve_when_the_explicit_list_admits_them(
     approvals_client: TestClient,
     auth_headers: dict[str, str],
     clean_db: None,
     valkey: redis.Redis,
     runs_stream: str,
 ) -> None:
-    """AC2: the author is on the explicit allowlist and still cannot resolve."""
+    """The list, not requester inequality, is the authorization boundary."""
 
     calls: list[httpx.Request] = []
     _fake_slack(approvals_client, [], calls=calls)
@@ -2066,24 +2074,20 @@ def test_requester_cannot_self_approve_under_the_user_list_authorizer(
         headers=auth_headers,
     ).json()
 
-    denied = _resolve(approvals_client, auth_headers, created["id"], _LISTED)
-    assert denied.status_code == 403, denied.text
-    assert "self-approval" in denied.json()["detail"]
-    assert valkey.xrange(runs_stream) == []
+    resolved = _resolve(approvals_client, auth_headers, created["id"], _LISTED)
+    assert resolved.status_code == 200, resolved.text
+    assert resolved.json()["resolved_by"] == _LISTED
+    assert len(valkey.xrange(runs_stream)) == 1
 
 
-def test_requester_cannot_self_approve_under_a_bound_channel_authorizer(
+def test_requester_can_self_approve_when_the_bound_channel_admits_them(
     approvals_client: TestClient,
     auth_headers: dict[str, str],
     clean_db: None,
     valkey: redis.Redis,
     runs_stream: str,
 ) -> None:
-    """AC2's third implementation. Distinct from the unbound-approval case that
-    ``test_authorizer_blocks_non_member_and_self_approval`` already pins: here a
-    route binding placed the card, so the resolver walks the binding path before
-    landing on channel membership. The self-approval block must survive that
-    route."""
+    """A route-bound card channel applies the same membership-only rule."""
 
     agent_id = _agent_with_routes(
         approvals_client, auth_headers, {"managers": {"resolution": _slack_resolution(_BROAD)}}
@@ -2094,10 +2098,10 @@ def test_requester_cannot_self_approve_under_a_bound_channel_authorizer(
         headers=auth_headers,
     ).json()
 
-    denied = _resolve(approvals_client, auth_headers, created["id"], _APPROVER)
-    assert denied.status_code == 403, denied.text
-    assert "self-approval" in denied.json()["detail"]
-    assert valkey.xrange(runs_stream) == []
+    resolved = _resolve(approvals_client, auth_headers, created["id"], _APPROVER)
+    assert resolved.status_code == 200, resolved.text
+    assert resolved.json()["resolved_by"] == _APPROVER
+    assert len(valkey.xrange(runs_stream)) == 1
 
 
 # --- AC3: the audit names the authorizer AND the evidence that counted ---------
@@ -2260,6 +2264,8 @@ def test_expiry_sweeper_audit_rows_carry_no_evidence(
     assert [e["action"] for e in entries] == ["expired"]
     assert entries[0]["authorizer"] == "ExpirySweeper"
     assert entries[0]["evidence"] is None
+    assert entries[0]["principal_kind"] is None
+    assert entries[0]["authenticated"] is False
 
 
 # --- fail closed: a declared approvers spec never degrades to channel ----------
@@ -2465,11 +2471,11 @@ def test_agentless_routed_approval_fails_closed_without_a_binding(
     outside = _resolve(approvals_client, auth_headers, created["id"], _OTHER, _ELSEWHERE)
     assert outside.status_code == 403, outside.text
 
-    # AC2 survives the new path: self-approval is still refused BEFORE the set
-    # is asked, so the author is told about the self-approval, not the route.
+    # Requester equality grants no exception: the same missing route refusal
+    # applies to the author as to every other principal.
     author = _resolve(approvals_client, auth_headers, created["id"], _APPROVER)
     assert author.status_code == 403, author.text
-    assert "self-approval" in author.json()["detail"]
+    assert "no longer bound" in author.json()["detail"]
 
     # The card channel used to be enough here. It is not any more.
     inside = _resolve(approvals_client, auth_headers, created["id"], _OTHER)
@@ -2524,11 +2530,10 @@ def test_a_route_absent_from_the_map_is_unresolvable_and_borrows_no_other_route(
     assert listed_elsewhere.status_code == 403, listed_elsewhere.text
     assert "no longer bound" in listed_elsewhere.json()["detail"]
 
-    # AC2 survives the unbound-route path too: self-approval is refused before
-    # the set is asked, so this one keeps the self-approval reason.
+    # Requester equality grants no exception to the missing-binding refusal.
     author = _resolve(approvals_client, auth_headers, created["id"], _APPROVER)
     assert author.status_code == 403, author.text
-    assert "self-approval" in author.json()["detail"]
+    assert "no longer bound" in author.json()["detail"]
 
     # This was a 200 before ADR-0123: right room, vanished authority.
     inside = _resolve(approvals_client, auth_headers, created["id"], _OTHER)
@@ -2723,8 +2728,10 @@ def test_pending_age_resolved_and_expired_approval_metrics_are_bounded(
     assert pending.status_code == 200
     resolved = approvals_client.post(
         f"/approvals/{resolved_record['id']}/resolve",
-        json={"decision": "approved", "resolved_by": "U9", "actor_channel": "C1"},
-        headers=auth_headers,
+        json={"decision": "approved"},
+        headers=_chat_resolve_headers(
+            resolved_record["id"], "U9", "C1", base=auth_headers
+        ),
     )
     assert resolved.status_code == 200, resolved.text
 

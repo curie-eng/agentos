@@ -86,11 +86,21 @@ honest `ComingSoon` stub (Usage, Settings).
   surface for durable approvals (#867). Lists approvals (pending by default,
   with a status filter) from `GET /approvals`; a row opens a detail with the
   audit trail (`GET /approvals/{id}/audit`) and, for a pending record, drives
-  the resolve-once route (`POST /approvals/{id}/resolve`) with Approve/Reject,
-  a required resolver identity, and optional actor-channel/note. The resolve
-  route's designed failure statuses are surfaced distinctly (403 not
-  authorized/self-approval, 409 already resolved, 410 expired). Read + resolve
-  only -- it never creates approvals (that is the worker's job).
+  the resolve-once route (`POST /approvals/{id}/resolve`) with Approve/Reject
+  and an optional note. Resolver identity is the immutable subject of a live,
+  HttpOnly same-origin Console session: the UI has no free-text identity or
+  actor-channel field. A CLI-minted, single-use login code is exchanged for that
+  session; missing, revoked, or expired sessions return to the login-code prompt.
+  Console principals carry no Slack channel evidence. They can resolve an
+  explicit-user route containing their subject or a Slack user-group route when
+  the server verifies that subject's membership; they cannot satisfy the default
+  channel-membership set. Requester equality neither grants nor vetoes membership,
+  so an authenticated requester admitted by the selected set may self-confirm.
+  The resolve route's designed failure statuses are surfaced
+  distinctly (401 session invalid, 403 not authorized, 409 already resolved,
+  410 expired). Audit rows label `principal_kind` and `authenticated`; historical
+  assertion-era rows remain visibly unauthenticated. Read + resolve only -- it
+  never creates approvals (that is the worker's job).
 
 **Metrics divergence (deliberate).** The design canon's Metrics tab is a
 Prometheus/PromQL surface (a `rate(...)` query bar, a request-rate hero, and
@@ -107,7 +117,10 @@ plainly what is not wired yet rather than showing fictional data.
 
 **API access.** `src/api/config.ts` resolves the API key and prefix:
 - The API key is `?api_key=` else `VITE_API_KEY` else the dev default; sent as
-  `X-API-Key`.
+  `X-API-Key` for administrative/read surfaces. Approval resolution is the
+  exception: it sends the same-origin Console cookie, no platform key, and a body
+  containing only `decision` plus optional `note`. A platform key alone cannot
+  resolve an approval.
 - All calls go to the same-origin `/api` prefix. `vite.config.ts` proxies `/api`
   to `CURIE_API_TARGET` (default `http://localhost:8000`), stripping the
   prefix. This avoids CORS (Cross-Origin Resource Sharing) issues: apps/api
@@ -146,8 +159,10 @@ The wired Metrics/Logs are covered in the **stackless** suite
 stubbing the observability endpoints with real-shaped responses via Playwright
 route interception (200 metrics, 503 no-cluster logs, 200 logs) — no backend
 needed. Approvals are covered the same way (`e2e/approvals-wired.spec.ts`):
-stubbed `GET /approvals`/`/audit` and a `POST /resolve` interceptor asserting
-the list, detail, resolve payload, and the 409 conflict state. Against a real API on the dev box, runner-logs returns 502 rather than
+stubbed `GET /approvals`/`/audit` and Console session exchange plus a
+`POST /resolve` interceptor asserting the immutable subject, cookie-authenticated
+decision/note payload, authenticated-versus-historical audit proof, and the 409
+conflict state. Against a real API on the dev box, runner-logs returns 502 rather than
 503 because a kubeconfig is present (the 401-rejecting cluster), which the UI
 renders as the "Cluster error" state.
 

@@ -5821,10 +5821,12 @@ pub async fn memory_add(opts: AgentActionOpts, content: String) -> Result<Memory
 pub struct ApprovalCmd {
     pub list: bool,
     pub resolve: Option<String>,
-    pub as_actor: Option<String>,
     pub reject: bool,
     pub note: Option<String>,
-    pub actor_channel: Option<String>,
+    /// Administrative subject for a reusable operator-principal mint.
+    pub mint_operator_principal: Option<String>,
+    /// Administrative subject for a single-use console login-code mint.
+    pub mint_console_login_code: Option<String>,
     /// `--route-resolution NAME=CHANNEL`, repeatable.
     pub route_resolution: Vec<String>,
     /// `--route-approvers NAME=users:U1,U2` or `NAME=group:S1`, repeatable.
@@ -6278,6 +6280,15 @@ pub enum ApprovalsOutput {
     Resolved {
         record: crate::api::ApprovalRecord,
     },
+    /// One-time delivery of a reusable operator credential. The token is never
+    /// persisted and is emitted only from this explicit mint result.
+    OperatorPrincipal {
+        delivery: crate::api::OperatorPrincipalDelivery,
+    },
+    /// One-time delivery of a subject-bound console login code.
+    ConsoleLoginCode {
+        delivery: crate::api::ConsoleLoginCodeDelivery,
+    },
     /// The agent's approval route bindings, read back after `--list-routes` or
     /// after a write. `routes` empty means no route is bound, so any route the
     /// bundle names escalates to a human rather than posting a card.
@@ -6330,6 +6341,20 @@ impl crate::ui::CliOutput for ApprovalsOutput {
             }),
             ApprovalsOutput::Resolved { record } => serde_json::json!({
                 "resolved": approval_record_json(record),
+            }),
+            ApprovalsOutput::OperatorPrincipal { delivery } => serde_json::json!({
+                "operator_principal": {
+                    "token": delivery.token,
+                    "subject": delivery.subject,
+                    "expires_at": delivery.expires_at,
+                },
+            }),
+            ApprovalsOutput::ConsoleLoginCode { delivery } => serde_json::json!({
+                "console_login_code": {
+                    "code": delivery.code,
+                    "subject": delivery.subject,
+                    "expires_at": delivery.expires_at,
+                },
             }),
             ApprovalsOutput::Routes { agent, routes } => serde_json::json!({
                 "agent": agent,
@@ -6408,6 +6433,25 @@ impl crate::ui::CliOutput for ApprovalsOutput {
                     record.status,
                     record.resolved_by.as_deref().unwrap_or("?")
                 ));
+            }
+            ApprovalsOutput::OperatorPrincipal { delivery } => {
+                ui.note(&format!(
+                    "minted an operator approval principal for {} (expires {}); assign the \
+                     token to CURIE_APPROVAL_PRINCIPAL_TOKEN without pasting it into shell history",
+                    delivery.subject, delivery.expires_at
+                ));
+                // This explicit mint result is the token's one delivery. Keep
+                // it off progress/error output and do not cache it.
+                ui.payload_plain(&delivery.token);
+            }
+            ApprovalsOutput::ConsoleLoginCode { delivery } => {
+                ui.note(&format!(
+                    "minted a console login code for {} (expires {})",
+                    delivery.subject, delivery.expires_at
+                ));
+                // The browser exchanges this plaintext once; the CLI never
+                // stores or repeats it.
+                ui.payload_plain(&delivery.code);
             }
             ApprovalsOutput::Routes { agent, routes } => {
                 if routes.is_empty() {
@@ -6522,6 +6566,65 @@ pub async fn approvals(
         || !cmd.route_approvers.is_empty()
         || cmd.routes_from.is_some()
         || cmd.clear_routes;
+
+    let mint_subject = match (
+        cmd.mint_operator_principal.as_deref(),
+        cmd.mint_console_login_code.as_deref(),
+    ) {
+        (Some(_), Some(_)) => {
+            return Err(crate::exit::usage(
+                "--mint-operator-principal and --mint-console-login-code are separate \
+                 administrative actions; run one per invocation",
+            ));
+        }
+        (Some(subject), None) => Some(("operator", subject)),
+        (None, Some(subject)) => Some(("console", subject)),
+        (None, None) => None,
+    };
+    if let Some((kind, subject)) = mint_subject {
+        if subject.trim().is_empty() {
+            return Err(crate::exit::usage(
+                "the principal subject must not be blank",
+            ));
+        }
+        if gate_mode
+            || cmd.list
+            || cmd.resolve.is_some()
+            || route_write
+            || cmd.list_routes
+            || cmd.reject
+            || cmd.note.is_some()
+        {
+            return Err(crate::exit::usage(
+                "principal bootstrap cannot be combined with gate, route, pending-list, \
+                 resolution, reject, or note flags; run it as a separate invocation",
+            ));
+        }
+        if opts.dry_run {
+            let endpoint = if kind == "operator" {
+                "approvals/principals/operator"
+            } else {
+                "console/login-codes"
+            };
+            return Ok(ApprovalsOutput::DryRun(crate::ui::DryRunPlan {
+                lines: vec![format!(
+                    "POST {}/{endpoint} subject={subject:?} (one-time credential is returned only by a real run)",
+                    opts.api_url
+                )],
+            }));
+        }
+        let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
+        return if kind == "operator" {
+            Ok(ApprovalsOutput::OperatorPrincipal {
+                delivery: client.mint_operator_principal(subject).await?,
+            })
+        } else {
+            Ok(ApprovalsOutput::ConsoleLoginCode {
+                delivery: client.mint_console_login_code(subject).await?,
+            })
+        };
+    }
+
     if route_write || cmd.list_routes {
         if gate_mode || cmd.list || cmd.resolve.is_some() {
             return Err(crate::exit::usage(
@@ -6609,7 +6712,8 @@ pub async fn approvals(
         });
     }
 
-    // --resolve <id> --as <user>: resolve one live approval record (#506). It is
+    // --resolve <id>: resolve one live approval record as the authenticated
+    // principal from CURIE_APPROVAL_PRINCIPAL_TOKEN (#1531, ADR-0106). It is
     // id-scoped, not gate config, so it is mutually exclusive with --gate/--clear/
     // --list. Approve by default; --reject rejects.
     if let Some(approval_id) = cmd.resolve {
@@ -6618,26 +6722,33 @@ pub async fn approvals(
                 "--resolve cannot be combined with --gate/--clear/--list",
             ));
         }
-        let actor = cmd.as_actor.ok_or_else(|| {
-            crate::exit::usage("--resolve requires --as <user> (the actor resolving it)")
-        })?;
         let decision = if cmd.reject { "rejected" } else { "approved" };
         if opts.dry_run {
             return Ok(ApprovalsOutput::DryRun(crate::ui::DryRunPlan {
                 lines: vec![format!(
-                    "POST {}/approvals/{approval_id}/resolve decision={decision} resolved_by={actor:?}",
+                    "POST {}/approvals/{approval_id}/resolve decision={decision} \
+                     (authenticated principal read from CURIE_APPROVAL_PRINCIPAL_TOKEN at execution)",
                     opts.api_url
                 )],
             }));
         }
+        let principal_token = std::env::var("CURIE_APPROVAL_PRINCIPAL_TOKEN")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                crate::exit::usage(
+                    "--resolve requires CURIE_APPROVAL_PRINCIPAL_TOKEN. Mint a reusable \
+                     operator credential with `curie <local|cluster> approvals <AGENT> \
+                     --mint-operator-principal <SUBJECT>`, export the one-time result, and retry",
+                )
+            })?;
         let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
         let record = client
             .resolve_approval(
                 &approval_id,
                 decision,
-                &actor,
+                &principal_token,
                 cmd.note.as_deref(),
-                cmd.actor_channel.as_deref(),
             )
             .await?;
         return Ok(ApprovalsOutput::Resolved { record });

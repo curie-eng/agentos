@@ -7,7 +7,7 @@
 #
 #   1. A SEALED render (security.allowDevDefaults defaults false, `lookup` empty
 #      offline under `helm template`) GENERATES a strong random value for each of
-#      the eleven chart-owned secret keys instead of shipping the published dev
+#      the twelve chart-owned secret keys instead of shipping the published dev
 #      default. The generated langfuseEncryptionKey is 64 lowercase-hex chars,
 #      and the two Langfuse init credentials are 32 alphanumeric chars.
 #   2. The DEV overlay (values-dev.yaml sets allowDevDefaults=true) keeps the
@@ -46,7 +46,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHART="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$(cd "$CHART/../.." && pwd)"
 
-# The eleven chart-owned secret keys, each with its published dev default.
+# The twelve chart-owned secret keys, each with its published dev default.
 KEYS=(
   postgresPassword
   valkeyPassword
@@ -58,6 +58,7 @@ KEYS=(
   langfuseInitProjectSecretKey
   langfuseInitUserPassword
   apiKey
+  approvalChatAttesterSecret
   githubWebhookSecret
 )
 # The published dev default for each of those keys. A `case` lookup rather than
@@ -80,6 +81,7 @@ default_for() {
     langfuseInitProjectSecretKey) printf '%s\n' "sk-lf-curie-dev" ;;
     langfuseInitUserPassword)     printf '%s\n' "curie-dev-password" ;;
     apiKey)                       printf '%s\n' "curie-dev-key" ;;
+    approvalChatAttesterSecret)   printf '%s\n' "curie-dev-approval-chat-attester" ;;
     githubWebhookSecret)          printf '%s\n' "dev-webhook-secret" ;;
     *) return 1 ;;
   esac
@@ -1728,4 +1730,4 @@ fi
 echo "  ok: the reverted direct-Alembic command is rejected (the assert can fail)"
 
 echo
-echo "PASS: sealed render generates strong values for all 11 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every control-plane pod, the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; every rendered pod surface receives its exact placement class while empty defaults omit placement fields and a platform-only label does not leak across classes; the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases; the security probe uses the configured RustFS port in DATATIER_TARGETS; and the API migration init command waits quietly with bounded retries before preserving the original Alembic upgrade, with readiness exhaustion proven to exit nonzero without invoking Alembic."
+echo "PASS: sealed render generates strong values for all 12 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every control-plane pod, the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; every rendered pod surface receives its exact placement class while empty defaults omit placement fields and a platform-only label does not leak across classes; the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases; the security probe uses the configured RustFS port in DATATIER_TARGETS; and the API migration init command waits quietly with bounded retries before preserving the original Alembic upgrade, with readiness exhaustion proven to exit nonzero without invoking Alembic."

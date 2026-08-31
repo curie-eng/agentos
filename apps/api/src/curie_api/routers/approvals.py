@@ -7,49 +7,91 @@ resolve endpoint owns the claim race: a conditional UPDATE picks exactly one
 winner, losers get 409 with who resolved it, and a past-SLA record flips to
 expired (410) instead of resolving.
 
-Authorization today is the shared API key, like every router. WHO may resolve
-(channel membership, self-approval block) is the server-side authorizer of
-#246 and slots in at this endpoint -- the decision point is deliberately here,
-on the server that owns the record, never inside the sandbox.
+Administrative and read routes retain platform API-key authentication. The
+resolver instead requires an authenticated chat, console, or operator principal
+and derives the actor and channel evidence from it (ADR-0106). The decision
+point remains here, on the server that owns the record, never in the sandbox.
 """
 
 import logging
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from curie_telemetry import operation_span, record_metric
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from opentelemetry.trace import SpanKind
 from sqlalchemy.exc import IntegrityError
 
-from .. import crud
-from ..auth import require_api_key
+from .. import approval_principal, crud
+from ..approval_auth import ApprovalPrincipalDep
+from ..auth import require_api_key, require_platform_key
 from ..authorizer import authorize_approval
 from ..config import get_settings
 from ..deps import ApproverSetSelectorDep, ResumeQueueDep, SessionDep
 from ..models import Approval, ApprovalStatus
 from ..resumequeue import build_expiry_resume_turn, build_resume_turn
-from ..schemas import ApprovalAuditOut, ApprovalOut, ApprovalResolve
+from ..schemas import (
+    ApprovalAuditOut,
+    ApprovalOut,
+    ApprovalPrincipalMint,
+    ApprovalPrincipalOut,
+    ApprovalResolve,
+)
 from ..wirebody import ApprovalRequestBody
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(
-    prefix="/approvals", tags=["approvals"], dependencies=[Depends(require_api_key)]
+router = APIRouter(prefix="/approvals", tags=["approvals"])
+
+
+@router.post(
+    "/principals/operator",
+    response_model=ApprovalPrincipalOut,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_platform_key)],
 )
+async def mint_operator_principal(
+    data: ApprovalPrincipalMint, response: Response
+) -> ApprovalPrincipalOut:
+    """Mint an operator credential; the platform key authorizes issuance only.
+
+    The token is returned once and marked non-cacheable.  Resolution will
+    authenticate the subject from this credential rather than accepting a
+    caller-supplied actor string.
+    """
+
+    now = datetime.now(UTC)
+    expires_at = now + timedelta(seconds=approval_principal.OPERATOR_TOKEN_TTL_SECONDS)
+    token = approval_principal.mint(
+        get_settings().api_key,
+        subject=data.subject,
+        kind="operator",
+        scope=approval_principal.APPROVE_SCOPE,
+        exp=int(expires_at.timestamp()),
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return ApprovalPrincipalOut(
+        token=token,
+        subject=data.subject,
+        expires_at=expires_at,
+    )
 
 
 def _expired(approval: Approval) -> bool:
     """True when a pending record's SLA has passed (naive-UTC comparison,
     matching the DateTime columns)."""
 
-    return (
-        approval.expires_at is not None
-        and approval.expires_at <= datetime.now(UTC).replace(tzinfo=None)
+    return approval.expires_at is not None and approval.expires_at <= datetime.now(UTC).replace(
+        tzinfo=None
     )
 
 
-@router.post("", response_model=ApprovalOut, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "",
+    response_model=ApprovalOut,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_api_key)],
+)
 async def create_approval(
     data: ApprovalRequestBody, session: SessionDep, response: Response
 ) -> ApprovalOut:
@@ -74,7 +116,7 @@ async def create_approval(
     return ApprovalOut.model_validate(approval)
 
 
-@router.get("", response_model=list[ApprovalOut])
+@router.get("", response_model=list[ApprovalOut], dependencies=[Depends(require_api_key)])
 async def list_approvals(
     session: SessionDep,
     status_filter: str | None = None,
@@ -92,7 +134,11 @@ async def list_approvals(
     return [ApprovalOut.model_validate(a) for a in approvals]
 
 
-@router.get("/{approval_id}", response_model=ApprovalOut)
+@router.get(
+    "/{approval_id}",
+    response_model=ApprovalOut,
+    dependencies=[Depends(require_api_key)],
+)
 async def get_approval(approval_id: uuid.UUID, session: SessionDep) -> ApprovalOut:
     approval = await crud.get_approval(session, approval_id)
     if approval is None:
@@ -100,10 +146,12 @@ async def get_approval(approval_id: uuid.UUID, session: SessionDep) -> ApprovalO
     return ApprovalOut.model_validate(approval)
 
 
-@router.get("/{approval_id}/audit", response_model=list[ApprovalAuditOut])
-async def get_approval_audit(
-    approval_id: uuid.UUID, session: SessionDep
-) -> list[ApprovalAuditOut]:
+@router.get(
+    "/{approval_id}/audit",
+    response_model=list[ApprovalAuditOut],
+    dependencies=[Depends(require_api_key)],
+)
+async def get_approval_audit(approval_id: uuid.UUID, session: SessionDep) -> list[ApprovalAuditOut]:
     """The approval's audit trail (#247), oldest first: every resolution
     attempt with the authorizer snapshot that counted or refused it."""
 
@@ -121,13 +169,15 @@ async def resolve_approval(
     session: SessionDep,
     resume_queue: ResumeQueueDep,
     approver_sets: ApproverSetSelectorDep,
+    principal: ApprovalPrincipalDep,
 ) -> ApprovalOut:
     """Claim the resolution (resolve-once) and wake the suspended session.
 
-    The authorizer runs first, server-side (#246): self-approval is blocked and
-    the route's approvers decide -- an explicit user list, a Slack user group,
-    or (declaring none) the card channel's members (#420); a denied actor gets
-    403 with the reason. Then exactly one authorized resolver wins
+    The authorizer runs first, server-side (#246): the route's approvers decide
+    whether the authenticated principal belongs -- an explicit user list, a
+    Slack user group, or (declaring none) the card channel's members (#420).
+    Requester equality neither grants nor vetoes membership. Then exactly one
+    authorized resolver wins
     the conditional UPDATE; a loser gets 409 naming who resolved it, and a
     past-SLA record flips to expired and returns 410 while still enqueuing the
     expiry resume turn so the suspended session wakes down its timeout branch.
@@ -152,9 +202,10 @@ async def resolve_approval(
     await session.commit()
     authorizer_name, decision = await authorize_approval(
         approval,
-        data.resolved_by,
-        data.actor_channel,
+        principal.subject,
+        principal.actor_channel,
         approver_set=approver_set,
+        principal_kind=principal.kind,
     )
 
     async def _audit(action: str, *, authorized: bool, reason: str | None) -> None:
@@ -165,8 +216,10 @@ async def resolve_approval(
             session,
             approval_id=approval_id,
             action=action,
-            actor=data.resolved_by,
-            actor_channel=data.actor_channel,
+            actor=principal.subject,
+            actor_channel=principal.actor_channel,
+            principal_kind=principal.kind,
+            authenticated=True,
             decision=data.decision,
             authorizer=authorizer_name,
             authorized=authorized,
@@ -283,7 +336,7 @@ async def resolve_approval(
             session,
             approval_id,
             decision=data.decision,
-            resolved_by=data.resolved_by,
+            resolved_by=principal.subject,
             note=data.note,
         )
     if claimed is None:

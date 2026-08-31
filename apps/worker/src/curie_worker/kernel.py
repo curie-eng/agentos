@@ -368,10 +368,11 @@ def _remaining_budget(lease: DeliveryLease | None) -> float | None:
 # (vs a resolve). Set by ``resumequeue.build_expiry_resume_turn`` on both expiry
 # paths (the #412 sweeper and a past-SLA resolve); ``build_resume_turn`` uses
 # ``[approval resolved]`` instead. This text marker -- not the turn author -- is
-# the expiry discriminator: ``author`` is caller-supplied on a resolve
-# (``resolved_by``), and "system" is the codebase's reserved machine-actor name
-# (e.g. the sweeper's audit rows), so a resolver named "system" would otherwise
-# get its resolved card wrongly stamped expired. The marker is a stable
+# the expiry discriminator: ``author`` is the authenticated resolver on a
+# resolve (``resolved_by``), and "system" is the codebase's reserved
+# machine-actor name (e.g. the sweeper's audit rows), so an authenticated
+# resolver whose subject is "system" would otherwise get the card wrongly
+# stamped expired. The marker is a stable
 # platform contract on a platform-authored turn -- not user-intent guessing.
 _EXPIRY_RESUME_MARKER = "[approval expired]"
 

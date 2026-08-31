@@ -74,6 +74,12 @@ fn pending_fields(out: &ApprovalsOutput) -> (usize, bool) {
         ApprovalsOutput::Routes { .. } => {
             panic!("expected the pending list, not the route bindings")
         }
+        ApprovalsOutput::OperatorPrincipal { .. } => {
+            panic!("expected the pending list, not an operator-principal mint")
+        }
+        ApprovalsOutput::ConsoleLoginCode { .. } => {
+            panic!("expected the pending list, not a console login-code mint")
+        }
     }
 }
 
@@ -203,6 +209,12 @@ async fn dry_run_plan_reports_the_same_limit_as_the_real_request() {
         ApprovalsOutput::Gates { .. } => panic!("expected a dry-run plan, not the gate view"),
         ApprovalsOutput::Resolved { .. } => {
             panic!("expected a dry-run plan, not a resolved record")
+        }
+        ApprovalsOutput::OperatorPrincipal { .. } => {
+            panic!("expected a dry-run plan, not an operator-principal mint")
+        }
+        ApprovalsOutput::ConsoleLoginCode { .. } => {
+            panic!("expected a dry-run plan, not a console login-code mint")
         }
     }
 }

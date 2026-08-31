@@ -1,4 +1,4 @@
-"""Console session exchange: mint a login code, trade it for a session cookie.
+"""Console session exchange and authenticated current-session inspection.
 
 ADR-0083, first slice (#1044) of #630. The console holds the shared platform
 administrator key in browser code today -- resolved from `?api_key=`, a build
@@ -8,45 +8,59 @@ logs and referrers, revocable only by rotating the Secret and restarting the API
 
 Two endpoints, deliberately asymmetric:
 
-- ``POST /console/login-codes`` requires the platform key. Minting is an
-  administrative act, and the CLI is the only intended caller.
+- ``POST /console/login-codes`` requires the immutable platform-key-only
+  dependency. Minting is an administrative act, and the CLI is the intended
+  caller. The administrator-selected subject is bound to the row at mint time.
 - ``POST /console/session`` requires NO credential, because the login code IS the
   credential being presented. It is the one unauthenticated write in the API, so
   it is bounded on purpose: the code is single-use and short-lived, a failure is
   indistinguishable from any other failure (so codes cannot be probed), and
   success grants a session, never the platform key.
 
-NOTHING CONSUMES A SESSION YET. ``require_api_key`` starts accepting one in slice
-2 (#1045); until then these endpoints are inert and the console is unchanged. That
-is the point of the slicing: the store and the exchange are provable on their own
-before anything depends on them.
+ADR-0106 consumes the live session only as an approval principal. The cookie
+does not become a platform key and cannot call either administrative mint.
 """
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from typing import Annotated
+
+from fastapi import APIRouter, Cookie, Depends, HTTPException, Response, status
 
 from .. import crud
-from ..auth import require_api_key
+from ..approval_auth import CONSOLE_SESSION_COOKIE
+from ..auth import require_platform_key
 from ..deps import SessionDep
-from ..schemas import ConsoleLoginCodeOut, ConsoleSessionExchange, ConsoleSessionOut
+from ..schemas import (
+    ConsoleLoginCodeMint,
+    ConsoleLoginCodeOut,
+    ConsoleSessionExchange,
+    ConsoleSessionOut,
+)
 
 router = APIRouter(prefix="/console", tags=["console"])
 
 #: The cookie the console authenticates with. `HttpOnly` is the property that
 #: makes this strictly stronger than the status quo: page script cannot read it,
 #: so injected script cannot exfiltrate the credential it authenticates with.
-SESSION_COOKIE = "curie_console_session"
+SESSION_COOKIE = CONSOLE_SESSION_COOKIE
 
 
 @router.post(
     "/login-codes",
     response_model=ConsoleLoginCodeOut,
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(require_api_key)],
+    dependencies=[Depends(require_platform_key)],
 )
-async def create_login_code(session: SessionDep) -> ConsoleLoginCodeOut:
+async def create_login_code(
+    data: ConsoleLoginCodeMint, session: SessionDep, response: Response
+) -> ConsoleLoginCodeOut:
     """Mint a single-use login code for an operator to copy into the console."""
-    code, row = await crud.create_console_login_code(session)
-    return ConsoleLoginCodeOut(code=code, expires_at=row.login_code_expires_at)
+    code, row = await crud.create_console_login_code(session, subject=data.subject)
+    response.headers["Cache-Control"] = "no-store"
+    return ConsoleLoginCodeOut(
+        code=code,
+        subject=data.subject,
+        expires_at=row.login_code_expires_at,
+    )
 
 
 @router.post("/session", response_model=ConsoleSessionOut)
@@ -83,4 +97,35 @@ async def exchange_login_code(
     # Note the response body: an expiry, never the token. Returning it would hand
     # the credential back to the JavaScript this whole design keeps it from.
     assert row.session_expires_at is not None  # set by the exchange above
-    return ConsoleSessionOut(expires_at=row.session_expires_at)
+    response.headers["Cache-Control"] = "no-store"
+    return ConsoleSessionOut(subject=row.subject, expires_at=row.session_expires_at)
+
+
+@router.get("/session", response_model=ConsoleSessionOut)
+async def current_session(
+    session: SessionDep,
+    response: Response,
+    console_session: Annotated[str | None, Cookie(alias=SESSION_COOKIE)] = None,
+) -> ConsoleSessionOut:
+    """Return the immutable subject of the live session in the HttpOnly cookie."""
+
+    row = await crud.live_console_session(session, console_session or "")
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="missing, invalid, or expired console session",
+            headers={"Cache-Control": "no-store"},
+        )
+    subject = row.subject
+    expires_at = row.session_expires_at
+    if subject is None or not subject.strip() or expires_at is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="missing, invalid, or expired console session",
+            headers={"Cache-Control": "no-store"},
+        )
+    response.headers["Cache-Control"] = "no-store"
+    return ConsoleSessionOut(
+        subject=subject,
+        expires_at=expires_at,
+    )

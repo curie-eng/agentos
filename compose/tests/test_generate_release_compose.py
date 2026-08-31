@@ -403,6 +403,33 @@ def test_dispatcher_api_key_matches_the_api():
         )
 
 
+def test_approval_chat_attester_secret_is_independent_and_minimally_distributed():
+    """Slack approval attestation uses its own HMAC key on both compose forms.
+
+    The API key authenticates administrators and must not also let its holder
+    forge a Slack click. Only the attestation producer (dispatcher) and verifier
+    (API) receive this key; the worker and browser UI must not.
+    """
+    env_name = "CURIE_APPROVAL_CHAT_ATTESTER_SECRET"
+    for label, doc in compose_docs():
+        services = doc["services"]
+        dispatcher = env_map(services["curie-dispatcher"])
+        api = env_map(services["curie-api"])
+
+        assert dispatcher.get(env_name), f"{label}: dispatcher has no {env_name}"
+        assert api.get(env_name), f"{label}: API has no {env_name}"
+        assert dispatcher[env_name] == api[env_name], (
+            f"{label}: dispatcher and API use different chat attestation keys"
+        )
+        assert api[env_name] != api["API_KEY"], (
+            f"{label}: chat attestation key reuses the platform API key"
+        )
+        for service_name in ("curie-worker", "curie-ui"):
+            assert env_name not in env_map(services[service_name]), (
+                f"{label}: {service_name} must not receive the chat attestation key"
+            )
+
+
 def test_dispatcher_depends_on_api_healthy():
     """The dispatcher waits for the API to be healthy before it starts.
 

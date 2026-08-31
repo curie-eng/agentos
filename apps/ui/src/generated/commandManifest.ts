@@ -363,14 +363,6 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "The actor resolving the approval (paired with --resolve on local/cluster). Accepted here only so a local/cluster-style resolve invocation is declined cleanly, not rejected as an unknown flag",
-              "id": "as_actor",
-              "long": "as",
-              "positional": false,
-              "required": false
-            },
-            {
-              "global": false,
               "help": "Reject instead of approve (paired with --resolve). Accepted only to be declined cleanly at this tier",
               "id": "reject",
               "long": "reject",
@@ -1740,17 +1732,9 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Resolve the approval with this id (approve by default; requires --as)",
+              "help": "Resolve the approval with this id (approve by default). Authentication comes from CURIE_APPROVAL_PRINCIPAL_TOKEN",
               "id": "resolve",
               "long": "resolve",
-              "positional": false,
-              "required": false
-            },
-            {
-              "global": false,
-              "help": "The actor resolving the approval (required with --resolve). The requester and approver may differ; the server blocks self-approval",
-              "id": "as_actor",
-              "long": "as",
               "positional": false,
               "required": false
             },
@@ -1776,9 +1760,17 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Channel id asserting the operator's membership, required by channel-authorized approval gates (with --resolve)",
-              "id": "actor_channel",
-              "long": "actor-channel",
+              "help": "Administratively mint a reusable, subject-bound operator principal. The token is delivered once; export it as CURIE_APPROVAL_PRINCIPAL_TOKEN before resolving",
+              "id": "mint_operator_principal",
+              "long": "mint-operator-principal",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Administratively mint a single-use, subject-bound Console login code",
+              "id": "mint_console_login_code",
+              "long": "mint-console-login-code",
               "positional": false,
               "required": false
             },
@@ -4729,17 +4721,9 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Resolve the approval with this id (approve by default; requires --as)",
+              "help": "Resolve the approval with this id (approve by default). Authentication comes from CURIE_APPROVAL_PRINCIPAL_TOKEN",
               "id": "resolve",
               "long": "resolve",
-              "positional": false,
-              "required": false
-            },
-            {
-              "global": false,
-              "help": "The actor resolving the approval (required with --resolve). The requester and approver may differ; the server blocks self-approval",
-              "id": "as_actor",
-              "long": "as",
               "positional": false,
               "required": false
             },
@@ -4765,9 +4749,17 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Channel id asserting the operator's membership, required by channel-authorized approval gates (with --resolve)",
-              "id": "actor_channel",
-              "long": "actor-channel",
+              "help": "Administratively mint a reusable, subject-bound operator principal. The token is delivered once; export it as CURIE_APPROVAL_PRINCIPAL_TOKEN before resolving",
+              "id": "mint_operator_principal",
+              "long": "mint-operator-principal",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Administratively mint a single-use, subject-bound Console login code",
+              "id": "mint_console_login_code",
+              "long": "mint-console-login-code",
               "positional": false,
               "required": false
             },

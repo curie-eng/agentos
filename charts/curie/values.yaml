@@ -758,6 +758,12 @@ api:
   # Single shared API key the UI and CLI authenticate with. Dev default; override
   # (or point at an existingSecret) in any shared deployment.
   apiKey: curie-dev-key
+  # Dedicated HMAC secret shared only by the Slack dispatcher (which attests a
+  # click's authenticated user/channel) and API (which verifies it). It MUST
+  # differ from apiKey: otherwise every platform-key holder could forge chat
+  # approval evidence. A sealed install generates and persists this value
+  # independently; values-dev.yaml keeps the published deterministic default.
+  approvalChatAttesterSecret: curie-dev-approval-chat-attester
   # Human-readable org/workspace name the UI reads from the open /config endpoint.
   # Override to white-label the app for a deployment.
   orgName: Curie

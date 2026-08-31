@@ -52,7 +52,11 @@ def main() -> int:
     try:
         payload = sys.stdin.read()
         try:
-            config = DispatcherConfig()
+            # BaseSettings supplies the required chat-attester secret from the
+            # environment; mypy sees only the constructor signature, not that
+            # runtime settings source. The one-shot path still validates the
+            # full process config so every dispatcher entrypoint fails closed.
+            config = DispatcherConfig()  # type: ignore[call-arg]
             redis_client = build_redis(config)
             stream_id = enqueue_payload(
                 payload,

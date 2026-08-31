@@ -2232,7 +2232,7 @@ fn approval_record() -> ApprovalRecord {
         summary: "run tests".to_string(),
         expires_at: Some("2026-01-01T00:00:00Z".to_string()),
         resolved_by: None,
-        // #1078: the field --actor-channel is derived from.
+        // #1078: the persisted card location for a route-bound approval.
         card_channel: Some("CFINANCE01".to_string()),
     }
 }

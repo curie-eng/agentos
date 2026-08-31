@@ -49,6 +49,8 @@ from .conftest import FakeSocketClient, _authorize, _black_hole_api
 APPROVAL_ID = "9a1e8a10-0000-0000-0000-000000001053"
 CARD_TS = "1700.0042"
 CARD_CHANNEL = "C_MGRS"
+_PLATFORM_API_KEY = "platform-api-test-key"
+_CHAT_ATTESTER_SECRET = "dispatcher-attester-test-secret"
 
 _CARD_MESSAGE: dict[str, Any] = {
     "ts": CARD_TS,
@@ -72,20 +74,64 @@ class ScriptedResolver:
         approval_id: str,
         *,
         decision: str,
-        resolved_by: str,
-        actor_channel: str,
+        attested_user: str,
+        attested_channel: str,
         note: str | None = None,
     ) -> ResolveOutcome:
         self.calls.append(
             {
                 "approval_id": approval_id,
                 "decision": decision,
-                "resolved_by": resolved_by,
-                "actor_channel": actor_channel,
+                "attested_user": attested_user,
+                "attested_channel": attested_channel,
                 "note": note,
             }
         )
         return self.outcome
+
+
+class _CapturingHttpResponse:
+    status_code = 200
+    text = ""
+
+    def json(self) -> dict[str, str]:
+        return {"status": "approved", "resolved_by": "U_MANAGER"}
+
+
+class _CapturingHttpClient:
+    """Records the real resolve client's request at its one HTTP seam."""
+
+    def __init__(self) -> None:
+        self.requests: list[dict[str, Any]] = []
+
+    def post(
+        self, url: str, *, json: dict[str, Any], headers: dict[str, str]
+    ) -> _CapturingHttpResponse:
+        self.requests.append({"url": url, "json": json, "headers": headers})
+        return _CapturingHttpResponse()
+
+
+def _claims(token: str) -> dict[str, Any]:
+    """Decode claims only; signature correctness is pinned in the click suite."""
+
+    _prefix, payload, _signature = token.split(".")
+    import base64
+    import json
+
+    return json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+
+
+def _wire_resolver() -> tuple[ApprovalResolveClient, _CapturingHttpClient]:
+    captured = _CapturingHttpClient()
+    return (
+        ApprovalResolveClient(
+            api_base_url="https://api.example.test",
+            api_key=_PLATFORM_API_KEY,
+            approval_chat_attester_secret=_CHAT_ATTESTER_SECRET,
+            client=captured,  # type: ignore[arg-type]
+        ),
+        captured,
+    )
 
 
 def _gated_history(gate: threading.Event) -> Callable[..., dict[str, Any]]:
@@ -269,8 +315,8 @@ def test_submitting_the_dialog_resolves_with_the_typed_note(
         {
             "approval_id": APPROVAL_ID,
             "decision": "approved",
-            "resolved_by": "U_MANAGER",
-            "actor_channel": CARD_CHANNEL,
+            "attested_user": "U_MANAGER",
+            "attested_channel": CARD_CHANNEL,
             "note": "approved for Q3",
         }
     ]
@@ -282,6 +328,87 @@ def test_submitting_the_dialog_resolves_with_the_typed_note(
     assert kwargs["channel"] == CARD_CHANNEL and kwargs["ts"] == CARD_TS
     assert "approved for Q3" in kwargs["text"]
     assert not any(b.get("type") == "actions" for b in kwargs["blocks"])
+
+
+def test_modal_submit_posts_the_note_with_a_chat_principal(
+    redis_client: redis.Redis, config: DispatcherConfig
+) -> None:
+    """A modal's private metadata may locate a card, never assert its actor.
+
+    The Socket Mode envelope is the identity source. Even though the modal
+    reconstructs its channel from private metadata, the outbound proof must
+    bind the real authenticated user, that card channel, and the approval id.
+    """
+
+    resolver, captured = _wire_resolver()
+    app, _ = _build(config, redis_client, resolver)  # type: ignore[arg-type]
+    handler = SocketModeHandler(app, app_token="xapp-test")
+
+    handler.handle(
+        FakeSocketClient(),
+        _note_submit(
+            "env-principal-modal",
+            note="approved for Q3",
+            user="U_MODAL_APPROVER",
+        ),
+    )
+    _drain(app)
+
+    assert len(captured.requests) == 1
+    request = captured.requests[0]
+    assert request["json"] == {
+        "decision": "approved",
+        "note": "approved for Q3",
+    }
+    claims = _claims(request["headers"]["X-Curie-Approval-Principal"])
+    expected_claims = {
+        "approval_id": APPROVAL_ID,
+        "sub": "U_MODAL_APPROVER",
+        "actor_channel": CARD_CHANNEL,
+        "kind": "chat",
+        "scope": "approval.resolve",
+    }
+    assert {key: claims[key] for key in expected_claims} == expected_claims
+    assert isinstance(claims["exp"], int) and claims["exp"] > 0
+
+
+def test_failed_modal_open_falls_forward_with_the_same_chat_principal(
+    redis_client: redis.Redis, config: DispatcherConfig
+) -> None:
+    """The note enrichment failure must not fall back to asserted identity."""
+
+    resolver, captured = _wire_resolver()
+    app, _ = _build(
+        config,
+        redis_client,
+        resolver,  # type: ignore[arg-type]
+        views_open_raises=True,
+    )
+    handler = SocketModeHandler(app, app_token="xapp-test")
+
+    handler.handle(
+        FakeSocketClient(),
+        _note_click(
+            "env-principal-fall-forward",
+            action_id=APPROVE_NOTE_ACTION_ID,
+            user="U_FALL_FORWARD_APPROVER",
+        ),
+    )
+    _drain(app)
+
+    assert len(captured.requests) == 1
+    request = captured.requests[0]
+    assert request["json"] == {"decision": "approved"}
+    claims = _claims(request["headers"]["X-Curie-Approval-Principal"])
+    expected_claims = {
+        "approval_id": APPROVAL_ID,
+        "sub": "U_FALL_FORWARD_APPROVER",
+        "actor_channel": CARD_CHANNEL,
+        "kind": "chat",
+        "scope": "approval.resolve",
+    }
+    assert {key: claims[key] for key in expected_claims} == expected_claims
+    assert isinstance(claims["exp"], int) and claims["exp"] > 0
 
 
 def test_a_blank_note_resolves_with_no_note_at_all(
@@ -372,7 +499,10 @@ def test_a_refused_submission_does_not_stamp_the_card(
     redis_client: redis.Redis, config: DispatcherConfig
 ) -> None:
     resolver = ScriptedResolver(
-        ResolveOutcome(status_code=403, detail="self-approval is blocked")
+        ResolveOutcome(
+            status_code=403,
+            detail="operator approval principals require an explicit user list",
+        )
     )
     app, web_client = _build(config, redis_client, resolver)
     handler = SocketModeHandler(app, app_token="xapp-test")
@@ -384,7 +514,7 @@ def test_a_refused_submission_does_not_stamp_the_card(
     web_client.chat_update.assert_not_called()
     payload = sock.ack_payload_for("env-n7")
     assert payload is not None
-    assert "self-approval is blocked" in next(iter(payload["errors"].values()))
+    assert "explicit user list" in next(iter(payload["errors"].values()))
 
 
 def test_a_failed_views_open_falls_forward_and_resolves(
@@ -430,7 +560,7 @@ def test_a_failed_views_open_reports_a_403_refusal_to_the_clicker(
     resolver = ScriptedResolver(
         ResolveOutcome(
             status_code=403,
-            detail="self-approval is blocked: the requester cannot resolve their own request",
+            detail="operator approval principals require an explicit user list",
         )
     )
     app, web_client = _build(config, redis_client, resolver, views_open_raises=True)
@@ -444,7 +574,7 @@ def test_a_failed_views_open_reports_a_403_refusal_to_the_clicker(
     text = web_client.chat_postEphemeral.call_args.kwargs["text"]
     # The API's own reason, verbatim: the refusal classes stay distinguishable
     # (#453 AC5), so this must not read like a generic failure.
-    assert "self-approval is blocked" in text, text
+    assert "explicit user list" in text, text
     # A refusal is not a resolution: the card keeps its live buttons.
     web_client.chat_update.assert_not_called()
 
@@ -570,9 +700,7 @@ def test_a_refused_submission_acks_before_the_card_read_and_still_refreshes_it(
             "a refused submission must ack with a response_action before any Slack call"
         )
         assert payload.get("response_action") == "errors"
-        assert (
-            next(iter(payload["errors"].values())) == "already resolved by U_FIRST (approved)"
-        )
+        assert next(iter(payload["errors"].values())) == "already resolved by U_FIRST (approved)"
     finally:
         gate.set()
     _drain(app)
@@ -721,9 +849,9 @@ def test_a_stamped_card_keeps_its_summary_in_blocks_and_in_the_fallback(
     kwargs = web_client.chat_update.call_args.kwargs
     rendered = list(kwargs["blocks"])
     assert rendered[0]["type"] == "header", "the header must survive the stamp"
-    assert any(
-        "Discount for ACME" in (b.get("text") or {}).get("text", "") for b in rendered
-    ), f"the summary block must survive the stamp, got {rendered}"
+    assert any("Discount for ACME" in (b.get("text") or {}).get("text", "") for b in rendered), (
+        f"the summary block must survive the stamp, got {rendered}"
+    )
     assert not any(b.get("type") == "actions" for b in rendered), "buttons must go"
     assert "Discount for ACME" in kwargs["text"], "the fallback must carry the summary"
     assert "approved for Q3" in kwargs["text"]
@@ -803,15 +931,16 @@ def test_a_real_api_conflict_carries_no_resolver_id_and_names_the_approver_in_it
 
     client = ApprovalResolveClient(
         api_base_url="http://platform.invalid",
-        api_key="k",
+        api_key=_PLATFORM_API_KEY,
+        approval_chat_attester_secret=_CHAT_ATTESTER_SECRET,
         client=httpx.Client(transport=httpx.MockTransport(_conflict)),
     )
     try:
         outcome = client.resolve(
             APPROVAL_ID,
             decision="approved",
-            resolved_by="U_MANAGER",
-            actor_channel=CARD_CHANNEL,
+            attested_user="U_MANAGER",
+            attested_channel=CARD_CHANNEL,
             note="mine",
         )
     finally:
@@ -838,7 +967,12 @@ def test_a_discarded_outcome_does_not_read_the_card_at_all(
     case in ``test_a_refused_submission_acks_before_the_card_read_and_still_refreshes_it``.
     """
 
-    resolver = ScriptedResolver(ResolveOutcome(status_code=403, detail="self-approval is blocked"))
+    resolver = ScriptedResolver(
+        ResolveOutcome(
+            status_code=403,
+            detail="operator approval principals require an explicit user list",
+        )
+    )
     app, web_client = _build(config, redis_client, resolver)
     handler = SocketModeHandler(app, app_token="xapp-test")
 
@@ -872,14 +1006,18 @@ def test_the_resolver_gives_up_inside_the_ack_budget() -> None:
     """
 
     with _black_hole_api() as url:
-        client = ApprovalResolveClient(api_base_url=url, api_key="k")
+        client = ApprovalResolveClient(
+            api_base_url=url,
+            api_key=_PLATFORM_API_KEY,
+            approval_chat_attester_secret=_CHAT_ATTESTER_SECRET,
+        )
         try:
             started = time.monotonic()
             outcome = client.resolve(
                 APPROVAL_ID,
                 decision="approved",
-                resolved_by="U_MANAGER",
-                actor_channel=CARD_CHANNEL,
+                attested_user="U_MANAGER",
+                attested_channel=CARD_CHANNEL,
             )
             elapsed = time.monotonic() - started
         finally:

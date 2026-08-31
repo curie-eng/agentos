@@ -8,15 +8,18 @@ is allowed to resolve it, and what your skill has to do when the decision comes 
 The narrative "why" behind the shape lives in the ADRs, chiefly
 [ADR-0010](adr/0010-approval-gates-and-human-in-the-loop.md) (the approval primitive)
 and [ADR-0034](adr/0034-approval-authorizers-resolve-membership-in-the-api.md) (one
-authorizer over swappable approver sets). This page is the "how do I use it".
+authorizer over swappable approver sets), extended by
+[ADR-0106](adr/0106-an-approver-is-an-authenticated-principal.md) (authenticated
+resolver identity and authorized self-confirmation). This page is the "how do I use it".
 
 ## The one-paragraph version
 
 A run raises an approval. The worker persists a durable record, suspends the sandbox,
 and posts one interactive card to the request route's **resolution** target. The route
 may also name a **notification** target, which receives a text-only ping directing humans
-to the configured approval channel without disclosing its identifier. A human resolves on
-the one card; the platform authorizes that person
+to the configured approval channel without disclosing its identifier. An authenticated
+principal resolves on the card, in the Console, or from the CLI; the platform derives the
+person from that credential and authorizes them
 **server-side**, wakes the suspended session with a platform-authored turn carrying the
 decision, and the agent finishes the job it started. Nothing about the decision is
 trusted from inside the sandbox, and nothing holds a worker slot while a human thinks.
@@ -72,6 +75,15 @@ platform binds to a channel per deployment. Declaring a route this way means the
 validates the model's `route` argument against it in-turn: an unknown route comes back
 as a tool error naming the valid ones, so the model can retry inside the same turn
 instead of burning it.
+
+Policy gates do not grant a tool call after approval by default. Set
+`"grantableViaPolicy": true` on a gate only when an approval should authorize one call to
+that gate's tool on the resume turn. Grantable policy is unambiguous per route: every
+grantable gate claiming one route must name the same tool. Repeating that same tool is
+valid; assigning two distinct grantable tools to one route is rejected as
+`approval_policy.grant_route_ambiguous`. This keeps the route-to-granted-tool mapping
+single-valued rather than letting a model-selected request decide which tool receives the
+one-shot allowance.
 
 View what a bundle declares, offline and with no credential:
 
@@ -163,12 +175,12 @@ One authorizer decides, and the swappable part behind it is the approver set
 (`apps/api/src/curie_api/authorizer.py`, `apps/api/src/curie_api/approvers.py`). The
 precedence is fixed: `users` beats `group` beats channel membership.
 
-| Declared | Set | Lookup | Does the click channel matter? |
+| Declared | Set | Lookup | Eligible principal |
 |---|---|---|---|
-| nothing, and the route is bound (or the approval has no route at all) | `SlackChannelMembers` | none, the click's channel is the proof | yes, it is the only test |
-| nothing, and the approval names a route that is **not** bound | `UnboundRoute` — refuses everyone | none, there is no set to resolve | no, nobody is admitted |
-| `approvers.group: S...` | `SlackUserGroupMembers` | Slack `usergroups.users.list` | no |
-| `approvers.users: [U...]` | `ExplicitUsers` | none, pure config | no |
+| nothing, and the route is bound (or the approval has no route at all) | `SlackChannelMembers` | none, the attested card channel is the proof | authenticated `chat` only |
+| nothing, and the approval names a route that is **not** bound | `UnboundRoute` — refuses everyone | none, there is no set to resolve | none |
+| `approvers.group: S...` | `SlackUserGroupMembers` | Slack `usergroups.users.list` | authenticated `chat` or `console` |
+| `approvers.users: [U...]` | `ExplicitUsers` | none, pure config | authenticated `chat`, `console`, or `operator` |
 
 Because `users` and `group` ignore the click channel entirely, a card can sit in a room
 everyone can read while only a narrow set may act. That unfusing of *where* from *who*
@@ -188,15 +200,37 @@ remember to do from the CLI. If a deployment turns out to want the opt-out, it w
 operator-written config, never a bundle-declared field: an agent must not get to widen
 how its own approvals are collected.
 
-Three properties worth knowing before you design around this:
+An approver is always an authenticated principal, never a name or channel supplied in the
+resolve body. The API derives `resolved_by` and any channel evidence from exactly one of
+three credential paths:
 
-- **Self-approval is refused under every set.** The author of the turn that raised the
-  request may not resolve it, from any channel. The check runs before any set is
-  consulted, so no set can skip it. Testing an approval flow therefore needs a second
-  actor.
+- **`chat`** — the dispatcher attests the Slack user, card channel, and approval ID from
+  the authenticated Socket Mode interaction. The short-lived attestation is usable only
+  for that approval.
+- **`console`** — a single-use, subject-bound login code creates an HttpOnly same-origin
+  session. The Console shows that immutable subject and never asks who is resolving.
+- **`operator`** — an administrator mints a reusable, subject-bound terminal token. It
+  carries no channel evidence, so it can resolve only a route whose explicit `users` list
+  contains its subject. The stateless token is valid for twelve hours and has no
+  per-token revocation; rotate the platform API key to invalidate it before expiry.
+
+The shared platform API key administers principal issuance but is not a person. By itself
+it cannot resolve an approval. `POST /approvals/{id}/resolve` accepts policy input only:
+`decision` and optional `note`; `resolved_by` and `actor_channel` are rejected.
+
+Four properties worth knowing before you design around this:
+
+- **Requester equality neither grants nor denies.** The authorizer always consults the
+  selected set, including when the authenticated principal also requested the turn. A
+  requester who belongs may approve; one who does not remains denied. Two-person
+  separation of duties requires a distinct future policy and is not implicit in an
+  ordinary approval gate.
 - **The buttons are visible to everyone in the channel.** Slack cannot hide a button per
   user, so authorization is enforced when the click arrives, not by hiding the control.
   A refused click gets a private, reasoned refusal.
+- **Terminal principals are explicit-user only.** A Console session also carries no
+  channel, but its authenticated subject may be checked by the API's Slack user-group
+  lookup. Neither principal can satisfy the channel-membership set.
 - **A lookup that fails denies.** A group route with no bot token, or a Slack
   outage, reports "could not verify approver group membership" and refuses. It never falls back to channel
   membership, because that would silently widen the set an operator narrowed.
@@ -244,11 +278,18 @@ a bare runner keeps no durable store
 # what is pending: each record's id, summary, and the route it named
 curie local approvals my-agent --list
 
-# settle one as a named actor (must not be the requester)
-curie local approvals my-agent --resolve <id> --as U0MANAGER --actor-channel C0EXAMPLE3 --note "approved for Q3"
+# mint a reusable token for a subject named in the route's explicit users list
+curie local approvals my-agent --mint-operator-principal U0EXAMPLE1
+export CURIE_APPROVAL_PRINCIPAL_TOKEN=<one-time-output>
+
+# settle one as the authenticated token subject
+curie local approvals my-agent --resolve <id> --note "approved for Q3"
 
 # reject instead
-curie local approvals my-agent --resolve <id> --as U0MANAGER --reject --note "discount too deep"
+curie local approvals my-agent --resolve <id> --reject --note "discount too deep"
+
+# create the Console's single-use, subject-bound login code instead
+curie local approvals my-agent --mint-console-login-code U0EXAMPLE1
 
 # which tools are gated behind approval
 curie local approvals my-agent
@@ -257,11 +298,14 @@ curie local approvals my-agent
 Resolution is **once-only**: the first authorized resolver wins the compare-and-set, and
 a later one is told who won rather than overwriting the decision.
 
-`--actor-channel` is what proves channel membership for the default approver set. The
-channel to pass is the record's route resolution address, or the requesting channel when
-`--list` shows the record named no route. The notification address is never valid channel
-evidence. A route that declares `approvers.users` or `approvers.group` ignores the channel
-entirely, so passing it there is harmless.
+The CLI never asks for an actor or channel. `CURIE_APPROVAL_PRINCIPAL_TOKEN` proves the
+operator subject and carries no channel, so terminal resolution works only for an explicit
+`approvers.users` route. Use the authenticated Slack card for channel-membership or group
+routes. When a turn parks, its resolve hint names the approval's real `card_channel` — the
+route-bound resolution address when one was configured, not the requesting-channel stub —
+so a human knows where that authenticated card lives. A null or empty `card_channel` is
+from an older row or a direct API write that omitted the field; for that compatibility
+case, the requesting channel is the card location.
 
 ## Operational guarantees
 
@@ -277,15 +321,24 @@ entirely, so passing it there is harmless.
   reconciler re-drives resolutions whose resume turn never landed
   (`apps/api/src/curie_api/resumereconciler.py`).
 - **Every attempt is audited.** `GET /approvals/{id}/audit` returns each resolution
-  attempt with the authorizer that decided and the membership evidence it decided on,
-  including refusals.
+  attempt with the authorizer, membership evidence, `principal_kind`, and
+  `authenticated` proof state, including refusals. Historical rows remain
+  `principal_kind: null` and `authenticated: false`; they are not retroactively trusted.
+- **Roll the API before the dispatcher.** The identity contract intentionally has no
+  assertion-compatible dual mode. During an upgrade, bring up the verifier first, then
+  the attester; the reverse order is rejected rather than reopening asserted identity.
+- **Console resolution requires HTTPS.** Its session cookie is `Secure`, `HttpOnly`, and
+  same-site. A browser on a plain-HTTP endpoint will not retain the credential.
 
 ## Common failures
 
 | Symptom | Cause and fix |
 |---|---|
-| `403 self-approval is blocked` | You are the author of the turn that raised it. Resolve as a different actor. |
-| `403 you are not an approver` | The route's set does not admit that actor from that channel. Pass the record's `card_channel` as `--actor-channel` (`--list --json` reports it since #1078), or check the `approvers` block. A null `card_channel` is from an older row or a direct API write that omitted the field, so use the requesting channel. |
+| `401 missing or invalid approval principal` | A platform API key alone cannot resolve. For an explicit-user route, mint an operator principal, export it as `CURIE_APPROVAL_PRINCIPAL_TOKEN`, and retry; otherwise use the authenticated Slack card or a live Console session. |
+| `403 operator approval principals can resolve only routes bound to an explicit user list` | Terminal credentials carry no Slack membership evidence. Add the subject to an explicit `approvers.users` binding, or resolve through the authenticated card. |
+| `403 console approval principals can resolve only routes bound to an explicit user list or verifiable user group` | The Console session carries no channel evidence. Use an explicit `approvers.users` binding, a group the API can verify, or the authenticated card. |
+| Console login succeeds but session inspection or resolve returns `401` | Serve the Console over HTTPS. Its `Secure` session cookie is deliberately not retained on plain HTTP. |
+| `403 you are not an approver` | The selected set does not admit the authenticated principal. Check the `approvers` block and current membership. Requester equality does not bypass or veto that check. |
 | `403 could not verify approvers` | The declared `approvers` block is malformed and cannot be evaluated. Correct its `users` or `group` value, then replace the complete route map. |
 | `403 could not verify approvers: ... route is no longer bound` | The approval named a route whose binding was cleared or rewritten while it was pending — `--clear-routes`, a `--routes-from` file that omits the route, or any `--route` write, since a write is a full replacement. A pending approval is resolvable only through its own route's binding (ADR-0123), so it fails closed rather than widening to card-channel membership. Restore the binding and the approval resolves normally; it is not lost. |
 | `403 could not verify approver group membership` | Slack group membership could not be verified. This fails closed and does not name its cause. Check the API `SLACK_BOT_TOKEN`, its `usergroups:read` scope and reinstallation, and Slack availability. It never falls back to channel membership. |

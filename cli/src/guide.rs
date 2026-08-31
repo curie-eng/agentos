@@ -262,9 +262,32 @@ pub fn primer() -> Primer {
                              (a Slack user group) beats the card channel's members, which is the \
                              zero-setup default when no approvers block is declared. users and \
                              group ignore the click channel entirely, so a card can sit in a \
-                             room everyone reads while a narrow set decides. Every check runs \
+                             room everyone reads while a narrow set decides. The API authorizes \
+                             an authenticated principal against that selected set; it never \
+                             trusts a caller-selected name or channel. Every check runs \
                              server-side: the buttons are visible to all, and a refused click \
                              gets a private reason.",
+                },
+                ApprovalFact {
+                    title: "Terminal and Console identity are bootstrapped explicitly",
+                    detail: "An administrator can mint a reusable operator token with \
+                             `approvals <AGENT> --mint-operator-principal <SUBJECT>`, then export \
+                             its one-time result as CURIE_APPROVAL_PRINCIPAL_TOKEN before running \
+                             --resolve. A terminal principal carries no channel evidence, so it \
+                             works only when the route uses an explicit-user approver list. \
+                             `--mint-console-login-code <SUBJECT>` instead creates a subject-bound \
+                             one-time browser login: the Console can use an explicit-user list or \
+                             a Slack user group the server verifies for that subject, but never \
+                             channel membership. For a channel-backed route, use the authenticated \
+                             card; neither bootstrap mode may invent membership.",
+                },
+                ApprovalFact {
+                    title: "Authorized requesters may self-confirm",
+                    detail: "An ordinary gate is a confirmation, not an implicit two-person \
+                             policy. The authenticated requester may self-confirm when that same \
+                             principal belongs to the configured approver set; matching the author \
+                             neither grants membership nor vetoes it. A workflow requiring \
+                             separation of duties needs a distinct policy.",
                 },
                 ApprovalFact {
                     title: "A decision can carry a reason",
@@ -285,20 +308,22 @@ pub fn primer() -> Primer {
                 ApprovalFact {
                     title: "Driving it with no workspace connected",
                     detail: "--list reports each pending record's id, summary, and the route it \
-                             named; --resolve settles one as a named actor. Resolution is \
+                             named; --resolve settles one as the authenticated principal from \
+                             CURIE_APPROVAL_PRINCIPAL_TOKEN. Resolution is \
                              once-only: the first authorized resolver wins and a later one is \
                              told who won.",
                 },
             ],
             commands: vec![
                 "curie local approvals <AGENT> --list",
-                "curie local approvals <AGENT> --resolve <id> --as <user> --actor-channel <channel>",
+                "curie local approvals <AGENT> --mint-operator-principal <SUBJECT>",
+                "curie local approvals <AGENT> --resolve <id>",
             ],
         },
         landmines: vec![
             Landmine {
-                title: "Self-approval is refused, from any channel",
-                detail: "The platform blocks the author of the turn that raised a request from resolving it, under every approver set. Testing an approval flow therefore needs a second actor: pass `--as <other-user>` on the resolve.",
+                title: "A terminal principal has no channel membership",
+                detail: "CURIE_APPROVAL_PRINCIPAL_TOKEN proves its subject but carries no channel. It can resolve only an explicit-user route that includes that subject. Use the authenticated card for the default card-channel set or a Slack group set.",
             },
             Landmine {
                 title: "A group route with no bot token on the API refuses every click",
@@ -355,8 +380,8 @@ pub fn primer() -> Primer {
                 fix: "Run `curie skill check` -- a RED verdict names the server that failed to load and how to fix the declaration.",
             },
             Recovery {
-                symptom: "a resolve is refused with \"self-approval is blocked\"",
-                fix: "You are the author of the turn that raised it, which no approver set overrides. Resolve as a different actor with `--as <user>`.",
+                symptom: "a resolve says CURIE_APPROVAL_PRINCIPAL_TOKEN is missing",
+                fix: "Mint a reusable subject-bound token with `<tier> approvals <AGENT> --mint-operator-principal <SUBJECT>`, export the one-time result as CURIE_APPROVAL_PRINCIPAL_TOKEN, and retry. It is eligible only for explicit-user routes; use the authenticated card for channel/group routes.",
             },
             Recovery {
                 symptom: "a resolve returns 409 already resolved",
@@ -368,7 +393,7 @@ pub fn primer() -> Primer {
             },
             Recovery {
                 symptom: "a resolve is refused with \"you are not an approver\"",
-                fix: "The route's approver set does not admit that actor from that channel. With no approvers block the card channel's members are the set, so pass `--actor-channel` with the channel that route is bound to. A null `card_channel` is from an older row or a direct API write that omitted the field, so use the requesting channel.",
+                fix: "The route's selected approver set does not admit the authenticated principal. A terminal principal is eligible only for an explicit-user list containing its subject. A Console principal can also satisfy a Slack user group through the server-side membership lookup, but neither principal can satisfy channel membership; use the authenticated card for that default set. A null `card_channel` is from an older row or a direct API write that omitted the field, so the requesting channel is the card location.",
             },
             Recovery {
                 symptom: "a resolve is refused with \"could not verify approvers\"",
