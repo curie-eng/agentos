@@ -2,7 +2,8 @@
 
 import json
 
-from aci_protocol import SessionStatus
+import pytest
+from aci_protocol import ErrorEvent, Final, SessionStatus
 from claude_agent_sdk import (
     AssistantMessage,
     RateLimitEvent,
@@ -162,6 +163,30 @@ def test_result_error_is_error_then_classified_final() -> None:
     events = _translate(msg)
     assert [e.type for e in events] == ["error", "final"]
     assert events[-1].status == SessionStatus.CLASSIFIED_FAILURE
+
+
+@pytest.mark.parametrize("terminal_reason", ("aborted_streaming", "aborted_tools"))
+def test_sdk_abort_result_is_error_then_classified_final(
+    terminal_reason: str,
+) -> None:
+    msg = ResultMessage(
+        subtype="error_during_execution",
+        duration_ms=1,
+        duration_api_ms=1,
+        is_error=True,
+        num_turns=1,
+        session_id="s",
+        result="run failed",
+        terminal_reason=terminal_reason,
+    )
+
+    events = _translate(msg)
+
+    assert [event.type for event in events] == ["error", "final"]
+    assert isinstance(events[0], ErrorEvent)
+    assert events[0].classification == "error_during_execution"
+    assert isinstance(events[1], Final)
+    assert events[1].status is SessionStatus.CLASSIFIED_FAILURE
 
 
 def test_assistant_error_field_emits_error_event() -> None:

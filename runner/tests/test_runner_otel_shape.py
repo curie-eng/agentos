@@ -138,6 +138,39 @@ def _canonical_trace_spans() -> list[tuple[dict[str, object], dict[str, object]]
     ]
 
 
+def _single_round_tool_free_trace_spans() -> list[
+    tuple[dict[str, object], dict[str, object]]
+]:
+    root = _span(
+        "agent.run",
+        _ROOT_SPAN_ID,
+        start_ns=1_000_000_000,
+        end_ns=1_100_000_000,
+        parent_span_id=None,
+        attributes={
+            "curie.phase": "provider_wait",
+            "curie.terminal.cause": "completed",
+            "curie.terminal.status": "succeeded",
+        },
+    )
+    generation = _span(
+        "llm.generation",
+        _GENERATION_ONE_SPAN_ID,
+        start_ns=1_001_000_000,
+        end_ns=1_099_000_000,
+        attributes={
+            "curie.phase": "provider_wait",
+            "curie.phase.start_kind": "query_observed",
+            "curie.phase.end_kind": "result_observed",
+            "curie.generation.round": 1,
+            "curie.generation.ttft_ms": 7,
+            "gen_ai.request.model": "acme-model",
+            "model": "acme-model",
+        },
+    )
+    return [(span, dict(_RUNNER_RESOURCE)) for span in (root, generation)]
+
+
 def _legacy_trace_spans() -> list[tuple[dict[str, object], dict[str, object]]]:
     root = _span(
         "agent.run",
@@ -206,15 +239,39 @@ def _mentions(violations: list[str], *fragments: str) -> bool:
 
 
 def test_canonical_runner_otlp_json_shape_has_no_violations() -> None:
-    assert canonical_runner_shape_violations(_canonical_trace_spans()) == []
+    trace_spans = _canonical_trace_spans()
+
+    assert canonical_runner_shape_violations(trace_spans) == []
+    assert canonical_runner_shape_violations(
+        trace_spans,
+        require_multi_round_tool=True,
+    ) == []
+
+
+def test_single_round_tool_free_trace_is_valid_by_default_and_strictly_rejected() -> None:
+    trace_spans = _single_round_tool_free_trace_spans()
+
+    assert canonical_runner_shape_violations(trace_spans) == []
+
+    strict_violations = canonical_runner_shape_violations(
+        trace_spans,
+        require_multi_round_tool=True,
+    )
+    assert _mentions(strict_violations, "llm.generation", "expected 2", "found 1")
+    assert _mentions(strict_violations, "execute_tool", "expected 1", "found 0")
 
 
 def test_legacy_monolithic_generation_and_nested_zero_duration_tool_are_rejected() -> None:
     violations = canonical_runner_shape_violations(_legacy_trace_spans())
 
-    assert _mentions(violations, "llm.generation", "expected 2", "found 1")
     assert _mentions(violations, "execute_tool", "root sibling")
     assert _mentions(violations, "execute_tool", "zero duration")
+
+    strict_violations = canonical_runner_shape_violations(
+        _legacy_trace_spans(),
+        require_multi_round_tool=True,
+    )
+    assert _mentions(strict_violations, "llm.generation", "expected 2", "found 1")
 
 
 def test_payload_raw_id_and_unknown_attributes_are_rejected_without_values() -> None:

@@ -1208,21 +1208,22 @@ def test_classified_failure_uses_bounded_cause_without_raw_provider_reason() -> 
 
 
 @pytest.mark.parametrize("reason", ("aborted_streaming", "aborted_tools"))
-def test_sdk_abort_is_intentional_cancellation_with_ok_otel_status(reason: str) -> None:
+def test_sdk_abort_without_runner_interrupt_is_a_classified_failure(reason: str) -> None:
     events, spans = _run_and_export(
         lambda: FakeModelSession(
             lambda: [_result(is_error=True, terminal_reason=reason)]
         )
     )
-    assert [event.type for event in events] == ["final"]
-    terminal = events[0]
+    assert [event.type for event in events] == ["error", "final"]
+    assert isinstance(events[0], ErrorEvent)
+    terminal = events[-1]
     assert isinstance(terminal, Final)
-    assert terminal.status is SessionStatus.IDLE_AWAITING_INPUT
+    assert terminal.status is SessionStatus.CLASSIFIED_FAILURE
     root = spans["agent.run"][0]
-    assert root.status.status_code is StatusCode.OK
+    assert root.status.status_code is StatusCode.ERROR
     assert root.attributes["curie.phase"] == "provider_wait"
     assert root.attributes["curie.terminal.cause"] == reason
-    assert root.attributes["curie.terminal.status"] == "cancelled"
+    assert root.attributes["curie.terminal.status"] == "failed"
 
 
 def test_interrupt_requested_wins_over_error_result_and_sdk_abort_reason() -> None:
@@ -1242,19 +1243,23 @@ def test_interrupt_requested_wins_over_error_result_and_sdk_abort_reason() -> No
         trace_name="curie-run:test",
         model="configured-model",
     )
+    events: list[object] = []
 
     async def go() -> None:
         await runner.start()
         turn = runner.run_turn(
             Event(type="message", text="go", user="U0EXAMPLE1", ts="1")
         )
-        await anext(turn)
+        events.append(parse_ndjson_line(await anext(turn)))
         await runner.interrupt("operator stop")
-        async for _ in turn:
-            pass
+        async for line in turn:
+            events.append(parse_ndjson_line(line))
         await runner.close()
 
     anyio.run(go)
+    terminal = events[-1]
+    assert isinstance(terminal, Final)
+    assert terminal.status is SessionStatus.IDLE_AWAITING_INPUT
     root = _spans_by_name(list(exporter.get_finished_spans()))["agent.run"][0]
     assert root.status.status_code is StatusCode.OK
     assert root.attributes["curie.terminal.cause"] == "interrupt_requested"
