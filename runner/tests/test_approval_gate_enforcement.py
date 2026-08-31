@@ -941,6 +941,46 @@ def test_explicit_gate_keeps_pager_and_annotations_classify_receipt_actions(
     ]
 
 
+def test_explicit_tool_gate_overrides_its_read_only_annotation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(boot, "ClaudeAgentSession", _CapturedSession)
+    tool = "mcp__plugin_approval-demo_operations__inspect_or_change"
+    cases = (
+        ("tool-gated", tool, [tool]),
+        # Control: a gate on an unrelated built-in must not turn this annotated
+        # MCP read into a receipt mutation.
+        ("bash-gated", "Bash", []),
+    )
+
+    for directory, gated_tool, expected_flags in cases:
+        plugin_dir = _bundle(tmp_path / directory)
+        _add_capability_server(plugin_dir, "read-only")
+        runner = build_runner(
+            _config(plugin_dir, CURIE_APPROVAL_REQUIRED_TOOLS=gated_tool)
+        )
+        session = runner._factory()
+        assert isinstance(session, _CapturedSession)
+        assert "request_approval" in anyio.run(
+            _mcp_tool_names,
+            session.options.mcp_servers[APPROVAL_SERVER_NAME],
+        )
+
+        events = translate_message(
+            AssistantMessage(
+                content=[ToolUseBlock(id=f"call-{directory}", name=tool, input={})],
+                model="m",
+            ),
+            TurnState(),
+            runner._classifier,
+            None,
+        )
+
+        assert [event.tool for event in events if event.type == "side_effect_flag"] == (
+            expected_flags
+        )
+
+
 def test_publish_only_gate_does_not_recreate_the_generic_pager(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

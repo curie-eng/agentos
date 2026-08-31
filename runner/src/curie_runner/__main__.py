@@ -389,7 +389,12 @@ def build_runner(
         ceiling=config.ceiling,
         tracer=RunTracer(provider),
         classifier=SideEffectClassifier(
-            readonly_tools=harness.readonly_tools | observed_readonly_tools
+            readonly_tools=harness.readonly_tools
+            | (
+                observed_readonly_tools - approval_gate.required
+                if approval_gate is not None
+                else observed_readonly_tools
+            )
         ),
         trace_name=f"curie-run:{config.session.session_id}",
         session_id=config.session.session_id,
