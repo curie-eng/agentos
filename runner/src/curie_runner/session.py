@@ -572,6 +572,8 @@ class SessionRunner:
             else:
                 tracker.add_increment(usage)
             budget_hit = tracker.exceeded
+            events = translate_message(message, state, self._classifier, gen)
+            decided_result_final: Final | None = None
             if isinstance(message, ResultMessage):
                 terminal_reason = getattr(message, "terminal_reason", None)
                 cancelled = self._interrupt_requested
@@ -579,11 +581,23 @@ class SessionRunner:
                 result_failed = budget_hit or (
                     not cancelled and (message.is_error or subtype.startswith("error"))
                 )
+                if not budget_hit:
+                    self._merge_gate_block(state)
+                    sdk_final = next(
+                        (outbound for outbound in events if isinstance(outbound, Final)),
+                        None,
+                    )
+                    if sdk_final is not None:
+                        decided_result_final = _apply_approval_override(
+                            self._reclassify(sdk_final), state
+                        )
                 gen.result_boundary_observed(
                     failed=result_failed,
                     terminal_reason=terminal_reason,
+                    approval_paused=decided_result_final is not None
+                    and decided_result_final.status
+                    is SessionStatus.AWAITING_APPROVAL,
                 )
-            events = translate_message(message, state, self._classifier, gen)
 
             for outbound in events:
                 if isinstance(outbound, ToolNote):
@@ -600,8 +614,13 @@ class SessionRunner:
                         for line in self._budget_halt_lines():
                             yield line
                         return
-                    self._merge_gate_block(state)
-                    final = _apply_approval_override(self._reclassify(outbound), state)
+                    if decided_result_final is None:
+                        self._merge_gate_block(state)
+                        final = _apply_approval_override(
+                            self._reclassify(outbound), state
+                        )
+                    else:
+                        final = decided_result_final
                     for line in self._approval_not_acted_lines(state, final):
                         yield line
                     for line in self._false_completion_lines(state, final):
@@ -612,6 +631,8 @@ class SessionRunner:
                         interrupt_requested=self._interrupt_requested,
                         classified_failure=final.status
                         is SessionStatus.CLASSIFIED_FAILURE,
+                        approval_paused=final.status
+                        is SessionStatus.AWAITING_APPROVAL,
                         completed_without_result=final.status
                         is SessionStatus.AWAITING_APPROVAL,
                     )
@@ -652,6 +673,7 @@ class SessionRunner:
         gen.finish_turn(
             interrupt_requested=self._interrupt_requested,
             classified_failure=final.status is SessionStatus.CLASSIFIED_FAILURE,
+            approval_paused=final.status is SessionStatus.AWAITING_APPROVAL,
             completed_without_result=final.status is SessionStatus.AWAITING_APPROVAL,
         )
         yield to_ndjson_line(final)

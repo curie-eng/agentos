@@ -25,10 +25,12 @@ from claude_agent_sdk import (
     ToolUseBlock,
     UserMessage,
 )
+from claude_agent_sdk.types import PermissionResultDeny
 from curie_runner import RunTracer, SideEffectClassifier, build_tracer_provider
 from curie_runner import otel as otel_module
 from curie_runner import session as session_module
 from curie_runner.adapter import ClaudeAgentSession, PartialMessageBoundary
+from curie_runner.approval import ApprovalGate
 from curie_runner.fake import FakeModelSession
 from curie_runner.otel import _SchemaValidatingSpanProcessor
 from curie_runner.session import SessionRunner
@@ -1230,6 +1232,84 @@ def test_sdk_abort_without_runner_interrupt_is_a_classified_failure(reason: str)
     assert root.attributes["curie.phase"] == "provider_wait"
     assert root.attributes["curie.terminal.cause"] == reason
     assert root.attributes["curie.terminal.status"] == "failed"
+
+
+def test_approval_halt_abort_is_a_paused_non_error_terminal() -> None:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    gate = ApprovalGate(
+        required=frozenset({"Bash"}), route_by_tool={"Bash": "ops"}
+    )
+
+    async def record_gate(
+        tool_name: str, tool_input: dict[str, Any], _context: Any
+    ) -> PermissionResultDeny:
+        gate.block(tool_name, tool_input)
+        # Let the scripted SDK result through: this fixture models the real
+        # post-denial shape where the CLI still supplies its abort result.
+        return PermissionResultDeny(message="approval required", interrupt=False)
+
+    script = [
+        AssistantMessage(content=[TextBlock(text="working")], model="observed-model"),
+        AssistantMessage(
+            content=[
+                ToolUseBlock(
+                    id=_TOOL_CALL_ID,
+                    name="Bash",
+                    input={"command": "echo approval-pause-PLACEHOLDER"},
+                )
+            ],
+            model="observed-model",
+        ),
+        _result(is_error=True, terminal_reason="aborted_tools"),
+    ]
+    fake = FakeModelSession(
+        lambda: script,
+        truncate_on_interrupt=False,
+        can_use_tool=record_gate,
+    )
+    runner = SessionRunner(
+        session_factory=lambda: fake,
+        ceiling=0,
+        tracer=RunTracer(provider),
+        classifier=SideEffectClassifier(),
+        trace_name="curie-run:test",
+        model="configured-model",
+        approval_gate=gate,
+    )
+
+    async def go() -> list[object]:
+        await runner.start()
+        try:
+            lines = [
+                line
+                async for line in runner.run_turn(
+                    Event(type="message", text="go", user="U0EXAMPLE1", ts="1")
+                )
+            ]
+            return parse_ndjson("".join(lines))
+        finally:
+            await runner.close()
+
+    events = anyio.run(go)
+    terminal = events[-1]
+    assert isinstance(terminal, Final)
+    assert terminal.status is SessionStatus.AWAITING_APPROVAL
+
+    spans = _spans_by_name(list(exporter.get_finished_spans()))
+    root = spans["agent.run"][0]
+    generation = spans["llm.generation"][0]
+    tool = spans["execute_tool"][0]
+    assert root.status.status_code is StatusCode.OK
+    assert generation.status.status_code is StatusCode.OK
+    assert tool.status.status_code is StatusCode.OK
+    assert root.attributes["curie.terminal.cause"] == "approval_required"
+    assert root.attributes["curie.terminal.status"] == "paused"
+    assert root.attributes["curie.phase"] == "tool_wait"
+    assert generation.attributes["curie.phase.end_kind"] == "tool_use_observed"
+    assert tool.attributes["curie.phase.end_kind"] == "terminal_inferred"
+    assert tool.attributes["curie.tool.outcome"] == "cancelled"
 
 
 def test_interrupt_requested_wins_over_error_result_and_sdk_abort_reason() -> None:

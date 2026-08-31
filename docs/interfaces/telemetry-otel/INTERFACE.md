@@ -169,14 +169,21 @@ keys:
   `gen_ai.tool.name` and `gen_ai.operation.name=execute_tool` describe the operation.
 - **Terminal state is truthful and bounded.** `curie.phase` marks each interval as
   `provider_wait` or `tool_wait`, and on `agent.run` retains the last active phase.
-  Terminal cause/status pairs are `completed`/`succeeded`,
-  `classified_failure`/`failed`, `interrupt_requested`/`cancelled`, either SDK abort
-  (`aborted_streaming` or `aborted_tools`)/`failed`, and `abandoned`/`abandoned`.
-  Bare SDK abort causes are failures with OTel `ERROR`; when the runner requested an
-  interrupt, `interrupt_requested`/`cancelled` wins and closes with OTel `OK`. Completed
-  runs are also `OK`; classified failure and abandonment are `ERROR`. Tool results close
-  with `curie.tool.outcome` `success` or `error`; any tool still active at terminal
-  cleanup closes as `cancelled`, with its real duration preserved.
+  The root terminal mapping is closed and ordered:
+
+  | Terminal decision | `curie.terminal.cause` / `curie.terminal.status` | OTel |
+  | --- | --- | --- |
+  | Runner interrupt (highest precedence) | `interrupt_requested` / `cancelled` | `OK` |
+  | ACI final intentionally parked for approval | `approval_required` / `paused` | `OK` |
+  | Bare SDK abort | `aborted_streaming` or `aborted_tools` / `failed` | `ERROR` |
+  | Generic classified failure | `classified_failure` / `failed` | `ERROR` |
+  | Completed turn | `completed` / `succeeded` | `OK` |
+  | Abandoned instrumentation | `abandoned` / `abandoned` | `ERROR` |
+
+  An `AWAITING_APPROVAL` final outranks an error-shaped SDK abort because the runner's
+  gate intentionally parked that turn; it does not fabricate an operator interrupt.
+  Tool results close with `curie.tool.outcome` `success` or `error`; any tool still
+  active at terminal cleanup closes as `cancelled`, with its real duration preserved.
 
 ### Collector delivery
 

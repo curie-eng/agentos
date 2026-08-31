@@ -496,12 +496,15 @@ class _GenerationSpan:
         *,
         interrupt_requested: bool,
         classified_failure: bool,
+        approval_paused: bool = False,
         completed_without_result: bool = False,
     ) -> None:
         """Apply the closed terminal mapping after the ACI final is decided."""
 
         if interrupt_requested:
             self._finish("interrupt_requested", "cancelled", failed=False)
+        elif approval_paused:
+            self._finish("approval_required", "paused", failed=False)
         elif self._result_abort_cause is not None:
             self._finish(
                 self._result_abort_cause,
@@ -520,13 +523,17 @@ class _GenerationSpan:
         *,
         failed: bool,
         terminal_reason: str | None,
+        approval_paused: bool = False,
     ) -> None:
         """Close the active generation at an SDK ResultMessage boundary."""
 
         self._result_observed = True
         if terminal_reason in self._ABORT_CAUSES:
             self._result_abort_cause = terminal_reason
-        self._close_generation("result_observed", failed=failed)
+        self._close_generation(
+            "result_observed",
+            failed=failed and not approval_paused,
+        )
 
     def record_model(self, model: str | None) -> None:
         """Compatibility setter for direct instrumentation callers.
