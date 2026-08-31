@@ -604,6 +604,16 @@ pub fn model_credential_env() -> Result<Option<String>> {
 /// The helm value key that pins the sandbox runner model in the chart.
 const RUNNER_MODEL_KEY: &str = "agentSandbox.runner.model";
 
+pub(crate) const INFERENCE_PERSISTENCE_ENABLED_KEY: &str = "inference.persistence.enabled";
+pub(crate) const INFERENCE_PULL_MODEL_KEY: &str = "inference.pullModel";
+
+pub(crate) fn inference_asset_policy_is_safe(
+    persistence_enabled: Option<bool>,
+    pull_model: Option<bool>,
+) -> bool {
+    persistence_enabled == Some(true) || pull_model == Some(false)
+}
+
 /// The value of the last explicit `--set agentSandbox.runner.model=VAL` in
 /// `set`, if the operator passed one (last wins, matching helm precedence).
 /// Helm accepts comma-joined `--set a=1,b=2`, so each element is split on `,`
@@ -662,6 +672,7 @@ pub(crate) fn validate_up_inputs(
     github_token: Option<&str>,
     clear_github_token: bool,
 ) -> Result<()> {
+    validate_local_model_asset_policy(opts)?;
     validate_web_egress_cidrs(&opts.allow_web_egress)
         .context("invalid --allow-web-egress value")?;
     let operator_sets = opts.operator_sets();
@@ -671,6 +682,41 @@ pub(crate) fn validate_up_inputs(
         parse_egress_provider(host)?;
     }
     Ok(())
+}
+
+fn last_typed_bool(sets: &[String], key: &str) -> Option<bool> {
+    operator_set_entries(sets)
+        .into_iter()
+        .filter_map(|(candidate, value)| (candidate.trim() == key).then_some(value.trim()))
+        .next_back()
+        .and_then(|value| match value {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        })
+}
+
+fn validate_local_model_asset_policy(opts: &UpOpts) -> Result<()> {
+    if opts.local_model.is_none() {
+        return Ok(());
+    }
+    let persistence_enabled = last_typed_bool(&opts.set, INFERENCE_PERSISTENCE_ENABLED_KEY);
+    let pull_model = last_typed_bool(&opts.set, INFERENCE_PULL_MODEL_KEY);
+    if inference_asset_policy_is_safe(persistence_enabled, pull_model) {
+        return Ok(());
+    }
+
+    Err(crate::exit::CliError::usage(
+        "`--local-model` requires an explicit model-weight policy: pass \
+         `--set inference.persistence.enabled=true` to pull weights into persistent storage, \
+         or pass `--set inference.pullModel=false` when the model is already present; \
+         `--set-string` cannot express the required typed boolean policy",
+    )
+    .with_fix(
+        "re-run with `--set inference.persistence.enabled=true` or \
+         `--set inference.pullModel=false`",
+    )
+    .into())
 }
 
 /// Validate every operator-supplied `--allow-web-egress` value is a real CIDR
