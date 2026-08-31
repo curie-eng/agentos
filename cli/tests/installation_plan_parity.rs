@@ -2100,6 +2100,14 @@ fn absent_release_diff_matches_apply_dry_run_for_effective_installation_values()
     );
     assert_added(&diff, "agentSandbox.runner.credentials", "<secret>");
     assert_added(&diff, "api.githubToken", "<secret>");
+    for key in ["inference.deploy", "inference.persistence.enabled"] {
+        let setting = format!("--set {key}=true");
+        assert!(
+            apply.contains(&setting),
+            "apply must plan the modeled inference boolean through Helm's typed lane: {apply}"
+        );
+        assert_added(&diff, key, "true");
+    }
 
     let apply_values = helm_values(&apply);
     for (key, apply_value) in &apply_values {
