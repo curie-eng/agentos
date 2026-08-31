@@ -118,4 +118,9 @@ def test_no_bundle_name_cannot_resolve_a_plugin_mount() -> None:
     """The plugin prefix is built from the bundle name; without one there is no
     prefix to match, and guessing would attribute a tool to a server on the
     strength of a substring."""
-    assert _canonical("mcp__plugin_sre-bot_probe__ping", bundle_name=None, mcp_servers={"probe"}) is None
+    assert (
+        _canonical(
+            "mcp__plugin_sre-bot_probe__ping", bundle_name=None, mcp_servers={"probe"}
+        )
+        is None
+    )
