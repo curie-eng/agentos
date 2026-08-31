@@ -68,8 +68,11 @@ never needed again and `up` is unchanged — measured at **17.9s warm**, against
 **232s** for the same command on a cold machine over a fast link.
 
 `cluster up --local-model` has no host-side Ollama to provision and no
-`--pull-model` flag. Instead, the chart requires an explicit durable-storage
-choice before it can pull weights inside the cluster; see
+`--pull-model` flag. A bare cluster command refuses before Helm or Kubernetes
+creates resources: choose either typed `--set inference.persistence.enabled=true`
+to permit a pull into durable storage, or typed
+`--set inference.pullModel=false` when weights are pre-provisioned. Direct Helm
+installs receive the same chart guard. See
 [the cluster tier](#the-cluster-tier-durable-storage-or-a-pre-provisioned-model)
 below.
 
@@ -91,8 +94,8 @@ bakes `ANTHROPIC_BASE_URL` plus the inference model into the runner template.
 
 The default cluster values set `inference.pullModel=true` and
 `inference.persistence.enabled=false`. `curie cluster up --local-model` with
-those defaults fails at chart render time, before Helm creates any resources:
-the chart refuses to download weights into its default `emptyDir`.
+those defaults fails at chart render time, before Helm or Kubernetes creates any
+resources: the chart refuses to download weights into its default `emptyDir`.
 
 For the normal stock Ollama image, enable persistent storage and size it for the
 model. The chart still pulls the model from the Ollama container's `postStart`
@@ -103,6 +106,10 @@ survive Pod replacement rather than downloading again:
 ```bash
 curie cluster up --local-model qwen3-coder:30b --set inference.persistence.enabled=true --set inference.persistence.size=40Gi
 ```
+
+Persistence defaults to the chart's `10Gi` size unless
+`--set inference.persistence.size=<size>` supplies a non-boolean string. Size
+storage for the selected model; larger models need more than that default.
 
 The advanced alternative is for operators whose custom image or other
 provisioning already supplies the requested model: disable the chart pull with

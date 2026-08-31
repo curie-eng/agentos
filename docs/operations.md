@@ -90,6 +90,41 @@ curie apply
 
 Use `curie cluster up` below for flag driven installs.
 
+#### Declarative local inference
+
+`platform.inference: true` opts into the in-chart Ollama inference deployment.
+It does not permit the default implicit pull to an `emptyDir`: `curie apply`
+refuses before Helm or Kubernetes creates resources unless the manifest chooses
+durable storage or declares that its model is already provisioned. For the stock
+Ollama image, enable persistence and size it for the model:
+
+```yaml
+platform:
+  inference: true
+  inference_persistence: true
+set:
+  inference.persistence.size: 40Gi
+```
+
+With `inference_persistence: true`, the existing `postStart` hook pulls the
+model into the PVC. If `set.inference.persistence.size` is absent, the chart
+uses `10Gi`; when supplied it must be a non-boolean string, and large models
+need a larger size.
+
+The advanced alternative is a custom image or other provisioning that already
+has the requested weights. Declare that explicitly instead:
+
+```yaml
+platform:
+  inference: true
+  inference_pull_model: false
+```
+
+This disables the `postStart` pull. The stock Ollama image on the default
+`emptyDir` has no weights, so it cannot serve a model unless provisioning has
+placed those weights at Ollama's data path. Direct Helm installs have the same
+chart guard.
+
 ### `curie cluster up`
 
 Installs (or upgrades) Curie's Helm chart onto the cluster you're pointed at:
