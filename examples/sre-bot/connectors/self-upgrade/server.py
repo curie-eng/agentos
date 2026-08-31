@@ -1,7 +1,11 @@
-"""One gated write -- start this bot's upgrade -- and one read beside it.
+"""Two gated upgrade buttons and one read. None of them takes an argument.
 
-`upgrade_self` starts the upgrade. `latest_release` says what version is
-available to upgrade TO. Both take no arguments.
+`upgrade_self` redeploys this bot's own bundle. `upgrade_platform` moves the
+Curie release underneath it. `latest_release` says what version is available.
+
+The two writes are the same mechanism pointed at different operator-written
+CronJob templates, which is why they share `_start_job_from` rather than being
+two files kept in step.
 
 Why the bot cannot just do the upgrade itself
 ---------------------------------------------
@@ -27,12 +31,16 @@ name, the image and the command all come from the CronJob's own `jobTemplate`,
 read from the cluster at call time. There is no field a caller can influence, so
 there is nothing to validate and nothing to escape.
 
-There are now two tools here, and the "one thing for a gate to miss" argument
-still holds, because the second one is a READ. `latest_release` takes no
-arguments either, holds no credential, and changes nothing; there is exactly one
-write on this server and exactly one gate in front of it. What would break the
-argument is a second WRITE, or either tool growing a parameter -- not a
-zero-argument read of a public page.
+There are three tools here now, and the "nothing for a gate to miss" argument
+holds differently than it did with one. Both writes are gated, and both are
+zero-argument buttons that copy a template verbatim -- so the property that
+matters is not the COUNT of tools but that no tool takes caller input. A gate
+cannot be missed here because there is no unclassified verb: two writes, two
+gates, one read that changes nothing and holds no credential.
+
+What would break it is a tool growing a parameter. That is the line, and it is
+worth restating because the obvious next request -- "let me name the version" --
+is exactly that.
 
 It lives here rather than in its own connector because it answers the same
 question from the other side. "What version is available" is what a person asks
@@ -104,6 +112,11 @@ NAMESPACE = os.environ.get("SELF_UPGRADE_NAMESPACE", "").strip()
 # Read-only and public: no credential, and none is added here on purpose -- see
 # `latest_release`. Empty disables that tool's answer rather than guessing a repo.
 RELEASE_REPO = os.environ.get("SELF_UPGRADE_RELEASE_REPO", "").strip()
+
+# The CronJob that upgrades the PLATFORM, as distinct from this bot's bundle.
+# Empty means `upgrade_platform` refuses -- an install that has not decided to
+# grant a platform upgrade should not get one by default.
+PLATFORM_CRONJOB = os.environ.get("PLATFORM_UPGRADE_CRONJOB", "").strip()
 RELEASE_API = os.environ.get("SELF_UPGRADE_RELEASE_API", "https://api.github.com").rstrip("/")
 RELEASE_TIMEOUT = float(os.environ.get("SELF_UPGRADE_RELEASE_TIMEOUT_SECONDS", "15"))
 
@@ -224,8 +237,13 @@ def _namespace() -> str:
         return ""
 
 
-def _active_job(client, namespace: str) -> str | None:
-    """The name of a still-running Job for this CronJob, if there is one.
+def _active_job(client, namespace: str, cronjob: str) -> str | None:
+    """The name of a still-running Job for `cronjob`, if there is one.
+
+    Scoped to the named CronJob, not to this connector: the two upgrade verbs run
+    different templates and must not block one another. A platform upgrade and a
+    bundle redeploy are independent, and treating either as "an upgrade is
+    running" would refuse a call that is safe.
 
     Returns None when nothing is active. A listing failure also returns None:
     refusing to upgrade because a *status* read failed would be a worse outcome
@@ -235,7 +253,7 @@ def _active_job(client, namespace: str) -> str | None:
     try:
         listed = client.get(
             f"/apis/batch/v1/namespaces/{namespace}/jobs",
-            params={"labelSelector": f"curie.dev/self-upgrade-of={CRONJOB}"},
+            params={"labelSelector": f"curie.dev/self-upgrade-of={cronjob}"},
         )
     except httpx.HTTPError:
         return None
@@ -279,10 +297,62 @@ def upgrade_self() -> str:
     `prior` is always null, because this action has no prior state to restore.
     """
 
-    if not CRONJOB:
+    return _start_job_from(CRONJOB, "SELF_UPGRADE_CRONJOB")
+
+
+@mcp.tool(annotations=UPGRADE)
+def upgrade_platform() -> str:
+    """Move the Curie platform this bot runs on to the newest published release.
+
+    THIS IS NOT `upgrade_self`. That one redeploys this bot's own bundle and
+    leaves the platform alone. This one upgrades the platform underneath every
+    agent on it, including you -- api, worker, dispatcher and the rest. Do not
+    call it when someone asks you to update yourself.
+
+    Starts an upgrade Job an operator installed. That Job reads the newest
+    published release itself, fetches its chart, and runs the Helm upgrade with
+    the values this install is already using. This tool takes no arguments: you
+    cannot choose the version, the chart or the values, and there is no way to
+    ask for a specific release through it. If someone names a version, say that
+    what runs is "the newest published release" and let them decide whether that
+    is what they wanted.
+
+    This is a WRITE, it is gated, and it is the widest one you have. Before
+    calling it, say plainly which version is installed now, which is newest, and
+    that every platform component restarts.
+
+    NOT REVERSIBLE by you, and not reliably reversible at all. `helm rollback`
+    restores objects but not the database: migrations run as an init container
+    and rollback does not undo them, so for a version pair that migrated,
+    recovery is restore-from-backup by an operator. Never describe this as
+    something that can be undone.
+
+    Starting the Job is not finishing it. The reply carries the Job's name; watch
+    it with the read-only Kubernetes tools and report what it actually did. Your
+    own sandbox may be replaced while it runs -- that is the upgrade working.
+
+    The reply is a JSON object: `ok`, `summary`, `prior`, `post`, `target`.
+    `prior` is always null, because this action has no prior state you can
+    restore.
+    """
+
+    return _start_job_from(PLATFORM_CRONJOB, "PLATFORM_UPGRADE_CRONJOB")
+
+
+def _start_job_from(cronjob: str, env_name: str) -> str:
+    """Create a Job from `cronjob`'s template, or say why not.
+
+    Shared by both upgrade verbs because they differ in exactly one thing: which
+    operator-written template runs. Everything the security argument rests on --
+    no caller input, the template copied verbatim, one at a time -- is a property
+    of this function, so it holds for both by construction rather than by two
+    files being kept in step.
+    """
+
+    if not cronjob:
         return _reply(
             False,
-            "refusing: SELF_UPGRADE_CRONJOB is not set, so this connector does not "
+            f"refusing: {env_name} is not set, so this connector does not "
             "know which upgrade to start. Setting it is an operator change.",
         )
 
@@ -299,7 +369,7 @@ def upgrade_self() -> str:
         return _reply(False, client)
 
     with client:
-        path = f"/apis/batch/v1/namespaces/{namespace}/cronjobs/{CRONJOB}"
+        path = f"/apis/batch/v1/namespaces/{namespace}/cronjobs/{cronjob}"
         try:
             existing = client.get(path)
         except httpx.HTTPError as exc:
@@ -307,18 +377,18 @@ def upgrade_self() -> str:
         if existing.status_code == 404:
             return _reply(
                 False,
-                f"no CronJob {namespace}/{CRONJOB}. The upgrade job is not installed "
+                f"no CronJob {namespace}/{cronjob}. The upgrade job is not installed "
                 "on this cluster; installing it is an operator change.",
             )
         if existing.status_code in (401, 403):
             return _reply(
                 False,
-                f"the upgrade identity may not read {namespace}/{CRONJOB} "
+                f"the upgrade identity may not read {namespace}/{cronjob} "
                 f"({existing.status_code}). It needs get on that cronjob.",
             )
         if existing.status_code >= 400:
             return _reply(
-                False, f"could not read {namespace}/{CRONJOB}: {existing.status_code}"
+                False, f"could not read {namespace}/{cronjob}: {existing.status_code}"
             )
 
         try:
@@ -329,11 +399,11 @@ def upgrade_self() -> str:
         if not job_spec:
             return _reply(
                 False,
-                f"{namespace}/{CRONJOB} has no jobTemplate.spec to run; the CronJob "
+                f"{namespace}/{cronjob} has no jobTemplate.spec to run; the CronJob "
                 "is malformed.",
             )
 
-        running = _active_job(client, namespace)
+        running = _active_job(client, namespace, cronjob)
         if running:
             return _reply(
                 False,
@@ -351,11 +421,11 @@ def upgrade_self() -> str:
             "apiVersion": "batch/v1",
             "kind": "Job",
             "metadata": {
-                "generateName": f"{CRONJOB}-",
+                "generateName": f"{cronjob}-",
                 "namespace": namespace,
                 "labels": {
                     **((template.get("metadata") or {}).get("labels") or {}),
-                    "curie.dev/self-upgrade-of": CRONJOB,
+                    "curie.dev/self-upgrade-of": cronjob,
                 },
                 "annotations": {
                     **((template.get("metadata") or {}).get("annotations") or {}),

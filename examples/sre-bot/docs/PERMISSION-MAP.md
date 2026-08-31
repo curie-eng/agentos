@@ -88,7 +88,7 @@ Two limits to state rather than imply:
 - Curie's posture today is approval-required plus **allow-by-omission**. A tool
   no gate names is callable. So "which tools are gated" is the whole policy, and
   a forgotten gate is a silent grant rather than a refusal. See the prerequisite
-  in entry 4.
+  in entry 5.
 
 ### Deliberately not granted
 
@@ -183,7 +183,7 @@ namespace if the token escapes the connector pod. It does not leave the pod, for
 the same reason the read connector drops `configuration_view`: the sandbox learns
 a URL and never holds a credential.
 
-### Why this is not the abstraction entry 4 rejects
+### Why this is not the abstraction entry 5 rejects
 
 Entry 4 rejects `upgrade_release(target_version)` -- a connector validating a
 version against a list it holds itself -- because that makes the connector the
@@ -193,7 +193,7 @@ This tool holds no policy. It has no version list, no sequencing, and no
 decision: which repository, which branch, which image and which command all come
 from a CronJob an operator wrote and can read. The connector's entire
 contribution is "start that, now, if nothing like it is already running". Move
-any of those choices into the connector and entry 4's objection would apply here
+any of those choices into the connector and entry 5's objection would apply here
 too.
 
 ### Why the bot does not simply do the upgrade
@@ -224,7 +224,59 @@ erase the evidence of what it started.
 
 ---
 
-## 4. Upgrading Curie's own release — a workflow, not a tool
+## 4. `upgrade_platform` — moving the release to the newest published version
+
+| | |
+|---|---|
+| Tool | `mcp__self-upgrade__upgrade_platform()` — no arguments |
+| Kubernetes verbs | `get` on `batch/cronjobs`; `create`, `list` on `batch/jobs` |
+| The JOB's verbs | namespace-wide write across the kinds the chart owns — see `manifests/platform-upgrade-role.yaml` |
+| Authorization | `approvalPolicy` gate — a human approves each call |
+| Status | Implemented, ships with its CronJob and identity absent |
+
+This is entry 5's problem solved by giving up the thing entry 5 wanted most: a
+**named version**. It upgrades to whatever the project published last, and there
+is no way to ask it for a particular release.
+
+That trade is what makes it shippable now. Entry 5's design needs a
+general-purpose Helm tool surface, which cannot be safely classified while the
+platform's live behaviour is allow-by-omission (curie#2119). One no-argument
+verb has no surface to classify.
+
+### The grant, and where it actually lives
+
+The bot's own grant is the same as entry 3's: start a Job, read its name. The
+credential that can rewrite the release belongs to the **Job**, not to the bot
+and not to a connector — it exists for the ninety seconds the upgrade runs and
+the sandbox never sees it.
+
+Read `manifests/platform-upgrade-role.yaml` before installing this. Its rules are
+namespace-admin in all but name, and the file says so and enumerates them rather
+than burying it. What bounds it is lifetime, an operator-written script the bot
+cannot edit, and the namespace; what does NOT bound it is the gate or the bot's
+good behaviour, which govern only who starts the Job.
+
+### Why the version is not a parameter
+
+A version argument is caller input, and the caller is a language model. Entry 5
+is right that the allowlist of acceptable versions is builder config rather than
+connector state — so until there is a builder-owned place to put it, "newest
+published" is the only target this can honestly offer.
+
+In practice that is usually the question being asked. The request that produced
+this entry named a specific version, and that version was already two releases
+stale; what the person wanted was "get us current".
+
+### Deliberately not granted
+
+No rollback verb. `helm rollback` restores objects but not the database —
+migrations run as an init container and rollback does not undo them — so for a
+version pair that migrated, recovery is restore-from-backup by an operator. A
+rollback tool here would read as an undo that this cannot perform.
+
+---
+
+## 5. Upgrading Curie by naming a version — a workflow, not a tool
 
 **PROPOSED. Not implemented.** Superseded as a weekly requirement — issue #1857
 asks for "rollback or recovery behavior", not a named-version upgrade — so this

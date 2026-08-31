@@ -49,6 +49,10 @@ const WRITE_ALLOWLIST_ENV: &str = "K8S_WRITE_ALLOWLIST";
 const WRITE_GATE: &str = "mcp__k8s-write__restart_deployment";
 const SCALE_GATE: &str = "mcp__k8s-scale__scale_deployment";
 const UPGRADE_GATE: &str = "mcp__self-upgrade__upgrade_self";
+// The platform-upgrade verb. Stripped like the others on a read-only install:
+// its Job, its identity and its CronJob are all absent by default, so shipping
+// the gate without them would validate and never fire.
+const PLATFORM_UPGRADE_GATE: &str = "mcp__self-upgrade__upgrade_platform";
 // The one grant the write path may carry. Read from the shipped manifest and
 // asserted rather than assumed, so editing that file to widen the verb set stops
 // the install instead of shipping in it -- the same posture the connector and
@@ -1837,7 +1841,8 @@ fn runtime_plugin_manifest(source: &[u8], write_enabled: bool) -> Result<Vec<u8>
         "gates": [
             {"gate": WRITE_GATE, "route": "sre-approvals"},
             {"gate": SCALE_GATE, "route": "sre-approvals"},
-            {"gate": UPGRADE_GATE, "route": "sre-approvals"}
+            {"gate": UPGRADE_GATE, "route": "sre-approvals"},
+            {"gate": PLATFORM_UPGRADE_GATE, "route": "sre-approvals"}
         ]
     });
     if manifest.get("approvalPolicy") != Some(&expected_policy) {

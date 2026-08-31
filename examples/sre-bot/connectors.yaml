@@ -308,6 +308,11 @@ connectors:
       # the network. Connector pods do have egress, so the read happens here and
       # the sandbox still learns only a URL.
       SELF_UPGRADE_RELEASE_REPO: curie-eng/curie
+      # The CronJob that upgrades the PLATFORM, as distinct from this bot's own
+      # bundle. EMPTY BY DEFAULT AND MEANT TO STAY THAT WAY unless you have read
+      # manifests/platform-upgrade-role.yaml and accepted the credential it
+      # describes. Empty means `upgrade_platform` refuses every call.
+      PLATFORM_UPGRADE_CRONJOB: ""
     # A FOURTH kubeconfig, bound to the ServiceAccount in
     # manifests/upgrade-role.yaml. Never one of the other three: those are
     # scoped to the workloads this bot may touch, and this one is scoped to the
