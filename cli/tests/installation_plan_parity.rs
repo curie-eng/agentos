@@ -2085,10 +2085,7 @@ fn apply_and_diff_refuse_inference_without_an_explicit_asset_policy_before_helm(
         );
         let error = json_error(output, verb);
         let guidance = format!("{} {}", error["error"], error["fix"]);
-        for recovery in [
-            "inference_persistence: true",
-            "inference_pull_model: false",
-        ] {
+        for recovery in ["inference_persistence: true", "inference_pull_model: false"] {
             assert!(
                 guidance.contains(recovery),
                 "{verb} must give both explicit curie.yaml recovery choices ({recovery}): {error}"

@@ -61,6 +61,10 @@ pub struct Platform {
     pub ui: Option<bool>,
     #[serde(default)]
     pub inference: Option<bool>,
+    #[serde(default)]
+    pub inference_persistence: Option<bool>,
+    #[serde(default)]
+    pub inference_pull_model: Option<bool>,
     /// Named providers, resolved to narrow host CIDRs at install time. Named
     /// hosts rather than hand-written CIDRs because the allowlist is a security
     /// control, and a hand-copied range is how it silently goes wrong.
@@ -148,6 +152,24 @@ impl Installation {
             if e.host.trim().is_empty() {
                 bail!("platform.egress[].host must not be empty");
             }
+        }
+        if self.platform.inference == Some(true)
+            && !crate::ops::inference_asset_policy_is_safe(
+                self.platform.inference_persistence,
+                self.platform.inference_pull_model,
+            )
+        {
+            return Err(crate::exit::CliError::usage(
+                "`platform.inference: true` requires an explicit model-weight policy: set \
+                 `inference_persistence: true` under `platform` to pull weights into persistent \
+                 storage, or set `inference_pull_model: false` there when the model is already \
+                 present",
+            )
+            .with_fix(
+                "add either `platform.inference_persistence: true` or \
+                 `platform.inference_pull_model: false` to curie.yaml",
+            )
+            .into());
         }
         for (key, value) in &self.set {
             let trimmed = value.trim();
@@ -244,9 +266,18 @@ impl Installation {
         }
         if let Some(inference) = self.platform.inference {
             out.push(format!("inference.deploy={inference}"));
-            if inference {
-                out.push("inference.persistence.enabled=true".to_string());
-            }
+        }
+        if let Some(persistence) = self.platform.inference_persistence {
+            out.push(format!(
+                "{}={persistence}",
+                crate::ops::INFERENCE_PERSISTENCE_ENABLED_KEY
+            ));
+        }
+        if let Some(pull_model) = self.platform.inference_pull_model {
+            out.push(format!(
+                "{}={pull_model}",
+                crate::ops::INFERENCE_PULL_MODEL_KEY
+            ));
         }
         out
     }
