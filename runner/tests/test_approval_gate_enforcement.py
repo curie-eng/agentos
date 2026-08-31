@@ -84,6 +84,7 @@ from curie_runner.fake import FakeModelSession
 from curie_runner.otel import RunTracer
 from curie_runner.session import SessionRunner
 from curie_runner.side_effects import SideEffectClassifier
+from curie_runner.translate import TurnState, translate_message
 
 _BUDGET = '{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}'
 _CAPABILITY_SERVER = Path(__file__).parent / "fixtures" / "mcp_tool_capability_server.py"
@@ -880,23 +881,64 @@ def test_boot_keeps_request_approval_for_an_observed_write_capable_bundle(
     assert options.mcp_servers[APPROVAL_SERVER_NAME]["name"] == APPROVAL_SERVER_NAME
 
 
-def test_boot_keeps_request_approval_for_an_explicit_gate_on_a_read_only_surface(
+def test_explicit_gate_keeps_pager_and_annotations_classify_receipt_actions(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    plugin_dir = _bundle(tmp_path, gates=["Bash"])
-    _add_capability_server(plugin_dir, "read-only")
+    monkeypatch.setattr(boot, "ClaudeAgentSession", _CapturedSession)
+    expected_flags = {
+        "read-only": [],
+        "write": ["mcp__operations__inspect_or_change"],
+        "unknown": ["mcp__operations__inspect_or_change"],
+    }
+    read_only_runner: SessionRunner | None = None
 
-    async def unexpected_probe(*_args: Any, **_kwargs: Any) -> typing.NoReturn:
-        raise AssertionError("an actionable explicit gate must skip the MCP probe")
+    for mode, flagged_tools in expected_flags.items():
+        plugin_dir = _bundle(tmp_path / mode, gates=["Bash"])
+        _add_capability_server(plugin_dir, mode)
 
-    monkeypatch.setattr(boot, "probe_mcp_tool_capability", unexpected_probe)
+        runner = build_runner(_config(plugin_dir))
+        if mode == "read-only":
+            read_only_runner = runner
+        session = runner._factory()
+        assert isinstance(session, _CapturedSession)
 
-    options = _options_from_boot(monkeypatch, _config(plugin_dir))
+        # An explicit actionable gate retains the pager regardless of MCP hints.
+        assert APPROVAL_SERVER_NAME in session.options.mcp_servers
+        assert "request_approval" in anyio.run(
+            _mcp_tool_names,
+            session.options.mcp_servers[APPROVAL_SERVER_NAME],
+        )
 
-    assert APPROVAL_SERVER_NAME in options.mcp_servers
-    assert "request_approval" in anyio.run(
-        _mcp_tool_names, options.mcp_servers[APPROVAL_SERVER_NAME]
+        tool = "mcp__operations__inspect_or_change"
+        events = translate_message(
+            AssistantMessage(
+                content=[ToolUseBlock(id=f"call-{mode}", name=tool, input={})],
+                model="m",
+            ),
+            TurnState(),
+            runner._classifier,
+            None,
+        )
+        assert [event.tool for event in events if event.type == "side_effect_flag"] == (
+            flagged_tools
+        )
+
+    # The annotation is exact and fail-closed: it cannot bless an unadvertised
+    # tool merely because that call shares the same MCP server.
+    assert read_only_runner is not None
+    unadvertised = "mcp__operations__not_advertised"
+    events = translate_message(
+        AssistantMessage(
+            content=[ToolUseBlock(id="call-unadvertised", name=unadvertised, input={})],
+            model="m",
+        ),
+        TurnState(),
+        read_only_runner._classifier,
+        None,
     )
+    assert [event.tool for event in events if event.type == "side_effect_flag"] == [
+        unadvertised
+    ]
 
 
 def test_publish_only_gate_does_not_recreate_the_generic_pager(

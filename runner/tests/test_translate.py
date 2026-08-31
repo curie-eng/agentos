@@ -54,6 +54,19 @@ def test_read_only_tool_notes_without_flag() -> None:
     assert [e.type for e in events] == ["tool_note"]
 
 
+def test_tool_search_notes_without_flag() -> None:
+    """#2130: Claude's tool-discovery read is not a receipt mutation."""
+
+    msg = AssistantMessage(
+        content=[ToolUseBlock(id="1", name="ToolSearch", input={"query": "resources"})],
+        model="m",
+    )
+
+    events = _translate(msg)
+
+    assert [event.type for event in events] == ["tool_note"]
+
+
 def test_result_success_is_final_done() -> None:
     msg = ResultMessage(
         subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
