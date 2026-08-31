@@ -11,10 +11,12 @@ Use the flag on whichever target you are running:
 ```bash
 curie skill up --local-model
 curie local up --local-model
-curie cluster up --local-model
+# Cluster pulls require durable storage sized for the selected model.
+curie cluster up --local-model qwen3-coder:30b --set inference.persistence.enabled=true --set inference.persistence.size=40Gi
 ```
 
-Bare `--local-model` uses `qwen3:4b`. Override it by passing a model name:
+At the `skill` and `local` tiers, bare `--local-model` uses `qwen3:4b`.
+Override it by passing a model name:
 
 ```bash
 curie local up --local-model qwen3-coder:30b
@@ -65,13 +67,11 @@ download from a wedged one (issue #1183). Once both assets are cached the flag i
 never needed again and `up` is unchanged — measured at **17.9s warm**, against
 **232s** for the same command on a cold machine over a fast link.
 
-`cluster up --local-model` has **no** such preflight and no `--pull-model` flag,
-because there is no host-side Ollama to provision. That is not the same as
-nothing being downloaded: the chart's inference Deployment pulls the weights
-*inside the cluster* instead, and does it implicitly. See
-[the cluster tier](#the-cluster-tier-downloads-implicitly) below before running
-this against a real cluster with a large model
-([#1779](https://github.com/curie-eng/curie/issues/1779)).
+`cluster up --local-model` has no host-side Ollama to provision and no
+`--pull-model` flag. Instead, the chart requires an explicit durable-storage
+choice before it can pull weights inside the cluster; see
+[the cluster tier](#the-cluster-tier-durable-storage-or-a-pre-provisioned-model)
+below.
 
 ## How it runs
 
@@ -87,38 +87,29 @@ reclaimed with `docker volume rm <volume>` — after which the next
 Service and Deployment, opens the runner egress carve-out automatically, and
 bakes `ANTHROPIC_BASE_URL` plus the inference model into the runner template.
 
-### The cluster tier downloads implicitly
+### The cluster tier: durable storage or a pre-provisioned model
 
-Unlike the other two tiers, the cluster tier fetches the weights for you, and
-nothing announces it. `inference.pullModel` defaults to `true`, and the chart
-pulls from a `postStart` lifecycle hook on the Ollama container, so:
+The default cluster values set `inference.pullModel=true` and
+`inference.persistence.enabled=false`. `curie cluster up --local-model` with
+those defaults fails at chart render time, before Helm creates any resources:
+the chart refuses to download weights into its default `emptyDir`.
 
-- **the pod is not-ready for the whole download.** kubelet does not mark a
-  container started until `postStart` returns, so the readiness probe has not
-  begun yet and the wait is unbounded. A large model looks identical to a wedged
-  deploy, which is the failure ADR-0093 removed at the other two tiers;
-- **a failed pull restarts the container.** A non-zero `postStart` makes kubelet
-  kill it, so a network error or an unknown model name surfaces as
-  `CrashLoopBackOff` with the reason in a `FailedPostStartHook` event, and each
-  restart retries the whole download;
-- **the default does not keep the weights.** `inference.persistence.enabled`
-  defaults to `false`, so the data directory is an `emptyDir` and `cluster up`
-  requests no PVC. Kubernetes preserves an `emptyDir` across a container restart
-  within the same Pod, so that alone does not touch the weights. Pod removal or
-  replacement -- eviction, node drain -- does: the replacement Pod's `postStart`
-  pulls the weights again.
-
-With the `qwen3:4b` default (~2.5GB) this is mostly invisible. With a documented
-upgrade such as `qwen3-coder:30b` (~17-19GB) it is not. Until
-[#1779](https://github.com/curie-eng/curie/issues/1779) is resolved, deploy a
-large model with persistence turned on so an evicted or rescheduled Pod does not
-re-fetch it:
+For the normal stock Ollama image, enable persistent storage and size it for the
+model. The chart still pulls the model from the Ollama container's `postStart`
+hook, so the Pod remains unready during the initial download and a failed pull
+can restart the container. The weights are stored on the PVC, however, and
+survive Pod replacement rather than downloading again:
 
 ```bash
 curie cluster up --local-model qwen3-coder:30b --set inference.persistence.enabled=true --set inference.persistence.size=40Gi
 ```
 
-and expect that first `up` to sit at not-ready for as long as the pull takes.
+The advanced alternative is for operators whose custom image or other
+provisioning already supplies the requested model: disable the chart pull with
+`--set inference.pullModel=false`. Do this only when the model is actually
+available at Ollama's data path. The stock Ollama image with an `emptyDir` has no
+weights, so disabling the pull there starts an endpoint that cannot serve the
+requested model.
 
 ## Choosing a model
 
