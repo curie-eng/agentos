@@ -94,8 +94,10 @@ bakes `ANTHROPIC_BASE_URL` plus the inference model into the runner template.
 
 The default cluster values set `inference.pullModel=true` and
 `inference.persistence.enabled=false`. `curie cluster up --local-model` with
-those defaults fails at chart render time, before Helm or Kubernetes creates any
-resources: the chart refuses to download weights into its default `emptyDir`.
+those defaults is rejected during CLI input validation, before Helm or
+Kubernetes creates resources. A direct Helm install with the same unsafe values
+fails at chart render time, also before resources: the chart refuses to download
+weights into its default `emptyDir`.
 
 For the normal stock Ollama image, enable persistent storage and size it for the
 model. The chart still pulls the model from the Ollama container's `postStart`
