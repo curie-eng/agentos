@@ -1939,7 +1939,12 @@ fn cluster_up_explicit_model_modes_suppress_recorded_provider_configuration() {
     for (name, args, expected_value) in [
         (
             "local model",
-            &["--local-model", "qwen3:4b"] as &[&str],
+            &[
+                "--local-model",
+                "qwen3:4b",
+                "--set",
+                "inference.pullModel=false",
+            ] as &[&str],
             Some("inference.model=qwen3:4b"),
         ),
         ("fake model", &["--fake-model"], None),
