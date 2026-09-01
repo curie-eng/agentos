@@ -40,19 +40,15 @@ const HELM_TIMEOUT: &str = "10m";
 const MANAGED_HELM_RELEASES: [&str; 4] = ["grafana", "loki", "alloy", "prometheus"];
 const GRAFANA_ADMIN_SECRET: &str = "grafana-admin";
 const GRAFANA_RELEASE: &str = "grafana";
-const READER_IDENTITY: &str = "sre-bot-reader";
-const READER_TOKEN_SECRET: &str = "sre-bot-reader-token";
-const WRITER_IDENTITY: &str = "sre-bot-writer";
-const WRITER_TOKEN_SECRET: &str = "sre-bot-writer-token";
-const WRITE_KUBECONFIG_SECRET_KEY: &str = "K8S_WRITE_KUBECONFIG";
-const WRITE_ALLOWLIST_ENV: &str = "K8S_WRITE_ALLOWLIST";
-const WRITE_GATE: &str = "mcp__k8s-write__restart_deployment";
-const SCALE_GATE: &str = "mcp__k8s-scale__scale_deployment";
+const READER_IDENTITY: &str = "sre-bot-kubernetes";
+const READER_TOKEN_SECRET: &str = "sre-bot-kubernetes-token";
 const UPGRADE_GATE: &str = "mcp__self-upgrade__upgrade_self";
+const UPGRADE_TOOL: &str = "self-upgrade/upgrade_self";
 // The platform-upgrade verb. Stripped like the others on a read-only install:
 // its Job, its identity and its CronJob are all absent by default, so shipping
 // the gate without them would validate and never fire.
 const PLATFORM_UPGRADE_GATE: &str = "mcp__self-upgrade__upgrade_platform";
+const PLATFORM_UPGRADE_TOOL: &str = "self-upgrade/upgrade_platform";
 // The platform-upgrade objects this installer renders. Names are fixed rather
 // than configurable: the connector is told the CronJob's name through its own
 // env, and two places free to disagree is how a tool ends up refusing every call
@@ -103,18 +99,13 @@ const PLATFORM_RULE_SHAPE: [(&str, &[&str]); 6] = [
 // asserted rather than assumed, so editing that file to widen the verb set stops
 // the install instead of shipping in it -- the same posture the connector and
 // gate removals below already take.
-const WRITE_RULE_API_GROUPS: [&str; 1] = ["apps"];
-const WRITE_RULE_RESOURCES: [&str; 1] = ["deployments"];
-const WRITE_RULE_VERBS: [&str; 2] = ["get", "patch"];
 const READER_TOKEN_TIMEOUT: &str = "2m";
-const KUBECONFIG_SECRET_KEY: &str = "K8S_READONLY_KUBECONFIG";
+const KUBECONFIG_SECRET_KEY: &str = "K8S_KUBECONFIG";
 // The gated write connector's published image. A `sha-<commit>` tag rather than a
 // semver one because no tagged release has carried this connector yet: it is
 // published by `release.yaml` on every push to a release branch, and a commit tag
 // is immutable in the way `latest` is not. Move this to a semver tag once a
 // release publishes one.
-const K8S_WRITE_IMAGE_REPOSITORY: &str = "ghcr.io/curie-eng/curie-sre-bot-k8s-write";
-const K8S_WRITE_IMAGE_TAG: &str = "sha-0fb841432db69f67591648eedf96f278aa87bd2c";
 // The self-upgrade connector's published image. Same reasoning as the write
 // connector's above: a `sha-<commit>` tag because no tagged release carries this
 // connector yet, and an immutable one because `latest` is not.
@@ -123,8 +114,6 @@ const SELF_UPGRADE_IMAGE_TAG: &str = "sha-a391c48b591cf4bf9637ce816964031288151f
 const TEMPO_IMAGE_REPOSITORY: &str = "ghcr.io/curie-eng/curie-sre-bot-tempo";
 const TEMPO_IMAGE_TAG: &str = "0.8.0";
 const TEMPO_TAGGED_IMAGE: &str = "ghcr.io/curie-eng/curie-sre-bot-tempo:0.8.0";
-const RUNTIME_PLUGIN_DESCRIPTION: &str = "SRE triage assistant for plain English production health and Kubernetes questions in Slack. This installer deploys read only Kubernetes, Grafana, and Tempo connectors. It omits the source bundle's gated write connector and approval policy; enable that path only through the documented explicit build and deploy flow.";
-const RUNTIME_PLUGIN_WRITE_DESCRIPTION: &str = "SRE triage assistant for plain English production health and Kubernetes questions in Slack. This installer deploys read only Kubernetes, Grafana, and Tempo connectors, plus one approval-gated Kubernetes restart tool scoped to the Deployments named at install time. Every restart requires a human approval; no other write verb is available.";
 const OCI_INDEX_MEDIA_TYPE: &str = "application/vnd.oci.image.index.v1+json";
 const DOCKER_INDEX_MEDIA_TYPE: &str = "application/vnd.docker.distribution.manifest.list.v2+json";
 
@@ -173,12 +162,8 @@ const BUNDLE_FILES: &[(&str, &[u8])] = &[
         include_bytes!("../../examples/sre-bot/evals/cases.json"),
     ),
     (
-        "manifests/read-access.yaml",
-        include_bytes!("../../examples/sre-bot/manifests/read-access.yaml"),
-    ),
-    (
-        "manifests/write-role.yaml",
-        include_bytes!("../../examples/sre-bot/manifests/write-role.yaml"),
+        "manifests/kubernetes-access.yaml",
+        include_bytes!("../../examples/sre-bot/manifests/kubernetes-access.yaml"),
     ),
     (
         "manifests/upgrade-role.yaml",
@@ -206,12 +191,6 @@ pub struct SreBotInstallOpts {
     pub observability: bool,
     pub dry_run: bool,
     pub slack_channel: Option<String>,
-    /// `ns/name[,ns/name]`. Absent still INSTALLS the gated write connector,
-    /// with an empty ceiling: the tool is published and gated, and every call is
-    /// refused until an operator names targets. See `write_targets` below.
-    pub write_allowlist: Option<String>,
-    /// Leave the write connector out entirely, as absence used to.
-    pub no_write: bool,
     /// Install the upgrade path: the self-upgrade connector, the platform
     /// upgrade Job and the two identities behind them. Absent, the connector is
     /// stripped exactly as it was before this flag existed, so an install that
@@ -465,25 +444,13 @@ fn curie_integration_command(identity: &InstallIdentity) -> InstallCommand {
     }
 }
 
-fn write_role_command() -> InstallCommand {
-    InstallCommand {
-        program: "kubectl",
-        args: vec![
-            plain("apply"),
-            plain("-f"),
-            CommandArg::BundleFile("manifests/write-role.yaml"),
-        ],
-        helm_target: None,
-    }
-}
-
 fn read_access_command() -> InstallCommand {
     InstallCommand {
         program: "kubectl",
         args: vec![
             plain("apply"),
             plain("-f"),
-            CommandArg::BundleFile("manifests/read-access.yaml"),
+            CommandArg::BundleFile("manifests/kubernetes-access.yaml"),
         ],
         helm_target: None,
     }
@@ -496,38 +463,6 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
         ));
     }
 
-    // Three states, not two. The write connector is now installed by default,
-    // because a capability nobody can see is indistinguishable from one that was
-    // never built -- which is exactly how this bundle's second write verb came to
-    // read as a design choice.
-    //
-    // `None` here means the connector is absent. `Some(&[])` means it is present
-    // with an EMPTY ceiling, and both halves of that ceiling are closed:
-    //
-    //   * the connector starts, publishes its tool, and refuses every call. Its
-    //     own source says so: "a missing config fails closed rather than granting
-    //     everything."
-    //   * no Role is rendered at all. This is the load-bearing half. An RBAC rule
-    //     whose `resourceNames` is empty or absent is NOT a rule that grants
-    //     nothing -- it grants the verb on EVERY resource of that type. So the
-    //     empty case must omit the Role rather than render one with no names, and
-    //     `render_write_role` does: with no targets it emits the ServiceAccount
-    //     and its token Secret and stops.
-    //
-    // The identity is still minted either way, because bring-up refuses without
-    // `K8S_WRITE_KUBECONFIG` -- an identity that can do nothing is what makes
-    // "enabled, ceiling empty" a state the platform can actually boot.
-    let write_targets = match (opts.no_write, opts.write_allowlist.as_deref()) {
-        (true, Some(_)) => {
-            return Err(crate::exit::usage(
-                "--no-write and --write-allowlist contradict each other; pass one",
-            ));
-        }
-        (true, None) => None,
-        (false, Some(raw)) => Some(parse_write_allowlist(raw)?),
-        (false, None) => Some(Vec::new()),
-    };
-    let write_targets = write_targets.as_deref();
     let identity = InstallIdentity::from_opts(&opts);
 
     preflight_capacity(&identity.observability_namespace).await?;
@@ -542,7 +477,6 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
     let stack_commands = stack_install_commands(&identity.observability_namespace);
     let integration_command = curie_integration_command(&identity);
     let read_access_command = read_access_command();
-    let write_role_command = write_role_command();
 
     if opts.dry_run {
         let chart = resolved_chart.planned_target();
@@ -562,24 +496,9 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
             identity.namespace
         ));
         lines.push(
-            "build the read only Kubernetes connector kubeconfig in memory from the ServiceAccount token"
+            "build the Kubernetes connector kubeconfig in memory from the ServiceAccount token"
                 .to_string(),
         );
-        if let Some(targets) = write_targets {
-            if targets.is_empty() {
-                lines.push(format!(
-                    "install connectors.k8s-write with an EMPTY {WRITE_ALLOWLIST_ENV}: the tool is \
-                     published and gated, every call is refused, and NO Role is rendered (an empty \
-                     resourceNames would grant every Deployment). Name targets with --write-allowlist"
-                ));
-            } else {
-                lines.push(format!(
-                    "render manifests/write-role.yaml and connectors.k8s-write env {} from one allowlist: {}",
-                    WRITE_ALLOWLIST_ENV,
-                    write_allowlist_value(targets)
-                ));
-            }
-        }
         let mut deploy = format!(
             "curie cluster deploy --plugin-dir embedded:examples/sre-bot --namespace {} --release {}",
             identity.namespace, identity.release
@@ -588,23 +507,6 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
             deploy.push_str(&format!(" --slack-channel {channel}"));
         }
         lines.push(deploy);
-        if write_targets.is_some() {
-            lines.push(format!(
-                "{} -- applied HERE only on a fresh install; when ServiceAccount \
-                 {WRITER_IDENTITY} already exists in namespace {} the same apply runs BEFORE the \
-                 deploy above, so a narrowed allowlist is in force before the new version activates",
-                write_role_command.display(&chart),
-                identity.namespace
-            ));
-            lines.push(format!(
-                "kubectl wait --namespace {} --for=jsonpath={{.data.token}} secret/{WRITER_TOKEN_SECRET} --timeout={READER_TOKEN_TIMEOUT}",
-                identity.namespace
-            ));
-            lines.push(
-                "build the gated write Kubernetes connector kubeconfig in memory from the ServiceAccount token"
-                    .to_string(),
-            );
-        }
         if opts.platform_upgrade {
             // The widest grant this installer can create, and the reason someone
             // runs --dry-run at all. Omitting it was the first version of this
@@ -653,14 +555,6 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
     let tempo_digest = resolve_tempo_index_digest().await?;
     let chart = crate::artifacts::ensure_cached(&resolved_chart).await?;
     crate::ops::require_on_path("helm")?;
-    // Resolved only when the connector is kept, so a --no-write install makes no
-    // registry call for an image it will never run.
-    let write_digest = match write_targets {
-        Some(_) => {
-            Some(resolve_index_digest(K8S_WRITE_IMAGE_REPOSITORY, K8S_WRITE_IMAGE_TAG).await?)
-        }
-        None => None,
-    };
     // Resolved before the workspace renders, like the other two: `build:` records
     // a LOCAL image id the cluster tier refuses, so a kept connector with no
     // resolved digest is one that can never start.
@@ -670,13 +564,7 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
         }
         false => None,
     };
-    let workspace = EmbeddedWorkspace::create(
-        &tempo_digest,
-        write_digest.as_deref(),
-        write_targets,
-        &identity,
-        upgrade_digest.as_deref(),
-    )?;
+    let workspace = EmbeddedWorkspace::create(&tempo_digest, &identity, upgrade_digest.as_deref())?;
     ensure_grafana_admin_secret(&identity.observability_namespace).await?;
     for command in &stack_commands {
         run_install_command(command, &workspace, &chart).await?;
@@ -687,67 +575,12 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
     apply_curie_platform(&chart, false, &identity).await?;
     run_install_command(&integration_command, &workspace, &chart).await?;
     run_install_command(&read_access_command, &workspace, &chart).await?;
-    let kubeconfig = read_only_connector_kubeconfig(&identity.namespace).await?;
+    let kubeconfig = kubernetes_connector_kubeconfig(&identity.namespace).await?;
 
     let bundle_dir = workspace.bundle_dir();
     let connection = resolve_embedded_cluster_connection(&identity).await?;
-    // The write Role and the writer kubeconfig are ordered around the deploy by
-    // PRIVILEGE DIRECTION, keyed on whether the writer identity already exists:
-    //
-    //     never create a NEW privileged identity before the deploy;
-    //     always tighten an EXISTING one before the deploy.
-    //
-    // FRESH INSTALL -- no `sre-bot-writer` ServiceAccount in the namespace, so
-    // the apply is DEFERRED to after the deploy succeeds. The identity it mints
-    // is a NON-EXPIRING ServiceAccount token, and with named targets it carries
-    // get,patch on apps/deployments. Nothing between the workspace render and
-    // the deploy needs it -- the only consumer is sync_deployed_version below --
-    // so creating it any sooner buys nothing and leaves a live write credential
-    // in the cluster for the whole length of the deploy.
-    //
-    // Deferred rather than rolled back. A rollback would need the same cluster
-    // API call that just failed: if the deploy died because the API server is
-    // unreachable, the RBAC write is being throttled, or the port-forward
-    // dropped, the compensating delete fails too and the credential is still
-    // standing -- now behind a log line claiming it was cleaned up. Deferring
-    // means the exposure window does not exist, rather than merely being
-    // shorter, and it adds no new failure path of its own.
-    //
-    // What this does NOT cover: a failure between that apply and
-    // sync_deployed_version still strands the identity, now with a deployed bot
-    // in front of it. That residual window is one API call wide, and it is the
-    // price of declining a rollback path.
-    //
-    // RE-INSTALL / UPGRADE -- the ServiceAccount is already there, so the same
-    // apply runs BEFORE the deploy. Applying early strands nothing, because
-    // every object it names already exists; and it is the only ordering that
-    // fails CLOSED when an operator NARROWS the allowlist. sync_deployed_version
-    // reconciles the connector Deployment's K8S_WRITE_ALLOWLIST only AFTER the
-    // new version is activated, so deferring the Role on an upgrade leaves the
-    // activation-to-sync window with the OLD wide Role still on the API server
-    // AND the OLD wide env still on the running connector pod: both halves
-    // permit, and an approved call can patch a target the operator just removed.
-    // That is the #1886 class -- the two allowlists disagreeing in the dangerous
-    // direction. Tightening the Role first makes that same window 403 instead.
-    let writer_identity_present = match write_targets {
-        Some(_) => writer_identity_exists(&identity.namespace).await?,
-        None => false,
-    };
-    let mut write_kubeconfig = None;
-    if writer_identity_present {
-        write_kubeconfig = Some(
-            apply_write_access(&write_role_command, &workspace, &chart, &identity.namespace)
-                .await?,
-        );
-    }
     let deployed =
         deploy_embedded_sre_bot(&bundle_dir, &connection, opts.slack_channel.as_deref()).await?;
-    if write_targets.is_some() && !writer_identity_present {
-        write_kubeconfig = Some(
-            apply_write_access(&write_role_command, &workspace, &chart, &identity.namespace)
-                .await?,
-        );
-    }
     // ALWAYS after the deploy, never before. `install_sre_bot` orders privileged
     // identities by direction -- never create a NEW one before the deploy -- and
     // both of these are new every time: unlike the write Role there is no
@@ -761,9 +594,6 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
             Some(apply_upgrade_path(&workspace, &chart, &identity.namespace).await?);
     }
     let mut secret_overrides = BTreeMap::from([(KUBECONFIG_SECRET_KEY.to_string(), kubeconfig)]);
-    if let Some(write_kubeconfig) = write_kubeconfig {
-        secret_overrides.insert(WRITE_KUBECONFIG_SECRET_KEY.to_string(), write_kubeconfig);
-    }
     if let Some(upgrade_kubeconfig) = upgrade_kubeconfig {
         secret_overrides.insert(
             SELF_UPGRADE_KUBECONFIG_SECRET_KEY.to_string(),
@@ -1372,74 +1202,14 @@ fn helm_pending_upgrade_recovery(target: &HelmTarget) -> String {
     )
 }
 
-async fn read_only_connector_kubeconfig(namespace: &str) -> Result<String> {
+async fn kubernetes_connector_kubeconfig(namespace: &str) -> Result<String> {
     connector_kubeconfig(READER_IDENTITY, READER_TOKEN_SECRET, namespace).await
-}
-
-async fn write_connector_kubeconfig(namespace: &str) -> Result<String> {
-    connector_kubeconfig(WRITER_IDENTITY, WRITER_TOKEN_SECRET, namespace).await
-}
-
-/// Apply the rendered write Role and mint the writer identity's kubeconfig.
-///
-/// One helper because the install issues this from two places -- before the
-/// deploy on an upgrade, after it on a fresh install -- and the two orderings
-/// must stay identical in what they apply and what they hand back.
-async fn apply_write_access(
-    write_role_command: &InstallCommand,
-    workspace: &EmbeddedWorkspace,
-    chart: &Path,
-    namespace: &str,
-) -> Result<String> {
-    run_install_command(write_role_command, workspace, chart).await?;
-    write_connector_kubeconfig(namespace).await
-}
-
-/// Does the gated write ServiceAccount already exist in `namespace`?
-///
-/// This is what picks the ordering of the write Role apply around the deploy, so
-/// it must not confuse "absent" with "could not tell". `--ignore-not-found`
-/// makes absence an exit-0 with empty stdout, which separates the two cleanly
-/// without parsing stderr: any nonzero exit is a real probe failure and is
-/// surfaced as an error. Reporting an unreadable cluster as a fresh install
-/// would pick the deferred ordering on an upgrade and re-open exactly the
-/// fail-open window this probe exists to close.
-async fn writer_identity_exists(namespace: &str) -> Result<bool> {
-    let args = [
-        "get",
-        "serviceaccount",
-        WRITER_IDENTITY,
-        "--namespace",
-        namespace,
-        "--ignore-not-found",
-        "-o",
-        "name",
-    ];
-    crate::ui::ui().plumbing(&format!("+ kubectl {}", args.join(" ")));
-    let output = tokio::process::Command::new("kubectl")
-        .args(args)
-        .output()
-        .await
-        .context("probing for the gated write ServiceAccount")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!(
-            "could not determine whether ServiceAccount {WRITER_IDENTITY} already exists in namespace {namespace}, and the write Role apply is ordered on that answer; check the cluster with `kubectl get serviceaccount {WRITER_IDENTITY} -n {namespace}` and retry: {}",
-            if stderr.trim().is_empty() {
-                "kubectl exited nonzero"
-            } else {
-                stderr.trim()
-            }
-        );
-    }
-    Ok(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
 }
 
 /// Build one connector's in-memory kubeconfig from a ServiceAccount token Secret.
 ///
-/// Shared by the read and write identities so they cannot drift in how they
-/// verify the token: both refuse an absent, malformed, or empty token rather
-/// than emitting a kubeconfig the connector would only fail on later.
+/// Refuses an absent, malformed, or empty token rather than emitting a
+/// kubeconfig the connector would only fail on later.
 async fn connector_kubeconfig(
     identity: &str,
     token_secret: &str,
@@ -1623,8 +1393,6 @@ struct EmbeddedWorkspace {
 impl EmbeddedWorkspace {
     fn create(
         tempo_digest: &str,
-        write_digest: Option<&str>,
-        write_targets: Option<&[WriteTarget]>,
         identity: &InstallIdentity,
         upgrade_digest: Option<&str>,
     ) -> Result<Self> {
@@ -1646,32 +1414,13 @@ impl EmbeddedWorkspace {
                 let runtime = runtime_connector_declaration(
                     contents,
                     tempo_digest,
-                    write_digest,
-                    write_targets,
                     &identity.observability_namespace,
                     upgrade_digest,
                 )?;
                 workspace.write(&Path::new("bundle").join(name), &runtime)?;
             } else if *name == ".claude-plugin/plugin.json" {
-                let runtime = runtime_plugin_manifest(
-                    contents,
-                    write_targets.is_some(),
-                    upgrade_digest.is_some(),
-                )?;
+                let runtime = runtime_plugin_manifest(contents, upgrade_digest.is_some())?;
                 workspace.write(&Path::new("bundle").join(name), &runtime)?;
-            } else if *name == "manifests/write-role.yaml" {
-                // Rendered from the allowlist when the write path is opted into,
-                // and NOT written at all otherwise. Shipping the shipped
-                // placeholder next to read-access.yaml -- which this install does
-                // apply -- reads as though a Deployment patch grant were in
-                // effect, when every consumer of it was stripped above.
-                match write_targets {
-                    Some(targets) => {
-                        let rendered = render_write_role(contents, targets, &identity.namespace)?;
-                        workspace.write(&Path::new("bundle").join(name), &rendered)?;
-                    }
-                    None => continue,
-                }
             } else if *name == "manifests/upgrade-role.yaml" {
                 // Both upgrade identities are written only when the path is
                 // opted into. Writing them otherwise would leave manifests
@@ -1688,7 +1437,7 @@ impl EmbeddedWorkspace {
                 }
                 let rendered = render_platform_upgrade_role(contents, &identity.namespace)?;
                 workspace.write(&Path::new("bundle").join(name), &rendered)?;
-            } else if *name == "manifests/read-access.yaml" {
+            } else if *name == "manifests/kubernetes-access.yaml" {
                 let rendered = render_read_access(contents, &identity.namespace)?;
                 workspace.write(&Path::new("bundle").join(name), &rendered)?;
             } else {
@@ -1734,87 +1483,6 @@ impl EmbeddedWorkspace {
     }
 }
 
-/// One `namespace/name` the write connector may target.
-///
-/// The SAME parsed list renders both ceilings: the Role's `resourceNames` and
-/// the connector's `K8S_WRITE_ALLOWLIST`. They are two allowlists over the same
-/// question in two files, and editing one without the other is not hypothetical
-/// -- downstream they disagreed for four days after a cluster changed, in the
-/// direction that 403s AFTER a human approved the call. Deriving both from one
-/// input makes that disagreement unrepresentable rather than merely detectable.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct WriteTarget {
-    namespace: String,
-    name: String,
-}
-
-impl WriteTarget {
-    fn qualified(&self) -> String {
-        format!("{}/{}", self.namespace, self.name)
-    }
-}
-
-fn valid_dns_label(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 253
-        && value
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.')
-        && !value.starts_with('-')
-        && !value.ends_with('-')
-}
-
-/// Parse `--write-allowlist ns/name[,ns/name]`, refusing anything that would
-/// produce a grant nobody chose.
-pub fn parse_write_allowlist(raw: &str) -> Result<Vec<WriteTarget>> {
-    let mut targets: Vec<WriteTarget> = Vec::new();
-    for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
-        // The placeholder the bundle ships. Accepting it would render a Role
-        // granting patch on a Deployment literally named `<deployment>`, which
-        // is inert but reads as configured.
-        if entry.contains('<') || entry.contains('>') {
-            bail!(
-                "--write-allowlist got the placeholder {entry:?}; replace it with a real \
-                 namespace/name pair"
-            );
-        }
-        let (namespace, name) = entry.split_once('/').with_context(|| {
-            format!("--write-allowlist entry {entry:?} is not in namespace/name form")
-        })?;
-        if !valid_dns_label(namespace) || !valid_dns_label(name) {
-            bail!(
-                "--write-allowlist entry {entry:?} is not a valid namespace/name pair \
-                 (lowercase alphanumeric, '-' and '.')"
-            );
-        }
-        targets.push(WriteTarget {
-            namespace: namespace.to_string(),
-            name: name.to_string(),
-        });
-    }
-    if targets.is_empty() {
-        bail!("--write-allowlist needs at least one namespace/name pair");
-    }
-    targets.sort();
-    targets.dedup();
-    Ok(targets)
-}
-
-fn write_allowlist_value(targets: &[WriteTarget]) -> String {
-    targets
-        .iter()
-        .map(WriteTarget::qualified)
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-/// Render the write identity for `targets` from the shipped manifest's own rule.
-///
-/// The ServiceAccount and its token Secret live in the release namespace; each
-/// target namespace gets a Role naming only its own Deployments plus a
-/// RoleBinding back to that one ServiceAccount. The verb set is read from
-/// `manifests/write-role.yaml` and asserted against what this build knows how to
-/// grant, so widening that file stops the install rather than shipping in it.
 fn rewrite_observability_namespace(contents: &[u8], observability_namespace: &str) -> Vec<u8> {
     if observability_namespace == OBSERVABILITY_NAMESPACE {
         return contents.to_vec();
@@ -1836,7 +1504,11 @@ fn rewrite_manifest_namespace(value: &mut serde_json::Value, namespace: &str) {
         .get_mut("metadata")
         .and_then(serde_json::Value::as_object_mut)
     {
-        if metadata.contains_key("namespace") {
+        if metadata
+            .get("namespace")
+            .and_then(serde_json::Value::as_str)
+            == Some(CURIE_NAMESPACE)
+        {
             metadata.insert(
                 "namespace".to_string(),
                 serde_json::Value::String(namespace.to_string()),
@@ -1849,7 +1521,9 @@ fn rewrite_manifest_namespace(value: &mut serde_json::Value, namespace: &str) {
     {
         for subject in subjects {
             if let Some(object) = subject.as_object_mut() {
-                if object.contains_key("namespace") {
+                if object.get("namespace").and_then(serde_json::Value::as_str)
+                    == Some(CURIE_NAMESPACE)
+                {
                     object.insert(
                         "namespace".to_string(),
                         serde_json::Value::String(namespace.to_string()),
@@ -1864,12 +1538,12 @@ fn render_read_access(source: &[u8], namespace: &str) -> Result<Vec<u8>> {
     if namespace == CURIE_NAMESPACE {
         return Ok(source.to_vec());
     }
-    let source =
-        std::str::from_utf8(source).context("embedded SRE bot read-access.yaml is not UTF-8")?;
+    let source = std::str::from_utf8(source)
+        .context("embedded SRE bot kubernetes-access.yaml is not UTF-8")?;
     let mut rendered = String::new();
     for document in serde_norway::Deserializer::from_str(source) {
         let mut value: serde_json::Value = serde::Deserialize::deserialize(document)
-            .context("parsing embedded SRE bot read-access.yaml")?;
+            .context("parsing embedded SRE bot kubernetes-access.yaml")?;
         rewrite_manifest_namespace(&mut value, namespace);
         rendered.push_str("---\n");
         rendered.push_str(
@@ -1927,118 +1601,9 @@ fn render_platform_upgrade_configmap(script: &[u8], namespace: &str) -> Result<V
     Ok(rendered.into_bytes())
 }
 
-fn render_write_role(
-    source: &[u8],
-    targets: &[WriteTarget],
-    curie_namespace: &str,
-) -> Result<Vec<u8>> {
-    let source =
-        std::str::from_utf8(source).context("embedded SRE bot write-role.yaml is not UTF-8")?;
-    let mut rule: Option<serde_json::Value> = None;
-    for document in serde_norway::Deserializer::from_str(source) {
-        let value: serde_json::Value = serde::Deserialize::deserialize(document)
-            .context("parsing embedded SRE bot write-role.yaml")?;
-        if value.get("kind").and_then(serde_json::Value::as_str) != Some("Role") {
-            continue;
-        }
-        let rules = value
-            .get("rules")
-            .and_then(serde_json::Value::as_array)
-            .context("the embedded write Role declares no rules")?;
-        if rules.len() != 1 {
-            bail!(
-                "the embedded write Role declares {} rules; this build renders exactly one",
-                rules.len()
-            );
-        }
-        rule = Some(rules[0].clone());
-    }
-    let rule = rule.context("the embedded write-role.yaml declares no Role")?;
-    for (field, expected) in [
-        ("apiGroups", WRITE_RULE_API_GROUPS.as_slice()),
-        ("resources", WRITE_RULE_RESOURCES.as_slice()),
-        ("verbs", WRITE_RULE_VERBS.as_slice()),
-    ] {
-        let actual: Vec<&str> = rule
-            .get(field)
-            .and_then(serde_json::Value::as_array)
-            .map(|items| items.iter().filter_map(serde_json::Value::as_str).collect())
-            .unwrap_or_default();
-        if actual != expected {
-            bail!(
-                "the embedded write Role's {field} are {actual:?}, but this build only knows how \
-                 to render {expected:?}; widening the grant needs a matching change here"
-            );
-        }
-    }
-
-    let mut documents: Vec<serde_json::Value> = vec![
-        serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "ServiceAccount",
-            "metadata": {"name": WRITER_IDENTITY, "namespace": curie_namespace},
-        }),
-        serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "Secret",
-            "metadata": {
-                "name": WRITER_TOKEN_SECRET,
-                "namespace": curie_namespace,
-                "annotations": {"kubernetes.io/service-account.name": WRITER_IDENTITY},
-            },
-            "type": "kubernetes.io/service-account-token",
-        }),
-    ];
-    let mut namespaces: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-    for target in targets {
-        namespaces
-            .entry(target.namespace.as_str())
-            .or_default()
-            .push(target.name.as_str());
-    }
-    for (namespace, names) in namespaces {
-        documents.push(serde_json::json!({
-            "apiVersion": "rbac.authorization.k8s.io/v1",
-            "kind": "Role",
-            "metadata": {"name": WRITER_IDENTITY, "namespace": namespace},
-            "rules": [{
-                "apiGroups": WRITE_RULE_API_GROUPS,
-                "resources": WRITE_RULE_RESOURCES,
-                "resourceNames": names,
-                "verbs": WRITE_RULE_VERBS,
-            }],
-        }));
-        documents.push(serde_json::json!({
-            "apiVersion": "rbac.authorization.k8s.io/v1",
-            "kind": "RoleBinding",
-            "metadata": {"name": WRITER_IDENTITY, "namespace": namespace},
-            "roleRef": {
-                "apiGroup": "rbac.authorization.k8s.io",
-                "kind": "Role",
-                "name": WRITER_IDENTITY,
-            },
-            "subjects": [{
-                "kind": "ServiceAccount",
-                "name": WRITER_IDENTITY,
-                "namespace": curie_namespace,
-            }],
-        }));
-    }
-    let mut rendered = String::new();
-    for document in documents {
-        rendered.push_str("---\n");
-        rendered.push_str(
-            &serde_norway::to_string(&document)
-                .context("serializing the rendered SRE bot write identity")?,
-        );
-    }
-    Ok(rendered.into_bytes())
-}
-
 /// The platform-upgrade identity, rendered into the release's namespace.
 ///
-/// Mirrors `render_write_role`, including the part that matters most: the
-/// shipped manifest's rules are ASSERTED against what this build knows how to
+/// The shipped manifest's rules are ASSERTED against what this build knows how to
 /// render before anything is emitted. This is the widest grant in the bundle --
 /// namespace-admin in all but name -- so a manifest that grows a rule must stop
 /// the install rather than have the installer grant it silently.
@@ -2229,8 +1794,6 @@ fn render_platform_cronjob(
 fn runtime_connector_declaration(
     source: &[u8],
     tempo_digest: &str,
-    write_digest: Option<&str>,
-    write_targets: Option<&[WriteTarget]>,
     observability_namespace: &str,
     upgrade_digest: Option<&str>,
 ) -> Result<Vec<u8>> {
@@ -2242,35 +1805,6 @@ fn runtime_connector_declaration(
         .get_mut("connectors")
         .and_then(serde_json::Value::as_object_mut)
         .context("embedded SRE bot must declare connectors")?;
-    match write_targets {
-        // Opt-in: keep the one gated write connector and point its allowlist at
-        // the SAME targets the Role was rendered from.
-        Some(targets) => {
-            let write = connectors
-                .get_mut("k8s-write")
-                .and_then(serde_json::Value::as_object_mut)
-                .context("embedded SRE bot must declare connectors.k8s-write")?;
-            let env = write
-                .entry("env")
-                .or_insert_with(|| serde_json::Value::Object(Default::default()))
-                .as_object_mut()
-                .context("embedded SRE bot k8s-write connector env is not a mapping")?;
-            env.insert(
-                WRITE_ALLOWLIST_ENV.to_string(),
-                serde_json::Value::String(write_allowlist_value(targets)),
-            );
-        }
-        None => {
-            if connectors.remove("k8s-write").is_none() {
-                bail!("embedded SRE bot must declare connectors.k8s-write");
-            }
-        }
-    }
-    // Scale stays out either way: a separate blast radius (scale to zero is an
-    // outage) deserves its own opt-in, not a ride on this one.
-    if connectors.remove("k8s-scale").is_none() {
-        bail!("embedded SRE bot must declare connectors.k8s-scale");
-    }
     // Self-upgrade stays out too, and for a stronger reason than scale. It is
     // inert without a CronJob this installer does not create, and its identity
     // holds namespace-wide `create` on `jobs` in the namespace that holds the
@@ -2320,21 +1854,12 @@ fn runtime_connector_declaration(
             }
         }
     }
-    // Fail closed on a connector this build does not know about. Removing the
-    // write connectors by name is only as narrow as intended if the bundle has no
-    // third one -- and the bundle is edited far more often than this file, so an
+    // Fail closed on a connector this build does not know about. The bundle is
+    // edited far more often than this file, so an
     // unrecognized connector must stop the install rather than ship in it.
-    let known: &[&str] = match (write_targets.is_some(), upgrade_digest.is_some()) {
-        (true, true) => &[
-            "kubernetes",
-            "grafana",
-            "tempo",
-            "k8s-write",
-            "self-upgrade",
-        ],
-        (true, false) => &["kubernetes", "grafana", "tempo", "k8s-write"],
-        (false, true) => &["kubernetes", "grafana", "tempo", "self-upgrade"],
-        (false, false) => &["kubernetes", "grafana", "tempo"],
+    let known: &[&str] = match upgrade_digest.is_some() {
+        true => &["kubernetes", "grafana", "tempo", "self-upgrade"],
+        false => &["kubernetes", "grafana", "tempo"],
     };
     if let Some(unexpected) = connectors
         .keys()
@@ -2342,7 +1867,7 @@ fn runtime_connector_declaration(
     {
         bail!(
             "embedded SRE bot declares connector {unexpected}, which this build does not \
-             know how to classify; the read only install ships only read connectors"
+             know how to classify"
         );
     }
     let tempo = connectors
@@ -2358,31 +1883,6 @@ fn runtime_connector_declaration(
         "image".to_string(),
         serde_json::Value::String(format!("{TEMPO_IMAGE_REPOSITORY}@{tempo_digest}")),
     );
-    // The kept write connector gets the same treatment, and for the same reason:
-    // `build:` records a LOCAL image id, which the cluster tier refuses because a
-    // cluster cannot pull an image that exists only in one machine's Docker
-    // daemon. Without this the opt-in produced a bundle whose write path could
-    // never come up. Deliberately after the known-connector check above, so an
-    // unrecognised connector is still reported as one rather than as a missing
-    // image.
-    if write_targets.is_some() {
-        let digest =
-            write_digest.context("keeping connectors.k8s-write needs its resolved image digest")?;
-        let write = connectors
-            .get_mut("k8s-write")
-            .and_then(serde_json::Value::as_object_mut)
-            .context("embedded SRE bot must declare connectors.k8s-write")?;
-        if write.remove("build").is_none() || write.contains_key("image") {
-            bail!(
-                "embedded SRE bot k8s-write connector must declare one build source and no \
-                 image before immutable resolution"
-            );
-        }
-        write.insert(
-            "image".to_string(),
-            serde_json::Value::String(format!("{K8S_WRITE_IMAGE_REPOSITORY}@{digest}")),
-        );
-    }
     let serialized = serde_norway::to_string(&declaration)
         .context("serializing the immutable SRE bot connector declaration")?;
     Ok(rewrite_observability_namespace(
@@ -2391,21 +1891,13 @@ fn runtime_connector_declaration(
     ))
 }
 
-fn runtime_plugin_manifest(
-    source: &[u8],
-    write_enabled: bool,
-    upgrade_enabled: bool,
-) -> Result<Vec<u8>> {
+fn runtime_plugin_manifest(source: &[u8], upgrade_enabled: bool) -> Result<Vec<u8>> {
     let mut manifest: serde_json::Value =
         serde_json::from_slice(source).context("parsing embedded SRE bot plugin.json")?;
-    // Pinned, not merely present. This install strips approvalPolicy entirely
-    // because it ships read only, and stripping a gate is only safe when the
-    // connector it guards is also gone -- so an unrecognized gate means the
-    // bundle grew a write verb this build does not know to remove.
+    // Pinned, not merely present. The Kubernetes tool policy remains intact;
+    // approvalPolicy only governs the optional self-upgrade connector.
     let expected_policy = serde_json::json!({
         "gates": [
-            {"gate": WRITE_GATE, "route": "sre-approvals"},
-            {"gate": SCALE_GATE, "route": "sre-approvals"},
             {"gate": UPGRADE_GATE, "route": "sre-approvals"},
             {"gate": PLATFORM_UPGRADE_GATE, "route": "sre-approvals"}
         ]
@@ -2416,14 +1908,26 @@ fn runtime_plugin_manifest(
     let manifest = manifest
         .as_object_mut()
         .context("embedded SRE bot plugin.json must be an object")?;
-    // Keep exactly the gates whose connectors survived, and no others. A gate
-    // naming a stripped connector fails bundle validation for everyone; a kept
-    // connector with no gate is the ungated write this whole path exists to
-    // avoid. Both halves are decided here, from the same two conditions.
-    let mut kept: Vec<serde_json::Value> = Vec::new();
-    if write_enabled {
-        kept.push(serde_json::json!({"gate": WRITE_GATE, "route": "sre-approvals"}));
+    let tool_policy = manifest
+        .get_mut("toolPolicy")
+        .and_then(serde_json::Value::as_object_mut)
+        .context("embedded SRE bot must declare toolPolicy")?;
+    let allow = tool_policy
+        .get_mut("allow")
+        .and_then(serde_json::Value::as_array_mut)
+        .context("embedded SRE bot toolPolicy.allow must be an array")?;
+    for tool in [UPGRADE_TOOL, PLATFORM_UPGRADE_TOOL] {
+        if !allow.iter().any(|entry| entry.as_str() == Some(tool)) {
+            bail!("embedded SRE bot toolPolicy.allow must contain {tool}");
+        }
     }
+    if !upgrade_enabled {
+        allow.retain(|entry| !matches!(entry.as_str(), Some(UPGRADE_TOOL | PLATFORM_UPGRADE_TOOL)));
+    }
+    // Keep exactly the gates and tool-policy entries whose connectors survived.
+    // Either kind of reference to a stripped connector fails bundle validation;
+    // a kept connector without both layers would bypass the intended gate.
+    let mut kept: Vec<serde_json::Value> = Vec::new();
     if upgrade_enabled {
         kept.push(serde_json::json!({"gate": UPGRADE_GATE, "route": "sre-approvals"}));
         kept.push(serde_json::json!({"gate": PLATFORM_UPGRADE_GATE, "route": "sre-approvals"}));
@@ -2438,16 +1942,8 @@ fn runtime_plugin_manifest(
             "approvalPolicy".to_string(),
             serde_json::json!({"gates": kept}),
         );
-        manifest.insert(
-            "description".to_string(),
-            serde_json::Value::String(RUNTIME_PLUGIN_WRITE_DESCRIPTION.to_string()),
-        );
     } else {
         manifest.remove("approvalPolicy");
-        manifest.insert(
-            "description".to_string(),
-            serde_json::Value::String(RUNTIME_PLUGIN_DESCRIPTION.to_string()),
-        );
     }
     serde_json::to_vec_pretty(&manifest).context("serializing the SRE bot plugin manifest")
 }
@@ -2771,8 +2267,6 @@ mod tests {
         let connectors = runtime_connector_declaration(
             bundle_file("connectors.yaml"),
             "sha256:tempo",
-            None,
-            None,
             OBSERVABILITY_NAMESPACE,
             None,
         )
@@ -2781,10 +2275,13 @@ mod tests {
         assert!(parsed["connectors"].get("self-upgrade").is_none());
 
         let manifest =
-            runtime_plugin_manifest(bundle_file(".claude-plugin/plugin.json"), false, false)
-                .unwrap();
+            runtime_plugin_manifest(bundle_file(".claude-plugin/plugin.json"), false).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
         assert!(parsed.get("approvalPolicy").is_none());
+        let allow = parsed["toolPolicy"]["allow"].as_array().unwrap();
+        assert!(!allow
+            .iter()
+            .any(|tool| { matches!(tool.as_str(), Some(UPGRADE_TOOL | PLATFORM_UPGRADE_TOOL)) }));
     }
 
     #[test]
@@ -2796,8 +2293,6 @@ mod tests {
         let connectors = runtime_connector_declaration(
             bundle_file("connectors.yaml"),
             "sha256:tempo",
-            None,
-            None,
             OBSERVABILITY_NAMESPACE,
             Some("sha256:upgrade"),
         )
@@ -2824,8 +2319,7 @@ mod tests {
         // kept connector with no gate is an ungated write. Both are decided from
         // the same condition, so both are asserted here.
         let manifest =
-            runtime_plugin_manifest(bundle_file(".claude-plugin/plugin.json"), false, true)
-                .unwrap();
+            runtime_plugin_manifest(bundle_file(".claude-plugin/plugin.json"), true).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
         let gates: Vec<&str> = parsed["approvalPolicy"]["gates"]
             .as_array()
@@ -2961,335 +2455,92 @@ mod tests {
             .unwrap_or_else(|| panic!("embedded bundle has no {name}"))
     }
 
-    fn targets(raw: &str) -> Vec<WriteTarget> {
-        parse_write_allowlist(raw).expect("fixture allowlist parses")
-    }
-
     #[test]
-    fn write_allowlist_normalizes_order_and_duplicates() {
-        let parsed = targets("curie/b , curie/a,curie/b");
-        assert_eq!(
-            parsed
-                .iter()
-                .map(WriteTarget::qualified)
-                .collect::<Vec<_>>(),
-            vec!["curie/a", "curie/b"]
-        );
-    }
-
-    #[test]
-    fn write_allowlist_refuses_the_shipped_placeholder() {
-        let error = parse_write_allowlist("<namespace>/<deployment>")
-            .expect_err("the placeholder must not render a Role");
-        assert!(error.to_string().contains("placeholder"), "{error:#}");
-    }
-
-    #[test]
-    fn write_allowlist_refuses_entries_that_are_not_namespace_qualified() {
-        for raw in ["curie-api", "curie/", "/curie-api", "curie/Curie_API", ""] {
-            assert!(
-                parse_write_allowlist(raw).is_err(),
-                "{raw:?} must be refused"
-            );
-        }
-    }
-
-    /// The property this whole flag exists for: ONE input, both ceilings, and
-    /// they agree by construction rather than by a later comparison.
-    #[test]
-    fn one_allowlist_renders_both_ceilings_identically() {
-        let parsed = targets("curie/curie-api,other/web");
-        let role = render_write_role(
-            bundle_file("manifests/write-role.yaml"),
-            &parsed,
-            CURIE_NAMESPACE,
-        )
-        .expect("write role renders");
-        let role = String::from_utf8(role).expect("rendered role is UTF-8");
-        let mut granted: Vec<String> = Vec::new();
-        for document in serde_norway::Deserializer::from_str(&role) {
-            let value: serde_json::Value =
-                serde::Deserialize::deserialize(document).expect("rendered document parses");
-            if value.get("kind").and_then(serde_json::Value::as_str) != Some("Role") {
-                continue;
-            }
-            let namespace = value["metadata"]["namespace"].as_str().unwrap().to_string();
-            for name in value["rules"][0]["resourceNames"].as_array().unwrap() {
-                granted.push(format!("{namespace}/{}", name.as_str().unwrap()));
-            }
-        }
-        granted.sort();
-
-        let connectors = runtime_connector_declaration(
+    fn kubernetes_connector_survives_runtime_render_unchanged() {
+        let rendered = runtime_connector_declaration(
             bundle_file("connectors.yaml"),
-            "sha256:fixture",
-            Some("sha256:writefixture"),
-            Some(&parsed),
+            "sha256:tempo",
             OBSERVABILITY_NAMESPACE,
             None,
         )
         .expect("connector declaration renders");
-        let declaration: serde_json::Value =
-            serde_norway::from_slice(&connectors).expect("rendered connectors parse");
-        let allowlist = declaration["connectors"]["k8s-write"]["env"][WRITE_ALLOWLIST_ENV]
-            .as_str()
-            .expect("the write connector carries an allowlist");
-        let mut declared: Vec<String> = allowlist.split(',').map(str::to_string).collect();
-        declared.sort();
-
+        let source: serde_json::Value =
+            serde_norway::from_slice(bundle_file("connectors.yaml")).unwrap();
+        let runtime: serde_json::Value = serde_norway::from_slice(&rendered).unwrap();
         assert_eq!(
-            granted, declared,
-            "the two ceilings must name the same targets"
+            runtime["connectors"]["kubernetes"],
+            source["connectors"]["kubernetes"],
+            "the installer must preserve the pinned upstream image, core-only flags, and kubeconfig mount"
         );
-        assert_eq!(granted, vec!["curie/curie-api", "other/web"]);
+        assert!(runtime["connectors"].get("k8s-write").is_none());
+        assert!(runtime["connectors"].get("k8s-scale").is_none());
     }
 
-    /// The write connector is installed by default now, so the empty ceiling has
-    /// to be a state that is safe rather than merely representable.
-    ///
-    /// The RBAC trap this guards: a rule whose `resourceNames` is empty or absent
-    /// grants the verb on EVERY resource of that type. So "no targets" must omit
-    /// the Role, not render one with no names -- otherwise the default install
-    /// would hand the bot patch on every Deployment in the namespace, which is the
-    /// exact opposite of what an empty allowlist reads like.
     #[test]
-    fn no_targets_renders_an_identity_with_no_role_at_all() {
-        let rendered = render_write_role(
-            bundle_file("manifests/write-role.yaml"),
-            &[],
-            CURIE_NAMESPACE,
+    fn kubernetes_access_rewrites_only_the_curie_identity_namespace() {
+        let rendered = render_read_access(
+            bundle_file("manifests/kubernetes-access.yaml"),
+            "curie-prod",
         )
-        .expect("write role renders with no targets");
-        let text = String::from_utf8(rendered).expect("rendered role is UTF-8");
-        let mut kinds: Vec<String> = Vec::new();
-        for document in serde_norway::Deserializer::from_str(&text) {
-            let value: serde_json::Value =
-                serde::Deserialize::deserialize(document).expect("rendered document parses");
-            if let Some(kind) = value.get("kind").and_then(serde_json::Value::as_str) {
-                kinds.push(kind.to_string());
-            }
-        }
-        kinds.sort();
+        .expect("Kubernetes access manifest renders");
+        let text = String::from_utf8(rendered).unwrap();
+        assert!(
+            text.contains("namespace: curie-prod"),
+            "the connector identity must follow the selected release namespace: {text}"
+        );
+        assert!(
+            text.contains("namespace: sre-demo"),
+            "the disposable workload ceiling must remain in sre-demo: {text}"
+        );
+        assert!(
+            !text.contains("namespace: curie\n"),
+            "the shipped release namespace must be fully rewritten: {text}"
+        );
+    }
+
+    #[test]
+    fn upgrade_disabled_removes_only_self_upgrade_policy_entries() {
+        let manifest =
+            runtime_plugin_manifest(bundle_file(".claude-plugin/plugin.json"), false).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
+        assert!(parsed.get("approvalPolicy").is_none());
+        let source: serde_json::Value =
+            serde_json::from_slice(bundle_file(".claude-plugin/plugin.json")).unwrap();
         assert_eq!(
-            kinds,
-            vec!["Secret".to_string(), "ServiceAccount".to_string()],
-            "an empty ceiling must mint the identity and grant it nothing; rendered: {text}"
+            parsed["toolPolicy"]["approvalRequired"],
+            source["toolPolicy"]["approvalRequired"]
         );
-    }
-
-    /// The other half of the empty ceiling: the connector is present, so the tool
-    /// is published and gated, and its own allowlist is empty rather than the
-    /// shipped placeholder.
-    #[test]
-    fn no_targets_keeps_the_connector_with_an_empty_allowlist() {
-        let rendered = runtime_connector_declaration(
-            bundle_file("connectors.yaml"),
-            "sha256:fixture",
-            Some("sha256:writefixture"),
-            Some(&[]),
-            OBSERVABILITY_NAMESPACE,
-            None,
-        )
-        .expect("connector declaration renders with no targets");
-        let declaration: serde_json::Value =
-            serde_norway::from_slice(&rendered).expect("rendered declaration parses");
-        let write = &declaration["connectors"]["k8s-write"];
-        assert!(
-            !write.is_null(),
-            "the write connector must be installed by default"
-        );
+        assert_eq!(parsed["toolPolicy"]["deny"], source["toolPolicy"]["deny"]);
+        let allow = parsed["toolPolicy"]["allow"].as_array().unwrap();
         assert_eq!(
-            write["env"][WRITE_ALLOWLIST_ENV].as_str(),
-            Some(""),
-            "an empty ceiling is an empty allowlist, never the shipped placeholder"
+            allow.len(),
+            source["toolPolicy"]["allow"].as_array().unwrap().len() - 2
         );
-    }
-
-    /// And the opt-out still produces exactly what absence used to.
-    #[test]
-    fn opting_out_leaves_the_write_connector_absent() {
-        let rendered = runtime_connector_declaration(
-            bundle_file("connectors.yaml"),
-            "sha256:fixture",
-            None,
-            None,
-            OBSERVABILITY_NAMESPACE,
-            None,
-        )
-        .expect("connector declaration renders with the write path out");
-        let declaration: serde_json::Value =
-            serde_norway::from_slice(&rendered).expect("rendered declaration parses");
-        assert!(
-            declaration["connectors"]["k8s-write"].is_null(),
-            "--no-write must leave the connector out entirely"
-        );
+        assert!(allow
+            .iter()
+            .all(|tool| { !matches!(tool.as_str(), Some(UPGRADE_TOOL | PLATFORM_UPGRADE_TOOL)) }));
+        assert!(allow
+            .iter()
+            .any(|tool| tool.as_str() == Some("kubernetes/pods_list")));
     }
 
     #[test]
-    fn rendered_write_role_refuses_a_widened_grant() {
-        let widened = b"---\napiVersion: rbac.authorization.k8s.io/v1\nkind: Role\nmetadata:\n  name: sre-bot-writer\n  namespace: curie\nrules:\n  - apiGroups: [apps]\n    resources: [deployments]\n    resourceNames: [my-app]\n    verbs: [get, patch, delete]\n";
-        let error = render_write_role(widened, &targets("curie/api"), CURIE_NAMESPACE)
-            .expect_err("a widened verb set must stop the install");
-        assert!(error.to_string().contains("verbs"), "{error:#}");
-    }
-
-    #[test]
-    fn write_role_identity_uses_the_selected_curie_namespace() {
-        let rendered = render_write_role(
-            bundle_file("manifests/write-role.yaml"),
-            &targets("apps/api"),
-            "soak",
-        )
-        .expect("write role renders");
-        let text = String::from_utf8(rendered).expect("rendered role is UTF-8");
-        let mut sa_ns = Vec::new();
-        let mut role_ns = Vec::new();
-        let mut subject_ns = Vec::new();
-        for document in serde_norway::Deserializer::from_str(&text) {
-            let value: serde_json::Value =
-                serde::Deserialize::deserialize(document).expect("rendered document parses");
-            match value.get("kind").and_then(serde_json::Value::as_str) {
-                Some("ServiceAccount") | Some("Secret") => {
-                    sa_ns.push(value["metadata"]["namespace"].as_str().unwrap().to_string());
-                }
-                Some("Role") => {
-                    role_ns.push(value["metadata"]["namespace"].as_str().unwrap().to_string());
-                }
-                Some("RoleBinding") => {
-                    subject_ns.push(
-                        value["subjects"][0]["namespace"]
-                            .as_str()
-                            .unwrap()
-                            .to_string(),
-                    );
-                    role_ns.push(value["metadata"]["namespace"].as_str().unwrap().to_string());
-                }
-                _ => {}
-            }
-        }
-        assert_eq!(sa_ns, vec!["soak", "soak"]);
-        assert_eq!(subject_ns, vec!["soak"]);
-        assert_eq!(role_ns, vec!["apps", "apps"]);
-        assert!(
-            !text.contains("namespace: curie"),
-            "selected Curie identity must replace the shipped default: {text}"
-        );
-    }
-
-    #[test]
-    fn write_opt_in_keeps_only_the_restart_gate() {
-        let manifest =
-            runtime_plugin_manifest(bundle_file(".claude-plugin/plugin.json"), true, false)
-                .expect("write manifest renders");
-        let manifest: serde_json::Value =
-            serde_json::from_slice(&manifest).expect("rendered manifest parses");
-        let gates = manifest["approvalPolicy"]["gates"].as_array().unwrap();
-        assert_eq!(gates.len(), 1, "scale must not ride along: {gates:?}");
-        assert_eq!(gates[0]["gate"].as_str(), Some(WRITE_GATE));
-    }
-
-    /// Every write connector kept must still be gated, and every gate must still
-    /// name a connector kept -- the two halves that were forgotten separately.
-    #[test]
-    fn write_opt_in_keeps_the_connector_its_gate_names() {
-        let parsed = targets("curie/api");
-        let connectors = runtime_connector_declaration(
-            bundle_file("connectors.yaml"),
-            "sha256:fixture",
-            Some("sha256:writefixture"),
-            Some(&parsed),
-            OBSERVABILITY_NAMESPACE,
-            None,
-        )
-        .expect("connector declaration renders");
-        let declaration: serde_json::Value = serde_norway::from_slice(&connectors).unwrap();
-        let connectors = declaration["connectors"].as_object().unwrap();
-        assert!(connectors.contains_key("k8s-write"));
-        assert!(
-            !connectors.contains_key("k8s-scale"),
-            "scale is a separate opt-in"
-        );
-
-        let manifest =
-            runtime_plugin_manifest(bundle_file(".claude-plugin/plugin.json"), true, false)
-                .unwrap();
-        let manifest: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
-        for gate in manifest["approvalPolicy"]["gates"].as_array().unwrap() {
-            let gate = gate["gate"].as_str().unwrap();
-            let server = gate.trim_start_matches("mcp__").split("__").next().unwrap();
-            assert!(
-                connectors.contains_key(server),
-                "gate {gate} names connector {server}, which this install removed"
-            );
-        }
-    }
-
-    #[test]
-    fn read_only_install_is_unchanged_by_the_new_flag() {
-        let connectors = runtime_connector_declaration(
-            bundle_file("connectors.yaml"),
-            "sha256:fixture",
-            None,
-            None,
-            OBSERVABILITY_NAMESPACE,
-            None,
-        )
-        .expect("read only declaration renders");
-        let declaration: serde_json::Value = serde_norway::from_slice(&connectors).unwrap();
-        let connectors = declaration["connectors"].as_object().unwrap();
-        assert!(!connectors.contains_key("k8s-write"));
-        assert!(!connectors.contains_key("k8s-scale"));
-
-        let manifest =
-            runtime_plugin_manifest(bundle_file(".claude-plugin/plugin.json"), false, false)
-                .unwrap();
-        let manifest: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
-        assert!(manifest.get("approvalPolicy").is_none());
-    }
-
-    #[test]
-    fn write_opt_in_still_refuses_an_unknown_connector() {
-        let source = b"connectors:\n  kubernetes: {}\n  grafana: {}\n  tempo:\n    build:\n      context: connectors/tempo\n  k8s-write: {}\n  k8s-scale: {}\n  self-upgrade: {}\n  mystery: {}\n";
-        let error = runtime_connector_declaration(
-            source,
-            "sha256:fixture",
-            Some("sha256:writefixture"),
-            Some(&targets("curie/api")),
-            OBSERVABILITY_NAMESPACE,
-            None,
-        )
-        .expect_err("an unclassified connector must stop the install");
+    fn runtime_connector_transform_refuses_an_unknown_connector() {
+        let source = b"connectors:\n  kubernetes: {}\n  grafana: {}\n  tempo:\n    build:\n      context: connectors/tempo\n  self-upgrade: {}\n  mystery: {}\n";
+        let error =
+            runtime_connector_declaration(source, "sha256:fixture", OBSERVABILITY_NAMESPACE, None)
+                .expect_err("an unclassified connector must stop the install");
         assert!(error.to_string().contains("mystery"), "{error:#}");
     }
 
     #[test]
-    fn runtime_connector_transform_requires_the_declared_write_connector() {
-        let source = b"connectors:\n  tempo:\n    build:\n      context: connectors/tempo\n      platforms: [linux/amd64]\n";
-        let error = runtime_connector_declaration(
-            source,
-            "sha256:fixture",
-            None,
-            None,
-            OBSERVABILITY_NAMESPACE,
-            None,
-        )
-        .expect_err("missing k8s-write must be refused");
-        assert!(
-            error
-                .to_string()
-                .contains("must declare connectors.k8s-write"),
-            "unexpected error: {error:#}"
-        );
-    }
-
-    #[test]
-    fn runtime_plugin_transform_requires_the_exact_write_gate_policy() {
-        let exact_gate = serde_json::json!({
-            "gate": "mcp__k8s-write__restart_deployment",
+    fn runtime_plugin_transform_requires_the_exact_upgrade_gate_policy() {
+        let exact_upgrade = serde_json::json!({
+            "gate": UPGRADE_GATE,
             "route": "sre-approvals"
         });
-        let scale_gate = serde_json::json!({
-            "gate": "mcp__k8s-scale__scale_deployment",
+        let exact_platform = serde_json::json!({
+            "gate": PLATFORM_UPGRADE_GATE,
             "route": "sre-approvals"
         });
         let cases = [
@@ -3304,10 +2555,10 @@ mod tests {
                     "description": "source",
                     "approvalPolicy": {"gates": [
                         {
-                            "gate": "mcp__k8s-write__rollout_restart",
+                            "gate": "mcp__self-upgrade__upgrade_agent",
                             "route": "sre-approvals"
                         },
-                        scale_gate.clone()
+                        exact_platform.clone()
                     ]}
                 }),
             ),
@@ -3317,18 +2568,18 @@ mod tests {
                     "name": "sre-bot",
                     "description": "source",
                     "approvalPolicy": {"gates": [
-                        exact_gate.clone(),
-                        scale_gate.clone(),
+                        exact_upgrade.clone(),
+                        exact_platform.clone(),
                         {"gate": "mcp__other__write", "route": "sre-approvals"}
                     ]}
                 }),
             ),
             (
-                "only the restart gate, scale gate dropped",
+                "platform gate dropped",
                 serde_json::json!({
                     "name": "sre-bot",
                     "description": "source",
-                    "approvalPolicy": {"gates": [exact_gate.clone()]}
+                    "approvalPolicy": {"gates": [exact_upgrade.clone()]}
                 }),
             ),
             (
@@ -3338,10 +2589,10 @@ mod tests {
                     "description": "source",
                     "approvalPolicy": {"gates": [
                         {
-                            "gate": "mcp__k8s-write__restart_deployment",
+                            "gate": UPGRADE_GATE,
                             "route": "other-approvals"
                         },
-                        scale_gate.clone()
+                        exact_platform.clone()
                     ]}
                 }),
             ),
@@ -3349,7 +2600,7 @@ mod tests {
 
         for (case, manifest) in cases {
             let source = serde_json::to_vec(&manifest).expect("serialize fixture manifest");
-            let error = match runtime_plugin_manifest(&source, false, false) {
+            let error = match runtime_plugin_manifest(&source, false) {
                 Ok(_) => panic!("{case} must be refused"),
                 Err(error) => error,
             };

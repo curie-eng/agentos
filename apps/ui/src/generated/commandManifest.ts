@@ -4864,26 +4864,6 @@ export const commandManifest = {
                 },
                 {
                   "global": false,
-                  "help": "Scope the approval-gated restart tool to these Deployments (`namespace/name`, comma separated). One list renders BOTH ceilings: the Role's resourceNames and the connector's K8S_WRITE_ALLOWLIST. Omit and the connector is still installed, gated, with an empty ceiling that refuses every call until targets are named",
-                  "id": "write_allowlist",
-                  "long": "write-allowlist",
-                  "positional": false,
-                  "required": false
-                },
-                {
-                  "global": false,
-                  "help": "Leave the gated write connector out of the install entirely",
-                  "id": "no_write",
-                  "long": "no-write",
-                  "positional": false,
-                  "possible_values": [
-                    "true",
-                    "false"
-                  ],
-                  "required": false
-                },
-                {
-                  "global": false,
                   "help": "Install the upgrade path: the self-upgrade connector, the platform upgrade Job, and the two identities behind them",
                   "id": "platform_upgrade",
                   "long": "platform-upgrade",

@@ -16,10 +16,9 @@ start that one Job and learn its name. It cannot say what the Job runs.
 
 Why a separate server, and why zero arguments
 ----------------------------------------------
-`k8s-write`'s docstring is the standing argument: it exposes ONE tool, so there
-is no second thing for a gate to miss, and "there is no parameter through which a
-caller could reach an image, an env var, a command". This tool goes one step
-further and takes NO arguments at all. The repository, the branch, the agent
+This connector exposes one zero-argument tool, so there is no second action for
+a gate to miss and no parameter through which a caller could reach an image, an
+environment variable, or a command. The repository, the branch, the agent
 name, the image and the command all come from the CronJob's own `jobTemplate`,
 read from the cluster at call time. There is no field a caller can influence, so
 there is nothing to validate and nothing to escape.
@@ -27,10 +26,9 @@ there is nothing to validate and nothing to escape.
 The grant RBAC cannot narrow, and what stands in for it
 --------------------------------------------------------
 `create` on `jobs` is namespace-wide -- Kubernetes has no `resourceNames` for a
-resource that does not exist yet, so RBAC cannot say "only this Job". That is the
-same shape as `k8s-write`'s `patch deployments`, which RBAC also cannot separate
-from `set image`, and it gets the same answer: the ceiling is enforced here, in
-Python, by never letting a caller supply a body. The Job posted is the CronJob's
+resource that does not exist yet, so RBAC cannot say "only this Job". The
+purpose-built ceiling is enforced here, in Python, by never letting a caller
+supply a body. The Job posted is the CronJob's
 template verbatim, and the CronJob is named by operator configuration
 (`SELF_UPGRADE_CRONJOB`), not by the model.
 

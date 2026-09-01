@@ -1,18 +1,14 @@
-# What the tree actually installs, and how to reproduce it
+# What the tree installs, and how to reproduce it
 
-The reproduction is one command. It used to be this bundle plus four deltas
-applied by hand; that gap is why a reviewer could interrogate a live bot and
-then find nothing in the repository that reproduced it. The installer has
-landed, so this file describes what `curie example sre-bot install` does
-today, including the two upgrade paths the previous write-up never named.
+The supported cluster reproduction is one command:
 
 ```bash
 curie example sre-bot install --observability
 ```
 
-`--observability` is required. With no targeting flags, Curie lands as release
-`curie` in namespace `curie`, and the Grafana/Loki/Alloy/Tempo/Prometheus stack
-lands in namespace `observability`. To install beside an existing release:
+With no targeting flags, Curie lands as release `curie` in namespace `curie`,
+and the observability stack lands in namespace `observability`. To install
+beside an existing release:
 
 ```bash
 curie example sre-bot install --observability \
@@ -21,112 +17,65 @@ curie example sre-bot install --observability \
   --observability-namespace <obs-ns>
 ```
 
-`--dry-run` prints the same plan without mutating the cluster. Read that
-output before accepting `--platform-upgrade`: it is the one listing that
-names the widest identity this installer can create.
+`--dry-run` prints the same plan without mutating the cluster. The installer
+copies a runtime bundle from the checked-in tree. It does not use `deploy.yaml`
+for routing; the agent name comes from `plugin.json`, and Slack binding comes
+from `--slack-channel` when supplied.
 
-The installer copies a runtime bundle out of the checked-in tree. It does
-**not** apply `deploy.yaml` as routing. Agent name comes from `plugin.json`;
-Slack binding comes from `--slack-channel` if you pass it. `curie cluster
-deploy --plugin-dir examples/sre-bot --target ...` is a different path and
-is the one that reads `deploy.yaml`.
+## Default connector shape
 
-## What the default install keeps
+| Connector | Default install |
+|---|---|
+| `kubernetes` | kept at the pinned upstream digest with exact tool policy |
+| `grafana` | kept and pointed at the bundled stack |
+| `tempo` | kept at the published immutable digest |
+| `self-upgrade` | stripped unless `--platform-upgrade` is selected |
 
-| Connector     | Default install                                              |
-|---------------|--------------------------------------------------------------|
-| `kubernetes`  | kept, read-only                                              |
-| `grafana`     | kept, pointed at the bundled stack                           |
-| `tempo`       | kept, pinned to the published `curie-sre-bot-tempo` digest   |
-| `k8s-write`   | kept, with an empty `K8S_WRITE_ALLOWLIST`                    |
-| `k8s-scale`   | stripped                                                     |
-| `self-upgrade`| stripped                                                     |
+The installer applies `manifests/kubernetes-access.yaml`, waits for the one
+ServiceAccount token, constructs one kubeconfig, and reconciles it as
+`K8S_KUBECONFIG`. That credential combines non-secret operational reads with
+workload writes only in `sre-demo`.
 
-`k8s-write` ships declared, not commented out. With no `--write-allowlist`
-the connector is kept with an empty `K8S_WRITE_ALLOWLIST`. Empty means
-the process **refuses to start**, not that a healthy connector refuses
-every call: `connectors/k8s-write/server.py` exits 1 when the allowlist
-is empty, so the writer pod CrashLoopBackOffs until you name targets.
-**No Role is rendered.** An empty `resourceNames` would grant every
-Deployment, so the empty case omits the Role rather than rendering one
-with no names. The writer identity is still minted, because bring-up
-refuses without `K8S_WRITE_KUBECONFIG`.
+There is no write allowlist flag and no separate scale identity. The exact 13
+read tools execute immediately, the exact six mutating core tools require
+one-shot approval, and unmatched tools deny. The config toolset and
+multi-cluster support are disabled at server startup. RBAC, not approval, keeps
+the write blast radius inside the disposable workload namespace.
 
-`k8s-scale` stays out even though a published image now exists. Scale to
-zero is an outage, and that blast radius is its own opt-in, not a ride on
-the write path.
+## Upgrade path: `--platform-upgrade`
 
-`self-upgrade` stays out for a stronger reason: its identity holds
-namespace-wide `create` on `jobs` in the namespace that holds the platform
-API key. That grant is an operator decision made while reading
-`manifests/upgrade-role.yaml`, never a side effect of the default install.
-
-The installer also applies `manifests/read-access.yaml` and mints the
-read-only kubeconfig the `kubernetes` connector needs.
-
-## The write allowlist
-
-```bash
-curie example sre-bot install --observability \
-  --write-allowlist <ns>/<deploy-a>,<ns>/<deploy-b>
-```
-
-One input renders both ceilings: `manifests/write-role.yaml`'s
-`resourceNames` and the connector's `K8S_WRITE_ALLOWLIST`. They are two
-allowlists over the same question in two files, and editing one without
-the other is not hypothetical. Deriving both from one flag makes that
-disagreement unrepresentable.
-
-`--no-write` strips the connector and its gate together. `--no-write` and
-`--write-allowlist` contradict each other; the command refuses rather than
-picking one.
-
-`scripts/check-write-path-gated.py` remains the check for a hand-edited
-bundle that did not go through this flag.
-
-## The upgrade path: `--platform-upgrade`
-
-This is the part the previous write-up omitted. Passing the flag keeps the
-`self-upgrade` connector and installs the **platform** upgrade Job:
+Passing the flag keeps the `self-upgrade` connector and installs the platform
+upgrade Job path:
 
 ```bash
 curie example sre-bot install --observability --platform-upgrade
 ```
 
-That does four extra things, after the deploy, never before:
+After the ordinary deploy, the installer:
 
-1. Applies `manifests/upgrade-role.yaml`. This is the **connector**
-   identity (`sre-bot-upgrader`): `create` on `jobs`, so the bot can start
-   an upgrade. It cannot run `helm upgrade` itself.
-2. Applies `manifests/platform-upgrade-role.yaml`. This is the **Job**
-   identity (`curie-platform-upgrader`): namespace-admin in all but name,
-   because `helm upgrade` rewrites nearly every object the release owns.
-   Read that file before accepting the flag. The sandbox never sees this
-   credential; it exists for the ~90s an upgrade runs.
-3. Applies a ConfigMap whose body is `platform-upgrade/upgrade.sh`, and a
-   CronJob (`suspend: true`) that runs it. The CronJob never fires on its
-   own. The gated tool `mcp__self-upgrade__upgrade_platform` creates a Job
-   from that template when a human approves one.
-4. Mints `SELF_UPGRADE_KUBECONFIG` from the connector identity and
-   reconciles it onto the deployed version.
+1. Applies `manifests/upgrade-role.yaml` for `sre-bot-upgrader`, the connector
+   identity that can create Jobs but cannot run Helm itself.
+2. Applies `manifests/platform-upgrade-role.yaml` for the short-lived
+   `curie-platform-upgrader` Job identity that rewrites release objects.
+3. Applies the upgrade script ConfigMap and a suspended CronJob. It never fires
+   on schedule; an approved `mcp__self-upgrade__upgrade_platform` call creates
+   one Job from the template.
+4. Mints `SELF_UPGRADE_KUBECONFIG` and reconciles it onto the deployed version.
 
-The same connector also publishes `mcp__self-upgrade__upgrade_self`, which
-starts a Job from this bot's own CronJob template
-(`self-upgrade/cronjob.yaml`) rather than the platform one. The installer
-does not apply `self-upgrade/cronjob.yaml`. Without that hand apply,
-`upgrade_self` is a gated tool pointed at a CronJob that is not there.
-`--platform-upgrade` is what installs `upgrade_platform`; reproducing
-`upgrade_self` still means applying `self-upgrade/cronjob.yaml` yourself
-after reading `manifests/upgrade-role.yaml`.
+Read both Role manifests before accepting this flag. Kubernetes lets a holder
+of the connector token create a Job selecting the wider platform-upgrader
+ServiceAccount; RBAC does not restrict `spec.serviceAccountName` on Job create.
+The connector cannot form that request, but a leaked token can bypass it. The
+permission map names mitigation choices and the residual risk.
 
-`--dry-run` lists those four applies. If they are not in the plan, the
-flag was not passed.
+The same connector publishes the separate zero-argument `upgrade_self` tool,
+which targets `self-upgrade/cronjob.yaml`. The installer does not apply `self-upgrade/cronjob.yaml`;
+enabling the platform path does not silently enable a self-upgrade template that
+an operator did not install.
 
-The script the Job runs is `platform-upgrade/upgrade.sh`. It takes no
-target version from the bot: it reads the newest published release of the
-source repository, refuses when that is already installed, and does not
-roll back. Rollback is an operator action; `docs/PERMISSION-MAP.md`
-entry 4 says why.
+`platform-upgrade/upgrade.sh` accepts no target version from the bot. It reads
+the newest published release, refuses when that version is already installed,
+and does not roll back. Rollback remains an operator action.
 
 ## Slack
 
@@ -134,60 +83,37 @@ entry 4 says why.
 curie example sre-bot install --observability --slack-channel <channel-id>
 ```
 
-Bind by channel ID, never by `#name`. The dispatcher routes by ID, so a
-name binds nothing and the deploy still reports success.
+Bind by channel ID, never `#name`. `deploy.yaml` carries no active documentation
+placeholder binding. Both API and CLI refuse the `C0EXAMPLE<digits>` placeholder
+shape before creating or changing an agent, version, or deployment.
 
-`deploy.yaml` used to ship documentation placeholder ids (`C0EXAMPLE1`,
-`C0EXAMPLE2`) as live `slack_channel` values. Those match the Slack id
-shape, so `curie cluster deploy --target` reported success and rebound
-the bot to a channel that does not exist. The shipped file no longer
-carries live `slack_channel` lines, and both the API target resolver and
-CLI reject the `C0EXAMPLE<digits>` documentation shape before creating or
-changing an agent, version, or deployment. Uncomment a line only after
-replacing the value with a real id, and only when you are using `--target`
-/ `--all-targets` rather than this installer.
+## Manual bundle deployment
 
-## What a hand deploy still has to do
+`curie cluster deploy --plugin-dir examples/sre-bot` is a lower-level path:
 
-The installer is the cluster-tier path. A manual
-`curie cluster deploy --plugin-dir examples/sre-bot` of the checked-in
-tree is a different shape:
+- `tempo` and `self-upgrade` declare local build sources. A cluster deploy needs
+  immutable registry locks for any connector it keeps.
+- The Kubernetes connector is already an immutable upstream image and must keep
+  its core-only, stateless, single-cluster arguments.
+- `toolPolicy` and `approvalPolicy` references must name connectors that remain
+  in the runtime bundle. Removing `self-upgrade` also removes its two allow
+  entries and legacy gates; the installer performs this transformation.
+- `K8S_KUBECONFIG` must be supplied outside the bundle. If self-upgrade remains,
+  `SELF_UPGRADE_KUBECONFIG` is also required.
 
-- Four connectors declare `build:` (`k8s-write`, `k8s-scale`,
-  `self-upgrade`, `tempo`). `curie build --plugin-dir` without
-  `--registry` records a local image id, which the cluster tier refuses.
-  The installer resolves published digests instead.
-- `.claude-plugin/plugin.json` declares gates for every write the bundle
-  names. A gate naming a connector the deploy does not carry fails bundle
-  validation, so dropping a connector means dropping its gate in the same
-  edit. The installer does that pairing; a hand edit must too.
-- Both kubeconfigs must be available (`K8S_READONLY_KUBECONFIG` and, if
-  the write connector is kept, `K8S_WRITE_KUBECONFIG`). The installer
-  mints those as one-off secret overrides and does not persist them to
-  the host vault, so a later manual deploy still needs them supplied.
-
-`--env` defaults to `dev`. Deploying a prod-environment agent without
-`--env prod` creates a version that is never applied. `--target` supplies
-this when you use `deploy.yaml`; the installer does not.
+The installer mints one-off overrides and does not persist them to the host
+vault, so a later manual deploy still needs its credentials supplied.
 
 ## Historical staging cluster
 
-The original write-up of this file was read off a single-node k3s host
-that was running a hand-patched copy of this bundle: `k8s-scale` removed,
-`k8s-write` and `tempo` pinned to images from an archived predecessor
-repository, a real write allowlist typed into two files by hand, and
-`deploy.yaml` deleted so its placeholder channel ids could not rebind
-the bot.
+An older staging host ran hand-patched bespoke `k8s-write` and `k8s-scale`
+connectors with duplicated allowlists and credentials. That shape is retired.
+Do not copy those deltas: the installer, exact tri-state policy, one Kubernetes
+identity, and `manifests/kubernetes-access.yaml` are the reproducible source of
+truth.
 
-Do not copy those deltas onto a fresh install. The installer is the
-source of truth for what this tree deploys: published images under
-`ghcr.io/curie-eng/curie-sre-bot-*`, one allowlist flag, and
-`--platform-upgrade` for the two upgrade identities.
-
-The chart-hook note from that host still bites on an older release: the
-Grafana connector Secret named `curie-grafana-connector` is created by
-the chart's `grafanaConnector` hook, which did not exist in chart 0.7.0.
-On such a release the connector pods fail with
-`CreateContainerConfigError` while the previous ReplicaSet keeps serving,
-so `kubectl get deploy` still reads `1/1`. Check pod names and ages, not
-the ready column.
+On an older Curie release, the Grafana connector Secret may still be absent
+because the chart's `grafanaConnector` hook did not exist. New connector pods
+then fail with `CreateContainerConfigError` while an old ReplicaSet can keep the
+Deployment at `1/1`; inspect pod names and ages rather than trusting only the
+ready column.

@@ -169,8 +169,8 @@ testpaths = [
     "compose/tests",
     "release/tests",
     "examples/tests",
-    # The four shipped SRE-bot connectors (tempo, k8s-write, k8s-scale,
-    # self-upgrade) are built by CI and published by release.yaml, but each
+    # The two source-built SRE-bot connectors (tempo and self-upgrade) are built
+    # by CI and published by release.yaml, but each
     # ships its own test_server.py outside every collection root above -- so
     # the only CI signal on the shipped images was "the Dockerfile builds"
     # (#2093).

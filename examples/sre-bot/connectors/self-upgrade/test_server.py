@@ -386,14 +386,7 @@ def test_an_active_job_refusal_and_a_started_upgrade_have_different_error_flags(
 
 
 def test_the_fake_client_cannot_accept_a_call_the_real_one_rejects():
-    """Pinned for the reason the sibling connector had to learn (#1947).
-
-    `k8s-scale` passed its patch body positionally and every one of its tests
-    passed, because its fake accepted it positionally too while the real
-    `httpx.Client` takes everything after the URL keyword-only. The verb could
-    never run. This connector's calls are already keyword, and this keeps the
-    fake from quietly drifting looser than the client it stands in for.
-    """
+    """Keep the fake from accepting a call the real httpx client rejects."""
 
     import httpx
 

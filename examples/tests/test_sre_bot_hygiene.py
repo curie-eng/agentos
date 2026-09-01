@@ -80,18 +80,15 @@ def test_staging_deploy_doc_names_what_the_tree_installs_today() -> None:
         "self-upgrade/cronjob.yaml; --platform-upgrade installs the "
         "platform Job, not this bot's own upgrade CronJob"
     )
-    # Empty K8S_WRITE_ALLOWLIST refuses to start the process (server.py
-    # main() exits 1). "every call is refused" is the stale comment in
-    # that file, not what a default install does.
-    assert "refuses to start" in text, (
-        "docs/STAGING-DEPLOY.md must say an empty write allowlist refuses "
-        "to start the connector; a healthy pod that refuses calls is not "
-        "what the default install produces"
-    )
-    assert "every call is refused" not in text, (
-        "docs/STAGING-DEPLOY.md still claims the default write connector "
-        "refuses every call; the process exits 1 on an empty allowlist"
-    )
+    # #2169 retired the bespoke writer and its duplicated allowlist. The
+    # reproduction guide must describe the one policy-scoped upstream server,
+    # not retain knobs the installer no longer accepts.
+    for retired in ("--write-allowlist", "--no-write", "K8S_WRITE_ALLOWLIST"):
+        assert retired not in text, (
+            f"docs/STAGING-DEPLOY.md still names retired writer surface {retired}"
+        )
+    assert "K8S_KUBECONFIG" in text
+    assert "six mutating core tools require" in text
 
 
 def test_deploy_yaml_placeholder_channels_cannot_silently_rebind() -> None:
@@ -132,23 +129,19 @@ def test_deploy_yaml_placeholder_channels_cannot_silently_rebind() -> None:
     )
 
 
-def test_permission_map_restart_status_matches_live_connectors_yaml() -> None:
-    """PERMISSION-MAP must not claim restart_deployment ships commented out
-    while connectors.yaml declares k8s-write live."""
+def test_permission_map_matches_the_vanilla_kubernetes_connector() -> None:
+    """Retiring the bespoke writers must retire their documentation too."""
 
     connectors = yaml.safe_load((BUNDLE / "connectors.yaml").read_text(encoding="utf-8"))
     declared = connectors.get("connectors") or {}
-    assert "k8s-write" in declared, (
-        "connectors.yaml no longer declares k8s-write; this test needs a "
-        "new status string, not a pass, if the connector was removed"
-    )
+    assert "kubernetes" in declared
+    assert "k8s-write" not in declared
+    assert "k8s-scale" not in declared
     text = (BUNDLE / "docs" / "PERMISSION-MAP.md").read_text(encoding="utf-8")
-    assert "ships commented out" not in text, (
-        "docs/PERMISSION-MAP.md says restart_deployment 'ships commented "
-        "out' but connectors.yaml declares k8s-write live. Update the "
-        "Status row to match the other declared-but-uncredentialed writes "
-        "('ships with its credential absent')."
-    )
+    assert "mcp__k8s-write__" not in text
+    assert "mcp__k8s-scale__" not in text
+    assert "kubernetes/resources_create_or_update" in text
+    assert "kubernetes/resources_scale" in text
 
 
 def test_ci_shellchecks_the_platform_upgrade_script() -> None:

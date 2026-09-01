@@ -1,7 +1,7 @@
 {
   "name": "sre-bot",
   "version": "0.1.0",
-  "description": "SRE triage assistant for plain-English production health and Kubernetes questions in Slack. Read-only by default: the Kubernetes read connector exposes only read tools, and its credential cannot read Secrets or mutate resources. Grafana and Tempo connectors add observability reads. The one declared write verb rolls a single allowlisted Deployment using a separate credential and the exact human approval gate mcp__k8s-write__restart_deployment. A second gated verb scales a single allowlisted Deployment through the `deployments/scale` subresource with its own credential and the gate mcp__k8s-scale__scale_deployment; it reports the replica count it read before writing, so the platform can offer an undo.",
+  "description": "SRE triage assistant for plain-English production health and Kubernetes questions in Slack. One pinned upstream Kubernetes MCP connector exposes the core toolset: reads execute immediately, six mutations require a fresh human approval, and unmatched tools fail closed. Kubernetes RBAC limits writes to disposable demo-namespace workloads and independently excludes credentials, identity, RBAC, cluster-scoped mutation, and platform upgrades.",
   "license": "Apache-2.0",
   "author": {
     "name": "CurieTech"
@@ -17,7 +17,7 @@
     "k8s",
     "cluster",
     "triage",
-    "read-only"
+    "approval-gated"
   ],
   "starterPrompts": [
     "Is anything broken right now?",
@@ -32,14 +32,6 @@
   "approvalPolicy": {
     "gates": [
       {
-        "gate": "mcp__k8s-write__restart_deployment",
-        "route": "sre-approvals"
-      },
-      {
-        "gate": "mcp__k8s-scale__scale_deployment",
-        "route": "sre-approvals"
-      },
-      {
         "gate": "mcp__self-upgrade__upgrade_self",
         "route": "sre-approvals"
       },
@@ -48,5 +40,34 @@
         "route": "sre-approvals"
       }
     ]
+  },
+  "toolPolicy": {
+    "enforcement": "curie/mcp-tool-policy@1",
+    "allow": [
+      "kubernetes/events_list",
+      "kubernetes/namespaces_list",
+      "kubernetes/projects_list",
+      "kubernetes/nodes_log",
+      "kubernetes/nodes_stats_summary",
+      "kubernetes/nodes_top",
+      "kubernetes/pods_list",
+      "kubernetes/pods_list_in_namespace",
+      "kubernetes/pods_get",
+      "kubernetes/pods_top",
+      "kubernetes/pods_log",
+      "kubernetes/resources_list",
+      "kubernetes/resources_get",
+      "self-upgrade/upgrade_self",
+      "self-upgrade/upgrade_platform"
+    ],
+    "approvalRequired": [
+      "kubernetes/pods_delete",
+      "kubernetes/pods_exec",
+      "kubernetes/pods_run",
+      "kubernetes/resources_create_or_update",
+      "kubernetes/resources_delete",
+      "kubernetes/resources_scale"
+    ],
+    "deny": []
   }
 }
