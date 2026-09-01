@@ -246,8 +246,9 @@ fn guide_documents_the_approval_plane() {
     // product and the primer used to omit it entirely, so a coding agent reading
     // only the CLI concluded cross-channel approval did not exist. Pin the four
     // facts it cannot derive: the tool that raises a request, the where/who split
-    // on a route binding, that self-approval is refused, and the resume-turn
-    // prefix a skill must handle. Both renderings carry them.
+    // on a route binding, authorized requester self-confirmation through the
+    // configured approver set, and the resume-turn prefix a skill must handle.
+    // Both renderings carry them.
     let md = out_str(&run(&["guide"]));
     let json = out_str(&run(&["guide", "--json"]));
     for (label, text) in [("markdown", &md), ("json", &json)] {
@@ -265,7 +266,8 @@ fn guide_documents_the_approval_plane() {
             "adapter",
             "verified Slack",
             "scoped credential",
-            "self-approval",
+            "Authorized requesters may self-confirm",
+            "configured approver set",
             "[approval resolved]",
             // #1086. Each is a fact an agent cannot derive from the command
             // tree, and each was reachable only from docs/approvals.md, which
@@ -319,6 +321,40 @@ fn guide_documents_the_approval_plane() {
         md.contains("## Approvals"),
         "markdown primer has no Approvals section\n{md}"
     );
+}
+
+/// ADR-0106 made the principal, rather than a caller-selected name or channel,
+/// the approval boundary.  This is deliberately a guide test instead of a
+/// source-string assertion: the generated human and `--json` guides are what a
+/// terminal operator actually uses to recover from a missing credential.  Both
+/// forms must teach the two valid routes without preserving a copy-pasteable
+/// version of the identity-forgery interface.
+#[test]
+fn guide_replaces_asserted_resolver_flags_with_authenticated_principal_paths() {
+    let md = out_str(&run(&["guide"]));
+    let json = out_str(&run(&["guide", "--json"]));
+
+    for (label, text) in [("markdown", &md), ("json", &json)] {
+        for fact in [
+            "CURIE_APPROVAL_PRINCIPAL_TOKEN",
+            "authenticated principal",
+            "explicit-user",
+            "authenticated card",
+            "self-confirm",
+            "mint",
+        ] {
+            assert!(
+                text.contains(fact),
+                "{label} guide must explain the authenticated approval path with `{fact}`\n{text}"
+            );
+        }
+        for retired in ["--as", "--actor-channel", "Self-approval is refused"] {
+            assert!(
+                !text.contains(retired),
+                "{label} guide must not preserve retired asserted-identity guidance `{retired}`\n{text}"
+            );
+        }
+    }
 }
 
 #[test]

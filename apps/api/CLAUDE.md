@@ -7,12 +7,15 @@ worker, Postgres, RustFS/S3, Langfuse, and GitHub.
 
 ## Load-bearing invariants
 
-- **Auth is one shared API key today.** `require_api_key` (`auth.py`) compares
-  the `X-API-Key` header against `Settings.api_key` with `hmac.compare_digest`.
-  This is explicitly MVP-only; GitHub-App identity work is expected to
-  replace it eventually, but until that lands, do not add a second
-  auth scheme for a new router without raising it in an issue/PR first --
-  every router should share the one dependency.
+- **Administrative auth is one shared API key today.** `require_api_key`
+  (`auth.py`) compares the `X-API-Key` header against `Settings.api_key` with
+  `hmac.compare_digest`. This is explicitly MVP-only; GitHub-App identity work
+  is expected to replace it eventually. The approval resolver is the recorded
+  exception (ADR-0106): the platform key may mint a subject-bound operator or
+  console credential but cannot resolve by itself, while Slack clicks arrive as
+  approval-bound attestations signed with an independent dispatcher/API key.
+  Resolver identity and channel are derived from those credentials, never the
+  request body. Do not add another auth scheme without an Accepted ADR.
 - **The `state` router authenticates differently, on purpose (ADR-0033, #410).**
   `require_state_access` (`routers/state.py`) accepts EITHER the platform key OR a
   scoped, path-`agent_id`-bound `state` token minted by the worker for the

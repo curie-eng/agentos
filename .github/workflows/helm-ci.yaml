@@ -118,6 +118,15 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/litellm-sidecar-assertions.sh
 
+      # Prove cluster-local inference cannot silently download model weights
+      # into an emptyDir (issue #1779): the unsafe pull+ephemeral combination
+      # fails with both recovery paths, while durable pulls and explicitly
+      # pre-provisioned/no-pull ephemeral models retain their intended shapes.
+      - name: helm render assertions (inference download guard)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/inference-download-guard-assertions.sh
+
       # Prove the direct-passthrough existingSecret escape (issue #1759): the
       # eight keys that previously had none now resolve to the chart's own
       # Secret by default and to an operator-named Secret when
@@ -172,6 +181,12 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/otel-collector-checksum-assertions.sh
 
+      # Metadata only chart and app bumps must not recycle stateful backing stores.
+      - name: helm render assertions (stateful metadata rollout isolation)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/statefulset-metadata-rollout-assertions.sh
+
       - name: helm render assertions (otel collector durable delivery)
         run: |
           set -euo pipefail
@@ -191,6 +206,11 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/otel-collector-langfuse-secret-assertions.sh
+
+      - name: helm render assertions (BYO Langfuse host)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/langfuse-byo-assertions.sh
 
       # Prove Langfuse startup is gated on ClickHouse being up (issue #2009). A
       # Helm upgrade that recreates the ClickHouse Service otherwise lets the new
@@ -321,6 +341,11 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/dispatcher-api-wiring-assertions.sh
+
+      - name: helm render assertions (approval principal wiring)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/approval-principal-wiring-assertions.sh
 
       # Prove the mail adapter's chart wiring (issue #1515): it does not render
       # at all by default, it is told where the platform API is, it receives its

@@ -10,10 +10,13 @@ and the one validation that proves it.
 
 ## The swap
 
-1. **Provision a Postgres** on your managed provider (RDS, Cloud SQL, Neon, or any
-   standard Postgres). No extensions are required. Curie confines its tables to a
-   dedicated `curie` schema (`config.db_schema`), so it can share a database with
-   Langfuse without colliding with Langfuse's `public`-schema Prisma baseline.
+1. **Provision PostgreSQL 15 or newer** on your managed provider (RDS, Cloud SQL,
+   Neon, or any standard Postgres). No extensions are required. Curie uses
+   `UNIQUE NULLS NOT DISTINCT` for shared workflow-state identity, which requires
+   PostgreSQL 15+; the shipped compose stack and chart use PostgreSQL 16. Curie
+   confines its tables to a dedicated `curie` schema (`config.db_schema`), so it
+   can share a database with Langfuse without colliding with Langfuse's
+   `public`-schema Prisma baseline.
 
 2. **Point `DATABASE_URL` at it.** Two services read it, each building its own
    engine from it: the API (`apps/api/src/curie_api/config.py`,
@@ -64,6 +67,9 @@ so any managed Postgres is unaffected (the full, cited list lives in
    raw-SQL reads also decode JSONB with `json.loads`, because asyncpg hands back a
    `str` for a raw-text `SELECT`. Postgres-only and asyncpg-specific, but unchanged
    by which Postgres sits behind the DSN.
+5. **`UNIQUE NULLS NOT DISTINCT`** — the shared (`NULL`) scope in
+   `workflow_state_entries` is one identity rather than PostgreSQL's ordinary
+   many-NULLs behavior. This needs PostgreSQL 15+ on every managed target.
 
 Cross-database portability (MySQL, etc.) is explicitly a non-goal
 ([ADR-0007](../../adr/0007-adopt-not-build-boundaries.md)); if a non-Postgres store
@@ -78,8 +84,9 @@ shape of pointing the app at a managed Postgres. The test then asserts that item
 and 2 materialized as expected: native `uuid` id columns on `agents`,
 `agent_versions` and `deployments`; the `environment` enum type in the `curie`
 schema with the right labels; zero tables in `public`. Items 3 and 4 have no
-assertion here, so the JSONB columns and the raw `DISTINCT ON` queries are covered
-only by the ordinary API and worker suites.
+assertion here: the ordinary API and worker suites cover JSONB and raw
+`DISTINCT ON`, while the migration suite covers the singular shared-state
+identity (item 5).
 
 ```bash
 cd apps/api

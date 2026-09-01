@@ -275,9 +275,9 @@ pub(crate) fn recipes() -> Vec<Recipe> {
                 required: true,
             }],
             notes: &[
-                "Each record reports its id and `card_channel`, the channel its route bound the card to; pass that as `--actor-channel` when resolving: `--resolve <id> --as <user> --actor-channel <card_channel>`.",
-                "A null `card_channel` is from an older row or a direct API write that omitted the field; pass the requesting channel instead.",
-                "The server blocks self-approval, so the resolving actor must not be the person whose turn raised the request.",
+                "Each record reports its id and `card_channel`, the real channel its route bound the authenticated card to. Terminal `--resolve <id>` instead authenticates with CURIE_APPROVAL_PRINCIPAL_TOKEN and works only for an explicit-user approver list.",
+                "A null `card_channel` is from an older row or a direct API write that omitted the field; the requesting channel is the authenticated card location in that compatibility case.",
+                "An authenticated requester may self-confirm only when the configured approver set admits that principal; author equality neither grants nor vetoes membership.",
             ],
         },
         // #1051 item 4, landed by #1086: the end-to-end flow, not another
@@ -325,7 +325,8 @@ pub(crate) fn recipes() -> Vec<Recipe> {
                 "3. Bind the route (the command above). `resolution` is the one verified Slack card. Add `--route-approvers <name>=users:U1,U2` to say WHO may act; without it the resolution card channel's members are the approver set.",
                 "Declare an optional notification in the strict --routes-from JSON map; non-Slack notifications include their complete endpoint and adapter there. The text-only ping has interaction=None, directs humans to the configured approval channel without disclosing its identifier, and is not a resolving surface. Extending resolution to a second channel requires a scoped credential and is not built here.",
                 "4. Drive a turn that calls the gated tool. The call is denied before it runs and the turn ends awaiting approval, with a card in the bound channel.",
-                "5. Resolve it: `approvals <AGENT> --list` for the id, then `--resolve <id> --as <user> --actor-channel <channel>`. Self-approval is refused, so `--as` must name someone other than the author of the turn.",
+                "5. Resolve it through the authenticated card. For an explicit-user route, an administrator may instead mint a reusable token with `approvals <AGENT> --mint-operator-principal <SUBJECT>`, export the one-time result as CURIE_APPROVAL_PRINCIPAL_TOKEN, then run `--resolve <id>`. The terminal principal carries no channel membership.",
+                "An authenticated requester may self-confirm when the selected approver set admits the same principal. Two-person separation of duties is a distinct policy, not an implicit property of an ordinary gate.",
                 "A route write REPLACES the whole map, so pass every route the agent should keep. `--list-routes` shows what is bound now.",
             ],
         },

@@ -126,6 +126,14 @@ the regenerated files.
 - Every behavior-bearing change must be verified end-to-end through the real
   product loop (the `curie` CLI, the compose services, or a real sandbox on a
   local `kind`/`k3s` cluster), not just by unit tests.
+- A change with no runtime behavior is exempt from E2E tier classification and
+  E2E evidence for each acceptance criterion. State the reason once and report
+  the checks appropriate to the changed artifact instead: applicable prose
+  validators for documentation, confirmation that an ADR repair leaves its
+  decision unchanged, or the touched area's tests for a behavior-preserving
+  refactor. Documentation, ADR, and strictly behavior-preserving refactor
+  changes can qualify; the file type alone does not. If a documentation or ADR
+  change alters runtime behavior, the full E2E tier rule still applies.
 - If you touch one side of a known parity seam (see the registry in
   AGENTS.md), do one of:
   - Change the sibling in the same PR.

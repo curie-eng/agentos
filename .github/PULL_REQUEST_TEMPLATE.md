@@ -37,9 +37,21 @@ Fix pin: n/a - <reason>
 
 ## End-to-end verification
 
-<!-- Behavior-bearing changes only. Classify every tier required or n/a with a
-     concrete reason, and paste the exact command plus what you observed for
-     each required tier. See "E2E verification is mandatory" in AGENTS.md. -->
+<!-- Choose exactly one path.
+
+     Behavior-bearing: keep the tier table and three evidence checkboxes below.
+     Classify every tier required or n/a with a concrete reason, and paste the
+     exact command plus what you observed for each required tier.
+
+     No runtime behavior: delete the tier table and three evidence checkboxes.
+     Replace them with one explanation and the scoped checks you ran:
+
+     This change does not alter runtime behavior because <reason>.
+     Scoped verification: `<command>` - <observed outcome>.
+
+     Documentation and ADR changes are not automatically exempt. If they alter
+     runtime behavior, use the behavior-bearing path. See "E2E verification is
+     mandatory" in AGENTS.md. -->
 
 | Tier | Required / n/a | Reason | Mode (fake / live) | Command and observed outcome |
 | --- | --- | --- | --- | --- |
@@ -56,8 +68,6 @@ Fix pin: n/a - <reason>
       negative or a second independent path.
 - [ ] No required tier is left unproved; any blocked tier names its blocker in
       the table.
-- [ ] Or: this change is not behavior-bearing, so no tier applies, and the
-      summary says why.
 
 ## Checklist
 

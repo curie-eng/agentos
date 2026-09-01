@@ -1271,7 +1271,7 @@ case_live_approval_gate_denies() {
             --secret CURIE_APPROVAL_REQUIRED_TOOLS
     )
 
-    local attempt out code status
+    local attempt out code status parked_shape parsed
     status=""
     # A live model may answer without calling any tool at all, which ends the
     # turn `done` and is a flake rather than a regression. One retry, then a
@@ -1293,22 +1293,39 @@ case_live_approval_gate_denies() {
         # stdout only: --json puts the payload on stdout and human text on
         # stderr, so a combined-stream parse fails intermittently and reads like
         # a product bug.
-        status="$(printf '%s' "$out" | python3 -c '
+        parsed="$(printf '%s' "$out" | python3 -c '
 import json, sys
 try:
     payload = json.loads(sys.stdin.read())
 except Exception:
-    print("unparseable")
+    print("unparseable invalid")
     sys.exit(0)
-print(payload.get("status") if isinstance(payload, dict) else "unparseable")
-' || echo "unparseable")"
+if not isinstance(payload, dict):
+    print("unparseable invalid")
+    sys.exit(0)
+status = payload.get("status")
+parked_shape = (
+    "valid"
+    if payload.get("finalized") is False
+    and isinstance(payload.get("approval_summary"), str)
+    else "invalid"
+)
+print(status, parked_shape)
+' || echo "unparseable invalid")"
+        status="${parsed%% *}"
+        parked_shape="${parsed#* }"
 
         # (b) parked. Deliberately NOT the ladder's finalized-reply helper,
-        # which treats an approval park as a failure; and deliberately not
-        # `finalized` (the skill tier hardcodes it true) nor the exit code (a
-        # parked turn exits 0).
-        if [[ "$status" == "awaiting-approval" ]]; then
+        # which treats an approval park as a failure. The runner final-frame
+        # contract requires status=awaiting-approval, finalized=false, and a
+        # non-null approval_summary; a parked turn still exits 0.
+        if [[ "$status" == "awaiting-approval" && "$parked_shape" == "valid" ]]; then
             break
+        fi
+        if [[ "$status" == "awaiting-approval" ]]; then
+            echo "the gated turn parked without finalized=false and a non-null approval_summary." >&2
+            printf '%s\n' "$out" >&2
+            return 1
         fi
         if [[ "$status" == "done" && "$attempt" == "1" ]]; then
             echo "retrying: the model answered without calling Bash"
@@ -1319,7 +1336,7 @@ print(payload.get("status") if isinstance(payload, dict) else "unparseable")
         printf '%s\n' "$out" >&2
         return 1
     done
-    echo "the gated turn parked: status=$status"
+    echo "the gated turn parked: status=$status finalized=false approval_summary=present"
 
     # (c) unrun, asserted inside the container that would have run it. Confirm
     # the runner is still up first, purely for the precise diagnostic: a dead
@@ -2302,13 +2319,27 @@ stop_local_otel_sink() {
 
 local_otel_query() {
     local mode="$1" baseline="${2:-}"
-    python3 - "$mode" "$WORKDIR/otel-sink" "$baseline" "$PROMPT" "$OTEL_E2E_SECRET_SENTINEL" <<'PY'
+    python3 - "$mode" "$WORKDIR/otel-sink" "$baseline" "$PROMPT" \
+        "$OTEL_E2E_SECRET_SENTINEL" "$REPO_ROOT" "$LIVE" <<'PY'
+import importlib.util
 import json
 import pathlib
 import sys
 
-mode, root_raw, baseline_raw, prompt, sentinel = sys.argv[1:]
+mode, root_raw, baseline_raw, prompt, sentinel, repo_root_raw, live_raw = sys.argv[1:]
 root = pathlib.Path(root_raw)
+require_multi_round_tool = live_raw != "1"
+
+shape_helper_path = pathlib.Path(repo_root_raw) / "scripts" / "runner_otel_shape.py"
+shape_helper_spec = importlib.util.spec_from_file_location(
+    "curie_runner_otel_shape", shape_helper_path
+)
+if shape_helper_spec is None or shape_helper_spec.loader is None:
+    raise RuntimeError("could not load the canonical runner shape validator")
+shape_helper = importlib.util.module_from_spec(shape_helper_spec)
+sys.modules[shape_helper_spec.name] = shape_helper
+shape_helper_spec.loader.exec_module(shape_helper)
+canonical_runner_shape_violations = shape_helper.canonical_runner_shape_violations
 
 def documents(name):
     path = root / f"{name}.json"
@@ -2466,6 +2497,14 @@ if mode == "healthy":
     )
     for trace_id in new_healthy:
         trace_spans = by_trace[trace_id]
+        shape_violations = canonical_runner_shape_violations(
+            trace_spans,
+            require_multi_round_tool=require_multi_round_tool,
+        )
+        assert not shape_violations, (
+            f"healthy trace {trace_id} violates canonical runner shape: "
+            + "; ".join(shape_violations)
+        )
         assert all(
             span.get("status", {}).get("code") not in (2, "STATUS_CODE_ERROR")
             for span, _ in trace_spans
@@ -2553,6 +2592,7 @@ if mode == "healthy":
     )
     print(json.dumps({
         "healthy_new_traces": len(new_healthy),
+        "canonical_runner_shape_traces": len(new_healthy),
         "correlated_services": sorted(correlated_services),
         "metric_deltas": positive_deltas,
         "classified_failure_delta": classified_delta,
@@ -2708,6 +2748,8 @@ assert_local_otel_healthy_turn() {
     # curie.turn.process -> curie.sandbox.claim -> curie.runner.rpc ->
     # agent.run -> curie.reply.update or curie.reply.post. Correlated logs must carry traceId,
     # spanId, and resource service.name for dispatcher, worker, and runner.
+    # Every new healthy trace must also carry the canonical runner phase tree:
+    # root-sibling provider/tool intervals with closed boundaries and bounded indices.
     # Operational metrics pinned here are
     # curie.turn.accepted, curie.turn.completed, curie.turn.duration,
     # curie.queue.message.age, curie.sandbox.lifecycle, and
@@ -2717,7 +2759,7 @@ assert_local_otel_healthy_turn() {
         if assert_bounded_metric_attributes "$baseline" >/dev/null 2>&1; then
             assert_bounded_metric_attributes "$baseline"
             assert_local_otel_redacted
-            echo "local: OTel healthy control proved causality, log correlation, bounded metric attributes, and redaction"
+            echo "local: OTel healthy control proved causality, canonical runner shape, log correlation, bounded metric attributes, and redaction"
             return 0
         fi
         sleep 2

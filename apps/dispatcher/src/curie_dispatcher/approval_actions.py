@@ -4,9 +4,9 @@ The worker posts a Block Kit approval card whose Approve/Reject buttons carry
 these action ids; a click arrives here over the authenticated Socket Mode
 websocket and is forwarded to the platform API's resolve endpoint, where the
 authorizer decides server-side whether this actor may resolve (channel
-membership, self-approval block). The dispatcher never decides authorization
-itself -- it relays who clicked and from which channel, and renders the API's
-verdict back into Slack:
+membership). The dispatcher never decides authorization itself -- it attests
+the user and channel Slack authenticated, then renders the API's verdict back
+into Slack:
 
 - the winner's card is edited in place (buttons removed, verdict stamped);
 - a non-approver gets the ephemeral "you are not an approver" rejection;
@@ -26,6 +26,7 @@ from typing import Any
 import httpx
 from slack_sdk.web import WebClient
 
+from .approval_principal import mint_chat_principal
 from .config import DispatcherConfig
 
 logger = logging.getLogger(__name__)
@@ -184,13 +185,19 @@ _RESOLVE_TIMEOUT = httpx.Timeout(connect=0.4, read=1.4, write=0.3, pool=0.1)
 
 
 class ApprovalResolveClient:
-    """Thin client for POST /approvals/{id}/resolve (shared API key auth)."""
+    """Thin client for authenticated chat approval resolution."""
 
     def __init__(
-        self, *, api_base_url: str, api_key: str, client: httpx.Client | None = None
+        self,
+        *,
+        api_base_url: str,
+        api_key: str,
+        approval_chat_attester_secret: str,
+        client: httpx.Client | None = None,
     ) -> None:
         self._base = api_base_url.rstrip("/")
         self._headers = {"X-API-Key": api_key} if api_key else {}
+        self._approval_chat_attester_secret = approval_chat_attester_secret
         self._client = client or httpx.Client(timeout=_RESOLVE_TIMEOUT)
 
     def resolve(
@@ -198,26 +205,31 @@ class ApprovalResolveClient:
         approval_id: str,
         *,
         decision: str,
-        resolved_by: str,
-        actor_channel: str,
+        attested_user: str,
+        attested_channel: str,
         note: str | None = None,
     ) -> ResolveOutcome:
-        body: dict[str, Any] = {
-            "decision": decision,
-            "resolved_by": resolved_by,
-            "actor_channel": actor_channel,
-        }
+        body: dict[str, Any] = {"decision": decision}
         # Only send the key when the approver typed something. The field is
         # optional on ``ApprovalResolve`` and an empty string is not the same
         # statement as leaving the note blank: it would persist as a
         # resolution_note the resume turn then interpolates as ``Note: .``.
         if note:
             body["note"] = note
+        headers = {
+            **self._headers,
+            "X-Curie-Approval-Principal": mint_chat_principal(
+                self._approval_chat_attester_secret,
+                subject=attested_user,
+                actor_channel=attested_channel,
+                approval_id=approval_id,
+            ),
+        }
         try:
             response = self._client.post(
                 f"{self._base}/approvals/{approval_id}/resolve",
                 json=body,
-                headers=self._headers,
+                headers=headers,
             )
         except httpx.HTTPError as exc:
             logger.warning("approval resolve call failed for %s: %s", approval_id, exc)
@@ -372,9 +384,7 @@ def _resolved_card_blocks(original: dict[str, Any], verdict: str) -> list[dict[s
     returns the verdict alone, which as a ``chat_update`` payload is a wipe.
     """
 
-    blocks = [
-        b for b in original.get("blocks", []) if b.get("type") != "actions"
-    ]
+    blocks = [b for b in original.get("blocks", []) if b.get("type") != "actions"]
     blocks.append(
         {
             "type": "context",
@@ -608,8 +618,8 @@ def resolve_note_submission(
     outcome = resolver.resolve(
         approval_id,
         decision=decision,
-        resolved_by=user,
-        actor_channel=channel,
+        attested_user=user,
+        attested_channel=channel,
         note=note,
     )
     response_action = (
@@ -691,9 +701,7 @@ def render_note_submission(
             log=log,
         )
     except Exception as exc:  # noqa: BLE001 - a raise past the ack eats the ack
-        log.warning(
-            "post-ack render failed for approval %s: %s", submission.approval_id, exc
-        )
+        log.warning("post-ack render failed for approval %s: %s", submission.approval_id, exc)
 
 
 def _fetch_card_message(
@@ -727,9 +735,7 @@ def _fetch_card_message(
         for message in replies.get("messages") or []:
             if message.get("ts") == card_ts:
                 return dict(message)
-        log.warning(
-            "approval card %s not found in %s; leaving it unstamped", card_ts, channel
-        )
+        log.warning("approval card %s not found in %s; leaving it unstamped", card_ts, channel)
     except Exception as exc:  # noqa: BLE001 - the stamp is best-effort
         log.warning("could not read approval card %s in %s: %s", card_ts, channel, exc)
     return {}
@@ -740,12 +746,9 @@ def _refusal_text(outcome: ResolveOutcome) -> str:
 
     if outcome.status_code == 403:
         # The API already words each refusal class distinctly (non-membership,
-        # self-approval, could-not-verify), so render its reason verbatim rather
+        # not-authorized, could-not-verify), so render its reason verbatim rather
         # than guessing the class. An empty detail stays class-neutral (#453 AC5).
-        return (
-            outcome.detail.strip()
-            or "This click was refused and the platform gave no reason."
-        )
+        return outcome.detail.strip() or "This click was refused and the platform gave no reason."
     if outcome.status_code == 409:
         return (
             f"Already resolved by {outcome.resolved_by}."
@@ -793,8 +796,8 @@ def _resolve_and_render(
     outcome = resolver.resolve(
         approval_id,
         decision=decision,
-        resolved_by=user,
-        actor_channel=channel,
+        attested_user=user,
+        attested_channel=channel,
         note=note,
     )
     _render_outcome(
@@ -968,5 +971,7 @@ def build_resolver(config: DispatcherConfig) -> ApprovalResolveClient:
     """The production resolver, from the dispatcher's API settings."""
 
     return ApprovalResolveClient(
-        api_base_url=config.api_base_url, api_key=config.api_key
+        api_base_url=config.api_base_url,
+        api_key=config.api_key,
+        approval_chat_attester_secret=config.approval_chat_attester_secret,
     )

@@ -24,8 +24,9 @@ locally in Docker.
   suppress it with a root `curie.bundle.json` containing
   `{"webSearch": false}`; the provider connection remains the only network
   path, so this adds no sandbox web egress.
-- Exports gen_ai OTel spans (`agent.run` -> `llm.generation` -> `execute_tool`)
-  via OTLP-HTTP (the OpenTelemetry Protocol over HTTP) to the collector, which
+- Exports gen_ai OTel spans: an `agent.run` root with duration-bearing
+  `llm.generation` provider-wait and `execute_tool` tool-wait siblings, via
+  OTLP-HTTP (the OpenTelemetry Protocol over HTTP) to the collector, which
   forwards to Langfuse.
 - Rehydrates from a history ref on start (`resume`), stateless-first
   (ADR-0003, an Architecture Decision Record).

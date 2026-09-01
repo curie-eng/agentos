@@ -343,6 +343,11 @@ as a whole; remembered only):
   Python/Rust, so they are frozen together in
   `tests/vectors/approval-action-ids.json`.
   [vector: `tests/vectors/approval-action-ids.json`]
+- dispatcher vs API approval-principal tokens -- the dispatcher mint codec
+  (`apps/dispatcher/src/curie_dispatcher/approval_principal.py`) and API verifier
+  (`apps/api/src/curie_api/approval_principal.py`) are frozen together in
+  `tests/vectors/approval-principal.json`.
+  [vector: `tests/vectors/approval-principal.json`]
 - API vs worker vs CLI thread-reset SET -- `THREAD_RESET_SET` /
   `THREAD_RESET_INFLIGHT_SET` (`apps/api/src/curie_api/threadreset.py`,
   `apps/worker/src/curie_worker/consumer.py`) and the CLI's `THREAD_RESET_SET`
@@ -465,10 +470,18 @@ a claim that the change alters no runtime behavior on any surface: either say
 that plainly and carry no tier, or the tier set is wrong for this change and
 the maintainer decides, but do not proceed on all six not applicable while
 still calling the change behavior-bearing. A change that genuinely bears no
-runtime behavior, which is the documentation, ADR, and strictly
-behavior-preserving refactor case, records that reason once and is exempt,
-including on the build path. Promoting a tier to required is always allowed;
-dropping a required tier is not.
+runtime behavior records that reason once and is exempt from tier
+classification and E2E evidence for each acceptance criterion, including on
+the build path. Examples include an explanatory documentation edit, an ADR
+pointer repair that leaves the decision unchanged, and a strictly
+behavior-preserving refactor. Run and report the checks appropriate to the
+changed artifact instead: the repository's applicable formatting, link,
+command, or documentation validators for prose; review that an ADR repair did
+not change its decision; and the touched area's tests for a behavior-preserving
+refactor. File type alone does not grant the exemption: a documentation or ADR
+change that alters runtime behavior remains behavior-bearing and follows the
+full tier rule. Promoting a tier to required is always allowed; dropping a
+required tier is not.
 
 Classification is taken at triage and re-checked whenever the diff grows past
 the scope that was triaged. A tier that becomes reachable is promoted to

@@ -9,11 +9,15 @@ resolved by X", and the ordinary-button catch-all never double-handles an
 approval click.
 """
 
+import base64
+import hashlib
+import hmac
 import json
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
 import redis
 from curie_dispatcher.app import build_app
 from curie_dispatcher.approval_actions import (
@@ -25,6 +29,7 @@ from curie_dispatcher.approval_actions import (
     ResolveOutcome,
     settled_verdict_line,
 )
+from curie_dispatcher.approval_principal import mint_chat_principal
 from curie_dispatcher.config import DispatcherConfig
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
@@ -34,6 +39,24 @@ from slack_sdk.web import WebClient
 from .conftest import FakeSocketClient, _authorize
 
 APPROVAL_ID = "9a1e8a10-0000-0000-0000-000000000246"
+_PLATFORM_API_KEY = "platform-api-test-key"
+_CHAT_ATTESTER_SECRET = "dispatcher-attester-test-secret"
+
+
+def test_dispatcher_minter_matches_the_api_wire_vector() -> None:
+    vector = json.loads(
+        (Path(__file__).parents[3] / "tests/vectors/approval-principal.json").read_text()
+    )
+    claims = vector["claims"]
+    token = mint_chat_principal(
+        vector["secret"],
+        subject=claims["sub"],
+        actor_channel=claims["actor_channel"],
+        approval_id=claims["approval_id"],
+        now=vector["issued_at"],
+    )
+    assert token == vector["token"]
+
 
 _CARD_MESSAGE = {
     "ts": "1700.0042",
@@ -47,15 +70,13 @@ _CARD_MESSAGE = {
 
 # Real API reason strings, copied verbatim (not imported -- the dispatcher
 # does not depend on apps/api). Sources: apps/api/src/curie_api/authorizer.py
-# (_SELF_APPROVAL_REASON) and apps/api/src/curie_api/slack_approvers.py (the
+# (_PRINCIPAL_ELIGIBILITY_REASON) and apps/api/src/curie_api/slack_approvers.py (the
 # channel non-membership reason and the group-lookup could-not-verify reason).
 # The API side pins its own half of this contract in
 # apps/api/tests/test_approvers_port.py and apps/api/tests/test_approvals.py.
-_CHANNEL_NON_APPROVER_REASON = (
-    "you are not an approver: resolve this from the approval's channel"
-)
-_SELF_APPROVAL_REASON = (
-    "self-approval is blocked: the requester cannot resolve their own request"
+_CHANNEL_NON_APPROVER_REASON = "you are not an approver: resolve this from the approval's channel"
+_PRINCIPAL_ELIGIBILITY_REASON = (
+    "operator approval principals can resolve only routes bound to an explicit user list"
 )
 _COULD_NOT_VERIFY_GROUP_REASON = (
     "could not verify approver group membership: this approval's route is "
@@ -75,8 +96,8 @@ class ScriptedResolver:
         approval_id: str,
         *,
         decision: str,
-        resolved_by: str,
-        actor_channel: str,
+        attested_user: str,
+        attested_channel: str,
         note: str | None = None,
     ) -> ResolveOutcome:
         # `note` is recorded, not ignored: the dialog path's whole point is that
@@ -86,8 +107,8 @@ class ScriptedResolver:
             {
                 "approval_id": approval_id,
                 "decision": decision,
-                "resolved_by": resolved_by,
-                "actor_channel": actor_channel,
+                "attested_user": attested_user,
+                "attested_channel": attested_channel,
                 "note": note,
             }
         )
@@ -157,14 +178,14 @@ def test_authorized_click_resolves_and_stamps_the_card(
     assert sock.acked_envelope_ids == ["env-a1"]
     _drain(app)
 
-    # The API was asked to resolve with the clicker's identity and channel
-    # (the membership evidence the server-side authorizer checks).
+    # The resolver receives values Slack authenticated, rather than body fields
+    # the caller asserts. Its real HTTP implementation attests these values.
     assert resolver.calls == [
         {
             "approval_id": APPROVAL_ID,
             "decision": "approved",
-            "resolved_by": "U_MANAGER",
-            "actor_channel": "C_MGRS",
+            "attested_user": "U_MANAGER",
+            "attested_channel": "C_MGRS",
             # The immediate pair carries no note by construction; only the
             # dialog pair can collect one (#1053).
             "note": None,
@@ -204,10 +225,10 @@ def test_non_approver_rejection_renders_the_api_reason(
 ) -> None:
     """Strengthened from the original #246 test. The old assertion
     (``"not an approver" in kwargs["text"]``) also passes against the
-    hardcoded fixed string, so it would pass unchanged even for a
-    self-approval 403. Asserting the SPECIFIC channel reason from
-    ``outcome.detail`` is the only way to prove the rendering is not a
-    hardcoded literal (#453 AC4).
+    hardcoded fixed string. Asserting the SPECIFIC channel reason from
+    ``outcome.detail`` is the only way to prove the rendering preserves the
+    server's selected-set refusal instead of substituting a generic literal
+    (#453 AC4).
     """
 
     resolver = ScriptedResolver(
@@ -233,13 +254,13 @@ def test_non_approver_rejection_renders_the_api_reason(
     web_client.chat_postMessage.assert_not_called()
 
 
-def test_self_approval_rejection_is_distinguishable(
+def test_principal_eligibility_rejection_is_distinguishable(
     redis_client: redis.Redis, config: DispatcherConfig
 ) -> None:
-    """AC4: a self-approval 403 must not read like a non-membership 403."""
+    """A principal/set eligibility 403 must not read like non-membership."""
 
     resolver = ScriptedResolver(
-        ResolveOutcome(status_code=403, detail=_SELF_APPROVAL_REASON)
+        ResolveOutcome(status_code=403, detail=_PRINCIPAL_ELIGIBILITY_REASON)
     )
     app, web_client = _build(config, redis_client, resolver)
     handler = SocketModeHandler(app, app_token="xapp-test")
@@ -251,7 +272,7 @@ def test_self_approval_rejection_is_distinguishable(
     _drain(app)
 
     kwargs = web_client.chat_postEphemeral.call_args.kwargs
-    assert "self-approval is blocked" in kwargs["text"]
+    assert "explicit user list" in kwargs["text"]
     assert "not an approver" not in kwargs["text"]
 
 
@@ -281,7 +302,7 @@ def test_could_not_verify_is_not_worded_as_a_policy_denial(
 def test_the_three_refusal_classes_render_distinctly(
     redis_client: redis.Redis, config: DispatcherConfig
 ) -> None:
-    """AC4: non-membership, self-approval, and could-not-verify are
+    """Non-membership, principal eligibility, and could-not-verify are
     distinguishable to the clicker. A hardcoded fixed string can never
     satisfy this, since all three would collapse to one rendered string."""
 
@@ -289,7 +310,7 @@ def test_the_three_refusal_classes_render_distinctly(
     for i, detail in enumerate(
         (
             _CHANNEL_NON_APPROVER_REASON,
-            _SELF_APPROVAL_REASON,
+            _PRINCIPAL_ELIGIBILITY_REASON,
             _COULD_NOT_VERIFY_GROUP_REASON,
         )
     ):
@@ -298,9 +319,7 @@ def test_the_three_refusal_classes_render_distinctly(
         handler = SocketModeHandler(app, app_token="xapp-test")
         handler.handle(
             FakeSocketClient(),
-            _approval_click(
-                f"env-distinct-{i}", action_id=APPROVE_ACTION_ID, user="U_OUTSIDER"
-            ),
+            _approval_click(f"env-distinct-{i}", action_id=APPROVE_ACTION_ID, user="U_OUTSIDER"),
         )
         _drain(app)
         rendered.append(web_client.chat_postEphemeral.call_args.kwargs["text"])
@@ -354,10 +373,7 @@ def test_claim_race_loser_sees_already_resolved_by_winner(
     assert "already resolved by U_FIRST" in kwargs["text"]
     # The stale card is refreshed so it stops offering buttons.
     assert web_client.chat_update.call_count == 1
-    assert all(
-        b["type"] != "actions"
-        for b in web_client.chat_update.call_args.kwargs["blocks"]
-    )
+    assert all(b["type"] != "actions" for b in web_client.chat_update.call_args.kwargs["blocks"])
 
 
 def test_expired_click_gets_ephemeral_expiry_notice(
@@ -391,10 +407,122 @@ class _FakeHttpClient:
     def __init__(self, response: _FakeHttpResponse) -> None:
         self._response = response
 
+    def post(self, url: str, *, json: dict[str, Any], headers: dict[str, str]) -> _FakeHttpResponse:
+        return self._response
+
+
+class _CapturingHttpResponse:
+    status_code = 200
+    text = ""
+
+    def json(self) -> dict[str, str]:
+        return {"status": "approved", "resolved_by": "U_MANAGER"}
+
+
+class _CapturingHttpClient:
+    """The resolver's only outbound boundary, recorded without weakening it."""
+
+    def __init__(self) -> None:
+        self.requests: list[dict[str, Any]] = []
+
     def post(
         self, url: str, *, json: dict[str, Any], headers: dict[str, str]
-    ) -> _FakeHttpResponse:
-        return self._response
+    ) -> _CapturingHttpResponse:
+        self.requests.append({"url": url, "json": json, "headers": headers})
+        return _CapturingHttpResponse()
+
+
+def _assert_chat_attestation(
+    token: str,
+    *,
+    approval_id: str,
+    user: str,
+    channel: str,
+) -> None:
+    """Pin the attestation's wire codec without importing the API verifier.
+
+    The dispatcher must prove the Slack-authenticated user, the actual channel,
+    and this exact approval record. Importing the server's verifier here would
+    let a shared bug make both sides pass, so this is an independent stdlib
+    check of the compact HMAC contract.
+    """
+
+    prefix, encoded_claims, signature = token.split(".")
+    assert prefix == "apr"
+    signing_input = f"{prefix}.{encoded_claims}"
+    expected = (
+        base64.urlsafe_b64encode(
+            hmac.new(
+                _CHAT_ATTESTER_SECRET.encode(), signing_input.encode(), hashlib.sha256
+            ).digest()
+        )
+        .rstrip(b"=")
+        .decode()
+    )
+    api_key_signature = (
+        base64.urlsafe_b64encode(
+            hmac.new(_PLATFORM_API_KEY.encode(), signing_input.encode(), hashlib.sha256).digest()
+        )
+        .rstrip(b"=")
+        .decode()
+    )
+    assert hmac.compare_digest(signature, expected), (
+        "the approval principal must be signed with the dedicated Slack attester credential"
+    )
+    assert not hmac.compare_digest(signature, api_key_signature), (
+        "a platform-key-signed principal must not substitute for a chat attestation"
+    )
+    padded = encoded_claims + "=" * (-len(encoded_claims) % 4)
+    claims = json.loads(base64.urlsafe_b64decode(padded))
+    assert claims["kind"] == "chat"
+    assert claims["scope"] == "approval.resolve"
+    assert claims["sub"] == user
+    assert claims["actor_channel"] == channel
+    assert claims["approval_id"] == approval_id
+
+
+def test_immediate_click_posts_only_decision_with_an_authenticated_chat_principal(
+    redis_client: redis.Redis,
+    config: DispatcherConfig,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The simple card path must not retain either caller-asserted field.
+
+    Socket Mode authenticates this user and delivers this channel. The HTTP
+    request must carry that proof in ``X-Curie-Approval-Principal`` and no
+    token/credential may escape into a Slack render or dispatcher log.
+    """
+
+    captured = _CapturingHttpClient()
+    resolver = ApprovalResolveClient(
+        api_base_url="https://api.example.test",
+        api_key=_PLATFORM_API_KEY,
+        approval_chat_attester_secret=_CHAT_ATTESTER_SECRET,
+        client=captured,  # type: ignore[arg-type]
+    )
+    app, web_client = _build(config, redis_client, resolver)  # type: ignore[arg-type]
+    handler = SocketModeHandler(app, app_token="xapp-test")
+
+    handler.handle(
+        FakeSocketClient(), _approval_click("env-principal-immediate", action_id=APPROVE_ACTION_ID)
+    )
+    _drain(app)
+
+    assert len(captured.requests) == 1
+    request = captured.requests[0]
+    assert request["url"].endswith(f"/approvals/{APPROVAL_ID}/resolve")
+    assert request["json"] == {"decision": "approved"}
+    token = request["headers"]["X-Curie-Approval-Principal"]
+    _assert_chat_attestation(token, approval_id=APPROVAL_ID, user="U_MANAGER", channel="C_MGRS")
+    assert token not in caplog.text
+    rendered = repr(
+        (
+            web_client.chat_postMessage.call_args_list,
+            web_client.chat_update.call_args_list,
+            web_client.chat_postEphemeral.call_args_list,
+        )
+    )
+    assert token not in rendered
 
 
 def test_non_json_403_body_is_not_captured_as_detail() -> None:
@@ -412,11 +540,17 @@ def test_non_json_403_body_is_not_captured_as_detail() -> None:
     raw_body = "<html>403 Forbidden - waf-node-7.internal</html>"
     fake_client = _FakeHttpClient(_FakeHttpResponse(status_code=403, text=raw_body))
     resolver = ApprovalResolveClient(
-        api_base_url="https://api.internal", api_key="k", client=fake_client
+        api_base_url="https://api.internal",
+        api_key=_PLATFORM_API_KEY,
+        approval_chat_attester_secret=_CHAT_ATTESTER_SECRET,
+        client=fake_client,  # type: ignore[arg-type]
     )
 
     outcome = resolver.resolve(
-        APPROVAL_ID, decision="approved", resolved_by="U_MANAGER", actor_channel="C_MGRS"
+        APPROVAL_ID,
+        decision="approved",
+        attested_user="U_MANAGER",
+        attested_channel="C_MGRS",
     )
 
     assert outcome.status_code == 403
@@ -553,17 +687,13 @@ def test_escaping_is_ampersand_first_so_entities_are_not_double_escaped() -> Non
 def test_cosmetic_markdown_is_left_alone() -> None:
     """`*`, `_` and backticks are not escaped on purpose: they render inertly,
     and stripping them would mangle a note that legitimately quotes code."""
-    line = settled_verdict_line(
-        decision="rejected", resolver="U1", note="use `--force` carefully"
-    )
+    line = settled_verdict_line(decision="rejected", resolver="U1", note="use `--force` carefully")
 
     assert "`--force`" in line
 
 
 def test_a_plain_note_is_unchanged() -> None:
     """The common case pays nothing for the guard."""
-    line = settled_verdict_line(
-        decision="rejected", resolver="U1", note="discount exceeds policy"
-    )
+    line = settled_verdict_line(decision="rejected", resolver="U1", note="discount exceeds policy")
 
     assert "Note: discount exceeds policy" in line

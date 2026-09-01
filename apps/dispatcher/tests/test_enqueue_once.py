@@ -91,6 +91,9 @@ def test_main_without_otlp_endpoint_prints_only_the_stream_id(
     monkeypatch.setenv("VALKEY_PORT", str(config.valkey_port))
     monkeypatch.setenv("VALKEY_PASSWORD", config.valkey_password)
     monkeypatch.setenv("CURIE_STREAM", config.stream)
+    monkeypatch.setenv(
+        "CURIE_APPROVAL_CHAT_ATTESTER_SECRET", "dispatcher-attester-test-secret"
+    )
     monkeypatch.setattr(enqueue_once.sys, "stdin", io.StringIO(turn.model_dump_json()))
 
     assert enqueue_once.main() == 0

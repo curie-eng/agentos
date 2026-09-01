@@ -39,7 +39,7 @@ from claude_agent_sdk import AssistantMessage, ResultMessage
 from curie_telemetry import record_metric
 from opentelemetry.context import Context
 
-from .adapter import ModelSession, model_message_to_conversation
+from .adapter import ModelSession, PartialMessageBoundary, model_message_to_conversation
 from .approval import ApprovalGate
 from .budget import BUDGET_CLASSIFICATION, BudgetTracker
 from .history import (
@@ -537,10 +537,6 @@ class SessionRunner:
                                 # without requesting the generator's next item.
                                 metric_outcome = self._metric_outcome(tracker)
                             yield line
-                        if self._status is SessionStatus.CLASSIFIED_FAILURE:
-                            gen.set_failed()
-                        else:
-                            gen.set_succeeded()
                         logger.info(
                             "turn end session=%s status=%s duration_ms=%d",
                             self._session_id,
@@ -553,31 +549,54 @@ class SessionRunner:
                         metric_outcome = self._metric_outcome(tracker)
                     except Exception as exc:  # noqa: BLE001 - the ACI stream must
                         # always terminate in a final; a raised SDK/transport error
-                        # (CLI disconnect, auth expiry, model error) becomes a
-                        # classified failure rather than a truncated, final-less
-                        # stream. GeneratorExit (consumer disconnect) is a
-                        # BaseException and is intentionally not caught here -- the
-                        # finally handles that abandonment case.
-                        logger.error(
-                            "turn failed session=%s error_class=%s: %s duration_ms=%d",
-                            self._session_id,
-                            type(exc).__name__,
-                            exc,
-                            int((time.monotonic() - start) * 1000),
-                        )
+                        # becomes a classified failure unless a requested interrupt
+                        # released the iterator, in which case it is cancellation.
+                        # GeneratorExit (consumer disconnect) is a BaseException and
+                        # is intentionally not caught here -- the finally handles
+                        # that abandonment case.
                         self._turn_open = False
-                        self._status = SessionStatus.CLASSIFIED_FAILURE
-                        metric_outcome = self._metric_outcome(tracker)
-                        gen.set_failed()
-                        yield to_ndjson_line(
-                            ErrorEvent(
-                                message=f"runner error: {exc}",
-                                classification="runner-error",
+                        if self._interrupt_requested:
+                            # Some SDK iterators surface the runner-requested
+                            # interrupt as an exception instead of a terminal
+                            # ResultMessage. The interrupt remains authoritative:
+                            # do not expose or log the implementation exception as
+                            # a model failure, and close every active phase as an
+                            # intentional cancellation.
+                            self._status = SessionStatus.IDLE_AWAITING_INPUT
+                            metric_outcome = "interrupted"
+                            gen.finish_turn(
+                                interrupt_requested=True,
+                                classified_failure=False,
                             )
-                        )
-                        yield to_ndjson_line(
-                            Final(text="run failed", status=SessionStatus.CLASSIFIED_FAILURE)
-                        )
+                            yield to_ndjson_line(
+                                Final(
+                                    text="run interrupted",
+                                    status=SessionStatus.IDLE_AWAITING_INPUT,
+                                )
+                            )
+                        else:
+                            logger.error(
+                                "turn failed session=%s error_class=%s: %s duration_ms=%d",
+                                self._session_id,
+                                type(exc).__name__,
+                                exc,
+                                int((time.monotonic() - start) * 1000),
+                            )
+                            self._status = SessionStatus.CLASSIFIED_FAILURE
+                            metric_outcome = self._metric_outcome(tracker)
+                            gen.set_failed()
+                            yield to_ndjson_line(
+                                ErrorEvent(
+                                    message=f"runner error: {exc}",
+                                    classification="runner-error",
+                                )
+                            )
+                            yield to_ndjson_line(
+                                Final(
+                                    text="run failed",
+                                    status=SessionStatus.CLASSIFIED_FAILURE,
+                                )
+                            )
                     finally:
                         # If the turn never reached a terminal final (_turn_open still
                         # set), the consumer abandoned the stream mid-run (client
@@ -622,8 +641,12 @@ class SessionRunner:
         """Drive one turn to a terminal final (budget/interrupt overrides applied)."""
 
         assert self._session is not None
+        gen.query_observed()
         await self._session.query(event.text)
         async for message in self._session.receive_turn():
+            if isinstance(message, PartialMessageBoundary):
+                gen.record_first_response_boundary()
+                continue
             if _is_auth_rejection(message):
                 # A rejected model credential is terminal: stop the live session
                 # so the SDK/CLI does not keep retrying with backoff to the wall,
@@ -634,6 +657,7 @@ class SessionRunner:
                 # terminal ``model-credential-rejected`` error is emitted regardless.
                 with contextlib.suppress(Exception):
                     await self._session.interrupt()
+                gen.set_failed()
                 for line in self._auth_halt_lines():
                     yield line
                 return
@@ -679,6 +703,31 @@ class SessionRunner:
                 tracker.add_increment(usage)
             budget_hit = tracker.exceeded
             events = translate_message(message, state, self._classifier, gen)
+            decided_result_final: Final | None = None
+            if isinstance(message, ResultMessage):
+                terminal_reason = getattr(message, "terminal_reason", None)
+                cancelled = self._interrupt_requested
+                subtype = message.subtype or ""
+                result_failed = budget_hit or (
+                    not cancelled and (message.is_error or subtype.startswith("error"))
+                )
+                if not budget_hit:
+                    self._merge_gate_block(state)
+                    sdk_final = next(
+                        (outbound for outbound in events if isinstance(outbound, Final)),
+                        None,
+                    )
+                    if sdk_final is not None:
+                        decided_result_final = _apply_approval_override(
+                            self._reclassify(sdk_final), state
+                        )
+                gen.result_boundary_observed(
+                    failed=result_failed,
+                    terminal_reason=terminal_reason,
+                    approval_paused=decided_result_final is not None
+                    and decided_result_final.status
+                    is SessionStatus.AWAITING_APPROVAL,
+                )
 
             for outbound in events:
                 if isinstance(outbound, ToolNote):
@@ -691,17 +740,32 @@ class SessionRunner:
                     )
                 if isinstance(outbound, Final):
                     if budget_hit:
+                        gen.set_failed()
                         for line in self._budget_halt_lines():
                             yield line
                         return
-                    self._merge_gate_block(state)
-                    final = _apply_approval_override(self._reclassify(outbound), state)
+                    if decided_result_final is None:
+                        self._merge_gate_block(state)
+                        final = _apply_approval_override(
+                            self._reclassify(outbound), state
+                        )
+                    else:
+                        final = decided_result_final
                     for line in self._approval_not_acted_lines(state, final):
                         yield line
                     for line in self._false_completion_lines(state, final):
                         yield line
                     self._status = final.status
                     self._turn_open = False
+                    gen.finish_turn(
+                        interrupt_requested=self._interrupt_requested,
+                        classified_failure=final.status
+                        is SessionStatus.CLASSIFIED_FAILURE,
+                        approval_paused=final.status
+                        is SessionStatus.AWAITING_APPROVAL,
+                        completed_without_result=final.status
+                        is SessionStatus.AWAITING_APPROVAL,
+                    )
                     # Persist clean replies and resumable approval suspensions;
                     # classified failures remain delivery outcomes, not history.
                     if final.status in {
@@ -717,6 +781,7 @@ class SessionRunner:
                 # Budget crossed on a non-terminal message: stop the live run,
                 # then emit the same error+final pair.
                 await self._session.interrupt()
+                gen.set_failed()
                 for line in self._budget_halt_lines():
                     yield line
                 return
@@ -737,6 +802,12 @@ class SessionRunner:
             yield line
         self._status = final.status
         self._turn_open = False
+        gen.finish_turn(
+            interrupt_requested=self._interrupt_requested,
+            classified_failure=final.status is SessionStatus.CLASSIFIED_FAILURE,
+            approval_paused=final.status is SessionStatus.AWAITING_APPROVAL,
+            completed_without_result=final.status is SessionStatus.AWAITING_APPROVAL,
+        )
         # A missing provider ResultMessage is still incomplete for a nominal
         # DONE turn. The one resumable exception is a runner-owned approval
         # halt: its structured tool call and gate context must cross runners.

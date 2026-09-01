@@ -109,6 +109,10 @@ def config(redis_client: redis.Redis) -> Iterator[DispatcherConfig]:
         dedupe_prefix=f"test:curie:dedupe:{token}:",
         dedupe_ttl_seconds=60,
         placeholder_text="Working on it.",
+        # ADR-0106: this is deliberately distinct from the platform API key.
+        # Socket Mode interactions become a chat principal only when the
+        # dispatcher can sign an attestation with this dedicated credential.
+        approval_chat_attester_secret="dispatcher-attester-test-secret",
     )
     yield cfg
     keys = list(redis_client.scan_iter(f"test:curie:dedupe:{token}:*"))

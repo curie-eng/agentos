@@ -10,6 +10,11 @@ Status: Accepted
 sniff), replacing it with durable runner-authored provenance. The one-shot grant
 lifecycle established below is otherwise unchanged.
 
+**Partially superseded by [ADR-0106](0106-an-approver-is-an-authenticated-principal.md)**
+(back-link added under [ADR-0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+ADR-0106 supersedes only this ADR's upstream non-requester guarantee. The
+one-shot grant lifecycle and its other load-bearing properties remain in force.
+
 Implements [#430](https://github.com/curie-eng/curie/issues/430).
 
 ## Context

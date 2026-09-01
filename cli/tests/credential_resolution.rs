@@ -767,7 +767,15 @@ fn local_credential_free_modes_do_not_read_private_storage() {
 fn cluster_credential_free_modes_do_not_read_private_storage() {
     for (label, mode_args) in [
         ("fake model", vec!["--fake-model"]),
-        ("local model", vec!["--local-model", "qwen3:8b"]),
+        (
+            "local model",
+            vec![
+                "--local-model",
+                "qwen3:8b",
+                "--set",
+                "inference.pullModel=false",
+            ],
+        ),
     ] {
         let fixture = unreadable_vault_with_saved_curie_credentials();
         let mut cmd = promotion_command(&fixture);

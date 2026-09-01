@@ -35,6 +35,24 @@ async def require_api_key(
         )
 
 
+async def require_platform_key(
+    x_api_key: Annotated[str | None, Header()] = None,
+) -> None:
+    """Authenticate an immutable platform-administration boundary.
+
+    Unlike ``require_api_key``, this dependency must never grow support for a
+    console session or another human credential.  Principal and console-code
+    mint routes use it so a future widening of ordinary API authentication
+    cannot let a logged-in browser mint an arbitrary operator identity.
+    """
+
+    if not verify_platform_key(x_api_key):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="missing or invalid platform API key",
+        )
+
+
 def verify_internal_worker_token(value: str | None) -> bool:
     """Constant-time check for the credential-redemption trust boundary."""
 
@@ -45,9 +63,7 @@ def verify_internal_worker_token(value: str | None) -> bool:
 
 
 async def require_internal_worker_token(
-    x_curie_worker_token: Annotated[
-        str | None, Header(alias="X-Curie-Worker-Token")
-    ] = None,
+    x_curie_worker_token: Annotated[str | None, Header(alias="X-Curie-Worker-Token")] = None,
 ) -> None:
     if not verify_internal_worker_token(x_curie_worker_token):
         raise HTTPException(
@@ -58,9 +74,7 @@ async def require_internal_worker_token(
 
 
 async def require_internal_adapter_secret(
-    x_curie_adapter_secret: Annotated[
-        str | None, Header(alias="X-Curie-Adapter-Secret")
-    ] = None,
+    x_curie_adapter_secret: Annotated[str | None, Header(alias="X-Curie-Adapter-Secret")] = None,
 ) -> None:
     """Authenticate the built-in reply relay on its adapter-shaped header.
 

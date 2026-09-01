@@ -50,8 +50,12 @@ pub struct UpOpts {
     pub model: Option<String>,
     /// Required chart secrets (dotted helm key -> value) the CLI supplies so a
     /// no-override install never ships the published dev defaults (see #196).
-    /// Populated by [`up`] from [`resolve_generated_secrets`]; empty in the pure
-    /// argv tests and whenever `--dev` keeps the chart's dev defaults. Delivered
+    /// Populated by [`up`] from [`resolve_generated_secrets`] on a sealed
+    /// install, and from [`resolve_preserved_values`] on both sealed and
+    /// `--dev` upgrades so a sibling verb's recorded values (`cluster comms`,
+    /// `cluster github-app`, a previously generated sealing key) survive a
+    /// full Helm upgrade (#1134). Empty in the pure argv tests and on a fresh
+    /// `--dev` install, which keeps the chart's published defaults. Delivered
     /// through a private 0600 `-f` values file, never the argv.
     pub secrets: Vec<(String, String)>,
     /// What this run does with `api.githubToken`, resolved by [`up`] from
@@ -1615,6 +1619,13 @@ fn complete_up_opts_without_runner_egress(
             &operator_sets,
             opts.common.dry_run,
         ));
+    } else {
+        // `--dev` keeps the chart's published credential defaults (#195) and
+        // must not mint a sealing key, but it is still a FULL helm upgrade:
+        // values a sibling verb recorded have to be re-supplied or they reset
+        // to the empty chart default (#1134, #1125). Preserve, never invent.
+        opts.secrets
+            .extend(resolve_preserved_values(existing, &operator_sets));
     }
     opts.github_token =
         resolve_github_token(existing, &operator_sets, github_token, clear_github_token);
@@ -3367,9 +3378,9 @@ async fn run_prepared_up(
 ) -> Result<ClusterUpOutput> {
     // The single call site, and deliberately the first statement of the single
     // choke point both `up()` and `up_prepared()` funnel through: upstream of
-    // the `inference.render(ui)` loop, of the `!opts.dev` preservation notes,
-    // and of every helm invocation, so a refused run (#1145) emits the error
-    // and nothing else.
+    // the `inference.render(ui)` loop, of the preservation notes, and of every
+    // helm invocation, so a refused run (#1145) emits the error and nothing
+    // else.
     guard_dev_defaults_flip(opts.dev, existing.as_ref(), &opts.operator_sets())?;
     let ui = crate::ui::ui();
     let (detect_facts, initial_inferences) = match inference_policy {
@@ -3379,33 +3390,33 @@ async fn run_prepared_up(
     for inference in &initial_inferences {
         inference.render(ui);
     }
+    let operator_sets = opts.operator_sets();
+    let preserved = resolve_preserved_values(existing.as_ref(), &operator_sets);
+    if !preserved.is_empty() {
+        let sealing_values = preserved
+            .iter()
+            .filter(|(key, _)| crate::sealing::SEALING_MANAGED_KEYS.contains(&key.as_str()))
+            .count();
+        let message = if sealing_values == preserved.len() {
+            format!(
+                "preserving {} sealing value(s) recorded by the release",
+                preserved.len()
+            )
+        } else if sealing_values == 0 {
+            format!(
+                "preserving {} value(s) recorded by `cluster comms` / `cluster github-app`; re-run those verbs only to change them",
+                preserved.len()
+            )
+        } else {
+            format!(
+                "preserving {} value(s), including {} sealing value(s), recorded by the release",
+                preserved.len(),
+                sealing_values
+            )
+        };
+        ui.note(&message);
+    }
     if !opts.dev {
-        let operator_sets = opts.operator_sets();
-        let preserved = resolve_preserved_values(existing.as_ref(), &operator_sets);
-        if !preserved.is_empty() {
-            let sealing_values = preserved
-                .iter()
-                .filter(|(key, _)| crate::sealing::SEALING_MANAGED_KEYS.contains(&key.as_str()))
-                .count();
-            let message = if sealing_values == preserved.len() {
-                format!(
-                    "preserving {} sealing value(s) recorded by the release",
-                    preserved.len()
-                )
-            } else if sealing_values == 0 {
-                format!(
-                    "preserving {} value(s) recorded by `cluster comms` / `cluster github-app`; re-run those verbs only to change them",
-                    preserved.len()
-                )
-            } else {
-                format!(
-                    "preserving {} value(s), including {} sealing value(s), recorded by the release",
-                    preserved.len(),
-                    sealing_values
-                )
-            };
-            ui.note(&message);
-        }
         match sealing_private_key_disposition(
             existing.as_ref(),
             &operator_sets,
@@ -5045,6 +5056,170 @@ mod tests {
             "dispatcher": {"slack": {"appToken": "", "botToken": ""}}
         });
         assert!(resolve_comms_values(Some(&disconnected), &[]).is_empty());
+    }
+
+    fn secret_for<'a>(opts: &'a UpOpts, key: &str) -> Option<&'a str> {
+        opts.secrets
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    fn completed_dev_up(existing: Option<&serde_json::Value>, set: Vec<String>) -> UpOpts {
+        complete_up_opts_without_runner_egress(
+            UpOpts {
+                common: common(),
+                github_token: GithubTokenPlan::Untouched,
+                allow_egress_host: vec![],
+                resolved_egress_cidrs: vec![],
+                chart: "charts/curie".into(),
+                secrets: vec![],
+                dev: true,
+                no_expose: true,
+                set,
+                set_string: vec![],
+                allow_web_egress: vec![],
+                fake_model: false,
+                credentials: None,
+                local_model: None,
+                model: None,
+            },
+            existing,
+            None,
+            false,
+        )
+        .unwrap()
+    }
+
+    /// #1134 / #1125: `cluster up --dev` after `cluster comms` is a FULL
+    /// upgrade. Helm reuse never engages because `--dev` always passes
+    /// `--set security.allowDevDefaults=true`, so anything this path does not
+    /// re-pass resets to the empty chart default.
+    ///
+    /// This is the wiring, not the family helpers: `resolve_comms_values` and
+    /// `resolve_preserved_values` already return the keys. Deleting the `--dev`
+    /// arm that copies them onto `opts.secrets` (or gating it behind
+    /// `if !opts.dev`) is what this fails on -- the same class of hole that
+    /// left #1256 green.
+    #[test]
+    fn a_dev_upgrade_re_supplies_recorded_comms_and_sealing_values() {
+        let existing = serde_json::json!({
+            "security": {"allowDevDefaults": true},
+            "dispatcher": {"slack": {"appToken": "xapp-EXAMPLE", "botToken": "xoxb-EXAMPLE"}},
+            "sealing": {"privateKey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="},
+            "api": {
+                "githubAppId": "1234567",
+                "githubAppPrivateKey": "FAKEKEY",
+            }
+        });
+        let opts = completed_dev_up(Some(&existing), vec![]);
+        assert_eq!(
+            secret_for(&opts, "dispatcher.slack.appToken"),
+            Some("xapp-EXAMPLE"),
+            "a second `cluster up --dev` dropped the Slack app token (#1134): {:?}",
+            opts.secrets
+        );
+        assert_eq!(
+            secret_for(&opts, "dispatcher.slack.botToken"),
+            Some("xoxb-EXAMPLE"),
+            "a second `cluster up --dev` dropped the Slack bot token (#1134): {:?}",
+            opts.secrets
+        );
+        assert_eq!(
+            secret_for(&opts, crate::sealing::SEALING_PRIVATE_KEY),
+            Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+            "a second `cluster up --dev` dropped the recorded sealing key (#1134): {:?}",
+            opts.secrets
+        );
+        assert_eq!(
+            secret_for(&opts, "api.githubAppPrivateKey"),
+            Some("FAKEKEY"),
+            "a second `cluster up --dev` dropped the GitHub App on the --dev arm: {:?}",
+            opts.secrets
+        );
+        for (key, _) in REQUIRED_SECRETS {
+            assert!(
+                secret_for(&opts, key).is_none(),
+                "--dev must keep published chart credential defaults, not mint {key}: {:?}",
+                opts.secrets
+            );
+        }
+
+        let (materialized, _guards) = up_commands(&opts)[0].materialize_secret_files().unwrap();
+        let argv = materialized.argv().join(" ");
+        assert!(
+            argv.contains("security.allowDevDefaults=true"),
+            "dev mode must still opt into chart defaults: {argv}"
+        );
+        assert!(
+            !argv.contains("--reuse-values"),
+            "up must remain a full Helm upgrade: {argv}"
+        );
+        assert!(
+            !argv.contains("xapp-EXAMPLE") && !argv.contains("xoxb-EXAMPLE"),
+            "Slack tokens leaked into argv: {argv}"
+        );
+        let joined = secret_values_file_bodies(&materialized).join("\n");
+        assert!(
+            joined.contains("xapp-EXAMPLE") && joined.contains("xoxb-EXAMPLE"),
+            "the --dev values file dropped the Slack tokens: {joined}"
+        );
+        assert!(
+            joined.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+            "the --dev values file dropped the sealing key: {joined}"
+        );
+    }
+
+    #[test]
+    fn a_dev_upgrade_does_not_mint_a_sealing_key_when_none_is_recorded() {
+        let existing = serde_json::json!({"security": {"allowDevDefaults": true}});
+        let opts = completed_dev_up(Some(&existing), vec![]);
+        assert!(
+            secret_for(&opts, crate::sealing::SEALING_PRIVATE_KEY).is_none(),
+            "--dev must not mint a sealing key on a release that never had one: {:?}",
+            opts.secrets
+        );
+        assert!(
+            opts.secrets.is_empty(),
+            "a --dev rerun with nothing recorded must not invent secrets: {:?}",
+            opts.secrets
+        );
+    }
+
+    #[test]
+    fn a_dev_upgrade_stays_disconnected_after_comms_disconnect() {
+        let existing = serde_json::json!({
+            "security": {"allowDevDefaults": true},
+            "dispatcher": {"slack": {"appToken": "", "botToken": ""}}
+        });
+        let opts = completed_dev_up(Some(&existing), vec![]);
+        assert!(
+            secret_for(&opts, "dispatcher.slack.appToken").is_none(),
+            "empty disconnect values must not be resurrected: {:?}",
+            opts.secrets
+        );
+        assert!(secret_for(&opts, "dispatcher.slack.botToken").is_none());
+    }
+
+    #[test]
+    fn a_dev_upgrade_lets_an_explicit_set_replace_a_recorded_comms_value() {
+        let existing = serde_json::json!({
+            "security": {"allowDevDefaults": true},
+            "dispatcher": {"slack": {"appToken": "xapp-old", "botToken": "xoxb-old"}}
+        });
+        let opts = completed_dev_up(
+            Some(&existing),
+            vec!["dispatcher.slack.botToken=xoxb-new".into()],
+        );
+        assert_eq!(
+            secret_for(&opts, "dispatcher.slack.appToken"),
+            Some("xapp-old")
+        );
+        assert!(
+            secret_for(&opts, "dispatcher.slack.botToken").is_none(),
+            "an explicit --set must own the key, not ride alongside the recorded value: {:?}",
+            opts.secrets
+        );
     }
 
     #[test]

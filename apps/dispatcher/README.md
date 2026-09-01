@@ -9,6 +9,16 @@ All of this runs under reconnect supervision with graceful shutdown.
 It does exactly that and no more: routing, the finish-race, steer/interrupt, and
 run orchestration are the worker's job, not the dispatcher's.
 
+Approval actions are the dispatcher's one authenticated-principal responsibility
+([ADR-0106](../../docs/adr/0106-an-approver-is-an-authenticated-principal.md)). Slack
+authenticates the click over Socket Mode; the dispatcher signs a short-lived `chat`
+principal containing that Slack user, channel, and approval ID, then sends it in
+`X-Curie-Approval-Principal`. The resolve body carries only `decision` and optional
+`note`. It never forwards caller-controlled `resolved_by` or `actor_channel`, and the
+platform API key alone cannot resolve. Authorization still happens in the API: requester
+equality neither grants nor denies, so the same authenticated requester may confirm only
+when the selected approver set admits them.
+
 ## What is ingested, and what is refused
 
 Ingest admits more than it used to (#2006). A message whose body lives in Block Kit
@@ -115,7 +125,8 @@ Read from the environment by `DispatcherConfig()` (a `pydantic_settings.BaseSett
 | `CURIE_BACKOFF_MAX_SECONDS` | `30.0` | backoff cap |
 | `CURIE_BACKOFF_MULTIPLIER` | `2.0` | backoff growth factor |
 | `CURIE_API_URL` | `http://localhost:8000` | platform API used to resolve approval clicks (compose: `http://curie-api:8000`). `CURIE_API_BASE_URL` is a deprecated alias. |
-| `CURIE_API_KEY` | `curie-dev-key` | shared API key sent as `X-API-Key` on the resolve call |
+| `CURIE_API_KEY` | `curie-dev-key` | platform administrative key; sent for compatibility with API plumbing, but it is not resolver identity and cannot authorize a resolution alone |
+| `CURIE_APPROVAL_CHAT_ATTESTER_SECRET` | `curie-dev-approval-chat-attester` | independent HMAC secret shared only with the API; signs short-lived, approval-bound `chat` principals. Must be nonblank and must not equal `CURIE_API_KEY`. |
 | `CURIE_API_PREFLIGHT_TIMEOUT_SECONDS` | `30.0` | deadline for the boot gate below; must be positive |
 
 ### Boot gate on the platform API
@@ -137,13 +148,15 @@ resolve call degrades per-call on its own). There is no off switch: the gate is
 the point, so a non-positive timeout is rejected as a config error at boot.
 
 **Known limit: the gate proves reachability, not credentials.** `/health` is
-unauthenticated, so a wrong `CURIE_API_KEY` still passes the gate and fails at
-click time. This check catches the base-URL class of misconfiguration only.
+unauthenticated, so a mismatched API key or chat-attester secret still passes the gate and
+fails at click time. This check catches the base-URL class of misconfiguration only.
 
-The two Slack tokens are the only secrets. When a workspace exists they come from
+The two Slack tokens and the independent approval chat-attester key are secrets. When a workspace exists the Slack tokens come from
 the app's install (App-Level Token with `connections:write` for `SLACK_APP_TOKEN`;
 Bot User OAuth Token for `SLACK_BOT_TOKEN`), delivered as env vars (a K8s Secret
-in the chart). Nothing else is secret.
+in the chart). The chart or compose stack supplies the attester secret to the dispatcher
+and API only; it must not be reused as the platform key or exposed to workers, runners,
+the Console, or operators.
 
 ## Run it
 

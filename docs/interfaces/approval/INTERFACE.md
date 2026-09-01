@@ -13,8 +13,8 @@ order: 13
 Repository publication uses this same approval plane but does not wake the
 sandbox after resolution. The trusted worker atomically creates the approval
 and private publication row through `POST /v1/internal/publications`; requester
-self-approval is allowed only for records whose server-owned purpose is
-`publication`. Approve schedules the platform publication reconciler, while
+equality has the same meaning as every other approval: it neither grants nor
+denies membership in the selected approver set. Approve schedules the platform publication reconciler, while
 deny and expiry terminalize without redeeming a write credential. Terminal
 results are delivered from a bounded durable outbox, independently of patch and
 credential cleanup, so adapter retries cannot repeat a GitHub mutation.
@@ -30,7 +30,7 @@ credential cleanup, so adapter retries cannot repeat a GitHub mutation.
 ## The black line
 
 The black line is an **Authorizer** port: a server-side decision, at approval-resolution
-time, of whether a given actor is allowed to resolve a given pending approval — plus the
+time, of whether an authenticated principal is allowed to resolve a given pending approval — plus the
 `awaiting-approval` lifecycle state that lets a session durably pause on that decision. What
 stays opinionated core is *where* the decision is enforced (server-side, at resolution) and
 that gates are policy-triggered, never phase-hardcoded by the platform. What becomes
@@ -61,9 +61,21 @@ in code now:
   fields (ADR-0036) and are persisted as the `gate_kind`/`granted_tool` columns on the
   `Approval` record (migration `0015_approval_gate_provenance`). They replace the old
   summary-prefix sniff as the durable source of grant provenance — see the #430 bullet below.
-- **The lifecycle (landed, #244).** A skill raises a policy gate through the runner's
-  in-process `mcp__curie__request_approval` tool (`runner/src/curie_runner/approval.py`);
-  the turn ends `awaiting-approval`, the worker persists the record and suspends the sandbox
+- **The lifecycle (landed, #244; pager advertisement narrowed, #1444).** A skill raises a
+  policy gate through the runner's in-process `mcp__curie__request_approval` tool
+  (`runner/src/curie_runner/approval.py`) when that tool is present. The runner advertises
+  this generic pager only when the observed MCP surface has an action that may write — a
+  tool not explicitly `readOnlyHint=true`, including an unknown or unreachable surface — or
+  when an explicit actionable approval gate exists. A surface with no MCP tools or only
+  explicitly read-only tools carries no generic pager, because approval cannot unlock an
+  action it cannot perform. `readOnlyHint` is not authorization and does not change gates
+  or tool execution. A live probe that explicitly reports `readOnlyHint=true` also feeds
+  the MCP tool's SDK-visible name to the read-only classifier, suppressing the side-effect
+  flag, no-retry-after-side-effects classification, and therefore its receipt line. A
+  missing or `false` hint, an unknown surface, or a failed probe remains potentially
+  write-capable and is classified conservatively. Publication's dedicated approval flow
+  and state tools remain independent. When the pager is used, the turn ends
+  `awaiting-approval`, the worker persists the record and suspends the sandbox
   (`kernel._pause_for_approval` — the first live use of the dormant ADR-0003 suspend path);
   resolution enqueues a resume turn onto the ordinary runs stream
   (`apps/api/src/curie_api/resumequeue.py`), and the kernel's claim path rehydrates the
@@ -148,8 +160,10 @@ in code now:
   **server-side** --
   derived by the worker from the durable record, never minted by the sandbox, so the
   ADR-0010/0033/0034 "enforced server-side, unspoofable from the sandbox" guarantee holds.
-  The non-requester guarantee is upstream: the authorizer denies self-approval before the
-  status flips to `approved`. **Known gaps:** (1) *fail-safe adoption* -- if the pod is
+  The membership guarantee is upstream: the authorizer checks every authenticated principal,
+  including the requester, against the selected approver set before the status flips to
+  `approved`. Requester equality neither grants nor vetoes that membership; a distinct-person
+  requirement needs its own future policy. **Known gaps:** (1) *fail-safe adoption* -- if the pod is
   still live when the resume arrives (suspend failed, or a user mention resumed the thread
   first), `claim()` adopts it and the boot env is ignored, so the grant is lost and the
   action re-pauses (self-heals via re-approval). (2) *tool-name, not argument, scoping* --
@@ -241,8 +255,10 @@ in code now:
   notification may use the default transport, while another kind stores its own required
   `endpoint` and `adapter`. Those transport fields are redacted from API/CLI reads. Every
   resolution attempt appends to the platform audit log (`approval_audit_entries`,
-  `GET /approvals/{id}/audit`): actor, channel evidence, decision, and the authorizer
-  snapshot -- who resolved, and why they counted (or were refused).
+  `GET /approvals/{id}/audit`): actor, authenticated principal kind, channel evidence,
+  decision, and the authorizer snapshot -- who resolved, how the platform authenticated
+  them, and why they counted (or were refused). Rows written before ADR-0106 retain
+  `principal_kind=NULL` and `authenticated=false` rather than being retroactively trusted.
 
 ### Arming a gate: bare MCP shorthand is normalized; unresolvable names fail closed
 
@@ -314,14 +330,22 @@ names as unrecognized on purpose, so arming one still trips the existing
 ## Implementations today
 
 **One authorizer** (`apps/api/src/curie_api/authorizer.py`, pure policy with no Slack in
-it) over **three approver sets** behind the `ApproverSet` port (ADR-0034). A set answers
-only "is this actor in the set"; every rule that is not membership lives in the authorizer,
-applied identically whatever the set. Self-approval is the rule that matters:
-`authorize_approval` denies a self-attempt after the set is selected and before it is asked
-(so a self-click never spends a Slack lookup), and a set is never consulted, so none can
-skip it. The durable record, the
+it) over **three approver sets** behind the `ApproverSet` port (ADR-0034), after an
+independent authentication boundary resolves one of ADR-0106's `chat`, `console`, or
+`operator` principals. A set answers only "is this actor in the set"; every rule that is
+not membership lives in the authorizer, applied identically whatever the set. Requester
+equality is deliberately not a rule: the selected set is always consulted, so a requester
+who belongs may confirm and one who does not remains denied. A deployment that needs
+two-person separation of duties must declare a future distinct policy rather than inherit
+one from every ordinary gate. The durable record, the
 `awaiting-approval` status, both gate trigger types, the card click-to-resolve flow, and the
 suspend/resume lifecycle are live (#244, #245, #246).
+
+The resolve body carries policy input only: `decision` and optional `note`. The API derives
+`resolved_by` and channel evidence from exactly one credential; caller-supplied
+`resolved_by` and `actor_channel` fields are rejected. The shared platform API key may mint
+operator principals and Console login codes but, alone, is not a human identity and cannot
+resolve an approval.
 
 Two of the three sets are Slack's, and that is the honest framing: a channel and a user
 group are two ways Slack says "who is in the authorized set", not a neutral baseline plus a
@@ -331,19 +355,24 @@ Slack feature.
   membership is proven by the resolution attempt's channel — the worker routes the Block Kit
   approval card into the approval's channel, Slack only renders that message (and accepts
   clicks) for members of that channel, and the click reaches the platform over the
-  dispatcher's authenticated Socket Mode connection, which relays the click's channel as
-  `actor_channel`. Non-dispatcher callers (operator curl, CLI) authenticate with the
-  platform API key and assert the channel explicitly. Performs no lookup.
+  dispatcher's authenticated Socket Mode connection. The dispatcher mints a short-lived
+  `chat` attestation bound to the Slack user, channel, and approval ID; the API derives
+  `actor_channel` from it. `operator` and `console` principals carry no channel and are
+  ineligible for this set. Performs no lookup.
 - **`SlackUserGroupMembers`** (#420, `slack_approvers.py`), a Slack user group as the
   approver set. Owns its lookup, through the `GroupMembershipSource` port below. Membership
   is never accepted from the caller: a dispatcher-asserted membership claim would be
-  forgeable by any platform-key holder, so ADR-0034 rejected it. The only set that can come
-  back undetermined.
+  forgeable by any platform-key holder, so ADR-0034 rejected it. Authenticated `chat` and
+  subject-bound `console` principals are eligible because the API performs the lookup;
+  terminal principals remain explicit-user-only. The only set that can come back
+  undetermined.
 - **`ExplicitUsers`** (#420, `approvers.py`), a literal allowlist of user IDs. Pure, no I/O.
   It owes Slack no *lookup*, but it can still only be **configured with Slack-validated user
   IDs**: the binding schema rejects anything that is not a Slack `U`/`W`-prefixed ID
   (`apps/api/src/curie_api/schemas.py::_SLACK_USER_ID`), never a handle or a name, so even this
-  "Slack-free" set is expressed in Slack-shaped identifiers.
+  "Slack-free" set is expressed in Slack-shaped identifiers. It is the only set eligible
+  for `operator` principals; Console principals may use it or a verified user group. The
+  authenticated subject must appear in the selected set.
 
 Platform-RBAC remains the epic's fourth set and is not built.
 
@@ -387,7 +416,9 @@ the durable approval ID and directs humans to the configured approval channel wi
 disclosing its kind or address; its message has `interaction=None` and no action values.
 Only the resolution card is remembered for later settlement. The group and user-list
 authorizers deliberately ignore `actor_channel` — the whole point is that authority does
-not depend on card location.
+not depend on card location. Terminal principals remain explicit-user-only. A Console
+principal may use the server-side group lookup because its session authenticates the
+subject, but it still cannot satisfy channel membership without an attested channel.
 
 `resolution.kind` is the explicit extension point, but the writer rejects every kind except
 Slack today. A second interactive channel first needs an adapter-scoped credential that
@@ -430,7 +461,8 @@ resolves normally; nothing is lost.
 ### The three ports
 
 **`ApproverSet`** (`approvers.py`) is the black line #420 draws: `async contains(actor,
-actor_channel) -> MembershipVerdict`, plus an `audit_name` for the audit row. It is async
+actor_channel) -> MembershipVerdict`, plus `audit_name`, `operator_eligible`, and
+`console_eligible` policies for the audit and principal eligibility checks. It is async
 because a set may own a lookup; `ExplicitUsers` simply never awaits. `MembershipVerdict`
 carries a third state beyond member/not-member: `undetermined`, meaning the set could not
 find out. The authorizer fails closed on it, and it is deliberately never collapsed into
@@ -439,8 +471,10 @@ reasons, and telling a clicker the first when the second is true sends them argu
 policy over an outage.
 
 The two Slack sets are asymmetrical and the port does not hide it. `contains` takes
-`actor_channel` precisely because channel membership proves membership from the click itself
-and performs no lookup, while the user group has no such free evidence and must ask.
+`actor_channel` precisely because channel membership proves membership from the authenticated
+card click and performs no lookup, while the user group has no such free evidence and must
+ask. `actor_channel` is server-derived from the `chat` attestation, never a resolve-body
+assertion.
 
 A fourth set, **`InvalidApprovers`** (`approvers.py`), covers a declared block the platform
 cannot read: it admits nobody and reports `undetermined`. Modelling that as a set rather
@@ -470,7 +504,7 @@ is still Slack-shaped**: `schemas.py` validates usergroup IDs as `S...` and chan
 `C...`, so a non-Slack provider would need a schema change plus an adapter and a selector.
 What the ports buy is dependency direction — #420 is the first outbound Slack call
 `apps/api` makes, and the authorization decision must not be what holds that client — plus
-the structural self-approval invariant. There is no second provider today.
+the authenticated-principal boundary. There is no second provider today.
 
 **Audit records the authority, not just the actor.** Each attempt's audit row carries a
 structured `evidence` object naming the basis of the decision: the channel pair for channel
@@ -487,10 +521,12 @@ resume enqueue all live with the API/worker), so a compromised sandbox cannot mi
 resolve an approval. That guarantee holds only while the sandbox does not carry a
 resolve-capable credential: earlier the worker forwarded the shared platform API key
 into the sandbox as the memory/transcript token, and because `POST /approvals/{id}/resolve`
-is guarded by the same platform key, a compromised sandbox could self-approve its own
-gated tool call. ADR-0033 (#410) closed that gap by minting a scoped, agent-bound `state`
-token for the sandbox that only the state router accepts; the resolve endpoint stays
-platform-key-only, so the sandbox credential can no longer resolve an approval. A
+was guarded by the same platform key, a compromised sandbox could resolve its own gated
+tool call under any asserted identity. ADR-0033 (#410) closed the sandbox-key gap by
+minting a scoped, agent-bound `state` token that only the state router accepts. ADR-0106
+closes the remaining caller-assertion gap: the resolve endpoint now accepts only a
+dispatcher-attested `chat` token, a live subject-bound Console session, or a signed
+subject-bound `operator` token. The platform key alone resolves nothing. A
 notification transport credential likewise confers no resolution capability: the
 notification contains no interaction, and this contract exposes no second-channel resolver.
 The runtime `canUseTool` gate (#245) will block the *tool call*, but
@@ -499,23 +535,15 @@ owns the durable `Approval` record. Policy gate points ship versioned in the bun
 bindings (where the verified card resolves, where a text-only notification goes, and who may
 approve) are per-agent deployment config (#247, #1460).
 
-One limit the audit trail must not be read as overstating (#420, ADR-0034): the evidence
-proves that the ASSERTED identity satisfied policy at click time; it does not prove who
-clicked. Identity is dispatcher-verified on the Slack path — the dispatcher populates the
-actor from Slack's authenticated interaction payload
-(`apps/dispatcher/src/curie_dispatcher/approval_actions.py::process_approval_action`) — and
-caller-asserted on the platform-API-key path, the named ADR-0033 residual tracked as a follow-up.
-**The channel evidence is asserted on the same footing:** `actor_channel` on the platform-key
-path is caller-supplied and unvalidated too, so the residual is not identity-only — a
-platform-key caller asserts both *who* acted and *from which channel*, and the channel-membership
-set trusts that asserted channel exactly as the authorizer trusts the asserted actor. Richer
-evidence makes a forged resolution look MORE legitimate in the trail than today's thinner
-rows do, which is exactly why this limit is written down rather than left implicit. The
-membership authorizers narrow *who counts as an approver*; they do not change *how the
-actor is established*.
+The audit trail now records both halves rather than overstating either one. Authentication
+establishes the actor and writes `principal_kind` (`chat`, `console`, or `operator`) with
+`authenticated=true`; authorization writes the selected set's evidence and verdict.
+Historical assertion-era rows remain visibly unauthenticated with a null principal kind.
+An audit row may truthfully show the same principal as requester and approver: that says
+one authenticated member confirmed their own request, not that a second person reviewed it.
 
 ## Cross-links
 
 - **Epic(s):** [#22](https://github.com/curie-eng/curie/issues/22) — approval gates and human-in-the-loop; adds the durable record, `awaiting-approval` status, `canUseTool` gate, and the authorizer interface.
 - **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — not one of the six graded jobs; a cross-cutting core lifecycle change, not separately graded.
-- **ADR(s):** [ADR-0010](../../adr/0010-approval-gates-and-human-in-the-loop.md) — Approval gates and human-in-the-loop (Accepted); grounds this intended line, including the authorizer sequence (channel membership first, then user-group, explicit user-list, platform-RBAC). [ADR-0034](../../adr/0034-approval-authorizers-resolve-membership-in-the-api.md) — Approval authorizers resolve membership in the API (Accepted); adds the user-group and user-list sets, the API-resident membership lookup, the scoped fail-closed rule, and fresh-read binding resolution. Supersedes ADR-0010's framing of those four as `Authorizer` implementations: they are approver SETS behind one authorizer, and platform-RBAC becomes the fourth set. Composes with [ADR-0003](../../adr/0003-stateless-first-rehydrate-on-resume.md) (stateless-first suspend/resume, the pause mechanism).
+- **ADR(s):** [ADR-0010](../../adr/0010-approval-gates-and-human-in-the-loop.md) — Approval gates and human-in-the-loop (Accepted); grounds this intended line, including the authorizer sequence (channel membership first, then user-group, explicit user-list, platform-RBAC). [ADR-0034](../../adr/0034-approval-authorizers-resolve-membership-in-the-api.md) — Approval authorizers resolve membership in the API (Accepted); adds the user-group and user-list sets, the API-resident membership lookup, the scoped fail-closed rule, and fresh-read binding resolution. Supersedes ADR-0010's framing of those four as `Authorizer` implementations: they are approver SETS behind one authorizer, and platform-RBAC becomes the fourth set. [ADR-0106](../../adr/0106-an-approver-is-an-authenticated-principal.md) — An approver is an authenticated principal (Accepted); removes caller-asserted resolver identity/channel, makes membership the boundary even for the requester, limits operators to explicit users, and lets Console subjects pass through the same membership sets their authenticated identity can satisfy. Composes with [ADR-0003](../../adr/0003-stateless-first-rehydrate-on-resume.md) (stateless-first suspend/resume, the pause mechanism).

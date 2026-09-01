@@ -136,7 +136,7 @@ fn approval_route_split_is_a_v2_schema_contract() {
     )
     .expect("approvals schema is JSON");
     assert_eq!(
-        schema["$id"], "https://schemas.curietech.ai/cli/approvals/v2.0.json",
+        schema["$id"], "https://schemas.curietech.ai/cli/approvals/v2.1.json",
         "removing the fused channel field and requiring resolution is a major schema break"
     );
 
@@ -164,7 +164,7 @@ fn approval_route_split_is_a_v2_schema_contract() {
         .iter()
         .find(|entry| entry["result"] == "ApprovalsOutput")
         .expect("ApprovalsOutput inventory entry");
-    assert_eq!(approvals["version"], "2.0");
+    assert_eq!(approvals["version"], "2.1");
 }
 
 #[test]

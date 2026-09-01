@@ -64,7 +64,7 @@ spec:
         {{- with (include "curie.placement.labels" (dict "root" $ "class" "data")) }}
         {{- . | nindent 8 }}
         {{- end }}
-        {{- include "curie.labels" . | nindent 8 }}
+        {{- include "curie.statefulPodLabels" . | nindent 8 }}
         {{- include "curie.selectorLabels" (dict "root" . "component" "clickhouse") | nindent 8 }}
     spec:
       {{- with (include "curie.placement.spec" (dict "root" $ "class" "data")) }}

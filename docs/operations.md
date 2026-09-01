@@ -90,6 +90,41 @@ curie apply
 
 Use `curie cluster up` below for flag driven installs.
 
+#### Declarative local inference
+
+`platform.inference: true` opts into the in-chart Ollama inference deployment.
+It does not permit the default implicit pull to an `emptyDir`: `curie apply`
+refuses before Helm or Kubernetes creates resources unless the manifest chooses
+durable storage or declares that its model is already provisioned. For the stock
+Ollama image, enable persistence and size it for the model:
+
+```yaml
+platform:
+  inference: true
+  inference_persistence: true
+set:
+  inference.persistence.size: 40Gi
+```
+
+With `inference_persistence: true`, the existing `postStart` hook pulls the
+model into the PVC. If `set.inference.persistence.size` is absent, the chart
+uses `10Gi`; when supplied it must be a non-boolean string, and large models
+need a larger size.
+
+The advanced alternative is a custom image or other provisioning that already
+has the requested weights. Declare that explicitly instead:
+
+```yaml
+platform:
+  inference: true
+  inference_pull_model: false
+```
+
+This disables the `postStart` pull. The stock Ollama image on the default
+`emptyDir` has no weights, so it cannot serve a model unless provisioning has
+placed those weights at Ollama's data path. Direct Helm installs have the same
+chart guard.
+
 ### `curie cluster up`
 
 Installs (or upgrades) Curie's Helm chart onto the cluster you're pointed at:
@@ -566,6 +601,47 @@ different channel, see [Building a channel adapter](guides/building-a-channel-ad
 A chart upgrade is a **full** upgrade: anything the new chart does not render is
 deleted. For a Deployment that means a restart. For a StatefulSet it means the
 data too.
+
+### State-identity migration (Alembic revision 0037)
+
+Before upgrading to a release containing revision 0037, take a
+transaction-consistent database backup. The revision restores the shared posture
+for unambiguous legacy general state and makes a NULL `binding_scope` a single
+state identity. Run these **read-only** preflights against the target database
+immediately before the upgrade:
+
+```sql
+-- Every duplicate shared identity, including reserved namespaces.
+SELECT agent_id, namespace, key, count(*) AS row_count
+FROM curie.workflow_state_entries
+WHERE binding_scope IS NULL
+GROUP BY agent_id, namespace, key
+HAVING count(*) > 1
+ORDER BY agent_id, namespace, key;
+
+-- memory=false owners that 0037 would promote, but whose general state is
+-- already split between shared and binding-scoped rows.
+SELECT agents.id AS agent_id,
+       count(*) FILTER (WHERE state.binding_scope IS NULL) AS shared_rows,
+       count(*) FILTER (WHERE state.binding_scope IS NOT NULL) AS isolated_rows
+FROM curie.agents AS agents
+JOIN curie.workflow_state_entries AS state ON state.agent_id = agents.id
+WHERE agents.memory = false
+  AND state.namespace NOT IN ('memory', 'transcript')
+GROUP BY agents.id
+HAVING bool_or(state.binding_scope IS NULL)
+   AND bool_or(state.binding_scope IS NOT NULL)
+ORDER BY agents.id;
+```
+
+Both result sets must be empty. Do not auto-merge a reported row: the database
+cannot choose between state values or versions, nor infer whether a mixed
+agent's general state should be shared or isolated. For each duplicate, inspect
+its values and versions, then explicitly merge or delete until one row remains.
+For each mixed `memory=false` agent, choose shared or isolated policy and
+move/merge every general-state row into that one shape. Re-run the preflights,
+then the upgrade. On any refusal, the whole 0037 transaction rolls back: agent
+flags, state rows, the constraint, and the Alembic revision stay unchanged.
 
 ### Before you upgrade, check what would be removed
 

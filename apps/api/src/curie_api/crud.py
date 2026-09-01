@@ -352,9 +352,7 @@ async def update_agent_model(session: AsyncSession, agent: Agent, model: str | N
     return agent
 
 
-async def update_agent_thinking(
-    session: AsyncSession, agent: Agent, thinking: str | None
-) -> Agent:
+async def update_agent_thinking(session: AsyncSession, agent: Agent, thinking: str | None) -> Agent:
     agent.thinking = thinking
     await session.commit()
     await session.refresh(agent)
@@ -562,9 +560,7 @@ async def create_deployment_row(
     resolved_workspace_enabled: bool
     if workspace_enabled is _WORKSPACE_UNSET:
         current = await get_active_deployment(session, agent_id, environment)
-        resolved_workspace_enabled = (
-            current.workspace_enabled if current is not None else False
-        )
+        resolved_workspace_enabled = current.workspace_enabled if current is not None else False
     else:
         assert isinstance(workspace_enabled, bool)
         resolved_workspace_enabled = workspace_enabled
@@ -632,9 +628,7 @@ async def select_thread_workspace(
             repo_full_name=repo_full_name,
             selected_by=selected_by,
         )
-        .on_conflict_do_nothing(
-            constraint="thread_workspaces_agent_conversation_key"
-        )
+        .on_conflict_do_nothing(constraint="thread_workspaces_agent_conversation_key")
         .returning(ThreadWorkspace.id)
     )
     await session.commit()
@@ -702,12 +696,8 @@ async def create_publication(
     conflict and can never replace bytes that were already approved.
     """
 
-    deployment, thread_workspace = await _require_current_publication_workspace(
-        session, data
-    )
-    existing = await _adopt_publication_replay(
-        session, data, patch, agent_id=deployment.agent_id
-    )
+    deployment, thread_workspace = await _require_current_publication_workspace(session, data)
+    existing = await _adopt_publication_replay(session, data, patch, agent_id=deployment.agent_id)
     if existing is not None:
         return existing, False
 
@@ -782,9 +772,7 @@ async def create_publication(
     return publication, True
 
 
-async def get_publication(
-    session: AsyncSession, publication_id: uuid.UUID
-) -> Publication | None:
+async def get_publication(session: AsyncSession, publication_id: uuid.UUID) -> Publication | None:
     return await session.get(Publication, publication_id)
 
 
@@ -797,9 +785,7 @@ async def get_publication_by_approval(
     return publication
 
 
-async def list_publications(
-    session: AsyncSession, *, limit: int = 100
-) -> list[Publication]:
+async def list_publications(session: AsyncSession, *, limit: int = 100) -> list[Publication]:
     result = await session.scalars(
         select(Publication).order_by(Publication.created_at.desc()).limit(limit)
     )
@@ -934,9 +920,7 @@ async def complete_action(
     return action
 
 
-async def list_action_audit(
-    session: AsyncSession, action_id: uuid.UUID
-) -> list[ActionAuditEntry]:
+async def list_action_audit(session: AsyncSession, action_id: uuid.UUID) -> list[ActionAuditEntry]:
     result = await session.execute(
         select(ActionAuditEntry)
         .where(ActionAuditEntry.action_id == action_id)
@@ -1362,6 +1346,8 @@ async def append_approval_audit(
     authorized: bool,
     reason: str | None,
     evidence: dict[str, Any] | None = None,
+    principal_kind: str | None = None,
+    authenticated: bool = False,
 ) -> ApprovalAuditEntry:
     """Append one audit row (#247). Append-only by design; never updated.
 
@@ -1374,6 +1360,8 @@ async def append_approval_audit(
         action=action,
         actor=actor,
         actor_channel=actor_channel,
+        principal_kind=principal_kind,
+        authenticated=authenticated,
         decision=decision,
         authorizer=authorizer,
         authorized=authorized,
@@ -1440,21 +1428,25 @@ def new_session_token() -> str:
 
 
 async def create_console_login_code(
-    session: AsyncSession, *, now: datetime | None = None
+    session: AsyncSession, *, subject: str, now: datetime | None = None
 ) -> tuple[str, ConsoleSession]:
     """Mint a login code and its pending session row.
 
     Args:
         session: The database session.
+        subject: The administrator-selected identity this session will carry.
         now: Injectable clock, so expiry is testable without sleeping.
 
     Returns:
         ``(plaintext code, row)``. The plaintext is returned ONCE and never
         stored; only its hash is persisted.
     """
+    if not subject.strip():
+        raise ValueError("console session subject must not be blank")
     moment = now or datetime.now(UTC).replace(tzinfo=None)
     code = new_login_code()
     row = ConsoleSession(
+        subject=subject,
         login_code_hash=hash_console_credential(code),
         login_code_expires_at=moment + LOGIN_CODE_TTL,
     )
@@ -1510,9 +1502,10 @@ async def live_console_session(
 ) -> ConsoleSession | None:
     """The session a token authenticates, or ``None`` if it does not authenticate one.
 
-    "Live" means exchanged, unrevoked and unexpired. Slice 2 (#1045) is what calls
-    this from `require_api_key`; it lands here with the store so the store's own
-    tests can prove revocation and expiry are expressed, per #1044's acceptance.
+    "Live" means exchanged, unrevoked and unexpired. ADR-0106 consumes this
+    store directly for console approval principals without widening platform
+    API-key authentication; revocation and expiry therefore take effect on the
+    next resolve attempt.
 
     Args:
         session: The database session.

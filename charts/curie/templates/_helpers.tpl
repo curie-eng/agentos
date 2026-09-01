@@ -35,6 +35,15 @@ app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 {{- end }}
 {{- end -}}
 
+{{/* Stable labels for backing StatefulSet pod templates. Release metadata
+     stays on the owning objects, while chart and application version labels
+     stay out of pod templates so metadata updates do not restart data pods. */}}
+{{- define "curie.statefulPodLabels" -}}
+app.kubernetes.io/name: {{ include "curie.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- end -}}
+
 {{/* Component selector labels. Pass a dict with "root" (the top context) and
      "component" (the component name). */}}
 {{- define "curie.selectorLabels" -}}
@@ -270,7 +279,11 @@ true
 {{- end -}}
 
 {{- define "curie.langfuse.webHost" -}}
+{{- if .Values.langfuse.deploy -}}
 {{- printf "%s-langfuse-web" (include "curie.fullname" .) -}}
+{{- else -}}
+{{- required "langfuse.deploy is false: set langfuse.host to your external Langfuse hostname" .Values.langfuse.host -}}
+{{- end -}}
 {{- end -}}
 
 {{/* Base URL of the platform API for a first-party service that calls it. Call

@@ -1,4 +1,4 @@
-"""The approver-set port is a port, not a rename (#420, ADR-0034).
+"""The approver-set port is a port, not a rename (#420, ADR-0106).
 
 Every other test drives the authorizer through Slack's sets, which cannot tell a
 real seam from a hardcoded one. These drive it through a set and a selector that
@@ -6,11 +6,9 @@ Slack has nothing to do with, so the file importing no Slack module is the
 assertion: the authorizer needs no provider at all to work, and if it ever
 reaches for one again this stops compiling rather than quietly still passing.
 
-The self-approval case is the one that matters. A fake set can be written that
-happily reports the author as a member, which is exactly what a careless real
-implementation would do. The authorizer must still refuse. That is the proof AC2
-is structural -- a property of the authorizer that no set can opt out of -- rather
-than a promise each implementation makes in a docstring and might forget.
+Requester equality has no independent vote. A provider-free fake proves the
+authorizer asks the selected set even for the requester: an admitting set allows
+them, while a denying set refuses them with its own reason and evidence.
 """
 
 import asyncio
@@ -31,19 +29,19 @@ class _EveryoneIsAMember:
     """A set that admits anyone, including the author. No provider behind it."""
 
     audit_name = "FakeApproverSet"
+    operator_eligible = True
+    console_eligible = True
 
-    async def contains(
-        self, actor: str, actor_channel: str | None
-    ) -> MembershipVerdict:
+    async def contains(self, actor: str, actor_channel: str | None) -> MembershipVerdict:
         return MembershipVerdict(member=True, evidence={"kind": "fake", "actor": actor})
 
 
 class _NobodyIsAMember:
     audit_name = "FakeApproverSet"
+    operator_eligible = True
+    console_eligible = True
 
-    async def contains(
-        self, actor: str, actor_channel: str | None
-    ) -> MembershipVerdict:
+    async def contains(self, actor: str, actor_channel: str | None) -> MembershipVerdict:
         return MembershipVerdict(
             member=False, reason="you are not an approver: fake set", evidence=None
         )
@@ -53,10 +51,10 @@ class _CannotTell:
     """A set whose lookup yielded nothing: the port's undetermined case."""
 
     audit_name = "FakeApproverSet"
+    operator_eligible = True
+    console_eligible = True
 
-    async def contains(
-        self, actor: str, actor_channel: str | None
-    ) -> MembershipVerdict:
+    async def contains(self, actor: str, actor_channel: str | None) -> MembershipVerdict:
         return MembershipVerdict(
             member=False,
             undetermined=True,
@@ -71,9 +69,7 @@ class _FakeSelector:
     def __init__(self, approver_set: ApproverSet) -> None:
         self._approver_set = approver_set
 
-    def __call__(
-        self, approval: Approval, binding: Mapping[str, Any] | None
-    ) -> ApproverSet:
+    def __call__(self, approval: Approval, binding: Mapping[str, Any] | None) -> ApproverSet:
         return self._approver_set
 
 
@@ -101,6 +97,7 @@ def _authorize(approver_set: ApproverSet, actor: str) -> tuple[str, AuthzDecisio
             actor,
             _CARD_CHANNEL,
             approver_set=select(approval, None),
+            principal_kind="chat",
         )
     )
 
@@ -112,8 +109,8 @@ def test_a_member_of_any_set_is_allowed() -> None:
     assert decision.evidence == {"kind": "fake", "actor": _APPROVER}
 
 
-def test_a_non_member_of_any_set_is_denied_with_the_sets_reason() -> None:
-    _name, decision = _authorize(_NobodyIsAMember(), _APPROVER)
+def test_a_requester_denied_by_any_set_gets_the_sets_reason() -> None:
+    _name, decision = _authorize(_NobodyIsAMember(), _AUTHOR)
     assert not decision.allowed
     assert "not an approver" in decision.reason
 
@@ -128,24 +125,19 @@ def test_an_undetermined_set_fails_closed() -> None:
     assert decision.evidence == {"kind": "fake", "lookup_failed": True}
 
 
-def test_the_author_is_denied_even_by_a_set_that_admits_them() -> None:
-    """AC2 is structural. The set says the author is a member; the authorizer
-    refuses anyway, because a set never gets a vote on self-approval."""
+def test_the_requester_is_allowed_by_a_set_that_admits_them() -> None:
+    """ADR-0106 makes set membership the whole authorization boundary."""
 
     admitting = _EveryoneIsAMember()
     assert asyncio.run(admitting.contains(_AUTHOR, _CARD_CHANNEL)).member
 
     _name, decision = _authorize(admitting, _AUTHOR)
-    assert not decision.allowed
-    assert "self-approval" in decision.reason
-    # The set never ran, so its snapshot must not appear next to this denial.
-    assert decision.evidence is None
+    assert decision.allowed
+    assert decision.evidence == {"kind": "fake", "actor": _AUTHOR}
 
 
 def test_an_outsider_is_still_allowed_by_a_set_that_admits_everyone() -> None:
-    """Guards the test above from passing vacuously: the admitting set really
-    does allow a non-author, so the author's denial is the self-approval rule and
-    not a broken fake."""
+    """The provider-free admitting set applies identically to another actor."""
 
     _name, decision = _authorize(_EveryoneIsAMember(), _OUTSIDER)
     assert decision.allowed

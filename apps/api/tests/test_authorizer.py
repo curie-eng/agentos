@@ -4,13 +4,10 @@ The originals below pin the channel-membership behavior (#246), now driven
 through ``authorize_approval`` on an unbound approval, which is the path
 production takes to reach that set. Everything after the divider pins #420: the
 explicit-user-list and user-group sets that unfuse "who may approve" from "where
-the card posted", plus the authorizer that selects between them and owns every
-rule that is not membership. Slack is the only external service here and it is
+the card posted", plus the authorizer that selects between them. Under ADR-0106
+the selected set is the authorization boundary even for the requester. Slack is
+the only external service here and it is
 reached exclusively through a MockTransport-backed real client.
-
-Self-approval is deliberately NOT tested at the set level: a set is never asked
-about it (ADR-0034), so a set-level self-approval test would assert an invariant
-that does not live there. It is pinned on the authorizer, once per set, below.
 
 The ADR-0123 (#1081) section pins the last piece: an ABSENT binding is not the
 same fact as a binding that declares no approvers. These go through the same
@@ -53,6 +50,7 @@ def _authorize(
     *,
     binding: Any = None,
     group_client: GroupMembershipSource | None = None,
+    principal_kind: str = "chat",
 ) -> tuple[str, AuthzDecision]:
     """The resolve endpoint's exact shape: select a set from the binding, then
     authorize on it. Selection is real, so these stay end-to-end tests of the
@@ -61,7 +59,11 @@ def _authorize(
     select = SlackApproverSetSelector(group_client)
     return asyncio.run(
         authorize_approval(
-            approval, actor, actor_channel, approver_set=select(approval, binding)
+            approval,
+            actor,
+            actor_channel,
+            approver_set=select(approval, binding),
+            principal_kind=principal_kind,
         )
     )
 
@@ -84,10 +86,13 @@ def test_wrong_or_missing_channel_is_denied() -> None:
         assert "not an approver" in decision.reason
 
 
-def test_self_approval_is_denied_even_from_the_right_channel() -> None:
+def test_requester_in_the_approval_channel_is_allowed_with_channel_evidence() -> None:
     decision = _decide(_approval(author="U_AE"), "U_AE", "C_MGRS")
-    assert not decision.allowed
-    assert "self-approval" in decision.reason
+    assert decision.allowed
+    assert decision.evidence is not None
+    assert decision.evidence["kind"] == "channel_membership"
+    assert decision.evidence["approvers_channel"] == "C_MGRS"
+    assert decision.evidence["actor_channel"] == "C_MGRS"
 
 
 # --- #420: the user-list + user-group sets, and the authorizer over them -------
@@ -146,9 +151,7 @@ def _slack(members: list[str], calls: list[httpx.Request] | None = None) -> Slac
     )
 
 
-def _contains(
-    approver_set: ApproverSet, actor: str, channel: str | None
-) -> MembershipVerdict:
+def _contains(approver_set: ApproverSet, actor: str, channel: str | None) -> MembershipVerdict:
     return asyncio.run(approver_set.contains(actor, channel))
 
 
@@ -170,23 +173,22 @@ def test_user_list_set_excludes_an_unlisted_actor() -> None:
     assert "not an approver" in verdict.reason
 
 
-def test_user_list_authorizer_denies_the_author_even_when_listed() -> None:
-    """AC2: self-approval is blocked independent of the membership check, so an
-    author who is also on the allowlist still cannot resolve their own request.
-
-    Pinned on the authorizer, not the set: the set reports the author as a member
-    (asserted here), and the refusal is the authorizer's alone."""
+def test_user_list_authorizer_allows_the_requester_when_listed() -> None:
+    """ADR-0106: the selected list decides even when actor equals requester."""
 
     assert _contains(ExplicitUsers([_AUTHOR, _APPROVER]), _AUTHOR, _CARD_CHANNEL).member
 
-    _name, decision = _authorize(
+    name, decision = _authorize(
         _bound_approval(author=_AUTHOR),
         _AUTHOR,
         _CARD_CHANNEL,
         binding={"channel": _CARD_CHANNEL, "approvers": {"users": [_AUTHOR, _APPROVER]}},
     )
-    assert not decision.allowed
-    assert "self-approval" in decision.reason
+    assert name == "ExplicitUserListAuthorizer"
+    assert decision.allowed
+    assert decision.evidence is not None
+    assert decision.evidence["kind"] == "user_list"
+    assert decision.evidence["actor_listed"] is True
 
 
 def test_user_list_set_ignores_the_actor_channel() -> None:
@@ -258,24 +260,22 @@ def test_user_group_set_ignores_the_actor_channel() -> None:
     assert "not an approver" in in_card_channel.reason
 
 
-def test_user_group_authorizer_denies_the_author_even_when_a_member() -> None:
-    """AC2: an author who is in the approver group still cannot self-approve.
-
-    Pinned on the authorizer: the set would report the author as a member, and
-    the authorizer refuses before it is ever asked (proven by the empty
-    ``calls`` -- the group is not even fetched)."""
+def test_user_group_authorizer_allows_the_requester_when_a_member() -> None:
+    """ADR-0106: requester membership is fetched and decides normally."""
 
     calls: list[httpx.Request] = []
-    _name, decision = _authorize(
+    name, decision = _authorize(
         _bound_approval(author=_AUTHOR),
         _AUTHOR,
         _CARD_CHANNEL,
         binding={"channel": _CARD_CHANNEL, "approvers": {"group": _GROUP}},
         group_client=_slack([_AUTHOR, _APPROVER], calls),
     )
-    assert not decision.allowed
-    assert "self-approval" in decision.reason
-    assert calls == []
+    assert name == "UserGroupAuthorizer"
+    assert decision.allowed
+    assert decision.evidence is not None
+    assert decision.evidence["actor_in_group"] is True
+    assert len(calls) == 1
 
 
 def test_user_group_set_is_undetermined_when_the_lookup_failed() -> None:
@@ -438,9 +438,7 @@ def test_authorizer_falls_back_to_channel_membership_without_approvers() -> None
 
     binding = {"channel": _CARD_CHANNEL}
 
-    name, member = _authorize(
-        _bound_approval(), _OUTSIDER, _CARD_CHANNEL, binding=binding
-    )
+    name, member = _authorize(_bound_approval(), _OUTSIDER, _CARD_CHANNEL, binding=binding)
     assert name == "ChannelMembershipAuthorizer"
     assert member.allowed
     assert member.evidence is not None
@@ -448,9 +446,7 @@ def test_authorizer_falls_back_to_channel_membership_without_approvers() -> None
     assert member.evidence["approvers_channel"] == _CARD_CHANNEL
     assert member.evidence["actor_channel"] == _CARD_CHANNEL
 
-    _name, elsewhere = _authorize(
-        _bound_approval(), _OUTSIDER, "C0WRONG01", binding=binding
-    )
+    _name, elsewhere = _authorize(_bound_approval(), _OUTSIDER, "C0WRONG01", binding=binding)
     assert not elsewhere.allowed
     assert "not an approver" in elsewhere.reason
     assert elsewhere.evidence is not None
@@ -485,9 +481,7 @@ def test_authorizer_refuses_a_routed_approval_whose_binding_is_gone() -> None:
     (crud returns a bare ``None`` for it), so that edge case is this case.
     """
 
-    name, in_channel = _authorize(
-        _bound_approval(), _OUTSIDER, _CARD_CHANNEL, binding=None
-    )
+    name, in_channel = _authorize(_bound_approval(), _OUTSIDER, _CARD_CHANNEL, binding=None)
     assert name == "UnboundRouteBinding"
     assert not in_channel.allowed
     assert "no longer bound" in in_channel.reason
@@ -498,9 +492,7 @@ def test_authorizer_refuses_a_routed_approval_whose_binding_is_gone() -> None:
 
     # The set admits nobody, so the wrong channel is refused for the same
     # reason rather than the channel-membership one.
-    elsewhere_name, elsewhere = _authorize(
-        _bound_approval(), _OUTSIDER, "C0WRONG01", binding=None
-    )
+    elsewhere_name, elsewhere = _authorize(_bound_approval(), _OUTSIDER, "C0WRONG01", binding=None)
     assert elsewhere_name == "UnboundRouteBinding"
     assert not elsewhere.allowed
     assert "no longer bound" in elsewhere.reason
@@ -529,9 +521,7 @@ def test_authorizer_treats_an_empty_binding_as_present_not_absent() -> None:
     of ``binding is None`` refuses here. This is the exact off-by-one, and this
     test is the only thing that catches it."""
 
-    name, decision = _authorize(
-        _bound_approval(), _OUTSIDER, _CARD_CHANNEL, binding={}
-    )
+    name, decision = _authorize(_bound_approval(), _OUTSIDER, _CARD_CHANNEL, binding={})
     assert name == "ChannelMembershipAuthorizer"
     assert decision.allowed
 
@@ -550,9 +540,7 @@ def test_an_empty_route_string_is_routeless_and_keeps_channel_membership() -> No
     else pins.
     """
 
-    name, decision = _authorize(
-        _bound_approval(route=""), _OUTSIDER, _CARD_CHANNEL, binding=None
-    )
+    name, decision = _authorize(_bound_approval(route=""), _OUTSIDER, _CARD_CHANNEL, binding=None)
     assert name == "ChannelMembershipAuthorizer"
     assert decision.allowed
 
@@ -564,9 +552,7 @@ def test_an_unbound_route_and_an_unreadable_block_stay_distinct_in_the_audit() -
     approvers block does not parse". ADR-0123 adds a NEW string and renames
     nothing, so the malformed case must NOT drift onto the new name."""
 
-    gone, _gone_decision = _authorize(
-        _bound_approval(), _OUTSIDER, _CARD_CHANNEL, binding=None
-    )
+    gone, _gone_decision = _authorize(_bound_approval(), _OUTSIDER, _CARD_CHANNEL, binding=None)
     unreadable, decision = _authorize(
         _bound_approval(),
         _OUTSIDER,
@@ -580,21 +566,40 @@ def test_an_unbound_route_and_an_unreadable_block_stay_distinct_in_the_audit() -
     assert decision.evidence["kind"] == "approvers_config"
 
 
-def test_self_approval_wins_over_a_missing_binding_but_the_audit_still_names_it() -> None:
-    """Ordering (ADR-0034, unchanged by ADR-0123): self-approval is refused
-    BEFORE the set is asked, so an author clicking their own request on a route
-    whose binding is gone is told about the self-approval, not about the route.
-    The audit name still comes from the set that WOULD have decided and carries
-    no evidence -- the same contract the malformed-block case pins, now for the
-    new set. Both branches deny, so nothing is widened either way."""
+def test_requester_with_a_missing_binding_is_denied_for_the_binding() -> None:
+    """Requester equality cannot bypass or mask ADR-0123's missing-route set."""
 
     name, decision = _authorize(
         _bound_approval(author=_AUTHOR), _AUTHOR, _CARD_CHANNEL, binding=None
     )
     assert name == "UnboundRouteBinding"
     assert not decision.allowed
-    assert "self-approval" in decision.reason
-    assert decision.evidence is None
+    assert "no longer bound" in decision.reason
+    assert decision.evidence is not None
+    assert decision.evidence["kind"] == "route_binding"
+    assert decision.evidence["route"] == "managers"
+    assert decision.evidence["binding_present"] is False
+
+
+def test_operator_with_a_missing_binding_is_denied_for_the_binding() -> None:
+    """Principal eligibility must not disguise an ADR-0123 config failure."""
+
+    name, decision = _authorize(
+        _bound_approval(),
+        _OUTSIDER,
+        None,
+        binding=None,
+        principal_kind="operator",
+    )
+    assert name == "UnboundRouteBinding"
+    assert not decision.allowed
+    assert "no longer bound" in decision.reason
+    assert decision.evidence is not None
+    assert decision.evidence == {
+        "kind": "route_binding",
+        "route": "managers",
+        "binding_present": False,
+    }
 
 
 def test_authorizer_denies_a_malformed_approvers_block_without_channel_fallback() -> None:
@@ -641,14 +646,8 @@ def test_authorizer_fails_closed_on_a_malformed_stored_binding() -> None:
         assert name == "InvalidApproversSpec"
 
 
-def test_self_approval_wins_over_a_malformed_block_but_the_audit_still_names_it() -> None:
-    """Ordering: self-approval is refused before the set is asked, so an author
-    self-clicking an unreadable block is told about the self-approval rather than
-    the spec. Both deny, so nothing is widened.
-
-    The audit row still records ``InvalidApproversSpec``, because the name comes
-    from the selected set: an operator reading the trail can still see the block
-    was unreadable, which is the fact the reason string no longer carries."""
+def test_requester_with_a_malformed_block_is_denied_for_the_config() -> None:
+    """Requester equality cannot bypass or mask an unreadable approver set."""
 
     name, decision = _authorize(
         _bound_approval(author=_AUTHOR),
@@ -658,13 +657,32 @@ def test_self_approval_wins_over_a_malformed_block_but_the_audit_still_names_it(
     )
     assert name == "InvalidApproversSpec"
     assert not decision.allowed
-    assert "self-approval" in decision.reason
+    assert "could not verify approvers" in decision.reason
+    assert decision.evidence is not None
+    assert decision.evidence["kind"] == "approvers_config"
+    assert decision.evidence["error"]
 
 
-def test_authorizer_denies_self_approval_before_fetching_the_group() -> None:
-    """AC2 + the pre-fetch guard's no-I/O property: the author is refused
-    before any Slack call is made, so a self-attempt against a group-bound route
-    spends no rate-limit budget and cannot be used to probe the group."""
+def test_operator_with_a_malformed_block_is_denied_for_the_config() -> None:
+    """An unreadable set denies before policy eligibility can mislabel it."""
+
+    name, decision = _authorize(
+        _bound_approval(),
+        _OUTSIDER,
+        None,
+        binding={"channel": _CARD_CHANNEL, "approvers": {"group": 123}},
+        principal_kind="operator",
+    )
+    assert name == "InvalidApproversSpec"
+    assert not decision.allowed
+    assert "could not verify approvers" in decision.reason
+    assert decision.evidence is not None
+    assert decision.evidence["kind"] == "approvers_config"
+    assert decision.evidence["error"]
+
+
+def test_requester_not_in_the_group_is_looked_up_then_denied() -> None:
+    """The selected set runs for a requester and its negative verdict controls."""
 
     calls: list[httpx.Request] = []
     _name, decision = _authorize(
@@ -672,11 +690,14 @@ def test_authorizer_denies_self_approval_before_fetching_the_group() -> None:
         _AUTHOR,
         _CARD_CHANNEL,
         binding={"channel": _CARD_CHANNEL, "approvers": {"group": _GROUP}},
-        group_client=_slack([_AUTHOR, _APPROVER], calls),
+        group_client=_slack([_APPROVER], calls),
     )
     assert not decision.allowed
-    assert "self-approval" in decision.reason
-    assert calls == []
+    assert "not an approver" in decision.reason
+    assert decision.evidence is not None
+    assert decision.evidence["actor_in_group"] is False
+    assert decision.evidence["member_count"] == 1
+    assert len(calls) == 1
 
 
 def test_authorizer_fails_closed_when_no_slack_client_is_configured() -> None:

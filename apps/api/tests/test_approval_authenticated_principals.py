@@ -1,0 +1,553 @@
+"""Authenticated approval resolution across chat, operator, and console.
+
+These are the red-on-revert tests for ADR-0106 and #1531.  The resolve body is
+only a decision plus an optional note; every human identity and every piece of
+membership evidence comes from authenticated principal material.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+import uuid
+from collections.abc import Iterator
+from datetime import UTC, datetime
+from typing import Any
+
+import pytest
+import redis
+from curie_api import approval_principal, crud
+from curie_api.config import get_settings
+from curie_api.deps import get_approver_sets
+from curie_api.main import create_app
+from curie_api.models import ConsoleSession
+from curie_api.routers.console import SESSION_COOKIE
+from curie_api.slack_approvers import SlackApproverSetSelector
+from curie_api.usergroups import UserGroupMembership
+from fastapi.testclient import TestClient
+from sqlalchemy import select, text
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+
+PRINCIPAL_HEADER = "X-Curie-Approval-Principal"
+SUBJECT = "U0EXAMPLE1"
+OTHER = "U0EXAMPLE2"
+CARD_CHANNEL = "C0EXAMPLE1"
+SOURCE_CHANNEL = "C0EXAMPLE2"
+GROUP = "S0EXAMPLE1"
+
+
+@pytest.fixture
+def approvals_client(_disposable_db: Any, runs_stream: str) -> Iterator[TestClient]:
+    """Build the app after the per-test runs-stream override is installed."""
+
+    with TestClient(create_app()) as test_client:
+        yield test_client
+
+
+def _payload(**overrides: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "conversation_id": f"th-{uuid.uuid4().hex[:8]}",
+        "author": OTHER,
+        "summary": "Confirm the requested action",
+        "reply_kind": "slack",
+        "reply_channel": CARD_CHANNEL,
+        "reply_placeholder": "p-1",
+        "dedupe_key": uuid.uuid4().hex,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _create_approval(
+    client: TestClient, auth_headers: dict[str, str], **overrides: Any
+) -> dict[str, Any]:
+    response = client.post("/approvals", json=_payload(**overrides), headers=auth_headers)
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+def _explicit_approval(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    *,
+    users: list[str],
+    author: str = OTHER,
+) -> dict[str, Any]:
+    route = f"operators-{uuid.uuid4().hex[:8]}"
+    source_channel = f"C0SOURCE{uuid.uuid4().hex[:8].upper()}"
+    agent = client.post(
+        "/agents",
+        json={
+            "name": f"approval-principal-{uuid.uuid4().hex[:8]}",
+            "channel": {"kind": "slack", "address": source_channel},
+            "approval_routes": {
+                route: {
+                    "resolution": {"kind": "slack", "address": CARD_CHANNEL},
+                    "approvers": {"users": users},
+                }
+            },
+        },
+        headers=auth_headers,
+    )
+    assert agent.status_code == 201, agent.text
+    return _create_approval(
+        client,
+        auth_headers,
+        agent_id=agent.json()["id"],
+        author=author,
+        route=route,
+        card_channel=CARD_CHANNEL,
+        reply_channel=source_channel,
+        gate_kind="policy",
+    )
+
+
+def _group_approval(
+    client: TestClient, auth_headers: dict[str, str], *, author: str = OTHER
+) -> dict[str, Any]:
+    route = f"managers-{uuid.uuid4().hex[:8]}"
+    agent = client.post(
+        "/agents",
+        json={
+            "name": f"approval-group-{uuid.uuid4().hex[:8]}",
+            "channel": {"kind": "slack", "address": SOURCE_CHANNEL},
+            "approval_routes": {
+                route: {
+                    "resolution": {"kind": "slack", "address": CARD_CHANNEL},
+                    "approvers": {"group": GROUP},
+                }
+            },
+        },
+        headers=auth_headers,
+    )
+    assert agent.status_code == 201, agent.text
+    return _create_approval(
+        client,
+        auth_headers,
+        agent_id=agent.json()["id"],
+        author=author,
+        route=route,
+        card_channel=CARD_CHANNEL,
+        reply_channel=SOURCE_CHANNEL,
+        gate_kind="policy",
+    )
+
+
+def _chat_token(
+    approval_id: str,
+    *,
+    subject: str = SUBJECT,
+    channel: str = CARD_CHANNEL,
+    signing_key: str | None = None,
+    scope: str = approval_principal.APPROVE_SCOPE,
+    exp: int | None = None,
+) -> str:
+    key = signing_key or get_settings().approval_chat_attester_secret
+    return approval_principal.mint(
+        key,
+        subject=subject,
+        kind="chat",
+        actor_channel=channel,
+        approval_id=approval_id,
+        scope=scope,
+        exp=exp if exp is not None else int(time.time()) + 60,
+    )
+
+
+def _operator_token(
+    subject: str = SUBJECT,
+    *,
+    scope: str = approval_principal.APPROVE_SCOPE,
+    exp: int | None = None,
+) -> str:
+    return approval_principal.mint(
+        get_settings().api_key,
+        subject=subject,
+        kind="operator",
+        scope=scope,
+        exp=exp if exp is not None else int(time.time()) + 60,
+    )
+
+
+def _principal_headers(token: str) -> dict[str, str]:
+    return {PRINCIPAL_HEADER: token}
+
+
+def _mint_console_session(
+    client: TestClient, auth_headers: dict[str, str], subject: str = SUBJECT
+) -> str:
+    minted = client.post("/console/login-codes", json={"subject": subject}, headers=auth_headers)
+    assert minted.status_code == 201, minted.text
+    assert minted.json()["subject"] == subject
+    exchanged = client.post("/console/session", json={"code": minted.json()["code"]})
+    assert exchanged.status_code == 200, exchanged.text
+    assert exchanged.json()["subject"] == subject
+    token = client.cookies.get(SESSION_COOKIE)
+    assert token
+    client.cookies.clear()
+    return token
+
+
+def _cookie_headers(token: str) -> dict[str, str]:
+    # TestClient's default origin is HTTP, so its cookie jar correctly refuses
+    # to auto-send a Secure cookie.  Supply the captured Set-Cookie value as a
+    # browser on the production HTTPS same-origin would.
+    return {"Cookie": f"{SESSION_COOKIE}={token}"}
+
+
+def _revoke_console_session(token: str) -> None:
+    async def revoke() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with AsyncSession(engine) as session:
+                row = await crud.live_console_session(session, token)
+                assert row is not None
+                await crud.revoke_console_session(session, row)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(revoke())
+
+
+def test_resolve_rejects_every_non_principal_credential_shape(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    created = _create_approval(approvals_client, auth_headers)
+    url = f"/approvals/{created['id']}/resolve"
+    attempts = [
+        {},
+        auth_headers,
+        {"X-API-Key": "not-the-platform-key"},
+        _principal_headers("not-a-principal"),
+        _principal_headers(_operator_token(exp=int(time.time()) - 1)),
+        _principal_headers(_operator_token(scope="approval.read")),
+    ]
+
+    for headers in attempts:
+        response = approvals_client.post(url, json={"decision": "approved"}, headers=headers)
+        assert response.status_code == 401, (headers.keys(), response.text)
+
+    pending = approvals_client.get(f"/approvals/{created['id']}", headers=auth_headers)
+    assert pending.json()["status"] == "pending"
+
+
+@pytest.mark.parametrize("retired_field", ["resolved_by", "actor_channel"])
+def test_resolve_loudly_rejects_retired_identity_fields(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    retired_field: str,
+) -> None:
+    created = _create_approval(approvals_client, auth_headers)
+    response = approvals_client.post(
+        f"/approvals/{created['id']}/resolve",
+        json={"decision": "approved", retired_field: "caller-asserted"},
+        headers=_principal_headers(_chat_token(created["id"])),
+    )
+
+    assert response.status_code == 422, response.text
+    detail = response.text
+    assert retired_field in detail
+    assert "ADR-0106" in detail
+    assert "principal" in detail.lower()
+
+
+def test_chat_principal_derives_actor_channel_and_audit_proof(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    created = _create_approval(approvals_client, auth_headers)
+    resolved = approvals_client.post(
+        f"/approvals/{created['id']}/resolve",
+        json={"decision": "approved", "note": "confirmed in the card"},
+        headers=_principal_headers(_chat_token(created["id"])),
+    )
+
+    assert resolved.status_code == 200, resolved.text
+    assert resolved.json()["resolved_by"] == SUBJECT
+    audit = approvals_client.get(f"/approvals/{created['id']}/audit", headers=auth_headers).json()
+    assert len(audit) == 1
+    assert audit[0]["actor"] == SUBJECT
+    assert audit[0]["actor_channel"] == CARD_CHANNEL
+    assert audit[0]["principal_kind"] == "chat"
+    assert audit[0]["authenticated"] is True
+
+
+def test_chat_principal_uses_only_the_attester_key_and_is_approval_bound(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    first = _create_approval(approvals_client, auth_headers)
+    second = _create_approval(approvals_client, auth_headers)
+
+    platform_signed_chat = _chat_token(first["id"], signing_key=get_settings().api_key)
+    wrong_key = approvals_client.post(
+        f"/approvals/{first['id']}/resolve",
+        json={"decision": "approved"},
+        headers=_principal_headers(platform_signed_chat),
+    )
+    assert wrong_key.status_code == 401, wrong_key.text
+
+    first_bound = _chat_token(first["id"])
+    replayed = approvals_client.post(
+        f"/approvals/{second['id']}/resolve",
+        json={"decision": "approved"},
+        headers=_principal_headers(first_bound),
+    )
+    assert replayed.status_code == 401, replayed.text
+
+    valid = approvals_client.post(
+        f"/approvals/{first['id']}/resolve",
+        json={"decision": "approved"},
+        headers=_principal_headers(first_bound),
+    )
+    assert valid.status_code == 200, valid.text
+    assert (
+        approvals_client.get(f"/approvals/{second['id']}", headers=auth_headers).json()["status"]
+        == "pending"
+    )
+
+
+def test_authorized_solo_requester_can_self_confirm_but_membership_still_denies(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+) -> None:
+    operator_headers = _principal_headers(_operator_token(SUBJECT))
+    admitted = _explicit_approval(approvals_client, auth_headers, users=[SUBJECT], author=SUBJECT)
+    accepted = approvals_client.post(
+        f"/approvals/{admitted['id']}/resolve",
+        json={"decision": "approved"},
+        headers=operator_headers,
+    )
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["resolved_by"] == SUBJECT
+
+    excluded = _explicit_approval(approvals_client, auth_headers, users=[OTHER], author=SUBJECT)
+    denied = approvals_client.post(
+        f"/approvals/{excluded['id']}/resolve",
+        json={"decision": "approved"},
+        headers=operator_headers,
+    )
+    assert denied.status_code == 403, denied.text
+    assert (
+        approvals_client.get(f"/approvals/{excluded['id']}", headers=auth_headers).json()["status"]
+        == "pending"
+    )
+    # Only the admitted approval woke its suspended turn.
+    assert len(valkey.xrange(runs_stream)) == 1
+
+    audit = approvals_client.get(f"/approvals/{admitted['id']}/audit", headers=auth_headers).json()
+    assert audit[0]["actor"] == SUBJECT
+    assert audit[0]["actor_channel"] is None
+    assert audit[0]["principal_kind"] == "operator"
+    assert audit[0]["authenticated"] is True
+
+
+class _AlwaysMemberGroup:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def members(self, group_id: str) -> UserGroupMembership:
+        self.calls += 1
+        return UserGroupMembership(
+            group=group_id,
+            users=frozenset({SUBJECT}),
+            fetched_at=datetime.now(UTC),
+            cache_age_s=0.0,
+        )
+
+
+def test_operator_principals_are_explicit_user_only_even_if_group_members(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    source = _AlwaysMemberGroup()
+    approvals_client.app.dependency_overrides[get_approver_sets] = lambda: SlackApproverSetSelector(
+        source
+    )
+    group_bound = _group_approval(approvals_client, auth_headers)
+
+    denied = approvals_client.post(
+        f"/approvals/{group_bound['id']}/resolve",
+        json={"decision": "approved"},
+        headers=_principal_headers(_operator_token()),
+    )
+    assert denied.status_code == 403, denied.text
+    assert "explicit" in denied.json()["detail"].lower()
+    # Eligibility is decided from the set kind before any Slack lookup. A
+    # terminal credential cannot turn itself into provider membership evidence.
+    assert source.calls == 0
+
+
+def test_console_principal_can_resolve_as_a_verified_group_member(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    source = _AlwaysMemberGroup()
+    approvals_client.app.dependency_overrides[get_approver_sets] = lambda: SlackApproverSetSelector(
+        source
+    )
+    group_bound = _group_approval(approvals_client, auth_headers)
+    cookie = _cookie_headers(_mint_console_session(approvals_client, auth_headers))
+
+    resolved = approvals_client.post(
+        f"/approvals/{group_bound['id']}/resolve",
+        json={"decision": "approved"},
+        headers=cookie,
+    )
+    assert resolved.status_code == 200, resolved.text
+    assert source.calls == 1
+    audit = approvals_client.get(
+        f"/approvals/{group_bound['id']}/audit", headers=auth_headers
+    ).json()
+    assert audit[0]["principal_kind"] == "console"
+    assert audit[0]["evidence"]["kind"] == "user_group"
+
+
+def test_console_session_subject_is_immutable_reusable_and_revocable(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    token = _mint_console_session(approvals_client, auth_headers)
+    cookie = _cookie_headers(token)
+    current = approvals_client.get("/console/session", headers=cookie)
+    assert current.status_code == 200, current.text
+    assert current.json()["subject"] == SUBJECT
+
+    first = _explicit_approval(approvals_client, auth_headers, users=[SUBJECT])
+    second = _explicit_approval(approvals_client, auth_headers, users=[SUBJECT])
+    resolved = approvals_client.post(
+        f"/approvals/{first['id']}/resolve",
+        json={"decision": "approved"},
+        headers=cookie,
+    )
+    assert resolved.status_code == 200, resolved.text
+    assert resolved.json()["resolved_by"] == SUBJECT
+    audit = approvals_client.get(f"/approvals/{first['id']}/audit", headers=auth_headers).json()
+    assert audit[0]["actor"] == SUBJECT
+    assert audit[0]["actor_channel"] is None
+    assert audit[0]["principal_kind"] == "console"
+    assert audit[0]["authenticated"] is True
+
+    _revoke_console_session(token)
+    assert approvals_client.get("/console/session", headers=cookie).status_code == 401
+    revoked = approvals_client.post(
+        f"/approvals/{second['id']}/resolve",
+        json={"decision": "approved"},
+        headers=cookie,
+    )
+    assert revoked.status_code == 401, revoked.text
+    assert (
+        approvals_client.get(f"/approvals/{second['id']}", headers=auth_headers).json()["status"]
+        == "pending"
+    )
+
+
+def test_null_subject_console_session_cannot_be_an_approval_principal(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    async def make_legacy_session() -> str:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with AsyncSession(engine) as session:
+                code = crud.new_login_code()
+                await session.execute(
+                    text(
+                        "INSERT INTO curie.console_sessions "
+                        "(id, subject, login_code_hash, login_code_expires_at) "
+                        "VALUES (:id, NULL, :code_hash, :expires_at)"
+                    ),
+                    {
+                        "id": uuid.uuid4(),
+                        "code_hash": crud.hash_console_credential(code),
+                        "expires_at": datetime.now(UTC).replace(tzinfo=None) + crud.LOGIN_CODE_TTL,
+                    },
+                )
+                await session.commit()
+                return code
+        finally:
+            await engine.dispose()
+
+    code = asyncio.run(make_legacy_session())
+    exchanged = approvals_client.post("/console/session", json={"code": code})
+    assert exchanged.status_code == 200, exchanged.text
+    token = approvals_client.cookies.get(SESSION_COOKIE)
+    assert token
+    cookie = _cookie_headers(token)
+    assert approvals_client.get("/console/session", headers=cookie).status_code == 401
+
+    approval = _explicit_approval(approvals_client, auth_headers, users=[SUBJECT])
+    denied = approvals_client.post(
+        f"/approvals/{approval['id']}/resolve",
+        json={"decision": "approved"},
+        headers=cookie,
+    )
+    assert denied.status_code == 401, denied.text
+
+
+def test_two_principal_credentials_are_ambiguous_and_fail_closed(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    approval = _explicit_approval(approvals_client, auth_headers, users=[SUBJECT])
+    cookie_token = _mint_console_session(approvals_client, auth_headers)
+    headers = {
+        **_principal_headers(_operator_token()),
+        **_cookie_headers(cookie_token),
+    }
+    denied = approvals_client.post(
+        f"/approvals/{approval['id']}/resolve",
+        json={"decision": "approved"},
+        headers=headers,
+    )
+    assert denied.status_code == 401, denied.text
+    assert "ambiguous" in denied.json()["detail"].lower()
+
+
+def test_administrative_mints_never_accept_a_cookie_or_principal_token(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    cookie = _cookie_headers(_mint_console_session(approvals_client, auth_headers))
+    principal = _principal_headers(_operator_token())
+
+    for endpoint in ("/console/login-codes", "/approvals/principals/operator"):
+        for headers in (cookie, principal):
+            denied = approvals_client.post(endpoint, json={"subject": OTHER}, headers=headers)
+            assert denied.status_code == 401, (endpoint, headers.keys(), denied.text)
+
+        minted = approvals_client.post(endpoint, json={"subject": OTHER}, headers=auth_headers)
+        assert minted.status_code == 201, (endpoint, minted.text)
+
+
+def test_console_session_rows_store_the_bound_subject(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    _mint_console_session(approvals_client, auth_headers)
+
+    async def read_subject() -> str | None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with AsyncSession(engine) as session:
+                row = (await session.execute(select(ConsoleSession))).scalar_one()
+                return row.subject
+        finally:
+            await engine.dispose()
+
+    assert asyncio.run(read_subject()) == SUBJECT

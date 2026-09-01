@@ -51,26 +51,30 @@ class SlackChannelMembers:
 
     Membership is proven by the resolution attempt's channel -- ``card_channel``
     when a route binding placed the card (#247), else the requesting channel.
-    Callers that are not the dispatcher (an operator's curl, the CLI) authenticate
-    with the platform API key and assert the channel explicitly.
+    Only a dispatcher-attested chat principal carries that channel. Operator and
+    console principals carry none and therefore cannot satisfy this set.
     """
 
     # Frozen to the pre-port class name; see the audit-vocabulary note in
     # authorizer.py.
     audit_name = "ChannelMembershipAuthorizer"
+    operator_eligible = False
+    console_eligible = False
 
     def __init__(self, approvers_channel: str | None) -> None:
         self._approvers_channel = approvers_channel
 
-    async def contains(
-        self, actor: str, actor_channel: str | None
-    ) -> MembershipVerdict:
+    async def contains(self, actor: str, actor_channel: str | None) -> MembershipVerdict:
         evidence: dict[str, Any] = {
             "kind": "channel_membership",
             "approvers_channel": self._approvers_channel,
             "actor_channel": actor_channel,
         }
-        if actor_channel != self._approvers_channel:
+        if (
+            not actor_channel
+            or not self._approvers_channel
+            or actor_channel != self._approvers_channel
+        ):
             return MembershipVerdict(
                 member=False,
                 reason="you are not an approver: resolve this from the approval's channel",
@@ -94,14 +98,17 @@ class SlackUserGroupMembers:
     # Frozen to the pre-port class name; see the audit-vocabulary note in
     # authorizer.py.
     audit_name = "UserGroupAuthorizer"
+    operator_eligible = False
+    # A subject-bound console session proves the actor identity needed for the
+    # server-side Slack lookup; unlike channel membership, no channel evidence
+    # is required. Operator tokens remain explicit-user-only per ADR-0106.
+    console_eligible = True
 
     def __init__(self, group_id: str, source: GroupMembershipSource | None) -> None:
         self._group_id = group_id
         self._source = source
 
-    async def contains(
-        self, actor: str, actor_channel: str | None
-    ) -> MembershipVerdict:
+    async def contains(self, actor: str, actor_channel: str | None) -> MembershipVerdict:
         if self._source is None:
             return self._undetermined("no Slack bot token is configured for the API")
         try:
@@ -199,8 +206,8 @@ class SlackApproverSetSelector:
                 # read (ADR-0123). Not the same fact as a binding that declares
                 # no approvers: falling through would let whoever rewrote the
                 # route map swap a server-enforced approver set for a
-                # caller-asserted ``actor_channel`` check on an approval that is
-                # ALREADY pending, which is the whole escalation.
+                # channel-membership check on an approval that is ALREADY
+                # pending, which is the whole escalation.
                 #
                 # ``binding is None`` and not ``not binding``: a route bound to
                 # ``{}`` is BOUND, the operator just declared nothing, and only

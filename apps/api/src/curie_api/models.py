@@ -12,7 +12,16 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Enum, ForeignKey, Index, LargeBinary, Text, UniqueConstraint, func
+from sqlalchemy import (
+    CheckConstraint,
+    Enum,
+    ForeignKey,
+    Index,
+    LargeBinary,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
@@ -353,8 +362,8 @@ class Approval(Base):
     # The thread key routing keeps one live session per (the worker's
     # conversation_id); the resume turn is enqueued back onto it.
     conversation_id: Mapped[str] = mapped_column(index=True)
-    # Who authored the turn that raised the request. #246 blocks self-approval
-    # against this field; recorded now so existing rows carry it.
+    # Who authored the turn that raised the request. ADR-0106 permits that same
+    # authenticated principal to resolve only when the selected set admits it.
     author: Mapped[str]
     # The human-readable statement of what needs approval, from the run's
     # approval request (the ACI final's approval_summary).
@@ -407,8 +416,8 @@ class Approval(Base):
     # which is the rolling-deploy window the worker's prefix fallback covers.
     gate_kind: Mapped[str | None] = mapped_column(default=None)
     granted_tool: Mapped[str | None] = mapped_column(default=None)
-    # Server-owned purpose. Only ``publication`` enables the narrowly scoped
-    # requester self-approval rule and suppresses the ordinary model wake.
+    # Server-owned purpose. ``publication`` suppresses the ordinary model wake;
+    # requester equality follows the same approver-set rule for every purpose.
     purpose: Mapped[str] = mapped_column(server_default="session", default="session")
 
     publication: Mapped[Publication | None] = relationship(back_populates="approval", uselist=False)
@@ -467,17 +476,11 @@ class Publication(Base):
     # publication mutation, while claim_next gates Job creation on delivery so
     # even an immediate CLI approval cannot race ahead of the required card.
     approval_card_reported_at: Mapped[datetime | None] = mapped_column(default=None)
-    approval_card_delivery_started_at: Mapped[datetime | None] = mapped_column(
-        default=None
-    )
-    approval_card_delivery_attempts: Mapped[int] = mapped_column(
-        server_default="0", default=0
-    )
+    approval_card_delivery_started_at: Mapped[datetime | None] = mapped_column(default=None)
+    approval_card_delivery_attempts: Mapped[int] = mapped_column(server_default="0", default=0)
     approval_card_version: Mapped[int] = mapped_column(server_default="1", default=1)
     approval_card_delivery_error: Mapped[str | None] = mapped_column(Text, default=None)
-    approval_card_delivery_dead_lettered_at: Mapped[datetime | None] = mapped_column(
-        default=None
-    )
+    approval_card_delivery_dead_lettered_at: Mapped[datetime | None] = mapped_column(default=None)
     approval_card_lease_owner: Mapped[str | None] = mapped_column(default=None)
     approval_card_lease_expires_at: Mapped[datetime | None] = mapped_column(default=None)
     # Resource cleanup is an unbounded durable obligation, separate from the
@@ -540,6 +543,12 @@ class ApprovalAuditEntry(Base):
     """
 
     __tablename__ = "approval_audit_entries"
+    __table_args__ = (
+        CheckConstraint(
+            "principal_kind IS NULL OR principal_kind IN ('chat', 'console', 'operator')",
+            name="approval_audit_principal_kind_ck",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     approval_id: Mapped[uuid.UUID] = mapped_column(
@@ -549,6 +558,10 @@ class ApprovalAuditEntry(Base):
     action: Mapped[str]
     actor: Mapped[str]
     actor_channel: Mapped[str | None] = mapped_column(default=None)
+    # The proof attached to this actor (ADR-0106). Historical and system rows
+    # honestly retain NULL/false rather than being retro-labelled.
+    principal_kind: Mapped[str | None] = mapped_column(default=None)
+    authenticated: Mapped[bool] = mapped_column(server_default="false", default=False)
     # The decision the actor attempted (approved/rejected).
     decision: Mapped[str]
     # The authorizer snapshot: which implementation decided, its verdict, and
@@ -627,9 +640,7 @@ class AgentAction(Base):
     # the forward action required, and a sweeper deleting the approval row must
     # not silently downgrade a gated action to an ungated one. An id whose
     # approval can no longer be read fails closed at the undo instead.
-    gate_approval_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), default=None
-    )
+    gate_approval_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), default=None)
     status: Mapped[str] = mapped_column(server_default=ActionStatus.pending, index=True)
     dedupe_key: Mapped[str] = mapped_column(unique=True)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
@@ -756,6 +767,9 @@ class ConsoleSession(Base):
     __tablename__ = "console_sessions"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # Administrator-selected at login-code mint and immutable thereafter. NULL
+    # preserves pre-ADR-0106 sessions, which cannot resolve approvals.
+    subject: Mapped[str | None] = mapped_column(default=None)
     # SHA-256 hex of the single-use login code. Unique so a hash collision or a
     # duplicate mint cannot produce two rows one code could satisfy.
     login_code_hash: Mapped[str] = mapped_column(unique=True, index=True)

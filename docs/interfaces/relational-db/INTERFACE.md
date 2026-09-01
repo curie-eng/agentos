@@ -34,8 +34,9 @@ non-Postgres store is ever demanded.
 
 ## Current contract
 
-A second implementation must be a Postgres speaking the async `asyncpg` dialect and
-honoring the models/migrations verbatim:
+A second implementation must be PostgreSQL 15 or newer, speaking the async `asyncpg`
+dialect and honoring the models/migrations verbatim. Compose and the chart ship
+PostgreSQL 16:
 
 - **DSN + schema** (`apps/api/src/curie_api/db.py::SCHEMA`, `apps/api/src/curie_api/db.py::create_engine`): `SCHEMA = get_settings().db_schema` (default `"curie"`, `apps/api/src/curie_api/config.py::Settings`); the engine is built from `database_url` (env `DATABASE_URL`) via `create_async_engine(..., pool_pre_ping=True)`.
 - **Schema-scoped metadata** (`apps/api/src/curie_api/db.py::Base`): `Base.metadata = MetaData(schema=SCHEMA)` — every table is qualified into the `curie` schema.

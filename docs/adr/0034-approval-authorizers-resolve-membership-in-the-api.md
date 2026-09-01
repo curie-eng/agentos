@@ -4,6 +4,10 @@ Date: 2026-07-15
 
 Status: Accepted
 
+**Partially superseded by [ADR 0106](0106-an-approver-is-an-authenticated-principal.md).**
+ADR 0106 supersedes only the universal pre-membership self-approval prohibition;
+the server-side, fail-closed approver-set design remains in force.
+
 Implements [#420](https://github.com/curie-eng/curie/issues/420). Supersedes
 ADR-0010's framing of the authorizer line: where ADR-0010 named channel
 membership, user-group, explicit user-list, and platform-RBAC as four

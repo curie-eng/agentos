@@ -280,7 +280,7 @@ sequenceDiagram
 
     R->>A: model call (streaming)
     R-->>W: NDJSON: text_delta*, tool notes*, final
-    R--)O: gen_ai spans (agent.run -> generation -> tool)
+    R--)O: gen_ai spans (agent.run root + generation/tool sibling intervals)
 
     alt turn completes
         W->>V: markers (done / side_effect_flag as seen)

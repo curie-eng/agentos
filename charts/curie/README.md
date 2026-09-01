@@ -406,6 +406,41 @@ Flipping any to `false` removes its resources from the render; consumers
 fields on the same block (`host`/`port` for stores, `otelCollector.endpoint`
 for an external collector).
 
+BYO Langfuse requires a bare external hostname in `langfuse.host`. Consumers
+compose its URL as
+`http://<langfuse.host>:<langfuse.web.service.port>`; do not include a scheme,
+port, or path in `langfuse.host`. With `langfuse.deploy: false`, the chart omits
+the Langfuse Service, web and worker Deployments, and model-pricing Job. Helm
+rendering fails with an error naming `langfuse.host` when that value is missing
+or empty, instead of emitting the hostname of a Service the chart did not
+create.
+
+```yaml
+langfuse:
+  deploy: false
+  host: langfuse.example.com
+  existingSecret: acme-langfuse-credentials
+  init:
+    projectPublicKey: pk-lf-acme-example
+  web:
+    service:
+      port: 3000
+```
+
+Set `langfuse.init.projectPublicKey` to the external project's public key. Its
+secret key must match: supply it as `langfuse.init.projectSecretKey`, or under
+`langfuseInitProjectSecretKey` in `langfuse.existingSecret`; otherwise the
+sealed chart-generated key will not authenticate to the external project. When
+the chart collector is enabled, that existing Secret must also supply its
+complete `otlpAuthHeader` value. As an alternative for collector
+authentication, set `otelCollector.otlpAuthHeader` explicitly; see the
+credential details below.
+
+This BYO path currently composes HTTP only and has no HTTPS/TLS selector.
+Deploy it only across a trusted private transport or through a proxy that
+provides the required protection: an on-path observer can recover the full
+project credential because the Basic header is encoded, not encrypted.
+
 ### Langfuse Postgres startup readiness
 
 `langfuse.web.postgresReadiness` is enabled by default. Before Langfuse web

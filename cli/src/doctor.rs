@@ -933,11 +933,15 @@ pub fn evaluate(f: &Facts) -> Vec<Check> {
         None => skipped(
             "repo-binding",
             "Repo binding",
-            "platform API not reached — pass --api-url/--api-key to include this",
+            "platform API not reached — could not discover it from the release; \
+             pass --api-url/--api-key to include this",
         ),
-        Some(agents) if agents.is_empty() => {
-            skipped("repo-binding", "Repo binding", "no agents deployed yet")
-        }
+        Some(agents) if agents.is_empty() => missing(
+            "repo-binding",
+            "Repo binding",
+            "no agents deployed yet — a push matches nothing and is silently ignored",
+            targeted("deploy", namespace, release) + " --plugin-dir . --repo <owner>/<name>",
+        ),
         Some(agents) => {
             let unbound: Vec<&str> = agents
                 .iter()
@@ -1049,12 +1053,11 @@ pub fn summary(checks: &[Check]) -> String {
                 missing items above."
             .to_string();
     }
-    // repo-binding reads NotApplicable in two situations that both reach this
-    // point: the platform API was never consulted (no --api-url/--api-key, an
-    // unreachable API, or a rejected key -- indistinguishable from here) or it
-    // was reached and found no agents deployed yet. Neither is evidence a git
-    // push deploys anything, so claiming "Fully wired" here asserted the one
-    // capability the run did not check (#1354).
+    // repo-binding reads NotApplicable only when the platform API was never
+    // consulted (discovery failed, an unreachable API, or a rejected key --
+    // indistinguishable from here). Zero agents is Missing, not this hedge
+    // (#1367). Claiming "Fully wired" here asserted the one capability the
+    // run did not check (#1354).
     if !has("repo-binding") {
         return "Answering in Slack. Git-push deploys are unverified -- see the \
                 Repo binding line above."
@@ -2526,10 +2529,44 @@ mod tests {
         assert!(s.contains("Git-push deploys are unverified"), "{s}");
     }
 
-    /// The sibling NotApplicable path: the platform API WAS reached but no
-    /// agents are deployed yet. A different reason, the same lack of evidence
-    /// that a git push deploys anything, so both paths must land on the same
-    /// hedge rather than one of them slipping through to "Fully wired".
+    /// #1367 item 2: zero agents is a proven negative, not an unknown. A push
+    /// matching no agent is answered `ignored` with nothing logged. Reporting
+    /// NotApplicable shared the unverified verdict with "the API was never
+    /// reached", which is the wrong epistemic state.
+    #[test]
+    fn no_agents_deployed_is_a_missing_binding() {
+        let f = Facts {
+            agents: Some(vec![]),
+            ..wired()
+        };
+        let checks = evaluate(&f);
+        let c = find(&checks, "repo-binding").clone();
+        assert_eq!(c.state, State::Missing, "{}", c.detail);
+        assert!(
+            c.detail.contains("no agents"),
+            "must say the API was reached and found none: {}",
+            c.detail
+        );
+        let fix = c.fix.expect("a proven negative must carry a fix");
+        assert!(
+            fix.contains("cluster deploy"),
+            "the fix is to deploy an agent: {fix}"
+        );
+        assert!(fix.contains("--repo"), "{fix}");
+        let s = summary(&checks);
+        assert!(!s.contains("Fully wired"), "{s}");
+        assert!(
+            s.contains("Git-push deploys are not wired yet"),
+            "zero agents must route to the actionable verdict: {s}"
+        );
+        assert!(
+            !s.contains("unverified"),
+            "unverified is reserved for never having checked: {s}"
+        );
+    }
+
+    /// The sibling NotApplicable path is only "the platform API was never
+    /// reached". Reaching it and finding no agents is item 2 above.
     #[test]
     fn no_agents_deployed_does_not_claim_fully_wired() {
         let f = Facts {
@@ -2539,7 +2576,51 @@ mod tests {
         let checks = evaluate(&f);
         let s = summary(&checks);
         assert!(!s.contains("Fully wired"), "{s}");
-        assert!(s.contains("Git-push deploys are unverified"), "{s}");
+        assert!(s.contains("Git-push deploys are not wired yet"), "{s}");
+    }
+
+    /// #1367 item 3: `ready` stays the "no check is missing" carve-out, so an
+    /// unverified deploy path still reports ready=true. A machine consumer
+    /// needs the other half of what the summary already says.
+    #[test]
+    fn deploys_verified_tracks_repo_binding_ok() {
+        let bound = Facts {
+            agents: Some(vec![("bot".into(), Some("acme/bot".into()))]),
+            ..wired()
+        };
+        let bound_out = DoctorOutput {
+            checks: evaluate(&bound),
+            summary: summary(&evaluate(&bound)),
+        };
+        assert_eq!(bound_out.to_json()["deploys_verified"], json!(true));
+
+        let unread = DoctorOutput {
+            checks: evaluate(&wired()),
+            summary: summary(&evaluate(&wired())),
+        };
+        assert_eq!(unread.to_json()["deploys_verified"], json!(false));
+        assert_eq!(
+            unread.to_json()["ready"],
+            json!(true),
+            "ready must keep the not_applicable carve-out: {}",
+            unread.to_json()
+        );
+
+        let empty = Facts {
+            agents: Some(vec![]),
+            ..wired()
+        };
+        let empty_out = DoctorOutput {
+            checks: evaluate(&empty),
+            summary: summary(&evaluate(&empty)),
+        };
+        assert_eq!(empty_out.to_json()["deploys_verified"], json!(false));
+        assert_eq!(
+            empty_out.to_json()["ready"],
+            json!(false),
+            "zero agents is missing, so ready flips: {}",
+            empty_out.to_json()
+        );
     }
 
     /// Found by running this against a real install. sre-bot serves its webhook
@@ -4418,6 +4499,10 @@ impl crate::ui::CliOutput for DoctorOutput {
         serde_json::json!({
             "summary": self.summary,
             "ready": self.checks.iter().all(|c| c.state != State::Missing),
+            "deploys_verified": self
+                .checks
+                .iter()
+                .any(|c| c.id == "repo-binding" && c.state == State::Ok),
             "checks": self.checks,
             "guidance": guidance(&self.checks),
         })
@@ -4443,7 +4528,48 @@ impl crate::ui::CliOutput for DoctorOutput {
     }
 }
 
-pub async fn doctor(namespace: &str, release: &str, api: Option<(&str, &str)>) -> DoctorOutput {
+/// Resolve the platform API connection doctor should use.
+///
+/// Explicit `--api-url`/`--api-key` (and their env vars, via clap) win.
+/// Omitted values are discovered from the release with the same helpers
+/// sibling cluster verbs use. Discovery errors are discarded: gather is
+/// failure-tolerant, and an unreachable API narrows the report to
+/// `agents: None` rather than failing the whole run (#1367).
+pub async fn resolve_api(
+    namespace: &str,
+    release: &str,
+    api_url: Option<&str>,
+    api_key: Option<&str>,
+) -> Option<(String, String)> {
+    let url = match nonempty(api_url) {
+        Some(url) => url.to_string(),
+        None => crate::ops::discover_api_url(namespace, release)
+            .await
+            .ok()?,
+    };
+    let key = match nonempty(api_key) {
+        Some(key) => key.to_string(),
+        None => crate::ops::discover_api_key(namespace, release)
+            .await
+            .ok()?,
+    };
+    Some((url, key))
+}
+
+fn nonempty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+pub async fn doctor(
+    namespace: &str,
+    release: &str,
+    api_url: Option<&str>,
+    api_key: Option<&str>,
+) -> DoctorOutput {
+    let resolved = resolve_api(namespace, release, api_url, api_key).await;
+    let api = resolved
+        .as_ref()
+        .map(|(url, key)| (url.as_str(), key.as_str()));
     let checks = evaluate(&gather(namespace, release, api).await);
     let summary = summary(&checks);
     DoctorOutput { checks, summary }
