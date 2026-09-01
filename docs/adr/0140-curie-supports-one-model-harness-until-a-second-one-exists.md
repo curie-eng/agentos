@@ -4,9 +4,11 @@ Date: 2026-09-01
 
 Status: Draft
 
-When Accepted, this ADR supersedes [ADR-0060](0060-the-harness-is-a-declared-package.md),
-[ADR-0061](0061-out-of-process-harness-boundary.md), and
-[ADR-0062](0062-harness-conformance-has-teeth.md). Until then, it authorizes
+When Accepted, this ADR supersedes the Accepted decisions in
+[ADR-0060](0060-the-harness-is-a-declared-package.md) and
+[ADR-0062](0062-harness-conformance-has-teeth.md). It also closes the unfinished
+program described by Draft
+[ADR-0061](0061-out-of-process-harness-boundary.md). Until then, it authorizes
 nothing.
 
 ## Context
