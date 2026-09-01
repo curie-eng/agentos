@@ -1912,6 +1912,11 @@ fn doctor_output_validates() {
         serde_json::Value::Bool(false),
         "a report carrying a missing check is not ready: {json}"
     );
+    assert_eq!(
+        json["deploys_verified"],
+        serde_json::Value::Bool(false),
+        "an unbound agent is not a verified deploy path: {json}"
+    );
 
     // This payload is pasted into issues; it must never carry a secret value.
     let rendered = serde_json::to_string(&json).expect("serializes");
@@ -1962,6 +1967,11 @@ fn doctor_ready_tracks_the_checks() {
         json["ready"],
         serde_json::Value::Bool(true),
         "a fully wired report is ready: {json}"
+    );
+    assert_eq!(
+        json["deploys_verified"],
+        serde_json::Value::Bool(true),
+        "all-bound agents mean git-push deploys were verified: {json}"
     );
 }
 
