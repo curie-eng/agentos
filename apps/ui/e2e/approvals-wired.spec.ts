@@ -30,11 +30,39 @@ function approval(overrides: Record<string, unknown> = {}) {
   };
 }
 
-// Stub the approvals list; the audit endpoint (more specific path) is stubbed
-// first so the list matcher does not swallow it.
-async function stubApprovals(page: Page, rows: object[]) {
+// Stub the approvals list and the same-origin console session. The audit
+// endpoint (more specific path) is stubbed first so the list matcher does not
+// swallow it. A session becomes authenticated only through POST /console/session
+// in the login-code test, matching the browser's actual contract.
+async function stubApprovals(page: Page, rows: object[], initialSubject: string | null = "U0AUTHENTICATED") {
+  let sessionSubject = initialSubject;
   await page.route("**/api/approvals/*/audit*", (route) =>
     route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify([]) }),
+  );
+  await page.route(
+    (url) => url.pathname.endsWith("/api/console/session"),
+    (route) => {
+      if (route.request().method() === "POST") {
+        sessionSubject = "U0EXCHANGED";
+        return route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({ subject: sessionSubject, expires_at: "2026-07-24T12:00:00+00:00" }),
+        });
+      }
+      if (sessionSubject === null) {
+        return route.fulfill({
+          status: 401,
+          contentType: "application/json",
+          body: JSON.stringify({ detail: "missing, invalid, or expired console session" }),
+        });
+      }
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ subject: sessionSubject, expires_at: "2026-07-24T12:00:00+00:00" }),
+      });
+    },
   );
   await page.route(
     (url) => url.pathname.endsWith("/api/approvals"),
@@ -61,26 +89,50 @@ test("lists pending approvals and opens the detail with its audit trail", async 
   await expect(detail).toContainText("issue_refund");
 });
 
-test("resolves a pending approval as approved through POST /resolve", async ({ page }) => {
+test("exchanges a login code before showing the immutable console principal", async ({ page }) => {
+  await stubApprovals(page, [], null);
+  await openApprovalsTab(page);
+
+  await expect(page.getByLabel("login code")).toBeVisible();
+  await page.getByLabel("login code").fill("one-time-example-code");
+  await page.getByTestId("approval-login-submit").click();
+  await expect(page.getByTestId("approval-principal")).toContainText("U0EXCHANGED");
+  await expect(page.getByLabel("resolved by")).toHaveCount(0);
+  await expect(page.getByLabel("actor channel")).toHaveCount(0);
+});
+
+test("resolves with the same-origin console cookie and exactly decision/note, never the platform key", async ({ page }, testInfo) => {
   await stubApprovals(page, [approval()]);
 
+  await page.context().addCookies([
+    {
+      name: "curie_console_session",
+      value: "session-example",
+      url: String(testInfo.project.use.baseURL),
+    },
+  ]);
+
   let resolveBody: Record<string, unknown> | null = null;
+  let resolveHeaders: Record<string, string> | null = null;
   await page.route("**/api/approvals/*/resolve", (route) => {
     resolveBody = JSON.parse(route.request().postData() ?? "{}");
+    resolveHeaders = route.request().headers();
     return route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify(approval({ status: "approved", resolved_by: "you@x.com" })),
+      body: JSON.stringify(approval({ status: "approved", resolved_by: "U0AUTHENTICATED" })),
     });
   });
 
   await openApprovalsTab(page);
   await page.getByTestId("approval-summary").click();
-  await page.getByLabel("resolved by").fill("you@x.com");
+  await page.getByLabel("note").fill("Confirmed in console");
   await page.getByTestId("approve-btn").click();
 
-  await expect.poll(() => resolveBody && (resolveBody as { decision?: string }).decision).toBe("approved");
-  await expect.poll(() => resolveBody && (resolveBody as { resolved_by?: string }).resolved_by).toBe("you@x.com");
+  await expect.poll(() => resolveBody).toEqual({ decision: "approved", note: "Confirmed in console" });
+  await expect.poll(() => resolveHeaders).not.toBeNull();
+  expect(resolveHeaders?.cookie).toContain("curie_console_session=session-example");
+  expect(resolveHeaders?.["x-api-key"]).toBeUndefined();
 });
 
 test("surfaces a 409 already-resolved conflict from the resolve route", async ({ page }) => {
@@ -95,7 +147,6 @@ test("surfaces a 409 already-resolved conflict from the resolve route", async ({
 
   await openApprovalsTab(page);
   await page.getByTestId("approval-summary").click();
-  await page.getByLabel("resolved by").fill("you@x.com");
   await page.getByTestId("reject-btn").click();
 
   await expect(page.getByTestId("resolve-error")).toContainText("Already resolved: already resolved by U-bob");

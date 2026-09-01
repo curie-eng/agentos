@@ -20,7 +20,7 @@ from typing import Any
 import pytest
 import redis
 import redis.asyncio as aioredis
-from curie_api import crud
+from curie_api import approval_principal, crud
 from curie_api.config import get_settings
 from curie_api.github_app import _RESOLVERS
 from curie_api.main import create_app
@@ -309,15 +309,22 @@ def _resolve(
     channel: str = "C0EXAMPLE1",
     note: str | None = None,
 ) -> Any:
+    token = approval_principal.mint(
+        get_settings().approval_chat_attester_secret,
+        subject=actor,
+        kind="chat",
+        actor_channel=channel,
+        approval_id=approval_id,
+        scope=approval_principal.APPROVE_SCOPE,
+        exp=int(datetime.now(UTC).timestamp()) + 60,
+    )
     return client.post(
         f"/approvals/{approval_id}/resolve",
-        json={
-            "decision": decision,
-            "resolved_by": actor,
-            "note": note,
-            "actor_channel": channel,
+        json={"decision": decision, "note": note},
+        headers={
+            **auth_headers,
+            "X-Curie-Approval-Principal": token,
         },
-        headers=auth_headers,
     )
 
 
@@ -1268,7 +1275,7 @@ def test_publication_patch_cap_counts_decoded_raw_bytes_exactly(
         assert _counts() == (0, 0)
 
 
-def test_publication_requester_self_approval_still_requires_membership_and_is_audited(
+def test_publication_requester_self_approval_requires_membership_and_is_audited(
     publication_stack: tuple[TestClient, str],
     auth_headers: dict[str, str],
     clean_db: None,
@@ -1305,9 +1312,11 @@ def test_publication_requester_self_approval_still_requires_membership_and_is_au
     assert denied["authorized"] is False
     assert resolved["authorized"] is True
     assert resolved["actor"] == "U0REQUEST1"
-    assert resolved["evidence"]["publication_requester_exception"] is True
+    assert "publication_requester_exception" not in resolved["evidence"]
     assert resolved["evidence"]["approvers_channel"] == "C0EXAMPLE1"
     assert resolved["evidence"]["actor_channel"] == "C0EXAMPLE1"
+    assert resolved["principal_kind"] == "chat"
+    assert resolved["authenticated"] is True
 
 
 def test_publication_resolution_cas_has_one_winner_and_never_enqueues_resume(

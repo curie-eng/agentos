@@ -856,8 +856,8 @@ pub enum MessageOutcomeOutput {
     NoEdit { thread: String },
     /// The turn parked awaiting human approval. `tier`/`agent`/`channel` shape the
     /// human resolve hint into a copy-paste-runnable `approvals <agent> --resolve
-    /// ... --actor-channel <channel>` command (#766); none of them touch
-    /// `to_json`, which stays byte-identical.
+    /// ...` command plus the authenticated card's real channel (#766, #1531);
+    /// none of them touch `to_json`, which stays byte-identical.
     AwaitingApproval {
         thread: String,
         reply: Option<String>,
@@ -1894,7 +1894,7 @@ const HINT_CHANNEL_LOOKUP_BUDGET: Duration = Duration::from_secs(10);
 /// A null `card_channel` means "an older row or a direct API write, so the
 /// requesting channel applies" (#1431), and the requesting channel IS the turn
 /// channel -- so it takes the same fallback rather than printing an empty or
-/// literal-null `--actor-channel`.
+/// literal-null card location.
 ///
 /// An EMPTY (or whitespace-only) `card_channel` takes that same fallback, and
 /// the reason is the server, not caution. The wire model admits
@@ -1903,12 +1903,10 @@ const HINT_CHANNEL_LOOKUP_BUDGET: Duration = Duration::from_secs(10);
 /// `approval.card_channel or approval.reply_channel`
 /// (`apps/api/src/curie_api/slack_approvers.py`). An empty string is FALSY in
 /// Python, so the server itself reads it as absent and falls back to
-/// `reply_channel` -- which is the turn channel. Echoing the empty value back
-/// would render `--actor-channel ''`, which that same membership check refuses
-/// 403 with "resolve this from the approval's channel": the exact failure #1531
-/// exists to remove. "Empty string is not the same as absent" is true in Rust
-/// and false on this wire, so do not collapse this arm back into a plain
-/// `Some(_)` match.
+/// `reply_channel` -- which is the turn channel. The CLI therefore describes
+/// that requesting channel as the authenticated card's location. "Empty string
+/// is not the same as absent" is true in Rust and false on this wire, so do not
+/// collapse this arm back into a plain `Some(_)` match.
 ///
 /// `deadline` is the TURN's overall deadline, not this lookup's. The effective
 /// bound is `capped(HINT_CHANNEL_LOOKUP_BUDGET, deadline)`, so a short
@@ -1990,15 +1988,12 @@ async fn hint_channel(
         // emptiness guard is load-bearing, not defensive: the server reads
         // `approval.card_channel or approval.reply_channel`, and in Python
         // that `or` treats ONLY the empty string as falsy. A whitespace-only
-        // value such as a single space is truthy there, so the authorizer
-        // treats it as a real card channel and compares `--actor-channel`
-        // against it byte for byte. This arm must mirror that exactly and
-        // print a whitespace-only channel verbatim rather than trimming it
-        // away (#1531, see the doc comment above). Do not add `.trim()` back:
-        // a trimmed whitespace-only channel would degrade to the turn
-        // channel, and the printed command would then name a channel the
-        // server does not accept for this approval, drawing exactly the 403
-        // that #1531 exists to remove.
+        // value such as a single space is truthy there, so the server treats it
+        // as the real card channel. This arm must mirror that exactly and print
+        // a whitespace-only channel verbatim rather than trimming it away
+        // (#1531, see the doc comment above). Do not add `.trim()` back: a
+        // trimmed whitespace-only channel would confidently direct the operator
+        // to the wrong authenticated card location.
         Ok(Some(card_channel)) if !card_channel.is_empty() => card_channel,
         // Every remaining arm is the same answer: "no answer". An expired budget
         // is indistinguishable from a 500 here, and a null or empty
@@ -2011,28 +2006,20 @@ async fn hint_channel(
 /// The one runnable `approvals --resolve` command shape, shared by the pre-wait
 /// hint and the terminal wording so the two cannot drift (#766).
 ///
-/// Every flag here is load-bearing against the server:
+/// Every part here is load-bearing against the server and operator recovery:
 /// - `<AGENT>` is a REQUIRED positional on the `approvals` clap surface
 ///   (`AgentTarget` flattens a mandatory `agent` arg), so omitting it made the
 ///   printed hint fail with `error: the following required arguments were not
 ///   provided: <AGENT>`.
-/// - `--as <user>` is required by `--resolve`, and the server blocks
-///   self-approval, so it must not be the turn's author.
-/// - `--actor-channel <channel>` is required by the DEFAULT approver set. With no
-///   `approvers` block on the route binding, the API selects
-///   `SlackChannelMembers(approval.card_channel or approval.reply_channel)`
-///   (`apps/api/src/curie_api/slack_approvers.py`), whose `contains` admits the
-///   actor only when `actor_channel` equals that channel -- otherwise the resolve
-///   is refused 403 ("resolve this from the approval's channel"). The channel this
-///   turn routed to IS `reply_channel`, so it is the correct value in the common
-///   case; a route binding that placed the card elsewhere carries a different
-///   `card_channel`. The pre-wait hint now resolves that `card_channel` itself
-///   whenever it has an approval id in hand ([`hint_channel`], #1531), so the
-///   caller hands this formatter the corrected value; `approvals --list` remains
-///   the fallback for the terminal arms that carry no parseable id and so print
-///   the literal `<id>`. (Route bindings that declare
-///   `approvers.users`/`approvers.group` ignore the channel entirely, so passing
-///   it is harmless there.)
+/// - The terminal command carries no asserted actor or channel. It authenticates
+///   with `CURIE_APPROVAL_PRINCIPAL_TOKEN`, and that channel-less operator
+///   principal is eligible only for an explicit-user approver set (ADR-0106).
+/// - `channel` is still the approval's real card location. The default approver
+///   set is that authenticated card channel's membership, so an operator without
+///   an explicit-user token route must act through the authenticated card. The
+///   pre-wait hint resolves `card_channel` per approval ([`hint_channel`],
+///   #1531), including nested gates, rather than pointing at the turn/stub
+///   channel.
 ///
 /// This stays a PURE formatter: it renders the channel it is GIVEN, verbatim,
 /// and does no I/O. The lookup lives in the caller precisely so a string helper
@@ -2040,7 +2027,10 @@ async fn hint_channel(
 /// dependency.
 fn approval_resolve_command(tier: &str, agent: Option<&str>, channel: &str, id: &str) -> String {
     let agent = agent.unwrap_or("<AGENT>");
-    format!("curie {tier} approvals {agent} --resolve {id} --as <user> --actor-channel '{channel}'")
+    format!(
+        "curie {tier} approvals {agent} --resolve {id}  # authenticated card channel: \
+         {channel:?}; a terminal principal works only for an explicit-user route"
+    )
 }
 
 /// The awaiting-approval terminal wording a `local`/`cluster message` prints when
@@ -2064,10 +2054,11 @@ fn note_approval_pending(ui: &crate::ui::Ui, tier: &str, agent: Option<&str>, ch
     );
     ui.note(&format!(
         "resolve it later with `{command}` (the id is listed by `curie {tier} approvals \
-         <AGENT> --list`, which also reports the approval's channel if its route binds one). \
-         Because this command has exited, the resumed reply does NOT print here -- read it from \
-         the agent transcript. There is no clickable Slack card unless a real workspace is \
-         connected (`curie {tier} comms --slack`).",
+         <AGENT> --list`). Set CURIE_APPROVAL_PRINCIPAL_TOKEN only for a route whose approvers \
+         are an explicit user list; otherwise use the authenticated card in the channel named \
+         above. Because this command has exited, the resumed reply does NOT print here -- read \
+         it from the agent transcript. There is no clickable Slack card unless a real workspace \
+         is connected (`curie {tier} comms --slack`).",
     ));
 }
 
@@ -4748,12 +4739,9 @@ mod tests {
         assert_eq!(opts.chart, "charts/curie");
     }
 
-    /// The printed resolve hint must be runnable AS PRINTED. Every flag the
-    /// server requires has to be on it: the mandatory `<AGENT>` positional,
-    /// `--as`, and `--actor-channel` -- without the last one the default
-    /// channel-membership approver set
-    /// (`SlackChannelMembers.contains`, apps/api/.../slack_approvers.py) refuses
-    /// the resolve with 403 and the waiting CLI just times out (#766).
+    /// The printed resolve hint is runnable as a principal-backed command and
+    /// separately names the authenticated card's real channel. It must never
+    /// revive the retired caller-asserted actor/channel flags (ADR-0106).
     #[test]
     fn the_resolve_hint_carries_every_flag_the_server_requires() {
         let id = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
@@ -4761,16 +4749,27 @@ mod tests {
         assert_eq!(
             line,
             format!(
-                "curie local approvals weather-bot --resolve {id} --as <user> \
-                 --actor-channel 'C-SIM-abc'"
+                "curie local approvals weather-bot --resolve {id}  # authenticated card \
+                 channel: \"C-SIM-abc\"; a terminal principal works only for an \
+                 explicit-user route"
             )
         );
+        assert!(!line.contains("--as"), "{line}");
+        assert!(!line.contains("--actor-channel"), "{line}");
 
         // With no resolved agent name the `<AGENT>` slot keeps the command shape
-        // valid so the operator sees the slot to fill, and the channel still rides.
+        // valid, while the actual authenticated-card channel remains explanatory.
         let line = approval_resolve_command("cluster", None, "C-SIM-xyz", id);
         assert!(line.contains("approvals <AGENT> --resolve"), "{line}");
-        assert!(line.contains("--actor-channel 'C-SIM-xyz'"), "{line}");
+        assert!(
+            line.contains("authenticated card channel: \"C-SIM-xyz\""),
+            "{line}"
+        );
+        assert!(line.contains("explicit-user route"), "{line}");
+        assert!(
+            !line.contains("--as") && !line.contains("--actor-channel"),
+            "{line}"
+        );
         assert!(line.starts_with("curie cluster approvals"), "{line}");
 
         // #1531: the fix for the wrong-channel hint resolves the approval's
@@ -4783,24 +4782,29 @@ mod tests {
         for tier in ["local", "cluster"] {
             let line = approval_resolve_command(tier, Some("weather-bot"), "C-SIM-route", id);
             assert!(
-                line.contains("--actor-channel 'C-SIM-route'"),
-                "the formatter must echo the channel it was handed, not one it \
-                 sourced itself ({tier}): {line}"
+                line.contains("authenticated card channel: \"C-SIM-route\""),
+                "the formatter must explain the actual card channel it was handed \
+                 ({tier}): {line}"
             );
             assert!(
-                !line.contains("C-SIM-abc") && !line.contains("C-SIM-xyz"),
-                "no channel from an earlier call may leak into this one \
+                !line.contains("C-SIM-turn")
+                    && !line.contains("C0LOCALDEV")
+                    && !line.contains("C-SIM-abc")
+                    && !line.contains("C-SIM-xyz"),
+                "no turn, stub, or earlier card channel may replace the real card channel \
                  ({tier}): {line}"
+            );
+            assert!(
+                !line.contains("--as") && !line.contains("--actor-channel"),
+                "{line}"
             );
         }
     }
 
     // ─── #1531 finding 3: the advisory hint-channel lookup ───────────────────
     //
-    // RED CONTRACT: the tests below call a private helper that does not exist
-    // yet, so this crate fails to COMPILE until it is added -- the intended RED
-    // signal, matching the idiom at
-    // `cli/tests/approvals_resolve_actor_channel.rs:14-24`. Intended shape:
+    // The private helper below is kept here so its deadline and degraded-path
+    // behavior can be tested without widening the crate's public API:
     //
     //     async fn hint_channel(
     //         opts: &MessageOpts,
@@ -4867,14 +4871,13 @@ mod tests {
     /// What this turn routed to: the value the hint prints today, and the value
     /// every degraded path must keep printing.
     const HINT_TURN_CHANNEL: &str = "C-SIM-turn";
-    /// Where the route binding actually put the card: the value the server's
-    /// authorizer compares `--actor-channel` against.
+    /// Where the route binding actually put the card: authenticated channel
+    /// location used to help the operator find the approval card.
     const HINT_CARD_CHANNEL: &str = "C-SIM-card";
     /// Placeholder platform API key for the hint lookup tests. Held in a const
     /// rather than written inline so the commit-time secret scan does not read
     /// an `api_key: "..."` assignment as a real credential; the same shape is
-    /// already proven safe at
-    /// `cli/tests/approvals_resolve_actor_channel.rs:30`.
+    /// already proven safe in the approval CLI integration tests.
     const HINT_API_KEY: &str = "test-key";
 
     /// A one-endpoint stand-in for the platform API on an ephemeral port,
@@ -4978,7 +4981,7 @@ mod tests {
         assert_eq!(
             resolved, HINT_CARD_CHANNEL,
             "the hint must name the channel the card was posted to, which is \
-             what the server-side authorizer compares --actor-channel against"
+             where an authenticated chat principal can act on the card"
         );
         assert_ne!(
             resolved, HINT_TURN_CHANNEL,
@@ -5186,7 +5189,7 @@ mod tests {
     /// here would print an unrunnable command.
     ///
     /// Mutation it catches: `unwrap_or_default()` on the option, which yields
-    /// `--actor-channel ''`.
+    /// an empty, unusable channel hint.
     #[tokio::test]
     async fn the_hint_names_the_turn_channel_when_the_record_binds_no_route() {
         let base = hint_stub_api(200, HINT_UNROUTED_APPROVAL).await;
@@ -5216,11 +5219,9 @@ mod tests {
     /// `approval.card_channel or approval.reply_channel`
     /// (`apps/api/src/curie_api/slack_approvers.py:174`), and an empty string is
     /// falsy in Python, so the members of the REPLY channel are the approver
-    /// set. A CLI that echoed the empty value would print `--actor-channel ''`,
-    /// which that same membership check refuses 403 with "resolve this from the
-    /// approval's channel" -- the exact failure #1531 exists to remove,
-    /// reintroduced by the fix for it and on a record shape nothing else in the
-    /// suite covers.
+    /// set. A CLI that echoed the empty value would print an unusable hint --
+    /// the exact failure #1531 exists to remove, reintroduced by the fix for it
+    /// and on a record shape nothing else in the suite covers.
     ///
     /// The turn channel is the right answer rather than merely a safe one: it
     /// IS the reply channel, which is what the server falls back to.
@@ -5243,8 +5244,8 @@ mod tests {
 
         assert!(
             !resolved.is_empty(),
-            "the hint must never render `--actor-channel ''`; an empty channel \
-             is a guaranteed 403 on the default approver set"
+            "the hint must never report an empty card location; fall back to \
+             the requesting channel when no route-bound location exists"
         );
         assert_eq!(
             resolved, HINT_TURN_CHANNEL,
@@ -5263,11 +5264,10 @@ mod tests {
     /// approver set with `approval.card_channel or approval.reply_channel`
     /// (`apps/api/src/curie_api/slack_approvers.py:174`), and in Python ONLY the
     /// empty string is falsy. `" "` is truthy, so the authorizer takes that
-    /// exact whitespace value as the card channel and compares
-    /// `--actor-channel` against it. A CLI that trimmed before testing for
-    /// emptiness would degrade to the turn channel and hand the operator a
-    /// command the server refuses 403 -- which is the very failure #1531 exists
-    /// to remove, so a guard meant to prevent it would be causing it.
+    /// exact whitespace value as the card channel. A CLI that trimmed before
+    /// testing for emptiness would degrade to the turn channel and hand the
+    /// operator the wrong card location -- which is the very failure #1531
+    /// exists to remove, so a guard meant to prevent it would be causing it.
     ///
     /// The CLI's job here is to mirror Python falsiness exactly, not to improve
     /// on it: only `""` is absent, and everything else is printed as-is. A later
@@ -5442,12 +5442,11 @@ mod tests {
     ///
     /// What it covers:
     ///
-    /// 1. DEGRADATION (#1531 finding 3). The hint is a command a human copy
-    ///    pastes, and the default approver set compares `--actor-channel`
-    ///    against the approval's channel. A cluster whose API cannot be reached
-    ///    knows nothing about the card, so it must print exactly what the hint
-    ///    printed before this change. A wrong or empty channel is a guaranteed
-    ///    403, which is the failure #1531 exists to remove.
+    /// 1. DEGRADATION (#1531 finding 3). The hint tells a human where the
+    ///    approval card was posted. A cluster whose API cannot be reached knows
+    ///    nothing about the card, so it must print exactly what the hint printed
+    ///    before this change. A wrong or empty channel sends the operator to the
+    ///    wrong place, which is the failure #1531 exists to remove.
     /// 2. BOUND. The lookup runs INSIDE the resume wait, so a cluster arm that
     ///    sat on `start_port_forward` would freeze a terminal on a turn whose
     ///    durable approval is already fine.
@@ -5503,8 +5502,8 @@ mod tests {
         );
         assert!(
             !resolved.is_empty(),
-            "the hint must never render `--actor-channel ''` on the cluster arm \
-             either; an empty channel is a guaranteed 403"
+            "the cluster hint must never report an empty card location; its \
+             unreachable-API fallback is the requesting channel"
         );
         // A forward that cannot bind fails at once on every environment listed
         // above, so anything near the budget means the failure is being waited

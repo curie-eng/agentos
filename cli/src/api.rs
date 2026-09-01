@@ -15,6 +15,37 @@ pub struct ApiClient {
     http: reqwest::Client,
 }
 
+/// One-time delivery returned by the administrative operator-principal mint.
+///
+/// Deliberately does not derive `Debug`: the token may be printed only by the
+/// explicit mint result, never by an incidental diagnostic.
+pub struct OperatorPrincipalDelivery {
+    pub token: String,
+    pub subject: String,
+    pub expires_at: String,
+}
+
+/// One-time delivery returned by the administrative console login-code mint.
+///
+/// Like [`OperatorPrincipalDelivery`], this is intentionally not `Debug` so a
+/// future error path cannot accidentally include the credential.
+pub struct ConsoleLoginCodeDelivery {
+    pub code: String,
+    pub subject: String,
+    pub expires_at: String,
+}
+
+fn required_response_string(
+    body: &serde_json::Value,
+    field: &str,
+    response_name: &str,
+) -> Result<String> {
+    body.get(field)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .with_context(|| format!("decoding {response_name}: missing string field {field:?}"))
+}
+
 /// One cursor page from the rollout-free disconnected cluster-message reply
 /// relay. The API stores channel-protocol events verbatim; the CLI projects
 /// only the fields needed to render progress and recognize semantic completion.
@@ -352,12 +383,11 @@ pub struct ApprovalRecord {
     pub resolved_by: Option<String>,
     /// The channel the approval card was posted to (#1078). Load-bearing, not
     /// a delivery detail: with no `approvers` block on the route this channel's
-    /// MEMBERS are the approver set, and `--resolve` needs it as
-    /// `--actor-channel` because that is what the server-side authorizer
-    /// compares against. Without it the value is underivable from the CLI and
-    /// a guess is a refusal. `#[serde(default)]` keeps a record that predates
-    /// route bindings parsing to None, which is the same fact as "no route, so
-    /// the requesting channel applies".
+    /// MEMBERS are the approver set. The terminal principal carries no channel,
+    /// so the CLI reports this value as the authenticated card location instead
+    /// of asserting it during resolution. `#[serde(default)]` keeps a record
+    /// that predates route bindings parsing to None, which means the requesting
+    /// channel applies.
     #[serde(default)]
     pub card_channel: Option<String>,
 }
@@ -2317,11 +2347,10 @@ impl ApiClient {
     ///
     /// The CLI reads this for `card_channel` (#1531 finding 3): a route binding
     /// can put the card in a channel other than the one the turn spoke in, and
-    /// the printed resolve hint has to name the channel the server's authorizer
-    /// actually compares `--actor-channel` against. The single-record read is
-    /// what the hint needs rather than [`Self::list_pending_approvals`], whose
-    /// page is capped at the server max and can simply not contain the approval
-    /// being waited on (#670).
+    /// the printed resolve hint has to name the authenticated card's real
+    /// location. The single-record read is what the hint needs rather than
+    /// [`Self::list_pending_approvals`], whose page is capped at the server max
+    /// and can simply not contain the approval being waited on (#670).
     ///
     /// Deliberately UNBOUNDED here, unlike [`Self::check_git_flow_routing`]:
     /// this stays a plain mirror of the endpoint like every other method, so a
@@ -2344,31 +2373,29 @@ impl ApiClient {
             .context("decoding the approval")
     }
 
-    /// Resolve one approval as a chosen actor: `POST /approvals/{id}/resolve`.
-    /// The server owns the resolve-once CAS, the authorizer (self-approval block,
-    /// route approvers), and the resume-turn enqueue; `resolved_by` is the acting
-    /// actor (the `--as` flag), which is what makes requester != approver
-    /// expressible without hand-curling the API (#506).
+    /// Resolve one approval as the authenticated principal carried by
+    /// `principal_token`: `POST /approvals/{id}/resolve`.
+    ///
+    /// The body carries policy input only. The API derives `resolved_by` and any
+    /// channel evidence from the credential, then owns the membership check,
+    /// resolve-once CAS, audit entry and resume-turn enqueue (ADR-0106, #1531).
     pub async fn resolve_approval(
         &self,
         approval_id: &str,
         decision: &str,
-        resolved_by: &str,
+        principal_token: &str,
         note: Option<&str>,
-        actor_channel: Option<&str>,
     ) -> Result<ApprovalRecord> {
-        let mut body = json!({ "decision": decision, "resolved_by": resolved_by });
+        let mut body = json!({ "decision": decision });
         if let Some(note) = note {
             body["note"] = json!(note);
-        }
-        if let Some(chan) = actor_channel {
-            body["actor_channel"] = json!(chan);
         }
         let resp = self
             .send_request(
                 self.http
                     .post(format!("{}/approvals/{approval_id}/resolve", self.base_url))
                     .header("X-API-Key", &self.api_key)
+                    .header("X-Curie-Approval-Principal", principal_token)
                     .json(&body),
                 "POST /approvals/{id}/resolve",
             )
@@ -2378,6 +2405,65 @@ impl ApiClient {
             .json()
             .await
             .context("decoding resolved approval")
+    }
+
+    /// Mint a reusable operator approval principal under the platform key.
+    /// The returned token is a one-time delivery and is never cached by the CLI.
+    pub async fn mint_operator_principal(
+        &self,
+        subject: &str,
+    ) -> Result<OperatorPrincipalDelivery> {
+        let resp = self
+            .send_request(
+                self.http
+                    .post(format!("{}/approvals/principals/operator", self.base_url))
+                    .header("X-API-Key", &self.api_key)
+                    .json(&json!({ "subject": subject })),
+                "POST /approvals/principals/operator",
+            )
+            .await?;
+        let body: serde_json::Value = Self::expect_ok(resp, "minting operator principal")
+            .await?
+            .json()
+            .await
+            .context("decoding operator principal delivery")?;
+        Ok(OperatorPrincipalDelivery {
+            token: required_response_string(&body, "token", "operator principal delivery")?,
+            subject: required_response_string(&body, "subject", "operator principal delivery")?,
+            expires_at: required_response_string(
+                &body,
+                "expires_at",
+                "operator principal delivery",
+            )?,
+        })
+    }
+
+    /// Mint a subject-bound, single-use console login code under the platform
+    /// key. The plaintext code is returned once and is never cached by the CLI.
+    pub async fn mint_console_login_code(&self, subject: &str) -> Result<ConsoleLoginCodeDelivery> {
+        let resp = self
+            .send_request(
+                self.http
+                    .post(format!("{}/console/login-codes", self.base_url))
+                    .header("X-API-Key", &self.api_key)
+                    .json(&json!({ "subject": subject })),
+                "POST /console/login-codes",
+            )
+            .await?;
+        let body: serde_json::Value = Self::expect_ok(resp, "minting console login code")
+            .await?
+            .json()
+            .await
+            .context("decoding console login-code delivery")?;
+        Ok(ConsoleLoginCodeDelivery {
+            code: required_response_string(&body, "code", "console login-code delivery")?,
+            subject: required_response_string(&body, "subject", "console login-code delivery")?,
+            expires_at: required_response_string(
+                &body,
+                "expires_at",
+                "console login-code delivery",
+            )?,
+        })
     }
 
     /// Set the agent's approval-required tool gates: `PATCH /agents/{id}` with

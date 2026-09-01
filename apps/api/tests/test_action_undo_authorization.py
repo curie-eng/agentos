@@ -9,11 +9,11 @@ action nobody had to approve is not gated on the way back either -- the state
 being restored is one the cluster was already in, and it got there without anyone
 approving it.
 
-What is deliberately NOT inherited is the self-approval refusal (#246). That rule
-stops a requester approving their own REQUEST. An undo is not a request: the
-actor is putting back a state that predates it, so requiring them not to be the
-turn's author would be MORE authorization than the forward action needed, which
-is the half of decision 3 that says "and no more".
+ADR-0106's authenticated-principal contract applies to approval resolution, not
+this ADR-0117 action-undo seam. Undo preserves ADR-0117's existing approver-set
+check over the request's actor and actor channel without adding a
+distinct-requester rule. Adding that rule would be MORE authorization than the
+forward action needed, which is the half of decision 3 that says "and no more".
 """
 
 from __future__ import annotations

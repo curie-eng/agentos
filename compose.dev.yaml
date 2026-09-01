@@ -391,6 +391,11 @@ services:
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/postgres
       DB_SCHEMA: curie
       API_KEY: curie-dev-key
+      # Dedicated Slack approval-principal attestation key. It is independent
+      # from API_KEY so an administrator holding the platform key cannot forge
+      # the authenticated Slack identity/channel evidence accepted by the API.
+      # Only the API verifier and dispatcher producer receive it.
+      CURIE_APPROVAL_CHAT_ATTESTER_SECRET: ${CURIE_APPROVAL_CHAT_ATTESTER_SECRET:-curie-dev-approval-chat-attester}
       CURIE_INTERNAL_WORKER_TOKEN: curie-dev-worker-token
       VALKEY_HOST: valkey
       VALKEY_PORT: "6379"
@@ -686,6 +691,9 @@ services:
       # Mirrors curie-api's API_KEY so resolve calls authenticate. Wired
       # explicitly rather than relying on the two defaults happening to match.
       CURIE_API_KEY: curie-dev-key
+      # Same independent attestation key the API verifies. Do not reuse
+      # CURIE_API_KEY: that would let any platform-key holder mint chat proof.
+      CURIE_APPROVAL_CHAT_ATTESTER_SECRET: ${CURIE_APPROVAL_CHAT_ATTESTER_SECRET:-curie-dev-approval-chat-attester}
       # Like API/worker, explicit empty disables export for a core-only stack.
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT-http://otel-collector:4318}
       OTEL_EXPORTER_OTLP_PROTOCOL: ${OTEL_EXPORTER_OTLP_PROTOCOL-http/protobuf}

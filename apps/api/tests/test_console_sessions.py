@@ -14,10 +14,8 @@ the table exists rather than the console simply holding the platform key:
 - the exchange response carries no token, only a cookie, so page script never
   sees the credential it authenticates with.
 
-Nothing consumes a session yet -- `require_api_key` starts accepting one in slice
-2 (#1045) -- so there is deliberately no test here that a session authorizes a
-real request. What IS asserted is that the store can express liveness, which is
-what slice 2 will build on.
+ADR-0106 now consumes the subject-bound session only for approval resolution;
+the platform-key surface remains a separate administrative boundary.
 """
 
 import asyncio
@@ -31,6 +29,8 @@ from curie_api.models import ConsoleSession
 from curie_api.routers.console import SESSION_COOKIE
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+
+SUBJECT = "U0EXAMPLE1"
 
 
 def with_session[T](body: Callable[[AsyncSession], Awaitable[T]]) -> T:
@@ -58,14 +58,17 @@ def with_session[T](body: Callable[[AsyncSession], Awaitable[T]]) -> T:
 def test_minting_requires_the_platform_key(client: Any, clean_db: None) -> None:
     # Minting is an administrative act; only the CLI, holding the platform key,
     # should be able to do it.
-    assert client.post("/console/login-codes").status_code == 401
+    assert client.post("/console/login-codes", json={"subject": SUBJECT}).status_code == 401
 
 
 def test_mint_then_exchange_sets_an_httponly_cookie_and_returns_no_token(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
-    minted = client.post("/console/login-codes", headers=auth_headers)
+    minted = client.post(
+        "/console/login-codes", json={"subject": SUBJECT}, headers=auth_headers
+    )
     assert minted.status_code == 201, minted.text
+    assert minted.json()["subject"] == SUBJECT
     code = minted.json()["code"]
 
     # The exchange needs no credential of its own: the code IS the credential.
@@ -77,6 +80,7 @@ def test_mint_then_exchange_sets_an_httponly_cookie_and_returns_no_token(
     body = exchanged.json()
     assert "token" not in body and "session_token" not in body, body
     assert "expires_at" in body
+    assert body["subject"] == SUBJECT
 
     # ... and the cookie must be HttpOnly, so page script cannot read it.
     set_cookie = exchanged.headers.get("set-cookie", "")
@@ -89,7 +93,9 @@ def test_mint_then_exchange_sets_an_httponly_cookie_and_returns_no_token(
 def test_a_login_code_works_exactly_once(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
-    code = client.post("/console/login-codes", headers=auth_headers).json()["code"]
+    code = client.post(
+        "/console/login-codes", json={"subject": SUBJECT}, headers=auth_headers
+    ).json()["code"]
     assert client.post("/console/session", json={"code": code}).status_code == 200
     # Second attempt: the code is consumed.
     again = client.post("/console/session", json={"code": code})
@@ -101,7 +107,9 @@ def test_an_unknown_code_fails_identically_to_a_consumed_one(
 ) -> None:
     # Indistinguishable failures, so the endpoint cannot be used to learn which
     # codes exist.
-    used = client.post("/console/login-codes", headers=auth_headers).json()["code"]
+    used = client.post(
+        "/console/login-codes", json={"subject": SUBJECT}, headers=auth_headers
+    ).json()["code"]
     client.post("/console/session", json={"code": used})
 
     consumed = client.post("/console/session", json={"code": used})
@@ -118,7 +126,9 @@ def test_no_plaintext_credential_is_ever_stored(
 ) -> None:
     """The property that makes a database dump useless to an attacker."""
 
-    code = client.post("/console/login-codes", headers=auth_headers).json()["code"]
+    code = client.post(
+        "/console/login-codes", json={"subject": SUBJECT}, headers=auth_headers
+    ).json()["code"]
     client.post("/console/session", json={"code": code})
 
     async def read(session: AsyncSession) -> list[ConsoleSession]:
@@ -127,6 +137,7 @@ def test_no_plaintext_credential_is_ever_stored(
     rows = with_session(read)
     assert len(rows) == 1
     row = rows[0]
+    assert row.subject == SUBJECT
     assert code not in f"{row.login_code_hash}{row.session_token_hash}"
     # Hashes, not values: hex SHA-256 is 64 characters.
     assert len(row.login_code_hash) == 64
@@ -137,7 +148,7 @@ def test_no_plaintext_credential_is_ever_stored(
 def test_an_expired_code_cannot_be_exchanged(clean_db: None) -> None:
     async def body(session: AsyncSession) -> None:
         # Injected clock rather than sleeping: expiry is arithmetic, not a race.
-        code, row = await crud.create_console_login_code(session)
+        code, row = await crud.create_console_login_code(session, subject=SUBJECT)
         past = row.login_code_expires_at + timedelta(seconds=1)
         assert await crud.exchange_console_login_code(session, code, now=past) is None
 
@@ -146,12 +157,13 @@ def test_an_expired_code_cannot_be_exchanged(clean_db: None) -> None:
 
 def test_a_live_session_is_recognized_and_expiry_ends_it(clean_db: None) -> None:
     async def body(session: AsyncSession) -> None:
-        code, _ = await crud.create_console_login_code(session)
+        code, _ = await crud.create_console_login_code(session, subject=SUBJECT)
         exchanged = await crud.exchange_console_login_code(session, code)
         assert exchanged is not None
         token, row = exchanged
 
         assert await crud.live_console_session(session, token) is not None
+        assert row.subject == SUBJECT
         assert row.session_expires_at is not None
         after = row.session_expires_at + timedelta(seconds=1)
         assert await crud.live_console_session(session, token, now=after) is None
@@ -165,7 +177,7 @@ def test_revocation_kills_a_live_session_without_waiting_for_expiry(
     """The reason this is a table and not a signed stateless token (ADR-0083)."""
 
     async def body(session: AsyncSession) -> None:
-        code, _ = await crud.create_console_login_code(session)
+        code, _ = await crud.create_console_login_code(session, subject=SUBJECT)
         exchanged = await crud.exchange_console_login_code(session, code)
         assert exchanged is not None
         token, row = exchanged
@@ -180,7 +192,7 @@ def test_revocation_kills_a_live_session_without_waiting_for_expiry(
 
 def test_a_revoked_row_cannot_still_have_its_code_exchanged(clean_db: None) -> None:
     async def body(session: AsyncSession) -> None:
-        code, row = await crud.create_console_login_code(session)
+        code, row = await crud.create_console_login_code(session, subject=SUBJECT)
         await crud.revoke_console_session(session, row)
         assert await crud.exchange_console_login_code(session, code) is None
 

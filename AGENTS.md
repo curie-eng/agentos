@@ -338,6 +338,10 @@ Known seam pairs:
   `APPROVE_ACTION_ID_PREFIX` (`cli/src/chat.rs`) can't share code across
   Python/Rust, so they are frozen together in
   `tests/vectors/approval-action-ids.json`.
+- dispatcher vs API approval-principal tokens -- the dispatcher mint codec
+  (`apps/dispatcher/src/curie_dispatcher/approval_principal.py`) and API verifier
+  (`apps/api/src/curie_api/approval_principal.py`) are frozen together in
+  `tests/vectors/approval-principal.json`.
 - API vs worker vs CLI thread-reset SET -- `THREAD_RESET_SET` /
   `THREAD_RESET_INFLIGHT_SET` (`apps/api/src/curie_api/threadreset.py`,
   `apps/worker/src/curie_worker/consumer.py`) and the CLI's `THREAD_RESET_SET`

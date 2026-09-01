@@ -28,6 +28,7 @@ from .workspace_policy import valid_allowlist_entry
 _DEV_DEFAULT_API_KEY = "curie-dev-key"
 _DEV_DEFAULT_WEBHOOK_SECRET = "dev-webhook-secret"
 _DEV_DEFAULT_INTERNAL_WORKER_TOKEN = "curie-dev-worker-token"
+_DEV_DEFAULT_APPROVAL_CHAT_ATTESTER_SECRET = "curie-dev-approval-chat-attester"
 
 
 class Settings(BaseSettings):
@@ -45,13 +46,21 @@ class Settings(BaseSettings):
 
     # Single shared API key. Dev-only default; override in any shared deployment.
     api_key: str = "curie-dev-key"
+    # Dedicated credential with which the dispatcher attests a Slack identity,
+    # channel, and approval id.  It has no built-in value and must never fall
+    # back to the platform key: sharing those keys would let any API-key holder
+    # forge the chat evidence that channel/group approver sets trust.
+    approval_chat_attester_secret: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "CURIE_APPROVAL_CHAT_ATTESTER_SECRET", "approval_chat_attester_secret"
+        ),
+    )
     # Separate trust boundary for credential redemption. The operator/CLI API
     # key can administer deployments but cannot redeem the GitHub identity.
     internal_worker_token: str = Field(
         default=_DEV_DEFAULT_INTERNAL_WORKER_TOKEN,
-        validation_alias=AliasChoices(
-            "CURIE_INTERNAL_WORKER_TOKEN", "INTERNAL_WORKER_TOKEN"
-        ),
+        validation_alias=AliasChoices("CURIE_INTERNAL_WORKER_TOKEN", "INTERNAL_WORKER_TOKEN"),
     )
 
     # Human-readable org/workspace name the UI reads (open /config endpoint) to
@@ -397,9 +406,7 @@ class Settings(BaseSettings):
             entry for entry in self.github_repo_allowlist if not valid_allowlist_entry(entry)
         ]
         if invalid:
-            raise ValueError(
-                "GITHUB_REPO_ALLOWLIST entries must be owner/repository or owner/*"
-            )
+            raise ValueError("GITHUB_REPO_ALLOWLIST entries must be owner/repository or owner/*")
         return self
 
     @model_validator(mode="after")
@@ -407,6 +414,11 @@ class Settings(BaseSettings):
         """Production boot gate (#57): with ENVIRONMENT=prod, refuse to start if a
         shared secret is unset or still the shipped dev default, so a prod deploy
         can never silently run on well-known credentials."""
+        attester_secret = self.approval_chat_attester_secret
+        if attester_secret and not attester_secret.strip():
+            raise ValueError("CURIE_APPROVAL_CHAT_ATTESTER_SECRET must be non-blank")
+        if attester_secret and attester_secret == self.api_key:
+            raise ValueError("CURIE_APPROVAL_CHAT_ATTESTER_SECRET must be distinct from API_KEY")
         if self.environment.strip().lower() != "prod":
             return self
         offenders = []
@@ -416,6 +428,8 @@ class Settings(BaseSettings):
             offenders.append("GITHUB_WEBHOOK_SECRET")
         if self.internal_worker_token in ("", _DEV_DEFAULT_INTERNAL_WORKER_TOKEN):
             offenders.append("CURIE_INTERNAL_WORKER_TOKEN")
+        if attester_secret in ("", _DEV_DEFAULT_APPROVAL_CHAT_ATTESTER_SECRET):
+            offenders.append("CURIE_APPROVAL_CHAT_ATTESTER_SECRET")
         if offenders:
             raise ValueError(
                 "ENVIRONMENT=prod but these secrets are unset or still the dev "

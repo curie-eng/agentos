@@ -123,6 +123,11 @@ spec:
                 secretKeyRef:
                   name: {{ include "curie.secretName" . }}
                   key: apiKey
+            - name: CURIE_APPROVAL_CHAT_ATTESTER_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "curie.secretName" . }}
+                  key: approvalChatAttesterSecret
             - name: CURIE_INTERNAL_WORKER_TOKEN
               valueFrom:
                 secretKeyRef:

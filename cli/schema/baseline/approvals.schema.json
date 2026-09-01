@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/approvals/v2.0.json",
+  "$id": "https://schemas.curietech.ai/cli/approvals/v2.1.json",
   "title": "curie <tier> approvals --json",
-  "description": "The agent-facing payload of `curie <tier> approvals <agent>`: the dry-run plan; the gate list (`manifest_unreadable` non-null when the deployed manifest could not be read); the pending approval records (`truncated` true when the server page cap was hit); a single resolved record; or the agent's approval route bindings. Each binding separates its verified interactive Slack `resolution`, optional text-only `notification`, and optional `approvers` authority.",
+  "description": "The agent-facing payload of `curie <tier> approvals <agent>`: the dry-run plan; the gate list (`manifest_unreadable` non-null when the deployed manifest could not be read); the pending approval records (`truncated` true when the server page cap was hit); a single resolved record; one-time operator-principal or console-login-code delivery; or the agent's approval route bindings. Each binding separates its verified interactive Slack `resolution`, optional text-only `notification`, and optional `approvers` authority.",
   "$defs": {
     "dryRun": {
       "type": "object",
@@ -73,7 +73,7 @@
           ]
         },
         "card_channel": {
-          "description": "The channel the approval card was posted to, or null on an older row or a direct API write that omitted the field. This is what `--resolve` needs as `--actor-channel`: with no `approvers` block the channel's MEMBERS are the approver set, and the server-side authorizer compares against it, so the value is not derivable by guessing (#1078).\n\nOPTIONAL, and the only optional property in this record, which is deliberate rather than an oversight. Every sibling was required at birth, when no compatibility question existed. ADR-0101 prefers optional for a property added later: a consumer can tolerate its absence in a payload from an older CLI, which keeps this a MINOR bump. Making it required would reject those older payloads and cost a major version for no gain.",
+          "description": "The channel the approval card was posted to, or null on an older row or a direct API write that omitted the field. The CLI uses the authenticated card channel in its resolve hint; resolver identity and channel are derived from the authenticated principal and are never asserted as request fields.\n\nOPTIONAL, and the only optional property in this record, which is deliberate rather than an oversight. Every sibling was required at birth, when no compatibility question existed. ADR-0101 prefers optional for a property added later: a consumer can tolerate its absence in a payload from an older CLI, which keeps this a MINOR bump. Making it required would reject those older payloads and cost a major version for no gain.",
           "type": [
             "string",
             "null"
@@ -231,6 +231,40 @@
       "required": [
         "resolved"
       ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "operator_principal": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "token": {"type": "string"},
+            "subject": {"type": "string"},
+            "expires_at": {"type": "string"}
+          },
+          "required": ["token", "subject", "expires_at"]
+        }
+      },
+      "required": ["operator_principal"]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "console_login_code": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {"type": "string"},
+            "subject": {"type": "string"},
+            "expires_at": {"type": "string"}
+          },
+          "required": ["code", "subject", "expires_at"]
+        }
+      },
+      "required": ["console_login_code"]
     },
     {
       "type": "object",

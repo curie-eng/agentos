@@ -1240,11 +1240,6 @@ enum SkillAction {
         /// the same reason as --list; declined with that reason.
         #[arg(long, value_name = "APPROVAL_ID")]
         resolve: Option<String>,
-        /// The actor resolving the approval (paired with --resolve on
-        /// local/cluster). Accepted here only so a local/cluster-style resolve
-        /// invocation is declined cleanly, not rejected as an unknown flag.
-        #[arg(long = "as", value_name = "USER")]
-        as_actor: Option<String>,
         /// Reject instead of approve (paired with --resolve). Accepted only to be
         /// declined cleanly at this tier.
         #[arg(long)]
@@ -1757,23 +1752,24 @@ enum LocalAction {
         /// List the agent's pending approval records instead of the gate config.
         #[arg(long)]
         list: bool,
-        /// Resolve the approval with this id (approve by default; requires --as).
+        /// Resolve the approval with this id (approve by default). Authentication
+        /// comes from CURIE_APPROVAL_PRINCIPAL_TOKEN.
         #[arg(long, value_name = "APPROVAL_ID")]
         resolve: Option<String>,
-        /// The actor resolving the approval (required with --resolve). The
-        /// requester and approver may differ; the server blocks self-approval.
-        #[arg(long = "as", value_name = "USER")]
-        as_actor: Option<String>,
         /// Reject instead of approve (with --resolve).
         #[arg(long)]
         reject: bool,
         /// Optional note recorded with the resolution (with --resolve).
         #[arg(long)]
         note: Option<String>,
-        /// Channel id asserting the operator's membership, required by
-        /// channel-authorized approval gates (with --resolve).
-        #[arg(long)]
-        actor_channel: Option<String>,
+        /// Administratively mint a reusable, subject-bound operator principal.
+        /// The token is delivered once; export it as
+        /// CURIE_APPROVAL_PRINCIPAL_TOKEN before resolving.
+        #[arg(long, value_name = "SUBJECT")]
+        mint_operator_principal: Option<String>,
+        /// Administratively mint a single-use, subject-bound Console login code.
+        #[arg(long, value_name = "SUBJECT")]
+        mint_console_login_code: Option<String>,
         /// Bind a manifest route's verified Slack resolution card, as
         /// NAME=CHANNEL (e.g. deal_desk=C0123ABCD). Repeatable. A write REPLACES
         /// the whole route map, like --gate does for tool gates.
@@ -2671,23 +2667,24 @@ enum ClusterAction {
         /// List the agent's pending approval records instead of the gate config.
         #[arg(long)]
         list: bool,
-        /// Resolve the approval with this id (approve by default; requires --as).
+        /// Resolve the approval with this id (approve by default). Authentication
+        /// comes from CURIE_APPROVAL_PRINCIPAL_TOKEN.
         #[arg(long, value_name = "APPROVAL_ID")]
         resolve: Option<String>,
-        /// The actor resolving the approval (required with --resolve). The
-        /// requester and approver may differ; the server blocks self-approval.
-        #[arg(long = "as", value_name = "USER")]
-        as_actor: Option<String>,
         /// Reject instead of approve (with --resolve).
         #[arg(long)]
         reject: bool,
         /// Optional note recorded with the resolution (with --resolve).
         #[arg(long)]
         note: Option<String>,
-        /// Channel id asserting the operator's membership, required by
-        /// channel-authorized approval gates (with --resolve).
-        #[arg(long)]
-        actor_channel: Option<String>,
+        /// Administratively mint a reusable, subject-bound operator principal.
+        /// The token is delivered once; export it as
+        /// CURIE_APPROVAL_PRINCIPAL_TOKEN before resolving.
+        #[arg(long, value_name = "SUBJECT")]
+        mint_operator_principal: Option<String>,
+        /// Administratively mint a single-use, subject-bound Console login code.
+        #[arg(long, value_name = "SUBJECT")]
+        mint_console_login_code: Option<String>,
         /// Bind a manifest route's verified Slack resolution card, as
         /// NAME=CHANNEL (e.g. deal_desk=C0123ABCD). Repeatable. A write REPLACES
         /// the whole route map, like --gate does for tool gates.
@@ -3456,10 +3453,10 @@ async fn run(command: Option<Command>) -> Result<()> {
                 clear,
                 list,
                 resolve,
-                as_actor,
                 reject,
                 note,
-                actor_channel,
+                mint_operator_principal,
+                mint_console_login_code,
                 route_resolution,
                 route_approvers,
                 routes_from,
@@ -3473,10 +3470,10 @@ async fn run(command: Option<Command>) -> Result<()> {
                     commands::ApprovalCmd {
                         list,
                         resolve,
-                        as_actor,
                         reject,
                         note,
-                        actor_channel,
+                        mint_operator_principal,
+                        mint_console_login_code,
                         route_resolution,
                         route_approvers,
                         routes_from,
@@ -4635,10 +4632,10 @@ async fn run(command: Option<Command>) -> Result<()> {
                 clear,
                 list,
                 resolve,
-                as_actor,
                 reject,
                 note,
-                actor_channel,
+                mint_operator_principal,
+                mint_console_login_code,
                 route_resolution,
                 route_approvers,
                 routes_from,
@@ -4665,10 +4662,10 @@ async fn run(command: Option<Command>) -> Result<()> {
                         commands::ApprovalCmd {
                             list,
                             resolve,
-                            as_actor,
                             reject,
                             note,
-                            actor_channel,
+                            mint_operator_principal,
+                            mint_console_login_code,
                             route_resolution,
                             route_approvers,
                             routes_from,
@@ -4886,16 +4883,8 @@ mod tests {
         // (ADR-0077), not clap-erroring like an unknown-flag typo.
         Cli::try_parse_from(["curie", "skill", "approvals", "--list"])
             .expect("skill approvals --list should parse");
-        Cli::try_parse_from([
-            "curie",
-            "skill",
-            "approvals",
-            "--resolve",
-            "abc",
-            "--as",
-            "u",
-        ])
-        .expect("skill approvals --resolve --as should parse");
+        Cli::try_parse_from(["curie", "skill", "approvals", "--resolve", "abc"])
+            .expect("skill approvals --resolve should parse");
     }
 
     /// Serializes the two `cluster up` GitHub-credential cases below.

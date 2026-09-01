@@ -41,6 +41,13 @@ from sqlalchemy.sql import text
 # contributor pointing the suite at another store by exporting their own value wins.
 os.environ.setdefault("S3_ACCESS_KEY", "rustfs")
 os.environ.setdefault("S3_SECRET_KEY", "rustfssecret")
+# A dedicated placeholder attester key for authenticated chat approval tests.
+# It is intentionally distinct from the platform key: sharing those keys would
+# let any platform-key holder forge the Slack identity/channel proof ADR-0106
+# requires the dispatcher alone to attest.
+os.environ.setdefault(
+    "CURIE_APPROVAL_CHAT_ATTESTER_SECRET", "approval-chat-attester-test-secret"
+)
 
 API_DIR = Path(__file__).resolve().parents[1]
 ALEMBIC_DIR = API_DIR / "alembic"

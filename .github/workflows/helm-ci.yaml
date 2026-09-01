@@ -342,6 +342,11 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/dispatcher-api-wiring-assertions.sh
 
+      - name: helm render assertions (approval principal wiring)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/approval-principal-wiring-assertions.sh
+
       # Prove the mail adapter's chart wiring (issue #1515): it does not render
       # at all by default, it is told where the platform API is, it receives its
       # channel token, egress secret and AgentMail key by reference only, and it
