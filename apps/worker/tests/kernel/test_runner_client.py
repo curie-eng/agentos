@@ -659,6 +659,51 @@ def test_budgeted_request_logs_the_effective_timeout_bound(caplog) -> None:
     asyncio.run(go())
 
 
+def test_budgeted_status_does_not_log_the_turn_timeout_bound(caplog) -> None:
+    """Budget propagation still bounds control RPCs, but the effective turn
+    timeout record belongs only to the request that opens the streamed turn.
+    Polling status must not emit that operator-facing message or its structured
+    fields.
+    """
+
+    async def go() -> None:
+        app = web.Application()
+
+        async def status_handler(_request: web.Request) -> web.Response:
+            return web.json_response({"turn_active": False})
+
+        app.add_routes([web.get("/status", status_handler)])
+        server = TestServer(app)
+        await server.start_server()
+        base_url = f"http://127.0.0.1:{server.port}"
+        client = RunnerClient(total_timeout_s=30.0)
+        try:
+            caplog.clear()
+            with caplog.at_level(logging.INFO, logger="curie_worker.runner_client"):
+                status = await client.status(base_url, remaining_s=5.0)
+
+            assert status["turn_active"] is False
+            records = [
+                record
+                for record in caplog.records
+                if record.name == "curie_worker.runner_client"
+            ]
+            assert not any(
+                record.levelno == logging.INFO
+                and "runner request timeout bound" in record.getMessage()
+                for record in records
+            ), caplog.text
+            assert not any(
+                hasattr(record, "effective_request_timeout_s")
+                for record in records
+            ), caplog.text
+        finally:
+            await client.close()
+            await server.close()
+
+    asyncio.run(go())
+
+
 def test_a_remaining_budget_does_not_break_a_responsive_turn() -> None:
     """The positive control for the three timeout tests above: with a budget in
     hand and a runner that answers, the turn still opens and streams. Without it

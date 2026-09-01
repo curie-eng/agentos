@@ -297,18 +297,6 @@ class RunnerClient:
         if remaining_s is None:
             return sentinel
         bounded = max(_MIN_REQUEST_TIMEOUT_S, min(self._total_timeout_s, remaining_s))
-        logger.info(
-            "runner request timeout bound: configured ceiling %.3fs, "
-            "remaining delivery %.3fs, effective timeout %.3fs",
-            self._total_timeout_s,
-            remaining_s,
-            bounded,
-            extra={
-                "effective_request_timeout_s": bounded,
-                "configured_runner_ceiling_s": self._total_timeout_s,
-                "remaining_delivery_s": remaining_s,
-            },
-        )
         return aiohttp.ClientTimeout(
             total=bounded, connect=self._connect_timeout_s, sock_read=bounded
         )
@@ -372,6 +360,19 @@ class RunnerClient:
             if request_timeout is sentinel
             else request_timeout.total
         )
+        if remaining_s is not None:
+            logger.info(
+                "runner request timeout bound: configured ceiling %.3fs, "
+                "remaining delivery %.3fs, effective timeout %.3fs",
+                self._total_timeout_s,
+                remaining_s,
+                stream_timeout_s,
+                extra={
+                    "effective_request_timeout_s": stream_timeout_s,
+                    "configured_runner_ceiling_s": self._total_timeout_s,
+                    "remaining_delivery_s": remaining_s,
+                },
+            )
 
         async def request(headers: dict[str, str] | None) -> tuple[TurnStream, str]:
             resp = await self._session.post(
