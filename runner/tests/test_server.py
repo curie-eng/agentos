@@ -37,6 +37,7 @@ def test_healthz_status_and_event_round_trip() -> None:
             body = await status.json()
             assert body["status"] == SessionStatus.IDLE_AWAITING_INPUT.value
             assert body["ready"] is True
+            assert body["history_durable"] is True
 
             frame = {"kind": "event", "type": "message", "text": "hi", "user": "U", "ts": "1"}
             resp = await client.post("/v1/event", json=frame)
@@ -210,6 +211,23 @@ def test_reset_requires_auth_when_a_token_is_configured() -> None:
             assert unauth.status == 401
             ok = await client.post("/v1/reset", headers=_AUTH)
             assert ok.status == 200
+
+    anyio.run(go)
+
+
+def test_control_status_requires_auth_while_probe_status_remains_open() -> None:
+    runner, _ = _runner()
+
+    async def go() -> None:
+        await runner.start()
+        async with TestClient(TestServer(create_app(runner, token=_TOKEN))) as client:
+            probe = await client.get("/status")
+            assert probe.status == 200
+            unauthenticated = await client.get("/v1/status")
+            assert unauthenticated.status == 401
+            authenticated = await client.get("/v1/status", headers=_AUTH)
+            assert authenticated.status == 200
+            assert (await authenticated.json())["history_durable"] is True
 
     anyio.run(go)
 

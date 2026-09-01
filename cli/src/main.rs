@@ -1714,11 +1714,14 @@ enum LocalAction {
         /// it; a warning names the binding it kept.
         #[arg(long = "repo", value_name = "OWNER/NAME")]
         repo: Option<String>,
-        /// Let each new session select an allowed GitHub repository from the
-        /// opening message and materialize it as managed /workspace.
+        /// Deprecated compatibility no-op: coding tools are built in, and an
+        /// allowed root GitHub URL in the opening message drives managed
+        /// /workspace acquisition.
         #[arg(long, conflicts_with = "no_workspace")]
         workspace: bool,
-        /// Explicitly disable a previously configured managed workspace.
+        /// Deprecated compatibility no-op: coding tools are built in, and an
+        /// allowed root GitHub URL in the opening message drives managed
+        /// /workspace acquisition.
         #[arg(long, conflicts_with = "workspace")]
         no_workspace: bool,
         /// Target environment. Defaults to dev; a `--target` supplies it
@@ -2492,11 +2495,14 @@ enum ClusterAction {
         /// it; a warning names the binding it kept.
         #[arg(long = "repo", value_name = "OWNER/NAME")]
         repo: Option<String>,
-        /// Let sessions on each deployment select an allowed GitHub repository
-        /// from the opening message and materialize it as managed /workspace.
+        /// Deprecated compatibility no-op: coding tools are built in, and an
+        /// allowed root GitHub URL in the opening message drives managed
+        /// /workspace acquisition.
         #[arg(long, conflicts_with = "no_workspace")]
         workspace: bool,
-        /// Explicitly disable a previously configured managed workspace.
+        /// Deprecated compatibility no-op: coding tools are built in, and an
+        /// allowed root GitHub URL in the opening message drives managed
+        /// /workspace acquisition.
         #[arg(long, conflicts_with = "workspace")]
         no_workspace: bool,
         /// Target environment. Defaults to dev; a `--target` supplies it

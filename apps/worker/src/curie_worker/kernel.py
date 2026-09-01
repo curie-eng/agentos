@@ -1159,30 +1159,13 @@ class Kernel:
                     thread_key,
                     **boot_env_kwargs,
                 )
-                if getattr(resolved, "workspace_enabled", False):
-                    workspace_deployment_id = getattr(resolved, "deployment_id", None)
-                    if workspace_deployment_id is None:
-                        # Outside _attempt's handlers, so this one has to name
-                        # itself: deployment_id is legitimately optional on a
-                        # resolved binding, making this a reachable
-                        # misconfiguration that would otherwise reach the
-                        # consumer as an anonymous processing exception (#2004).
-                        # Log first so the failure names the agent, then let the
-                        # raise stand unchanged: it leaves the stream entry
-                        # pending for reclaim rather than settling it -- only
-                        # the visibility changed here.
-                        binding_failure = WorkspacePreparationError(
-                            "binding", "workspace-enabled deployment has no deployment id"
-                        )
-                        self._log_workspace_start_failure(
-                            qevent,
-                            qevent.text,
-                            binding_failure,
-                            agent_id=agent_id,
-                            agent_name=agent_name,
-                            workspace_deployment_id=None,
-                        )
-                        raise binding_failure
+                # The deployment id is the server-side authority used to select
+                # and redeem a repository at initial claim time.  The legacy
+                # per-deployment workspace_enabled bit is deliberately not a
+                # runtime coding gate: the worker-wide coordinator switch is the
+                # operational kill switch, while a missing deployment id simply
+                # leaves this turn on the generic claim path.
+                workspace_deployment_id = getattr(resolved, "deployment_id", None)
                 # One-shot post-approval allowance (#430, ADR-0035): when THIS turn is the
                 # resume of a genuinely-approved permission-gate approval, deliver a single
                 # gated-tool grant so the approved action completes once; the gate re-arms
@@ -2120,11 +2103,8 @@ class Kernel:
         workspace start failure -- a clone, an archive, an upload, a missing
         coordinator -- falls into ``_attempt``'s broad start-failure clause,
         which used to log an event id and an anonymous ``repr``: naming neither
-        the agent, nor the deployment, nor the repository. A binding carrying no
-        deployment id is different again: it never reaches that clause at all,
-        because it is raised earlier, in ``_process_event``, before ``_attempt``
-        runs -- and had no log of its own before this ticket. The reported
-        symptom is what both cost -- the turn acks, creates no sandbox, and an
+        the agent, nor the deployment, nor the repository. The reported symptom
+        is what those faults cost -- the turn acks, creates no sandbox, and an
         operator has nothing to search on.
 
         So this emits one WARNING carrying everything needed to find the
@@ -2136,11 +2116,8 @@ class Kernel:
         decision the feature made on purpose, a preparation failure is a fault
         nobody chose.
 
-        It takes the turn TEXT rather than an ``Event`` because the earliest
-        workspace failure -- a workspace-enabled deployment carrying no
-        deployment id -- is raised before ``_attempt`` has built one, and a
-        failure this helper cannot be called from is exactly the silence #2004
-        is about.
+        It takes the turn TEXT rather than an ``Event`` so it can name the
+        repository fact independently of where preparation failed.
         """
         # Total by construction: parse_github_repo_fact RAISES
         # WorkspaceSelectionRefused on a multi-repository message. That refusal
@@ -2443,13 +2420,14 @@ class Kernel:
         # greeting/help shortcut: a canned reply must not create a thread whose
         # repository remains ambiguous, and a conflicting repository must be
         # refused before an existing sandbox can be adopted or steered.
+        workspace_repo: str | None = None
         if workspace_deployment_id is not None:
             if self._workspace is None:
                 raise WorkspacePreparationError(
                     "wiring", "workspace-enabled deployment has no trusted coordinator"
                 )
             repo_fact = parse_github_repo_fact(event.text)
-            await asyncio.to_thread(
+            workspace_repo = await asyncio.to_thread(
                 self._workspace.select_repository,
                 thread_key=thread_key,
                 deployment_id=workspace_deployment_id,
@@ -2470,6 +2448,26 @@ class Kernel:
         # mere presence of an affinity record as proof that a live route was
         # retained.
         existing_handle = await asyncio.to_thread(self._substrate.lookup, thread_key)
+        if (
+            workspace_repo is not None
+            and existing_handle is not None
+            and existing_handle.workspace_repo is not None
+            and existing_handle.workspace_repo != workspace_repo
+        ):
+            raise WorkspacePreparationError(
+                "route-fence", "live workspace route does not match sticky repository"
+            )
+        if (
+            workspace_repo is not None
+            and existing_handle is not None
+            and existing_handle.workspace_repo is None
+            and not await self._workspace_handoff_ready(
+                existing_handle, remaining_s=remaining_s
+            )
+        ):
+            raise ThreadBusyError(
+                f"thread {thread_key} has not reached a durable workspace handoff boundary"
+            )
         if packs is not None:
             reply = match_greeting(packs, event.text) or match_help(packs, event.text)
             if reply is not None and existing_handle is None:
@@ -2492,7 +2490,17 @@ class Kernel:
         handle = await self._claim_or_resume(
             thread_key,
             boot_env,
-            workspace_deployment_id=workspace_deployment_id,
+            workspace_deployment_id=(
+                workspace_deployment_id if workspace_repo is not None else None
+            ),
+            workspace_repo=workspace_repo,
+            replace_handle=(
+                existing_handle
+                if workspace_repo is not None
+                and existing_handle is not None
+                and existing_handle.workspace_repo is None
+                else None
+            ),
             agent_name=agent_name,
         )
         retained_live_route = existing_handle is not None and handle == existing_handle
@@ -2529,7 +2537,9 @@ class Kernel:
                     # (min(600, a 30-minute budget) is still 600). Routed
                     # separately; a committed test also doubles ``status`` with a
                     # base_url-only stub here.
-                    status = await self._runner.status(handle.base_url)
+                    status = await self._runner.status(
+                        handle.base_url, token=handle.token or None
+                    )
                 except Exception as exc:  # noqa: BLE001 -- steering still decides the route
                     logger.warning(
                         "could not read pre-steer turn liveness at %s: %r",
@@ -2599,7 +2609,11 @@ class Kernel:
             True when a turn is live, or when liveness could not be determined.
         """
         try:
-            status = await self._runner.status(handle.base_url, remaining_s=remaining_s)
+            status = await self._runner.status(
+                handle.base_url,
+                token=handle.token or None,
+                remaining_s=remaining_s,
+            )
         except Exception as exc:  # noqa: BLE001 -- any unreadable answer means "assume busy"
             logger.warning("could not read turn liveness at %s: %r", handle.base_url, exc)
             return True
@@ -2609,12 +2623,40 @@ class Kernel:
             return True
         return active
 
+    async def _workspace_handoff_ready(
+        self, handle: SandboxHandle, *, remaining_s: float | None = None
+    ) -> bool:
+        """Fail closed unless the old runner is idle with durable replay state."""
+
+        if not handle.token:
+            logger.warning(
+                "workspace handoff refused an unauthenticated legacy runner at %s",
+                handle.base_url,
+            )
+            return False
+        try:
+            status = await self._runner.status(
+                handle.base_url,
+                token=handle.token,
+                remaining_s=remaining_s,
+            )
+        except Exception as exc:  # noqa: BLE001 - unreadable is never safe to replace
+            logger.warning("could not read workspace handoff fence at %s: %r", handle.base_url, exc)
+            return False
+        return (
+            status.get("turn_active") is False
+            and status.get("history_durable") is True
+            and status.get("status") != SessionStatus.AWAITING_APPROVAL.value
+        )
+
     async def _claim_or_resume(
         self,
         thread_key: str,
         boot_env: dict[str, str] | None,
         *,
         workspace_deployment_id: uuid.UUID | None = None,
+        workspace_repo: str | None = None,
+        replace_handle: SandboxHandle | None = None,
         agent_name: str | None = None,
     ) -> SandboxHandle:
         # A live route is an adopt/steer, not a session start. Preparing before
@@ -2627,10 +2669,10 @@ class Kernel:
         if workspace_deployment_id is not None:
             if self._workspace is None:
                 raise WorkspacePreparationError(
-                    "wiring", "workspace-enabled deployment has no trusted preparer"
+                    "wiring", "selected workspace has no trusted claim-time preparer"
                 )
             existing = await asyncio.to_thread(self._substrate.adopt, thread_key)
-            if existing is not None:
+            if existing is not None and existing.workspace_repo == workspace_repo:
                 await asyncio.to_thread(
                     self._workspace.touch,
                     thread_key,
@@ -2646,6 +2688,8 @@ class Kernel:
                 deployment_id=workspace_deployment_id,
                 env=boot_env,
                 agent_name=agent_name,
+                repo_full_name=workspace_repo,
+                replace_handle=replace_handle,
             )
             if not isinstance(workspace_claim.handle, SandboxHandle):
                 raise WorkspacePreparationError(

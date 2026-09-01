@@ -20,9 +20,51 @@ from plugin_format import (
     validate_bundle,
 )
 
+BUNDLE_CONFIG_NAME = "curie.bundle.json"
+
 
 class PluginBundleError(RuntimeError):
     """Raised when the mounted plugin bundle fails validation."""
+
+
+def load_bundle_web_search_enabled(plugin_dir: str | None) -> bool:
+    """Return the bundle's provider-side web-search choice (ADR-0138).
+
+    ``curie.bundle.json`` is a Curie-owned sidecar beside, not inside, the
+    frozen Claude plugin-format contract. An absent sidecar defaults on. A
+    present document is strict because a misspelled opt-out would otherwise
+    widen the model's capability while appearing to disable it.
+    """
+
+    if not plugin_dir:
+        return True
+    config_path = Path(plugin_dir) / BUNDLE_CONFIG_NAME
+    try:
+        raw = config_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return True
+    except OSError as exc:
+        raise PluginBundleError(f"cannot read {config_path}: {exc}") from exc
+
+    try:
+        loaded = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise PluginBundleError(
+            f"invalid {config_path}: expected JSON object ({exc.msg})"
+        ) from exc
+    if not isinstance(loaded, dict):
+        raise PluginBundleError(f"invalid {config_path}: root must be a JSON object")
+    unknown = sorted(set(loaded) - {"webSearch"})
+    if unknown:
+        raise PluginBundleError(
+            f"invalid {config_path}: unknown key(s): {', '.join(unknown)}"
+        )
+    enabled = loaded.get("webSearch", True)
+    if not isinstance(enabled, bool):
+        raise PluginBundleError(
+            f"invalid {config_path}: webSearch must be a JSON boolean"
+        )
+    return enabled
 
 
 def load_bundle_system_prompt(plugin_dir: str | None) -> str | None:

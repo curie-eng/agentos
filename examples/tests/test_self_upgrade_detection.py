@@ -30,6 +30,7 @@ from redeploy import (  # noqa: E402
     member_of,
     pin_build_connectors,
     replace_member,
+    upgrade_disposition,
 )
 
 
@@ -310,3 +311,32 @@ def test_the_bundle_is_uploaded_as_a_multipart_file(
     # And the order still holds: create, upload, then deploy -- so a failure
     # never leaves a version marked active with no bundle behind it.
     assert [c["path"].rsplit("/", 1)[-1] for c in seen] == ["versions", "bundle", "deployments"]
+
+
+def test_a_version_with_no_commit_is_still_upgradable() -> None:
+    """The regression that stuck: an installer-created version could never move.
+
+    `curie example sre-bot install` records no commit, so this job refused --
+    and told the reader to deploy through the installer, which is what produced
+    the state. An install deployed the supported way could never be upgraded by
+    the supported job (#2128).
+
+    Losing the commit loses the COMPARISON, not the ability to deploy.
+    """
+    assert upgrade_disposition(None, "a-version-id") == "deploy-unknown"
+    assert upgrade_disposition("", "a-version-id") == "deploy-unknown"
+
+
+def test_no_version_is_still_refused() -> None:
+    """The half that must stay fatal.
+
+    Without a version there is no running connector env to carry forward, so a
+    deploy ships the bundle's placeholder ceilings -- a bot that refuses every
+    write and looks exactly like one that chose not to act.
+    """
+    assert upgrade_disposition("c" * 40, None) == "refuse"
+    assert upgrade_disposition(None, None) == "refuse"
+
+
+def test_a_fully_known_version_deploys_normally() -> None:
+    assert upgrade_disposition("c" * 40, "a-version-id") == "deploy"

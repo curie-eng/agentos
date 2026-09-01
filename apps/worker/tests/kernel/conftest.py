@@ -446,12 +446,15 @@ class FakeRunner:
         self.app.add_routes(
             [
                 web.get("/status", self._status),
+                web.get("/v1/status", self._status),
                 web.post("/v1/event", self._event),
                 web.post("/v1/steer", self._steer),
                 web.post("/v1/interrupt", self._interrupt),
             ]
         )
         self.turn_active = False
+        self.history_durable = True
+        self.session_status = "idle-awaiting-input"
         # When set, /status answers 500 so a test can drive the fail-closed
         # liveness read (an unreadable session must count as busy).
         self.status_fails = False
@@ -481,7 +484,13 @@ class FakeRunner:
             # 200, but without the field the liveness read needs. A newer or
             # third-party runner could answer exactly this.
             return web.json_response({"status": "idle-awaiting-input"})
-        return web.json_response({"status": "idle-awaiting-input", "turn_active": self.turn_active})
+        return web.json_response(
+            {
+                "status": self.session_status,
+                "turn_active": self.turn_active,
+                "history_durable": self.history_durable,
+            }
+        )
 
     async def _event(self, request: web.Request) -> web.StreamResponse:
         self.event_headers.append(dict(request.headers))
@@ -657,6 +666,7 @@ async def kernel_harness(
     actions: object | None = None,
     publication_creator: object | None = None,
     sink: object | None = None,
+    runner_app: web.Application | None = None,
     claim_timeout_seconds: float = 3.0,
     per_sandbox_runners: int = 0,
     **config_overrides: object,
@@ -664,7 +674,10 @@ async def kernel_harness(
     """Assemble a live kernel wired to a fake runner and real Valkey."""
     config = make_config(names, **config_overrides)
     fake_runner = FakeRunner()
-    server = TestServer(fake_runner.app)
+    # Most kernel tests use the deliberately tiny ACI fake above.  The coder
+    # publication boundary test supplies the real runner app, still with its
+    # model seam faked, so the worker consumes production ACI frames.
+    server = TestServer(runner_app or fake_runner.app)
     await server.start_server()
     port = server.port
     assert port is not None

@@ -11,7 +11,9 @@ A third live test covers the OpenRouter path, gated on ``OPENROUTER_API_KEY``.
 
 import os
 import shlex
+from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import anyio
 import pytest
@@ -254,6 +256,102 @@ def test_live_permission_gate_pauses_awaiting_approval() -> None:
     # The blocked command never executed and never produced output text
     # claiming it ran; the summary records what WOULD have run.
     assert "echo curie-gate-live" in final.approval_summary
+
+
+@pytest.mark.skipif(
+    not _LIVE_REQUESTED,
+    reason="set CURIE_E2E_LIVE=1 for provider-side web-search evidence",
+)
+def test_live_provider_web_search_default_and_bundle_opt_out(tmp_path: Path) -> None:
+    """The provider executes default WebSearch; the opt-out removes it.
+
+    Anthropic documents ``web_search`` as a server tool whose result blocks
+    arrive in the model response, and the Agent SDK documents ``WebSearch`` as
+    the Claude Code built-in name. These are external API facts, not inferred
+    from Curie's option mapping:
+    https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool
+    https://github.com/anthropics/claude-agent-sdk-python#using-tools
+    """
+
+    from claude_agent_sdk import (
+        AssistantMessage,
+        ClaudeAgentOptions,
+        ClaudeSDKClient,
+        ResultMessage,
+        SystemMessage,
+        ToolResultBlock,
+        ToolUseBlock,
+        UserMessage,
+    )
+    from curie_runner.__main__ import build_runner
+    from curie_runner.config import RunnerConfig
+
+    def bundle_options(enabled: bool) -> ClaudeAgentOptions:
+        bundle = tmp_path / ("default" if enabled else "opted-out")
+        manifest = bundle / ".claude-plugin" / "plugin.json"
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text('{"name": "acme-web-search"}', encoding="utf-8")
+        if not enabled:
+            (bundle / "curie.bundle.json").write_text(
+                '{"webSearch": false}', encoding="utf-8"
+            )
+        run_id = str(uuid4())
+        config = RunnerConfig.from_env(
+            {
+                "CURIE_PLUGIN_DIR": str(bundle),
+                "CURIE_SESSION_ID": run_id,
+                "CURIE_SANDBOX_ID": run_id,
+                "CURIE_BUDGET": (
+                    '{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}'
+                ),
+            }
+        )
+        return build_runner(config)._factory()._options
+
+    async def observe(options: ClaudeAgentOptions, prompt: str) -> dict[str, Any]:
+        observed: dict[str, Any] = {
+            "catalog": None,
+            "tool_ids": {},
+            "result_ids": set(),
+            "terminal_success": False,
+        }
+        async with ClaudeSDKClient(options) as client:
+            await client.query(prompt)
+            async for message in client.receive_response():
+                if isinstance(message, SystemMessage) and message.subtype == "init":
+                    observed["catalog"] = "WebSearch" in (message.data.get("tools") or [])
+                if isinstance(message, AssistantMessage):
+                    for block in message.content:
+                        if isinstance(block, ToolUseBlock):
+                            observed["tool_ids"][block.name] = block.id
+                if isinstance(message, UserMessage):
+                    for block in message.content:
+                        if isinstance(block, ToolResultBlock):
+                            observed["result_ids"].add(block.tool_use_id)
+                if isinstance(message, ResultMessage):
+                    observed["terminal_success"] = not message.is_error
+                    break
+        return observed
+
+    async def go() -> tuple[dict[str, Any], dict[str, Any]]:
+        default = await observe(
+            bundle_options(True),
+            "Use WebSearch to find Anthropic's official web search tool "
+            "documentation, then reply with only: done",
+        )
+        opted_out = await observe(bundle_options(False), "Reply with only: done")
+        return default, opted_out
+
+    default, opted_out = anyio.run(go)
+
+    assert default["catalog"] is True
+    assert "WebSearch" in default["tool_ids"]
+    assert default["tool_ids"]["WebSearch"] in default["result_ids"]
+    assert default["terminal_success"] is True
+
+    assert opted_out["catalog"] is False
+    assert "WebSearch" not in opted_out["tool_ids"]
+    assert opted_out["terminal_success"] is True
 
 
 @pytest.mark.skipif(

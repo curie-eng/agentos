@@ -104,7 +104,7 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0072 | [Keep the hand-rolled Rust ACI emitter; typify cannot express the wire contract's runtime semantics](0072-keep-the-hand-rolled-rust-aci-emitter-over-typify.md) | Accepted |
 | 0073 | [The durable state store reaches bundle code as an auto-mounted MCP server, not a bundle-shipped one](0073-agentos-state-mcp-server-and-state-boot-env.md) | Accepted |
 | 0074 | [Versioned JSON Schemas for every agent-facing CLI result](0074-versioned-json-schemas-for-cli-results.md) | Accepted |
-| 0075 | [The Agent Proxy: credentials and egress leave the sandbox](0075-the-agent-proxy-credential-and-egress-boundary.md) | Draft |
+| 0075 | [The Agent Proxy: credentials and egress leave the sandbox](0075-the-agent-proxy-credential-and-egress-boundary.md) | Accepted |
 | 0076 | [A closed, versioned attribute schema for the runner's OTel span stream](0076-closed-typed-telemetry-attribute-schema.md) | Accepted |
 | 0077 | [Skill-tier durable approvals stay unavailable, reported not absent](0077-skill-tier-durable-approvals-stay-unavailable.md) | Accepted |
 | 0078 | [Route message-driven approval cards through the connected Slack transport](0078-approval-cards-over-connected-transport.md) | Accepted |
@@ -165,4 +165,7 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0133 | [The control agent renders screens; a human presses the buttons](0133-the-control-agent-renders-screens-a-human-presses.md) | Draft |
 | 0134 | [A hook shares one thread per partition](0134-a-hook-shares-one-thread-per-partition.md) | Draft |
 | 0135 | [A skill bundle has two conformance profiles](0135-a-skill-bundle-has-two-conformance-profiles.md) | Draft |
+| 0136 | [A late workspace handoff replaces the sandbox at a fenced turn boundary](0136-a-late-workspace-handoff-replaces-the-sandbox-at-a-fenced-turn-boundary.md) | Accepted |
+| 0137 | [Coding tools are built in and an initial repository URL selects the workspace](0137-coding-tools-are-built-in-and-an-initial-repository-url-selects-the-workspace.md) | Draft |
+| 0138 | [Provider-side web search is a default-on bundle capability](0138-provider-side-web-search-is-a-default-on-bundle-capability.md) | Proposed |
 <!-- END GENERATED: adr-index -->

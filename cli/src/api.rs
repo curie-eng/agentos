@@ -2093,6 +2093,25 @@ impl ApiClient {
                  `--target` and pass `--agent`/`--env`/`--slack-channel` directly."
             );
         }
+        if status == reqwest::StatusCode::BAD_REQUEST {
+            let detail = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|value| value["detail"].as_str().map(str::to_string));
+            if let Some(detail) = detail.filter(|detail| {
+                detail
+                    .split_once(':')
+                    .is_some_and(|(code, _)| code == "deploy.placeholder_channel")
+            }) {
+                return Err(crate::exit::CliError::usage(format!(
+                    "resolving target `{target}` failed: {detail}"
+                ))
+                .with_fix(
+                    "replace the target's slack_channel with a real Slack channel ID, or remove \
+                     slack_channel from deploy.yaml",
+                )
+                .into());
+            }
+        }
         if !status.is_success() {
             anyhow::bail!("resolving target `{target}` failed with {status}: {body}");
         }

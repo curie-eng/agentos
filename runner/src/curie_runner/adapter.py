@@ -295,6 +295,7 @@ def build_options(
     mcp_servers: dict[str, McpSdkServerConfig] | None = None,
     can_use_tool: CanUseTool | None = None,
     cwd: str | None = None,
+    web_search_enabled: bool = True,
 ) -> ClaudeAgentOptions:
     """Assemble ClaudeAgentOptions for the session.
 
@@ -327,6 +328,18 @@ def build_options(
     return ClaudeAgentOptions(
         plugins=plugins,
         model=model,
+        # Pin the SDK's complete Claude Code tool surface explicitly.  Coding
+        # tools are a platform session capability, not something a bundle skill
+        # opts into; ``allowed_tools`` stays empty so this does not pre-authorize
+        # any call or bypass Curie's permission/approval callbacks.
+        tools=cast("Any", {"type": "preset", "preset": "claude_code"}),
+        allowed_tools=[],
+        # Anthropic documents WebSearch as a provider-executed server tool.
+        # ``disallowed_tools`` removes a tool from the model catalogue; unlike
+        # ``allowed_tools`` it is not a permission preauthorization. See:
+        # https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool
+        # https://github.com/anthropics/claude-agent-sdk-python#using-tools
+        disallowed_tools=[] if web_search_enabled else ["WebSearch"],
         **thinking_option,
         **cwd_option,
         system_prompt=system_prompt,

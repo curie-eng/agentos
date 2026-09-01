@@ -41,10 +41,12 @@ from .workspace_snapshot import WorkspaceSnapshot, WorkspaceSnapshotError
 
 _NDJSON = "application/x-ndjson"
 
-# The five runner POST routes; gated when a token is configured.
-# /healthz and /status stay open so the chart readinessProbe (no auth header)
-# keeps working.
-_GATED_PATHS = frozenset({"/v1/event", "/v1/steer", "/v1/interrupt", "/v1/reset", "/v1/snapshot"})
+# Authenticated control routes. /healthz and the probe-oriented /status stay
+# open so chart probes keep working; the worker reads replacement authority
+# from /v1/status with the per-claim bearer token.
+_GATED_PATHS = frozenset(
+    {"/v1/event", "/v1/steer", "/v1/interrupt", "/v1/reset", "/v1/snapshot", "/v1/status"}
+)
 
 # Typed app key so aiohttp resolves the runner without the string-key warning.
 RUNNER: web.AppKey[SessionRunner] = web.AppKey("runner", SessionRunner)
@@ -53,7 +55,7 @@ SNAPSHOTTER: web.AppKey[object] = web.AppKey("snapshotter", object)
 
 
 def _auth_middleware(token: str) -> Middleware:
-    """Require ``Authorization: Bearer <token>`` on the gated ACI POST routes.
+    """Require ``Authorization: Bearer <token>`` on the gated control routes.
 
     Runs before body parsing so an authenticated call keeps the route's existing
     400/409 semantics unchanged. The presented token is compared with the
@@ -66,7 +68,7 @@ def _auth_middleware(token: str) -> Middleware:
 
     @web.middleware
     async def middleware(request: web.Request, handler: Handler) -> web.StreamResponse:
-        if request.method == "POST" and request.path in _GATED_PATHS:
+        if request.path in _GATED_PATHS:
             header = request.headers.get("Authorization", "")
             scheme = "Bearer "
             if not header.startswith(scheme):
@@ -89,9 +91,9 @@ def create_app(
 ) -> web.Application:
     """Build the aiohttp application bound to a started SessionRunner.
 
-    When ``token`` is set, the five runner POST routes require a matching bearer
-    token; when it is ``None`` the app is a pass-through (CLI, fake-model CI, and
-    pre-token sandboxes stay unauthenticated).
+    When ``token`` is set, the runner control routes require a matching bearer
+    token; when it is ``None`` the app is a pass-through (CLI, fake-model CI,
+    and pre-token sandboxes stay unauthenticated).
     """
 
     # A falsy token (None or empty string) means no enforcement: an empty token
@@ -105,6 +107,7 @@ def create_app(
         [
             web.get("/healthz", _healthz),
             web.get("/status", _status),
+            web.get("/v1/status", _status),
             web.post("/v1/event", _event),
             web.post("/v1/steer", _steer),
             web.post("/v1/interrupt", _interrupt),
@@ -131,6 +134,7 @@ async def _status(request: web.Request) -> web.Response:
             "status": runner.status.value,
             "ready": runner.ready,
             "turn_active": runner.turn_active,
+            "history_durable": runner.history_durable,
         }
     )
 

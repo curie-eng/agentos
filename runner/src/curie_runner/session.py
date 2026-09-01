@@ -257,6 +257,11 @@ class SessionRunner:
         # finish-race window (final produced, lock not yet freed) is rejected
         # instead of writing into an already-terminal stream.
         self._turn_open = False
+        # Safe-boundary fence for replacing a runner. A fresh runner has no
+        # completed turn to lose. Once a turn begins, only a successful durable
+        # transcript append re-authorizes replacement.
+        self._history_durable = True
+        self._active_state: TurnState | None = None
 
     @property
     def status(self) -> SessionStatus:
@@ -271,6 +276,12 @@ class SessionRunner:
         """True while a turn can still accept a steer (open, pre-terminal)."""
 
         return self._turn_open
+
+    @property
+    def history_durable(self) -> bool:
+        """Whether every completed logical turn is present in durable replay."""
+
+        return self._history_durable
 
     async def remember(
         self,
@@ -361,7 +372,9 @@ class SessionRunner:
                     harness_replay=harness_replay,
                 )
             )
+            self._history_durable = True
         except Exception as exc:  # noqa: BLE001 - best-effort; never fail a completed turn
+            self._history_durable = False
             logger.warning(
                 "history append failed session=%s error_class=%s: %s",
                 self._session_id,
@@ -429,6 +442,7 @@ class SessionRunner:
             await self._session.connect()
             self._interrupt_requested = False
             self._turn_open = False
+            self._active_state = None
             self._status = SessionStatus.IDLE_AWAITING_INPUT
 
     async def steer(self, text: str) -> bool:
@@ -442,6 +456,10 @@ class SessionRunner:
         if self._session is None or not self._turn_open:
             return False
         await self._session.query(text)
+        if self._active_state is not None:
+            self._active_state.history_messages.append(
+                ConversationMessage(role="user", content=text)
+            )
         return True
 
     async def interrupt(self, _reason: str = "") -> None:
@@ -486,7 +504,9 @@ class SessionRunner:
             logger.info("turn start session=%s user=%s", self._session_id, event.user)
             self._interrupt_requested = False
             self._turn_open = True
+            self._history_durable = False
             state = TurnState()
+            self._active_state = state
             # A permission-gate block belongs to exactly one turn: clear any
             # prior turn's residue before the model runs (#245).
             if self._approval_gate is not None:
@@ -569,6 +589,7 @@ class SessionRunner:
                                 await self._session.interrupt()
                         self._turn_open = False
             finally:
+                self._active_state = None
                 completed_attributes = {
                     "service.name": "curie-runner",
                     "source": "runner",
