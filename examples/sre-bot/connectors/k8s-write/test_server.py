@@ -23,8 +23,8 @@ import anyio
 import httpx
 import pytest
 import yaml
-from mcp.server.fastmcp.exceptions import ToolError
-from mcp.shared.memory import create_connected_server_and_client_session as _connect
+from mcp import types as mcp_types
+from mcp.server.mcpserver.exceptions import ToolError
 
 _REAL_CA_PEM = (
     b"-----BEGIN CERTIFICATE-----\n"
@@ -303,8 +303,9 @@ def _call_tool(srv, name, args):
     """Call one tool through the real MCP request path and return the CallToolResult."""
 
     async def go():
-        async with _connect(srv.mcp._mcp_server) as client:
-            return await client.call_tool(name, args)
+        entry = srv.mcp._lowlevel_server.get_request_handler("tools/call")
+        assert entry is not None
+        return await entry.handler(None, mcp_types.CallToolRequestParams(name=name, arguments=args))
 
     return anyio.run(go)
 
@@ -316,7 +317,7 @@ def test_a_refusal_and_a_restart_carry_different_is_error_flags(tmp_path, monkey
     monkeypatch.setattr(srv, "_client", lambda: _FakeClient())
 
     refused = _call_tool(srv, "restart_deployment", {"namespace": "platform", "name": "api"})
-    assert refused.isError is True
+    assert refused.is_error is True
     # The prose survives the trip, minus a fixed SDK prefix: FastMCP puts our
     # message text on the wire and adds no traceback, so raising costs nothing
     # the sentence was doing.
@@ -344,7 +345,7 @@ def test_a_refusal_and_a_restart_carry_different_is_error_flags(tmp_path, monkey
     )
 
     done = _call_tool(srv, "restart_deployment", {"namespace": "public", "name": "api"})
-    assert done.isError is False
+    assert done.is_error is False
     assert "restart triggered" in done.content[0].text
     # The contrast in the OTHER direction: the success path carries no prefix at
     # all, so the two results differ in text shape as well as in the flag.
@@ -354,7 +355,7 @@ def test_a_refusal_and_a_restart_carry_different_is_error_flags(tmp_path, monkey
     # THE contrast, stated outright: this is the whole property. When both of
     # these were returned strings the two results were the same shape, and a
     # program counting successful restarts counted the refusal as one.
-    assert refused.isError != done.isError
+    assert refused.is_error != done.is_error
 
 
 # --------------------------------------------------------------------------- #
@@ -362,10 +363,10 @@ def test_a_refusal_and_a_restart_carry_different_is_error_flags(tmp_path, monkey
 # --------------------------------------------------------------------------- #
 def test_tool_is_annotated_as_a_non_idempotent_write(tmp_path):
     srv = _load(tmp_path)
-    assert srv.WRITE.readOnlyHint is False
+    assert srv.WRITE.read_only_hint is False
     # Each call starts a NEW rollout, so a client that retries on timeout rolls
     # twice. This annotation is what tells it not to.
-    assert srv.WRITE.idempotentHint is False
+    assert srv.WRITE.idempotent_hint is False
 
 
 def test_inline_ca_data_is_materialised_for_verification(tmp_path, monkeypatch):

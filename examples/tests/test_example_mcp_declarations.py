@@ -130,3 +130,14 @@ def test_sre_bot_observability_connectors_ship_self_configured() -> None:
     assert "curie secrets set GRAFANA_SERVICE_ACCOUNT_TOKEN" not in raw
     assert "GRAFANA -- SHIPS OFF" not in raw
     assert "TEMPO (DISTRIBUTED TRACES) -- SHIPS OFF" not in raw
+
+
+def test_sre_bot_python_connectors_pin_the_mcp_2_runtime_their_servers_import() -> None:
+    connector_root = EXAMPLES / "sre-bot" / "connectors"
+    connector_names = ("k8s-scale", "k8s-write", "self-upgrade", "tempo")
+
+    for name in connector_names:
+        requirements = (connector_root / name / "requirements.txt").read_text().splitlines()
+        assert "mcp==2.1.1" in requirements, (
+            f"{name} imports mcp.server.mcpserver but its image does not pin MCP 2.1.1"
+        )

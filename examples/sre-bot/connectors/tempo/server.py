@@ -55,8 +55,8 @@ from typing import Any
 from urllib.parse import quote
 
 import httpx
-from mcp.server.fastmcp import FastMCP
-from mcp.server.fastmcp.exceptions import ToolError
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 log = logging.getLogger("tempo-mcp")
@@ -88,14 +88,7 @@ DEFAULT_LIMIT = 20
 # comfortably more than any answerable trace and far under the memory ceiling.
 MAX_RESPONSE_BYTES = 1024 * 1024
 
-mcp = FastMCP(
-    "tempo",
-    host=os.environ.get("BIND_ADDRESS", "0.0.0.0"),
-    port=int(os.environ.get("PORT", "8000")),
-    # Curie addresses hosted connectors at the exact, redirect-free /mcp path.
-    # MCP 1.28 mounts this value literally; "/" would leave /mcp returning 404.
-    streamable_http_path="/mcp",
-)
+mcp = MCPServer("tempo")
 
 READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=True)
 
@@ -143,8 +136,7 @@ def _proxy(path: str, params: dict[str, Any] | None = None) -> Any:
         )
     if discovery.status_code >= 400:
         raise ToolError(
-            f"Grafana datasource discovery returned {discovery.status_code}: "
-            f"{discovery.text[:300]}"
+            f"Grafana datasource discovery returned {discovery.status_code}: {discovery.text[:300]}"
         )
 
     try:
@@ -166,14 +158,10 @@ def _proxy(path: str, params: dict[str, Any] | None = None) -> Any:
     datasource_uid = matches[0].get("uid")
     if not isinstance(datasource_uid, str) or not datasource_uid:
         raise ToolError(
-            "the Grafana datasource named Tempo has no usable uid. "
-            "Refusing to proxy the request."
+            "the Grafana datasource named Tempo has no usable uid. Refusing to proxy the request."
         )
 
-    url = (
-        f"{GRAFANA_URL}/api/datasources/proxy/uid/"
-        f"{quote(datasource_uid, safe='')}{path}"
-    )
+    url = f"{GRAFANA_URL}/api/datasources/proxy/uid/{quote(datasource_uid, safe='')}{path}"
     try:
         r = httpx.get(
             url,
@@ -331,7 +319,12 @@ def main() -> int:
         log.error("refusing to start: missing %s", ", ".join(missing))
         return 1
     log.info("tempo connector connected to %s", GRAFANA_URL)
-    mcp.run(transport="streamable-http")
+    mcp.run(
+        transport="streamable-http",
+        host=os.environ.get("BIND_ADDRESS", "0.0.0.0"),
+        port=int(os.environ.get("PORT", "8000")),
+        streamable_http_path="/mcp",
+    )
     return 0
 
 

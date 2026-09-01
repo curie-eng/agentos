@@ -24,8 +24,8 @@ from pathlib import Path
 import anyio
 import pytest
 import yaml
-from mcp.server.fastmcp.exceptions import ToolError
-from mcp.shared.memory import create_connected_server_and_client_session as _connect
+from mcp import types as mcp_types
+from mcp.server.mcpserver.exceptions import ToolError
 
 _MODULE_NAME = "sre_bot_self_upgrade_server"
 _SERVER_PY = Path(__file__).parent / "server.py"
@@ -240,9 +240,9 @@ def test_the_name_is_generated_server_side(tmp_path, monkeypatch):
 
 def test_tool_is_annotated_as_a_destructive_non_idempotent_write(tmp_path):
     srv = _load(tmp_path)
-    assert srv.UPGRADE.readOnlyHint is False
-    assert srv.UPGRADE.destructiveHint is True
-    assert srv.UPGRADE.idempotentHint is False
+    assert srv.UPGRADE.read_only_hint is False
+    assert srv.UPGRADE.destructive_hint is True
+    assert srv.UPGRADE.idempotent_hint is False
 
 
 def test_insecure_skip_tls_verify_is_refused(tmp_path):
@@ -285,8 +285,9 @@ def _call_tool(srv, name, args):
     """Call one tool through the real MCP path and return its CallToolResult."""
 
     async def go():
-        async with _connect(srv.mcp._mcp_server) as client:
-            return await client.call_tool(name, args)
+        entry = srv.mcp._lowlevel_server.get_request_handler("tools/call")
+        assert entry is not None
+        return await entry.handler(None, mcp_types.CallToolRequestParams(name=name, arguments=args))
 
     return anyio.run(go)
 
@@ -304,7 +305,7 @@ def test_an_active_job_refusal_and_a_started_upgrade_have_different_error_flags(
     )
 
     refused = _call_tool(srv, "upgrade_self", {})
-    assert refused.isError is True
+    assert refused.is_error is True
     assert "post_body" not in refused_seen
     refusal_text = refused.content[0].text
 
@@ -322,7 +323,7 @@ def test_an_active_job_refusal_and_a_started_upgrade_have_different_error_flags(
     started_seen = {}
     monkeypatch.setattr(srv, "_client", lambda: _FakeClient(started_seen))
     started = _call_tool(srv, "upgrade_self", {})
-    assert started.isError is False
+    assert started.is_error is False
     assert not started.content[0].text.startswith("Error executing tool")
     payload = json.loads(started.content[0].text)
     assert payload["ok"] is True
@@ -333,7 +334,7 @@ def test_an_active_job_refusal_and_a_started_upgrade_have_different_error_flags(
         "namespace": "curie",
         "name": "sre-bot-self-upgrade-abc12",
     }
-    assert refused.isError != started.isError
+    assert refused.is_error != started.is_error
 
 
 def test_the_fake_client_cannot_accept_a_call_the_real_one_rejects():

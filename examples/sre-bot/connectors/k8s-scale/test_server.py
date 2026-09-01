@@ -17,8 +17,8 @@ import anyio
 import httpx
 import pytest
 import yaml
-from mcp.server.fastmcp.exceptions import ToolError
-from mcp.shared.memory import create_connected_server_and_client_session as _connect
+from mcp import types as mcp_types
+from mcp.server.mcpserver.exceptions import ToolError
 
 _MODULE_NAME = "sre_bot_k8s_scale_server"
 _SERVER_PY = Path(__file__).parent / "server.py"
@@ -253,8 +253,9 @@ def _call_tool(srv, name, args):
     """Call one tool through the real MCP path and return its CallToolResult."""
 
     async def go():
-        async with _connect(srv.mcp._mcp_server) as client:
-            return await client.call_tool(name, args)
+        entry = srv.mcp._lowlevel_server.get_request_handler("tools/call")
+        assert entry is not None
+        return await entry.handler(None, mcp_types.CallToolRequestParams(name=name, arguments=args))
 
     return anyio.run(go)
 
@@ -268,7 +269,7 @@ def test_a_refusal_and_a_scale_carry_different_is_error_flags(tmp_path, monkeypa
         "scale_deployment",
         {"namespace": "platform", "name": "api", "replicas": 10},
     )
-    assert refused.isError is True
+    assert refused.is_error is True
     refusal_text = refused.content[0].text
 
     # OBSERVED against the pinned mcp==1.28.1. FastMCP builds this prefix at
@@ -288,7 +289,7 @@ def test_a_refusal_and_a_scale_carry_different_is_error_flags(tmp_path, monkeypa
         "scale_deployment",
         {"namespace": "public", "name": "api", "replicas": 10},
     )
-    assert scaled.isError is False
+    assert scaled.is_error is False
     assert not scaled.content[0].text.startswith("Error executing tool")
     payload = json.loads(scaled.content[0].text)
     assert payload["ok"] is True
@@ -299,7 +300,7 @@ def test_a_refusal_and_a_scale_carry_different_is_error_flags(tmp_path, monkeypa
         "namespace": "public",
         "name": "api",
     }
-    assert refused.isError != scaled.isError
+    assert refused.is_error != scaled.is_error
 
 
 def test_streamable_http_is_mounted_at_curie_connector_path(tmp_path):
