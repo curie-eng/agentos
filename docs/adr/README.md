@@ -169,4 +169,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0137 | [Coding tools are built in and an initial repository URL selects the workspace](0137-coding-tools-are-built-in-and-an-initial-repository-url-selects-the-workspace.md) | Draft |
 | 0138 | [Provider-side web search is a default-on bundle capability](0138-provider-side-web-search-is-a-default-on-bundle-capability.md) | Proposed |
 | 0139 | [Bundle owners classify every vanilla MCP tool](0139-bundle-owners-classify-every-vanilla-mcp-tool.md) | Draft |
+| 0140 | [A canary is a weighted second active deployment and every trace carries its version](0140-a-canary-is-a-weighted-second-active-deployment-and-every-trace-carries-its-version.md) | Draft |
 <!-- END GENERATED: adr-index -->
