@@ -69,9 +69,9 @@ The connector cannot form that request, but a leaked token can bypass it. The
 permission map names mitigation choices and the residual risk.
 
 The same connector publishes the separate zero-argument `upgrade_self` tool,
-which targets `self-upgrade/cronjob.yaml`. The installer does not apply that
-CronJob. Enabling the platform path does not silently enable a self-upgrade
-template that an operator did not install.
+which targets `self-upgrade/cronjob.yaml`. The installer does not apply `self-upgrade/cronjob.yaml`;
+enabling the platform path does not silently enable a self-upgrade template that
+an operator did not install.
 
 `platform-upgrade/upgrade.sh` accepts no target version from the bot. It reads
 the newest published release, refuses when that version is already installed,
