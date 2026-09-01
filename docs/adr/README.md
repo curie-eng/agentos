@@ -167,4 +167,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0135 | [A skill bundle has two conformance profiles](0135-a-skill-bundle-has-two-conformance-profiles.md) | Draft |
 | 0136 | [A late workspace handoff replaces the sandbox at a fenced turn boundary](0136-a-late-workspace-handoff-replaces-the-sandbox-at-a-fenced-turn-boundary.md) | Accepted |
 | 0137 | [Coding tools are built in and an initial repository URL selects the workspace](0137-coding-tools-are-built-in-and-an-initial-repository-url-selects-the-workspace.md) | Draft |
+| 0138 | [Provider-side web search is a default-on bundle capability](0138-provider-side-web-search-is-a-default-on-bundle-capability.md) | Proposed |
 <!-- END GENERATED: adr-index -->
