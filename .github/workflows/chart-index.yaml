@@ -4,6 +4,7 @@ on:
   workflow_run:
     workflows: [Release images and binaries]
     types: [completed]
+  workflow_dispatch: {}
   push:
     branches: [next]
     paths:
@@ -21,6 +22,7 @@ jobs:
     name: Verify the release and publish its chart index
     if: >-
       github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'workflow_run' &&
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'push' &&
@@ -191,7 +193,9 @@ jobs:
 
           git config user.name github-actions
           git config user.email github-actions@users.noreply.github.com
-          cr index --config cr.yaml --push
+          index_path="$RUNNER_TEMP/curie-chart-index/index.yaml"
+          mkdir -p "$(dirname "$index_path")"
+          cr index --config cr.yaml --index-path "$index_path" --push
 
       - name: Install Helm
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
