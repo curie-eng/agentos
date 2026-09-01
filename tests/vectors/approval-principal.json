@@ -1,0 +1,13 @@
+{
+  "secret": "approval-vector-secret",
+  "issued_at": 100,
+  "token": "apr.eyJhY3Rvcl9jaGFubmVsIjoiQzBFWEFNUExFMSIsImFwcHJvdmFsX2lkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMTUzIiwiZXhwIjoxNjAsImtpbmQiOiJjaGF0Iiwic2NvcGUiOiJhcHByb3ZhbC5yZXNvbHZlIiwic3ViIjoiVTBFWEFNUExFMSJ9.-1rvjz9IG6kxz36LHBrN4A6qcTIxsi_RrxqCee3Nn5E",
+  "claims": {
+    "actor_channel": "C0EXAMPLE1",
+    "approval_id": "00000000-0000-4000-8000-000000000153",
+    "exp": 160,
+    "kind": "chat",
+    "scope": "approval.resolve",
+    "sub": "U0EXAMPLE1"
+  }
+}

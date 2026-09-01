@@ -153,6 +153,18 @@ _ADR_0076_V1_KEYS = {
     "service.name": "str",
 }
 
+_PHASE_V1_ADDITIONS = {
+    "curie.generation.round": "int",
+    "curie.phase": "str",
+    "curie.phase.end_kind": "str",
+    "curie.phase.start_kind": "str",
+    "curie.terminal.cause": "str",
+    "curie.terminal.status": "str",
+    "curie.tool.call.index": "int",
+    "curie.generation.ttft_ms": "int",
+    "curie.tool.outcome": "str",
+}
+
 
 def _committed_schema() -> dict:
     return json.loads(_SCHEMA_PATH.read_text())
@@ -186,6 +198,21 @@ def test_committed_schema_matches_the_enum() -> None:
         "Regenerate the committed file (see this module's docstring) and "
         "commit it alongside the code change."
     )
+
+
+def test_phase_keys_are_an_additive_typed_v1_extension() -> None:
+    committed = _committed_schema()
+    committed_keys = committed["keys"]
+
+    assert committed["schema_version"] == "v1"
+    assert {
+        key: committed_keys.get(key) for key in _ADR_0076_V1_KEYS
+    } == _ADR_0076_V1_KEYS
+    assert {
+        key: committed_keys.get(key) for key in _PHASE_V1_ADDITIONS
+    } == _PHASE_V1_ADDITIONS
+    assert committed_keys == _ADR_0076_V1_KEYS | _PHASE_V1_ADDITIONS
+    assert set(committed_keys.values()) == {"str", "int"}
 
 
 def test_runner_reexports_the_shared_span_attribute_key_enum() -> None:
@@ -278,10 +305,10 @@ def test_every_declared_key_emits_its_committed_value_type() -> None:
     # (the FakeModelSession default script never threads a session/sandbox id,
     # an approval decision, or the prompt-cache usage fields through). This test
     # closes that gap by driving every declared key through its real setter --
-    # the 12 span-level keys via RunTracer.run_span/record_usage/tool_span, and
-    # the stable resource keys via build_tracer_provider -- so a call-site
-    # retype of any previously-unexercised key (that also forgot
-    # to update SPAN_ATTRIBUTE_VALUE_TYPES) fails here instead of slipping past.
+    # direct compatibility setters for usage/tools, an opt-in payload-free fake
+    # boundary for TTFT, and build_tracer_provider for stable resource keys -- so
+    # a call-site retype of any previously-unexercised key (that also forgot to
+    # update SPAN_ATTRIBUTE_VALUE_TYPES) fails here instead of slipping past.
     committed = _committed_schema()["keys"]
     emitted: dict[str, object] = {}
 
@@ -307,6 +334,27 @@ def test_every_declared_key_emits_its_committed_value_type() -> None:
             }
         )
         span.tool_span("Bash")
+
+    runner = SessionRunner(
+        session_factory=lambda: FakeModelSession(emit_partial_boundaries=True),
+        ceiling=0,
+        tracer=tracer,
+        classifier=SideEffectClassifier(),
+        trace_name="curie-run:test",
+        model="fake-model",
+    )
+
+    async def go() -> None:
+        await runner.start()
+        try:
+            async for _ in runner.run_turn(
+                Event(type="message", text="go", user="U0EXAMPLE1", ts="1")
+            ):
+                pass
+        finally:
+            await runner.close()
+
+    anyio.run(go)
 
     for finished in exporter.get_finished_spans():
         if finished.attributes:

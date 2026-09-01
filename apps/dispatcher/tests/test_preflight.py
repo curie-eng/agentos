@@ -44,6 +44,10 @@ def _config(**overrides: object) -> DispatcherConfig:
     """
     defaults: dict[str, object] = {
         "api_base_url": API_URL,
+        # This test is about the reachability probe, not principal issuance.
+        # Supply the independent mandatory attester credential so a fail-closed
+        # DispatcherConfig does not hide the probe behavior under test.
+        "approval_chat_attester_secret": "dispatcher-attester-test-secret",
         "api_preflight_timeout_s": 0.2,
         "backoff_initial_seconds": 0.01,
         "backoff_max_seconds": 0.02,
@@ -323,6 +327,9 @@ def test_run_main_gates_before_connecting_slack(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setenv("CURIE_API_PREFLIGHT_TIMEOUT_SECONDS", "0.2")
     monkeypatch.setenv("CURIE_BACKOFF_INITIAL_SECONDS", "0.01")
     monkeypatch.setenv("CURIE_BACKOFF_MAX_SECONDS", "0.02")
+    monkeypatch.setenv(
+        "CURIE_APPROVAL_CHAT_ATTESTER_SECRET", "dispatcher-attester-test-secret"
+    )
 
     with pytest.raises(SystemExit) as excinfo:
         run.main()

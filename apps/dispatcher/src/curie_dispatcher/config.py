@@ -24,6 +24,7 @@ Env mapping:
     CURIE_BACKOFF_MULTIPLIER      -> backoff_multiplier
     CURIE_API_URL            -> api_base_url  (CURIE_API_BASE_URL: deprecated alias)
     CURIE_API_KEY            -> api_key
+    CURIE_APPROVAL_CHAT_ATTESTER_SECRET -> approval_chat_attester_secret
     CURIE_API_PREFLIGHT_TIMEOUT_SECONDS -> api_preflight_timeout_s
     CURIE_HEARTBEAT_FILE             -> heartbeat_file
     CURIE_HEARTBEAT_INTERVAL_SECONDS -> heartbeat_interval_s
@@ -39,7 +40,7 @@ from aci_protocol.service_config import (
     api_url_validation_alias,
     warn_if_deprecated_api_url_env,
 )
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic_settings.sources import (
     PydanticBaseSettingsSource,
@@ -95,6 +96,14 @@ class DispatcherConfig(BaseSettings):
         default="http://localhost:8000", validation_alias=api_url_validation_alias()
     )
     api_key: str = Field(default="curie-dev-key", validation_alias=API_KEY_ENV)
+    # Socket Mode proves which Slack user acted, but the platform API accepts
+    # that fact only when the dispatcher attests it with a credential held by
+    # no other caller class (ADR-0106). This is deliberately required: falling
+    # back to the widely shared platform key would let any holder mint a chat
+    # identity and recreate the caller-asserted boundary under a signed shape.
+    approval_chat_attester_secret: str = Field(
+        validation_alias="CURIE_APPROVAL_CHAT_ATTESTER_SECRET"
+    )
     # Deadline for the boot-time gate on that wiring (see preflight.py). Long
     # enough to absorb the API's own startup. Must be positive: the gate is the
     # AC2 requirement, so a non-positive value is a config error at boot rather
@@ -147,6 +156,18 @@ class DispatcherConfig(BaseSettings):
     heartbeat_interval_s: float = Field(
         default=10.0, validation_alias=HEARTBEAT_INTERVAL_ENV
     )
+
+    @model_validator(mode="after")
+    def _require_independent_chat_attester(self) -> "DispatcherConfig":
+        """Fail boot when the Slack identity attester is absent or shared."""
+
+        if not self.approval_chat_attester_secret.strip():
+            raise ValueError("CURIE_APPROVAL_CHAT_ATTESTER_SECRET must be non-blank")
+        if self.approval_chat_attester_secret == self.api_key:
+            raise ValueError(
+                "CURIE_APPROVAL_CHAT_ATTESTER_SECRET must differ from CURIE_API_KEY"
+            )
+        return self
 
     def dedupe_key(self, slack_event_id: str) -> str:
         """The Valkey key that guards a single Slack event id against retries."""

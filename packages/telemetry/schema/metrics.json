@@ -941,6 +941,7 @@
           "/agents/{agent_id}/versions/{version_id}/connectors",
           "/agents/{agent_id}/versions/{version_id}/files",
           "/approvals",
+          "/approvals/principals/operator",
           "/approvals/{approval_id}",
           "/approvals/{approval_id}/audit",
           "/approvals/{approval_id}/resolve",
@@ -1002,7 +1003,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 2760
+      "cardinality_bound": 2800
     },
     "curie.http.server.request.duration": {
       "type": "histogram",
@@ -1044,6 +1045,7 @@
           "/agents/{agent_id}/versions/{version_id}/connectors",
           "/agents/{agent_id}/versions/{version_id}/files",
           "/approvals",
+          "/approvals/principals/operator",
           "/approvals/{approval_id}",
           "/approvals/{approval_id}/audit",
           "/approvals/{approval_id}/resolve",
@@ -1105,7 +1107,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 2760
+      "cardinality_bound": 2800
     },
     "curie.http.server.active": {
       "type": "up_down_counter",
@@ -1147,6 +1149,7 @@
           "/agents/{agent_id}/versions/{version_id}/connectors",
           "/agents/{agent_id}/versions/{version_id}/files",
           "/approvals",
+          "/approvals/principals/operator",
           "/approvals/{approval_id}",
           "/approvals/{approval_id}/audit",
           "/approvals/{approval_id}/resolve",
@@ -1201,7 +1204,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 552
+      "cardinality_bound": 560
     },
     "curie.background.loop": {
       "type": "counter",

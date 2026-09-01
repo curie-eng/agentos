@@ -985,6 +985,10 @@
             "title": "Approval Id",
             "type": "string"
           },
+          "authenticated": {
+            "title": "Authenticated",
+            "type": "boolean"
+          },
           "authorized": {
             "title": "Authorized",
             "type": "boolean"
@@ -1019,6 +1023,22 @@
             "title": "Id",
             "type": "string"
           },
+          "principal_kind": {
+            "anyOf": [
+              {
+                "enum": [
+                  "chat",
+                  "console",
+                  "operator"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Principal Kind"
+          },
           "reason": {
             "anyOf": [
               {
@@ -1037,6 +1057,8 @@
           "action",
           "actor",
           "actor_channel",
+          "principal_kind",
+          "authenticated",
           "decision",
           "authorizer",
           "authorized",
@@ -1274,6 +1296,52 @@
         "title": "ApprovalOut",
         "type": "object"
       },
+      "ApprovalPrincipalMint": {
+        "description": "Administrative request to mint one operator approval credential.",
+        "properties": {
+          "subject": {
+            "minLength": 1,
+            "title": "Subject",
+            "type": "string"
+          }
+        },
+        "required": [
+          "subject"
+        ],
+        "title": "ApprovalPrincipalMint",
+        "type": "object"
+      },
+      "ApprovalPrincipalOut": {
+        "description": "One-time delivery of a short-lived operator approval credential.",
+        "properties": {
+          "expires_at": {
+            "format": "date-time",
+            "title": "Expires At",
+            "type": "string"
+          },
+          "kind": {
+            "const": "operator",
+            "default": "operator",
+            "title": "Kind",
+            "type": "string"
+          },
+          "subject": {
+            "title": "Subject",
+            "type": "string"
+          },
+          "token": {
+            "title": "Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "token",
+          "subject",
+          "expires_at"
+        ],
+        "title": "ApprovalPrincipalOut",
+        "type": "object"
+      },
       "ApprovalRequest": {
         "description": "A durable approval request (#244), created by the worker when a run ends\nawaiting-approval.\n\n``dedupe_key`` is the triggering event id, so a redelivered turn adopts the\nexisting record instead of forking a second one. ``route``/``card_channel``\n(#247) record the manifest route the request named and the channel the worker\nrouted the card to after binding resolution; the authorizer proves membership\nagainst ``card_channel``. ``gate_kind``/``granted_tool`` are the durable gate\nprovenance (#544, Decision C) written by the runner; both stay optional for\nthe rolling-deploy window.\n\n``reply_kind``/``reply_channel`` are the durable twin of ``ReplyHandle``'s\nrouting pair (ADR-0096), and ``reply_adapter`` the durable twin of its egress\nselector. ``reply_kind`` is REQUIRED, deliberately unlike ``gate_kind`` above:\nan absent kind puts the silent misroute back on the resume path, where it is\nleast observable, and ADR-0096 phase 2 buys the right to reject it with a\nquiescent cutover rather than a rolling-deploy window. ``reply_adapter`` is\nnullable because ``slack`` legitimately has no adapter -- its route is the\nworker's configured Slack origin.",
         "properties": {
@@ -1443,19 +1511,8 @@
         "type": "object"
       },
       "ApprovalResolve": {
-        "description": "One resolution attempt. Exactly one attempt wins (compare-and-set), and\nthe server-side authorizer (#246) decides first whether this actor may\nresolve at all: ordinary self-approval is blocked, while a server-linked\npublication requester must still prove membership. ``actor_channel`` is the\nchannel the resolution attempt was made from (the card click's channel,\nrelayed by the dispatcher; asserted explicitly by API-key operators).",
+        "description": "One resolution attempt. Exactly one attempt wins (compare-and-set), and\nthe server-side authorizer decides whether the authenticated principal may\nresolve it. Identity and channel evidence come only from that credential;\nthis body carries no caller-asserted actor fields (ADR-0106).",
         "properties": {
-          "actor_channel": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Actor Channel"
-          },
           "decision": {
             "enum": [
               "approved",
@@ -1474,16 +1531,10 @@
               }
             ],
             "title": "Note"
-          },
-          "resolved_by": {
-            "minLength": 1,
-            "title": "Resolved By",
-            "type": "string"
           }
         },
         "required": [
-          "decision",
-          "resolved_by"
+          "decision"
         ],
         "title": "ApprovalResolve",
         "type": "object"
@@ -1957,6 +2008,21 @@
         "title": "ConnectorManifests",
         "type": "object"
       },
+      "ConsoleLoginCodeMint": {
+        "description": "Administrative request for one immutable subject-bound console login.",
+        "properties": {
+          "subject": {
+            "minLength": 1,
+            "title": "Subject",
+            "type": "string"
+          }
+        },
+        "required": [
+          "subject"
+        ],
+        "title": "ConsoleLoginCodeMint",
+        "type": "object"
+      },
       "ConsoleLoginCodeOut": {
         "description": "A freshly minted login code, returned exactly once.\n\nThe code is plaintext here because this response IS the one delivery: the CLI\nprints it for the operator to copy. Only its hash is stored.",
         "properties": {
@@ -1968,10 +2034,15 @@
             "format": "date-time",
             "title": "Expires At",
             "type": "string"
+          },
+          "subject": {
+            "title": "Subject",
+            "type": "string"
           }
         },
         "required": [
           "code",
+          "subject",
           "expires_at"
         ],
         "title": "ConsoleLoginCodeOut",
@@ -1999,9 +2070,21 @@
             "format": "date-time",
             "title": "Expires At",
             "type": "string"
+          },
+          "subject": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Subject"
           }
         },
         "required": [
+          "subject",
           "expires_at"
         ],
         "title": "ConsoleSessionOut",
@@ -7945,6 +8028,66 @@
         ]
       }
     },
+    "/approvals/principals/operator": {
+      "post": {
+        "description": "Mint an operator credential; the platform key authorizes issuance only.\n\nThe token is returned once and marked non-cacheable.  Resolution will\nauthenticate the subject from this credential rather than accepting a\ncaller-supplied actor string.",
+        "operationId": "mint_operator_principal_approvals_principals_operator_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApprovalPrincipalMint"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApprovalPrincipalOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Mint Operator Principal",
+        "tags": [
+          "approvals"
+        ]
+      }
+    },
     "/approvals/{approval_id}": {
       "get": {
         "operationId": "get_approval_approvals__approval_id__get",
@@ -8070,7 +8213,7 @@
     },
     "/approvals/{approval_id}/resolve": {
       "post": {
-        "description": "Claim the resolution (resolve-once) and wake the suspended session.\n\nThe authorizer runs first, server-side (#246): self-approval is blocked and\nthe route's approvers decide -- an explicit user list, a Slack user group,\nor (declaring none) the card channel's members (#420); a denied actor gets\n403 with the reason. Then exactly one authorized resolver wins\nthe conditional UPDATE; a loser gets 409 naming who resolved it, and a\npast-SLA record flips to expired and returns 410 while still enqueuing the\nexpiry resume turn so the suspended session wakes down its timeout branch.\nThe winner's response is sent only after the resume turn is enqueued.",
+        "description": "Claim the resolution (resolve-once) and wake the suspended session.\n\nThe authorizer runs first, server-side (#246): the route's approvers decide\nwhether the authenticated principal belongs -- an explicit user list, a\nSlack user group, or (declaring none) the card channel's members (#420).\nRequester equality neither grants nor vetoes membership. Then exactly one\nauthorized resolver wins\nthe conditional UPDATE; a loser gets 409 naming who resolved it, and a\npast-SLA record flips to expired and returns 410 while still enqueuing the\nexpiry resume turn so the suspended session wakes down its timeout branch.\nThe winner's response is sent only after the resume turn is enqueued.",
         "operationId": "resolve_approval_approvals__approval_id__resolve_post",
         "parameters": [
           {
@@ -8085,7 +8228,7 @@
           },
           {
             "in": "header",
-            "name": "x-api-key",
+            "name": "X-Curie-Approval-Principal",
             "required": false,
             "schema": {
               "anyOf": [
@@ -8096,7 +8239,23 @@
                   "type": "null"
                 }
               ],
-              "title": "X-Api-Key"
+              "title": "X-Curie-Approval-Principal"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
             }
           }
         ],
@@ -8360,6 +8519,16 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConsoleLoginCodeMint"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "201": {
             "content": {
@@ -8389,6 +8558,54 @@
       }
     },
     "/console/session": {
+      "get": {
+        "description": "Return the immutable subject of the live session in the HttpOnly cookie.",
+        "operationId": "current_session_console_session_get",
+        "parameters": [
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConsoleSessionOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Current Session",
+        "tags": [
+          "console"
+        ]
+      },
       "post": {
         "description": "Exchange a login code for a session cookie.\n\nUnauthenticated by design (see the module docstring). Every rejection is the\nsame 401 with the same text: an unknown code, an already-consumed one, an\nexpired one and a revoked row are indistinguishable to the caller, so this\nendpoint cannot be used to enumerate which codes exist.",
         "operationId": "exchange_login_code_console_session_post",

@@ -14,6 +14,16 @@ import pytest
 from curie_dispatcher.config import DispatcherConfig
 from pydantic import ValidationError
 
+_CHAT_ATTESTER_SECRET = "dispatcher-attester-test-secret"
+
+
+def _set_valid_chat_attester_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Provide the independent credential needed by unrelated config tests."""
+
+    monkeypatch.setenv(
+        "CURIE_APPROVAL_CHAT_ATTESTER_SECRET", _CHAT_ATTESTER_SECRET
+    )
+
 
 def _clear_all_config_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Delete every env var the config could read, for a clean-env baseline.
@@ -67,6 +77,7 @@ def test_aliased_field_ignores_bare_field_name_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A stray bare-name env var must not leak into an aliased field."""
+    _set_valid_chat_attester_secret(monkeypatch)
     monkeypatch.setenv("STREAM", "stray:stream")
 
     config = DispatcherConfig()
@@ -76,6 +87,7 @@ def test_aliased_field_ignores_bare_field_name_env(
 
 def test_aliased_field_reads_its_alias(monkeypatch: pytest.MonkeyPatch) -> None:
     """The intended CURIE_* alias is still read from the env."""
+    _set_valid_chat_attester_secret(monkeypatch)
     monkeypatch.setenv("CURIE_STREAM", "intended:stream")
 
     assert DispatcherConfig().stream == "intended:stream"
@@ -83,6 +95,7 @@ def test_aliased_field_reads_its_alias(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_alias_wins_over_bare_field_name(monkeypatch: pytest.MonkeyPatch) -> None:
     """With both set, only the alias is read and the bare name is ignored."""
+    _set_valid_chat_attester_secret(monkeypatch)
     monkeypatch.setenv("STREAM", "stray:stream")
     monkeypatch.setenv("CURIE_STREAM", "intended:stream")
 
@@ -91,7 +104,11 @@ def test_alias_wins_over_bare_field_name(monkeypatch: pytest.MonkeyPatch) -> Non
 
 def test_field_name_kwargs_still_populate() -> None:
     """populate_by_name construction (used by tests) is unchanged."""
-    config = DispatcherConfig(stream="s", dedupe_ttl_seconds=99)
+    config = DispatcherConfig(
+        stream="s",
+        dedupe_ttl_seconds=99,
+        approval_chat_attester_secret=_CHAT_ATTESTER_SECRET,
+    )
 
     assert config.stream == "s"
     assert config.dedupe_ttl_seconds == 99
@@ -101,6 +118,7 @@ def test_non_aliased_field_still_reads_plain_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Fields without an alias keep reading their uppercased field name."""
+    _set_valid_chat_attester_secret(monkeypatch)
     monkeypatch.setenv("VALKEY_HOST", "valkey.internal")
 
     assert DispatcherConfig().valkey_host == "valkey.internal"
@@ -115,12 +133,14 @@ def test_defaults_parity_with_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     Every field is enumerated; a drifted default is a silent prod break.
     """
     _clear_all_config_env(monkeypatch)
+    _set_valid_chat_attester_secret(monkeypatch)
 
     config = DispatcherConfig()
 
     assert config.slack_app_token == ""
     assert config.slack_bot_token == ""
     assert config.slack_signing_secret == ""
+    assert config.approval_chat_attester_secret == _CHAT_ATTESTER_SECRET
     assert config.valkey_host == "localhost"
     assert config.valkey_port == 6379
     assert config.valkey_password == ""
@@ -141,6 +161,7 @@ def test_overrides_parity_with_from_env(monkeypatch: pytest.MonkeyPatch) -> None
     Proves no env-var name drifted and no read was dropped.
     """
     _clear_all_config_env(monkeypatch)
+    _set_valid_chat_attester_secret(monkeypatch)
     for env_var, (_field, raw, _expected) in _DISPATCHER_OVERRIDES.items():
         monkeypatch.setenv(env_var, raw)
 
@@ -166,6 +187,61 @@ def test_overrides_parity_with_from_env(monkeypatch: pytest.MonkeyPatch) -> None
 # These lock that decision, and cover the setting the boot gate reads.
 
 
+@pytest.mark.parametrize("chat_attester_secret", [None, "", "curie-dev-key"])
+def test_approval_chat_attester_secret_is_required_and_independent(
+    monkeypatch: pytest.MonkeyPatch, chat_attester_secret: str | None
+) -> None:
+    """ADR-0106: an API key must never become a Slack identity attester.
+
+    A missing or blank key would make a click unable to prove who Slack
+    authenticated. Reusing the platform API key is worse: it lets every holder
+    of that widely shared key forge an approval principal. All three are a
+    startup error, rather than a button that appears to work but records an
+    assertion.
+    """
+
+    _clear_all_config_env(monkeypatch)
+    if chat_attester_secret is not None:
+        monkeypatch.setenv(
+            "CURIE_APPROVAL_CHAT_ATTESTER_SECRET", chat_attester_secret
+        )
+
+    with pytest.raises(ValidationError):
+        DispatcherConfig()
+
+
+def test_approval_chat_attester_secret_reads_only_its_explicit_alias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A generic field-name env var cannot quietly become a signing key."""
+
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("APPROVAL_CHAT_ATTESTER_SECRET", _CHAT_ATTESTER_SECRET)
+
+    with pytest.raises(ValidationError):
+        DispatcherConfig()
+
+    monkeypatch.setenv(
+        "CURIE_APPROVAL_CHAT_ATTESTER_SECRET", _CHAT_ATTESTER_SECRET
+    )
+    assert DispatcherConfig().approval_chat_attester_secret == _CHAT_ATTESTER_SECRET
+
+
+def test_approval_chat_attester_secret_cannot_equal_a_non_default_platform_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The independence guard compares values, not just the dev default."""
+
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_API_KEY", "different-platform-api-test-key")
+    monkeypatch.setenv(
+        "CURIE_APPROVAL_CHAT_ATTESTER_SECRET", "different-platform-api-test-key"
+    )
+
+    with pytest.raises(ValidationError):
+        DispatcherConfig()
+
+
 def test_api_base_url_default_stays_localhost(monkeypatch: pytest.MonkeyPatch) -> None:
     """The code default is unchanged: the fix is manifest wiring, not a new default.
 
@@ -173,6 +249,7 @@ def test_api_base_url_default_stays_localhost(monkeypatch: pytest.MonkeyPatch) -
     no env set at all.
     """
     _clear_all_config_env(monkeypatch)
+    _set_valid_chat_attester_secret(monkeypatch)
 
     assert DispatcherConfig().api_base_url == "http://localhost:8000"
 
@@ -180,6 +257,7 @@ def test_api_base_url_default_stays_localhost(monkeypatch: pytest.MonkeyPatch) -
 def test_api_preflight_timeout_default(monkeypatch: pytest.MonkeyPatch) -> None:
     """The boot gate's deadline defaults to 30s: long enough to absorb API startup."""
     _clear_all_config_env(monkeypatch)
+    _set_valid_chat_attester_secret(monkeypatch)
 
     assert DispatcherConfig().api_preflight_timeout_s == 30.0
 
@@ -187,6 +265,7 @@ def test_api_preflight_timeout_default(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_api_preflight_timeout_reads_its_alias(monkeypatch: pytest.MonkeyPatch) -> None:
     """The deadline is tunable via CURIE_API_PREFLIGHT_TIMEOUT_SECONDS, and float-coerced."""
     _clear_all_config_env(monkeypatch)
+    _set_valid_chat_attester_secret(monkeypatch)
     monkeypatch.setenv("CURIE_API_PREFLIGHT_TIMEOUT_SECONDS", "5.5")
 
     config = DispatcherConfig()
@@ -200,6 +279,7 @@ def test_api_preflight_timeout_ignores_bare_field_name(
 ) -> None:
     """The new aliased field follows the house rule: alias only, no bare-name fallback."""
     _clear_all_config_env(monkeypatch)
+    _set_valid_chat_attester_secret(monkeypatch)
     monkeypatch.setenv("API_PREFLIGHT_TIMEOUT_S", "99.0")
 
     assert DispatcherConfig().api_preflight_timeout_s == 30.0
@@ -215,6 +295,7 @@ def test_api_preflight_timeout_rejects_non_positive(
     button the gate exists to prevent.
     """
     _clear_all_config_env(monkeypatch)
+    _set_valid_chat_attester_secret(monkeypatch)
     monkeypatch.setenv("CURIE_API_PREFLIGHT_TIMEOUT_SECONDS", "0")
 
     with pytest.raises(ValidationError):
@@ -233,6 +314,7 @@ def test_api_preflight_timeout_rejects_non_finite(
     failure AC2 exists to eliminate, so the value is rejected at boot instead.
     """
     _clear_all_config_env(monkeypatch)
+    _set_valid_chat_attester_secret(monkeypatch)
     monkeypatch.setenv("CURIE_API_PREFLIGHT_TIMEOUT_SECONDS", token)
 
     with pytest.raises(ValidationError):
@@ -274,6 +356,7 @@ def test_the_dispatcher_does_not_read_the_shimmer_flag(
     for a pydantic bool field and stayed green under an inverted parser (#1394).
     """
     _clear_all_config_env(monkeypatch)
+    _set_valid_chat_attester_secret(monkeypatch)
     monkeypatch.setenv("CURIE_SHIMMER", "on")
     monkeypatch.setenv("CURIE_STATUS_TEXT", "is doing something")
 

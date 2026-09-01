@@ -12,11 +12,14 @@ bindings, or how an approver set is chosen: it is handed an
 applies every rule that is not membership. There is ONE authorizer, and the
 swappable part is the set behind it (ADR-0034).
 
-Self-approval is structural for ordinary session approvals: the actor who
-authored the request is refused before a set is asked. A server-owned
-``publication`` purpose is the sole exception. Its requester still passes
-through the selected membership set, and the exception is recorded in evidence;
-a caller cannot opt another approval into it.
+Requester equality has no special meaning here. ADR-0106 makes the selected set
+the authorization boundary, so an authenticated requester who belongs to it may
+confirm their own action and an unlisted requester remains denied.
+
+Channel-less principals have one additional eligibility rule. An ``operator``
+can be evaluated only by an explicit-user set. A subject-bound ``console``
+principal may also be checked by a server-side user-group lookup, but neither
+kind may manufacture Slack channel evidence.
 
 Fail closed: a set that could not determine membership (a lookup that failed, a
 binding the platform cannot read) denies. That is the set reporting
@@ -25,24 +28,18 @@ member -- a config or infrastructure error must not be rendered to a clicker as
 policy, and must never widen an approver set an operator narrowed.
 
 Each decision carries the evidence that produced it, so the audit row records
-the authority that counted rather than only the actor. One honest limit on that
-evidence: it proves the ASSERTED identity satisfied policy at click time, not
-who actually clicked (the ADR-0033 residual, tracked separately).
+the authority that counted rather than only the authenticated actor.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from .approvers import ApproverSet
 from .models import Approval
 
-# The one wording for a self-approval refusal, so the dispatcher's rendering of
-# it does not depend on which set the approval happened to be bound to.
-_SELF_APPROVAL_REASON = (
-    "self-approval is blocked: the requester cannot resolve their own request"
-)
+PrincipalKind = Literal["chat", "console", "operator"]
 
 
 @dataclass(frozen=True)
@@ -62,6 +59,7 @@ async def authorize_approval(
     actor_channel: str | None,
     *,
     approver_set: ApproverSet,
+    principal_kind: PrincipalKind,
 ) -> tuple[str, AuthzDecision]:
     """Decide whether ``actor`` may resolve ``approval``, and name what decided
     (for the audit row).
@@ -71,31 +69,44 @@ async def authorize_approval(
     set, including one the platform could not read, so there is no second path
     through here.
 
-    The order is the contract: refuse ordinary self-approval BEFORE asking the
-    set. A publication requester is intentionally checked by the set, because
-    membership remains required even under that purpose-specific exception.
+    The order is the contract: a channel-less principal must first be eligible
+    for the selected set, then every principal (including the requester) is
+    checked for membership.
     """
 
     name = approver_set.audit_name
 
-    publication_requester = (
-        actor == approval.author and approval.purpose == "publication"
-    )
-    if actor == approval.author and not publication_requester:
-        # Named after the set that would have decided, but carrying no evidence:
-        # the set never ran, and recording its snapshot next to this denial would
-        # imply membership was what refused.
-        return name, AuthzDecision(allowed=False, reason=_SELF_APPROVAL_REASON)
+    if principal_kind == "operator" and not approver_set.operator_eligible:
+        return name, AuthzDecision(
+            allowed=False,
+            reason=(
+                f"{principal_kind} approval principals can resolve only routes "
+                "bound to an explicit user list"
+            ),
+            evidence={
+                "kind": "principal_set_eligibility",
+                "principal_kind": principal_kind,
+                "explicit_users_required": True,
+            },
+        )
+    if principal_kind == "console" and not approver_set.console_eligible:
+        return name, AuthzDecision(
+            allowed=False,
+            reason=(
+                "console approval principals can resolve only routes bound to "
+                "an explicit user list or verifiable user group"
+            ),
+            evidence={
+                "kind": "principal_set_eligibility",
+                "principal_kind": principal_kind,
+                "channel_evidence_required": True,
+            },
+        )
 
     verdict = await approver_set.contains(actor, actor_channel)
     if verdict.undetermined or not verdict.member:
         # Both refuse, and the set says why: it is the only one that knows
         # whether it could not determine membership or the actor is genuinely
         # outside the set.
-        return name, AuthzDecision(
-            allowed=False, reason=verdict.reason, evidence=verdict.evidence
-        )
-    evidence = dict(verdict.evidence or {})
-    if publication_requester:
-        evidence["publication_requester_exception"] = True
-    return name, AuthzDecision(allowed=True, evidence=evidence)
+        return name, AuthzDecision(allowed=False, reason=verdict.reason, evidence=verdict.evidence)
+    return name, AuthzDecision(allowed=True, evidence=dict(verdict.evidence or {}))

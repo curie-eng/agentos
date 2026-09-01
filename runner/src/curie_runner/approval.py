@@ -5,10 +5,12 @@ trigger types, and this module is the runner half of both:
 
 - **Policy gate** (#244): the agent's own logic decides something needs a
   human decision. An in-process SDK MCP tool
-  (``mcp__curie__request_approval``) is carried by every session, so a
-  skill instructs the model to call it with a one-line summary. The call
-  executes no real-world action; it only marks the turn, and the session
-  emits its terminal ``final`` with ``status=awaiting-approval``.
+  (``mcp__curie__request_approval``) is carried when the live MCP surface has
+  a potentially mutating tool or an explicit approval gate. A fully observed
+  surface whose tools all declare ``readOnlyHint=true`` omits it, so a model
+  cannot page a human for an action the session cannot perform. The call
+  executes no real-world action; it only marks the turn, and the session emits
+  its terminal ``final`` with ``status=awaiting-approval``.
 - **Permission gate** (#245): configuration marks a tool as
   approval-required, and the runner intercepts the model-initiated call
   proactively through the SDK ``can_use_tool`` callback -- the replacement
@@ -313,9 +315,12 @@ def _distinct_routes(gate: ApprovalGate | None) -> list[str]:
 
 
 def build_approval_server(
-    gate: ApprovalGate | None = None, *, managed_workspace: bool = False
+    gate: ApprovalGate | None = None,
+    *,
+    managed_workspace: bool = False,
+    include_request_approval: bool = True,
 ) -> McpSdkServerConfig:
-    """The in-process MCP server carrying the approval-request tool.
+    """Build the in-process MCP server carrying applicable approval tools.
 
     Per-gate (#544, Decision B): the tool closes over ``gate`` so it can
     validate the model-supplied ``route`` against the manifest routes the gate
@@ -330,11 +335,17 @@ def build_approval_server(
     ``.strip()``) before comparison so a route that validates green at deploy
     can never fail to match at runtime (#453, the validator/runtime split that
     shipped two silent fail-opens).
+
+    ``include_request_approval=False`` omits only the generic policy gate. A
+    managed workspace still carries ``publish_changes``, whose separate
+    permission gate corresponds to an action the platform can actually perform.
     """
 
     @tool(_TOOL_NAME, _TOOL_DESCRIPTION, _TOOL_SCHEMA)
     async def request_approval(args: dict[str, Any]) -> dict[str, Any]:
         return process_approval_request(gate, args)
+
+    tools = [request_approval] if include_request_approval else []
 
     @tool(_PUBLISH_TOOL, _PUBLISH_DESCRIPTION, _PUBLISH_SCHEMA)
     async def publish_changes(_args: dict[str, Any]) -> dict[str, Any]:
@@ -355,7 +366,7 @@ def build_approval_server(
             "this sandbox tool cannot execute it directly."
         )
 
-    tools = [request_approval, publish_changes]
+    tools.append(publish_changes)
 
     return create_sdk_mcp_server(
         name=APPROVAL_SERVER_NAME,
@@ -587,9 +598,8 @@ class ApprovalGate:
     # ``SessionRunner`` knows the runner itself requested that stop. It is
     # runner-internal and is NEVER serialized onto the wire.
     pending_halt: bool = False
-    # The bundle's declared `toolPolicy`, and the identity needed to read a live
-    # tool name against it. A `None` policy is every bundle shipped to date: no
-    # policy, no classification, today's posture exactly.
+    # A declared tool policy plus the bundle identity needed to translate live
+    # SDK MCP names back to the canonical "<server>/<tool>" policy surface.
     tool_policy: ToolPolicy | None = None
     bundle_name: str | None = None
     mcp_servers: set[str] | None = None
@@ -678,15 +688,6 @@ class _GateDecision(NamedTuple):
     ``blocked`` is the only field a caller branches on today; ``ungated`` is
     carried so a caller that wants to distinguish "nothing to do" from
     "allowed via grant" can, without re-deriving it from ``gate.required``.
-
-    ``refusal`` is a FOURTH outcome and deliberately not a fourth flavour of
-    ``blocked``, because the two ask different things of the caller. A block
-    pauses the turn and names a human who can let the call through; a refusal
-    says no approval exists that would. A ``toolPolicy`` ``deny``, and a tool the
-    policy classifies as nothing at all, are refusals -- recording an approval
-    request for either would invite a human to grant something the policy
-    forbids, and the audience would have no way to tell that from an ordinary
-    gate. When set it carries the sentence the model is shown.
     """
 
     blocked: bool
@@ -694,26 +695,41 @@ class _GateDecision(NamedTuple):
     refusal: str | None = None
 
 
+def is_mcp_tool(live_tool_name: str) -> bool:
+    """Return whether a live SDK name belongs to an MCP server."""
+
+    return live_tool_name.startswith("mcp__")
+
+
+def canonical_tool_name(
+    live_tool_name: str,
+    *,
+    bundle_name: str | None,
+    mcp_servers: set[str] | None,
+    connector_servers: set[str] | None,
+) -> str | None:
+    """Map a live SDK MCP name to the canonical policy name, if declared."""
+
+    if not is_mcp_tool(live_tool_name):
+        return None
+    for server in sorted(connector_servers or ()):
+        prefix = connector_tool_prefix(server)
+        if live_tool_name.startswith(prefix):
+            tool = live_tool_name[len(prefix) :]
+            return f"{server}/{tool}" if tool else None
+    if bundle_name:
+        for server in sorted(mcp_servers or ()):
+            prefix = effective_tool_prefix(bundle_name, server)
+            if live_tool_name.startswith(prefix):
+                tool = live_tool_name[len(prefix) :]
+                return f"{server}/{tool}" if tool else None
+    return None
+
+
 def _tool_policy_outcome(gate: ApprovalGate, tool_name: str) -> ToolPolicyDecision | None:
-    """How this bundle's ``toolPolicy`` classifies one live tool name.
+    """Classify one live tool, preserving built-ins outside MCP policy."""
 
-    ``None`` when no policy is declared -- the path every bundle shipped to date
-    takes, and the reason this change moves nothing for them.
-
-    A built-in is ``None`` too, and that is not an oversight: policy patterns are
-    ``"<server>/<tool>"`` globs, so ``Bash`` cannot be written into one. Reading
-    "no pattern matches ``Bash``" as the documented unclassified-is-denied
-    default would have a policy about connectors silently revoke every built-in
-    the bundle relies on.
-
-    An ``mcp__`` name that cannot be attributed to a declared server is
-    ``DENY``, not unclassified-by-accident. That case is the drift the default
-    exists for: a connector image advertising a tool from a server this bundle
-    never declared.
-    """
-
-    policy = gate.tool_policy
-    if policy is None or not is_mcp_tool(tool_name):
+    if gate.tool_policy is None or not is_mcp_tool(tool_name):
         return None
     canonical = canonical_tool_name(
         tool_name,
@@ -723,7 +739,7 @@ def _tool_policy_outcome(gate: ApprovalGate, tool_name: str) -> ToolPolicyDecisi
     )
     if canonical is None:
         return ToolPolicyDecision.DENY
-    return classify_tool(policy, canonical)
+    return classify_tool(gate.tool_policy, canonical)
 
 
 def _decide_gate(gate: ApprovalGate, tool_name: str, tool_input: dict[str, Any]) -> _GateDecision:
@@ -749,11 +765,8 @@ def _decide_gate(gate: ApprovalGate, tool_name: str, tool_input: dict[str, Any])
                 "it; say what you were trying to do and stop."
             ),
         )
-    # An approvalRequired classification gates a tool the operator's own list may
-    # not name. It joins the gate path rather than short-circuiting it, so the
-    # grant, the block record and the route all behave exactly as a declared gate
-    # does -- and so a policy can only ADD a gate, never remove one (#520): an
-    # `allow` below still falls through to `gate.required`.
+    # Policy gates are additive to legacy/operator gates. A policy allow never
+    # removes a legacy gate, while approvalRequired joins the same one-shot path.
     if outcome is ToolPolicyDecision.APPROVAL_REQUIRED and tool_name not in gate.required:
         if gate.consume_grant(tool_name):
             return _GateDecision(blocked=False, ungated=False)
@@ -808,10 +821,6 @@ def build_can_use_tool(gate: ApprovalGate) -> CanUseTool:
                 interrupt=True,
             )
         if decision.refusal is not None:
-            # A policy refusal, not a gate block: no approval is recorded and no
-            # human is named, because none could permit it. `interrupt` still
-            # stops the turn -- prose is not a halt mechanism (#1852), and a
-            # model that keeps retrying a denied tool burns the turn either way.
             return PermissionResultDeny(message=decision.refusal, interrupt=True)
         if decision.blocked:
             # ``interrupt`` is the SDK-native "deny AND stop the turn" flag
@@ -927,16 +936,8 @@ def build_approval_hook(gate: ApprovalGate) -> dict[str, list[HookMatcher]]:
             # gate would become a fail-open. Abstaining leaves ``can_use_tool``
             # as the backstop, which is strictly the pre-#1852 posture.
             return {}
-        # The short-circuit is conditional on there being NO policy, and that
-        # condition is the whole point. Returning `{}` for any tool outside
-        # `gate.required` would hand a policy-denied tool to `can_use_tool` --
-        # which the SDK skips whenever some other permission rule already allows
-        # the call. That is #1852 reproduced against the new decision: the hook
-        # exists precisely because it is the only interception no permission rule
-        # can shadow, so a policy-bearing bundle must reach `_decide_gate` here.
-        #
-        # With no policy declared this is the pre-existing fast path, unchanged,
-        # which is every bundle shipped to date.
+        # A policy-bearing bundle must classify every MCP call in this hook;
+        # unlike can_use_tool, PreToolUse cannot be shadowed by another allow.
         if gate.tool_policy is None and tool_name not in gate.required:
             return {}
 
@@ -960,9 +961,6 @@ def build_approval_hook(gate: ApprovalGate) -> dict[str, list[HookMatcher]]:
                 "stopReason": reason,
             }
         if decision.refusal is not None:
-            # Refusal, not a block: nothing is recorded for a human to resolve,
-            # because no approval would permit it. Same deny shape, different
-            # meaning, and the reason text is what says so to the model.
             return {
                 "hookSpecificOutput": {
                     "hookEventName": "PreToolUse",
@@ -973,13 +971,6 @@ def build_approval_hook(gate: ApprovalGate) -> dict[str, list[HookMatcher]]:
                 "stopReason": decision.refusal,
             }
         if decision.ungated:
-            # Back to `{}` -- the documented ungated outcome, and NOT the allow
-            # below. Reaching here at all is new: with a policy declared every
-            # tool now passes through `_decide_gate` so a denied one cannot slip
-            # by, which means the ungated ones arrive here too. Returning the
-            # `allow` below for them would widen authority for every non-gated
-            # tool and skip the callback the policy lane (#544/#558) relies on --
-            # the two costs this function's own docstring names.
             return {}
         if not decision.blocked:
             # Observability for #1852 (accepted, not fixed): the grant is spent
@@ -1037,73 +1028,6 @@ class ApprovalPolicyError(RuntimeError):
     """
 
 
-def is_mcp_tool(live_tool_name: str) -> bool:
-    """Is this live SDK name an MCP tool rather than a built-in?
-
-    `toolPolicy` patterns are `"<server>/<tool>"` globs, so a built-in (`Bash`,
-    `Read`) cannot be written down in one and is therefore not governed by a
-    policy at all. Asking this first is what keeps the documented
-    unclassified-is-denied default from silently revoking `Bash` from every
-    bundle that ships a policy about its connectors.
-    """
-
-    return live_tool_name.startswith("mcp__")
-
-
-def canonical_tool_name(
-    live_tool_name: str,
-    *,
-    bundle_name: str | None,
-    mcp_servers: set[str] | None,
-    connector_servers: set[str] | None,
-) -> str | None:
-    """The `"<server>/<tool>"` a policy pattern is written against, or `None`.
-
-    The piece `plugin_format.tool_policy` deliberately left to this lane: "Mapping
-    canonical -> live SDK name is the runtime lane's job and is out of scope
-    here." This is that mapping, run backwards -- the hook sees the live name and
-    the policy speaks canonical.
-
-    `None` means the name could not be attributed to a declared server, and the
-    caller must treat that as a REFUSAL rather than as "ungoverned". An `mcp__`
-    tool from a server this bundle does not declare is precisely the drift the
-    unclassified default exists to catch; returning `None` for both "unknown" and
-    "not MCP" would collapse the two and fail open, which is why `is_mcp_tool`
-    is a separate question asked first.
-
-    Two mount shapes, and the known-server sets are what disambiguate them
-    (`approval_policy`'s own prefix builders, shared with the deploy validator so
-    the format cannot drift):
-
-    - `connectors.yaml` -> `mcp__<server>__<tool>`
-    - plugin `mcpServers`  -> `mcp__plugin_<bundle>_<server>__<tool>`
-
-    Neither can be parsed by splitting on `__`, because a server name may contain
-    underscores. Connectors are matched first: a connector literally named
-    `plugin_<something>` would otherwise be readable as either shape, and
-    resolving that toward the bare form keeps the answer deterministic.
-
-    A `None` server set is the `declared_mcp_server_names` poison -- unknowable
-    rather than empty -- so it contributes no matches and the name falls through
-    to the refusal above.
-    """
-
-    if not is_mcp_tool(live_tool_name):
-        return None
-    for server in sorted(connector_servers or ()):
-        prefix = connector_tool_prefix(server)
-        if live_tool_name.startswith(prefix):
-            tool = live_tool_name[len(prefix) :]
-            return f"{server}/{tool}" if tool else None
-    if bundle_name:
-        for server in sorted(mcp_servers or ()):
-            prefix = effective_tool_prefix(bundle_name, server)
-            if live_tool_name.startswith(prefix):
-                tool = live_tool_name[len(prefix) :]
-                return f"{server}/{tool}" if tool else None
-    return None
-
-
 @dataclass(frozen=True)
 class ApprovalPolicyResolution:
     """The single parse of a bundle's ``approvalPolicy`` (#544/#558).
@@ -1135,11 +1059,6 @@ class ApprovalPolicyResolution:
     bundle_name: str | None = None
     mcp_servers: set[str] | None = None
     connector_servers: set[str] | None = None
-    # `None` for every bundle that declares no `toolPolicy`, which is all of them
-    # today. `load_tool_policy` refuses to hand one over unless this build names
-    # `TOOL_POLICY_ENFORCEMENT` and the bundle asks for the same contract, so a
-    # policy object here is a two-sided statement that it will actually be
-    # applied -- there is deliberately no value meaning "declared but ignored".
     tool_policy: ToolPolicy | None = None
 
 
@@ -1199,14 +1118,6 @@ def resolve_approval_policy(plugin_dir: str | None) -> ApprovalPolicyResolution:
     bundle_name = name if isinstance(name, str) else None
     mcp_servers = declared_mcp_server_names(root)
     connectors = connector_server_names(root)
-    # BEFORE the approvalPolicy branch, because the two are independent: a bundle
-    # may classify its tool surface without gating anything, and returning early
-    # on a missing approvalPolicy would drop its policy on the floor -- the exact
-    # "declared but not applied" state `load_tool_policy` refuses to produce.
-    #
-    # Fail-closed like every other read here. A policy that does not parse, whose
-    # patterns the deploy validator would reject, or that asks for a contract this
-    # build does not implement, refuses the boot rather than starting unclassified.
     tool_policy: ToolPolicy | None = None
     if isinstance(raw, dict) and raw.get("toolPolicy") is not None:
         try:
@@ -1411,9 +1322,6 @@ def build_approval_gate(
     gated_tools = operator | frozenset(policy_routes)
     if managed_workspace:
         gated_tools |= frozenset({PUBLISH_TOOL_NAME})
-    # A toolPolicy is itself an interception source: it can add approval gates,
-    # permanently refuse deny/unclassified tools, and must classify calls at
-    # both PreToolUse and can_use_tool even when no legacy/operator gate exists.
     if not gated_tools and tool_policy is None:
         return None
     safe_grant_tool = None if grant_tool == PUBLISH_TOOL_NAME else grant_tool
@@ -1422,9 +1330,6 @@ def build_approval_gate(
         route_by_tool=policy_routes,
         grant_tool=safe_grant_tool,
         grantable_by_route=grantable_by_route or {},
-        # Carried on the gate because both interception points already receive
-        # one, so the classification travels with the thing that intercepts
-        # rather than through a second channel that could go missing on one path.
         tool_policy=tool_policy,
         bundle_name=bundle_name,
         mcp_servers=mcp_servers,

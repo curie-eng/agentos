@@ -20,7 +20,9 @@ from claude_agent_sdk import (
     AssistantMessage,
     ResultMessage,
     TextBlock,
+    ToolResultBlock,
     ToolUseBlock,
+    UserMessage,
 )
 from curie_runner import RunTracer, SideEffectClassifier
 from curie_runner.fake import FakeModelSession
@@ -132,6 +134,9 @@ def _span_attributes(vector: str) -> dict[str, dict[str, object]]:
             AssistantMessage(
                 content=[ToolUseBlock(id="t1", name=vector, input={"command": "echo hi"})],
                 model=vector,
+            ),
+            UserMessage(
+                content=[ToolResultBlock(tool_use_id="t1", content="command completed")]
             ),
             AssistantMessage(content=[TextBlock(text="done")], model=vector, usage=usage),
             ResultMessage(

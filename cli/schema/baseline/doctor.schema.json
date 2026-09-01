@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/doctor/v2.0.json",
+  "$id": "https://schemas.curietech.ai/cli/doctor/v2.1.json",
   "title": "curie doctor --json",
   "description": "What is set up, what is missing, and the command that fixes it. Read-only. Credentials appear as the NAME of the variable holding them, never as a value.",
   "type": "object",
@@ -13,6 +13,10 @@
     "ready": {
       "type": "boolean",
       "description": "True when no check is `missing`. A `not_applicable` check does not make an install unready -- the laptop rung has no cluster and is not misconfigured."
+    },
+    "deploys_verified": {
+      "type": "boolean",
+      "description": "True when git-push deploys were checked and every agent is repo-bound. Distinct from `ready`: a `not_applicable` repo-binding check does not make an install unready, but it also does not mean deploys were verified."
     },
     "checks": {
       "type": "array",

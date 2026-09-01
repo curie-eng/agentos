@@ -6,7 +6,7 @@
 //! <command>`" rule, and neither the CLI nor the console could do it.
 //!
 //! Driven through the real `commands::approvals` handler and a real `ApiClient`
-//! against a wire-level stub, mirroring `approvals_resolve_actor_channel.rs`.
+//! against a wire-level stub.
 //! The regressions worth catching only show up in the actual outgoing PATCH
 //! body, or in the ABSENCE of one:
 //!
@@ -158,7 +158,18 @@ fn assert_routes_cleared(out: ApprovalsOutput, context: &str) {
             routes.is_empty(),
             "{context}: the agent still has bindings {routes:?}"
         ),
-        _ => panic!("expected the Routes output"),
+        ApprovalsOutput::DryRun(_) => panic!("expected the Routes output, not a dry-run plan"),
+        ApprovalsOutput::Gates { .. } => panic!("expected the Routes output, not the gate view"),
+        ApprovalsOutput::Pending { .. } => {
+            panic!("expected the Routes output, not pending approvals")
+        }
+        ApprovalsOutput::Resolved { .. } => panic!("expected the Routes output, not a resolution"),
+        ApprovalsOutput::OperatorPrincipal { .. } => {
+            panic!("expected the Routes output, not an operator-principal mint")
+        }
+        ApprovalsOutput::ConsoleLoginCode { .. } => {
+            panic!("expected the Routes output, not a console login-code mint")
+        }
     }
 }
 
@@ -316,7 +327,18 @@ async fn routes_from_builds_the_strict_split_route_shape() {
             );
             assert!(routes["deal_desk"].approvers.is_none());
         }
-        _ => panic!("expected the Routes output"),
+        ApprovalsOutput::DryRun(_) => panic!("expected the Routes output, not a dry-run plan"),
+        ApprovalsOutput::Gates { .. } => panic!("expected the Routes output, not the gate view"),
+        ApprovalsOutput::Pending { .. } => {
+            panic!("expected the Routes output, not pending approvals")
+        }
+        ApprovalsOutput::Resolved { .. } => panic!("expected the Routes output, not a resolution"),
+        ApprovalsOutput::OperatorPrincipal { .. } => {
+            panic!("expected the Routes output, not an operator-principal mint")
+        }
+        ApprovalsOutput::ConsoleLoginCode { .. } => {
+            panic!("expected the Routes output, not a console login-code mint")
+        }
     }
 }
 
@@ -407,7 +429,18 @@ async fn route_approvers_narrows_who_without_moving_where() {
                 Some("S0FINGRP0")
             );
         }
-        _ => panic!("expected the Routes output"),
+        ApprovalsOutput::DryRun(_) => panic!("expected the Routes output, not a dry-run plan"),
+        ApprovalsOutput::Gates { .. } => panic!("expected the Routes output, not the gate view"),
+        ApprovalsOutput::Pending { .. } => {
+            panic!("expected the Routes output, not pending approvals")
+        }
+        ApprovalsOutput::Resolved { .. } => panic!("expected the Routes output, not a resolution"),
+        ApprovalsOutput::OperatorPrincipal { .. } => {
+            panic!("expected the Routes output, not an operator-principal mint")
+        }
+        ApprovalsOutput::ConsoleLoginCode { .. } => {
+            panic!("expected the Routes output, not a console login-code mint")
+        }
     }
 }
 
@@ -458,7 +491,18 @@ async fn list_routes_reads_without_writing() {
             assert_eq!(agent, "deal-desk");
             assert_eq!(routes["deal_desk"].resolution.address, "C0EXAMPLE1");
         }
-        _ => panic!("expected the Routes output"),
+        ApprovalsOutput::DryRun(_) => panic!("expected the Routes output, not a dry-run plan"),
+        ApprovalsOutput::Gates { .. } => panic!("expected the Routes output, not the gate view"),
+        ApprovalsOutput::Pending { .. } => {
+            panic!("expected the Routes output, not pending approvals")
+        }
+        ApprovalsOutput::Resolved { .. } => panic!("expected the Routes output, not a resolution"),
+        ApprovalsOutput::OperatorPrincipal { .. } => {
+            panic!("expected the Routes output, not an operator-principal mint")
+        }
+        ApprovalsOutput::ConsoleLoginCode { .. } => {
+            panic!("expected the Routes output, not a console login-code mint")
+        }
     }
 }
 
@@ -599,7 +643,24 @@ async fn the_dry_run_plan_names_the_payload_the_real_clear_sends() {
         assert_no_write(&server);
         match out {
             ApprovalsOutput::DryRun(plan) => planned_routes_payload(&plan.lines),
-            _ => panic!("expected the DryRun output"),
+            ApprovalsOutput::Gates { .. } => {
+                panic!("expected the DryRun output, not the gate view")
+            }
+            ApprovalsOutput::Pending { .. } => {
+                panic!("expected the DryRun output, not pending approvals")
+            }
+            ApprovalsOutput::Resolved { .. } => {
+                panic!("expected the DryRun output, not a resolution")
+            }
+            ApprovalsOutput::Routes { .. } => {
+                panic!("expected the DryRun output, not route bindings")
+            }
+            ApprovalsOutput::OperatorPrincipal { .. } => {
+                panic!("expected the DryRun output, not an operator-principal mint")
+            }
+            ApprovalsOutput::ConsoleLoginCode { .. } => {
+                panic!("expected the DryRun output, not a console login-code mint")
+            }
         }
     };
 
@@ -1031,7 +1092,18 @@ async fn an_api_response_tolerates_a_field_the_cli_does_not_model() {
             assert!(json["notification"].get("endpoint").is_none());
             assert!(json["notification"].get("adapter").is_none());
         }
-        _ => panic!("expected the Routes output"),
+        ApprovalsOutput::DryRun(_) => panic!("expected the Routes output, not a dry-run plan"),
+        ApprovalsOutput::Gates { .. } => panic!("expected the Routes output, not the gate view"),
+        ApprovalsOutput::Pending { .. } => {
+            panic!("expected the Routes output, not pending approvals")
+        }
+        ApprovalsOutput::Resolved { .. } => panic!("expected the Routes output, not a resolution"),
+        ApprovalsOutput::OperatorPrincipal { .. } => {
+            panic!("expected the Routes output, not an operator-principal mint")
+        }
+        ApprovalsOutput::ConsoleLoginCode { .. } => {
+            panic!("expected the Routes output, not a console login-code mint")
+        }
     }
 }
 

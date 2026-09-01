@@ -21,7 +21,9 @@
 
 # Backing stores the bundle-fetch/runner path does not touch.
 langfuse:
+  # The harness selectively re-enables a zero-replica API, which still renders this dependency env.
   deploy: false
+  host: langfuse.example.com
 postgres:
   deploy: false
 valkey:

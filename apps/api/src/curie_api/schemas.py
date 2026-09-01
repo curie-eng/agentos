@@ -1101,9 +1101,7 @@ class AgentUpdate(BaseModel):
     _reject_retired_channel_keys = model_validator(mode="before")(_reject_retired_binding_keys)
     # The update-only half: a withdrawn `channel` here is refused, while the
     # same key stays required on `AgentCreate`.
-    _reject_retired_channel_key = model_validator(mode="before")(
-        _reject_retired_update_binding_key
-    )
+    _reject_retired_channel_key = model_validator(mode="before")(_reject_retired_update_binding_key)
 
 
 class AgentOut(BaseModel):
@@ -1347,6 +1345,7 @@ class DeploymentCreate(BaseModel):
 
     _check_commit_sha = field_validator("commit_sha")(_validate_optional_commit_sha)
 
+
 class DeploymentOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -1432,18 +1431,11 @@ class PublicationCreate(BaseModel):
         builtin_relay = self.reply_adapter == BUILTIN_CLUSTER_MESSAGE_ADAPTER
         if builtin_relay and self.reply_endpoint is not None:
             raise ValueError(
-                "the built-in cluster-message publication reply route must not "
-                "set an endpoint"
+                "the built-in cluster-message publication reply route must not set an endpoint"
             )
-        if not builtin_relay and (
-            (self.reply_endpoint is None) != (self.reply_adapter is None)
-        ):
-            raise ValueError(
-                "publication reply route must set endpoint and adapter together"
-            )
-        if self.reply_adapter is not None and not _CHANNEL_KIND.match(
-            self.reply_adapter
-        ):
+        if not builtin_relay and ((self.reply_endpoint is None) != (self.reply_adapter is None)):
+            raise ValueError("publication reply route must set endpoint and adapter together")
+        if self.reply_adapter is not None and not _CHANNEL_KIND.match(self.reply_adapter):
             raise ValueError("publication reply adapter must be a lowercase slug")
         if self.reply_endpoint is not None:
             _validate_channel_endpoint(self.reply_endpoint)
@@ -1458,18 +1450,14 @@ class PublicationCreate(BaseModel):
                 ".github",
                 "workflows",
             ):
-                raise ValueError(
-                    "GitHub workflow changes cannot be published by this capability"
-                )
+                raise ValueError("GitHub workflow changes cannot be published by this capability")
             if (
                 not path
                 or path.startswith("/")
                 or parts[0].casefold() == ".git"
                 or any(part in ("", ".", "..") for part in parts)
             ):
-                raise ValueError(
-                    "changed_paths must contain safe repository-relative paths"
-                )
+                raise ValueError("changed_paths must contain safe repository-relative paths")
         return value
 
     def decoded_patch(self) -> bytes:
@@ -1508,16 +1496,48 @@ class PublicationOut(BaseModel):
 
 class ApprovalResolve(BaseModel):
     """One resolution attempt. Exactly one attempt wins (compare-and-set), and
-    the server-side authorizer (#246) decides first whether this actor may
-    resolve at all: ordinary self-approval is blocked, while a server-linked
-    publication requester must still prove membership. ``actor_channel`` is the
-    channel the resolution attempt was made from (the card click's channel,
-    relayed by the dispatcher; asserted explicitly by API-key operators)."""
+    the server-side authorizer decides whether the authenticated principal may
+    resolve it. Identity and channel evidence come only from that credential;
+    this body carries no caller-asserted actor fields (ADR-0106)."""
 
     decision: Literal["approved", "rejected"]
-    resolved_by: str = Field(min_length=1)
     note: str | None = None
-    actor_channel: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_retired_approval_identity_fields(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        for field in ("resolved_by", "actor_channel"):
+            if field in data:
+                raise ValueError(
+                    f"{field} is no longer accepted by approval resolution "
+                    "(ADR-0106): remove the field and authenticate with an "
+                    "approval principal instead"
+                )
+        return data
+
+
+class ApprovalPrincipalMint(BaseModel):
+    """Administrative request to mint one operator approval credential."""
+
+    subject: str = Field(min_length=1)
+
+    @field_validator("subject")
+    @classmethod
+    def _nonblank_subject(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("subject must not be blank")
+        return value
+
+
+class ApprovalPrincipalOut(BaseModel):
+    """One-time delivery of a short-lived operator approval credential."""
+
+    token: str
+    subject: str
+    kind: Literal["operator"] = "operator"
+    expires_at: datetime
 
 
 class ApprovalOut(BaseModel):
@@ -1672,6 +1692,8 @@ class ApprovalAuditOut(BaseModel):
     action: str
     actor: str
     actor_channel: str | None
+    principal_kind: Literal["chat", "console", "operator"] | None
+    authenticated: bool
     decision: str
     authorizer: str
     authorized: bool
@@ -2101,6 +2123,19 @@ class MemoryEntryCreate(BaseModel):
 # --- console sessions (ADR-0083, #1044) -------------------------------------
 
 
+class ConsoleLoginCodeMint(BaseModel):
+    """Administrative request for one immutable subject-bound console login."""
+
+    subject: str = Field(min_length=1)
+
+    @field_validator("subject")
+    @classmethod
+    def _nonblank_subject(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("subject must not be blank")
+        return value
+
+
 class ConsoleLoginCodeOut(BaseModel):
     """A freshly minted login code, returned exactly once.
 
@@ -2109,6 +2144,7 @@ class ConsoleLoginCodeOut(BaseModel):
     """
 
     code: str
+    subject: str
     expires_at: datetime
 
 
@@ -2126,4 +2162,5 @@ class ConsoleSessionOut(BaseModel):
     the JavaScript this design exists to keep it away from.
     """
 
+    subject: str | None
     expires_at: datetime

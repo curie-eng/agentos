@@ -1,11 +1,10 @@
 """The approver-set port: who counts as an approver (#420, ADR-0034).
 
-An ``ApproverSet`` answers exactly one question -- is this actor in the set --
-and gets no vote on anything else. That narrowness is the point. Self-approval
-(AC2) is the authorizer's rule, enforced once in ``authorize_approval`` before
-any set is consulted, so a set cannot skip it, forget it, or be safe only by
-accident. The predecessor of this port had three authorizers each promising in a
-docstring to re-check self-approval themselves; a promise is not a mechanism.
+An ``ApproverSet`` answers whether an actor belongs to the set and whether that
+set can be evaluated from a channel-less operator/console credential.  That
+second fact prevents a terminal or browser principal manufacturing provider
+membership evidence.  Requester equality is deliberately absent: ADR-0106
+makes set membership the authorization boundary for every requester.
 
 Two axes decide an approval today, and they are not symmetrical:
 
@@ -65,9 +64,13 @@ class ApproverSet(Protocol):
     @property
     def audit_name(self) -> str: ...
 
-    async def contains(
-        self, actor: str, actor_channel: str | None
-    ) -> MembershipVerdict: ...
+    @property
+    def operator_eligible(self) -> bool: ...
+
+    @property
+    def console_eligible(self) -> bool: ...
+
+    async def contains(self, actor: str, actor_channel: str | None) -> MembershipVerdict: ...
 
 
 class ExplicitUsers:
@@ -82,13 +85,13 @@ class ExplicitUsers:
 
     # Frozen; see the audit-vocabulary note above.
     audit_name = "ExplicitUserListAuthorizer"
+    operator_eligible = True
+    console_eligible = True
 
     def __init__(self, users: Sequence[str]) -> None:
         self._users = tuple(users)
 
-    async def contains(
-        self, actor: str, actor_channel: str | None
-    ) -> MembershipVerdict:
+    async def contains(self, actor: str, actor_channel: str | None) -> MembershipVerdict:
         listed = actor in self._users
         evidence: dict[str, Any] = {
             "kind": "user_list",
@@ -124,13 +127,15 @@ class InvalidApprovers:
     # Frozen; see the audit-vocabulary note above. Never was a class name, but it
     # ships in rows #420 wrote, so it is vocabulary all the same.
     audit_name = "InvalidApproversSpec"
+    # This sentinel needs no channel or provider evidence to evaluate: every
+    # principal receives the same undetermined, fail-closed verdict below.
+    operator_eligible = True
+    console_eligible = True
 
     def __init__(self, error: str) -> None:
         self._error = error
 
-    async def contains(
-        self, actor: str, actor_channel: str | None
-    ) -> MembershipVerdict:
+    async def contains(self, actor: str, actor_channel: str | None) -> MembershipVerdict:
         return MembershipVerdict(
             member=False,
             undetermined=True,
@@ -148,9 +153,9 @@ class UnboundRoute:
     A pending approval that named a route is resolvable only through that
     route's binding (ADR-0123). Once the binding is gone there is no set left to
     resolve and no fallback applies: falling through to the card channel would
-    swap a server-enforced approver set for a caller-asserted ``actor_channel``
-    check on an approval that is ALREADY pending, which is exactly the
-    escalation ADR-0123 closes. An absent binding is therefore NOT the same fact
+    swap a server-enforced approver set for a different membership check on an
+    approval that is ALREADY pending, which is exactly the escalation ADR-0123
+    closes. An absent binding is therefore NOT the same fact
     as a binding present with no ``approvers`` block -- that one is still ADR-0034
     AC4's zero-setup default and still resolves through channel membership.
 
@@ -168,13 +173,15 @@ class UnboundRoute:
     # tell "the route you named is gone" from "the approvers block does not
     # parse", so this refusal gets its own name rather than borrowing one.
     audit_name = "UnboundRouteBinding"
+    # The missing binding itself is the answer, independent of principal kind
+    # or channel evidence; let ``contains`` preserve that reason in the audit.
+    operator_eligible = True
+    console_eligible = True
 
     def __init__(self, route: str) -> None:
         self._route = route
 
-    async def contains(
-        self, actor: str, actor_channel: str | None
-    ) -> MembershipVerdict:
+    async def contains(self, actor: str, actor_channel: str | None) -> MembershipVerdict:
         # The reason names the CLASS of failure and the evidence carries the
         # route, following ``SlackUserGroupMembers._undetermined``: the reason is
         # echoed to whoever clicked, while the evidence lands on the audit row
@@ -197,10 +204,9 @@ class UnboundRoute:
 class ApproverSetSelector(Protocol):
     """Pick the approver set an approval's route binding calls for.
 
-    Performs no I/O: a set that needs a lookup does it in ``contains``, which is
-    what lets the authorizer refuse a self-approval before anything is fetched.
-    Never raises -- an unreadable block is an ``InvalidApprovers`` set, not an
-    error, so every binding maps to a set and the authorizer has one code path.
+    Performs no I/O: a set that needs a lookup does it in ``contains``. Never
+    raises -- an unreadable block is an ``InvalidApprovers`` set, not an error,
+    so every binding maps to a set and the authorizer has one code path.
 
     Implementations are provider-aware by nature: selection reads the binding
     schema, and that schema is the provider's shape. That is why they live on the

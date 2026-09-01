@@ -52,6 +52,9 @@ def test_dispatcher_config_heartbeat_defaults(
 ) -> None:
     monkeypatch.delenv("CURIE_HEARTBEAT_FILE", raising=False)
     monkeypatch.delenv("CURIE_HEARTBEAT_INTERVAL_SECONDS", raising=False)
+    monkeypatch.setenv(
+        "CURIE_APPROVAL_CHAT_ATTESTER_SECRET", "dispatcher-attester-test-secret"
+    )
 
     cfg = DispatcherConfig()
 
@@ -64,6 +67,9 @@ def test_dispatcher_config_reads_heartbeat_env(
 ) -> None:
     monkeypatch.setenv("CURIE_HEARTBEAT_FILE", "/var/run/curie/dp.hb")
     monkeypatch.setenv("CURIE_HEARTBEAT_INTERVAL_SECONDS", "3.5")
+    monkeypatch.setenv(
+        "CURIE_APPROVAL_CHAT_ATTESTER_SECRET", "dispatcher-attester-test-secret"
+    )
 
     cfg = DispatcherConfig()
 

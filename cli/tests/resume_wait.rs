@@ -431,6 +431,13 @@ async fn run_local_message_terminal(debug: bool) -> Option<String> {
         )
         .env("VALKEY_HOST", "localhost")
         .env("VALKEY_PORT", "26379")
+        // The fake Docker shim executes the dispatcher module directly instead
+        // of loading the Compose service environment. Supply the dedicated
+        // attester secret that the real service definition now provides.
+        .env(
+            "CURIE_APPROVAL_CHAT_ATTESTER_SECRET",
+            "resume-wait-test-attester",
+        )
         .env("OTEL_EXPORTER_OTLP_ENDPOINT", "")
         .env_remove("CI")
         .stdin(Stdio::null())

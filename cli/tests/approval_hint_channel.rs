@@ -2,41 +2,24 @@
 //! card was actually posted to, and only `GET /approvals/{approval_id}` can
 //! answer that (#1531 finding 3).
 //!
-//! Today `approval_resolve_command` is handed the channel THIS TURN routed to
-//! (`--channel`, or the sole agent's bound channel). When a route binding put
-//! the card somewhere else, the printed `--actor-channel` names the wrong
-//! channel and the copy-pasted command 403s with "resolve this from the
-//! approval's channel". The correct value is `ApprovalRecord.card_channel`,
-//! which the API has always returned and the CLI has always parsed; nothing
-//! ever fetched it for a single approval, because the only approvals client
-//! method is the truncatable `list_pending_approvals`.
+//! A route binding can put the card somewhere other than the channel this turn
+//! used. The resolve hint therefore reads `ApprovalRecord.card_channel` through
+//! the single-record endpoint instead of reusing the turn channel.
 //!
 //! Driven through a real `ApiClient` against the wire-level stub rather than by
 //! hand-building an `ApprovalRecord`: the defect class here is the REQUEST (the
 //! wrong path, a missing API key, a list scan instead of a single-record read),
 //! which a constructed record walks straight past.
 //!
-//! RED CONTRACT: this file calls a method that does not exist yet, so it fails
-//! to COMPILE rather than merely failing to run -- that is the intended RED
-//! signal, and it is the same idiom this file's sibling uses at
-//! `approvals_resolve_actor_channel.rs:14-24`. The intended shapes, which the
-//! implementer should treat as the target:
+//! The wire-level contract stays here while the private hint fallback and
+//! timeout behavior are covered in `message.rs`:
 //!
-//! - `pub async fn get_approval(&self, approval_id: &str) -> Result<ApprovalRecord>`
-//!   on `ApiClient` in `cli/src/api.rs`, mirroring `list_pending_approvals`
-//!   exactly: `send_request(self.http.get(format!("{}/approvals/{approval_id}",
-//!   self.base_url)).header("X-API-Key", &self.api_key), "GET /approvals/{id}")`
-//!   then `expect_ok(resp, "reading an approval")` and `.json()`.
-//! - `async fn hint_channel(opts: &MessageOpts, verb: TurnVerb,
-//!   turn_channel: &str, id: &str) -> String`, PRIVATE in `cli/src/message.rs`.
-//!   Its own tests live in that file's `#[cfg(test)]` block, because an
-//!   integration test cannot reach a private item and making it `pub` would
-//!   widen the crate's public API for a test.
-//! - `const HINT_CHANNEL_LOOKUP_BUDGET: Duration = Duration::from_secs(10);`,
-//!   also PRIVATE in `cli/src/message.rs`: the single bound wrapped around the
-//!   whole lookup, port-forward startup included. Named rather than inlined so
-//!   the stalling-peer test in that file's `#[cfg(test)]` block tracks the
-//!   budget if it is ever retuned.
+//! - `ApiClient::get_approval` authenticates one `GET /approvals/{id}` request
+//!   and decodes the record.
+//! - private `hint_channel` uses that value when present and falls back to the
+//!   turn channel without failing the turn.
+//! - `HINT_CHANNEL_LOOKUP_BUDGET` bounds the whole advisory lookup, including
+//!   cluster port-forward startup.
 
 mod support;
 
@@ -93,8 +76,8 @@ async fn get_approval_reads_the_card_channel_the_hint_needs() {
     assert_eq!(
         record.card_channel.as_deref(),
         Some("CFINANCE01"),
-        "the card channel is the value `--actor-channel` must carry; without it \
-         the printed hint names the requesting channel and the resolve 403s"
+        "the hint must report the card's real route-bound location instead of \
+         sending the operator back to the requesting channel"
     );
     assert_ne!(
         record.card_channel.as_deref(),
