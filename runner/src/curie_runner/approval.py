@@ -1411,7 +1411,10 @@ def build_approval_gate(
     gated_tools = operator | frozenset(policy_routes)
     if managed_workspace:
         gated_tools |= frozenset({PUBLISH_TOOL_NAME})
-    if not gated_tools:
+    # A toolPolicy is itself an interception source: it can add approval gates,
+    # permanently refuse deny/unclassified tools, and must classify calls at
+    # both PreToolUse and can_use_tool even when no legacy/operator gate exists.
+    if not gated_tools and tool_policy is None:
         return None
     safe_grant_tool = None if grant_tool == PUBLISH_TOOL_NAME else grant_tool
     return ApprovalGate(
