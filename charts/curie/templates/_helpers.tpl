@@ -1188,10 +1188,10 @@ securityContext:
 {{- $budget := int64 .Values.worker.deliveryBudgetSeconds -}}
 {{- $reserve := int64 .Values.worker.deliveryShutdownReserveSeconds -}}
 {{- $required := add $budget $reserve -}}
-{{- if hasKey .Values.api.resumeReconciler "graceSeconds" -}}
+{{- if and (hasKey .Values.api.resumeReconciler "graceSeconds") (not (kindIs "invalid" .Values.api.resumeReconciler.graceSeconds)) -}}
 {{- $grace := int64 .Values.api.resumeReconciler.graceSeconds -}}
 {{- if lt $grace $required -}}
-{{- fail (printf "api.resumeReconciler.graceSeconds (%d) must be at least worker.deliveryBudgetSeconds (%d) + worker.deliveryShutdownReserveSeconds (%d) = %d. Fix: raise api.resumeReconciler.graceSeconds to %d or more, or lower worker.deliveryBudgetSeconds and/or worker.deliveryShutdownReserveSeconds so their sum is at most %d." $grace $budget $reserve $required $required $grace) -}}
+{{- fail (printf "api.resumeReconciler.graceSeconds (%d) must be at least worker.deliveryBudgetSeconds (%d) + worker.deliveryShutdownReserveSeconds (%d) = %d. At %d, a duplicate resume delivery can reach an active turn and repeat an approved action. Fix: raise api.resumeReconciler.graceSeconds to %d or more, or lower worker.deliveryBudgetSeconds and/or worker.deliveryShutdownReserveSeconds so their sum is at most %d." $grace $budget $reserve $required $grace $required $grace) -}}
 {{- end -}}
 {{- $grace -}}
 {{- else -}}

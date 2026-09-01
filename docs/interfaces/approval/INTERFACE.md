@@ -100,9 +100,11 @@ in code now:
   (`apps/api/src/curie_api/crud.py::list_resolved_unresumed`) to include `expired` rows, which
   the pending-guarded sweeper can never re-select. The backstop is the resume reconciler
   (`apps/api/src/curie_api/resumereconciler.py::ResumeReconciler`, #411), which re-enqueues
-  every owed wake past a grace horizon (`resume_reconciler_grace_seconds`, default 900s,
-  deliberately longer than the worker's maximum single turn so a re-enqueue cannot steer a
-  live one) and, since #532, first runs
+  every owed wake past a grace horizon. In Helm, `api.resumeReconciler.graceSeconds` derives
+  from `worker.deliveryBudgetSeconds + worker.deliveryShutdownReserveSeconds`, and an explicit
+  non-null override below that floor is refused at render time so a duplicate resume cannot
+  reach an active turn. Outside Helm, `resume_reconciler_grace_seconds` remains the intentionally
+  conservative 900s Settings fallback. Since #532, it first runs
   `ResumeReconciler.reopen_dead_lettered_resumes` to re-open an approval whose *delivered*
   resume turn died at the worker's ADR-0039 delivery cap and was dead-lettered (`resumed_at`
   set, so the NULL-gated finder alone would never re-select it). Residual: the backstop is a

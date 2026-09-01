@@ -6,7 +6,8 @@
 #   (b) raising the delivery budget raises the derived grace without an API
 #       override;
 #   (c) an explicit grace at the raised floor renders and reaches the API; and
-#   (d) an explicit grace below that floor is refused during rendering.
+#   (d) an explicit YAML null selects the derived default; and
+#   (e) an explicit grace below that floor is refused during rendering.
 #
 # These assertions read the API Deployment structurally, so a similarly named
 # environment variable on another workload cannot produce a false pass.
@@ -68,21 +69,30 @@ PY
 assert_api_grace a 660
 
 # (b) With no API override, a higher delivery budget raises the derived grace.
-assert_api_grace b 1860 --set worker.deliveryBudgetSeconds=1800
+assert_api_grace b 1860 \
+  --set worker.deliveryBudgetSeconds=1800 \
+  --set worker.terminationGracePeriodSeconds=1860
 
 # (c) An explicit value at the raised floor is accepted and reaches the API.
 assert_api_grace c 1920 \
   --set worker.deliveryBudgetSeconds=1800 \
-  --set worker.deliveryShutdownReserveSeconds=120 \
-  --set worker.terminationGracePeriodSeconds=1920 \
+  --set worker.deliveryShutdownReserveSeconds=60 \
+  --set worker.terminationGracePeriodSeconds=1860 \
   --set api.resumeReconciler.graceSeconds=1920
 
-# (d) A grace below delivery budget plus reserve must fail at render time.
+# (d) An explicit YAML null selects the derived default.
+assert_api_grace d 1860 \
+  --set worker.deliveryBudgetSeconds=1800 \
+  --set worker.terminationGracePeriodSeconds=1860 \
+  --set-json api.resumeReconciler.graceSeconds=null
+
+# (e) A grace below delivery budget plus reserve must fail at render time.
 invalid_output=""
 if invalid_output="$(helm template curie "$CHART" \
   --set worker.deliveryBudgetSeconds=1800 \
+  --set worker.terminationGracePeriodSeconds=1860 \
   --set api.resumeReconciler.graceSeconds=1800 2>&1)"; then
-  fail d "helm accepted api.resumeReconciler.graceSeconds=1800 below the required delivery floor of 1860"
+  fail e "helm accepted api.resumeReconciler.graceSeconds=1800 below the required delivery floor of 1860"
 fi
 for token in \
   "api.resumeReconciler.graceSeconds" \
@@ -91,8 +101,8 @@ for token in \
   "(1800) + " \
   "(60) = 1860"; do
   grep -qF "$token" <<<"$invalid_output" \
-    || fail d "the refusal does not identify $token
+    || fail e "the refusal does not identify $token
 $(head -3 <<<"$invalid_output")"
 done
 
-echo "api-resume-reconciler-grace-assertions: all four assertions passed"
+echo "api-resume-reconciler-grace-assertions: all five assertions passed"
