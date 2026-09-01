@@ -28,6 +28,11 @@ on:
       - "apps/worker/src/curie_worker/bundle_store.py"
       - "uv.lock"
       - "pyproject.toml"
+      # Same reason, for the Langfuse image-pin gate below: it renders
+      # compose.dev.yaml as the second shipping surface, so a PR that floats
+      # the Langfuse tag there and nowhere else would otherwise match no path
+      # here, skip this job, and never run the gate that exists to catch it.
+      - "compose.dev.yaml"
 
 permissions:
   contents: read
@@ -218,6 +223,19 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/langfuse-postgres-readiness-assertions.sh
+
+      # Prove both shipping surfaces -- the chart and compose.dev.yaml -- pin one
+      # exact Langfuse version, and that a floating tag is rejected (issue #2190).
+      # Upstream rebuilt the floating `:3` and minor `3.225` tags in place onto a
+      # new digest rather than publishing a new patch tag, so the web container
+      # reported healthy while never serving /api/public/health. The chart runs
+      # Langfuse images in initContainers as well as application containers, and
+      # every one of those references must carry the reviewed tag. Includes a red
+      # mutation for each surface, initContainers among them.
+      - name: helm render assertions (langfuse image pin)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/langfuse-image-pin-assertions.sh
 
       # Prove the controller NetworkPolicy RBAC split (issue #350): exactly one
       # read-only cluster grant (get/list/watch) so the informer syncs, no

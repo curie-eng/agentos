@@ -106,7 +106,10 @@ langfuse:
   image:
     web: langfuse/langfuse
     worker: langfuse/langfuse-worker
-    tag: "3"
+    # On 2026-09-01 upstream shipped v3.225.6 by rebuilding the floating :3
+    # and minor tag 3.225 in place onto its digest; no 3.225.6 tag exists, so
+    # only the exact patch tag 3.225.5 is stable (broke CI bring-up) (#2190).
+    tag: "3.225.5"
   telemetryEnabled: false
   enableExperimentalFeatures: true
   # Startup gate on the ClickHouse endpoint Langfuse boots against (issue
