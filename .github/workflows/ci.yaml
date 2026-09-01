@@ -90,6 +90,12 @@ jobs:
       # cluster-free static gate, so it runs alongside the docs gate.
       - name: Wire tolerance gate (_AciModel model_validate call sites)
         run: bash scripts/check-wire-tolerance.sh
+      # The platform-upgrade Job runs examples/sre-bot/platform-upgrade/upgrade.sh
+      # as its body. That script had no test and no CI; a helm upgrade the bot
+      # can start must be shellchecked on every PR, cheap and cluster-free, so
+      # this sits with the other static gates before the dev stack boots.
+      - name: Shellcheck sre-bot platform-upgrade script
+        run: shellcheck --severity=warning examples/sre-bot/platform-upgrade/upgrade.sh
       # Integration tests dial the real dev stack (Postgres 25432, Valkey 26379,
       # RustFS 29000, Langfuse 23000 + ClickHouse + OTel Collector). Boot it after
       # ruff/mypy so cheap failures stay fast. The first up starts the one-shot

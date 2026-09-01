@@ -39,7 +39,7 @@ advisory.
 | Kubernetes verbs | `get`, `patch` on `apps/deployments` |
 | Scoped by | `resourceNames`, one namespace |
 | Authorization | `approvalPolicy` gate — a human approves each call |
-| Status | Implemented, ships commented out |
+| Status | Implemented, ships with its credential absent |
 
 ### What that grant actually permits
 
