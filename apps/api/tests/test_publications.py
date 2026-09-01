@@ -10,11 +10,17 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import subprocess
+import tarfile
 import threading
 import uuid
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from io import BytesIO
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -202,9 +208,7 @@ def test_builtin_reply_adapter_and_ref_persist_on_both_publication_rows(
     client, _ = publication_stack
     deployment = _create_deployment(client, auth_headers)
     reply_ref = str(uuid.uuid4())
-    payload = _publication_payload(
-        deployment["id"], dedupe_key="builtin-cluster-message-reply"
-    )
+    payload = _publication_payload(deployment["id"], dedupe_key="builtin-cluster-message-reply")
     payload.update(
         reply_placeholder=reply_ref,
         reply_endpoint=None,
@@ -283,9 +287,7 @@ def test_publication_persistence_refuses_casefolded_git_metadata_path(
     payload = _publication_payload(deployment["id"])
     payload["changed_paths"] = [".GIT/config"]
 
-    refused = client.post(
-        "/v1/internal/publications", json=payload, headers=WORKER_HEADERS
-    )
+    refused = client.post("/v1/internal/publications", json=payload, headers=WORKER_HEADERS)
 
     assert refused.status_code == 422
     assert "safe repository-relative paths" in refused.text
@@ -381,9 +383,7 @@ def test_publication_create_is_atomic_private_and_idempotent(
 
     changed_replay = dict(payload)
     changed_replay["patch_b64"] = base64.b64encode(b"different patch").decode()
-    conflict = client.post(
-        "/v1/internal/publications", json=changed_replay, headers=WORKER_HEADERS
-    )
+    conflict = client.post("/v1/internal/publications", json=changed_replay, headers=WORKER_HEADERS)
     assert conflict.status_code == 409
     assert _counts() == (1, 1)
 
@@ -396,9 +396,7 @@ def test_publication_create_is_atomic_private_and_idempotent(
         ("body", "b" * 65_537),
     ],
 )
-def test_publication_create_rejects_noncanonical_or_oversized_text(
-    field: str, value: str
-) -> None:
+def test_publication_create_rejects_noncanonical_or_oversized_text(field: str, value: str) -> None:
     from curie_api.schemas import PublicationCreate
 
     payload = _publication_payload(str(uuid.uuid4()))
@@ -423,9 +421,7 @@ def test_publication_replay_refuses_a_changed_conversation_or_agent_identity(
     )
     assert rejected_thread.status_code == 409
 
-    other_deployment = _create_deployment(
-        client, auth_headers, channel="C0EXAMPLE2"
-    )
+    other_deployment = _create_deployment(client, auth_headers, channel="C0EXAMPLE2")
     wrong_agent = dict(payload, deployment_id=other_deployment["id"])
     rejected_agent = client.post(
         "/v1/internal/publications", json=wrong_agent, headers=WORKER_HEADERS
@@ -528,9 +524,7 @@ def test_publication_credential_resolution_does_not_block_the_event_loop(
         try:
             async with sessionmaker() as session:
                 call = asyncio.create_task(
-                    redeem_publication_credential(
-                        uuid.UUID(publication["id"]), session, Response()
-                    )
+                    redeem_publication_credential(uuid.UUID(publication["id"]), session, Response())
                 )
 
                 async def prove_progress() -> None:
@@ -568,9 +562,7 @@ def test_publication_repo_must_match_the_thread_selection(
     assert selected.status_code == 200, selected.text
     payload["repo_full_name"] = "acme-corp/acme-api"
 
-    refused = client.post(
-        "/v1/internal/publications", json=payload, headers=WORKER_HEADERS
-    )
+    refused = client.post("/v1/internal/publications", json=payload, headers=WORKER_HEADERS)
 
     assert refused.status_code == 409
     assert "differs" in refused.json()["detail"]
@@ -598,9 +590,7 @@ def test_publication_card_outbox_acks_original_turn_before_job_claim(
     # would hit this conflict and strand the first approval.
     changed = dict(payload)
     changed["patch_b64"] = base64.b64encode(b"changed second-run snapshot").decode()
-    replay = client.post(
-        "/v1/internal/publications", json=changed, headers=WORKER_HEADERS
-    )
+    replay = client.post("/v1/internal/publications", json=changed, headers=WORKER_HEADERS)
     assert replay.status_code == 409
 
     async def exercise() -> tuple[Any, Any, Any]:
@@ -643,9 +633,7 @@ def test_publication_card_outbox_dead_letters_to_terminal_result(
     deployment = _create_deployment(client, auth_headers)
     _, publication = _create_publication(
         client,
-        _publication_payload(
-            deployment["id"], dedupe_key="event-card-outbox-dead-letter"
-        ),
+        _publication_payload(deployment["id"], dedupe_key="event-card-outbox-dead-letter"),
     )
 
     async def exhaust() -> Any:
@@ -752,10 +740,7 @@ def test_publication_card_and_result_claims_survive_process_replacement(
             abandoned_result = await first.pending_result(job.publication_id)
             assert abandoned_result is not None
             assert abandoned_result.resolved_by == "U0REQUEST1"
-            assert (
-                abandoned_result.resolution_note
-                == "Approved for the release fixture"
-            )
+            assert abandoned_result.resolution_note == "Approved for the release fixture"
             async with engine.begin() as connection:
                 await connection.execute(
                     text(
@@ -865,14 +850,18 @@ def test_publication_cleanup_outbox_retries_beyond_result_delivery_cap(
             assert result is not None
             async with engine.connect() as connection:
                 row = (
-                    await connection.execute(
-                        text(
-                            "SELECT resource_cleanup_completed_at IS NOT NULL AS completed, "
-                            "resource_cleanup_error FROM curie.publications WHERE id = :id"
-                        ),
-                        {"id": publication["id"]},
+                    (
+                        await connection.execute(
+                            text(
+                                "SELECT resource_cleanup_completed_at IS NOT NULL AS completed, "
+                                "resource_cleanup_error FROM curie.publications WHERE id = :id"
+                            ),
+                            {"id": publication["id"]},
+                        )
                     )
-                ).mappings().one()
+                    .mappings()
+                    .one()
+                )
             return bool(row["completed"]), row["resource_cleanup_error"]
         finally:
             await engine.dispose()
@@ -1045,9 +1034,7 @@ def test_publication_turn_is_done_before_card_delivery_and_never_replays_model(
         def __init__(self, engine: Any) -> None:
             self.engine = engine
 
-        async def create_publication(
-            self, request: PublicationCreateRequest
-        ) -> CreatedPublication:
+        async def create_publication(self, request: PublicationCreateRequest) -> CreatedPublication:
             sessionmaker = async_sessionmaker(self.engine, expire_on_commit=False)
             async with sessionmaker() as session:
                 data = PublicationCreate.model_validate(request.to_json())
@@ -1153,15 +1140,271 @@ def test_publication_turn_is_done_before_card_delivery_and_never_replays_model(
 
     assert attempts == 1
     assert card_posts == 0, "the persisted outbox, not process_event, posts the card"
-    rows = _rows(
-        "SELECT patch_bytes, approval_card_reported_at FROM curie.publications"
-    )
+    rows = _rows("SELECT patch_bytes, approval_card_reported_at FROM curie.publications")
     assert rows == [
         {
             "patch_bytes": b"diff --git a/README.md b/README.md\n",
             "approval_card_reported_at": None,
         }
     ]
+
+
+def test_coder_path_reaches_the_publication_boundary_through_real_runner_and_api(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+    tmp_path: Path,
+) -> None:
+    """The coder's publish tool crosses runner -> kernel -> API, not a test-only _attempt.
+
+    Kubernetes is deliberately outside this test: a pending publication row is
+    the handoff consumed by ``publication_k8s`` after an approver resolves it.
+    The model is the sole fake; the runner HTTP server, ACI client, kernel,
+    snapshot validation, and internal publication route are production code.
+    """
+    from aci_protocol import QueuedTurn, ReplyHandle
+    from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, ToolUseBlock
+    from claude_agent_sdk.types import PermissionResultDeny
+    from curie_runner.approval import PUBLISH_TOOL_NAME, build_approval_gate, build_can_use_tool
+    from curie_runner.fake import FakeModelSession
+    from curie_runner.otel import RunTracer
+    from curie_runner.server import create_app as create_runner_app
+    from curie_runner.session import SessionRunner
+    from curie_runner.side_effects import SideEffectClassifier
+    from curie_runner.workspace_snapshot import capture_workspace_snapshot
+    from curie_worker.approvals import CreatedPublication, PublicationCreateRequest
+    from curie_worker.behaviorpacks import BehaviorPacks
+    from curie_worker.binding import ResolvedDeployment
+
+    from apps.worker.tests.kernel.conftest import kernel_harness
+
+    client, _ = publication_stack
+    runner_token = "coder-publication-runner-token"
+    deployment = _create_deployment(client, auth_headers)
+    conversation_id = "1700000000.000100"
+    selected = client.post(
+        f"/v1/internal/workspaces/{deployment['id']}/selection",
+        json={
+            "conversation_id": conversation_id,
+            "author": "U0REQUEST1",
+            "repo_full_name": REPO,
+        },
+        headers=WORKER_HEADERS,
+    )
+    assert selected.status_code == 200, selected.text
+
+    # A real, credential-free checkout supplies both the runner snapshot and
+    # the worker's independently rehashed retained base.
+    repo = tmp_path / "workspace"
+    repo.mkdir()
+    subprocess.run(["git", "init", "--quiet"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "coder@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Coder Test"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "remote", "add", "origin", f"https://github.com/{REPO}.git"],
+        cwd=repo,
+        check=True,
+    )
+    (repo / "README.md").write_text("before\n")
+    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "--quiet", "-m", "base"], cwd=repo, check=True)
+    base_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    base_archive = BytesIO()
+    with tarfile.open(fileobj=base_archive, mode="w:gz") as archive:
+        archive.add(repo / "README.md", arcname="README.md")
+    (repo / "README.md").write_text("after\n")
+
+    class RetainedWorkspace:
+        preparer = SimpleNamespace(limits=SimpleNamespace(max_archive_bytes=1_000_000))
+
+        def current(self, thread_key: str) -> object:
+            return SimpleNamespace(repo_full_name=REPO, base_sha=base_sha)
+
+        def stream_current_base(self, thread_key: str):
+            yield base_archive.getvalue()
+
+        def select_repository(self, **_kwargs: Any) -> str:
+            return REPO
+
+        def claim_or_resume_with_handle(
+            self,
+            *,
+            thread_key: str,
+            env: dict[str, str],
+            agent_name: str | None,
+            repo_full_name: str,
+            **_kwargs: Any,
+        ) -> object:
+            return SimpleNamespace(
+                handle=self.substrate.claim(
+                    thread_key,
+                    env=env,
+                    agent_name=agent_name,
+                    workspace_repo=repo_full_name,
+                )
+            )
+
+        def touch(self, thread_key: str, *, ttl_seconds: int) -> None:
+            del thread_key, ttl_seconds
+
+        def release(self, thread_key: str) -> None:
+            del thread_key
+
+    class WorkspaceBinding:
+        async def resolve(self, kind: str, address: str) -> ResolvedDeployment:
+            assert (kind, address) == ("slack", "C0EXAMPLE1")
+            return ResolvedDeployment(
+                agent_id=uuid.UUID(deployment["agent_id"]),
+                agent_name="acme-coder",
+                deployment_id=uuid.UUID(deployment["id"]),
+                workspace_enabled=True,
+                version_id=uuid.UUID(deployment["version_id"]),
+                version_label="v1",
+                bundle_ref=None,
+                max_usd_per_day=None,
+                max_output_tokens_per_run=None,
+            )
+
+        def boot_env(self, resolved: Any, thread: str, **_kwargs: Any) -> dict[str, str]:
+            return {
+                "CURIE_SESSION_ID": f"session-{thread}",
+                "CURIE_RUNNER_TOKEN": runner_token,
+            }
+
+        def packs_for(self, resolved: Any) -> BehaviorPacks:
+            return BehaviorPacks.from_config(None)
+
+    gate = build_approval_gate(operator_tools=None, policy_routes={}, managed_workspace=True)
+    assert gate is not None
+
+    async def record_publish_gate(*args: Any, **kwargs: Any) -> object:
+        decision = await build_can_use_tool(gate)(*args, **kwargs)
+        # The SDK reports the denied platform-owned publish call, then returns
+        # its terminal response.  Keep the fake model on that observable path
+        # so SessionRunner emits the real awaiting-approval final frame.
+        if isinstance(decision, PermissionResultDeny):
+            return replace(decision, interrupt=False)
+        return decision
+
+    model = FakeModelSession(
+        lambda: [
+            AssistantMessage(
+                content=[
+                    TextBlock(text="Prepared README."),
+                    ToolUseBlock(
+                        id="publish",
+                        name=PUBLISH_TOOL_NAME,
+                        input={"title": "Update README", "body": "Prepared by coder."},
+                    ),
+                ],
+                model="fake-model",
+            ),
+            ResultMessage(
+                subtype="success",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id="fake",
+                result="Prepared README.",
+            ),
+        ],
+        can_use_tool=record_publish_gate,
+        approval_gate=gate,
+    )
+    runner = SessionRunner(
+        session_factory=lambda: model,
+        ceiling=10_000,
+        tracer=RunTracer(None),
+        classifier=SideEffectClassifier(),
+        trace_name="coder-publication",
+        approval_gate=gate,
+    )
+
+    class DatabasePublicationCreator:
+        def __init__(self, engine: Any) -> None:
+            self.engine = engine
+
+        async def create_publication(self, request: PublicationCreateRequest) -> CreatedPublication:
+            sessionmaker = async_sessionmaker(self.engine, expire_on_commit=False)
+            async with sessionmaker() as session:
+                data = PublicationCreate.model_validate(request.to_json())
+                publication, _ = await crud.create_publication(
+                    session, data, patch=data.decoded_patch()
+                )
+                return CreatedPublication(
+                    id=str(publication.id),
+                    approval_id=str(publication.approval_id),
+                    status=publication.status,
+                )
+
+    async def exercise() -> None:
+        await runner.start()
+        suffix = uuid.uuid4().hex
+        names = {
+            "stream": f"test:coder-publication:{suffix}",
+            "group": f"g-{suffix}",
+            "prefix": f"test:coder-publication:{suffix}:",
+            "sandbox_prefix": f"test:coder-sandbox:{suffix}:",
+        }
+        sync_redis = connect_or_skip(decode_responses=True)
+        validation_scratch = tmp_path / "publication-validation"
+        validation_scratch.mkdir()
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            creator = DatabasePublicationCreator(engine)
+            async with kernel_harness(
+                names,
+                sync_redis,
+                binding=WorkspaceBinding(),
+                publication_creator=creator,
+                workspace_scratch_root=str(validation_scratch),
+                runner_app=create_runner_app(
+                    runner,
+                    token=runner_token,
+                    snapshotter=lambda: capture_workspace_snapshot(
+                        repo,
+                        expected_repo=REPO,
+                        publication_title="Update README",
+                        publication_body="Prepared by coder.",
+                    ),
+                ),
+            ) as harness:
+                workspace = RetainedWorkspace()
+                workspace.substrate = harness.substrate
+                harness.kernel._workspace = workspace  # type: ignore[assignment]
+                await harness.kernel.process_event(
+                    QueuedTurn(
+                        event_id="coder-publication-boundary",
+                        conversation_id=conversation_id,
+                        author="U0REQUEST1",
+                        text="publish the README change",
+                        reply_handle=ReplyHandle(
+                            kind="slack",
+                            channel="C0EXAMPLE1",
+                            placeholder="1700000000.000001",
+                        ),
+                        received_at="2026-09-01T00:00:00+00:00",
+                    )
+                )
+        finally:
+            await engine.dispose()
+            sync_redis.close()
+
+    asyncio.run(exercise())
+    rows = _rows(
+        "SELECT status, base_sha, patch_bytes, changed_paths, title, body FROM curie.publications"
+    )
+    assert len(rows) == 1
+    boundary = rows[0]
+    assert boundary["status"] == "pending"
+    assert boundary["base_sha"] == base_sha
+    assert boundary["changed_paths"] == ["README.md"]
+    assert boundary["title"] == "Update README"
+    assert boundary["body"] == "Prepared by coder."
+    assert boundary["patch_bytes"].endswith(b"@@ -1 +1 @@\n-before\n+after\n")
 
 
 def test_publication_insert_failure_rolls_back_the_approval(
