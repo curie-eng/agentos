@@ -141,9 +141,11 @@ name binds nothing and the deploy still reports success.
 `C0EXAMPLE2`) as live `slack_channel` values. Those match the Slack id
 shape, so `curie cluster deploy --target` reported success and rebound
 the bot to a channel that does not exist. The shipped file no longer
-carries live `slack_channel` lines. Uncomment them only with a real id,
-and only when you are using `--target` / `--all-targets` rather than this
-installer.
+carries live `slack_channel` lines, and both the API target resolver and
+CLI reject the `C0EXAMPLE<digits>` documentation shape before creating or
+changing an agent, version, or deployment. Uncomment a line only after
+replacing the value with a real id, and only when you are using `--target`
+/ `--all-targets` rather than this installer.
 
 ## What a hand deploy still has to do
 

@@ -4525,6 +4525,34 @@ pub struct PreparedDeploy {
     plugin_dir: PathBuf,
 }
 
+fn is_documentation_placeholder_channel(channel: &str) -> bool {
+    channel.strip_prefix("C0EXAMPLE").is_some_and(|suffix| {
+        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+fn reject_documentation_placeholder_target(
+    target_name: &str,
+    target: &crate::api::ResolvedTarget,
+) -> Result<()> {
+    let Some(channel) = target.slack_channel.as_deref() else {
+        return Ok(());
+    };
+    if !is_documentation_placeholder_channel(channel) {
+        return Ok(());
+    }
+
+    Err(crate::exit::CliError::usage(format!(
+        "deploy target `{target_name}` uses documentation placeholder Slack channel `{channel}`; \
+         refusing before creating or changing an agent, version, or deployment"
+    ))
+    .with_fix(
+        "replace the target's slack_channel with a real Slack channel ID, or remove \
+         slack_channel from deploy.yaml",
+    )
+    .into())
+}
+
 impl PreparedDeploy {
     pub fn agent_id(&self) -> &str {
         &self.outcome.agent.id
@@ -4674,7 +4702,9 @@ pub async fn prepare_deploy(opts: DeployOpts) -> Result<PreparedDeploy> {
                     deploy_targets_path.display()
                 ))
             })?;
-            Some(client.resolve_deploy_target(content, name).await?)
+            let target = client.resolve_deploy_target(content, name).await?;
+            reject_documentation_placeholder_target(name, &target)?;
+            Some(target)
         }
         None => None,
     };
