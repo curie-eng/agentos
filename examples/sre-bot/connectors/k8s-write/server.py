@@ -56,8 +56,8 @@ from typing import Any
 
 import httpx
 import yaml
-from mcp.server.fastmcp import FastMCP
-from mcp.server.fastmcp.exceptions import ToolError
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 log = logging.getLogger("k8s-write-mcp")
@@ -70,19 +70,10 @@ TIMEOUT = float(os.environ.get("K8S_TIMEOUT_SECONDS", "30"))
 # for a write path: an operator opts workloads in by name, and a missing config
 # fails closed rather than granting everything.
 ALLOWLIST = frozenset(
-    entry.strip()
-    for entry in os.environ.get("K8S_WRITE_ALLOWLIST", "").split(",")
-    if entry.strip()
+    entry.strip() for entry in os.environ.get("K8S_WRITE_ALLOWLIST", "").split(",") if entry.strip()
 )
 
-mcp = FastMCP(
-    "k8s-write",
-    host=os.environ.get("BIND_ADDRESS", "0.0.0.0"),
-    port=int(os.environ.get("PORT", "8000")),
-    # Curie addresses hosted connectors at the exact, redirect-free /mcp path.
-    # MCP 1.28 mounts this value literally; "/" would leave /mcp returning 404.
-    streamable_http_path="/mcp",
-)
+mcp = MCPServer("k8s-write")
 
 # readOnlyHint=False is the honest value and the point of this server.
 # destructiveHint=False: a rolling restart replaces pods under the Deployment's
@@ -229,9 +220,7 @@ def restart_deployment(namespace: str, name: str) -> str:
         with client:
             existing = client.get(path)
             if existing.status_code == 404:
-                raise ToolError(
-                    f"no Deployment {target}. Check the name with the read-only tools."
-                )
+                raise ToolError(f"no Deployment {target}. Check the name with the read-only tools.")
             if existing.status_code in (401, 403):
                 raise ToolError(
                     f"the API server refused the read ({existing.status_code}). The write "
@@ -248,9 +237,7 @@ def restart_deployment(namespace: str, name: str) -> str:
             patch = {
                 "spec": {
                     "template": {
-                        "metadata": {
-                            "annotations": {"kubectl.kubernetes.io/restartedAt": stamp}
-                        }
+                        "metadata": {"annotations": {"kubectl.kubernetes.io/restartedAt": stamp}}
                     }
                 }
             }
@@ -274,9 +261,7 @@ def restart_deployment(namespace: str, name: str) -> str:
             "can read this Deployment but not patch it. This will not fix itself on retry."
         )
     if applied.status_code >= 400:
-        raise ToolError(
-            f"the restart was rejected: {applied.status_code} {applied.text[:200]}"
-        )
+        raise ToolError(f"the restart was rejected: {applied.status_code} {applied.text[:200]}")
 
     return (
         f"restart triggered for {target} at {stamp}. New pods are rolling out under the "
@@ -291,14 +276,18 @@ def main() -> int:
         # Starting with an empty allowlist would look healthy and refuse every
         # call, which reads as a broken bot rather than a missing config.
         log.error(
-            "K8S_WRITE_ALLOWLIST is empty; refusing to start a write connector "
-            "that permits nothing"
+            "K8S_WRITE_ALLOWLIST is empty; refusing to start a write connector that permits nothing"
         )
         return 1
     if not os.path.exists(KUBECONFIG):
         log.error("no kubeconfig at %s; refusing to start without a credential", KUBECONFIG)
         return 1
-    mcp.run(transport="streamable-http")
+    mcp.run(
+        transport="streamable-http",
+        host=os.environ.get("BIND_ADDRESS", "0.0.0.0"),
+        port=int(os.environ.get("PORT", "8000")),
+        streamable_http_path="/mcp",
+    )
     return 0
 
 

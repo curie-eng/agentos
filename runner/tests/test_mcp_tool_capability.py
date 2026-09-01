@@ -162,6 +162,14 @@ def test_derived_connector_read_only_tool_uses_connector_runtime_prefix(
     )
 
 
+def test_paginated_read_only_tools_prove_no_write_capability(tmp_path: Path) -> None:
+    result = _probe(_bundle(tmp_path, mode="paginated"))
+
+    assert result.complete
+    assert not result.has_potential_write_tool
+    assert result.tool_count == 2
+
+
 def test_manifest_mcp_path_string_is_an_unknown_surface(tmp_path: Path) -> None:
     root = _bundle(tmp_path, mode="read-only")
     manifest = root / ".claude-plugin" / "plugin.json"

@@ -755,11 +755,11 @@ def _options_from_boot(
 
 
 async def _mcp_tool_names(server: Any) -> set[str]:
-    handler = server["instance"].request_handlers.get(mcp_types.ListToolsRequest)
-    if handler is None:
+    entry = server["instance"].get_request_handler("tools/list")
+    if entry is None:
         return set()
-    result = await handler(mcp_types.ListToolsRequest(method="tools/list"))
-    return {tool.name for tool in result.root.tools}
+    result = await entry.handler(None, mcp_types.PaginatedRequestParams())
+    return {tool.name for tool in result.tools}
 
 
 def _add_capability_server(plugin_dir: str, mode: str) -> None:

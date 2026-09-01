@@ -49,8 +49,8 @@ from typing import Any
 
 import httpx
 import yaml
-from mcp.server.fastmcp import FastMCP
-from mcp.server.fastmcp.exceptions import ToolError
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 log = logging.getLogger("k8s-scale-mcp")
@@ -60,23 +60,14 @@ TIMEOUT = float(os.environ.get("K8S_TIMEOUT_SECONDS", "30"))
 
 # "namespace/name,namespace/name". Empty means nothing is permitted.
 ALLOWLIST = frozenset(
-    entry.strip()
-    for entry in os.environ.get("K8S_SCALE_ALLOWLIST", "").split(",")
-    if entry.strip()
+    entry.strip() for entry in os.environ.get("K8S_SCALE_ALLOWLIST", "").split(",") if entry.strip()
 )
 
 # A ceiling an operator sets, because "scale to 10000" is a denial-of-service
 # with an approval on it. Refused before a client is built, like the allowlist.
 MAX_REPLICAS = int(os.environ.get("K8S_SCALE_MAX_REPLICAS", "50"))
 
-mcp = FastMCP(
-    "k8s-scale",
-    host=os.environ.get("BIND_ADDRESS", "0.0.0.0"),
-    port=int(os.environ.get("PORT", "8000")),
-    # Curie addresses hosted connectors at the exact, redirect-free /mcp path.
-    # MCP 1.28 mounts this value literally; "/" would leave /mcp returning 404.
-    streamable_http_path="/mcp",
-)
+mcp = MCPServer("k8s-scale")
 
 # idempotentHint=True is the honest value and the difference from restart:
 # setting replicas to 3 twice leaves the same cluster state. It is still a write
@@ -182,6 +173,7 @@ def _client() -> httpx.Client:
         timeout=TIMEOUT,
     )
 
+
 @mcp.tool(annotations=SCALE)
 def scale_deployment(namespace: str, name: str, replicas: int) -> str:
     """Set a Deployment's replica count.
@@ -234,18 +226,14 @@ def scale_deployment(namespace: str, name: str, replicas: int) -> str:
         with client:
             existing = client.get(path)
             if existing.status_code == 404:
-                raise ToolError(
-                    f"no Deployment {target}. Check the name with the read-only tools."
-                )
+                raise ToolError(f"no Deployment {target}. Check the name with the read-only tools.")
             if existing.status_code in (401, 403):
                 raise ToolError(
                     f"the write identity may not read the scale of {target} "
                     f"({existing.status_code}). It needs get on deployments/scale."
                 )
             if existing.status_code >= 400:
-                raise ToolError(
-                    f"could not read the scale of {target}: {existing.status_code}"
-                )
+                raise ToolError(f"could not read the scale of {target}: {existing.status_code}")
             try:
                 prior_replicas = (existing.json().get("spec") or {}).get("replicas")
             except (ValueError, AttributeError):
@@ -305,7 +293,12 @@ def scale_deployment(namespace: str, name: str, replicas: int) -> str:
 def main() -> None:
     if not ALLOWLIST:
         log.warning("K8S_SCALE_ALLOWLIST is empty; every call will be refused")
-    mcp.run(transport="streamable-http")
+    mcp.run(
+        transport="streamable-http",
+        host=os.environ.get("BIND_ADDRESS", "0.0.0.0"),
+        port=int(os.environ.get("PORT", "8000")),
+        streamable_http_path="/mcp",
+    )
 
 
 if __name__ == "__main__":

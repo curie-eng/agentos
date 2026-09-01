@@ -698,6 +698,11 @@ RUN /app/.venv/bin/pip install \\
             f"{expected['aiohttp']}, found Dockerfile version 3.14.1",
         ),
         Violation(
+            "anyio",
+            "expected lock version "
+            f"{expected['anyio']}, found Dockerfile version 4.14.1",
+        ),
+        Violation(
             "claude-agent-sdk",
             "expected lock version "
             f"{expected['claude-agent-sdk']}, found Dockerfile version 0.2.115",
