@@ -89,18 +89,30 @@ is a judgement call, not something derivable from the tree.
    `SELECT`, and `apps/worker/src/curie_worker/binding.py::_RESOLVE_SQL` orders on
    `(d.environment = 'prod')`, comparing the native enum of item 2 against a string
    literal.
+5. **`UNIQUE NULLS NOT DISTINCT` workflow-state identity** —
+   `workflow_state_entries` treats `binding_scope IS NULL` as the one real shared scope
+   identity, rather than as an absent value. This preserves the shared state of a
+   `memory=True` agent (including a legacy general-state row) and the permanently
+   agent-wide `memory` and `transcript` namespaces. The named
+   `uq_state_agent_scope_ns_key` constraint therefore makes
+   `(agent_id, binding_scope, namespace, key)` unique with `NULLS NOT DISTINCT`;
+   ordinary Postgres unique semantics would allow duplicate NULL tuples. This clause is
+   PostgreSQL-specific and was added in PostgreSQL 15, which is the minimum server
+   version for this relational contract.
 
 Items 1 to 3 are cheap within the Postgres family: any managed Postgres speaks all three
-natively, so the DSN-only swap is unaffected by them. Item 4 is different in kind. It is
+natively, so the DSN-only swap is unaffected by them. Item 4 is different in kind: it is
 dialect-specific and driver-specific SQL living in application code, so it leaks past the
-stated contract as well as past Postgres: swapping the models and migrations would not
-carry it, and a reader looking only at `models.py` would not find it. All of them would
-need rework for a different RDBMS, which is the marker that a real port should be
-extracted first.
+stated contract as well as past Postgres; swapping the models and migrations would not
+carry it, and a reader looking only at `models.py` would not find it. Item 5 is likewise
+a database-level contract rather than a model type: it is native on a supported managed
+Postgres, but a pre-15 server cannot represent Curie's singular NULL shared identity.
+All five items would need rework for a different RDBMS, which is the marker that a real
+port should be extracted first.
 
 ## Cross-links
 
-- **Swap guide + validation:** [managed-postgres-swap.md](./managed-postgres-swap.md) — the DSN-only swap to RDS/Cloud SQL/Neon, with the `apps/api/tests/test_managed_pg_swap.py` smoke test that proves the migration chain applies against a DSN-selected throwaway database (#283). That test covers leakage items 1 and 2 only; items 3 and 4 have no equivalent assertion.
+- **Swap guide + validation:** [managed-postgres-swap.md](./managed-postgres-swap.md) — the DSN-only swap to RDS/Cloud SQL/Neon, with the `apps/api/tests/test_managed_pg_swap.py` smoke test that proves the migration chain applies against a DSN-selected throwaway database (#283). That test covers leakage items 1 and 2 only; items 3 through 5 have no equivalent managed-swap assertion.
 - **Epic(s):** #84 — vision epic for the relational-DB seam (keep the swap a DSN change; extract a port only for a non-Postgres store).
 - **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — Job 5 (Relational database), grade A-
 - **ADR(s):** [ADR-0007](../../adr/0007-adopt-not-build-boundaries.md) — Adopt-not-build boundaries ("vanilla Postgres" adopted for app state)
