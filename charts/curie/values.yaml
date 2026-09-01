@@ -109,7 +109,9 @@ langfuse:
   image:
     web: langfuse/langfuse
     worker: langfuse/langfuse-worker
-    tag: "3"
+    # Keep web and worker on one reviewed migration set. A floating :3 moved to
+    # 3.225.6 during CI and left ClickHouse migration 39 dirty (#2190).
+    tag: "3.225.5"
   telemetryEnabled: false
   enableExperimentalFeatures: true
   # Startup gate on the ClickHouse endpoint Langfuse boots against (issue
