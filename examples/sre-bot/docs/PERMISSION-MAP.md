@@ -183,6 +183,22 @@ namespace if the token escapes the connector pod. It does not leave the pod, for
 the same reason the read connector drops `configuration_view`: the sandbox learns
 a URL and never holds a credential.
 
+### The service-account escalation RBAC also cannot prevent
+
+When this Role is installed beside `manifests/platform-upgrade-role.yaml`, a
+leaked `sre-bot-upgrader` token can create a Job with
+`spec.serviceAccountName: curie-platform-upgrader`. Kubernetes RBAC authorizes
+the Job create but does not restrict which service account the created Pod runs
+as, so that Job inherits the platform upgrader's namespace-wide permissions.
+The connector cannot make that request -- its one tool posts an operator-written
+CronJob template verbatim -- but a holder of the leaked token bypasses the
+connector entirely.
+
+This is a disclosure, not a permission change. Mitigate it with an admission
+policy that constrains service-account choice for the connector identity, by
+placing the wider identity in a separate namespace, or by avoiding a long-lived
+connector token. If none is acceptable, do not install this connector.
+
 ### Why this is not the abstraction entry 5 rejects
 
 Entry 4 rejects `upgrade_release(target_version)` -- a connector validating a

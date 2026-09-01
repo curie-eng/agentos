@@ -19,6 +19,16 @@
 # with any command in this namespace, which is the namespace holding the
 # platform's API key.
 #
+# There is a second, more serious consequence when this manifest is installed
+# alongside `platform-upgrade-role.yaml`: RBAC does not restrict the
+# `spec.serviceAccountName` a Job creator chooses. A leaked `sre-bot-upgrader`
+# token can therefore create a Job that runs as `curie-platform-upgrader`,
+# inheriting that account's namespace-wide platform-upgrade permissions. The
+# connector cannot construct that Job, but a party holding its leaked token can.
+# Mitigations include an admission policy that constrains service-account choice
+# for this requesting identity, separating the wider identity into another
+# namespace, or avoiding a long-lived connector token.
+#
 # That is the same shape as `write-role.yaml`'s `patch` on `deployments`, which
 # RBAC also cannot separate from `set image`, and it gets the same answer: the
 # real ceiling is the connector, which exposes ONE tool that takes NO arguments
