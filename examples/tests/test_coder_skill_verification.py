@@ -38,24 +38,53 @@ def test_coder_verifies_and_reports_changes_before_publication() -> None:
     assert publication, "coder skill must retain an explicit publication instruction"
     before_publish = body[: publication.start()]
 
-    assert "/workspace" in before_publish, "verification must run inside the sandbox"
+    # Anchor these checks to the verification section itself. The opening
+    # workspace instructions alone must not satisfy the contract.
+    verification = re.search(
+        r"After making a requested change,.*?(?=\nWhen the user asks to publish|\Z)",
+        body,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    assert verification, "coder skill must have a distinct pre-publication verification section"
+    verification_text = verification.group(0)
+    assert verification.end() <= publication.start(), (
+        "verification instructions must appear before publication"
+    )
+    assert re.search(
+        r"run\s+(?:that\s+)?command\s+from\s+[`\"']?/workspace[`\"']?",
+        verification_text,
+        flags=re.IGNORECASE,
+    ), "the repository command must explicitly run from /workspace"
     assert re.search(
         r"(?:repository(?:'s)?\s+own|repo[- ]owned|own\s+repository)"
         r".{0,140}(?:document(?:ed|ation)?).{0,140}"
         r"(?:test\s+or\s+check|test/check|check\s+or\s+test).{0,80}command",
-        before_publish,
+        verification_text,
         flags=re.IGNORECASE | re.DOTALL,
     ), "run the target repository's documented test/check command"
     assert re.search(
         r"(?:after|once|following).{0,100}(?:change|edit|modif)",
-        before_publish,
+        verification_text,
         flags=re.IGNORECASE | re.DOTALL,
     ), "verification must happen after the requested changes"
 
-    assert "thread" in before_publish.casefold()
-    assert "exit status" in before_publish.casefold()
-    assert re.search(r"\bcommand\b", before_publish, flags=re.IGNORECASE)
-    assert re.search(r"\bresult\b", before_publish, flags=re.IGNORECASE)
+    assert "thread" in verification_text.casefold()
+    assert "exit status" in verification_text.casefold()
+    assert re.search(r"\bcommand\b", verification_text, flags=re.IGNORECASE)
+    assert re.search(r"\bresult\b", verification_text, flags=re.IGNORECASE)
+
+    assert re.search(
+        r"cannot\s+identify\s+or\s+run\s+an?\s+appropriate\s+command"
+        r".{0,120}(?:do\s+not|must\s+not|never)\s+publish",
+        verification_text,
+        flags=re.IGNORECASE | re.DOTALL,
+    ), "inability to identify or run a command must prevent publication"
+    assert re.search(
+        r"(?:if\s+)?verification\s+generates\s+artifacts?"
+        r".{0,140}(?:do\s+not|must\s+not|never)\s+publish\s+unrequested\s+artifacts?",
+        verification_text,
+        flags=re.IGNORECASE | re.DOTALL,
+    ), "verification artifacts must not publish unrequested artifacts"
 
     # A failed check must be an observable stop condition, not merely a report.
     failure_blocks_publish = re.search(
@@ -63,7 +92,7 @@ def test_coder_verifies_and_reports_changes_before_publication() -> None:
         r"(?:block|prevent|do not|must not|never).{0,100}publish"
         r"|(?:do not|must not|never|block|prevent).{0,100}publish"
         r".{0,140}(?:fail(?:s|ed|ure|ing)?|non[- ]zero)",
-        before_publish,
+        verification_text,
         flags=re.IGNORECASE | re.DOTALL,
     )
     assert failure_blocks_publish, "a failed verification must prevent publication"

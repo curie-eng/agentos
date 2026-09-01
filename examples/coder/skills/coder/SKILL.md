@@ -29,8 +29,10 @@ that fact and do not publish. If the command fails, report the failure and do no
 publish.
 
 If verification generates artifacts, do not publish unrequested artifacts. Use
-the repository's documented cleanup procedure when one exists; otherwise report
-the generated artifacts in the session thread and do not publish.
+the repository's documented cleanup procedure when one exists, but remove only
+artifacts created by this verification; never remove requested or unrelated
+checkout work. Otherwise report the generated artifacts in the session thread
+and do not publish.
 
 When the user asks to publish the current changes, call
 `mcp__curie__publish_changes`. The platform will post an approval card in the
