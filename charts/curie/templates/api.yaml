@@ -1,3 +1,4 @@
+{{- $resumeReconcilerGrace := include "curie.api.resumeReconciler.grace" . -}}
 {{- if .Values.api.deploy }}
 apiVersion: v1
 kind: Service
@@ -224,7 +225,7 @@ spec:
             - name: RESUME_RECONCILER_INTERVAL_SECONDS
               value: {{ .Values.api.resumeReconciler.intervalSeconds | quote }}
             - name: RESUME_RECONCILER_GRACE_SECONDS
-              value: {{ .Values.api.resumeReconciler.graceSeconds | quote }}
+              value: {{ $resumeReconcilerGrace | quote }}
             - name: RESUME_RECONCILER_BATCH_LIMIT
               value: {{ .Values.api.resumeReconciler.batchLimit | quote }}
             # Slack bot token for the approval user-group authorizer (#420): the

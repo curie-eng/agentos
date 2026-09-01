@@ -1175,6 +1175,30 @@ securityContext:
 {{- end -}}
 {{- end -}}
 
+{{/* ---- Resume reconciler grace arithmetic (API) ----
+     The reconciler must wait through a worker's complete delivery budget and
+     terminal-settlement reserve before it can enqueue a replacement resume
+     turn. The default therefore derives from those two worker settings.
+
+     An explicit api.resumeReconciler.graceSeconds is an operator-selected
+     extension of that wait, not an independent timeout. Refusing a value below
+     the derived floor prevents a clean Helm operation from producing a
+     reconciler that can enqueue while the preceding delivery remains active. */}}
+{{- define "curie.api.resumeReconciler.grace" -}}
+{{- $budget := int64 .Values.worker.deliveryBudgetSeconds -}}
+{{- $reserve := int64 .Values.worker.deliveryShutdownReserveSeconds -}}
+{{- $required := add $budget $reserve -}}
+{{- if hasKey .Values.api.resumeReconciler "graceSeconds" -}}
+{{- $grace := int64 .Values.api.resumeReconciler.graceSeconds -}}
+{{- if lt $grace $required -}}
+{{- fail (printf "api.resumeReconciler.graceSeconds (%d) must be at least worker.deliveryBudgetSeconds (%d) + worker.deliveryShutdownReserveSeconds (%d) = %d. Fix: raise api.resumeReconciler.graceSeconds to %d or more, or lower worker.deliveryBudgetSeconds and/or worker.deliveryShutdownReserveSeconds so their sum is at most %d." $grace $budget $reserve $required $required $grace) -}}
+{{- end -}}
+{{- $grace -}}
+{{- else -}}
+{{- $required -}}
+{{- end -}}
+{{- end -}}
+
 {{/* ---- Upgrade drain gate arithmetic (issue #2010) ----
      The gate's two clocks are DERIVED, with the values as floors, and only a
      self-contradictory pair is refused outright. The split is deliberate.
