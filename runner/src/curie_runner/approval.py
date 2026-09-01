@@ -49,12 +49,21 @@ from claude_agent_sdk.types import (
     ToolPermissionContext,
 )
 from plugin_format import (
+    TOOL_POLICY_ENFORCEMENT,
     ApprovalPolicy,
     PluginManifest,
+    ToolPolicy,
+    ToolPolicyDecision,
+    ToolPolicyInvalid,
+    ToolPolicyUnenforceable,
+    classify_tool,
     connector_server_names,
+    connector_tool_prefix,
     declared_mcp_server_names,
     effective_operator_gates,
+    effective_tool_prefix,
     grantable_routes,
+    load_tool_policy,
     parse_allowed_tools,
     resolve_manifest,
 )
@@ -589,6 +598,12 @@ class ApprovalGate:
     # ``SessionRunner`` knows the runner itself requested that stop. It is
     # runner-internal and is NEVER serialized onto the wire.
     pending_halt: bool = False
+    # A declared tool policy plus the bundle identity needed to translate live
+    # SDK MCP names back to the canonical "<server>/<tool>" policy surface.
+    tool_policy: ToolPolicy | None = None
+    bundle_name: str | None = None
+    mcp_servers: set[str] | None = None
+    connector_servers: set[str] | None = None
     _boot_turn_seen: bool = False
 
     def grantable_tool_for_route(self, route: str | None) -> str | None:
@@ -677,6 +692,54 @@ class _GateDecision(NamedTuple):
 
     blocked: bool
     ungated: bool
+    refusal: str | None = None
+
+
+def is_mcp_tool(live_tool_name: str) -> bool:
+    """Return whether a live SDK name belongs to an MCP server."""
+
+    return live_tool_name.startswith("mcp__")
+
+
+def canonical_tool_name(
+    live_tool_name: str,
+    *,
+    bundle_name: str | None,
+    mcp_servers: set[str] | None,
+    connector_servers: set[str] | None,
+) -> str | None:
+    """Map a live SDK MCP name to the canonical policy name, if declared."""
+
+    if not is_mcp_tool(live_tool_name):
+        return None
+    for server in sorted(connector_servers or ()):
+        prefix = connector_tool_prefix(server)
+        if live_tool_name.startswith(prefix):
+            tool = live_tool_name[len(prefix) :]
+            return f"{server}/{tool}" if tool else None
+    if bundle_name:
+        for server in sorted(mcp_servers or ()):
+            prefix = effective_tool_prefix(bundle_name, server)
+            if live_tool_name.startswith(prefix):
+                tool = live_tool_name[len(prefix) :]
+                return f"{server}/{tool}" if tool else None
+    return None
+
+
+def _tool_policy_outcome(gate: ApprovalGate, tool_name: str) -> ToolPolicyDecision | None:
+    """Classify one live tool, preserving built-ins outside MCP policy."""
+
+    if gate.tool_policy is None or not is_mcp_tool(tool_name):
+        return None
+    canonical = canonical_tool_name(
+        tool_name,
+        bundle_name=gate.bundle_name,
+        mcp_servers=gate.mcp_servers,
+        connector_servers=gate.connector_servers,
+    )
+    if canonical is None:
+        return ToolPolicyDecision.DENY
+    return classify_tool(gate.tool_policy, canonical)
 
 
 def _decide_gate(gate: ApprovalGate, tool_name: str, tool_input: dict[str, Any]) -> _GateDecision:
@@ -691,6 +754,24 @@ def _decide_gate(gate: ApprovalGate, tool_name: str, tool_input: dict[str, Any])
     flag) -- this function decides, it does not render.
     """
 
+    outcome = _tool_policy_outcome(gate, tool_name)
+    if outcome is ToolPolicyDecision.DENY:
+        return _GateDecision(
+            blocked=False,
+            ungated=False,
+            refusal=(
+                f"{tool_name} is denied by this agent's tool policy. This is not an "
+                "approval you can request -- the policy forbids the call. Do not retry "
+                "it; say what you were trying to do and stop."
+            ),
+        )
+    # Policy gates are additive to legacy/operator gates. A policy allow never
+    # removes a legacy gate, while approvalRequired joins the same one-shot path.
+    if outcome is ToolPolicyDecision.APPROVAL_REQUIRED and tool_name not in gate.required:
+        if gate.consume_grant(tool_name):
+            return _GateDecision(blocked=False, ungated=False)
+        gate.block(tool_name, tool_input)
+        return _GateDecision(blocked=True, ungated=False)
     if tool_name not in gate.required:
         return _GateDecision(blocked=False, ungated=True)
     # Publication is completed outside the sandbox after approval, so an
@@ -739,6 +820,8 @@ def build_can_use_tool(gate: ApprovalGate) -> CanUseTool:
                 message=f"Publication request was not recorded: {exc}. Correct it and retry.",
                 interrupt=True,
             )
+        if decision.refusal is not None:
+            return PermissionResultDeny(message=decision.refusal, interrupt=True)
         if decision.blocked:
             # ``interrupt`` is the SDK-native "deny AND stop the turn" flag
             # (``PermissionResultDeny.interrupt``, claude_agent_sdk/types.py:247-252),
@@ -853,7 +936,9 @@ def build_approval_hook(gate: ApprovalGate) -> dict[str, list[HookMatcher]]:
             # gate would become a fail-open. Abstaining leaves ``can_use_tool``
             # as the backstop, which is strictly the pre-#1852 posture.
             return {}
-        if tool_name not in gate.required:
+        # A policy-bearing bundle must classify every MCP call in this hook;
+        # unlike can_use_tool, PreToolUse cannot be shadowed by another allow.
+        if gate.tool_policy is None and tool_name not in gate.required:
             return {}
 
         raw_input = _hook_field(hook_input, "tool_input")
@@ -875,6 +960,18 @@ def build_approval_hook(gate: ApprovalGate) -> dict[str, list[HookMatcher]]:
                 "continue_": False,
                 "stopReason": reason,
             }
+        if decision.refusal is not None:
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": decision.refusal,
+                },
+                "continue_": False,
+                "stopReason": decision.refusal,
+            }
+        if decision.ungated:
+            return {}
         if not decision.blocked:
             # Observability for #1852 (accepted, not fixed): the grant is spent
             # HERE, before the concurrently-dispatched bundle PreToolUse hook's
@@ -962,6 +1059,7 @@ class ApprovalPolicyResolution:
     bundle_name: str | None = None
     mcp_servers: set[str] | None = None
     connector_servers: set[str] | None = None
+    tool_policy: ToolPolicy | None = None
 
 
 def resolve_approval_policy(plugin_dir: str | None) -> ApprovalPolicyResolution:
@@ -1020,6 +1118,19 @@ def resolve_approval_policy(plugin_dir: str | None) -> ApprovalPolicyResolution:
     bundle_name = name if isinstance(name, str) else None
     mcp_servers = declared_mcp_server_names(root)
     connectors = connector_server_names(root)
+    tool_policy: ToolPolicy | None = None
+    if isinstance(raw, dict) and raw.get("toolPolicy") is not None:
+        try:
+            manifest_for_policy = PluginManifest.model_validate(raw)
+            tool_policy = load_tool_policy(
+                manifest_for_policy, enforces=TOOL_POLICY_ENFORCEMENT
+            )
+        except (ValueError, TypeError, ToolPolicyUnenforceable, ToolPolicyInvalid) as exc:
+            raise ApprovalPolicyError(
+                f"the bundle at {root} declares a toolPolicy this build cannot apply"
+                f" as written; refusing to boot with its tool surface unclassified"
+                f" ({exc})"
+            ) from exc
     if not isinstance(raw, dict) or raw.get("approvalPolicy") is None:
         return ApprovalPolicyResolution(
             {},
@@ -1027,6 +1138,7 @@ def resolve_approval_policy(plugin_dir: str | None) -> ApprovalPolicyResolution:
             bundle_name=bundle_name,
             mcp_servers=mcp_servers,
             connector_servers=connectors,
+            tool_policy=tool_policy,
         )
     # An approvalPolicy IS declared. From here every failure is fail-closed:
     # the intent is established and a parse error cannot revoke it.
@@ -1064,6 +1176,7 @@ def resolve_approval_policy(plugin_dir: str | None) -> ApprovalPolicyResolution:
         bundle_name=bundle_name,
         mcp_servers=mcp_servers,
         connector_servers=connectors,
+        tool_policy=tool_policy,
     )
 
 
@@ -1089,6 +1202,7 @@ def build_approval_gate(
     mcp_servers: set[str] | None = None,
     connector_servers: set[str] | None = None,
     managed_workspace: bool = False,
+    tool_policy: ToolPolicy | None = None,
 ) -> ApprovalGate | None:
     """Merge the operator's gated tools with the bundle's declared gates.
 
@@ -1208,7 +1322,7 @@ def build_approval_gate(
     gated_tools = operator | frozenset(policy_routes)
     if managed_workspace:
         gated_tools |= frozenset({PUBLISH_TOOL_NAME})
-    if not gated_tools:
+    if not gated_tools and tool_policy is None:
         return None
     safe_grant_tool = None if grant_tool == PUBLISH_TOOL_NAME else grant_tool
     return ApprovalGate(
@@ -1216,6 +1330,10 @@ def build_approval_gate(
         route_by_tool=policy_routes,
         grant_tool=safe_grant_tool,
         grantable_by_route=grantable_by_route or {},
+        tool_policy=tool_policy,
+        bundle_name=bundle_name,
+        mcp_servers=mcp_servers,
+        connector_servers=connector_servers,
     )
 
 

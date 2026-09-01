@@ -13,7 +13,12 @@ import json
 from pathlib import Path
 
 from claude_agent_sdk import SdkPluginConfig
-from plugin_format import PluginManifest, resolve_manifest, validate_bundle
+from plugin_format import (
+    TOOL_POLICY_ENFORCEMENT,
+    PluginManifest,
+    resolve_manifest,
+    validate_bundle,
+)
 
 BUNDLE_CONFIG_NAME = "curie.bundle.json"
 
@@ -99,7 +104,10 @@ def load_plugins(plugin_dir: str | None) -> list[SdkPluginConfig]:
         return []
 
     root = Path(plugin_dir)
-    result = validate_bundle(root)
+    # Naming the enforcement contract is a statement that this build applies a
+    # declared toolPolicy. Older runners omit it and safely refuse policy-bearing
+    # bundles rather than starting them unfenced.
+    result = validate_bundle(root, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
     if not result.valid:
         detail = "; ".join(f"[{i.code}] {i.location}: {i.message}" for i in result.errors)
         raise PluginBundleError(f"invalid plugin bundle at {root}: {detail}")
