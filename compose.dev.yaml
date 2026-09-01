@@ -224,7 +224,7 @@ services:
     restart: "no"
 
   langfuse-worker:
-    image: langfuse/langfuse-worker:3
+    image: langfuse/langfuse-worker:3.225.5
     profiles: *full_profiles
     depends_on:
       postgres:
@@ -244,7 +244,7 @@ services:
     restart: unless-stopped
 
   langfuse-web:
-    image: langfuse/langfuse:3
+    image: langfuse/langfuse:3.225.5
     profiles: *full_profiles
     depends_on:
       postgres:
