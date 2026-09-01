@@ -1430,8 +1430,8 @@ fn target_config(
     channels: DeployTargetChannels,
 ) -> (&'static str, &'static str, &'static str) {
     match (target, channels) {
-        ("dev", DeployTargetChannels::RealisticFixtures) => ("acme-dev", "dev", "C000000D01"),
-        ("prod", DeployTargetChannels::RealisticFixtures) => ("acme-prod", "prod", "C000000P01"),
+        ("dev", DeployTargetChannels::RealisticFixtures) => ("acme-dev", "dev", "C000000A01"),
+        ("prod", DeployTargetChannels::RealisticFixtures) => ("acme-prod", "prod", "C000000A02"),
         ("dev", DeployTargetChannels::DocumentationPlaceholders) => {
             ("acme-dev", "dev", "C0EXAMPLE2")
         }

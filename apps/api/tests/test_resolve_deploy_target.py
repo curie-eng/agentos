@@ -39,11 +39,11 @@ REAL = (
     "  dev:\n"
     "    agent: acme-dev\n"
     "    env: dev\n"
-    "    slack_channel: C000000D01\n"
+    "    slack_channel: C000000A01\n"
     "  prod:\n"
     "    agent: acme-bot\n"
     "    env: prod\n"
-    "    slack_channel: C000000P01\n"
+    "    slack_channel: C000000A02\n"
 )
 
 
@@ -56,7 +56,7 @@ def _resolve(client: TestClient, headers: dict, content: str, target: str):
 def test_resolves_the_named_target(client: TestClient, auth_headers: dict) -> None:
     r = _resolve(client, auth_headers, REAL, "prod")
     assert r.status_code == 200, r.text
-    assert r.json() == {"agent": "acme-bot", "env": "prod", "slack_channel": "C000000P01"}
+    assert r.json() == {"agent": "acme-bot", "env": "prod", "slack_channel": "C000000A02"}
 
 
 def test_each_target_resolves_differently(client: TestClient, auth_headers: dict) -> None:
