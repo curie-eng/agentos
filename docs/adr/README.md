@@ -104,7 +104,7 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0072 | [Keep the hand-rolled Rust ACI emitter; typify cannot express the wire contract's runtime semantics](0072-keep-the-hand-rolled-rust-aci-emitter-over-typify.md) | Accepted |
 | 0073 | [The durable state store reaches bundle code as an auto-mounted MCP server, not a bundle-shipped one](0073-agentos-state-mcp-server-and-state-boot-env.md) | Accepted |
 | 0074 | [Versioned JSON Schemas for every agent-facing CLI result](0074-versioned-json-schemas-for-cli-results.md) | Accepted |
-| 0075 | [The Agent Proxy: credentials and egress leave the sandbox](0075-the-agent-proxy-credential-and-egress-boundary.md) | Draft |
+| 0075 | [The Agent Proxy: credentials and egress leave the sandbox](0075-the-agent-proxy-credential-and-egress-boundary.md) | Accepted |
 | 0076 | [A closed, versioned attribute schema for the runner's OTel span stream](0076-closed-typed-telemetry-attribute-schema.md) | Accepted |
 | 0077 | [Skill-tier durable approvals stay unavailable, reported not absent](0077-skill-tier-durable-approvals-stay-unavailable.md) | Accepted |
 | 0078 | [Route message-driven approval cards through the connected Slack transport](0078-approval-cards-over-connected-transport.md) | Accepted |

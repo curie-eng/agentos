@@ -1,9 +1,9 @@
 # 75. The Agent Proxy: credentials and egress leave the sandbox
 
 Date: 2026-07-23
-Status: Draft
+Status: Accepted
 
-Supersedes-when-accepted: [ADR-0032](0032-explicit-provider-egress.md) (the
+Supersedes: [ADR-0032](0032-explicit-provider-egress.md) (the
 interim install-time CIDR resolve becomes the FQDN proxy the durable-mechanism
 clause of that ADR already promised).
 
@@ -183,8 +183,7 @@ its own decision when it lands:
 
 ## Status note
 
-Draft. Once Accepted, this ADR supersedes ADR-0032, and ADR-0032's status line is
-updated to point here. It remains Draft because the substrate and
-TLS-termination decisions above are unresolved and the shape of the credential
-injection contract is not yet pinned; it records the direction both reviews
-converged on so the future ADRs build to it.
+Accepted. This ADR supersedes ADR-0032's install-time CIDR resolve as the
+durable FQDN mechanism. Substrate, TLS-termination, and the credential
+injection contract remain the follow-up ADRs listed above; they are not pinned
+by this acceptance.

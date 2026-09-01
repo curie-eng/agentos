@@ -8,6 +8,11 @@ The first Decision clause and rejected Alternative 1 no longer require an
 explicit provider when the effective credential prefix selects one provider.
 Every other egress rule remains unchanged.
 
+**Superseded in part by [ADR 0075](0075-the-agent-proxy-credential-and-egress-boundary.md).**
+The install-time CIDR resolve is the interim FQDN mechanism this ADR deferred;
+ADR-0075 is that durable proxy. The CIDR path remains the fallback where the
+proxy is not deployed.
+
 Implements [#362](https://github.com/curie-eng/curie/issues/362).
 
 ## Context
