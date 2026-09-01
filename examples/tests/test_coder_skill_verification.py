@@ -52,8 +52,8 @@ def test_coder_verifies_and_reports_changes_before_publication() -> None:
         flags=re.IGNORECASE | re.DOTALL,
     ), "verification must happen after the requested changes"
 
-    assert "thread" in lowered
-    assert "exit status" in lowered
+    assert "thread" in before_publish.casefold()
+    assert "exit status" in before_publish.casefold()
     assert re.search(r"\bcommand\b", before_publish, flags=re.IGNORECASE)
     assert re.search(r"\bresult\b", before_publish, flags=re.IGNORECASE)
 
@@ -67,5 +67,3 @@ def test_coder_verifies_and_reports_changes_before_publication() -> None:
         flags=re.IGNORECASE | re.DOTALL,
     )
     assert failure_blocks_publish, "a failed verification must prevent publication"
-
-    assert publication.start() > 0, "publication cannot precede verification instructions"

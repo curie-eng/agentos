@@ -28,6 +28,10 @@ session thread. If you cannot identify or run an appropriate command, report
 that fact and do not publish. If the command fails, report the failure and do not
 publish.
 
+If verification generates artifacts, do not publish unrequested artifacts. Use
+the repository's documented cleanup procedure when one exists; otherwise report
+the generated artifacts in the session thread and do not publish.
+
 When the user asks to publish the current changes, call
 `mcp__curie__publish_changes`. The platform will post an approval card in the
 session thread and will report the pull-request URL there after approval. Only
