@@ -168,4 +168,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0136 | [A late workspace handoff replaces the sandbox at a fenced turn boundary](0136-a-late-workspace-handoff-replaces-the-sandbox-at-a-fenced-turn-boundary.md) | Accepted |
 | 0137 | [Coding tools are built in and an initial repository URL selects the workspace](0137-coding-tools-are-built-in-and-an-initial-repository-url-selects-the-workspace.md) | Draft |
 | 0138 | [Provider-side web search is a default-on bundle capability](0138-provider-side-web-search-is-a-default-on-bundle-capability.md) | Proposed |
+| 0139 | [Bundle owners classify every vanilla MCP tool](0139-bundle-owners-classify-every-vanilla-mcp-tool.md) | Draft |
 <!-- END GENERATED: adr-index -->
