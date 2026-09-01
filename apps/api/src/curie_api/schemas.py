@@ -1339,9 +1339,9 @@ class DeploymentCreate(BaseModel):
     version_id: uuid.UUID
     environment: Environment
     commit_sha: str | None = None
-    # Three states are distinguished by ``model_fields_set`` in the router:
-    # omitted carries the last active deployment value, true enables runtime
-    # repository selection, and false disables it.
+    # Retained as a compatibility-only deployment field; it is not a runtime
+    # coding gate. The worker-wide workspace coordinator plus an allowed root
+    # GitHub URL determine whether claim-time repository acquisition occurs.
     workspace_enabled: bool | None = None
     status: str = "active"
 

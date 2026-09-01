@@ -1159,30 +1159,13 @@ class Kernel:
                     thread_key,
                     **boot_env_kwargs,
                 )
-                if getattr(resolved, "workspace_enabled", False):
-                    workspace_deployment_id = getattr(resolved, "deployment_id", None)
-                    if workspace_deployment_id is None:
-                        # Outside _attempt's handlers, so this one has to name
-                        # itself: deployment_id is legitimately optional on a
-                        # resolved binding, making this a reachable
-                        # misconfiguration that would otherwise reach the
-                        # consumer as an anonymous processing exception (#2004).
-                        # Log first so the failure names the agent, then let the
-                        # raise stand unchanged: it leaves the stream entry
-                        # pending for reclaim rather than settling it -- only
-                        # the visibility changed here.
-                        binding_failure = WorkspacePreparationError(
-                            "binding", "workspace-enabled deployment has no deployment id"
-                        )
-                        self._log_workspace_start_failure(
-                            qevent,
-                            qevent.text,
-                            binding_failure,
-                            agent_id=agent_id,
-                            agent_name=agent_name,
-                            workspace_deployment_id=None,
-                        )
-                        raise binding_failure
+                # The deployment id is the server-side authority used to select
+                # and redeem a repository at initial claim time.  The legacy
+                # per-deployment workspace_enabled bit is deliberately not a
+                # runtime coding gate: the worker-wide coordinator switch is the
+                # operational kill switch, while a missing deployment id simply
+                # leaves this turn on the generic claim path.
+                workspace_deployment_id = getattr(resolved, "deployment_id", None)
                 # One-shot post-approval allowance (#430, ADR-0035): when THIS turn is the
                 # resume of a genuinely-approved permission-gate approval, deliver a single
                 # gated-tool grant so the approved action completes once; the gate re-arms
@@ -2120,11 +2103,8 @@ class Kernel:
         workspace start failure -- a clone, an archive, an upload, a missing
         coordinator -- falls into ``_attempt``'s broad start-failure clause,
         which used to log an event id and an anonymous ``repr``: naming neither
-        the agent, nor the deployment, nor the repository. A binding carrying no
-        deployment id is different again: it never reaches that clause at all,
-        because it is raised earlier, in ``_process_event``, before ``_attempt``
-        runs -- and had no log of its own before this ticket. The reported
-        symptom is what both cost -- the turn acks, creates no sandbox, and an
+        the agent, nor the deployment, nor the repository. The reported symptom
+        is what those faults cost -- the turn acks, creates no sandbox, and an
         operator has nothing to search on.
 
         So this emits one WARNING carrying everything needed to find the
@@ -2136,11 +2116,8 @@ class Kernel:
         decision the feature made on purpose, a preparation failure is a fault
         nobody chose.
 
-        It takes the turn TEXT rather than an ``Event`` because the earliest
-        workspace failure -- a workspace-enabled deployment carrying no
-        deployment id -- is raised before ``_attempt`` has built one, and a
-        failure this helper cannot be called from is exactly the silence #2004
-        is about.
+        It takes the turn TEXT rather than an ``Event`` so it can name the
+        repository fact independently of where preparation failed.
         """
         # Total by construction: parse_github_repo_fact RAISES
         # WorkspaceSelectionRefused on a multi-repository message. That refusal
@@ -2692,7 +2669,7 @@ class Kernel:
         if workspace_deployment_id is not None:
             if self._workspace is None:
                 raise WorkspacePreparationError(
-                    "wiring", "workspace-enabled deployment has no trusted preparer"
+                    "wiring", "selected workspace has no trusted claim-time preparer"
                 )
             existing = await asyncio.to_thread(self._substrate.adopt, thread_key)
             if existing is not None and existing.workspace_repo == workspace_repo:

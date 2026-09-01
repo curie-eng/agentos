@@ -246,6 +246,9 @@ class ResolvedDeployment(BaseModel):
     # through the internal workspace credential endpoint.  Optional defaults
     # keep old worker doubles and rolling-deploy rows source-compatible.
     deployment_id: uuid.UUID | None = None
+    # Retained on the wire-facing deployment model for compatibility only. The
+    # kernel deliberately does not use this legacy per-deployment bit as coding
+    # enablement; CURIE_WORKSPACE_ENABLED remains the worker-wide kill switch.
     workspace_enabled: bool = False
     version_id: uuid.UUID
     version_label: str

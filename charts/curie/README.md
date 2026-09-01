@@ -1062,13 +1062,23 @@ namespace named by `worker.publication.namespace` (release-scoped when empty).
 For a private runner image, create the referenced image pull Secret in that
 namespace separately; the chart deliberately does not copy the platform Secret.
 
-Deployment workspace capability is tri-state: `curie ... deploy --workspace`
-enables runtime selection, `--no-workspace` explicitly disables it, and
-omitting both carries the active deployment's value forward. The first root
-GitHub repository URL that establishes selection in a Slack thread is pinned to
-that agent and thread. A later message can establish selection when no earlier
-message did; later messages may omit the URL. Choosing another repository
-requires a new thread.
+`curie ... deploy --workspace` and `--no-workspace` are deprecated compatibility
+options and no longer enable or disable coding. Every session exposes the Claude
+Code file tools and `mcp__curie__publish_changes`. The publication tool is only
+an approval request: it cannot publish without a managed workspace and a human
+approval, publication still runs outside the sandbox, and no GitHub credential
+is mounted into the sandbox.
+
+One allowed root `https://github.com/owner/repository` URL in the initial
+message establishes the thread's selection and causes the worker to acquire its
+managed workspace at claim time. An initial message without a repository URL
+uses a generic sandbox and does not redeem a repository credential. If a root
+URL arrives after that generic route is already running, Curie refuses it
+before selection, credential redemption, or a second claim; the fenced
+same-thread replacement described by Draft
+[ADR 0136](../../docs/adr/0136-a-late-workspace-handoff-replaces-the-sandbox-at-a-fenced-turn-boundary.md)
+is not yet available. The first established selection remains pinned to the
+agent and thread, and choosing another repository requires a new thread.
 
 Set `api.githubRepoAllowlist` to exact `owner/repository` entries or explicit
 owner-wide `owner/*` entries. Empty is deny-all. Curie checks this policy before

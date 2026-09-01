@@ -451,6 +451,39 @@ def test_internal_workspace_selection_accepts_explicit_unselected_response(
     assert client.select(DEPLOYMENT_ID, "thread-generic", "U0REQUEST1", None) is None
 
 
+def test_workspace_coordinator_propagates_absent_repository_selection(
+    workspace: Any,
+) -> None:
+    """The kernel-facing coordinator preserves the API's nullable result."""
+
+    def transport(**_request: Any) -> Any:
+        return SimpleNamespace(
+            status=200,
+            headers={},
+            body=b'{"repo_full_name":null}',
+        )
+
+    credentials = workspace.WorkspaceCredentialClient(
+        api_url="https://api.example.com",
+        worker_token=WORKER_AUTH,
+        transport=transport,
+    )
+    coordinator = workspace.WorkspaceClaimCoordinator(
+        preparer=SimpleNamespace(credentials=credentials),
+        substrate=_RecordingSubstrate(),
+    )
+
+    assert (
+        coordinator.select_repository(
+            thread_key="1700000000.000100",
+            deployment_id=DEPLOYMENT_ID,
+            author="U0REQUEST1",
+            repo_full_name=None,
+        )
+        is None
+    )
+
+
 @pytest.mark.parametrize(
     ("code", "expected_detail"),
     [
