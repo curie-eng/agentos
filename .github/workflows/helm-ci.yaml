@@ -28,6 +28,11 @@ on:
       - "apps/worker/src/curie_worker/bundle_store.py"
       - "uv.lock"
       - "pyproject.toml"
+      # The Langfuse image-pin assertion step below renders compose.dev.yaml
+      # as the second shipping surface for the pinned Langfuse version. A PR
+      # that floats the tag only there would match no path here, skip this
+      # job, and never run the gate that catches exactly that.
+      - "compose.dev.yaml"
 
 permissions:
   contents: read

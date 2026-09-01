@@ -170,9 +170,12 @@ jobs:
           --event "$GITHUB_EVENT_PATH"
           --curie cli/target/release/curie
           --ref HEAD
+      # Every dev-stack service sits behind the compose `full` profile. Without
+      # --profile full, `docker compose logs` matches no service and prints
+      # nothing, so a real outage gets diagnosed with no container logs at all.
       - name: Dump dev stack logs on failure
         if: failure()
-        run: docker compose -f compose.dev.yaml logs --no-color --tail=200
+        run: docker compose --profile full -f compose.dev.yaml logs --no-color --tail=200
 
   rust:
     name: Rust (fmt + clippy + test)

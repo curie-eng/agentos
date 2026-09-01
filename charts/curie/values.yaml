@@ -109,8 +109,10 @@ langfuse:
   image:
     web: langfuse/langfuse
     worker: langfuse/langfuse-worker
-    # Keep web and worker on one reviewed migration set. A floating major tag
-    # moved during CI and left ClickHouse migration 39 dirty (#2190).
+    # Keep web and worker on one reviewed version. On 2026-09-01 upstream
+    # rebuilt both the `3` and `3.225` tags in place to ship v3.225.6 without
+    # ever publishing a 3.225.6 tag, breaking CI bring-up. Neither major nor
+    # minor tags are safe -- only the exact patch tag is stable (#2190).
     tag: "3.225.5"
   telemetryEnabled: false
   enableExperimentalFeatures: true

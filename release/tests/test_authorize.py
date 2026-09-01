@@ -1247,6 +1247,10 @@ class TestHelmCiWorkflowTriggers:
         # web-identity gate executes those repository files against each
         # rendered workload, so a PR touching only them (a revert of the
         # credential fix) must still match this filter or the gate never runs.
+        # The same holds for compose.dev.yaml: the Langfuse image-pin
+        # assertion this job runs renders it as the second shipping surface
+        # for the pinned Langfuse version, so a PR that floats the tag only
+        # in Compose must still match this filter or that gate never runs.
         assert triggers["pull_request"]["paths"] == [
             "charts/curie/**",
             "examples/sre-bot/observability/**",
@@ -1258,6 +1262,7 @@ class TestHelmCiWorkflowTriggers:
             "apps/worker/src/curie_worker/bundle_store.py",
             "uv.lock",
             "pyproject.toml",
+            "compose.dev.yaml",
         ]
 
 
