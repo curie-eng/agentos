@@ -224,6 +224,31 @@ def test_first_repo_selection_is_sticky_allowlisted_and_conflict_safe(
     ]
 
 
+def test_workspace_capability_without_repo_remains_an_unselected_generic_thread(
+    worker_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    """Capability alone must not force repository selection or persist a row."""
+
+    agent_id, version_id = _create_agent_version(worker_client, auth_headers)
+    deployment = _deploy(worker_client, auth_headers, agent_id, version_id, workspace=True)
+
+    response = worker_client.post(
+        f"/v1/internal/workspaces/{deployment['id']}/selection",
+        json={
+            "conversation_id": "thread-generic-first",
+            "author": "U0REQUEST1",
+            "repo_full_name": None,
+        },
+        headers=WORKER_HEADERS,
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"repo_full_name": None}
+    assert _selection_rows() == []
+
+
 def test_selection_survives_redeployment_for_the_same_agent_thread(
     worker_client: TestClient,
     auth_headers: dict[str, str],

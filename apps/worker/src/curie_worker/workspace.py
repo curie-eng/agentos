@@ -269,7 +269,7 @@ class WorkspaceCredentialClient:
         conversation_id: str,
         author: str,
         repo_full_name: str | None,
-    ) -> str:
+    ) -> str | None:
         body = json.dumps(
             {
                 "conversation_id": conversation_id,
@@ -322,12 +322,14 @@ class WorkspaceCredentialClient:
                 "repository-selection", f"API returned HTTP {response.status}"
             )
         try:
-            selected = str(json.loads(response.body)["repo_full_name"])
+            selected = json.loads(response.body)["repo_full_name"]
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise WorkspacePreparationError(
                 "repository-selection", "API returned an invalid selection response"
             ) from exc
-        if not _REPO_FULL_NAME.fullmatch(selected):
+        if selected is None:
+            return None
+        if not isinstance(selected, str) or not _REPO_FULL_NAME.fullmatch(selected):
             raise WorkspacePreparationError(
                 "repository-selection", "API returned an invalid repository selection"
             )
@@ -1213,6 +1215,8 @@ class WorkspaceClaimCoordinator:
         deployment_id: uuid.UUID,
         env: dict[str, str] | None = None,
         agent_name: str | None = None,
+        repo_full_name: str | None = None,
+        replace_handle: Any | None = None,
     ) -> WorkspaceClaimResult:
         """Prepare once, then cold-claim or resume a suspended route."""
 
@@ -1234,18 +1238,34 @@ class WorkspaceClaimCoordinator:
             previous_ownership = self._stage_ownership(thread_key, prepared)
             ownership_staged = True
             claim_env = {**(env or {}), **prepared.claim_env()}
-            try:
-                handle = self.substrate.claim(
-                    thread_key, env=claim_env, agent_name=agent_name
+            if replace_handle is not None:
+                if repo_full_name is None:
+                    raise WorkspacePreparationError(
+                        "claim", "late workspace handoff requires a selected repository"
+                    )
+                handle = self.substrate.handoff(
+                    thread_key,
+                    expected=replace_handle,
+                    env=claim_env,
+                    workspace_repo=repo_full_name,
+                    agent_name=agent_name,
                 )
-            except Exception as exc:
-                # The substrate signal is injected to keep this worker-local
-                # port independent of the concrete Docker/Kubernetes package.
-                if not isinstance(exc, self._suspended_errors):
-                    raise
-                handle = self.substrate.resume(
-                    thread_key, env=claim_env, agent_name=agent_name
-                )
+            else:
+                try:
+                    handle = self.substrate.claim(
+                        thread_key,
+                        env=claim_env,
+                        agent_name=agent_name,
+                        workspace_repo=repo_full_name,
+                    )
+                except Exception as exc:
+                    # The substrate signal is injected to keep this worker-local
+                    # port independent of the concrete Docker/Kubernetes package.
+                    if not isinstance(exc, self._suspended_errors):
+                        raise
+                    handle = self.substrate.resume(
+                        thread_key, env=claim_env, agent_name=agent_name
+                    )
             sandbox_exposed = True
             self._commit_ownership(thread_key, prepared)
             return WorkspaceClaimResult(prepared=prepared, handle=handle)
@@ -1267,11 +1287,11 @@ class WorkspaceClaimCoordinator:
         deployment_id: uuid.UUID,
         author: str,
         repo_full_name: str | None,
-    ) -> str:
+    ) -> str | None:
         """Authorize or reuse the immutable server-side thread selection."""
 
         return cast(
-            "str",
+            "str | None",
             self.preparer.credentials.select(
                 deployment_id, thread_key, author, repo_full_name
             ),

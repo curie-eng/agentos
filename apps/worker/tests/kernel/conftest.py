@@ -446,12 +446,15 @@ class FakeRunner:
         self.app.add_routes(
             [
                 web.get("/status", self._status),
+                web.get("/v1/status", self._status),
                 web.post("/v1/event", self._event),
                 web.post("/v1/steer", self._steer),
                 web.post("/v1/interrupt", self._interrupt),
             ]
         )
         self.turn_active = False
+        self.history_durable = True
+        self.session_status = "idle-awaiting-input"
         # When set, /status answers 500 so a test can drive the fail-closed
         # liveness read (an unreadable session must count as busy).
         self.status_fails = False
@@ -481,7 +484,13 @@ class FakeRunner:
             # 200, but without the field the liveness read needs. A newer or
             # third-party runner could answer exactly this.
             return web.json_response({"status": "idle-awaiting-input"})
-        return web.json_response({"status": "idle-awaiting-input", "turn_active": self.turn_active})
+        return web.json_response(
+            {
+                "status": self.session_status,
+                "turn_active": self.turn_active,
+                "history_durable": self.history_durable,
+            }
+        )
 
     async def _event(self, request: web.Request) -> web.StreamResponse:
         self.event_headers.append(dict(request.headers))

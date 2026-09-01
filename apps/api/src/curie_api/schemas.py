@@ -1384,7 +1384,7 @@ class WorkspaceSelectionRequest(BaseModel):
 
 
 class WorkspaceSelectionOut(BaseModel):
-    repo_full_name: str
+    repo_full_name: str | None
 
 
 class WorkspaceCredentialRequest(BaseModel):

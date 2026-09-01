@@ -266,7 +266,7 @@ def test_workspace_clone_strips_authenticated_remote_before_first_turn(
 
 
 def test_clone_credential_is_absent_from_argv_archive_config_and_claim_env(
-    workspace: Any, tmp_path: Path
+    workspace: Any, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     preparer, commands, objects = _preparer(workspace, tmp_path)
     prepared = _prepare(preparer)
@@ -279,6 +279,8 @@ def test_clone_credential_is_absent_from_argv_archive_config_and_claim_env(
     assert b"redeemed-credential-value" not in payload
     assert b"redeemed-credential-value" not in config
     assert all("redeemed-credential-value" not in value for value in claim_env.values())
+    assert "redeemed-credential-value" not in "\n".join(commands.events)
+    assert "redeemed-credential-value" not in caplog.text
     assert set(claim_env) == {"CURIE_WORKSPACE_REF", "CURIE_WORKSPACE_SHA256"}
 
 
@@ -428,6 +430,25 @@ def test_internal_workspace_selection_sends_author_thread_and_optional_repo(
         "author": "U0REQUEST1",
         "repo_full_name": "acme-corp/acme-bot",
     }
+
+
+def test_internal_workspace_selection_accepts_explicit_unselected_response(
+    workspace: Any,
+) -> None:
+    def transport(**_request: Any) -> Any:
+        return SimpleNamespace(
+            status=200,
+            headers={},
+            body=b'{"repo_full_name":null}',
+        )
+
+    client = workspace.WorkspaceCredentialClient(
+        api_url="https://api.example.com",
+        worker_token=WORKER_AUTH,
+        transport=transport,
+    )
+
+    assert client.select(DEPLOYMENT_ID, "thread-generic", "U0REQUEST1", None) is None
 
 
 @pytest.mark.parametrize(
@@ -685,6 +706,7 @@ def test_workspace_archive_member_and_compression_caps_are_enforced_before_init(
 class _RecordingSubstrate:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, dict[str, str]]] = []
+        self.handoff_calls: list[dict[str, Any]] = []
 
     def claim(
         self, thread_key: str, *, env: dict[str, str] | None = None, **_: object
@@ -696,6 +718,28 @@ class _RecordingSubstrate:
         self, thread_key: str, *, env: dict[str, str] | None = None, **_: object
     ) -> object:
         self.calls.append(("resume", thread_key, dict(env or {})))
+        return object()
+
+    def handoff(
+        self,
+        thread_key: str,
+        *,
+        expected: object,
+        env: dict[str, str] | None = None,
+        workspace_repo: str,
+        agent_name: str | None = None,
+    ) -> object:
+        payload = dict(env or {})
+        self.calls.append(("handoff", thread_key, payload))
+        self.handoff_calls.append(
+            {
+                "thread_key": thread_key,
+                "expected": expected,
+                "env": payload,
+                "workspace_repo": workspace_repo,
+                "agent_name": agent_name,
+            }
+        )
         return object()
 
 
@@ -809,6 +853,130 @@ def test_workspace_claim_or_resume_failure_restores_prior_durable_ownership(
     deleted_workspace_keys = [key for key in objects.deleted if not key.startswith("_ownership/")]
     assert len(deleted_workspace_keys) == 1
     assert previous.object_key not in objects.deleted
+
+
+def test_late_handoff_uses_substrate_handoff_and_keeps_credentials_out_of_claim_env(
+    workspace: Any, tmp_path: Path
+) -> None:
+    preparer, commands, _objects = _preparer(workspace, tmp_path)
+    substrate = _RecordingSubstrate()
+    coordinator = workspace.WorkspaceClaimCoordinator(
+        preparer=preparer,
+        substrate=substrate,
+        ownership_ttl_seconds=60,
+        wall_clock=lambda: 1000.0,
+    )
+    old_handle = object()
+
+    result = coordinator.claim_or_resume_with_handle(
+        thread_key="1700000000.000100",
+        deployment_id=DEPLOYMENT_ID,
+        env={"CURIE_RUNNER_TOKEN": "workspace-test-token"},
+        agent_name="acme-bot",
+        repo_full_name="acme-corp/acme-bot",
+        replace_handle=old_handle,
+    )
+
+    assert substrate.calls[0][0] == "handoff"
+    assert [kind for kind, _thread, _env in substrate.calls] == ["handoff"]
+    handoff = substrate.handoff_calls[0]
+    assert handoff["expected"] is old_handle
+    assert handoff["workspace_repo"] == "acme-corp/acme-bot"
+    assert handoff["agent_name"] == "acme-bot"
+    workspace_env = result.prepared.claim_env()
+    assert handoff["env"]["CURIE_WORKSPACE_REF"] == workspace_env["CURIE_WORKSPACE_REF"]
+    assert handoff["env"]["CURIE_WORKSPACE_SHA256"] == workspace_env["CURIE_WORKSPACE_SHA256"]
+    assert handoff["env"]["CURIE_RUNNER_TOKEN"] == "workspace-test-token"
+    assert GIT_CREDENTIAL not in json.dumps(handoff["env"])
+    assert "redeemed-credential-value" not in json.dumps(handoff["env"])
+    assert not any(
+        marker in f"{name}={value}".upper()
+        for name, value in handoff["env"].items()
+        for marker in ("AUTHORIZATION", "PASSWORD", "SECRET")
+        if name != "CURIE_RUNNER_TOKEN"
+    )
+    assert "clone" in commands.events
+
+
+def test_late_handoff_without_a_selected_repository_never_touches_the_substrate(
+    workspace: Any, tmp_path: Path
+) -> None:
+    preparer, _, _objects = _preparer(workspace, tmp_path)
+    substrate = _RecordingSubstrate()
+    coordinator = workspace.WorkspaceClaimCoordinator(
+        preparer=preparer,
+        substrate=substrate,
+        ownership_ttl_seconds=60,
+        wall_clock=lambda: 1000.0,
+    )
+
+    with pytest.raises(
+        workspace.WorkspacePreparationError,
+        match="late workspace handoff requires a selected repository",
+    ):
+        coordinator.claim_or_resume_with_handle(
+            thread_key="1700000000.000100",
+            deployment_id=DEPLOYMENT_ID,
+            repo_full_name=None,
+            replace_handle=object(),
+        )
+
+    assert substrate.calls == []
+    assert substrate.handoff_calls == []
+
+
+def test_late_handoff_fence_loss_restores_prior_durable_ownership(
+    workspace: Any, tmp_path: Path
+) -> None:
+    preparer, _, objects = _preparer(workspace, tmp_path)
+    thread_key = "1700000000.000100"
+
+    class LosingSubstrate(_RecordingSubstrate):
+        def handoff(
+            self,
+            thread_key: str,
+            *,
+            expected: object,
+            env: dict[str, str] | None = None,
+            workspace_repo: str,
+            agent_name: str | None = None,
+        ) -> object:
+            del expected, env, workspace_repo, agent_name
+            self.calls.append(("handoff", thread_key, {}))
+            raise RuntimeError("late workspace handoff lost its route fence")
+
+    substrate = LosingSubstrate()
+    coordinator = workspace.WorkspaceClaimCoordinator(
+        preparer=preparer,
+        substrate=substrate,
+        ownership_ttl_seconds=60,
+        wall_clock=lambda: 1000.0,
+    )
+    previous = coordinator.claim_or_resume_with_handle(
+        thread_key=thread_key,
+        deployment_id=DEPLOYMENT_ID,
+    ).prepared
+
+    with pytest.raises(RuntimeError, match="lost its route fence"):
+        coordinator.claim_or_resume_with_handle(
+            thread_key=thread_key,
+            deployment_id=DEPLOYMENT_ID,
+            repo_full_name="acme-corp/acme-bot",
+            replace_handle=object(),
+        )
+
+    restarted = workspace.WorkspaceClaimCoordinator(
+        preparer=preparer,
+        substrate=_RecordingSubstrate(),
+        ownership_ttl_seconds=60,
+        wall_clock=lambda: 1001.0,
+    )
+    assert restarted.current(thread_key) == previous
+    assert previous.object_key in objects.objects
+    deleted_workspace_keys = [
+        key for key in objects.deleted if not key.startswith("_ownership/")
+    ]
+    assert previous.object_key not in deleted_workspace_keys
 
 
 def test_fresh_claim_and_resume_each_prepare_a_new_workspace_and_reap_the_old_object(

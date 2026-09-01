@@ -69,16 +69,7 @@ async def select_workspace_repository(
     )
     if selected is None:
         if data.repo_full_name is None:
-            raise HTTPException(
-                status.HTTP_409_CONFLICT,
-                {
-                    "code": "workspace.repository_required",
-                    "message": (
-                        "Name one allowed root GitHub repository URL before "
-                        "preparing this conversation's workspace."
-                    ),
-                },
-            )
+            return WorkspaceSelectionOut(repo_full_name=None)
         _require_allowed(data.repo_full_name)
         selected, _ = await crud.select_thread_workspace(
             session,

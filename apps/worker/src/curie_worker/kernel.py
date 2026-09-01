@@ -2443,13 +2443,14 @@ class Kernel:
         # greeting/help shortcut: a canned reply must not create a thread whose
         # repository remains ambiguous, and a conflicting repository must be
         # refused before an existing sandbox can be adopted or steered.
+        workspace_repo: str | None = None
         if workspace_deployment_id is not None:
             if self._workspace is None:
                 raise WorkspacePreparationError(
                     "wiring", "workspace-enabled deployment has no trusted coordinator"
                 )
             repo_fact = parse_github_repo_fact(event.text)
-            await asyncio.to_thread(
+            workspace_repo = await asyncio.to_thread(
                 self._workspace.select_repository,
                 thread_key=thread_key,
                 deployment_id=workspace_deployment_id,
@@ -2470,6 +2471,26 @@ class Kernel:
         # mere presence of an affinity record as proof that a live route was
         # retained.
         existing_handle = await asyncio.to_thread(self._substrate.lookup, thread_key)
+        if (
+            workspace_repo is not None
+            and existing_handle is not None
+            and existing_handle.workspace_repo is not None
+            and existing_handle.workspace_repo != workspace_repo
+        ):
+            raise WorkspacePreparationError(
+                "route-fence", "live workspace route does not match sticky repository"
+            )
+        if (
+            workspace_repo is not None
+            and existing_handle is not None
+            and existing_handle.workspace_repo is None
+            and not await self._workspace_handoff_ready(
+                existing_handle, remaining_s=remaining_s
+            )
+        ):
+            raise ThreadBusyError(
+                f"thread {thread_key} has not reached a durable workspace handoff boundary"
+            )
         if packs is not None:
             reply = match_greeting(packs, event.text) or match_help(packs, event.text)
             if reply is not None and existing_handle is None:
@@ -2492,7 +2513,17 @@ class Kernel:
         handle = await self._claim_or_resume(
             thread_key,
             boot_env,
-            workspace_deployment_id=workspace_deployment_id,
+            workspace_deployment_id=(
+                workspace_deployment_id if workspace_repo is not None else None
+            ),
+            workspace_repo=workspace_repo,
+            replace_handle=(
+                existing_handle
+                if workspace_repo is not None
+                and existing_handle is not None
+                and existing_handle.workspace_repo is None
+                else None
+            ),
             agent_name=agent_name,
         )
         retained_live_route = existing_handle is not None and handle == existing_handle
@@ -2529,7 +2560,9 @@ class Kernel:
                     # (min(600, a 30-minute budget) is still 600). Routed
                     # separately; a committed test also doubles ``status`` with a
                     # base_url-only stub here.
-                    status = await self._runner.status(handle.base_url)
+                    status = await self._runner.status(
+                        handle.base_url, token=handle.token or None
+                    )
                 except Exception as exc:  # noqa: BLE001 -- steering still decides the route
                     logger.warning(
                         "could not read pre-steer turn liveness at %s: %r",
@@ -2599,7 +2632,11 @@ class Kernel:
             True when a turn is live, or when liveness could not be determined.
         """
         try:
-            status = await self._runner.status(handle.base_url, remaining_s=remaining_s)
+            status = await self._runner.status(
+                handle.base_url,
+                token=handle.token or None,
+                remaining_s=remaining_s,
+            )
         except Exception as exc:  # noqa: BLE001 -- any unreadable answer means "assume busy"
             logger.warning("could not read turn liveness at %s: %r", handle.base_url, exc)
             return True
@@ -2609,12 +2646,40 @@ class Kernel:
             return True
         return active
 
+    async def _workspace_handoff_ready(
+        self, handle: SandboxHandle, *, remaining_s: float | None = None
+    ) -> bool:
+        """Fail closed unless the old runner is idle with durable replay state."""
+
+        if not handle.token:
+            logger.warning(
+                "workspace handoff refused an unauthenticated legacy runner at %s",
+                handle.base_url,
+            )
+            return False
+        try:
+            status = await self._runner.status(
+                handle.base_url,
+                token=handle.token,
+                remaining_s=remaining_s,
+            )
+        except Exception as exc:  # noqa: BLE001 - unreadable is never safe to replace
+            logger.warning("could not read workspace handoff fence at %s: %r", handle.base_url, exc)
+            return False
+        return (
+            status.get("turn_active") is False
+            and status.get("history_durable") is True
+            and status.get("status") != SessionStatus.AWAITING_APPROVAL.value
+        )
+
     async def _claim_or_resume(
         self,
         thread_key: str,
         boot_env: dict[str, str] | None,
         *,
         workspace_deployment_id: uuid.UUID | None = None,
+        workspace_repo: str | None = None,
+        replace_handle: SandboxHandle | None = None,
         agent_name: str | None = None,
     ) -> SandboxHandle:
         # A live route is an adopt/steer, not a session start. Preparing before
@@ -2630,7 +2695,7 @@ class Kernel:
                     "wiring", "workspace-enabled deployment has no trusted preparer"
                 )
             existing = await asyncio.to_thread(self._substrate.adopt, thread_key)
-            if existing is not None:
+            if existing is not None and existing.workspace_repo == workspace_repo:
                 await asyncio.to_thread(
                     self._workspace.touch,
                     thread_key,
@@ -2646,6 +2711,8 @@ class Kernel:
                 deployment_id=workspace_deployment_id,
                 env=boot_env,
                 agent_name=agent_name,
+                repo_full_name=workspace_repo,
+                replace_handle=replace_handle,
             )
             if not isinstance(workspace_claim.handle, SandboxHandle):
                 raise WorkspacePreparationError(
