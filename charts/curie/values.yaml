@@ -1090,6 +1090,11 @@ mailAdapter:
     # sent to a third party as a bearer token and fail auth in a way that looks
     # like a permissions problem rather than a missing credential.
     apiKey: ""
+    # BYO Secret escape (issue #1759). When set, the adapter reads this Secret
+    # and key directly and the chart omits mailAgentmailApiKey from its own
+    # Secret, so an upgrade cannot replace externally managed credential data.
+    apiKeyExistingSecret: ""
+    apiKeyExistingSecretKey: mailAgentmailApiKey
     baseUrl: "https://api.agentmail.to/v0"
     # NetworkPolicy cannot authorize a DNS name. Supply the current provider
     # (or a controlled egress proxy) HTTPS CIDRs explicitly. Enabling the
@@ -1098,14 +1103,23 @@ mailAdapter:
   # The `chn` channel token minted by the API's POST /channels/token, scoped to
   # this adapter's channel binding. The adapter presents it on every inbound post.
   channelToken: ""
+  channelTokenExistingSecret: ""
+  channelTokenExistingSecretKey: mailChannelToken
   # The shared secret the worker presents as X-Curie-Adapter-Secret when it
   # delivers reply events here, and that the adapter verifies before any side
   # effect. THIS IS THE SINGLE SOURCE OF TRUTH FOR BOTH HALVES of the pair: the
   # chart derives the worker's half, worker.adapterCredentials[adapterSlug],
-  # from it, so setting this one value wires both sides. Do not also write that
-  # entry by hand. Coalesced by curie.adapterCredentials; see _helpers.tpl for
-  # why an equal value is accepted and a conflicting one fails the render.
+  # from the plain value, so setting this one value wires both sides. The BYO
+  # Secret fields below control the adapter's reference only. When
+  # egressSecretExistingSecret is set, worker.adapterCredentialsExistingSecret
+  # must also source the worker's JSON credential map because Helm cannot derive
+  # that map from externally managed Secret data; the render fails closed when
+  # only the adapter-side escape is set. Coalesced by curie.adapterCredentials;
+  # see _helpers.tpl for why an equal inline value is accepted and a conflicting
+  # one fails the render.
   egressSecret: ""
+  egressSecretExistingSecret: ""
+  egressSecretExistingSecretKey: mailEgressSecret
   # Must equal the `adapter` slug on the agent's channel binding row, and it is
   # also the key the derived worker.adapterCredentials entry lands under.
   adapterSlug: "mail-adapter"

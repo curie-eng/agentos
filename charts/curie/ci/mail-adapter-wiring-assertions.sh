@@ -16,10 +16,15 @@
 #      platform key; this is what keeps curie.env.api from being "helpfully"
 #      included later.
 #   6  CURIE_CHANNEL_TOKEN, CURIE_EGRESS_SECRET and AGENTMAIL_API_KEY each arrive
-#      by secretKeyRef to the chart Secret, never as inline literals.
+#      by secretKeyRef, never as inline literals. Each per-field existingSecret
+#      overrides both the Secret name and key without making the reference
+#      optional, so a missing external key fails closed.
 #   7  The chart Secret carries mailChannelToken, mailEgressSecret and
-#      mailAgentmailApiKey, and the worker's adapterCredentials entry for the
-#      same slug renders alongside them in the same render.
+#      mailAgentmailApiKey only for chart-managed values, omits each externally
+#      sourced key, and renders the worker's adapterCredentials entry alongside
+#      the chart-managed egress credential in the same render. An externally
+#      sourced adapter egress credential requires the worker's external
+#      credential map, with a value-safe render failure when that pair is split.
 #   8  priorityClassName is the platform class (asserted here, not in
 #      render-assertions.sh, whose assertion 8 would break on the default render
 #      where this Deployment deliberately does not exist).
@@ -32,9 +37,9 @@
 #      must not exist), and the rollout strategy is Recreate. All routing state
 #      is process-local, and a rolling update runs two pods for the duration of
 #      every upgrade.
-#   12 checksum/mail-adapter-credentials tracks ALL THREE credentials, proven by
-#      three independent one-credential pairs. A one-credential assertion passes
-#      against a two-thirds-correct checksum, which is the bug.
+#   12 checksum/mail-adapter-credentials is derived from the three live Secret
+#      sources, with a stable source-ref fallback when clusterless helm template
+#      cannot read them. Raw Helm credential values are not the checksum source.
 #   13 The egress pair cannot diverge: derived from mailAdapter.egressSecret when
 #      the operator writes only that half, unchanged when both halves agree, and
 #      a hard `helm template` FAILURE naming both keys when they differ -- and
@@ -233,16 +238,17 @@ assert_env_value() {
 
 # Assert one env entry arrives by secretKeyRef, with no inline literal.
 assert_env_secret_ref() {
-  # $1 = rendered dir, $2 = env name, $3 = expected Secret key
-  local dir="$1" name="$2" key="$3" got
+  # $1 = rendered dir, $2 = env name, $3 = expected Secret name,
+  # $4 = expected Secret key
+  local dir="$1" name="$2" secret="$3" key="$4" got
   if ! got="$(env_field "$dir" "$DEPLOY_NAME" "$name" valueFrom.secretKeyRef.name)"; then
     fail "env '$name' does not arrive by valueFrom.secretKeyRef; an inline credential lands in 'helm get manifest' and in every rendered artifact CI uploads"
   fi
-  [ "$got" = "$SECRET_NAME" ] \
-    || fail "env '$name' secretKeyRef names Secret '$got', expected the chart Secret '$SECRET_NAME'"
+  [ "$got" = "$secret" ] \
+    || fail "env '$name' secretKeyRef names Secret '$got', expected '$secret'"
   got="$(env_field "$dir" "$DEPLOY_NAME" "$name" valueFrom.secretKeyRef.key)"
   [ "$got" = "$key" ] \
-    || fail "env '$name' secretKeyRef uses key '$got', expected '$key' (the key secrets.yaml renders; a different key silently reads an empty credential)"
+    || fail "env '$name' secretKeyRef uses key '$got', expected '$key'; a different key leaves the required credential unavailable"
   if env_field "$dir" "$DEPLOY_NAME" "$name" value >/dev/null 2>&1; then
     got="$(env_field "$dir" "$DEPLOY_NAME" "$name" value)"
     fail "env '$name' renders an inline literal value '$got'; the credential must come from the Secret by reference only"
@@ -328,9 +334,9 @@ fi
 # ---------------------------------------------------------------------------
 # 6: all three credentials arrive by secretKeyRef, never inline.
 # ---------------------------------------------------------------------------
-assert_env_secret_ref "$on_dir" CURIE_CHANNEL_TOKEN mailChannelToken
-assert_env_secret_ref "$on_dir" CURIE_EGRESS_SECRET mailEgressSecret
-assert_env_secret_ref "$on_dir" AGENTMAIL_API_KEY mailAgentmailApiKey
+assert_env_secret_ref "$on_dir" CURIE_CHANNEL_TOKEN "$SECRET_NAME" mailChannelToken
+assert_env_secret_ref "$on_dir" CURIE_EGRESS_SECRET "$SECRET_NAME" mailEgressSecret
+assert_env_secret_ref "$on_dir" AGENTMAIL_API_KEY "$SECRET_NAME" mailAgentmailApiKey
 
 # ---------------------------------------------------------------------------
 # 7: the Secret carries the three keys, and the worker's adapterCredentials
@@ -357,6 +363,67 @@ if got != want:
     sys.exit(1)
 ' "$creds_json" "$SLUG" "egress-assert-secret" \
   || fail "the worker half of the egress pair is missing or wrong; the worker will present nothing (or the wrong secret) and every reply delivery 401s"
+
+# An externally sourced adapter egress credential cannot be copied into the
+# worker's chart-managed JSON map because Helm cannot read the external Secret's
+# credential data. Require the worker's external credential map and keep the
+# render failure actionable without interpolating any supplied value.
+PAIR_SECRET_VALUE=zzmailpairexternalsecretzz
+PAIR_KEY_VALUE=zzmailpairexternalkeyzz
+PAIR_CREDENTIAL_VALUE=zzmailpaircredentialzz
+set +e
+unpaired_egress_out="$(helm template "$RELEASE" "$CHART" "${ON[@]}" "${CREDS[@]}" \
+  --set-string mailAdapter.egressSecretExistingSecret="$PAIR_SECRET_VALUE" \
+  --set-string mailAdapter.egressSecretExistingSecretKey="$PAIR_KEY_VALUE" \
+  --set-string mailAdapter.egressSecret="$PAIR_CREDENTIAL_VALUE" 2>&1)"
+unpaired_egress_rc=$?
+set -e
+[ "$unpaired_egress_rc" -ne 0 ] \
+  || fail "mailAdapter.egressSecretExistingSecret rendered without worker.adapterCredentialsExistingSecret; the paired credential sources must fail closed"
+case "$unpaired_egress_out" in
+  *"mailAdapter.egressSecretExistingSecret"*) : ;;
+  *) fail "the split egress-source failure did not name mailAdapter.egressSecretExistingSecret; output was: $unpaired_egress_out" ;;
+esac
+case "$unpaired_egress_out" in
+  *"worker.adapterCredentialsExistingSecret"*) : ;;
+  *) fail "the split egress-source failure did not name worker.adapterCredentialsExistingSecret; output was: $unpaired_egress_out" ;;
+esac
+for supplied_value in "$PAIR_SECRET_VALUE" "$PAIR_KEY_VALUE" "$PAIR_CREDENTIAL_VALUE"; do
+  case "$unpaired_egress_out" in
+    *"$supplied_value"*) fail "the split egress-source failure printed a supplied value; name configuration keys without echoing their contents. Output was: $unpaired_egress_out" ;;
+  esac
+done
+
+# Each credential can instead point at an operator-managed Secret. No such
+# Secret exists during this clusterless render: the non-optional secretKeyRefs
+# are therefore also the falsifiable missing-reference path. The chart must not
+# silently keep a same-named key in its own Secret as a fallback.
+external_dir="$(render external-secrets "${ON[@]}" "${CREDS[@]}" \
+  --set mailAdapter.channelTokenExistingSecret=mail-channel-source \
+  --set mailAdapter.channelTokenExistingSecretKey=channel-token \
+  --set mailAdapter.egressSecretExistingSecret=mail-egress-source \
+  --set mailAdapter.egressSecretExistingSecretKey=egress-token \
+  --set mailAdapter.agentmail.apiKeyExistingSecret=mail-provider-source \
+  --set mailAdapter.agentmail.apiKeyExistingSecretKey=provider-token \
+  --set worker.adapterCredentialsExistingSecret=mail-worker-source \
+  --set worker.adapterCredentialsExistingSecretKey=adapter-egress-map)"
+assert_env_secret_ref "$external_dir" CURIE_CHANNEL_TOKEN mail-channel-source channel-token
+assert_env_secret_ref "$external_dir" CURIE_EGRESS_SECRET mail-egress-source egress-token
+assert_env_secret_ref "$external_dir" AGENTMAIL_API_KEY mail-provider-source provider-token
+
+for name in CURIE_CHANNEL_TOKEN CURIE_EGRESS_SECRET AGENTMAIL_API_KEY; do
+  if env_field "$external_dir" "$DEPLOY_NAME" "$name" valueFrom.secretKeyRef.optional >/dev/null 2>&1; then
+    fail "env '$name' makes its external secretKeyRef optional; a missing Secret or key must prevent the adapter container from starting"
+  fi
+done
+
+field "$external_dir" Secret "$SECRET_NAME" >/dev/null \
+  || fail "the chart Secret did not render, so existingSecret omission checks would pass vacuously"
+for key in mailChannelToken mailEgressSecret mailAgentmailApiKey; do
+  if field "$external_dir" Secret "$SECRET_NAME" "stringData.$key" >/dev/null 2>&1; then
+    fail "chart Secret key '$key' still renders when its mail-adapter existingSecret is set; a Helm upgrade would keep managing or overwrite the externally sourced credential"
+  fi
+done
 
 # ---------------------------------------------------------------------------
 # 8: priorityClassName is the platform class. The control plane must outrank
@@ -786,10 +853,10 @@ if not expected.issubset(cidrs):
 PY
 
 # ---------------------------------------------------------------------------
-# 12: checksum/mail-adapter-credentials tracks ALL THREE credentials. Three
-#     independent one-credential pairs: a checksum over the channel token alone
-#     passes a one-credential assertion while rotating the egress secret or the
-#     AgentMail key leaves the pod running on stale environment credentials.
+# 12: checksum/mail-adapter-credentials hashes the live data behind all three
+#     secretKeyRefs. `helm template` has no live cluster, so it must fall back to
+#     a deterministic digest of the three source refs rather than hashing the
+#     raw Helm credential values.
 # ---------------------------------------------------------------------------
 ANNOTATION=spec.template.metadata.annotations.checksum/mail-adapter-credentials
 base_sum="$(field "$on_dir" Deployment "$DEPLOY_NAME" "$ANNOTATION")" \
@@ -797,19 +864,26 @@ base_sum="$(field "$on_dir" Deployment "$DEPLOY_NAME" "$ANNOTATION")" \
 [ -n "$base_sum" ] \
   || fail "'checksum/mail-adapter-credentials' rendered empty"
 
-assert_checksum_tracks() {
-  # $1 = label, $2... = the single --set that differs from the baseline render
-  local label="$1"
-  shift
-  local dir sum
-  dir="$(render "sum-$label" "${ON[@]}" "${CREDS[@]}" "$@")"
-  sum="$(field "$dir" Deployment "$DEPLOY_NAME" "$ANNOTATION")"
-  [ "$sum" != "$base_sum" ] \
-    || fail "rotating $label did not change 'checksum/mail-adapter-credentials' (still '$base_sum'); that credential is not part of the hashed input, so a rotation leaves the pod running on the revoked value"
-}
-assert_checksum_tracks "mailAdapter.channelToken" --set mailAdapter.channelToken=chn-rotated
-assert_checksum_tracks "mailAdapter.egressSecret" --set mailAdapter.egressSecret=egress-rotated
-assert_checksum_tracks "mailAdapter.agentmail.apiKey" --set mailAdapter.agentmail.apiKey=am-rotated
+repeat_dir="$(render checksum-repeat "${ON[@]}" "${CREDS[@]}")"
+repeat_sum="$(field "$repeat_dir" Deployment "$DEPLOY_NAME" "$ANNOTATION")"
+[ "$repeat_sum" = "$base_sum" ] \
+  || fail "clusterless checksum fallback is not deterministic: identical renders produced '$base_sum' and '$repeat_sum'"
+
+raw_values_dir="$(render checksum-raw-values "${ON[@]}" \
+  --set mailAdapter.channelToken=changed-channel-value \
+  --set mailAdapter.egressSecret=changed-egress-value \
+  --set mailAdapter.agentmail.apiKey=changed-provider-value)"
+raw_values_sum="$(field "$raw_values_dir" Deployment "$DEPLOY_NAME" "$ANNOTATION")"
+[ "$raw_values_sum" = "$base_sum" ] \
+  || fail "clusterless checksum changed with raw Helm credential values; it must checksum live Secret data and use only the source refs as its no-live-object fallback"
+
+external_sum="$(field "$external_dir" Deployment "$DEPLOY_NAME" "$ANNOTATION")"
+[ "$external_sum" != "$base_sum" ] \
+  || fail "checksum fallback ignored the external Secret names/keys; changing the credential source would leave the pod on its prior secretKeyRefs"
+
+if ! grep -F 'lookup "v1" "Secret"' "$CHART/templates/mail-adapter.yaml" >/dev/null; then
+  fail "mail-adapter checksum never looks up live Secret data; a Secret value rotated in place would not roll the adapter on the next Helm upgrade"
+fi
 
 # ---------------------------------------------------------------------------
 # 13: the egress pair cannot diverge. (a) derived from mailAdapter.egressSecret
