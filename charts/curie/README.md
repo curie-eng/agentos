@@ -1226,7 +1226,7 @@ As with `githubAppExistingSecret`, a Secret missing the referenced key fails
 that one pod at `CreateContainerConfigError` rather than the chart silently
 falling back to an empty credential.
 
-**Known gap, tracked in #1801.** None of these 16 new fields are yet covered
+**Known gap, tracked in #1801.** None of these 22 new fields are yet covered
 by the CLI's preserved-values mechanism (the same one `COMMS_MANAGED_KEYS` and
 `GITHUB_APP_MANAGED_KEYS` give the Slack tokens and the GitHub App identity in
 `cli/src/ops.rs`). A plain `curie cluster up` runs a full `helm upgrade

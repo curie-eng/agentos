@@ -24,7 +24,8 @@
 #      sourced key, and renders the worker's adapterCredentials entry alongside
 #      the chart-managed egress credential in the same render. An externally
 #      sourced adapter egress credential requires the worker's external
-#      credential map, with a value-safe render failure when that pair is split.
+#      credential map, omits the mail slug from the chart-managed map, and has a
+#      value-safe render failure when that pair is split.
 #   8  priorityClassName is the platform class (asserted here, not in
 #      render-assertions.sh, whose assertion 8 would break on the default render
 #      where this Deployment deliberately does not exist).
@@ -37,13 +38,13 @@
 #      must not exist), and the rollout strategy is Recreate. All routing state
 #      is process-local, and a rolling update runs two pods for the duration of
 #      every upgrade.
-#   12 checksum/mail-adapter-credentials is derived from the three live Secret
-#      sources, with a stable source-ref fallback when clusterless helm template
-#      cannot read them. Raw Helm credential values are not the checksum source.
-#   13 The egress pair cannot diverge: derived from mailAdapter.egressSecret when
-#      the operator writes only that half, unchanged when both halves agree, and
-#      a hard `helm template` FAILURE naming both keys when they differ -- and
-#      that failure message names the two KEYS without printing either live
+#   12 checksum/mail-adapter-credentials uses incoming Helm values for
+#      chart-managed credentials and live Secret data for external sources,
+#      with a stable source-ref fallback when no cluster read is available.
+#   13 The chart-managed egress pair cannot diverge: derived from
+#      mailAdapter.egressSecret when the operator writes only that half,
+#      unchanged when both halves agree, and a hard `helm template` FAILURE
+#      naming both keys when they differ -- without printing either live
 #      credential VALUE into terminal scrollback or a CI log.
 #   14 The worker's checksum/adapter-credentials sees the DERIVED entry, so
 #      rotating mailAdapter.egressSecret actually rolls the workers.
@@ -398,15 +399,17 @@ done
 # Secret exists during this clusterless render: the non-optional secretKeyRefs
 # are therefore also the falsifiable missing-reference path. The chart must not
 # silently keep a same-named key in its own Secret as a fallback.
-external_dir="$(render external-secrets "${ON[@]}" "${CREDS[@]}" \
-  --set mailAdapter.channelTokenExistingSecret=mail-channel-source \
-  --set mailAdapter.channelTokenExistingSecretKey=channel-token \
-  --set mailAdapter.egressSecretExistingSecret=mail-egress-source \
-  --set mailAdapter.egressSecretExistingSecretKey=egress-token \
-  --set mailAdapter.agentmail.apiKeyExistingSecret=mail-provider-source \
-  --set mailAdapter.agentmail.apiKeyExistingSecretKey=provider-token \
-  --set worker.adapterCredentialsExistingSecret=mail-worker-source \
-  --set worker.adapterCredentialsExistingSecretKey=adapter-egress-map)"
+EXTERNAL_REFS=(
+  --set mailAdapter.channelTokenExistingSecret=mail-channel-source
+  --set mailAdapter.channelTokenExistingSecretKey=channel-token
+  --set mailAdapter.egressSecretExistingSecret=mail-egress-source
+  --set mailAdapter.egressSecretExistingSecretKey=egress-token
+  --set mailAdapter.agentmail.apiKeyExistingSecret=mail-provider-source
+  --set mailAdapter.agentmail.apiKeyExistingSecretKey=provider-token
+  --set worker.adapterCredentialsExistingSecret=mail-worker-source
+  --set worker.adapterCredentialsExistingSecretKey=adapter-egress-map
+)
+external_dir="$(render external-secrets "${ON[@]}" "${CREDS[@]}" "${EXTERNAL_REFS[@]}")"
 assert_env_secret_ref "$external_dir" CURIE_CHANNEL_TOKEN mail-channel-source channel-token
 assert_env_secret_ref "$external_dir" CURIE_EGRESS_SECRET mail-egress-source egress-token
 assert_env_secret_ref "$external_dir" AGENTMAIL_API_KEY mail-provider-source provider-token
@@ -424,6 +427,27 @@ for key in mailChannelToken mailEgressSecret mailAgentmailApiKey; do
     fail "chart Secret key '$key' still renders when its mail-adapter existingSecret is set; a Helm upgrade would keep managing or overwrite the externally sourced credential"
   fi
 done
+
+# The raw egress value remains set in CREDS above on purpose. Once the adapter's
+# egress source is external, the chart-managed worker map must neither derive
+# the mail slug from that unused value nor divergence-check it against the
+# independently managed external map.
+external_chart_creds="$(field "$external_dir" Secret "$SECRET_NAME" stringData.adapterCredentials)"
+python3 -c '
+import json, sys
+if sys.argv[2] in json.loads(sys.argv[1]):
+    raise SystemExit("external egress source leaked the mail slug into chart-managed adapterCredentials")
+' "$external_chart_creds" "$SLUG" \
+  || fail "worker adapterCredentials still contains '$SLUG' when mailAdapter.egressSecretExistingSecret is set; the required external worker map must be the only paired egress source"
+
+# Even a stale plain worker entry must not be compared with the stale plain mail
+# value on the external path. Neither map is consumed there; the two external
+# references above are authoritative.
+external_stale_values_dir="$(render external-stale-values "${ON[@]}" "${EXTERNAL_REFS[@]}" \
+  --set mailAdapter.egressSecret=unused-mail-value \
+  --set worker.adapterCredentials.mail-adapter=unused-worker-value)"
+field "$external_stale_values_dir" Deployment "$DEPLOY_NAME" >/dev/null \
+  || fail "external egress sources failed to render when unused plain mail and worker values differed; the chart must not divergence-validate unconsumed values"
 
 # ---------------------------------------------------------------------------
 # 8: priorityClassName is the platform class. The control plane must outrank
@@ -853,10 +877,11 @@ if not expected.issubset(cidrs):
 PY
 
 # ---------------------------------------------------------------------------
-# 12: checksum/mail-adapter-credentials hashes the live data behind all three
-#     secretKeyRefs. `helm template` has no live cluster, so it must fall back to
-#     a deterministic digest of the three source refs rather than hashing the
-#     raw Helm credential values.
+# 12: checksum/mail-adapter-credentials hashes the incoming values for
+#     chart-managed credentials, because the live chart Secret still holds the
+#     old data during an upgrade. External references instead hash live Secret
+#     data and use a deterministic source-ref fallback when `helm template` has
+#     no cluster to read.
 # ---------------------------------------------------------------------------
 ANNOTATION=spec.template.metadata.annotations.checksum/mail-adapter-credentials
 base_sum="$(field "$on_dir" Deployment "$DEPLOY_NAME" "$ANNOTATION")" \
@@ -869,17 +894,41 @@ repeat_sum="$(field "$repeat_dir" Deployment "$DEPLOY_NAME" "$ANNOTATION")"
 [ "$repeat_sum" = "$base_sum" ] \
   || fail "clusterless checksum fallback is not deterministic: identical renders produced '$base_sum' and '$repeat_sum'"
 
-raw_values_dir="$(render checksum-raw-values "${ON[@]}" \
-  --set mailAdapter.channelToken=changed-channel-value \
-  --set mailAdapter.egressSecret=changed-egress-value \
+channel_rotation_dir="$(render checksum-channel-rotation "${ON[@]}" "${CREDS[@]}" \
+  --set mailAdapter.channelToken=changed-channel-value)"
+channel_rotation_sum="$(field "$channel_rotation_dir" Deployment "$DEPLOY_NAME" "$ANNOTATION")"
+[ "$channel_rotation_sum" != "$base_sum" ] \
+  || fail "rotating chart-managed mailAdapter.channelToken left the adapter checksum unchanged; an upgrade would keep the old environment value"
+
+egress_rotation_dir="$(render checksum-egress-rotation "${ON[@]}" "${CREDS[@]}" \
+  --set mailAdapter.egressSecret=changed-egress-value)"
+egress_rotation_sum="$(field "$egress_rotation_dir" Deployment "$DEPLOY_NAME" "$ANNOTATION")"
+[ "$egress_rotation_sum" != "$base_sum" ] \
+  || fail "rotating chart-managed mailAdapter.egressSecret left the adapter checksum unchanged; an upgrade would keep the old environment value"
+
+provider_rotation_dir="$(render checksum-provider-rotation "${ON[@]}" "${CREDS[@]}" \
   --set mailAdapter.agentmail.apiKey=changed-provider-value)"
-raw_values_sum="$(field "$raw_values_dir" Deployment "$DEPLOY_NAME" "$ANNOTATION")"
-[ "$raw_values_sum" = "$base_sum" ] \
-  || fail "clusterless checksum changed with raw Helm credential values; it must checksum live Secret data and use only the source refs as its no-live-object fallback"
+provider_rotation_sum="$(field "$provider_rotation_dir" Deployment "$DEPLOY_NAME" "$ANNOTATION")"
+[ "$provider_rotation_sum" != "$base_sum" ] \
+  || fail "rotating chart-managed mailAdapter.agentmail.apiKey left the adapter checksum unchanged; an upgrade would keep the old environment value"
 
 external_sum="$(field "$external_dir" Deployment "$DEPLOY_NAME" "$ANNOTATION")"
 [ "$external_sum" != "$base_sum" ] \
   || fail "checksum fallback ignored the external Secret names/keys; changing the credential source would leave the pod on its prior secretKeyRefs"
+
+external_raw_values_dir="$(render checksum-external-raw-values "${ON[@]}" "${EXTERNAL_REFS[@]}" \
+  --set mailAdapter.channelToken=unused-channel-value \
+  --set mailAdapter.egressSecret=unused-egress-value \
+  --set mailAdapter.agentmail.apiKey=unused-provider-value)"
+external_raw_values_sum="$(field "$external_raw_values_dir" Deployment "$DEPLOY_NAME" "$ANNOTATION")"
+[ "$external_raw_values_sum" = "$external_sum" ] \
+  || fail "external credential checksum changed with unused plain Helm values; existingSecret makes the referenced Secret the sole source"
+
+external_source_dir="$(render checksum-external-source "${ON[@]}" "${CREDS[@]}" "${EXTERNAL_REFS[@]}" \
+  --set mailAdapter.channelTokenExistingSecretKey=next-channel-token)"
+external_source_sum="$(field "$external_source_dir" Deployment "$DEPLOY_NAME" "$ANNOTATION")"
+[ "$external_source_sum" != "$external_sum" ] \
+  || fail "external checksum fallback ignored a referenced key change; clusterless renders must track the source ref"
 
 if ! grep -F 'lookup "v1" "Secret"' "$CHART/templates/mail-adapter.yaml" >/dev/null; then
   fail "mail-adapter checksum never looks up live Secret data; a Secret value rotated in place would not roll the adapter on the next Helm upgrade"
