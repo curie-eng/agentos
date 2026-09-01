@@ -636,14 +636,11 @@ def test_budgeted_request_logs_the_effective_timeout_bound(caplog) -> None:
                 record
                 for record in caplog.records
                 if record.name == "curie_worker.runner_client"
-                and hasattr(record, "effective_request_timeout_s")
+                and "runner request timeout bound" in record.getMessage()
             ]
             assert len(budget_records) == 1, caplog.text
             record = budget_records[0]
             assert record.levelno == logging.INFO
-            assert getattr(record, "configured_runner_ceiling_s", None) == 30.0
-            assert getattr(record, "remaining_delivery_s", None) == 5.0
-            assert getattr(record, "effective_request_timeout_s", None) == 5.0
             message = record.getMessage()
             normalized_message = message.lower()
             assert "configured" in normalized_message
@@ -652,6 +649,10 @@ def test_budgeted_request_logs_the_effective_timeout_bound(caplog) -> None:
             assert "remaining" in normalized_message
             assert "effective" in normalized_message
             assert message.count("5.0") >= 2
+            # The numeric body is fully formatted before logging. OTLP log
+            # exporters receive this same body rather than a format template
+            # plus deferred arguments that lose their intended representation.
+            assert record.args == ()
         finally:
             await client.close()
             await server.close()
@@ -662,8 +663,7 @@ def test_budgeted_request_logs_the_effective_timeout_bound(caplog) -> None:
 def test_budgeted_status_does_not_log_the_turn_timeout_bound(caplog) -> None:
     """Budget propagation still bounds control RPCs, but the effective turn
     timeout record belongs only to the request that opens the streamed turn.
-    Polling status must not emit that operator-facing message or its structured
-    fields.
+    Polling status must not emit that operator-facing message.
     """
 
     async def go() -> None:
@@ -693,11 +693,40 @@ def test_budgeted_status_does_not_log_the_turn_timeout_bound(caplog) -> None:
                 and "runner request timeout bound" in record.getMessage()
                 for record in records
             ), caplog.text
-            assert not any(
-                hasattr(record, "effective_request_timeout_s")
-                for record in records
-            ), caplog.text
         finally:
+            await client.close()
+            await server.close()
+
+    asyncio.run(go())
+
+
+def test_budgeted_status_uses_the_remaining_delivery_timeout() -> None:
+    """A status read still consumes the delivery deadline even though it does
+    not emit the turn-start timeout record. A short remainder must bound the
+    request instead of inheriting the much larger configured ceiling.
+    """
+
+    async def go() -> None:
+        hold = asyncio.Event()
+        app = web.Application()
+
+        async def hanging_status(_request: web.Request) -> web.Response:
+            await hold.wait()
+            return web.json_response({"turn_active": False})
+
+        app.add_routes([web.get("/status", hanging_status)])
+        server = TestServer(app)
+        await server.start_server()
+        base_url = f"http://127.0.0.1:{server.port}"
+        client = RunnerClient(total_timeout_s=30.0)
+        try:
+            loop = asyncio.get_event_loop()
+            started = loop.time()
+            with pytest.raises(TimeoutError):
+                await client.status(base_url, remaining_s=0.2)
+            assert loop.time() - started < 5.0
+        finally:
+            hold.set()
             await client.close()
             await server.close()
 

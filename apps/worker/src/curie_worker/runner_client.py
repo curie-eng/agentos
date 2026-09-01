@@ -362,16 +362,9 @@ class RunnerClient:
         )
         if remaining_s is not None:
             logger.info(
-                "runner request timeout bound: configured ceiling %.3fs, "
-                "remaining delivery %.3fs, effective timeout %.3fs",
-                self._total_timeout_s,
-                remaining_s,
-                stream_timeout_s,
-                extra={
-                    "effective_request_timeout_s": stream_timeout_s,
-                    "configured_runner_ceiling_s": self._total_timeout_s,
-                    "remaining_delivery_s": remaining_s,
-                },
+                f"runner request timeout bound: configured ceiling {self._total_timeout_s:.3f}s, "
+                f"remaining delivery {remaining_s:.3f}s, effective timeout "
+                f"{stream_timeout_s:.3f}s"
             )
 
         async def request(headers: dict[str, str] | None) -> tuple[TurnStream, str]:
