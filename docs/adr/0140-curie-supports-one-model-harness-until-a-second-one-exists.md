@@ -43,7 +43,8 @@ that engine needs.
 3. **The minimal extension seam stays.** The registry, its fail-closed guards,
    the built-in Claude shortcut, and the import-linter boundaries remain. They
    keep the current code organized; they are not a claim that Curie already
-   supports multiple engines.
+   supports multiple engines. The existing runner-local `CURIE_HARNESS` knob
+   remains internal; it is not promoted into the CLI, worker, compose, or chart.
 4. **The unfinished program stops.** The selector, Omnigent boundary spike, fake
    harness rewrite, capability matrix, and expanded cross-harness conformance
    work tracked in [#844](https://github.com/curie-eng/curie/issues/844) are no
