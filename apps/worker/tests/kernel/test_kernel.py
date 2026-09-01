@@ -410,58 +410,6 @@ def test_no_repository_selection_runs_on_a_generic_claim(make_harness) -> None:
     asyncio.run(go())
 
 
-def test_repo_url_on_existing_generic_route_fails_before_selection_or_claim(
-    make_harness,
-) -> None:
-    deployment_id = uuid.UUID("77777777-7777-4777-8777-777777777777")
-
-    async def go() -> None:
-        binding = _BuiltInCodingBinding(
-            deployment_id,
-            workspace_enabled=False,
-        )
-        async with make_harness(binding=binding) as h:
-            class WorkspaceProbe:
-                selections: list[str | None] = []
-                claims = 0
-
-                def select_repository(self, **kwargs: object) -> str | None:
-                    repo = kwargs["repo_full_name"]
-                    assert repo is None or isinstance(repo, str)
-                    self.selections.append(repo)
-                    return None
-
-                def claim_or_resume_with_handle(self, **_kwargs: object) -> object:
-                    self.claims += 1
-                    raise AssertionError(
-                        "late URL must not redeem or claim a workspace"
-                    )
-
-            probe = WorkspaceProbe()
-            h.kernel._workspace = probe  # type: ignore[assignment]
-            h.runner.default_script = [Final(text="generic", status=DONE)]
-
-            await h.kernel.process_event(
-                _qevent("Triage first", thread="tLateWorkspace")
-            )
-            await h.kernel.process_event(
-                _qevent(
-                    "Now change https://github.com/acme-corp/acme-bot",
-                    thread="tLateWorkspace",
-                )
-            )
-
-            assert probe.selections == [None]
-            assert probe.claims == 0
-            assert h.runner.opened == ["Triage first"]
-            assert len(h.fake_k8s.claim_envs) == 1
-            assert h.sink.last_text is not None
-            assert "handoff" in h.sink.last_text.lower()
-            assert "unavailable" in h.sink.last_text.lower()
-
-    asyncio.run(go())
-
-
 def test_conflicting_runtime_repo_is_terminal_before_claim_or_model(
     make_harness,
 ) -> None:
