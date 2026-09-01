@@ -10,7 +10,6 @@ verification language after it would be too late to guide the coder.
 import re
 from pathlib import Path
 
-
 REPO = Path(__file__).resolve().parents[2]
 CODER_SKILL = REPO / "examples" / "coder" / "skills" / "coder" / "SKILL.md"
 PUBLISH_TOOL = "mcp__curie__publish_changes"
@@ -26,7 +25,6 @@ def _skill_body() -> str:
 
 def test_coder_verifies_and_reports_changes_before_publication() -> None:
     body = _skill_body()
-    lowered = body.casefold()
 
     # Keep the assertion tied to the actual publication paragraph, rather than
     # the same tool name in front matter or an incidental example.
@@ -36,7 +34,6 @@ def test_coder_verifies_and_reports_changes_before_publication() -> None:
         flags=re.IGNORECASE | re.DOTALL,
     )
     assert publication, "coder skill must retain an explicit publication instruction"
-    before_publish = body[: publication.start()]
 
     # Anchor these checks to the verification section itself. The opening
     # workspace instructions alone must not satisfy the contract.
