@@ -212,6 +212,14 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/langfuse-byo-assertions.sh
 
+      # Keep the shipped Helm and Compose Langfuse images on one exact,
+      # reviewed migration set. A floating major tag can move between jobs and
+      # leave the two stores on incompatible migration state (#2190).
+      - name: helm render assertions (langfuse image pin)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/langfuse-image-pin-assertions.sh
+
       # Prove Langfuse startup is gated on ClickHouse being up (issue #2009). A
       # Helm upgrade that recreates the ClickHouse Service otherwise lets the new
       # Langfuse pods start their migrations against an unresolvable name, so the

@@ -293,7 +293,7 @@ pipeline and environment are applied on `helm upgrade`.
 
 | Component | Image | Notes |
 |---|---|---|
-| Langfuse web + worker | `langfuse/langfuse:3`, `langfuse/langfuse-worker:3` | Observability + eval backbone. Headless-bootstrapped dev org/project. |
+| Langfuse web + worker | `langfuse/langfuse:3.225.5`, `langfuse/langfuse-worker:3.225.5` | Observability + eval backbone. Headless-bootstrapped dev org/project. Web and worker stay on one reviewed migration set; do not replace the version with floating `:3`. |
 | Postgres | `postgres:16-alpine` | Langfuse transactional store + app state. StatefulSet. |
 | Valkey | `valkey/valkey:8-alpine` | Langfuse cache/queue + dispatcher Streams queue. |
 | ClickHouse | `clickhouse/clickhouse-server:24.8` | Langfuse OLAP store. Tag pinned SSE4.2-safe (see preflight). |
