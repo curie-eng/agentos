@@ -57,6 +57,7 @@ from .history import (
 from .hooks import load_bundle_hooks
 from .memory import MemoryRecord, MemoryStore, format_memory_preamble, resolve_memory
 from .otel import RunTracer, build_tracer_provider
+from .plugin import load_bundle_web_search_enabled
 from .redact import install_stdout_redaction
 from .sdk_auth import UnsupportedCredentialError
 from .server import create_app
@@ -185,6 +186,7 @@ def build_runner(
     # bundle's plugins feed the session factory below.
     compiled = harness.compile_bundle(config.session.plugin_dir)
     system_prompt = compiled.system_prompt
+    web_search_enabled = load_bundle_web_search_enabled(config.session.plugin_dir)
     # Prior memory (#264) still leads the system prompt. Conversation history
     # (#20) deliberately does not: ADR-0119 sends its ordered messages through
     # the harness adapter below. The configured model identity is appended after
@@ -349,6 +351,7 @@ def build_runner(
             ),
             can_use_tool=(build_can_use_tool(approval_gate) if approval_gate is not None else None),
             cwd=workspace_cwd,
+            web_search_enabled=web_search_enabled,
         )
         return ClaudeAgentSession(options)
 

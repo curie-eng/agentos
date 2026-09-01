@@ -20,6 +20,10 @@ locally in Docker.
 - Emits `side_effect_flag` when a non-idempotent tool executes (read-only
   allowlist, deny-by-default; see `side_effects.py`).
 - Loads and validates the mounted plugin bundle via `plugin_format.validate_bundle`.
+- Offers Anthropic's provider-side `WebSearch` tool by default. A bundle can
+  suppress it with a root `curie.bundle.json` containing
+  `{"webSearch": false}`; the provider connection remains the only network
+  path, so this adds no sandbox web egress.
 - Exports gen_ai OTel spans (`agent.run` -> `llm.generation` -> `execute_tool`)
   via OTLP-HTTP (the OpenTelemetry Protocol over HTTP) to the collector, which
   forwards to Langfuse.
@@ -122,5 +126,9 @@ uv run pytest runner/tests -q   # unit + integration + conformance
 uv run ruff check . && uv run mypy
 ```
 
-Live tests (`runner/tests/test_live.py`) run only when `CLAUDE_CODE_OAUTH_TOKEN`
-or `ANTHROPIC_API_KEY` is present; otherwise they are skipped.
+Most live tests (`runner/tests/test_live.py`) run only when
+`CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` is present. Disposable tests
+explicitly selected with `CURIE_E2E_LIVE=1`, including the provider-side web
+search proof, may instead use an already-authenticated local Claude SDK. Without
+either authentication path they fail honestly rather than fabricating a live
+result.
