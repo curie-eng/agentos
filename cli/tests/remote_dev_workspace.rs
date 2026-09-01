@@ -232,8 +232,8 @@ fn fanout_response(
         ("POST", "/deploy-targets/list") => Response::json(
             200,
             &json!({"targets": [
-                {"name": "dev", "agent": "acme-dev", "env": "dev", "slack_channel": "C0EXAMPLE1"},
-                {"name": "prod", "agent": "acme-prod", "env": "prod", "slack_channel": "C0EXAMPLE2"}
+                {"name": "dev", "agent": "acme-dev", "env": "dev", "slack_channel": "C000000A01"},
+                {"name": "prod", "agent": "acme-prod", "env": "prod", "slack_channel": "C000000A02"}
             ]})
             .to_string(),
         ),
@@ -245,7 +245,7 @@ fn fanout_response(
                 &json!({
                     "agent": format!("acme-{target}"),
                     "env": target,
-                    "slack_channel": if target == "dev" { "C0EXAMPLE1" } else { "C0EXAMPLE2" }
+                    "slack_channel": if target == "dev" { "C000000A01" } else { "C000000A02" }
                 })
                 .to_string(),
             )
@@ -253,8 +253,8 @@ fn fanout_response(
         ("GET", "/agents") => Response::json(
             200,
             &json!([
-                target_agent("acme-dev", dev_repo, "C0EXAMPLE1"),
-                target_agent("acme-prod", prod_repo, "C0EXAMPLE2")
+                target_agent("acme-dev", dev_repo, "C000000A01"),
+                target_agent("acme-prod", prod_repo, "C000000A02")
             ])
             .to_string(),
         ),
@@ -317,7 +317,7 @@ fn run_fanout(
     scaffold(plugin.path(), "acme-bundle").expect("scaffold bundle");
     fs::write(
         plugin.path().join("deploy.yaml"),
-        "targets:\n  dev: { agent: acme-dev, env: dev, slack_channel: C0EXAMPLE1 }\n  prod: { agent: acme-prod, env: prod, slack_channel: C0EXAMPLE2 }\n",
+        "targets:\n  dev: { agent: acme-dev, env: dev, slack_channel: C000000A01 }\n  prod: { agent: acme-prod, env: prod, slack_channel: C000000A02 }\n",
     )
     .expect("write deploy targets");
     let tools = tempfile::tempdir().expect("tool tempdir");
