@@ -42,6 +42,12 @@
           "maximum": 1800,
           "description": "Overall wall-clock deadline for one delivery (ADR-0131). Below 60s a budget cannot cover claim + one runner request + settle; above 1800s (the ADR's stated maximum) silently requires a termination grace the schema will not accept."
         },
+        "runnerTotalTimeoutSeconds": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 1800,
+          "description": "Positive per-request ceiling for runner work, at most 1800 seconds. Must be no greater than worker.deliveryBudgetSeconds; the worker template enforces this cross-field relationship at render time."
+        },
         "deliveryLeaseTtlSeconds": {
           "type": "integer",
           "exclusiveMinimum": 0,

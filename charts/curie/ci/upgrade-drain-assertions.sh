@@ -69,6 +69,7 @@ helm template t "$CHART" \
   --set worker.terminationGracePeriodSeconds=1860 > "$TMP/raised.yaml"
 helm template t "$CHART" \
   --set worker.deliveryBudgetSeconds=60 \
+  --set worker.runnerTotalTimeoutSeconds=60 \
   --set worker.deliveryShutdownReserveSeconds=0 \
   --set worker.upgradeDrain.timeoutSeconds=120 \
   --set worker.upgradeDrain.quiesceTtlSeconds=300 > "$TMP/small.yaml"

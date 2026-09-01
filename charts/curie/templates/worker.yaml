@@ -14,6 +14,10 @@
      before its supervisor exists, so a bad value that reaches a Pod is a
      CrashLoopBackOff after a green `helm upgrade`. */}}
 {{- include "curie.worker.validateDrainBudget" . }}
+{{/* A runner request ceiling above the overall delivery budget is internally
+     inconsistent. Refuse it before creating a worker Pod; the worker boot
+     validator remains the backstop outside Helm. */}}
+{{- include "curie.worker.validateRunnerBudget" . }}
 {{- if .Values.worker.serviceAccount.create }}
 {{/*
 The worker drives the Kubernetes API to claim and manage agent-sandbox custom
@@ -348,6 +352,9 @@ spec:
             # cleanup.
             - name: CURIE_DELIVERY_BUDGET_S
               value: {{ .Values.worker.deliveryBudgetSeconds | quote }}
+            # Per-request runner ceiling within the overall delivery budget.
+            - name: CURIE_RUNNER_TOTAL_TIMEOUT_S
+              value: {{ .Values.worker.runnerTotalTimeoutSeconds | quote }}
             # How long the renewable ownership lease lives before it is
             # considered expired and transferable to a new owner.
             - name: CURIE_DELIVERY_LEASE_TTL_S

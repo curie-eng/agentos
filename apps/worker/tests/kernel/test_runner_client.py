@@ -551,7 +551,9 @@ def test_start_turn_uses_the_remaining_budget_when_it_is_shorter() -> None:
     asyncio.run(go())
 
 
-def test_start_turn_without_a_remaining_budget_uses_the_session_default() -> None:
+def test_start_turn_without_a_remaining_budget_uses_the_session_default(
+    caplog,
+) -> None:
     """``remaining_s=None`` must leave the session timeout in charge: that is the
     path every leaseless caller and every existing test takes, and it must stay
     byte-identical in behavior."""
@@ -565,9 +567,23 @@ def test_start_turn_without_a_remaining_budget_uses_the_session_default() -> Non
         try:
             loop = asyncio.get_event_loop()
             started = loop.time()
-            with pytest.raises(TimeoutError):
-                await client.start_turn(base_url, _event(), remaining_s=None)
+            with caplog.at_level(logging.INFO, logger="curie_worker.runner_client"):
+                with pytest.raises(TimeoutError):
+                    await client.start_turn(base_url, _event(), remaining_s=None)
             assert loop.time() - started < 5.0
+            budget_records = [
+                record
+                for record in caplog.records
+                if record.name == "curie_worker.runner_client"
+                and hasattr(record, "effective_request_timeout_s")
+            ]
+            assert budget_records == [], caplog.text
+            assert not any(
+                "remaining" in record.getMessage()
+                and "effective" in record.getMessage()
+                for record in caplog.records
+                if record.name == "curie_worker.runner_client"
+            ), caplog.text
         finally:
             runner.hang.set()
             await client.close()
@@ -595,6 +611,48 @@ def test_the_effective_timeout_is_the_min_of_the_budget_and_the_session_ceiling(
             assert loop.time() - started < 5.0
         finally:
             runner.hang.set()
+            await client.close()
+            await server.close()
+
+    asyncio.run(go())
+
+
+def test_budgeted_request_logs_the_effective_timeout_bound(caplog) -> None:
+    """A real request records the configured ceiling, the unmodified delivery
+    remainder, and the effective post-floor timeout handed to aiohttp."""
+
+    async def go() -> None:
+        runner = _HeaderRecordingRunner()
+        server = TestServer(runner.app)
+        await server.start_server()
+        base_url = f"http://127.0.0.1:{server.port}"
+        client = RunnerClient(total_timeout_s=30.0)
+        try:
+            with caplog.at_level(logging.INFO, logger="curie_worker.runner_client"):
+                turn = await client.start_turn(base_url, _event(), remaining_s=5.0)
+                await _drain(turn)
+
+            budget_records = [
+                record
+                for record in caplog.records
+                if record.name == "curie_worker.runner_client"
+                and hasattr(record, "effective_request_timeout_s")
+            ]
+            assert len(budget_records) == 1, caplog.text
+            record = budget_records[0]
+            assert record.levelno == logging.INFO
+            assert getattr(record, "configured_runner_ceiling_s", None) == 30.0
+            assert getattr(record, "remaining_delivery_s", None) == 5.0
+            assert getattr(record, "effective_request_timeout_s", None) == 5.0
+            message = record.getMessage()
+            normalized_message = message.lower()
+            assert "configured" in normalized_message
+            assert "ceiling" in normalized_message
+            assert "30.0" in message
+            assert "remaining" in normalized_message
+            assert "effective" in normalized_message
+            assert message.count("5.0") >= 2
+        finally:
             await client.close()
             await server.close()
 
@@ -686,10 +744,12 @@ def test_stream_timeout_raises_a_named_timeout_and_logs_the_expired_budget(
             h.runner.hold = hold
             h.runner.default_script = [TextDelta(text="x")]
             handle = await asyncio.to_thread(h.substrate.claim, "tStreamTimeout")
-            client = RunnerClient(total_timeout_s=0.5)
+            client = RunnerClient(total_timeout_s=5.0)
             try:
                 with caplog.at_level(logging.WARNING, logger="curie_worker.runner_client"):
-                    turn = await client.start_turn(handle.base_url, _event())
+                    turn = await client.start_turn(
+                        handle.base_url, _event(), remaining_s=0.2
+                    )
                     with pytest.raises(TimeoutError) as excinfo:
                         async with turn:
                             async for _frame in turn:
@@ -700,7 +760,10 @@ def test_stream_timeout_raises_a_named_timeout_and_logs_the_expired_budget(
                 assert isinstance(exc, TimeoutError)  # existing handlers still catch it
                 assert str(exc).strip(), "a stream timeout must not stringify to nothing"
                 assert "Timeout" in str(exc)  # the normalized underlying class
-                assert "0.5" in str(exc)  # the budget that expired, in seconds
+                # The delivery had only 0.2s left, so that effective request
+                # bound -- not the configured 5s ceiling -- is what expired.
+                assert "0.2" in str(exc)
+                assert "5.0s" not in str(exc)
 
                 warnings = [
                     record.getMessage()
@@ -709,9 +772,10 @@ def test_stream_timeout_raises_a_named_timeout_and_logs_the_expired_budget(
                     and record.levelno >= logging.WARNING
                 ]
                 assert warnings, caplog.text
-                assert any("Timeout" in message and "0.5" in message for message in warnings), (
-                    warnings
-                )
+                assert any(
+                    "Timeout" in message and "0.2" in message for message in warnings
+                ), warnings
+                assert all("5.0s" not in message for message in warnings)
             finally:
                 hold.set()
                 await client.close()

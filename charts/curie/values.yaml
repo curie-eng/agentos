@@ -1351,9 +1351,9 @@ worker:
   # Delivery budget and ownership lease (ADR-0131, #1971). One overall
   # wall-clock deadline and one renewable fenced owner per delivery, replacing
   # the old dead pair of a flat per-request HTTP timeout and a 900s idle-based
-  # steal window. Integers, not floats -- as with routeTtlSeconds, a YAML
-  # float renders through the template's `| quote` as scientific notation for
-  # larger values, which the worker then cannot parse.
+  # steal window. deliveryBudgetSeconds is an integer -- as with
+  # routeTtlSeconds, a YAML float renders through the template's `| quote` as
+  # scientific notation for larger values, which the worker then cannot parse.
   #
   # The OVERALL deadline for one delivery: claim, every runner request, every
   # retry backoff, reclaim, and terminal cleanup. Must be between 60 and 1800
@@ -1361,6 +1361,12 @@ worker:
   # install/template time and the worker's own validator enforces it again at
   # boot.
   deliveryBudgetSeconds: 600
+  # Positive per-request ceiling for runner work within the overall delivery
+  # budget. Must be at most 1800 seconds and no greater than
+  # deliveryBudgetSeconds; fractional seconds are supported. values.schema.json
+  # enforces the scalar bounds and the worker template enforces the relationship
+  # at render time.
+  runnerTotalTimeoutSeconds: 600
   # How long the renewable ownership lease lives before it is considered
   # expired and transferable. Must span at least 3 heartbeat periods
   # (deliveryLeaseHeartbeatSeconds) so a single missed heartbeat never drops a
