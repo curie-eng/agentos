@@ -255,8 +255,9 @@ class Settings(BaseSettings):
     # turn is still live: the cross-thread turn lock would steer a duplicate into
     # that live turn and it could re-run the approved action. The worker's
     # done-marker only dedupes a re-enqueue once the turn has reached terminal, so
-    # the grace has to outlast the turn. Kept at 900s to stay above the 600s worker
-    # max with margin (analogous to the migration's 24h done-marker /
+    # the Helm chart derives its grace from the worker delivery budget plus its
+    # shutdown reserve. This non-Helm Settings fallback remains the intentionally
+    # conservative 900s default (analogous to the migration's 24h done-marker /
     # idempotency_ttl_s coupling). Residual: worker retry loops (max_attempts,
     # backoff) can extend total processing past a single turn, so a fully airtight
     # guarantee needs a worker-side in-flight lease (follow-up); 900s covers the

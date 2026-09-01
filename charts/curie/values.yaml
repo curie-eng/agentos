@@ -920,14 +920,14 @@ api:
   # permanently stranded. `enabled` is the off-switch -- with it false the loop
   # does not run AND the resolve endpoint fails loud (500) on an enqueue failure
   # instead of returning 200 and deferring to the (now-absent) backstop.
-  # `graceSeconds` is load-bearing: it MUST exceed the worker's max single-turn
-  # time (the worker's runner_total_timeout_s, a Python default of 600s that is
-  # not currently Helm-configurable) so a re-enqueue never lands in a still-live
-  # resume turn (which would re-run the approved action).
+  # `graceSeconds` is derived at render time from
+  # worker.deliveryBudgetSeconds + worker.deliveryShutdownReserveSeconds, so a
+  # re-enqueue cannot land while the prior delivery is still running or
+  # completing its terminal settlement. Set an explicit value only to extend
+  # that wait; values below the derived floor are refused during rendering.
   resumeReconciler:
     enabled: true
     intervalSeconds: 30
-    graceSeconds: 900
     batchLimit: 100
   resources:
     requests: { cpu: 100m, memory: 256Mi }
