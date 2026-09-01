@@ -98,7 +98,9 @@ def test_handoff_cold_claims_then_atomically_replaces_and_retires_old_route(
     fake_k8s: FakeSandboxClient,
     affinity: AffinityStore,
 ) -> None:
-    old = substrate.claim("T1", env={SESSION_ENV: "logical-session"})
+    claimed = substrate.claim("T1", env={SESSION_ENV: "logical-session"})
+    old = replace(claimed, history_ref="history/private-base")
+    affinity.replace("T1", RouteRecord(handle=old), ttl_seconds=60)
 
     replacement = substrate.handoff(
         "T1",
@@ -109,9 +111,12 @@ def test_handoff_cold_claims_then_atomically_replaces_and_retires_old_route(
 
     assert replacement.claim_name != old.claim_name
     assert replacement.session_id == old.session_id
+    assert replacement.history_ref == old.history_ref == "history/private-base"
     assert replacement.workspace_repo == "acme-corp/acme-bot"
     assert replacement.generation == 1
     assert affinity.get("T1") == RouteRecord(handle=replacement)
+    assert fake_k8s.claims[replacement.claim_name].env[SESSION_ENV] == old.session_id
+    assert fake_k8s.claims[replacement.claim_name].env[HISTORY_ENV] == "history/private-base"
     assert old.claim_name in fake_k8s.deleted
     assert replacement.claim_name not in fake_k8s.deleted
 
