@@ -1,0 +1,31 @@
+apiVersion: v1
+entries:
+  curie:
+  - apiVersion: v2
+    appVersion: 0.8.3
+    created: "2026-09-01T15:01:19.493832114Z"
+    description: 'Curie (Relay) umbrella chart. Installs the whole self-hosted stack
+      on a single node: Langfuse v3 (web + worker) plus its ClickHouse, Valkey, Postgres,
+      and RustFS backing stores, and the OTel Collector that adapts app traces into
+      Langfuse. Every backing store is condition-gated with a bring-your-own block,
+      and two install-time preflights ship baked in: a CPU-AVX / ClickHouse-pin check
+      and a NetworkPolicy-enforcement probe.'
+    digest: 50e33ec20dc62521dc74d59ce6c3e03803d7a8310d89fa4f2c997e00b023b167
+    home: https://github.com/curie-eng/curie
+    icon: https://raw.githubusercontent.com/curie-eng/curie/main/apps/ui/public/favicon.svg
+    keywords:
+    - curie
+    - langfuse
+    - agents
+    - observability
+    kubeVersion: '>=1.25.0-0'
+    maintainers:
+    - name: Curie
+    name: curie
+    sources:
+    - https://github.com/curie-eng/curie
+    type: application
+    urls:
+    - https://github.com/curie-eng/curie/releases/download/v0.8.3/curie-0.8.3.tgz
+    version: 0.8.3
+generated: "2026-09-01T15:01:19.493841301Z"
