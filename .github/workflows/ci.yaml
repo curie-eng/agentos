@@ -505,13 +505,6 @@ jobs:
             context: examples/sre-bot/connectors/tempo
             dockerfile: examples/sre-bot/connectors/tempo/Dockerfile
             platforms: linux/amd64,linux/arm64
-          - name: sre-bot-k8s-write
-            context: examples/sre-bot/connectors/k8s-write
-            dockerfile: examples/sre-bot/connectors/k8s-write/Dockerfile
-            platforms: linux/amd64,linux/arm64
-          - name: sre-bot-k8s-scale
-            context: examples/sre-bot/connectors/k8s-scale
-            dockerfile: examples/sre-bot/connectors/k8s-scale/Dockerfile
           - name: sre-bot-self-upgrade
             context: examples/sre-bot/connectors/self-upgrade
             dockerfile: examples/sre-bot/connectors/self-upgrade/Dockerfile

@@ -936,16 +936,6 @@ enum SreBotAction {
         /// Bind the installed bot to this Slack channel.
         #[arg(long, value_name = "CHANNEL")]
         slack_channel: Option<String>,
-        /// Scope the approval-gated restart tool to these Deployments
-        /// (`namespace/name`, comma separated). One list renders BOTH ceilings:
-        /// the Role's resourceNames and the connector's K8S_WRITE_ALLOWLIST.
-        /// Omit and the connector is still installed, gated, with an empty
-        /// ceiling that refuses every call until targets are named.
-        #[arg(long, value_name = "NS/NAME[,NS/NAME]")]
-        write_allowlist: Option<String>,
-        /// Leave the gated write connector out of the install entirely.
-        #[arg(long)]
-        no_write: bool,
         /// Install the upgrade path: the self-upgrade connector, the platform
         /// upgrade Job, and the two identities behind them.
         ///
@@ -2867,8 +2857,6 @@ async fn run(command: Option<Command>) -> Result<()> {
                             observability,
                             dry_run,
                             slack_channel,
-                            write_allowlist,
-                            no_write,
                             platform_upgrade,
                             namespace,
                             release,
@@ -2879,8 +2867,6 @@ async fn run(command: Option<Command>) -> Result<()> {
             observability,
             dry_run,
             slack_channel,
-            write_allowlist,
-            no_write,
             platform_upgrade,
             namespace,
             release,

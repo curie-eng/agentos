@@ -102,8 +102,6 @@ REQUIRED_CHECK_NAMES = frozenset(
         "Build worker image (no push)",
         "Build ui image (no push)",
         "Build sre-bot-tempo image (no push)",
-        "Build sre-bot-k8s-write image (no push)",
-        "Build sre-bot-k8s-scale image (no push)",
         "Build sre-bot-self-upgrade image (no push)",
         "Build worker-local overlay image (no push)",
         "Dispatcher image imports resolve",

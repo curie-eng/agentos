@@ -177,6 +177,54 @@ def test_tool_policy_alone_constructs_both_live_interceptors(tmp_path) -> None:
     anyio.run(go)
 
 
+def test_tool_policy_allow_preserves_a_separate_legacy_connector_gate(
+    tmp_path,
+) -> None:
+    """An explicit policy allow cannot subtract an approvalPolicy gate."""
+
+    tool = "mcp__self-upgrade__upgrade_platform"
+    plugin_dir = _write_manifest(
+        tmp_path,
+        {
+            "name": "acme-bot",
+            "approvalPolicy": {
+                "gates": [{"gate": tool, "route": "sre-approvals"}]
+            },
+            "toolPolicy": {
+                "enforcement": "curie/mcp-tool-policy@1",
+                "allow": ["self-upgrade/upgrade_platform"],
+                "approvalRequired": [],
+                "deny": [],
+            },
+        },
+    )
+    (tmp_path / "connectors.yaml").write_text(
+        "connectors:\n"
+        "  self-upgrade:\n"
+        "    image: ghcr.io/example/self-upgrade:0.0.1\n",
+        encoding="utf-8",
+    )
+    runner = build_runner(
+        RunnerConfig.from_env(_base_env(plugin_dir)), fake_model=True
+    )
+    gate = runner._approval_gate  # noqa: SLF001 - boot wiring is the assertion
+    assert gate is not None
+    hook = build_approval_hook(gate)["PreToolUse"][0].hooks[0]
+    callback = build_can_use_tool(gate)
+
+    async def go() -> None:
+        hook_result = await hook(
+            {"tool_name": tool, "tool_input": {}}, None, None
+        )
+        assert hook_result["hookSpecificOutput"]["permissionDecision"] == "deny"
+        callback_result = await callback(tool, {}, ToolPermissionContext())
+        assert isinstance(callback_result, PermissionResultDeny)
+        assert gate.pending_route == "sre-approvals"
+        assert gate.pending_granted_tool == tool
+
+    anyio.run(go)
+
+
 def test_managed_workspace_arms_mandatory_publish_on_fake_boot_path(tmp_path) -> None:
     plugin_dir = _write_manifest(tmp_path / "plugin", {"name": "publisher"})
     workspace = tmp_path / "workspace"

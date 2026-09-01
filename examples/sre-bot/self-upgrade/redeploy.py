@@ -312,12 +312,10 @@ def pin_build_connectors(
 ) -> bytes:
     """Turn every `build:` connector into a digest-pinned `image:`.
 
-    Two substitutions, and the second is the one that is easy to forget. A
-    `build:` block records a LOCAL image id, which the cluster tier refuses. And
-    the declaration in the repository ships PLACEHOLDER allowlists -- deploying
-    those verbatim would leave every write connector refusing every call, which
-    reads exactly like a working bot that has decided not to act. So the ceilings
-    the install is actually running are carried across.
+    Two substitutions: a `build:` block records a LOCAL image id, which the
+    cluster tier refuses, and runtime connector environment may differ from the
+    repository defaults. Resolve the image and carry the running environment
+    across the immutable rebuild.
     """
 
     import yaml

@@ -10,11 +10,9 @@ an unpublished connector is a connector the live bot cannot have, and if that
 connector carries the bundle's write verb, it is a *write verb* the live bot
 cannot have.
 
-``examples/sre-bot``'s ``k8s-scale`` reached `next` merged and reviewed in exactly
-that state: the source, the Dockerfile, the tests and the gate all landed, no
-image was ever published, and the deployed bot answered `restart_deployment`
-alone. Nothing reported it -- a bundle validates, a connector is healthy, and the
-absent second verb looks like a design choice rather than a missing pipeline.
+This guard keeps a source-built connector from reaching a cluster bundle with
+no pullable release image. Nothing else reports that omission: the source bundle
+can validate and local runs can still use their daemon image.
 
 The check is deliberately shallow and cheap: it reads the declaration and the
 release workflow, not a registry. It cannot tell you whether a published image is
@@ -40,10 +38,10 @@ property as "a pullable image comes out the other end":
                      image this file was written about.
 
   the row's own dir  The original guard asserted only that the *name* appeared.
-                     Repointing ``sre-bot-k8s-scale``'s ``context`` and
-                     ``dockerfile`` at the tempo connector's directory stayed
-                     green, and would have published the tempo server under the
-                     ``k8s-scale`` name -- a bot answering with the wrong verb
+                     Repointing one connector's ``context`` and ``dockerfile``
+                     at another connector's directory stayed green, and would
+                     have published the wrong server under the first connector's
+                     name -- a bot answering with the wrong verb
                      entirely, which is worse than the verb simply being absent
                      because nothing about it looks broken.
 """
@@ -137,7 +135,7 @@ def _published_image_names() -> set[str]:
 def _build_connectors_with_context() -> list[tuple[str, str, str]]:
     """``(bundle, connector, build.context)`` for every connector declaring ``build:``.
 
-    The declared ``context`` is bundle-relative (``connectors/k8s-scale``), which
+    The declared ``context`` is bundle-relative (for example, ``connectors/tempo``), which
     is what makes it usable as the expected release-row path instead of a
     convention hardcoded here: if a connector ever builds from somewhere other
     than ``connectors/<name>``, the expectation follows the declaration rather

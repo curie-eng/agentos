@@ -120,10 +120,8 @@ def test_a_symlink_inside_the_bundle_is_dropped() -> None:
 # every release-branch push tagged `sha-<commit>`, so the images that belong with
 # a bundle are derivable from the bundle's own commit.
 #
-# The second substitution is the one that is easy to forget: the declaration in
-# the repository ships PLACEHOLDER allowlists, and deploying those verbatim would
-# leave every write connector refusing every call -- which reads exactly like a
-# working bot that has decided not to act.
+# The second substitution carries runtime connector environment across the
+# immutable rebuild rather than reverting it to repository defaults.
 
 
 def _bundle(files: dict[str, bytes]) -> bytes:
@@ -148,11 +146,11 @@ def _read(bundle: bytes) -> dict[str, bytes]:
 DECLARATION = b"""connectors:
   kubernetes:
     image: ghcr.io/containers/kubernetes-mcp-server@sha256:aaa
-  k8s-write:
+  tempo:
     build:
-      context: connectors/k8s-write
+      context: connectors/tempo
     env:
-      K8S_WRITE_ALLOWLIST: <namespace>/<deployment>
+      TEMPO_URL: http://tempo.observability.svc.cluster.local:3200
 """
 
 
@@ -167,23 +165,27 @@ def offline_registry(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_a_build_connector_is_pinned_to_the_commits_published_image(
     offline_registry: None,
 ) -> None:
-    parsed = yaml.safe_load(pin_build_connectors(DECLARATION, "c" * 40, {"k8s-write": {}}))
-    write = parsed["connectors"]["k8s-write"]
-    assert "build" not in write, "a build declaration cannot reach a cluster deploy"
-    assert write["image"] == ("ghcr.io/curie-eng/curie-sre-bot-k8s-write@sha256:fixture")
+    parsed = yaml.safe_load(pin_build_connectors(DECLARATION, "c" * 40, {"tempo": {}}))
+    tempo = parsed["connectors"]["tempo"]
+    assert "build" not in tempo, "a build declaration cannot reach a cluster deploy"
+    assert tempo["image"] == ("ghcr.io/curie-eng/curie-sre-bot-tempo@sha256:fixture")
     # An already-pinned connector is left alone rather than re-resolved.
     assert parsed["connectors"]["kubernetes"]["image"].endswith("@sha256:aaa")
 
 
-def test_the_running_ceiling_survives_the_upgrade(offline_registry: None) -> None:
-    # The placeholder in the repository would refuse every call, and a bot that
-    # refuses everything looks exactly like a bot that chose not to act.
+def test_the_running_connector_environment_survives_the_upgrade(
+    offline_registry: None,
+) -> None:
     parsed = yaml.safe_load(
         pin_build_connectors(
-            DECLARATION, "c" * 40, {"k8s-write": {"K8S_WRITE_ALLOWLIST": "ns/one,ns/two"}}
+            DECLARATION,
+            "c" * 40,
+            {"tempo": {"TEMPO_URL": "http://tempo.custom.svc.cluster.local:3200"}},
         )
     )
-    assert parsed["connectors"]["k8s-write"]["env"]["K8S_WRITE_ALLOWLIST"] == "ns/one,ns/two"
+    assert parsed["connectors"]["tempo"]["env"]["TEMPO_URL"] == (
+        "http://tempo.custom.svc.cluster.local:3200"
+    )
 
 
 def test_replacing_one_member_leaves_the_others_byte_for_byte() -> None:
