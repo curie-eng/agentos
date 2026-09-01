@@ -354,19 +354,31 @@ class RunnerClient:
         remaining_s: float | None = None,
     ) -> TurnStream:
         """Open a turn. Returns once the runner has accepted it (turn active)."""
+        request_timeout = self._request_timeout(remaining_s)
+        stream_timeout_s = (
+            self._total_timeout_s
+            if request_timeout is sentinel
+            else request_timeout.total
+        )
+        if remaining_s is not None:
+            logger.info(
+                f"runner request timeout bound: configured ceiling {self._total_timeout_s:.3f}s, "
+                f"remaining delivery {remaining_s:.3f}s, effective timeout "
+                f"{stream_timeout_s:.3f}s"
+            )
 
         async def request(headers: dict[str, str] | None) -> tuple[TurnStream, str]:
             resp = await self._session.post(
                 f"{base_url}/v1/event",
                 json=event.model_dump(),
                 headers=headers,
-                timeout=self._request_timeout(remaining_s),
+                timeout=request_timeout,
             )
             if resp.status != 200:
                 body = await resp.text()
                 resp.release()
                 raise RunnerError(f"/v1/event -> {resp.status}: {body}")
-            return TurnStream(resp, self._total_timeout_s), "success"
+            return TurnStream(resp, stream_timeout_s), "success"
 
         return await self._rpc("event", token, request)
 

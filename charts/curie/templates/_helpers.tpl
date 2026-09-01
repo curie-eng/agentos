@@ -1203,6 +1203,21 @@ securityContext:
 {{- end -}}
 {{- end -}}
 
+{{/* ---- Runner ceiling / delivery-budget relationship (worker) ----
+     Each runner request is bounded by `worker.runnerTotalTimeoutSeconds`, but
+     the request still has to fit inside the delivery's overall
+     `worker.deliveryBudgetSeconds`. JSON Schema cannot express this
+     cross-field relationship, so refuse it before an invalid worker Pod is
+     created. The worker's boot validator remains the backstop for non-Helm
+     configuration. */}}
+{{- define "curie.worker.validateRunnerBudget" -}}
+{{- $runnerCeiling := float64 .Values.worker.runnerTotalTimeoutSeconds -}}
+{{- $deliveryBudget := float64 .Values.worker.deliveryBudgetSeconds -}}
+{{- if gt $runnerCeiling $deliveryBudget -}}
+{{- fail (printf "worker.runnerTotalTimeoutSeconds (%g) must be <= worker.deliveryBudgetSeconds (%g). Fix: lower worker.runnerTotalTimeoutSeconds to %g or less, or raise worker.deliveryBudgetSeconds to at least %g." $runnerCeiling $deliveryBudget $deliveryBudget $runnerCeiling) -}}
+{{- end -}}
+{{- end -}}
+
 {{/* ---- Upgrade drain gate arithmetic (issue #2010) ----
      The gate's two clocks are DERIVED, with the values as floors, and only a
      self-contradictory pair is refused outright. The split is deliberate.

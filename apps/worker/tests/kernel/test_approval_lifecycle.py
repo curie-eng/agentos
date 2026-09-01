@@ -29,6 +29,7 @@ from curie_worker.approvals import (
     SettledApproval,
 )
 from curie_worker.reply_sink import TargetRoute
+from curie_worker.runner_client import RunnerError
 from curie_worker.sandbox.types import RouteState
 
 DONE = SessionStatus.DONE
@@ -713,6 +714,54 @@ def test_unknown_gate_kind_escalates_instead_of_stranding_the_turn(make_harness)
             assert modes == ["Running"]
             # Terminally handled, so the entry is acked rather than redelivered.
             assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+
+    asyncio.run(go())
+
+
+def test_publication_snapshot_inherits_the_attempts_remaining_delivery_budget(
+    make_harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The publication snapshot is part of the same delivery as the turn.
+
+    Pin the handoff at the kernel boundary: a snapshot must not silently regain
+    the configured runner ceiling after the streamed request has consumed part
+    of the delivery deadline.
+    """
+
+    async def go() -> None:
+        async with make_harness() as h:
+            h.runner.default_script = [
+                Final(
+                    text="Ready to publish",
+                    status=AWAITING,
+                    approval_summary="Publish the prepared changes",
+                    approval_gate_kind="permission",
+                    approval_granted_tool="mcp__curie__publish_changes",
+                )
+            ]
+            observed_remaining: list[float] = []
+
+            async def snapshot_spy(
+                _base_url: str,
+                token: str | None = None,
+                *,
+                remaining_s: float,
+            ) -> None:
+                observed_remaining.append(remaining_s)
+                # Stop after capturing the boundary; _attempt deliberately
+                # converts runner snapshot failures into a publication error.
+                raise RunnerError("captured snapshot deadline")
+
+            monkeypatch.setattr(h.kernel._runner, "snapshot", snapshot_spy)
+            outcome = await h.kernel._attempt(
+                _qevent("publish", thread="th-publication-deadline"),
+                TargetRoute(),
+                lambda: None,
+                remaining_s=17.25,
+            )
+
+            assert outcome.status is AWAITING
+            assert observed_remaining == [17.25]
 
     asyncio.run(go())
 

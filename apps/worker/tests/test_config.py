@@ -18,6 +18,7 @@ from types import ModuleType
 
 import pytest
 from curie_worker.config import WorkerConfig
+from pydantic import AliasChoices, ValidationError
 
 
 def _clear_all_config_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -31,8 +32,16 @@ def _clear_all_config_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     for name, field in WorkerConfig.model_fields.items():
         alias = field.validation_alias
-        key = alias if isinstance(alias, str) else name.upper()
-        monkeypatch.delenv(key, raising=False)
+        if isinstance(alias, str):
+            keys = (alias,)
+        elif isinstance(alias, AliasChoices):
+            keys = tuple(
+                choice for choice in alias.choices if isinstance(choice, str)
+            )
+        else:
+            keys = (name.upper(),)
+        for key in keys:
+            monkeypatch.delenv(key, raising=False)
 
 
 # Every env var the OLD hand-rolled ``WorkerConfig.from_env`` read (on
@@ -818,6 +827,97 @@ def test_delivery_knobs_read_their_curie_aliases(
     assert config.delivery_shutdown_reserve_s == 45.0
     assert config.termination_grace_period_s == 1860.0
     assert config.reclaim_interval_s == 10.0
+
+
+def test_runner_total_timeout_reads_the_canonical_curie_alias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_RUNNER_TOTAL_TIMEOUT_S", "1700")
+    monkeypatch.setenv("CURIE_DELIVERY_BUDGET_S", "1800")
+
+    config = WorkerConfig()
+
+    assert config.runner_total_timeout_s == 1700.0
+
+
+def test_runner_total_timeout_keeps_the_legacy_alias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("RUNNER_TOTAL_TIMEOUT_S", "1600")
+    monkeypatch.setenv("CURIE_DELIVERY_BUDGET_S", "1800")
+
+    config = WorkerConfig()
+
+    assert config.runner_total_timeout_s == 1600.0
+
+
+def test_runner_total_timeout_canonical_alias_wins_over_legacy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_RUNNER_TOTAL_TIMEOUT_S", "1700")
+    monkeypatch.setenv("RUNNER_TOTAL_TIMEOUT_S", "1600")
+    monkeypatch.setenv("CURIE_DELIVERY_BUDGET_S", "1800")
+
+    config = WorkerConfig()
+
+    assert config.runner_total_timeout_s == 1700.0
+
+
+def test_runner_total_timeout_accepts_short_programmatic_values_and_maximum(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The chart and Python config accept positive timeout values, including
+    sub-minute values; only positivity and the 1800s ceiling apply here."""
+    _clear_all_config_env(monkeypatch)
+
+    short = _lease_config(runner_total_timeout_s=0.5)
+    maximum = _lease_config(
+        delivery_budget_s=1800.0,
+        runner_total_timeout_s=1800.0,
+    )
+
+    assert short.runner_total_timeout_s == 0.5
+    assert maximum.runner_total_timeout_s == 1800.0
+
+
+@pytest.mark.parametrize(
+    ("value", "error_type"),
+    [(0.0, "greater_than"), (-0.1, "greater_than"), (1800.1, "less_than_equal")],
+)
+def test_runner_total_timeout_rejects_programmatic_values_outside_its_bounds(
+    monkeypatch: pytest.MonkeyPatch,
+    value: float,
+    error_type: str,
+) -> None:
+    _clear_all_config_env(monkeypatch)
+
+    with pytest.raises(ValidationError) as exc_info:
+        _lease_config(delivery_budget_s=1800.0, runner_total_timeout_s=value)
+
+    assert any(
+        error["loc"] == ("runner_total_timeout_s",)
+        and error["type"] == error_type
+        for error in exc_info.value.errors()
+    )
+
+
+def test_runner_total_timeout_rejects_zero_from_the_canonical_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_RUNNER_TOTAL_TIMEOUT_S", "0")
+
+    with pytest.raises(ValidationError) as exc_info:
+        WorkerConfig()
+
+    assert any(
+        error["loc"] == ("CURIE_RUNNER_TOTAL_TIMEOUT_S",)
+        and error["type"] == "greater_than"
+        for error in exc_info.value.errors()
+    )
 
 
 def test_delivery_knobs_ignore_bare_field_name_env(

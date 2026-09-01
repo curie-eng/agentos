@@ -8,7 +8,7 @@
 # command`. That exception is not classified by the kernel, so the turn hangs,
 # the entry is re-delivered to dead-letter, and every attempt leaks a sandbox.
 # `values.schema.json` makes helm refuse the value at install/template time so it
-# never reaches worker env at all. Ten assertions:
+# never reaches worker env at all. Eleven assertions:
 #
 #   (a) POSITIVE, defaults: the render SUCCEEDS and the worker Deployment
 #       carries the three env vars at their shipped defaults.
@@ -66,12 +66,23 @@
 #       assertion in (a) only ever sees 1860 at the default; this is the half
 #       that actually exercises the inequality the ADR mandates, and the only
 #       assertion that demonstrates the guard REJECTING something.
-#
+#   (k) RUNNER CEILING, positive and negative: the shipped worker env contains
+#       CURIE_RUNNER_TOTAL_TIMEOUT_S=600 exactly once; 1700 under an 1800-second
+#       delivery budget renders and reaches the worker; equality at 600, a
+#       fractional 0.5-second ceiling, and the inclusive 1800 maximum render
+#       with coherent delivery budgets. The schema refuses 0 and 1800.1,
+#       proving the exclusive lower bound and inclusive upper bound. Finally,
+#       the relationship guard refuses the individually schema-valid combination
+#       runnerTotalTimeoutSeconds=1700 / deliveryBudgetSeconds=600 and names
+#       both keys, values, inequality, and corrective actions in chart-owned
+#       output. This is the cross-field negative JSON Schema cannot express.
 # SCHEMA WORDING IS NOT ASSERTED, AND MUST NOT BECOME ASSERTED. Every negative
-# below EXCEPT (j) checks only (1) that helm exited non-zero and (2) that the
-# captured output contains the bare knob name. The failure text comes from
-# helm's own bundled JSON-Schema validator, whose wording changed between the
-# CI-pinned helm and current helm while the pass/fail outcomes stayed identical:
+# below EXCEPT the relationship negatives in (j) and (k) checks only (1)
+# that helm exited non-zero and (2) that the captured output contains the bare
+# knob name. The schema-bound negatives in (k) follow this generic rule too.
+# The failure text comes from helm's own bundled JSON-Schema validator, whose
+# wording changed between the CI-pinned helm and current helm while the
+# pass/fail outcomes stayed identical:
 #
 #   helm 3.16.4 (the CI pin, .github/workflows/helm-ci.yaml:40):
 #     - worker.routeTtlSeconds: Must be greater than 0
@@ -86,11 +97,12 @@
 # passes on the author's machine and fails in CI, or the reverse, for a reason
 # that has nothing to do with the chart.
 #
-# (j) is the deliberate exception: its message is CHART-OWNED text from
-# `fail` in _helpers.tpl, not helm's validator, so it cannot drift with the
-# helm version and asserting it is what proves the guard -- rather than some
-# unrelated template error -- is what refused the render. It checks the three
-# key names and the arithmetic, not the full sentence.
+# The relationship negatives in (j), (k), and (l) are the deliberate
+# exceptions: their messages are CHART-OWNED text from `fail` in _helpers.tpl,
+# not helm's validator, so they cannot drift with the helm version and
+# asserting them is what proves each guard -- rather than some unrelated
+# template error -- is what refused the render. They check stable
+# operands/actions, not full sentences.
 #
 # Runnable locally (from anywhere) and from CI. Fails loudly.
 set -euo pipefail
@@ -116,13 +128,23 @@ if len(deploys) != 1:
     raise SystemExit(f"expected exactly one worker Deployment, rendered {len(deploys)}")
 containers = deploys[0]["spec"]["template"]["spec"]["containers"]
 env = {}
+counts = {}
 for c in containers:
     for e in c.get("env", []):
-        env[e["name"]] = e.get("value")
+        name = e["name"]
+        counts[name] = counts.get(name, 0) + 1
+        # Preserve this harness's historical last-value semantics for every
+        # pre-existing env assertion. Only the newly introduced runner ceiling
+        # has an exactly-once contract below.
+        env[name] = e.get("value")
 for pair in want:
     name, _, expected = pair.partition("=")
     if name not in env:
         raise SystemExit(f"{name} is not in the worker env (got {sorted(env)})")
+    if name == "CURIE_RUNNER_TOTAL_TIMEOUT_S" and counts[name] != 1:
+        raise SystemExit(
+            f"{name} occurs {counts[name]} times in the worker env, expected exactly once"
+        )
     got = env[name]
     if expected == "":
         # "present with an empty value". `nil | quote` emits a bare `value:`,
@@ -251,6 +273,7 @@ assert_env a -- \
   CURIE_ROUTE_TTL_SECONDS=3600 \
   CURIE_SUSPENDED_ROUTE_TTL_SECONDS=86400 \
   CURIE_DELIVERY_BUDGET_S=600 \
+  CURIE_RUNNER_TOTAL_TIMEOUT_S=600 \
   CURIE_DELIVERY_LEASE_TTL_S=45 \
   CURIE_DELIVERY_LEASE_HEARTBEAT_S=10 \
   CURIE_DELIVERY_SHUTDOWN_RESERVE_S=60 \
@@ -370,4 +393,69 @@ for token in \
   $(head -3 <<<"$J_NEGATIVE_OUT")"
 done
 
-echo "worker-ttl-bounds-assertions: all ten assertions passed"
+# (k) Runner per-request ceiling. The default is asserted in (a), including
+# exactly-once env placement. Exercise an operational override, equality, a
+# legal fractional ceiling, and the inclusive schema maximum with compatible
+# delivery budgets. The 1800 case also needs the matching ADR-0131 termination
+# grace.
+assert_env k \
+  --set worker.runnerTotalTimeoutSeconds=1700 \
+  --set worker.deliveryBudgetSeconds=1800 \
+  --set worker.terminationGracePeriodSeconds=1860 \
+  -- \
+  CURIE_RUNNER_TOTAL_TIMEOUT_S=1700 \
+  CURIE_DELIVERY_BUDGET_S=1800
+assert_env k \
+  --set worker.runnerTotalTimeoutSeconds=600 \
+  --set worker.deliveryBudgetSeconds=600 \
+  -- \
+  CURIE_RUNNER_TOTAL_TIMEOUT_S=600 \
+  CURIE_DELIVERY_BUDGET_S=600
+assert_env k \
+  --set-json worker.runnerTotalTimeoutSeconds=0.5 \
+  --set worker.deliveryBudgetSeconds=60 \
+  -- \
+  CURIE_RUNNER_TOTAL_TIMEOUT_S=0.5 \
+  CURIE_DELIVERY_BUDGET_S=60
+assert_env k \
+  --set worker.runnerTotalTimeoutSeconds=1800 \
+  --set worker.deliveryBudgetSeconds=1800 \
+  --set worker.terminationGracePeriodSeconds=1860 \
+  -- \
+  CURIE_RUNNER_TOTAL_TIMEOUT_S=1800 \
+  CURIE_DELIVERY_BUDGET_S=1800
+
+# Disable both resource templates so these failures isolate JSON Schema rather
+# than either cross-field guard. Use --set-json for 1800.1 so the schema sees a
+# genuine number and the refusal proves the inclusive maximum.
+assert_refused k runnerTotalTimeoutSeconds \
+  --set worker.deploy=false \
+  --set api.deploy=false \
+  --set worker.runnerTotalTimeoutSeconds=0
+assert_refused k runnerTotalTimeoutSeconds \
+  --set worker.deploy=false \
+  --set api.deploy=false \
+  --set-json worker.runnerTotalTimeoutSeconds=1800.1
+
+# Individually valid scalar values, relationally invalid together. Capture the
+# result directly so Helm's required non-zero status is the asserted outcome.
+K_RELATIONSHIP_OUT=""
+if K_RELATIONSHIP_OUT="$(helm template curie "$CHART" \
+  --set worker.runnerTotalTimeoutSeconds=1700 \
+  --set worker.deliveryBudgetSeconds=600 2>&1)"; then
+  fail k "helm ACCEPTED worker.runnerTotalTimeoutSeconds=1700 above worker.deliveryBudgetSeconds=600; the render must refuse a runner ceiling that exceeds the overall delivery budget"
+fi
+for token in \
+  "worker.runnerTotalTimeoutSeconds" \
+  "(1700)" \
+  "worker.deliveryBudgetSeconds" \
+  "(600)" \
+  "<=" \
+  "lower" \
+  "raise"; do
+  grep -qF "$token" <<<"$K_RELATIONSHIP_OUT" \
+    || fail k "the runner/delivery refusal does not mention $token; an operator cannot identify and correct the invalid timeout relationship
+  $(head -3 <<<"$K_RELATIONSHIP_OUT")"
+done
+
+echo "worker-ttl-bounds-assertions: all eleven assertions passed"
