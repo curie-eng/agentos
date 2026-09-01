@@ -73,12 +73,12 @@ assert_api_grace b 1860 \
   --set worker.deliveryBudgetSeconds=1800 \
   --set worker.terminationGracePeriodSeconds=1860
 
-# (c) An explicit value at the raised floor is accepted and reaches the API.
-assert_api_grace c 1920 \
+# (c) An explicit value exactly at the raised floor is accepted and reaches the API.
+assert_api_grace c 1860 \
   --set worker.deliveryBudgetSeconds=1800 \
   --set worker.deliveryShutdownReserveSeconds=60 \
   --set worker.terminationGracePeriodSeconds=1860 \
-  --set api.resumeReconciler.graceSeconds=1920
+  --set api.resumeReconciler.graceSeconds=1860
 
 # (d) An explicit YAML null selects the derived default.
 assert_api_grace d 1860 \
