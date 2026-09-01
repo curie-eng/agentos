@@ -3,11 +3,91 @@
 import logging
 
 import anyio
-from aci_protocol import Event, Interrupt, SessionStatus, parse_ndjson
-from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
+import pytest
+from aci_protocol import ErrorEvent, Event, Interrupt, SessionStatus, parse_ndjson
+from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, ToolUseBlock
 from curie_runner import RunTracer, SideEffectClassifier, build_options
 from curie_runner.fake import FakeModelSession, default_turn
 from curie_runner.session import SessionRunner
+from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import StatusCode
+
+
+class _ProviderStallSession:
+    def __init__(self, entered: anyio.Event, release: anyio.Event) -> None:
+        self.entered = entered
+        self.release = release
+        self.interrupts = 0
+
+    async def connect(self) -> None: ...
+
+    async def query(self, _text: str) -> None: ...
+
+    async def receive_turn(self):
+        self.entered.set()
+        await self.release.wait()
+        if False:  # pragma: no cover - makes this an async generator
+            yield None
+
+    async def interrupt(self) -> None:
+        self.interrupts += 1
+        self.release.set()
+
+    async def close(self) -> None:
+        self.release.set()
+
+
+class _ToolStallSession(_ProviderStallSession):
+    async def receive_turn(self):
+        yield AssistantMessage(
+            content=[
+                ToolUseBlock(
+                    id="internal-stalled-call-PLACEHOLDER",
+                    name="Read",
+                    input={"path": "private-stalled-argument-PLACEHOLDER"},
+                )
+            ],
+            model="observed-model",
+        )
+        self.entered.set()
+        await self.release.wait()
+
+
+class _ProviderInterruptErrorSession(_ProviderStallSession):
+    async def receive_turn(self):
+        if False:  # pragma: no cover - makes this an async generator
+            yield None
+        self.entered.set()
+        await self.release.wait()
+        assert self.interrupts > 0
+        raise RuntimeError("provider transport stopped after interrupt")
+
+
+class _ToolInterruptErrorSession(_ProviderStallSession):
+    async def receive_turn(self):
+        yield AssistantMessage(
+            content=[
+                ToolUseBlock(
+                    id="internal-interrupt-error-call-PLACEHOLDER",
+                    name="Read",
+                    input={"path": "private-interrupt-error-argument-PLACEHOLDER"},
+                )
+            ],
+            model="observed-model",
+        )
+        self.entered.set()
+        await self.release.wait()
+        assert self.interrupts > 0
+        raise RuntimeError("tool transport stopped after interrupt")
+
+
+def _span_named(spans: list[ReadableSpan], name: str) -> list[ReadableSpan]:
+    return sorted(
+        (span for span in spans if span.name == name),
+        key=lambda span: span.start_time or 0,
+    )
 
 
 def _runner(
@@ -47,6 +127,192 @@ def test_happy_turn_stream_shape() -> None:
     assert events[-1].status == SessionStatus.DONE
     assert fake.queries == ["go"]  # the event text was pushed into the session
     assert runner.status == SessionStatus.DONE
+
+
+@pytest.mark.parametrize(
+    ("session_type", "expected_phase", "expect_tool"),
+    (
+        (_ProviderStallSession, "provider_wait", False),
+        (_ToolStallSession, "tool_wait", True),
+    ),
+)
+def test_interrupting_a_stalled_phase_preserves_phase_and_cancels_cleanly(
+    session_type,
+    expected_phase: str,
+    expect_tool: bool,
+) -> None:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+
+    async def go() -> tuple[list[str], _ProviderStallSession]:
+        entered = anyio.Event()
+        release = anyio.Event()
+        session = session_type(entered, release)
+        runner = SessionRunner(
+            session_factory=lambda: session,
+            ceiling=0,
+            tracer=RunTracer(provider),
+            classifier=SideEffectClassifier(),
+            trace_name="t",
+        )
+        lines: list[str] = []
+
+        async def consume() -> None:
+            async for line in runner.run_turn(
+                Event(type="message", text="go", user="U", ts="1")
+            ):
+                lines.append(line)
+
+        await runner.start()
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(consume)
+            await entered.wait()
+            await runner.interrupt("operator stop")
+        await runner.close()
+        return lines, session
+
+    lines, session = anyio.run(go)
+    events = parse_ndjson("".join(lines))
+    assert events[-1].status is SessionStatus.IDLE_AWAITING_INPUT
+    assert session.interrupts >= 1
+    spans = list(exporter.get_finished_spans())
+    root = _span_named(spans, "agent.run")[0]
+    assert root.attributes["curie.phase"] == expected_phase
+    assert root.attributes["curie.terminal.cause"] == "interrupt_requested"
+    assert root.attributes["curie.terminal.status"] == "cancelled"
+    assert root.status.status_code is StatusCode.OK
+    tools = _span_named(spans, "execute_tool")
+    assert bool(tools) is expect_tool
+    if tools:
+        assert tools[0].attributes["curie.tool.outcome"] == "cancelled"
+        assert "internal-stalled-call-PLACEHOLDER" not in repr(tools[0].attributes)
+
+
+@pytest.mark.parametrize(
+    ("session_type", "expected_phase", "expect_tool"),
+    (
+        (_ProviderInterruptErrorSession, "provider_wait", False),
+        (_ToolInterruptErrorSession, "tool_wait", True),
+    ),
+)
+def test_interrupt_precedes_iterator_exception_and_preserves_cancelled_terminal(
+    session_type,
+    expected_phase: str,
+    expect_tool: bool,
+) -> None:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+
+    async def go() -> tuple[list[str], _ProviderStallSession]:
+        entered = anyio.Event()
+        release = anyio.Event()
+        session = session_type(entered, release)
+        runner = SessionRunner(
+            session_factory=lambda: session,
+            ceiling=0,
+            tracer=RunTracer(provider),
+            classifier=SideEffectClassifier(),
+            trace_name="t",
+        )
+        lines: list[str] = []
+
+        async def consume() -> None:
+            async for line in runner.run_turn(
+                Event(type="message", text="go", user="U", ts="1")
+            ):
+                lines.append(line)
+
+        await runner.start()
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(consume)
+            await entered.wait()
+            await runner.interrupt("operator stop")
+        await runner.close()
+        return lines, session
+
+    lines, session = anyio.run(go)
+    events = parse_ndjson("".join(lines))
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    assert events[-1].status is SessionStatus.IDLE_AWAITING_INPUT
+    assert session.interrupts >= 1
+
+    spans = list(exporter.get_finished_spans())
+    root = _span_named(spans, "agent.run")[0]
+    assert root.attributes["curie.phase"] == expected_phase
+    assert root.attributes["curie.terminal.cause"] == "interrupt_requested"
+    assert root.attributes["curie.terminal.status"] == "cancelled"
+    assert root.status.status_code is StatusCode.OK
+    tools = _span_named(spans, "execute_tool")
+    assert bool(tools) is expect_tool
+    if tools:
+        assert tools[0].status.status_code is StatusCode.OK
+        assert tools[0].attributes["curie.phase.end_kind"] == "terminal_inferred"
+        assert tools[0].attributes["curie.tool.outcome"] == "cancelled"
+        assert "internal-interrupt-error-call-PLACEHOLDER" not in repr(
+            tools[0].attributes
+        )
+
+
+@pytest.mark.parametrize(
+    ("session_type", "expected_phase", "expect_tool"),
+    (
+        (_ProviderStallSession, "provider_wait", False),
+        (_ToolStallSession, "tool_wait", True),
+    ),
+)
+def test_abandoning_a_stalled_phase_is_error_not_intentional_cancellation(
+    session_type,
+    expected_phase: str,
+    expect_tool: bool,
+) -> None:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+
+    async def go() -> None:
+        entered = anyio.Event()
+        release = anyio.Event()
+        session = session_type(entered, release)
+        runner = SessionRunner(
+            session_factory=lambda: session,
+            ceiling=0,
+            tracer=RunTracer(provider),
+            classifier=SideEffectClassifier(),
+            trace_name="t",
+        )
+        scope_ready = anyio.Event()
+        scope_holder: list[anyio.CancelScope] = []
+
+        async def consume() -> None:
+            with anyio.CancelScope() as scope:
+                scope_holder.append(scope)
+                scope_ready.set()
+                async for _ in runner.run_turn(
+                    Event(type="message", text="go", user="U", ts="1")
+                ):
+                    pass
+
+        await runner.start()
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(consume)
+            await scope_ready.wait()
+            await entered.wait()
+            scope_holder[0].cancel()
+        await runner.close()
+
+    anyio.run(go)
+    spans = list(exporter.get_finished_spans())
+    root = _span_named(spans, "agent.run")[0]
+    assert root.attributes["curie.phase"] == expected_phase
+    assert root.attributes["curie.terminal.cause"] == "abandoned"
+    assert root.attributes["curie.terminal.status"] == "abandoned"
+    assert root.status.status_code is StatusCode.ERROR
+    tools = _span_named(spans, "execute_tool")
+    assert bool(tools) is expect_tool
+    if tools:
+        assert tools[0].attributes["curie.tool.outcome"] == "cancelled"
 
 
 def test_turn_lifecycle_logged(caplog) -> None:
@@ -446,6 +712,18 @@ def test_build_options_no_history_ref_is_none() -> None:
     )
     assert options.resume is None
     assert options.task_budget is None
+
+
+def test_build_options_requests_payload_stripped_partial_boundaries() -> None:
+    options = build_options(
+        plugins=[],
+        model=None,
+        system_prompt=None,
+        max_turns=20,
+        max_budget_usd=1.0,
+        resume=None,
+    )
+    assert options.include_partial_messages is True
 
 
 def test_build_options_carries_task_budget_hint() -> None:

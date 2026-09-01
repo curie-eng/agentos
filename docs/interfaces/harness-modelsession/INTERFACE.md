@@ -49,17 +49,20 @@ A second harness must supply an object satisfying `ModelSession`
 - `async def query(self, text: str) -> None` (`runner/src/curie_runner/adapter.py::ModelSession.query`) — push a user message;
   a `query` issued while a turn is live is the mid-run **steer**.
 - `def receive_turn(self) -> AsyncIterator[Any]` (`runner/src/curie_runner/adapter.py::ModelSession.receive_turn`) — yield the harness
-  messages for the current turn, ending at its terminal result.
+  messages for the current turn and, optionally, the runner-internal payload-free
+  `PartialMessageBoundary`, ending at the terminal result.
 - `async def interrupt(self) -> None` (`runner/src/curie_runner/adapter.py::ModelSession.interrupt`) — native hard stop at the next
   safe boundary.
 - `async def close(self) -> None` (`runner/src/curie_runner/adapter.py::ModelSession.close`) — tear down.
 
-The messages a `receive_turn` iterator yields must be mappable by
-`translate_message` (`runner/src/curie_runner/translate.py::translate_message`) into the ACI
-outbound union (`TextDelta` / `ToolNote` / `SideEffectFlag` / `ErrorEvent` /
-`Final`). Today those messages are the concrete `claude_agent_sdk` dataclasses, and the
-neutral `TurnEvent` payload that was to decouple the port from the SDK shape was
-withdrawn with #307/#315 rather than shipped. Session options are assembled by `build_options`
+Apart from `PartialMessageBoundary`, the values a `receive_turn` iterator yields must be
+mappable by `translate_message` (`runner/src/curie_runner/translate.py::translate_message`)
+into the ACI outbound union (`TextDelta` / `ToolNote` / `SideEffectFlag` / `ErrorEvent` /
+`Final`). `SessionRunner` consumes that internal boundary only as telemetry evidence; it
+never reaches `translate_message` or the ACI stream. Today the translatable messages are
+the concrete `claude_agent_sdk` dataclasses, and the neutral `TurnEvent` payload that was
+to decouple the port from the SDK shape was withdrawn with #307/#315 rather than shipped.
+Session options are assembled by `build_options`
 (`runner/src/curie_runner/adapter.py::build_options`). Since #245 / ADR-0010 the permission
 posture is conditional, not pinned: with an approval `can_use_tool` callback the session
 runs in `permission_mode="default"` so each tool call is gated, and only an unconfigured
@@ -90,9 +93,11 @@ and fails loud on an unregistered name.
 Two, both in `runner/src/curie_runner/`:
 
 - **Real:** `ClaudeAgentSession` (`runner/src/curie_runner/adapter.py::ClaudeAgentSession`), wrapping `ClaudeSDKClient` in
-  streaming-input mode; `receive_turn` delegates to `self._client.receive_response()`
-  (`runner/src/curie_runner/adapter.py::ClaudeAgentSession.receive_turn`) and `interrupt` to `self._client.interrupt()`
-  (`runner/src/curie_runner/adapter.py::ClaudeAgentSession.interrupt`).
+  streaming-input mode. Its `receive_turn` normalization iterator wraps
+  `self._client.receive_response()`: it converts only allowlisted partial-message starts
+  into payload-free `PartialMessageBoundary` values, discards other SDK `StreamEvent`
+  payloads, and otherwise yields the SDK messages. `interrupt` delegates to
+  `self._client.interrupt()` (`runner/src/curie_runner/adapter.py::ClaudeAgentSession.interrupt`).
 - **Fake:** `FakeModelSession` (`runner/src/curie_runner/fake.py::FakeModelSession`), a scripted
   replayer that constructs real SDK message dataclasses. It is the reusable acceptance
   harness: `conformance_producer` (`runner/src/curie_runner/conformance.py::conformance_producer`) drives

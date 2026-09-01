@@ -2319,13 +2319,27 @@ stop_local_otel_sink() {
 
 local_otel_query() {
     local mode="$1" baseline="${2:-}"
-    python3 - "$mode" "$WORKDIR/otel-sink" "$baseline" "$PROMPT" "$OTEL_E2E_SECRET_SENTINEL" <<'PY'
+    python3 - "$mode" "$WORKDIR/otel-sink" "$baseline" "$PROMPT" \
+        "$OTEL_E2E_SECRET_SENTINEL" "$REPO_ROOT" "$LIVE" <<'PY'
+import importlib.util
 import json
 import pathlib
 import sys
 
-mode, root_raw, baseline_raw, prompt, sentinel = sys.argv[1:]
+mode, root_raw, baseline_raw, prompt, sentinel, repo_root_raw, live_raw = sys.argv[1:]
 root = pathlib.Path(root_raw)
+require_multi_round_tool = live_raw != "1"
+
+shape_helper_path = pathlib.Path(repo_root_raw) / "scripts" / "runner_otel_shape.py"
+shape_helper_spec = importlib.util.spec_from_file_location(
+    "curie_runner_otel_shape", shape_helper_path
+)
+if shape_helper_spec is None or shape_helper_spec.loader is None:
+    raise RuntimeError("could not load the canonical runner shape validator")
+shape_helper = importlib.util.module_from_spec(shape_helper_spec)
+sys.modules[shape_helper_spec.name] = shape_helper
+shape_helper_spec.loader.exec_module(shape_helper)
+canonical_runner_shape_violations = shape_helper.canonical_runner_shape_violations
 
 def documents(name):
     path = root / f"{name}.json"
@@ -2483,6 +2497,14 @@ if mode == "healthy":
     )
     for trace_id in new_healthy:
         trace_spans = by_trace[trace_id]
+        shape_violations = canonical_runner_shape_violations(
+            trace_spans,
+            require_multi_round_tool=require_multi_round_tool,
+        )
+        assert not shape_violations, (
+            f"healthy trace {trace_id} violates canonical runner shape: "
+            + "; ".join(shape_violations)
+        )
         assert all(
             span.get("status", {}).get("code") not in (2, "STATUS_CODE_ERROR")
             for span, _ in trace_spans
@@ -2570,6 +2592,7 @@ if mode == "healthy":
     )
     print(json.dumps({
         "healthy_new_traces": len(new_healthy),
+        "canonical_runner_shape_traces": len(new_healthy),
         "correlated_services": sorted(correlated_services),
         "metric_deltas": positive_deltas,
         "classified_failure_delta": classified_delta,
@@ -2725,6 +2748,8 @@ assert_local_otel_healthy_turn() {
     # curie.turn.process -> curie.sandbox.claim -> curie.runner.rpc ->
     # agent.run -> curie.reply.update or curie.reply.post. Correlated logs must carry traceId,
     # spanId, and resource service.name for dispatcher, worker, and runner.
+    # Every new healthy trace must also carry the canonical runner phase tree:
+    # root-sibling provider/tool intervals with closed boundaries and bounded indices.
     # Operational metrics pinned here are
     # curie.turn.accepted, curie.turn.completed, curie.turn.duration,
     # curie.queue.message.age, curie.sandbox.lifecycle, and
@@ -2734,7 +2759,7 @@ assert_local_otel_healthy_turn() {
         if assert_bounded_metric_attributes "$baseline" >/dev/null 2>&1; then
             assert_bounded_metric_attributes "$baseline"
             assert_local_otel_redacted
-            echo "local: OTel healthy control proved causality, log correlation, bounded metric attributes, and redaction"
+            echo "local: OTel healthy control proved causality, canonical runner shape, log correlation, bounded metric attributes, and redaction"
             return 0
         fi
         sleep 2

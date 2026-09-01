@@ -1,6 +1,8 @@
 """OTel: the gen_ai span tree is emitted for a turn; exporter wiring is gated."""
 
 import time
+from collections import defaultdict
+from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 import anyio
@@ -14,9 +16,21 @@ from aci_protocol import (
     parse_ndjson,
     parse_ndjson_line,
 )
+from claude_agent_sdk import (
+    AssistantMessage,
+    ResultMessage,
+    StreamEvent,
+    TextBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+    UserMessage,
+)
+from claude_agent_sdk.types import PermissionResultDeny
 from curie_runner import RunTracer, SideEffectClassifier, build_tracer_provider
 from curie_runner import otel as otel_module
 from curie_runner import session as session_module
+from curie_runner.adapter import ClaudeAgentSession, PartialMessageBoundary
+from curie_runner.approval import ApprovalGate
 from curie_runner.fake import FakeModelSession
 from curie_runner.otel import _SchemaValidatingSpanProcessor
 from curie_runner.session import SessionRunner
@@ -38,6 +52,697 @@ from opentelemetry.trace import (
     TraceState,
     set_span_in_context,
 )
+
+_STREAM_BODY = "private-partial-body-PLACEHOLDER"
+_STREAM_ARGUMENT = "private-partial-argument-PLACEHOLDER"
+_TOOL_ARGUMENT = "private-tool-argument-PLACEHOLDER"
+_TOOL_RESULT = "private-tool-result-PLACEHOLDER"
+_STREAM_UUID = "stream-uuid-PLACEHOLDER"
+_STREAM_SESSION_ID = "stream-session-PLACEHOLDER"
+_PARENT_TOOL_ID = "parent-tool-id-PLACEHOLDER"
+_TOOL_CALL_ID = "tool-call-id-PLACEHOLDER"
+
+
+def _result(
+    *,
+    text: str = "done",
+    is_error: bool = False,
+    terminal_reason: str | None = None,
+    usage: dict[str, Any] | None = None,
+) -> ResultMessage:
+    return ResultMessage(
+        subtype="error_during_execution" if is_error else "success",
+        duration_ms=1,
+        duration_api_ms=1,
+        is_error=is_error,
+        num_turns=1,
+        session_id="sdk-result-session-PLACEHOLDER",
+        result=text,
+        terminal_reason=terminal_reason,
+        usage=usage,
+    )
+
+
+def _tool_result(
+    call_id: str,
+    *,
+    content: str = _TOOL_RESULT,
+    is_error: bool = False,
+) -> UserMessage:
+    return UserMessage(
+        content=[
+            ToolResultBlock(
+                tool_use_id=call_id,
+                content=content,
+                is_error=is_error,
+            )
+        ]
+    )
+
+
+def _spans_by_name(spans: list[ReadableSpan]) -> dict[str, list[ReadableSpan]]:
+    grouped: dict[str, list[ReadableSpan]] = defaultdict(list)
+    for span in spans:
+        grouped[span.name].append(span)
+    for same_name in grouped.values():
+        same_name.sort(key=lambda span: span.start_time or 0)
+    return dict(grouped)
+
+
+def _export_turn(
+    session_factory: Callable[[], Any],
+    *,
+    model: str | None = "configured-model",
+) -> tuple[list[object], list[ReadableSpan]]:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    runner = SessionRunner(
+        session_factory=session_factory,
+        ceiling=0,
+        tracer=RunTracer(provider),
+        classifier=SideEffectClassifier(),
+        trace_name="curie-run:test",
+        model=model,
+    )
+
+    async def go() -> list[object]:
+        await runner.start()
+        try:
+            lines = [
+                line
+                async for line in runner.run_turn(
+                    Event(type="message", text="go", user="U0EXAMPLE1", ts="1")
+                )
+            ]
+            return parse_ndjson("".join(lines))
+        finally:
+            await runner.close()
+
+    events = anyio.run(go)
+    return events, list(exporter.get_finished_spans())
+
+
+class _ScriptedSDKClient:
+    """SDK-shaped client that drives the real adapter without a provider call."""
+
+    def __init__(self, script: list[object]) -> None:
+        self._script = script
+        self.queries: list[str] = []
+
+    async def connect(self) -> None:
+        return None
+
+    async def query(self, text: str) -> None:
+        self.queries.append(text)
+
+    def receive_response(self) -> AsyncIterator[object]:
+        async def messages() -> AsyncIterator[object]:
+            for message in self._script:
+                yield message
+
+        return messages()
+
+    async def interrupt(self) -> None:
+        return None
+
+    async def disconnect(self) -> None:
+        return None
+
+
+def _adapter_session_factory(script: list[object]) -> Callable[[], ClaudeAgentSession]:
+    def factory() -> ClaudeAgentSession:
+        session = ClaudeAgentSession.__new__(ClaudeAgentSession)
+        session._client = _ScriptedSDKClient(script)  # type: ignore[attr-defined]
+        return session
+
+    return factory
+
+
+def test_adapter_aclose_closes_the_inner_sdk_stream_on_the_driving_task() -> None:
+    finalizer_task_ids: list[int] = []
+
+    class FinalizingSDKClient:
+        def receive_response(self) -> AsyncIterator[object]:
+            async def messages() -> AsyncIterator[object]:
+                try:
+                    yield AssistantMessage(
+                        content=[TextBlock(text="first response")],
+                        model="observed-model",
+                    )
+                    await anyio.sleep_forever()
+                finally:
+                    finalizer_task_ids.append(anyio.get_current_task().id)
+
+            return messages()
+
+    async def go() -> None:
+        session = ClaudeAgentSession.__new__(ClaudeAgentSession)
+        session._client = FinalizingSDKClient()  # type: ignore[attr-defined]
+        response: Any = session.receive_turn()
+        driving_task_id = anyio.get_current_task().id
+
+        assert isinstance(await anext(response), AssistantMessage)
+        await response.aclose()
+
+        assert finalizer_task_ids == [driving_task_id]
+
+    anyio.run(go)
+
+
+def _partial_boundary(event_type: str, *, second: bool = False) -> StreamEvent:
+    event: dict[str, Any] = {
+        "type": event_type,
+        "message": {"content": _STREAM_BODY},
+    }
+    if second:
+        event["content_block"] = {
+            "type": "tool_use",
+            "input": _STREAM_ARGUMENT,
+        }
+    return StreamEvent(
+        uuid=_STREAM_UUID,
+        session_id=_STREAM_SESSION_ID,
+        parent_tool_use_id=_PARENT_TOOL_ID,
+        event=event,
+    )
+
+
+def _two_round_script(*, include_boundaries: bool = True) -> list[object]:
+    first_usage = {
+        "input_tokens": 3,
+        "output_tokens": 2,
+        "cache_read_input_tokens": 4,
+    }
+    second_first_round_usage = {
+        "input_tokens": 5,
+        "output_tokens": 7,
+        "cache_creation_input_tokens": 6,
+    }
+    second_round_usage = {
+        "input_tokens": 11,
+        "output_tokens": 13,
+        "cache_read_input_tokens": 17,
+        "cache_creation_input_tokens": 19,
+    }
+    result_total = {
+        "input_tokens": 101,
+        "output_tokens": 103,
+        "cache_read_input_tokens": 107,
+        "cache_creation_input_tokens": 109,
+    }
+    script: list[object] = []
+    if include_boundaries:
+        script.extend(
+            [
+                _partial_boundary("message_start"),
+                # A later allowed partial in the same provider wait must not
+                # replace/backdate the first-response observation.
+                _partial_boundary("content_block_start", second=True),
+            ]
+        )
+    script.extend(
+        [
+            AssistantMessage(
+                content=[TextBlock(text="first response")],
+                model="observed-model",
+                usage=first_usage,
+            ),
+            AssistantMessage(
+                content=[
+                    TextBlock(text="using tool"),
+                    ToolUseBlock(
+                        id=_TOOL_CALL_ID,
+                        name="Read",
+                        input={"path": _TOOL_ARGUMENT},
+                    ),
+                ],
+                model="observed-model",
+                usage=second_first_round_usage,
+            ),
+            _tool_result(_TOOL_CALL_ID),
+        ]
+    )
+    if include_boundaries:
+        script.append(_partial_boundary("message_start"))
+    script.extend(
+        [
+            AssistantMessage(
+                content=[TextBlock(text="second response")],
+                model="observed-model",
+                usage=second_round_usage,
+            ),
+            _result(text="done", usage=result_total),
+        ]
+    )
+    return script
+
+
+def _span_wire_material(spans: list[ReadableSpan]) -> str:
+    return repr(
+        [
+            (
+                span.name,
+                dict(span.attributes or {}),
+                [(event.name, dict(event.attributes or {})) for event in span.events],
+                span.status.description,
+            )
+            for span in spans
+        ]
+    )
+
+
+def test_two_true_provider_wait_rounds_accumulate_assistant_usage_only() -> None:
+    _, finished = _export_turn(_adapter_session_factory(_two_round_script()))
+    spans = _spans_by_name(finished)
+
+    generations = spans["llm.generation"]
+    assert len(generations) == 2
+    assert [span.attributes["curie.generation.round"] for span in generations] == [1, 2]
+    assert [span.attributes["curie.phase"] for span in generations] == [
+        "provider_wait",
+        "provider_wait",
+    ]
+    assert [span.attributes["curie.phase.start_kind"] for span in generations] == [
+        "query_observed",
+        "tool_result_inferred",
+    ]
+    assert [span.attributes["curie.phase.end_kind"] for span in generations] == [
+        "tool_use_observed",
+        "result_observed",
+    ]
+
+    first, second = generations
+    assert first.attributes["gen_ai.usage.input_tokens"] == 8
+    assert first.attributes["gen_ai.usage.output_tokens"] == 9
+    assert first.attributes["gen_ai.usage.cache_read_input_tokens"] == 4
+    assert first.attributes["gen_ai.usage.cache_creation_input_tokens"] == 6
+    assert second.attributes["gen_ai.usage.input_tokens"] == 11
+    assert second.attributes["gen_ai.usage.output_tokens"] == 13
+    assert second.attributes["gen_ai.usage.cache_read_input_tokens"] == 17
+    assert second.attributes["gen_ai.usage.cache_creation_input_tokens"] == 19
+
+    # ResultMessage usage is the turn total. Stamping it on the last generation
+    # would double-count earlier rounds and overwrite the per-message evidence.
+    emitted_values = {
+        value
+        for generation in generations
+        for key, value in generation.attributes.items()
+        if key.startswith("gen_ai.usage.")
+    }
+    assert emitted_values.isdisjoint({101, 103, 107, 109})
+
+    for generation in generations:
+        ttft = generation.attributes["curie.generation.ttft_ms"]
+        assert type(ttft) is int
+        assert ttft >= 0
+
+    root = spans["agent.run"][0]
+    tool = spans["execute_tool"][0]
+    assert root.attributes["curie.phase"] == "provider_wait"
+    assert root.attributes["curie.terminal.cause"] == "completed"
+    assert root.attributes["curie.terminal.status"] == "succeeded"
+    assert tool.attributes["curie.tool.call.index"] == 1
+
+
+def test_generation_omits_ttft_without_an_allowlisted_partial_boundary() -> None:
+    _, finished = _export_turn(
+        lambda: FakeModelSession(lambda: _two_round_script(include_boundaries=False))
+    )
+    generations = _spans_by_name(finished)["llm.generation"]
+
+    assert len(generations) == 2
+    assert all("curie.generation.ttft_ms" not in span.attributes for span in generations)
+
+
+def test_unallowlisted_stream_event_produces_no_boundary_ttft_or_private_material() -> None:
+    raw_event = _partial_boundary("content_block_delta", second=True)
+
+    async def collect_adapter_output() -> list[object]:
+        session = _adapter_session_factory([raw_event])()
+        return [message async for message in session.receive_turn()]
+
+    assert anyio.run(collect_adapter_output) == []
+
+    script = [
+        raw_event,
+        AssistantMessage(
+            content=[TextBlock(text="visible response")],
+            model="observed-model",
+        ),
+        _result(),
+    ]
+    _, finished = _export_turn(_adapter_session_factory(script))
+    generation = _spans_by_name(finished)["llm.generation"][0]
+
+    assert "curie.generation.ttft_ms" not in generation.attributes
+    material = _span_wire_material(finished)
+    for private_value in (
+        _STREAM_BODY,
+        _STREAM_ARGUMENT,
+        _STREAM_UUID,
+        _STREAM_SESSION_ID,
+        _PARENT_TOOL_ID,
+    ):
+        assert private_value not in material
+
+
+def test_ttft_is_first_boundary_once_and_is_measured_from_each_round_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timestamps = (
+        1_000_000_000,
+        1_007_000_000,
+        10_000_000_000,
+        10_011_000_000,
+    )
+    observed_timestamps: list[int] = []
+
+    def monotonic_ns() -> int:
+        value = timestamps[len(observed_timestamps)]
+        observed_timestamps.append(value)
+        return value
+
+    monkeypatch.setattr(otel_module.time, "monotonic_ns", monotonic_ns)
+    _, finished = _export_turn(_adapter_session_factory(_two_round_script()))
+    generations = _spans_by_name(finished)["llm.generation"]
+
+    assert observed_timestamps == list(timestamps)
+    assert [
+        generation.attributes["curie.generation.ttft_ms"]
+        for generation in generations
+    ] == [7, 11]
+
+
+def test_steer_during_provider_wait_preserves_generation_and_ttft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timestamps = (
+        1_000_000_000,
+        1_013_000_000,
+        # A steer that restarts the phase would consume these deliberately
+        # different values and make both the call-count and span assertions fail.
+        50_000_000_000,
+        50_029_000_000,
+    )
+    observed_timestamps: list[int] = []
+
+    def monotonic_ns() -> int:
+        value = timestamps[len(observed_timestamps)]
+        observed_timestamps.append(value)
+        return value
+
+    monkeypatch.setattr(otel_module.time, "monotonic_ns", monotonic_ns)
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+
+    class BlockingSteerSession:
+        def __init__(self) -> None:
+            self.queries: list[str] = []
+            self.waiting_after_boundary = anyio.Event()
+            self.release = anyio.Event()
+
+        async def connect(self) -> None:
+            return None
+
+        async def query(self, text: str) -> None:
+            self.queries.append(text)
+
+        def receive_turn(self) -> AsyncIterator[object]:
+            async def messages() -> AsyncIterator[object]:
+                # This is the same payload-free, allowlisted adapter boundary the
+                # real SessionRunner sees; provider content never enters the test.
+                yield PartialMessageBoundary(event_type="message_start")
+                self.waiting_after_boundary.set()
+                await self.release.wait()
+                yield AssistantMessage(
+                    content=[TextBlock(text="completed after steer")],
+                    model="observed-model",
+                )
+                yield _result(text="completed after steer")
+
+            return messages()
+
+        async def interrupt(self) -> None:
+            self.release.set()
+
+        async def close(self) -> None:
+            return None
+
+    async def go() -> tuple[list[object], BlockingSteerSession]:
+        session = BlockingSteerSession()
+        runner = SessionRunner(
+            session_factory=lambda: session,
+            ceiling=0,
+            tracer=RunTracer(provider),
+            classifier=SideEffectClassifier(),
+            trace_name="curie-run:steer-telemetry",
+            model="configured-model",
+        )
+        lines: list[str] = []
+
+        async def consume() -> None:
+            async for line in runner.run_turn(
+                Event(type="message", text="initial", user="U0EXAMPLE1", ts="1")
+            ):
+                lines.append(line)
+
+        await runner.start()
+        try:
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(consume)
+                await session.waiting_after_boundary.wait()
+                assert runner.turn_active
+                assert session.queries == ["initial"]
+                assert await runner.steer("steered follow-up") is True
+                session.release.set()
+        finally:
+            await runner.close()
+        return parse_ndjson("".join(lines)), session
+
+    events, session = anyio.run(go)
+    assert session.queries == ["initial", "steered follow-up"]
+    assert isinstance(events[-1], Final)
+    assert events[-1].status is SessionStatus.DONE
+
+    spans = _spans_by_name(list(exporter.get_finished_spans()))
+    generations = spans["llm.generation"]
+    assert len(generations) == 1
+    assert generations[0].attributes["curie.generation.round"] == 1
+    assert generations[0].attributes["curie.generation.ttft_ms"] == 13
+    assert observed_timestamps == list(timestamps[:2])
+
+    root = spans["agent.run"][0]
+    assert root.attributes["curie.terminal.cause"] == "completed"
+    assert root.attributes["curie.terminal.status"] == "succeeded"
+    assert root.status.status_code is StatusCode.OK
+
+
+def test_fake_partial_boundaries_are_opt_in_payload_free_and_precede_each_assistant() -> None:
+    script: list[object] = [
+        AssistantMessage(
+            content=[TextBlock(text=_STREAM_BODY)],
+            model="fake-model",
+        ),
+        _tool_result("fake-result-call-PLACEHOLDER"),
+        AssistantMessage(
+            content=[
+                ToolUseBlock(
+                    id="fake-call-PLACEHOLDER",
+                    name="Read",
+                    input={"path": _STREAM_ARGUMENT},
+                )
+            ],
+            model="fake-model",
+        ),
+        _result(),
+    ]
+
+    async def replay(session: FakeModelSession) -> list[object]:
+        await session.connect()
+        await session.query("go")
+        try:
+            return [message async for message in session.receive_turn()]
+        finally:
+            await session.close()
+
+    default_messages = anyio.run(replay, FakeModelSession(lambda: script))
+    assert default_messages == script
+    assert not any(
+        isinstance(message, PartialMessageBoundary) for message in default_messages
+    )
+
+    boundary_messages = anyio.run(
+        replay,
+        FakeModelSession(lambda: script, emit_partial_boundaries=True),
+    )
+    assistant_positions = [
+        index
+        for index, message in enumerate(boundary_messages)
+        if isinstance(message, AssistantMessage)
+    ]
+    boundaries = [
+        boundary_messages[index - 1]
+        for index in assistant_positions
+        if index > 0
+    ]
+
+    assert len(assistant_positions) == 2
+    assert boundaries == [
+        PartialMessageBoundary(event_type="message_start"),
+        PartialMessageBoundary(event_type="message_start"),
+    ]
+    assert _STREAM_BODY not in repr(boundaries)
+    assert _STREAM_ARGUMENT not in repr(boundaries)
+
+
+def test_raw_stream_tool_payloads_and_provider_ids_never_reach_otel() -> None:
+    _, finished = _export_turn(_adapter_session_factory(_two_round_script()))
+    material = _span_wire_material(finished)
+
+    for private_value in (
+        _STREAM_BODY,
+        _STREAM_ARGUMENT,
+        _TOOL_ARGUMENT,
+        _TOOL_RESULT,
+        _STREAM_UUID,
+        _STREAM_SESSION_ID,
+        _PARENT_TOOL_ID,
+        _TOOL_CALL_ID,
+        "sdk-result-session-PLACEHOLDER",
+    ):
+        assert private_value not in material
+
+
+@pytest.mark.parametrize(
+    ("tool_failed", "expected_outcome", "expected_status"),
+    (
+        (False, "success", StatusCode.OK),
+        (True, "error", StatusCode.ERROR),
+    ),
+)
+def test_tool_use_result_is_a_duration_bearing_agent_run_sibling(
+    tool_failed: bool,
+    expected_outcome: str,
+    expected_status: StatusCode,
+) -> None:
+    script = [
+        AssistantMessage(
+            content=[
+                ToolUseBlock(
+                    id=_TOOL_CALL_ID,
+                    name="Read",
+                    input={"path": _TOOL_ARGUMENT},
+                )
+            ],
+            model="observed-model",
+        ),
+        _tool_result(_TOOL_CALL_ID, is_error=tool_failed),
+        AssistantMessage(
+            content=[TextBlock(text="done")],
+            model="observed-model",
+            usage={"output_tokens": 1},
+        ),
+        _result(usage={"output_tokens": 999}),
+    ]
+    _, finished = _export_turn(lambda: FakeModelSession(lambda: script))
+    spans = _spans_by_name(finished)
+    root = spans["agent.run"][0]
+    tool = spans["execute_tool"][0]
+
+    assert root.context is not None
+    assert tool.parent is not None
+    assert tool.parent.span_id == root.context.span_id
+    assert all(
+        generation.context is None or tool.parent.span_id != generation.context.span_id
+        for generation in spans["llm.generation"]
+    )
+    assert tool.start_time is not None
+    assert tool.end_time is not None
+    assert tool.end_time > tool.start_time
+    assert tool.attributes["curie.phase"] == "tool_wait"
+    assert tool.attributes["curie.phase.start_kind"] == "tool_use_inferred"
+    assert tool.attributes["curie.phase.end_kind"] == "tool_result_inferred"
+    assert tool.attributes["curie.tool.outcome"] == expected_outcome
+    assert tool.attributes["curie.tool.call.index"] == 1
+    assert tool.status.status_code is expected_status
+    assert _TOOL_CALL_ID not in _span_wire_material(finished)
+
+
+def test_parallel_tools_are_root_siblings_and_reopen_provider_after_both_results() -> None:
+    first_call_id = "parallel-call-one-PLACEHOLDER"
+    second_call_id = "parallel-call-two-PLACEHOLDER"
+    script = [
+        AssistantMessage(
+            content=[
+                ToolUseBlock(id=first_call_id, name="Read", input={}),
+                ToolUseBlock(id=second_call_id, name="Grep", input={}),
+            ],
+            model="observed-model",
+        ),
+        _tool_result(first_call_id),
+        _tool_result(second_call_id),
+        AssistantMessage(
+            content=[TextBlock(text="done")],
+            model="observed-model",
+        ),
+        _result(),
+    ]
+    _, finished = _export_turn(lambda: FakeModelSession(lambda: script))
+    spans = _spans_by_name(finished)
+    root = spans["agent.run"][0]
+    generations = spans["llm.generation"]
+    tools = spans["execute_tool"]
+
+    assert len(generations) == 2
+    assert len(tools) == 2
+    assert [tool.attributes["curie.tool.call.index"] for tool in tools] == [1, 2]
+    assert root.context is not None
+    assert all(
+        tool.parent is not None and tool.parent.span_id == root.context.span_id
+        for tool in tools
+    )
+    second_tool = next(
+        tool for tool in tools if tool.attributes["gen_ai.tool.name"] == "Grep"
+    )
+    assert generations[1].start_time is not None
+    assert second_tool.end_time is not None
+    assert generations[1].start_time >= second_tool.end_time
+
+
+def test_unmatched_tool_result_creates_no_tool_span() -> None:
+    script = [
+        _tool_result("unmatched-call-id-PLACEHOLDER"),
+        AssistantMessage(content=[TextBlock(text="done")], model="observed-model"),
+        _result(),
+    ]
+    _, finished = _export_turn(lambda: FakeModelSession(lambda: script))
+    spans = _spans_by_name(finished)
+
+    assert "execute_tool" not in spans
+    assert len(spans["llm.generation"]) == 1
+    assert "unmatched-call-id-PLACEHOLDER" not in _span_wire_material(finished)
+
+
+def test_dangling_tool_is_closed_as_cancelled_without_exporting_call_id() -> None:
+    script = [
+        AssistantMessage(
+            content=[ToolUseBlock(id=_TOOL_CALL_ID, name="Read", input={})],
+            model="observed-model",
+        ),
+        _result(),
+    ]
+    _, finished = _export_turn(lambda: FakeModelSession(lambda: script))
+    spans = _spans_by_name(finished)
+    tool = spans["execute_tool"][0]
+
+    assert tool.attributes["curie.tool.outcome"] == "cancelled"
+    assert tool.attributes["curie.phase.end_kind"] == "terminal_inferred"
+    assert tool.end_time is not None
+    assert tool.start_time is not None
+    assert tool.end_time > tool.start_time
+    assert _TOOL_CALL_ID not in _span_wire_material(finished)
 
 
 def test_run_emits_agent_generation_and_tool_spans() -> None:
@@ -61,13 +766,17 @@ def test_run_emits_agent_generation_and_tool_spans() -> None:
 
     anyio.run(go)
 
-    spans = {s.name: s for s in exporter.get_finished_spans()}
+    spans = _spans_by_name(list(exporter.get_finished_spans()))
     assert {"agent.run", "llm.generation", "execute_tool"} <= set(spans)
-    assert spans["agent.run"].attributes["langfuse.trace.name"] == "curie-run:test"
-    gen = spans["llm.generation"]
-    assert gen.attributes["gen_ai.request.model"] == "fake-model"
-    assert gen.attributes["gen_ai.usage.output_tokens"] == 8
-    assert spans["execute_tool"].attributes["gen_ai.tool.name"] == "Bash"
+    assert spans["agent.run"][0].attributes["langfuse.trace.name"] == "curie-run:test"
+    generations = spans["llm.generation"]
+    assert len(generations) == 2
+    assert all(
+        generation.attributes["gen_ai.request.model"] == "fake-model"
+        for generation in generations
+    )
+    assert generations[1].attributes["gen_ai.usage.output_tokens"] == 8
+    assert spans["execute_tool"][0].attributes["gen_ai.tool.name"] == "Bash"
 
 
 def test_generation_model_backfilled_from_sdk_when_unconfigured() -> None:
@@ -96,11 +805,15 @@ def test_generation_model_backfilled_from_sdk_when_unconfigured() -> None:
 
     anyio.run(go)
 
-    gen = {s.name: s for s in exporter.get_finished_spans()}["llm.generation"]
-    assert gen.attributes["gen_ai.request.model"] == "fake-model"
+    generations = _spans_by_name(list(exporter.get_finished_spans()))["llm.generation"]
+    assert len(generations) == 2
+    assert all(
+        generation.attributes["gen_ai.request.model"] == "fake-model"
+        for generation in generations
+    )
     # The usage counts only land on a model-bearing generation, so their presence
     # is the end-to-end proof the span was typed as a generation, not a bare span.
-    assert gen.attributes["gen_ai.usage.output_tokens"] == 8
+    assert generations[1].attributes["gen_ai.usage.output_tokens"] == 8
 
 
 def test_run_stamps_langfuse_session_and_user_ids() -> None:
@@ -219,7 +932,11 @@ def test_run_omits_approval_decision_on_an_ordinary_turn() -> None:
 
 
 @pytest.mark.parametrize("otel", (OtelConfig(), OtelConfig(endpoint="")))
-def test_tracer_provider_none_without_endpoint(otel: OtelConfig) -> None:
+def test_tracer_provider_none_without_endpoint(
+    otel: OtelConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", raising=False)
     assert build_tracer_provider(otel, "s1") is None
 
 
@@ -345,23 +1062,76 @@ def test_run_span_uses_explicit_parent_instead_of_ambient_context() -> None:
     exporter = InMemorySpanExporter()
     provider = TracerProvider()
     provider.add_span_processor(SimpleSpanProcessor(exporter))
-    tracer = RunTracer(provider)
     parent, parent_span_context = _remote_parent()
     ambient_tracer = TracerProvider().get_tracer("ambient")
+    runner = SessionRunner(
+        session_factory=FakeModelSession,
+        ceiling=0,
+        tracer=RunTracer(provider),
+        classifier=SideEffectClassifier(),
+        trace_name="curie-run:test",
+        model="fake-model",
+    )
+
+    async def go() -> None:
+        await runner.start()
+        try:
+            async for _ in runner.run_turn(
+                Event(type="message", text="go", user="U0EXAMPLE1", ts="1"),
+                parent=parent,
+            ):
+                pass
+        finally:
+            await runner.close()
 
     with ambient_tracer.start_as_current_span("ambient"):
-        with tracer.run_span("curie-run:test", "fake-model", parent=parent):
-            pass
+        anyio.run(go)
 
-    spans = {span.name: span for span in exporter.get_finished_spans()}
-    root = spans["agent.run"]
-    generation = spans["llm.generation"]
+    spans = _spans_by_name(list(exporter.get_finished_spans()))
+    root = spans["agent.run"][0]
     assert root.context is not None
     assert root.context.trace_id == parent_span_context.trace_id
     assert root.parent is not None
     assert root.parent.span_id == parent_span_context.span_id
-    assert generation.parent is not None
-    assert generation.parent.span_id == root.context.span_id
+    for child in spans["llm.generation"] + spans["execute_tool"]:
+        assert child.context is not None
+        assert child.context.trace_id == parent_span_context.trace_id
+        assert child.parent is not None
+        assert child.parent.span_id == root.context.span_id
+
+
+def test_empty_run_span_is_lazy_and_exports_the_root_only() -> None:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+
+    with RunTracer(provider).run_span("curie-run:test", "fake-model"):
+        pass
+
+    spans = list(exporter.get_finished_spans())
+    assert [span.name for span in spans] == ["agent.run"]
+
+
+def test_direct_compat_usage_and_tools_do_not_fabricate_ttft_or_generations() -> None:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+
+    with RunTracer(provider).run_span("curie-run:test", "fake-model") as span:
+        span.record_usage({"input_tokens": 3, "output_tokens": 2})
+        span.tool_span("Read")
+        span.tool_span("Grep")
+
+    spans = _spans_by_name(list(exporter.get_finished_spans()))
+    generations = spans["llm.generation"]
+    tools = spans["execute_tool"]
+
+    assert len(generations) == 1
+    assert "curie.generation.ttft_ms" not in generations[0].attributes
+    assert generations[0].attributes["gen_ai.usage.input_tokens"] == 3
+    assert generations[0].attributes["gen_ai.usage.output_tokens"] == 2
+    assert len(tools) == 2
+    assert [tool.attributes["curie.tool.call.index"] for tool in tools] == [1, 2]
 
 
 def test_run_span_with_missing_parent_starts_a_safe_root() -> None:
@@ -375,7 +1145,9 @@ def test_run_span_with_missing_parent_starts_a_safe_root() -> None:
         with tracer.run_span("curie-run:test", "fake-model", parent=None):
             pass
 
-    root = {span.name: span for span in exporter.get_finished_spans()}["agent.run"]
+    spans = list(exporter.get_finished_spans())
+    assert [span.name for span in spans] == ["agent.run"]
+    root = spans[0]
     assert root.context is not None
     assert root.parent is None
     assert root.context.trace_id != ambient.get_span_context().trace_id
@@ -383,33 +1155,9 @@ def test_run_span_with_missing_parent_starts_a_safe_root() -> None:
 
 def _run_and_export(
     session_factory: Any = FakeModelSession,
-) -> tuple[list[object], dict[str, ReadableSpan]]:
-    exporter = InMemorySpanExporter()
-    provider = TracerProvider()
-    provider.add_span_processor(SimpleSpanProcessor(exporter))
-    runner = SessionRunner(
-        session_factory=session_factory,
-        ceiling=0,
-        tracer=RunTracer(provider),
-        classifier=SideEffectClassifier(),
-        trace_name="curie-run:test",
-        model="fake-model",
-    )
-
-    async def go() -> list[object]:
-        await runner.start()
-        lines = [
-            line
-            async for line in runner.run_turn(
-                Event(type="message", text="go", user="U0EXAMPLE1", ts="1")
-            )
-        ]
-        await runner.close()
-        return parse_ndjson("".join(lines))
-
-    events = anyio.run(go)
-    spans = {span.name: span for span in exporter.get_finished_spans()}
-    return events, spans
+) -> tuple[list[object], dict[str, list[ReadableSpan]]]:
+    events, finished = _export_turn(session_factory, model="fake-model")
+    return events, _spans_by_name(finished)
 
 
 def test_successful_turn_sets_explicit_ok_status() -> None:
@@ -417,8 +1165,14 @@ def test_successful_turn_sets_explicit_ok_status() -> None:
     terminal = events[-1]
     assert isinstance(terminal, Final)
     assert terminal.status is SessionStatus.DONE
-    assert spans["agent.run"].status.status_code is StatusCode.OK
-    assert spans["llm.generation"].status.status_code is StatusCode.OK
+    root = spans["agent.run"][0]
+    assert root.status.status_code is StatusCode.OK
+    assert root.attributes["curie.terminal.cause"] == "completed"
+    assert root.attributes["curie.terminal.status"] == "succeeded"
+    assert all(
+        generation.status.status_code is StatusCode.OK
+        for generation in spans["llm.generation"]
+    )
 
 
 def test_caught_runner_failure_sets_explicit_error_status() -> None:
@@ -430,8 +1184,184 @@ def test_caught_runner_failure_sets_explicit_error_status() -> None:
     terminal = events[-1]
     assert isinstance(terminal, Final)
     assert terminal.status is SessionStatus.CLASSIFIED_FAILURE
-    assert spans["agent.run"].status.status_code is StatusCode.ERROR
-    assert spans["llm.generation"].status.status_code is StatusCode.ERROR
+    root = spans["agent.run"][0]
+    assert root.status.status_code is StatusCode.ERROR
+    assert root.attributes["curie.terminal.cause"] == "classified_failure"
+    assert root.attributes["curie.terminal.status"] == "failed"
+    assert all(
+        generation.status.status_code is StatusCode.ERROR
+        for generation in spans["llm.generation"]
+    )
+
+
+def test_classified_failure_uses_bounded_cause_without_raw_provider_reason() -> None:
+    raw_reason = "private-provider-failure-reason-PLACEHOLDER"
+    events, spans = _run_and_export(
+        lambda: FakeModelSession(
+            lambda: [_result(is_error=True, terminal_reason=raw_reason)]
+        )
+    )
+    assert isinstance(events[-1], Final)
+    assert events[-1].status is SessionStatus.CLASSIFIED_FAILURE
+    root = spans["agent.run"][0]
+    assert root.status.status_code is StatusCode.ERROR
+    assert root.attributes["curie.phase"] == "provider_wait"
+    assert root.attributes["curie.terminal.cause"] == "classified_failure"
+    assert root.attributes["curie.terminal.status"] == "failed"
+    assert raw_reason not in _span_wire_material(
+        [span for same_name in spans.values() for span in same_name]
+    )
+
+
+@pytest.mark.parametrize("reason", ("aborted_streaming", "aborted_tools"))
+def test_sdk_abort_without_runner_interrupt_is_a_classified_failure(reason: str) -> None:
+    events, spans = _run_and_export(
+        lambda: FakeModelSession(
+            lambda: [_result(is_error=True, terminal_reason=reason)]
+        )
+    )
+    assert [event.type for event in events] == ["error", "final"]
+    assert isinstance(events[0], ErrorEvent)
+    terminal = events[-1]
+    assert isinstance(terminal, Final)
+    assert terminal.status is SessionStatus.CLASSIFIED_FAILURE
+    root = spans["agent.run"][0]
+    generation = spans["llm.generation"][0]
+    assert root.status.status_code is StatusCode.ERROR
+    assert generation.status.status_code is StatusCode.ERROR
+    assert root.attributes["curie.phase"] == "provider_wait"
+    assert root.attributes["curie.terminal.cause"] == reason
+    assert root.attributes["curie.terminal.status"] == "failed"
+
+
+def test_approval_halt_abort_is_a_paused_non_error_terminal() -> None:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    gate = ApprovalGate(
+        required=frozenset({"Bash"}), route_by_tool={"Bash": "ops"}
+    )
+
+    async def record_gate(
+        tool_name: str, tool_input: dict[str, Any], _context: Any
+    ) -> PermissionResultDeny:
+        gate.block(tool_name, tool_input)
+        # Let the scripted SDK result through: this fixture models the real
+        # post-denial shape where the CLI still supplies its abort result.
+        return PermissionResultDeny(message="approval required", interrupt=False)
+
+    script = [
+        AssistantMessage(content=[TextBlock(text="working")], model="observed-model"),
+        AssistantMessage(
+            content=[
+                ToolUseBlock(
+                    id=_TOOL_CALL_ID,
+                    name="Bash",
+                    input={"command": "echo approval-pause-PLACEHOLDER"},
+                )
+            ],
+            model="observed-model",
+        ),
+        _result(is_error=True, terminal_reason="aborted_tools"),
+    ]
+    fake = FakeModelSession(
+        lambda: script,
+        truncate_on_interrupt=False,
+        can_use_tool=record_gate,
+    )
+    runner = SessionRunner(
+        session_factory=lambda: fake,
+        ceiling=0,
+        tracer=RunTracer(provider),
+        classifier=SideEffectClassifier(),
+        trace_name="curie-run:test",
+        model="configured-model",
+        approval_gate=gate,
+    )
+
+    async def go() -> list[object]:
+        await runner.start()
+        try:
+            lines = [
+                line
+                async for line in runner.run_turn(
+                    Event(type="message", text="go", user="U0EXAMPLE1", ts="1")
+                )
+            ]
+            return parse_ndjson("".join(lines))
+        finally:
+            await runner.close()
+
+    events = anyio.run(go)
+    terminal = events[-1]
+    assert isinstance(terminal, Final)
+    assert terminal.status is SessionStatus.AWAITING_APPROVAL
+
+    spans = _spans_by_name(list(exporter.get_finished_spans()))
+    root = spans["agent.run"][0]
+    generation = spans["llm.generation"][0]
+    tool = spans["execute_tool"][0]
+    assert root.status.status_code is StatusCode.OK
+    assert generation.status.status_code is StatusCode.OK
+    assert tool.status.status_code is StatusCode.OK
+    assert root.attributes["curie.terminal.cause"] == "approval_required"
+    assert root.attributes["curie.terminal.status"] == "paused"
+    assert root.attributes["curie.phase"] == "tool_wait"
+    assert generation.attributes["curie.phase.end_kind"] == "tool_use_observed"
+    assert tool.attributes["curie.phase.end_kind"] == "terminal_inferred"
+    assert tool.attributes["curie.tool.outcome"] == "cancelled"
+
+
+def test_interrupt_requested_wins_over_error_result_and_sdk_abort_reason() -> None:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    script = [
+        AssistantMessage(content=[TextBlock(text="working")], model="observed-model"),
+        _result(is_error=True, terminal_reason="aborted_tools"),
+    ]
+    fake = FakeModelSession(lambda: script, truncate_on_interrupt=False)
+    runner = SessionRunner(
+        session_factory=lambda: fake,
+        ceiling=0,
+        tracer=RunTracer(provider),
+        classifier=SideEffectClassifier(),
+        trace_name="curie-run:test",
+        model="configured-model",
+    )
+    events: list[object] = []
+
+    async def go() -> None:
+        await runner.start()
+        turn = runner.run_turn(
+            Event(type="message", text="go", user="U0EXAMPLE1", ts="1")
+        )
+        events.append(parse_ndjson_line(await anext(turn)))
+        await runner.interrupt("operator stop")
+        async for line in turn:
+            events.append(parse_ndjson_line(line))
+        await runner.close()
+
+    anyio.run(go)
+    terminal = events[-1]
+    assert isinstance(terminal, Final)
+    assert terminal.status is SessionStatus.IDLE_AWAITING_INPUT
+    spans = _spans_by_name(list(exporter.get_finished_spans()))
+    root = spans["agent.run"][0]
+    generation = spans["llm.generation"][0]
+    assert root.status.status_code is StatusCode.OK
+    assert generation.status.status_code is StatusCode.OK
+    assert root.attributes["curie.terminal.cause"] == "interrupt_requested"
+    assert root.attributes["curie.terminal.status"] == "cancelled"
+
+
+def test_exhausted_stream_is_abandoned_not_a_false_success() -> None:
+    _, spans = _run_and_export(lambda: FakeModelSession(lambda: []))
+    root = spans["agent.run"][0]
+    assert root.status.status_code is StatusCode.ERROR
+    assert root.attributes["curie.phase"] == "provider_wait"
+    assert root.attributes["curie.terminal.cause"] == "abandoned"
+    assert root.attributes["curie.terminal.status"] == "abandoned"
 
 
 def test_escaping_exception_exports_only_bounded_error_status() -> None:
@@ -446,13 +1376,15 @@ def test_escaping_exception_exports_only_bounded_error_status() -> None:
         with RunTracer(provider).run_span("curie-run:test", "fake-model"):
             raise RuntimeError(detail)
 
-    spans = {span.name: span for span in exporter.get_finished_spans()}
-    for name in ("agent.run", "llm.generation"):
-        span = spans[name]
-        assert span.status.status_code is StatusCode.ERROR
-        assert span.status.description is None
-        assert not any(event.name == "exception" for event in span.events)
-        assert detail not in repr((span.attributes, span.events, span.status))
+    spans = list(exporter.get_finished_spans())
+    assert [span.name for span in spans] == ["agent.run"]
+    root = spans[0]
+    assert root.status.status_code is StatusCode.ERROR
+    assert root.attributes["curie.terminal.cause"] == "abandoned"
+    assert root.attributes["curie.terminal.status"] == "abandoned"
+    assert root.status.description is None
+    assert not any(event.name == "exception" for event in root.events)
+    assert detail not in repr((root.attributes, root.events, root.status))
 
 
 def test_abandoned_turn_reports_interrupted_not_stale_prior_success(
