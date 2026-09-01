@@ -666,6 +666,7 @@ async def kernel_harness(
     actions: object | None = None,
     publication_creator: object | None = None,
     sink: object | None = None,
+    runner_app: web.Application | None = None,
     claim_timeout_seconds: float = 3.0,
     per_sandbox_runners: int = 0,
     **config_overrides: object,
@@ -673,7 +674,10 @@ async def kernel_harness(
     """Assemble a live kernel wired to a fake runner and real Valkey."""
     config = make_config(names, **config_overrides)
     fake_runner = FakeRunner()
-    server = TestServer(fake_runner.app)
+    # Most kernel tests use the deliberately tiny ACI fake above.  The coder
+    # publication boundary test supplies the real runner app, still with its
+    # model seam faked, so the worker consumes production ACI frames.
+    server = TestServer(runner_app or fake_runner.app)
     await server.start_server()
     port = server.port
     assert port is not None
