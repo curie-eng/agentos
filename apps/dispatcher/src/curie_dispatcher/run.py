@@ -46,7 +46,10 @@ def main() -> None:
         environ=os.environ,
     )
     try:
-        config = DispatcherConfig()
+        # BaseSettings supplies the required chat-attester secret from the
+        # environment; mypy sees only the constructor signature, not that
+        # runtime settings source.
+        config = DispatcherConfig()  # type: ignore[call-arg]
 
         # Gate on the platform API wiring before touching Slack: a dispatcher that
         # cannot reach the API dead-ends every approval click (#442).

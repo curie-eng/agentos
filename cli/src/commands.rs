@@ -3377,16 +3377,15 @@ pub async fn send(
         step.clear();
     }
 
-    if let Some(OutboundEvent::Final { status, .. }) = events.last() {
-        // Under `--json`, emit the one buffered turn object (reply + final
-        // status) rather than the streamed/human trailer (#485). Emit BEFORE any
-        // exit so a classified failure still carries its data to the consumer.
+    if let Some(final_event @ OutboundEvent::Final { status, .. }) = events.last() {
+        // Under `--json`, project the real final frame into one buffered turn
+        // object (reply, status, and approval metadata) rather than the
+        // streamed/human trailer (#485, #2108). Emit BEFORE any exit so a
+        // classified failure still carries its data to the consumer.
         if json {
-            ui.emit(&SkillMessageOutput {
-                reply: std::mem::take(&mut reply),
-                status: status_str(status).to_string(),
-                finalized: true,
-            });
+            let output = SkillMessageOutput::from_final(std::mem::take(&mut reply), final_event)
+                .expect("the matched outbound event is final");
+            ui.emit(&output);
             return Ok(*status == SessionStatus::ClassifiedFailure);
         }
         // Close the streamed answer on stdout only if the last thing written was
@@ -3402,14 +3401,48 @@ pub async fn send(
     Ok(false)
 }
 
-/// Output of `skill message` under `--json`: the full buffered reply plus the
-/// final session status. The human path streams tokens live and never builds
-/// this; it exists so `--json` emits one object instead of empty stdout (#485).
+/// Output of `skill message` under `--json`: the full buffered reply, final
+/// session status, and approval metadata copied from the runner's final frame.
+/// The human path streams tokens live and never builds this; it exists so
+/// `--json` emits one complete object instead of empty stdout (#485, #2108).
 #[derive(Debug)]
 pub struct SkillMessageOutput {
     pub reply: String,
     pub status: String,
     pub finalized: bool,
+    pub approval_summary: Option<String>,
+    pub approval_route: Option<String>,
+    pub approval_gate_kind: Option<String>,
+    pub approval_granted_tool: Option<String>,
+}
+
+impl SkillMessageOutput {
+    /// Project a runner final frame into the agent-facing result without
+    /// inventing terminal state. An approval park is resumable, so it is the
+    /// only final-frame status for which `finalized` is false.
+    pub fn from_final(reply: String, event: &OutboundEvent) -> Option<Self> {
+        let OutboundEvent::Final {
+            status,
+            approval_summary,
+            approval_route,
+            approval_gate_kind,
+            approval_granted_tool,
+            ..
+        } = event
+        else {
+            return None;
+        };
+
+        Some(Self {
+            reply,
+            status: status_str(status).to_string(),
+            finalized: !matches!(status, SessionStatus::AwaitingApproval),
+            approval_summary: approval_summary.clone(),
+            approval_route: approval_route.clone(),
+            approval_gate_kind: approval_gate_kind.clone(),
+            approval_granted_tool: approval_granted_tool.clone(),
+        })
+    }
 }
 
 fn editable_bundle_warning(saved: Option<&state::RunnerState>, url: &str) -> Option<String> {
@@ -3439,12 +3472,14 @@ impl crate::ui::CliOutput for SkillMessageOutput {
             "reply": self.reply,
             "status": self.status,
             "finalized": self.finalized,
+            "approval_summary": self.approval_summary,
+            "approval_route": self.approval_route,
+            "approval_gate_kind": self.approval_gate_kind,
+            "approval_granted_tool": self.approval_granted_tool,
         })
     }
 
     fn render(&self, ui: &crate::ui::Ui) {
-        // Only reached if a caller routes this through the human path; mirror the
-        // streamed output as a single block for completeness.
         ui.answer(&self.reply);
         ui.note(&format!("-- final ({})", self.status));
     }
@@ -4568,6 +4603,17 @@ impl PreparedDeploy {
 }
 
 pub async fn prepare_deploy(opts: DeployOpts) -> Result<PreparedDeploy> {
+    prepare_deploy_with_commit_sha(opts, None).await
+}
+
+/// Prepare a deploy with commit provenance supplied by an installer binary.
+/// Ordinary deploys pass no override and continue discovering the clean bundle
+/// checkout's HEAD. The override is deliberately crate-private: it is not a
+/// user-facing way to claim arbitrary provenance.
+async fn prepare_deploy_with_commit_sha(
+    opts: DeployOpts,
+    installer_commit_sha: Option<&str>,
+) -> Result<PreparedDeploy> {
     let plugin_dir = opts
         .plugin_dir
         .canonicalize()
@@ -4634,41 +4680,11 @@ pub async fn prepare_deploy(opts: DeployOpts) -> Result<PreparedDeploy> {
         validate_channel_binding("slack", channel)?;
     }
     let archive = pack_tar_gz(&plugin_dir)?;
-    let git_prefix = tokio::process::Command::new("git")
-        .args(["rev-parse", "--show-prefix"])
-        .current_dir(&plugin_dir)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .output()
-        .await
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|prefix| PathBuf::from(prefix.trim_end_matches(['\r', '\n'])));
-    let git_status = tokio::process::Command::new("git")
-        .args([
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--no-renames",
-            "--untracked-files=all",
-            "--ignored=matching",
-            "--",
-            ".",
-        ])
-        .current_dir(&plugin_dir)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .output()
-        .await
-        .ok();
-    let commit_sha = match (git_prefix, git_status) {
-        (Some(prefix), Some(output))
-            if output.status.success()
-                && git_status_is_clean_for_pack(&plugin_dir, &prefix, &output.stdout) =>
-        {
-            tokio::process::Command::new("git")
-                .args(["rev-parse", "HEAD"])
+    let commit_sha = match installer_commit_sha {
+        Some(commit_sha) => Some(commit_sha.to_string()),
+        None => {
+            let git_prefix = tokio::process::Command::new("git")
+                .args(["rev-parse", "--show-prefix"])
                 .current_dir(&plugin_dir)
                 .env_remove("GIT_DIR")
                 .env_remove("GIT_WORK_TREE")
@@ -4677,10 +4693,45 @@ pub async fn prepare_deploy(opts: DeployOpts) -> Result<PreparedDeploy> {
                 .ok()
                 .filter(|output| output.status.success())
                 .and_then(|output| String::from_utf8(output.stdout).ok())
-                .map(|sha| sha.trim().to_string())
-                .filter(|sha| !sha.is_empty())
+                .map(|prefix| PathBuf::from(prefix.trim_end_matches(['\r', '\n'])));
+            let git_status = tokio::process::Command::new("git")
+                .args([
+                    "status",
+                    "--porcelain=v1",
+                    "-z",
+                    "--no-renames",
+                    "--untracked-files=all",
+                    "--ignored=matching",
+                    "--",
+                    ".",
+                ])
+                .current_dir(&plugin_dir)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .output()
+                .await
+                .ok();
+            match (git_prefix, git_status) {
+                (Some(prefix), Some(output))
+                    if output.status.success()
+                        && git_status_is_clean_for_pack(&plugin_dir, &prefix, &output.stdout) =>
+                {
+                    tokio::process::Command::new("git")
+                        .args(["rev-parse", "HEAD"])
+                        .current_dir(&plugin_dir)
+                        .env_remove("GIT_DIR")
+                        .env_remove("GIT_WORK_TREE")
+                        .output()
+                        .await
+                        .ok()
+                        .filter(|output| output.status.success())
+                        .and_then(|output| String::from_utf8(output.stdout).ok())
+                        .map(|sha| sha.trim().to_string())
+                        .filter(|sha| !sha.is_empty())
+                }
+                _ => None,
+            }
         }
-        _ => None,
     };
     let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
     // Resolve a declared target, if one was named (ADR-0089). The file is sent
@@ -4993,7 +5044,17 @@ pub async fn deploy_prepared(prepared: PreparedDeploy) -> Result<DeployOutput> {
 }
 
 pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
-    deploy_prepared(prepare_deploy(opts).await?).await
+    deploy_with_commit_sha(opts, None).await
+}
+
+/// Installer-only deploy entry point. A stamped binary commit takes precedence
+/// over bundle-directory Git discovery; `None` preserves ordinary deploy
+/// behavior for no-Git builds.
+pub(crate) async fn deploy_with_commit_sha(
+    opts: DeployOpts,
+    installer_commit_sha: Option<&str>,
+) -> Result<DeployOutput> {
+    deploy_prepared(prepare_deploy_with_commit_sha(opts, installer_commit_sha).await?).await
 }
 
 /// Output of `<tier> deploy`: the deployed agent/version/channel/bundle/deployment
@@ -5831,10 +5892,12 @@ pub async fn memory_add(opts: AgentActionOpts, content: String) -> Result<Memory
 pub struct ApprovalCmd {
     pub list: bool,
     pub resolve: Option<String>,
-    pub as_actor: Option<String>,
     pub reject: bool,
     pub note: Option<String>,
-    pub actor_channel: Option<String>,
+    /// Administrative subject for a reusable operator-principal mint.
+    pub mint_operator_principal: Option<String>,
+    /// Administrative subject for a single-use console login-code mint.
+    pub mint_console_login_code: Option<String>,
     /// `--route-resolution NAME=CHANNEL`, repeatable.
     pub route_resolution: Vec<String>,
     /// `--route-approvers NAME=users:U1,U2` or `NAME=group:S1`, repeatable.
@@ -6288,6 +6351,15 @@ pub enum ApprovalsOutput {
     Resolved {
         record: crate::api::ApprovalRecord,
     },
+    /// One-time delivery of a reusable operator credential. The token is never
+    /// persisted and is emitted only from this explicit mint result.
+    OperatorPrincipal {
+        delivery: crate::api::OperatorPrincipalDelivery,
+    },
+    /// One-time delivery of a subject-bound console login code.
+    ConsoleLoginCode {
+        delivery: crate::api::ConsoleLoginCodeDelivery,
+    },
     /// The agent's approval route bindings, read back after `--list-routes` or
     /// after a write. `routes` empty means no route is bound, so any route the
     /// bundle names escalates to a human rather than posting a card.
@@ -6340,6 +6412,20 @@ impl crate::ui::CliOutput for ApprovalsOutput {
             }),
             ApprovalsOutput::Resolved { record } => serde_json::json!({
                 "resolved": approval_record_json(record),
+            }),
+            ApprovalsOutput::OperatorPrincipal { delivery } => serde_json::json!({
+                "operator_principal": {
+                    "token": delivery.token,
+                    "subject": delivery.subject,
+                    "expires_at": delivery.expires_at,
+                },
+            }),
+            ApprovalsOutput::ConsoleLoginCode { delivery } => serde_json::json!({
+                "console_login_code": {
+                    "code": delivery.code,
+                    "subject": delivery.subject,
+                    "expires_at": delivery.expires_at,
+                },
             }),
             ApprovalsOutput::Routes { agent, routes } => serde_json::json!({
                 "agent": agent,
@@ -6418,6 +6504,25 @@ impl crate::ui::CliOutput for ApprovalsOutput {
                     record.status,
                     record.resolved_by.as_deref().unwrap_or("?")
                 ));
+            }
+            ApprovalsOutput::OperatorPrincipal { delivery } => {
+                ui.note(&format!(
+                    "minted an operator approval principal for {} (expires {}); assign the \
+                     token to CURIE_APPROVAL_PRINCIPAL_TOKEN without pasting it into shell history",
+                    delivery.subject, delivery.expires_at
+                ));
+                // This explicit mint result is the token's one delivery. Keep
+                // it off progress/error output and do not cache it.
+                ui.payload_plain(&delivery.token);
+            }
+            ApprovalsOutput::ConsoleLoginCode { delivery } => {
+                ui.note(&format!(
+                    "minted a console login code for {} (expires {})",
+                    delivery.subject, delivery.expires_at
+                ));
+                // The browser exchanges this plaintext once; the CLI never
+                // stores or repeats it.
+                ui.payload_plain(&delivery.code);
             }
             ApprovalsOutput::Routes { agent, routes } => {
                 if routes.is_empty() {
@@ -6532,6 +6637,65 @@ pub async fn approvals(
         || !cmd.route_approvers.is_empty()
         || cmd.routes_from.is_some()
         || cmd.clear_routes;
+
+    let mint_subject = match (
+        cmd.mint_operator_principal.as_deref(),
+        cmd.mint_console_login_code.as_deref(),
+    ) {
+        (Some(_), Some(_)) => {
+            return Err(crate::exit::usage(
+                "--mint-operator-principal and --mint-console-login-code are separate \
+                 administrative actions; run one per invocation",
+            ));
+        }
+        (Some(subject), None) => Some(("operator", subject)),
+        (None, Some(subject)) => Some(("console", subject)),
+        (None, None) => None,
+    };
+    if let Some((kind, subject)) = mint_subject {
+        if subject.trim().is_empty() {
+            return Err(crate::exit::usage(
+                "the principal subject must not be blank",
+            ));
+        }
+        if gate_mode
+            || cmd.list
+            || cmd.resolve.is_some()
+            || route_write
+            || cmd.list_routes
+            || cmd.reject
+            || cmd.note.is_some()
+        {
+            return Err(crate::exit::usage(
+                "principal bootstrap cannot be combined with gate, route, pending-list, \
+                 resolution, reject, or note flags; run it as a separate invocation",
+            ));
+        }
+        if opts.dry_run {
+            let endpoint = if kind == "operator" {
+                "approvals/principals/operator"
+            } else {
+                "console/login-codes"
+            };
+            return Ok(ApprovalsOutput::DryRun(crate::ui::DryRunPlan {
+                lines: vec![format!(
+                    "POST {}/{endpoint} subject={subject:?} (one-time credential is returned only by a real run)",
+                    opts.api_url
+                )],
+            }));
+        }
+        let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
+        return if kind == "operator" {
+            Ok(ApprovalsOutput::OperatorPrincipal {
+                delivery: client.mint_operator_principal(subject).await?,
+            })
+        } else {
+            Ok(ApprovalsOutput::ConsoleLoginCode {
+                delivery: client.mint_console_login_code(subject).await?,
+            })
+        };
+    }
+
     if route_write || cmd.list_routes {
         if gate_mode || cmd.list || cmd.resolve.is_some() {
             return Err(crate::exit::usage(
@@ -6619,7 +6783,8 @@ pub async fn approvals(
         });
     }
 
-    // --resolve <id> --as <user>: resolve one live approval record (#506). It is
+    // --resolve <id>: resolve one live approval record as the authenticated
+    // principal from CURIE_APPROVAL_PRINCIPAL_TOKEN (#1531, ADR-0106). It is
     // id-scoped, not gate config, so it is mutually exclusive with --gate/--clear/
     // --list. Approve by default; --reject rejects.
     if let Some(approval_id) = cmd.resolve {
@@ -6628,26 +6793,33 @@ pub async fn approvals(
                 "--resolve cannot be combined with --gate/--clear/--list",
             ));
         }
-        let actor = cmd.as_actor.ok_or_else(|| {
-            crate::exit::usage("--resolve requires --as <user> (the actor resolving it)")
-        })?;
         let decision = if cmd.reject { "rejected" } else { "approved" };
         if opts.dry_run {
             return Ok(ApprovalsOutput::DryRun(crate::ui::DryRunPlan {
                 lines: vec![format!(
-                    "POST {}/approvals/{approval_id}/resolve decision={decision} resolved_by={actor:?}",
+                    "POST {}/approvals/{approval_id}/resolve decision={decision} \
+                     (authenticated principal read from CURIE_APPROVAL_PRINCIPAL_TOKEN at execution)",
                     opts.api_url
                 )],
             }));
         }
+        let principal_token = std::env::var("CURIE_APPROVAL_PRINCIPAL_TOKEN")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                crate::exit::usage(
+                    "--resolve requires CURIE_APPROVAL_PRINCIPAL_TOKEN. Mint a reusable \
+                     operator credential with `curie <local|cluster> approvals <AGENT> \
+                     --mint-operator-principal <SUBJECT>`, export the one-time result, and retry",
+                )
+            })?;
         let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
         let record = client
             .resolve_approval(
                 &approval_id,
                 decision,
-                &actor,
+                &principal_token,
                 cmd.note.as_deref(),
-                cmd.actor_channel.as_deref(),
             )
             .await?;
         return Ok(ApprovalsOutput::Resolved { record });

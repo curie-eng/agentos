@@ -17,6 +17,7 @@ from curie_api.config import get_settings
 from curie_api.routers.state import _NAMESPACE_LOCK_CLASS, _namespace_lock_key
 from curie_api.sandbox_token import mint
 from sqlalchemy import make_url
+from sqlalchemy.exc import IntegrityError
 
 # Scoped-sandbox-token auth matrix constants (#410).
 _FAR_FUTURE = 4102444800  # 2100-01-01, valid at test time
@@ -567,10 +568,17 @@ def _hold_advisory_lock(
         acquired.set()
 
 
-def _run_ordered_state_requests(
+def _request_result_or_exception(request: Future[Any]) -> Any:
+    try:
+        return request.result(timeout=10)
+    except Exception as error:
+        return error
+
+
+def _run_ordered_state_request_outcomes(
     first: Callable[[], Any], second: Callable[[], Any]
 ) -> tuple[Any, Any]:
-    """Run two real requests concurrently, both parked at the INSERT gate.
+    """Return each real request's response or exception after the INSERT gate.
 
     Ordering is established by the database, not by a timer: `first` is submitted
     and confirmed blocked before `second` is submitted, and both are confirmed
@@ -601,8 +609,8 @@ def _run_ordered_state_requests(
                 asyncio.run(_wait_for_blocked_state_requests(2, [first_request, second_request]))
             finally:
                 release.set()
-            first_response = first_request.result(timeout=10)
-            second_response = second_request.result(timeout=10)
+            first_outcome = _request_result_or_exception(first_request)
+            second_outcome = _request_result_or_exception(second_request)
     finally:
         # An INSERT gate left installed would block essentially every later test
         # in the session, so it comes down even if the orchestration failed.
@@ -612,7 +620,19 @@ def _run_ordered_state_requests(
 
     assert not lock_thread.is_alive(), "database gate did not release"
     assert not lock_errors, lock_errors
-    return first_response, second_response
+    return first_outcome, second_outcome
+
+
+def _run_ordered_state_requests(
+    first: Callable[[], Any], second: Callable[[], Any]
+) -> tuple[Any, Any]:
+    """Success-only wrapper preserving the original #933 helper contract."""
+    first_outcome, second_outcome = _run_ordered_state_request_outcomes(first, second)
+    if isinstance(first_outcome, Exception):
+        raise first_outcome
+    if isinstance(second_outcome, Exception):
+        raise second_outcome
+    return first_outcome, second_outcome
 
 
 def _state_writer(
@@ -790,6 +810,50 @@ def test_concurrent_writes_to_the_same_new_namespace_both_succeed(
         assert by_ns["shared-new"]["key_count"] == 2, body
     finally:
         get_settings.cache_clear()
+
+
+def test_concurrent_initial_shared_state_creation_is_database_unique(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """#1901: PostgreSQL arbitrates concurrent creation of one NULL identity.
+
+    Seeding a different key makes both PUTs take `_enforce_caps`' intentional
+    existing-namespace hot path. They therefore race all the way to INSERT,
+    where the shared NULL scope must be protected by the named constraint.
+    """
+    aid = _agent(client, auth_headers)
+    namespace = "shared-race"
+    target_key = "target"
+    seed = client.put(
+        f"/agents/{aid}/state/{namespace}/seed",
+        json={"value": "existing namespace"},
+        headers=auth_headers,
+    )
+    assert seed.status_code == 200, seed.text
+
+    outcomes = _run_ordered_state_request_outcomes(
+        _state_writer(client, auth_headers, aid, namespace, target_key),
+        _state_writer(client, auth_headers, aid, namespace, target_key),
+    )
+    responses = [outcome for outcome in outcomes if not isinstance(outcome, Exception)]
+    errors = [outcome for outcome in outcomes if isinstance(outcome, Exception)]
+
+    assert len(responses) == 1, outcomes
+    assert responses[0].status_code == 200, responses[0].text
+    assert len(errors) == 1, outcomes
+    assert isinstance(errors[0], IntegrityError), repr(errors[0])
+    assert "uq_state_agent_scope_ns_key" in str(errors[0])
+
+    listing = client.get(f"/agents/{aid}/state/{namespace}", headers=auth_headers)
+    assert listing.status_code == 200, listing.text
+    target_rows = [entry for entry in listing.json() if entry["key"] == target_key]
+    assert len(target_rows) == 1, listing.text
+
+    readback = client.get(
+        f"/agents/{aid}/state/{namespace}/{target_key}", headers=auth_headers
+    )
+    assert readback.status_code == 200, readback.text
+    assert readback.json()["value"] == 1
 
 
 def test_list_namespaces_summarizes_the_store_recent_first(

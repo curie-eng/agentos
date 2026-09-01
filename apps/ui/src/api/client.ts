@@ -1,5 +1,7 @@
 // Typed client for the B1/B2 API, reached through the same-origin /api proxy.
-// Every call carries the X-API-Key header. Shapes mirror apps/api/openapi.json.
+// Administrative and read calls carry X-API-Key unless a function explicitly
+// documents its narrower credential (for example, console-session approval
+// resolution). Shapes mirror apps/api/openapi.json.
 
 import { API_PREFIX, apiKey } from "./config";
 
@@ -797,6 +799,10 @@ export interface ApprovalAudit {
   action: string;
   actor: string;
   actor_channel: string | null;
+  // Proof attached to the derived actor (ADR-0106). Historical rows retain a
+  // null kind and authenticated=false rather than being retroactively trusted.
+  principal_kind: "chat" | "console" | "operator" | null;
+  authenticated: boolean;
   decision: string;
   authorizer: string;
   authorized: boolean;
@@ -844,22 +850,47 @@ export async function getApprovalAudit(approvalId: string): Promise<ApprovalAudi
 
 export interface ApprovalResolveInput {
   decision: "approved" | "rejected";
-  // Who is resolving (server requires non-empty); the authorizer blocks
-  // self-approval against the record's author.
-  resolved_by: string;
   note?: string;
-  // The channel the resolution is asserted from; an API-key operator asserts it
-  // explicitly so the channel-membership authorizer can count them.
-  actor_channel?: string;
 }
 
-// Resolve an approval (resolve-once compare-and-set). The server-side authorizer
-// runs first; distinct failure statuses carried on the thrown ApiError: 403
-// (not authorized / self-approval), 409 (already resolved), 410 (expired).
+export interface ConsoleSession {
+  // The server rejects subject-less sessions on the current-session route, but
+  // the response schema remains nullable for pre-ADR-0106 historical rows.
+  subject: string | null;
+  expires_at: string;
+}
+
+// Inspect the HttpOnly same-origin console session. No platform key is sent:
+// the ambient cookie is the only credential on this identity boundary.
+export async function getConsoleSession(): Promise<ConsoleSession> {
+  const resp = await fetch(url("/console/session"), {
+    credentials: "same-origin",
+  });
+  return jsonOrThrow<ConsoleSession>(resp);
+}
+
+// Exchange a single-use CLI-minted login code. The response never exposes the
+// session token; the API installs it as an HttpOnly cookie.
+export async function exchangeConsoleLoginCode(code: string): Promise<ConsoleSession> {
+  const resp = await fetch(url("/console/session"), {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ code }),
+  });
+  return jsonOrThrow<ConsoleSession>(resp);
+}
+
+// Resolve an approval (resolve-once compare-and-set) as the immutable subject
+// in the HttpOnly console session. The request deliberately omits X-API-Key and
+// carries no caller-asserted identity/channel fields. Designed failures are 401
+// (session missing/revoked/expired), 403 (not authorized), 409 (already
+// resolved), and 410 (expired).
 export async function resolveApproval(approvalId: string, input: ApprovalResolveInput): Promise<ApprovalOut> {
   const resp = await fetch(url(`/approvals/${encodeURIComponent(approvalId)}/resolve`), {
     method: "POST",
-    headers: headers({ "Content-Type": "application/json" }),
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(input),
   });
   return jsonOrThrow<ApprovalOut>(resp);

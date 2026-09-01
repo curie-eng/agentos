@@ -176,8 +176,9 @@ channel details -> the ID is at the bottom, starting with `C`.
 
 The bot gains exactly one thing it can change: rolling one named Deployment.
 Every call pauses the turn and posts an approval card, **and the person who
-asked can never be the person who approves** -- the platform blocks
-self-approval.
+asked may approve only when their authenticated principal belongs to the
+configured approver set**. Requester equality neither grants nor vetoes that
+membership; two-person separation requires a distinct policy.
 
 The connector source declaration and the exact
 `mcp__k8s-write__restart_deployment` gate already ship together. There is no
@@ -304,14 +305,14 @@ replaces the whole route map, so name every route you want on every invocation.
 Notifications are declared only in the complete `--routes-from` map. Passing one
 route to add it silently drops the others.
 
-**6. Request one restart, approve it as a second actor, and verify the rollout.**
+**6. Request one restart, confirm it as an authorized principal, and verify the rollout.**
 
-In Slack, someone other than the requester clicks the card. Self-approval is
-blocked by the platform, which in a one-person workspace is a dead end for a
-Slack-initiated request. The way through is to drive the turn from the CLI
-instead, which makes the CLI's own synthetic user the requester rather than you.
+In Slack, an authenticated user who belongs to the configured approver set clicks
+the card. That may be the requester: requester equality neither grants membership
+nor vetoes it. The terminal alternative below uses a subject-bound operator
+principal and therefore requires that subject in `approvers.users`.
 
-**Use two shells, and give the asking one a long timeout.** This is the pattern
+**Use two shells, and give the asking one a long timeout.** This is the terminal pattern
 that actually works, and the reason is worth knowing: on the cluster tier there
 is no way to read a resumed reply without Slack. If the approval outlives the
 `cluster message` call, the worker completes the resume *best-effort without
@@ -329,17 +330,20 @@ Shell 2, while the first is still waiting:
 
 ```bash
 curie cluster approvals sre-bot --list
-curie cluster approvals sre-bot --resolve <approval-id> --as <someone-else> --actor-channel C0EXAMPLE1
+curie cluster approvals sre-bot --mint-operator-principal U0EXAMPLE1
+export CURIE_APPROVAL_PRINCIPAL_TOKEN=<one-time-output>
+curie cluster approvals sre-bot --resolve <approval-id>
 ```
 
-`--as` must not name the requester. Raise `--timeout-secs` further if a human is
-doing the deciding rather than you in the next terminal.
+The terminal principal carries no Slack channel evidence, so bind this route's
+`approvers.users` list to `U0EXAMPLE1` before using the terminal path. Use the
+authenticated Slack card instead for channel-membership or group-bound routes.
+Raise `--timeout-secs` further if a human is doing the deciding.
 
 To reject instead, add `--reject`:
 
 ```bash
-curie cluster approvals sre-bot --resolve <approval-id> --as <someone-else> \
-  --actor-channel C0EXAMPLE1 --reject
+curie cluster approvals sre-bot --resolve <approval-id> --reject
 ```
 
 Shell 1's requester gets a no-action reply ("I won't retry it -- no rollout was

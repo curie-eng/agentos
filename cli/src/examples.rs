@@ -1594,22 +1594,25 @@ async fn deploy_embedded_sre_bot(
         "the platform API at {} is unreachable; confirm the Curie release with `curie cluster status` and retry this installer",
         connection.api_url
     );
-    commands::deploy(DeployOpts {
-        agent: None,
-        target: None,
-        plugin_dir: bundle_dir.to_path_buf(),
-        api_url: connection.api_url.clone(),
-        api_key: connection.api_key.clone(),
-        slack_channel: slack_channel.map(str::to_string),
-        repo: None,
-        workspace: commands::WorkspaceIntent::Preserve,
-        env: None,
-        label: None,
-        secret: vec![],
-        secret_binding_supported: false,
-        connect_hint,
-        tier: DeployTier::Cluster,
-    })
+    commands::deploy_with_commit_sha(
+        DeployOpts {
+            agent: None,
+            target: None,
+            plugin_dir: bundle_dir.to_path_buf(),
+            api_url: connection.api_url.clone(),
+            api_key: connection.api_key.clone(),
+            slack_channel: slack_channel.map(str::to_string),
+            repo: None,
+            workspace: commands::WorkspaceIntent::Preserve,
+            env: None,
+            label: None,
+            secret: vec![],
+            secret_binding_supported: false,
+            connect_hint,
+            tier: DeployTier::Cluster,
+        },
+        crate::artifacts::commit_sha(),
+    )
     .await
 }
 

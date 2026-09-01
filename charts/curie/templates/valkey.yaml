@@ -32,7 +32,7 @@ spec:
         {{- with (include "curie.placement.labels" (dict "root" $ "class" "data")) }}
         {{- . | nindent 8 }}
         {{- end }}
-        {{- include "curie.labels" . | nindent 8 }}
+        {{- include "curie.statefulPodLabels" . | nindent 8 }}
         {{- include "curie.selectorLabels" (dict "root" . "component" "valkey") | nindent 8 }}
       {{- with (include "curie.placement.annotations" (dict "root" $ "class" "data")) }}
       annotations:

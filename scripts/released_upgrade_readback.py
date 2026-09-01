@@ -25,13 +25,15 @@ Three constraints follow from that inversion, and all three are load-bearing:
    import of a sibling module in `scripts/` would silently mix two versions.
    In particular this file does NOT import `check-released-upgrade.py`; the
    fixture arrives entirely through argv.
-2. **No field name may be hard-coded.** `AgentOut` carries a singular
+2. **No agent-output field name may be hard-coded.** `AgentOut` carries a singular
    `channel: ChannelBinding` at v0.7.3 and a plural
    `channels: list[ChannelBindingOut]` on main, so naming either attribute
    would make the runner work on exactly one side of the fix it is judging.
    ORM rows are loaded and handed whole to `AgentOut.model_validate`, and the
    address expectations are checked by searching the SERIALIZED dump rather
-   than by reading a named field.
+   than by reading a named field. The optional state assertion is different: it
+   is passed only to candidates containing revision 0037, whose exact state
+   fields are the contract being proved.
 3. **It cannot pass vacuously.** Zero agents is a FAILURE. A seed that silently
    wrote nothing, or a migration that silently dropped the seeded rows, is the
    precise failure mode this gate exists to close, so "the read path raised
@@ -77,6 +79,28 @@ class AgentDump:
     addresses: tuple[str, ...]
     dump: dict[str, Any] | None
     error: str | None
+
+
+@dataclass(frozen=True)
+class StateSentinelExpectation:
+    """Identity and exact JSON of the released legacy-state sentinel."""
+
+    owner_name: str
+    namespace: str
+    key: str
+    value: Any
+
+
+@dataclass(frozen=True)
+class StateSentinelObservation:
+    """One candidate state row plus the visibility posture of its owner."""
+
+    owner_name: str
+    binding_scope: str | None
+    namespace: str
+    key: str
+    value: Any
+    owner_memory: bool
 
 
 def _json_strings_under(value: Any, keys: frozenset[str]) -> list[str]:
@@ -177,6 +201,53 @@ async def _load_dumps(database_url: str) -> tuple[AgentDump, ...]:
         await engine.dispose()
 
 
+def _read_state_observations(
+    session: Session,
+    expectation: StateSentinelExpectation,
+) -> tuple[StateSentinelObservation, ...]:
+    """Load every row with the sentinel identity and its owning candidate agent."""
+
+    rows = session.execute(
+        select(models.WorkflowStateEntry, models.Agent)
+        .join(models.Agent, models.WorkflowStateEntry.agent_id == models.Agent.id)
+        .where(
+            models.Agent.name == expectation.owner_name,
+            models.WorkflowStateEntry.namespace == expectation.namespace,
+            models.WorkflowStateEntry.key == expectation.key,
+        )
+        .order_by(models.WorkflowStateEntry.id)
+    ).all()
+    return tuple(
+        StateSentinelObservation(
+            owner_name=agent.name,
+            binding_scope=entry.binding_scope,
+            namespace=entry.namespace,
+            key=entry.key,
+            value=entry.value,
+            owner_memory=agent.memory,
+        )
+        for entry, agent in rows
+    )
+
+
+async def _load_state_observations(
+    database_url: str,
+    expectation: StateSentinelExpectation,
+) -> tuple[StateSentinelObservation, ...]:
+    """Read state only when the caller enabled the revision-0037 expectation."""
+
+    engine = create_async_engine(database_url)
+    try:
+        async with AsyncSession(engine) as session:
+            return await session.run_sync(
+                lambda sync_session: _read_state_observations(
+                    sync_session, expectation
+                )
+            )
+    finally:
+        await engine.dispose()
+
+
 def _rendered_addresses(addresses: tuple[str, ...]) -> str:
     if not addresses:
         return "no address recorded"
@@ -188,6 +259,8 @@ def _collect_failures(
     *,
     expected_agents: tuple[str, ...],
     expected_addresses: tuple[str, ...],
+    state_expectation: StateSentinelExpectation | None = None,
+    state_observations: tuple[StateSentinelObservation, ...] = (),
 ) -> tuple[str, ...]:
     """Judge a set of dumps against the seeded expectations. Empty tuple == pass.
 
@@ -247,6 +320,40 @@ def _collect_failures(
                 "back"
             )
 
+    if state_expectation is not None:
+        matching_state = [
+            observation
+            for observation in state_observations
+            if observation.owner_name == state_expectation.owner_name
+            and observation.namespace == state_expectation.namespace
+            and observation.key == state_expectation.key
+        ]
+        if len(matching_state) != 1:
+            failures.append(
+                "expected exactly one legacy state sentinel for agent "
+                f"{state_expectation.owner_name!r}, namespace "
+                f"{state_expectation.namespace!r}, key "
+                f"{state_expectation.key!r}; found {len(matching_state)}"
+            )
+        else:
+            observation = matching_state[0]
+            if observation.binding_scope is not None:
+                failures.append(
+                    "legacy state sentinel must retain binding_scope NULL, "
+                    f"but found {observation.binding_scope!r}"
+                )
+            if observation.value != state_expectation.value:
+                failures.append(
+                    "legacy state sentinel value changed during the upgrade: "
+                    f"expected {json.dumps(state_expectation.value, sort_keys=True)}, "
+                    f"found {json.dumps(observation.value, sort_keys=True)}"
+                )
+            if observation.owner_memory is not True:
+                failures.append(
+                    "legacy state sentinel owner must have memory true after "
+                    "the upgrade so runners select the shared state identity"
+                )
+
     return tuple(failures)
 
 
@@ -274,6 +381,26 @@ def main() -> int:
         metavar="ADDRESS",
         help="A channel address that must survive into the serialized agent.",
     )
+    parser.add_argument(
+        "--expect-state-owner",
+        metavar="NAME",
+        help="Agent owning the optional released legacy-state sentinel.",
+    )
+    parser.add_argument(
+        "--expect-state-namespace",
+        metavar="NAMESPACE",
+        help="Namespace of the optional released legacy-state sentinel.",
+    )
+    parser.add_argument(
+        "--expect-state-key",
+        metavar="KEY",
+        help="Key of the optional released legacy-state sentinel.",
+    )
+    parser.add_argument(
+        "--expect-state-value",
+        metavar="JSON",
+        help="Exact JSON value of the optional released legacy-state sentinel.",
+    )
     args = parser.parse_args()
 
     database_url = os.environ.get("DATABASE_URL", "")
@@ -291,6 +418,40 @@ def main() -> int:
         )
         return 1
 
+    state_parts = (
+        args.expect_state_owner,
+        args.expect_state_namespace,
+        args.expect_state_key,
+        args.expect_state_value,
+    )
+    if any(part is not None for part in state_parts) and not all(
+        part is not None for part in state_parts
+    ):
+        print(
+            "read-back state expectation requires all of "
+            "--expect-state-owner, --expect-state-namespace, "
+            "--expect-state-key, and --expect-state-value",
+            file=sys.stderr,
+        )
+        return 1
+
+    state_expectation: StateSentinelExpectation | None = None
+    if all(part is not None for part in state_parts):
+        try:
+            expected_state_value = json.loads(args.expect_state_value)
+        except json.JSONDecodeError as exc:
+            print(
+                f"read-back --expect-state-value is not valid JSON: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+        state_expectation = StateSentinelExpectation(
+            owner_name=args.expect_state_owner,
+            namespace=args.expect_state_namespace,
+            key=args.expect_state_key,
+            value=expected_state_value,
+        )
+
     dumps = asyncio.run(_load_dumps(database_url))
     for dump in dumps:
         status = "failed" if dump.error is not None else "loaded"
@@ -299,10 +460,26 @@ def main() -> int:
             f"{status}"
         )
 
+    state_observations: tuple[StateSentinelObservation, ...] = ()
+    if state_expectation is not None:
+        state_observations = asyncio.run(
+            _load_state_observations(database_url, state_expectation)
+        )
+        for observation in state_observations:
+            print(
+                "read-back: state sentinel candidate for agent "
+                f"{observation.owner_name!r}, namespace "
+                f"{observation.namespace!r}, key {observation.key!r}, "
+                f"binding_scope {observation.binding_scope!r}, memory "
+                f"{observation.owner_memory!r}"
+            )
+
     failures = _collect_failures(
         dumps,
         expected_agents=tuple(args.expect_agent),
         expected_addresses=tuple(args.expect_address),
+        state_expectation=state_expectation,
+        state_observations=state_observations,
     )
     if failures:
         print("Released upgrade read-back failed:")

@@ -124,9 +124,9 @@ def translate_message(
     if isinstance(message, AssistantMessage):
         return _translate_assistant(message, state, classifier, gen)
     if isinstance(message, ResultMessage):
-        return _translate_result(message, state, gen)
+        return _translate_result(message, state)
     if isinstance(message, UserMessage):
-        return _translate_user(message, state)
+        return _translate_user(message, state, gen)
     if isinstance(message, RateLimitEvent):
         # status is one of allowed / allowed_warning / rejected; only a hard
         # rejection is an ACI error. The warning states are advisory (the model
@@ -149,10 +149,14 @@ def _translate_assistant(
 ) -> list[OutboundEvent]:
     events: list[OutboundEvent] = []
 
-    # Backfill the generation model from the SDK's own report when CURIE_MODEL
-    # was unset at span open (record_model no-ops once a model is already stamped).
+    # Assistant usage is per-message. ResultMessage usage is a turn total and
+    # must never be copied onto the last generation, where it would double-count
+    # prior rounds.
     if gen is not None:
-        gen.record_model(getattr(message, "model", None))
+        gen.record_assistant(
+            getattr(message, "model", None),
+            getattr(message, "usage", None),
+        )
 
     error = getattr(message, "error", None)
     if error:
@@ -170,7 +174,9 @@ def _translate_assistant(
             # including the approval-request tool below and read-only tools.
             state.tool_call_count += 1
             if gen is not None:
-                gen.tool_span(block.name)
+                # The SDK block says only that a tool interval should be
+                # inferred. It is not proof this runner executed the tool.
+                gen.tool_use(block.id, block.name)
             if block.name == APPROVAL_TOOL_NAME:
                 # A policy gate fired (ADR-0010). Capture the summary (and the
                 # optional route, #247) at the wire level so the real path
@@ -217,7 +223,11 @@ def _translate_assistant(
     return events
 
 
-def _translate_user(message: UserMessage, state: TurnState) -> list[OutboundEvent]:
+def _translate_user(
+    message: UserMessage,
+    state: TurnState,
+    gen: _GenerationSpan | None,
+) -> list[OutboundEvent]:
     """Close a side-effecting call with what its tool answered, and nothing else.
 
     A tool result arrives on a ``UserMessage``, which the v0.1 contract dropped
@@ -236,6 +246,8 @@ def _translate_user(message: UserMessage, state: TurnState) -> list[OutboundEven
     for block in message.content:
         if not isinstance(block, ToolResultBlock):
             continue
+        if gen is not None:
+            gen.tool_result(block.tool_use_id, failed=bool(block.is_error))
         tool = state.pending_actions.pop(block.tool_use_id, None)
         if tool is None:
             # Read-only, or a result for a call this turn never saw, or a second
@@ -299,11 +311,7 @@ def _loads_object(raw: object) -> tuple[dict[str, object] | None, bool]:
 def _translate_result(
     message: ResultMessage,
     state: TurnState,
-    gen: _GenerationSpan | None,
 ) -> list[OutboundEvent]:
-    if gen is not None:
-        gen.record_usage(message.usage)
-
     subtype = message.subtype or ""
     if message.is_error or subtype.startswith("error"):
         text = message.result or "run failed"

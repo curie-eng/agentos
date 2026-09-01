@@ -233,6 +233,20 @@ WHERE c.kind = :kind AND c.address = :address
 ORDER BY (d.environment = 'prod') DESC, d.deployed_at DESC, d.id DESC
 """
 
+# ``resolve`` deliberately requires an active deployment: it is the only
+# deployment a worker may boot. When that lookup misses, the kernel needs this
+# narrower second query to distinguish an unbound route from an existing agent
+# that has not been deployed yet (#1522). It is never a routing fallback.
+_UNDEPLOYED_BINDING_SQL = """
+SELECT a.id AS agent_id,
+       a.name AS agent_name,
+       c.endpoint AS endpoint,
+       c.adapter AS adapter
+FROM {schema}.agents a
+JOIN {schema}.agent_channels c ON c.agent_id = a.id
+WHERE c.kind = :kind AND c.address = :address
+"""
+
 
 class ResolvedDeployment(BaseModel):
     """The agent binding for a channel: which version to run and its budget."""
@@ -292,6 +306,15 @@ class ResolvedDeployment(BaseModel):
     memory: bool = False
 
 
+class BoundAgent(BaseModel):
+    """An agent bound to a route but without a deployable active version."""
+
+    agent_id: uuid.UUID
+    agent_name: str
+    endpoint: str | None = None
+    adapter: str | None = None
+
+
 def warn_if_multiple_agents_bound(kind: str, address: str, rows: Sequence[Any]) -> None:
     """Warn when a binding resolves to more than one agent, naming the shadowed.
 
@@ -346,6 +369,9 @@ class BindingResolver:
         self._config = config
         # Table identifiers are not user input; the schema comes from config.
         self._sql = text(_RESOLVE_SQL.format(schema=config.db_schema))
+        self._undeployed_binding_sql = text(
+            _UNDEPLOYED_BINDING_SQL.format(schema=config.db_schema)
+        )
 
     async def resolve(self, kind: str, address: str) -> ResolvedDeployment | None:
         """Resolve the ``(kind, address)`` routing pair to its active deployment.
@@ -377,6 +403,20 @@ class BindingResolver:
         if isinstance(conn_secrets, str):
             data["secrets"] = json.loads(conn_secrets)
         return ResolvedDeployment.model_validate(data)
+
+    async def undeployed_binding(self, kind: str, address: str) -> BoundAgent | None:
+        """Return a bound agent after ``resolve`` found no active deployment.
+
+        The caller must use this only as a diagnostic after an active-resolution
+        miss. Returning this record never grants a runner boot: a route remains
+        runnable only through ``ResolvedDeployment`` above.
+        """
+        async with self._engine.connect() as conn:
+            result = await conn.execute(
+                self._undeployed_binding_sql, {"kind": kind, "address": address}
+            )
+            row = result.mappings().first()
+        return None if row is None else BoundAgent.model_validate(dict(row))
 
     async def repo_full_name(self, agent_id: uuid.UUID) -> str | None:
         """The agent's GitHub repo (owner/name), for the eval PR-check report."""

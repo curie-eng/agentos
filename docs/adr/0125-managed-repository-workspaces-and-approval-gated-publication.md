@@ -4,6 +4,11 @@ Date: 2026-08-23
 
 Status: Accepted
 
+**Partially superseded by [ADR 0106](0106-an-approver-is-an-authenticated-principal.md).**
+ADR 0106 supersedes only this ADR's publication-only requester exception and
+universal self-block premise; publication remains approval-gated under the
+selected approver set's authenticated-principal membership rule.
+
 Maintainer approval supplied for this decision on 2026-08-20 authorizes ADR
 0125 to land Accepted with its realizing code paths in this PR.
 

@@ -66,6 +66,12 @@ fn gates(out: &ApprovalsOutput) -> (Vec<String>, Option<String>) {
         ApprovalsOutput::Routes { .. } => {
             panic!("expected the gate view, not the route bindings")
         }
+        ApprovalsOutput::OperatorPrincipal { .. } => {
+            panic!("expected the gate view, not an operator-principal mint")
+        }
+        ApprovalsOutput::ConsoleLoginCode { .. } => {
+            panic!("expected the gate view, not a console login-code mint")
+        }
     }
 }
 

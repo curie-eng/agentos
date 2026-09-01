@@ -1071,6 +1071,7 @@ banner "INSTALL trimmed chart"
 CHART_VALUES=(
   -f "$CHART_PATH/values-e2e-nogvisor.yaml"
   -f "$CHART_PATH/values-e2e-harness.yaml"
+  -f "$OTEL_OVERLAY"
   --set api.deploy=true
   --set api.replicas=0
   --set api.service.type=NodePort

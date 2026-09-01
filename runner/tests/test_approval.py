@@ -238,7 +238,9 @@ def test_approval_server_config_shape() -> None:
 
 def test_publish_tool_is_always_listed_but_unmounted_invocation_refuses() -> None:
     async def names(server: object) -> set[str]:
-        handler = server["instance"].request_handlers[mcp_types.ListToolsRequest]  # type: ignore[index]
+        handler = server["instance"].request_handlers.get(mcp_types.ListToolsRequest)  # type: ignore[index]
+        if handler is None:
+            return set()
         result = await handler(mcp_types.ListToolsRequest(method="tools/list"))
         payload = result.model_dump()
         return {str(item["name"]) for item in payload["tools"]}
@@ -305,6 +307,28 @@ def test_publish_tool_description_carries_coding_and_approval_safety_protocol() 
     assert "human approval" in description
     assert "end your turn" in description
     assert "pending" in description
+
+
+def test_request_approval_can_be_omitted_without_dropping_managed_publication() -> None:
+    async def names(server: object) -> set[str]:
+        handler = server["instance"].request_handlers.get(mcp_types.ListToolsRequest)  # type: ignore[index]
+        if handler is None:
+            return set()
+        result = await handler(mcp_types.ListToolsRequest(method="tools/list"))
+        return {tool.name for tool in result.root.tools}
+
+    async def go() -> None:
+        assert await names(build_approval_server(include_request_approval=False)) == {
+            "publish_changes"
+        }
+        assert await names(
+            build_approval_server(
+                managed_workspace=True,
+                include_request_approval=False,
+            )
+        ) == {"publish_changes"}
+
+    anyio.run(go)
 
 
 # --- the permission gate (#245): canUseTool over approval-required tools --------

@@ -89,11 +89,13 @@ expect_refused sandbox-disabled \
   --set agentSandbox.deploy=false
 expect_refused inference-enabled \
   --set agentSandbox.runner.liteLLM.enabled=true \
-  --set inference.deploy=true
+  --set inference.deploy=true \
+  --set inference.persistence.enabled=true
 expect_refused both-bypasses \
   --set agentSandbox.runner.liteLLM.enabled=true \
   --set agentSandbox.deploy=false \
-  --set inference.deploy=true
+  --set inference.deploy=true \
+  --set inference.persistence.enabled=true
 expect_refused string-enabled \
   --set-string agentSandbox.runner.liteLLM.enabled=true
 

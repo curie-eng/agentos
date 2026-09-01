@@ -68,6 +68,14 @@ spec:
                 secretKeyRef:
                   {{- include "curie.secretRef" (dict "root" . "existingSecret" .Values.dispatcher.slack.signingSecretExistingSecret "existingSecretKey" .Values.dispatcher.slack.signingSecretExistingSecretKey "defaultKey" "slackSigningSecret") | nindent 18 }}
             {{- include "curie.env.api" . | nindent 12 }}
+            # Independent HMAC credential for Slack click identity/channel
+            # attestation. The platform API key authenticates API calls but is
+            # intentionally unable to forge this evidence.
+            - name: CURIE_APPROVAL_CHAT_ATTESTER_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "curie.secretName" . }}
+                  key: approvalChatAttesterSecret
             {{- include "curie.env.otel" (dict "root" . "extraEnv" .Values.dispatcher.extraEnv) | nindent 12 }}
             # Heartbeat file a background daemon thread in the dispatcher touches
             # each tick; the exec probes below read this same path so template and

@@ -10,6 +10,7 @@ def _settings(**overrides: str) -> Settings:
     base = {
         "environment": "prod",
         "api_key": "a-real-key",
+        "approval_chat_attester_secret": "a-real-chat-attester-secret",
         "github_webhook_secret": "a-real-secret",
         "internal_worker_token": "a-real-worker-token",
     }
@@ -37,11 +38,14 @@ def test_prod_with_real_secrets_boots() -> None:
         ({"github_webhook_secret": ""}, "GITHUB_WEBHOOK_SECRET"),
         ({"internal_worker_token": "curie-dev-worker-token"}, "CURIE_INTERNAL_WORKER_TOKEN"),
         ({"internal_worker_token": ""}, "CURIE_INTERNAL_WORKER_TOKEN"),
+        (
+            {"approval_chat_attester_secret": "curie-dev-approval-chat-attester"},
+            "CURIE_APPROVAL_CHAT_ATTESTER_SECRET",
+        ),
+        ({"approval_chat_attester_secret": ""}, "CURIE_APPROVAL_CHAT_ATTESTER_SECRET"),
     ],
 )
-def test_prod_refuses_dev_default_or_empty_secret(
-    overrides: dict[str, str], offender: str
-) -> None:
+def test_prod_refuses_dev_default_or_empty_secret(overrides: dict[str, str], offender: str) -> None:
     with pytest.raises(ValidationError) as exc:
         _settings(**overrides)
     assert offender in str(exc.value)
@@ -50,3 +54,15 @@ def test_prod_refuses_dev_default_or_empty_secret(
 def test_prod_is_case_insensitive() -> None:
     with pytest.raises(ValidationError):
         _settings(environment="PROD", api_key="curie-dev-key")
+
+
+def test_attester_secret_is_non_blank_and_distinct_in_every_environment() -> None:
+    for secret in ("   ", "curie-dev-key"):
+        with pytest.raises(ValidationError) as exc:
+            Settings(
+                _env_file=None,
+                environment="dev",
+                api_key="curie-dev-key",
+                approval_chat_attester_secret=secret,
+            )
+        assert "CURIE_APPROVAL_CHAT_ATTESTER_SECRET" in str(exc.value)

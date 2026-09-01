@@ -30,8 +30,8 @@ from collections.abc import Iterable
 
 # The platform's in-process approval-request tool (ADR-0010) is idempotent under
 # EVERY harness: it executes no real-world action (it only marks the turn
-# awaiting-approval), and it is injected into every session by the platform, not
-# shipped by the harness. It is therefore always treated as idempotent,
+# awaiting-approval), and when applicable it is injected by the platform rather
+# than shipped by the harness. It is therefore always treated as idempotent,
 # independent of which harness's read-only declaration is in force -- flagging it
 # would block the no-retry rule for the very turns approvals pause, and a harness
 # declaration that happened to omit it must not be able to reintroduce that bug.
@@ -55,6 +55,7 @@ CLAUDE_READONLY_TOOLS: frozenset[str] = frozenset(
         "NotebookRead",
         "WebFetch",
         "WebSearch",
+        "ToolSearch",
         "TodoRead",
     }
 )

@@ -1,11 +1,11 @@
 """OTel tracing for the runner: gen_ai spans exported by standard OTLP.
 
-Productizes the PT-4/PT-E prototype span shape. Each turn is a root ``agent.run``
-(SERVER) span carrying a ``langfuse.trace.name``, with a child ``llm.generation``
-span holding ``gen_ai.request.model`` and ``gen_ai.usage.*`` token counts, plus a
-child ``execute_tool`` span per tool call (``gen_ai.tool.name`` /
-``gen_ai.operation.name``). Langfuse maps a model-bearing span to a generation and
-nests tool spans as observations, so this reconstructs the tool-call tree (S1).
+Each turn is a root ``agent.run`` (SERVER) span carrying a
+``langfuse.trace.name``. Provider waits are duration-bearing ``llm.generation``
+children and tool waits are duration-bearing ``execute_tool`` children; both are
+siblings under the root. The SDK's opaque call ids are retained only in the
+in-process matching map, while exported round and call identities are bounded
+turn-local integers.
 
 Traces go to the OTel Collector over OTLP, never directly to Langfuse: the
 collector is the adapter that authenticates and forwards (Langfuse OTLP ingest is
@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from typing import Any, cast
@@ -79,9 +80,8 @@ SCHEMA_VERSION = "v1"
 # own source of truth to diff against -- the type half of the closed schema,
 # parallel to ``SpanAttributeKey`` being the key half. Every member must
 # appear here exactly once, mapped to its value-type name ("str" or "int");
-# the ``gen_ai.usage.*`` token counts are the only "int" members (see
-# ``record_usage`` below and ``redact.py``'s "only str and int attributes are
-# set today").
+# usage counts, TTFT milliseconds, and turn-local round/call indices are the
+# integer members. No boolean or float attributes cross this boundary.
 SPAN_ATTRIBUTE_VALUE_TYPES: Mapping[SpanAttributeKey, str] = {
     SpanAttributeKey.TRACE_NAME: "str",
     SpanAttributeKey.SESSION_ID: "str",
@@ -95,6 +95,15 @@ SPAN_ATTRIBUTE_VALUE_TYPES: Mapping[SpanAttributeKey, str] = {
     SpanAttributeKey.USAGE_CACHE_CREATION_INPUT_TOKENS: "int",
     SpanAttributeKey.TOOL_NAME: "str",
     SpanAttributeKey.OPERATION_NAME: "str",
+    SpanAttributeKey.PHASE: "str",
+    SpanAttributeKey.PHASE_START_KIND: "str",
+    SpanAttributeKey.PHASE_END_KIND: "str",
+    SpanAttributeKey.TERMINAL_CAUSE: "str",
+    SpanAttributeKey.TERMINAL_STATUS: "str",
+    SpanAttributeKey.GENERATION_TTFT_MS: "int",
+    SpanAttributeKey.GENERATION_ROUND: "int",
+    SpanAttributeKey.TOOL_CALL_INDEX: "int",
+    SpanAttributeKey.TOOL_OUTCOME: "str",
     SpanAttributeKey.SERVICE_NAME: "str",
     SpanAttributeKey.CURIE_SESSION_ID: "str",
     SpanAttributeKey.CURIE_SANDBOX_ID: "str",
@@ -323,7 +332,7 @@ class RunTracer:
         *,
         parent: Context | None = None,
     ) -> Iterator[_GenerationSpan]:
-        """Open the root ``agent.run`` span and its child ``llm.generation`` span.
+        """Open a root ``agent.run`` span and yield its lazy phase handle.
 
         ``session_id`` (the ACI ``CURIE_SESSION_ID``, one Slack thread) and
         ``user_id`` (the inbound event's Slack user) are stamped on the root span
@@ -363,26 +372,14 @@ class RunTracer:
                     _set(root, SpanAttributeKey.USER_ID, user_id)
                 if approval_decision:
                     _set(root, SpanAttributeKey.APPROVAL_DECISION, approval_decision)
-                with self._tracer.start_as_current_span(
-                    "llm.generation",
-                    record_exception=False,
-                    set_status_on_exception=False,
-                ) as gen:
-                    span = _GenerationSpan(self._tracer, root, gen)
-                    try:
-                        # Stamp the configured model at span open when CURIE_MODEL is
-                        # set; otherwise the span stays model-less until the SDK reports
-                        # the actual model on its first assistant message (record_model).
-                        span.record_model(model)
-                        yield span
-                    except BaseException:
-                        # Classify both spans while the generation is still open.
-                        # Doing this in the outer handler is too late: exiting
-                        # start_as_current_span ends the generation first.
-                        span.set_failed()
-                        raise
-                    else:
-                        span.set_succeeded()
+                span = _GenerationSpan(self._tracer, root, model)
+                try:
+                    yield span
+                except BaseException:
+                    span.set_abandoned()
+                    raise
+                else:
+                    span.finish_if_needed()
             except BaseException:
                 if span is None:
                     root.set_status(StatusCode.ERROR)
@@ -403,71 +400,306 @@ class RunTracer:
 
 
 class _GenerationSpan:
-    """Handle for annotating the generation span and emitting tool child spans."""
+    """Lazy, turn-local phase manager yielded by :meth:`RunTracer.run_span`.
 
-    def __init__(self, tracer: Tracer, root: Any, span: Any) -> None:
+    The private class name is retained for compatibility with the runner's
+    existing type annotations and direct instrumentation callers. It now owns
+    every provider/tool interval beneath one root rather than representing one
+    eagerly opened generation.
+    """
+
+    _ABORT_CAUSES = frozenset(("aborted_streaming", "aborted_tools"))
+
+    def __init__(self, tracer: Tracer, root: Any, model: str | None) -> None:
         self._tracer = tracer
         self._root = root
-        self._span = span
-        self._model_recorded = False
+        self._root_context = set_span_in_context(root)
+        self._configured_model = model
+        self._active_generation: Any | None = None
+        self._generation_started_ns = 0
+        self._generation_model_recorded = False
+        self._generation_ttft_recorded = False
+        self._generation_usage: dict[str, int] = {}
+        self._generation_round = 0
+        self._active_tools: dict[str, tuple[Any, int]] = {}
+        self._tool_call_index = 0
+        self._result_observed = False
+        self._result_abort_cause: str | None = None
+        self._terminal = False
+        self._has_activity = False
+
+    @property
+    def result_observed(self) -> bool:
+        """Whether the SDK supplied a terminal ResultMessage boundary."""
+
+        return self._result_observed
+
+    def query_observed(self) -> None:
+        """Open generation round one for the initial provider wait.
+
+        A steer joins an already active wait, so repeated calls deliberately do
+        nothing. A provider phase is never opened while a tool is still pending.
+        """
+
+        if self._terminal or self._active_generation is not None or self._active_tools:
+            return
+        self._open_generation("query_observed")
+
+    def record_first_response_boundary(self) -> None:
+        """Record TTFT once on the active generation from a stripped boundary."""
+
+        if self._active_generation is None or self._generation_ttft_recorded:
+            return
+        elapsed_ms = max(0, (time.monotonic_ns() - self._generation_started_ns) // 1_000_000)
+        _set(
+            self._active_generation,
+            SpanAttributeKey.GENERATION_TTFT_MS,
+            int(elapsed_ms),
+        )
+        self._generation_ttft_recorded = True
+
+    def record_assistant(
+        self,
+        model: str | None,
+        usage: Mapping[str, Any] | None,
+    ) -> None:
+        """Accumulate one assistant message's model and token usage."""
+
+        if self._active_generation is None:
+            return
+        self._record_model(model)
+        self._record_usage(usage)
 
     def set_succeeded(self) -> None:
-        """Mark both generation and run successful unless already classified."""
+        """Compatibility helper: close an unfinished active run as completed."""
 
-        for span in (self._span, self._root):
-            if span.is_recording() and span.status.status_code is StatusCode.UNSET:
-                span.set_status(StatusCode.OK)
+        self._finish("completed", "succeeded", failed=False)
 
     def set_failed(self) -> None:
-        """Mark both generation and run failed without exporting error text."""
+        """Close an unfinished active run as a classified failure."""
 
-        self._span.set_status(StatusCode.ERROR)
-        self._root.set_status(StatusCode.ERROR)
+        self._finish("classified_failure", "failed", failed=True)
+
+    def set_abandoned(self) -> None:
+        """Close unfinished phases after an exception or generator abandonment."""
+
+        self._finish("abandoned", "abandoned", failed=True)
+
+    def finish_if_needed(self) -> None:
+        """Complete direct instrumentation while leaving an empty root lazy."""
+
+        if self._has_activity and not self._terminal:
+            self.set_succeeded()
+
+    def finish_turn(
+        self,
+        *,
+        interrupt_requested: bool,
+        classified_failure: bool,
+        approval_paused: bool = False,
+        completed_without_result: bool = False,
+    ) -> None:
+        """Apply the closed terminal mapping after the ACI final is decided."""
+
+        if interrupt_requested:
+            self._finish("interrupt_requested", "cancelled", failed=False)
+        elif approval_paused:
+            self._finish("approval_required", "paused", failed=False)
+        elif self._result_abort_cause is not None:
+            self._finish(
+                self._result_abort_cause,
+                "failed",
+                failed=True,
+            )
+        elif classified_failure:
+            self.set_failed()
+        elif self._result_observed or completed_without_result:
+            self.set_succeeded()
+        else:
+            self.set_abandoned()
+
+    def result_boundary_observed(
+        self,
+        *,
+        failed: bool,
+        terminal_reason: str | None,
+        approval_paused: bool = False,
+    ) -> None:
+        """Close the active generation at an SDK ResultMessage boundary."""
+
+        self._result_observed = True
+        if terminal_reason in self._ABORT_CAUSES:
+            self._result_abort_cause = terminal_reason
+        self._close_generation(
+            "result_observed",
+            failed=failed and not approval_paused,
+        )
 
     def record_model(self, model: str | None) -> None:
-        """Stamp the generation model attribute once, first non-empty value wins.
+        """Compatibility setter for direct instrumentation callers.
 
-        Langfuse only maps ``llm.generation`` to a GENERATION observation (and so
-        records the ``gen_ai.usage.*`` token counts) when the span carries a model
-        attribute; a model-less span ingests as an untyped SPAN with zero usage.
-        The configured ``CURIE_MODEL`` is stamped at span open when set; when it
-        is unset the runner backfills the actual model the SDK reports on its first
-        assistant message, so the generation is typed either way. Only genuinely
-        unknown models leave the attribute absent.
+        The session path uses :meth:`record_assistant`, which never fabricates a
+        provider phase. Direct callers historically received an eager generation,
+        so this shim lazily opens their first generation on demand.
         """
 
-        if self._model_recorded or not model:
-            return
-        _set(self._span, SpanAttributeKey.REQUEST_MODEL, model)
-        _set(self._span, SpanAttributeKey.MODEL, model)
-        self._model_recorded = True
+        self._ensure_compat_generation()
+        self._record_model(model)
 
     def record_usage(self, usage: Mapping[str, Any] | None) -> None:
-        """Attach gen_ai token-usage attributes from an SDK usage mapping.
+        """Compatibility setter for a direct generation usage observation.
 
-        Prompt-cache tokens (``cache_read_input_tokens`` /
-        ``cache_creation_input_tokens``, the Anthropic wire shape preserved even
-        through OpenRouter) are recorded alongside the plain input/output counts,
-        so a warm thread's cache reuse is observable in the trace rather than
-        silently folded away. This is the signal the prompt-cache smoke test
-        asserts on: a translating gateway that silently breaks caching shows up
-        here as a warm turn with zero cache-read tokens.
+        Session-driven telemetry uses per-AssistantMessage increments through
+        :meth:`record_assistant`; ResultMessage turn totals never call this path.
         """
 
-        if not usage:
+        self._ensure_compat_generation()
+        self._record_usage(usage)
+
+    def tool_use(self, call_id: str, tool_name: str) -> None:
+        """Close provider wait and begin an inferred SDK tool interval."""
+
+        if self._terminal or call_id in self._active_tools:
+            return
+        self._close_generation("tool_use_observed", failed=False)
+        self._tool_call_index += 1
+        tool = self._tracer.start_span(
+            "execute_tool",
+            context=self._root_context,
+            record_exception=False,
+            set_status_on_exception=False,
+        )
+        _set(tool, SpanAttributeKey.PHASE, "tool_wait")
+        _set(tool, SpanAttributeKey.PHASE_START_KIND, "tool_use_inferred")
+        _set(tool, SpanAttributeKey.TOOL_CALL_INDEX, self._tool_call_index)
+        if isinstance(tool_name, str) and tool_name:
+            _set(tool, SpanAttributeKey.TOOL_NAME, tool_name)
+        _set(tool, SpanAttributeKey.OPERATION_NAME, "execute_tool")
+        self._active_tools[call_id] = (tool, self._tool_call_index)
+        self._has_activity = True
+        _set(self._root, SpanAttributeKey.PHASE, "tool_wait")
+
+    def tool_result(self, call_id: str, *, failed: bool) -> None:
+        """End a matching tool interval, then infer the next provider wait."""
+
+        pending = self._active_tools.pop(call_id, None)
+        if pending is None:
+            return
+        tool, _index = pending
+        self._end_tool(
+            tool,
+            end_kind="tool_result_inferred",
+            outcome="error" if failed else "success",
+            failed=failed,
+        )
+        if not self._active_tools and not self._terminal:
+            self._open_generation("tool_result_inferred")
+
+    def tool_span(self, tool_name: str) -> None:
+        """Compatibility shim for legacy immediate tool instrumentation."""
+
+        call_id = f"compat:{self._tool_call_index + 1}"
+        self.tool_use(call_id, tool_name)
+        pending = self._active_tools.pop(call_id, None)
+        if pending is None:
+            return
+        tool, _index = pending
+        self._end_tool(
+            tool,
+            end_kind="tool_result_inferred",
+            outcome="success",
+            failed=False,
+        )
+
+    def _ensure_compat_generation(self) -> None:
+        if self._active_generation is None and not self._active_tools and not self._terminal:
+            self._open_generation("query_observed")
+
+    def _open_generation(self, start_kind: str) -> None:
+        if self._active_generation is not None or self._active_tools or self._terminal:
+            return
+        self._generation_round += 1
+        self._active_generation = self._tracer.start_span(
+            "llm.generation",
+            context=self._root_context,
+            record_exception=False,
+            set_status_on_exception=False,
+        )
+        self._generation_started_ns = time.monotonic_ns()
+        self._generation_model_recorded = False
+        self._generation_ttft_recorded = False
+        self._generation_usage = {}
+        _set(self._active_generation, SpanAttributeKey.PHASE, "provider_wait")
+        _set(self._active_generation, SpanAttributeKey.PHASE_START_KIND, start_kind)
+        _set(
+            self._active_generation,
+            SpanAttributeKey.GENERATION_ROUND,
+            self._generation_round,
+        )
+        _set(self._root, SpanAttributeKey.PHASE, "provider_wait")
+        self._has_activity = True
+        self._record_model(self._configured_model)
+
+    def _record_model(self, model: str | None) -> None:
+        if (
+            self._active_generation is None
+            or self._generation_model_recorded
+            or not isinstance(model, str)
+            or not model
+        ):
+            return
+        _set(self._active_generation, SpanAttributeKey.REQUEST_MODEL, model)
+        _set(self._active_generation, SpanAttributeKey.MODEL, model)
+        self._generation_model_recorded = True
+
+    def _record_usage(self, usage: Mapping[str, Any] | None) -> None:
+        if self._active_generation is None or not usage:
             return
         for usage_field, attribute_key in _USAGE_ATTRIBUTE_KEYS.items():
             value = usage.get(usage_field)
-            if isinstance(value, int):
-                _set(self._span, attribute_key, value)
+            if type(value) is not int or value < 0:
+                continue
+            total = self._generation_usage.get(usage_field, 0) + value
+            self._generation_usage[usage_field] = total
+            _set(self._active_generation, attribute_key, total)
 
-    def tool_span(self, tool_name: str) -> None:
-        """Emit a short ``execute_tool`` child span for one tool call."""
+    def _close_generation(self, end_kind: str, *, failed: bool) -> None:
+        span = self._active_generation
+        if span is None:
+            return
+        _set(span, SpanAttributeKey.PHASE_END_KIND, end_kind)
+        span.set_status(StatusCode.ERROR if failed else StatusCode.OK)
+        span.end()
+        self._active_generation = None
 
-        with self._tracer.start_as_current_span(
-            "execute_tool",
-            record_exception=False,
-            set_status_on_exception=False,
-        ) as tool:
-            _set(tool, SpanAttributeKey.TOOL_NAME, tool_name)
-            _set(tool, SpanAttributeKey.OPERATION_NAME, "execute_tool")
+    def _end_tool(
+        self,
+        tool: Any,
+        *,
+        end_kind: str,
+        outcome: str,
+        failed: bool,
+    ) -> None:
+        _set(tool, SpanAttributeKey.PHASE_END_KIND, end_kind)
+        _set(tool, SpanAttributeKey.TOOL_OUTCOME, outcome)
+        tool.set_status(StatusCode.ERROR if failed else StatusCode.OK)
+        tool.end()
+
+    def _finish(self, cause: str, status: str, *, failed: bool) -> None:
+        if self._terminal:
+            return
+        self._close_generation("terminal_inferred", failed=failed)
+        for call_id, (tool, _index) in sorted(
+            self._active_tools.items(), key=lambda item: item[1][1]
+        ):
+            del self._active_tools[call_id]
+            self._end_tool(
+                tool,
+                end_kind="terminal_inferred",
+                outcome="cancelled",
+                failed=failed,
+            )
+        _set(self._root, SpanAttributeKey.TERMINAL_CAUSE, cause)
+        _set(self._root, SpanAttributeKey.TERMINAL_STATUS, status)
+        self._root.set_status(StatusCode.ERROR if failed else StatusCode.OK)
+        self._terminal = True
