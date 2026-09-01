@@ -812,16 +812,19 @@ http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.
 {{ include "curie.env.apiKey" . }}
 {{- end -}}
 
-{{/* Coalesce the worker's egress credentials and the first-party mail
-     adapter's paired credential. The chart Secret and the worker rollout
-     checksum must use this same rendered JSON so a rotation reaches both
-     sides. mailAdapter.egressSecret is the source of truth; accepting an equal
-     hand-written worker entry keeps migrations from hand-rolled manifests
-     possible, while a disagreement fails rather than deploying a reply path
-     that can only return 401. */}}
+{{/* Coalesce the worker's chart-managed egress credentials and the first-party
+     mail adapter's chart-managed paired credential. The chart Secret and the
+     worker rollout checksum must use this same rendered JSON so a rotation
+     reaches both sides. mailAdapter.egressSecret is the source of truth on
+     that path; accepting an equal hand-written worker entry keeps migrations
+     from hand-rolled manifests possible, while a disagreement fails rather
+     than deploying a reply path that can only return 401. When the adapter
+     uses egressSecretExistingSecret, the required external worker map is the
+     independent source of truth: never derive from or compare the unused plain
+     Helm value. */}}
 {{- define "curie.adapterCredentials" -}}
 {{- $creds := deepCopy (.Values.worker.adapterCredentials | default dict) -}}
-{{- if .Values.mailAdapter.deploy -}}
+{{- if and .Values.mailAdapter.deploy (not .Values.mailAdapter.egressSecretExistingSecret) -}}
 {{- $slug := .Values.mailAdapter.adapterSlug -}}
 {{- $derived := .Values.mailAdapter.egressSecret -}}
 {{- if hasKey $creds $slug -}}
@@ -1062,9 +1065,10 @@ true
 {{/* ---- BYO existingSecret escape for a direct-passthrough credential
      (issue #1759) ----
 
-     Eight keys (agentCredentials, adapterCredentials, githubToken,
+     Eleven keys (agentCredentials, adapterCredentials, githubToken,
      sealingPrivateKey, sealingPreviousPrivateKey, slackAppToken,
-     slackBotToken, slackSigningSecret) each grew a per-field
+     slackBotToken, slackSigningSecret, mailChannelToken, mailEgressSecret,
+     mailAgentmailApiKey) each grew a per-field
      `<field>ExistingSecret` / `<field>ExistingSecretKey` pair mirroring
      api.githubAppExistingSecret (ADR-0092): set, it wins over the plain
      value and the consumer's secretKeyRef points straight at the operator's
@@ -1072,7 +1076,7 @@ true
      CreateContainerConfigError instead of the chart emitting an empty
      credential.
 
-     One generic helper for all eight, following the dict-argument pattern
+     One generic helper for all eleven, following the dict-argument pattern
      `curie.image`/`curie.managedSecret` already use in this file, rather than
      a bespoke per-key helper or a hand-copied if/else at each consumer: every
      consumer of the SAME key -- there are three for slackBotToken, two for

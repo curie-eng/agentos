@@ -1185,11 +1185,11 @@ restarts.
 
 ### The other direct-passthrough credentials
 
-The GitHub App key was the first of nine credential keys read straight from
+The GitHub App key was the first of twelve credential keys read straight from
 `.Values` with no in-chart generation (`charts/curie/templates/secrets.yaml`
 calls these direct passthrough, as opposed to the eleven keys
 `curie.managedSecret` generates and persists). Issue #1759 gave the other
-eight the same `existingSecret` / `existingSecretKey` escape, one pair per
+eleven the same `existingSecret` / `existingSecretKey` escape, one pair per
 key, all winning over their plain value when set:
 
 | Credential | Plain value | BYO fields |
@@ -1202,6 +1202,9 @@ key, all winning over their plain value when set:
 | Slack app token | `dispatcher.slack.appToken` | `dispatcher.slack.appTokenExistingSecret` / `appTokenExistingSecretKey` (default key `slackAppToken`) |
 | Slack bot token | `dispatcher.slack.botToken` | `dispatcher.slack.botTokenExistingSecret` / `botTokenExistingSecretKey` (default key `slackBotToken`) |
 | Slack signing secret | `dispatcher.slack.signingSecret` | `dispatcher.slack.signingSecretExistingSecret` / `signingSecretExistingSecretKey` (default key `slackSigningSecret`) |
+| Mail channel token | `mailAdapter.channelToken` | `mailAdapter.channelTokenExistingSecret` / `channelTokenExistingSecretKey` (default key `mailChannelToken`) |
+| Mail egress secret | `mailAdapter.egressSecret` | `mailAdapter.egressSecretExistingSecret` / `egressSecretExistingSecretKey` (default key `mailEgressSecret`) -- when set, `worker.adapterCredentialsExistingSecret` must source the worker's paired credential map |
+| AgentMail API key | `mailAdapter.agentmail.apiKey` | `mailAdapter.agentmail.apiKeyExistingSecret` / `apiKeyExistingSecretKey` (default key `mailAgentmailApiKey`) |
 
 For example, to keep the model credential and both Slack tokens entirely out
 of helm values and release history:
@@ -1223,7 +1226,7 @@ As with `githubAppExistingSecret`, a Secret missing the referenced key fails
 that one pod at `CreateContainerConfigError` rather than the chart silently
 falling back to an empty credential.
 
-**Known gap, tracked in #1801.** None of these 16 new fields are yet covered
+**Known gap, tracked in #1801.** None of these 22 new fields are yet covered
 by the CLI's preserved-values mechanism (the same one `COMMS_MANAGED_KEYS` and
 `GITHUB_APP_MANAGED_KEYS` give the Slack tokens and the GitHub App identity in
 `cli/src/ops.rs`). A plain `curie cluster up` runs a full `helm upgrade
