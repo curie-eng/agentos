@@ -886,11 +886,12 @@ enum Command {
         /// when one is present in this directory, otherwise `curie`.
         #[arg(long)]
         release: Option<String>,
-        /// Platform API, to include the repo-binding check. Optional: every
-        /// other check needs only kubectl and helm.
+        /// Platform API, to include the repo-binding check. Optional: omitted
+        /// values are discovered from the release, same as sibling cluster verbs.
         #[arg(long, env = "CURIE_API_URL")]
         api_url: Option<String>,
-        /// API key for `--api-url`.
+        /// API key for `--api-url`. Optional: discovered from the release Secret
+        /// when omitted.
         #[arg(long, env = "CURIE_API_KEY")]
         api_key: Option<String>,
     },
@@ -4816,8 +4817,18 @@ async fn run(command: Option<Command>) -> Result<()> {
             if let Some(announcement) = &target.announcement {
                 ui::ui().note(announcement);
             }
-            let api = api_url.as_deref().zip(api_key.as_deref());
-            emit(curie::doctor::doctor(&target.namespace, &target.release, api).await)
+            // Discover independently. `zip` required both flags, so a bare
+            // `curie doctor` never reached the platform API (#1367). Errors
+            // are discarded inside `doctor`: gather is failure-tolerant.
+            emit(
+                curie::doctor::doctor(
+                    &target.namespace,
+                    &target.release,
+                    api_url.as_deref(),
+                    api_key.as_deref(),
+                )
+                .await,
+            )
         }
         Some(Command::Diff { file, chart }) => {
             let cfg = curie::installation::Installation::load(&file)?;

@@ -5573,7 +5573,7 @@ export const commandManifest = {
         {
           "env": "CURIE_API_URL",
           "global": false,
-          "help": "Platform API, to include the repo-binding check. Optional: every other check needs only kubectl and helm",
+          "help": "Platform API, to include the repo-binding check. Optional: omitted values are discovered from the release, same as sibling cluster verbs",
           "id": "api_url",
           "long": "api-url",
           "positional": false,
@@ -5582,7 +5582,7 @@ export const commandManifest = {
         {
           "env": "CURIE_API_KEY",
           "global": false,
-          "help": "API key for `--api-url`",
+          "help": "API key for `--api-url`. Optional: discovered from the release Secret when omitted",
           "id": "api_key",
           "long": "api-key",
           "positional": false,
