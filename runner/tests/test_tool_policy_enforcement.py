@@ -11,14 +11,23 @@ callback would be a policy a bundle can walk around by declaring its own
 permissions, and every other test here would still pass.
 """
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from typing import Any
 
+import anyio
 import pytest
+from claude_agent_sdk.types import PermissionResultDeny
+from curie_runner import mcp_tool_capability
 from curie_runner.approval import (
     ApprovalGate,
     build_approval_hook,
     build_can_use_tool,
+    policy_disallowed_tools,
 )
+from mcp import Tool
+from mcp.types import ToolAnnotations
 from plugin_format import ToolPolicy
 
 
@@ -45,8 +54,6 @@ def _hook_call(gate: ApprovalGate, tool_name: str) -> dict[str, Any]:
     hooks = build_approval_hook(gate)
     matcher = hooks["PreToolUse"][0]
     callback = matcher.hooks[0]
-    import anyio
-
     return anyio.run(
         callback, {"tool_name": tool_name, "tool_input": {}}, None, None
     )
@@ -59,6 +66,177 @@ def _denied(result: dict[str, Any]) -> bool:
 
 def _reason(result: dict[str, Any]) -> str:
     return (result.get("hookSpecificOutput") or {}).get("permissionDecisionReason", "")
+
+
+def _catalog_gate() -> ApprovalGate:
+    return ApprovalGate(
+        tool_policy=_policy(
+            allow=["operations/read_allowed"],
+            approval_required=["operations/write_approval"],
+            deny=["operations/write_denied"],
+        ),
+        bundle_name="acme-bot",
+        mcp_servers={"operations", "failed"},
+        connector_servers={"operations"},
+    )
+
+
+def _assert_no_approval_was_recorded(gate: ApprovalGate) -> None:
+    assert gate.pending_summary is None
+    assert gate.pending_route is None
+    assert gate.pending_gate_kind is None
+    assert gate.pending_granted_tool is None
+    assert gate.policy_requested is False
+    assert gate.policy_rejected is False
+    assert gate.policy_route is None
+    assert gate.pending_halt is False
+
+
+def _probe_advertised_tools(
+    monkeypatch: pytest.MonkeyPatch, names: list[str]
+) -> mcp_tool_capability.McpToolCapabilityProbe:
+    @asynccontextmanager
+    async def server_streams(
+        *_args: Any, **_kwargs: Any
+    ) -> AsyncIterator[tuple[object, object]]:
+        yield object(), object()
+
+    class ToolListSession:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> "ToolListSession":
+            return self
+
+        async def __aexit__(self, *_args: Any) -> None:
+            pass
+
+        async def initialize(self) -> None:
+            pass
+
+        async def list_tools(self, *, cursor: str | None) -> SimpleNamespace:
+            assert cursor is None
+            # MCP recommends this restricted alphabet but its Tool model accepts
+            # other strings. Exercise the raw server response at Curie's probe
+            # boundary. https://modelcontextprotocol.io/specification/2025-11-25/server/tools#tool-names
+            return SimpleNamespace(
+                tools=[
+                    Tool(
+                        name=name,
+                        description="Test-only MCP tool.",
+                        inputSchema={"type": "object"},
+                        annotations=ToolAnnotations(readOnlyHint=False),
+                    )
+                    for name in names
+                ],
+                nextCursor=None,
+            )
+
+    monkeypatch.setattr(mcp_tool_capability, "_server_streams", server_streams)
+    monkeypatch.setattr(mcp_tool_capability, "ClientSession", ToolListSession)
+    return anyio.run(
+        mcp_tool_capability.probe_mcp_tool_capability,
+        None,
+        {"operations": {}},
+    )
+
+
+@pytest.mark.parametrize(
+    "unsafe_name",
+    [
+        "write_denied,Bash",
+        "write_denied Bash",
+        "write_denied(Bash)",
+        "write_denied*",
+    ],
+    ids=["comma", "space", "parentheses", "wildcard"],
+)
+def test_nonconforming_mcp_tool_name_fails_catalog_probe_closed(
+    monkeypatch: pytest.MonkeyPatch, unsafe_name: str
+) -> None:
+    result = _probe_advertised_tools(monkeypatch, ["read_allowed", unsafe_name])
+
+    assert not result.complete
+    assert result.has_potential_write_tool
+    assert result.failures == ("operations",)
+    assert result.tool_count == 0
+    assert result.observed_tools == frozenset()
+    assert result.readonly_tools == frozenset()
+    assert policy_disallowed_tools(_catalog_gate(), result.observed_tools) == ()
+
+    live_name = f"mcp__operations__{unsafe_name}"
+    hook_gate = _catalog_gate()
+    assert _denied(_hook_call(hook_gate, live_name))
+    _assert_no_approval_was_recorded(hook_gate)
+
+    callback_gate = _catalog_gate()
+    callback_result = anyio.run(
+        build_can_use_tool(callback_gate), live_name, {}, None
+    )
+    assert isinstance(callback_result, PermissionResultDeny)
+    _assert_no_approval_was_recorded(callback_gate)
+
+
+def test_conforming_mcp_tool_name_punctuation_reaches_catalog_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    valid_names = ["write.denied", "write-denied", "write_denied"]
+    result = _probe_advertised_tools(monkeypatch, valid_names)
+    expected = {
+        f"mcp__operations__{tool_name}" for tool_name in valid_names
+    }
+
+    assert result.complete
+    assert result.has_potential_write_tool
+    assert result.failures == ()
+    assert result.tool_count == len(valid_names)
+    assert result.observed_tools == frozenset(expected)
+    assert set(policy_disallowed_tools(_catalog_gate(), result.observed_tools)) == expected
+
+
+def test_policy_disallowed_tools_project_only_denied_observed_runtime_names() -> None:
+    plugin_prefix = "mcp__plugin_acme-bot_operations__"
+    connector_prefix = "mcp__operations__"
+    suffixes = {"read_allowed", "write_approval", "write_denied", "write_unmatched"}
+    observed = frozenset(
+        {f"{plugin_prefix}{suffix}" for suffix in suffixes}
+        | {f"{connector_prefix}{suffix}" for suffix in suffixes}
+    )
+    expected_hidden = {
+        f"{plugin_prefix}write_denied",
+        f"{plugin_prefix}write_unmatched",
+        f"{connector_prefix}write_denied",
+        f"{connector_prefix}write_unmatched",
+    }
+
+    hidden = set(policy_disallowed_tools(_catalog_gate(), observed))
+
+    assert hidden == expected_hidden
+    assert all(name.startswith("mcp__") for name in hidden)
+    assert all("/" not in name and "*" not in name for name in hidden)
+    assert f"{plugin_prefix}read_allowed" not in hidden
+    assert f"{connector_prefix}read_allowed" not in hidden
+    assert f"{plugin_prefix}write_approval" not in hidden
+    assert f"{connector_prefix}write_approval" not in hidden
+
+    # A failed sibling was never observed, so catalog projection must not invent
+    # its exact SDK name. Authorization remains fail-closed independently.
+    failed_sibling = "mcp__plugin_acme-bot_failed__write_unmatched"
+    assert failed_sibling not in hidden
+    for tool_name in expected_hidden | {failed_sibling}:
+        hook_gate = _catalog_gate()
+        hook_result = _hook_call(hook_gate, tool_name)
+        assert _denied(hook_result)
+        assert "denied by this agent's tool policy" in _reason(hook_result)
+        _assert_no_approval_was_recorded(hook_gate)
+
+        callback_gate = _catalog_gate()
+        callback_result = anyio.run(
+            build_can_use_tool(callback_gate), tool_name, {}, None
+        )
+        assert isinstance(callback_result, PermissionResultDeny)
+        assert "denied by this agent's tool policy" in callback_result.message
+        _assert_no_approval_was_recorded(callback_gate)
 
 
 def test_a_denied_tool_is_refused_by_the_hook_not_only_the_callback() -> None:
@@ -134,8 +312,6 @@ def test_a_bundle_with_no_policy_is_unchanged() -> None:
 def test_the_callback_agrees_with_the_hook(tool: str) -> None:
     """Both interception points share `_decide_gate`, so they must not disagree
     -- the defect class #1852 closed for the two invocation contexts."""
-    import anyio
-
     gate = _gate(_policy(deny=["k8s-write/restart_deployment"]))
     callback = build_can_use_tool(gate)
     result = anyio.run(callback, tool, {}, None)

@@ -9,8 +9,10 @@ course, and turn 2 shows a warm prompt cache
 A third live test covers the OpenRouter path, gated on ``OPENROUTER_API_KEY``.
 """
 
+import json
 import os
 import shlex
+import sys
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -500,20 +502,17 @@ def test_live_structured_replay_cache_hit_and_changed_prefix_negative(tmp_path) 
 
 @pytest.mark.skipif(
     not _LIVE_REQUESTED,
-    reason="set CURIE_E2E_LIVE=1 for disposable structured-replay provider evidence",
+    reason="set CURIE_E2E_LIVE=1 for real SDK approval-catalog evidence",
 )
-def test_live_cross_runner_approval_exact_once_and_cache_observable(
-    tmp_path, monkeypatch
+def test_live_mcp_policy_catalog_approval_exact_once_and_cache_observable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A suspended real tool call resumes once, then its one-shot grant expires."""
+    """A real SDK catalog hides refusals while one-shot approval stays visible."""
 
-    from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
+    from claude_agent_sdk import SystemMessage
+    from curie_runner import __main__ as boot
     from curie_runner import session as session_module
-    from curie_runner.approval import (
-        ApprovalGate,
-        build_approval_hook,
-        build_can_use_tool,
-    )
+    from curie_runner.config import RunnerConfig
 
     metric_calls: list[tuple[str, float, dict[str, str] | None]] = []
     real_record_metric = session_module.record_metric
@@ -530,13 +529,236 @@ def test_live_cross_runner_approval_exact_once_and_cache_observable(
     monkeypatch.setattr(session_module, "record_metric", observe_metric)
 
     marker_file = tmp_path / "approval-executions.txt"
+    fixture = (
+        Path(__file__).parent / "fixtures" / "mcp_tool_capability_server.py"
+    ).resolve()
+    bundle = tmp_path / "approval-catalog"
+    (bundle / ".claude-plugin").mkdir(parents=True)
+    (bundle / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps(
+            {
+                "name": "acme-bot",
+                "systemPrompt": (
+                    "You are a deterministic test agent. When asked to write a test "
+                    "marker, call the operations write_approval MCP tool exactly once "
+                    "with the requested value, wait for its result, and then stop."
+                ),
+                "toolPolicy": {
+                    "enforcement": "curie/mcp-tool-policy@1",
+                    "allow": ["operations/read_allowed"],
+                    "approvalRequired": ["operations/write_approval"],
+                    "deny": ["operations/write_denied"],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (bundle / ".mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "operations": {
+                        "command": sys.executable,
+                        "args": [str(fixture)],
+                        "env": {
+                            "CURIE_TEST_TOOL_MODE": "policy-catalog",
+                            "CURIE_TEST_CALL_MARKER": str(marker_file),
+                        },
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    prefix = "mcp__plugin_acme-bot_operations__"
+    read_allowed = f"{prefix}read_allowed"
+    write_approval = f"{prefix}write_approval"
+    write_denied = f"{prefix}write_denied"
+    write_unmatched = f"{prefix}write_unmatched"
+    session_id = str(uuid4())
+    store = _LiveTranscriptStore()
+
+    def config_for(*, grant_tool: str | None = None) -> RunnerConfig:
+        env = {
+            "CURIE_PLUGIN_DIR": str(bundle),
+            "CURIE_SESSION_ID": session_id,
+            "CURIE_SANDBOX_ID": f"sandbox-{session_id}",
+            "CURIE_BUDGET": (
+                '{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}'
+            ),
+        }
+        if model := os.environ.get("CURIE_MODEL"):
+            env["CURIE_MODEL"] = model
+        if grant_tool is not None:
+            env["CURIE_APPROVAL_GRANT_TOOL"] = grant_tool
+            env["CURIE_APPROVAL_DECISION"] = "approved"
+        return RunnerConfig.from_env(env)
+
+    catalogs: list[tuple[str, ...]] = []
+
+    class CatalogObservingSession(ClaudeAgentSession):
+        def receive_turn(self):
+            upstream = super().receive_turn()
+
+            async def observe():
+                async for message in upstream:
+                    if isinstance(message, SystemMessage) and message.subtype == "init":
+                        tools = message.data.get("tools")
+                        if isinstance(tools, list):
+                            catalogs.append(tuple(str(tool) for tool in tools))
+                    yield message
+
+            return observe()
+
+    monkeypatch.setattr(boot, "ClaudeAgentSession", CatalogObservingSession)
+
+    async def drive(runner: SessionRunner, text: str, ts: str) -> Final:
+        await runner.start()
+        final: Final | None = None
+        try:
+            async for line in runner.run_turn(
+                Event(type="message", text=text, user="U0EXAMPLE", ts=ts)
+            ):
+                event = parse_ndjson_line(line)
+                if isinstance(event, Final):
+                    final = event
+        finally:
+            await runner.close()
+        assert final is not None
+        return final
+
+    blocked = boot.build_runner(config_for(), history_store=store)
+    first = anyio.run(
+        drive,
+        blocked,
+        (
+            "Write one test marker by calling write_approval exactly once with "
+            "value `approved-once`. Do not call any other tool."
+        ),
+        "1",
+    )
+    assert first.status is SessionStatus.AWAITING_APPROVAL
+    assert first.approval_summary is not None
+    assert write_approval in first.approval_summary
+    assert "approved-once" in first.approval_summary
+    assert not marker_file.exists()
+
+    # claude-agent-sdk 0.2.135 is pinned in uv.lock. Its types.py:1850-1855
+    # specifies that disallowed_tools are removed from model context, and its
+    # message_parser.py:281-284 preserves the CLI init frame as
+    # SystemMessage(subtype="init"). Inspecting that frame proves the real SDK
+    # catalog behavior rather than only asserting Curie's option construction.
+    assert catalogs
+    initial_catalog = set(catalogs[0])
+    assert {read_allowed, write_approval} <= initial_catalog
+    assert write_denied not in initial_catalog
+    assert write_unmatched not in initial_catalog
+
+    assert len(store.records) == 1
+    assert store.records[0].harness_replay is not None
+    replay, summary = build_conversation_replay(store.records)
+    assert summary is None
+    assert replay.messages[-1].role == "user"
+    assert replay.messages[-1].content[0]["type"] == "tool_result"
+
+    resumed = boot.build_runner(
+        config_for(grant_tool=write_approval),
+        conversation_replay=replay,
+    )
+
+    async def drive_resumed_turns() -> tuple[Final, Final]:
+        await resumed.start()
+        finals: list[Final] = []
+        try:
+            for text, ts in (
+                (
+                    "The prior write_approval call is approved. Retry it exactly once "
+                    "with value `approved-once`, wait for the result, and stop.",
+                    "2",
+                ),
+                (
+                    "Write another test marker by calling write_approval exactly once "
+                    "with value `duplicate`.",
+                    "3",
+                ),
+            ):
+                final: Final | None = None
+                async for line in resumed.run_turn(
+                    Event(type="message", text=text, user="U0EXAMPLE", ts=ts)
+                ):
+                    event = parse_ndjson_line(line)
+                    if isinstance(event, Final):
+                        final = event
+                assert final is not None
+                finals.append(final)
+        finally:
+            await resumed.close()
+        return finals[0], finals[1]
+
+    approved, duplicate = anyio.run(drive_resumed_turns)
+    assert approved.status is SessionStatus.DONE
+    assert marker_file.read_text(encoding="utf-8").splitlines() == [
+        "write_approval"
+    ]
+
+    cache_calls = [
+        call for call in metric_calls if call[0] == "curie.history.resume.cache_read"
+    ]
+    assert len(cache_calls) == 1
+    assert cache_calls[0][1] > 0
+    assert cache_calls[0][2] == {
+        "service.name": "curie-runner",
+        "source": "runner",
+        "cache_hit": "true",
+    }
+
+    # The projection at resumed boot must not spend the grant. The first real
+    # call consumes it; the same tool on the next turn creates a fresh pause.
+    assert duplicate.status is SessionStatus.AWAITING_APPROVAL
+    assert duplicate.approval_summary is not None
+    assert write_approval in duplicate.approval_summary
+    assert "duplicate" in duplicate.approval_summary
+    assert marker_file.read_text(encoding="utf-8").splitlines() == [
+        "write_approval"
+    ]
+
+
+@pytest.mark.skipif(
+    not _LIVE_REQUESTED,
+    reason="set CURIE_E2E_LIVE=1 for disposable structured-replay provider evidence",
+)
+def test_live_cross_runner_approval_exact_once_and_cache_observable(
+    tmp_path, monkeypatch
+) -> None:
+    """A suspended real tool call resumes once, then its one-shot grant expires."""
+    from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
+    from curie_runner import session as session_module
+    from curie_runner.approval import (
+        ApprovalGate,
+        build_approval_hook,
+        build_can_use_tool,
+    )
+
+    metric_calls: list[tuple[str, float, dict[str, str] | None]] = []
+    real_record_metric = session_module.record_metric
+    def observe_metric(
+        name: str,
+        value: float = 1,
+        *,
+        attributes: dict[str, str] | None = None,
+    ) -> None:
+        metric_calls.append((name, value, attributes))
+        real_record_metric(name, value, attributes=attributes)
+
+    monkeypatch.setattr(session_module, "record_metric", observe_metric)
+    marker_file = tmp_path / "approval-executions.txt"
     command = f"printf 'approved-once\\n' >> {shlex.quote(str(marker_file))}"
     system_prompt = (
         "You are a deterministic test agent. When explicitly asked to run a shell "
         "command, call Bash with that exact command once and then stop."
     )
     store = _LiveTranscriptStore()
-
     def options_for(
         gate: ApprovalGate,
         replay: tuple[ConversationMessage, ...],
@@ -561,7 +783,6 @@ def test_live_cross_runner_approval_exact_once_and_cache_observable(
             can_use_tool=build_can_use_tool(gate),
             cwd=str(tmp_path),
         )
-
     async def drive(runner: SessionRunner, text: str) -> Final:
         await runner.start()
         final: Final | None = None
@@ -576,7 +797,6 @@ def test_live_cross_runner_approval_exact_once_and_cache_observable(
             await runner.close()
         assert final is not None
         return final
-
     blocked_gate = ApprovalGate(required=frozenset({"Bash"}))
     blocked = SessionRunner(
         session_factory=lambda: ClaudeAgentSession(options_for(blocked_gate, ())),
@@ -593,7 +813,6 @@ def test_live_cross_runner_approval_exact_once_and_cache_observable(
     assert not marker_file.exists()
     assert len(store.records) == 1
     assert store.records[0].harness_replay is not None
-
     replay, summary = build_conversation_replay(store.records)
     assert summary is None
     assert replay.messages[-1].role == "user"
@@ -602,14 +821,12 @@ def test_live_cross_runner_approval_exact_once_and_cache_observable(
     allowed_commands: list[str] = []
     resumed_gate = ApprovalGate(required=frozenset({"Bash"}), grant_tool="Bash")
     permission_callback = build_can_use_tool(resumed_gate)
-
     async def observe_permission(tool_name, tool_input, context):
         decision = await permission_callback(tool_name, tool_input, context)
         if isinstance(decision, PermissionResultAllow):
             allowed_commands.append(str(tool_input.get("command") or ""))
         assert isinstance(decision, (PermissionResultAllow, PermissionResultDeny))
         return decision
-
     resumed_options = options_for(
         resumed_gate, replay.messages, replay.harness_replay
     )
@@ -647,17 +864,14 @@ def test_live_cross_runner_approval_exact_once_and_cache_observable(
         finally:
             await resumed.close()
         return finals[0], finals[1]
-
     approved, duplicate = anyio.run(drive_resumed_turns)
     assert approved.status is SessionStatus.DONE
     assert marker_file.read_text().splitlines() == ["approved-once"]
-
     # Same runner, later turn: reset() expires the one-shot grant. Asking for the
     # action again must pause without another write.
     assert duplicate.status is SessionStatus.AWAITING_APPROVAL
     assert marker_file.read_text().splitlines() == ["approved-once"]
     assert allowed_commands == []  # hook allow skips can_use_tool in the pinned SDK
-
     cache_calls = [
         call for call in metric_calls if call[0] == "curie.history.resume.cache_read"
     ]

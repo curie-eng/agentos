@@ -3,11 +3,15 @@
 `plugin_format.tool_policy` states the split of work outright: "Mapping canonical
 -> live SDK name is the runtime lane's job and is out of scope here." This is
 that mapping run backwards, and these tests pin the two things that make it more
-than a string split.
+than a string split, plus the specificity rule for overlapping server names.
 
 **Underscores.** Neither mount shape can be parsed by splitting on `__`, because
 a server name may contain them. The known-server sets are what disambiguate, and
 a test that only ever uses hyphenated names would pass with a naive split.
+
+**Specificity.** When more than one declared server prefix matches, the longest
+server name owns the tool. Otherwise a shorter server can shadow a more specific
+policy.
 
 **The refusal.** `None` for an `mcp__` name is not "ungoverned", it is "could not
 attribute this to a declared server". Collapsing that with "not an MCP tool" is
@@ -15,7 +19,17 @@ the fail-open the unclassified-is-denied default exists to prevent, which is why
 `is_mcp_tool` is asked separately.
 """
 
-from curie_runner.approval import canonical_tool_name, is_mcp_tool
+import anyio
+from claude_agent_sdk.types import PermissionResultDeny, ToolPermissionContext
+from curie_runner.approval import (
+    ApprovalGate,
+    build_approval_hook,
+    build_can_use_tool,
+    canonical_tool_name,
+    is_mcp_tool,
+    policy_disallowed_tools,
+)
+from plugin_format import ToolPolicy
 
 
 def _canonical(live: str, **kwargs: object) -> str | None:
@@ -64,6 +78,49 @@ def test_an_underscored_server_name_still_resolves() -> None:
         _canonical("mcp__plugin_sre-bot_my_probe__ping", mcp_servers={"my_probe"})
         == "my_probe/ping"
     )
+
+
+def test_overlapping_plugin_servers_use_the_longest_policy_name_everywhere() -> None:
+    live_short = "mcp__plugin_sre-bot_logs__read"
+    live_long = "mcp__plugin_sre-bot_logs__audit__export"
+
+    def gate() -> ApprovalGate:
+        return ApprovalGate(
+            tool_policy=ToolPolicy(
+                enforcement="curie/mcp-tool-policy@1",
+                approvalRequired=["logs__audit/export"],
+                deny=["logs/*"],
+            ),
+            bundle_name="sre-bot",
+            mcp_servers={"logs", "logs__audit"},
+            connector_servers=set(),
+        )
+
+    assert (
+        _canonical(live_long, mcp_servers={"logs", "logs__audit"})
+        == "logs__audit/export"
+    )
+    assert policy_disallowed_tools(gate(), [live_short, live_long]) == (live_short,)
+
+    hook_gate = gate()
+    hook = build_approval_hook(hook_gate)["PreToolUse"][0].hooks[0]
+    hook_result = anyio.run(
+        hook, {"tool_name": live_long, "tool_input": {}}, None, None
+    )
+    assert hook_result["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "denied by this agent's tool policy" not in hook_result["stopReason"]
+    assert hook_gate.pending_granted_tool == live_long
+
+    callback_gate = gate()
+    callback_result = anyio.run(
+        build_can_use_tool(callback_gate),
+        live_long,
+        {},
+        ToolPermissionContext(),
+    )
+    assert isinstance(callback_result, PermissionResultDeny)
+    assert "denied by this agent's tool policy" not in callback_result.message
+    assert callback_gate.pending_granted_tool == live_long
 
 
 def test_an_underscored_tool_name_survives_intact() -> None:
