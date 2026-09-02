@@ -286,6 +286,14 @@ true
 {{- end -}}
 {{- end -}}
 
+{{/* Shared ServiceAccount name for both Langfuse Deployments. Empty
+     langfuse.serviceAccount.name falls back to <release>-langfuse so a
+     key-free install can bind one role without duplicating the name on
+     web and worker (#2211). */}}
+{{- define "curie.langfuse.serviceAccountName" -}}
+{{- .Values.langfuse.serviceAccount.name | default (printf "%s-langfuse" (include "curie.fullname" .)) -}}
+{{- end -}}
+
 {{/* Base URL of the platform API for a first-party service that calls it. Call
      with a dict: root (the top context) and baseUrl (the caller's own BYO
      override). An empty override derives the in-chart API Service; a set value
@@ -961,6 +969,12 @@ livenessProbe:
        release reports healthy. See #2214. */}}
 - name: LANGFUSE_S3_EVENT_UPLOAD_REGION
   value: {{ .Values.rustfs.region | quote }}
+{{- /* Credential env is gated the same way as api/worker/bundle-fetch
+       (#2211). An empty rustfs.auth.accessKey on the key-free path must
+       omit these, not emit them empty: Langfuse's AWS SDK treats an empty
+       explicit credential as a credential and never reaches the
+       web-identity provider. */}}
+{{- if include "curie.rustfs.staticCredentials" . }}
 - name: LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID
   value: {{ .Values.rustfs.auth.accessKey | quote }}
 - name: LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY
@@ -968,6 +982,7 @@ livenessProbe:
     secretKeyRef:
       name: {{ .Values.rustfs.existingSecret | default (include "curie.secretName" .) }}
       key: rustfsSecretKey
+{{- end }}
 {{- /* Both endpoints go through curie.rustfs.endpoint, never a literal
        scheme. They were hardcoded http:// while api/worker/sandbox used the
        helper, so a BYO store on rustfs.port 443 got https:// everywhere except
@@ -983,6 +998,7 @@ livenessProbe:
   value: {{ .Values.rustfs.bucket | quote }}
 - name: LANGFUSE_S3_MEDIA_UPLOAD_REGION
   value: {{ .Values.rustfs.region | quote }}
+{{- if include "curie.rustfs.staticCredentials" . }}
 - name: LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID
   value: {{ .Values.rustfs.auth.accessKey | quote }}
 - name: LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY
@@ -990,6 +1006,7 @@ livenessProbe:
     secretKeyRef:
       name: {{ .Values.rustfs.existingSecret | default (include "curie.secretName" .) }}
       key: rustfsSecretKey
+{{- end }}
 - name: LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT
   value: {{ include "curie.rustfs.endpoint" . }}
 - name: LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE

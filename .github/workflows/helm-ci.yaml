@@ -454,16 +454,17 @@ jobs:
       - name: Sync workspace
         run: uv sync
 
-      # Prove the key-free object store path (#1325). Pointing the bundle store
-      # at a real cloud object store used to REQUIRE static access keys: all
-      # three consumers supplied explicit credentials unconditionally, so an
-      # ambient role was never consulted. Clearing rustfs.auth.accessKey now
-      # omits every credential env and shell export, which only works if the
-      # omission is COMPLETE -- an empty AWS_ACCESS_KEY_ID is still a credential
-      # to the SDK, so it stops the provider chain and the web-identity provider
-      # is never reached. Also asserts the instance-role shortcut stays shut:
-      # NetworkPolicy selects pods and not containers, so opening IMDS for
-      # bundle-fetch would hand the node's IAM role to the runner as well.
+      # Prove the key-free object store path (#1325, #2211). Pointing the bundle
+      # store at a real cloud object store used to REQUIRE static access keys:
+      # all four consumers (api, worker, bundle-fetch, Langfuse) supplied
+      # explicit credentials unconditionally, so an ambient role was never
+      # consulted. Clearing rustfs.auth.accessKey now omits every credential env
+      # and shell export, which only works if the omission is COMPLETE -- an
+      # empty AWS_ACCESS_KEY_ID is still a credential to the SDK, so it stops
+      # the provider chain and the web-identity provider is never reached. Also
+      # asserts the instance-role shortcut stays shut: NetworkPolicy selects
+      # pods and not containers, so opening IMDS for bundle-fetch would hand
+      # the node's IAM role to the runner as well.
       - name: helm render assertions (object store web identity)
         run: |
           set -euo pipefail

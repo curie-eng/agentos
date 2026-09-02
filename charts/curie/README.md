@@ -577,10 +577,10 @@ Pointing the bundle store at a real cloud object store (`rustfs.deploy: false`)
 normally means a scoped IAM user and long-lived keys in a Secret. That works and
 is genuinely least-privilege, but it is not the only option: clearing
 `rustfs.auth.accessKey` selects a key-free path (#1325) in which the chart omits
-every S3 credential from the API, the worker, and the sandbox bundle-fetch init
-container, so the AWS SDK falls through its provider chain to the **web-identity
-provider** (`AWS_ROLE_ARN` + `AWS_WEB_IDENTITY_TOKEN_FILE`) fed by a projected
-ServiceAccount token.
+every S3 credential from the API, the worker, the sandbox bundle-fetch init
+container, and Langfuse, so the AWS SDK falls through its provider chain to
+the **web-identity provider** (`AWS_ROLE_ARN` + `AWS_WEB_IDENTITY_TOKEN_FILE`)
+fed by a projected ServiceAccount token.
 
 Bind the role through the ServiceAccount annotations. On EKS with IRSA the
 pod-identity webhook reads the annotation and injects the projected token and
@@ -624,6 +624,10 @@ agentSandbox:
     serviceAccount:
       annotations:
         eks.amazonaws.com/role-arn: arn:aws:iam::000000000000:role/curie-runner
+langfuse:
+  serviceAccount:
+    annotations:
+      eks.amazonaws.com/role-arn: arn:aws:iam::000000000000:role/curie-langfuse
 ```
 
 The chart talks to **three buckets** on that same endpoint, not one. Create them
