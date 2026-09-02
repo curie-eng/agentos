@@ -96,6 +96,23 @@ helm upgrade curie charts/curie -n curie --reuse-values \
 | Value | Default | Meaning |
 | --- | --- | --- |
 | `dispatcher.apiBaseUrl` | `""` | Empty derives the in-chart API Service. A set value is used verbatim (BYO), and is **required** when `api.deploy: false`, where no in-chart Service exists to derive from. |
+| `dispatcher.apiPreflightTimeoutSeconds` | `120` | Bounded time for API `/health`, followed by a fresh same-size discovery-and-Slack budget. The bare dispatcher default remains 30 seconds. |
+| `dispatcher.startupProbe.initialDelaySeconds` | `0` | Delay before Kubernetes begins the dispatcher heartbeat startup probe. |
+| `dispatcher.startupProbe.periodSeconds` | `10` | Interval between dispatcher startup probes. |
+| `dispatcher.startupProbe.timeoutSeconds` | `5` | Timeout for each dispatcher startup probe. |
+| `dispatcher.startupProbe.failureThreshold` | `27` | Consecutive failures allowed. With the other defaults, the earliest failure cutoff is 260 seconds. |
+
+The dispatcher starts its heartbeat only after every boot preflight succeeds.
+Until then, the startup probe gates readiness and liveness so Kubernetes does
+not restart the pod during normal API warmup or the following Slack checks.
+With the defaults, API health and discovery/Slack each have a 120-second
+budget, a final started Slack call can use at most two more seconds, and the
+startup probe cannot fail the pod before 260 seconds. Helm rendering rejects a
+cutoff that does not strictly outlast that full application startup envelope
+and names the values to adjust. This keeps delayed API readiness restart free
+while preserving a bounded failure: if the API never becomes ready, the
+dispatcher exits with guidance to check `CURIE_API_URL` and whether the API pod
+is Ready before the startup probe budget expires.
 
 Two limits worth knowing. With `api.deploy: false` and an empty
 `dispatcher.apiBaseUrl` the dispatcher is pointed at a Service that does not

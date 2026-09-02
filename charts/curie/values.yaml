@@ -960,6 +960,20 @@ dispatcher:
   # catch the mismatch since /health is unauthenticated and proves reachability
   # only, not that the key is right.
   apiBaseUrl: ""
+  # Bounded startup window for API /health, followed by a fresh same-size
+  # discovery-and-Slack budget. Normal in-chart API warm-up must fit inside the
+  # first deadline; the startup probe below outlasts both phases plus the final
+  # bounded two-second Slack call.
+  apiPreflightTimeoutSeconds: 120
+  # Startup uses the same heartbeat freshness check as readiness/liveness. The
+  # kubelet can count its first failure at t=0, so 27 samples every 10 seconds
+  # make the earliest fast-failure 260s -- strictly after the maximum 242s
+  # application startup envelope above.
+  startupProbe:
+    initialDelaySeconds: 0
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 27
   image:
     repository: ghcr.io/curie-eng/curie-dispatcher
     # Empty -> chart appVersion (immutable). Set to pin an explicit version tag.

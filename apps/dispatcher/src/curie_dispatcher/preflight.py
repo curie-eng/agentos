@@ -82,6 +82,10 @@ if not _SLACK_SDK_SILENT_LOGGER.handlers:
 _SLACK_SDK_SILENT_LOGGER.propagate = False
 _SLACK_SDK_SILENT_LOGGER.setLevel(logging.CRITICAL + 1)
 
+# Keep polling throughout longer readiness windows even when the shared
+# reconnect backoff allows much longer sleeps. The deadline still bounds the
+# whole preflight and each request remains capped separately above.
+_MAX_POLL_INTERVAL_S = 10.0
 
 class ApiUnreachableError(RuntimeError):
     """The platform API did not answer ``GET /health`` before the deadline."""
@@ -171,12 +175,12 @@ def check_api_reachable(
             except httpx.HTTPError as exc:
                 last_error = str(exc)
 
-            delay = backoff.delay(attempt)
+            delay = min(backoff.delay(attempt), _MAX_POLL_INTERVAL_S)
             attempt += 1
             # Clamp to the remaining budget rather than breaking when the next
-            # delay would overshoot it: with the shipped defaults (backoff_max
-            # 30.0 vs a 30.0s deadline) breaking abandons half the budget, and
-            # raising the deadline then buys the operator nothing.
+            # delay would overshoot it. Combined with the poll ceiling above,
+            # this keeps probes near the end of a long readiness window while
+            # preserving the configured terminal deadline.
             remaining = deadline - monotonic()
             if remaining <= 0:
                 break
@@ -188,7 +192,8 @@ def check_api_reachable(
     elapsed = monotonic() - start
     raise ApiUnreachableError(
         f"cannot reach the platform API at {logged_base} after {elapsed:.1f}s "
-        f"({attempt} attempts, last error: {last_error}); check CURIE_API_URL"
+        f"({attempt} attempts, last error: {last_error}); check CURIE_API_URL; "
+        "the API may still be starting, so check that the API pod is Ready"
     )
 
 
