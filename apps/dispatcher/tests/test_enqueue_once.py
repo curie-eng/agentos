@@ -11,9 +11,13 @@ from aci_protocol import QueuedTurn, ReplyHandle
 from curie_dispatcher import enqueue_once
 from curie_dispatcher.config import DispatcherConfig
 from curie_dispatcher.queue import from_stream_fields
-from curie_telemetry import TRACEPARENT_STREAM_FIELD
+from curie_telemetry import TRACEPARENT_STREAM_FIELD, extract_trace_context
+from curie_telemetry.tracing import configure_tracer_provider
 from opentelemetry import context as otel_context
 from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags, TraceState
 
 _TRACE_ID = int("fedcba9876543210fedcba9876543210", 16)
@@ -52,6 +56,19 @@ def _turn() -> QueuedTurn:
     )
 
 
+@contextmanager
+def _captured_spans() -> Iterator[InMemorySpanExporter]:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    configure_tracer_provider(provider)
+    try:
+        yield exporter
+    finally:
+        configure_tracer_provider(None)
+        provider.shutdown()
+
+
 def test_enqueue_payload_uses_dispatcher_carrier_beside_unchanged_payload(
     redis_client: redis.Redis,
     config: DispatcherConfig,
@@ -76,6 +93,36 @@ def test_enqueue_payload_uses_dispatcher_carrier_beside_unchanged_payload(
     assert len(span_id) == 16
     assert flags == "01"
     assert from_stream_fields(fields) == turn
+
+
+def test_enqueue_payload_owns_the_same_ingress_root_as_slack(
+    redis_client: redis.Redis,
+    config: DispatcherConfig,
+) -> None:
+    """The CLI bridge is a sibling ingress, not a parentless producer."""
+
+    turn = _turn()
+    with _captured_spans() as exporter:
+        stream_id = enqueue_once.enqueue_payload(
+            turn.model_dump_json(),
+            config=config,
+            redis_client=redis_client,
+        )
+
+    spans = exporter.get_finished_spans()
+    receipt, = [span for span in spans if span.name == "curie.turn.ingress"]
+    producer, = [span for span in spans if span.name == "curie.queue.enqueue"]
+    assert receipt.parent is None
+    assert producer.context.trace_id == receipt.context.trace_id
+    assert producer.parent is not None
+    assert producer.parent.span_id == receipt.context.span_id
+
+    (entry_id, fields), = redis_client.xrange(config.stream)
+    assert entry_id == stream_id
+    transported = trace.get_current_span(extract_trace_context(fields)).get_span_context()
+    assert transported.trace_id == receipt.context.trace_id
+    assert transported.span_id == producer.context.span_id
+    assert fields["payload"] == turn.model_dump_json()
 
 
 def test_main_without_otlp_endpoint_prints_only_the_stream_id(

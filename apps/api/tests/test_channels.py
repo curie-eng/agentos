@@ -38,11 +38,15 @@ from curie_api.config import Settings, get_settings
 from curie_api.main import create_app
 from curie_api.routers import channels as channels_router
 from curie_telemetry import TRACEPARENT_STREAM_FIELD, extract_trace_context
+from curie_telemetry.tracing import configure_tracer_provider
 from curie_test_support.valkey import connect_or_skip
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from opentelemetry import context as otel_context
 from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags, TraceState
 from sqlalchemy import text as sql_text
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -57,6 +61,7 @@ PAST = 1000000000  # 2001, comfortably expired
 FAR_FUTURE = 4102444800  # 2100-01-01
 _TRACE_ID = int("1123456789abcdef0123456789abcdef", 16)
 _SPAN_ID = int("1123456789abcdef", 16)
+_TRACEPARENT = "00-1123456789abcdef0123456789abcdef-1123456789abcdef-01"
 
 
 @contextmanager
@@ -73,6 +78,19 @@ def _remote_parent() -> Iterator[None]:
         yield
     finally:
         otel_context.detach(token)
+
+
+@contextmanager
+def _captured_spans() -> Iterator[InMemorySpanExporter]:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    configure_tracer_provider(provider)
+    try:
+        yield exporter
+    finally:
+        configure_tracer_provider(None)
+        provider.shutdown()
 
 # The one detail string every ingress auth failure returns. Identical for
 # "no credential" and "wrong credential" so a caller cannot probe the
@@ -635,6 +653,77 @@ def test_channel_ingress_injects_traceparent_adjacent_to_unchanged_payload(
     assert parent.is_valid is True
     assert parent.is_remote is True
     assert parent.trace_id == _TRACE_ID
+
+
+def test_channel_http_parent_is_observation_context_never_ingress_authority(
+    channels_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+) -> None:
+    """A standard carrier parents telemetry but cannot replace a chn token."""
+
+    _bind(
+        channels_client,
+        auth_headers,
+        name="http-traced-ingress-agent",
+        channel=_email_channel("http-trace@example.test"),
+    )
+    token = _mint(
+        channels_client,
+        auth_headers,
+        kind="email",
+        address="http-trace@example.test",
+    )
+    accepted_body = _turn("email", "http-trace@example.test")
+
+    with _captured_spans() as exporter:
+        accepted = _post_turn(
+            channels_client,
+            token,
+            accepted_body,
+            headers={TRACEPARENT_STREAM_FIELD: _TRACEPARENT},
+        )
+        unauthorized = _post_turn(
+            channels_client,
+            None,
+            _turn("email", "http-trace@example.test"),
+            headers={TRACEPARENT_STREAM_FIELD: _TRACEPARENT},
+        )
+
+    assert accepted.status_code == 200, accepted.text
+    assert unauthorized.status_code == 401, unauthorized.text
+    entries = valkey.xrange(runs_stream)
+    assert len(entries) == 1
+    _entry_id, fields = entries[0]
+
+    server_spans = [
+        span
+        for span in exporter.get_finished_spans()
+        if span.name == "http.server.request" and span.context.trace_id == _TRACE_ID
+    ]
+    producers = [
+        span for span in exporter.get_finished_spans() if span.name == "curie.queue.enqueue"
+    ]
+    assert len(server_spans) == 2
+    assert len(producers) == 1
+    producer = producers[0]
+    producer_parent = producer.parent
+    assert producer_parent is not None
+    accepted_server = next(
+        span for span in server_spans if span.context.span_id == producer_parent.span_id
+    )
+    assert accepted_server.parent is not None
+    assert accepted_server.parent.span_id == _SPAN_ID
+    assert producer.context.trace_id == accepted_server.context.trace_id
+
+    transported = trace.get_current_span(extract_trace_context(fields)).get_span_context()
+    assert transported.trace_id == producer.context.trace_id
+    assert transported.span_id == producer.context.span_id
+    assert QueuedTurn.model_validate_json(fields["payload"]).model_dump_json() == fields[
+        "payload"
+    ]
 
 
 def test_a_slack_binding_enqueues_with_neither_endpoint_nor_adapter(

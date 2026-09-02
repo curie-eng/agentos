@@ -7,6 +7,7 @@ from pathlib import Path
 
 from curie_telemetry import (
     TRACEPARENT_STREAM_FIELD,
+    canonicalize_traceparent,
     extract_trace_context,
     inject_trace_context,
 )
@@ -44,3 +45,28 @@ def test_missing_or_malformed_traceparent_extracts_a_safe_root_context() -> None
     for carrier in ({}, {TRACEPARENT_STREAM_FIELD: "not-a-traceparent"}):
         extracted = trace.get_current_span(extract_trace_context(carrier)).get_span_context()
         assert not extracted.is_valid
+
+
+def test_canonicalize_traceparent_returns_only_a_valid_w3c_carrier() -> None:
+    carrier = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01"
+
+    assert canonicalize_traceparent(carrier) == carrier
+    assert canonicalize_traceparent(f"  {carrier}  ") == carrier
+
+
+def test_canonicalize_traceparent_rejects_missing_malformed_and_zero_ids() -> None:
+    assert canonicalize_traceparent(None) is None
+    assert canonicalize_traceparent("") is None
+    assert canonicalize_traceparent("not-a-traceparent") is None
+    assert (
+        canonicalize_traceparent(
+            "00-00000000000000000000000000000000-0123456789abcdef-01"
+        )
+        is None
+    )
+    assert (
+        canonicalize_traceparent(
+            "00-0123456789abcdef0123456789abcdef-0000000000000000-01"
+        )
+        is None
+    )
