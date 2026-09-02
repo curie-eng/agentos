@@ -50,12 +50,16 @@ from curie_telemetry import (
     operation_span,
     record_metric,
 )
+from curie_telemetry.tracing import configure_tracer_provider
 from curie_test_support.valkey import (
     connect_or_skip,
 )
 from fastapi.testclient import TestClient
 from opentelemetry import context as otel_context
 from opentelemetry import trace
+from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags, TraceState
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
@@ -66,6 +70,10 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 ALEMBIC_DIR = Path(__file__).resolve().parents[1] / "alembic"
 _TRACE_ID = int("2123456789abcdef0123456789abcdef", 16)
 _SPAN_ID = int("2123456789abcdef", 16)
+_TRACEPARENT = "00-2123456789abcdef0123456789abcdef-2123456789abcdef-01"
+_CLICK_TRACE_ID = int("6123456789abcdef0123456789abcdef", 16)
+_CLICK_SPAN_ID = int("6123456789abcdef", 16)
+_CLICK_TRACEPARENT = "00-6123456789abcdef0123456789abcdef-6123456789abcdef-01"
 
 
 @asynccontextmanager
@@ -82,6 +90,25 @@ async def _remote_parent() -> AsyncIterator[None]:
         yield
     finally:
         otel_context.detach(token)
+
+
+@contextmanager
+def _captured_approval_spans() -> Iterator[InMemorySpanExporter]:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    configure_tracer_provider(provider)
+    try:
+        yield exporter
+    finally:
+        configure_tracer_provider(None)
+        provider.shutdown()
+
+
+def _span_named(exporter: InMemorySpanExporter, name: str) -> ReadableSpan:
+    matches = [span for span in exporter.get_finished_spans() if span.name == name]
+    assert len(matches) == 1, [(span.name, span.context.trace_id) for span in matches]
+    return matches[0]
 
 
 @pytest.fixture
@@ -288,6 +315,28 @@ def _read_reply_placeholder(approval_id: str) -> str | None:
     return asyncio.run(_run())
 
 
+def _read_approval_traceparent(approval_id: str) -> str | None:
+    """Read the private carrier directly; it must never enter ApprovalOut."""
+
+    async def _run() -> str | None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.connect() as conn:
+                result = await conn.execute(
+                    text(
+                        "SELECT traceparent FROM curie.approvals WHERE id = :id"
+                    ),
+                    {"id": uuid.UUID(approval_id)},
+                )
+                row = result.first()
+                assert row is not None
+                return row[0]
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(_run())
+
+
 def test_resolve_endpoint_stays_200_when_enqueue_fails(
     approvals_client: TestClient,
     auth_headers: dict[str, str],
@@ -334,6 +383,68 @@ def test_resolve_endpoint_stays_200_when_enqueue_fails(
     )
     assert retry.status_code == 409
     assert valkey.xrange(runs_stream) == []
+
+
+def test_failed_inline_enqueue_then_reconciler_keeps_the_stored_parent(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created = approvals_client.post(
+        "/approvals",
+        json=_payload(),
+        headers={**auth_headers, "traceparent": _TRACEPARENT},
+    ).json()
+    queue = approvals_client.app.state.resume_queue
+    original_enqueue = queue.enqueue
+
+    async def _boom(_turn: Any, **_kwargs: Any) -> str:
+        raise RuntimeError("valkey unreachable")
+
+    monkeypatch.setattr(queue, "enqueue", _boom)
+    resolved = approvals_client.post(
+        f"/approvals/{created['id']}/resolve",
+        json={"decision": "approved"},
+        headers=_chat_resolve_headers(
+            created["id"],
+            "U0APPROVER1",
+            "C1",
+            base={**auth_headers, "traceparent": _CLICK_TRACEPARENT},
+        ),
+    )
+    assert resolved.status_code == 200, resolved.text
+    assert valkey.xrange(runs_stream) == []
+    assert _read_resumed_at(created["id"]) is None
+    monkeypatch.setattr(queue, "enqueue", original_enqueue)
+
+    async def _recover() -> int:
+        async with _sweeper_stack(runs_stream) as (sessionmaker, resume_queue, _client):
+            reconciler = ResumeReconciler(
+                sessionmaker,
+                resume_queue,
+                interval_seconds=30,
+                grace_seconds=0,
+                batch_limit=100,
+            )
+            return await reconciler.reconcile_once()
+
+    with _captured_approval_spans() as exporter:
+        assert asyncio.run(_recover()) == 1
+
+    enqueue = _span_named(exporter, "curie.queue.enqueue")
+    assert enqueue.context.trace_id == _TRACE_ID
+    assert enqueue.parent is not None and enqueue.parent.span_id == _SPAN_ID
+    entries = valkey.xrange(runs_stream)
+    assert len(entries) == 1
+    carried = trace.get_current_span(
+        extract_trace_context(entries[0][1])
+    ).get_span_context()
+    assert carried.trace_id == _TRACE_ID
+    assert carried.span_id == enqueue.context.span_id
+    assert _read_resumed_at(created["id"]) is not None
 
 
 @pytest.fixture
@@ -443,21 +554,21 @@ def test_resume_queue_injects_traceparent_adjacent_to_unchanged_payload(
     """Approval resume uses the same transport carrier without widening the DTO."""
 
     created = approvals_client.post(
-        "/approvals", json=_payload(), headers=auth_headers
+        "/approvals",
+        json=_payload(),
+        headers={**auth_headers, "traceparent": _TRACEPARENT},
     ).json()
 
-    async def _resolve_with_parent() -> Any:
-        async with _remote_parent():
-            return await asyncio.to_thread(
-                approvals_client.post,
-                f"/approvals/{created['id']}/resolve",
-                json={"decision": "approved"},
-                headers=_chat_resolve_headers(
-                    created["id"], "U9", "C1", base=auth_headers
-                ),
-            )
-
-    resolved = asyncio.run(_resolve_with_parent())
+    resolved = approvals_client.post(
+        f"/approvals/{created['id']}/resolve",
+        json={"decision": "approved"},
+        headers=_chat_resolve_headers(
+            created["id"],
+            "U9",
+            "C1",
+            base={**auth_headers, "traceparent": _CLICK_TRACEPARENT},
+        ),
+    )
     assert resolved.status_code == 200, resolved.text
 
     entries = valkey.xrange(runs_stream)
@@ -471,6 +582,144 @@ def test_resume_queue_injects_traceparent_adjacent_to_unchanged_payload(
     assert parent.is_valid is True
     assert parent.is_remote is True
     assert parent.trace_id == _TRACE_ID
+
+
+def test_create_privately_persists_only_the_first_inbound_carrier(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    """The authenticated HTTP header is metadata; body and replay are not authority."""
+
+    payload = _payload(traceparent=_CLICK_TRACEPARENT)
+    created = approvals_client.post(
+        "/approvals",
+        json=payload,
+        headers={**auth_headers, "traceparent": _TRACEPARENT},
+    )
+    assert created.status_code == 201, created.text
+    body = created.json()
+    assert "traceparent" not in body
+    assert _read_approval_traceparent(body["id"]) == _TRACEPARENT
+
+    replayed = approvals_client.post(
+        "/approvals",
+        json=payload,
+        headers={**auth_headers, "traceparent": _CLICK_TRACEPARENT},
+    )
+    assert replayed.status_code == 200, replayed.text
+    assert replayed.json()["id"] == body["id"]
+    assert "traceparent" not in replayed.json()
+    assert _read_approval_traceparent(body["id"]) == _TRACEPARENT
+
+    listed = approvals_client.get("/approvals", headers=auth_headers).json()
+    got = approvals_client.get(
+        f"/approvals/{body['id']}", headers=auth_headers
+    ).json()
+    assert all("traceparent" not in row for row in listed)
+    assert "traceparent" not in got
+
+
+@pytest.mark.parametrize("carrier", [None, "not-w3c", "x" * 1024])
+def test_create_with_missing_or_malformed_carrier_stores_a_safe_null(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    carrier: str | None,
+) -> None:
+    headers = dict(auth_headers)
+    if carrier is not None:
+        headers["traceparent"] = carrier
+    created = approvals_client.post("/approvals", json=_payload(), headers=headers)
+    assert created.status_code == 201, created.text
+    assert _read_approval_traceparent(created.json()["id"]) is None
+
+
+@pytest.mark.parametrize("decision", ["approved", "rejected"])
+def test_terminal_resolution_and_resume_parent_to_the_stored_turn(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+    decision: str,
+) -> None:
+    created = approvals_client.post(
+        "/approvals",
+        json=_payload(),
+        headers={**auth_headers, "traceparent": _TRACEPARENT},
+    ).json()
+
+    with _captured_approval_spans() as exporter:
+        resolved = approvals_client.post(
+            f"/approvals/{created['id']}/resolve",
+            json={"decision": decision},
+            headers=_chat_resolve_headers(
+                created["id"],
+                "U0APPROVER1",
+                "C1",
+                base={**auth_headers, "traceparent": _CLICK_TRACEPARENT},
+            ),
+        )
+
+    assert resolved.status_code == 200, resolved.text
+    server = _span_named(exporter, "http.server.request")
+    transition = _span_named(exporter, "curie.approval.resolve")
+    enqueue = _span_named(exporter, "curie.queue.enqueue")
+    assert server.context.trace_id == _CLICK_TRACE_ID
+    assert server.parent is not None and server.parent.span_id == _CLICK_SPAN_ID
+    for span in (transition, enqueue):
+        assert span.context.trace_id == _TRACE_ID
+        assert span.parent is not None and span.parent.span_id == _SPAN_ID
+
+    entries = valkey.xrange(runs_stream)
+    assert len(entries) == 1
+    resumed_parent = trace.get_current_span(
+        extract_trace_context(entries[0][1])
+    ).get_span_context()
+    assert resumed_parent.trace_id == _TRACE_ID
+    assert resumed_parent.span_id == enqueue.context.span_id
+
+
+def test_late_expiry_transition_and_resume_parent_to_the_stored_turn(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+) -> None:
+    created = approvals_client.post(
+        "/approvals",
+        json=_payload(expires_in_seconds=1),
+        headers={**auth_headers, "traceparent": _TRACEPARENT},
+    ).json()
+    time.sleep(1.1)
+
+    with _captured_approval_spans() as exporter:
+        expired = approvals_client.post(
+            f"/approvals/{created['id']}/resolve",
+            json={"decision": "approved"},
+            headers=_chat_resolve_headers(
+                created["id"],
+                "U0APPROVER1",
+                "C1",
+                base={**auth_headers, "traceparent": _CLICK_TRACEPARENT},
+            ),
+        )
+
+    assert expired.status_code == 410, expired.text
+    transition = _span_named(exporter, "curie.approval.expire")
+    enqueue = _span_named(exporter, "curie.queue.enqueue")
+    for span in (transition, enqueue):
+        assert span.context.trace_id == _TRACE_ID
+        assert span.parent is not None and span.parent.span_id == _SPAN_ID
+    entries = valkey.xrange(runs_stream)
+    assert len(entries) == 1
+    resumed_parent = trace.get_current_span(
+        extract_trace_context(entries[0][1])
+    ).get_span_context()
+    assert resumed_parent.trace_id == _TRACE_ID
+    assert resumed_parent.span_id == enqueue.context.span_id
 
 
 def test_create_get_list_round_trip(
@@ -1293,6 +1542,46 @@ def test_sweeper_expires_lapsed_pending_and_enqueues_resume_turn(
 
     assert asyncio.run(_reconcile()) == 0
     assert len(valkey.xrange(runs_stream)) == 1
+
+
+def test_sweeper_transition_and_resume_use_the_stored_turn_parent(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+) -> None:
+    created = approvals_client.post(
+        "/approvals",
+        json=_payload(expires_in_seconds=1),
+        headers={**auth_headers, "traceparent": _TRACEPARENT},
+    ).json()
+
+    async def _sweep() -> int:
+        async with _sweeper_stack(runs_stream) as (sessionmaker, queue, _client):
+            async with sessionmaker() as session:
+                return await sweep_expired_approvals(
+                    session, queue, now=_naive_utc(2)
+                )
+
+    with _captured_approval_spans() as exporter:
+        assert asyncio.run(_sweep()) == 1
+
+    transition = _span_named(exporter, "curie.approval.expire")
+    enqueue = _span_named(exporter, "curie.queue.enqueue")
+    for span in (transition, enqueue):
+        assert span.context.trace_id == _TRACE_ID
+        assert span.parent is not None and span.parent.span_id == _SPAN_ID
+    entries = valkey.xrange(runs_stream)
+    assert len(entries) == 1
+    assert json.loads(entries[0][1]["payload"])["event_id"] == (
+        f"approval-{created['id']}-resolved"
+    )
+    carried = trace.get_current_span(
+        extract_trace_context(entries[0][1])
+    ).get_span_context()
+    assert carried.trace_id == _TRACE_ID
+    assert carried.span_id == enqueue.context.span_id
 
 
 def test_sweeper_ignores_unexpired_and_unbounded_records(
