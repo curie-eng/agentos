@@ -125,42 +125,83 @@ fn local_otel_failure_recovery_scopes_classified_metrics_to_the_traces_worker_in
 
     let attr = |key: &str, value: &str| json!({"key": key, "value": {"stringValue": value}});
     let resource = |service: &str, instance: &str| json!({"attributes": [attr("service.name", service), attr("service.instance.id", instance)]});
-    let span = |name: &str, service: &str, status: i64, trace: &str, id: &str| {
-        json!({"name": name, "traceId": trace, "spanId": id, "status": {"code": status}, "service": service, "instance": format!("{service}-{trace}")})
-    };
+    let span = |name: &str, service: &str, status: i64, trace: &str, id: &str| json!({"name": name, "traceId": trace, "spanId": id, "status": {"code": status}, "service": service, "instance": format!("{service}-{trace}")});
     let failure_trace = "failure-trace";
     let mut failed = vec![
-        span("curie.queue.enqueue", "curie-dispatcher", 1, failure_trace, "01"),
-        span("curie.queue.process", "curie-dispatcher", 1, failure_trace, "02"),
+        span(
+            "curie.queue.enqueue",
+            "curie-dispatcher",
+            1,
+            failure_trace,
+            "01",
+        ),
+        span(
+            "curie.queue.process",
+            "curie-dispatcher",
+            1,
+            failure_trace,
+            "02",
+        ),
         span("curie.turn.process", "curie-worker", 2, failure_trace, "03"),
-        span("curie.sandbox.claim", "curie-worker", 1, failure_trace, "04"),
+        span(
+            "curie.sandbox.claim",
+            "curie-worker",
+            1,
+            failure_trace,
+            "04",
+        ),
         span("curie.runner.rpc", "curie-worker", 1, failure_trace, "05"),
         span("agent.run", "curie-runner", 2, failure_trace, "06"),
     ];
     failed[2]["events"] = json!([{"attributes": [attr("curie.outcome", "classified_failure")]}]);
-    let trace_doc = |spans: Vec<serde_json::Value>| json!({"resourceSpans": spans.into_iter().map(|span| {
+    let trace_doc = |spans: Vec<serde_json::Value>| {
+        json!({"resourceSpans": spans.into_iter().map(|span| {
         let service = span["service"].as_str().expect("fixture service").to_owned();
         let instance = span["instance"].as_str().expect("fixture instance").to_owned();
         let mut span = span;
         span.as_object_mut().expect("fixture span").remove("service");
         span.as_object_mut().expect("fixture span").remove("instance");
         json!({"resource": resource(&service, &instance), "scopeSpans": [{"spans": [span]}]})
-    }).collect::<Vec<_>>()});
+    }).collect::<Vec<_>>()})
+    };
     write_otlp_fixture(root, "traces", &[trace_doc(failed)]);
-    write_otlp_fixture(root, "logs", &[json!({"resourceLogs": [{"resource": resource("curie-worker", "curie-worker-failure-trace"), "scopeLogs": [{"logRecords": [{"traceId": failure_trace, "spanId": "03", "severityNumber": 17}]}]}]})]);
-    let metric = |service: &str, instance: &str, name: &str, outcome: &str, value: i64, time: i64| json!({
-        "resourceMetrics": [{"resource": resource(service, instance), "scopeMetrics": [{"metrics": [{"name": name, "sum": {"dataPoints": [{"attributes": [attr("outcome", outcome)], "asInt": value, "timeUnixNano": time}]}}]}]}]
-    });
+    write_otlp_fixture(
+        root,
+        "logs",
+        &[
+            json!({"resourceLogs": [{"resource": resource("curie-worker", "curie-worker-failure-trace"), "scopeLogs": [{"logRecords": [{"traceId": failure_trace, "spanId": "03", "severityNumber": 17}]}]}]}),
+        ],
+    );
+    let metric = |service: &str,
+                  instance: &str,
+                  name: &str,
+                  outcome: &str,
+                  value: i64,
+                  time: i64| {
+        json!({
+            "resourceMetrics": [{"resource": resource(service, instance), "scopeMetrics": [{"metrics": [{"name": name, "sum": {"dataPoints": [{"attributes": [attr("outcome", outcome)], "asInt": value, "timeUnixNano": time}]}}]}]}]
+        })
+    };
 
     // The runner has already emitted the failed trace, but its worker-owned
     // completed counter has not yet crossed the BatchSpanProcessor boundary.
-    write_otlp_fixture(root, "metrics", &[metric("curie-runner", "curie-runner-failure-trace", "curie.turn.completed", "classified_failure", 1, 1)]);
+    write_otlp_fixture(
+        root,
+        "metrics",
+        &[metric(
+            "curie-runner",
+            "curie-runner-failure-trace",
+            "curie.turn.completed",
+            "classified_failure",
+            1,
+            1,
+        )],
+    );
     let runner_only = run_local_otel_query(&script, "failed", root, &empty);
     let racy_baseline = root.join("racy-baseline.json");
-    let runner_snapshot: serde_json::Value = serde_json::from_slice(
-        &run_local_otel_query(&script, "snapshot", root, &empty).stdout,
-    )
-    .expect("parse runner-only snapshot");
+    let runner_snapshot: serde_json::Value =
+        serde_json::from_slice(&run_local_otel_query(&script, "snapshot", root, &empty).stdout)
+            .expect("parse runner-only snapshot");
     fs::write(
         &racy_baseline,
         serde_json::to_vec(&runner_snapshot).expect("serialize recovery baseline"),
@@ -176,30 +217,87 @@ fn local_otel_failure_recovery_scopes_classified_metrics_to_the_traces_worker_in
     .expect("write failed metric baseline");
 
     // This is the late worker export that used to land after restored_before.
-    let mut metrics = vec![metric("curie-runner", "curie-runner-failure-trace", "curie.turn.completed", "classified_failure", 1, 1)];
-    metrics.push(metric("curie-worker", "curie-worker-failure-trace", "curie.turn.completed", "classified_failure", 1, 2));
+    let mut metrics = vec![metric(
+        "curie-runner",
+        "curie-runner-failure-trace",
+        "curie.turn.completed",
+        "classified_failure",
+        1,
+        1,
+    )];
+    metrics.push(metric(
+        "curie-worker",
+        "curie-worker-failure-trace",
+        "curie.turn.completed",
+        "classified_failure",
+        1,
+        2,
+    ));
     write_otlp_fixture(root, "metrics", &metrics);
-    let delayed_failed_worker = run_local_otel_query(
-        &script,
-        "failed",
-        root,
-        &failed_metric_baseline,
-    );
+    let delayed_failed_worker =
+        run_local_otel_query(&script, "failed", root, &failed_metric_baseline);
 
     let healthy_trace = "healthy-trace";
     let mut healthy = vec![
         span("curie.health", "curie-api", 1, healthy_trace, "10"),
-        span("curie.queue.enqueue", "curie-dispatcher", 1, healthy_trace, "11"),
-        span("curie.queue.process", "curie-dispatcher", 1, healthy_trace, "12"),
+        span(
+            "curie.queue.enqueue",
+            "curie-dispatcher",
+            1,
+            healthy_trace,
+            "11",
+        ),
+        span(
+            "curie.queue.process",
+            "curie-dispatcher",
+            1,
+            healthy_trace,
+            "12",
+        ),
         span("curie.turn.process", "curie-worker", 1, healthy_trace, "13"),
-        span("curie.sandbox.claim", "curie-worker", 1, healthy_trace, "14"),
+        span(
+            "curie.sandbox.claim",
+            "curie-worker",
+            1,
+            healthy_trace,
+            "14",
+        ),
         span("curie.runner.rpc", "curie-worker", 1, healthy_trace, "15"),
-        span("curie.reply.post", "curie-dispatcher", 1, healthy_trace, "16"),
+        span(
+            "curie.reply.post",
+            "curie-dispatcher",
+            1,
+            healthy_trace,
+            "16",
+        ),
         json!({"name": "agent.run", "traceId": healthy_trace, "spanId": "17", "status": {"code": 1}, "attributes": [attr("curie.phase", "provider_wait"), attr("curie.terminal.cause", "completed"), attr("curie.terminal.status", "succeeded")], "service": "curie-runner", "instance": "curie-runner-healthy-trace"}),
         json!({"name": "llm.generation", "traceId": healthy_trace, "spanId": "18", "parentSpanId": "17", "status": {"code": 1}, "attributes": [attr("curie.phase", "provider_wait"), attr("curie.phase.start_kind", "query_observed"), attr("curie.phase.end_kind", "result_observed"), json!({"key": "curie.generation.round", "value": {"intValue": "1"}})], "service": "curie-runner", "instance": "curie-runner-healthy-trace"}),
     ];
     let mut traces = vec![trace_doc(vec![
-        span("curie.queue.enqueue", "curie-dispatcher", 1, failure_trace, "01"), span("curie.queue.process", "curie-dispatcher", 1, failure_trace, "02"), span("curie.turn.process", "curie-worker", 2, failure_trace, "03"), span("curie.sandbox.claim", "curie-worker", 1, failure_trace, "04"), span("curie.runner.rpc", "curie-worker", 1, failure_trace, "05"), json!({"name": "agent.run", "traceId": failure_trace, "spanId": "06", "status": {"code": 2}, "events": [{"attributes": [attr("curie.outcome", "classified_failure")]}], "service": "curie-runner", "instance": "curie-runner-failure-trace"})
+        span(
+            "curie.queue.enqueue",
+            "curie-dispatcher",
+            1,
+            failure_trace,
+            "01",
+        ),
+        span(
+            "curie.queue.process",
+            "curie-dispatcher",
+            1,
+            failure_trace,
+            "02",
+        ),
+        span("curie.turn.process", "curie-worker", 2, failure_trace, "03"),
+        span(
+            "curie.sandbox.claim",
+            "curie-worker",
+            1,
+            failure_trace,
+            "04",
+        ),
+        span("curie.runner.rpc", "curie-worker", 1, failure_trace, "05"),
+        json!({"name": "agent.run", "traceId": failure_trace, "spanId": "06", "status": {"code": 2}, "events": [{"attributes": [attr("curie.outcome", "classified_failure")]}], "service": "curie-runner", "instance": "curie-runner-failure-trace"}),
     ])];
     traces.push(trace_doc(std::mem::take(&mut healthy)));
     write_otlp_fixture(root, "traces", &traces);
@@ -215,18 +313,54 @@ fn local_otel_failure_recovery_scopes_classified_metrics_to_the_traces_worker_in
     })
     .collect();
     write_otlp_fixture(root, "logs", &[json!({"resourceLogs": resource_logs})]);
-    for (name, outcome) in [("curie.turn.accepted", ""), ("curie.turn.completed", "done"), ("curie.turn.duration", "done"), ("curie.queue.message.age", ""), ("curie.sandbox.lifecycle", ""), ("curie.runner.rpc.result", "success")] {
-        metrics.push(metric("curie-worker", "curie-worker-healthy-trace", name, outcome, 1, 3));
+    for (name, outcome) in [
+        ("curie.turn.accepted", ""),
+        ("curie.turn.completed", "done"),
+        ("curie.turn.duration", "done"),
+        ("curie.queue.message.age", ""),
+        ("curie.sandbox.lifecycle", ""),
+        ("curie.runner.rpc.result", "success"),
+    ] {
+        metrics.push(metric(
+            "curie-worker",
+            "curie-worker-healthy-trace",
+            name,
+            outcome,
+            1,
+            3,
+        ));
     }
     write_otlp_fixture(root, "metrics", &metrics);
     let racy_healthy = run_local_otel_query(&script, "healthy", root, &racy_baseline);
-    assert!(!runner_only.status.success(), "runner-only classified_failure must not prove the worker failure");
-    assert!(delayed_failed_worker.status.success(), "the causally matched failed worker metric must retain the failure proof: {}", String::from_utf8_lossy(&delayed_failed_worker.stderr));
-    assert!(racy_healthy.status.success(), "a delayed failure from the old worker instance must not poison healthy recovery: {}", String::from_utf8_lossy(&racy_healthy.stderr));
-    metrics.push(metric("curie-worker", "curie-worker-healthy-trace", "curie.turn.completed", "classified_failure", 1, 4));
+    assert!(
+        !runner_only.status.success(),
+        "runner-only classified_failure must not prove the worker failure"
+    );
+    assert!(
+        delayed_failed_worker.status.success(),
+        "the causally matched failed worker metric must retain the failure proof: {}",
+        String::from_utf8_lossy(&delayed_failed_worker.stderr)
+    );
+    assert!(
+        racy_healthy.status.success(),
+        "a delayed failure from the old worker instance must not poison healthy recovery: {}",
+        String::from_utf8_lossy(&racy_healthy.stderr)
+    );
+    metrics.push(metric(
+        "curie-worker",
+        "curie-worker-healthy-trace",
+        "curie.turn.completed",
+        "classified_failure",
+        1,
+        4,
+    ));
     write_otlp_fixture(root, "metrics", &metrics);
-    let same_healthy_worker_failure = run_local_otel_query(&script, "healthy", root, &racy_baseline);
-    assert!(!same_healthy_worker_failure.status.success(), "classified_failure on the healthy worker instance must remain a negative control");
+    let same_healthy_worker_failure =
+        run_local_otel_query(&script, "healthy", root, &racy_baseline);
+    assert!(
+        !same_healthy_worker_failure.status.success(),
+        "classified_failure on the healthy worker instance must remain a negative control"
+    );
 }
 
 fn chart_runtime_e2e() -> String {
