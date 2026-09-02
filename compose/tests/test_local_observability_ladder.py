@@ -15,6 +15,7 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LADDER_PATH = REPO_ROOT / "cli" / "scripts" / "e2e-ladder.sh"
 SINK_CONFIG_PATH = REPO_ROOT / "cli" / "scripts" / "fixtures" / "otel-e2e-sink-config.yaml"
+MCP_RECEIPT_FIXTURE = REPO_ROOT / "cli" / "scripts" / "fixtures" / "mcp-receipt"
 
 
 def _function_body(source: str, name: str, next_marker: str) -> str:
@@ -22,6 +23,16 @@ def _function_body(source: str, name: str, next_marker: str) -> str:
     assert start_marker in source, f"{LADDER_PATH}: missing {name}"
     start = source.index(start_marker)
     end = source.index(next_marker, start)
+    return source[start:end]
+
+
+def _shell_function(source: str, name: str) -> str:
+    """Return one top-level shell function without depending on its successor."""
+
+    start_marker = f"{name}() {{"
+    assert start_marker in source, f"{LADDER_PATH}: missing {name}"
+    start = source.index(start_marker)
+    end = source.index("\n}\n", start) + len("\n}\n")
     return source[start:end]
 
 
@@ -242,4 +253,220 @@ def test_local_otel_controls_distinguish_a_live_sink_from_a_turn() -> None:
     )
     assert "sleep 12" in helper, (
         "the failure baseline must outwait the 10-second metric export interval"
+    )
+
+
+def test_product_oracle_discovers_only_the_seed_trace_from_bounded_transport() -> None:
+    """A background/newest trace must be unable to satisfy the turn oracle."""
+
+    source = LADDER_PATH.read_text()
+    assert "local observability runs --limit 100" not in source, (
+        "a newest-runs page can select an unrelated background trace; exact discovery "
+        "must start from the seeded stream entry"
+    )
+
+    discover = _shell_function(source, "discover_trace_id_for_seed")
+    for required in (
+        "stream_start",
+        "stream_end",
+        "marker",
+        "XRANGE",
+        "traceparent",
+        "[0-9a-f]{32}",
+        "umask 077",
+    ):
+        assert required in discover, (
+            "exact discovery must inspect only the marker's bounded stream slice, "
+            f"validate its adjacent W3C carrier, and keep raw fields private; missing {required!r}"
+        )
+    assert "printf '%s\\n' \"$payload\"" not in discover
+    assert "printf '%s\\n' \"$traceparent\"" not in discover
+
+    query = _shell_function(source, "query_exact_seed_trace")
+    assert 'observability run "$trace_id"' in query
+    assert "sanitize_exact_trace_read" in query
+    assert "observability runs" not in query
+    assert "printf '%s\\n' \"$out\"" not in query, (
+        "raw Langfuse JSON may contain prompt, user, session, and deployment fields"
+    )
+    sanitizer = _shell_function(source, "sanitize_exact_trace_read")
+    for allowed in (
+        "trace_id",
+        "service",
+        "operation",
+        "observation_count",
+        "observation_type",
+        "approval_decision",
+    ):
+        assert allowed in sanitizer, f"sanitized evidence omits safe field {allowed!r}"
+    for private in ("input", "output", "session", "user", "headers"):
+        assert private in sanitizer, (
+            f"sanitizer must explicitly prevent raw {private!r} from reaching stdout"
+        )
+
+
+def test_ordinary_mcp_and_approval_seeds_have_independent_receipts() -> None:
+    """An unexercised seed is seed-invalid before telemetry is interpreted."""
+
+    source = LADDER_PATH.read_text()
+    for name, required in {
+        "seed_ordinary_turn": ("assert_finalized_reply", "ordinary", "seed-invalid"),
+        "seed_mcp_read_turn": ("mcp_receipt_call_count", "seed-invalid"),
+        "seed_approval_resume_turn": (
+            "awaiting-approval",
+            "pending",
+            "resolve",
+            "assert_finalized_reply",
+            "seed-invalid",
+        ),
+    }.items():
+        body = _shell_function(source, name)
+        missing = [marker for marker in required if marker not in body]
+        assert not missing, f"{name} lacks independent outcome evidence: {missing}"
+        assert "discover_trace_id_for_seed" in body
+        assert "query_exact_seed_trace" in body
+
+    assert "seed-invalid" in source
+    assert MCP_RECEIPT_FIXTURE.is_dir(), (
+        "the MCP observation needs a hosted fixture whose container log is an "
+        "independent tools/call receipt ledger"
+    )
+    server = MCP_RECEIPT_FIXTURE / "server.py"
+    assert server.is_file()
+    fixture_source = server.read_text()
+    assert '"tools/call"' in fixture_source
+    assert "print(" in fixture_source
+    assert "flush=True" in fixture_source
+
+    receipt = _shell_function(source, "mcp_receipt_call_count")
+    assert "connector_container_for_alias" in receipt
+    assert "docker logs" in receipt or "kubectl logs" in receipt
+    assert "wc -l" in receipt or "count" in receipt
+    for forbidden in ("tool input", "arguments", "receipt line"):
+        assert forbidden not in receipt.lower(), (
+            "public evidence may expose only an aggregate MCP call count"
+        )
+
+
+def test_product_collector_restore_restarts_and_verifies_every_seed_emitter() -> None:
+    """Worker-only restore cannot prove dispatcher, API, or runner delivery."""
+
+    source = LADDER_PATH.read_text()
+    restore = _shell_function(source, "route_local_observability_to_product_collector")
+    for service in (
+        "curie-api",
+        "curie-dispatcher",
+        "curie-worker",
+        "curie-runner",
+    ):
+        assert service in restore, (
+            f"{service} can keep the disposable sink endpoint unless it is recreated "
+            "or launched after product routing is restored"
+        )
+    assert "assert_product_collector_endpoint" in restore
+    for protocol in ("http/protobuf", "otel-collector:4318"):
+        assert protocol in restore
+
+
+def test_invalid_langfuse_auth_is_temporary_durable_and_recovers_the_same_id() -> None:
+    """Pin the real backend negative without redefining exporter semantics."""
+
+    source = LADDER_PATH.read_text()
+    negative = _shell_function(source, "case_local_langfuse_invalid_auth")
+
+    # Observed shipped behavior, not an assumed external-API contract:
+    # otel/collector-config.yaml enables retry_on_failure at 5s/30s/5m and a
+    # file_storage-backed sending_queue of 1000. Therefore invalid auth is a
+    # bounded temporary absence, and success means recovery of the same queued
+    # trace ID after restoring auth, never permanent loss or a fresh control ID.
+    for required in (
+        "LANGFUSE_OTLP_AUTH_HEADER",
+        "INVALID_LANGFUSE_OTLP_AUTH_HEADER",
+        "langfuse-web",
+        "otelcol_receiver_accepted_spans",
+        "otelcol_exporter_send_failed_spans",
+        "sending_queue",
+        "file_storage",
+        "queue_size",
+        "Ready",
+        "restart",
+        "same_queued_trace_id",
+        "query_exact_seed_trace",
+        "queue_drained",
+    ):
+        assert required in negative, f"invalid-auth proof omits {required!r}"
+    assert "down -v" not in negative
+    assert negative.index("INVALID_LANGFUSE_OTLP_AUTH_HEADER") < negative.index(
+        "same_queued_trace_id"
+    )
+    assert negative.count("same_queued_trace_id") >= 2, (
+        "the ID observed absent while auth is invalid must be the ID recovered "
+        "after the queue-preserving restart"
+    )
+
+
+def test_cluster_product_observability_is_private_preflight_and_query_only() -> None:
+    """The ladder may inspect a task release but must never install or remove it."""
+
+    source = LADDER_PATH.read_text()
+    preflight = _shell_function(source, "preflight_cluster_product_observability")
+    for required in (
+        "CURIE_NAMESPACE",
+        "CURIE_RELEASE",
+        "default",
+        "curie",
+        "langfuse",
+        "otel-collector",
+        "api",
+        "worker",
+        "runner-prewarm",
+        "imageID",
+        "docker image inspect",
+        "curie-api:local",
+        "curie-worker:local",
+        "curie-runner:latest",
+        "mismatch",
+    ):
+        assert required in preflight, f"cluster preflight omits {required!r}"
+
+    mode = _shell_function(source, "run_cluster_product_observability")
+    assert "preflight_cluster_product_observability" in mode
+    assert "seed_ordinary_turn" in mode
+    assert "seed_approval_resume_turn" in mode
+    assert "cluster observability run" in mode
+    for mutating in (
+        "cluster up",
+        "cluster down",
+        "helm install",
+        "helm upgrade",
+        "helm uninstall",
+        "kubectl delete",
+    ):
+        assert mutating not in mode, (
+            f"product-observability mode must be preflight/query-only, found {mutating!r}"
+        )
+
+
+def test_adopted_component_stop_requires_successful_export_on_both_product_surfaces() -> None:
+    """Selective ingest loss is a dependency blocker only after Curie is cleared."""
+
+    source = LADDER_PATH.read_text()
+    decision = _shell_function(source, "classify_product_observability_owner")
+    for required in (
+        "raw_emitted_observations",
+        "otelcol_receiver_accepted_spans",
+        "otelcol_exporter_sent_spans",
+        "langfuse_observation_membership",
+        "local",
+        "cluster",
+        "image_ids_match",
+        "seed_valid",
+        "adopted-component",
+    ):
+        assert required in decision, f"ownership classification omits {required!r}"
+    assert decision.index("otelcol_exporter_sent_spans") < decision.index(
+        "adopted-component"
+    )
+    assert decision.index("langfuse_observation_membership") < decision.index(
+        "adopted-component"
     )

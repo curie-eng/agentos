@@ -59,6 +59,18 @@ fn ladder() -> String {
     fs::read_to_string(path).unwrap_or_default()
 }
 
+fn ladder_function(name: &str) -> String {
+    let source = ladder();
+    let marker = format!("{name}() {{");
+    let (_, tail) = source
+        .split_once(&marker)
+        .unwrap_or_else(|| panic!("ladder must define {name}"));
+    let (body, _) = tail
+        .split_once("\n}\n")
+        .unwrap_or_else(|| panic!("ladder function {name} must close"));
+    format!("{marker}{body}\n}}\n")
+}
+
 /// The local OTel assertions deliberately live in the shell harness, where
 /// they consume the Collector's raw JSON files.  Keep this test on that real
 /// consumer instead of re-implementing its attribution rules in Rust.
@@ -812,11 +824,21 @@ fn live_local_rung_grades_the_deployed_weather_cases() {
         .map(|offset| product_collector + offset)
         .expect("the local rung must prove observability queries after telemetry");
     assert!(
-        text.contains(r#"local observability runs --limit 100"#)
-            && text.contains(r#"timestamp = row.get("timestamp")"#)
-            && text.contains(r#"if matched is None:"#),
-        "the live proof must scan a bounded newest-first page and select its first complete typed row without relying on an identity field the list DTO does not promise"
+        !text.contains(r#"local observability runs --limit 100"#),
+        "a newest-runs page can select a background trace; the live proof must derive the exact trace ID from the seeded bounded stream entry"
     );
+    for required in [
+        "discover_trace_id_for_seed",
+        "query_exact_seed_trace",
+        "sanitize_exact_trace_read",
+        "seed_ordinary_turn",
+        "seed_approval_resume_turn",
+    ] {
+        assert!(
+            text.contains(required),
+            "the local product proof is missing exact-seed contract {required}"
+        );
+    }
     let contract = r#"echo "=== curie local eval --dry-run (suite parity) ==="
     local eval_args=(local eval)
     if [[ ! -f "$WORKDIR/bundle/evals/trajectory.json" ]]; then
@@ -849,6 +871,173 @@ fn live_local_rung_grades_the_deployed_weather_cases() {
         !local_rung.contains("up_args+=(--minimal)"),
         "the local rung must never add --minimal now that its observability \
           proof requires Langfuse/ClickHouse; ladder contents:\n{text}"
+    );
+}
+
+#[test]
+fn product_observability_requires_three_valid_seeds_and_count_only_mcp_receipt() {
+    let text = ladder();
+    for required in [
+        "seed_ordinary_turn() {",
+        "seed_mcp_read_turn() {",
+        "seed_approval_resume_turn() {",
+        "seed-invalid",
+        "mcp_receipt_call_count() {",
+        "discover_trace_id_for_seed",
+        "query_exact_seed_trace",
+        "fixtures/mcp-receipt",
+    ] {
+        assert!(
+            text.contains(required),
+            "the product observability oracle must pin independent ordinary, MCP, and approval seed evidence; missing {required}"
+        );
+    }
+
+    let receipt_fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts/fixtures/mcp-receipt/server.py");
+    let receipt_source = fs::read_to_string(&receipt_fixture).unwrap_or_default();
+    assert!(
+        receipt_source.contains(r#""tools/call""#),
+        "the hosted MCP fixture must log exactly one private receipt per tools/call"
+    );
+    let receipt = ladder_function("mcp_receipt_call_count");
+    assert!(
+        receipt.contains("docker logs") || receipt.contains("kubectl logs"),
+        "the independent MCP receipt must come from the hosted connector container"
+    );
+    assert!(
+        receipt.contains("count") || receipt.contains("wc -l"),
+        "only an aggregate MCP call count may reach evidence output"
+    );
+}
+
+#[test]
+fn product_collector_restore_covers_every_emitter_and_invalid_auth_recovers_same_id() {
+    let restore = ladder_function("route_local_observability_to_product_collector");
+    for required in [
+        "curie-api",
+        "curie-dispatcher",
+        "curie-worker",
+        "curie-runner",
+        "assert_product_collector_endpoint",
+        "http/protobuf",
+        "otel-collector:4318",
+    ] {
+        assert!(
+            restore.contains(required),
+            "worker-only exporter restoration can leave {required} routed to the disposable sink"
+        );
+    }
+
+    let negative = ladder_function("case_local_langfuse_invalid_auth");
+    // This contract is grounded in the shipped otel/collector-config.yaml:
+    // retry_on_failure is 5s/30s/5m and sending_queue uses file_storage with
+    // queue_size 1000. Invalid auth is therefore a temporary observed absence;
+    // the proof must recover the same queued ID before the unchanged horizon.
+    for required in [
+        "INVALID_LANGFUSE_OTLP_AUTH_HEADER",
+        "langfuse-web",
+        "otelcol_receiver_accepted_spans",
+        "otelcol_exporter_send_failed_spans",
+        "sending_queue",
+        "file_storage",
+        "queue_size",
+        "Ready",
+        "restart",
+        "same_queued_trace_id",
+        "queue_drained",
+    ] {
+        assert!(
+            negative.contains(required),
+            "real pinned-Langfuse invalid-auth proof omits {required}"
+        );
+    }
+    assert!(
+        !negative.contains("down -v"),
+        "the negative must retain the Collector file queue across restart"
+    );
+    assert!(
+        negative.matches("same_queued_trace_id").count() >= 2,
+        "the temporarily absent ID, not a fresh post-recovery control, must become queryable"
+    );
+}
+
+#[test]
+fn cluster_product_observability_is_private_preflight_and_query_only() {
+    let preflight = ladder_function("preflight_cluster_product_observability");
+    for required in [
+        "CURIE_NAMESPACE",
+        "CURIE_RELEASE",
+        "default",
+        "curie",
+        "langfuse",
+        "otel-collector",
+        "api",
+        "worker",
+        "runner-prewarm",
+        "imageID",
+        "docker image inspect",
+        "curie-api:local",
+        "curie-worker:local",
+        "curie-runner:latest",
+        "mismatch",
+    ] {
+        assert!(
+            preflight.contains(required),
+            "cluster product preflight omits {required}"
+        );
+    }
+
+    let query = ladder_function("run_cluster_product_observability");
+    for required in [
+        "preflight_cluster_product_observability",
+        "seed_ordinary_turn",
+        "seed_approval_resume_turn",
+        "cluster observability run",
+    ] {
+        assert!(query.contains(required), "cluster query mode omits {required}");
+    }
+    for mutation in [
+        "cluster up",
+        "cluster down",
+        "helm install",
+        "helm upgrade",
+        "helm uninstall",
+        "kubectl delete",
+    ] {
+        assert!(
+            !query.contains(mutation),
+            "cluster product mode must never mutate the installed release: found {mutation}"
+        );
+    }
+}
+
+#[test]
+fn adopted_component_stop_requires_successful_local_and_cluster_export() {
+    let decision = ladder_function("classify_product_observability_owner");
+    for required in [
+        "raw_emitted_observations",
+        "otelcol_receiver_accepted_spans",
+        "otelcol_exporter_sent_spans",
+        "langfuse_observation_membership",
+        "local",
+        "cluster",
+        "image_ids_match",
+        "seed_valid",
+        "adopted-component",
+    ] {
+        assert!(
+            decision.contains(required),
+            "ownership classification omits prerequisite {required}"
+        );
+    }
+    assert!(
+        decision.find("otelcol_exporter_sent_spans") < decision.find("adopted-component"),
+        "the harness cannot blame the adopted backend before proving export success"
+    );
+    assert!(
+        decision.find("langfuse_observation_membership") < decision.find("adopted-component"),
+        "the harness cannot blame the adopted backend before checking exact-ID membership"
     );
 }
 
@@ -1713,27 +1902,27 @@ fn looks_like_utc_second(value: &str) -> bool {
 
 /// Pin the public argv the ladder itself must exercise. These are not test-only
 /// probes: every line is a command an operator can paste against the candidate
-/// binary. The bounded newest-page read occurs before the discovered-id detail;
+/// binary. Exact trace discovery is private to the bounded seed stream slice;
 /// the separate agent-filtered list is the unavailable-API negative with its
 /// process environment pointed at a closed endpoint.
 fn assert_observability_candidate_invocations(invocations: &str, trace_id: &str) {
-    let runs = "--json local observability runs --limit 100";
+    let legacy_runs = "--json local observability runs --limit 100";
     let unavailable = format!("--json local observability runs --limit 1 --agent-id {AGENT_ID}");
     let detail = format!("--json local observability run {trace_id}");
     let unknown = format!("--json local observability run {UNKNOWN_OBSERVABILITY_TRACE_ID}");
 
     assert_eq!(
-        invocation_count(invocations, runs),
-        1,
-        "the local rung must issue one bounded newest-runs read for typed client selection; invocations:\n{invocations}"
+        invocation_count(invocations, legacy_runs),
+        0,
+        "the local rung must never let a newest-runs page select an unrelated background trace; invocations:\n{invocations}"
     );
-    assert_eq!(
+    assert!(
         invocations
             .lines()
             .filter(|line| line.starts_with("--json local message "))
-            .count(),
-        2,
-        "the query proof must seed the product Collector with its own finalized turn after the independent sink controls; invocations:\n{invocations}"
+            .count()
+            >= 2,
+        "the query proof must seed the product Collector with independently finalized turns after the raw sink controls; invocations:\n{invocations}"
     );
     assert_eq!(
         invocation_count(invocations, &unavailable),
@@ -1817,17 +2006,17 @@ fn assert_observability_candidate_invocations(invocations: &str, trace_id: &str)
         summary_window, series_window,
         "summary and series must share the one dynamically captured window; invocations:\n{invocations}"
     );
-    let bounded_position = invocations
-        .lines()
-        .position(|line| line == runs)
-        .expect("bounded runs invocation");
     let detail_position = invocations
         .lines()
         .position(|line| line == detail.as_str())
         .expect("discovered trace detail invocation");
+    let seed_position = invocations
+        .lines()
+        .position(|line| line.starts_with("--json local message "))
+        .expect("seed message invocation");
     assert!(
-        bounded_position < detail_position,
-        "the rung must discover the real trace id from the bounded list before querying its complete tree; invocations:\n{invocations}"
+        seed_position < detail_position,
+        "the rung must complete a seed before querying the exact trace ID privately derived from that seed; invocations:\n{invocations}"
     );
 }
 
@@ -2011,19 +2200,13 @@ fn local_observability_proof_leaves_a_borrowed_stack_to_its_owner() {
     );
 }
 
-/// #866 NEGATIVE CONTROLS. Move one stub contract at a time while the positive
-/// control above stays green: JSON cardinality, unknown-trace exit 1,
+/// #866 NEGATIVE CONTROLS. Move one candidate query contract at a time while
+/// the positive control above stays green: unknown-trace exit 1,
 /// unavailable-API exit 3, and the mandatory recovery instruction must each
 /// make the real ladder reject the candidate and still run owner teardown.
 #[test]
 fn local_observability_negative_controls_are_falsifiable() {
     let cases: &[(&str, &str, &[&str], bool)] = &[
-        (
-            "STUB_RUNS_EXTRA_JSON",
-            "1",
-            &["runs", "exactly one JSON object"],
-            false,
-        ),
         (
             "STUB_UNKNOWN_TRACE_EXIT",
             "0",
