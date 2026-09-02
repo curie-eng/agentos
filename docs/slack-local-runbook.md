@@ -192,14 +192,21 @@ docker compose -f compose.release.yaml exec valkey valkey-cli -a valkeypass XLEN
 `valkeypass` is the `.env.example` default (`VALKEY_PASSWORD`); substitute your
 own if you overrode it.
 
-## One Socket Mode owner per app token
+## Shared Socket Mode apps
 
-Slack allows exactly one Socket Mode owner per app token at a time. A local
-dispatcher and a cluster dispatcher on the SAME Slack app conflict: it is either
-or per app. Stop one before starting the other. This is exactly why the compose
-service is off by default behind the profile. The cluster side states the same
-constraint: see [`operations.md`](operations.md), which says to stop a local
-dispatcher before enabling `dispatcher.deploy=true` in the chart.
+Slack allows an app to maintain up to ten Socket Mode connections and may send
+each payload to any connection, with no distribution pattern an application can
+assume ([Slack's Socket Mode documentation](https://docs.slack.dev/apis/events-api/using-socket-mode/#using-multiple-connections)).
+A local dispatcher and a cluster dispatcher can therefore connect with the same
+app token, but they do not both receive each interaction.
+
+Prefer a separate Slack app per long-lived Curie release. When two Curie
+releases temporarily share one app, an approval interaction may first reach the
+release whose API does not contain that approval. That release leaves the
+approval and card unchanged and tells the approver to try again so Slack can
+deliver a later interaction to the owner. Stop the extra dispatcher after the
+overlap; the compose dispatcher remains off by default behind the Slack profile
+to make accidental overlap less likely.
 
 ## Teardown and return to Slack-free
 
