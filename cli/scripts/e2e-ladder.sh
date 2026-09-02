@@ -3597,12 +3597,15 @@ assert_product_runner_endpoints() {
 # The independent sink above proves raw telemetry crossed every service
 # boundary, but it deliberately replaces the product Collector endpoint. Once
 # those controls finish, restore every actual emitter before seeding Langfuse.
+# Pin the task-owned Collector explicitly: unsetting these variables permits
+# shell or ignored local configuration to redirect the evidence elsewhere.
 route_local_observability_to_product_collector() {
     if [[ -n "${STUB_STATE:-}" ]] || (( ! LOCAL_OTEL_SINK_ACTIVE )); then
         return 0
     fi
 
-    unset OTEL_EXPORTER_OTLP_ENDPOINT OTEL_EXPORTER_OTLP_PROTOCOL
+    export OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+    export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
     local stale runner dispatcher=""
     # An already-running curie-runner inherited the disposable endpoint. Reap
     # exactly those emitters, rather than selecting on CURIE_RELEASE: that is a
@@ -3647,7 +3650,7 @@ route_local_observability_to_product_collector() {
             "http://otel-collector:4318" "http/protobuf"
     else
         # curie local message launches the curie-dispatcher image after these
-        # exports are unset; the adjacent stream carrier and exact trace prove
+        # exports are pinned; the adjacent stream carrier and exact trace prove
         # that actual one-shot emitter rather than a config-only assertion.
         echo "local observability: curie-dispatcher one-shot will inherit product routing"
     fi

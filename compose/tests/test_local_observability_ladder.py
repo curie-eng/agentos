@@ -806,6 +806,11 @@ def test_product_collector_restore_restarts_and_verifies_every_seed_emitter() ->
             "or launched after product routing is restored"
         )
     assert "assert_product_collector_endpoint" in restore
+    assert (
+        "export OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318" in restore
+    )
+    assert "export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf" in restore
+    assert "unset OTEL_EXPORTER_OTLP_ENDPOINT" not in restore
     for protocol in ("http/protobuf", "otel-collector:4318"):
         assert protocol in restore
 

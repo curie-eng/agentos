@@ -1049,6 +1049,18 @@ fn product_collector_restore_covers_every_emitter_and_invalid_auth_recovers_same
             "worker-only exporter restoration can leave {required} routed to the disposable sink"
         );
     }
+    assert!(
+        restore.contains("export OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318"),
+        "product restoration must override unrelated shell or ignored-file routing"
+    );
+    assert!(
+        restore.contains("export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf"),
+        "product restoration must pin the protocol expected by the task-owned collector"
+    );
+    assert!(
+        !restore.contains("unset OTEL_EXPORTER_OTLP_ENDPOINT"),
+        "unsetting the override permits ignored local configuration to redirect evidence"
+    );
 
     let negative = ladder_function("case_local_langfuse_invalid_auth");
     // This contract is grounded in the shipped otel/collector-config.yaml:
