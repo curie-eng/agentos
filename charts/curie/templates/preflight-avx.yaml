@@ -3,11 +3,13 @@
 Preflight (a): CPU-AVX / ClickHouse-pin check.
 
 Newer ClickHouse (>= 25.x) is compiled for AVX and SIGILLs with exit 132 on
-CPUs that only have SSE4.2. A crash-looping ClickHouse pod is a confusing way to
-discover this, so this hook catches it BEFORE the stores install: it reads the
-node's /proc/cpuinfo (a container shares the host kernel, so the flags are the
-node's), and if the node lacks AVX it FAILS the install unless the configured
-ClickHouse tag is in clickhouse.sse42SafeTags.
+CPUs that only have SSE4.2. The chart default is ClickHouse 25.12, required by
+the Langfuse pin (#2210); that tag is not SSE4.2-safe, so AVX is a
+chart-default requirement. This hook catches a missing AVX BEFORE the stores
+install: it reads the node's /proc/cpuinfo (a container shares the host kernel,
+so the flags are the node's), and if the node lacks AVX it FAILS the install
+unless the operator pins a tag in clickhouse.sse42SafeTags. That override
+cannot apply Langfuse ClickHouse migration 39.
 
 Runs as a pre-install / pre-upgrade hook (blocks a broken install) and is
 re-runnable via `helm test`. The Job is kept after success so its verdict log
@@ -101,9 +103,11 @@ spec:
               fi
 
               echo "RESULT: FAIL - node lacks AVX and ClickHouse tag '${CLICKHOUSE_TAG}' is NOT"
-              echo "        SSE4.2-safe. It will SIGILL (exit 132) and crash-loop on this node."
-              echo "REMEDY: pin clickhouse.image.tag to an SSE4.2-safe build (one of:"
-              echo "        ${SSE42_SAFE_TAGS}), e.g. --set clickhouse.image.tag=24.8"
+              echo "        SSE4.2-safe. Chart defaults require AVX because this tag is"
+              echo "        required by the Langfuse pin and will SIGILL (exit 132) here."
+              echo "REMEDY: install on AVX-capable nodes, or pin clickhouse.image.tag to an"
+              echo "        SSE4.2-safe build (one of: ${SSE42_SAFE_TAGS}) together with a"
+              echo "        Langfuse release whose ClickHouse migrations that tag can apply."
               exit 1
           resources:
             {{- toYaml .Values.preflights.avxCheck.resources | nindent 12 }}
