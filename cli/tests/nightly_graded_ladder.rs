@@ -893,8 +893,8 @@ fn product_observability_requires_three_valid_seeds_and_count_only_mcp_receipt()
         );
     }
 
-    let receipt_fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("scripts/fixtures/mcp-receipt/server.py");
+    let receipt_fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/fixtures/mcp-receipt/server.py");
     let receipt_source = fs::read_to_string(&receipt_fixture).unwrap_or_default();
     assert!(
         receipt_source.contains(r#""tools/call""#),
@@ -995,7 +995,10 @@ fn cluster_product_observability_is_private_preflight_and_query_only() {
         "seed_approval_resume_turn",
         "cluster observability run",
     ] {
-        assert!(query.contains(required), "cluster query mode omits {required}");
+        assert!(
+            query.contains(required),
+            "cluster query mode omits {required}"
+        );
     }
     for mutation in [
         "cluster up",

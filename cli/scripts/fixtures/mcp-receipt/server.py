@@ -12,7 +12,6 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-
 TOOL = {
     "name": "receipt_read",
     "description": "Return a deterministic, non-sensitive read receipt.",
@@ -88,7 +87,11 @@ class Handler(BaseHTTPRequestHandler):
             replies = [reply for item in messages if (reply := response_for(item)) is not None]
         except (json.JSONDecodeError, TypeError, ValueError):
             body = json.dumps(
-                {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "invalid request"}},
+                {
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {"code": -32700, "message": "invalid request"},
+                },
                 separators=(",", ":"),
             ).encode()
             self.send_response(HTTPStatus.BAD_REQUEST)
