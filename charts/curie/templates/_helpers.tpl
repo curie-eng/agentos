@@ -684,6 +684,12 @@ http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.
      passed in as `.existingData` (an always-present dict, empty under `helm
      template`/--dry-run/first install), so this helper does no per-key lookup.
 
+     A legacy retained values set can omit a key that a newer chart adds. Treat
+     that nil as the declared default before applying the four branches below,
+     so it is not mistaken for an explicit override. A persisted key whose
+     decoded value is blank is likewise absent: retaining it would keep every
+     consumer crash looping instead of healing the release.
+
      Four branches, in PRECEDENCE order, and WHY this order is correct:
        1. allowDevDefaults: the deterministic dev/CI escape hatch (values-dev.yaml
           sets it true). Return the value verbatim so the dev/e2e path renders the
@@ -702,7 +708,7 @@ http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.
           The override must sit ahead of the persist branch or an explicit value
           on upgrade would be silently ignored.
        3. Persist existing: no override, so if a prior install already GENERATED
-          this key, re-use it. `helm upgrade` must NEVER rotate a live store
+          this key with a nonblank value, re-use it. `helm upgrade` must NEVER rotate a live store
           credential (Postgres would reject the new password against its persisted
           data), so we return the stored value from `.existingData` when present.
           Generated secrets always have value==published-default (nobody set them),
@@ -720,12 +726,20 @@ http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.
      safely reverts value to the default, which then reuses the persisted generated
      value via branch 3 rather than rotating it. */}}
 {{- define "curie.managedSecret" -}}
+{{- $value := .value -}}
+{{- if kindIs "invalid" $value -}}
+{{- $value = .default -}}
+{{- end -}}
+{{- $existingValue := "" -}}
+{{- if hasKey .existingData .key -}}
+{{- $existingValue = index .existingData .key | b64dec -}}
+{{- end -}}
 {{- if eq (toString .root.Values.security.allowDevDefaults) "true" -}}{{/* string-coercion safety -- a quoted "false" must not read as truthy and silently ship a published default (fail closed to generation). */}}
-{{- .value -}}
-{{- else if ne (toString .value) (toString .default) -}}
-{{- .value -}}
-{{- else if hasKey .existingData .key -}}
-{{- index .existingData .key | b64dec -}}
+{{- $value -}}
+{{- else if ne (toString $value) (toString .default) -}}
+{{- $value -}}
+{{- else if ne (trim $existingValue) "" -}}
+{{- $existingValue -}}
 {{- else if .hex -}}
 {{- randAlphaNum 32 | sha256sum -}}
 {{- else -}}
@@ -812,16 +826,19 @@ http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.
 {{ include "curie.env.apiKey" . }}
 {{- end -}}
 
-{{/* Coalesce the worker's egress credentials and the first-party mail
-     adapter's paired credential. The chart Secret and the worker rollout
-     checksum must use this same rendered JSON so a rotation reaches both
-     sides. mailAdapter.egressSecret is the source of truth; accepting an equal
-     hand-written worker entry keeps migrations from hand-rolled manifests
-     possible, while a disagreement fails rather than deploying a reply path
-     that can only return 401. */}}
+{{/* Coalesce the worker's chart-managed egress credentials and the first-party
+     mail adapter's chart-managed paired credential. The chart Secret and the
+     worker rollout checksum must use this same rendered JSON so a rotation
+     reaches both sides. mailAdapter.egressSecret is the source of truth on
+     that path; accepting an equal hand-written worker entry keeps migrations
+     from hand-rolled manifests possible, while a disagreement fails rather
+     than deploying a reply path that can only return 401. When the adapter
+     uses egressSecretExistingSecret, the required external worker map is the
+     independent source of truth: never derive from or compare the unused plain
+     Helm value. */}}
 {{- define "curie.adapterCredentials" -}}
 {{- $creds := deepCopy (.Values.worker.adapterCredentials | default dict) -}}
-{{- if .Values.mailAdapter.deploy -}}
+{{- if and .Values.mailAdapter.deploy (not .Values.mailAdapter.egressSecretExistingSecret) -}}
 {{- $slug := .Values.mailAdapter.adapterSlug -}}
 {{- $derived := .Values.mailAdapter.egressSecret -}}
 {{- if hasKey $creds $slug -}}
@@ -1062,9 +1079,10 @@ true
 {{/* ---- BYO existingSecret escape for a direct-passthrough credential
      (issue #1759) ----
 
-     Eight keys (agentCredentials, adapterCredentials, githubToken,
+     Eleven keys (agentCredentials, adapterCredentials, githubToken,
      sealingPrivateKey, sealingPreviousPrivateKey, slackAppToken,
-     slackBotToken, slackSigningSecret) each grew a per-field
+     slackBotToken, slackSigningSecret, mailChannelToken, mailEgressSecret,
+     mailAgentmailApiKey) each grew a per-field
      `<field>ExistingSecret` / `<field>ExistingSecretKey` pair mirroring
      api.githubAppExistingSecret (ADR-0092): set, it wins over the plain
      value and the consumer's secretKeyRef points straight at the operator's
@@ -1072,7 +1090,7 @@ true
      CreateContainerConfigError instead of the chart emitting an empty
      credential.
 
-     One generic helper for all eight, following the dict-argument pattern
+     One generic helper for all eleven, following the dict-argument pattern
      `curie.image`/`curie.managedSecret` already use in this file, rather than
      a bespoke per-key helper or a hand-copied if/else at each consumer: every
      consumer of the SAME key -- there are three for slackBotToken, two for
@@ -1172,6 +1190,45 @@ securityContext:
 {{- $required := add $budget $reserve -}}
 {{- if lt $grace $required -}}
 {{- fail (printf "worker.terminationGracePeriodSeconds (%d) must be at least worker.deliveryBudgetSeconds (%d) + worker.deliveryShutdownReserveSeconds (%d) = %d (ADR-0131). At %d a worker draining a full-budget delivery is SIGKILLed before it can settle, and the worker refuses this configuration at boot, so the Pod CrashLoopBackOffs instead of starting. Fix: raise worker.terminationGracePeriodSeconds to %d or more, or lower worker.deliveryBudgetSeconds and/or worker.deliveryShutdownReserveSeconds so their sum is at most %d." $grace $budget $reserve $required $grace $required $grace) -}}
+{{- end -}}
+{{- end -}}
+
+{{/* ---- Resume reconciler grace arithmetic (API) ----
+     The reconciler must wait through a worker's complete delivery budget and
+     terminal-settlement reserve before it can enqueue a replacement resume
+     turn. The default therefore derives from those two worker settings.
+
+     An explicit api.resumeReconciler.graceSeconds is an operator-selected
+     extension of that wait, not an independent timeout. Refusing a value below
+     the derived floor prevents a clean Helm operation from producing a
+     reconciler that can enqueue while the preceding delivery remains active. */}}
+{{- define "curie.api.resumeReconciler.grace" -}}
+{{- $budget := int64 .Values.worker.deliveryBudgetSeconds -}}
+{{- $reserve := int64 .Values.worker.deliveryShutdownReserveSeconds -}}
+{{- $required := add $budget $reserve -}}
+{{- if and (hasKey .Values.api.resumeReconciler "graceSeconds") (not (kindIs "invalid" .Values.api.resumeReconciler.graceSeconds)) -}}
+{{- $grace := int64 .Values.api.resumeReconciler.graceSeconds -}}
+{{- if lt $grace $required -}}
+{{- fail (printf "api.resumeReconciler.graceSeconds (%d) must be at least worker.deliveryBudgetSeconds (%d) + worker.deliveryShutdownReserveSeconds (%d) = %d. At %d, a duplicate resume delivery can reach an active turn and repeat an approved action. Fix: raise api.resumeReconciler.graceSeconds to %d or more, or lower worker.deliveryBudgetSeconds and/or worker.deliveryShutdownReserveSeconds so their sum is at most %d." $grace $budget $reserve $required $grace $required $grace) -}}
+{{- end -}}
+{{- $grace -}}
+{{- else -}}
+{{- $required -}}
+{{- end -}}
+{{- end -}}
+
+{{/* ---- Runner ceiling / delivery-budget relationship (worker) ----
+     Each runner request is bounded by `worker.runnerTotalTimeoutSeconds`, but
+     the request still has to fit inside the delivery's overall
+     `worker.deliveryBudgetSeconds`. JSON Schema cannot express this
+     cross-field relationship, so refuse it before an invalid worker Pod is
+     created. The worker's boot validator remains the backstop for non-Helm
+     configuration. */}}
+{{- define "curie.worker.validateRunnerBudget" -}}
+{{- $runnerCeiling := float64 .Values.worker.runnerTotalTimeoutSeconds -}}
+{{- $deliveryBudget := float64 .Values.worker.deliveryBudgetSeconds -}}
+{{- if gt $runnerCeiling $deliveryBudget -}}
+{{- fail (printf "worker.runnerTotalTimeoutSeconds (%g) must be <= worker.deliveryBudgetSeconds (%g). Fix: lower worker.runnerTotalTimeoutSeconds to %g or less, or raise worker.deliveryBudgetSeconds to at least %g." $runnerCeiling $deliveryBudget $deliveryBudget $runnerCeiling) -}}
 {{- end -}}
 {{- end -}}
 

@@ -5,9 +5,9 @@ loader (Claude Code CLI --plugin-dir) to prove that a well-formed inline
 mcpServers declaration actually spawns and registers a tool.
 """
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
-mcp = FastMCP("mcp-green-probe")
+mcp = MCPServer("mcp-green-probe")
 
 
 @mcp.tool()

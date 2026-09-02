@@ -264,6 +264,9 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # anything injected into a runner claim.
         # - CURIE_DELIVERY_BUDGET_S: the overall wall-clock deadline for one
         #   delivery (claim, every runner request, retries, reclaim, cleanup).
+        # - CURIE_RUNNER_TOTAL_TIMEOUT_S: the worker-side per-request HTTP
+        #   ceiling consumed by RunnerClient inside that delivery budget. It
+        #   bounds calls to a runner but is never injected into the sandbox.
         # - CURIE_DELIVERY_LEASE_TTL_S: how long the fenced ownership lease on
         #   an in-flight delivery is valid before it is reclaimable.
         # - CURIE_DELIVERY_LEASE_HEARTBEAT_S: how often the owner renews that
@@ -275,6 +278,7 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         #   CURIE_RECLAIM_MIN_IDLE_MS in the code above, worker-side policy
         #   decided before any sandbox exists.
         "CURIE_DELIVERY_BUDGET_S",
+        "CURIE_RUNNER_TOTAL_TIMEOUT_S",
         "CURIE_DELIVERY_LEASE_TTL_S",
         "CURIE_DELIVERY_LEASE_HEARTBEAT_S",
         "CURIE_DELIVERY_SHUTDOWN_RESERVE_S",

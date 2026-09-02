@@ -2399,7 +2399,9 @@ class Kernel:
             ):
                 try:
                     snapshot = await self._runner.snapshot(
-                        routed.handle.base_url, token=routed.handle.token or None
+                        routed.handle.base_url,
+                        token=routed.handle.token or None,
+                        remaining_s=remaining_s,
                     )
                     if self._workspace is None:
                         raise WorkspacePreparationError(

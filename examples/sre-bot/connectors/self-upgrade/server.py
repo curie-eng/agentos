@@ -66,8 +66,8 @@ from typing import Any
 
 import httpx
 import yaml
-from mcp.server.fastmcp import FastMCP
-from mcp.server.fastmcp.exceptions import ToolError
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 log = logging.getLogger("self-upgrade-mcp")
@@ -95,14 +95,7 @@ RELEASE_REPO = os.environ.get("SELF_UPGRADE_RELEASE_REPO", "").strip()
 RELEASE_API = os.environ.get("SELF_UPGRADE_RELEASE_API", "https://api.github.com").rstrip("/")
 RELEASE_TIMEOUT = float(os.environ.get("SELF_UPGRADE_RELEASE_TIMEOUT_SECONDS", "15"))
 
-mcp = FastMCP(
-    "self-upgrade",
-    host=os.environ.get("BIND_ADDRESS", "0.0.0.0"),
-    port=int(os.environ.get("PORT", "8000")),
-    # Curie addresses hosted connectors at the exact, redirect-free /mcp path.
-    # MCP 1.28 mounts this value literally; "/" would leave /mcp returning 404.
-    streamable_http_path="/mcp",
-)
+mcp = MCPServer("self-upgrade")
 
 # destructiveHint=True: it replaces the running bot with a different build of
 # itself. idempotentHint=False: calling it twice starts two upgrades, which is
@@ -418,8 +411,7 @@ def _start_job_from(cronjob: str, env_name: str) -> str:
     namespace = _namespace()
     if not namespace:
         raise ToolError(
-            "refusing: could not determine a namespace to act in. Set "
-            "SELF_UPGRADE_NAMESPACE."
+            "refusing: could not determine a namespace to act in. Set SELF_UPGRADE_NAMESPACE."
         )
 
     client = _client()
@@ -494,9 +486,7 @@ def _start_job_from(cronjob: str, env_name: str) -> str:
         }
 
         try:
-            created = client.post(
-                f"/apis/batch/v1/namespaces/{namespace}/jobs", json=body
-            )
+            created = client.post(f"/apis/batch/v1/namespaces/{namespace}/jobs", json=body)
         except httpx.HTTPError as exc:
             raise ToolError(f"could not reach the API server: {exc}") from exc
         if created.status_code in (401, 403):
@@ -528,7 +518,12 @@ def _start_job_from(cronjob: str, env_name: str) -> str:
 def main() -> None:
     if not CRONJOB:
         log.warning("SELF_UPGRADE_CRONJOB is empty; every call will be refused")
-    mcp.run(transport="streamable-http")
+    mcp.run(
+        transport="streamable-http",
+        host=os.environ.get("BIND_ADDRESS", "0.0.0.0"),
+        port=int(os.environ.get("PORT", "8000")),
+        streamable_http_path="/mcp",
+    )
 
 
 if __name__ == "__main__":

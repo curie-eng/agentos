@@ -127,9 +127,10 @@ component and rail detail in `charts/curie/README.md`.
   on lint, template, install, and upgrade -- not just the keys a given
   operation touches. Because of that blast radius, the schema stays
   draft-07 with no top-level `required` and no `additionalProperties:
-  false`, and it types only the three bounded worker knobs
+  false`, and it types only four bounded values: the three worker knobs
   (`worker.claimTimeoutSeconds`, `worker.routeTtlSeconds`,
-  `worker.suspendedRouteTtlSeconds`). Adding a `required` or
+  `worker.suspendedRouteTtlSeconds`) and the approval-chat attester's explicit
+  nonblank contract (`api.approvalChatAttesterSecret`). Adding a `required` or
   `additionalProperties: false` constraint, or typing any other existing
   key, would fail every install whose values file happens not to match the
   new shape -- broaden the schema only for a key you are prepared to
@@ -144,7 +145,9 @@ component and rail detail in `charts/curie/README.md`.
   - Corollary: `--set-string` on any of the three bounded worker knobs now
     fails by design -- a JSON string violates `type: integer` /
     `type: number` even though the rendered env var is itself a quoted
-    string.
+    string. The attester remains a string, but an explicitly supplied empty
+    or whitespace-only string fails by design; omitting it still delegates to
+    the managed-secret generator.
   - The schema is not the only gate. Helm drops nil-valued keys during
     values coalescing before schema validation runs, so
     `--set worker.routeTtlSeconds=null` is not caught by the schema; it

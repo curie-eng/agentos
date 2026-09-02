@@ -54,6 +54,35 @@ install is green with zero secrets:
   RuntimeClass, runner pods use it; if not, they run without it and `NOTES.txt`
   prints a warning. Either way the install does not block.
 
+**Upgrading chart versions.** Merge the new chart defaults with the release's
+retained values. Plain `--reuse-values` omits keys introduced by the new chart,
+which can render a required value as blank. Helm 3.14 and newer provide the
+safe merge directly:
+
+```bash
+helm upgrade curie <new-chart> -n curie --reset-then-reuse-values
+```
+
+For an auditable values file instead, capture the release's user supplied
+values privately and pass that file over the new defaults:
+
+```bash
+(
+  set -euo pipefail
+  upgrade_values="$(mktemp)"
+  trap 'rm -f "$upgrade_values"' EXIT HUP INT TERM
+  chmod 600 "$upgrade_values"
+  helm get values curie -n curie -o yaml > "$upgrade_values"
+  test -s "$upgrade_values"
+  helm upgrade curie <new-chart> -n curie -f "$upgrade_values"
+)
+```
+
+Keep the file private because retained values can contain credentials. Remove
+it after the upgrade even when Helm fails. The commands below use
+`--reuse-values` only for same chart configuration changes, not a chart version
+upgrade.
+
 **Step 2 -- connect Slack + a real model.** When you have Slack tokens and a
 model credential, upgrade in place (the exact command is also printed in
 `NOTES.txt` after step 1):
@@ -96,15 +125,32 @@ helm upgrade curie charts/curie -n curie --reuse-values \
 | Value | Default | Meaning |
 | --- | --- | --- |
 | `dispatcher.apiBaseUrl` | `""` | Empty derives the in-chart API Service. A set value is used verbatim (BYO), and is **required** when `api.deploy: false`, where no in-chart Service exists to derive from. |
+| `dispatcher.apiPreflightTimeoutSeconds` | `120` | Bounded time for API `/health`, followed by a fresh same-size discovery-and-Slack budget. The bare dispatcher default remains 30 seconds. |
+| `dispatcher.startupProbe.initialDelaySeconds` | `0` | Delay before Kubernetes begins the dispatcher heartbeat startup probe. |
+| `dispatcher.startupProbe.periodSeconds` | `10` | Interval between dispatcher startup probes. |
+| `dispatcher.startupProbe.timeoutSeconds` | `5` | Timeout for each dispatcher startup probe. |
+| `dispatcher.startupProbe.failureThreshold` | `27` | Consecutive failures allowed. With the other defaults, the earliest failure cutoff is 260 seconds. |
+
+The dispatcher starts its heartbeat only after every boot preflight succeeds.
+Until then, the startup probe gates readiness and liveness so Kubernetes does
+not restart the pod during normal API warmup or the following Slack checks.
+With the defaults, API health and discovery/Slack each have a 120-second
+budget, a final started Slack call can use at most two more seconds, and the
+startup probe cannot fail the pod before 260 seconds. Helm rendering rejects a
+cutoff that does not strictly outlast that full application startup envelope
+and names the values to adjust. This keeps delayed API readiness restart free
+while preserving a bounded failure: if the API never becomes ready, the
+dispatcher exits with guidance to check `CURIE_API_URL` and whether the API pod
+is Ready before the startup probe budget expires.
 
 Two limits worth knowing. With `api.deploy: false` and an empty
 `dispatcher.apiBaseUrl` the dispatcher is pointed at a Service that does not
 exist; its boot preflight fails and the pod CrashLoopBackOffs naming the
 unreachable URL. That is intentional (a loud boot failure beats a silent
 dead-end at click time) and the fix is to set `dispatcher.apiBaseUrl`. And
-because the API's `/health` is unauthenticated, that preflight proves only
-reachability, not that the key is right: a BYO API expecting a different key
-still passes boot and fails at click time. Match `apiKey` to the API you point at.
+because the API's `/health` is unauthenticated, that first preflight proves only
+reachability. The following authenticated `/agents` discovery refuses startup
+when a BYO API expects a different key. Match `apiKey` to the API you point at.
 
 **Cluster variants:**
 
@@ -293,7 +339,7 @@ pipeline and environment are applied on `helm upgrade`.
 
 | Component | Image | Notes |
 |---|---|---|
-| Langfuse web + worker | `langfuse/langfuse:3.225.5`, `langfuse/langfuse-worker:3.225.5` | Observability + eval backbone. Headless-bootstrapped dev org/project. Web and worker stay on one reviewed migration set. |
+| Langfuse web + worker | `langfuse/langfuse:3.225.5`, `langfuse/langfuse-worker:3.225.5` | Observability + eval backbone. Headless-bootstrapped dev org/project. Web and worker stay on one reviewed migration set; do not replace the version with floating `:3`. |
 | Postgres | `postgres:16-alpine` | Langfuse transactional store + app state. StatefulSet. |
 | Valkey | `valkey/valkey:8-alpine` | Langfuse cache/queue + dispatcher Streams queue. |
 | ClickHouse | `clickhouse/clickhouse-server:24.8` | Langfuse OLAP store. Tag pinned SSE4.2-safe (see preflight). |
@@ -1195,11 +1241,11 @@ restarts.
 
 ### The other direct-passthrough credentials
 
-The GitHub App key was the first of nine credential keys read straight from
+The GitHub App key was the first of twelve credential keys read straight from
 `.Values` with no in-chart generation (`charts/curie/templates/secrets.yaml`
 calls these direct passthrough, as opposed to the eleven keys
 `curie.managedSecret` generates and persists). Issue #1759 gave the other
-eight the same `existingSecret` / `existingSecretKey` escape, one pair per
+eleven the same `existingSecret` / `existingSecretKey` escape, one pair per
 key, all winning over their plain value when set:
 
 | Credential | Plain value | BYO fields |
@@ -1212,6 +1258,9 @@ key, all winning over their plain value when set:
 | Slack app token | `dispatcher.slack.appToken` | `dispatcher.slack.appTokenExistingSecret` / `appTokenExistingSecretKey` (default key `slackAppToken`) |
 | Slack bot token | `dispatcher.slack.botToken` | `dispatcher.slack.botTokenExistingSecret` / `botTokenExistingSecretKey` (default key `slackBotToken`) |
 | Slack signing secret | `dispatcher.slack.signingSecret` | `dispatcher.slack.signingSecretExistingSecret` / `signingSecretExistingSecretKey` (default key `slackSigningSecret`) |
+| Mail channel token | `mailAdapter.channelToken` | `mailAdapter.channelTokenExistingSecret` / `channelTokenExistingSecretKey` (default key `mailChannelToken`) |
+| Mail egress secret | `mailAdapter.egressSecret` | `mailAdapter.egressSecretExistingSecret` / `egressSecretExistingSecretKey` (default key `mailEgressSecret`) -- when set, `worker.adapterCredentialsExistingSecret` must source the worker's paired credential map |
+| AgentMail API key | `mailAdapter.agentmail.apiKey` | `mailAdapter.agentmail.apiKeyExistingSecret` / `apiKeyExistingSecretKey` (default key `mailAgentmailApiKey`) |
 
 For example, to keep the model credential and both Slack tokens entirely out
 of helm values and release history:
@@ -1233,7 +1282,7 @@ As with `githubAppExistingSecret`, a Secret missing the referenced key fails
 that one pod at `CreateContainerConfigError` rather than the chart silently
 falling back to an empty credential.
 
-**Known gap, tracked in #1801.** None of these 16 new fields are yet covered
+**Known gap, tracked in #1801.** None of these 22 new fields are yet covered
 by the CLI's preserved-values mechanism (the same one `COMMS_MANAGED_KEYS` and
 `GITHUB_APP_MANAGED_KEYS` give the Slack tokens and the GitHub App identity in
 `cli/src/ops/up.rs`). A plain `curie cluster up` runs a full `helm upgrade

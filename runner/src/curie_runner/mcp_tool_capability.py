@@ -28,7 +28,6 @@ import re
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +38,7 @@ from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared._httpx_utils import create_mcp_http_client
 from mcp.shared.tool_name_validation import validate_tool_name
+from mcp.types import PaginatedRequestParams
 from plugin_format import PluginManifest, resolve_manifest
 from plugin_format.approval_policy import connector_tool_prefix, effective_tool_prefix
 
@@ -176,7 +176,7 @@ async def _server_streams(
 
     async with create_mcp_http_client(headers=headers) as http_client:
         async with streamable_http_client(expanded_url, http_client=http_client) as streams:
-            read_stream, write_stream, _session_id = streams
+            read_stream, write_stream = streams
             yield read_stream, write_stream
 
 
@@ -200,12 +200,14 @@ async def _probe_server(
             async with ClientSession(
                 read_stream,
                 write_stream,
-                read_timeout_seconds=timedelta(seconds=_PROBE_TIMEOUT_SECONDS),
+                read_timeout_seconds=_PROBE_TIMEOUT_SECONDS,
             ) as session:
                 await session.initialize()
                 cursor: str | None = None
                 while True:
-                    result = await session.list_tools(cursor=cursor)
+                    result = await session.list_tools(
+                        params=PaginatedRequestParams(cursor=cursor)
+                    )
                     if any(
                         not validate_tool_name(tool.name).is_valid
                         for tool in result.tools
@@ -217,7 +219,7 @@ async def _probe_server(
                     )
                     if any(
                         tool.annotations is None
-                        or tool.annotations.readOnlyHint is not True
+                        or tool.annotations.read_only_hint is not True
                         for tool in result.tools
                     ):
                         has_potential_write = True
@@ -225,9 +227,9 @@ async def _probe_server(
                         f"{tool_prefix}{tool.name}"
                         for tool in result.tools
                         if tool.annotations is not None
-                        and tool.annotations.readOnlyHint is True
+                        and tool.annotations.read_only_hint is True
                     )
-                    cursor = result.nextCursor
+                    cursor = result.next_cursor
                     if not cursor:
                         break
     return (

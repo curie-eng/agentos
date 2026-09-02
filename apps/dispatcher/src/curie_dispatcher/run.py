@@ -16,7 +16,12 @@ from . import __version__
 from .app import SocketModeConnection, build_app, build_redis, build_web_client
 from .config import DispatcherConfig
 from .heartbeat import start_heartbeat
-from .preflight import ApiUnreachableError, check_api_reachable
+from .preflight import (
+    ApiUnreachableError,
+    SlackChannelPreflightError,
+    check_api_reachable,
+    check_slack_channel_capabilities,
+)
 from .supervisor import BackoffPolicy, Supervisor
 
 
@@ -56,6 +61,15 @@ def main() -> None:
         try:
             check_api_reachable(config, logger=logger)
         except ApiUnreachableError as exc:
+            logger.error("%s", exc)
+            raise SystemExit(1) from exc
+
+        try:
+            check_slack_channel_capabilities(
+                config,
+                logger=logger,
+            )
+        except SlackChannelPreflightError as exc:
             logger.error("%s", exc)
             raise SystemExit(1) from exc
 

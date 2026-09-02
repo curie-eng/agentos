@@ -11,12 +11,14 @@ from typing import Any, cast
 
 import yaml
 
-TIERS = ("skill", "local", "local-release", "cluster")
+BASE_TIERS = ("skill", "local", "local-release", "cluster")
+TIERS = (*BASE_TIERS, "released-upgrade")
 OUTPUT_KEYS = {
     "skill": "skill",
     "local": "local",
     "local-release": "local_release",
     "cluster": "cluster",
+    "released-upgrade": "released_upgrade",
 }
 
 
@@ -106,8 +108,8 @@ def _load_registry(path: Path) -> Registry:
         raise RegistryError("registry version must be 1")
 
     fallback = _tiers(root.get("fallback"), "fallback")
-    if fallback != TIERS:
-        raise RegistryError("fallback must contain every tier in canonical order")
+    if fallback != BASE_TIERS:
+        raise RegistryError("fallback must contain every base tier in canonical order")
 
     rules = _mapping(root.get("rules"), "rules")
     if set(rules) != {"exact", "prefixes", "ignored_prefixes"}:

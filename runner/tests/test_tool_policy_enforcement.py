@@ -114,8 +114,8 @@ def _probe_advertised_tools(
         async def initialize(self) -> None:
             pass
 
-        async def list_tools(self, *, cursor: str | None) -> SimpleNamespace:
-            assert cursor is None
+        async def list_tools(self, *, params: Any | None) -> SimpleNamespace:
+            assert params is not None and params.cursor is None
             # MCP recommends this restricted alphabet but its Tool model accepts
             # other strings. Exercise the raw server response at Curie's probe
             # boundary. https://modelcontextprotocol.io/specification/2025-11-25/server/tools#tool-names
@@ -129,7 +129,7 @@ def _probe_advertised_tools(
                     )
                     for name in names
                 ],
-                nextCursor=None,
+                next_cursor=None,
             )
 
     monkeypatch.setattr(mcp_tool_capability, "_server_streams", server_streams)

@@ -160,6 +160,13 @@ SHELL_KEYWORDS = frozenset({"do", "done", "fi", "then", "else", "esac", "true", 
 RUN_RETRY_EXEMPT: frozenset[tuple[str, str, str]] = frozenset(
     {
         ("ci.yaml", "python", "Wait for Langfuse to serve"),
+        # The candidate API has already rolled out; this only waits for the
+        # temporary local port-forward to expose its external health state.
+        (
+            "ci.yaml",
+            "e2e-released-upgrade",
+            "Require healthy API after the candidate upgrade",
+        ),
         # The raw CDN is eventually consistent after publication. This poll
         # never reruns repository code or the Pages publication mutation.
         ("chart-index.yaml", "publish-index", "Verify the public Helm consumer path"),

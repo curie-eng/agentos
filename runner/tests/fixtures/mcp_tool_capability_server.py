@@ -6,20 +6,23 @@ import os
 from pathlib import Path
 
 import anyio
-from mcp import Tool
+from mcp import Tool, types
+from mcp.server import ServerRequestContext
 from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, ToolAnnotations
+from mcp.types import CallToolResult, ListToolsResult, TextContent, ToolAnnotations
 
 
-async def main() -> None:
-    server = Server("capability-fixture", version="1.0.0")
+async def list_tools(
+    _context: ServerRequestContext[object],
+    params: types.PaginatedRequestParams | None,
+) -> ListToolsResult:
+    """Serve one or two tools so the client exercises MCP pagination."""
 
-    @server.list_tools()
-    async def list_tools() -> list[Tool]:
-        mode = os.environ.get("CURIE_TEST_TOOL_MODE", "unknown")
-        if mode == "policy-catalog":
-            return [
+    mode = os.environ.get("CURIE_TEST_TOOL_MODE", "unknown")
+    if mode == "policy-catalog":
+        return ListToolsResult(
+            tools=[
                 Tool(
                     name="read_allowed",
                     description="Read a test value without changing external state.",
@@ -48,12 +51,26 @@ async def main() -> None:
                     inputSchema={"type": "object"},
                 ),
             ]
-        annotations = None
-        if mode == "read-only":
-            annotations = ToolAnnotations(readOnlyHint=True)
-        elif mode == "write":
-            annotations = ToolAnnotations(readOnlyHint=False)
-        return [
+        )
+    annotations = None
+    if mode in {"read-only", "paginated"}:
+        annotations = ToolAnnotations(readOnlyHint=True)
+    elif mode == "write":
+        annotations = ToolAnnotations(readOnlyHint=False)
+    if mode == "paginated" and (params is None or params.cursor is None):
+        return ListToolsResult(
+            tools=[
+                Tool(
+                    name="inspect_first_page",
+                    description="Test-only MCP tool.",
+                    inputSchema={"type": "object"},
+                    annotations=annotations,
+                )
+            ],
+            nextCursor="second-page",
+        )
+    return ListToolsResult(
+        tools=[
             Tool(
                 name="inspect_or_change",
                 description="Test-only MCP tool.",
@@ -61,14 +78,26 @@ async def main() -> None:
                 annotations=annotations,
             )
         ]
+    )
 
-    @server.call_tool()
-    async def call_tool(name: str, _arguments: dict[str, object]) -> list[TextContent]:
-        marker = os.environ.get("CURIE_TEST_CALL_MARKER")
-        if marker:
-            with Path(marker).open("a", encoding="utf-8") as output:
-                output.write(f"{name}\n")
-        return [TextContent(type="text", text=f"executed {name}")]
+
+async def call_tool(
+    _context: ServerRequestContext[object], params: types.CallToolRequestParams
+) -> CallToolResult:
+    marker = os.environ.get("CURIE_TEST_CALL_MARKER")
+    if marker:
+        with Path(marker).open("a", encoding="utf-8") as output:
+            output.write(f"{params.name}\n")
+    return CallToolResult(content=[TextContent(type="text", text=f"executed {params.name}")])
+
+
+async def main() -> None:
+    server = Server(
+        "capability-fixture",
+        version="1.0.0",
+        on_list_tools=list_tools,
+        on_call_tool=call_tool,
+    )
 
     async with stdio_server() as (read_stream, write_stream):
         await server.run(
