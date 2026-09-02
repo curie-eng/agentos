@@ -19,13 +19,16 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 SELECTOR = REPO_ROOT / "tools" / "e2e-ci-selection" / "select_tiers.py"
 REGISTRY = REPO_ROOT / ".github" / "e2e-selection.yaml"
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yaml"
+UPGRADE_MUTANT_BUILDER = REPO_ROOT / "charts" / "curie" / "ci" / "make-upgrade-mutants.py"
 
-TIERS = ("skill", "local", "local-release", "cluster")
+TIERS = ("skill", "local", "local-release", "cluster", "released-upgrade")
+BASE_TIERS = TIERS[:-1]
 OUTPUT_KEYS = {
     "skill": "skill",
     "local": "local",
     "local-release": "local_release",
     "cluster": "cluster",
+    "released-upgrade": "released_upgrade",
 }
 APPROVED_ROOT_DOCS = (
     "AGENTS.md",
@@ -102,17 +105,17 @@ def _assert_selection(
 @pytest.mark.parametrize(
     ("path", "selected"),
     [
-        ("runner/example.py", TIERS),
+        ("runner/example.py", BASE_TIERS),
         ("compose.dev.yaml", ("local",)),
         ("compose/generated.py", ("local-release",)),
-        ("charts/curie/values.yaml", ("cluster",)),
+        ("charts/curie/values.yaml", ("cluster", "released-upgrade")),
         ("apps/api/example.py", ("local", "local-release", "cluster")),
         ("apps/worker/example.py", ("local", "local-release", "cluster")),
         ("otel/collector.yaml", ("local", "local-release")),
-        ("cli/example.rs", TIERS),
-        ("packages/example.py", TIERS),
-        ("pyproject.toml", TIERS),
-        ("uv.lock", TIERS),
+        ("cli/example.rs", BASE_TIERS),
+        ("packages/example.py", BASE_TIERS),
+        ("pyproject.toml", BASE_TIERS),
+        ("uv.lock", BASE_TIERS),
     ],
 )
 def test_registry_maps_each_known_surface(
@@ -126,14 +129,59 @@ def test_registry_maps_each_known_surface(
 @pytest.mark.parametrize(
     "path",
     [
-        "examples/weather/evals/cases.json",
         ".github/e2e-selection.yaml",
         ".github/workflows/ci.yaml",
         "tools/e2e-ci-selection/select_tiers.py",
     ],
 )
-def test_weather_and_enforcement_paths_select_every_tier(tmp_path: Path, path: str) -> None:
+def test_enforcement_paths_select_every_tier(tmp_path: Path, path: str) -> None:
     _assert_selection(tmp_path, path, TIERS)
+
+
+def test_weather_fixture_does_not_select_released_upgrade(tmp_path: Path) -> None:
+    _assert_selection(tmp_path, "examples/weather/evals/cases.json", BASE_TIERS)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "charts/curie/values.yaml",
+        "charts/curie/templates/secrets.yaml",
+        "apps/api/src/curie_api/migrations/versions/example.py",
+        "apps/worker/src/curie_worker/config.py",
+        "apps/worker/src/curie_worker/approval_cards.py",
+        "apps/worker/src/curie_worker/consumer_liveness.py",
+        "apps/worker/src/curie_worker/workspace.py",
+    ],
+)
+def test_released_upgrade_selects_upgrade_state_owners(
+    tmp_path: Path,
+    path: str,
+) -> None:
+    completed, output = _invoke_selector(tmp_path, path)
+    assert completed.returncode == 0, completed.stderr
+    outputs = dict(line.split("=", maxsplit=1) for line in output.splitlines())
+    assert outputs["released_upgrade"] == "true"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "apps/api/src/curie_api/routers/agents.py",
+        "apps/worker/src/curie_worker/binding.py",
+        "apps/worker/src/curie_worker/state/config.py",
+        "apps/ui/src/main.tsx",
+        "docs/guides/getting-started.md",
+    ],
+)
+def test_released_upgrade_does_not_select_unrelated_paths(
+    tmp_path: Path,
+    path: str,
+) -> None:
+    completed, output = _invoke_selector(tmp_path, path)
+    assert completed.returncode == 0, completed.stderr
+    outputs = dict(line.split("=", maxsplit=1) for line in output.splitlines())
+    assert outputs["released_upgrade"] == "false"
 
 
 @pytest.mark.parametrize(
@@ -152,19 +200,19 @@ def test_genuine_documentation_only_selects_no_runtime_e2e_tiers(
     [
         (".github/e2e-selection.yaml", TIERS),
         (".github/workflows/ci.yaml", TIERS),
-        (".github/workflows/README.md", TIERS),
-        (".github/action.yml", TIERS),
-        ("scripts/README.md", TIERS),
-        ("scripts/check-docs.sh", TIERS),
+        (".github/workflows/README.md", BASE_TIERS),
+        (".github/action.yml", BASE_TIERS),
+        ("scripts/README.md", BASE_TIERS),
+        ("scripts/check-docs.sh", BASE_TIERS),
         ("apps/api/README.md", ("local", "local-release", "cluster")),
         ("apps/api/runtime-config.yaml", ("local", "local-release", "cluster")),
-        ("packages/plugin-format/README.md", TIERS),
-        ("packages/plugin-format/plugin.yaml", TIERS),
-        ("examples/weather/README.md", TIERS),
-        ("examples/weather/skill-config.yaml", TIERS),
-        ("tests/README.md", TIERS),
-        ("tests/selector-config.yaml", TIERS),
-        ("UNAPPROVED.md", TIERS),
+        ("packages/plugin-format/README.md", BASE_TIERS),
+        ("packages/plugin-format/plugin.yaml", BASE_TIERS),
+        ("examples/weather/README.md", BASE_TIERS),
+        ("examples/weather/skill-config.yaml", BASE_TIERS),
+        ("tests/README.md", BASE_TIERS),
+        ("tests/selector-config.yaml", BASE_TIERS),
+        ("UNAPPROVED.md", BASE_TIERS),
     ],
 )
 def test_non_allowlisted_paths_never_bypass_runtime_e2e_selection(
@@ -186,7 +234,7 @@ def test_mixed_root_documentation_and_runtime_diff_selects_runtime_tiers(
 def test_unknown_and_union_selection_are_deterministic(tmp_path: Path) -> None:
     unknown, unknown_output = _invoke_selector(tmp_path, "new-surface/module.py")
     assert unknown.returncode == 0, unknown.stderr
-    assert unknown_output == _expected_output(*TIERS)
+    assert unknown_output == _expected_output(*BASE_TIERS)
 
     forward, forward_output = _invoke_selector(
         tmp_path,
@@ -206,6 +254,7 @@ def test_unknown_and_union_selection_are_deterministic(tmp_path: Path) -> None:
         "local",
         "local-release",
         "cluster",
+        "released-upgrade",
     )
 
 
@@ -283,7 +332,7 @@ def test_revisions_select_changed_paths_and_unknown_fallback(tmp_path: Path) -> 
         cwd=repository,
     )
     assert unknown.returncode == 0, unknown.stderr
-    assert unknown_output == _expected_output(*TIERS)
+    assert unknown_output == _expected_output(*BASE_TIERS)
 
 
 VALID_REGISTRY = """
@@ -292,8 +341,10 @@ fallback: [skill, local, local-release, cluster]
 rules:
   exact:
     compose.dev.yaml: [local]
+    apps/worker/src/curie_worker/config.py: [released-upgrade]
   prefixes:
     charts: [cluster]
+    charts/curie: [released-upgrade]
   ignored_prefixes:
     docs: []
 """
@@ -346,9 +397,11 @@ AGGREGATE_EXPRESSIONS = {
     "local_selected": "${{ needs.changes.outputs.local }}",
     "local_release_selected": "${{ needs.changes.outputs.local_release }}",
     "cluster_selected": "${{ needs.changes.outputs.cluster }}",
+    "released_upgrade_selected": "${{ needs.changes.outputs.released_upgrade }}",
     "skill_local_result": "${{ needs.e2e-ladder.result }}",
     "local_release_result": "${{ needs.e2e-ladder-release.result }}",
     "cluster_result": "${{ needs.e2e-ladder-cluster.result }}",
+    "released_upgrade_result": "${{ needs.e2e-released-upgrade.result }}",
 }
 
 
@@ -360,6 +413,7 @@ def test_workflow_consumes_each_selection_output_exactly() -> None:
         "local": "${{ steps.filter.outputs.local }}",
         "local_release": "${{ steps.filter.outputs.local_release }}",
         "cluster": "${{ steps.filter.outputs.cluster }}",
+        "released_upgrade": "${{ steps.filter.outputs.released_upgrade }}",
         "skill_local_tiers": "${{ steps.filter.outputs.skill_local_tiers }}",
     }
 
@@ -384,6 +438,207 @@ def test_workflow_consumes_each_selection_output_exactly() -> None:
     assert jobs["e2e-ladder-cluster"]["if"] == (
         "${{ needs.changes.outputs.cluster == 'true' }}"
     )
+    assert jobs["e2e-released-upgrade"]["if"] == (
+        "${{ needs.changes.outputs.released_upgrade == 'true' }}"
+    )
+
+
+def test_released_upgrade_workflow_pins_issue_2194_runtime_contract() -> None:
+    workflow = yaml.safe_load(WORKFLOW.read_text())
+    jobs = workflow["jobs"]
+    job = workflow["jobs"]["e2e-released-upgrade"]
+    assert set(job["needs"]) == {"rust-build", "changes"}
+
+    named_steps = {
+        step["name"]: step for step in job["steps"] if isinstance(step.get("name"), str)
+    }
+    assert len(named_steps) == sum("name" in step for step in job["steps"])
+
+    candidate_images = {
+        "api": ("apps/api/Dockerfile", "curie-api:upgrade-candidate"),
+        "dispatcher": (
+            "apps/dispatcher/Dockerfile",
+            "curie-dispatcher:upgrade-candidate",
+        ),
+        "worker": ("apps/worker/Dockerfile", "curie-worker:upgrade-candidate"),
+        "ui": ("apps/ui/Dockerfile", "curie-ui:upgrade-candidate"),
+        "runner": ("runner/Dockerfile", "curie-runner:upgrade-candidate"),
+    }
+    for component, (dockerfile, tag) in candidate_images.items():
+        step = named_steps[f"Build the candidate {component} image locally"]
+        assert step["uses"].startswith("docker/build-push-action@")
+        assert step["with"]["context"] == "."
+        assert step["with"]["file"] == dockerfile
+        assert step["with"]["tags"] == tag
+        assert step["with"]["push"] is False
+        assert step["with"]["load"] is True
+
+    load_run = named_steps["Load candidate images into the kind cluster"]["run"]
+    for _component, (_dockerfile, tag) in candidate_images.items():
+        assert f"  {tag} \\" in load_run or f"  {tag}; do" in load_run
+    assert 'kind load docker-image "$image" --name curie-upgrade' in load_run
+
+    download_run = named_steps["Download and verify the exact public v0.8.2 chart"][
+        "run"
+    ]
+    assert (
+        "https://github.com/curie-eng/curie/releases/download/"
+        "v0.8.2/curie-0.8.2.tgz"
+    ) in download_run
+    assert 'sha256sum --check --strict' in download_run
+    assert 'test "$(helm show chart "$released_chart"' in download_run
+    assert ')" = "0.8.2"' in download_run
+
+    fixture_run = named_steps["Write the legacy retained values fixture"]["run"]
+    for exact_line in (
+        "  placeholderText: legacy-retained",
+        "    appToken: xapp-example-upgrade",
+        "    botToken: xoxb-example-upgrade",
+        '    mode: "off"',
+        "placement: null",
+    ):
+        assert exact_line in fixture_run
+
+    image_overrides = (
+        "--set api.image.repository=curie-api --set api.image.tag=upgrade-candidate "
+        "--set api.image.digest= --set api.image.pullPolicy=Never",
+        "--set dispatcher.image.repository=curie-dispatcher "
+        "--set dispatcher.image.tag=upgrade-candidate "
+        "--set dispatcher.image.digest= --set dispatcher.image.pullPolicy=Never",
+        "--set worker.image.repository=curie-worker "
+        "--set worker.image.tag=upgrade-candidate "
+        "--set worker.image.digest= --set worker.image.pullPolicy=Never",
+        "--set ui.image.repository=curie-ui --set ui.image.tag=upgrade-candidate "
+        "--set ui.image.digest= --set ui.image.pullPolicy=Never",
+        "--set agentSandbox.runner.image=curie-runner "
+        "--set agentSandbox.runner.tag=upgrade-candidate "
+        "--set agentSandbox.runner.digest= "
+        "--set agentSandbox.runner.imagePullPolicy=Never",
+    )
+    runner_prewarm_override = (
+        "--set agentSandbox.runner.prewarm.imagePullPolicy=Never"
+    )
+    retained_projection = (
+        "placeholderText: .dispatcher.placeholderText",
+        "slackAppToken: .dispatcher.slack.appToken",
+        "slackBotToken: .dispatcher.slack.botToken",
+        "gvisorMode: .security.gvisor.mode",
+        "placement: .placement",
+    )
+
+    install_run = named_steps["Install the exact public v0.8.2 release"]["run"]
+    assert 'helm get values curie -n curie -o json' in install_run
+    for projection in retained_projection:
+        assert projection in install_run
+    for predicate in (
+        '.placeholderText == "legacy-retained"',
+        '.slackAppToken == "xapp-example-upgrade"',
+        '.slackBotToken == "xoxb-example-upgrade"',
+        '.gvisorMode == "off"',
+        ".placement == null",
+    ):
+        assert predicate in install_run
+
+    first_upgrade = named_steps["Upgrade the legacy release to the candidate chart"][
+        "run"
+    ]
+    second_upgrade = named_steps[
+        "Upgrade a second time and preserve the generated attester"
+    ]["run"]
+    for upgrade, snapshot in (
+        (first_upgrade, "first-retained-values.json"),
+        (second_upgrade, "second-retained-values.json"),
+    ):
+        assert "helm upgrade curie charts/curie -n curie" in upgrade
+        assert "--reset-then-reuse-values" in upgrade
+        for override in image_overrides:
+            assert override in upgrade
+        assert runner_prewarm_override in upgrade
+        assert 'helm get values curie -n curie -o json' in upgrade
+        for projection in retained_projection:
+            assert projection in upgrade
+        assert snapshot in upgrade
+        assert (
+            f'cmp "$RUNNER_TEMP/retained-values.json" '
+            f'"$RUNNER_TEMP/{snapshot}"'
+        ) in upgrade
+        assert "kubectl rollout status deploy/curie-api" in upgrade
+        assert "kubectl rollout status deploy/curie-dispatcher" in upgrade
+
+    assert (
+        'printf \'%s\' "$first_attester" | sha256sum | cut -d\' \' -f1 '
+        '> "$RUNNER_TEMP/first-attester.sha256"'
+    ) in first_upgrade
+    assert (
+        'first_attester="$(cat "$RUNNER_TEMP/first-attester.sha256")"'
+    ) in second_upgrade
+    assert (
+        'test "$(printf \'%s\' "$second_attester" | sha256sum | '
+        'cut -d\' \' -f1)" = "$first_attester"'
+    ) in second_upgrade
+
+    verifier_step = named_steps["Write the managed attester verifier"]
+    verifier_run = verifier_step["run"]
+    assert 'test -n "$attester"' in verifier_run
+    assert 'test "$attester" != "$api_key"' in verifier_run
+    verifier_call = '"$RUNNER_TEMP/verify-managed-attester.sh"'
+    assert verifier_call in first_upgrade
+
+    negative_run = named_steps["Nil unsafe helper negative control"]["run"]
+    placement_mutant_setup = '''placement_mutant="$RUNNER_TEMP/nil-unsafe-placement-chart"
+cp -a charts/curie "$placement_mutant"'''
+    assert placement_mutant_setup in negative_run
+    assert "python3 charts/curie/ci/make-upgrade-mutants.py" in negative_run
+    mutant_builder = UPGRADE_MUTANT_BUILDER.read_text()
+    assert "match = block_re.search(text)" in mutant_builder
+    assert 'if match is None or "| default dict" not in match.group(0):' in mutant_builder
+    assert (
+        'mutated = match.group(0).replace("| default dict", "", 1)'
+    ) in mutant_builder
+    assert 'start_marker = \'{{- define "curie.managedSecret" -}}\'' in mutant_builder
+    placement_upgrade = '''if helm upgrade curie-negative "$placement_mutant" -n curie-negative \\
+    --reset-then-reuse-values --timeout 15m; then
+  echo "nil-unsafe placement mutant unexpectedly upgraded legacy placement:null values" >&2
+  exit 1
+fi'''
+    assert placement_upgrade in negative_run
+    placement_rejection = (
+        'echo "Released-upgrade rung rejected the nil-unsafe placement mutant as expected"'
+    )
+    assert placement_rejection in negative_run
+    managed_secret_mutation = (
+        "kubectl patch secret curie-negative-secrets -n curie-negative --type merge"
+    )
+    assert negative_run.index(placement_upgrade) < negative_run.index(placement_rejection)
+    assert negative_run.index(placement_rejection) < negative_run.index(
+        managed_secret_mutation
+    )
+    assert verifier_call in negative_run
+    assert f"if {verifier_call}" in negative_run
+    assert 'test -z "$negative_attester"' in negative_run
+    assert "unexpectedly passed" in negative_run
+
+    health_run = named_steps["Require healthy API after the candidate upgrade"]["run"]
+    assert "curl -fsS http://127.0.0.1:28000/health" in health_run
+    assert 'grep -q \'"status":"ok"\'' in health_run
+
+    smoke = named_steps["Existing cluster rung smoke on the upgraded candidate"]
+    assert smoke["env"]["CURIE_E2E_TIERS"] == "cluster"
+    assert "bash cli/scripts/e2e-ladder.sh" in smoke["run"]
+    for override in image_overrides:
+        assert override in smoke["run"]
+    assert runner_prewarm_override in smoke["run"]
+
+    existing_cluster_steps = jobs["e2e-ladder-cluster"]["steps"]
+    existing_smoke = [
+        step
+        for step in existing_cluster_steps
+        if step.get("run") == "bash cli/scripts/e2e-ladder.sh"
+    ]
+    assert len(existing_smoke) == 1
+    assert existing_smoke[0]["env"]["CURIE_E2E_TIERS"] == "cluster"
+
+    assert named_steps["Tear down the disposable upgrade cluster"]["if"] == "always()"
 
 
 def _aggregate_contract() -> tuple[str, dict[str, str]]:
@@ -395,6 +650,7 @@ def _aggregate_contract() -> tuple[str, dict[str, str]]:
         "e2e-ladder",
         "e2e-ladder-release",
         "e2e-ladder-cluster",
+        "e2e-released-upgrade",
     }
     assert job["if"] == "${{ !cancelled() }}"
 
@@ -432,9 +688,11 @@ def _run_aggregate(
         "local_selected": "false",
         "local_release_selected": "false",
         "cluster_selected": "false",
+        "released_upgrade_selected": "false",
         "skill_local_result": "skipped",
         "local_release_result": "skipped",
         "cluster_result": "skipped",
+        "released_upgrade_result": "skipped",
     }
     state.update(overrides)
     environment = os.environ.copy()

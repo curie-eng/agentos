@@ -54,6 +54,35 @@ install is green with zero secrets:
   RuntimeClass, runner pods use it; if not, they run without it and `NOTES.txt`
   prints a warning. Either way the install does not block.
 
+**Upgrading chart versions.** Merge the new chart defaults with the release's
+retained values. Plain `--reuse-values` omits keys introduced by the new chart,
+which can render a required value as blank. Helm 3.14 and newer provide the
+safe merge directly:
+
+```bash
+helm upgrade curie <new-chart> -n curie --reset-then-reuse-values
+```
+
+For an auditable values file instead, capture the release's user supplied
+values privately and pass that file over the new defaults:
+
+```bash
+(
+  set -euo pipefail
+  upgrade_values="$(mktemp)"
+  trap 'rm -f "$upgrade_values"' EXIT HUP INT TERM
+  chmod 600 "$upgrade_values"
+  helm get values curie -n curie -o yaml > "$upgrade_values"
+  test -s "$upgrade_values"
+  helm upgrade curie <new-chart> -n curie -f "$upgrade_values"
+)
+```
+
+Keep the file private because retained values can contain credentials. Remove
+it after the upgrade even when Helm fails. The commands below use
+`--reuse-values` only for same chart configuration changes, not a chart version
+upgrade.
+
 **Step 2 -- connect Slack + a real model.** When you have Slack tokens and a
 model credential, upgrade in place (the exact command is also printed in
 `NOTES.txt` after step 1):

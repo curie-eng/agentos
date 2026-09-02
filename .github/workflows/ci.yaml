@@ -1014,6 +1014,7 @@ jobs:
       local: ${{ steps.filter.outputs.local }}
       local_release: ${{ steps.filter.outputs.local_release }}
       cluster: ${{ steps.filter.outputs.cluster }}
+      released_upgrade: ${{ steps.filter.outputs.released_upgrade }}
       skill_local_tiers: ${{ steps.filter.outputs.skill_local_tiers }}
     steps:
       - uses: actions/checkout@v7
@@ -1340,10 +1341,364 @@ jobs:
           kubectl delete namespace curie \
             --ignore-not-found --wait=false 2>/dev/null || true
 
+  # RELEASED CHART UPGRADE REGRESSION (issues #2097 and #2194). This is separate
+  # from the fresh install cluster rung because it starts from the exact public
+  # v0.8.2 chart and its published images. The candidate chart is then applied
+  # over retained release values on the same disposable kind cluster. The
+  # selector keeps this expensive history bearing path limited to chart,
+  # migration, and worker state key changes.
+  e2e-released-upgrade:
+    name: E2E released chart upgrade (v0.8.2 to candidate)
+    runs-on: ubuntu-latest
+    needs: [rust-build, changes]
+    if: ${{ needs.changes.outputs.released_upgrade == 'true' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Download the candidate curie binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: curie-x86_64-linux-${{ github.sha }}
+          path: cli/target/release
+      - name: Make the candidate binary executable
+        run: chmod +x cli/target/release/curie
+      - name: Install Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.16.4
+      - name: Set up a cache-only buildx builder (named, NOT the default)
+        id: upgradecache
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          use: false
+      - name: Build the candidate api image locally
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: apps/api/Dockerfile
+          builder: ${{ steps.upgradecache.outputs.name }}
+          tags: curie-api:upgrade-candidate
+          push: false
+          load: true
+          cache-from: type=gha,scope=ladder-api
+          cache-to: type=gha,mode=max,scope=ladder-api
+      - name: Build the candidate dispatcher image locally
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: apps/dispatcher/Dockerfile
+          builder: ${{ steps.upgradecache.outputs.name }}
+          tags: curie-dispatcher:upgrade-candidate
+          push: false
+          load: true
+          cache-from: type=gha,scope=ladder-dispatcher
+          cache-to: type=gha,mode=max,scope=ladder-dispatcher
+      - name: Build the candidate worker image locally
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: apps/worker/Dockerfile
+          builder: ${{ steps.upgradecache.outputs.name }}
+          tags: curie-worker:upgrade-candidate
+          push: false
+          load: true
+          cache-from: type=gha,scope=ladder-worker
+          cache-to: type=gha,mode=max,scope=ladder-worker
+      - name: Build the candidate ui image locally
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: apps/ui/Dockerfile
+          builder: ${{ steps.upgradecache.outputs.name }}
+          tags: curie-ui:upgrade-candidate
+          push: false
+          load: true
+          cache-from: type=gha,scope=ladder-ui
+          cache-to: type=gha,mode=max,scope=ladder-ui
+      - name: Build the candidate runner image locally
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: runner/Dockerfile
+          builder: ${{ steps.upgradecache.outputs.name }}
+          tags: curie-runner:upgrade-candidate
+          push: false
+          load: true
+          cache-from: type=gha,scope=ladder-runner
+          cache-to: type=gha,mode=max,scope=ladder-runner
+      - name: Write the kind cluster config
+        run: |
+          cat > kind-upgrade-config.yaml <<'EOF'
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          networking:
+            disableDefaultCNI: true
+            podSubnet: "192.168.0.0/16"
+          nodes:
+            - role: control-plane
+              extraPortMappings:
+                - containerPort: 30080
+                  hostPort: 30080
+                  listenAddress: "127.0.0.1"
+                  protocol: TCP
+          EOF
+      - name: Create the disposable kind cluster
+        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
+        with:
+          version: v0.24.0
+          node_image: kindest/node:v1.31.0@sha256:25a3504b2b340954595fa7a6ed1575ef2edadf5abd83c0776a4308b64bf47c93
+          cluster_name: curie-upgrade
+          config: kind-upgrade-config.yaml
+      - name: Install Calico so NetworkPolicy is enforced
+        run: |
+          set -euo pipefail
+          calico_manifest="$RUNNER_TEMP/calico-v3.28.2.yaml"
+          curl -fsSL -o "$calico_manifest" \
+            https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/calico.yaml
+          echo "be59408bf990e96276f631d2f9285c2a0f9802194c0ad1cecdb6d9c52623a1c8  $calico_manifest" \
+            | sha256sum --check --strict
+          kubectl apply -f "$calico_manifest"
+          kubectl -n kube-system rollout status daemonset/calico-node --timeout=300s
+          kubectl wait --for=condition=Ready node --all --timeout=300s
+      - name: Load candidate images into the kind cluster
+        run: |
+          set -euo pipefail
+          for image in \
+            curie-api:upgrade-candidate \
+            curie-dispatcher:upgrade-candidate \
+            curie-worker:upgrade-candidate \
+            curie-ui:upgrade-candidate \
+            curie-runner:upgrade-candidate; do
+            kind load docker-image "$image" --name curie-upgrade
+          done
+      - name: Resolve the pod-reachable host for the reply stub
+        run: |
+          set -euo pipefail
+          node="curie-upgrade-control-plane"
+          gateway="$(docker inspect "$node" --format '{{ .NetworkSettings.Networks.kind.Gateway }}' 2>/dev/null || true)"
+          if [[ ! "$gateway" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+            gateway="$(docker network inspect kind \
+              --format '{{range .IPAM.Config}}{{println .Gateway}}{{end}}' 2>/dev/null \
+              | grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' | head -1 || true)"
+          fi
+          [[ "$gateway" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]
+          echo "CURIE_E2E_LISTEN_HOST=$gateway" >> "$GITHUB_ENV"
+      - name: Download and verify the exact public v0.8.2 chart
+        run: |
+          set -euo pipefail
+          released_chart="$RUNNER_TEMP/curie-0.8.2.tgz"
+          curl -fsSL -o "$released_chart" \
+            https://github.com/curie-eng/curie/releases/download/v0.8.2/curie-0.8.2.tgz
+          echo "b7fb394e29cbb3267c149aed6a9cda53570e71e338f873ed02f1902a138f37c7  $released_chart" \
+            | sha256sum --check --strict
+          test "$(helm show chart "$released_chart" | awk '$1 == "version:" {print $2}')" = "0.8.2"
+          echo "RELEASED_CHART=$released_chart" >> "$GITHUB_ENV"
+      - name: Write the legacy retained values fixture
+        run: |
+          cat > "$RUNNER_TEMP/legacy-values.yaml" <<'EOF'
+          dispatcher:
+            placeholderText: legacy-retained
+            slack:
+              appToken: xapp-example-upgrade
+              botToken: xoxb-example-upgrade
+          security:
+            gvisor:
+              mode: "off"
+          placement: null
+          EOF
+          echo "LEGACY_VALUES=$RUNNER_TEMP/legacy-values.yaml" >> "$GITHUB_ENV"
+      - name: Write the managed attester verifier
+        run: |
+          cat > "$RUNNER_TEMP/verify-managed-attester.sh" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          release="$1"
+          namespace="$2"
+          attester="$(kubectl get secret "${release}-secrets" -n "$namespace" \
+            -o jsonpath='{.data.approvalChatAttesterSecret}' | base64 --decode)"
+          api_key="$(kubectl get secret "${release}-secrets" -n "$namespace" \
+            -o jsonpath='{.data.apiKey}' | base64 --decode)"
+          test -n "$attester"
+          test "$attester" != "$api_key"
+          EOF
+          chmod +x "$RUNNER_TEMP/verify-managed-attester.sh"
+      - name: Nil unsafe helper negative control
+        run: |
+          set -euo pipefail
+          placement_mutant="$RUNNER_TEMP/nil-unsafe-placement-chart"
+          cp -a charts/curie "$placement_mutant"
+          mutant="$RUNNER_TEMP/nil-unsafe-chart"
+          cp -a charts/curie "$mutant"
+          python3 charts/curie/ci/make-upgrade-mutants.py \
+            "$placement_mutant/templates/_helpers.tpl" \
+            "$mutant/templates/_helpers.tpl"
+          helm install curie-negative "$RELEASED_CHART" \
+            -n curie-negative --create-namespace -f "$LEGACY_VALUES" --timeout 15m \
+            --set api.image.digest=sha256:71aa652c0af87084e4254402268e2d08c0cdbc2f197b6f1f1cf136b49aa93dc0 \
+            --set dispatcher.image.digest=sha256:154e874d735131c64e449af281178bed0c4e30d6dcc7b72ebecda6337aea8f93 \
+            --set worker.image.digest=sha256:5368f1a6be11b79fa28d9cea197539f15b56caae280a4d9dee39b72d47bfdd38 \
+            --set ui.image.digest=sha256:1348c3cc03ecae315829a0cf6170ba5aaa2af8e31436cc76b0d24f12967b74b7 \
+            --set agentSandbox.runner.digest=sha256:bd871217023604c7d2934fd4534c08efb5448a739e5e5603ac35c100f9c8949c
+          if helm upgrade curie-negative "$placement_mutant" -n curie-negative \
+              --reset-then-reuse-values --timeout 15m; then
+            echo "nil-unsafe placement mutant unexpectedly upgraded legacy placement:null values" >&2
+            exit 1
+          fi
+          echo "Released-upgrade rung rejected the nil-unsafe placement mutant as expected"
+          kubectl patch secret curie-negative-secrets -n curie-negative --type merge \
+            -p '{"stringData":{"approvalChatAttesterSecret":""}}'
+          helm upgrade curie-negative "$mutant" -n curie-negative \
+            --reset-then-reuse-values \
+            --set api.approvalChatAttesterSecret=null \
+            --timeout 15m
+          if "$RUNNER_TEMP/verify-managed-attester.sh" curie-negative curie-negative; then
+            echo "nil-unsafe negative control unexpectedly passed the released-upgrade assertion" >&2
+            exit 1
+          fi
+          negative_attester="$(kubectl get secret curie-negative-secrets -n curie-negative \
+            -o jsonpath='{.data.approvalChatAttesterSecret}' | base64 --decode)"
+          test -z "$negative_attester"
+          echo "Released-upgrade assertion rejected the nil-unsafe mutant's blank attester as expected"
+          helm uninstall curie-negative -n curie-negative --wait --timeout 5m
+          kubectl delete namespace curie-negative --wait=true --timeout=300s
+      - name: Install the exact public v0.8.2 release
+        run: |
+          set -euo pipefail
+          helm install curie "$RELEASED_CHART" \
+            -n curie --create-namespace -f "$LEGACY_VALUES" --timeout 15m \
+            --set api.image.digest=sha256:71aa652c0af87084e4254402268e2d08c0cdbc2f197b6f1f1cf136b49aa93dc0 \
+            --set dispatcher.image.digest=sha256:154e874d735131c64e449af281178bed0c4e30d6dcc7b72ebecda6337aea8f93 \
+            --set worker.image.digest=sha256:5368f1a6be11b79fa28d9cea197539f15b56caae280a4d9dee39b72d47bfdd38 \
+            --set ui.image.digest=sha256:1348c3cc03ecae315829a0cf6170ba5aaa2af8e31436cc76b0d24f12967b74b7 \
+            --set agentSandbox.runner.digest=sha256:bd871217023604c7d2934fd4534c08efb5448a739e5e5603ac35c100f9c8949c
+          kubectl rollout status deploy/curie-api -n curie --timeout=600s
+          kubectl rollout status deploy/curie-dispatcher -n curie --timeout=600s
+          helm get values curie -n curie -o json | jq -S '{
+            placeholderText: .dispatcher.placeholderText,
+            slackAppToken: .dispatcher.slack.appToken,
+            slackBotToken: .dispatcher.slack.botToken,
+            gvisorMode: .security.gvisor.mode,
+            placement: .placement
+          }' > "$RUNNER_TEMP/retained-values.json"
+          jq -e '.placeholderText == "legacy-retained"
+            and .slackAppToken == "xapp-example-upgrade"
+            and .slackBotToken == "xoxb-example-upgrade"
+            and .gvisorMode == "off"
+            and .placement == null' "$RUNNER_TEMP/retained-values.json"
+          kubectl patch secret curie-secrets -n curie --type merge \
+            -p '{"stringData":{"approvalChatAttesterSecret":""}}'
+      - name: Upgrade the legacy release to the candidate chart
+        run: |
+          set -euo pipefail
+          helm upgrade curie charts/curie -n curie \
+            --reset-then-reuse-values --timeout 15m \
+            --set api.image.repository=curie-api --set api.image.tag=upgrade-candidate --set api.image.digest= --set api.image.pullPolicy=Never \
+            --set dispatcher.image.repository=curie-dispatcher --set dispatcher.image.tag=upgrade-candidate --set dispatcher.image.digest= --set dispatcher.image.pullPolicy=Never \
+            --set worker.image.repository=curie-worker --set worker.image.tag=upgrade-candidate --set worker.image.digest= --set worker.image.pullPolicy=Never \
+            --set ui.image.repository=curie-ui --set ui.image.tag=upgrade-candidate --set ui.image.digest= --set ui.image.pullPolicy=Never \
+            --set agentSandbox.runner.image=curie-runner --set agentSandbox.runner.tag=upgrade-candidate --set agentSandbox.runner.digest= --set agentSandbox.runner.imagePullPolicy=Never \
+            --set agentSandbox.runner.prewarm.imagePullPolicy=Never
+          kubectl rollout status deploy/curie-api -n curie --timeout=600s
+          kubectl rollout status deploy/curie-dispatcher -n curie --timeout=600s
+          "$RUNNER_TEMP/verify-managed-attester.sh" curie curie
+          first_attester="$(kubectl get secret curie-secrets -n curie \
+            -o jsonpath='{.data.approvalChatAttesterSecret}' | base64 --decode)"
+          api_key="$(kubectl get secret curie-secrets -n curie \
+            -o jsonpath='{.data.apiKey}' | base64 --decode)"
+          test -n "$first_attester"
+          test "$first_attester" != "$api_key"
+          helm get values curie -n curie -o json | jq -S '{
+            placeholderText: .dispatcher.placeholderText,
+            slackAppToken: .dispatcher.slack.appToken,
+            slackBotToken: .dispatcher.slack.botToken,
+            gvisorMode: .security.gvisor.mode,
+            placement: .placement
+          }' > "$RUNNER_TEMP/first-retained-values.json"
+          cmp "$RUNNER_TEMP/retained-values.json" "$RUNNER_TEMP/first-retained-values.json"
+          printf '%s' "$first_attester" | sha256sum | cut -d' ' -f1 > "$RUNNER_TEMP/first-attester.sha256"
+      - name: Require healthy API after the candidate upgrade
+        run: |
+          set -euo pipefail
+          kubectl port-forward -n curie svc/curie-api 28000:8000 > "$RUNNER_TEMP/api-port-forward.log" 2>&1 &
+          forward_pid=$!
+          trap 'kill "$forward_pid" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 60); do
+            response="$(curl -fsS http://127.0.0.1:28000/health 2>/dev/null || true)"
+            if printf '%s' "$response" | grep -q '"status":"ok"'; then
+              echo "Candidate API health returned status ok"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "candidate /health did not return {\"status\":\"ok\"}" >&2
+          exit 1
+      - name: Upgrade a second time and preserve the generated attester
+        run: |
+          set -euo pipefail
+          helm upgrade curie charts/curie -n curie \
+            --reset-then-reuse-values --timeout 15m \
+            --set api.image.repository=curie-api --set api.image.tag=upgrade-candidate --set api.image.digest= --set api.image.pullPolicy=Never \
+            --set dispatcher.image.repository=curie-dispatcher --set dispatcher.image.tag=upgrade-candidate --set dispatcher.image.digest= --set dispatcher.image.pullPolicy=Never \
+            --set worker.image.repository=curie-worker --set worker.image.tag=upgrade-candidate --set worker.image.digest= --set worker.image.pullPolicy=Never \
+            --set ui.image.repository=curie-ui --set ui.image.tag=upgrade-candidate --set ui.image.digest= --set ui.image.pullPolicy=Never \
+            --set agentSandbox.runner.image=curie-runner --set agentSandbox.runner.tag=upgrade-candidate --set agentSandbox.runner.digest= --set agentSandbox.runner.imagePullPolicy=Never \
+            --set agentSandbox.runner.prewarm.imagePullPolicy=Never
+          kubectl rollout status deploy/curie-api -n curie --timeout=600s
+          kubectl rollout status deploy/curie-dispatcher -n curie --timeout=600s
+          "$RUNNER_TEMP/verify-managed-attester.sh" curie curie
+          second_attester="$(kubectl get secret curie-secrets -n curie \
+            -o jsonpath='{.data.approvalChatAttesterSecret}' | base64 --decode)"
+          first_attester="$(cat "$RUNNER_TEMP/first-attester.sha256")"
+          test -n "$second_attester"
+          test "$(printf '%s' "$second_attester" | sha256sum | cut -d' ' -f1)" = "$first_attester"
+          helm get values curie -n curie -o json | jq -S '{
+            placeholderText: .dispatcher.placeholderText,
+            slackAppToken: .dispatcher.slack.appToken,
+            slackBotToken: .dispatcher.slack.botToken,
+            gvisorMode: .security.gvisor.mode,
+            placement: .placement
+          }' > "$RUNNER_TEMP/second-retained-values.json"
+          cmp "$RUNNER_TEMP/retained-values.json" "$RUNNER_TEMP/second-retained-values.json"
+      - name: Existing cluster rung smoke on the upgraded candidate
+        env:
+          CURIE_BIN: cli/target/release/curie
+          CURIE_E2E_TIERS: cluster
+        run: |
+          set -euo pipefail
+          helm upgrade curie charts/curie -n curie \
+            --reset-then-reuse-values --timeout 15m \
+            --set dispatcher.deploy=false \
+            --set dispatcher.image.repository=curie-dispatcher --set dispatcher.image.tag=upgrade-candidate --set dispatcher.image.digest= --set dispatcher.image.pullPolicy=Never \
+            --set ui.service.type=NodePort --set ui.service.nodePort=30080 \
+            --set api.image.repository=curie-api --set api.image.tag=upgrade-candidate --set api.image.digest= --set api.image.pullPolicy=Never \
+            --set worker.image.repository=curie-worker --set worker.image.tag=upgrade-candidate --set worker.image.digest= --set worker.image.pullPolicy=Never \
+            --set ui.image.repository=curie-ui --set ui.image.tag=upgrade-candidate --set ui.image.digest= --set ui.image.pullPolicy=Never \
+            --set agentSandbox.runner.image=curie-runner --set agentSandbox.runner.tag=upgrade-candidate --set agentSandbox.runner.digest= --set agentSandbox.runner.imagePullPolicy=Never \
+            --set agentSandbox.runner.prewarm.imagePullPolicy=Never
+          kubectl rollout status deploy/curie-api -n curie --timeout=600s
+          kubectl rollout status deploy/curie-worker -n curie --timeout=600s
+          kubectl rollout status deploy/curie-ui -n curie --timeout=600s
+          kubectl rollout status daemonset/curie-runner-prewarm -n curie --timeout=600s
+          bash cli/scripts/e2e-ladder.sh
+      - name: Dump released upgrade diagnostics on failure
+        if: failure()
+        run: |
+          kubectl get pods -A -o wide || true
+          kubectl get events -n curie --sort-by=.lastTimestamp | tail -50 || true
+          kubectl logs -n curie deploy/curie-api --tail=100 || true
+          kubectl logs -n curie deploy/curie-dispatcher --tail=100 || true
+      - name: Tear down the disposable upgrade cluster
+        if: always()
+        run: |
+          kubectl delete namespace curie curie-negative \
+            --ignore-not-found --wait=false 2>/dev/null || true
+          kind delete cluster --name curie-upgrade 2>/dev/null || true
+
   e2e-required:
     name: E2E required
     runs-on: ubuntu-latest
-    needs: [changes, e2e-ladder, e2e-ladder-release, e2e-ladder-cluster]
+    needs: [changes, e2e-ladder, e2e-ladder-release, e2e-ladder-cluster, e2e-released-upgrade]
     # A cancelled run leaves no evidence and must rerun. In a completed run,
     # every dependency outcome reaches the strict matcher below, which rejects
     # selected results other than success.
@@ -1356,16 +1711,19 @@ jobs:
           LOCAL_SELECTED: ${{ needs.changes.outputs.local }}
           LOCAL_RELEASE_SELECTED: ${{ needs.changes.outputs.local_release }}
           CLUSTER_SELECTED: ${{ needs.changes.outputs.cluster }}
+          RELEASED_UPGRADE_SELECTED: ${{ needs.changes.outputs.released_upgrade }}
           SKILL_LOCAL_RESULT: ${{ needs.e2e-ladder.result }}
           LOCAL_RELEASE_RESULT: ${{ needs.e2e-ladder-release.result }}
           CLUSTER_RESULT: ${{ needs.e2e-ladder-cluster.result }}
+          RELEASED_UPGRADE_RESULT: ${{ needs.e2e-released-upgrade.result }}
         run: |
           set -euo pipefail
 
           validate_selected_outcomes() {
             if [[ "$SKILL_LOCAL_RESULT" != "$skill_local_expected" ||
                   "$LOCAL_RELEASE_RESULT" != "$local_release_expected" ||
-                  "$CLUSTER_RESULT" != "$cluster_expected" ]]; then
+                  "$CLUSTER_RESULT" != "$cluster_expected" ||
+                  "$RELEASED_UPGRADE_RESULT" != "$released_upgrade_expected" ]]; then
               return 1
             fi
             return 0
@@ -1375,7 +1733,8 @@ jobs:
                 ( "$SKILL_SELECTED" != "true" && "$SKILL_SELECTED" != "false" ) ||
                 ( "$LOCAL_SELECTED" != "true" && "$LOCAL_SELECTED" != "false" ) ||
                 ( "$LOCAL_RELEASE_SELECTED" != "true" && "$LOCAL_RELEASE_SELECTED" != "false" ) ||
-                ( "$CLUSTER_SELECTED" != "true" && "$CLUSTER_SELECTED" != "false" ) ]]; then
+                ( "$CLUSTER_SELECTED" != "true" && "$CLUSTER_SELECTED" != "false" ) ||
+                ( "$RELEASED_UPGRADE_SELECTED" != "true" && "$RELEASED_UPGRADE_SELECTED" != "false" ) ]]; then
             echo "E2E required failed" >&2
             exit 1
           fi
@@ -1392,6 +1751,10 @@ jobs:
           if [[ "$CLUSTER_SELECTED" == "true" ]]; then
             cluster_expected="success"
           fi
+          released_upgrade_expected="skipped"
+          if [[ "$RELEASED_UPGRADE_SELECTED" == "true" ]]; then
+            released_upgrade_expected="success"
+          fi
 
           if ! validate_selected_outcomes; then
             echo "E2E required failed" >&2
@@ -1401,12 +1764,15 @@ jobs:
           negative_skill_local_result="$skill_local_expected"
           negative_local_release_result="$local_release_expected"
           negative_cluster_result="$cluster_expected"
+          negative_released_upgrade_result="$released_upgrade_expected"
           if [[ "$skill_local_expected" == "success" ]]; then
             negative_skill_local_result="skipped"
           elif [[ "$local_release_expected" == "success" ]]; then
             negative_local_release_result="skipped"
           elif [[ "$cluster_expected" == "success" ]]; then
             negative_cluster_result="skipped"
+          elif [[ "$released_upgrade_expected" == "success" ]]; then
+            negative_released_upgrade_result="skipped"
           else
             negative_skill_local_result="success"
           fi
@@ -1414,6 +1780,7 @@ jobs:
           if SKILL_LOCAL_RESULT="$negative_skill_local_result" \
             LOCAL_RELEASE_RESULT="$negative_local_release_result" \
             CLUSTER_RESULT="$negative_cluster_result" \
+            RELEASED_UPGRADE_RESULT="$negative_released_upgrade_result" \
             validate_selected_outcomes; then
             echo "Selected and skipped negative control failed" >&2
             exit 1

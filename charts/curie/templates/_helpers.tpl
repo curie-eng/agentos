@@ -684,6 +684,12 @@ http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.
      passed in as `.existingData` (an always-present dict, empty under `helm
      template`/--dry-run/first install), so this helper does no per-key lookup.
 
+     A legacy retained values set can omit a key that a newer chart adds. Treat
+     that nil as the declared default before applying the four branches below,
+     so it is not mistaken for an explicit override. A persisted key whose
+     decoded value is blank is likewise absent: retaining it would keep every
+     consumer crash looping instead of healing the release.
+
      Four branches, in PRECEDENCE order, and WHY this order is correct:
        1. allowDevDefaults: the deterministic dev/CI escape hatch (values-dev.yaml
           sets it true). Return the value verbatim so the dev/e2e path renders the
@@ -702,7 +708,7 @@ http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.
           The override must sit ahead of the persist branch or an explicit value
           on upgrade would be silently ignored.
        3. Persist existing: no override, so if a prior install already GENERATED
-          this key, re-use it. `helm upgrade` must NEVER rotate a live store
+          this key with a nonblank value, re-use it. `helm upgrade` must NEVER rotate a live store
           credential (Postgres would reject the new password against its persisted
           data), so we return the stored value from `.existingData` when present.
           Generated secrets always have value==published-default (nobody set them),
@@ -720,12 +726,20 @@ http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.
      safely reverts value to the default, which then reuses the persisted generated
      value via branch 3 rather than rotating it. */}}
 {{- define "curie.managedSecret" -}}
+{{- $value := .value -}}
+{{- if kindIs "invalid" $value -}}
+{{- $value = .default -}}
+{{- end -}}
+{{- $existingValue := "" -}}
+{{- if hasKey .existingData .key -}}
+{{- $existingValue = index .existingData .key | b64dec -}}
+{{- end -}}
 {{- if eq (toString .root.Values.security.allowDevDefaults) "true" -}}{{/* string-coercion safety -- a quoted "false" must not read as truthy and silently ship a published default (fail closed to generation). */}}
-{{- .value -}}
-{{- else if ne (toString .value) (toString .default) -}}
-{{- .value -}}
-{{- else if hasKey .existingData .key -}}
-{{- index .existingData .key | b64dec -}}
+{{- $value -}}
+{{- else if ne (toString $value) (toString .default) -}}
+{{- $value -}}
+{{- else if ne (trim $existingValue) "" -}}
+{{- $existingValue -}}
 {{- else if .hex -}}
 {{- randAlphaNum 32 | sha256sum -}}
 {{- else -}}

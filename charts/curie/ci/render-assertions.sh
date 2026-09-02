@@ -199,6 +199,7 @@ echo "=== Assertion 4a: explicit override wins on the sealed path ==="
 OVERRIDE="$TMP/override.yaml"
 helm template "$CHART" \
   --set api.apiKey=override-sentinel-xyz \
+  --set api.approvalChatAttesterSecret=override-attester-2194 \
   --set langfuse.init.projectSecretKey=override-project-secret-1569 \
   --set langfuse.init.userPassword=override-user-password-1569 \
   --show-only templates/secrets.yaml > "$OVERRIDE"
@@ -207,6 +208,14 @@ if [[ "$got" != "override-sentinel-xyz" ]]; then
   fail "explicit --set api.apiKey override must be honored on the sealed path; expected 'override-sentinel-xyz', got '$got'."
 fi
 echo "  ok: explicit apiKey override honored (override wins over generation)"
+got_attester="$(read_key "$OVERRIDE" approvalChatAttesterSecret)"
+if [[ "$got_attester" != "override-attester-2194" ]]; then
+  fail "explicit --set api.approvalChatAttesterSecret override must be honored verbatim; expected 'override-attester-2194', got '$got_attester'."
+fi
+if [[ "$got_attester" == "$got" ]]; then
+  fail "explicit api.approvalChatAttesterSecret override must remain distinct from api.apiKey; both rendered '$got'."
+fi
+echo "  ok: explicit approval chat attester override honored and distinct from apiKey"
 got="$(read_key "$OVERRIDE" langfuseInitProjectSecretKey)"
 if [[ "$got" != "override-project-secret-1569" ]]; then
   fail "explicit --set langfuse.init.projectSecretKey override must be honored on the sealed path; expected 'override-project-secret-1569', got '$got'."
@@ -217,6 +226,96 @@ if [[ "$got" != "override-user-password-1569" ]]; then
   fail "explicit --set langfuse.init.userPassword override must be honored on the sealed path; expected 'override-user-password-1569', got '$got'."
 fi
 echo "  ok: explicit Langfuse init user password override honored"
+
+echo "=== Assertion 4b: a legacy retained nil attester generates independently (#2194) ==="
+# A v0.8.2 release has no api.approvalChatAttesterSecret. On an upgrade that
+# replays the old release config, Helm represents the absent new key as nil.
+# Preserve an ordinary retained override in the fixture so this exercises the
+# legacy values shape rather than a one-key synthetic probe.
+LEGACY_ATTESTER_VALUES="$TMP/legacy-attester-values.yaml"
+cat > "$LEGACY_ATTESTER_VALUES" <<'YAMLEOF'
+api:
+  apiKey: legacy-retained
+  approvalChatAttesterSecret: null
+global:
+  storageClass: legacy-retained-storage-class-2194
+YAMLEOF
+LEGACY_ATTESTER="$TMP/legacy-attester.yaml"
+helm template legacy-attester "$CHART" \
+  -f "$LEGACY_ATTESTER_VALUES" \
+  --show-only templates/secrets.yaml > "$LEGACY_ATTESTER"
+legacy_api_key="$(read_key "$LEGACY_ATTESTER" apiKey)"
+legacy_attester="$(read_key "$LEGACY_ATTESTER" approvalChatAttesterSecret)"
+if [[ -z "${legacy_attester//[[:space:]]/}" ]]; then
+  fail "a legacy retained nil api.approvalChatAttesterSecret rendered blank; the managed Secret must generate a nonblank attester (#2194)."
+fi
+if [[ "$legacy_attester" == "$legacy_api_key" ]]; then
+  fail "a legacy retained nil api.approvalChatAttesterSecret resolved to apiKey; the attester must use an independent trust domain (#2194)."
+fi
+echo "  ok: legacy retained nil attester resolves nonblank and differs from apiKey"
+
+echo "=== Assertion 4c: explicit blank attesters are rejected (#2194) ==="
+for label in empty whitespace; do
+  EXPLICIT_BLANK_VALUES="$TMP/explicit-blank-attester-$label.yaml"
+  if [[ "$label" == "empty" ]]; then
+    printf '%s\n' 'api:' '  approvalChatAttesterSecret: ""' > "$EXPLICIT_BLANK_VALUES"
+  else
+    printf '%s\n' 'api:' '  approvalChatAttesterSecret: "   "' > "$EXPLICIT_BLANK_VALUES"
+  fi
+  explicit_blank_output=""
+  if explicit_blank_output="$(helm template explicit-blank-attester "$CHART" \
+      -f "$EXPLICIT_BLANK_VALUES" --show-only templates/secrets.yaml 2>&1)"; then
+    fail "explicit $label api.approvalChatAttesterSecret rendered successfully; values validation must reject blank credentials (#2194)."
+  fi
+  if [[ "$explicit_blank_output" != *"approvalChatAttesterSecret"* ]]; then
+    fail "explicit $label attester was rejected for an unexpected reason: $explicit_blank_output"
+  fi
+  echo "  ok: explicit $label attester is rejected by the chart values contract"
+done
+
+echo "=== Assertion 4d negative control: nil-unsafe managedSecret FAILS (#2194) ==="
+# Replace only the managedSecret helper in a temporary chart copy with its
+# pre-fix body. The same legacy-values assertion above must then observe the
+# zero-byte attester that escaped the v0.8.2 -> v0.8.3 upgrade.
+ATTESTER_MUTANT="$TMP/mutant-managed-secret-nil"
+cp -a "$CHART" "$ATTESTER_MUTANT"
+python3 - "$ATTESTER_MUTANT/templates/_helpers.tpl" <<'PYEOF'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+start_marker = '{{- define "curie.managedSecret" -}}'
+end_marker = '{{/* ---- Shared first-party-app environment fragments ---- */}}'
+start = text.find(start_marker)
+end = text.find(end_marker, start)
+if start == -1 or end == -1:
+    sys.stderr.write("negative control could not find curie.managedSecret to mutate\n")
+    sys.exit(1)
+old_body = r'''{{- define "curie.managedSecret" -}}
+{{- if eq (toString .root.Values.security.allowDevDefaults) "true" -}}{{/* string-coercion safety -- a quoted "false" must not read as truthy and silently ship a published default (fail closed to generation). */}}
+{{- .value -}}
+{{- else if ne (toString .value) (toString .default) -}}
+{{- .value -}}
+{{- else if hasKey .existingData .key -}}
+{{- index .existingData .key | b64dec -}}
+{{- else if .hex -}}
+{{- randAlphaNum 32 | sha256sum -}}
+{{- else -}}
+{{- randAlphaNum 32 -}}
+{{- end -}}
+{{- end -}}'''
+path.write_text(text[:start] + old_body + "\n\n" + text[end:])
+PYEOF
+ATTESTER_MUTANT_OUT="$TMP/mutant-managed-secret-nil.yaml"
+helm template legacy-attester "$ATTESTER_MUTANT" \
+  -f "$LEGACY_ATTESTER_VALUES" \
+  --show-only templates/secrets.yaml > "$ATTESTER_MUTANT_OUT"
+mutant_attester="$(read_key "$ATTESTER_MUTANT_OUT" approvalChatAttesterSecret)"
+if [[ -n "$mutant_attester" ]]; then
+  fail "nil-unsafe managedSecret negative control did not reproduce the exact blank attester; got a nonblank value."
+fi
+echo "  ok: restoring the nil-unsafe helper reproduces the blank legacy attester"
 
 assert_otlp_auth_agrees() {
   # $1 = rendered Secret, $2 = expected public key, $3 = render label
@@ -230,7 +329,7 @@ assert_otlp_auth_agrees() {
   echo "  ok: $label OTel Basic auth agrees with the rendered project secret"
 }
 
-echo "=== Assertion 4b: default OTel auth uses the resolved Langfuse project secret ==="
+echo "=== Assertion 4e: default OTel auth uses the resolved Langfuse project secret ==="
 assert_otlp_auth_agrees "$SEALED" "pk-lf-curie-dev" "sealed render"
 assert_otlp_auth_agrees "$OVERRIDE" "pk-lf-curie-dev" "credential override render"
 
