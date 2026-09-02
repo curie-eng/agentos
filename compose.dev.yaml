@@ -243,20 +243,6 @@ services:
         condition: service_completed_successfully
     environment:
       <<: *langfuse-env
-    # Port 3030 starts listening only after Langfuse initialization completes
-    # and app import registers the BullMQ OTel ingestion consumers. Without a
-    # healthcheck, `docker compose up --wait` returns while the container is
-    # merely running and a first trace can sit invisible until worker restart.
-    healthcheck:
-      test:
-        - CMD
-        - node
-        - -e
-        - "fetch('http://' + process.env.HOSTNAME + ':3030/').then((response) => { if (!response.ok) process.exit(1); }).catch(() => process.exit(1))"
-      interval: 2s
-      timeout: 5s
-      retries: 150
-      start_period: 5s
     restart: unless-stopped
 
   langfuse-web:

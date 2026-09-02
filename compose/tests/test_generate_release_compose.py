@@ -190,24 +190,6 @@ def test_rustfs_and_aws_bucket_bootstrap_preserve_the_s3_consumer_contract():
             assert consumer_env["LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE"] == "true"
 
 
-def test_langfuse_worker_readiness_gates_compose_wait():
-    """Do not accept OTel before the adopted ingest consumer is registered."""
-    for label, doc in compose_docs():
-        worker = doc["services"]["langfuse-worker"]
-        healthcheck = worker.get("healthcheck", {})
-        health_command = " ".join(str(part) for part in healthcheck.get("test", []))
-        assert healthcheck.get("test", [None])[0] == "CMD", (
-            f"{label} Langfuse worker readiness must be an executable healthcheck"
-        )
-        assert "node" in health_command and "process.env.HOSTNAME" in health_command, (
-            f"{label} Langfuse worker healthcheck must probe its post-initialization "
-            f"HTTP listener, got {health_command!r}"
-        )
-        assert healthcheck.get("start_period") and healthcheck.get("retries"), (
-            f"{label} Langfuse worker readiness must tolerate bounded first-boot initialization"
-        )
-
-
 def test_invariants_preserved_from_dev():
     generate = load_generate()
     out = generate(DEV_TEXT, OTEL_TEXT, version="9.9.9")
