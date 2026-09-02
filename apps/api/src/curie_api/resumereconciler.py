@@ -70,7 +70,12 @@ from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from . import crud
-from .resumequeue import ResumeQueue, parse_resume_event_id, resume_turn_for
+from .resumequeue import (
+    ResumeQueue,
+    approval_trace_context,
+    parse_resume_event_id,
+    resume_turn_for,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -210,7 +215,9 @@ class ResumeReconciler:
                             # exit the txn block cleanly, releasing any lock.
                             continue
                         turn = resume_turn_for(approval)
-                        await self._resume_queue.enqueue(turn)
+                        await self._resume_queue.enqueue(
+                            turn, parent=approval_trace_context(approval)
+                        )
                         approval.resumed_at = datetime.now(UTC).replace(tzinfo=None)
                     # session.begin() committed here, releasing the row lock.
                 except Exception:  # noqa: BLE001

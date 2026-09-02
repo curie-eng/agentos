@@ -12,7 +12,7 @@ from alembic import command
 from alembic.config import Config
 from curie_api.config import get_settings
 from sqlalchemy import text
-from sqlalchemy.exc import DataError
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 
 ALEMBIC_DIR = Path(__file__).resolve().parents[1] / "alembic"
@@ -97,7 +97,7 @@ def test_0039_adds_nullable_bounded_private_carrier_and_round_trips(
         "SELECT traceparent FROM curie.approvals WHERE id = :id",
         {"id": approval_id},
     ) == [{"traceparent": valid}]
-    with pytest.raises(DataError):
+    with pytest.raises(DBAPIError):
         _write_traceparent(approval_id, "x" * 56)
 
     command.downgrade(cfg, "0038")

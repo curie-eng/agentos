@@ -1892,13 +1892,13 @@ def test_sweeper_isolates_a_failing_record(
             orig = queue.enqueue
             calls = {"n": 0}
 
-            async def _flaky_enqueue(turn: QueuedTurn) -> str:
+            async def _flaky_enqueue(turn: QueuedTurn, **kwargs: Any) -> str:
                 # Raise on the first record's enqueue (a Valkey blip), then let
                 # every later record enqueue for real.
                 calls["n"] += 1
                 if calls["n"] == 1:
                     raise RuntimeError("valkey down")
-                return await orig(turn)
+                return await orig(turn, **kwargs)
 
             monkeypatch.setattr(queue, "enqueue", _flaky_enqueue)
             async with sessionmaker() as session:

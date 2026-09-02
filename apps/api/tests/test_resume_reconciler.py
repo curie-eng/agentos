@@ -170,7 +170,7 @@ def _detached_approval(
         status=status,
         resolved_by=resolved_by,
     )
-    setattr(approval, "traceparent", traceparent)
+    approval.traceparent = traceparent
     return approval
 
 
@@ -947,10 +947,10 @@ def test_reconciler_isolates_per_record_failure(
         real_enqueue = queue.enqueue
         fail_event = f"approval-{fail_id}-resolved"
 
-        async def flaky(turn: QueuedTurn) -> str:
+        async def flaky(turn: QueuedTurn, **kwargs: object) -> str:
             if turn.event_id == fail_event:
                 raise RuntimeError("valkey blip for one record")
-            return await real_enqueue(turn)
+            return await real_enqueue(turn, **kwargs)
 
         queue.enqueue = flaky  # type: ignore[method-assign]
 
