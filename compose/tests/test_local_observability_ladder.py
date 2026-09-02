@@ -8,6 +8,11 @@ exported signal files, and run both healthy and injected-failure controls.
 
 from __future__ import annotations
 
+import json
+import os
+import re
+import subprocess
+import sys
 from pathlib import Path
 
 import yaml
@@ -34,6 +39,65 @@ def _shell_function(source: str, name: str) -> str:
     start = source.index(start_marker)
     end = source.index("\n}\n", start) + len("\n}\n")
     return source[start:end]
+
+
+def _python_heredoc(function: str) -> str:
+    """Extract the sole quoted Python heredoc from a shell function."""
+
+    start = function.index("<<'PY'\n") + len("<<'PY'\n")
+    end = function.index("\nPY\n", start)
+    return function[start:end]
+
+
+def _run_seed_matcher(
+    tmp_path: Path, matcher: str, marker: str, rows: list[object]
+) -> subprocess.CompletedProcess[str]:
+    private_slice = tmp_path / "bounded-stream.json"
+    private_slice.write_text(json.dumps(rows))
+    return subprocess.run(
+        [sys.executable, "-", str(private_slice), marker],
+        input=matcher,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def _run_absent_trace_query(
+    tmp_path: Path, query: str, *, error: str
+) -> tuple[subprocess.CompletedProcess[str], int]:
+    """Run the real shell helper against a deterministic failing candidate CLI."""
+
+    count = tmp_path / "query-count"
+    fake_bin = tmp_path / "curie"
+    fake_bin.write_text(
+        "#!/bin/sh\n"
+        'count="$(cat "$FAKE_COUNT" 2>/dev/null || printf 0)"\n'
+        'count=$((count + 1))\n'
+        'printf "%s" "$count" > "$FAKE_COUNT"\n'
+        'printf \'{"error":"%s","fix":"retry exact id"}\\n\' "$FAKE_ERROR"\n'
+        "exit 1\n"
+    )
+    fake_bin.chmod(0o700)
+    script = f"""set -u
+sanitize_exact_trace_read() {{ return 1; }}
+{query}
+WORKDIR="$1"
+BIN="$2"
+OBSERVABILITY_POLL_ATTEMPTS=3
+OBSERVABILITY_POLL_INTERVAL_SECONDS=0
+CURIE_NAMESPACE=acme-observability
+CURIE_RELEASE=acme-observability
+query_exact_seed_trace local aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa "" "" absent
+"""
+    result = subprocess.run(
+        ["bash", "-c", script, "bash", str(tmp_path), str(fake_bin)],
+        env={**os.environ, "FAKE_COUNT": str(count), "FAKE_ERROR": error},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return result, int(count.read_text()) if count.exists() else 0
 
 
 def test_local_ladder_owns_a_real_queryable_otlp_sink() -> None:
@@ -256,14 +320,36 @@ def test_local_otel_controls_distinguish_a_live_sink_from_a_turn() -> None:
     )
 
 
-def test_product_oracle_discovers_only_the_seed_trace_from_bounded_transport() -> None:
+def test_product_oracle_discovers_only_the_seed_trace_from_bounded_transport(
+    tmp_path: Path,
+) -> None:
     """A background/newest trace must be unable to satisfy the turn oracle."""
 
     source = LADDER_PATH.read_text()
-    assert "local observability runs --limit 100" not in source, (
-        "a newest-runs page can select an unrelated background trace; exact discovery "
-        "must start from the seeded stream entry"
+    # The unavailable-API negative may still exercise the public runs verb, but
+    # no helper may select a turn from that list or dump a selected row. Inspect
+    # whole function bodies so `--limit "$limit"` cannot evade this contract.
+    functions = {
+        match.group(1): _shell_function(source, match.group(1))
+        for match in re.finditer(r"(?m)^([A-Za-z0-9_]+)\(\) \{$", source)
+    }
+    forbidden_selectors = {
+        name: body
+        for name, body in functions.items()
+        if "local observability runs" in body
+        and name != "prove_local_observability_queries"
+    }
+    assert not forbidden_selectors, (
+        "a newest-runs selector/raw-dump helper can choose an unrelated background "
+        f"trace regardless of limit interpolation: {sorted(forbidden_selectors)}"
     )
+    for removed_helper in (
+        "discover_local_observability_trace",
+        "assert_local_observability_detail",
+    ):
+        assert removed_helper not in functions, (
+            f"obsolete raw selector/detail helper remains: {removed_helper}"
+        )
 
     discover = _shell_function(source, "discover_trace_id_for_seed")
     for required in (
@@ -281,6 +367,60 @@ def test_product_oracle_discovers_only_the_seed_trace_from_bounded_transport() -
         )
     assert "printf '%s\\n' \"$payload\"" not in discover
     assert "printf '%s\\n' \"$traceparent\"" not in discover
+
+    matcher = _python_heredoc(discover)
+    marker = "curie-seed-ordinary-example"
+    target_trace = "a" * 32
+    background_trace = "b" * 32
+    background = [
+        "1-0",
+        [
+            "payload",
+            json.dumps({"text": "ordinary correlation another-seed"}),
+            "traceparent",
+            f"00-{background_trace}-{'1' * 16}-01",
+        ],
+    ]
+    target = [
+        "2-0",
+        [
+            "payload",
+            json.dumps({"text": f"ordinary correlation {marker}"}),
+            "traceparent",
+            f"00-{target_trace}-{'2' * 16}-01",
+        ],
+    ]
+    matched = _run_seed_matcher(tmp_path, matcher, marker, [background, target])
+    assert matched.returncode == 0, matched.stderr
+    assert matched.stdout.strip() == target_trace, (
+        "the real matcher must recover the carrier adjacent to a marker embedded "
+        "in representative QueuedTurn.text, never the background carrier"
+    )
+
+    mismatch = _run_seed_matcher(tmp_path, matcher, marker, [background])
+    assert mismatch.returncode != 0, (
+        "a background entry without the marker must not satisfy exact discovery"
+    )
+    duplicate = _run_seed_matcher(
+        tmp_path,
+        matcher,
+        marker,
+        [
+            target,
+            [
+                "3-0",
+                [
+                    "payload",
+                    json.dumps({"text": f"ordinary correlation {marker}"}),
+                    "traceparent",
+                    f"00-{'c' * 32}-{'3' * 16}-01",
+                ],
+            ],
+        ],
+    )
+    assert duplicate.returncode != 0, (
+        "more than one matching adjacent carrier must fail closed"
+    )
 
     query = _shell_function(source, "query_exact_seed_trace")
     assert 'observability run "$trace_id"' in query
@@ -302,6 +442,81 @@ def test_product_oracle_discovers_only_the_seed_trace_from_bounded_transport() -
     for private in ("input", "output", "session", "user", "headers"):
         assert private in sanitizer, (
             f"sanitizer must explicitly prevent raw {private!r} from reaching stdout"
+        )
+    assert "if private_fields.intersection(node):\n        pass" not in sanitizer, (
+        "private-field handling must reject or remove data, not be a no-op"
+    )
+
+
+def test_product_evidence_sanitizer_and_failure_paths_never_dump_private_json(
+    tmp_path: Path,
+) -> None:
+    """Raw replies and private Langfuse fields stay in task-owned artifacts."""
+
+    source = LADDER_PATH.read_text()
+    sanitizer = _shell_function(source, "sanitize_exact_trace_read")
+    sanitizer_python = _python_heredoc(sanitizer)
+    trace_id = "d" * 32
+    private_sentinels = {
+        "input": "PRIVATE_PROMPT_SENTINEL",
+        "output": "PRIVATE_REPLY_SENTINEL",
+        "session": "PRIVATE_SESSION_SENTINEL",
+        "user": "PRIVATE_USER_SENTINEL",
+        "headers": {"authorization": "PRIVATE_HEADER_SENTINEL"},
+    }
+    raw = tmp_path / "raw-trace.json"
+    raw.write_text(
+        json.dumps(
+            {
+                "trace": {"id": trace_id},
+                "tree": [
+                    {
+                        "name": "curie.queue.enqueue",
+                        "type": "SPAN",
+                        "children": [],
+                        **private_sentinels,
+                    }
+                ],
+                "approval_decision": None,
+            }
+        )
+    )
+    result = subprocess.run(
+        [sys.executable, "-", trace_id, str(raw), "curie.queue.enqueue", ""],
+        input=sanitizer_python,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    evidence = json.loads(result.stdout)
+    assert set(evidence) == {
+        "trace_id",
+        "service",
+        "operation",
+        "observation_count",
+        "observation_type",
+        "approval_decision",
+    }
+    combined_output = result.stdout + result.stderr
+    for private_value in (
+        "PRIVATE_PROMPT_SENTINEL",
+        "PRIVATE_REPLY_SENTINEL",
+        "PRIVATE_SESSION_SENTINEL",
+        "PRIVATE_USER_SENTINEL",
+        "PRIVATE_HEADER_SENTINEL",
+    ):
+        assert private_value not in combined_output
+
+    finalized = _shell_function(source, "assert_finalized_reply")
+    for raw_dump in (
+        'printf \'%s\\n\' "$payload"',
+        'printf "%s\\n" "$payload"',
+        'echo "$payload"',
+    ):
+        assert raw_dump not in finalized, (
+            "message parse/finalization failures must report a bounded verdict, "
+            "not the private message JSON"
         )
 
 
@@ -325,6 +540,14 @@ def test_ordinary_mcp_and_approval_seeds_have_independent_receipts() -> None:
         assert not missing, f"{name} lacks independent outcome evidence: {missing}"
         assert "discover_trace_id_for_seed" in body
         assert "query_exact_seed_trace" in body
+
+    approval = _shell_function(source, "seed_approval_resume_turn")
+    assert "curie.approval.suspend" in approval, (
+        "the approval oracle must require the worker's real parked-turn span"
+    )
+    assert "curie.approval.wait" not in approval, (
+        "the oracle must not invent a wait span that no current emitter produces"
+    )
 
     assert "seed-invalid" in source
     assert MCP_RECEIPT_FIXTURE.is_dir(), (
@@ -368,11 +591,14 @@ def test_product_collector_restore_restarts_and_verifies_every_seed_emitter() ->
         assert protocol in restore
 
 
-def test_invalid_langfuse_auth_is_temporary_durable_and_recovers_the_same_id() -> None:
+def test_invalid_langfuse_auth_is_temporary_durable_and_recovers_the_same_id(
+    tmp_path: Path,
+) -> None:
     """Pin the real backend negative without redefining exporter semantics."""
 
     source = LADDER_PATH.read_text()
     negative = _shell_function(source, "case_local_langfuse_invalid_auth")
+    query = _shell_function(source, "query_exact_seed_trace")
 
     # Observed shipped behavior, not an assumed external-API contract:
     # otel/collector-config.yaml enables retry_on_failure at 5s/30s/5m and a
@@ -404,6 +630,66 @@ def test_invalid_langfuse_auth_is_temporary_durable_and_recovers_the_same_id() -
         "after the queue-preserving restart"
     )
 
+    invalid_auth = negative.index(
+        'export LANGFUSE_OTLP_AUTH_HEADER="$INVALID_LANGFUSE_OTLP_AUTH_HEADER"'
+    )
+    control = negative.find('query_exact_seed_trace local "$LAST_ORDINARY_TRACE_ID"')
+    assert 0 <= control < invalid_auth, (
+        "a successful exact read under valid auth must discriminate backend/query "
+        "health before the credential is made invalid"
+    )
+
+    # Restart once while auth is still invalid, then re-observe both queued
+    # failure and stable absence. Restoring auth is a later, separate restart.
+    before_restore = negative[: negative.index("restore_local_langfuse_auth")]
+    restart_positions = [
+        match.start()
+        for match in re.finditer("restart_local_product_collector", before_restore)
+    ]
+    assert len(restart_positions) >= 2, (
+        "the file-backed queue must survive a Collector restart while auth remains invalid"
+    )
+    after_invalid_restart = before_restore[restart_positions[1] :]
+    assert "otelcol_exporter_queue_size" in after_invalid_restart
+    assert "otelcol_exporter_send_failed_spans" in after_invalid_restart
+    assert "query_exact_seed_trace" in after_invalid_restart
+
+    # Execute the production query helper: absence is a bounded observation,
+    # not one lucky first poll, and only the stable not-found error is accepted.
+    stable_absence_dir = tmp_path / "stable-absence"
+    stable_absence_dir.mkdir()
+    absent, polls = _run_absent_trace_query(
+        stable_absence_dir, query, error="exact trace not found"
+    )
+    assert absent.returncode == 0, absent.stderr
+    assert polls == 3, (
+        "temporary absence must remain not-found for the full declared poll bound"
+    )
+
+    wrong_failure_dir = tmp_path / "wrong-failure"
+    wrong_failure_dir.mkdir()
+    wrong_failure, _ = _run_absent_trace_query(
+        wrong_failure_dir, query, error="Langfuse authorization failed"
+    )
+    assert wrong_failure.returncode != 0, (
+        "an arbitrary candidate-CLI exit 1 must not masquerade as stable not-found"
+    )
+
+    absent_call = re.search(
+        r'query_exact_seed_trace local "\$same_queued_trace_id"[^\n]*absent',
+        negative,
+    )
+    recovered_call = re.search(
+        r'query_exact_seed_trace local "\$same_queued_trace_id"\s*$',
+        negative,
+        re.MULTILINE,
+    )
+    assert (
+        absent_call
+        and recovered_call
+        and absent_call.start() < recovered_call.start()
+    ), "the same ID must be absent during failure and present after recovery"
+
 
 def test_cluster_product_observability_is_private_preflight_and_query_only() -> None:
     """The ladder may inspect a task release but must never install or remove it."""
@@ -430,10 +716,14 @@ def test_cluster_product_observability_is_private_preflight_and_query_only() -> 
         assert required in preflight, f"cluster preflight omits {required!r}"
 
     mode = _shell_function(source, "run_cluster_product_observability")
+    wrapper = _shell_function(source, "rung_cluster_product")
     assert "preflight_cluster_product_observability" in mode
     assert "seed_ordinary_turn" in mode
     assert "seed_approval_resume_turn" in mode
     assert "cluster observability run" in mode
+    assert "cluster deploy" in wrapper, (
+        "the wrapper must retain the intended agent seed deployment"
+    )
     for mutating in (
         "cluster up",
         "cluster down",
@@ -442,9 +732,22 @@ def test_cluster_product_observability_is_private_preflight_and_query_only() -> 
         "helm uninstall",
         "kubectl delete",
     ):
-        assert mutating not in mode, (
-            f"product-observability mode must be preflight/query-only, found {mutating!r}"
-        )
+        for helper_name, helper in (
+            ("preflight", preflight),
+            ("query", mode),
+            ("product wrapper", wrapper),
+        ):
+            assert mutating not in helper, (
+                "product-observability preflight/query/wrapper must not manage the "
+                f"release; found {mutating!r} in {helper_name}"
+            )
+    assert '-o json > "$inventory"' not in preflight, (
+        "preflight must query Ready/imageID fields directly, not persist full pod "
+        "JSON that may contain private environment values"
+    )
+    assert "cluster-product-pods" not in preflight, (
+        "full pod specifications must not be persisted even in a mode-0600 artifact"
+    )
 
 
 def test_adopted_component_stop_requires_successful_export_on_both_product_surfaces() -> None:

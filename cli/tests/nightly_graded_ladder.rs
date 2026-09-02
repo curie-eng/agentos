@@ -71,6 +71,43 @@ fn ladder_function(name: &str) -> String {
     format!("{marker}{body}\n}}\n")
 }
 
+fn ladder_python_heredoc(function_name: &str) -> String {
+    let function = ladder_function(function_name);
+    let (_, tail) = function
+        .split_once("<<'PY'\n")
+        .unwrap_or_else(|| panic!("ladder function {function_name} must contain Python"));
+    tail.split_once("\nPY\n")
+        .unwrap_or_else(|| panic!("ladder function {function_name} Python must close"))
+        .0
+        .to_owned()
+}
+
+fn run_seed_trace_matcher(matcher: &str, marker: &str, rows: &serde_json::Value) -> Output {
+    let harness = tempfile::tempdir().expect("create seed matcher fixture directory");
+    let bounded_slice = harness.path().join("bounded-stream.json");
+    fs::write(
+        &bounded_slice,
+        serde_json::to_vec(rows).expect("serialize bounded stream fixture"),
+    )
+    .expect("write bounded stream fixture");
+    let mut child = Command::new("python3")
+        .arg("-")
+        .arg(&bounded_slice)
+        .arg(marker)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start exact seed matcher");
+    child
+        .stdin
+        .take()
+        .expect("open matcher stdin")
+        .write_all(matcher.as_bytes())
+        .expect("write exact seed matcher");
+    child.wait_with_output().expect("wait for seed matcher")
+}
+
 /// The local OTel assertions deliberately live in the shell harness, where
 /// they consume the Collector's raw JSON files.  Keep this test on that real
 /// consumer instead of re-implementing its attribution rules in Rust.
@@ -823,10 +860,15 @@ fn live_local_rung_grades_the_deployed_weather_cases() {
         .find(r#"prove_local_observability_queries "$agent_id""#)
         .map(|offset| product_collector + offset)
         .expect("the local rung must prove observability queries after telemetry");
-    assert!(
-        !text.contains(r#"local observability runs --limit 100"#),
-        "a newest-runs page can select a background trace; the live proof must derive the exact trace ID from the seeded bounded stream entry"
-    );
+    for removed_helper in [
+        "discover_local_observability_trace() {",
+        "assert_local_observability_detail() {",
+    ] {
+        assert!(
+            !text.contains(removed_helper),
+            "a newest-runs selector/raw-dump helper remains ({removed_helper}); variable interpolation must not evade exact-ID discovery"
+        );
+    }
     for required in [
         "discover_trace_id_for_seed",
         "query_exact_seed_trace",
@@ -875,6 +917,75 @@ fn live_local_rung_grades_the_deployed_weather_cases() {
 }
 
 #[test]
+fn exact_seed_matcher_recovers_embedded_marker_once_and_rejects_background() {
+    let matcher = ladder_python_heredoc("discover_trace_id_for_seed");
+    let marker = "curie-seed-ordinary-example";
+    let target_trace = "a".repeat(32);
+    let background_trace = "b".repeat(32);
+    let target = serde_json::json!([
+        "2-0",
+        [
+            "payload",
+            serde_json::json!({"text": format!("ordinary correlation {marker}")}).to_string(),
+            "traceparent",
+            format!("00-{target_trace}-{}-01", "2".repeat(16))
+        ]
+    ]);
+    let background = serde_json::json!([
+        "1-0",
+        [
+            "payload",
+            serde_json::json!({"text": "ordinary correlation another-seed"}).to_string(),
+            "traceparent",
+            format!("00-{background_trace}-{}-01", "1".repeat(16))
+        ]
+    ]);
+
+    let matched = run_seed_trace_matcher(
+        &matcher,
+        marker,
+        &serde_json::json!([background.clone(), target.clone()]),
+    );
+    assert!(
+        matched.status.success(),
+        "representative embedded marker was not recovered: {}",
+        String::from_utf8_lossy(&matched.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&matched.stdout).trim(),
+        target_trace,
+        "background carrier must not substitute for the marker-adjacent carrier"
+    );
+
+    let mismatch = run_seed_trace_matcher(&matcher, marker, &serde_json::json!([background]));
+    assert!(
+        !mismatch.status.success(),
+        "a background payload without the marker must fail closed"
+    );
+    let duplicate = run_seed_trace_matcher(
+        &matcher,
+        marker,
+        &serde_json::json!([
+            target,
+            [
+                "3-0",
+                [
+                    "payload",
+                    serde_json::json!({"text": format!("ordinary correlation {marker}")})
+                        .to_string(),
+                    "traceparent",
+                    format!("00-{}-{}-01", "c".repeat(32), "3".repeat(16))
+                ]
+            ]
+        ]),
+    );
+    assert!(
+        !duplicate.status.success(),
+        "multiple matching adjacent carriers must fail closed"
+    );
+}
+
+#[test]
 fn product_observability_requires_three_valid_seeds_and_count_only_mcp_receipt() {
     let text = ladder();
     for required in [
@@ -908,6 +1019,16 @@ fn product_observability_requires_three_valid_seeds_and_count_only_mcp_receipt()
     assert!(
         receipt.contains("count") || receipt.contains("wc -l"),
         "only an aggregate MCP call count may reach evidence output"
+    );
+
+    let approval = ladder_function("seed_approval_resume_turn");
+    assert!(
+        approval.contains("curie.approval.suspend"),
+        "approval evidence must require the worker's real parked-turn span"
+    );
+    assert!(
+        !approval.contains("curie.approval.wait"),
+        "the oracle must not invent a wait span that no current emitter produces"
     );
 }
 
@@ -960,6 +1081,73 @@ fn product_collector_restore_covers_every_emitter_and_invalid_auth_recovers_same
         negative.matches("same_queued_trace_id").count() >= 2,
         "the temporarily absent ID, not a fresh post-recovery control, must become queryable"
     );
+
+    let valid_control = negative
+        .find(r#"query_exact_seed_trace local "$LAST_ORDINARY_TRACE_ID""#)
+        .expect("invalid-auth proof must first read an exact known-valid trace");
+    let invalidate = negative
+        .find(r#"export LANGFUSE_OTLP_AUTH_HEADER="$INVALID_LANGFUSE_OTLP_AUTH_HEADER""#)
+        .expect("invalid-auth proof must roll the Collector to the placeholder credential");
+    assert!(
+        valid_control < invalidate,
+        "the valid exact-read control must precede credential invalidation"
+    );
+
+    let before_restore = negative
+        .split_once("restore_local_langfuse_auth")
+        .map(|(prefix, _)| prefix)
+        .expect("invalid-auth proof must restore valid auth");
+    let invalid_restarts: Vec<_> = before_restore
+        .match_indices("restart_local_product_collector")
+        .map(|(index, _)| index)
+        .collect();
+    assert!(
+        invalid_restarts.len() >= 2,
+        "the file-backed queue must survive a Collector restart while auth is still invalid"
+    );
+    let after_invalid_restart = &before_restore[invalid_restarts[1]..];
+    for required in [
+        "otelcol_exporter_send_failed_spans",
+        "otelcol_exporter_queue_size",
+        "query_exact_seed_trace",
+    ] {
+        assert!(
+            after_invalid_restart.contains(required),
+            "queued failure must be re-observed after the invalid-auth restart: missing {required}"
+        );
+    }
+
+    let query = ladder_function("query_exact_seed_trace");
+    let poll_start = query
+        .find(r#"for attempt in $(seq 1 "$OBSERVABILITY_POLL_ATTEMPTS"); do"#)
+        .expect("exact trace query must use the declared bounded poll count");
+    let poll_end = poll_start
+        + query[poll_start..]
+            .find("\n    done")
+            .expect("exact trace bounded poll must close");
+    let absent_success = query
+        .find("exact trace remained not-found through the full bounded observation poll")
+        .expect("exact trace query must report a bounded absent verdict");
+    assert!(
+        absent_success > poll_end,
+        "absence must stay stable for the full poll bound, not return on the first exit 1"
+    );
+    assert!(
+        query.to_ascii_lowercase().contains("not found")
+            || query.to_ascii_lowercase().contains("not_found"),
+        "only a typed not-found result may satisfy absence; arbitrary exit 1 is not evidence"
+    );
+
+    let absent = negative
+        .find(r#"query_exact_seed_trace local "$same_queued_trace_id" "" "" absent"#)
+        .expect("queued exact ID must be checked absent while auth is invalid");
+    let recovered = negative
+        .rfind(r#"query_exact_seed_trace local "$same_queued_trace_id""#)
+        .expect("the same queued exact ID must be queried after valid auth returns");
+    assert!(
+        absent < recovered,
+        "same-ID recovery must follow the bounded queued-failure observation"
+    );
 }
 
 #[test]
@@ -989,6 +1177,7 @@ fn cluster_product_observability_is_private_preflight_and_query_only() {
     }
 
     let query = ladder_function("run_cluster_product_observability");
+    let wrapper = ladder_function("rung_cluster_product");
     for required in [
         "preflight_cluster_product_observability",
         "seed_ordinary_turn",
@@ -1008,9 +1197,51 @@ fn cluster_product_observability_is_private_preflight_and_query_only() {
         "helm uninstall",
         "kubectl delete",
     ] {
+        for (helper_name, helper) in [
+            ("preflight", preflight.as_str()),
+            ("query", query.as_str()),
+            ("product wrapper", wrapper.as_str()),
+        ] {
+            assert!(
+                !helper.contains(mutation),
+                "cluster product {helper_name} must never install, upgrade, uninstall, or delete the release: found {mutation}"
+            );
+        }
+    }
+    assert!(
+        wrapper.contains("cluster deploy"),
+        "the product wrapper must retain the intended agent seed deployment"
+    );
+    assert!(
+        !preflight.contains(r#"-o json > "$inventory""#)
+            && !preflight.contains("cluster-product-pods"),
+        "cluster preflight must query Ready/imageID fields directly and never persist full pod JSON containing private spec/env data"
+    );
+}
+
+#[test]
+fn product_sanitizer_and_message_failures_never_dump_private_json() {
+    let sanitizer = ladder_function("sanitize_exact_trace_read");
+    assert!(
+        !sanitizer.contains("if private_fields.intersection(node):\n        pass"),
+        "private-field handling must reject or remove data, not be a no-op"
+    );
+    for private in ["input", "output", "session", "user", "headers"] {
         assert!(
-            !query.contains(mutation),
-            "cluster product mode must never mutate the installed release: found {mutation}"
+            sanitizer.contains(private),
+            "sanitizer must explicitly account for private field {private}"
+        );
+    }
+
+    let finalized = ladder_function("assert_finalized_reply");
+    for raw_dump in [
+        r#"printf '%s\n' "$payload""#,
+        r#"printf "%s\n" "$payload""#,
+        r#"echo "$payload""#,
+    ] {
+        assert!(
+            !finalized.contains(raw_dump),
+            "message parse/finalization failures must emit a bounded verdict, not private raw JSON"
         );
     }
 }

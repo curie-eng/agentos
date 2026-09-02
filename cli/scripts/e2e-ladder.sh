@@ -457,24 +457,22 @@ else:
     case "$verdict" in
         ok) ;;
         empty_reply)
-            echo "$label: the turn finalized but the reply was empty, so no output made it back through the plumbing." >&2
+            echo "$label: finalized=true reply_present=false status=empty_reply" >&2
             return 1 ;;
         awaiting_approval)
-            echo "$label: the turn parked on an approval gate instead of finalizing; the ladder's bundle must not require approval." >&2
+            echo "$label: finalized=false awaiting_approval=true status=awaiting_approval" >&2
             return 1 ;;
         timed_out)
-            echo "$label: no reply finalized before the deadline. The worker never completed the turn." >&2
+            echo "$label: finalized=false timed_out=true status=timed_out" >&2
             return 1 ;;
         dry_run)
-            echo "$label: got a dry-run descriptor; the ladder must run for real, never with --dry-run." >&2
+            echo "$label: finalized=false dry_run=true status=dry_run" >&2
             return 1 ;;
         not_finalized)
-            echo "$label: the payload is neither finalized nor a known terminal shape." >&2
-            printf '%s\n' "$payload" >&2
+            echo "$label: finalized=false status=not_finalized" >&2
             return 1 ;;
         *)
-            echo "$label: could not parse message --json output:" >&2
-            printf '%s\n' "$payload" >&2
+            echo "$label: finalized=false status=unparseable" >&2
             return 1 ;;
     esac
 
@@ -637,14 +635,11 @@ rows = json.loads(pathlib.Path(sys.argv[1]).read_text())
 marker = sys.argv[2]
 carrier = re.compile(r"^00-([0-9a-f]{32})-[0-9a-f]{16}-[0-9a-f]{2}$")
 
-def exact_marker(value):
-    if value == marker:
-        return True
-    if isinstance(value, dict):
-        return any(exact_marker(item) for item in value.values())
-    if isinstance(value, list):
-        return any(exact_marker(item) for item in value)
-    return False
+def marker_in_turn_text(value):
+    if not isinstance(value, dict):
+        return False
+    text = value.get("text")
+    return isinstance(text, str) and marker in text
 
 matches = []
 for row in rows:
@@ -663,7 +658,7 @@ for row in rows:
         except (TypeError, json.JSONDecodeError):
             continue
         match = carrier.fullmatch(fields[index + 3]) if isinstance(fields[index + 3], str) else None
-        if exact_marker(payload) and match:
+        if marker_in_turn_text(payload) and match:
             matches.append(match.group(1))
 matches = sorted(set(matches))
 if len(matches) != 1:
@@ -704,8 +699,7 @@ safe_operations = {
     "curie.queue.enqueue", "curie.queue.process", "curie.turn.process",
     "curie.sandbox.claim", "curie.runner.rpc", "agent.run", "execute_tool",
     "curie.reply.post", "curie.reply.update", "curie.slack.receipt",
-    "curie.approval.wait", "curie.approval.resolve", "curie.approval.resume",
-    "approval.wait", "approval.resolve", "approval.resume",
+    "curie.approval.suspend", "curie.approval.resolve", "curie.approval.resume",
     }
 operations = []
 types = set()
@@ -714,17 +708,17 @@ observation_count = [0]
 def walk(node):
     if not isinstance(node, dict):
         raise SystemExit("exact trace tree contains a non-object node")
-    # Deliberately never dereference values in private_fields.
-    if private_fields.intersection(node):
-        pass
+    # Strip private response fields before inspecting the allowlisted shape.
+    # Their values are never copied, compared, formatted, or emitted.
+    public_node = {key: value for key, value in node.items() if key not in private_fields}
     observation_count[0] += 1
-    name = node.get("name")
-    kind = node.get("type")
+    name = public_node.get("name")
+    kind = public_node.get("type")
     if name in safe_operations:
         operations.append(name)
     if isinstance(kind, str) and kind.upper() in {"SPAN", "GENERATION", "EVENT"}:
         types.add(kind.upper())
-    children = node.get("children")
+    children = public_node.get("children")
     if not isinstance(children, list):
         raise SystemExit("exact trace node omitted its child array")
     for child in children:
@@ -793,13 +787,39 @@ query_exact_seed_trace() {
             return 1
         fi
         if [[ "$expected_state" == "absent" ]]; then
-            rm -f "$private_read" "$safe_read"
-            if (( code == 1 )); then
-                echo "exact trace temporarily absent as required"
-                return 0
+            if (( code == 0 )); then
+                rm -f "$private_read" "$safe_read"
+                echo "exact trace was queryable while the exporter was required to be failing" >&2
+                return 1
             fi
-            echo "exact trace was queryable while the exporter was required to be failing" >&2
-            return 1
+            if (( code != 1 )) || ! python3 - "$private_read" "$trace_id" "$tier" <<'PY'
+import json
+import pathlib
+import sys
+
+source, trace_id, tier = sys.argv[1:4]
+try:
+    value = json.loads(pathlib.Path(source).read_text())
+except (OSError, json.JSONDecodeError):
+    raise SystemExit(1)
+expected_error = f'observability trace "{trace_id}" was not found'
+if not isinstance(value, dict) or set(value) != {"error", "fix"}:
+    raise SystemExit(1)
+error = value.get("error")
+fix = value.get("fix")
+stable_not_found = error in {"exact trace not found", expected_error}
+if not stable_not_found or not isinstance(fix, str) or not fix.strip():
+    raise SystemExit(1)
+PY
+            then
+                rm -f "$private_read" "$safe_read"
+                echo "exact trace absence query returned an unexpected failure" >&2
+                return 1
+            fi
+            if (( attempt < OBSERVABILITY_POLL_ATTEMPTS )); then
+                sleep "$OBSERVABILITY_POLL_INTERVAL_SECONDS"
+            fi
+            continue
         fi
         if (( code == 0 )) && sanitize_exact_trace_read "$trace_id" "$private_read" "$expected_csv" "$expected_decision" > "$safe_read"; then
             cat "$safe_read"
@@ -810,6 +830,11 @@ query_exact_seed_trace() {
             sleep "$OBSERVABILITY_POLL_INTERVAL_SECONDS"
         fi
     done
+    if [[ "$expected_state" == "absent" ]]; then
+        rm -f "$private_read" "$safe_read"
+        echo "exact trace remained not-found through the full bounded observation poll"
+        return 0
+    fi
     rm -f "$private_read" "$safe_read"
     echo "exact trace did not become queryable inside the bounded ingestion poll" >&2
     return 1
@@ -976,151 +1001,10 @@ PY
     stream_end="$(capture_stream_cursor "$tier")" || return 1
     trace_id="$(discover_trace_id_for_seed "$tier" "$marker" "$stream_start" "$stream_end")" || return 1
     query_exact_seed_trace "$tier" "$trace_id" \
-        "curie.approval.wait,curie.approval.resolve,curie.approval.resume,curie.reply.post|curie.reply.update" \
+        "curie.approval.suspend,curie.approval.resolve,curie.approval.resume,curie.reply.post|curie.reply.update" \
         "approved"
     LAST_APPROVAL_TRACE_ID="$trace_id"
     printf '%s' "$trace_id"
-}
-
-# Langfuse ingestion is asynchronous to turn finalization. Poll through the
-# candidate CLI, never its backing API. Scan one bounded newest-first page and
-# select the newest complete row. The returned id is the sole input to the
-# detail read; no latest shortcut or message-output parsing duplicates #1664.
-# Correlation to this rung is proved independently by the explicit-window
-# metrics reads below; trace-list DTOs do not promise an agent identity field.
-discover_local_observability_trace() {
-    local attempt out code verdict state detail limit=100
-    DISCOVERED_OBSERVABILITY_TRACE_ID=""
-    for attempt in $(seq 1 "$OBSERVABILITY_POLL_ATTEMPTS"); do
-        out="$("$BIN" --json local observability runs --limit "$limit")" && code=0 || code=$?
-        if (( code != 0 )); then
-            echo "local observability runs: bounded ingestion read exited $code, expected 0." >&2
-            printf '%s\n' "$out" >&2
-            return 1
-        fi
-        verdict="$(printf '%s' "$out" | python3 -c '
-import json, re, sys
-try:
-    value = json.loads(sys.stdin.read())
-except Exception as exc:
-    print("invalid")
-    print("expected exactly one JSON object: %s" % exc)
-    sys.exit(0)
-if not isinstance(value, dict):
-    print("invalid")
-    print("top level is not an object")
-    sys.exit(0)
-runs = value.get("runs")
-limit = value.get("limit")
-count = value.get("count")
-if isinstance(limit, bool) or limit != 100:
-    print("invalid")
-    print("limit is not the requested bound of 100")
-elif not isinstance(runs, list) or len(runs) > 100:
-    print("invalid")
-    print("runs is not an array bounded to at most 100 rows")
-elif isinstance(count, bool) or not isinstance(count, int) or count != len(runs):
-    print("invalid")
-    print("count does not equal the bounded row count")
-else:
-    matched = None
-    for row in runs:
-        if not isinstance(row, dict):
-            print("invalid")
-            print("a run row is not an object")
-            sys.exit(0)
-        trace_id = row.get("id")
-        name = row.get("name")
-        timestamp = row.get("timestamp")
-        if not isinstance(trace_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", trace_id):
-            print("invalid")
-            print("run id is absent or not a safe trace id")
-            sys.exit(0)
-        if name is not None and not isinstance(name, str):
-            print("invalid")
-            print("run name is neither a string nor null")
-            sys.exit(0)
-        if not isinstance(timestamp, str) or not timestamp:
-            print("invalid")
-            print("run timestamp is absent or not a string")
-            sys.exit(0)
-        if matched is None:
-            matched = trace_id
-    if matched is None:
-        print("pending")
-        print("no ingested run yet")
-    else:
-        print("ok")
-        print(matched)
-' || printf '%s\n%s\n' invalid 'validator failed')"
-        detail="${verdict#*$'\n'}"
-        state="${verdict%%$'\n'*}"
-        case "$state" in
-            ok)
-                DISCOVERED_OBSERVABILITY_TRACE_ID="${detail%%$'\n'*}"
-                printf '%s\n' "$out"
-                echo "local observability runs: bounded result discovered trace $DISCOVERED_OBSERVABILITY_TRACE_ID after $attempt ingestion poll(s)"
-                return 0
-                ;;
-            pending)
-                if (( attempt < OBSERVABILITY_POLL_ATTEMPTS )); then
-                    sleep "$OBSERVABILITY_POLL_INTERVAL_SECONDS"
-                fi
-                ;;
-            *)
-                echo "local observability runs: $detail." >&2
-                printf '%s\n' "$out" >&2
-                return 1
-                ;;
-        esac
-    done
-    echo "local observability runs: no run appeared in the newest 100 traces after $OBSERVABILITY_POLL_ATTEMPTS bounded poll(s)." >&2
-    return 1
-}
-
-assert_local_observability_detail() {
-    local trace_id="$1" payload="$2" verdict
-    verdict="$(printf '%s' "$payload" | python3 -c '
-import json, sys
-expected = sys.argv[1]
-try:
-    value = json.loads(sys.stdin.read())
-except Exception as exc:
-    print("expected exactly one JSON object: %s" % exc)
-    sys.exit(0)
-trace = value.get("trace") if isinstance(value, dict) else None
-tree = value.get("tree") if isinstance(value, dict) else None
-def valid_node(node):
-    if not isinstance(node, dict) or not isinstance(node.get("id"), str) or not isinstance(node.get("type"), str):
-        return False
-    for key in ("name", "startTime", "model"):
-        if node.get(key) is not None and not isinstance(node.get(key), str):
-            return False
-    if node.get("usageDetails") is not None and not isinstance(node.get("usageDetails"), dict):
-        return False
-    children = node.get("children")
-    return isinstance(children, list) and all(valid_node(child) for child in children)
-if not isinstance(trace, dict) or trace.get("id") != expected:
-    print("trace object does not carry the discovered id")
-elif not isinstance(trace.get("name"), str):
-    print("trace name is not a string")
-elif not isinstance(tree, list):
-    print("observation tree is not an array")
-elif not all(valid_node(node) for node in tree):
-    print("observation tree does not match the recursive typed node shape")
-elif "sandbox_id" not in value or value["sandbox_id"] is not None and not isinstance(value["sandbox_id"], str):
-    print("sandbox_id correlation field is absent or mistyped")
-elif "approval_decision" not in value or value["approval_decision"] is not None and not isinstance(value["approval_decision"], str):
-    print("approval_decision correlation field is absent or mistyped")
-else:
-    print("ok %d" % len(tree))
-' "$trace_id" || echo "validator failed")"
-    if [[ "$verdict" != ok\ * ]]; then
-        echo "local observability run: $verdict." >&2
-        printf '%s\n' "$payload" >&2
-        return 1
-    fi
-    echo "local observability run: fetched complete trace $trace_id with ${verdict#ok } root observation(s) and both correlation fields"
 }
 
 assert_local_observability_summary() {
@@ -3468,7 +3352,7 @@ case_local_langfuse_invalid_auth() {
     local INVALID_LANGFUSE_OTLP_AUTH_HEADER='Basic aW52YWxpZDppbnZhbGlk'
     local agent_id="$1" original_set=0 original="${LANGFUSE_OTLP_AUTH_HEADER-}"
     local receipt same_queued_trace_id queue_drained accepted accepted_before sent langfuse_web
-    local collector storage_directory
+    local collector storage_directory accepted_baseline failed failed_baseline queue_size
     [[ ${LANGFUSE_OTLP_AUTH_HEADER+x} ]] && original_set=1
     langfuse_web="$(docker compose --profile full -f "$REPO_ROOT/compose.dev.yaml" ps -q langfuse-web)"
     [[ -n "$langfuse_web" ]] || {
@@ -3509,6 +3393,14 @@ if not any(
 
     echo
     echo "=== case: pinned Langfuse invalid auth queues and recovers the same ID ==="
+    if [[ ! "$LAST_ORDINARY_TRACE_ID" =~ ^[0-9a-f]{32}$ ]] || ! query_exact_seed_trace local "$LAST_ORDINARY_TRACE_ID" \
+        "curie.queue.enqueue,curie.queue.process,curie.turn.process,curie.sandbox.claim,curie.runner.rpc,agent.run,curie.reply.post|curie.reply.update" \
+        >/dev/null; then
+        rm -f "$receipt"
+        echo "invalid-auth negative lacks a valid exact-query control" >&2
+        return 1
+    fi
+    echo "invalid-auth negative: valid exact-query control passed before auth changed"
     if ! (
         set -e
         export LANGFUSE_OTLP_AUTH_HEADER="$INVALID_LANGFUSE_OTLP_AUTH_HEADER"
@@ -3517,6 +3409,8 @@ if not any(
             echo "Collector failed the Ready check after invalid-auth restart" >&2
             exit 1
         }
+        accepted_baseline="$(product_collector_metric_value otelcol_receiver_accepted_spans)"
+        failed_baseline="$(product_collector_metric_value otelcol_exporter_send_failed_spans)"
 
         marker="curie-seed-invalid-auth-$$-$RANDOM"
         stream_start="$(capture_stream_cursor local)"
@@ -3533,14 +3427,32 @@ if not any(
             accepted="$(product_collector_metric_value otelcol_receiver_accepted_spans)"
             failed="$(product_collector_metric_value otelcol_exporter_send_failed_spans)"
             queue_size="$(product_collector_metric_value otelcol_exporter_queue_size)"
-            if python3 -c 'import sys; raise SystemExit(0 if all(float(v) > 0 for v in sys.argv[1:]) else 1)' \
-                "$accepted" "$failed" "$queue_size"; then
+            if python3 -c 'import sys; a,f,q,ab,fb=map(float,sys.argv[1:]); raise SystemExit(0 if a > ab and f > fb and 0 < q <= 1000 else 1)' \
+                "$accepted" "$failed" "$queue_size" "$accepted_baseline" "$failed_baseline"; then
                 break
             fi
             sleep 2
         done
-        python3 -c 'import sys; q=float(sys.argv[3]); raise SystemExit(0 if float(sys.argv[1]) > 0 and float(sys.argv[2]) > 0 and 0 < q <= 1000 else 1)' \
-            "$accepted" "$failed" "$queue_size"
+        python3 -c 'import sys; a,f,q,ab,fb=map(float,sys.argv[1:]); raise SystemExit(0 if a > ab and f > fb and 0 < q <= 1000 else 1)' \
+            "$accepted" "$failed" "$queue_size" "$accepted_baseline" "$failed_baseline"
+        query_exact_seed_trace local "$same_queued_trace_id" "" "" absent
+
+        # Recreate once while auth is still invalid. The file-backed queue must
+        # survive the process boundary and retry the same pending export.
+        restart_local_product_collector
+        queue_size=0
+        failed=0
+        for attempt in $(seq 1 45); do
+            queue_size="$(product_collector_metric_value otelcol_exporter_queue_size)"
+            failed="$(product_collector_metric_value otelcol_exporter_send_failed_spans)"
+            if python3 -c 'import sys; q,f=map(float,sys.argv[1:]); raise SystemExit(0 if 0 < q <= 1000 and f > 0 else 1)' \
+                "$queue_size" "$failed"; then
+                break
+            fi
+            sleep 2
+        done
+        python3 -c 'import sys; q,f=map(float,sys.argv[1:]); raise SystemExit(0 if 0 < q <= 1000 and f > 0 else 1)' \
+            "$queue_size" "$failed"
         query_exact_seed_trace local "$same_queued_trace_id" "" "" absent
 
         python3 - "$receipt" "$same_queued_trace_id" "$accepted" <<'PY'
@@ -4134,26 +4046,30 @@ preflight_cluster_product_observability() {
         return 1
     fi
     umask 077
-    inventory="$(mktemp "$WORKDIR/cluster-product-pods.XXXXXX")"
+    inventory="$(mktemp "$WORKDIR/cluster-product-status.XXXXXX")"
+    # Persist only the component label, Ready condition, and runtime image IDs.
+    # A complete pod JSON document can contain environment values from spec.
     kubectl -n "$namespace" get pods \
-        -l "app.kubernetes.io/instance=$release" -o json > "$inventory" || {
+        -l "app.kubernetes.io/instance=$release" \
+        -o go-template='{{range .items}}{{index .metadata.labels "app.kubernetes.io/component"}}{{"\t"}}{{range .status.conditions}}{{if eq .type "Ready"}}{{.status}}{{end}}{{end}}{{"\t"}}{{range .status.containerStatuses}}{{.imageID}}{{" "}}{{end}}{{"\n"}}{{end}}' \
+        > "$inventory" || {
         rm -f "$inventory"
         return 1
     }
     python3 - "$inventory" <<'PY'
-import json, pathlib, sys
-items = json.loads(pathlib.Path(sys.argv[1]).read_text()).get("items", [])
+import pathlib, sys
 required = {"langfuse-web", "langfuse-worker", "otel-collector", "api", "worker", "runner-prewarm"}
 seen = set()
-for item in items:
-    component = item.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/component")
+for raw in pathlib.Path(sys.argv[1]).read_text().splitlines():
+    fields = raw.split("\t")
+    if len(fields) != 3:
+        raise SystemExit("product status row is malformed")
+    component, ready, image_ids = fields
     if component not in required:
         continue
-    conditions = item.get("status", {}).get("conditions", [])
-    if not any(c.get("type") == "Ready" and c.get("status") == "True" for c in conditions):
+    if ready != "True":
         raise SystemExit("product component is not Ready")
-    statuses = item.get("status", {}).get("containerStatuses", [])
-    if not statuses or any(not status.get("imageID") for status in statuses):
+    if not image_ids.split():
         raise SystemExit("Ready product component omitted imageID")
     seen.add(component)
 missing = required - seen
@@ -4167,14 +4083,14 @@ PY
         component="${mapping%%|*}"
         tag="${mapping#*|}"
         runtime_id="$(python3 - "$inventory" "$component" <<'PY'
-import json, pathlib, sys
-items = json.loads(pathlib.Path(sys.argv[1]).read_text()).get("items", [])
+import pathlib, sys
 want = sys.argv[2]
 values = []
-for item in items:
-    if item.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/component") != want:
+for raw in pathlib.Path(sys.argv[1]).read_text().splitlines():
+    fields = raw.split("\t")
+    if len(fields) != 3 or fields[0] != want:
         continue
-    values.extend(status.get("imageID", "") for status in item.get("status", {}).get("containerStatuses", []))
+    values.extend(fields[2].split())
 values = sorted(set(values))
 if len(values) != 1:
     raise SystemExit("component imageID is absent or inconsistent")
