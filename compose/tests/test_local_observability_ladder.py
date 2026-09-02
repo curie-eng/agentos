@@ -100,6 +100,37 @@ query_exact_seed_trace local aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa "" "" absent
     return result, int(count.read_text()) if count.exists() else 0
 
 
+def _run_product_classifier(
+    tmp_path: Path,
+    *,
+    local: dict[str, object] | None,
+    cluster: dict[str, object] | None,
+) -> subprocess.CompletedProcess[str]:
+    """Execute the production ownership classifier against explicit evidence."""
+
+    function = _shell_function(
+        LADDER_PATH.read_text(), "classify_product_observability_owner"
+    )
+    local_path = tmp_path / "local.json"
+    cluster_path = tmp_path / "cluster.json"
+    if local is not None:
+        local_path.write_text(json.dumps({**local, "surface": "local"}))
+    if cluster is not None:
+        cluster_path.write_text(json.dumps({**cluster, "surface": "cluster"}))
+    script = f"""set -u
+{function}
+LOCAL_PRODUCT_EVIDENCE="$1"
+CLUSTER_PRODUCT_EVIDENCE="$2"
+classify_product_observability_owner
+"""
+    return subprocess.run(
+        ["bash", "-c", script, "bash", str(local_path), str(cluster_path)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
 def test_local_ladder_owns_a_real_queryable_otlp_sink() -> None:
     """A plain local rung must create, query, and remove its own OTLP sink."""
 
@@ -718,9 +749,22 @@ def test_cluster_product_observability_is_private_preflight_and_query_only() -> 
     mode = _shell_function(source, "run_cluster_product_observability")
     wrapper = _shell_function(source, "rung_cluster_product")
     assert "preflight_cluster_product_observability" in mode
-    assert "seed_ordinary_turn" in mode
-    assert "seed_approval_resume_turn" in mode
+    assert "seed_cluster_missing_carrier_control" in mode
+    assert "cluster_external_ingress_seed" in mode
+    assert "CURIE_E2E_CLUSTER_EXTERNAL_INGRESS_RECEIPT" in source
+    assert "CURIE_E2E_PRODUCT_RUN_ID" in source
+    assert "otelcol_receiver_accepted_spans_delta" in source
+    assert "otelcol_exporter_sent_spans_delta" in source
     assert "cluster observability run" in mode
+    for manufactured in (
+        "enqueue_cluster_carried_turn",
+        "CLUSTER_SEEDED_TRACE_ID",
+        "secrets.token_hex",
+    ):
+        assert manufactured not in source, (
+            "cluster correlation evidence must be derived from a real accepted "
+            f"ingress path, not manufactured by the harness: {manufactured}"
+        )
     assert "cluster deploy" in wrapper, (
         "the wrapper must retain the intended agent seed deployment"
     )
@@ -750,7 +794,86 @@ def test_cluster_product_observability_is_private_preflight_and_query_only() -> 
     )
 
 
-def test_adopted_component_stop_requires_successful_export_on_both_product_surfaces() -> None:
+def test_cluster_carrierless_control_and_external_slack_carrier_are_executed(
+    tmp_path: Path,
+) -> None:
+    """The fake cluster path stays negative; only Slack ingress can be positive."""
+
+    source = LADDER_PATH.read_text()
+    marker = "curie-seed-external-ordinary-example"
+    trace_id = "a" * 32
+    span_id = "b" * 16
+    payload_only = [
+        "2-0",
+        [
+            "payload",
+            json.dumps(
+                {
+                    "text": f"missing carrier compatibility {marker}",
+                    "reply_handle": {"adapter": "curie-cluster-message"},
+                }
+            ),
+        ],
+    ]
+    carried_slack = [
+        "3-0",
+        [
+            "payload",
+            json.dumps(
+                {
+                    "text": f"ordinary correlation {marker}",
+                    "reply_handle": {"kind": "slack", "adapter": None},
+                }
+            ),
+            "traceparent",
+            f"00-{trace_id}-{span_id}-01",
+        ],
+    ]
+
+    negative = _run_seed_matcher(
+        tmp_path,
+        _python_heredoc(_shell_function(source, "seed_cluster_missing_carrier_control")),
+        marker,
+        [payload_only],
+    )
+    assert negative.returncode == 0, negative.stderr
+
+    external_matcher = _python_heredoc(
+        _shell_function(source, "discover_cluster_external_trace_id")
+    )
+    positive = _run_seed_matcher(tmp_path, external_matcher, marker, [carried_slack])
+    assert positive.returncode == 0, positive.stderr
+    assert positive.stdout.strip() == trace_id
+
+    forged = _run_seed_matcher(
+        tmp_path,
+        external_matcher,
+        marker,
+        [
+            [
+                "4-0",
+                [
+                    "payload",
+                    json.dumps(
+                        {
+                            "text": f"ordinary correlation {marker}",
+                            "reply_handle": {"adapter": "curie-cluster-message"},
+                        }
+                    ),
+                    "traceparent",
+                    f"00-{trace_id}-{span_id}-01",
+                ],
+            ]
+        ],
+    )
+    assert forged.returncode != 0, (
+        "a harness/cluster-message-shaped entry must not satisfy real Slack ingress"
+    )
+
+
+def test_adopted_component_stop_requires_successful_export_on_both_product_surfaces(
+    tmp_path: Path,
+) -> None:
     """Selective ingest loss is a dependency blocker only after Curie is cleared."""
 
     source = LADDER_PATH.read_text()
@@ -764,6 +887,8 @@ def test_adopted_component_stop_requires_successful_export_on_both_product_surfa
         "cluster",
         "image_ids_match",
         "seed_valid",
+        "same_id_raw_collector_receipt",
+        "run_id",
         "adopted-component",
     ):
         assert required in decision, f"ownership classification omits {required!r}"
@@ -773,3 +898,64 @@ def test_adopted_component_stop_requires_successful_export_on_both_product_surfa
     assert decision.index("langfuse_observation_membership") < decision.index(
         "adopted-component"
     )
+
+    def record(
+        *,
+        membership: bool,
+        same_id_raw: bool = True,
+        run_id: str = "run-example",
+    ) -> dict[str, object]:
+        return {
+            "run_id": run_id,
+            "seed_valid": True,
+            "same_id_raw_collector_receipt": same_id_raw,
+            "raw_emitted_observations": 3,
+            "otelcol_receiver_accepted_spans": 3,
+            "otelcol_exporter_sent_spans": 3,
+            "langfuse_observation_membership": membership,
+            "image_ids_match": True,
+        }
+
+    cases = (
+        (None, None, "curie-unresolved", False),
+        (
+            {
+                key: value
+                for key, value in record(membership=True).items()
+                if key != "langfuse_observation_membership"
+            },
+            record(membership=True),
+            "curie-unresolved",
+            False,
+        ),
+        (
+            record(membership=True, run_id="run-one"),
+            record(membership=True, run_id="run-two"),
+            "curie-unresolved",
+            False,
+        ),
+        (record(membership=False), record(membership=False), "adopted-component", False),
+        (
+            record(membership=False, same_id_raw=False),
+            record(membership=False, same_id_raw=False),
+            "curie-unresolved",
+            False,
+        ),
+        (record(membership=True), record(membership=False), "curie-owned", False),
+        (
+            record(membership=True, same_id_raw=False),
+            record(membership=True),
+            "curie-clear",
+            True,
+        ),
+        (record(membership=True), record(membership=True), "curie-clear", True),
+    )
+    for index, (local, cluster, verdict, succeeds) in enumerate(cases):
+        case_dir = tmp_path / str(index)
+        case_dir.mkdir()
+        result = _run_product_classifier(case_dir, local=local, cluster=cluster)
+        assert verdict in result.stdout
+        assert (result.returncode == 0) is succeeds, (
+            "only complete same-run, positive export and exact membership may "
+            f"clear the STOP; verdict={verdict} stdout={result.stdout!r}"
+        )

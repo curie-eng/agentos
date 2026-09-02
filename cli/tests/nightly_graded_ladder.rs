@@ -1180,8 +1180,8 @@ fn cluster_product_observability_is_private_preflight_and_query_only() {
     let wrapper = ladder_function("rung_cluster_product");
     for required in [
         "preflight_cluster_product_observability",
-        "seed_ordinary_turn",
-        "seed_approval_resume_turn",
+        "seed_cluster_missing_carrier_control",
+        "cluster_external_ingress_seed",
         "cluster observability run",
     ] {
         assert!(
@@ -1212,6 +1212,37 @@ fn cluster_product_observability_is_private_preflight_and_query_only() {
         wrapper.contains("cluster deploy"),
         "the product wrapper must retain the intended agent seed deployment"
     );
+    for manufactured in [
+        "enqueue_cluster_carried_turn",
+        "CLUSTER_SEEDED_TRACE_ID",
+        "secrets.token_hex",
+    ] {
+        assert!(
+            !ladder().contains(manufactured),
+            "cluster correlation evidence must come from real Slack ingress, not harness-manufactured carrier {manufactured}"
+        );
+    }
+    let missing_carrier = ladder_function("seed_cluster_missing_carrier_control");
+    assert!(
+        missing_carrier.contains("cluster message")
+            && missing_carrier.contains("adjacent_traceparent=false"),
+        "the dispatcher-absent cluster message path must remain an explicit executed missing-carrier compatibility negative"
+    );
+    let external = ladder_function("cluster_external_ingress_seed");
+    for required in [
+        "CURIE_E2E_CLUSTER_EXTERNAL_INGRESS_RECEIPT",
+        "CURIE_E2E_PRODUCT_RUN_ID",
+        "reply_observed",
+        "completion_observed",
+        "otelcol_receiver_accepted_spans_delta",
+        "otelcol_exporter_sent_spans_delta",
+        "discover_cluster_external_trace_id",
+    ] {
+        assert!(
+            ladder().contains(required) || external.contains(required),
+            "external Slack cluster evidence omits {required}"
+        );
+    }
     assert!(
         !preflight.contains(r#"-o json > "$inventory""#)
             && !preflight.contains("cluster-product-pods"),
@@ -1258,6 +1289,8 @@ fn adopted_component_stop_requires_successful_local_and_cluster_export() {
         "cluster",
         "image_ids_match",
         "seed_valid",
+        "same_id_raw_collector_receipt",
+        "run_id",
         "adopted-component",
     ] {
         assert!(
@@ -1272,6 +1305,20 @@ fn adopted_component_stop_requires_successful_local_and_cluster_export() {
     assert!(
         decision.find("langfuse_observation_membership") < decision.find("adopted-component"),
         "the harness cannot blame the adopted backend before checking exact-ID membership"
+    );
+    for verdict in ["curie-unresolved", "curie-owned", "adopted-component"] {
+        let tail = decision
+            .split(verdict)
+            .nth(1)
+            .unwrap_or_else(|| panic!("classifier omits verdict {verdict}"));
+        assert!(
+            tail.contains("SystemExit(1)"),
+            "blocking verdict {verdict} must terminate the supported run nonzero"
+        );
+    }
+    assert!(
+        decision.contains("curie-clear") && decision.contains("SystemExit(0)"),
+        "only a fully cleared local+cluster classification may exit zero"
     );
 }
 
