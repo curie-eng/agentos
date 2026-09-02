@@ -1278,7 +1278,7 @@ fn product_sanitizer_and_message_failures_never_dump_private_json() {
 }
 
 #[test]
-fn adopted_component_stop_requires_successful_local_and_cluster_export() {
+fn adopted_component_stop_requires_complete_available_surface_export() {
     let decision = ladder_function("classify_product_observability_owner");
     for required in [
         "raw_emitted_observations",
@@ -1318,7 +1318,7 @@ fn adopted_component_stop_requires_successful_local_and_cluster_export() {
     }
     assert!(
         decision.contains("curie-clear") && decision.contains("SystemExit(0)"),
-        "only a fully cleared local+cluster classification may exit zero"
+        "only complete exact membership for every exercised surface may exit zero"
     );
 }
 

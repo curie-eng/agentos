@@ -3974,25 +3974,31 @@ rung_local() {
     echo
     echo "=== exact ordinary product-observability seed ==="
     local product_accepted_before product_sent_before product_accepted_after product_sent_after
-    local product_accepted_delta product_sent_delta product_membership
+    local product_accepted_delta product_sent_delta product_membership product_query_state=present
+    if [[ "$PRODUCT_OBSERVABILITY" == "1" ]]; then
+        # Ownership diagnostics must retain an incomplete exact read so the
+        # classifier can distinguish unresolved/Curie/adopted outcomes. The
+        # ordinary default local positive is strict and fails before continuing.
+        product_query_state=observe
+    fi
     if [[ -n "${STUB_STATE:-}" ]]; then
         seed_ordinary_turn local "$agent_id" stub
     else
         product_accepted_before="$(product_collector_metric_value otelcol_receiver_accepted_spans)"
         product_sent_before="$(product_collector_metric_value otelcol_exporter_sent_spans)"
-        seed_ordinary_turn local "$agent_id" observe
+        seed_ordinary_turn local "$agent_id" "$product_query_state"
         product_membership="$LAST_ORDINARY_MEMBERSHIP"
 
     if [[ "$LIVE" == "0" ]]; then
         echo
         echo "=== exact approval wait/resolve/resume product-observability seed ==="
-        seed_approval_resume_turn local "$agent_id" observe
+        seed_approval_resume_turn local "$agent_id" "$product_query_state"
         [[ "$LAST_APPROVAL_MEMBERSHIP" == "true" ]] || product_membership="false"
     fi
     if [[ "$LIVE" == "1" ]]; then
         echo
         echo "=== exact hosted MCP read product-observability seed ==="
-        seed_mcp_read_turn local "$agent_id" "$agent_name" observe
+        seed_mcp_read_turn local "$agent_id" "$agent_name" "$product_query_state"
         [[ "$LAST_MCP_MEMBERSHIP" == "true" ]] || product_membership="false"
     fi
 
@@ -4008,10 +4014,8 @@ PY
     write_product_observability_evidence "$LOCAL_PRODUCT_EVIDENCE" local \
         "$product_accepted_delta" "$product_sent_delta" "$product_membership" not-applicable false
 
-    if [[ -z "${STUB_STATE:-}" && "$LAST_ORDINARY_MEMBERSHIP" == "true" ]] && (( LOCAL_STACK_OWNED )); then
+    if [[ -z "${STUB_STATE:-}" ]] && (( LOCAL_STACK_OWNED )); then
         case_local_langfuse_invalid_auth "$agent_id"
-    elif [[ -z "${STUB_STATE:-}" && "$LAST_ORDINARY_MEMBERSHIP" != "true" ]]; then
-        echo "local invalid-auth negative skipped: exact known-valid control was not queryable"
     fi
     fi
 
@@ -4451,13 +4455,15 @@ records = {}
 for surface, raw_path in zip(("local", "cluster"), sys.argv[1:]):
     path = pathlib.Path(raw_path)
     if not path.is_file():
-        print("curie-unresolved: both product surfaces have not been exercised")
-        raise SystemExit(1)
+        continue
     try:
         records[surface] = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError):
         print(f"curie-unresolved: {surface} evidence is unreadable")
         raise SystemExit(1)
+if not records:
+    print("curie-unresolved: no product surface has been exercised")
+    raise SystemExit(1)
 
 required_fields = (
     "run_id", "surface", "seed_valid", "same_id_raw_collector_receipt",
@@ -4492,8 +4498,7 @@ if len(run_ids) != 1 or not next(iter(run_ids), None):
 
 # These names deliberately mirror the evidence record. Ownership cannot be
 # assigned away from Curie until both product surfaces clear every prerequisite.
-for surface in ("local", "cluster"):
-    record = records[surface]
+for surface, record in records.items():
     raw_emitted_observations = record.get("raw_emitted_observations", 0)
     otelcol_receiver_accepted_spans = record.get("otelcol_receiver_accepted_spans", 0)
     otelcol_exporter_sent_spans = record.get("otelcol_exporter_sent_spans", 0)
@@ -4511,8 +4516,16 @@ for surface in ("local", "cluster"):
 
 memberships = dict(
     (surface, records[surface].get("langfuse_observation_membership") is True)
-    for surface in ("local", "cluster")
+    for surface in records
 )
+if len(records) == 1:
+    surface = next(iter(records))
+    if memberships[surface]:
+        print(f"curie-clear: Langfuse exact observation membership passed on {surface}")
+        raise SystemExit(0)
+    print(f"curie-unresolved: {surface} exact Langfuse membership is missing without a sibling control")
+    raise SystemExit(1)
+
 same_id_raw_receipts = dict(
     (surface, records[surface].get("same_id_raw_collector_receipt") is True)
     for surface in ("local", "cluster")

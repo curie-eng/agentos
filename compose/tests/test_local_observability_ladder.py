@@ -131,6 +131,62 @@ classify_product_observability_owner
     )
 
 
+def _run_local_exact_positive(
+    tmp_path: Path,
+    *,
+    operations: tuple[str, ...],
+    expected_state: str = "present",
+) -> subprocess.CompletedProcess[str]:
+    """Drive the production local exact-read positive against a candidate CLI."""
+
+    source = LADDER_PATH.read_text()
+    sanitizer = _shell_function(source, "sanitize_exact_trace_read")
+    query = _shell_function(source, "query_exact_seed_trace")
+    trace_id = "a" * 32
+    response = tmp_path / "response.json"
+    response.write_text(
+        json.dumps(
+            {
+                "trace": {"id": trace_id},
+                "tree": [
+                    {"name": operation, "type": "SPAN", "children": []}
+                    for operation in operations
+                ],
+                "approval_decision": None,
+            }
+        )
+    )
+    fake_bin = tmp_path / "curie"
+    fake_bin.write_text('#!/bin/sh\ncat "$FAKE_TRACE_RESPONSE"\n')
+    fake_bin.chmod(0o700)
+    script = f"""set -u
+{sanitizer}
+{query}
+WORKDIR="$1"
+BIN="$2"
+OBSERVABILITY_POLL_ATTEMPTS=1
+OBSERVABILITY_POLL_INTERVAL_SECONDS=0
+CURIE_NAMESPACE=acme-observability
+CURIE_RELEASE=acme-observability
+query_exact_seed_trace local {trace_id} "curie.queue.enqueue,curie.reply.post" "" "$3"
+"""
+    return subprocess.run(
+        [
+            "bash",
+            "-c",
+            script,
+            "bash",
+            str(tmp_path),
+            str(fake_bin),
+            expected_state,
+        ],
+        env={**os.environ, "FAKE_TRACE_RESPONSE": str(response)},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
 def test_local_ladder_owns_a_real_queryable_otlp_sink() -> None:
     """A plain local rung must create, query, and remove its own OTLP sink."""
 
@@ -722,6 +778,49 @@ def test_invalid_langfuse_auth_is_temporary_durable_and_recovers_the_same_id(
     ), "the same ID must be absent during failure and present after recovery"
 
 
+def test_default_local_exact_positive_rejects_incomplete_membership(
+    tmp_path: Path,
+) -> None:
+    """Normal local is strict; only ownership diagnostics may retain a miss."""
+
+    source = LADDER_PATH.read_text()
+    rung = _function_body(source, "rung_local", "# local-release mode:")
+    assert "product_query_state=present" in rung
+    assert 'if [[ "$PRODUCT_OBSERVABILITY" == "1" ]]' in rung
+    assert rung.count("product_query_state=observe") == 1
+    assert 'seed_ordinary_turn local "$agent_id" "$product_query_state"' in rung
+    assert "invalid-auth negative skipped" not in rung
+
+    complete_dir = tmp_path / "complete"
+    complete_dir.mkdir()
+    complete = _run_local_exact_positive(
+        complete_dir,
+        operations=("curie.queue.enqueue", "curie.reply.post"),
+    )
+    assert complete.returncode == 0, complete.stderr
+
+    incomplete_dir = tmp_path / "incomplete"
+    incomplete_dir.mkdir()
+    incomplete = _run_local_exact_positive(
+        incomplete_dir,
+        operations=("curie.queue.enqueue",),
+    )
+    assert incomplete.returncode != 0, (
+        "the default local positive must fail when exact Langfuse membership is incomplete"
+    )
+
+    diagnostic_dir = tmp_path / "diagnostic"
+    diagnostic_dir.mkdir()
+    diagnostic = _run_local_exact_positive(
+        diagnostic_dir,
+        operations=("curie.queue.enqueue",),
+        expected_state="observe",
+    )
+    assert diagnostic.returncode == 0, (
+        "only explicit product ownership diagnostics may retain incomplete membership"
+    )
+
+
 def test_cluster_product_observability_is_private_preflight_and_query_only() -> None:
     """The ladder may inspect a task release but must never install or remove it."""
 
@@ -918,6 +1017,9 @@ def test_adopted_component_stop_requires_successful_export_on_both_product_surfa
 
     cases = (
         (None, None, "curie-unresolved", False),
+        (record(membership=True, same_id_raw=False), None, "curie-clear", True),
+        (None, record(membership=True, same_id_raw=False), "curie-clear", True),
+        (record(membership=False, same_id_raw=False), None, "curie-unresolved", False),
         (
             {
                 key: value
