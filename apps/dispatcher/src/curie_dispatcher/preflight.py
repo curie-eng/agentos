@@ -1,4 +1,4 @@
-"""Boot-time gate on the platform API wiring (#442, AC2).
+"""Boot-time platform API and Slack channel capability gates (#442, #2205).
 
 The dispatcher resolves Slack approval clicks by calling the platform API. When
 ``CURIE_API_URL`` points somewhere unreachable, the only symptom today is
@@ -13,23 +13,35 @@ fail-immediately would crash-loop a healthy stack. Restart backoff is the outer
 retry loop there, and a CrashLoopBackOff with the named URL in the log is the
 operator signal.
 
-It is a wiring gate, not a liveness monitor: one shot at boot only. The heartbeat
-probes own liveness and ``ApprovalResolveClient`` owns per-call degradation, so an
-API restart hours later must not kill the dispatcher.
+These are wiring gates, not liveness monitors: one shot at boot only. The API
+health probe proves reachability; authenticated agent discovery loads the Slack
+destinations before Slack starts. The Slack phase probes destination visibility,
+but not message deliverability. Only the definitive ``missing_scope`` and
+``invalid_types`` responses from the public-channel ``conversations.list`` probe
+receive the exact ``channels:read`` recovery. Discovery failures and aggregate
+deadline exhaustion also refuse startup; ambiguous Slack provider outcomes remain
+``unverified`` so one destination cannot crash-loop every agent.
 
-``/health`` is unauthenticated by design, so this gate proves reachability only: a
-wrong ``CURIE_API_KEY`` still passes it and surfaces as a 401 at the first
-approval click.
+API health retains its full configured startup budget. Once health succeeds,
+authenticated discovery and all Slack checks share one fresh aggregate budget.
+If that second deadline leaves any configured destination unattempted, startup
+refuses rather than silently treating an absent scope check as success.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import time
+from collections.abc import Callable, Mapping
+from typing import Any, Protocol
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
+from slack_sdk.errors import SlackApiError
+from slack_sdk.web import WebClient
 
+from .app import _SLACK_API_TIMEOUT_SECONDS
 from .config import DispatcherConfig
 from .supervisor import BackoffPolicy
 
@@ -39,9 +51,58 @@ from .supervisor import BackoffPolicy
 # refusing fast like a closed port does.
 _MAX_PROBE_TIMEOUT_S = 5.0
 
+_MISSING_CHANNELS_READ_MESSAGE = (
+    "Slack channel capability preflight failed: bot token is missing required "
+    "scope channels:read. Add channels:read under OAuth & Permissions > Bot "
+    "Token Scopes, then reinstall the app to the workspace."
+)
+_AGENT_DISCOVERY_FAILURE_MESSAGE = (
+    "Slack channel capability preflight failed: could not load configured "
+    "channel destinations from the platform API."
+)
+_AGENT_DISCOVERY_CONNECTIVITY_MESSAGE = (
+    "Slack channel capability preflight failed: platform API agent discovery "
+    "could not connect after bounded retries."
+)
+_AGENT_DISCOVERY_RESPONSE_SHAPE_MESSAGE = (
+    "Slack channel capability preflight failed: platform API agent discovery "
+    "returned an invalid response shape."
+)
+_SLACK_CAPABILITY_DEADLINE_MESSAGE = (
+    "Slack channel capability preflight failed: could not attempt every configured "
+    "destination within the bounded startup budget. Check Slack API availability "
+    "and retry."
+)
+# slack_sdk logs request and response context at DEBUG/ERROR. Production
+# preflight calls cross a redaction boundary, so give their clients a dedicated
+# sink rather than allowing SDK records to inherit application/root handlers.
+_SLACK_SDK_SILENT_LOGGER = logging.getLogger(f"{__name__}.slack_sdk_silent")
+if not _SLACK_SDK_SILENT_LOGGER.handlers:
+    _SLACK_SDK_SILENT_LOGGER.addHandler(logging.NullHandler())
+_SLACK_SDK_SILENT_LOGGER.propagate = False
+_SLACK_SDK_SILENT_LOGGER.setLevel(logging.CRITICAL + 1)
+
 
 class ApiUnreachableError(RuntimeError):
     """The platform API did not answer ``GET /health`` before the deadline."""
+
+
+class SlackChannelPreflightError(RuntimeError):
+    """Configured Slack destinations could not be safely capability-checked."""
+
+
+class SlackChannelClient(Protocol):
+    """The narrow Slack Web API surface used by the channel preflight."""
+
+    def conversations_list(
+        self,
+        *,
+        types: str,
+        exclude_archived: bool,
+        limit: int,
+    ) -> Any: ...
+
+    def conversations_info(self, *, channel: str) -> Any: ...
 
 
 def _safe_for_log(url: str) -> str:
@@ -65,6 +126,8 @@ def check_api_reachable(
     *,
     logger: logging.Logger,
     client: httpx.Client | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> None:
     """Poll ``GET {api_base_url}/health`` until it answers 200 or the deadline passes.
 
@@ -84,7 +147,7 @@ def check_api_reachable(
     )
     http = client or httpx.Client(timeout=min(_MAX_PROBE_TIMEOUT_S, timeout_s))
     owned = client is None
-    start = time.monotonic()
+    start = monotonic()
     deadline = start + timeout_s
     attempt = 0
     last_error = ""
@@ -94,7 +157,7 @@ def check_api_reachable(
             # start a request it has no time for and then block past the deadline
             # on that request's own timeout. Without this a 30s deadline takes
             # ~35s and a short one nearly doubles.
-            remaining = deadline - time.monotonic()
+            remaining = deadline - monotonic()
             if remaining <= 0:
                 break
             try:
@@ -114,16 +177,283 @@ def check_api_reachable(
             # delay would overshoot it: with the shipped defaults (backoff_max
             # 30.0 vs a 30.0s deadline) breaking abandons half the budget, and
             # raising the deadline then buys the operator nothing.
-            remaining = deadline - time.monotonic()
+            remaining = deadline - monotonic()
             if remaining <= 0:
                 break
-            time.sleep(min(delay, remaining))
+            sleep(min(delay, remaining))
     finally:
         if owned:
             http.close()
 
-    elapsed = time.monotonic() - start
+    elapsed = monotonic() - start
     raise ApiUnreachableError(
         f"cannot reach the platform API at {logged_base} after {elapsed:.1f}s "
         f"({attempt} attempts, last error: {last_error}); check CURIE_API_URL"
+    )
+
+
+def _collect_slack_addresses(payload: object) -> set[str]:
+    """Extract Slack destinations from the display-safe ``AgentOut`` projection."""
+    if not isinstance(payload, list):
+        raise ValueError("agent list is not an array")
+
+    addresses: set[str] = set()
+
+    def collect_target(target: object) -> None:
+        if not isinstance(target, Mapping):
+            raise ValueError("channel target is not an object")
+        kind = target.get("kind")
+        if not isinstance(kind, str):
+            raise ValueError("channel target kind is malformed")
+        if kind != "slack":
+            return
+        address = target.get("address")
+        if not isinstance(address, str) or not address:
+            raise ValueError("Slack channel target is malformed")
+        addresses.add(address)
+
+    for agent in payload:
+        if not isinstance(agent, Mapping):
+            raise ValueError("agent is not an object")
+
+        channels = agent.get("channels")
+        if not isinstance(channels, list):
+            raise ValueError("agent channels are not an array")
+        for target in channels:
+            collect_target(target)
+
+        approval_routes = agent.get("approval_routes")
+        if approval_routes is None:
+            continue
+        if not isinstance(approval_routes, Mapping):
+            raise ValueError("approval routes are not an object")
+        for route in approval_routes.values():
+            if not isinstance(route, Mapping) or "resolution" not in route:
+                raise ValueError("approval route is malformed")
+            collect_target(route["resolution"])
+            notification = route.get("notification")
+            if notification is not None:
+                collect_target(notification)
+
+    return addresses
+
+
+def _slack_response_field(response: object, field: str) -> object:
+    """Read a Slack response field without assuming a printable response shape."""
+    getter = getattr(response, "get", None)
+    if not callable(getter):
+        return None
+    try:
+        return getter(field)
+    except Exception:
+        return None
+
+
+def _slack_error_code(exc: SlackApiError) -> str | None:
+    """Read only Slack's documented string error code from an SDK exception."""
+    error = _slack_response_field(exc.response, "error")
+    return error if isinstance(error, str) else None
+
+
+def _is_conversations_list_success(response: object) -> bool:
+    """Accept only the documented successful public-channel listing shape."""
+    return _slack_response_field(response, "ok") is True and isinstance(
+        _slack_response_field(response, "channels"), list
+    )
+
+
+def _is_conversations_info_success(response: object) -> bool:
+    """Fail closed if a client returns a malformed success instead of raising."""
+    return _slack_response_field(response, "ok") is True and isinstance(
+        _slack_response_field(response, "channel"), Mapping
+    )
+
+
+def _slack_probe_client(
+    config: DispatcherConfig,
+    *,
+    injected: SlackChannelClient | None,
+    remaining: float,
+) -> SlackChannelClient:
+    """Return the injected seam or a no-retry client bounded by remaining time."""
+    if injected is not None:
+        return injected
+
+    # Ceil retains usable sub-second remainder while the one-second minimum
+    # satisfies slack_sdk's integer timeout contract. With retries disabled,
+    # aggregate overshoot is bounded to this one in-flight provider call.
+    probe_timeout = max(
+        1,
+        min(_SLACK_API_TIMEOUT_SECONDS, math.ceil(remaining)),
+    )
+    return WebClient(
+        token=config.slack_bot_token,
+        timeout=probe_timeout,
+        retry_handlers=[],
+        logger=_SLACK_SDK_SILENT_LOGGER,
+    )
+
+
+def check_slack_channel_capabilities(
+    config: DispatcherConfig,
+    *,
+    logger: logging.Logger,
+    web_client: SlackChannelClient | None = None,
+    api_client: httpx.Client | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    """Probe visibility of each unique Slack destination within a fixed budget.
+
+    Agent discovery and Slack calls share one fresh configured deadline after the
+    API health gate. A 401 fails immediately with a generic redaction-safe
+    refusal, while deterministic response-shape failures fail promptly. A bounded
+    public-channel-only ``conversations.list`` call proves ``channels:read``
+    directly; its documented ``missing_scope`` and ``invalid_types`` errors are
+    provider-terminal because the request fixes ``types=public_channel``.
+    Ambiguous capability and destination outcomes are counted as unverified.
+    Production builds a no-retry client for each provider call, with its integer
+    timeout capped by both the remaining aggregate budget and the dispatcher's
+    two-second Slack policy. If time expires before the capability probe or every
+    destination is attempted, startup refuses with a fixed recovery message.
+    Output never exposes credentials, destinations, scopes, bodies, or deployment
+    identifiers.
+    """
+    timeout_s = config.api_preflight_timeout_s
+    http = api_client or httpx.Client(timeout=min(_MAX_PROBE_TIMEOUT_S, timeout_s))
+    owned = api_client is None
+    backoff = BackoffPolicy(
+        initial_seconds=config.backoff_initial_seconds,
+        max_seconds=config.backoff_max_seconds,
+        multiplier=config.backoff_multiplier,
+    )
+    headers = {"X-API-Key": config.api_key}
+    deadline = monotonic() + timeout_s
+    attempt = 0
+    addresses: set[str] | None = None
+    discovery_failure_message = _AGENT_DISCOVERY_FAILURE_MESSAGE
+    try:
+        while True:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                break
+
+            try:
+                response = http.get(
+                    f"{config.api_base_url.rstrip('/')}/agents",
+                    headers=headers,
+                    timeout=min(_MAX_PROBE_TIMEOUT_S, remaining),
+                )
+                if response.status_code == 401:
+                    raise SlackChannelPreflightError(
+                        _AGENT_DISCOVERY_FAILURE_MESSAGE
+                    ) from None
+                if response.status_code == 200:
+                    try:
+                        addresses = _collect_slack_addresses(response.json())
+                    except Exception:
+                        raise SlackChannelPreflightError(
+                            _AGENT_DISCOVERY_RESPONSE_SHAPE_MESSAGE
+                        ) from None
+                    break
+                status_class = response.status_code // 100
+                discovery_failure_message = (
+                    "Slack channel capability preflight failed: platform API "
+                    f"agent discovery returned HTTP {status_class}xx after "
+                    "bounded retries."
+                )
+            except SlackChannelPreflightError:
+                raise
+            except Exception:
+                # Provider bodies, exception messages, and request metadata are
+                # deliberately discarded at this redaction boundary.
+                discovery_failure_message = _AGENT_DISCOVERY_CONNECTIVITY_MESSAGE
+
+            delay = backoff.delay(attempt)
+            attempt += 1
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                break
+            sleep(min(delay, remaining))
+    finally:
+        if owned:
+            http.close()
+
+    if addresses is None:
+        raise SlackChannelPreflightError(discovery_failure_message) from None
+
+    ordered_addresses = sorted(addresses)
+    checked = 0
+    unverified = 0
+    capability_status = "verified"
+
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        raise SlackChannelPreflightError(
+            _SLACK_CAPABILITY_DEADLINE_MESSAGE
+        ) from None
+
+    capability_client = _slack_probe_client(
+        config,
+        injected=web_client,
+        remaining=remaining,
+    )
+    try:
+        capability_response = capability_client.conversations_list(
+            types="public_channel",
+            exclude_archived=True,
+            limit=1,
+        )
+    except SlackApiError as exc:
+        error = _slack_error_code(exc)
+        if error in {"missing_scope", "invalid_types"}:
+            raise SlackChannelPreflightError(
+                _MISSING_CHANNELS_READ_MESSAGE
+            ) from None
+        capability_status = "unverified"
+    except Exception:
+        capability_status = "unverified"
+    else:
+        if not _is_conversations_list_success(capability_response):
+            capability_status = "unverified"
+
+    for address in ordered_addresses:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise SlackChannelPreflightError(
+                _SLACK_CAPABILITY_DEADLINE_MESSAGE
+            ) from None
+
+        probe_client = _slack_probe_client(
+            config,
+            injected=web_client,
+            remaining=remaining,
+        )
+
+        try:
+            slack_response = probe_client.conversations_info(channel=address)
+        except SlackApiError:
+            unverified += 1
+            continue
+        except Exception:
+            unverified += 1
+            continue
+
+        if not _is_conversations_info_success(slack_response):
+            unverified += 1
+            continue
+
+        checked += 1
+
+    log = (
+        logger.warning
+        if capability_status == "unverified" or unverified
+        else logger.info
+    )
+    log(
+        "Slack channel capability preflight public-channel capability %s; checked "
+        "%d configured destinations; unverified %d",
+        capability_status,
+        checked,
+        unverified,
     )

@@ -127,29 +127,70 @@ Read from the environment by `DispatcherConfig()` (a `pydantic_settings.BaseSett
 | `CURIE_API_URL` | `http://localhost:8000` | platform API used to resolve approval clicks (compose: `http://curie-api:8000`). `CURIE_API_BASE_URL` is a deprecated alias. |
 | `CURIE_API_KEY` | `curie-dev-key` | platform administrative key; sent for compatibility with API plumbing, but it is not resolver identity and cannot authorize a resolution alone |
 | `CURIE_APPROVAL_CHAT_ATTESTER_SECRET` | `curie-dev-approval-chat-attester` | independent HMAC secret shared only with the API; signs short-lived, approval-bound `chat` principals. Must be nonblank and must not equal `CURIE_API_KEY`. |
-| `CURIE_API_PREFLIGHT_TIMEOUT_SECONDS` | `30.0` | deadline for the boot gate below; must be positive |
+| `CURIE_API_PREFLIGHT_TIMEOUT_SECONDS` | `30.0` | API-health budget, followed by a fresh same-size discovery-and-Slack budget; must be positive |
 
-### Boot gate on the platform API
+### Boot preflights
 
-Before any Slack wiring, `main()` polls `GET {CURIE_API_URL}/health` until
-it answers 200 or `CURIE_API_PREFLIGHT_TIMEOUT_SECONDS` elapses, reusing the
-`CURIE_BACKOFF_*` tunables for the poll interval. On success it logs the
-resolved URL once at INFO. On the deadline it logs an error naming that URL and
-the time actually spent, and
-exits non-zero, so a misconfigured base URL is dead on arrival instead of
-dead-ending every Slack Approve click much later (the previous behavior was a
-single warning at click time). It retries rather than probing once so a
-slow-starting API does not fail a healthy stack; in Kubernetes the restart
-backoff is the outer retry loop and `CrashLoopBackOff` is the operator signal.
+Before Socket Mode starts, `main()` runs these bounded preflights in order:
+
+1. Platform API reachability: poll `GET {CURIE_API_URL}/health`, reusing the
+   `CURIE_BACKOFF_*` tunables for the poll interval, within
+   `CURIE_API_PREFLIGHT_TIMEOUT_SECONDS`.
+2. Destination discovery: make an authenticated `GET {CURIE_API_URL}/agents`
+   using `CURIE_API_KEY` and collect configured Slack destinations.
+3. Slack metadata capability attempts: make one bounded
+   `conversations.list(types=public_channel, limit=1)` public-channel
+   capability call, then use `conversations.info` for every configured
+   destination before opening the Socket Mode connection.
+
+After health succeeds, discovery and Slack metadata checks share a fresh
+`CURIE_API_PREFLIGHT_TIMEOUT_SECONDS` budget. The reachability and discovery
+phases retry rather than probing once so a slow-starting API does not fail a
+healthy stack. If the health budget is exhausted, correct `CURIE_API_URL`. If
+discovery cannot finish, check platform API availability and configuration,
+then retry.
+
+If the Slack phase cannot attempt every configured destination before its
+budget, startup refuses safely; restore Slack availability or increase
+`CURIE_API_PREFLIGHT_TIMEOUT_SECONDS`, then retry. These failures identify only
+the failing phase and recovery action; they never print configured Slack
+destinations or credentials.
+
+The public-channel capability call always runs after discovery, including when
+there are zero configured destinations. Its Slack `missing_scope` or documented
+`invalid_types` permission outcome maps unambiguously to the recovery below
+without reading or logging its `needed` or `provided` sets. Production creates
+a dedicated no-retry Slack WebClient for each metadata attempt, with an integer
+timeout derived from the remaining phase budget and capped at two seconds. The
+phase budget prevents starting additional calls after it expires; a final
+already-started call can extend it only by that bounded timeout.
 
 The gate runs once at boot only. It is not a liveness monitor: an API restart
 later does not kill the dispatcher (the heartbeat probes own liveness, and the
 resolve call degrades per-call on its own). There is no off switch: the gate is
 the point, so a non-positive timeout is rejected as a config error at boot.
 
-**Known limit: the gate proves reachability, not credentials.** `/health` is
-unauthenticated, so a mismatched API key or chat-attester secret still passes the gate and
-fails at click time. This check catches the base-URL class of misconfiguration only.
+`/health` is deliberately unauthenticated and proves reachability only. The
+following `/agents` discovery is authenticated with `CURIE_API_KEY`. Discovery
+failures remain a fixed, redaction-safe platform API failure rather than
+printing credentials or response bodies. The independent approval chat-attester
+secret is not checked by these preflights.
+
+The only boot-fatal Slack metadata responses are `missing_scope` and
+`invalid_types` from that fixed public-channel capability request. Both use the
+same missing-public-permission recovery:
+`Slack channel capability preflight failed: bot token is missing required scope channels:read. Add channels:read under OAuth & Permissions > Bot Token Scopes, then reinstall the app to the workspace.`
+The preflight logs only a safe public capability state (`verified` or
+`unverified`) and aggregate checked or unverified destination counts. Other
+capability-call failures, plus private, stale, or transient per-destination
+`conversations.info` outcomes, remain aggregate unverified warnings and do not
+stop Socket Mode once every destination has been attempted; no tokens or
+destination identifiers are printed.
+
+An unverified warning can recur for a private channel, DM, stale destination,
+or transient provider outcome. It is deliberately non-terminal and does not
+assert private-channel or DM scope coverage; inspect the trusted configuration
+and correct the destination or access separately.
 
 The two Slack tokens and the independent approval chat-attester key are secrets. When a workspace exists the Slack tokens come from
 the app's install (App-Level Token with `connections:write` for `SLACK_APP_TOKEN`;
@@ -168,9 +209,12 @@ python -m curie_dispatcher
 
 1. Create a Slack app. Fastest path: at <https://api.slack.com/apps> choose
    "From a manifest" and paste [`slack-app-manifest.yaml`](slack-app-manifest.yaml),
-   which already sets Socket Mode on, the bot scopes (`app_mentions:read`,
-   `chat:write`, `im:history`, `im:read`), and the `app_mention` + `message.im`
-   event subscriptions. (To do it by hand, configure exactly those.)
+   which already sets Socket Mode on and the bot scopes (`app_mentions:read`,
+   `chat:write`, `channels:read`, `im:history`, `im:read`), plus the
+   `app_mention` and `message.im` event subscriptions. If the app was already
+   installed before `channels:read` was added, reinstall it to the workspace so
+   its bot-token grant is refreshed. (To configure the app manually, include
+   those same scopes.)
 2. Generate an App-Level Token with `connections:write` -> `SLACK_APP_TOKEN`
    (`xapp-...`); copy the Bot User OAuth Token -> `SLACK_BOT_TOKEN` (`xoxb-...`).
 3. Set both env vars (plus `VALKEY_*` for the target Valkey) and run
