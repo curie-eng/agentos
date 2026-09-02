@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -712,13 +712,13 @@ def canonical_tool_name(
 
     if not is_mcp_tool(live_tool_name):
         return None
-    for server in sorted(connector_servers or ()):
+    for server in sorted(connector_servers or (), key=lambda name: (-len(name), name)):
         prefix = connector_tool_prefix(server)
         if live_tool_name.startswith(prefix):
             tool = live_tool_name[len(prefix) :]
             return f"{server}/{tool}" if tool else None
     if bundle_name:
-        for server in sorted(mcp_servers or ()):
+        for server in sorted(mcp_servers or (), key=lambda name: (-len(name), name)):
             prefix = effective_tool_prefix(bundle_name, server)
             if live_tool_name.startswith(prefix):
                 tool = live_tool_name[len(prefix) :]
@@ -740,6 +740,27 @@ def _tool_policy_outcome(gate: ApprovalGate, tool_name: str) -> ToolPolicyDecisi
     if canonical is None:
         return ToolPolicyDecision.DENY
     return classify_tool(gate.tool_policy, canonical)
+
+
+def policy_disallowed_tools(
+    gate: ApprovalGate, observed_tools: Iterable[str]
+) -> tuple[str, ...]:
+    """Project observed policy refusals into exact SDK-visible tool names.
+
+    Catalog visibility is not authorization. This projection therefore uses
+    only the side-effect-free policy classification and never consumes a grant
+    or records a pending approval on ``gate``.
+    """
+
+    return tuple(
+        sorted(
+            {
+                tool_name
+                for tool_name in observed_tools
+                if _tool_policy_outcome(gate, tool_name) is ToolPolicyDecision.DENY
+            }
+        )
+    )
 
 
 def _decide_gate(gate: ApprovalGate, tool_name: str, tool_input: dict[str, Any]) -> _GateDecision:

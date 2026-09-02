@@ -34,6 +34,7 @@ from .approval import (
     build_approval_hook,
     build_approval_server,
     build_can_use_tool,
+    policy_disallowed_tools,
     resolve_approval_policy,
 )
 from .config import RunnerConfig
@@ -304,6 +305,11 @@ def build_runner(
             sdk_env,
         )
         observed_readonly_tools = capability.readonly_tools
+        policy_hidden_tools = (
+            policy_disallowed_tools(approval_gate, capability.observed_tools)
+            if approval_gate is not None
+            else ()
+        )
         carries_request_approval = (
             carries_explicit_action_gate or capability.has_potential_write_tool
         )
@@ -372,6 +378,7 @@ def build_runner(
             can_use_tool=(build_can_use_tool(approval_gate) if approval_gate is not None else None),
             cwd=workspace_cwd,
             web_search_enabled=web_search_enabled,
+            policy_disallowed_tools=policy_hidden_tools,
         )
 
     def factory() -> ModelSession:

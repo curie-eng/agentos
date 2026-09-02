@@ -7,10 +7,7 @@ Status: Draft
 This Draft records the requested architecture decision backfill. It does not
 accept itself or authorize implementation. The frozen declaration and
 validation slice merged in [PR #2058](https://github.com/curie-eng/curie/pull/2058).
-The realizing runtime work is still open in
-[PR #2147](https://github.com/curie-eng/curie/pull/2147), tracked by
-[#2119](https://github.com/curie-eng/curie/issues/2119), so runtime enforcement
-must not be described as shipped on `next` yet.
+The realizing runtime work is now present on `next`.
 
 ## Context
 
@@ -138,32 +135,25 @@ runtime. Absence means that no tri state MCP classification was declared, not
 that an empty deny policy was declared. This compatibility path covers every
 bundle that predates the field.
 
-### Visibility filtering is deferred and is not authorization
+### Visibility filtering is not authorization
 
-Denied and unmatched tools may remain visible in the catalogue offered to the
-model. Hiding them can prevent futile calls and reduce model churn, but it
-cannot replace execution enforcement. The visibility work is deliberately
-deferred to [#2182](https://github.com/curie-eng/curie/issues/2182), which must
-retain the independent `PreToolUse` and `can_use_tool` refusals after filtering
-is added.
+Tools classified as `approvalRequired` remain visible in the catalogue offered
+to the model so the existing approval lifecycle can be entered at `PreToolUse`.
+Denied and unmatched tools are removed from the SDK catalogue. This filtering
+can prevent futile calls and reduce model churn, but it cannot replace
+execution enforcement: independent `PreToolUse` and `can_use_tool` refusals
+remain the authorization boundary.
 
 ## Current implementation state
 
-[PR #2058](https://github.com/curie-eng/curie/pull/2058) is merged. It added the
-optional frozen `toolPolicy` shape, canonical glob validation, shared
-classification helpers, and the enforcement identifier handshake. On current
-`next`, API intake and runner boot do not claim that identifier, so a policy
-bearing bundle is refused rather than accepted without enforcement.
-
-[PR #2147](https://github.com/curie-eng/curie/pull/2147) is open. It proposes
-the canonical runtime name mapping, the shared decision at `PreToolUse` and
-`can_use_tool`, and the API, validator, loader, and runner handshake that makes
-policy bearing bundles deployable. Until that PR or an equivalent realization
-merges, the runtime portion of this decision is not shipped on `next`.
-
-[#2182](https://github.com/curie-eng/curie/issues/2182) remains a follow-up. It
-does not block deterministic authorization in #2147 and must not be used as
-evidence that authorization is complete.
+[PR #2058](https://github.com/curie-eng/curie/pull/2058) is merged. Current
+`next` also realizes the canonical runtime name mapping; the shared decision at
+`PreToolUse` and `can_use_tool`; and the API, validator, loader, and runner
+handshake that makes policy-bearing bundles deployable. The implementation
+keeps `approvalRequired` tools model-visible until `PreToolUse`, while it
+removes denied and unmatched tools from the SDK catalogue. Independent runtime
+enforcement still rejects denied or unmatched calls, so catalogue filtering is
+not an authorization boundary.
 
 ## Consequences
 
@@ -187,8 +177,7 @@ bundles require a platform release and runner that both claim version 1
 enforcement, which turns unsafe skew into a visible deploy or boot failure.
 
 Denied tool visibility remains an efficiency and ergonomics concern, not a
-security claim. Runtime interception remains the authorization boundary even
-after #2182 lands.
+security claim. Runtime interception remains the authorization boundary.
 
 ## Alternatives considered
 
@@ -218,7 +207,7 @@ different decision path. Both interception points must share the classifier.
 
 Rejected. Visibility can reduce futile calls but does not prove that an
 attempted call cannot execute through another path or under version skew.
-Filtering remains the deferred defense in depth work in #2182.
+Filtering is defense in depth, not authorization.
 
 ### Apply unmatched denial to built-in tools
 

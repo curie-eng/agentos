@@ -479,10 +479,14 @@ def test_build_options_permission_posture() -> None:
     assert plain.allowed_tools == []
     assert plain.permission_mode == "bypassPermissions"
     assert plain.can_use_tool is None
+    assert plain.disallowed_tools == []
     assert plain.cwd == "/workspace"
     assert plain.hooks == hooks
 
-    gate = ApprovalGate(required=frozenset({"Bash"}))
+    approval_required = "mcp__plugin_acme-bot_operations__write_approval"
+    denied = "mcp__plugin_acme-bot_operations__write_denied"
+    unmatched = "mcp__plugin_acme-bot_operations__write_unmatched"
+    gate = ApprovalGate(required=frozenset({approval_required}))
     gated = build_options(
         plugins=[],
         model=None,
@@ -491,15 +495,43 @@ def test_build_options_permission_posture() -> None:
         max_budget_usd=None,
         resume=None,
         can_use_tool=build_can_use_tool(gate),
+        policy_disallowed_tools=[unmatched, denied, unmatched],
         cwd="/workspace",
         hooks=hooks,
     )
     assert gated.tools == {"type": "preset", "preset": "claude_code"}
     assert gated.allowed_tools == []
+    assert gated.disallowed_tools == [denied, unmatched]
     assert gated.permission_mode == "default"
     assert gated.can_use_tool is not None
     assert gated.cwd == "/workspace"
     assert gated.hooks == hooks
+
+    web_search_disabled = build_options(
+        plugins=[],
+        model=None,
+        system_prompt=None,
+        max_turns=1,
+        max_budget_usd=None,
+        resume=None,
+        web_search_enabled=False,
+    )
+    assert web_search_disabled.allowed_tools == []
+    assert web_search_disabled.disallowed_tools == ["WebSearch"]
+
+    combined = build_options(
+        plugins=[],
+        model=None,
+        system_prompt=None,
+        max_turns=1,
+        max_budget_usd=None,
+        resume=None,
+        can_use_tool=build_can_use_tool(gate),
+        policy_disallowed_tools=[unmatched, "WebSearch", denied, unmatched],
+        web_search_enabled=False,
+    )
+    assert combined.allowed_tools == []
+    assert combined.disallowed_tools == ["WebSearch", denied, unmatched]
 
 
 def test_runner_config_parses_approval_required_tools() -> None:

@@ -19,7 +19,7 @@ import contextlib
 import json
 import os
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, cast
@@ -307,6 +307,7 @@ def build_options(
     can_use_tool: CanUseTool | None = None,
     cwd: str | None = None,
     web_search_enabled: bool = True,
+    policy_disallowed_tools: Iterable[str] = (),
 ) -> ClaudeAgentOptions:
     """Assemble ClaudeAgentOptions for the session.
 
@@ -336,6 +337,12 @@ def build_options(
     # install has always said and must keep saying.
     thinking_option: dict[str, Any] = {"thinking": cast("Any", thinking)} if thinking else {}
     cwd_option: dict[str, Any] = {"cwd": cwd} if cwd is not None else {}
+    disallowed_tools = sorted(set(policy_disallowed_tools))
+    if not web_search_enabled:
+        disallowed_tools = [
+            "WebSearch",
+            *(tool_name for tool_name in disallowed_tools if tool_name != "WebSearch"),
+        ]
     return ClaudeAgentOptions(
         plugins=plugins,
         model=model,
@@ -350,7 +357,7 @@ def build_options(
         # ``allowed_tools`` it is not a permission preauthorization. See:
         # https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool
         # https://github.com/anthropics/claude-agent-sdk-python#using-tools
-        disallowed_tools=[] if web_search_enabled else ["WebSearch"],
+        disallowed_tools=disallowed_tools,
         **thinking_option,
         **cwd_option,
         system_prompt=system_prompt,

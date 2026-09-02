@@ -38,6 +38,7 @@ from mcp.client.sse import sse_client
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared._httpx_utils import create_mcp_http_client
+from mcp.shared.tool_name_validation import validate_tool_name
 from plugin_format import PluginManifest, resolve_manifest
 from plugin_format.approval_policy import connector_tool_prefix, effective_tool_prefix
 
@@ -56,6 +57,7 @@ class McpToolCapabilityProbe:
     tool_count: int
     failures: tuple[str, ...] = ()
     readonly_tools: frozenset[str] = frozenset()
+    observed_tools: frozenset[str] = frozenset()
 
 
 def _expand(value: str, env: Mapping[str, str]) -> str:
@@ -184,11 +186,12 @@ async def _probe_server(
     tool_prefix: str,
     plugin_dir: Path | None,
     inherited_env: Mapping[str, str],
-) -> tuple[int, bool, frozenset[str]]:
-    """Return count, write capability, and exact read-only runtime tool names."""
+) -> tuple[int, bool, frozenset[str], frozenset[str]]:
+    """Return count, write capability, and exact observed/read-only tool names."""
 
     count = 0
     has_potential_write = False
+    observed_tools: set[str] = set()
     readonly_tools: set[str] = set()
     with anyio.fail_after(_PROBE_TIMEOUT_SECONDS):
         async with _server_streams(
@@ -203,7 +206,15 @@ async def _probe_server(
                 cursor: str | None = None
                 while True:
                     result = await session.list_tools(cursor=cursor)
+                    if any(
+                        not validate_tool_name(tool.name).is_valid
+                        for tool in result.tools
+                    ):
+                        raise ValueError("MCP server returned a nonconforming tool name")
                     count += len(result.tools)
+                    observed_tools.update(
+                        f"{tool_prefix}{tool.name}" for tool in result.tools
+                    )
                     if any(
                         tool.annotations is None
                         or tool.annotations.readOnlyHint is not True
@@ -219,7 +230,12 @@ async def _probe_server(
                     cursor = result.nextCursor
                     if not cursor:
                         break
-    return count, has_potential_write, frozenset(readonly_tools)
+    return (
+        count,
+        has_potential_write,
+        frozenset(observed_tools),
+        frozenset(readonly_tools),
+    )
 
 
 async def probe_mcp_tool_capability(
@@ -238,7 +254,7 @@ async def probe_mcp_tool_capability(
     root = Path(plugin_dir) if plugin_dir is not None else None
     env = {**os.environ, **dict(inherited_env or {})}
     failures: list[str] = []
-    observations: list[tuple[int, bool, frozenset[str]]] = []
+    observations: list[tuple[int, bool, frozenset[str], frozenset[str]]] = []
 
     try:
         declared = _bundle_server_configs(root) if root is not None else []
@@ -292,11 +308,18 @@ async def probe_mcp_tool_capability(
         for name, config, cwd, tool_prefix in work:
             task_group.start_soon(inspect, name, config, cwd, tool_prefix)
 
-    tool_count = sum(count for count, _write, _readonly in observations)
-    has_write = bool(failures) or any(write for _count, write, _readonly in observations)
+    tool_count = sum(count for count, _write, _observed, _readonly in observations)
+    has_write = bool(failures) or any(
+        write for _count, write, _observed, _readonly in observations
+    )
+    observed_tools = frozenset(
+        tool
+        for _count, _write, observed, _readonly in observations
+        for tool in observed
+    )
     readonly_tools = frozenset(
         tool
-        for _count, _write, observed_readonly in observations
+        for _count, _write, _observed, observed_readonly in observations
         for tool in observed_readonly
     )
     return McpToolCapabilityProbe(
@@ -304,5 +327,6 @@ async def probe_mcp_tool_capability(
         has_potential_write_tool=has_write,
         tool_count=tool_count,
         failures=tuple(sorted(set(failures))),
+        observed_tools=observed_tools,
         readonly_tools=readonly_tools,
     )
