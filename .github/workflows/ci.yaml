@@ -1528,52 +1528,11 @@ jobs:
           set -euo pipefail
           placement_mutant="$RUNNER_TEMP/nil-unsafe-placement-chart"
           cp -a charts/curie "$placement_mutant"
-          python3 - "$placement_mutant/templates/_helpers.tpl" <<'PY'
-          import pathlib
-          import re
-          import sys
-
-          path = pathlib.Path(sys.argv[1])
-          text = path.read_text()
-          block_re = re.compile(
-              r'{{-?\s*define "curie\.placement\.class"\s*-?}}.*?{{-?\s*end\s*-?}}',
-              re.DOTALL,
-          )
-          match = block_re.search(text)
-          if match is None or "| default dict" not in match.group(0):
-              raise SystemExit("nil-unsafe negative control could not find the placement nil guard")
-          mutated = match.group(0).replace("| default dict", "", 1)
-          path.write_text(text[: match.start()] + mutated + text[match.end() :])
-          PY
           mutant="$RUNNER_TEMP/nil-unsafe-chart"
           cp -a charts/curie "$mutant"
-          python3 - "$mutant/templates/_helpers.tpl" <<'PY'
-          import pathlib
-          import sys
-
-          path = pathlib.Path(sys.argv[1])
-          text = path.read_text()
-          start_marker = '{{- define "curie.managedSecret" -}}'
-          end_marker = '{{/* ---- Shared first-party-app environment fragments ---- */}}'
-          start = text.find(start_marker)
-          end = text.find(end_marker, start)
-          if start == -1 or end == -1:
-              raise SystemExit("nil-unsafe negative control could not find curie.managedSecret")
-          nil_unsafe = r'''{{- define "curie.managedSecret" -}}
-          {{- if eq (toString .root.Values.security.allowDevDefaults) "true" -}}
-          {{- .value -}}
-          {{- else if ne (toString .value) (toString .default) -}}
-          {{- .value -}}
-          {{- else if hasKey .existingData .key -}}
-          {{- index .existingData .key | b64dec -}}
-          {{- else if .hex -}}
-          {{- randAlphaNum 32 | sha256sum -}}
-          {{- else -}}
-          {{- randAlphaNum 32 -}}
-          {{- end -}}
-          {{- end -}}'''
-          path.write_text(text[:start] + nil_unsafe + "\n\n" + text[end:])
-          PY
+          python3 charts/curie/ci/make-upgrade-mutants.py \
+            "$placement_mutant/templates/_helpers.tpl" \
+            "$mutant/templates/_helpers.tpl"
           helm install curie-negative "$RELEASED_CHART" \
             -n curie-negative --create-namespace -f "$LEGACY_VALUES" --timeout 15m \
             --set api.image.digest=sha256:71aa652c0af87084e4254402268e2d08c0cdbc2f197b6f1f1cf136b49aa93dc0 \

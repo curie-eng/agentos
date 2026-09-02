@@ -1411,6 +1411,7 @@ class TestLegitimateSkips:
             "local=true",
             "local_release=true",
             "cluster=true",
+            "released_upgrade=true",
             "skill_local_tiers=skill,local",
         ], (
             "ci.yaml's push selection no longer emits the complete tier contract: "

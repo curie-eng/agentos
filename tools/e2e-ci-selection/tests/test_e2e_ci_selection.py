@@ -19,6 +19,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 SELECTOR = REPO_ROOT / "tools" / "e2e-ci-selection" / "select_tiers.py"
 REGISTRY = REPO_ROOT / ".github" / "e2e-selection.yaml"
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yaml"
+UPGRADE_MUTANT_BUILDER = REPO_ROOT / "charts" / "curie" / "ci" / "make-upgrade-mutants.py"
 
 TIERS = ("skill", "local", "local-release", "cluster", "released-upgrade")
 BASE_TIERS = TIERS[:-1]
@@ -587,13 +588,14 @@ def test_released_upgrade_workflow_pins_issue_2194_runtime_contract() -> None:
     placement_mutant_setup = '''placement_mutant="$RUNNER_TEMP/nil-unsafe-placement-chart"
 cp -a charts/curie "$placement_mutant"'''
     assert placement_mutant_setup in negative_run
-    assert (
-        "match = block_re.search(text)\n"
-        'if match is None or "| default dict" not in match.group(0):'
-    ) in negative_run
+    assert "python3 charts/curie/ci/make-upgrade-mutants.py" in negative_run
+    mutant_builder = UPGRADE_MUTANT_BUILDER.read_text()
+    assert "match = block_re.search(text)" in mutant_builder
+    assert 'if match is None or "| default dict" not in match.group(0):' in mutant_builder
     assert (
         'mutated = match.group(0).replace("| default dict", "", 1)'
-    ) in negative_run
+    ) in mutant_builder
+    assert 'start_marker = \'{{- define "curie.managedSecret" -}}\'' in mutant_builder
     placement_upgrade = '''if helm upgrade curie-negative "$placement_mutant" -n curie-negative \\
     --reset-then-reuse-values --timeout 15m; then
   echo "nil-unsafe placement mutant unexpectedly upgraded legacy placement:null values" >&2
