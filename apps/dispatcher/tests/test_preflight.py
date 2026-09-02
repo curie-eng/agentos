@@ -12,16 +12,24 @@ races the API's own startup, and in k8s pod start order is not ordered at all, s
 fail-immediately would crash-loop a healthy stack. Test 3 is the guard on that
 decision.
 
-The API and Slack provider are faked only at their client seams. The retry
-loops, deadline decisions, parsing, and URL construction are real. Slow-path
-tests use the injected monotonic/sleep seam so aggregate budgets are exact and
-the suite does not wait on wall-clock time.
+Focused cases fake the API at the ``client=`` seam with
+``httpx.MockTransport``. The entrypoint regressions use a real loopback HTTP
+server and let the preflight construct its production client. Slack is faked
+only at its provider client seam. In both forms the retry loops, deadline
+decisions, parsing, and URL construction are real. Slow-path tests use the
+injected monotonic/sleep seam so aggregate budgets are exact and the suite does
+not wait on wall-clock time.
 """
 
 from __future__ import annotations
 
 import logging
+import re
+import threading
 import time
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -54,6 +62,73 @@ SLACK_TIMEOUT_MESSAGE = (
     "configured destination within the bounded startup budget. Check Slack "
     "API availability and retry."
 )
+
+
+@contextmanager
+def _loopback_health_server(
+    statuses: Sequence[int],
+    *,
+    userinfo: str = "",
+) -> Iterator[tuple[str, list[str]]]:
+    """Run a real loopback HTTP endpoint with a scripted ``/health`` result.
+
+    The entrypoint regressions below deliberately do not inject an httpx client:
+    they drive ``run.main`` through ``DispatcherConfig`` and the preflight's
+    production-owned client. Only the remote API's answers are scripted here.
+    """
+    if not statuses:
+        raise ValueError("statuses must contain at least one response")
+
+    requests: list[str] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
+            requests.append(self.path)
+            status = statuses[min(len(requests) - 1, len(statuses) - 1)]
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"status":"ok"}')
+
+        def log_message(self, _format: str, *args: object) -> None:
+            """Keep the test server out of the process's terminal log."""
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    authority = f"{userinfo}@" if userinfo else ""
+    try:
+        yield f"http://{authority}{host}:{port}", requests
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=1)
+
+
+def _configure_main_env(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    api_url: str,
+    timeout_s: float,
+) -> None:
+    """Configure the real ``DispatcherConfig()`` used by ``run.main``."""
+    for name, field in DispatcherConfig.model_fields.items():
+        alias = field.validation_alias
+        monkeypatch.delenv(
+            alias if isinstance(alias, str) else name.upper(), raising=False
+        )
+    monkeypatch.setenv("CURIE_API_URL", api_url)
+    monkeypatch.setenv("CURIE_API_PREFLIGHT_TIMEOUT_SECONDS", str(timeout_s))
+    monkeypatch.setenv("CURIE_BACKOFF_INITIAL_SECONDS", "0.01")
+    monkeypatch.setenv("CURIE_BACKOFF_MAX_SECONDS", "0.02")
+    monkeypatch.setenv("CURIE_BACKOFF_MULTIPLIER", "2")
+    monkeypatch.setenv("CURIE_API_KEY", "dispatcher-platform-test-key")
+    monkeypatch.setenv(
+        "CURIE_APPROVAL_CHAT_ATTESTER_SECRET", "dispatcher-attester-test-secret"
+    )
+    monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-entrypoint-test")
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-entrypoint-test")
 
 
 def _config(**overrides: object) -> DispatcherConfig:
@@ -312,37 +387,48 @@ def test_health_url_tolerates_a_trailing_slash() -> None:
 
 
 def test_the_loop_spends_its_whole_budget_with_production_backoff_ratios() -> None:
-    """The gate must poll until its deadline, and report what it really spent.
+    """The gate must keep polling until its deadline and report what it spent.
 
-    The other cases run `backoff_max << timeout`, where the growing delay never
-    approaches the deadline. The shipped defaults are the opposite ratio
-    (`backoff_max` 30.0 against a 30.0s deadline), so the delays 1, 2, 4, 8, 16
-    reach t=15s and the next 16s delay overshoots. An implementation that breaks
-    on the overshoot instead of clamping to the remaining budget abandons half
-    its deadline and then reports the configured 30.0s it never spent. This
-    config is those defaults scaled by 100.
+    This uses the production 120-second chart budget and reconnect ratios on an
+    injected clock. Without the preflight-specific poll ceiling, the loop can
+    spend the end of its budget asleep, so an API becoming healthy late in the
+    advertised readiness window is never probed.
     """
-
     config = _config(
-        api_preflight_timeout_s=0.3,
-        backoff_initial_seconds=0.01,
-        backoff_max_seconds=0.3,
+        api_preflight_timeout_s=120.0,
+        backoff_initial_seconds=1.0,
+        backoff_max_seconds=30.0,
         backoff_multiplier=2.0,
     )
-    start = time.monotonic()
+    clock = _FakeClock()
+    request_started_at: list[float] = []
+
+    def refusing(request: httpx.Request) -> httpx.Response:
+        request_started_at.append(clock.monotonic())
+        raise httpx.ConnectError("connection refused", request=request)
+
     with pytest.raises(ApiUnreachableError) as excinfo:
         check_api_reachable(
-            config, logger=logging.getLogger("test-preflight"), client=_client(_refusing)
+            config,
+            logger=logging.getLogger("test-preflight"),
+            client=_client(refusing),
+            monotonic=clock.monotonic,
+            sleep=clock.sleep,
         )
-    elapsed = time.monotonic() - start
 
-    assert elapsed >= 0.27, (
-        f"the preflight gave up after {elapsed:.3f}s of its 0.3s budget; the "
+    last_probe_elapsed = request_started_at[-1]
+    assert last_probe_elapsed >= config.api_preflight_timeout_s * 0.9, (
+        f"the last probe started only {last_probe_elapsed:.1f}s into the "
+        f"{config.api_preflight_timeout_s:.0f}s budget; the loop slept through "
+        "the final readiness window instead of polling it"
+    )
+    assert clock.monotonic() == config.api_preflight_timeout_s, (
+        f"the preflight gave up after {clock.monotonic():.1f}s of its 120s budget; the "
         f"delay must be clamped to the remaining time, not abandoned when it "
         f"would overshoot"
     )
-    # 0.15s is the pre-fix elapsed: the message must never claim time it did not spend.
-    assert "after 0.3s" in str(excinfo.value), (
+    # The terminal message must never claim time the loop did not really spend.
+    assert "after 120.0s" in str(excinfo.value), (
         f"the error must report the time actually elapsed, not the configured "
         f"deadline; got {str(excinfo.value)!r}"
     )
@@ -1484,3 +1570,159 @@ def test_run_main_missing_scope_exits_before_supervisor_without_leaking(
     assert excinfo.value.code not in (0, None)
     assert events == ["api", "slack"]
     assert [record.getMessage() for record in caplog.records] == [MISSING_SCOPE_MESSAGE]
+
+
+def test_run_main_waits_for_delayed_api_then_starts_supervisor_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A normally slow API does not restart the dispatcher before Slack starts.
+
+    This enters through the process entrypoint, reads a real
+    ``DispatcherConfig`` from the environment, and lets the production preflight
+    create its own HTTP client and execute its own retry loop. Slack, heartbeat,
+    signals, and telemetry are process boundaries, so record them without opening
+    external connections or changing this pytest process's signal handlers.
+    """
+    from curie_dispatcher import run
+
+    events: list[str] = []
+    health_requests: list[str] = []
+    heartbeat_stop = threading.Event()
+
+    class Telemetry:
+        def shutdown(self) -> None:
+            events.append("telemetry.shutdown")
+
+    class Supervisor:
+        def run(self) -> None:
+            events.append("supervisor.run")
+
+        def request_stop(self) -> None:
+            events.append("supervisor.request_stop")
+
+    def check_slack(*args: object, **kwargs: object) -> None:
+        assert health_requests == ["/health", "/health", "/health"], (
+            "Slack capability preflight started before delayed API readiness passed"
+        )
+        events.append("slack_preflight")
+
+    def build_supervisor(
+        config: DispatcherConfig, *, logger: logging.Logger
+    ) -> Supervisor:
+        assert type(config) is DispatcherConfig
+        assert logger.name == "curie_dispatcher"
+        assert health_requests == ["/health", "/health", "/health"], (
+            "Slack wiring started before delayed API readiness passed"
+        )
+        assert events[-1] == "slack_preflight"
+        events.append("build_supervisor")
+        return Supervisor()
+
+    def start_heartbeat(path: str, interval_s: float) -> threading.Event:
+        assert path == "/tmp/curie-dispatcher.heartbeat"
+        assert interval_s == 10.0
+        events.append("heartbeat.start")
+        return heartbeat_stop
+
+    monkeypatch.setattr(
+        run,
+        "bootstrap_service_telemetry",
+        lambda *args, **kwargs: Telemetry(),
+    )
+    monkeypatch.setattr(run, "check_slack_channel_capabilities", check_slack)
+    monkeypatch.setattr(run, "build_supervisor", build_supervisor)
+    monkeypatch.setattr(run, "start_heartbeat", start_heartbeat)
+    monkeypatch.setattr(
+        run.signal,
+        "signal",
+        lambda signum, handler: events.append(f"signal.{signum}"),
+    )
+
+    with _loopback_health_server([503, 503, 200]) as (api_url, requests):
+        health_requests = requests
+        _configure_main_env(monkeypatch, api_url=api_url, timeout_s=0.5)
+        run.main()
+
+    assert requests == ["/health", "/health", "/health"], (
+        "the real preflight must retry delayed readiness to success before "
+        f"starting Slack; observed {requests!r}"
+    )
+    assert events.count("slack_preflight") == 1
+    assert events.count("build_supervisor") == 1
+    assert events.count("supervisor.run") == 1
+    assert events.index("supervisor.run") > events.index("build_supervisor")
+    assert events.count("heartbeat.start") == 1
+    assert heartbeat_stop.is_set(), "normal supervisor return must stop the heartbeat"
+    assert events[-1] == "telemetry.shutdown", (
+        f"telemetry must shut down after a clean supervisor exit; events={events!r}"
+    )
+
+
+def test_run_main_times_out_before_slack_with_actionable_sanitized_log(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A persistently unhealthy API exits once, bounded and actionable.
+
+    This is the timeout-negative sibling of delayed success. Userinfo in the URL
+    makes sanitization falsifiable, while a real loopback 503 keeps ``last error``
+    deterministic and proves the process made multiple attempts before giving up.
+    """
+    from curie_dispatcher import run
+
+    events: list[str] = []
+
+    class Telemetry:
+        def shutdown(self) -> None:
+            events.append("telemetry.shutdown")
+
+    def reached_slack_preflight(*args: object, **kwargs: object) -> None:
+        raise AssertionError("Slack preflight ran after the terminal API timeout")
+
+    def reached_supervisor(*args: object, **kwargs: object) -> object:
+        events.append("build_supervisor")
+        raise AssertionError("Slack was built after the terminal preflight timeout")
+
+    def reached_heartbeat(*args: object, **kwargs: object) -> threading.Event:
+        raise AssertionError("heartbeat started before the API preflight passed")
+
+    monkeypatch.setattr(
+        run,
+        "bootstrap_service_telemetry",
+        lambda *args, **kwargs: Telemetry(),
+    )
+    monkeypatch.setattr(
+        run, "check_slack_channel_capabilities", reached_slack_preflight
+    )
+    monkeypatch.setattr(run, "build_supervisor", reached_supervisor)
+    monkeypatch.setattr(run, "start_heartbeat", reached_heartbeat)
+
+    with _loopback_health_server(
+        [503], userinfo="operator:credential"
+    ) as (api_url, requests):
+        _configure_main_env(monkeypatch, api_url=api_url, timeout_s=0.3)
+        safe_url = api_url.replace("operator:credential@", "")
+        started = time.monotonic()
+        with caplog.at_level(logging.ERROR, logger="curie_dispatcher"):
+            with pytest.raises(SystemExit) as excinfo:
+                run.main()
+        elapsed = time.monotonic() - started
+
+    assert excinfo.value.code not in (0, None)
+    assert 0.27 <= elapsed < 0.8, (
+        f"the 0.3s entrypoint deadline was not bounded; elapsed={elapsed:.3f}s"
+    )
+    assert len(requests) >= 2, (
+        f"the timeout path did not retry before failing; requests={requests!r}"
+    )
+    assert events == ["telemetry.shutdown"], (
+        "terminal preflight failure must happen before Slack/heartbeat and still "
+        f"shut down telemetry; events={events!r}"
+    )
+
+    terminal = "\n".join(record.getMessage() for record in caplog.records)
+    assert safe_url in terminal
+    assert "operator" not in terminal and "credential" not in terminal
+    assert re.search(r"after \d+\.\d+s", terminal), terminal
+    assert re.search(r"\(\d+ attempts, last error: HTTP 503\)", terminal), terminal
+    assert "check CURIE_API_URL" in terminal

@@ -127,7 +127,7 @@ Read from the environment by `DispatcherConfig()` (a `pydantic_settings.BaseSett
 | `CURIE_API_URL` | `http://localhost:8000` | platform API used to resolve approval clicks (compose: `http://curie-api:8000`). `CURIE_API_BASE_URL` is a deprecated alias. |
 | `CURIE_API_KEY` | `curie-dev-key` | platform administrative key; sent for compatibility with API plumbing, but it is not resolver identity and cannot authorize a resolution alone |
 | `CURIE_APPROVAL_CHAT_ATTESTER_SECRET` | `curie-dev-approval-chat-attester` | independent HMAC secret shared only with the API; signs short-lived, approval-bound `chat` principals. Must be nonblank and must not equal `CURIE_API_KEY`. |
-| `CURIE_API_PREFLIGHT_TIMEOUT_SECONDS` | `30.0` | API-health budget, followed by a fresh same-size discovery-and-Slack budget; must be positive |
+| `CURIE_API_PREFLIGHT_TIMEOUT_SECONDS` | `30.0` | API-health budget, followed by a fresh same-size discovery-and-Slack budget; the Helm chart supplies 120 seconds while a directly run dispatcher keeps this 30-second default; must be positive |
 
 ### Boot preflights
 
@@ -165,10 +165,23 @@ timeout derived from the remaining phase budget and capped at two seconds. The
 phase budget prevents starting additional calls after it expires; a final
 already-started call can extend it only by that bounded timeout.
 
-The gate runs once at boot only. It is not a liveness monitor: an API restart
-later does not kill the dispatcher (the heartbeat probes own liveness, and the
-resolve call degrades per-call on its own). There is no off switch: the gate is
-the point, so a non-positive timeout is rejected as a config error at boot.
+API-health exhaustion exits nonzero with guidance to check `CURIE_API_URL` and
+whether the API pod is Ready. The Helm chart supplies 120 seconds for each
+phase and gives its startup probe an earliest failure cutoff of 260 seconds,
+strictly beyond the two 120-second budgets plus the final bounded two-second
+Slack call. Rendering rejects settings where the startup cutoff does not
+strictly outlast that full application startup envelope.
+
+The gates run once at boot only. The heartbeat starts only after every preflight
+succeeds, so Kubernetes startup, readiness, and liveness checks remain gated
+while the dispatcher is polling. The startup probe prevents Kubernetes from
+restarting the pod during the application startup envelope. If a dependency
+never becomes ready, the application still reaches its own bounded terminal
+failure before the startup probe can restart it. The gate is not a liveness monitor:
+an API restart later does not kill the dispatcher (the heartbeat probes own
+liveness, and the resolve call degrades per call on its own). There is no off
+switch: the gate is the point, so a nonpositive timeout is rejected as a config
+error at boot.
 
 `/health` is deliberately unauthenticated and proves reachability only. The
 following `/agents` discovery is authenticated with `CURIE_API_KEY`. Discovery
