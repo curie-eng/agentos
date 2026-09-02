@@ -477,8 +477,8 @@ def test_the_read_tool_exposes_no_parameters(tmp_path):
 
 def test_it_is_annotated_as_a_read(tmp_path):
     srv = _load(tmp_path)
-    assert srv.READ.readOnlyHint is True
-    assert srv.READ.destructiveHint is False
+    assert srv.READ.read_only_hint is True
+    assert srv.READ.destructive_hint is False
 
 
 def test_an_unset_repository_refuses_without_a_network_call(tmp_path, monkeypatch):

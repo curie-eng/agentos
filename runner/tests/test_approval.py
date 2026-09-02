@@ -268,18 +268,17 @@ def test_publish_tool_is_always_listed_but_unmounted_invocation_refuses() -> Non
         # Defence in depth is also unconditional. Calling the discoverable
         # tool without a mounted checkout must fail usefully, never fabricate a
         # publication request or silently succeed.
-        handler = unmounted["instance"].request_handlers[mcp_types.CallToolRequest]
-        direct = await handler(
-            mcp_types.CallToolRequest(
-                method="tools/call",
-                params=mcp_types.CallToolRequestParams(
-                    name="publish_changes",
-                    arguments={"title": "Ship changes"},
-                ),
-            )
+        entry = unmounted["instance"].get_request_handler("tools/call")
+        assert entry is not None
+        direct = await entry.handler(
+            None,
+            mcp_types.CallToolRequestParams(
+                name="publish_changes",
+                arguments={"title": "Ship changes"},
+            ),
         )
         payload = direct.model_dump()
-        assert payload.get("isError") is True
+        assert payload.get("is_error") is True
         message = " ".join(
             str(item.get("text") or "") for item in payload.get("content") or []
         ).lower()
@@ -291,8 +290,9 @@ def test_publish_tool_is_always_listed_but_unmounted_invocation_refuses() -> Non
 def test_publish_tool_description_carries_coding_and_approval_safety_protocol() -> None:
     async def listed_description() -> str:
         server = build_approval_server()
-        handler = server["instance"].request_handlers[mcp_types.ListToolsRequest]
-        result = await handler(mcp_types.ListToolsRequest(method="tools/list"))
+        entry = server["instance"].get_request_handler("tools/list")
+        assert entry is not None
+        result = await entry.handler(None, mcp_types.PaginatedRequestParams())
         tools = result.model_dump()["tools"]
         publish = next(tool for tool in tools if tool["name"] == "publish_changes")
         return str(publish["description"]).lower()
