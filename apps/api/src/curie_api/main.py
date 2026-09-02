@@ -14,8 +14,11 @@ from contextlib import asynccontextmanager
 import httpx
 import redis.asyncio as redis
 from curie_telemetry import (
+    TRACEPARENT_STREAM_FIELD,
     bootstrap_service_telemetry,
+    canonicalize_traceparent,
     configure_service_logging,
+    extract_trace_context,
     operation_span,
     record_metric,
 )
@@ -348,6 +351,20 @@ def create_app() -> FastAPI:
     @app.middleware("http")
     async def observe_http(request: Request, call_next):  # type: ignore[no-untyped-def]
         operation = _route_template(app, request)
+        inbound_traceparent = request.headers.get(TRACEPARENT_STREAM_FIELD)
+        canonical_traceparent = canonicalize_traceparent(inbound_traceparent)
+        parent = extract_trace_context(
+            {TRACEPARENT_STREAM_FIELD: canonical_traceparent}
+            if canonical_traceparent is not None
+            else {}
+        )
+        diagnostic = (
+            "trace.context.missing"
+            if inbound_traceparent is None
+            else "trace.context.malformed"
+            if canonical_traceparent is None
+            else None
+        )
         active_attributes = {
             "service.name": "curie-api",
             "operation": operation,
@@ -361,8 +378,11 @@ def create_app() -> FastAPI:
             with operation_span(
                 "http.server.request",
                 kind=SpanKind.SERVER,
+                parent=parent,
                 attributes=active_attributes,
             ) as span:
+                if diagnostic is not None:
+                    span.add_event(diagnostic)
                 response = await call_next(request)
                 status_code = response.status_code
                 if status_code >= 500 and hasattr(span, "set_status"):

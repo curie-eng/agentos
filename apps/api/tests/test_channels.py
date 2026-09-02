@@ -634,12 +634,12 @@ def test_channel_ingress_injects_traceparent_adjacent_to_unchanged_payload(
         address="trace@example.test",
     )
 
-    with _remote_parent():
-        response = _post_turn(
-            channels_client,
-            token,
-            _turn("email", "trace@example.test"),
-        )
+    response = _post_turn(
+        channels_client,
+        token,
+        _turn("email", "trace@example.test"),
+        headers={TRACEPARENT_STREAM_FIELD: _TRACEPARENT},
+    )
     assert response.status_code == 200, response.text
 
     entries = valkey.xrange(runs_stream)
