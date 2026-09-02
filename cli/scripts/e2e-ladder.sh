@@ -341,7 +341,7 @@ cleanup() {
         # Tolerated failure, on top of `set +e`: the stack may never have
         # finished coming up, and a failed `local down` must not skip the
         # sandbox sweep below or change the exit code captured above.
-        "$BIN" local down || echo "warning: \`local down\` failed during teardown; sweeping anyway." >&2
+        "$BIN" local down -f "$REPO_ROOT/compose.dev.yaml" || echo "warning: \`local down\` failed during teardown; sweeping anyway." >&2
         local orphans
         orphans="$(docker ps -aq --filter "label=$SANDBOX_LABEL" 2>/dev/null)"
         if [[ -n "$orphans" ]]; then
@@ -499,6 +499,78 @@ else:
     fi
 }
 
+# A failed background approval turn used to discard both the structured result
+# and its stderr. Keep the raw artifacts private, but retain a bounded verdict
+# that makes an awaiting approval, timeout, or JSON parse failure actionable.
+approval_resume_failure_summary() {
+    local message_file="$1" stderr_file="$2" code="$3"
+    python3 - "$message_file" "$stderr_file" "$code" <<'PY'
+import json
+import pathlib
+import sys
+
+message_file, stderr_file, code = sys.argv[1:]
+try:
+    exit_code = int(code)
+except ValueError:
+    exit_code = 1
+
+try:
+    value = json.loads(pathlib.Path(message_file).read_text())
+except (OSError, json.JSONDecodeError):
+    value = None
+
+if not isinstance(value, dict):
+    status = "parse_failure"
+    finalized = "absent"
+    fields = "none"
+    error_category = "unparseable"
+else:
+    safe_fields = (
+        "awaiting_approval",
+        "timed_out",
+        "finalized",
+        "reply",
+        "error",
+        "fix",
+    )
+    fields = ",".join(field for field in safe_fields if field in value) or "none"
+    finalized = "true" if value.get("finalized") is True else "false" if value.get("finalized") is False else "absent"
+    if value.get("awaiting_approval") is True:
+        status = "awaiting_approval"
+    elif value.get("timed_out") is True:
+        status = "timed_out"
+    elif finalized == "true":
+        status = "finalized"
+    elif finalized == "false":
+        status = "not_finalized"
+    else:
+        status = "json_unclassified"
+    error_category = "error_field" if "error" in value else "none"
+
+try:
+    stderr = pathlib.Path(stderr_file).read_text(errors="replace").lower()
+except OSError:
+    stderr = ""
+if "awaiting_approval" in stderr or "awaiting approval" in stderr:
+    stderr_category = "awaiting_approval"
+elif "timed_out" in stderr or "timed out" in stderr:
+    stderr_category = "timed_out"
+elif any(term in stderr for term in ("json", "parse", "deserial")):
+    stderr_category = "parse_failure"
+elif stderr:
+    stderr_category = "unclassified"
+else:
+    stderr_category = "empty"
+
+print(
+    "approval resume failure: "
+    f"exit_code={exit_code} status={status} finalized={finalized} "
+    f"error_category={error_category} fields={fields} stderr_category={stderr_category}"
+)
+PY
+}
+
 # A `--json` failure is useful to an agent only when stdout contains one object
 # with exactly the centralized error contract's two non-empty string fields.
 # `json.loads` consumes the whole stream, so a second JSON document is rejected
@@ -575,7 +647,7 @@ product_stream_json() {
                 return 1
             }
             docker exec "$valkey" sh -c \
-                'VALKEYCLI_AUTH="${VALKEY_PASSWORD:-}" exec valkey-cli --json "$@"' \
+                'exec valkey-cli --no-auth-warning -a "$VALKEY_PASSWORD" --json "$@"' \
                 sh "$@"
             ;;
         cluster)
@@ -594,7 +666,7 @@ if len(ready) != 1:
 print(ready[0])
 ')" || return 1
             kubectl -n "$CURIE_NAMESPACE" exec "$pod" -- sh -c \
-                'VALKEYCLI_AUTH="${VALKEY_PASSWORD:-}" exec valkey-cli --json "$@"' \
+                'exec valkey-cli --no-auth-warning -a "$VALKEY_PASSWORD" --json "$@"' \
                 sh "$@"
             ;;
         *)
@@ -1147,7 +1219,7 @@ seed_mcp_read_turn() {
 
 seed_approval_resume_turn() {
     local tier="$1" agent_id="${2:-}" query_state="${3:-present}" marker="curie-seed-approval-$$-$RANDOM"
-    local stream_start stream_end message_file token_file pending_file approval_id token out trace_id
+    local stream_start stream_end message_file message_stderr_file token_file pending_file approval_id token out trace_id
     local message_pid code=0 attempt
     if [[ "$LIVE" == "1" || -z "$agent_id" || -z "$marker" ]]; then
         echo "seed-invalid: deterministic approval seed needs fake mode and a deployed agent before telemetry" >&2
@@ -1158,15 +1230,39 @@ seed_approval_resume_turn() {
         return 1
     fi
     umask 077
-    message_file="$(mktemp "$WORKDIR/approval-message.XXXXXX")"
-    token_file="$(mktemp "$WORKDIR/approval-token.XXXXXX")"
-    pending_file="$(mktemp "$WORKDIR/approval-pending.XXXXXX")"
+    if ! message_file="$(mktemp "$WORKDIR/approval-message.XXXXXX")"; then
+        echo "seed-invalid: could not create private approval message artifact" >&2
+        return 1
+    fi
+    if ! message_stderr_file="$(mktemp "$WORKDIR/approval-message-stderr.XXXXXX")"; then
+        rm -f "$message_file"
+        echo "seed-invalid: could not create private approval stderr artifact" >&2
+        return 1
+    fi
+    if ! token_file="$(mktemp "$WORKDIR/approval-token.XXXXXX")"; then
+        rm -f "$message_file" "$message_stderr_file"
+        echo "seed-invalid: could not create private approval token artifact" >&2
+        return 1
+    fi
+    if ! pending_file="$(mktemp "$WORKDIR/approval-pending.XXXXXX")"; then
+        rm -f "$message_file" "$message_stderr_file" "$token_file"
+        echo "seed-invalid: could not create private approval pending artifact" >&2
+        return 1
+    fi
     local scope=()
-    "$BIN" --json "$tier" approvals "$agent_id" "${scope[@]}" \
+    if ! "$BIN" --json "$tier" approvals "$agent_id" "${scope[@]}" \
         --route-resolution e2e=C0EXAMPLE1 --route-approvers e2e=users:U0EXAMPLE1 \
-        >/dev/null
-    "$BIN" --json "$tier" approvals "$agent_id" "${scope[@]}" \
-        --mint-operator-principal U0EXAMPLE1 > "$token_file"
+        >/dev/null; then
+        rm -f "$message_file" "$message_stderr_file" "$token_file" "$pending_file"
+        echo "seed-invalid: could not configure deterministic approval route" >&2
+        return 1
+    fi
+    if ! "$BIN" --json "$tier" approvals "$agent_id" "${scope[@]}" \
+        --mint-operator-principal U0EXAMPLE1 > "$token_file"; then
+        rm -f "$message_file" "$message_stderr_file" "$token_file" "$pending_file"
+        echo "seed-invalid: could not mint deterministic approval principal" >&2
+        return 1
+    fi
     token="$(python3 - "$token_file" <<'PY'
 import json, pathlib, sys
 value = json.loads(pathlib.Path(sys.argv[1]).read_text())
@@ -1176,13 +1272,16 @@ if not isinstance(token, str) or not token:
 print(token)
 PY
 )" || {
-        rm -f "$message_file" "$token_file" "$pending_file"
+        rm -f "$message_file" "$message_stderr_file" "$token_file" "$pending_file"
         return 1
     }
     rm -f "$token_file"
-    stream_start="$(capture_stream_cursor "$tier")" || return 1
+    stream_start="$(capture_stream_cursor "$tier")" || {
+        rm -f "$message_file" "$message_stderr_file" "$pending_file"
+        return 1
+    }
     "$BIN" --json local message --channel C0LOCALDEV --timeout-secs 120 \
-        "[fake:request-approval:e2e] approve correlation $marker" > "$message_file" 2>/dev/null &
+        "[fake:request-approval:e2e] approve correlation $marker" > "$message_file" 2> "$message_stderr_file" &
     message_pid=$!
     approval_id=""
     for attempt in $(seq 1 60); do
@@ -1203,20 +1302,33 @@ PY
     if [[ -z "$approval_id" ]]; then
         kill "$message_pid" 2>/dev/null || true
         wait "$message_pid" 2>/dev/null || true
-        rm -f "$message_file"
+        rm -f "$message_file" "$message_stderr_file"
         echo "seed-invalid: awaiting-approval record did not become pending" >&2
         return 1
     fi
-    CURIE_APPROVAL_PRINCIPAL_TOKEN="$token" "$BIN" --json "$tier" approvals "$agent_id" \
-        "${scope[@]}" --resolve "$approval_id" >/dev/null
-    unset token
-    wait "$message_pid" || code=$?
-    out="$(cat "$message_file")"
-    rm -f "$message_file"
-    if (( code != 0 )); then
-        echo "seed-invalid: approval resolution did not resume to a final reply" >&2
+    if ! CURIE_APPROVAL_PRINCIPAL_TOKEN="$token" "$BIN" --json "$tier" approvals "$agent_id" \
+        "${scope[@]}" --resolve "$approval_id" >/dev/null; then
+        unset token
+        kill "$message_pid" 2>/dev/null || true
+        wait "$message_pid" 2>/dev/null || true
+        rm -f "$message_file" "$message_stderr_file"
+        echo "seed-invalid: deterministic approval resolution command failed" >&2
         return 1
     fi
+    unset token
+    wait "$message_pid" || code=$?
+    if (( code != 0 )); then
+        approval_resume_failure_summary "$message_file" "$message_stderr_file" "$code" >&2
+        rm -f "$message_file" "$message_stderr_file"
+        echo "seed-invalid: approval resolution did not resume to a final reply (exit_code=$code)" >&2
+        return 1
+    fi
+    if ! out="$(cat "$message_file")"; then
+        rm -f "$message_file" "$message_stderr_file"
+        echo "seed-invalid: approval resume produced no readable private result artifact" >&2
+        return 1
+    fi
+    rm -f "$message_file" "$message_stderr_file"
     assert_finalized_reply "$tier approval resume" "$out"
     stream_end="$(capture_stream_cursor "$tier")" || return 1
     trace_id="$(discover_trace_id_for_seed "$tier" "$marker" "$stream_start" "$stream_end")" || return 1
@@ -3477,12 +3589,17 @@ route_local_observability_to_product_collector() {
     unset OTEL_EXPORTER_OTLP_ENDPOINT OTEL_EXPORTER_OTLP_PROTOCOL
     local stale runner dispatcher=""
     # An already-running curie-runner inherited the disposable endpoint. Reap
-    # only this task-owned stack's scoped sandboxes so every later runner is
-    # freshly launched from the restored worker environment.
+    # exactly those emitters, rather than selecting on CURIE_RELEASE: that is a
+    # worker configuration key, not part of the runner's declared boot env, so
+    # it is absent from an actual Docker-substrate sandbox. LOCAL_OTEL_ENDPOINT
+    # is a per-run, task-owned Collector address; matching it keeps an
+    # unrelated sandbox (including a concurrent product-routed one) out of
+    # this recovery sweep while ensuring the post-restore assertion cannot
+    # accidentally inspect the pre-restore runner.
     if (( LOCAL_STACK_OWNED )); then
         while IFS= read -r runner; do
             [[ -n "$runner" ]] || continue
-            if [[ "$(container_env_value "$runner" CURIE_RELEASE)" == "curie" ]]; then
+            if [[ "$(container_env_value "$runner" OTEL_EXPORTER_OTLP_ENDPOINT)" == "$LOCAL_OTEL_ENDPOINT" ]]; then
                 docker rm -f "$runner" >/dev/null
             fi
         done < <(docker ps --filter "label=$SANDBOX_LABEL" --format '{{.Names}}')
@@ -3855,7 +3972,10 @@ rung_local() {
         echo "note: the reused stack's model mode was fixed by whoever ran \`local up\`; it is verified below against this run's mode, and a mismatch fails this rung."
     else
         echo
-        local up_args=(local up)
+        # local up is deliberately pinned to this checkout and builds the
+        # candidate services; a release-channel binary otherwise resolves its
+        # cached release compose and silently tests published images.
+        local up_args=(local up -f "$REPO_ROOT/compose.dev.yaml" --build)
         echo "=== curie ${up_args[*]} ==="
         # The observability query proof below reads traces and metrics through
         # the Curie API. Those routes require Langfuse/ClickHouse, so every
@@ -4038,7 +4158,7 @@ PY
     if (( LOCAL_STACK_OWNED )); then
         echo
         echo "=== curie local down ==="
-        "$BIN" local down
+        "$BIN" local down -f "$REPO_ROOT/compose.dev.yaml"
         LOCAL_STACK_OWNED=0
         stop_local_otel_sink
 

@@ -905,7 +905,7 @@ fn live_local_rung_grades_the_deployed_weather_cases() {
     );
     assert!(
         local_rung
-            .contains("local up_args=(local up)\n        echo \"=== curie ${up_args[*]} ===\""),
+            .contains("local up_args=(local up -f \"$REPO_ROOT/compose.dev.yaml\" --build)\n        echo \"=== curie ${up_args[*]} ===\""),
         "the local rung must start the full profile required by its \
          observability query proof; ladder contents:\n{text}"
     );
@@ -1749,7 +1749,7 @@ print(json.dumps({
     "local up --minimal")
         echo "stub: compose stack up"
         ;;
-    "local up")
+    "local up -f "*/compose.dev.yaml" --build")
         echo "stub: full compose stack up"
         ;;
     "--json local deploy --plugin-dir "*)
@@ -1840,7 +1840,7 @@ print(json.dumps({
         fi
         exit "${STUB_EVAL_EXIT:-0}"
         ;;
-    "local down")
+    "local down -f "*/compose.dev.yaml)
         echo "stub: compose stack down"
         ;;
     *)
@@ -2169,6 +2169,33 @@ fn invocation_count(invocations: &str, expected: &str) -> usize {
     invocations.lines().filter(|line| *line == expected).count()
 }
 
+/// The local rung must boot the current source tree rather than the release
+/// compose resolved by the candidate binary. The compose file and `--build`
+/// are both load-bearing parts of this argv.
+fn is_current_source_local_up(invocation: &str) -> bool {
+    let args = invocation.split_whitespace().collect::<Vec<_>>();
+    args.len() == 5
+        && args[..3] == ["local", "up", "-f"]
+        && args[3].ends_with("/compose.dev.yaml")
+        && args[4] == "--build"
+}
+
+/// Teardown must target the same current-source compose file that the rung
+/// brought up; an unqualified `local down` could select a release compose.
+fn is_current_source_local_down(invocation: &str) -> bool {
+    let args = invocation.split_whitespace().collect::<Vec<_>>();
+    args.len() == 4
+        && args[..3] == ["local", "down", "-f"]
+        && args[3].ends_with("/compose.dev.yaml")
+}
+
+fn current_source_local_down_count(invocations: &str) -> usize {
+    invocations
+        .lines()
+        .filter(|line| is_current_source_local_down(line))
+        .count()
+}
+
 fn looks_like_utc_second(value: &str) -> bool {
     let bytes = value.as_bytes();
     bytes.len() == 20
@@ -2376,12 +2403,12 @@ fn ladder_selects_platform_trajectory_eval_without_overriding_deployed_cases() {
         .lines()
         .filter(|line| line.starts_with("local up"))
         .collect::<Vec<_>>();
-    assert_eq!(trajectory_starts, ["local up"], "{trajectory_invocations}");
+    assert_eq!(trajectory_starts.len(), 1, "{trajectory_invocations}");
     assert!(
         trajectory_starts
             .iter()
-            .all(|line| !line.contains("--minimal")),
-        "trajectory scoring requires the full local profile: {trajectory_invocations}"
+            .all(|line| is_current_source_local_up(line)),
+        "trajectory scoring requires current-source compose.dev.yaml with --build, never --minimal: {trajectory_invocations}"
     );
     for tier in ["local", "cluster"] {
         assert!(
@@ -2415,9 +2442,15 @@ fn ladder_selects_platform_trajectory_eval_without_overriding_deployed_cases() {
         .filter(|line| line.starts_with("local up"))
         .collect::<Vec<_>>();
     assert_eq!(
-        ordinary_starts,
-        ["local up"],
-        "the local rung's observability query proof requires the full profile even when the suite has no trajectory sidecar: {ordinary_invocations}"
+        ordinary_starts.len(),
+        1,
+        "the local rung's observability query proof requires one current-source boot even when the suite has no trajectory sidecar: {ordinary_invocations}"
+    );
+    assert!(
+        ordinary_starts
+            .iter()
+            .all(|line| is_current_source_local_up(line)),
+        "the local rung's observability query proof must pin compose.dev.yaml and --build even when the suite has no trajectory sidecar: {ordinary_invocations}"
     );
 }
 
@@ -2439,18 +2472,23 @@ fn local_rung_proves_observability_queries_with_real_candidate_verbs() {
         unavailable_called,
         "the local rung must actually move CURIE_API_URL to the closed-loopback control and exercise the unavailable-API path through the candidate CLI; invocations:\n{invocations}"
     );
+    let local_starts = invocations
+        .lines()
+        .filter(|line| line.starts_with("local up"))
+        .collect::<Vec<_>>();
     assert_eq!(
-        invocations
-            .lines()
-            .filter(|line| line.starts_with("local up"))
-            .collect::<Vec<_>>(),
-        ["local up"],
-        "observability proof requires the full local profile, never --minimal; invocations:\n{invocations}"
+        local_starts.len(),
+        1,
+        "observability proof requires exactly one local boot, never an additional minimal or release-compose boot; invocations:\n{invocations}"
+    );
+    assert!(
+        local_starts.iter().all(|line| is_current_source_local_up(line)),
+        "observability proof requires current-source compose.dev.yaml with --build, never --minimal; invocations:\n{invocations}"
     );
     assert_eq!(
-        invocation_count(&invocations, "local down"),
+        current_source_local_down_count(&invocations),
         1,
-        "a successful rung must tear down the one stack it claimed exactly once; invocations:\n{invocations}"
+        "a successful rung must tear down the one current-source stack it claimed exactly once; invocations:\n{invocations}"
     );
 }
 
@@ -2526,9 +2564,9 @@ fn local_observability_negative_controls_are_falsifiable() {
             "{variable} exercised the wrong unavailable-API path"
         );
         assert_eq!(
-            invocation_count(&invocations, "local down"),
+            current_source_local_down_count(&invocations),
             1,
-            "the owner-scoped EXIT trap must tear down {variable}; invocations:\n{invocations}"
+            "the owner-scoped EXIT trap must tear down {variable} through compose.dev.yaml; invocations:\n{invocations}"
         );
     }
 }

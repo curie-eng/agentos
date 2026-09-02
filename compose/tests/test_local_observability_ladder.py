@@ -211,7 +211,9 @@ def test_local_ladder_owns_a_real_queryable_otlp_sink() -> None:
     # The sink has to exist before `local up`, because service startup telemetry
     # and the ingress root are part of the proof. The query belongs after the
     # real turn finalized, not beside static compose/config assertions.
-    assert rung.index("start_local_otel_sink") < rung.index("local up)")
+    local_up = 'local up -f "$REPO_ROOT/compose.dev.yaml" --build'
+    assert local_up in rung, "the local rung must build the current compose source"
+    assert rung.index("start_local_otel_sink") < rung.index(local_up)
     assert rung.index("assert_local_otel_healthy_turn") > rung.index(
         'assert_finalized_reply "local"'
     )
@@ -656,6 +658,89 @@ def test_ordinary_mcp_and_approval_seeds_have_independent_receipts() -> None:
         assert forbidden not in receipt.lower(), (
             "public evidence may expose only an aggregate MCP call count"
         )
+
+
+def test_approval_resume_failure_evidence_is_bounded_and_private_artifacts_are_cleaned(
+    tmp_path: Path,
+) -> None:
+    """A failed background approval turn reports only a safe terminal verdict."""
+
+    source = LADDER_PATH.read_text()
+    approval = _shell_function(source, "seed_approval_resume_turn")
+    summary = _shell_function(source, "approval_resume_failure_summary")
+
+    assert 'message_stderr_file="$(mktemp "$WORKDIR/approval-message-stderr.XXXXXX")"' in approval
+    assert '2> "$message_stderr_file" &' in approval
+    assert (
+        'approval_resume_failure_summary "$message_file" "$message_stderr_file" "$code" >&2'
+        in approval
+    )
+    for cleanup in (
+        'rm -f "$message_file" "$message_stderr_file" "$token_file" "$pending_file"',
+        'rm -f "$message_file" "$message_stderr_file" "$pending_file"',
+        'rm -f "$message_file" "$message_stderr_file"',
+    ):
+        assert cleanup in approval, (
+            "every post-allocation approval failure path must remove the private "
+            "stdout and stderr artifacts"
+        )
+
+    private_stdout = tmp_path / "approval-message"
+    private_stderr = tmp_path / "approval-message-stderr"
+    private_stdout.write_text(
+        json.dumps(
+            {
+                "awaiting_approval": True,
+                "finalized": False,
+                "reply": "PRIVATE_REPLY_SENTINEL",
+                "error": "PRIVATE_TOKEN_SENTINEL",
+            }
+        )
+    )
+    private_stderr.write_text("timed out PRIVATE_STDERR_SENTINEL")
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            summary + '\napproval_resume_failure_summary "$1" "$2" 23\n',
+            "bash",
+            str(private_stdout),
+            str(private_stderr),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "exit_code=23" in result.stdout
+    assert "status=awaiting_approval" in result.stdout
+    assert "finalized=false" in result.stdout
+    assert "error_category=error_field" in result.stdout
+    assert "stderr_category=timed_out" in result.stdout
+    assert "PRIVATE_REPLY_SENTINEL" not in result.stdout + result.stderr
+    assert "PRIVATE_TOKEN_SENTINEL" not in result.stdout + result.stderr
+    assert "PRIVATE_STDERR_SENTINEL" not in result.stdout + result.stderr
+
+    private_stdout.write_text("PRIVATE_PARSE_SENTINEL")
+    private_stderr.write_text("could not parse PRIVATE_PARSE_STDERR_SENTINEL")
+    parse_result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            summary + '\napproval_resume_failure_summary "$1" "$2" 24\n',
+            "bash",
+            str(private_stdout),
+            str(private_stderr),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert parse_result.returncode == 0, parse_result.stderr
+    assert "status=parse_failure" in parse_result.stdout
+    assert "stderr_category=parse_failure" in parse_result.stdout
+    assert "PRIVATE_PARSE_SENTINEL" not in parse_result.stdout + parse_result.stderr
+    assert "PRIVATE_PARSE_STDERR_SENTINEL" not in parse_result.stdout + parse_result.stderr
 
 
 def test_product_collector_restore_restarts_and_verifies_every_seed_emitter() -> None:

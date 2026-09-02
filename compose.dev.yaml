@@ -92,6 +92,8 @@ services:
     image: valkey/valkey:8-alpine
     profiles: *core_profiles
     command: ["valkey-server", "--requirepass", "${VALKEY_PASSWORD:-valkeypass}"]
+    environment:
+      VALKEY_PASSWORD: ${VALKEY_PASSWORD:-valkeypass}
     ports:
       - "26379:6379"
     volumes:

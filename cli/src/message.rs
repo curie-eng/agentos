@@ -569,8 +569,12 @@ async fn await_cluster_relay(
                 });
             }
             if awaiting_approval {
+                let approval_id = latest.as_deref().and_then(parse_approval_id);
                 return Ok(ClusterRelayObservation {
-                    outcome: Outcome::AwaitingApproval(latest),
+                    outcome: Outcome::AwaitingApproval {
+                        reply: latest,
+                        approval_id,
+                    },
                     next_cursor: cursor,
                 });
             }
@@ -1757,7 +1761,7 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
             persist_and_hint(&opts, TurnVerb::Local, &channel, &thread_ts);
             Ok(())
         }
-        Outcome::AwaitingApproval(reply) => {
+        Outcome::AwaitingApproval { reply, approval_id } => {
             step.done("awaiting approval");
             // Persist the turn context BEFORE the (possibly full --timeout-secs)
             // approval wait: if the operator interrupts or the terminal closes
@@ -1767,10 +1771,10 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
             persist_turn_quietly(&opts, TurnVerb::Local, &channel, &thread_ts);
             // Keep the stub alive and wait for the resumed reply instead of
             // exiting and stranding it (#766). The wait rides the Valkey
-            // connection already open for the enqueue, so the only degradation is
-            // a placeholder notice we cannot parse an approval id from -- then
-            // fall back to the terminal.
-            match parse_approval_id(reply.as_deref().unwrap_or_default()) {
+            // connection already open for the enqueue. The explicit id normally
+            // comes from the card and falls back to the route-bound notice; if
+            // neither carries a valid UUID, report the parked terminal.
+            match approval_id {
                 Some(id) => {
                     let remaining = Duration::from_secs(opts.timeout_secs)
                         .saturating_sub(wait_started.elapsed());
@@ -2226,11 +2230,14 @@ async fn resume_after_approval(
                 persist_and_hint(opts, verb, channel, thread_ts);
                 return ResumeExit::Done;
             }
-            Outcome::AwaitingApproval(new_reply) => {
+            Outcome::AwaitingApproval {
+                reply: new_reply,
+                approval_id,
+            } => {
                 // The RESUMED turn hit a NEW gate of its own. Keep waiting on ITS
                 // resume entry rather than exiting and dropping the stub -- exiting
                 // here would re-create the dead-endpoint bug for the nested gate.
-                match parse_approval_id(new_reply.as_deref().unwrap_or_default()) {
+                match approval_id {
                     Some(new_id) => {
                         current_id = new_id;
                         last_reply = new_reply;
@@ -2392,8 +2399,11 @@ async fn resume_cluster_after_approval(
                 persist_and_hint(opts, TurnVerb::Cluster, channel, thread_ts);
                 return Ok(ResumeExit::Done);
             }
-            Outcome::AwaitingApproval(new_reply) => {
-                if let Some(new_id) = parse_approval_id(new_reply.as_deref().unwrap_or_default()) {
+            Outcome::AwaitingApproval {
+                reply: new_reply,
+                approval_id,
+            } => {
+                if let Some(new_id) = approval_id {
                     current_id = new_id;
                     last_reply = new_reply;
                     continue;
@@ -2988,7 +2998,7 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
             persist_and_hint(&opts, TurnVerb::Cluster, &channel, &thread_ts);
             Ok(())
         }
-        Outcome::AwaitingApproval(reply) => {
+        Outcome::AwaitingApproval { reply, approval_id } => {
             step.done("awaiting approval");
             // Persist the turn context BEFORE the (possibly full --timeout-secs)
             // approval wait, so an interrupted terminal still leaves a thread
@@ -2997,7 +3007,7 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
             persist_turn_quietly(&opts, TurnVerb::Cluster, &channel, &thread_ts);
             // The API resume queue preserves this turn's reply handle, so keep
             // polling the same opaque bucket through any approval resolution.
-            match parse_approval_id(reply.as_deref().unwrap_or_default()) {
+            match approval_id {
                 Some(id) => {
                     let remaining = Duration::from_secs(opts.timeout_secs)
                         .saturating_sub(wait_started.elapsed());
@@ -3184,14 +3194,16 @@ pub fn reply_passes(case: &EvalCase, outcome: &Outcome) -> bool {
             // here and fails closed. The trajectory-aware grade lives on the
             // `skill eval` path (`turn_passes`) and the server-side eval matrix.
             Outcome::Replied(reply) => case.grader.grade(reply, &[]),
-            Outcome::CompletedNoEdit | Outcome::AwaitingApproval(_) | Outcome::TimedOut => false,
+            Outcome::CompletedNoEdit | Outcome::AwaitingApproval { .. } | Outcome::TimedOut => {
+                false
+            }
         },
         // Gate-blocked assertion: the turn must have parked awaiting approval, and
         // the latest placeholder text (the model's narration before the gate flip)
         // must satisfy the grader. A match-anything grader ({kind:contains,expected:""})
         // asserts purely on the gate holding.
         ExpectedStatus::AwaitingApproval => match outcome {
-            Outcome::AwaitingApproval(reply) => {
+            Outcome::AwaitingApproval { reply, .. } => {
                 case.grader.grade(reply.as_deref().unwrap_or_default(), &[])
             }
             Outcome::Replied(_) | Outcome::CompletedNoEdit | Outcome::TimedOut => false,
@@ -3384,14 +3396,16 @@ async fn run_eval_turns(
                 let elapsed = started.elapsed().as_secs_f64();
                 let output = match &outcome {
                     Outcome::Replied(reply) => reply.clone(),
-                    Outcome::AwaitingApproval(reply) => reply.clone().unwrap_or_default(),
+                    Outcome::AwaitingApproval { reply, .. } => reply.clone().unwrap_or_default(),
                     Outcome::CompletedNoEdit => String::new(),
                     Outcome::TimedOut => diagnostics(conn, &opts.stream, &stream_id).await,
                 };
                 let passed = reply_passes(case, &outcome);
                 let completed = matches!(
                     outcome,
-                    Outcome::Replied(_) | Outcome::AwaitingApproval(_) | Outcome::CompletedNoEdit
+                    Outcome::Replied(_)
+                        | Outcome::AwaitingApproval { .. }
+                        | Outcome::CompletedNoEdit
                 );
                 samples.push(crate::eval_sampling::SampleRecord {
                     outcome: if passed {
@@ -6740,7 +6754,10 @@ mod tests {
         // even if the card text happens to contain the expected token (#529).
         assert!(!reply_passes(
             &case,
-            &Outcome::AwaitingApproval(Some("pong pending approval".into()))
+            &Outcome::AwaitingApproval {
+                reply: Some("pong pending approval".into()),
+                approval_id: None,
+            }
         ));
     }
 
@@ -6754,9 +6771,18 @@ mod tests {
             eval_case_with_status(GraderKind::Contains, "", ExpectedStatus::AwaitingApproval);
         assert!(reply_passes(
             &case,
-            &Outcome::AwaitingApproval(Some("blocked the close".into()))
+            &Outcome::AwaitingApproval {
+                reply: Some("blocked the close".into()),
+                approval_id: None,
+            }
         ));
-        assert!(reply_passes(&case, &Outcome::AwaitingApproval(None)));
+        assert!(reply_passes(
+            &case,
+            &Outcome::AwaitingApproval {
+                reply: None,
+                approval_id: None,
+            }
+        ));
         // The agent merely replied -> the gate did not hold -> RED.
         assert!(!reply_passes(
             &case,
