@@ -196,6 +196,21 @@ OBSERVABILITY_UNAVAILABLE_API_URL="http://127.0.0.1:1"
 OBSERVABILITY_POLL_ATTEMPTS=60
 OBSERVABILITY_POLL_INTERVAL_SECONDS=2
 
+# #2204 product correlation proof. Cluster product mode is intentionally
+# query-only: an operator installs a private release and loads task images
+# before invoking the ladder. The script refuses the shared defaults and never
+# installs, upgrades, uninstalls, or deletes cluster state in this mode.
+PRODUCT_OBSERVABILITY="${CURIE_E2E_PRODUCT_OBSERVABILITY:-0}"
+MCP_RECEIPT_FIXTURE="$REPO_ROOT/cli/scripts/fixtures/mcp-receipt"
+MCP_RECEIPT_CONNECTOR="mcp-receipt"
+MCP_RECEIPT_ALIAS=""
+MCP_RECEIPT_IMAGE=""
+LAST_ORDINARY_TRACE_ID=""
+LAST_MCP_TRACE_ID=""
+LAST_APPROVAL_TRACE_ID=""
+LOCAL_PRODUCT_EVIDENCE=""
+CLUSTER_PRODUCT_EVIDENCE=""
+
 # The component label every connector container carries, in both the skill start
 # path and the local compose overlay (cli/src/docker.rs
 # CONNECTOR_COMPONENT_LABEL). Teardown reaps by label, so this is the only
@@ -293,6 +308,8 @@ fi
 "$BIN" --version
 
 WORKDIR="$(mktemp -d)"
+LOCAL_PRODUCT_EVIDENCE="$WORKDIR/product-observability-local.json"
+CLUSTER_PRODUCT_EVIDENCE="$WORKDIR/product-observability-cluster.json"
 cleanup() {
     # Capture the real exit code FIRST: a teardown command that fails must not
     # turn a red run green, and a successful teardown must not mask a red rung.
@@ -349,6 +366,14 @@ cleanup() {
             echo "sweeping stranded connector container $survivor"
             docker rm -f "$survivor" >/dev/null 2>&1
         done
+    fi
+    if [[ -n "$MCP_RECEIPT_ALIAS" ]]; then
+        local receipt_container
+        receipt_container="$(connector_container_for_alias "$MCP_RECEIPT_ALIAS" 2>/dev/null)" || receipt_container=""
+        if [[ -n "$receipt_container" ]]; then
+            echo "sweeping stranded MCP receipt connector"
+            docker rm -f "$receipt_container" >/dev/null 2>&1
+        fi
     fi
     rm -rf "$WORKDIR"
     exit "$code"
@@ -523,6 +548,440 @@ print(start.strftime("%Y-%m-%dT%H:%M:%SZ"), end.strftime("%Y-%m-%dT%H:%M:%SZ"))
     echo "local observability metrics: captured explicit UTC window $OBSERVABILITY_START through $OBSERVABILITY_END around the just-completed local turn"
 }
 
+# Execute a read-only Valkey command against the product runs stream. Passwords
+# stay inside the selected container/pod and no command output is logged.
+product_stream_json() {
+    local tier="$1"
+    shift
+    case "$tier" in
+        local)
+            local valkey
+            valkey="$(docker ps \
+                --filter 'label=com.docker.compose.project=curie' \
+                --filter 'label=com.docker.compose.service=valkey' \
+                --format '{{.Names}}')"
+            [[ -n "$valkey" && "$valkey" != *$'\n'* ]] || {
+                echo "seed-invalid: expected exactly one product Valkey container" >&2
+                return 1
+            }
+            docker exec "$valkey" sh -c \
+                'VALKEYCLI_AUTH="${VALKEY_PASSWORD:-}" exec valkey-cli --json "$@"' \
+                sh "$@"
+            ;;
+        cluster)
+            local pod
+            pod="$(kubectl -n "$CURIE_NAMESPACE" get pods \
+                -l "app.kubernetes.io/instance=$CURIE_RELEASE,app.kubernetes.io/name=valkey" \
+                -o json | python3 -c '
+import json, sys
+ready = []
+for item in json.load(sys.stdin).get("items", []):
+    conditions = item.get("status", {}).get("conditions", [])
+    if any(c.get("type") == "Ready" and c.get("status") == "True" for c in conditions):
+        ready.append(item["metadata"]["name"])
+if len(ready) != 1:
+    raise SystemExit("expected exactly one Ready product Valkey pod")
+print(ready[0])
+')" || return 1
+            kubectl -n "$CURIE_NAMESPACE" exec "$pod" -- sh -c \
+                'VALKEYCLI_AUTH="${VALKEY_PASSWORD:-}" exec valkey-cli --json "$@"' \
+                sh "$@"
+            ;;
+        *)
+            echo "seed-invalid: unknown product stream tier" >&2
+            return 1
+            ;;
+    esac
+}
+
+capture_stream_cursor() {
+    local tier="$1" result
+    result="$(product_stream_json "$tier" XREVRANGE curie:runs + - COUNT 1)" || return 1
+    printf '%s' "$result" | python3 -c '
+import json, sys
+rows = json.load(sys.stdin)
+if not rows:
+    print("0-0")
+elif len(rows) == 1 and isinstance(rows[0], list) and isinstance(rows[0][0], str):
+    print(rows[0][0])
+else:
+    raise SystemExit("seed-invalid: malformed bounded stream cursor response")
+'
+}
+
+# Locate this seed's exact stream entry between two cursors, then extract only
+# the adjacent W3C carrier's 32-hex trace id. The private XRANGE slice is mode
+# 0600 and is deleted without ever being echoed, so payload and traceparent
+# bytes cannot enter public evidence.
+discover_trace_id_for_seed() {
+    local tier="$1" marker="$2" stream_start="$3" stream_end="$4"
+    local private_slice trace_id
+    umask 077
+    private_slice="$(mktemp "$WORKDIR/seed-stream.XXXXXX")"
+    if [[ -z "$marker" || -z "$stream_start" || -z "$stream_end" ]]; then
+        rm -f "$private_slice"
+        echo "seed-invalid: marker and bounded stream cursors are required" >&2
+        return 1
+    fi
+    product_stream_json "$tier" XRANGE curie:runs "($stream_start" "$stream_end" > "$private_slice" || {
+        rm -f "$private_slice"
+        return 1
+    }
+    trace_id="$(python3 - "$private_slice" "$marker" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+rows = json.loads(pathlib.Path(sys.argv[1]).read_text())
+marker = sys.argv[2]
+carrier = re.compile(r"^00-([0-9a-f]{32})-[0-9a-f]{16}-[0-9a-f]{2}$")
+
+def exact_marker(value):
+    if value == marker:
+        return True
+    if isinstance(value, dict):
+        return any(exact_marker(item) for item in value.values())
+    if isinstance(value, list):
+        return any(exact_marker(item) for item in value)
+    return False
+
+matches = []
+for row in rows:
+    if not isinstance(row, list) or len(row) != 2 or not isinstance(row[1], list):
+        raise SystemExit("seed-invalid: malformed bounded XRANGE entry")
+    fields = row[1]
+    if len(fields) % 2:
+        raise SystemExit("seed-invalid: malformed stream field pairs")
+    for index in range(0, len(fields), 2):
+        if fields[index] != "payload" or index + 3 >= len(fields):
+            continue
+        if fields[index + 2] != "traceparent":
+            continue
+        try:
+            payload = json.loads(fields[index + 1])
+        except (TypeError, json.JSONDecodeError):
+            continue
+        match = carrier.fullmatch(fields[index + 3]) if isinstance(fields[index + 3], str) else None
+        if exact_marker(payload) and match:
+            matches.append(match.group(1))
+matches = sorted(set(matches))
+if len(matches) != 1:
+    raise SystemExit("seed-invalid: exact marker did not select one adjacent carrier")
+print(matches[0])
+PY
+)" || {
+        rm -f "$private_slice"
+        return 1
+    }
+    rm -f "$private_slice"
+    [[ "$trace_id" =~ ^[0-9a-f]{32}$ ]] || {
+        echo "seed-invalid: selected carrier did not contain a 32-hex trace id" >&2
+        return 1
+    }
+    printf '%s' "$trace_id"
+}
+
+# Convert a private exact-detail response into the sole public trace evidence.
+# Explicitly private source fields (input, output, session, user, headers) are
+# ignored. Operation names are reduced to a code-owned allowlist.
+sanitize_exact_trace_read() {
+    local trace_id="$1" private_read="$2" expected_csv="${3:-}" expected_decision="${4:-}"
+    python3 - "$trace_id" "$private_read" "$expected_csv" "$expected_decision" <<'PY'
+import json
+import pathlib
+import sys
+
+trace_id, source, expected_csv, expected_decision = sys.argv[1:5]
+value = json.loads(pathlib.Path(source).read_text())
+trace = value.get("trace") if isinstance(value, dict) else None
+tree = value.get("tree") if isinstance(value, dict) else None
+if not isinstance(trace, dict) or trace.get("id") != trace_id or not isinstance(tree, list):
+    raise SystemExit("exact trace response did not match the requested id and tree shape")
+
+private_fields = {"input", "output", "session", "user", "headers"}
+safe_operations = {
+    "curie.queue.enqueue", "curie.queue.process", "curie.turn.process",
+    "curie.sandbox.claim", "curie.runner.rpc", "agent.run", "execute_tool",
+    "curie.reply.post", "curie.reply.update", "curie.slack.receipt",
+    "curie.approval.wait", "curie.approval.resolve", "curie.approval.resume",
+    "approval.wait", "approval.resolve", "approval.resume",
+    }
+operations = []
+types = set()
+observation_count = [0]
+
+def walk(node):
+    if not isinstance(node, dict):
+        raise SystemExit("exact trace tree contains a non-object node")
+    # Deliberately never dereference values in private_fields.
+    if private_fields.intersection(node):
+        pass
+    observation_count[0] += 1
+    name = node.get("name")
+    kind = node.get("type")
+    if name in safe_operations:
+        operations.append(name)
+    if isinstance(kind, str) and kind.upper() in {"SPAN", "GENERATION", "EVENT"}:
+        types.add(kind.upper())
+    children = node.get("children")
+    if not isinstance(children, list):
+        raise SystemExit("exact trace node omitted its child array")
+    for child in children:
+        walk(child)
+
+for root in tree:
+    walk(root)
+expected = [item for item in expected_csv.split(",") if item]
+missing = [item for item in expected if not any(candidate in operations for candidate in item.split("|"))]
+if missing:
+    raise SystemExit("exact trace omitted required allowlisted operations")
+decision = value.get("approval_decision")
+if decision is not None and decision not in {"approved", "rejected", "expired"}:
+    raise SystemExit("exact trace carried a non-allowlisted approval decision")
+if expected_decision and decision != expected_decision:
+    raise SystemExit("exact trace carried the wrong approval decision")
+
+service = []
+if any(op == "curie.queue.enqueue" for op in operations):
+    service.append("curie-dispatcher")
+if any(op.startswith("curie.queue.") or op.startswith("curie.turn.") or op.startswith("curie.sandbox.") or op.startswith("curie.approval.") for op in operations):
+    service.append("curie-worker")
+if any(op in {"curie.runner.rpc", "agent.run", "execute_tool"} for op in operations):
+    service.append("curie-runner")
+sanitized = {
+    "trace_id": trace_id,
+    "service": sorted(set(service)),
+    "operation": sorted(set(operations)),
+    "observation_count": observation_count[0],
+    "observation_type": sorted(types),
+    "approval_decision": decision,
+    }
+allowed_evidence_fields = {
+    "trace_id", "service", "operation", "observation_count",
+    "observation_type", "approval_decision",
+    }
+if set(sanitized) != allowed_evidence_fields:
+    raise SystemExit("sanitized evidence field set drifted")
+print(json.dumps(sanitized, sort_keys=True, separators=(",", ":")))
+PY
+}
+
+# Query one exact ID only. Raw CLI output remains in a mode-0600 file and only
+# sanitize_exact_trace_read reaches stdout.
+query_exact_seed_trace() {
+    local tier="$1" trace_id="$2" expected_csv="${3:-}" expected_decision="${4:-}" expected_state="${5:-present}"
+    local attempt code=0 private_read safe_read
+    umask 077
+    private_read="$(mktemp "$WORKDIR/exact-trace.XXXXXX")"
+    safe_read="$(mktemp "$WORKDIR/safe-trace.XXXXXX")"
+    [[ "$trace_id" =~ ^[0-9a-f]{32}$ ]] || {
+        rm -f "$private_read" "$safe_read"
+        echo "seed-invalid: exact trace id is not 32 lowercase hex characters" >&2
+        return 1
+    }
+    for attempt in $(seq 1 "$OBSERVABILITY_POLL_ATTEMPTS"); do
+        code=0
+        if [[ "$tier" == "local" ]]; then
+            "$BIN" --json local observability run "$trace_id" > "$private_read" 2>/dev/null || code=$?
+        elif [[ "$tier" == "cluster" ]]; then
+            "$BIN" --json cluster observability --namespace "$CURIE_NAMESPACE" \
+                --release "$CURIE_RELEASE" run "$trace_id" > "$private_read" 2>/dev/null || code=$?
+        else
+            rm -f "$private_read" "$safe_read"
+            echo "seed-invalid: exact trace query tier is unknown" >&2
+            return 1
+        fi
+        if [[ "$expected_state" == "absent" ]]; then
+            rm -f "$private_read" "$safe_read"
+            if (( code == 1 )); then
+                echo "exact trace temporarily absent as required"
+                return 0
+            fi
+            echo "exact trace was queryable while the exporter was required to be failing" >&2
+            return 1
+        fi
+        if (( code == 0 )) && sanitize_exact_trace_read "$trace_id" "$private_read" "$expected_csv" "$expected_decision" > "$safe_read"; then
+            cat "$safe_read"
+            rm -f "$private_read" "$safe_read"
+            return 0
+        fi
+        if (( attempt < OBSERVABILITY_POLL_ATTEMPTS )); then
+            sleep "$OBSERVABILITY_POLL_INTERVAL_SECONDS"
+        fi
+    done
+    rm -f "$private_read" "$safe_read"
+    echo "exact trace did not become queryable inside the bounded ingestion poll" >&2
+    return 1
+}
+
+seed_ordinary_turn() {
+    local tier="$1" agent_id="${2:-}" marker="curie-seed-ordinary-$$-$RANDOM"
+    local stream_start stream_end out trace_id expected_operations=""
+    if [[ -z "$marker" || "$tier" != "local" && "$tier" != "cluster" ]]; then
+        echo "seed-invalid: ordinary seed precondition failed before telemetry" >&2
+        return 1
+    fi
+    if [[ -n "${STUB_STATE:-}" ]]; then
+        trace_id="${STUB_OBSERVABILITY_TRACE_ID:-}"
+        [[ "$trace_id" =~ ^[0-9a-f]{32}$ ]] || {
+            echo "seed-invalid: stub exact trace id is absent" >&2
+            return 1
+        }
+    else
+        stream_start="$(capture_stream_cursor "$tier")" || return 1
+        if [[ "$tier" == "local" ]]; then
+            out="$("$BIN" --json local message --channel C0LOCALDEV "ordinary correlation $marker" || true)"
+        else
+            out="$("$BIN" --json cluster message --namespace "$CURIE_NAMESPACE" \
+                --release "$CURIE_RELEASE" "ordinary correlation $marker" || true)"
+        fi
+        assert_finalized_reply "$tier ordinary correlation" "$out"
+        if [[ "$tier" == "local" ]]; then
+            assert_product_runner_endpoints
+        fi
+        stream_end="$(capture_stream_cursor "$tier")" || return 1
+        [[ "$stream_end" != "$stream_start" ]] || {
+            echo "seed-invalid: ordinary seed produced no bounded stream receipt" >&2
+            return 1
+        }
+        trace_id="$(discover_trace_id_for_seed "$tier" "$marker" "$stream_start" "$stream_end")" || return 1
+        expected_operations="curie.queue.enqueue,curie.queue.process,curie.turn.process,curie.sandbox.claim,curie.runner.rpc,agent.run,curie.reply.post|curie.reply.update"
+    fi
+    query_exact_seed_trace "$tier" "$trace_id" "$expected_operations"
+    LAST_ORDINARY_TRACE_ID="$trace_id"
+    printf '%s' "$trace_id"
+}
+
+seed_mcp_read_turn() {
+    local tier="$1" agent_id="${2:-}" agent_name="${3:-}" marker="curie-seed-mcp-$$-$RANDOM"
+    local stream_start stream_end out trace_id before_count after_count alias release namespace
+    if [[ "$LIVE" != "1" || -z "$agent_name" || -z "$marker" ]]; then
+        echo "seed-invalid: MCP read seed needs live mode, a deployed agent, and a marker before telemetry" >&2
+        return 1
+    fi
+    if [[ "$tier" == "local" ]]; then
+        local worker
+        worker="$(local_worker_container)"
+        release="$(container_env_value "$worker" CURIE_RELEASE)"
+        namespace="$(container_env_value "$worker" CURIE_NAMESPACE)"
+    else
+        release="$CURIE_RELEASE"
+        namespace="$CURIE_NAMESPACE"
+    fi
+    alias="$(connector_object_name "$release" "$agent_name" "$MCP_RECEIPT_CONNECTOR").$namespace.svc.cluster.local"
+    MCP_RECEIPT_ALIAS="$alias"
+    before_count="$(mcp_receipt_call_count "$tier" "$alias")" || return 1
+    stream_start="$(capture_stream_cursor "$tier")" || return 1
+    if [[ "$tier" == "local" ]]; then
+        out="$("$BIN" --json local message --channel C0LOCALDEV \
+            "Call the receipt_read tool exactly once, then answer receipt complete. $marker" || true)"
+    else
+        out="$("$BIN" --json cluster message --namespace "$CURIE_NAMESPACE" \
+            --release "$CURIE_RELEASE" \
+            "Call the receipt_read tool exactly once, then answer receipt complete. $marker" || true)"
+    fi
+    assert_finalized_reply "$tier MCP correlation" "$out"
+    after_count="$(mcp_receipt_call_count "$tier" "$alias")" || return 1
+    if (( after_count != before_count + 1 )); then
+        echo "seed-invalid: MCP seed did not produce exactly one independent call receipt" >&2
+        return 1
+    fi
+    echo "MCP receipt call count delta=1"
+    stream_end="$(capture_stream_cursor "$tier")" || return 1
+    trace_id="$(discover_trace_id_for_seed "$tier" "$marker" "$stream_start" "$stream_end")" || return 1
+    query_exact_seed_trace "$tier" "$trace_id" "execute_tool"
+    LAST_MCP_TRACE_ID="$trace_id"
+    printf '%s' "$trace_id"
+}
+
+seed_approval_resume_turn() {
+    local tier="$1" agent_id="${2:-}" marker="curie-seed-approval-$$-$RANDOM"
+    local stream_start stream_end message_file token_file pending_file approval_id token out trace_id
+    local message_pid code=0 attempt
+    if [[ "$LIVE" == "1" || -z "$agent_id" || -z "$marker" ]]; then
+        echo "seed-invalid: deterministic approval seed needs fake mode and a deployed agent before telemetry" >&2
+        return 1
+    fi
+    umask 077
+    message_file="$(mktemp "$WORKDIR/approval-message.XXXXXX")"
+    token_file="$(mktemp "$WORKDIR/approval-token.XXXXXX")"
+    pending_file="$(mktemp "$WORKDIR/approval-pending.XXXXXX")"
+    local scope=()
+    if [[ "$tier" == "cluster" ]]; then
+        scope=(--namespace "$CURIE_NAMESPACE" --release "$CURIE_RELEASE")
+    fi
+    "$BIN" --json "$tier" approvals "$agent_id" "${scope[@]}" \
+        --route-resolution e2e=C0EXAMPLE1 --route-approvers e2e=users:U0EXAMPLE1 \
+        >/dev/null
+    "$BIN" --json "$tier" approvals "$agent_id" "${scope[@]}" \
+        --mint-operator-principal U0EXAMPLE1 > "$token_file"
+    token="$(python3 - "$token_file" <<'PY'
+import json, pathlib, sys
+value = json.loads(pathlib.Path(sys.argv[1]).read_text())
+token = value.get("operator_principal", {}).get("token")
+if not isinstance(token, str) or not token:
+    raise SystemExit("operator principal response omitted its token")
+print(token)
+PY
+)" || {
+        rm -f "$message_file" "$token_file" "$pending_file"
+        return 1
+    }
+    rm -f "$token_file"
+    stream_start="$(capture_stream_cursor "$tier")" || return 1
+    if [[ "$tier" == "local" ]]; then
+        "$BIN" --json local message --channel C0LOCALDEV --timeout-secs 120 \
+            "[fake:request-approval:e2e] approve correlation $marker" > "$message_file" 2>/dev/null &
+    else
+        "$BIN" --json cluster message --namespace "$CURIE_NAMESPACE" \
+            --release "$CURIE_RELEASE" --timeout-secs 120 \
+            "[fake:request-approval:e2e] approve correlation $marker" > "$message_file" 2>/dev/null &
+    fi
+    message_pid=$!
+    approval_id=""
+    for attempt in $(seq 1 60); do
+        if "$BIN" --json "$tier" approvals "$agent_id" "${scope[@]}" --list > "$pending_file" 2>/dev/null; then
+            approval_id="$(python3 - "$pending_file" <<'PY'
+import json, pathlib, sys
+value = json.loads(pathlib.Path(sys.argv[1]).read_text())
+rows = value.get("pending", [])
+matches = [row.get("id") for row in rows if row.get("status") == "pending" and row.get("route") == "e2e"]
+print(matches[0] if len(matches) == 1 and isinstance(matches[0], str) else "")
+PY
+)"
+            [[ -n "$approval_id" ]] && break
+        fi
+        sleep 1
+    done
+    rm -f "$pending_file"
+    if [[ -z "$approval_id" ]]; then
+        kill "$message_pid" 2>/dev/null || true
+        wait "$message_pid" 2>/dev/null || true
+        rm -f "$message_file"
+        echo "seed-invalid: awaiting-approval record did not become pending" >&2
+        return 1
+    fi
+    CURIE_APPROVAL_PRINCIPAL_TOKEN="$token" "$BIN" --json "$tier" approvals "$agent_id" \
+        "${scope[@]}" --resolve "$approval_id" >/dev/null
+    unset token
+    wait "$message_pid" || code=$?
+    out="$(cat "$message_file")"
+    rm -f "$message_file"
+    if (( code != 0 )); then
+        echo "seed-invalid: approval resolution did not resume to a final reply" >&2
+        return 1
+    fi
+    assert_finalized_reply "$tier approval resume" "$out"
+    stream_end="$(capture_stream_cursor "$tier")" || return 1
+    trace_id="$(discover_trace_id_for_seed "$tier" "$marker" "$stream_start" "$stream_end")" || return 1
+    query_exact_seed_trace "$tier" "$trace_id" \
+        "curie.approval.wait,curie.approval.resolve,curie.approval.resume,curie.reply.post|curie.reply.update" \
+        "approved"
+    LAST_APPROVAL_TRACE_ID="$trace_id"
+    printf '%s' "$trace_id"
+}
+
 # Langfuse ingestion is asynchronous to turn finalization. Poll through the
 # candidate CLI, never its backing API. Scan one bounded newest-first page and
 # select the newest complete row. The returned id is the sole input to the
@@ -530,10 +989,10 @@ print(start.strftime("%Y-%m-%dT%H:%M:%SZ"), end.strftime("%Y-%m-%dT%H:%M:%SZ"))
 # Correlation to this rung is proved independently by the explicit-window
 # metrics reads below; trace-list DTOs do not promise an agent identity field.
 discover_local_observability_trace() {
-    local attempt out code verdict state detail
+    local attempt out code verdict state detail limit=100
     DISCOVERED_OBSERVABILITY_TRACE_ID=""
     for attempt in $(seq 1 "$OBSERVABILITY_POLL_ATTEMPTS"); do
-        out="$("$BIN" --json local observability runs --limit 100)" && code=0 || code=$?
+        out="$("$BIN" --json local observability runs --limit "$limit")" && code=0 || code=$?
         if (( code != 0 )); then
             echo "local observability runs: bounded ingestion read exited $code, expected 0." >&2
             printf '%s\n' "$out" >&2
@@ -751,25 +1210,18 @@ else:
 }
 
 prove_local_observability_queries() {
-    local agent_id="$1" out code trace_id
+    local agent_id="$1" out code
 
     derive_observability_window
 
-    echo
-    echo "=== curie local observability runs --json (bounded ingestion poll) ==="
-    discover_local_observability_trace
-    trace_id="$DISCOVERED_OBSERVABILITY_TRACE_ID"
-
-    echo
-    echo "=== curie local observability run --json (discovered trace) ==="
-    out="$("$BIN" --json local observability run "$trace_id")" && code=0 || code=$?
-    if (( code != 0 )); then
-        echo "local observability run: discovered trace detail exited $code, expected 0." >&2
-        printf '%s\n' "$out" >&2
+    # seed_ordinary_turn has already made the only exact read through
+    # query_exact_seed_trace, whose sole public output comes from
+    # sanitize_exact_trace_read. Keeping the receipt here prevents metrics and
+    # negatives from running after a seed-invalid path.
+    if [[ ! "$LAST_ORDINARY_TRACE_ID" =~ ^[0-9a-f]{32}$ ]]; then
+        echo "local observability: ordinary exact-trace seed receipt is absent" >&2
         return 1
     fi
-    printf '%s\n' "$out"
-    assert_local_observability_detail "$trace_id" "$out"
 
     echo
     echo "=== curie local observability metrics --json (explicit UTC window) ==="
@@ -1450,6 +1902,26 @@ prepare_connector_bundle() {
     echo "connector fixture applied to $dir (connectors.yaml)"
 }
 
+# Add the independently countable, read-only MCP receipt server to a scratch
+# bundle. It goes through the ordinary connector build/lock path; no in-sandbox
+# file can be evidence because the sandbox is destroyed with the turn.
+prepare_mcp_receipt_bundle() {
+    local dir="$1"
+    local destination="$dir/connectors/mcp-receipt"
+    mkdir -p "$destination"
+    cp "$MCP_RECEIPT_FIXTURE/Dockerfile" "$MCP_RECEIPT_FIXTURE/server.py" "$destination/"
+    if [[ ! -f "$dir/connectors.yaml" ]]; then
+        printf '%s\n' 'connectors:' > "$dir/connectors.yaml"
+    fi
+    cat >> "$dir/connectors.yaml" <<'YAML'
+  mcp-receipt:
+    build:
+      context: connectors/mcp-receipt
+      platforms: [linux/amd64, linux/arm64]
+YAML
+    echo "MCP receipt fixture applied to $dir (fixtures/mcp-receipt)"
+}
+
 # One build before the first rung, so every rung consumes the same lock and the
 # bundle bytes each rung packs are identical (the PARITY_DIGEST assertion).
 #
@@ -1582,6 +2054,41 @@ connector_container_for_alias() {
         fi
     done < <(docker ps --filter "label=$CONNECTOR_LABEL" --format '{{.Names}}')
     return 1
+}
+
+# Read only the aggregate number of deterministic call markers. Neither the
+# marker lines nor any connector log payload is emitted into the evidence.
+mcp_receipt_call_count() {
+    local tier="$1" alias="$2" count=0 container pod
+    case "$tier" in
+        local)
+            container="$(connector_container_for_alias "$alias")" || {
+                echo "MCP receipt connector is not hosted at the expected alias" >&2
+                return 1
+            }
+            count="$(docker logs "$container" 2>&1 | awk '$0 == "MCP_RECEIPT tools/call" { count++ } END { print count + 0 }')"
+            ;;
+        cluster)
+            pod="$(kubectl -n "$CURIE_NAMESPACE" get pods \
+                -l "app.kubernetes.io/instance=$CURIE_RELEASE,curietech.ai/component=connector" \
+                -o json | python3 -c '
+import json, sys
+items = json.load(sys.stdin).get("items", [])
+want = sys.argv[1]
+matches = [item["metadata"]["name"] for item in items if want in item["metadata"]["name"]]
+if len(matches) != 1:
+    raise SystemExit("expected exactly one MCP receipt connector pod")
+print(matches[0])
+' "$MCP_RECEIPT_CONNECTOR")" || return 1
+            count="$(kubectl -n "$CURIE_NAMESPACE" logs "$pod" 2>/dev/null | awk '$0 == "MCP_RECEIPT tools/call" { count++ } END { print count + 0 }')"
+            ;;
+        *)
+            echo "unknown MCP receipt tier" >&2
+            return 1
+            ;;
+    esac
+    [[ "$count" =~ ^[0-9]+$ ]] || return 1
+    printf '%s' "$count"
 }
 
 # The MCP probe itself: an initialize / notifications/initialized / tools/list
@@ -2827,29 +3334,271 @@ restore_local_runner_health() {
     sleep 3
 }
 
+assert_product_collector_endpoint() {
+    local service="$1" container="$2" expected_endpoint="$3" expected_protocol="$4"
+    local endpoint protocol
+    endpoint="$(container_env_value "$container" OTEL_EXPORTER_OTLP_ENDPOINT)"
+    protocol="$(container_env_value "$container" OTEL_EXPORTER_OTLP_PROTOCOL)"
+    if [[ "$endpoint" != "$expected_endpoint" || "$protocol" != "$expected_protocol" ]]; then
+        echo "local observability: $service exporter does not target the shipped product Collector" >&2
+        return 1
+    fi
+    echo "local observability: $service exporter endpoint/protocol verified"
+}
+
+assert_product_runner_endpoints() {
+    local runners=() runner
+    while IFS= read -r runner; do
+        [[ -n "$runner" ]] && runners+=("$runner")
+    done < <(docker ps --filter "label=$SANDBOX_LABEL" --format '{{.Names}}')
+    (( ${#runners[@]} > 0 )) || {
+        echo "local observability: no actual curie-runner emitter survived long enough to inspect" >&2
+        return 1
+    }
+    for runner in "${runners[@]}"; do
+        assert_product_collector_endpoint curie-runner "$runner" \
+            "http://otel-collector:4318" "http/protobuf"
+    done
+}
+
 # The independent sink above proves raw telemetry crossed every service
 # boundary, but it deliberately replaces the product Collector endpoint. Once
-# those controls finish, put only the worker (and therefore newly spawned
-# runners) back on the shipped Collector so the API-backed #866 queries can
-# prove the product read path without changing the Collector configuration.
+# those controls finish, restore every actual emitter before seeding Langfuse.
 route_local_observability_to_product_collector() {
     if [[ -n "${STUB_STATE:-}" ]] || (( ! LOCAL_OTEL_SINK_ACTIVE )); then
         return 0
     fi
 
     unset OTEL_EXPORTER_OTLP_ENDPOINT OTEL_EXPORTER_OTLP_PROTOCOL
+    local stale runner dispatcher=""
+    # An already-running curie-runner inherited the disposable endpoint. Reap
+    # only this task-owned stack's scoped sandboxes so every later runner is
+    # freshly launched from the restored worker environment.
+    if (( LOCAL_STACK_OWNED )); then
+        while IFS= read -r runner; do
+            [[ -n "$runner" ]] || continue
+            if [[ "$(container_env_value "$runner" CURIE_RELEASE)" == "curie" ]]; then
+                docker rm -f "$runner" >/dev/null
+            fi
+        done < <(docker ps --filter "label=$SANDBOX_LABEL" --format '{{.Names}}')
+    fi
     docker compose --profile core --profile full -f "$REPO_ROOT/compose.dev.yaml" \
-        up -d --force-recreate --no-deps curie-worker >/dev/null
+        up -d --force-recreate --no-deps curie-api curie-worker >/dev/null
+    dispatcher="$(docker ps \
+        --filter 'label=com.docker.compose.project=curie' \
+        --filter 'label=com.docker.compose.service=curie-dispatcher' \
+        --format '{{.Names}}')"
+    if [[ -n "$dispatcher" ]]; then
+        docker compose --profile slack -f "$REPO_ROOT/compose.dev.yaml" \
+            up -d --force-recreate --no-deps curie-dispatcher >/dev/null
+    fi
     sleep 3
 
-    local worker endpoint
+    local api worker
+    api="$(docker ps --filter 'label=com.docker.compose.project=curie' \
+        --filter 'label=com.docker.compose.service=curie-api' --format '{{.Names}}')"
     worker="$(local_worker_container)"
-    endpoint="$(container_env_value "$worker" OTEL_EXPORTER_OTLP_ENDPOINT)"
-    if [[ "$endpoint" != "http://otel-collector:4318" ]]; then
-        echo "local observability: worker still targets '$endpoint', expected the product Collector." >&2
+    assert_product_collector_endpoint curie-api "$api" \
+        "http://otel-collector:4318" "http/protobuf"
+    assert_product_collector_endpoint curie-worker "$worker" \
+        "http://otel-collector:4318" "http/protobuf"
+    if [[ -n "$dispatcher" ]]; then
+        dispatcher="$(docker ps --filter 'label=com.docker.compose.project=curie' \
+            --filter 'label=com.docker.compose.service=curie-dispatcher' --format '{{.Names}}')"
+        assert_product_collector_endpoint curie-dispatcher "$dispatcher" \
+            "http://otel-collector:4318" "http/protobuf"
+    else
+        # curie local message launches the curie-dispatcher image after these
+        # exports are unset; the adjacent stream carrier and exact trace prove
+        # that actual one-shot emitter rather than a config-only assertion.
+        echo "local observability: curie-dispatcher one-shot will inherit product routing"
+    fi
+    # curie-runner is asserted after the first post-restore turn, when an
+    # actual sandbox emitter exists to inspect.
+    echo "local observability: curie-api, curie-dispatcher, curie-worker, and curie-runner routing restored"
+}
+
+product_collector_metric_value() {
+    local metric="$1"
+    curl -fsS http://127.0.0.1:28888/metrics | python3 -c '
+import re, sys
+name = sys.argv[1]
+total = 0.0
+for line in sys.stdin:
+    if re.match(r"^" + re.escape(name) + r"(?:\{|\s)", line):
+        total += float(line.rsplit(None, 1)[1])
+print(total)
+' "$metric"
+}
+
+wait_product_collector_ready() {
+    local attempt
+    for attempt in $(seq 1 60); do
+        if curl -fsS http://127.0.0.1:28888/metrics >/dev/null 2>&1; then
+            # The Collector's startup contract logs "Everything is ready";
+            # the live self-metrics endpoint is the stronger Ready probe.
+            return 0
+        fi
+        sleep 1
+    done
+    echo "product Collector did not become Ready" >&2
+    return 1
+}
+
+restart_local_product_collector() {
+    docker compose --profile full -f "$REPO_ROOT/compose.dev.yaml" \
+        up -d --force-recreate --no-deps otel-collector >/dev/null
+    wait_product_collector_ready
+}
+
+restore_local_langfuse_auth() {
+    local was_set="$1" original="$2"
+    if [[ "$was_set" == "1" ]]; then
+        export LANGFUSE_OTLP_AUTH_HEADER="$original"
+    else
+        unset LANGFUSE_OTLP_AUTH_HEADER
+    fi
+    restart_local_product_collector
+}
+
+# Exercise the pinned Langfuse exporter with temporary invalid auth while the
+# shipped retry_on_failure (5s/30s/5m) and sending_queue/file_storage settings
+# remain unchanged. The queue_size is 1000; no volume is removed.
+case_local_langfuse_invalid_auth() {
+    local INVALID_LANGFUSE_OTLP_AUTH_HEADER='Basic aW52YWxpZDppbnZhbGlk'
+    local agent_id="$1" original_set=0 original="${LANGFUSE_OTLP_AUTH_HEADER-}"
+    local receipt same_queued_trace_id queue_drained accepted accepted_before sent langfuse_web
+    local collector storage_directory
+    [[ ${LANGFUSE_OTLP_AUTH_HEADER+x} ]] && original_set=1
+    langfuse_web="$(docker compose --profile full -f "$REPO_ROOT/compose.dev.yaml" ps -q langfuse-web)"
+    [[ -n "$langfuse_web" ]] || {
+        echo "pinned langfuse-web is not running for the real exporter negative" >&2
+        return 1
+    }
+    storage_directory="$(python3 - "$REPO_ROOT/otel/collector-config.yaml" <<'PY'
+import pathlib, re, sys
+text = pathlib.Path(sys.argv[1]).read_text()
+required = {
+    "sending_queue": r"(?m)^\s*sending_queue:\s*$",
+    "file_storage": r"(?m)^\s*storage:\s*file_storage\s*$",
+    "queue_size": r"(?m)^\s*queue_size:\s*1000\s*$",
+    "retry_horizon": r"(?m)^\s*max_elapsed_time:\s*5m\s*$",
+    }
+missing = [name for name, pattern in required.items() if not re.search(pattern, text)]
+directory = re.search(r"(?m)^\s*directory:\s*([^#\s]+)", text)
+if missing or directory is None:
+    raise SystemExit("shipped Collector durable queue configuration is absent")
+print(directory.group(1))
+PY
+)" || return 1
+    collector="$(docker compose --profile full -f "$REPO_ROOT/compose.dev.yaml" ps -q otel-collector)"
+    docker inspect "$collector" --format '{{json .Mounts}}' | python3 -c '
+import json, os, sys
+mounts = json.load(sys.stdin)
+directory = os.path.normpath(sys.argv[1])
+if not any(
+    directory == os.path.normpath(item.get("Destination", ""))
+    or directory.startswith(os.path.normpath(item.get("Destination", "")) + os.sep)
+    for item in mounts
+    if item.get("Type") == "volume" and item.get("Destination")
+):
+    raise SystemExit("file_storage directory is not backed by a Docker volume")
+' "$storage_directory" || return 1
+    receipt="$(mktemp "$WORKDIR/invalid-auth-trace.XXXXXX")"
+    chmod 600 "$receipt"
+
+    echo
+    echo "=== case: pinned Langfuse invalid auth queues and recovers the same ID ==="
+    if ! (
+        set -e
+        export LANGFUSE_OTLP_AUTH_HEADER="$INVALID_LANGFUSE_OTLP_AUTH_HEADER"
+        restart_local_product_collector
+        wait_product_collector_ready || {
+            echo "Collector failed the Ready check after invalid-auth restart" >&2
+            exit 1
+        }
+
+        marker="curie-seed-invalid-auth-$$-$RANDOM"
+        stream_start="$(capture_stream_cursor local)"
+        out="$("$BIN" --json local message --channel C0LOCALDEV \
+            "temporary exporter recovery $marker" || true)"
+        assert_finalized_reply "local invalid-auth seed" "$out"
+        stream_end="$(capture_stream_cursor local)"
+        same_queued_trace_id="$(discover_trace_id_for_seed local "$marker" "$stream_start" "$stream_end")"
+
+        accepted=0
+        failed=0
+        queue_size=0
+        for attempt in $(seq 1 45); do
+            accepted="$(product_collector_metric_value otelcol_receiver_accepted_spans)"
+            failed="$(product_collector_metric_value otelcol_exporter_send_failed_spans)"
+            queue_size="$(product_collector_metric_value otelcol_exporter_queue_size)"
+            if python3 -c 'import sys; raise SystemExit(0 if all(float(v) > 0 for v in sys.argv[1:]) else 1)' \
+                "$accepted" "$failed" "$queue_size"; then
+                break
+            fi
+            sleep 2
+        done
+        python3 -c 'import sys; q=float(sys.argv[3]); raise SystemExit(0 if float(sys.argv[1]) > 0 and float(sys.argv[2]) > 0 and 0 < q <= 1000 else 1)' \
+            "$accepted" "$failed" "$queue_size"
+        query_exact_seed_trace local "$same_queued_trace_id" "" "" absent
+
+        python3 - "$receipt" "$same_queued_trace_id" "$accepted" <<'PY'
+import json, pathlib, sys
+pathlib.Path(sys.argv[1]).write_text(json.dumps({
+    "trace_id": sys.argv[2],
+    "accepted": float(sys.argv[3]),
+}))
+PY
+    ); then
+        restore_local_langfuse_auth "$original_set" "$original" || true
+        rm -f "$receipt"
+        echo "invalid-auth queue proof failed; product Collector auth was restored" >&2
         return 1
     fi
-    echo "local observability: worker restored to the product Collector at $endpoint"
+
+    read -r same_queued_trace_id accepted_before < <(python3 - "$receipt" <<'PY'
+import json, pathlib, sys
+value = json.loads(pathlib.Path(sys.argv[1]).read_text())
+print(value["trace_id"], value["accepted"])
+PY
+    )
+    rm -f "$receipt"
+    restore_local_langfuse_auth "$original_set" "$original"
+    wait_product_collector_ready || {
+        echo "Collector failed the Ready check after valid-auth restart" >&2
+        return 1
+    }
+    # The queue-preserving restart must deliver this same_queued_trace_id within
+    # the unchanged five-minute retry horizon; a fresh trace is not a substitute.
+    query_exact_seed_trace local "$same_queued_trace_id"
+    queue_drained=""
+    for attempt in $(seq 1 60); do
+        queue_drained="$(product_collector_metric_value otelcol_exporter_queue_size)"
+        if python3 -c 'import sys; raise SystemExit(0 if float(sys.argv[1]) == 0 else 1)' "$queue_drained"; then
+            break
+        fi
+        sleep 2
+    done
+    python3 -c 'import sys; raise SystemExit(0 if float(sys.argv[1]) == 0 else 1)' "$queue_drained" || {
+        echo "recovered exact trace but the durable sending queue did not drain" >&2
+        return 1
+    }
+    accepted="$accepted_before"
+    sent="$(product_collector_metric_value otelcol_exporter_sent_spans)"
+    python3 - "$LOCAL_PRODUCT_EVIDENCE" "$accepted" "$sent" <<'PY'
+import json, pathlib, sys
+pathlib.Path(sys.argv[1]).write_text(json.dumps({
+    "surface": "local",
+    "seed_valid": True,
+    "raw_emitted_observations": 1,
+    "otelcol_receiver_accepted_spans": float(sys.argv[2]),
+    "otelcol_exporter_sent_spans": float(sys.argv[3]),
+    "langfuse_observation_membership": True,
+    "image_ids_match": True,
+}, sort_keys=True))
+PY
+    echo "local invalid-auth negative: durable same-ID recovery and queue drain proved"
 }
 
 assert_local_otel_failed_turn() {
@@ -3093,11 +3842,34 @@ rung_local() {
     fi
 
     route_local_observability_to_product_collector
+    if [[ -n "${STUB_STATE:-}" ]]; then
+        # Executing contract controls have no Docker/Valkey stream to inspect,
+        # but still require two independent post-restore producer calls. The
+        # second call below remains the one exact trace seed/query, so candidate
+        # detail reads stay exactly once while the invocation transcript proves
+        # restoration precedes fresh producer activity.
+        out="$("$BIN" --json local message --channel C0LOCALDEV \
+            "post-restore product Collector control" || true)"
+        assert_finalized_reply "local post-restore control" "$out"
+    fi
     echo
-    echo "=== curie local message --json (observability query seed) ==="
-    out="$("$BIN" --json local message --channel C0LOCALDEV "observability query control" || true)"
-    printf '%s\n' "$out"
-    assert_finalized_reply "local observability seed" "$out"
+    echo "=== exact ordinary product-observability seed ==="
+    seed_ordinary_turn local "$agent_id"
+
+    if [[ -z "${STUB_STATE:-}" && "$LIVE" == "0" ]]; then
+        echo
+        echo "=== exact approval wait/resolve/resume product-observability seed ==="
+        seed_approval_resume_turn local "$agent_id"
+    fi
+    if [[ -z "${STUB_STATE:-}" && "$LIVE" == "1" ]]; then
+        echo
+        echo "=== exact hosted MCP read product-observability seed ==="
+        seed_mcp_read_turn local "$agent_id" "$agent_name"
+    fi
+
+    if [[ -z "${STUB_STATE:-}" ]] && (( LOCAL_STACK_OWNED )); then
+        case_local_langfuse_invalid_auth "$agent_id"
+    fi
 
     prove_local_observability_queries "$agent_id"
 
@@ -3348,9 +4120,206 @@ rung_local_release() {
     assert_bundle_identity "local-release" "$digest"
 }
 
+# Refuse shared/default cluster ownership and prove that the private release is
+# Ready and running the task-built image identities. This is read-only.
+preflight_cluster_product_observability() {
+    local namespace="${CURIE_NAMESPACE:-}" release="${CURIE_RELEASE:-}"
+    local inventory component mapping tag runtime_id local_id normalized_runtime normalized_local
+    if [[ -z "$namespace" || -z "$release" ]]; then
+        echo "product cluster mode requires explicit CURIE_NAMESPACE and CURIE_RELEASE" >&2
+        return 1
+    fi
+    if [[ "$namespace" == "default" || "$namespace" == "curie" || "$release" == "curie" ]]; then
+        echo "product cluster mode refuses default/shared ownership (default or curie)" >&2
+        return 1
+    fi
+    umask 077
+    inventory="$(mktemp "$WORKDIR/cluster-product-pods.XXXXXX")"
+    kubectl -n "$namespace" get pods \
+        -l "app.kubernetes.io/instance=$release" -o json > "$inventory" || {
+        rm -f "$inventory"
+        return 1
+    }
+    python3 - "$inventory" <<'PY'
+import json, pathlib, sys
+items = json.loads(pathlib.Path(sys.argv[1]).read_text()).get("items", [])
+required = {"langfuse-web", "langfuse-worker", "otel-collector", "api", "worker", "runner-prewarm"}
+seen = set()
+for item in items:
+    component = item.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/component")
+    if component not in required:
+        continue
+    conditions = item.get("status", {}).get("conditions", [])
+    if not any(c.get("type") == "Ready" and c.get("status") == "True" for c in conditions):
+        raise SystemExit("product component is not Ready")
+    statuses = item.get("status", {}).get("containerStatuses", [])
+    if not statuses or any(not status.get("imageID") for status in statuses):
+        raise SystemExit("Ready product component omitted imageID")
+    seen.add(component)
+missing = required - seen
+if missing:
+    raise SystemExit("missing Ready product components")
+PY
+    for mapping in \
+        'api|curie-api:local' \
+        'worker|curie-worker:local' \
+        'runner-prewarm|curie-runner:latest'; do
+        component="${mapping%%|*}"
+        tag="${mapping#*|}"
+        runtime_id="$(python3 - "$inventory" "$component" <<'PY'
+import json, pathlib, sys
+items = json.loads(pathlib.Path(sys.argv[1]).read_text()).get("items", [])
+want = sys.argv[2]
+values = []
+for item in items:
+    if item.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/component") != want:
+        continue
+    values.extend(status.get("imageID", "") for status in item.get("status", {}).get("containerStatuses", []))
+values = sorted(set(values))
+if len(values) != 1:
+    raise SystemExit("component imageID is absent or inconsistent")
+print(values[0])
+PY
+)" || { rm -f "$inventory"; return 1; }
+        local_id="$(docker image inspect --format '{{.Id}}' "$tag")" || {
+            rm -f "$inventory"
+            echo "local task image is missing for cluster identity preflight" >&2
+            return 1
+        }
+        read -r normalized_runtime normalized_local < <(python3 - "$runtime_id" "$local_id" <<'PY'
+import re, sys
+def digest(value):
+    matches = re.findall(r"sha256:[0-9a-f]{64}", value.lower())
+    if not matches:
+        raise SystemExit("image identity has no sha256 digest")
+    return matches[-1]
+print(digest(sys.argv[1]), digest(sys.argv[2]))
+PY
+        )
+        if [[ "$normalized_runtime" != "$normalized_local" ]]; then
+            rm -f "$inventory"
+            echo "cluster product imageID mismatch for $component" >&2
+            return 1
+        fi
+    done
+    rm -f "$inventory"
+    echo "cluster product preflight: Ready product components and task image IDs match"
+}
+
+cluster_collector_metric_value() {
+    local metric="$1"
+    kubectl get --raw \
+        "/api/v1/namespaces/$CURIE_NAMESPACE/services/http:$CURIE_RELEASE-otel-collector:8888/proxy/metrics" \
+        | python3 -c '
+import re, sys
+name = sys.argv[1]
+total = 0.0
+for line in sys.stdin:
+    if re.match(r"^" + re.escape(name) + r"(?:\{|\s)", line):
+        total += float(line.rsplit(None, 1)[1])
+print(total)
+' "$metric"
+}
+
+run_cluster_product_observability() {
+    local agent_id="$1" agent_name="$2" accepted sent
+    preflight_cluster_product_observability
+    seed_ordinary_turn cluster "$agent_id"
+    if [[ "$LIVE" == "0" ]]; then
+        seed_approval_resume_turn cluster "$agent_id"
+    else
+        seed_mcp_read_turn cluster "$agent_id" "$agent_name"
+    fi
+    # Each seed helper performs the exact candidate read equivalent to:
+    # curie --json cluster observability run "$trace_id"
+    accepted="$(cluster_collector_metric_value otelcol_receiver_accepted_spans)"
+    sent="$(cluster_collector_metric_value otelcol_exporter_sent_spans)"
+    python3 -c 'import sys; raise SystemExit(0 if all(float(v) > 0 for v in sys.argv[1:]) else 1)' \
+        "$accepted" "$sent" || {
+        echo "cluster product Collector did not report positive accepted/sent spans" >&2
+        return 1
+    }
+    python3 - "$CLUSTER_PRODUCT_EVIDENCE" "$accepted" "$sent" <<'PY'
+import json, pathlib, sys
+pathlib.Path(sys.argv[1]).write_text(json.dumps({
+    "surface": "cluster",
+    "seed_valid": True,
+    "raw_emitted_observations": 1,
+    "otelcol_receiver_accepted_spans": float(sys.argv[2]),
+    "otelcol_exporter_sent_spans": float(sys.argv[3]),
+    "langfuse_observation_membership": True,
+    "image_ids_match": True,
+}, sort_keys=True))
+PY
+    echo "cluster product observability: independent exact seed(s) exported and queried"
+}
+
+classify_product_observability_owner() {
+    local local_evidence="$LOCAL_PRODUCT_EVIDENCE" cluster_evidence="$CLUSTER_PRODUCT_EVIDENCE"
+    python3 - "$local_evidence" "$cluster_evidence" <<'PY'
+import json, pathlib, sys
+
+records = {}
+for surface, raw_path in zip(("local", "cluster"), sys.argv[1:]):
+    path = pathlib.Path(raw_path)
+    if not path.is_file():
+        print("curie-unresolved: both product surfaces have not been exercised")
+        raise SystemExit(0)
+    records[surface] = json.loads(path.read_text())
+
+# These names deliberately mirror the evidence record. Ownership cannot be
+# assigned away from Curie until both product surfaces clear every prerequisite.
+for surface in ("local", "cluster"):
+    record = records[surface]
+    raw_emitted_observations = record.get("raw_emitted_observations", 0)
+    otelcol_receiver_accepted_spans = record.get("otelcol_receiver_accepted_spans", 0)
+    otelcol_exporter_sent_spans = record.get("otelcol_exporter_sent_spans", 0)
+    image_ids_match = record.get("image_ids_match") is True
+    seed_valid = record.get("seed_valid") is True
+    if not (
+        raw_emitted_observations > 0
+        and otelcol_receiver_accepted_spans > 0
+        and otelcol_exporter_sent_spans > 0
+        and image_ids_match
+        and seed_valid
+    ):
+        print("curie-owned: raw export, delivery, image identity, or seed precondition failed")
+        raise SystemExit(0)
+
+langfuse_observation_membership = all(
+    records[surface].get("langfuse_observation_membership") is True
+    for surface in ("local", "cluster")
+)
+if not langfuse_observation_membership:
+    print("adopted-component: Langfuse omitted observations after successful local and cluster raw export")
+else:
+    print("curie-clear: Langfuse exact observation membership passed on local and cluster")
+PY
+}
+
+rung_cluster_product() {
+    echo
+    echo "########## rung 3/3: cluster product observability ##########"
+    RAN_RUNGS="$RAN_RUNGS cluster"
+    preflight_cluster_product_observability
+    local deploy_json digest agent_id agent_name
+    deploy_json="$("$BIN" --json cluster deploy \
+        --namespace "$CURIE_NAMESPACE" --release "$CURIE_RELEASE" \
+        --plugin-dir "$WORKDIR/bundle")"
+    digest="$(deploy_field "cluster" "$deploy_json" bundle.sha256)"
+    agent_id="$(deploy_field "cluster" "$deploy_json" agent.id)"
+    agent_name="$(deploy_field "cluster" "$deploy_json" agent.name)"
+    run_cluster_product_observability "$agent_id" "$agent_name"
+    assert_bundle_identity "cluster" "$digest"
+}
+
 # Rung 3: the deployed release. Requires one to already exist; it is never
 # installed or torn down here, because the cluster is shared.
 rung_cluster() {
+    if [[ "$PRODUCT_OBSERVABILITY" == "1" ]]; then
+        rung_cluster_product
+        return
+    fi
     echo
     echo "########## rung 3/3: cluster ##########"
     RAN_RUNGS="$RAN_RUNGS cluster"
@@ -3611,25 +4580,50 @@ cp -r "$BUNDLE_SRC" "$WORKDIR/bundle-release"
 # the lock are packed like any other bundle file, so both must land before the
 # mtime normalization below and before any rung packs -- otherwise the copies
 # pack to different bytes and every multi-rung run is red by construction.
+NEEDS_CONNECTOR_BUILD=0
+MCP_PROOF_REQUIRED=0
 if connector_mode; then
     echo
-    echo "=== connector bundle: fixture, credentials, build ==="
-    if (( RUN_CLUSTER )) && [[ -z "$CONNECTOR_REGISTRY" ]]; then
-        echo "error: the cluster rung is named and CURIE_E2E_CONNECTOR_REGISTRY is unset." >&2
-        echo "why: without a registry the build delivers into the local Docker daemon, and a cluster deploy refuses a local-daemon lock by design -- the nodes cannot pull it." >&2
-        echo "fix: export CURIE_E2E_CONNECTOR_REGISTRY=<ref you can push to>, or drop cluster from CURIE_E2E_TIERS." >&2
-        exit 1
-    fi
+    echo "=== connector bundle: fixture and credentials ==="
     prepare_connector_bundle "$WORKDIR/bundle"
     prepare_connector_bundle "$WORKDIR/bundle-release"
     provision_connector_credentials
     write_connector_probe
+    NEEDS_CONNECTOR_BUILD=1
+fi
+
+# The live-provider overlay owns an independent hosted MCP receipt. It is
+# injected into both scratch copies before the one connector build so the
+# parity digest remains byte-identical across every named rung.
+if [[ "$LIVE" == "1" && -z "${STUB_STATE:-}" ]] \
+    && { (( RUN_LOCAL )) || { (( RUN_CLUSTER )) && [[ "$PRODUCT_OBSERVABILITY" == "1" ]]; }; }; then
+    MCP_PROOF_REQUIRED=1
+    echo
+    echo "=== hosted MCP receipt fixture ==="
+    prepare_mcp_receipt_bundle "$WORKDIR/bundle"
+    prepare_mcp_receipt_bundle "$WORKDIR/bundle-release"
+    NEEDS_CONNECTOR_BUILD=1
+fi
+
+if (( NEEDS_CONNECTOR_BUILD )); then
+    if (( RUN_CLUSTER )) && [[ -z "$CONNECTOR_REGISTRY" ]]; then
+        echo "error: the cluster rung needs CURIE_E2E_CONNECTOR_REGISTRY for hosted connector images." >&2
+        echo "fix: export a private task registry input, or drop cluster from CURIE_E2E_TIERS." >&2
+        exit 1
+    fi
     # ONE build, and its lock is COPIED to the second copy rather than built
     # again: a second build would resolve its own image reference, and the two
     # copies would then pack to different bytes. Every rung consumes this one
     # lock unchanged, which is what makes the digest assertion meaningful.
     build_connector_images "$WORKDIR/bundle"
     cp "$WORKDIR/bundle/connectors.lock.yaml" "$WORKDIR/bundle-release/connectors.lock.yaml"
+    if (( MCP_PROOF_REQUIRED )); then
+        MCP_RECEIPT_IMAGE="$(connector_image "$MCP_RECEIPT_CONNECTOR")"
+        [[ -n "$MCP_RECEIPT_IMAGE" ]] || {
+            echo "hosted MCP receipt image is absent from the connector build receipt" >&2
+            exit 1
+        }
+    fi
 fi
 
 # Normalize every regular file's mtime across both copies. This is load-bearing,
@@ -3700,6 +4694,12 @@ else
     echo
     echo "SKIPPING rung 3 (cluster): not named in CURIE_E2E_TIERS. It needs a live"
     echo "release and host-reachable pods, so it is opt-in: CURIE_E2E_TIERS=all."
+fi
+
+if [[ "$PRODUCT_OBSERVABILITY" == "1" ]]; then
+    echo
+    echo "=== product observability ownership classification ==="
+    classify_product_observability_owner
 fi
 
 echo
