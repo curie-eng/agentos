@@ -531,8 +531,21 @@ jobs:
           platforms: ${{ matrix.platforms }}
           push: false
           load: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Scope the layer cache per image. Every leg of this matrix runs at
+          # once, and an unscoped `type=gha` puts all ten of them in ONE cache
+          # namespace, where they contend for the same reservation instead of
+          # sharing anything: the legs build different Dockerfiles, so there is
+          # no cross-image reuse to give up by separating them. Left unscoped,
+          # the export -- not the build -- became the job. On run 33690551116
+          # sre-bot-tempo built in 80.5s and then spent 1057.7s writing a single
+          # layer into the shared namespace, for a 19 minute job on a 2 minute
+          # image, while the same run logged `Unable to reserve cache with key
+          # docker.io--tonistiigi--binfmt-latest-linux-x64, another job may be
+          # creating this cache`. The ladder jobs below already scope their
+          # builds this way (`scope=ladder-runner`); this matrix was the one
+          # place left on the default.
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
 
   # The worker-local overlay is FROM the published curie-worker image, so it
   # cannot be built purely from the checkout. Build the base worker image
