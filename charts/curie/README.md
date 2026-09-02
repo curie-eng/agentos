@@ -102,9 +102,9 @@ Two limits worth knowing. With `api.deploy: false` and an empty
 exist; its boot preflight fails and the pod CrashLoopBackOffs naming the
 unreachable URL. That is intentional (a loud boot failure beats a silent
 dead-end at click time) and the fix is to set `dispatcher.apiBaseUrl`. And
-because the API's `/health` is unauthenticated, that preflight proves only
-reachability, not that the key is right: a BYO API expecting a different key
-still passes boot and fails at click time. Match `apiKey` to the API you point at.
+because the API's `/health` is unauthenticated, that first preflight proves only
+reachability. The following authenticated `/agents` discovery refuses startup
+when a BYO API expects a different key. Match `apiKey` to the API you point at.
 
 **Cluster variants:**
 

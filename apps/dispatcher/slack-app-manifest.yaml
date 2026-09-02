@@ -20,6 +20,10 @@ oauth_config:
     bot:
       - app_mentions:read
       - chat:write
+      # The boot preflight proves public-channel metadata access with a bounded
+      # conversations.list call. Adding this scope requires reinstalling the app
+      # to the workspace so the existing bot-token grant is refreshed.
+      - channels:read
       - channels:history
       - groups:history
       - im:history
