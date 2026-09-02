@@ -330,6 +330,71 @@ def test_submitting_the_dialog_resolves_with_the_typed_note(
     assert not any(b.get("type") == "actions" for b in kwargs["blocks"])
 
 
+def test_two_releases_only_the_owner_resolves_a_note_submission(
+    redis_client: redis.Redis, config: DispatcherConfig
+) -> None:
+    """The non-owner keeps the modal live and performs no Slack mutation (#2202)."""
+
+    non_owner = ScriptedResolver(
+        ResolveOutcome(status_code=404, detail="approval not found")
+    )
+    owner = ScriptedResolver(
+        ResolveOutcome(status_code=200, resolved_by="U_MANAGER", decision="approved")
+    )
+    non_owner_app, non_owner_web = _build(config, redis_client, non_owner)
+    owner_app, owner_web = _build(config, redis_client, owner)
+
+    non_owner_socket = FakeSocketClient()
+    SocketModeHandler(non_owner_app, app_token="xapp-test").handle(
+        non_owner_socket,
+        _note_submit("env-note-release-b", note="approved for Q3"),
+    )
+    _drain(non_owner_app)
+
+    refusal = non_owner_socket.ack_payload_for("env-note-release-b")
+    assert refusal is not None
+    assert refusal["response_action"] == "errors"
+    assert "nothing was changed" in refusal["errors"]["note"]
+    assert "owning release" in refusal["errors"]["note"]
+    assert len(non_owner.calls) == 1
+    non_owner_web.conversations_replies.assert_not_called()
+    non_owner_web.chat_update.assert_not_called()
+    non_owner_web.chat_postEphemeral.assert_not_called()
+
+    owner_socket = FakeSocketClient()
+    SocketModeHandler(owner_app, app_token="xapp-test").handle(
+        owner_socket,
+        _note_submit("env-note-release-a", note="approved for Q3"),
+    )
+    _drain(owner_app)
+
+    assert owner_socket.ack_payload_for("env-note-release-a") is None
+    assert len(owner.calls) == 1
+    assert owner.calls[0]["note"] == "approved for Q3"
+    owner_web.chat_update.assert_called_once()
+    assert "approved for Q3" in owner_web.chat_update.call_args.kwargs["text"]
+
+
+def test_an_unrelated_404_does_not_claim_cross_release_ownership() -> None:
+    """A missing proxy route and a missing approval row are different failures."""
+
+    assert (
+        _refusal_text(ResolveOutcome(status_code=404, detail="Not Found"))
+        == "Resolving failed; try again shortly."
+    )
+
+
+def test_an_approval_record_miss_asks_for_the_owning_release() -> None:
+    """The exact API row miss is retryable when two releases share one app."""
+
+    refusal = _refusal_text(
+        ResolveOutcome(status_code=404, detail="approval not found")
+    )
+
+    assert "nothing was changed" in refusal
+    assert "owning release" in refusal
+
+
 def test_modal_submit_posts_the_note_with_a_chat_principal(
     redis_client: redis.Redis, config: DispatcherConfig
 ) -> None:

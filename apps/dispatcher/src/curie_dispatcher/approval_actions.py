@@ -110,6 +110,14 @@ _DECISION_BY_ACTION_ID = {
     REJECT_NOTE_ACTION_ID: "rejected",
 }
 
+# FastAPI's approvals router uses this exact detail when the requested row is
+# absent from THIS release's database. With two releases sharing one Socket Mode
+# app, that absence is an ownership signal rather than proof that the approval
+# was deleted: Slack may have delivered the interaction to the other release.
+# Keep this narrower than status 404 so an ingress/proxy route miss ("Not Found")
+# does not masquerade as release affinity.
+_APPROVAL_NOT_FOUND_DETAIL = "approval not found"
+
 
 def is_approval_action(action_id: str) -> bool:
     """True when a Block Kit action id belongs to the approval card."""
@@ -758,7 +766,12 @@ def _refusal_text(outcome: ResolveOutcome) -> str:
     if outcome.status_code == 410:
         return "This approval expired and can no longer be resolved."
     if outcome.status_code == 404:
-        return "This approval no longer exists."
+        if outcome.detail.strip().casefold() == _APPROVAL_NOT_FOUND_DETAIL:
+            return (
+                "This Curie release does not have this approval, so nothing was "
+                "changed. Try again so the owning release can handle it."
+            )
+        return "Resolving failed; try again shortly."
     return "Resolving failed; try again shortly."
 
 
@@ -876,6 +889,15 @@ def _render_outcome(
             message=message,
             detail=_refusal_text(outcome),
             log=log,
+        )
+    elif (
+        outcome.status_code == 404
+        and outcome.detail.strip().casefold() == _APPROVAL_NOT_FOUND_DETAIL
+    ):
+        log.warning(
+            "approval %s was not found in this release and may be owned by "
+            "another Curie release",
+            approval_id,
         )
     log.info(
         "approval %s click by %s rejected: HTTP %s %s",

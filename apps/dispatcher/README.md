@@ -19,6 +19,13 @@ platform API key alone cannot resolve. Authorization still happens in the API: r
 equality neither grants nor denies, so the same authenticated requester may confirm only
 when the selected approver set admits them.
 
+Slack may distribute one app's interactive payloads across any of its open
+Socket Mode connections. If two Curie releases share that app, the release whose
+API does not contain the approval acknowledges the interaction without changing
+the approval or Slack card and asks the approver to retry; only the release whose
+API owns the row can pass the existing compare-and-set. Separate Slack apps per
+long-lived release avoid the retry UX.
+
 ## What is ingested, and what is refused
 
 Ingest admits more than it used to (#2006). A message whose body lives in Block Kit
