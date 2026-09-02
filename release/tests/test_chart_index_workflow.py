@@ -31,11 +31,12 @@ class TestChartIndexWorkflowContract:
         trigger = workflow["on"]
         job = next(iter(workflow["jobs"].values()))
 
-        assert set(trigger) == {"workflow_run", "push"}
+        assert set(trigger) == {"workflow_run", "workflow_dispatch", "push"}
         assert trigger["workflow_run"] == {
             "workflows": ["Release images and binaries"],
             "types": ["completed"],
         }
+        assert trigger["workflow_dispatch"] == {}
         assert trigger["push"]["branches"] == ["next"]
         assert len(trigger["push"]["paths"]) == 2
         assert set(trigger["push"]["paths"]) == {
@@ -44,6 +45,7 @@ class TestChartIndexWorkflowContract:
         }
         condition = " ".join(job["if"].split())
         assert "github.event_name == 'push'" in condition
+        assert "github.event_name == 'workflow_dispatch'" in condition
         assert "github.event_name == 'workflow_run'" in condition
         assert "github.event.workflow_run.conclusion == 'success'" in condition
         assert "github.event.workflow_run.event == 'push'" in condition
@@ -240,6 +242,21 @@ class TestChartIndexWorkflowContract:
         assert tracking_fetch is not None
         tracking_position = seed_push.end() + tracking_fetch.start()
         assert orphan.start() < seed_push.start() < tracking_position < index.start()
+
+    def test_chart_releaser_output_parent_exists_before_indexing(self):
+        workflow = load_yaml(WORKFLOW_PATH)
+        publication_script = next(
+            run_script(step)
+            for step in workflow_steps(workflow)
+            if re.search(r"\bcr\s+index\b", run_script(step))
+        )
+
+        output_path = publication_script.index('index_path="$RUNNER_TEMP/')
+        parent = publication_script.index('mkdir -p "$(dirname "$index_path")"')
+        index = publication_script.index('cr index --config cr.yaml')
+
+        assert output_path < parent < index
+        assert '--index-path "$index_path"' in publication_script[index:]
 
     def test_chart_releaser_cli_is_literal_digest_verified_before_it_can_run(self):
         workflow = load_yaml(WORKFLOW_PATH)

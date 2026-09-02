@@ -2441,15 +2441,21 @@ def load_baseline():
     assert baseline_raw, f"{mode} requires a before snapshot"
     return json.loads(pathlib.Path(baseline_raw).read_text())
 
-def metric_total(series, name, **wanted):
+def metric_total(series, name, *, service=None, instances=None, **wanted):
     return sum(
         item["value"] for item in series
         if item["name"] == name
+        and (service is None or item["service"] == service)
+        and (instances is None or item["instance"] in instances)
         and all(item["attributes"].get(key) == value for key, value in wanted.items())
     )
 
-def delta(before, current, name, **wanted):
-    return metric_total(current, name, **wanted) - metric_total(before, name, **wanted)
+def delta(before, current, name, *, service=None, instances=None, **wanted):
+    return metric_total(
+        current, name, service=service, instances=instances, **wanted
+    ) - metric_total(
+        before, name, service=service, instances=instances, **wanted
+    )
 
 if mode == "snapshot":
     print(json.dumps(snapshot(), sort_keys=True))
@@ -2524,6 +2530,17 @@ if mode == "healthy":
         assert not failure_events, (
             f"healthy trace {trace_id} carried failure outcomes {failure_events}"
         )
+    healthy_worker_instances = {
+        resource.get("service.instance.id")
+        for trace_id in new_healthy
+        for _, resource in by_trace[trace_id]
+        if resource.get("service.name") == "curie-worker"
+        and resource.get("service.instance.id")
+    }
+    assert healthy_worker_instances, (
+        "new healthy trace had no curie-worker resource service.instance.id; "
+        f"trace_ids={sorted(new_healthy)}"
+    )
 
     # The health probe immediately before the turn exercises API telemetry;
     # the one-shot producer and turn exercise dispatcher, worker, and runner.
@@ -2569,10 +2586,12 @@ if mode == "healthy":
     positive_deltas = {
         "curie.turn.accepted": delta(previous, current, "curie.turn.accepted"),
         "curie.turn.completed[done]": delta(
-            previous, current, "curie.turn.completed", outcome="done"
+            previous, current, "curie.turn.completed",
+            service="curie-worker", instances=healthy_worker_instances, outcome="done"
         ),
         "curie.turn.duration[done]": delta(
-            previous, current, "curie.turn.duration", outcome="done"
+            previous, current, "curie.turn.duration",
+            service="curie-worker", instances=healthy_worker_instances, outcome="done"
         ),
         "curie.queue.message.age": delta(previous, current, "curie.queue.message.age"),
         "curie.sandbox.lifecycle": delta(previous, current, "curie.sandbox.lifecycle"),
@@ -2584,7 +2603,9 @@ if mode == "healthy":
         f"successful turn did not move every required counter/measurement: {positive_deltas}"
     )
     classified_delta = delta(
-        previous, current, "curie.turn.completed", outcome="classified_failure"
+        previous, current, "curie.turn.completed",
+        service="curie-worker", instances=healthy_worker_instances,
+        outcome="classified_failure"
     )
     assert classified_delta == 0, (
         "healthy control changed the classified_failure counter by "
@@ -2647,15 +2668,31 @@ if mode == "failed":
     assert error_log_traces, (
         "the new failed trace had no ERROR LogRecord with the same traceId"
     )
+    failed_worker_instances = {
+        resource.get("service.instance.id")
+        for trace_id in failed_trace_ids
+        for _, resource in by_trace[trace_id]
+        if resource.get("service.name") == "curie-worker"
+        and resource.get("service.instance.id")
+    }
+    assert failed_worker_instances, (
+        "new failed trace had no curie-worker resource service.instance.id; "
+        f"trace_ids={sorted(failed_trace_ids)}"
+    )
     current = metric_series()
     previous = before["metrics"]
     classified_delta = delta(
-        previous, current, "curie.turn.completed", outcome="classified_failure"
+        previous, current, "curie.turn.completed",
+        service="curie-worker", instances=failed_worker_instances,
+        outcome="classified_failure"
     )
     assert classified_delta > 0, (
         "the injected failure did not increase curie.turn.completed{outcome=classified_failure}"
     )
-    done_delta = delta(previous, current, "curie.turn.completed", outcome="done")
+    done_delta = delta(
+        previous, current, "curie.turn.completed",
+        service="curie-worker", instances=failed_worker_instances, outcome="done"
+    )
     assert done_delta == 0, (
         f"the injected failure incorrectly increased successful completions by {done_delta}"
     )

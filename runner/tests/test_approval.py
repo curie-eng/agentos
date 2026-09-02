@@ -238,10 +238,10 @@ def test_approval_server_config_shape() -> None:
 
 def test_publish_tool_is_always_listed_but_unmounted_invocation_refuses() -> None:
     async def names(server: object) -> set[str]:
-        handler = server["instance"].request_handlers.get(mcp_types.ListToolsRequest)  # type: ignore[index]
-        if handler is None:
+        entry = server["instance"].get_request_handler("tools/list")  # type: ignore[index]
+        if entry is None:
             return set()
-        result = await handler(mcp_types.ListToolsRequest(method="tools/list"))
+        result = await entry.handler(None, mcp_types.PaginatedRequestParams())
         payload = result.model_dump()
         return {str(item["name"]) for item in payload["tools"]}
 
@@ -311,11 +311,11 @@ def test_publish_tool_description_carries_coding_and_approval_safety_protocol() 
 
 def test_request_approval_can_be_omitted_without_dropping_managed_publication() -> None:
     async def names(server: object) -> set[str]:
-        handler = server["instance"].request_handlers.get(mcp_types.ListToolsRequest)  # type: ignore[index]
-        if handler is None:
+        entry = server["instance"].get_request_handler("tools/list")  # type: ignore[index]
+        if entry is None:
             return set()
-        result = await handler(mcp_types.ListToolsRequest(method="tools/list"))
-        return {tool.name for tool in result.root.tools}
+        result = await entry.handler(None, mcp_types.PaginatedRequestParams())
+        return {tool.name for tool in result.tools}
 
     async def go() -> None:
         assert await names(build_approval_server(include_request_approval=False)) == {
@@ -1010,18 +1010,17 @@ def test_publish_tool_never_consumes_a_resume_grant_or_executes() -> None:
         # Bypass the permission callback and call the in-process tool directly:
         # it must still refuse, because publication belongs to the platform Job.
         server = build_approval_server(gate, managed_workspace=True)
-        handler = server["instance"].request_handlers[mcp_types.CallToolRequest]
-        direct = await handler(
-            mcp_types.CallToolRequest(
-                method="tools/call",
-                params=mcp_types.CallToolRequestParams(
-                    name=PUBLISH_TOOL_NAME.rsplit("__", 1)[-1],
-                    arguments={"title": "Ship changes"},
-                ),
-            )
+        entry = server["instance"].get_request_handler("tools/call")
+        assert entry is not None
+        direct = await entry.handler(
+            None,
+            mcp_types.CallToolRequestParams(
+                name=PUBLISH_TOOL_NAME.rsplit("__", 1)[-1],
+                arguments={"title": "Ship changes"},
+            ),
         )
         payload = direct.model_dump()
-        assert payload.get("isError") is True
+        assert payload.get("is_error") is True
         assert (
             "platform"
             in " ".join(
@@ -1135,18 +1134,15 @@ async def _call_request_approval(server: object, **args: object) -> tuple[bool, 
     internals, which a refactor is free to rename. Returns (is_error, text).
     """
 
-    handler = server["instance"].request_handlers[  # type: ignore[index]
-        mcp_types.CallToolRequest
-    ]
-    result = await handler(
-        mcp_types.CallToolRequest(
-            method="tools/call",
-            params=mcp_types.CallToolRequestParams(name=_BARE_TOOL_NAME, arguments=dict(args)),
-        )
+    entry = server["instance"].get_request_handler("tools/call")  # type: ignore[index]
+    assert entry is not None
+    result = await entry.handler(
+        None,
+        mcp_types.CallToolRequestParams(name=_BARE_TOOL_NAME, arguments=dict(args)),
     )
     payload = result.model_dump()
     text = " ".join(str(block.get("text") or "") for block in (payload.get("content") or []))
-    return bool(payload.get("isError")), text
+    return bool(payload.get("is_error")), text
 
 
 def _executing_approval_callback(gate: ApprovalGate):

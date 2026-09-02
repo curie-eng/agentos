@@ -26,7 +26,7 @@ jobs:
       # Keep untrusted PR text out of shell source. github-script reads the
       # payload directly and writes its bytes to a runner-owned temporary file.
       - name: Write the pull request body to a temporary file
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         env:
           PR_BODY_FILE: ${{ runner.temp }}/curie-pr-body.md
         with:

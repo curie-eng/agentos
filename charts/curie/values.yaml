@@ -922,14 +922,14 @@ api:
   # permanently stranded. `enabled` is the off-switch -- with it false the loop
   # does not run AND the resolve endpoint fails loud (500) on an enqueue failure
   # instead of returning 200 and deferring to the (now-absent) backstop.
-  # `graceSeconds` is load-bearing: it MUST exceed the worker's max single-turn
-  # time (the worker's runner_total_timeout_s, a Python default of 600s that is
-  # not currently Helm-configurable) so a re-enqueue never lands in a still-live
-  # resume turn (which would re-run the approved action).
+  # `graceSeconds` is derived at render time from
+  # worker.deliveryBudgetSeconds + worker.deliveryShutdownReserveSeconds, so a
+  # re-enqueue cannot land while the prior delivery is still running or
+  # completing its terminal settlement. Set an explicit value only to extend
+  # that wait; values below the derived floor are refused during rendering.
   resumeReconciler:
     enabled: true
     intervalSeconds: 30
-    graceSeconds: 900
     batchLimit: 100
   resources:
     requests: { cpu: 100m, memory: 256Mi }
@@ -962,6 +962,20 @@ dispatcher:
   # catch the mismatch since /health is unauthenticated and proves reachability
   # only, not that the key is right.
   apiBaseUrl: ""
+  # Bounded startup window for API /health, followed by a fresh same-size
+  # discovery-and-Slack budget. Normal in-chart API warm-up must fit inside the
+  # first deadline; the startup probe below outlasts both phases plus the final
+  # bounded two-second Slack call.
+  apiPreflightTimeoutSeconds: 120
+  # Startup uses the same heartbeat freshness check as readiness/liveness. The
+  # kubelet can count its first failure at t=0, so 27 samples every 10 seconds
+  # make the earliest fast-failure 260s -- strictly after the maximum 242s
+  # application startup envelope above.
+  startupProbe:
+    initialDelaySeconds: 0
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 27
   image:
     repository: ghcr.io/curie-eng/curie-dispatcher
     # Empty -> chart appVersion (immutable). Set to pin an explicit version tag.
@@ -1092,6 +1106,11 @@ mailAdapter:
     # sent to a third party as a bearer token and fail auth in a way that looks
     # like a permissions problem rather than a missing credential.
     apiKey: ""
+    # BYO Secret escape (issue #1759). When set, the adapter reads this Secret
+    # and key directly and the chart omits mailAgentmailApiKey from its own
+    # Secret, so an upgrade cannot replace externally managed credential data.
+    apiKeyExistingSecret: ""
+    apiKeyExistingSecretKey: mailAgentmailApiKey
     baseUrl: "https://api.agentmail.to/v0"
     # NetworkPolicy cannot authorize a DNS name. Supply the current provider
     # (or a controlled egress proxy) HTTPS CIDRs explicitly. Enabling the
@@ -1100,14 +1119,23 @@ mailAdapter:
   # The `chn` channel token minted by the API's POST /channels/token, scoped to
   # this adapter's channel binding. The adapter presents it on every inbound post.
   channelToken: ""
+  channelTokenExistingSecret: ""
+  channelTokenExistingSecretKey: mailChannelToken
   # The shared secret the worker presents as X-Curie-Adapter-Secret when it
   # delivers reply events here, and that the adapter verifies before any side
   # effect. THIS IS THE SINGLE SOURCE OF TRUTH FOR BOTH HALVES of the pair: the
   # chart derives the worker's half, worker.adapterCredentials[adapterSlug],
-  # from it, so setting this one value wires both sides. Do not also write that
-  # entry by hand. Coalesced by curie.adapterCredentials; see _helpers.tpl for
-  # why an equal value is accepted and a conflicting one fails the render.
+  # from the plain value, so setting this one value wires both sides. The BYO
+  # Secret fields below control the adapter's reference only. When
+  # egressSecretExistingSecret is set, worker.adapterCredentialsExistingSecret
+  # must also source the worker's JSON credential map because Helm cannot derive
+  # that map from externally managed Secret data; the render fails closed when
+  # only the adapter-side escape is set. Coalesced by curie.adapterCredentials;
+  # see _helpers.tpl for why an equal inline value is accepted and a conflicting
+  # one fails the render.
   egressSecret: ""
+  egressSecretExistingSecret: ""
+  egressSecretExistingSecretKey: mailEgressSecret
   # Must equal the `adapter` slug on the agent's channel binding row, and it is
   # also the key the derived worker.adapterCredentials entry lands under.
   adapterSlug: "mail-adapter"
@@ -1339,9 +1367,9 @@ worker:
   # Delivery budget and ownership lease (ADR-0131, #1971). One overall
   # wall-clock deadline and one renewable fenced owner per delivery, replacing
   # the old dead pair of a flat per-request HTTP timeout and a 900s idle-based
-  # steal window. Integers, not floats -- as with routeTtlSeconds, a YAML
-  # float renders through the template's `| quote` as scientific notation for
-  # larger values, which the worker then cannot parse.
+  # steal window. deliveryBudgetSeconds is an integer -- as with
+  # routeTtlSeconds, a YAML float renders through the template's `| quote` as
+  # scientific notation for larger values, which the worker then cannot parse.
   #
   # The OVERALL deadline for one delivery: claim, every runner request, every
   # retry backoff, reclaim, and terminal cleanup. Must be between 60 and 1800
@@ -1349,6 +1377,12 @@ worker:
   # install/template time and the worker's own validator enforces it again at
   # boot.
   deliveryBudgetSeconds: 600
+  # Positive per-request ceiling for runner work within the overall delivery
+  # budget. Must be at most 1800 seconds and no greater than
+  # deliveryBudgetSeconds; fractional seconds are supported. values.schema.json
+  # enforces the scalar bounds and the worker template enforces the relationship
+  # at render time.
+  runnerTotalTimeoutSeconds: 600
   # How long the renewable ownership lease lives before it is considered
   # expired and transferable. Must span at least 3 heartbeat periods
   # (deliveryLeaseHeartbeatSeconds) so a single missed heartbeat never drops a

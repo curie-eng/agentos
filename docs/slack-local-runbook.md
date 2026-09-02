@@ -38,8 +38,9 @@ subscriptions are correct from the start.
    It encodes:
 
    - Socket Mode on
-   - the bot scopes (`app_mentions:read`, `chat:write`, `channels:history`,
-     `groups:history`, `im:history`, `im:read`, and `assistant:write`)
+   - the bot scopes (`app_mentions:read`, `chat:write`, `channels:read`,
+     `channels:history`, `groups:history`, `im:history`, `im:read`, and
+     `assistant:write`)
    - the `app_mention` and `message.im` event subscriptions
    - interactivity on (so button and block-action clicks arrive over Socket
      Mode)
@@ -48,7 +49,8 @@ subscriptions are correct from the start.
    `SLACK_APP_TOKEN`, used for the Socket Mode connection.
 3. **Install to Workspace** (Install App), then copy the **Bot User OAuth
    Token**. This `xoxb-...` value is your `SLACK_BOT_TOKEN`, used by the Web API
-   to post replies.
+   to post replies. If this app was installed before `channels:read` was added,
+   reinstall it to the workspace so the existing bot-token grant is refreshed.
 4. `SLACK_SIGNING_SECRET` is optional and unused in Socket Mode (kept only for
    Bolt app construction); leave it empty.
 
@@ -133,6 +135,43 @@ What each export does:
 Socket Mode is outbound-only: the dispatcher dials Slack over an outbound
 WebSocket, so your laptop needs no public ingress, port-forward, or tunnel.
 
+Before opening that Socket Mode connection, the dispatcher performs bounded
+preflights in this order: platform API `/health` reachability within
+`CURIE_API_PREFLIGHT_TIMEOUT_SECONDS`, then authenticated `/agents` destination
+discovery with `CURIE_API_KEY` and Slack metadata capability attempts together
+within a fresh budget of the same size. `/health` is unauthenticated. If the
+health budget expires, correct `CURIE_API_URL`; if discovery cannot finish,
+check platform API availability and configuration, then retry.
+
+If Slack cannot attempt every configured destination before its budget,
+startup refuses safely: restore Slack availability or increase
+`CURIE_API_PREFLIGHT_TIMEOUT_SECONDS`, then retry. These failures name only the
+phase and recovery action, never configured Slack destinations or credentials.
+After discovery, the dispatcher always makes one bounded public-channel
+`conversations.list(types=public_channel, limit=1)` capability call, even with
+zero configured destinations, then attempts `conversations.info` for every
+configured destination. A Slack `missing_scope` or documented `invalid_types`
+permission outcome on that public capability call maps unambiguously to the
+recovery below without reading or logging its `needed` or `provided` sets.
+Production creates a dedicated no-retry Slack WebClient for each metadata call,
+with an integer timeout derived from the remaining phase budget and capped at
+two seconds. The phase budget stops new attempts; a final already-started call
+can extend it only by that bounded timeout.
+
+The only boot-fatal Slack metadata responses are `missing_scope` and
+`invalid_types` from that fixed public-channel capability request. Both use the
+same missing-public-permission recovery:
+`Slack channel capability preflight failed: bot token is missing required scope channels:read. Add channels:read under OAuth & Permissions > Bot Token Scopes, then reinstall the app to the workspace.`
+The preflight logs only a safe public capability state (`verified` or
+`unverified`) and aggregate checked or unverified destination counts. Other
+capability-call failures, plus private, stale, or transient per-destination
+`conversations.info` outcomes, remain aggregate unverified warnings once every
+destination has been attempted; no tokens or channel identifiers are printed.
+An unverified warning can recur for a private channel, DM, stale destination,
+or transient provider outcome; it is non-terminal and does not prove
+private-channel or DM scope coverage. Correct the destination or access through
+trusted configuration separately.
+
 For the dispatcher-internals angle (its process, reconnect behavior, and app
 creation details), see the runbook in
 [`../apps/dispatcher/README.md`](../apps/dispatcher/README.md).
@@ -153,14 +192,21 @@ docker compose -f compose.release.yaml exec valkey valkey-cli -a valkeypass XLEN
 `valkeypass` is the `.env.example` default (`VALKEY_PASSWORD`); substitute your
 own if you overrode it.
 
-## One Socket Mode owner per app token
+## Shared Socket Mode apps
 
-Slack allows exactly one Socket Mode owner per app token at a time. A local
-dispatcher and a cluster dispatcher on the SAME Slack app conflict: it is either
-or per app. Stop one before starting the other. This is exactly why the compose
-service is off by default behind the profile. The cluster side states the same
-constraint: see [`operations.md`](operations.md), which says to stop a local
-dispatcher before enabling `dispatcher.deploy=true` in the chart.
+Slack allows an app to maintain up to ten Socket Mode connections and may send
+each payload to any connection, with no distribution pattern an application can
+assume ([Slack's Socket Mode documentation](https://docs.slack.dev/apis/events-api/using-socket-mode/#using-multiple-connections)).
+A local dispatcher and a cluster dispatcher can therefore connect with the same
+app token, but they do not both receive each interaction.
+
+Prefer a separate Slack app per long-lived Curie release. When two Curie
+releases temporarily share one app, an approval interaction may first reach the
+release whose API does not contain that approval. That release leaves the
+approval and card unchanged and tells the approver to try again so Slack can
+deliver a later interaction to the owner. Stop the extra dispatcher after the
+overlap; the compose dispatcher remains off by default behind the Slack profile
+to make accidental overlap less likely.
 
 ## Teardown and return to Slack-free
 

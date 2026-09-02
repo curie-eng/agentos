@@ -25,12 +25,13 @@ so a row re-opened this pass is re-enqueued in the same pass.
 Three qualifications shape the design:
 
 - **Grace window (load-bearing).** ``reconcile_once`` only considers records
-  resolved at least ``grace_seconds`` ago. This is NOT approximate: the grace
-  must exceed the worker's maximum single-turn processing time
-  (``runner_total_timeout_s``, 600s) so the reconciler never re-enqueues while an
-  inline-delivered resume turn is still live. The worker writes its done-marker
-  only post-terminal, so a duplicate landing mid-turn is steered into that live
-  turn and re-runs the approved action -- a too-small grace re-introduces exactly
+  resolved at least ``grace_seconds`` ago. Helm derives this value from the
+  worker's delivery budget plus its delivery-shutdown reserve, ensuring the
+  reconciler does not re-enqueue while an inline-delivered resume turn is still
+  live. Callers outside Helm should use a conservative grace that covers the
+  worker's configured turn lifecycle. The worker writes its done-marker only
+  post-terminal, so a duplicate landing mid-turn is steered into that live turn
+  and re-runs the approved action -- a too-small grace re-introduces exactly
   that. The two clocks it compares (``resolved_at`` is the DB ``func.now()``,
   ``resolved_before`` is this pod's clock) only add a small skew margin on top of
   a large grace, not a correctness dependency.

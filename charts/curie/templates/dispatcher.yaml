@@ -1,4 +1,13 @@
 {{- if include "curie.dispatcher.enabled" . }}
+{{- $apiPreflightTimeout := float64 .Values.dispatcher.apiPreflightTimeoutSeconds -}}
+{{- $startupInitialDelay := float64 .Values.dispatcher.startupProbe.initialDelaySeconds -}}
+{{- $startupPeriod := float64 .Values.dispatcher.startupProbe.periodSeconds -}}
+{{- $startupFailureThreshold := float64 .Values.dispatcher.startupProbe.failureThreshold -}}
+{{- $startupFailureCutoff := addf $startupInitialDelay (mulf (subf $startupFailureThreshold 1.0) $startupPeriod) -}}
+{{- $startupApplicationBudget := addf (mulf $apiPreflightTimeout 2.0) 2.0 -}}
+{{- if le $startupFailureCutoff $startupApplicationBudget -}}
+{{- fail (printf "dispatcher.apiPreflightTimeoutSeconds (%g) gives a maximum application startup envelope of %g seconds (API health budget + fresh discovery/Slack budget + the final bounded 2-second Slack call), which must be less than the startupProbe earliest failure cutoff (%g seconds = %g + (%g - 1) * %g). Raise dispatcher.startupProbe.initialDelaySeconds, dispatcher.startupProbe.periodSeconds, or dispatcher.startupProbe.failureThreshold, or lower dispatcher.apiPreflightTimeoutSeconds." $apiPreflightTimeout $startupApplicationBudget $startupFailureCutoff $startupInitialDelay $startupFailureThreshold $startupPeriod) -}}
+{{- end -}}
 {{/*
 The dispatcher runs Slack in Socket Mode: it dials Slack outbound over a
 websocket, so there is no inbound port and therefore no Service and no HTTP
@@ -68,6 +77,8 @@ spec:
                 secretKeyRef:
                   {{- include "curie.secretRef" (dict "root" . "existingSecret" .Values.dispatcher.slack.signingSecretExistingSecret "existingSecretKey" .Values.dispatcher.slack.signingSecretExistingSecretKey "defaultKey" "slackSigningSecret") | nindent 18 }}
             {{- include "curie.env.api" . | nindent 12 }}
+            - name: CURIE_API_PREFLIGHT_TIMEOUT_SECONDS
+              value: {{ .Values.dispatcher.apiPreflightTimeoutSeconds | quote }}
             # Independent HMAC credential for Slack click identity/channel
             # attestation. The platform API key authenticates API calls but is
             # intentionally unable to forge this evidence.
@@ -90,6 +101,20 @@ spec:
           # touches each tick. The dispatcher blocks the main thread in
           # supervisor.run(), so a wedged/hung process stops touching the file ->
           # it goes stale -> the probe fails -> restart.
+          # startupProbe suppresses readiness/liveness until all bounded boot preflights complete.
+          startupProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - |
+                  import os, sys, time
+                  p = os.environ["CURIE_HEARTBEAT_FILE"]
+                  sys.exit(0 if os.path.exists(p) and time.time() - os.path.getmtime(p) < 30 else 1)
+            initialDelaySeconds: {{ .Values.dispatcher.startupProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.dispatcher.startupProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.dispatcher.startupProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.dispatcher.startupProbe.failureThreshold }}
           {{- include "curie.heartbeatProbes" . | nindent 10 }}
           resources:
             {{- toYaml .Values.dispatcher.resources | nindent 12 }}

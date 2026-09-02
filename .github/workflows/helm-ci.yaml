@@ -217,7 +217,10 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/langfuse-byo-assertions.sh
 
-      - name: helm render assertions (Langfuse image pin)
+      # Keep the shipped Helm and Compose Langfuse images on one exact,
+      # reviewed migration set. A floating major tag can move between jobs and
+      # leave the two stores on incompatible migration state (#2190).
+      - name: helm render assertions (langfuse image pin)
         run: |
           set -euo pipefail
           bash charts/curie/ci/langfuse-image-pin-assertions.sh
@@ -323,6 +326,15 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/upgrade-drain-assertions.sh
+
+      # The resume reconciler may enqueue a replacement turn only after the
+      # prior delivery has exhausted both its delivery budget and terminal
+      # settlement reserve. Prove the default derives from that floor and an
+      # explicitly shorter override is rejected during rendering.
+      - name: helm render assertions (API resume reconciler grace)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/api-resume-reconciler-grace-assertions.sh
 
       # Prove every container in the untrusted sandbox pod renders the identical
       # Rail 3 hardened securityContext from the shared helper (issue #493), so a

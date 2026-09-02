@@ -36,7 +36,7 @@ from aci_protocol.service_config import (
     derive_dead_letter_stream_name,
     warn_if_deprecated_api_url_env,
 )
-from pydantic import BeforeValidator, Field, model_validator
+from pydantic import AliasChoices, BeforeValidator, Field, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from pydantic_settings.sources import (
     PydanticBaseSettingsSource,
@@ -705,7 +705,14 @@ class WorkerConfig(BaseSettings):
 
     # Runner HTTP timeouts
     runner_connect_timeout_s: float = 10.0
-    runner_total_timeout_s: float = 600.0
+    runner_total_timeout_s: float = Field(
+        default=600.0,
+        gt=0.0,
+        le=1800.0,
+        validation_alias=AliasChoices(
+            "CURIE_RUNNER_TOTAL_TIMEOUT_S", "RUNNER_TOTAL_TIMEOUT_S"
+        ),
+    )
 
     # Eval stream (F3): a separate consumer group on curie:evals runs eval
     # suites and reports results to the platform API and Langfuse.

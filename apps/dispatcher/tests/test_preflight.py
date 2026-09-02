@@ -1,4 +1,4 @@
-"""Boot-time platform-API wiring gate (#442, AC2).
+"""Boot-time platform-API and Slack capability gates (#442, #2205).
 
 The dispatcher resolves Slack approval clicks by calling the platform API. When
 it is wired to the wrong place the only symptom today is a warning at click time
@@ -12,27 +12,123 @@ races the API's own startup, and in k8s pod start order is not ordered at all, s
 fail-immediately would crash-loop a healthy stack. Test 3 is the guard on that
 decision.
 
-Only the API is faked, at the ``client=`` seam, with ``httpx.MockTransport`` --
-the same "fake the platform API, drive the real code" discipline as
-test_approval_actions.py's scripted resolver. The retry loop, the deadline, and
-the URL construction are all real. Tests stay fast by configuring tiny backoff
-values (real settings, not a patched clock), so the poll loop under test is the
-one that ships.
+Focused cases fake the API at the ``client=`` seam with
+``httpx.MockTransport``. The entrypoint regressions use a real loopback HTTP
+server and let the preflight construct its production client. Slack is faked
+only at its provider client seam. In both forms the retry loops, deadline
+decisions, parsing, and URL construction are real. Slow-path tests use the
+injected monotonic/sleep seam so aggregate budgets are exact and the suite does
+not wait on wall-clock time.
 """
 
 from __future__ import annotations
 
 import logging
+import re
+import threading
 import time
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
+import yaml
 from curie_dispatcher.config import DispatcherConfig
-from curie_dispatcher.preflight import ApiUnreachableError, check_api_reachable
+from curie_dispatcher.preflight import (
+    ApiUnreachableError,
+    SlackChannelPreflightError,
+    check_api_reachable,
+    check_slack_channel_capabilities,
+)
+from slack_sdk.errors import SlackApiError
+from slack_sdk.web.slack_response import SlackResponse
 
 from .conftest import _black_hole_api
 
 API_URL = "http://curie-api:8000"
+CHANNEL_A = "C0EXAMPLE1"
+CHANNEL_B = "C0EXAMPLE2"
+CHANNEL_C = "C0EXAMPLE3"
+MISSING_SCOPE_MESSAGE = (
+    "Slack channel capability preflight failed: bot token is missing required "
+    "scope channels:read. Add channels:read under OAuth & Permissions > Bot "
+    "Token Scopes, then reinstall the app to the workspace."
+)
+SLACK_TIMEOUT_MESSAGE = (
+    "Slack channel capability preflight failed: could not attempt every "
+    "configured destination within the bounded startup budget. Check Slack "
+    "API availability and retry."
+)
+
+
+@contextmanager
+def _loopback_health_server(
+    statuses: Sequence[int],
+    *,
+    userinfo: str = "",
+) -> Iterator[tuple[str, list[str]]]:
+    """Run a real loopback HTTP endpoint with a scripted ``/health`` result.
+
+    The entrypoint regressions below deliberately do not inject an httpx client:
+    they drive ``run.main`` through ``DispatcherConfig`` and the preflight's
+    production-owned client. Only the remote API's answers are scripted here.
+    """
+    if not statuses:
+        raise ValueError("statuses must contain at least one response")
+
+    requests: list[str] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
+            requests.append(self.path)
+            status = statuses[min(len(requests) - 1, len(statuses) - 1)]
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"status":"ok"}')
+
+        def log_message(self, _format: str, *args: object) -> None:
+            """Keep the test server out of the process's terminal log."""
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    authority = f"{userinfo}@" if userinfo else ""
+    try:
+        yield f"http://{authority}{host}:{port}", requests
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=1)
+
+
+def _configure_main_env(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    api_url: str,
+    timeout_s: float,
+) -> None:
+    """Configure the real ``DispatcherConfig()`` used by ``run.main``."""
+    for name, field in DispatcherConfig.model_fields.items():
+        alias = field.validation_alias
+        monkeypatch.delenv(
+            alias if isinstance(alias, str) else name.upper(), raising=False
+        )
+    monkeypatch.setenv("CURIE_API_URL", api_url)
+    monkeypatch.setenv("CURIE_API_PREFLIGHT_TIMEOUT_SECONDS", str(timeout_s))
+    monkeypatch.setenv("CURIE_BACKOFF_INITIAL_SECONDS", "0.01")
+    monkeypatch.setenv("CURIE_BACKOFF_MAX_SECONDS", "0.02")
+    monkeypatch.setenv("CURIE_BACKOFF_MULTIPLIER", "2")
+    monkeypatch.setenv("CURIE_API_KEY", "dispatcher-platform-test-key")
+    monkeypatch.setenv(
+        "CURIE_APPROVAL_CHAT_ATTESTER_SECRET", "dispatcher-attester-test-secret"
+    )
+    monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-entrypoint-test")
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-entrypoint-test")
 
 
 def _config(**overrides: object) -> DispatcherConfig:
@@ -59,6 +155,117 @@ def _config(**overrides: object) -> DispatcherConfig:
 
 def _client(handler) -> httpx.Client:
     return httpx.Client(transport=httpx.MockTransport(handler))
+
+
+def _agent(
+    *,
+    channels: list[dict[str, str]],
+    approval_routes: dict[str, dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """A complete, public-placeholder ``AgentOut`` response fixture."""
+    return {
+        "id": "00000000-0000-0000-0000-000000000001",
+        "name": "acme-bot",
+        "channels": channels,
+        "repo_full_name": None,
+        "behavior_packs": None,
+        "model": None,
+        "thinking": None,
+        "approval_required_tools": None,
+        "approval_routes": approval_routes,
+        "hook_partitions": None,
+        "secrets": None,
+        "memory": True,
+        "created_at": "2026-01-01T00:00:00Z",
+    }
+
+
+class _RecordingSlackClient:
+    """The only Slack fake: it records the real SDK method boundary."""
+
+    def __init__(
+        self,
+        *,
+        side_effect: Exception | None = None,
+        list_side_effect: Exception | None = None,
+        list_response: object | None = None,
+    ) -> None:
+        self.channels: list[str] = []
+        self.list_calls: list[dict[str, object]] = []
+        self.side_effect = side_effect
+        self.list_side_effect = list_side_effect
+        self.list_response = (
+            {
+                "ok": True,
+                "channels": [],
+                "response_metadata": {"next_cursor": ""},
+            }
+            if list_response is None
+            else list_response
+        )
+
+    def conversations_list(
+        self,
+        *,
+        types: str,
+        exclude_archived: bool,
+        limit: int,
+    ) -> object:
+        self.list_calls.append(
+            {
+                "types": types,
+                "exclude_archived": exclude_archived,
+                "limit": limit,
+            }
+        )
+        if self.list_side_effect is not None:
+            raise self.list_side_effect
+        return self.list_response
+
+    def conversations_info(self, *, channel: str) -> Any:
+        self.channels.append(channel)
+        if self.side_effect is not None:
+            raise self.side_effect
+        return {"ok": True, "channel": {"id": channel}}
+
+
+class _FakeClock:
+    """Deterministic monotonic clock for bounded boot-preflight tests."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class _AdvancingSlackClient(_RecordingSlackClient):
+    """Successful Slack fake whose calls consume a deterministic budget."""
+
+    def __init__(self, *, clock: _FakeClock, seconds_per_call: float) -> None:
+        super().__init__()
+        self._clock = clock
+        self._seconds_per_call = seconds_per_call
+
+    def conversations_info(self, *, channel: str) -> dict[str, Any]:
+        response = super().conversations_info(channel=channel)
+        self._clock.sleep(self._seconds_per_call)
+        return response
+
+
+class _StaticSlackClient(_RecordingSlackClient):
+    """Slack fake for malformed non-exception response shapes."""
+
+    def __init__(self, response: object) -> None:
+        super().__init__()
+        self._response = response
+
+    def conversations_info(self, *, channel: str) -> object:
+        self.channels.append(channel)
+        return self._response
 
 
 def _refusing(request: httpx.Request) -> httpx.Response:
@@ -180,37 +387,48 @@ def test_health_url_tolerates_a_trailing_slash() -> None:
 
 
 def test_the_loop_spends_its_whole_budget_with_production_backoff_ratios() -> None:
-    """The gate must poll until its deadline, and report what it really spent.
+    """The gate must keep polling until its deadline and report what it spent.
 
-    The other cases run `backoff_max << timeout`, where the growing delay never
-    approaches the deadline. The shipped defaults are the opposite ratio
-    (`backoff_max` 30.0 against a 30.0s deadline), so the delays 1, 2, 4, 8, 16
-    reach t=15s and the next 16s delay overshoots. An implementation that breaks
-    on the overshoot instead of clamping to the remaining budget abandons half
-    its deadline and then reports the configured 30.0s it never spent. This
-    config is those defaults scaled by 100.
+    This uses the production 120-second chart budget and reconnect ratios on an
+    injected clock. Without the preflight-specific poll ceiling, the loop can
+    spend the end of its budget asleep, so an API becoming healthy late in the
+    advertised readiness window is never probed.
     """
-
     config = _config(
-        api_preflight_timeout_s=0.3,
-        backoff_initial_seconds=0.01,
-        backoff_max_seconds=0.3,
+        api_preflight_timeout_s=120.0,
+        backoff_initial_seconds=1.0,
+        backoff_max_seconds=30.0,
         backoff_multiplier=2.0,
     )
-    start = time.monotonic()
+    clock = _FakeClock()
+    request_started_at: list[float] = []
+
+    def refusing(request: httpx.Request) -> httpx.Response:
+        request_started_at.append(clock.monotonic())
+        raise httpx.ConnectError("connection refused", request=request)
+
     with pytest.raises(ApiUnreachableError) as excinfo:
         check_api_reachable(
-            config, logger=logging.getLogger("test-preflight"), client=_client(_refusing)
+            config,
+            logger=logging.getLogger("test-preflight"),
+            client=_client(refusing),
+            monotonic=clock.monotonic,
+            sleep=clock.sleep,
         )
-    elapsed = time.monotonic() - start
 
-    assert elapsed >= 0.27, (
-        f"the preflight gave up after {elapsed:.3f}s of its 0.3s budget; the "
+    last_probe_elapsed = request_started_at[-1]
+    assert last_probe_elapsed >= config.api_preflight_timeout_s * 0.9, (
+        f"the last probe started only {last_probe_elapsed:.1f}s into the "
+        f"{config.api_preflight_timeout_s:.0f}s budget; the loop slept through "
+        "the final readiness window instead of polling it"
+    )
+    assert clock.monotonic() == config.api_preflight_timeout_s, (
+        f"the preflight gave up after {clock.monotonic():.1f}s of its 120s budget; the "
         f"delay must be clamped to the remaining time, not abandoned when it "
         f"would overshoot"
     )
-    # 0.15s is the pre-fix elapsed: the message must never claim time it did not spend.
-    assert "after 0.3s" in str(excinfo.value), (
+    # The terminal message must never claim time the loop did not really spend.
+    assert "after 120.0s" in str(excinfo.value), (
         f"the error must report the time actually elapsed, not the configured "
         f"deadline; got {str(excinfo.value)!r}"
     )
@@ -297,6 +515,914 @@ def test_userinfo_is_stripped_from_the_error_too() -> None:
     assert "curie-api:8000" in str(excinfo.value)
 
 
+def test_slack_preflight_discovers_all_destinations_deduplicates_and_logs_count(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Every display-safe Slack destination is checked exactly once.
+
+    Slack documents ``channel`` as the required conversation ID argument and
+    ``{\"ok\": true, \"channel\": {...}}`` as the success response:
+    https://docs.slack.dev/reference/methods/conversations.info/
+    """
+    api_key = "fake-platform-key-sentinel"
+    config = _config(api_key=api_key)
+    agent = _agent(
+        channels=[
+            {"kind": "slack", "address": CHANNEL_A},
+            {"kind": "mail", "address": "mail-room-example"},
+        ],
+        approval_routes={
+            "security": {
+                "resolution": {"kind": "slack", "address": CHANNEL_B},
+                "notification": {"kind": "slack", "address": CHANNEL_C},
+            },
+            "operations": {
+                # Repeat the ordinary binding to prove the call is de-duplicated
+                # across AgentOut.channels and every approval route target.
+                "resolution": {"kind": "slack", "address": CHANNEL_A},
+                "notification": {
+                    "kind": "mail",
+                    "address": "mail-approval-example",
+                },
+            },
+        },
+    )
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=[agent])
+
+    slack = _RecordingSlackClient()
+    logger = logging.getLogger("test-slack-preflight-success")
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        check_slack_channel_capabilities(
+            config,
+            logger=logger,
+            web_client=slack,
+            api_client=_client(handler),
+        )
+
+    assert len(requests) == 1
+    assert requests[0].method == "GET"
+    assert str(requests[0].url) == f"{API_URL}/agents"
+    assert requests[0].headers["X-API-Key"] == api_key
+    assert len(slack.channels) == 3
+    assert sorted(slack.channels) == sorted([CHANNEL_A, CHANNEL_B, CHANNEL_C])
+    assert slack.list_calls == [
+        {"types": "public_channel", "exclude_archived": True, "limit": 1}
+    ]
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert messages == [
+        "Slack channel capability preflight public-channel capability verified; "
+        "checked 3 configured destinations; unverified 0"
+    ]
+    logged = " ".join(messages)
+    for private_value in (api_key, CHANNEL_A, CHANNEL_B, CHANNEL_C):
+        assert private_value not in logged, (
+            f"success logs must contain only an aggregate count, not {private_value!r}"
+        )
+
+
+def test_slack_preflight_empty_destination_set_still_checks_public_capability(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An unbound Slack surface still proves the workspace-level public scope."""
+    agent = _agent(
+        channels=[{"kind": "mail", "address": "mail-room-example"}],
+        approval_routes=None,
+    )
+    slack = _RecordingSlackClient()
+    logger = logging.getLogger("test-slack-preflight-empty")
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        check_slack_channel_capabilities(
+            _config(),
+            logger=logger,
+            web_client=slack,
+            api_client=_client(lambda _request: httpx.Response(200, json=[agent])),
+        )
+
+    assert slack.list_calls == [
+        {"types": "public_channel", "exclude_archived": True, "limit": 1}
+    ]
+    assert slack.channels == []
+    assert [record.getMessage() for record in caplog.records] == [
+        "Slack channel capability preflight public-channel capability verified; "
+        "checked 0 configured destinations; unverified 0"
+    ]
+
+
+def test_discovery_ignores_malformed_non_slack_target_before_reading_address() -> None:
+    """Only Slack targets make the Slack address field part of this gate."""
+    agent = _agent(
+        channels=[
+            {"kind": "mail"},
+            {"kind": "slack", "address": CHANNEL_A},
+        ],
+        approval_routes=None,
+    )
+    slack = _RecordingSlackClient()
+
+    check_slack_channel_capabilities(
+        _config(),
+        logger=logging.getLogger("test-non-slack-malformed-target"),
+        web_client=slack,
+        api_client=_client(lambda _request: httpx.Response(200, json=[agent])),
+    )
+
+    assert slack.list_calls == [
+        {"types": "public_channel", "exclude_archived": True, "limit": 1}
+    ]
+    assert slack.channels == [CHANNEL_A]
+
+
+def test_discovery_refuses_malformed_slack_target_without_leaking(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A Slack target still requires a nonempty string destination address."""
+    agent = _agent(
+        channels=[
+            {"kind": "slack", "private": "hostile-target-field-sentinel"},
+        ],
+        approval_routes=None,
+    )
+    slack = _RecordingSlackClient()
+    logger = logging.getLogger("test-slack-malformed-target")
+
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        with pytest.raises(SlackChannelPreflightError) as excinfo:
+            check_slack_channel_capabilities(
+                _config(),
+                logger=logger,
+                web_client=slack,
+                api_client=_client(
+                    lambda _request: httpx.Response(200, json=[agent])
+                ),
+            )
+
+    assert "returned an invalid response shape" in str(excinfo.value)
+    assert slack.list_calls == []
+    assert slack.channels == []
+    emitted = " ".join(
+        [str(excinfo.value), *(record.getMessage() for record in caplog.records)]
+    )
+    assert "hostile-target-field-sentinel" not in emitted
+
+
+def test_slack_preflight_retries_transient_agent_discovery_then_succeeds() -> None:
+    """Authenticated discovery retries transient 5xx and connection failures.
+
+    ``GET /health`` can answer before the API's database-backed ``GET /agents``
+    is ready. The latter therefore needs the same bounded startup tolerance.
+    """
+    api_key = "fake-platform-key-sentinel"
+    attempts: list[httpx.Request] = []
+    clock = _FakeClock()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(request)
+        if len(attempts) == 1:
+            return httpx.Response(503, text="transient-body-sentinel")
+        if len(attempts) == 2:
+            raise httpx.ConnectError("transient-connect-sentinel", request=request)
+        return httpx.Response(200, json=[])
+
+    check_slack_channel_capabilities(
+        _config(
+            api_key=api_key,
+            api_preflight_timeout_s=1.0,
+            backoff_initial_seconds=0.1,
+            backoff_max_seconds=0.2,
+        ),
+        logger=logging.getLogger("test-slack-preflight-discovery-retry"),
+        web_client=_RecordingSlackClient(),
+        api_client=_client(handler),
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    assert len(attempts) == 3
+    assert all(request.headers["X-API-Key"] == api_key for request in attempts)
+    assert clock.now == pytest.approx(0.3)
+
+
+def test_slack_preflight_api_discovery_failure_is_redaction_safe(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Exhausted discovery fails closed without relaying bodies or credentials."""
+    api_key = "hostile-api-key-sentinel"
+    raw_body = "hostile-api-response-body-sentinel"
+    logger = logging.getLogger("test-slack-preflight-api-failure")
+    clock = _FakeClock()
+
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        with pytest.raises(SlackChannelPreflightError) as excinfo:
+            check_slack_channel_capabilities(
+                _config(
+                    api_key=api_key,
+                    api_preflight_timeout_s=0.2,
+                    backoff_initial_seconds=0.1,
+                    backoff_max_seconds=0.1,
+                ),
+                logger=logger,
+                web_client=_RecordingSlackClient(),
+                api_client=_client(
+                    lambda _request: httpx.Response(503, text=raw_body)
+                ),
+                monotonic=clock.monotonic,
+                sleep=clock.sleep,
+            )
+
+    emitted = " ".join(
+        [str(excinfo.value), *(record.getMessage() for record in caplog.records)]
+    )
+    assert "Slack channel capability preflight failed" in emitted
+    assert api_key not in emitted
+    assert raw_body not in emitted
+
+
+@pytest.mark.parametrize(
+    ("provider_failure", "private_values"),
+    [
+        pytest.param(
+            SlackApiError(
+                "hostile-info-scope-sdk-message-sentinel",
+                {
+                    "ok": False,
+                    "error": "missing_scope",
+                    "needed": "channels:read",
+                    "provided": "groups:read",
+                    "detail": "hostile-info-scope-body-sentinel",
+                },
+            ),
+            (
+                "channels:read",
+                "groups:read",
+                "hostile-info-scope-sdk-message-sentinel",
+                "hostile-info-scope-body-sentinel",
+            ),
+            id="destination-public-scope-is-not-global-proof",
+        ),
+        pytest.param(
+            SlackApiError(
+                "hostile-groups-sdk-message-sentinel",
+                {
+                    "ok": False,
+                    "error": "missing_scope",
+                    "needed": "groups:read",
+                    "provided": "chat:write",
+                    "detail": "hostile-groups-body-sentinel",
+                },
+            ),
+            (
+                "groups:read",
+                "chat:write",
+                "hostile-groups-sdk-message-sentinel",
+                "hostile-groups-body-sentinel",
+            ),
+            id="private-channel-scope",
+        ),
+        pytest.param(
+            SlackApiError(
+                "hostile-stale-sdk-message-sentinel",
+                {
+                    "ok": False,
+                    "error": "channel_not_found",
+                    "detail": "hostile-stale-body-sentinel",
+                },
+            ),
+            (
+                "channel_not_found",
+                "hostile-stale-sdk-message-sentinel",
+                "hostile-stale-body-sentinel",
+            ),
+            id="stale-binding",
+        ),
+        pytest.param(
+            SlackApiError(
+                "hostile-rate-sdk-message-sentinel",
+                {
+                    "ok": False,
+                    "error": "ratelimited",
+                    "retry_after": "hostile-retry-after-sentinel",
+                },
+            ),
+            (
+                "ratelimited",
+                "hostile-rate-sdk-message-sentinel",
+                "hostile-retry-after-sentinel",
+            ),
+            id="rate-limit",
+        ),
+        pytest.param(
+            RuntimeError("hostile-transport-error-sentinel"),
+            ("hostile-transport-error-sentinel",),
+            id="transport-error",
+        ),
+        pytest.param(
+            SlackApiError(
+                "hostile-sdk-message-sentinel",
+                {
+                    "ok": False,
+                    "error": "hostile-sdk-error-sentinel",
+                    "detail": "hostile-sdk-body-sentinel",
+                },
+            ),
+            (
+                "hostile-sdk-message-sentinel",
+                "hostile-sdk-error-sentinel",
+                "hostile-sdk-body-sentinel",
+            ),
+            id="generic-sdk-error",
+        ),
+    ],
+)
+def test_slack_preflight_nondefinitive_failures_warn_aggregately_and_continue(
+    provider_failure: Exception,
+    private_values: tuple[str, ...],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Private, stale, rate-limited, and transport outcomes are not boot-fatal.
+
+    Slack documents ``missing_scope``, ``channel_not_found``, and
+    ``ratelimited`` for ``conversations.info``. A missing-scope response that
+    does not include public-channel ``channels:read`` remains nondefinitive:
+    https://docs.slack.dev/reference/methods/conversations.info/#errors
+    """
+    logger = logging.getLogger("test-slack-preflight-nondefinitive-failure")
+    with caplog.at_level(logging.WARNING, logger=logger.name):
+        check_slack_channel_capabilities(
+            _config(slack_bot_token="hostile-bot-token-sentinel"),
+            logger=logger,
+            web_client=_RecordingSlackClient(side_effect=provider_failure),
+            api_client=_client(
+                lambda _request: httpx.Response(
+                    200,
+                    json=[
+                        _agent(
+                            channels=[{"kind": "slack", "address": CHANNEL_A}],
+                            approval_routes=None,
+                        )
+                    ],
+                )
+            ),
+        )
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert messages == [
+        "Slack channel capability preflight public-channel capability verified; "
+        "checked 0 configured destinations; unverified 1"
+    ]
+    logged = " ".join(messages)
+    for private_value in (
+        "hostile-bot-token-sentinel",
+        CHANNEL_A,
+        *private_values,
+    ):
+        assert private_value not in logged
+
+
+def test_malformed_falsey_conversations_list_response_is_unverified_and_redacted(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A falsey provider mapping cannot be replaced by the fake's happy default."""
+
+    class FalseySlackResponse(dict[str, object]):
+        def __bool__(self) -> bool:
+            return False
+
+    provider_response = FalseySlackResponse(
+        ok=True,
+        channels="hostile-provider-channels-sentinel",
+        detail="hostile-provider-body-sentinel",
+    )
+    slack = _RecordingSlackClient(list_response=provider_response)
+    logger = logging.getLogger("test-slack-malformed-capability-response")
+    agent = _agent(
+        channels=[{"kind": "slack", "address": CHANNEL_A}],
+        approval_routes=None,
+    )
+
+    with caplog.at_level(logging.WARNING, logger=logger.name):
+        check_slack_channel_capabilities(
+            _config(slack_bot_token="hostile-bot-token-sentinel"),
+            logger=logger,
+            web_client=slack,
+            api_client=_client(lambda _request: httpx.Response(200, json=[agent])),
+        )
+
+    assert slack.list_calls == [
+        {"types": "public_channel", "exclude_archived": True, "limit": 1}
+    ]
+    assert slack.channels == [CHANNEL_A]
+    messages = [record.getMessage() for record in caplog.records]
+    assert messages == [
+        "Slack channel capability preflight public-channel capability unverified; "
+        "checked 1 configured destinations; unverified 0"
+    ]
+    logged = " ".join(messages)
+    for private_value in (
+        "hostile-bot-token-sentinel",
+        "hostile-provider-channels-sentinel",
+        "hostile-provider-body-sentinel",
+        CHANNEL_A,
+    ):
+        assert private_value not in logged
+
+
+@pytest.mark.parametrize(
+    ("provider_response", "private_values"),
+    [
+        pytest.param({"ok": False}, (), id="ok-false"),
+        pytest.param(
+            {
+                "ok": True,
+                "error": "hostile-missing-channel-error-sentinel",
+                "detail": "hostile-missing-channel-body-sentinel",
+            },
+            (
+                "hostile-missing-channel-error-sentinel",
+                "hostile-missing-channel-body-sentinel",
+            ),
+            id="missing-channel",
+        ),
+        pytest.param(
+            {
+                "ok": True,
+                "channel": "hostile-nonmapping-channel-sentinel",
+                "detail": "hostile-nonmapping-body-sentinel",
+            },
+            (
+                "hostile-nonmapping-channel-sentinel",
+                "hostile-nonmapping-body-sentinel",
+            ),
+            id="nonmapping-channel",
+        ),
+    ],
+)
+def test_slack_preflight_malformed_success_is_nonfatal_unverified_and_redacted(
+    provider_response: object,
+    private_values: tuple[str, ...],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Malformed success shapes are ambiguous and cannot make startup terminal.
+
+    Slack documents a successful ``conversations.info`` response as
+    ``{"ok": true, "channel": {...}}``. Any other non-exception shape is
+    unverified, and its provider-controlled fields stay out of logs:
+    https://docs.slack.dev/reference/methods/conversations.info/
+    """
+    logger = logging.getLogger("test-slack-preflight-malformed-response")
+    slack = _StaticSlackClient(provider_response)
+    with caplog.at_level(logging.WARNING, logger=logger.name):
+        check_slack_channel_capabilities(
+            _config(slack_bot_token="hostile-bot-token-sentinel"),
+            logger=logger,
+            web_client=slack,
+            api_client=_client(
+                lambda _request: httpx.Response(
+                    200,
+                    json=[
+                        _agent(
+                            channels=[{"kind": "slack", "address": CHANNEL_A}],
+                            approval_routes=None,
+                        )
+                    ],
+                )
+            ),
+        )
+
+    assert slack.channels == [CHANNEL_A]
+    messages = [record.getMessage() for record in caplog.records]
+    assert messages == [
+        "Slack channel capability preflight public-channel capability verified; "
+        "checked 0 configured destinations; unverified 1"
+    ]
+    logged = " ".join(messages)
+    for private_value in (
+        "hostile-bot-token-sentinel",
+        CHANNEL_A,
+        *private_values,
+    ):
+        assert private_value not in logged
+
+
+def test_slack_preflight_stops_at_aggregate_deadline_and_logs_safe_counts(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Unattempted destinations make aggregate-budget exhaustion terminal."""
+    clock = _FakeClock()
+    slack = _AdvancingSlackClient(clock=clock, seconds_per_call=1.0)
+    logger = logging.getLogger("test-slack-preflight-aggregate-budget")
+    agent = _agent(
+        channels=[
+            {"kind": "slack", "address": CHANNEL_A},
+            {"kind": "slack", "address": CHANNEL_B},
+            {"kind": "slack", "address": CHANNEL_C},
+        ],
+        approval_routes=None,
+    )
+
+    with caplog.at_level(logging.WARNING, logger=logger.name):
+        with pytest.raises(SlackChannelPreflightError) as excinfo:
+            check_slack_channel_capabilities(
+                _config(
+                    slack_bot_token="hostile-bot-token-sentinel",
+                    api_preflight_timeout_s=2.0,
+                ),
+                logger=logger,
+                web_client=slack,
+                api_client=_client(
+                    lambda _request: httpx.Response(
+                        200,
+                        json=[agent],
+                        headers={"X-Provider-Detail": "hostile-provider-sentinel"},
+                    )
+                ),
+                monotonic=clock.monotonic,
+                sleep=clock.sleep,
+            )
+
+    assert slack.channels == [CHANNEL_A, CHANNEL_B]
+    assert clock.now == pytest.approx(2.0)
+    assert str(excinfo.value) == SLACK_TIMEOUT_MESSAGE
+    emitted = " ".join(
+        [str(excinfo.value), *(record.getMessage() for record in caplog.records)]
+    )
+    for private_value in (
+        "hostile-bot-token-sentinel",
+        "hostile-provider-sentinel",
+        CHANNEL_A,
+        CHANNEL_B,
+        CHANNEL_C,
+    ):
+        assert private_value not in emitted
+
+
+def test_health_and_slack_each_receive_the_full_configured_budget(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Health has its own budget; discovery plus Slack gets a fresh budget."""
+    clock = _FakeClock()
+    config = _config(api_preflight_timeout_s=2.0)
+
+    def health_handler(_request: httpx.Request) -> httpx.Response:
+        clock.sleep(2.0)
+        return httpx.Response(200, json={"status": "ok"})
+
+    check_api_reachable(
+        config,
+        logger=logging.getLogger("test-separate-budget-health"),
+        client=_client(health_handler),
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    agent = _agent(
+        channels=[
+            {"kind": "slack", "address": CHANNEL_A},
+            {"kind": "slack", "address": CHANNEL_B},
+            {"kind": "slack", "address": CHANNEL_C},
+        ],
+        approval_routes=None,
+    )
+
+    def discovery_handler(_request: httpx.Request) -> httpx.Response:
+        clock.sleep(1.0)
+        return httpx.Response(200, json=[agent])
+
+    slack = _AdvancingSlackClient(clock=clock, seconds_per_call=1.0)
+    logger = logging.getLogger("test-separate-budget-slack")
+    with caplog.at_level(logging.WARNING, logger=logger.name):
+        with pytest.raises(SlackChannelPreflightError) as excinfo:
+            check_slack_channel_capabilities(
+                config,
+                logger=logger,
+                web_client=slack,
+                api_client=_client(discovery_handler),
+                monotonic=clock.monotonic,
+                sleep=clock.sleep,
+            )
+
+    # Health consumed its full 2s before the Slack preflight started. Discovery
+    # plus metadata still received another full 2s, ending at t=4 rather than
+    # inheriting health's exhausted deadline at t=2.
+    assert clock.now == pytest.approx(4.0)
+    assert slack.channels == [CHANNEL_A]
+    assert str(excinfo.value) == SLACK_TIMEOUT_MESSAGE
+    emitted = " ".join(
+        [str(excinfo.value), *(record.getMessage() for record in caplog.records)]
+    )
+    for private_value in (CHANNEL_A, CHANNEL_B, CHANNEL_C):
+        assert private_value not in emitted
+
+
+def test_production_slack_clients_are_per_destination_bounded_and_nonretrying(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Production probes cannot hide an unattempted destination behind retries."""
+    from curie_dispatcher import preflight
+
+    clock = _FakeClock()
+    constructor_calls: list[dict[str, Any]] = []
+    attempted: list[str] = []
+    capability_calls: list[dict[str, object]] = []
+    call_durations = iter([1.2, 1.5, 1.0])
+
+    class RecordingProductionClient:
+        def conversations_list(
+            self,
+            *,
+            types: str,
+            exclude_archived: bool,
+            limit: int,
+        ) -> dict[str, Any]:
+            capability_calls.append(
+                {
+                    "types": types,
+                    "exclude_archived": exclude_archived,
+                    "limit": limit,
+                }
+            )
+            clock.sleep(next(call_durations))
+            return {
+                "ok": True,
+                "channels": [],
+                "response_metadata": {"next_cursor": ""},
+            }
+
+        def conversations_info(self, *, channel: str) -> dict[str, Any]:
+            attempted.append(channel)
+            clock.sleep(next(call_durations))
+            return {"ok": True, "channel": {"id": channel}}
+
+    def construct_web_client(**kwargs: Any) -> RecordingProductionClient:
+        constructor_calls.append(kwargs)
+        return RecordingProductionClient()
+
+    monkeypatch.setattr(preflight, "WebClient", construct_web_client)
+    agent = _agent(
+        channels=[
+            {"kind": "slack", "address": CHANNEL_A},
+            {"kind": "slack", "address": CHANNEL_B},
+            {"kind": "slack", "address": CHANNEL_C},
+        ],
+        approval_routes=None,
+    )
+
+    def discovery_handler(_request: httpx.Request) -> httpx.Response:
+        clock.sleep(0.4)
+        return httpx.Response(
+            200,
+            json=[agent],
+            headers={"X-Provider-Detail": "hostile-provider-sentinel"},
+        )
+
+    logger = logging.getLogger("test-production-slack-client-budget")
+    with caplog.at_level(logging.WARNING, logger=logger.name):
+        with pytest.raises(SlackChannelPreflightError) as excinfo:
+            check_slack_channel_capabilities(
+                _config(
+                    slack_bot_token="hostile-bot-token-sentinel",
+                    api_preflight_timeout_s=4.0,
+                ),
+                logger=logger,
+                api_client=_client(discovery_handler),
+                monotonic=clock.monotonic,
+                sleep=clock.sleep,
+            )
+
+    assert capability_calls == [
+        {"types": "public_channel", "exclude_archived": True, "limit": 1}
+    ]
+    assert attempted == [CHANNEL_A, CHANNEL_B]
+    assert len(constructor_calls) == 3
+    assert [call["timeout"] for call in constructor_calls] == [2, 2, 1]
+    assert all(isinstance(call["timeout"], int) for call in constructor_calls)
+    assert all(call["retry_handlers"] == [] for call in constructor_calls)
+    assert all(isinstance(call["logger"], logging.Logger) for call in constructor_calls)
+    assert all(not call["logger"].propagate for call in constructor_calls)
+    assert all(
+        not call["logger"].isEnabledFor(logging.CRITICAL)
+        for call in constructor_calls
+    )
+    assert all(
+        any(isinstance(handler, logging.NullHandler) for handler in call["logger"].handlers)
+        for call in constructor_calls
+    )
+    assert all(
+        call["token"] == "hostile-bot-token-sentinel"
+        for call in constructor_calls
+    )
+    assert str(excinfo.value) == SLACK_TIMEOUT_MESSAGE
+    emitted = " ".join(
+        [str(excinfo.value), *(record.getMessage() for record in caplog.records)]
+    )
+    for private_value in (
+        "hostile-bot-token-sentinel",
+        "hostile-provider-sentinel",
+        CHANNEL_A,
+        CHANNEL_B,
+        CHANNEL_C,
+    ):
+        assert private_value not in emitted
+
+
+def test_production_provider_error_uses_silent_sdk_logger_and_safe_aggregate(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """SDK diagnostics cannot bypass the preflight's redaction boundary."""
+    from curie_dispatcher import preflight
+
+    constructor_calls: list[dict[str, Any]] = []
+    raw_message = "hostile-production-sdk-message-sentinel"
+    raw_body = "hostile-production-sdk-body-sentinel"
+
+    class FailingProductionClient:
+        def __init__(self, logger: logging.Logger) -> None:
+            self._logger = logger
+
+        def conversations_list(
+            self,
+            *,
+            types: str,
+            exclude_archived: bool,
+            limit: int,
+        ) -> object:
+            assert (types, exclude_archived, limit) == ("public_channel", True, 1)
+            self._logger.debug("%s %s", CHANNEL_A, raw_body)
+            self._logger.error("%s %s", raw_message, raw_body)
+            raise SlackApiError(
+                raw_message,
+                {
+                    "ok": False,
+                    "error": "ratelimited",
+                    "detail": raw_body,
+                    "channel": CHANNEL_A,
+                },
+            )
+
+        def conversations_info(self, *, channel: str) -> object:
+            raise AssertionError(f"unexpected destination call for {channel}")
+
+    def construct_web_client(**kwargs: Any) -> FailingProductionClient:
+        constructor_calls.append(kwargs)
+        return FailingProductionClient(kwargs["logger"])
+
+    monkeypatch.setattr(preflight, "WebClient", construct_web_client)
+    logger = logging.getLogger("test-production-provider-error")
+    with caplog.at_level(logging.DEBUG):
+        with caplog.at_level(logging.DEBUG, logger="slack_sdk.web.base_client"):
+            check_slack_channel_capabilities(
+                _config(slack_bot_token="hostile-bot-token-sentinel"),
+                logger=logger,
+                api_client=_client(lambda _request: httpx.Response(200, json=[])),
+            )
+
+    assert len(constructor_calls) == 1
+    constructor = constructor_calls[0]
+    assert constructor["retry_handlers"] == []
+    assert isinstance(constructor["timeout"], int)
+    silent_logger = constructor["logger"]
+    assert isinstance(silent_logger, logging.Logger)
+    assert silent_logger.propagate is False
+    assert not silent_logger.isEnabledFor(logging.CRITICAL)
+    assert any(
+        isinstance(handler, logging.NullHandler)
+        for handler in silent_logger.handlers
+    )
+    app_messages = [
+        record.getMessage() for record in caplog.records if record.name == logger.name
+    ]
+    assert app_messages == [
+        "Slack channel capability preflight public-channel capability unverified; "
+        "checked 0 configured destinations; unverified 0"
+    ]
+    emitted = " ".join(record.getMessage() for record in caplog.records)
+    for private_value in (
+        "hostile-bot-token-sentinel",
+        raw_message,
+        raw_body,
+        CHANNEL_A,
+        "ratelimited",
+    ):
+        assert private_value not in emitted
+
+
+@pytest.mark.parametrize(
+    "error_code",
+    [
+        pytest.param("missing_scope", id="missing-scope"),
+        pytest.param("invalid_types", id="types-rejected-by-granted-scopes"),
+    ],
+)
+def test_slack_public_capability_scope_error_has_exact_redacted_recovery(
+    error_code: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The workspace-level public-channel probe supplies precise recovery.
+
+    Slack documents ``channels:read`` for public-channel metadata returned by
+    ``conversations.list``. Its error table says ``missing_scope`` means the
+    token lacks necessary scope and ``invalid_types`` may mean the requested
+    type cannot be used with the token's granted permission scopes. Neither
+    response needs a provider ``needed`` hint for this public-only probe:
+    https://docs.slack.dev/reference/methods/conversations.list/#errors
+    https://docs.slack.dev/reference/scopes/channels.read/
+    """
+    raw_message = "hostile-slack-sdk-message-sentinel"
+    response = SlackResponse(
+        client=None,
+        http_verb="GET",
+        api_url="https://slack.com/api/conversations.list",
+        req_args={
+            "params": {
+                "types": "public_channel",
+                "exclude_archived": True,
+                "limit": 1,
+            }
+        },
+        data={
+            "ok": False,
+            "error": error_code,
+            "provided": "chat:write",
+            "detail": "hostile-response-body-sentinel",
+        },
+        headers={"X-Slack-Req-Id": "hostile-request-id-sentinel"},
+        status_code=200,
+    )
+    missing_scope = SlackApiError(raw_message, response)
+    logger = logging.getLogger("test-slack-preflight-missing-scope")
+    slack = _RecordingSlackClient(list_side_effect=missing_scope)
+
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        with pytest.raises(SlackChannelPreflightError) as excinfo:
+            check_slack_channel_capabilities(
+                _config(slack_bot_token="hostile-bot-token-sentinel"),
+                logger=logger,
+                web_client=slack,
+                api_client=_client(
+                    lambda _request: httpx.Response(
+                        200,
+                        json=[
+                            _agent(
+                                channels=[{"kind": "slack", "address": CHANNEL_A}],
+                                approval_routes=None,
+                            )
+                        ],
+                    )
+                ),
+            )
+
+    assert str(excinfo.value) == MISSING_SCOPE_MESSAGE
+    assert slack.list_calls == [
+        {"types": "public_channel", "exclude_archived": True, "limit": 1}
+    ]
+    assert slack.channels == []
+    emitted = " ".join(
+        [str(excinfo.value), *(record.getMessage() for record in caplog.records)]
+    )
+    for private_value in (
+        "hostile-bot-token-sentinel",
+        CHANNEL_A,
+        raw_message,
+        error_code,
+        "chat:write",
+        "hostile-response-body-sentinel",
+        "hostile-request-id-sentinel",
+    ):
+        assert private_value not in emitted
+
+
+def test_slack_manifest_declares_the_preflight_scope() -> None:
+    """The installable manifest must grant what the boot gate exercises."""
+    manifest = yaml.safe_load(
+        (Path(__file__).parents[1] / "slack-app-manifest.yaml").read_text()
+    )
+
+    assert "channels:read" in manifest["oauth_config"]["scopes"]["bot"]
+
+
+def _set_run_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clear ambient dispatcher config and install only public test values."""
+    for name, field in DispatcherConfig.model_fields.items():
+        alias = field.validation_alias
+        monkeypatch.delenv(
+            alias if isinstance(alias, str) else name.upper(), raising=False
+        )
+    monkeypatch.setenv(
+        "CURIE_APPROVAL_CHAT_ATTESTER_SECRET", "dispatcher-attester-test-secret"
+    )
+
+
+class _TestTelemetry:
+    def shutdown(self) -> None:
+        pass
+
+
 def test_run_main_gates_before_connecting_slack(monkeypatch: pytest.MonkeyPatch) -> None:
     """The ordering contract: the wiring gate precedes any Slack wiring.
 
@@ -309,27 +1435,31 @@ def test_run_main_gates_before_connecting_slack(monkeypatch: pytest.MonkeyPatch)
     """
     from curie_dispatcher import run
 
-    reached_slack: list[str] = []
+    reached_after_api: list[str] = []
+
+    def _unexpected_slack_preflight(*args: object, **kwargs: object) -> None:
+        reached_after_api.append("slack_preflight")
+        raise AssertionError(
+            "Slack capability preflight ran before API reachability passed"
+        )
 
     def _recording_build_supervisor(*args: object, **kwargs: object) -> object:
-        reached_slack.append("build_supervisor")
+        reached_after_api.append("build_supervisor")
         raise AssertionError(
             "build_supervisor was called with an unreachable API: the dispatcher "
             "wired up Slack before (or instead of) gating on the platform API"
         )
 
+    monkeypatch.setattr(
+        run, "check_slack_channel_capabilities", _unexpected_slack_preflight
+    )
     monkeypatch.setattr(run, "build_supervisor", _recording_build_supervisor)
-    for name, field in DispatcherConfig.model_fields.items():
-        alias = field.validation_alias
-        monkeypatch.delenv(alias if isinstance(alias, str) else name.upper(), raising=False)
+    _set_run_env(monkeypatch)
     # Port 1 is reserved and never listening: a real, immediate connection refusal.
     monkeypatch.setenv("CURIE_API_URL", "http://127.0.0.1:1")
     monkeypatch.setenv("CURIE_API_PREFLIGHT_TIMEOUT_SECONDS", "0.2")
     monkeypatch.setenv("CURIE_BACKOFF_INITIAL_SECONDS", "0.01")
     monkeypatch.setenv("CURIE_BACKOFF_MAX_SECONDS", "0.02")
-    monkeypatch.setenv(
-        "CURIE_APPROVAL_CHAT_ATTESTER_SECRET", "dispatcher-attester-test-secret"
-    )
 
     with pytest.raises(SystemExit) as excinfo:
         run.main()
@@ -338,4 +1468,261 @@ def test_run_main_gates_before_connecting_slack(monkeypatch: pytest.MonkeyPatch)
         f"the dispatcher must exit non-zero on an unreachable API so a "
         f"CrashLoopBackOff surfaces it; exited {excinfo.value.code!r}"
     )
-    assert reached_slack == []
+    assert reached_after_api == []
+
+
+def test_run_main_orders_api_then_slack_preflight_then_supervisor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful boot reaches Socket Mode only after both ordered gates."""
+    from curie_dispatcher import run
+
+    events: list[str] = []
+
+    class RecordingSupervisor:
+        def run(self) -> None:
+            events.append("supervisor.run")
+
+        def request_stop(self) -> None:
+            events.append("supervisor.request_stop")
+
+    class RecordingHeartbeat:
+        def set(self) -> None:
+            events.append("heartbeat.stop")
+
+    def check_api(*args: object, **kwargs: object) -> None:
+        assert "deadline" not in kwargs
+        events.append("api")
+
+    def check_slack(
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        assert "web_client" not in kwargs
+        assert "deadline" not in kwargs
+        events.append("slack")
+
+    def build_supervisor(
+        _config: DispatcherConfig,
+        *,
+        logger: logging.Logger,
+    ) -> RecordingSupervisor:
+        assert logger.name == "curie_dispatcher"
+        events.append("supervisor")
+        return RecordingSupervisor()
+
+    _set_run_env(monkeypatch)
+    monkeypatch.setattr(
+        run, "bootstrap_service_telemetry", lambda *a, **k: _TestTelemetry()
+    )
+    monkeypatch.setattr(run, "check_api_reachable", check_api)
+    monkeypatch.setattr(run, "check_slack_channel_capabilities", check_slack)
+    monkeypatch.setattr(run, "build_supervisor", build_supervisor)
+    monkeypatch.setattr(
+        run, "start_heartbeat", lambda *a, **k: RecordingHeartbeat()
+    )
+    monkeypatch.setattr(run.signal, "signal", lambda *a, **k: None)
+
+    run.main()
+
+    assert events[:3] == ["api", "slack", "supervisor"]
+    assert "supervisor.run" in events
+
+
+def test_run_main_missing_scope_exits_before_supervisor_without_leaking(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The actionable Slack refusal is terminal before Socket Mode wiring."""
+    from curie_dispatcher import run
+
+    events: list[str] = []
+
+    def check_api(*args: object, **kwargs: object) -> None:
+        events.append("api")
+
+    def refuse_slack(*args: object, **kwargs: object) -> None:
+        assert "web_client" not in kwargs
+        events.append("slack")
+        raise SlackChannelPreflightError(MISSING_SCOPE_MESSAGE)
+
+    def unexpected_supervisor(
+        _config: DispatcherConfig,
+        *,
+        logger: logging.Logger,
+    ) -> object:
+        assert logger.name == "curie_dispatcher"
+        events.append("supervisor")
+        raise AssertionError("missing_scope reached supervisor/Socket Mode wiring")
+
+    _set_run_env(monkeypatch)
+    monkeypatch.setattr(
+        run, "bootstrap_service_telemetry", lambda *a, **k: _TestTelemetry()
+    )
+    monkeypatch.setattr(run, "check_api_reachable", check_api)
+    monkeypatch.setattr(run, "check_slack_channel_capabilities", refuse_slack)
+    monkeypatch.setattr(run, "build_supervisor", unexpected_supervisor)
+
+    with caplog.at_level(logging.ERROR, logger="curie_dispatcher"):
+        with pytest.raises(SystemExit) as excinfo:
+            run.main()
+
+    assert excinfo.value.code not in (0, None)
+    assert events == ["api", "slack"]
+    assert [record.getMessage() for record in caplog.records] == [MISSING_SCOPE_MESSAGE]
+
+
+def test_run_main_waits_for_delayed_api_then_starts_supervisor_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A normally slow API does not restart the dispatcher before Slack starts.
+
+    This enters through the process entrypoint, reads a real
+    ``DispatcherConfig`` from the environment, and lets the production preflight
+    create its own HTTP client and execute its own retry loop. Slack, heartbeat,
+    signals, and telemetry are process boundaries, so record them without opening
+    external connections or changing this pytest process's signal handlers.
+    """
+    from curie_dispatcher import run
+
+    events: list[str] = []
+    health_requests: list[str] = []
+    heartbeat_stop = threading.Event()
+
+    class Telemetry:
+        def shutdown(self) -> None:
+            events.append("telemetry.shutdown")
+
+    class Supervisor:
+        def run(self) -> None:
+            events.append("supervisor.run")
+
+        def request_stop(self) -> None:
+            events.append("supervisor.request_stop")
+
+    def check_slack(*args: object, **kwargs: object) -> None:
+        assert health_requests == ["/health", "/health", "/health"], (
+            "Slack capability preflight started before delayed API readiness passed"
+        )
+        events.append("slack_preflight")
+
+    def build_supervisor(
+        config: DispatcherConfig, *, logger: logging.Logger
+    ) -> Supervisor:
+        assert type(config) is DispatcherConfig
+        assert logger.name == "curie_dispatcher"
+        assert health_requests == ["/health", "/health", "/health"], (
+            "Slack wiring started before delayed API readiness passed"
+        )
+        assert events[-1] == "slack_preflight"
+        events.append("build_supervisor")
+        return Supervisor()
+
+    def start_heartbeat(path: str, interval_s: float) -> threading.Event:
+        assert path == "/tmp/curie-dispatcher.heartbeat"
+        assert interval_s == 10.0
+        events.append("heartbeat.start")
+        return heartbeat_stop
+
+    monkeypatch.setattr(
+        run,
+        "bootstrap_service_telemetry",
+        lambda *args, **kwargs: Telemetry(),
+    )
+    monkeypatch.setattr(run, "check_slack_channel_capabilities", check_slack)
+    monkeypatch.setattr(run, "build_supervisor", build_supervisor)
+    monkeypatch.setattr(run, "start_heartbeat", start_heartbeat)
+    monkeypatch.setattr(
+        run.signal,
+        "signal",
+        lambda signum, handler: events.append(f"signal.{signum}"),
+    )
+
+    with _loopback_health_server([503, 503, 200]) as (api_url, requests):
+        health_requests = requests
+        _configure_main_env(monkeypatch, api_url=api_url, timeout_s=0.5)
+        run.main()
+
+    assert requests == ["/health", "/health", "/health"], (
+        "the real preflight must retry delayed readiness to success before "
+        f"starting Slack; observed {requests!r}"
+    )
+    assert events.count("slack_preflight") == 1
+    assert events.count("build_supervisor") == 1
+    assert events.count("supervisor.run") == 1
+    assert events.index("supervisor.run") > events.index("build_supervisor")
+    assert events.count("heartbeat.start") == 1
+    assert heartbeat_stop.is_set(), "normal supervisor return must stop the heartbeat"
+    assert events[-1] == "telemetry.shutdown", (
+        f"telemetry must shut down after a clean supervisor exit; events={events!r}"
+    )
+
+
+def test_run_main_times_out_before_slack_with_actionable_sanitized_log(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A persistently unhealthy API exits once, bounded and actionable.
+
+    This is the timeout-negative sibling of delayed success. Userinfo in the URL
+    makes sanitization falsifiable, while a real loopback 503 keeps ``last error``
+    deterministic and proves the process made multiple attempts before giving up.
+    """
+    from curie_dispatcher import run
+
+    events: list[str] = []
+
+    class Telemetry:
+        def shutdown(self) -> None:
+            events.append("telemetry.shutdown")
+
+    def reached_slack_preflight(*args: object, **kwargs: object) -> None:
+        raise AssertionError("Slack preflight ran after the terminal API timeout")
+
+    def reached_supervisor(*args: object, **kwargs: object) -> object:
+        events.append("build_supervisor")
+        raise AssertionError("Slack was built after the terminal preflight timeout")
+
+    def reached_heartbeat(*args: object, **kwargs: object) -> threading.Event:
+        raise AssertionError("heartbeat started before the API preflight passed")
+
+    monkeypatch.setattr(
+        run,
+        "bootstrap_service_telemetry",
+        lambda *args, **kwargs: Telemetry(),
+    )
+    monkeypatch.setattr(
+        run, "check_slack_channel_capabilities", reached_slack_preflight
+    )
+    monkeypatch.setattr(run, "build_supervisor", reached_supervisor)
+    monkeypatch.setattr(run, "start_heartbeat", reached_heartbeat)
+
+    with _loopback_health_server(
+        [503], userinfo="operator:credential"
+    ) as (api_url, requests):
+        _configure_main_env(monkeypatch, api_url=api_url, timeout_s=0.3)
+        safe_url = api_url.replace("operator:credential@", "")
+        started = time.monotonic()
+        with caplog.at_level(logging.ERROR, logger="curie_dispatcher"):
+            with pytest.raises(SystemExit) as excinfo:
+                run.main()
+        elapsed = time.monotonic() - started
+
+    assert excinfo.value.code not in (0, None)
+    assert 0.27 <= elapsed < 0.8, (
+        f"the 0.3s entrypoint deadline was not bounded; elapsed={elapsed:.3f}s"
+    )
+    assert len(requests) >= 2, (
+        f"the timeout path did not retry before failing; requests={requests!r}"
+    )
+    assert events == ["telemetry.shutdown"], (
+        "terminal preflight failure must happen before Slack/heartbeat and still "
+        f"shut down telemetry; events={events!r}"
+    )
+
+    terminal = "\n".join(record.getMessage() for record in caplog.records)
+    assert safe_url in terminal
+    assert "operator" not in terminal and "credential" not in terminal
+    assert re.search(r"after \d+\.\d+s", terminal), terminal
+    assert re.search(r"\(\d+ attempts, last error: HTTP 503\)", terminal), terminal
+    assert "check CURIE_API_URL" in terminal

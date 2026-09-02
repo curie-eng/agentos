@@ -483,29 +483,33 @@ Two platform-side steps come first, in this order:
    scoped `chn` token for that one binding. It refuses with 409 for a non-`slack`
    binding that has no reply route, which is why the binding comes first.
 
-Then turn the adapter on. Do not put any of its three credentials in `--set`:
-command arguments reach shell history and the process table. Keep the ordinary
-configuration in the installation's checked-in values and render the secret
-values from a secret manager into a gitignored mode-0600 file:
+Then turn the adapter on. Keep all three credentials out of `--set`, Helm
+values, and release history by having a secret manager materialize an
+operator-managed Kubernetes Secret before the install or upgrade. One Secret
+can carry the adapter's three keys plus the worker's JSON credential map. The
+map's `mail-adapter` entry must be generated from the same egress-secret source;
+do not copy the value by hand. The checked-in, non-secret values file then
+contains only references:
 
-```bash
-# One-time local guard for the private file. .git/info/exclude is local to this
-# checkout; it cannot accidentally publish the filename as a repo rule.
-printf '%s\n' '.curie-mail-secrets.yaml' >> .git/info/exclude
-install -m 0600 /dev/null .curie-mail-secrets.yaml
-
-# Have the secret manager/template step write this shape without echoing values:
-# mailAdapter:
-#   agentmail:
-#     apiKey: <secret>
-#   channelToken: <secret>
-#   egressSecret: <secret>
-${EDITOR:?set EDITOR} .curie-mail-secrets.yaml
-chmod 0600 .curie-mail-secrets.yaml
-
-helm upgrade <release> <chart> -n <ns> \
-  -f values.yaml -f .curie-mail-secrets.yaml
+```yaml
+mailAdapter:
+  channelTokenExistingSecret: curie-mail-credentials
+  channelTokenExistingSecretKey: channel-token
+  egressSecretExistingSecret: curie-mail-credentials
+  egressSecretExistingSecretKey: egress-secret
+  agentmail:
+    apiKeyExistingSecret: curie-mail-credentials
+    apiKeyExistingSecretKey: agentmail-api-key
+worker:
+  adapterCredentialsExistingSecret: curie-mail-credentials
+  adapterCredentialsExistingSecretKey: adapter-credentials
 ```
+
+The referenced Secret keys carry, respectively, the scoped channel token, the
+shared adapter egress credential, the AgentMail API key, and a JSON object that
+maps the configured `mailAdapter.adapterSlug` to that same egress credential.
+All `secretKeyRef`s are non-optional: a missing Secret or key prevents the pod
+from starting instead of falling back to an empty or chart-held value.
 
 The non-secret `values.yaml` contains the switch, inbox, allowed senders, and
 network destination. Kubernetes NetworkPolicy cannot authorize an FQDN, so use
@@ -550,25 +554,42 @@ mailAdapter:
 | `mailAdapter.allowedSenders` | Who may start a turn. Empty denies everyone, and with ingress on the pod refuses to boot rather than run an inbox that answers nobody; `*` is the explicit allow-all. |
 | `mailAdapter.ingressEnabled` | `false` serves egress while sending nothing inbound. That is the staged-cutover position while the platform side of a new binding is being wired. |
 | `mailAdapter.egressSecret` | The shared secret the worker presents on `X-Curie-Adapter-Secret` and the adapter checks before any side effect. |
+| `mailAdapter.channelTokenExistingSecret` / `channelTokenExistingSecretKey` | Source the scoped channel token from an operator-managed Secret instead of the chart Secret (default key `mailChannelToken`). |
+| `mailAdapter.egressSecretExistingSecret` / `egressSecretExistingSecretKey` | Source the adapter's egress credential externally (default key `mailEgressSecret`). This requires `worker.adapterCredentialsExistingSecret` to supply the paired worker map. |
+| `mailAdapter.agentmail.apiKeyExistingSecret` / `apiKeyExistingSecretKey` | Source the AgentMail API key from an operator-managed Secret instead of the chart Secret (default key `mailAgentmailApiKey`). |
 | `mailAdapter.agentmail.httpsCidrs` | Required provider/proxy destination CIDRs on TCP 443. The mail pod's egress policy otherwise allows only DNS and this release's API pods. |
 | `mailAdapter.apiEgress.httpsCidrs` / `port` | Required narrow destination peers when `api.deploy=false`; default port `8000`. Ignored for the in-chart API, whose pod selector and service port are used instead. |
 | `mailAdapter.persistence.size` / `storageClass` | Chart-managed RWO SQLite PVC. The default size is `1Gi`; empty storage class inherits `global.storageClass` and then the cluster default. |
 | `mailAdapter.persistence.existingClaim` | Mount an existing same-namespace RWO Filesystem PVC instead of rendering one. An install/upgrade hook checks the exact claim before replacing the pod. |
 
-**Do not write `worker.adapterCredentials.mail-adapter` by hand.** The chart derives it
-from `mailAdapter.egressSecret`, so the pair cannot drift. An equal value is accepted; a
-conflicting one fails the render by design. Rotating `mailAdapter.channelToken`,
-`mailAdapter.egressSecret` or `mailAdapter.agentmail.apiKey` and running `helm upgrade`
-restarts the adapter pod on its own, with no `kubectl rollout restart`. The one
-`Recreate` replica reopens the same SQLite file and resumes pending work. The
-adapter cannot mint a replacement `chn` token because it deliberately holds no
-platform key.
+On the chart-managed path, do not write
+`worker.adapterCredentials.mail-adapter` by hand. The chart derives it from
+`mailAdapter.egressSecret`, accepts an equal migration value, and refuses a
+conflict. Changing any of the three plain mail credential values and running
+`helm upgrade` changes the adapter pod-template checksum; changing the egress
+value also changes the derived worker map and rolls the worker.
 
-The chart Secret still contains the three values because the pods need them.
-Using secret references keeps them out of rendered Deployment manifests; it does
-not hide them from a release administrator who can read Helm's release Secret or
-the chart Secret. Restrict those permissions with cluster RBAC, and rotate at the
-provider/platform when an administrator loses that trust.
+On the external path, `mailAdapter.egressSecretExistingSecret` requires
+`worker.adapterCredentialsExistingSecret`. The chart neither derives the mail
+entry nor compares it with the unused plain egress value: the two referenced
+Secret keys are the authority. Rotate both representations from one source,
+then run `helm upgrade` so the adapter hashes the live referenced data and
+recreates its pod. The worker reads its external JSON map only at pod start and
+its checksum tracks the reference, not same-Secret data changes, so restart the
+worker after an in-place external rotation with `kubectl -n <ns> rollout
+restart deployment/<release>-worker`. A source name/key change through Helm
+rolls both consumers through their source-reference checksums. The one
+`Recreate` adapter replica reopens the same SQLite file and resumes pending
+work. The adapter cannot mint a replacement channel token because it
+deliberately holds no platform key.
+
+The chart Secret contains a mail key only while that field is chart-managed;
+setting its `existingSecret` omits the key so later upgrades cannot overwrite
+the external source. Secret references keep credentials out of Deployment
+manifests, and external references also keep their data out of Helm values and
+release history. They do not hide data from a cluster administrator who can
+read the referenced Secret. Restrict those permissions with cluster RBAC, and
+rotate at the provider/platform when an administrator loses that trust.
 
 Only a new SQLite file primes the current inbox as history. A restart performs
 one provider confirmation without marking messages seen, then resumes durable
@@ -845,9 +866,14 @@ next operator.
 - **langfuse-web restarts ~2x during first boot** while ClickHouse and
   Postgres come up, then stabilizes. This is startup ordering, not a
   crashloop; do not treat the early restarts as a failure.
-- **Exactly one Slack Socket Mode owner at a time.** Stop a local dispatcher
-  before enabling `dispatcher.deploy=true` in the chart, and stop the
-  in-cluster dispatcher before switching back to a local one for dev.
+- **Give long-lived releases separate Slack Socket Mode apps.** Slack permits
+  up to ten connections for one app and may send each payload to any connection
+  without a predictable distribution pattern. During a temporary overlap, a
+  non-owning Curie release leaves an absent approval unchanged and asks the
+  approver to retry; a retry may be needed before the owning release receives
+  the interaction. Stop the local dispatcher after testing rather than leaving
+  it competing with the in-cluster release. See
+  [Slack's multiple-connections contract](https://docs.slack.dev/apis/events-api/using-socket-mode/#using-multiple-connections).
 - **kube-router applies NetworkPolicy a few seconds after pod start.** A
   brand-new pod can see open egress for the first seconds before the policy
   lands. This is functionally irrelevant for runners (the first model call

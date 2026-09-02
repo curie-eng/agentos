@@ -15,8 +15,8 @@ from pathlib import Path
 import anyio
 import httpx
 import pytest
-from mcp.server.fastmcp.exceptions import ToolError
-from mcp.shared.memory import create_connected_server_and_client_session as _connect
+from mcp import types as mcp_types
+from mcp.server.mcpserver.exceptions import ToolError
 
 # Load server.py BY PATH under a unique module name, rather than putting this
 # directory on sys.path and importing `server`.
@@ -326,8 +326,9 @@ def _call_tool(srv, name, args):
     """Call one tool through the real MCP request path and return the CallToolResult."""
 
     async def go():
-        async with _connect(srv.mcp._mcp_server) as client:
-            return await client.call_tool(name, args)
+        entry = srv.mcp._lowlevel_server.get_request_handler("tools/call")
+        assert entry is not None
+        return await entry.handler(None, mcp_types.CallToolRequestParams(name=name, arguments=args))
 
     return anyio.run(go)
 
@@ -337,7 +338,7 @@ def test_a_refused_read_and_an_answered_one_carry_different_is_error_flags(monke
 
     _with_one_tempo(monkeypatch, srv, lambda *a, **kw: httpx.Response(403))
     refused = _call_tool(srv, "get_trace", {"trace_id": "abc123"})
-    assert refused.isError is True
+    assert refused.is_error is True
     # The sentence survives the trip behind a fixed SDK prefix: FastMCP puts our
     # message text on the wire, never a traceback, so raising costs nothing the
     # prose was doing.
@@ -367,7 +368,7 @@ def test_a_refused_read_and_an_answered_one_carry_different_is_error_flags(monke
         lambda *a, **kw: httpx.Response(200, json=payload),
     )
     answered = _call_tool(srv, "get_trace", {"trace_id": "abc123"})
-    assert answered.isError is False
+    assert answered.is_error is False
     assert "GET /health" in answered.content[0].text
     # The contrast in the OTHER direction: an answered read carries no prefix at
     # all, so the two results differ in text shape as well as in the flag.
@@ -376,15 +377,15 @@ def test_a_refused_read_and_an_answered_one_carry_different_is_error_flags(monke
     # THE contrast, stated outright: this is the whole property. While both were
     # returned strings these two results had the same shape, and a program
     # reading them could not tell a refusal from a trace.
-    assert refused.isError != answered.isError
+    assert refused.is_error != answered.is_error
 
 
 def test_every_tool_is_annotated_read_only():
     # readOnlyHint is not the boundary -- the Viewer token is -- but a
     # write-shaped tool should never reach a prompt-injectable agent's context.
     srv = _load()
-    assert srv.READ_ONLY.readOnlyHint is True
-    assert srv.READ_ONLY.destructiveHint is False
+    assert srv.READ_ONLY.read_only_hint is True
+    assert srv.READ_ONLY.destructive_hint is False
 
 
 def test_streamable_http_is_mounted_at_curie_connector_path():

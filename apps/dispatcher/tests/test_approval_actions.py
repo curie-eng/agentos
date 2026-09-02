@@ -220,6 +220,62 @@ def test_reject_button_resolves_with_rejected_decision(
     assert "Rejected by <@U_MANAGER>" in web_client.chat_update.call_args.kwargs["text"]
 
 
+def test_two_releases_only_the_owner_resolves_an_immediate_action(
+    redis_client: redis.Redis,
+    config: DispatcherConfig,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A loser may receive the shared-app envelope, but cannot settle it (#2202).
+
+    Drive the same approval id through two independent real Bolt apps. Release B
+    has its own API view and truthfully reports that the record is absent; release
+    A owns the row and is the only app allowed to stamp the card. This is both the
+    negative and positive half of the two-release regression.
+    """
+
+    non_owner = ScriptedResolver(
+        ResolveOutcome(status_code=404, detail="approval not found")
+    )
+    owner = ScriptedResolver(
+        ResolveOutcome(status_code=200, resolved_by="U_MANAGER", decision="approved")
+    )
+    non_owner_app, non_owner_web = _build(config, redis_client, non_owner)
+    owner_app, owner_web = _build(config, redis_client, owner)
+
+    non_owner_socket = FakeSocketClient()
+    SocketModeHandler(non_owner_app, app_token="xapp-test").handle(
+        non_owner_socket,
+        _approval_click("env-release-b", action_id=APPROVE_ACTION_ID),
+    )
+    _drain(non_owner_app)
+
+    assert non_owner_socket.acked_envelope_ids == ["env-release-b"]
+    assert len(non_owner.calls) == 1
+    non_owner_web.chat_update.assert_not_called()
+    non_owner_web.chat_postMessage.assert_not_called()
+    non_owner_web.chat_postEphemeral.assert_called_once()
+    notice = non_owner_web.chat_postEphemeral.call_args.kwargs["text"]
+    assert "nothing was changed" in notice
+    assert "owning release" in notice
+    assert any(
+        "may be owned by another Curie release" in record.getMessage()
+        for record in caplog.records
+    )
+
+    owner_socket = FakeSocketClient()
+    SocketModeHandler(owner_app, app_token="xapp-test").handle(
+        owner_socket,
+        _approval_click("env-release-a", action_id=APPROVE_ACTION_ID),
+    )
+    _drain(owner_app)
+
+    assert owner_socket.acked_envelope_ids == ["env-release-a"]
+    assert len(owner.calls) == 1
+    owner_web.chat_update.assert_called_once()
+    assert "Approved by <@U_MANAGER>" in owner_web.chat_update.call_args.kwargs["text"]
+    owner_web.chat_postEphemeral.assert_not_called()
+
+
 def test_non_approver_rejection_renders_the_api_reason(
     redis_client: redis.Redis, config: DispatcherConfig
 ) -> None:

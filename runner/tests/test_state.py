@@ -345,11 +345,12 @@ def test_state_server_exposes_the_five_verbs() -> None:
 
     client = StateApiClient("http://api:8000/agents/A/state", token="k")
     config = build_state_server(client)
-    handler = config["instance"].request_handlers[mcp_types.ListToolsRequest]
+    entry = config["instance"].get_request_handler("tools/list")
+    assert entry is not None
 
     async def names() -> set[str]:
-        result = await handler(mcp_types.ListToolsRequest(method="tools/list"))
-        return {t.name for t in result.root.tools}
+        result = await entry.handler(None, mcp_types.PaginatedRequestParams())
+        return {t.name for t in result.tools}
 
     assert anyio.run(names) == {"get", "set", "append", "list", "delete"}
 

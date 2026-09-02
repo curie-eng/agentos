@@ -27,6 +27,8 @@ flowchart TB
         OTel["OTel Collector"]
     end
 
+    Slack["Slack Web API"]
+
     subgraph sandbox["Sandbox substrate (agent-sandbox controller)"]
         Tmpl["SandboxTemplate<br/>the pod spec claims build from"]
         Pool["SandboxWarmPool<br/>referenced by name; replicas 0 by default"]
@@ -38,7 +40,8 @@ flowchart TB
     API --> PG
     API --> RustFS
     Disp --> Valkey
-    Disp -- "GET /health preflight" --> API
+    Disp -- "GET /health + authenticated /agents preflights" --> API
+    Disp -- "bounded channel metadata preflight" --> Slack
     Worker --> Valkey
     Worker -- "create SandboxClaim" --> Pod
     Pool -. "referenced by warmPoolRef;<br/>pre-warms pods only at replicas > 0" .-> Tmpl
