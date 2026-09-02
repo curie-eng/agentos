@@ -743,6 +743,53 @@ def test_approval_resume_failure_evidence_is_bounded_and_private_artifacts_are_c
     assert "PRIVATE_PARSE_STDERR_SENTINEL" not in parse_result.stdout + parse_result.stderr
 
 
+def test_approval_seed_background_message_is_owned_by_global_cleanup() -> None:
+    """Every approval-seed exit path must release its Slack stub before teardown."""
+
+    source = LADDER_PATH.read_text()
+    trap = _shell_function(source, "cleanup")
+    approval = _shell_function(source, "seed_approval_resume_turn")
+
+    assert "APPROVAL_SEED_MESSAGE_PID=$!" in approval
+    assert "stop_approval_seed_message terminate || true" in trap
+    assert trap.index("stop_approval_seed_message terminate || true") < trap.index(
+        '"$BIN" local down'
+    ), "the background Slack stub must stop before its stack is torn down"
+    assert approval.count("stop_approval_seed_message terminate || true") == 2
+    assert "stop_approval_seed_message || code=$?" in approval
+    for stale_local_wait in ('kill "$message_pid"', 'wait "$message_pid"'):
+        assert stale_local_wait not in approval
+
+
+def test_approval_seed_cleanup_terminates_and_clears_a_stale_pid() -> None:
+    """An interrupted seed cannot leave its background Slack stub alive."""
+
+    source = LADDER_PATH.read_text()
+    stop = _shell_function(source, "stop_approval_seed_message")
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f"""set -u
+{stop}
+APPROVAL_SEED_MESSAGE_PID=""
+sleep 30 &
+stale_pid=$!
+APPROVAL_SEED_MESSAGE_PID="$stale_pid"
+stop_approval_seed_message terminate || true
+[[ -z "$APPROVAL_SEED_MESSAGE_PID" ]]
+if kill -0 "$stale_pid" 2>/dev/null; then
+    exit 9
+fi
+""",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_product_collector_restore_restarts_and_verifies_every_seed_emitter() -> None:
     """Worker-only restore cannot prove dispatcher, API, or runner delivery."""
 

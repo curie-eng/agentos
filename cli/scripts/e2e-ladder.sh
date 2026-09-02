@@ -320,11 +320,29 @@ fi
 WORKDIR="$(mktemp -d)"
 LOCAL_PRODUCT_EVIDENCE="$WORKDIR/product-observability-local.json"
 CLUSTER_PRODUCT_EVIDENCE="$WORKDIR/product-observability-cluster.json"
+APPROVAL_SEED_MESSAGE_PID=""
+
+stop_approval_seed_message() {
+    local mode="${1:-wait}" pid code=0
+    pid="$APPROVAL_SEED_MESSAGE_PID"
+    [[ -n "$pid" ]] || return 0
+    if [[ "$mode" == "terminate" ]]; then
+        kill "$pid" 2>/dev/null || true
+    fi
+    wait "$pid" 2>/dev/null || code=$?
+    APPROVAL_SEED_MESSAGE_PID=""
+    return "$code"
+}
+
 cleanup() {
     # Capture the real exit code FIRST: a teardown command that fails must not
     # turn a red run green, and a successful teardown must not mask a red rung.
     local code=$?
     set +e
+    # The approval proof owns a background `local message` Slack stub. Reap it
+    # before stack teardown so an interrupted seed cannot retain the stub port
+    # after this run exits.
+    stop_approval_seed_message terminate || true
     # The compose worker spawns runner containers as SIBLINGS on the host daemon
     # via the mounted docker socket, so a rung that died before `local down` can
     # strand them. This raw sweep is a BACKSTOP, not duplication: `local down`
@@ -1220,7 +1238,7 @@ seed_mcp_read_turn() {
 seed_approval_resume_turn() {
     local tier="$1" agent_id="${2:-}" query_state="${3:-present}" marker="curie-seed-approval-$$-$RANDOM"
     local stream_start stream_end message_file message_stderr_file token_file pending_file approval_id token out trace_id
-    local message_pid code=0 attempt
+    local code=0 attempt
     if [[ "$LIVE" == "1" || -z "$agent_id" || -z "$marker" ]]; then
         echo "seed-invalid: deterministic approval seed needs fake mode and a deployed agent before telemetry" >&2
         return 1
@@ -1282,7 +1300,7 @@ PY
     }
     "$BIN" --json local message --channel C0LOCALDEV --timeout-secs 120 \
         "[fake:request-approval:e2e] approve correlation $marker" > "$message_file" 2> "$message_stderr_file" &
-    message_pid=$!
+    APPROVAL_SEED_MESSAGE_PID=$!
     approval_id=""
     for attempt in $(seq 1 60); do
         if "$BIN" --json "$tier" approvals "$agent_id" "${scope[@]}" --list > "$pending_file" 2>/dev/null; then
@@ -1300,8 +1318,7 @@ PY
     done
     rm -f "$pending_file"
     if [[ -z "$approval_id" ]]; then
-        kill "$message_pid" 2>/dev/null || true
-        wait "$message_pid" 2>/dev/null || true
+        stop_approval_seed_message terminate || true
         rm -f "$message_file" "$message_stderr_file"
         echo "seed-invalid: awaiting-approval record did not become pending" >&2
         return 1
@@ -1309,14 +1326,13 @@ PY
     if ! CURIE_APPROVAL_PRINCIPAL_TOKEN="$token" "$BIN" --json "$tier" approvals "$agent_id" \
         "${scope[@]}" --resolve "$approval_id" >/dev/null; then
         unset token
-        kill "$message_pid" 2>/dev/null || true
-        wait "$message_pid" 2>/dev/null || true
+        stop_approval_seed_message terminate || true
         rm -f "$message_file" "$message_stderr_file"
         echo "seed-invalid: deterministic approval resolution command failed" >&2
         return 1
     fi
     unset token
-    wait "$message_pid" || code=$?
+    stop_approval_seed_message || code=$?
     if (( code != 0 )); then
         approval_resume_failure_summary "$message_file" "$message_stderr_file" "$code" >&2
         rm -f "$message_file" "$message_stderr_file"

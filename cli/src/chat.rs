@@ -179,11 +179,11 @@ pub fn extract_fields(
 
 /// Extract a validated durable approval id from a structured approval card.
 ///
-/// The worker puts the same UUID in the card's `client_msg_id` and each action's
-/// `value`. A caller-supplied `client_msg_id` alone is not authoritative: the
-/// payload must also contain an action whose id starts with
-/// [`APPROVE_ACTION_ID_PREFIX`]. This keeps ordinary Slack posts (and arbitrary
-/// text mentioning the prefix) from being mistaken for approval control data.
+/// The worker puts the same UUID in the card's `client_msg_id` and approval
+/// action `value`. Neither copy is authoritative alone: both must be valid UUIDs
+/// and equal, and the action id must start with [`APPROVE_ACTION_ID_PREFIX`].
+/// This keeps incomplete, inconsistent, or ordinary Slack posts from being
+/// mistaken for approval control data.
 pub fn approval_card_id(content_type: &str, body: &str) -> Option<String> {
     fn valid_uuid(value: &str) -> Option<String> {
         uuid::Uuid::parse_str(value).ok().map(|_| value.to_string())
@@ -253,10 +253,11 @@ pub fn approval_card_id(content_type: &str, body: &str) -> Option<String> {
         (seen, action_id, client_msg_id)
     };
 
-    if card_seen {
-        action_id.or(client_msg_id)
-    } else {
-        None
+    match (card_seen, action_id, client_msg_id) {
+        (true, Some(action_id), Some(client_msg_id)) if action_id == client_msg_id => {
+            Some(action_id)
+        }
+        _ => None,
     }
 }
 
@@ -797,12 +798,13 @@ mod tests {
     }
 
     #[test]
-    fn approval_card_id_survives_card_before_notice_ordering() {
+    fn approval_card_id_requires_equal_structured_uuid_copies() {
         let id = "00000000-0000-4000-8000-000000000220";
         let body = format!(
             r#"{{"channel":"C0EXAMPLE1","client_msg_id":"{id}","blocks":[{{"type":"actions","elements":[{{"type":"button","action_id":"{APPROVE_ACTION_ID_PREFIX}","value":"{id}"}}]}}]}}"#
         );
         let captured = approval_card_id("application/json", &body);
+        assert_eq!(captured.as_deref(), Some(id));
 
         // The card can win the Slack-call race while the latest placeholder is
         // still ordinary text. Preserve that text for output, but carry the
@@ -834,6 +836,30 @@ mod tests {
         match completed_turn_outcome(None, true, approval_card_id("application/json", &malformed)) {
             Outcome::AwaitingApproval { approval_id, .. } => assert_eq!(approval_id, None),
             outcome => panic!("malformed card lost its awaiting status: {outcome:?}"),
+        }
+    }
+
+    #[test]
+    fn approval_card_id_rejects_mismatched_or_missing_uuid_copies() {
+        let client_id = "00000000-0000-4000-8000-000000000220";
+        let action_id = "00000000-0000-4000-8000-000000000221";
+        let mismatched = format!(
+            r#"{{"client_msg_id":"{client_id}","blocks":[{{"type":"actions","elements":[{{"type":"button","action_id":"{APPROVE_ACTION_ID_PREFIX}","value":"{action_id}"}}]}}]}}"#
+        );
+        let missing_client = format!(
+            r#"{{"blocks":[{{"type":"actions","elements":[{{"type":"button","action_id":"{APPROVE_ACTION_ID_PREFIX}","value":"{action_id}"}}]}}]}}"#
+        );
+        let missing_action_value = format!(
+            r#"{{"client_msg_id":"{client_id}","blocks":[{{"type":"actions","elements":[{{"type":"button","action_id":"{APPROVE_ACTION_ID_PREFIX}"}}]}}]}}"#
+        );
+
+        for body in [&mismatched, &missing_client, &missing_action_value] {
+            assert!(body.contains(APPROVE_ACTION_ID_PREFIX));
+            assert_eq!(approval_card_id("application/json", body), None);
+            match completed_turn_outcome(None, true, approval_card_id("application/json", body)) {
+                Outcome::AwaitingApproval { approval_id, .. } => assert_eq!(approval_id, None),
+                outcome => panic!("untrusted card lost its awaiting status: {outcome:?}"),
+            }
         }
     }
 
