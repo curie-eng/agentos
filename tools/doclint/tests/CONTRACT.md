@@ -75,6 +75,11 @@ resolve is a finding (deletion, not a skip).
   subcommand`.
 - Agent-contract names no command at all (vacuity guard): contains `no
   \`curie\` command appears`.
+- Missing SRE demo runbook (`examples/sre-bot/DEMO.md`): names the doc.
+- SRE demo runbook flag not declared: names the flag, the runbook path, and
+  contains `is not an argument of` and `not a global flag`.
+- SRE demo runbook names no command at all (vacuity guard): names the runbook
+  path and contains `no \`curie\` command appears`.
 
 ## Front-matter schema (per `INTERFACE.md`)
 

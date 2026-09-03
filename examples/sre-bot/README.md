@@ -80,6 +80,12 @@ The `self-upgrade` connector continues to publish `upgrade_self()` and
 approval gates. It starts pinned Job templates; it is not part of the general
 Kubernetes connector, and its kubeconfig is never shared with it.
 
+## Live demo
+
+The six Slack scenarios (read, approved scale, one-shot re-arm, configuration
+denial, RBAC ceiling, coding-agent pull request), the Slack app and GitHub
+prerequisites, and the expected evidence for each are in [DEMO.md](DEMO.md).
+
 ## Verification
 
 Use the real pinned image and a disposable cluster. A complete pass proves:
