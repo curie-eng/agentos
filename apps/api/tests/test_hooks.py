@@ -17,6 +17,7 @@ import hashlib
 import hmac
 import uuid
 from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 import pytest
@@ -25,12 +26,22 @@ from aci_protocol import QueuedTurn, TurnSource
 from curie_api.config import get_settings
 from curie_api.hook_signing import derive
 from curie_api.routers import hooks as hooks_router
+from curie_telemetry import TRACEPARENT_STREAM_FIELD, extract_trace_context
+from curie_telemetry.tracing import configure_tracer_provider
 from fastapi.testclient import TestClient
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from sqlalchemy import text as sql_text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 EMAIL_ENDPOINT = "http://curie-mail-adapter:8080/"
 EMAIL_ADAPTER = "agentmail-sandbox"
+_TRACE_ID = int("3123456789abcdef0123456789abcdef", 16)
+_PARENT_SPAN_ID = int("3123456789abcdef", 16)
+_TRACEPARENT = "00-3123456789abcdef0123456789abcdef-3123456789abcdef-01"
+_OTHER_TRACEPARENT = "00-4123456789abcdef0123456789abcdef-4123456789abcdef-01"
 
 
 # --- fixtures -----------------------------------------------------------------
@@ -84,6 +95,7 @@ def _post(
     secret: str | None = None,
     signature: str | None = None,
     delivery_id: str | None = "dlv-1",
+    traceparent: str | None = None,
 ) -> Any:
     """POST one delivery, signing with `secret` unless a signature is forced."""
 
@@ -94,7 +106,22 @@ def _post(
         headers["X-Curie-Signature-256"] = _sign(secret, body)
     if delivery_id is not None:
         headers["X-Curie-Delivery-Id"] = delivery_id
+    if traceparent is not None:
+        headers[TRACEPARENT_STREAM_FIELD] = traceparent
     return client.post(f"/hooks/{agent_id}/{hook}", content=body, headers=headers)
+
+
+@contextmanager
+def _captured_spans() -> Iterator[InMemorySpanExporter]:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    configure_tracer_provider(provider)
+    try:
+        yield exporter
+    finally:
+        configure_tracer_provider(None)
+        provider.shutdown()
 
 
 def _bump_generation(agent_id: str) -> None:
@@ -163,6 +190,73 @@ def test_a_signed_delivery_enqueues_a_webhook_turn_with_no_placeholder(
     # The payload reaches the agent, and the author is the platform, not a person.
     assert '{"issue": 42}' in turn.text
     assert turn.author == "hook:issues"
+
+
+def test_hook_ingress_producer_injects_the_http_parent_through_owned_enqueue(
+    hooks_client: TestClient,
+    auth_headers: dict[str, str],
+    valkey: redis.Redis,
+    runs_stream: str,
+    clean_db: None,
+) -> None:
+    """Hook and channel ingress share W3C transport without widening payload."""
+
+    agent_id = _bind(hooks_client, auth_headers, name="tracedhookagent")
+    secret = _secret_for(agent_id)
+    body = b'{"issue": 42}'
+
+    with _captured_spans() as exporter:
+        accepted = _post(
+            hooks_client,
+            agent_id,
+            "issues",
+            body,
+            secret=secret,
+            delivery_id="trace-delivery",
+            traceparent=_TRACEPARENT,
+        )
+        duplicate = _post(
+            hooks_client,
+            agent_id,
+            "issues",
+            body,
+            secret=secret,
+            delivery_id="trace-delivery",
+            traceparent=_OTHER_TRACEPARENT,
+        )
+
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["duplicate"] is False
+    assert duplicate.status_code == 200, duplicate.text
+    assert duplicate.json()["duplicate"] is True
+
+    entries = valkey.xrange(runs_stream)
+    assert len(entries) == 1
+    _entry_id, fields = entries[0]
+    assert set(fields) == {"payload", TRACEPARENT_STREAM_FIELD}
+    raw_payload = fields["payload"]
+    assert QueuedTurn.model_validate_json(raw_payload).model_dump_json() == raw_payload
+
+    server_spans = [
+        span for span in exporter.get_finished_spans() if span.name == "http.server.request"
+    ]
+    producers = [
+        span for span in exporter.get_finished_spans() if span.name == "curie.queue.enqueue"
+    ]
+    assert len(server_spans) == 2
+    assert len(producers) == 1, "the duplicate request owns no producer handoff"
+    accepted_server = next(span for span in server_spans if span.context.trace_id == _TRACE_ID)
+    assert accepted_server.parent is not None
+    assert accepted_server.parent.is_remote is True
+    assert accepted_server.parent.span_id == _PARENT_SPAN_ID
+    producer = producers[0]
+    assert producer.context.trace_id == accepted_server.context.trace_id
+    assert producer.parent is not None
+    assert producer.parent.span_id == accepted_server.context.span_id
+
+    transported = trace.get_current_span(extract_trace_context(fields)).get_span_context()
+    assert transported.trace_id == producer.context.trace_id
+    assert transported.span_id == producer.context.span_id
 
 
 def test_instruction_shaped_payload_is_delimited_as_untrusted_content(

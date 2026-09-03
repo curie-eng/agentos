@@ -1,4 +1,27 @@
 {{- if .Values.langfuse.deploy }}
+{{- if .Values.langfuse.serviceAccount.create }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "curie.langfuse.serviceAccountName" . }}
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: langfuse
+  {{- with .Values.langfuse.serviceAccount.annotations }}
+  # Where a key-free object store binds Langfuse's identity (#2211): an IRSA
+  # install annotates this SA with `eks.amazonaws.com/role-arn`, and the
+  # pod-identity webhook injects the projected token and the two web-identity
+  # env vars. Both Langfuse Deployments share this account.
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+# Langfuse does not call the Kubernetes API. IRSA's projected web-identity
+# token is a separate volume, so this composes with key-free object-store
+# auth. Leaving automount at the Kubernetes default would mint a namespace
+# API token the previous `default` ServiceAccount path did not need.
+automountServiceAccountToken: false
+---
+{{- end }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -25,6 +48,11 @@ metadata:
     {{- include "curie.labels" . | nindent 4 }}
 spec:
   replicas: 1
+  # Boot migrations (Prisma + ClickHouse) have no cross-process lock. Recreate
+  # stops the old pod before the new one starts so two versions never migrate
+  # the same database at once (#2216).
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       {{- include "curie.selectorLabels" (dict "root" . "component" "langfuse-web") | nindent 6 }}
@@ -44,6 +72,7 @@ spec:
       {{- with (include "curie.placement.spec" (dict "root" $ "class" "platform")) }}
       {{- . | nindent 6 }}
       {{- end }}
+      serviceAccountName: {{ include "curie.langfuse.serviceAccountName" . }}
       {{- if or .Values.langfuse.clickhouseReadiness.enabled .Values.langfuse.web.postgresReadiness.enabled }}
       initContainers:
       {{- if .Values.langfuse.web.postgresReadiness.enabled }}
@@ -193,6 +222,10 @@ metadata:
     {{- include "curie.labels" . | nindent 4 }}
 spec:
   replicas: 1
+  # Same boot-migration race as langfuse-web (#2216): Recreate so an image
+  # change never runs two worker pods against the same stores at once.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       {{- include "curie.selectorLabels" (dict "root" . "component" "langfuse-worker") | nindent 6 }}
@@ -212,6 +245,7 @@ spec:
       {{- with (include "curie.placement.spec" (dict "root" $ "class" "platform")) }}
       {{- . | nindent 6 }}
       {{- end }}
+      serviceAccountName: {{ include "curie.langfuse.serviceAccountName" . }}
       {{- if .Values.langfuse.clickhouseReadiness.enabled }}
       initContainers:
         {{- include "curie.langfuse.clickhouseGate" (dict

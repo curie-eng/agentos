@@ -51,7 +51,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from . import crud
 from .config import get_settings
-from .resumequeue import ResumeQueue, build_expiry_resume_turn
+from .resumequeue import (
+    ResumeQueue,
+    approval_trace_context,
+    build_expiry_resume_turn,
+)
 
 logger = logging.getLogger(__name__)
 _monotonic = time.monotonic
@@ -104,18 +108,21 @@ async def sweep_expired_approvals(
 
     now = now or datetime.now(UTC).replace(tzinfo=None)
     lapsed = await crud.list_expired_pending_approvals(session, now=now, limit=limit)
-    # Read the ids into plain values up front: the per-record rollback below
-    # expires every ORM instance in this shared session, so reading record.id
-    # lazily in a later iteration would trigger an implicit reload (MissingGreenlet
-    # under the async session).
-    approval_ids = [record.id for record in lapsed]
+    # Read ids and private parents into plain values up front: the per-record
+    # rollback below expires every ORM instance in this shared session, so
+    # reading record fields lazily in a later iteration would trigger an
+    # implicit reload (MissingGreenlet under the async session).
+    approval_work = [
+        (record.id, approval_trace_context(record)) for record in lapsed
+    ]
 
     flipped = 0
-    for approval_id in approval_ids:
+    for approval_id, stored_parent in approval_work:
         try:
             with operation_span(
                 "curie.approval.expire",
                 kind=SpanKind.INTERNAL,
+                parent=stored_parent,
                 attributes={
                     "service.name": "curie-api",
                     "operation": "expire",
@@ -140,7 +147,9 @@ async def sweep_expired_approvals(
             if expired.purpose == "publication":
                 flipped += 1
                 continue
-            stream_id = await resume_queue.enqueue(build_expiry_resume_turn(expired))
+            stream_id = await resume_queue.enqueue(
+                build_expiry_resume_turn(expired), parent=stored_parent
+            )
             flipped += 1
             # Enqueue-first-then-mark: only a wake that actually reached the
             # stream is written off. The mark's ``resumed_at IS NULL`` guard

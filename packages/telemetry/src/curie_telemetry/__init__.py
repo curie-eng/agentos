@@ -8,6 +8,7 @@ from .bootstrap import (
 from .config import resolve_otlp_endpoint, resolve_otlp_protocol
 from .context import (
     TRACEPARENT_STREAM_FIELD,
+    canonicalize_traceparent,
     extract_trace_context,
     inject_trace_context,
 )
@@ -22,6 +23,7 @@ __all__ = [
     "bootstrap_service_telemetry",
     "build_otlp_span_exporter",
     "build_resource",
+    "canonicalize_traceparent",
     "configure_meter_provider",
     "configure_service_logging",
     "deployment_environment",

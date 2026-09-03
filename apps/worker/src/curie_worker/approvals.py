@@ -23,6 +23,7 @@ from typing import Any, Protocol
 
 import httpx
 from aci_protocol import ApprovalRequest
+from curie_telemetry import inject_trace_context
 
 # Re-exported so this module stays the kernel-facing seam for the approval
 # payload: ``ApprovalRequest`` is now the shared wire model (#492), not a
@@ -169,11 +170,13 @@ class ApprovalClient:
         self._read_timeout_s = read_timeout_s
 
     async def create(self, request: ApprovalRequest) -> CreatedApproval:
+        headers = {**self._headers, "Content-Type": "application/json"}
+        inject_trace_context(headers)
         try:
             response = await self._client.post(
                 self._url,
                 content=request.model_dump_json(),
-                headers={**self._headers, "Content-Type": "application/json"},
+                headers=headers,
             )
         except httpx.HTTPError as exc:
             raise ApprovalBackendError(f"approval create failed: {exc}") from exc
@@ -194,10 +197,12 @@ class ApprovalClient:
         would turn a cosmetic gap into a dead-lettered resume.
         """
 
+        headers = dict(self._headers)
+        inject_trace_context(headers)
         try:
             response = await self._client.get(
                 f"{self._url}/{approval_id}",
-                headers=self._headers,
+                headers=headers,
                 timeout=self._read_timeout_s,
             )
         except httpx.HTTPError as exc:
@@ -231,11 +236,13 @@ class ApprovalClient:
             raise ApprovalBackendError(
                 "repository publication is cluster-only and requires internal worker auth"
             )
+        headers = {**self._worker_headers, "Content-Type": "application/json"}
+        inject_trace_context(headers)
         try:
             response = await self._client.post(
                 self._publication_url,
                 json=request.to_json(),
-                headers={**self._worker_headers, "Content-Type": "application/json"},
+                headers=headers,
             )
         except httpx.HTTPError as exc:
             raise ApprovalBackendError(f"publication create failed: {exc}") from exc

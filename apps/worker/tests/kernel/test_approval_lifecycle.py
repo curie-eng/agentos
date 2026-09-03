@@ -12,6 +12,8 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 import aiohttp
 import httpx
@@ -26,14 +28,38 @@ from curie_worker.approvals import (
     ApprovalClient,
     ApprovalRequest,
     CreatedApproval,
+    PublicationCreateRequest,
     SettledApproval,
 )
 from curie_worker.reply_sink import TargetRoute
 from curie_worker.runner_client import RunnerError
 from curie_worker.sandbox.types import RouteState
+from opentelemetry import context as otel_context
+from opentelemetry import trace
+from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags, TraceState
 
 DONE = SessionStatus.DONE
 AWAITING = SessionStatus.AWAITING_APPROVAL
+
+_HTTP_TRACE_ID = int("3123456789abcdef0123456789abcdef", 16)
+_HTTP_SPAN_ID = int("3123456789abcdef", 16)
+_HTTP_TRACEPARENT = "00-3123456789abcdef0123456789abcdef-3123456789abcdef-01"
+
+
+@contextmanager
+def _approval_http_parent() -> Iterator[None]:
+    parent = SpanContext(
+        trace_id=_HTTP_TRACE_ID,
+        span_id=_HTTP_SPAN_ID,
+        is_remote=True,
+        trace_flags=TraceFlags.SAMPLED,
+        trace_state=TraceState(),
+    )
+    token = otel_context.attach(trace.set_span_in_context(NonRecordingSpan(parent)))
+    try:
+        yield
+    finally:
+        otel_context.detach(token)
 
 
 class RecordingApprovals:
@@ -148,6 +174,120 @@ async def _peek_card_ref(h, approval_id: str) -> dict | None:
 
     raw = await h.async_redis.get(h.config.approval_card_key(approval_id))
     return None if raw is None else json.loads(raw)
+
+
+def test_worker_approval_http_requests_carry_the_active_turn_parent() -> None:
+    """Create, read, and publication siblings must retain the worker turn."""
+
+    async def go() -> None:
+        requests: list[httpx.Request] = []
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if request.method == "GET":
+                return httpx.Response(
+                    200,
+                    json={
+                        "status": "approved",
+                        "resolved_by": "U0APPROVER1",
+                        "resolution_note": None,
+                    },
+                )
+            if request.url.path == "/v1/internal/publications":
+                return httpx.Response(
+                    201,
+                    json={
+                        "id": str(uuid.uuid4()),
+                        "approval_id": str(uuid.uuid4()),
+                        "status": "pending",
+                    },
+                )
+            return httpx.Response(
+                201,
+                json={"id": str(uuid.uuid4()), "status": "pending"},
+            )
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
+            client = ApprovalClient(
+                api_base_url="https://api.example.test",
+                api_key="platform-test-key",
+                client=http,
+                read_timeout_s=1.0,
+                worker_token="worker-test-token",
+            )
+            approval = ApprovalRequest(
+                conversation_id="thread-example",
+                author="U0REQUEST1",
+                summary="Approve the bounded action",
+                reply_kind="slack",
+                reply_channel="C0EXAMPLE1",
+                reply_placeholder="1700000000.000001",
+                dedupe_key="event-example",
+            )
+            publication = PublicationCreateRequest(
+                deployment_id=uuid.uuid4(),
+                conversation_id="thread-example",
+                repo_full_name="acme-corp/acme-bot",
+                author="U0REQUEST1",
+                summary="Publish the bounded change",
+                reply_kind="slack",
+                reply_channel="C0EXAMPLE1",
+                reply_placeholder="1700000000.000001",
+                reply_endpoint=None,
+                reply_adapter=None,
+                dedupe_key="publication-example",
+                base_sha="0123456789abcdef0123456789abcdef01234567",
+                patch=b"diff --git a/README.md b/README.md\n",
+                changed_paths=("README.md",),
+                expires_in_seconds=600,
+                title="Publish the bounded change",
+                body="Approved platform publication.",
+            )
+
+            with _approval_http_parent():
+                await client.create(approval)
+                await client.get("00000000-0000-0000-0000-000000000001")
+                await client.create_publication(publication)
+
+        assert [request.method for request in requests] == ["POST", "GET", "POST"]
+        assert all(
+            request.headers.get("traceparent") == _HTTP_TRACEPARENT
+            for request in requests
+        )
+
+    asyncio.run(go())
+
+
+def test_worker_approval_http_does_not_fabricate_a_parent() -> None:
+    """A legacy/root call without an active trace stays a clean HTTP root."""
+
+    async def go() -> None:
+        seen: list[httpx.Request] = []
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            return httpx.Response(
+                200,
+                json={
+                    "status": "approved",
+                    "resolved_by": "U0APPROVER1",
+                    "resolution_note": None,
+                },
+            )
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
+            client = ApprovalClient(
+                api_base_url="https://api.example.test",
+                api_key="platform-test-key",
+                client=http,
+                read_timeout_s=1.0,
+            )
+            await client.get("00000000-0000-0000-0000-000000000001")
+
+        assert len(seen) == 1
+        assert "traceparent" not in seen[0].headers
+
+    asyncio.run(go())
 
 
 def test_awaiting_approval_creates_record_and_suspends(make_harness) -> None:
@@ -566,9 +706,12 @@ class GrantBinding:
     mirroring the worker's real derivation from durable approval state.
     """
 
-    def __init__(self, *, grant_event_id: str, grant_tool: str) -> None:
+    def __init__(
+        self, *, grant_event_id: str, grant_tool: str, decision: str = "approved"
+    ) -> None:
         self.grant_event_id = grant_event_id
         self.grant_tool = grant_tool
+        self.decision = decision
         self.agent_id = uuid.uuid4()
 
     async def resolve(self, kind: str, channel: str):  # noqa: ANN201
@@ -600,6 +743,9 @@ class GrantBinding:
     async def approval_grant_tool(self, event_id: str, agent_id):  # noqa: ANN001, ANN201
         return self.grant_tool if event_id == self.grant_event_id else None
 
+    async def approval_decision(self, event_id: str, agent_id):  # noqa: ANN001, ANN201
+        return self.decision if event_id == self.grant_event_id else None
+
 
 def test_resume_claim_injects_approval_grant_tool_env(make_harness) -> None:
     """#430: a resume claim for an approved permission-gate approval injects
@@ -627,6 +773,7 @@ def test_resume_claim_injects_approval_grant_tool_env(make_harness) -> None:
             resumed_env = h.fake_k8s.claim_envs[-1]
             assert resumed_env is not None
             assert resumed_env.get("CURIE_APPROVAL_GRANT_TOOL") == "mcp__github__create_issue"
+            assert resumed_env.get("CURIE_APPROVAL_DECISION") == "approved"
 
             # A fresh, unrelated mention has a different event id -> no grant env
             # (re-armed), so an adopted/warm follow-up cannot inherit an allowance.
@@ -636,6 +783,7 @@ def test_resume_claim_injects_approval_grant_tool_env(make_harness) -> None:
             fresh_env = h.fake_k8s.claim_envs[-1]
             assert fresh_env is not None
             assert "CURIE_APPROVAL_GRANT_TOOL" not in fresh_env
+            assert "CURIE_APPROVAL_DECISION" not in fresh_env
 
     asyncio.run(go())
 

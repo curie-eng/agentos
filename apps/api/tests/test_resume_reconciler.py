@@ -23,6 +23,7 @@ import json
 import os
 import uuid
 from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -33,6 +34,8 @@ from curie_api.config import get_settings
 from curie_api.models import Approval, ApprovalStatus
 from curie_api.resumequeue import ResumeQueue
 from curie_api.resumereconciler import ResumeReconciler
+from curie_telemetry import extract_trace_context
+from curie_telemetry.tracing import configure_tracer_provider
 from curie_test_support.valkey import (
     VALKEY_HOST as _VALKEY_HOST,
 )
@@ -45,12 +48,36 @@ from curie_test_support.valkey import (
 from curie_test_support.valkey import (
     connect_or_skip,
 )
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
 )
+
+_TRACE_A_ID = int("9123456789abcdef0123456789abcdef", 16)
+_TRACE_A_SPAN_ID = int("9123456789abcdef", 16)
+_TRACE_A = "00-9123456789abcdef0123456789abcdef-9123456789abcdef-01"
+_TRACE_B_ID = int("a123456789abcdef0123456789abcdef", 16)
+_TRACE_B_SPAN_ID = int("a123456789abcdef", 16)
+_TRACE_B = "00-a123456789abcdef0123456789abcdef-a123456789abcdef-01"
+
+
+@contextmanager
+def _captured_spans() -> Iterator[InMemorySpanExporter]:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    configure_tracer_provider(provider)
+    try:
+        yield exporter
+    finally:
+        configure_tracer_provider(None)
+        provider.shutdown()
 
 
 @pytest.fixture
@@ -115,6 +142,7 @@ def _detached_approval(
     reply_kind: str = "slack",
     reply_adapter: str | None = None,
     reply_placeholder: str | None = "p-1",
+    traceparent: str | None = None,
 ) -> Approval:
     """An unpersisted ``Approval`` in a chosen status, for the pure-unit selector
     test: the turn builders read the record's fields only, so no DB round-trip is
@@ -125,7 +153,7 @@ def _detached_approval(
     test exercises cannot drift from the one the DB tests insert.
     """
 
-    return Approval(
+    approval = Approval(
         id=uuid.uuid4(),
         conversation_id=f"th-{uuid.uuid4().hex[:8]}",
         author="U1",
@@ -142,6 +170,8 @@ def _detached_approval(
         status=status,
         resolved_by=resolved_by,
     )
+    approval.traceparent = traceparent
+    return approval
 
 
 async def _insert_approval(
@@ -156,6 +186,7 @@ async def _insert_approval(
     reply_channel: str | None = None,
     reply_adapter: str | None = None,
     reply_placeholder: str | None = "p-1",
+    traceparent: str | None = None,
 ) -> uuid.UUID:
     """Insert an approval row in a chosen lifecycle state (bypassing the resolve
     endpoint), so a test can construct the exact stranded/settled/expired shapes
@@ -167,6 +198,7 @@ async def _insert_approval(
         reply_kind=reply_kind,
         reply_adapter=reply_adapter,
         reply_placeholder=reply_placeholder,
+        traceparent=traceparent,
     )
     approval.reply_endpoint = reply_endpoint
     if reply_channel is not None:
@@ -225,6 +257,108 @@ def test_reconciler_reenqueues_stranded_resolved_record(
     assert turn.event_id == f"approval-{approval_id}-resolved"
     assert turn.reply_handle.placeholder == "reply placeholder"
     assert resumed_at is not None
+
+
+def test_reconciler_preserves_each_approvals_original_trace_and_isolation(
+    clean_db: None, valkey: redis.Redis, runs_stream: str
+) -> None:
+    """Recovery and duplicate passes cannot fork or cross two suspended turns."""
+
+    async def steps(
+        sessionmaker: async_sessionmaker[AsyncSession], queue: ResumeQueue
+    ) -> tuple[uuid.UUID, uuid.UUID]:
+        first_id = await _insert_approval(
+            sessionmaker,
+            status=ApprovalStatus.approved,
+            resolved_at=_naive(120),
+            resumed_at=None,
+            traceparent=_TRACE_A,
+        )
+        second_id = await _insert_approval(
+            sessionmaker,
+            status=ApprovalStatus.rejected,
+            resolved_at=_naive(120),
+            resumed_at=None,
+            traceparent=_TRACE_B,
+        )
+        reconciler = ResumeReconciler(
+            sessionmaker, queue, interval_seconds=30, grace_seconds=0, batch_limit=100
+        )
+        assert await reconciler.reconcile_once() == 2
+        assert await reconciler.reconcile_once() == 0
+        return first_id, second_id
+
+    with _captured_spans() as exporter:
+        first_id, second_id = _run_async(steps, runs_stream)
+
+    enqueue_spans = [
+        span for span in exporter.get_finished_spans() if span.name == "curie.queue.enqueue"
+    ]
+    assert len(enqueue_spans) == 2
+    assert {
+        (span.context.trace_id, span.parent.span_id if span.parent else None)
+        for span in enqueue_spans
+    } == {
+        (_TRACE_A_ID, _TRACE_A_SPAN_ID),
+        (_TRACE_B_ID, _TRACE_B_SPAN_ID),
+    }
+
+    entries = valkey.xrange(runs_stream)
+    assert len(entries) == 2
+    by_event = {json.loads(fields["payload"])["event_id"]: fields for _, fields in entries}
+    expected = {
+        f"approval-{first_id}-resolved": _TRACE_A_ID,
+        f"approval-{second_id}-resolved": _TRACE_B_ID,
+    }
+    assert set(by_event) == set(expected)
+    for event_id, expected_trace_id in expected.items():
+        carried = trace.get_current_span(
+            extract_trace_context(by_event[event_id])
+        ).get_span_context()
+        assert carried.trace_id == expected_trace_id
+
+
+@pytest.mark.parametrize("stored", [None, "not-w3c"])
+def test_reconciler_legacy_or_malformed_parent_starts_one_safe_root(
+    clean_db: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+    stored: str | None,
+) -> None:
+    async def steps(
+        sessionmaker: async_sessionmaker[AsyncSession], queue: ResumeQueue
+    ) -> uuid.UUID:
+        approval_id = await _insert_approval(
+            sessionmaker,
+            status=ApprovalStatus.approved,
+            resolved_at=_naive(120),
+            resumed_at=None,
+            traceparent=stored,
+        )
+        reconciler = ResumeReconciler(
+            sessionmaker, queue, interval_seconds=30, grace_seconds=0, batch_limit=100
+        )
+        assert await reconciler.reconcile_once() == 1
+        return approval_id
+
+    with _captured_spans() as exporter:
+        approval_id = _run_async(steps, runs_stream)
+
+    enqueue = [
+        span for span in exporter.get_finished_spans() if span.name == "curie.queue.enqueue"
+    ]
+    assert len(enqueue) == 1
+    assert enqueue[0].parent is None
+    assert enqueue[0].context.trace_id not in {_TRACE_A_ID, _TRACE_B_ID}
+    entries = valkey.xrange(runs_stream)
+    assert len(entries) == 1
+    assert json.loads(entries[0][1]["payload"])["event_id"] == (
+        f"approval-{approval_id}-resolved"
+    )
+    carried = trace.get_current_span(
+        extract_trace_context(entries[0][1])
+    ).get_span_context()
+    assert carried.trace_id == enqueue[0].context.trace_id
 
 
 def test_reconciler_preserves_a_post_once_reply_handle(
@@ -813,10 +947,10 @@ def test_reconciler_isolates_per_record_failure(
         real_enqueue = queue.enqueue
         fail_event = f"approval-{fail_id}-resolved"
 
-        async def flaky(turn: QueuedTurn) -> str:
+        async def flaky(turn: QueuedTurn, **kwargs: object) -> str:
             if turn.event_id == fail_event:
                 raise RuntimeError("valkey blip for one record")
-            return await real_enqueue(turn)
+            return await real_enqueue(turn, **kwargs)
 
         queue.enqueue = flaky  # type: ignore[method-assign]
 

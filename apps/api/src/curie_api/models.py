@@ -18,6 +18,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     LargeBinary,
+    String,
     Text,
     UniqueConstraint,
     func,
@@ -392,6 +393,11 @@ class Approval(Base):
     # Idempotency: the triggering event id. A reclaimed/redelivered turn that
     # re-requests the same approval adopts the existing row instead of forking.
     dedupe_key: Mapped[str] = mapped_column(unique=True)
+    # Private W3C carrier for the worker turn that created this record. It is
+    # deliberately absent from every request/response DTO: the authenticated
+    # ingress route derives it from the HTTP header, and terminal/recovery paths
+    # use it only to reconnect telemetry after the human pause.
+    traceparent: Mapped[str | None] = mapped_column(String(55), default=None)
     status: Mapped[str] = mapped_column(server_default=ApprovalStatus.pending, index=True)
     # Optional SLA: past this instant the record can no longer be approved or
     # rejected; a resolve attempt flips it to expired instead.

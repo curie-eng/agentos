@@ -225,6 +225,21 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/langfuse-image-pin-assertions.sh
 
+      # Keep the chart ClickHouse default and Langfuse pin as one supported
+      # pair. ClickHouse 24.8 cannot apply Langfuse 3.225.x migration 39, so
+      # the default must stay on 25.12 and AVX-required (#2210).
+      - name: helm render assertions (clickhouse langfuse pin pair)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/clickhouse-langfuse-pin-assertions.sh
+
+      # Prove both Langfuse Deployments use Recreate so an image change never
+      # runs two boot migrations against the same database (#2216).
+      - name: helm render assertions (langfuse Recreate strategy)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/langfuse-recreate-assertions.sh
+
       # Prove Langfuse startup is gated on ClickHouse being up (issue #2009). A
       # Helm upgrade that recreates the ClickHouse Service otherwise lets the new
       # Langfuse pods start their migrations against an unresolvable name, so the
@@ -452,20 +467,30 @@ jobs:
       - name: Sync workspace
         run: uv sync
 
-      # Prove the key-free object store path (#1325). Pointing the bundle store
-      # at a real cloud object store used to REQUIRE static access keys: all
-      # three consumers supplied explicit credentials unconditionally, so an
-      # ambient role was never consulted. Clearing rustfs.auth.accessKey now
-      # omits every credential env and shell export, which only works if the
-      # omission is COMPLETE -- an empty AWS_ACCESS_KEY_ID is still a credential
-      # to the SDK, so it stops the provider chain and the web-identity provider
-      # is never reached. Also asserts the instance-role shortcut stays shut:
-      # NetworkPolicy selects pods and not containers, so opening IMDS for
-      # bundle-fetch would hand the node's IAM role to the runner as well.
+      # Prove the key-free object store path (#1325, #2211). Pointing the bundle
+      # store at a real cloud object store used to REQUIRE static access keys:
+      # all four consumers (api, worker, bundle-fetch, Langfuse) supplied
+      # explicit credentials unconditionally, so an ambient role was never
+      # consulted. Clearing rustfs.auth.accessKey now omits every credential env
+      # and shell export, which only works if the omission is COMPLETE -- an
+      # empty AWS_ACCESS_KEY_ID is still a credential to the SDK, so it stops
+      # the provider chain and the web-identity provider is never reached. Also
+      # asserts the instance-role shortcut stays shut: NetworkPolicy selects
+      # pods and not containers, so opening IMDS for bundle-fetch would hand
+      # the node's IAM role to the runner as well.
       - name: helm render assertions (object store web identity)
         run: |
           set -euo pipefail
           bash charts/curie/ci/object-store-web-identity-assertions.sh
+
+      # Prove a BYO object store gets a runner egress allow for S3 (and STS on
+      # the key-free path). Rail 1 is fail-closed and the in-chart rustfs pod
+      # selector does not render when rustfs.deploy is false, so a default-shaped
+      # BYO install used to hang every sandbox in Init (#2213).
+      - name: helm render assertions (BYO object store runner egress)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/object-store-byo-egress-assertions.sh
 
       - name: helm template + kubeconform (values-dev overlay)
         run: |

@@ -6,9 +6,10 @@ ClickHouse + RustFS + OTel Collector, dev profile, BYO (bring-your-own)
 toggles, the two preflights) plus the security rails as chart defaults.
 
 The chart is a direct port of the proven `compose.dev.yaml` dev stack: same
-images, same tags, same `:24.8` ClickHouse pin, same headless-bootstrapped
-Langfuse dev project. So the compose stack and this chart verify
-the identical stack. Rather than vendoring the upstream Langfuse chart and its
+images and the same headless-bootstrapped Langfuse dev project. The chart
+ClickHouse default is `:25.12` (AVX required, coupled to `langfuse.image.tag`)
+while compose stays on `:24.8` so an SSE4.2-only developer host can still boot
+the local stack. Rather than vendoring the upstream Langfuse chart and its
 Bitnami subcharts, each component is a first-class template here -- this keeps
 the single-node footprint controllable and avoids the Bitnami-catalog
 (`bitnamilegacy/*`) instability. It still follows the Langfuse chart *idiom*:
@@ -339,10 +340,10 @@ pipeline and environment are applied on `helm upgrade`.
 
 | Component | Image | Notes |
 |---|---|---|
-| Langfuse web + worker | `langfuse/langfuse:3.225.5`, `langfuse/langfuse-worker:3.225.5` | Observability + eval backbone. Headless-bootstrapped dev org/project. Web and worker stay on one reviewed migration set; do not replace the version with floating `:3`. |
+| Langfuse web + worker | `langfuse/langfuse:3.225.5`, `langfuse/langfuse-worker:3.225.5` | Observability + eval backbone. Headless-bootstrapped dev org/project. Web and worker stay on one reviewed migration set; do not replace the version with floating `:3`. Both Deployments use Recreate, so a Langfuse image change is a brief outage while boot migrations run. |
 | Postgres | `postgres:16-alpine` | Langfuse transactional store + app state. StatefulSet. |
 | Valkey | `valkey/valkey:8-alpine` | Langfuse cache/queue + dispatcher Streams queue. |
-| ClickHouse | `clickhouse/clickhouse-server:24.8` | Langfuse OLAP store. Tag pinned SSE4.2-safe (see preflight). |
+| ClickHouse | `clickhouse/clickhouse-server:25.12` | Langfuse OLAP store. Coupled to `langfuse.image.tag` 3.225.5; chart default requires AVX (see preflight). |
 | RustFS | `rustfs/rustfs:1.0.0-beta.12` plus `amazon/aws-cli:2.32.6` init | Langfuse object storage; BYO real S3 in prod. |
 | OTel Collector | `otel/opentelemetry-collector-contrib:0.119.0` | Bounded OTLP gateway (gRPC+HTTP), durable queue by default; traces -> Langfuse over HTTP, logs/metrics -> configured exporters. |
 | Mail adapter | `ghcr.io/curie-eng/curie-mail-adapter` | Off by default. One `Recreate` replica with durable SQLite on single-writer storage; no platform key/database credential or ServiceAccount token. |
@@ -368,26 +369,32 @@ workflow (`.github/workflows/release.yaml`) on every push to `main`, as
 `ghcr.io/curie-eng/curie-<service>` tagged with the commit SHA and `latest`.
 All six first-party services build in the matrix: `curie-api`,
 `curie-dispatcher`, `curie-mail-adapter`, `curie-worker`, `curie-ui`, and
-`curie-runner`. The chart defaults every first-party image at its
-`ghcr.io/curie-eng/curie-*` `:latest`, so the bare install (above) pulls from
+`curie-runner`. The chart defaults every first-party image to the chart
+`appVersion` (empty `tag` in values, resolved by the `curie.image` helper), so
+the bare install (above) pulls `ghcr.io/curie-eng/curie-*:<appVersion>` from
 GHCR with no image overrides -- except `curie-mail-adapter`, whose Deployment is
 off by default (`mailAdapter.deploy`), so its image is published and defaulted
-but not pulled until an operator enables the email channel.
+but not pulled until an operator enables the email channel. The workflow still
+publishes a mutable `latest` tag alongside the SHA and version tags; that is a
+fact about the release artifacts, not about what this chart resolves to.
 
 - **Pull policy for the five Deployment-managed services** (api, dispatcher,
-  mail-adapter, worker, ui): `imagePullPolicy: Always` -- they pull once per
-  rollout, so `Always` just keeps a fresh install from serving a stale `latest`
-  a node cached earlier.
+  mail-adapter, worker, ui): `imagePullPolicy: Always`. The default tag is the
+  chart `appVersion`, so this is a cheap no-op on a node that already has that
+  immutable ref, and it still self-heals a node that cached a same-named ref
+  under a different digest.
 - **The runner image is the exception:** it uses `imagePullPolicy: IfNotPresent`
   because a sandbox pod is cold-created per Slack thread, and an `Always`
   (re-)pull inside that boot window blew past the worker's claim timeout and
-  killed runs. Its freshness comes instead from the `runner-prewarm` DaemonSet
+  killed runs. Its presence on the node comes from the `runner-prewarm` DaemonSet
   (`agentSandbox.runner.prewarm`, default on with the sandbox substrate),
-  which pulls the runner image `Always` and keeps it pinned on every node; a
-  Release-revision annotation rolls those pods on every `helm upgrade` so the
-  pin refreshes a churned `latest`.
-- **Pin an immutable tag** for reproducible deploys, where the pull policies
-  are a cheap no-op.
+  which pulls the runner image `Always` and keeps that same `appVersion` ref
+  pinned on every node; a Release-revision annotation rolls those pods on every
+  `helm upgrade` so an upgraded chart's new `appVersion` is pulled before the
+  next claim.
+- **Override `tag` (or set `digest`)** to pin an explicit version. Empty `tag`
+  is the default and resolves to `.Chart.AppVersion`; `digest` wins over `tag`
+  when set.
 
 A GHCR package inherits its repo's visibility, so on a **private** repo the image
 is not anonymously pullable and the node needs credentials. Two supported paths:
@@ -571,10 +578,10 @@ Pointing the bundle store at a real cloud object store (`rustfs.deploy: false`)
 normally means a scoped IAM user and long-lived keys in a Secret. That works and
 is genuinely least-privilege, but it is not the only option: clearing
 `rustfs.auth.accessKey` selects a key-free path (#1325) in which the chart omits
-every S3 credential from the API, the worker, and the sandbox bundle-fetch init
-container, so the AWS SDK falls through its provider chain to the **web-identity
-provider** (`AWS_ROLE_ARN` + `AWS_WEB_IDENTITY_TOKEN_FILE`) fed by a projected
-ServiceAccount token.
+every S3 credential from the API, the worker, the sandbox bundle-fetch init
+container, and Langfuse, so the AWS SDK falls through its provider chain to
+the **web-identity provider** (`AWS_ROLE_ARN` + `AWS_WEB_IDENTITY_TOKEN_FILE`)
+fed by a projected ServiceAccount token.
 
 Bind the role through the ServiceAccount annotations. On EKS with IRSA the
 pod-identity webhook reads the annotation and injects the projected token and
@@ -586,33 +593,96 @@ rustfs:
   host: s3.us-east-1.amazonaws.com
   port: 443
   region: us-east-1
+  bucket: langfuse           # Langfuse event and media uploads
   auth:
     accessKey: ""            # selects the key-free path
+  # Rail 1 is fail-closed. The in-chart runner-allow-rustfs policy selects the
+  # in-cluster rustfs pod and does not render here. NetworkPolicy cannot
+  # target rustfs.host (a DNS name), so these CIDRs are required at render.
+  # On EKS the tight form is VPC interface endpoints for s3 and sts with
+  # private DNS enabled, which turns each requirement into a /32 rather than
+  # an AWS public service CIDR range.
+  egress:
+    - cidr: 192.0.2.10/32    # S3 VPC interface endpoint
+      ports: [{ protocol: TCP, port: 443 }]
+  stsEgress:
+    - cidr: 192.0.2.11/32    # STS VPC interface endpoint
+      ports: [{ protocol: TCP, port: 443 }]
 api:
   serviceAccount:
     annotations:
       eks.amazonaws.com/role-arn: arn:aws:iam::000000000000:role/curie-api
 worker:
+  workspace:
+    bucket: curie-workspaces # repository workspace archives
   serviceAccount:
     annotations:
       eks.amazonaws.com/role-arn: arn:aws:iam::000000000000:role/curie-worker
 agentSandbox:
   runner:
+    bundleFetch:
+      bucket: curie-bundles  # plugin bundles (API writes, runner reads)
     serviceAccount:
       annotations:
         eks.amazonaws.com/role-arn: arn:aws:iam::000000000000:role/curie-runner
+langfuse:
+  serviceAccount:
+    annotations:
+      eks.amazonaws.com/role-arn: arn:aws:iam::000000000000:role/curie-langfuse
 ```
+
+The chart talks to **three buckets** on that same endpoint, not one. Create them
+before install; the in-chart RustFS Job creates them only while `rustfs.deploy`
+is true. The defaults are three distinct names, so a single-bucket BYO install
+fails on two of the three paths.
+
+- `rustfs.bucket` (default `langfuse`): Langfuse event and media uploads.
+- `worker.workspace.bucket` (default `curie-workspaces`): repository workspace archives.
+- `agentSandbox.runner.bundleFetch.bucket` (default `curie-bundles`): plugin bundles.
 
 The bundle fetch uses path style addressing, so it appends
 `agentSandbox.runner.bundleFetch.bucket` to this endpoint. For another AWS
 region, change the region in `rustfs.host` and set `rustfs.region` to control
-the SigV4 signing region used by the bundle fetch init container. This setting
-does not configure the API or worker S3 clients.
+the SigV4 signing region used by the bundle fetch init container and by
+Langfuse's event/media uploads. This setting does not configure the API or
+worker S3 clients.
 
-Scope the runner's role to the bundle bucket, **read-only**. NetworkPolicy
-selects pods rather than containers, so any identity the bundle-fetch init
-container can assume is equally reachable by the runner beside it, and the
-runner is prompt-injectable by design.
+**Runner egress is a separate required list.** Rail 1 default-denies the
+sandbox, and the in-chart `runner-allow-rustfs` policy is a pod selector on
+this release's rustfs component, so it does not render when
+`rustfs.deploy` is false. Putting S3 in `security.networkPolicy.allowedEgress`
+alongside the model API used to be the only workaround, and a model-only
+allowlist then installed green while every sandbox hung in `Init` on the first
+turn. The chart now refuses that shape at render: `rustfs.egress` must cover
+the object-store endpoint, and on this key-free path `rustfs.stsEgress` must
+cover STS (`AssumeRoleWithWebIdentity`). Both are `{cidr, ports}` entries like
+`allowedEgress`. Do not put a DNS name here; NetworkPolicy has no hostname
+peer. A default route or a CIDR that reaches `169.254.169.254` is refused:
+these lists are store endpoints, not a second model allowlist.
+
+On EKS, create VPC **interface** endpoints for `s3` and `sts` in the cluster
+VPC with private DNS enabled, then put each endpoint's ENI address in as a
+`/32` on TCP 443. That keeps the fail-closed posture meaningful instead of
+opening an AWS public service CIDR range. Gateway endpoints for S3 do not
+give the sandbox a unicast address to allow. Static-key BYO still needs
+`rustfs.egress` (the fetch talks to S3) and does not need `rustfs.stsEgress`.
+Opting out of Rail 1 (`security.networkPolicy.enabled: false`) skips both
+requirements because there is then no runner NetworkPolicy to satisfy.
+
+Scope each role to the bucket it actually uses:
+
+- **API role:** read/write on the bundle bucket. The API writes each uploaded bundle.
+- **Worker role:** read/write on the workspace bucket, and read on the bundle
+  bucket (the eval lane fetches the same objects the API wrote).
+- **Runner role:** read-only on the bundle bucket. NetworkPolicy selects pods
+  rather than containers, so any identity the bundle-fetch init container can
+  assume is equally reachable by the runner beside it, and the runner is
+  prompt-injectable by design.
+- **Langfuse:** `rustfs.bucket` for the `events/` and `media/` prefixes. Langfuse
+  still consumes `rustfs.auth` static keys for that bucket; the key-free path
+  only omits credentials from the API, the worker, and the sandbox bundle-fetch
+  init container. Scope those keys (or a Langfuse-specific IAM user) to
+  `rustfs.bucket`.
 
 Two constraints are worth stating plainly.
 
@@ -641,20 +711,26 @@ around.
 
 ## The two preflights
 
-Both run as Helm hooks (blocking a broken install) and are re-runnable via
-`helm test <release> -n <ns>`.
+(a) is a blocking `pre-install,pre-upgrade` hook. (b) is a `helm test` that
+must be run explicitly; it never runs during `helm install`. A green
+`helm install` does not prove NetworkPolicy is enforced, so run
+`helm test <release> -n <ns>` before treating the security rails as live.
+Both are re-runnable via that same `helm test` command.
 
 **(a) CPU-AVX / ClickHouse-pin check** (`preflights.avxCheck`). A pre-install /
 pre-upgrade hook Job.
 
 - ClickHouse >= 25.x is compiled for AVX and SIGILLs with exit 132 on
   SSE4.2-only CPUs -- a crash-looping pod is a confusing way to learn that.
+- Chart defaults require AVX: `clickhouse.image.tag` is `25.12` because
+  `langfuse.image.tag` 3.225.5's migration set from 39 onward cannot apply on
+  24.8, and 25.12 is not in `clickhouse.sse42SafeTags`.
 - The Job reads the node's `/proc/cpuinfo`; if the node lacks AVX it FAILS
-  the install unless the configured ClickHouse tag is in
-  `clickhouse.sse42SafeTags` (`24.8`, `24.3`, `23.8`). Skipped when
-  `clickhouse.deploy: false`.
-- Test knob `preflights.avxCheck.forceNoAvx: true` exercises the SSE4.2
-  branch on an AVX-capable node.
+  the install unless the operator pins a tag in `clickhouse.sse42SafeTags`
+  (`24.8`, `24.3`, `23.8`). That override cannot apply the current Langfuse
+  migration set. Skipped when `clickhouse.deploy: false`.
+- Test knob `preflights.avxCheck.forceNoAvx: true` exercises the AVX-required
+  failure branch on an AVX-capable node when the default tag is set.
 - Read the verdict: `kubectl logs -n <ns> job/<release>-preflight-avx`.
 
 **(b) NetworkPolicy-enforcement probe** (`preflights.networkPolicyProbe`). A
@@ -761,7 +837,10 @@ sandbox and renders whenever an in-chart store is deployed.
 **Fail-closed egress.** `security.networkPolicy.allowedEgress` is EMPTY by
 default: a fresh install denies all egress except DNS until the operator declares
 where the model API and MCP endpoints live (`{cidr, ports}` entries). An unset
-allowlist never means allow-all.
+allowlist never means allow-all. A BYO object store is not on that list: set
+`rustfs.egress` (and `rustfs.stsEgress` on the key-free path) so the sandbox
+bundle-fetch can reach S3 and STS without opening the model allowlist. See
+**Key-free object store auth** above.
 
 **The controller does not get a second vote on egress (#765, ADR-0067).**
 NetworkPolicy allows are additive across objects selecting the same pods -- Rail
@@ -948,9 +1027,9 @@ to install only the control plane + backing stores without the runner substrate.
   with an externally-managed controller) given the residual cluster-wide
   pod/service/PVC reach.
 - **Runner image**: the pool runs `curie-runner`, defaulting to
-  `ghcr.io/curie-eng/curie-runner:latest` with `imagePullPolicy: IfNotPresent`
+  `ghcr.io/curie-eng/curie-runner:<appVersion>` with `imagePullPolicy: IfNotPresent`
   (per-thread cold boots must not contain a pull; the `runner-prewarm` DaemonSet
-  keeps the image fresh on every node -- see "Publishing and pulling images").
+  keeps the image on every node -- see "Publishing and pulling images").
   For offline
   dev/e2e, `-f values-dev.yaml` overrides it to a locally-built, cluster-imported
   tag with `imagePullPolicy: Never` (`docker build -f runner/Dockerfile -t

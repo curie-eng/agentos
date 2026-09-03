@@ -105,20 +105,20 @@ def hoist_approval_decision(
 ) -> str | None:
     """Lift the runner's approval-gate decision out of a trace, or None.
 
-    Mirrors ``hoist_sandbox_id``'s trace-then-first-observation probe. The
-    attribute is stamped on the root ``agent.run`` span rather than as a
-    provider-wide resource attribute (ADR-0076 Stone 3, #889), so it is
-    ordinarily trace-level; the observation fallback stays for the same
-    reason ``hoist_sandbox_id`` keeps it -- Langfuse's OTLP ingestion doesn't
-    guarantee which level surfaces a given span attribute. Absent for the
-    ordinary case (no approval gate was resumed this turn); no value invented.
+    Prefer trace metadata, then inspect each observation in response order.
+    The resumed ``agent.run`` span carries the attribute (ADR-0076 Stone 3,
+    #889), but a correlated trace begins at dispatcher ingress and includes
+    reply spans, so the annotated observation need not be first. Absent for
+    the ordinary case (no approval gate was resumed); no value invented.
     """
 
     hit = _probe_attr(trace, _APPROVAL_DECISION_ATTR)
     if hit:
         return hit
-    if observations:
-        return _probe_attr(observations[0], _APPROVAL_DECISION_ATTR)
+    for observation in observations:
+        hit = _probe_attr(observation, _APPROVAL_DECISION_ATTR)
+        if hit:
+            return hit
     return None
 
 

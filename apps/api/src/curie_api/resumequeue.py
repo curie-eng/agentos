@@ -19,12 +19,37 @@ from typing import Any
 
 import redis.asyncio as redis
 from aci_protocol import STREAM_PAYLOAD_FIELD, QueuedTurn, ReplyHandle, TurnSource
-from curie_telemetry import inject_trace_context, operation_span, record_metric
+from curie_telemetry import (
+    TRACEPARENT_STREAM_FIELD,
+    canonicalize_traceparent,
+    extract_trace_context,
+    inject_trace_context,
+    operation_span,
+    record_metric,
+)
+from opentelemetry.context import Context
 from opentelemetry.trace import SpanKind, StatusCode
 from redis.typing import EncodableT
 
 from .config import get_settings
 from .models import Approval, ApprovalStatus
+
+
+def approval_trace_context(approval: Approval) -> Context:
+    """Return the approval's private W3C parent, or an explicit clean root.
+
+    Rows created before the carrier migration and manually malformed values are
+    intentionally indistinguishable here: neither may inherit an ambient HTTP
+    click or background-loop span by accident.
+    """
+
+    traceparent = canonicalize_traceparent(getattr(approval, "traceparent", None))
+    carrier = (
+        {TRACEPARENT_STREAM_FIELD: traceparent}
+        if traceparent is not None
+        else {}
+    )
+    return extract_trace_context(carrier)
 
 
 def resume_event_id(approval_id: object) -> str:
@@ -238,13 +263,16 @@ class ResumeQueue:
         # graveyard.
         self._dead_letter_stream = dead_letter_stream or f"{self._stream}:dead"
 
-    async def enqueue(self, turn: QueuedTurn) -> str:
+    async def enqueue(
+        self, turn: QueuedTurn, *, parent: Context | None = None
+    ) -> str:
         carrier: dict[str, str] = {STREAM_PAYLOAD_FIELD: turn.model_dump_json()}
         stream_id: Any = None
         error: Exception | None = None
         with operation_span(
             "curie.queue.enqueue",
             kind=SpanKind.PRODUCER,
+            parent=parent,
             attributes={"service.name": "curie-api", "source": "api"},
         ) as span:
             inject_trace_context(carrier)
