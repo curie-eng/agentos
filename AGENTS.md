@@ -631,8 +631,12 @@ branch list, restores the `RELEASE_NEXT_BRANCH` environment alias and the
   magic words fire once on the default branch.
 - PR bodies must contain real line breaks. The PR body guard rejects escaped
   newline sequences because GitHub treats them as text, making closing keywords
-  inert. Run `scripts/check-pr-body.sh <body-file>` before opening or editing a
-  PR.
+  inert. A patch release PR (title `Prepare the vX.Y.Z release` with Z not 0)
+  must also fill Trigger (issue numbers) and Live proof (a run URL or
+  `waiver: <reason>`); the same guard rejects either section left empty. Run
+  `scripts/check-pr-body.sh <body-file>` before opening or editing a PR
+  (`--title-file` for a release PR). See
+  [`docs/release-verification.md`](docs/release-verification.md#patch-releases-name-their-trigger-and-live-proof).
 - **Never mention any AI assistant (Claude, Codex, GPT, etc.) or AI in general in
   commit messages OR pull request bodies, and never add `Co-Authored-By` lines
   referencing AI.** This applies to the PR body as much as to the commits: many
