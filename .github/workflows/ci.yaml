@@ -144,8 +144,16 @@ jobs:
           git fetch --no-tags --depth=1 origin "${{ github.base_ref || 'main' }}" || true
           git show "origin/${{ github.base_ref || 'main' }}:packages/aci-protocol/schema/wire.lock" > /tmp/base-wire.lock 2>/dev/null || true
           uv run python -m aci_protocol.wire_lock --check-base /tmp/base-wire.lock
+      # --durations is why this line is not a bare `-q`. The suite is the largest
+      # single cost on the critical path (848s on run 33690551116, serial, 1370
+      # test files) and nothing in CI recorded where that time went, so the only
+      # profile available was a local one -- which turned out to be a bad proxy.
+      # Two tests read as ~59s each locally and about 4s on Linux, because a
+      # bound unlistening port is dropped on macOS and refused on Linux (#2233).
+      # Sharding on numbers like those would have split the suite along the wrong
+      # seam. This prints the real ones on every run, for the price of 25 lines.
       - name: Pytest
-        run: uv run pytest -q
+        run: uv run pytest -q --durations=25
       # Build ONLY when the body actually carries a declaration. tools/fix-pin-ci/
       # check.py reaches the binary at exactly one place, the
       # `curie dev verify-fix-pin` call, and only once `declaration.selector` is

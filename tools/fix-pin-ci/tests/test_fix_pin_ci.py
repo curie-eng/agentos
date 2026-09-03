@@ -563,10 +563,22 @@ def test_ci_keeps_the_required_python_status_and_calls_fix_pin_after_pytest() ->
         lambda step: "uv run alembic upgrade head" in _string(step, "run"),
         "shared database migration",
     )
+    # Matched on the prefix, not on equality. What this assertion is for is that
+    # the normal suite runs, unfiltered, before the gate; reporting flags like
+    # --durations do not bear on that, and pinning the exact string made a
+    # profiling flag look like a contract change.
     pytest_index = _single_step_index(
         steps,
-        lambda step: _string(step, "run").strip() == "uv run pytest -q",
+        lambda step: _string(step, "run").strip().startswith("uv run pytest -q"),
         "normal Python suite",
+    )
+    pytest_command = shlex.split(_string(steps[pytest_index], "run").strip())
+    assert pytest_command[:4] == ["uv", "run", "pytest", "-q"]
+    assert all(
+        argument.startswith("--durations") for argument in pytest_command[4:]
+    ), (
+        "the Python suite must run unfiltered: only reporting flags may be added "
+        f"to `uv run pytest -q`, got {pytest_command!r}"
     )
     gate_index = _single_step_index(
         steps,
