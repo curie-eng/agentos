@@ -26,6 +26,7 @@ from curie_runner.adapter import (
     build_structured_resume,
     model_message_to_conversation,
 )
+from curie_runner.approval import PUBLISH_TOOL_NAME
 from curie_runner.history import (
     ConversationMessage,
     ConversationReplay,
@@ -196,6 +197,43 @@ def _drive_live_catalog(
     return anyio.run(go)
 
 
+def _structured_tool_history(
+    record: TurnRecord,
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, list[dict[str, Any]]]]:
+    """Index persisted SDK tool calls and their results without trusting prose."""
+
+    uses: dict[str, list[dict[str, Any]]] = {}
+    results: dict[str, list[dict[str, Any]]] = {}
+    for message in record.messages:
+        if not isinstance(message.content, list):
+            continue
+        for block in message.content:
+            if block.get("type") == "tool_use":
+                name = block.get("name")
+                if isinstance(name, str):
+                    uses.setdefault(name, []).append(block)
+            elif block.get("type") == "tool_result":
+                tool_use_id = block.get("tool_use_id")
+                if isinstance(tool_use_id, str):
+                    results.setdefault(tool_use_id, []).append(block)
+    return uses, results
+
+
+def _successful_tool_result_text(
+    use: dict[str, Any], results: dict[str, list[dict[str, Any]]]
+) -> str:
+    tool_use_id = use.get("id")
+    assert isinstance(tool_use_id, str), f"tool use carried no id: {use!r}"
+    matches = results.get(tool_use_id)
+    assert matches, f"tool use {tool_use_id!r} carried no structured result"
+    assert all(result.get("is_error") is not True for result in matches), matches
+    return json.dumps(
+        [result.get("content") for result in matches],
+        sort_keys=True,
+        default=str,
+    )
+
+
 def test_workspace_catalog_assertion_rejects_missing_and_pluginless_init(
     tmp_path: Path,
 ) -> None:
@@ -231,16 +269,43 @@ def test_live_claim_time_workspace_init_catalogue(
     )
     bundle = _production_sre_bundle(tmp_path)
     init_messages = _install_init_observer(monkeypatch)
-    runner = boot.build_runner(
-        _catalog_config(bundle, f"claim-{uuid4()}"),
-        workspace_path=workspace,
-    )
+    store = _LiveTranscriptStore()
+    nonce = uuid4().hex
+    sentinel_path = workspace / f".curie-2271-claim-tool-{nonce}.txt"
+    sentinel_text = f"claim-workspace-sentinel-{nonce}"
+    sentinel_path.write_text(f"{sentinel_text}\n", encoding="utf-8")
+    try:
+        runner = boot.build_runner(
+            _catalog_config(bundle, f"claim-{uuid4()}"),
+            history_store=store,
+            workspace_path=workspace,
+        )
 
-    final = _drive_live_catalog(runner)
+        final = _drive_live_catalog(
+            runner,
+            prompt=(
+                "This is a bounded workspace tool check. Perform exactly these "
+                "steps before answering: call Bash with the command `pwd`; then "
+                f"call Read with the absolute file path `{sentinel_path}`. "
+                "Do not call Skill or any other tool. After both results arrive, "
+                "reply with only: workspace-tool-check-complete"
+            ),
+        )
 
-    assert final.status is SessionStatus.DONE
-    assert init_messages, "real SDK claim-time boot emitted no init frame"
-    _assert_production_workspace_init(init_messages[-1], bundle=bundle)
+        assert final.status is SessionStatus.DONE
+        assert init_messages, "real SDK claim-time boot emitted no init frame"
+        _assert_production_workspace_init(init_messages[-1], bundle=bundle)
+        assert len(store.records) == 1
+        uses, results = _structured_tool_history(store.records[0])
+        assert {"Bash", "Read"} <= set(uses), (
+            f"claim-time turn did not execute required coding tools: {sorted(uses)}"
+        )
+        bash_text = _successful_tool_result_text(uses["Bash"][0], results)
+        read_text = _successful_tool_result_text(uses["Read"][0], results)
+        assert "/workspace" in bash_text, bash_text
+        assert sentinel_text in read_text, read_text
+    finally:
+        sentinel_path.unlink(missing_ok=True)
 
 
 @pytest.mark.skipif(
@@ -284,7 +349,24 @@ def test_live_late_workspace_replacement_init_catalogue(
     assert config.session.session_id == logical_session_id
     assert config.history_ref == history_ref
 
-    history_marker = f"prior-workspace-context-{uuid4().hex}"
+    nonce = uuid4().hex
+    history_marker = f"prior-workspace-context-{nonce}"
+    fixture_dir = workspace / f".curie-2271-late-tool-{nonce}"
+    instruction_path = fixture_dir / "AGENTS.md"
+    sentinel_path = fixture_dir / "sentinel.txt"
+    old_sentinel = f"late-workspace-before-{nonce}"
+    new_sentinel = f"late-workspace-after-{nonce}"
+    verification_command = (
+        f"grep -Fx -- {shlex.quote(new_sentinel)} {shlex.quote(str(sentinel_path))}"
+    )
+    scoped_instructions = (
+        "# Scoped verification instructions\n\n"
+        "For changes to files in this directory, the required applicable check is "
+        "exactly:\n\n"
+        f"```sh\n{verification_command}\n```\n\n"
+        "Run that bounded check after editing `sentinel.txt` and before requesting "
+        "publication. A successful result verifies the complete sentinel content.\n"
+    )
     prior_turn = TurnRecord(
         user=f"Retain this exact marker for the next turn: {history_marker}",
         assistant="I will retain that exact marker for the next turn.",
@@ -320,27 +402,99 @@ def test_live_late_workspace_replacement_init_catalogue(
     assert replay.present
 
     init_messages = _install_init_observer(monkeypatch)
-    replacement = boot.build_runner(
-        config,
-        history_store=store,
-        conversation_replay=replay,
-        workspace_path=workspace,
-    )
+    fixture_dir.mkdir()
+    instruction_path.write_text(scoped_instructions, encoding="utf-8")
+    sentinel_path.write_text(f"{old_sentinel}\n", encoding="utf-8")
+    try:
+        replacement = boot.build_runner(
+            config,
+            history_store=store,
+            conversation_replay=replay,
+            workspace_path=workspace,
+        )
 
-    final = _drive_live_catalog(
-        replacement,
-        prompt=(
-            "Reply with only the exact marker I asked you to retain in the "
-            "immediately prior turn. Do not call any tool."
-        ),
-    )
+        final = _drive_live_catalog(
+            replacement,
+            prompt=(
+                "Complete every step in this bounded late-handoff check using tools; "
+                "do not merely describe the steps and do not stop after editing. "
+                "Recover the exact marker from the immediately prior turn. First call "
+                f"Read on the scoped instruction file `{instruction_path}` and follow "
+                f"it. Second call Read on `{sentinel_path}`. Third call Edit on that same file "
+                f"and replace the exact text `{old_sentinel}` with `{new_sentinel}`. "
+                "Do not edit the instruction file or touch any other file. Fourth call "
+                "Bash with exactly the check documented by the scoped instruction: "
+                f"verification command: `{verification_command}`. Wait for its "
+                "successful result. Fifth, you MUST call "
+                "mcp__curie__publish_changes with title `Workspace tool check` and "
+                "body set to exactly the recovered marker. Calling that tool requests "
+                "approval; make the call now even though it will pause the turn. Do "
+                "not call Skill."
+            ),
+        )
 
-    assert final.status is SessionStatus.DONE
-    assert history_marker in final.text, (
-        "late workspace replacement did not use its durable prior-turn context"
-    )
-    assert init_messages, "fresh late workspace runner emitted no SDK init frame"
-    _assert_production_workspace_init(init_messages[-1], bundle=bundle)
+        assert init_messages, "fresh late workspace runner emitted no SDK init frame"
+        _assert_production_workspace_init(init_messages[-1], bundle=bundle)
+        assert len(store.records) == 2
+        uses, results = _structured_tool_history(store.records[-1])
+        assert {"Read", "Edit", "Bash", PUBLISH_TOOL_NAME} <= set(uses), (
+            "late replacement did not execute required coding surface; "
+            f"persisted tool names={sorted(uses)}, final_status={final.status.value!r}, "
+            f"final_text={final.text!r}"
+        )
+        read_by_path = {
+            use.get("input", {}).get("file_path"): use
+            for use in uses["Read"]
+            if isinstance(use.get("input"), dict)
+        }
+        instruction_read = read_by_path.get(str(instruction_path))
+        sentinel_read = read_by_path.get(str(sentinel_path))
+        assert instruction_read is not None, read_by_path
+        assert sentinel_read is not None, read_by_path
+        assert verification_command in _successful_tool_result_text(
+            instruction_read, results
+        )
+        assert old_sentinel in _successful_tool_result_text(sentinel_read, results)
+        assert sentinel_path.read_text(encoding="utf-8") == f"{new_sentinel}\n"
+        edit_text = _successful_tool_result_text(uses["Edit"][0], results)
+        assert edit_text
+        bash_use = next(
+            (
+                use
+                for use in uses["Bash"]
+                if isinstance(use.get("input"), dict)
+                and use["input"].get("command") == verification_command
+            ),
+            None,
+        )
+        assert bash_use is not None, uses["Bash"]
+        bash_text = _successful_tool_result_text(bash_use, results)
+        assert new_sentinel in bash_text, bash_text
+        publish_use = uses[PUBLISH_TOOL_NAME][0]
+        publish_input = publish_use.get("input")
+        assert isinstance(publish_input, dict)
+        assert publish_input.get("body") == history_marker, (
+            "late workspace replacement did not recall durable prior-turn context"
+        )
+        publish_id = publish_use.get("id")
+        assert isinstance(publish_id, str)
+        publish_results = results.get(publish_id)
+        assert publish_results
+        assert any(result.get("is_error") is True for result in publish_results)
+        publish_result_text = json.dumps(
+            [result.get("content") for result in publish_results],
+            sort_keys=True,
+            default=str,
+        ).lower()
+        assert "requires human approval" in publish_result_text
+        assert "an approval request has been recorded" in publish_result_text
+        assert final.status is SessionStatus.AWAITING_APPROVAL
+        assert final.approval_gate_kind == "permission"
+        assert final.approval_granted_tool == PUBLISH_TOOL_NAME
+    finally:
+        sentinel_path.unlink(missing_ok=True)
+        instruction_path.unlink(missing_ok=True)
+        fixture_dir.rmdir()
 
 
 @pytest.mark.skipif(

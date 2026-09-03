@@ -95,7 +95,7 @@ def test_turn_stream_released_when_consumer_raises(make_harness) -> None:
 class _HeaderRecordingRunner:
     """Records the request headers seen on each ACI route."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, status_body: dict[str, object] | None = None) -> None:
         self.app = web.Application()
         self.app.add_routes(
             [
@@ -107,6 +107,11 @@ class _HeaderRecordingRunner:
             ]
         )
         self.headers: dict[str, dict[str, str]] = {}
+        self.status_body = status_body or {
+            "status": "idle-awaiting-input",
+            "turn_active": False,
+            "history_durable": True,
+        }
 
     async def _event(self, request: web.Request) -> web.StreamResponse:
         self.headers["event"] = dict(request.headers)
@@ -126,9 +131,7 @@ class _HeaderRecordingRunner:
 
     async def _status(self, request: web.Request) -> web.Response:
         self.headers[request.path] = dict(request.headers)
-        return web.json_response(
-            {"status": "idle-awaiting-input", "turn_active": False, "history_durable": True}
-        )
+        return web.json_response(self.status_body)
 
 
 async def _drain(turn: Any) -> None:
@@ -154,6 +157,35 @@ def test_runner_client_sends_bearer_token_on_every_call() -> None:
             assert runner.headers["event"].get("Authorization") == "Bearer tok-1"
             assert runner.headers["steer"].get("Authorization") == "Bearer tok-1"
             assert runner.headers["interrupt"].get("Authorization") == "Bearer tok-1"
+            assert runner.headers["/v1/status"].get("Authorization") == "Bearer tok-1"
+        finally:
+            await client.close()
+            await server.close()
+
+    asyncio.run(go())
+
+
+def test_runner_client_preserves_authenticated_boot_attestation() -> None:
+    async def go() -> None:
+        attested = {
+            "status": "idle-awaiting-input",
+            "ready": True,
+            "turn_active": False,
+            "history_durable": True,
+            "session_id": "session-acme-workspace",
+            "sandbox_id": "sandbox-acme-workspace",
+            "managed_workspace": True,
+            "cwd": "/workspace",
+        }
+        runner = _HeaderRecordingRunner(status_body=attested)
+        server = TestServer(runner.app)
+        await server.start_server()
+        base_url = f"http://127.0.0.1:{server.port}"
+        client = RunnerClient(total_timeout_s=30.0)
+        try:
+            status = await client.status(base_url, token="tok-1")
+
+            assert status == attested
             assert runner.headers["/v1/status"].get("Authorization") == "Bearer tok-1"
         finally:
             await client.close()

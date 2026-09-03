@@ -22,7 +22,7 @@ import stat
 import tarfile
 import threading
 import uuid
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -787,8 +787,10 @@ class _RecordingSubstrate:
         env: dict[str, str] | None = None,
         workspace_repo: str,
         agent_name: str | None = None,
+        validate_candidate: Callable[[object], None] | None = None,
     ) -> object:
         payload = dict(env or {})
+        candidate = object()
         self.calls.append(("handoff", thread_key, payload))
         self.handoff_calls.append(
             {
@@ -797,9 +799,12 @@ class _RecordingSubstrate:
                 "env": payload,
                 "workspace_repo": workspace_repo,
                 "agent_name": agent_name,
+                "candidate": candidate,
             }
         )
-        return object()
+        if validate_candidate is not None:
+            validate_candidate(candidate)
+        return candidate
 
 
 def test_workspace_ownership_is_durable_before_the_sandbox_claim_is_exposed(
@@ -1045,6 +1050,83 @@ def test_late_handoff_revalidation_refusal_restores_ownership_and_old_route(
 
     assert ordering == ["verified", "revalidated-refused"]
     assert substrate.handoff_calls == []
+    assert substrate.current_route is old_route
+
+    restarted = workspace.WorkspaceClaimCoordinator(
+        preparer=preparer,
+        substrate=_RecordingSubstrate(),
+        ownership_ttl_seconds=60,
+        wall_clock=lambda: 1001.0,
+    )
+    assert restarted.current(thread_key) == previous
+    assert previous.object_key in objects.objects
+    archive_keys = [key for key in objects.objects if not key.startswith("_ownership/")]
+    assert archive_keys == [previous.object_key]
+    assert any(
+        key != previous.object_key and not key.startswith("_ownership/")
+        for key in objects.deleted
+    )
+
+
+def test_late_handoff_candidate_refusal_restores_prior_durable_ownership(
+    workspace: Any, tmp_path: Path
+) -> None:
+    preparer, _, objects = _preparer(workspace, tmp_path)
+    thread_key = "1700000000.000100"
+    old_route = object()
+    ordering: list[str] = []
+    observed_candidates: list[object] = []
+
+    class CandidateSubstrate(_RecordingSubstrate):
+        current_route = old_route
+
+        def handoff(self, *args: Any, **kwargs: Any) -> object:
+            candidate = super().handoff(*args, **kwargs)
+            self.current_route = candidate
+            return candidate
+
+    substrate = CandidateSubstrate()
+    coordinator = workspace.WorkspaceClaimCoordinator(
+        preparer=preparer,
+        substrate=substrate,
+        ownership_ttl_seconds=60,
+        wall_clock=lambda: 1000.0,
+    )
+    previous = coordinator.claim_or_resume_with_handle(
+        thread_key=thread_key,
+        deployment_id=DEPLOYMENT_ID,
+    ).prepared
+    substrate.calls.clear()
+    substrate.handoff_calls.clear()
+
+    real_verify = preparer.verify
+
+    def verify(prepared: Any) -> None:
+        real_verify(prepared)
+        ordering.append("verified")
+
+    preparer.verify = verify
+
+    def refuse_candidate(candidate: object) -> None:
+        staged = coordinator.current(thread_key)
+        assert staged is not None and staged != previous
+        observed_candidates.append(candidate)
+        ordering.append("candidate-refused")
+        raise RuntimeError("candidate runner attestation mismatch")
+
+    with pytest.raises(RuntimeError, match="candidate runner attestation mismatch"):
+        coordinator.claim_or_resume_with_handle(
+            thread_key=thread_key,
+            deployment_id=DEPLOYMENT_ID,
+            repo_full_name="acme-corp/acme-bot",
+            replace_handle=old_route,
+            revalidate_before_handoff=lambda: ordering.append("old-revalidated"),
+            validate_candidate=refuse_candidate,
+        )
+
+    assert ordering == ["verified", "old-revalidated", "candidate-refused"]
+    assert len(substrate.handoff_calls) == 1
+    assert observed_candidates == [substrate.handoff_calls[0]["candidate"]]
     assert substrate.current_route is old_route
 
     restarted = workspace.WorkspaceClaimCoordinator(
