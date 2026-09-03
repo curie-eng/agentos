@@ -220,6 +220,13 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/langfuse-image-pin-assertions.sh
 
+      # Prove both Langfuse Deployments use Recreate so an image change never
+      # runs two boot migrations against the same database (#2216).
+      - name: helm render assertions (langfuse Recreate strategy)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/langfuse-recreate-assertions.sh
+
       # Prove Langfuse startup is gated on ClickHouse being up (issue #2009). A
       # Helm upgrade that recreates the ClickHouse Service otherwise lets the new
       # Langfuse pods start their migrations against an unresolvable name, so the
