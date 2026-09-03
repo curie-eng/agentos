@@ -220,6 +220,14 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/langfuse-image-pin-assertions.sh
 
+      # Keep the chart ClickHouse default and Langfuse pin as one supported
+      # pair. ClickHouse 24.8 cannot apply Langfuse 3.225.x migration 39, so
+      # the default must stay on 25.12 and AVX-required (#2210).
+      - name: helm render assertions (clickhouse langfuse pin pair)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/clickhouse-langfuse-pin-assertions.sh
+
       # Prove both Langfuse Deployments use Recreate so an image change never
       # runs two boot migrations against the same database (#2216).
       - name: helm render assertions (langfuse Recreate strategy)

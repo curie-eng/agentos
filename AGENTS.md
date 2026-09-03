@@ -198,9 +198,13 @@ Host ports (non-default host ports to avoid local collisions):
 Config lives in `.env.example` (copy to the gitignored `.env` to override; the
 stack runs on the baked defaults without one). Load-bearing facts:
 
-- **ClickHouse is pinned to `:24.8`.** Newer ClickHouse requires AVX and SIGILLs
-  with exit 132 on CPUs without it. Keep the pin unless every target CPU has AVX.
-  `charts/curie` turns this into a chart preflight (`preflights.avxCheck`).
+- **ClickHouse:** `compose.dev.yaml` stays on `:24.8` so an SSE4.2-only
+  developer host can still boot the local stack (Langfuse `3.225.5` still
+  applies on 24.8). The Helm chart default is `:25.12`, required by the
+  Langfuse pin's ClickHouse migrations from 39 onward; AVX is a chart-default
+  requirement. `preflights.avxCheck` fails an AVX-less node unless the
+  operator pins a tag in `clickhouse.sse42SafeTags`. Do not move the two
+  chart pins independently (#2210).
 - **Langfuse OTLP ingest is HTTP-only** (gRPC is silently unsupported). Services
   may emit OTLP over gRPC or HTTP to the OTel Collector (4317/4318); the
   collector always exports to Langfuse over HTTP. Send app traces to the

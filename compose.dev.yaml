@@ -30,6 +30,8 @@
 #
 # ClickHouse is pinned to :24.8 on purpose. Newer ClickHouse requires AVX and
 # SIGILLs with exit 132 on CPUs without it; :24.8 still ships an SSE4.2 build.
+# The Helm chart default is :25.12 (AVX required) so it can apply the Langfuse
+# pin's ClickHouse migrations; do not treat the two pins as the same knob.
 
 # Pin the Compose project name so `local up`/`down` target the same project
 # regardless of where this file sits (repo checkout or fetched cache dir).
