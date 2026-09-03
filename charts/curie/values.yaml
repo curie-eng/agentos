@@ -490,7 +490,8 @@ rustfs:
   # and Langfuse's event/media upload endpoints): an external RustFS on port 443 uses HTTPS. All other configurations use HTTP.
   host: ""
   port: 9000
-  # Signing region for sandbox bundle fetches. Keep it aligned with the regional S3 endpoint.
+  # Signing region for sandbox bundle fetches and Langfuse event/media uploads.
+  # Keep it aligned with the regional S3 endpoint.
   region: us-east-1
   consolePort: 9001
   bucket: langfuse
