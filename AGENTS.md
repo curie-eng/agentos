@@ -356,6 +356,12 @@ as a whole; remembered only):
   (`apps/api/src/curie_api/approval_principal.py`) are frozen together in
   `tests/vectors/approval-principal.json`.
   [vector: `tests/vectors/approval-principal.json`]
+- dispatcher vs API approval-row miss -- the API 404 detail
+  (`apps/api/src/curie_api/routers/approvals.py`) and the dispatcher's
+  ownership-miss match (`apps/dispatcher/src/curie_dispatcher/approval_actions.py`)
+  cannot share code, so they are frozen together in
+  `tests/vectors/approval-ownership.json`.
+  [vector: `tests/vectors/approval-ownership.json`]
 - API vs worker vs CLI thread-reset SET -- `THREAD_RESET_SET` /
   `THREAD_RESET_INFLIGHT_SET` (`apps/api/src/curie_api/threadreset.py`,
   `apps/worker/src/curie_worker/consumer.py`) and the CLI's `THREAD_RESET_SET`

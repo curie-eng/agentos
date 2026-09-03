@@ -63,6 +63,26 @@ class FakeSocketClient:
         return self.ack_payloads.get(envelope_id)
 
 
+def deliver_until_acked(
+    connections: list[tuple[Any, FakeSocketClient, Any]],
+    request: Any,
+) -> FakeSocketClient | None:
+    """Deliver one Socket Mode envelope to each connection until one acks.
+
+    Slack retries an unacked envelope on another connection of the same app
+    (https://docs.slack.dev/apis/events-api/using-socket-mode/#using-multiple-connections).
+    This is the fake-app stand-in for that retry: the same envelope_id, in
+    order, stopping at the first ack.
+    """
+
+    for handler, sock, app in connections:
+        handler.handle(sock, request)
+        app.listener_runner.listener_executor.shutdown(wait=True)
+        if request.envelope_id in sock.acked_envelope_ids:
+            return sock
+    return None
+
+
 @contextmanager
 def _black_hole_api() -> Iterator[str]:
     """A real port that completes the TCP handshake and then never answers.

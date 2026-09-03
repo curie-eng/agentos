@@ -203,10 +203,10 @@ app token, but they do not both receive each interaction.
 Prefer a separate Slack app per long-lived Curie release. When two Curie
 releases temporarily share one app, an approval interaction may first reach the
 release whose API does not contain that approval. That release leaves the
-approval and card unchanged and tells the approver to try again so Slack can
-deliver a later interaction to the owner. Stop the extra dispatcher after the
-overlap; the compose dispatcher remains off by default behind the Slack profile
-to make accidental overlap less likely.
+Socket Mode envelope unacked so Slack retries the owner; it does not resolve
+the record or change the card. Stop the extra dispatcher after the overlap;
+the compose dispatcher remains off by default behind the Slack profile to make
+accidental overlap less likely.
 
 ## Teardown and return to Slack-free
 
