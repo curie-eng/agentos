@@ -1022,6 +1022,8 @@ jobs:
         run: docker tag ghcr.io/curie-eng/curie-api:ci-local ghcr.io/curie-eng/curie-api:latest
       - name: Build the worker-local overlay for the generated release compose (ghcr.io/curie-eng/curie-worker-local:latest, no registry auth)
         run: docker build --build-arg BASE_TAG=ci-local -t ghcr.io/curie-eng/curie-worker-local:latest -f compose/worker-local.Dockerfile compose
+      - name: Build any remaining release-compose images the selected profile requires
+        run: python3 compose/ensure_release_images.py --profiles full --build-missing
       - name: Parity ladder (local-release rung against generated compose.release.yaml, fake model, credential-free)
         env:
           CURIE_BIN: cli/target/release/curie

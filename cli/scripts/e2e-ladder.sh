@@ -4237,17 +4237,21 @@ rung_local_release() {
     if [[ -f "$WORKDIR/bundle-release/evals/trajectory.json" ]]; then
         compose_profile="full"
     fi
+    # Derive the required GHCR refs from the generated compose plus the
+    # images `local message` still needs (dispatcher one-shot, runner env)
+    # rather than a hardcoded list that grows one missing image at a time
+    # (#2005, #2245).
     local missing=0 image
     while IFS= read -r image; do
-        [[ "$image" == ghcr.io/curie-eng/curie-* ]] || continue
+        [[ -n "$image" ]] || continue
         if ! docker image inspect "$image" >/dev/null 2>&1; then
             echo "error: image '$image' is required by compose.release.yaml's $compose_profile profile and is not present locally." >&2
             missing=1
         fi
-    done < <(docker compose -f "$release_compose" \
-        --profile "$compose_profile" --profile slack config --images)
+    done < <(python3 "$REPO_ROOT/compose/ensure_release_images.py" \
+        --compose-file "$release_compose" --profiles "$compose_profile" --list)
     if (( missing )); then
-        echo "fix: build and tag the missing image(s) locally under the tag compose.release.yaml pins (see .github/workflows/ci.yaml's e2e-ladder job for the exact build+tag steps CI uses), then re-run." >&2
+        echo "fix: python3 compose/ensure_release_images.py --profiles $compose_profile --build-missing, then re-run." >&2
         return 1
     fi
 
