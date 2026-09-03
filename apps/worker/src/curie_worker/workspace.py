@@ -294,7 +294,8 @@ class WorkspaceCredentialClient:
             ) from exc
         if response.status == 403:
             raise WorkspaceSelectionRefused(
-                "That repository is not authorized for this installation."
+                "That repository is not in api.githubRepoAllowlist for this installation; "
+                "allow `owner/repo` or `owner/*` in the chart values."
             )
         if response.status == 409:
             try:

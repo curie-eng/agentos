@@ -432,6 +432,32 @@ def test_internal_workspace_selection_sends_author_thread_and_optional_repo(
     }
 
 
+def test_unallowlisted_selection_names_the_chart_allowlist(
+    workspace: Any,
+) -> None:
+    """A 403 must name api.githubRepoAllowlist, not the GitHub App install."""
+
+    def transport(**_request: Any) -> Any:
+        return SimpleNamespace(status=403, headers={}, body=b"")
+
+    client = workspace.WorkspaceCredentialClient(
+        api_url="https://api.example.com",
+        worker_token=WORKER_AUTH,
+        transport=transport,
+    )
+
+    with pytest.raises(workspace.WorkspaceSelectionRefused) as excinfo:
+        client.select(
+            DEPLOYMENT_ID, "1700000000.000100", "U0REQUEST1", "attacker/other-bot"
+        )
+
+    assert excinfo.value.public_detail == (
+        "That repository is not in api.githubRepoAllowlist for this installation; "
+        "allow `owner/repo` or `owner/*` in the chart values."
+    )
+    assert "not authorized for this installation" not in excinfo.value.public_detail
+
+
 def test_internal_workspace_selection_accepts_explicit_unselected_response(
     workspace: Any,
 ) -> None:

@@ -1024,6 +1024,16 @@ fn warn_if_insecure(base_url: &str) {
     }
 }
 
+fn valid_github_owner(owner: &str) -> bool {
+    (1..=39).contains(&owner.len())
+        && owner
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        && !owner.starts_with('-')
+        && !owner.ends_with('-')
+        && !owner.contains("--")
+}
+
 fn validate_repo_full_name(repo_full_name: &str) -> Result<()> {
     let Some((owner, repository)) = repo_full_name.split_once('/') else {
         bail!(
@@ -1033,13 +1043,6 @@ fn validate_repo_full_name(repo_full_name: &str) -> Result<()> {
         );
     };
 
-    let owner_valid = (1..=39).contains(&owner.len())
-        && owner
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        && !owner.starts_with('-')
-        && !owner.ends_with('-')
-        && !owner.contains("--");
     let repository_valid = (1..=100).contains(&repository.len())
         && repository != "."
         && repository != ".."
@@ -1047,7 +1050,7 @@ fn validate_repo_full_name(repo_full_name: &str) -> Result<()> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
 
-    if !owner_valid || !repository_valid {
+    if !valid_github_owner(owner) || !repository_valid {
         bail!(
             "invalid repo_full_name: expected one owner/name pair; the owner must use 1 to 39 \
              ASCII letters or digits with single nonterminal hyphens, and the name must use 1 \
@@ -1056,6 +1059,21 @@ fn validate_repo_full_name(repo_full_name: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Accept exact `owner/repository` or owner-wide `owner/*` chart allowlist entries.
+pub(crate) fn validate_allowlist_entry(entry: &str) -> Result<()> {
+    if let Some((owner, rest)) = entry.split_once('/') {
+        if rest == "*" && valid_github_owner(owner) {
+            return Ok(());
+        }
+    }
+    validate_repo_full_name(entry).map_err(|_| {
+        anyhow::anyhow!(
+            "invalid --workspace-repo {entry}: expected `owner/repo` or `owner/*` in the \
+             api.githubRepoAllowlist shape"
+        )
+    })
 }
 
 /// The `POST /agents` body. Pure so the shape is testable without a live API.
@@ -2677,7 +2695,19 @@ impl ApiClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{add_channel_body, agent_create_body, agent_update_body, is_insecure_endpoint};
+    use super::{
+        add_channel_body, agent_create_body, agent_update_body, is_insecure_endpoint,
+        validate_allowlist_entry,
+    };
+
+    #[test]
+    fn allowlist_entries_accept_owner_repo_and_owner_wildcard() {
+        validate_allowlist_entry("acme-corp/acme-bot").expect("exact repo");
+        validate_allowlist_entry("acme-labs/*").expect("owner wildcard");
+        assert!(validate_allowlist_entry("not a repo").is_err());
+        assert!(validate_allowlist_entry("acme-corp/").is_err());
+        assert!(validate_allowlist_entry("*/acme-bot").is_err());
+    }
 
     #[test]
     fn create_agent_body_omits_repo_unless_asked() {

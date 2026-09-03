@@ -4907,6 +4907,14 @@ export const commandManifest = {
                   "long": "observability-namespace",
                   "positional": false,
                   "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Allow this GitHub repository, or `owner/*`, for runtime workspace selection. Repeatable. Sets `api.githubRepoAllowlist` on the Curie install",
+                  "id": "workspace_repo",
+                  "long": "workspace-repo",
+                  "positional": false,
+                  "required": false
                 }
               ],
               "hidden": false,
