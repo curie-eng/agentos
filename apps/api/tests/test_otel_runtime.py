@@ -18,7 +18,11 @@ from curie_api.resumereconciler import ResumeReconciler
 from curie_api.sweeper import run_expiry_sweeper
 from curie_telemetry import operation_span, record_metric
 from curie_telemetry.metrics import declared_metric_manifest
+from curie_telemetry.tracing import configure_tracer_provider
 from fastapi.testclient import TestClient
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from redis.asyncio import Redis
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -60,6 +64,19 @@ class _Probe:
 class _ProbeSpan:
     def add_event(self, _name: str, _attributes: Mapping[str, str] | None = None) -> None:
         pass
+
+
+@contextmanager
+def _captured_spans() -> Iterator[InMemorySpanExporter]:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    configure_tracer_provider(provider)
+    try:
+        yield exporter
+    finally:
+        configure_tracer_provider(None)
+        provider.shutdown()
 
 
 def _install(monkeypatch: pytest.MonkeyPatch) -> _Probe:
@@ -105,6 +122,47 @@ def test_http_metric_manifest_covers_every_registered_api_route(client: TestClie
     registered = set(_registered_http_routes(client.app.routes))
 
     assert registered <= declared_operations
+
+
+def test_http_server_span_extracts_the_standard_w3c_parent(
+    client: TestClient,
+) -> None:
+    trace_id = int("2123456789abcdef0123456789abcdef", 16)
+    parent_span_id = int("2123456789abcdef", 16)
+    traceparent = "00-2123456789abcdef0123456789abcdef-2123456789abcdef-01"
+
+    with _captured_spans() as exporter:
+        response = client.get("/health", headers={"traceparent": traceparent})
+
+    assert response.status_code == 200
+    server, = [
+        span for span in exporter.get_finished_spans() if span.name == "http.server.request"
+    ]
+    assert server.context.trace_id == trace_id
+    assert server.parent is not None
+    assert server.parent.is_remote is True
+    assert server.parent.span_id == parent_span_id
+
+
+@pytest.mark.parametrize(
+    ("headers", "diagnostic"),
+    [({}, "trace.context.missing"), ({"traceparent": "malformed"}, "trace.context.malformed")],
+    ids=["missing", "malformed"],
+)
+def test_http_server_missing_or_malformed_parent_is_a_diagnostic_safe_root(
+    client: TestClient,
+    headers: dict[str, str],
+    diagnostic: str,
+) -> None:
+    with _captured_spans() as exporter:
+        response = client.get("/health", headers=headers)
+
+    assert response.status_code == 200
+    server, = [
+        span for span in exporter.get_finished_spans() if span.name == "http.server.request"
+    ]
+    assert server.parent is None
+    assert [event.name for event in server.events] == [diagnostic]
 
 
 def test_actions_route_records_validated_bounded_metrics(

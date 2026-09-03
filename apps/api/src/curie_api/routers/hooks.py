@@ -47,7 +47,14 @@ from aci_protocol import (
     TurnSource,
     parse_queued_turn,
 )
+from curie_telemetry import (
+    TRACEPARENT_STREAM_FIELD,
+    inject_trace_context,
+    operation_span,
+    record_metric,
+)
 from fastapi import APIRouter, Header, HTTPException, Request, Response, status
+from opentelemetry.trace import SpanKind, StatusCode
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
@@ -411,16 +418,70 @@ async def ingest_hook(
                     headers={"Retry-After": str(settings.hook_backlog_window_s)},
                 )
             turn = _mint_turn(agent, binding, hook, event_id, raw, partition=partition)
-            enqueued, current = await enqueue_owned(
-                client,
-                key=key,
-                stream=settings.runs_stream,
-                owner=owner,
-                payload=turn.model_dump_json(),
-                payload_field=STREAM_PAYLOAD_FIELD,
-                lease_s=settings.channel_delivery_lease_s,
-            )
+            carrier: dict[str, str] = {}
+            enqueue_error: Exception | None = None
+            enqueue_result: tuple[bool, str] | None = None
+            with operation_span(
+                "curie.queue.enqueue",
+                kind=SpanKind.PRODUCER,
+                attributes={"service.name": "curie-api", "source": "api"},
+            ) as span:
+                inject_trace_context(carrier)
+                try:
+                    enqueue_result = await enqueue_owned(
+                        client,
+                        key=key,
+                        stream=settings.runs_stream,
+                        owner=owner,
+                        payload=turn.model_dump_json(),
+                        payload_field=STREAM_PAYLOAD_FIELD,
+                        lease_s=settings.channel_delivery_lease_s,
+                        transport_field=(
+                            TRACEPARENT_STREAM_FIELD
+                            if TRACEPARENT_STREAM_FIELD in carrier
+                            else None
+                        ),
+                        transport_value=carrier.get(TRACEPARENT_STREAM_FIELD),
+                    )
+                except Exception as exc:
+                    enqueue_error = exc
+                    span.set_status(StatusCode.ERROR)
+                    span.add_event("queue.enqueue.failed", {"outcome": "failure"})
+                else:
+                    assert enqueue_result is not None
+                    span.add_event(
+                        "queue.enqueued" if enqueue_result[0] else "queue.duplicate",
+                        {"outcome": "success" if enqueue_result[0] else "pending"},
+                    )
+            if enqueue_error is not None:
+                record_metric(
+                    "curie.queue.enqueue",
+                    attributes={
+                        "service.name": "curie-api",
+                        "source": "api",
+                        "outcome": "failure",
+                    },
+                )
+                raise enqueue_error
+            assert enqueue_result is not None
+            enqueued, current = enqueue_result
             if enqueued:
+                record_metric(
+                    "curie.queue.enqueue",
+                    attributes={
+                        "service.name": "curie-api",
+                        "source": "api",
+                        "outcome": "success",
+                    },
+                )
+                record_metric(
+                    "curie.turn.accepted",
+                    attributes={
+                        "service.name": "curie-api",
+                        "source": "api",
+                        "outcome": "accepted",
+                    },
+                )
                 # The conversation id is here because it is the operator's only
                 # server-side record of which thread a delivery landed on. There
                 # is no verb that resets every partition of one hook, so a

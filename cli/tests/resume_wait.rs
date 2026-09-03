@@ -635,7 +635,17 @@ async fn a_notice_without_a_card_parks_the_turn_and_the_keepalive_delivers_the_r
     .await;
 
     let parked = match outcome {
-        Outcome::AwaitingApproval(latest) => latest,
+        Outcome::AwaitingApproval {
+            reply: latest,
+            approval_id: captured_id,
+        } => {
+            assert_eq!(
+                captured_id.as_deref(),
+                Some(approval_id),
+                "the route-bound notice remains the explicit id fallback when no card arrives"
+            );
+            latest
+        }
         other => {
             let _: i64 = redis::cmd("DEL")
                 .arg(&stream)
@@ -750,7 +760,13 @@ async fn a_blank_line_summary_notice_parks_the_turn_and_the_keepalive_delivers_t
     .await;
 
     let parked = match outcome {
-        Outcome::AwaitingApproval(latest) => latest,
+        Outcome::AwaitingApproval {
+            reply: latest,
+            approval_id: captured_id,
+        } => {
+            assert_eq!(captured_id.as_deref(), Some(approval_id));
+            latest
+        }
         other => {
             let _: i64 = redis::cmd("DEL")
                 .arg(&stream)

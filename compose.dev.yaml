@@ -94,6 +94,8 @@ services:
     image: valkey/valkey:8-alpine
     profiles: *core_profiles
     command: ["valkey-server", "--requirepass", "${VALKEY_PASSWORD:-valkeypass}"]
+    environment:
+      VALKEY_PASSWORD: ${VALKEY_PASSWORD:-valkeypass}
     ports:
       - "26379:6379"
     volumes:
@@ -615,7 +617,9 @@ services:
       # The collector join is also what lets --local-model resolve ollama by name.
       # Both are overridable from the shell.
       #
-      # The endpoint default is what a full-profile `local up` gets. It uses the
+      # The worker itself uses host networking, while the runner joins
+      # `curie_runner`; they therefore need different addresses for the same
+      # Collector. The endpoint defaults use the
       # `${VAR-default}` form (substitute only when UNSET), not `${VAR:-default}`
       # (substitute when unset OR empty), so an explicit empty value means "no
       # endpoint". That is what lets `curie local up --minimal` suppress it:
@@ -633,7 +637,8 @@ services:
       # it to the worker, which forwards it into every claim's boot env.
       - CURIE_FALSE_COMPLETION_CHECK=${CURIE_FALSE_COMPLETION_CHECK:-}
       - CURIE_DOCKER_NETWORK=${CURIE_DOCKER_NETWORK:-curie_runner}
-      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT-http://otel-collector:4318}
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT-${OTEL_EXPORTER_OTLP_ENDPOINT-http://127.0.0.1:24318}}
+      - CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT-http://otel-collector:4318}
       - OTEL_EXPORTER_OTLP_PROTOCOL=${OTEL_EXPORTER_OTLP_PROTOCOL-http/protobuf}
       # config.py's connector_release/connector_namespace (CURIE_RELEASE /
       # CURIE_NAMESPACE) both default empty, which was built for the cluster

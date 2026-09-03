@@ -59,6 +59,55 @@ fn ladder() -> String {
     fs::read_to_string(path).unwrap_or_default()
 }
 
+fn ladder_function(name: &str) -> String {
+    let source = ladder();
+    let marker = format!("{name}() {{");
+    let (_, tail) = source
+        .split_once(&marker)
+        .unwrap_or_else(|| panic!("ladder must define {name}"));
+    let (body, _) = tail
+        .split_once("\n}\n")
+        .unwrap_or_else(|| panic!("ladder function {name} must close"));
+    format!("{marker}{body}\n}}\n")
+}
+
+fn ladder_python_heredoc(function_name: &str) -> String {
+    let function = ladder_function(function_name);
+    let (_, tail) = function
+        .split_once("<<'PY'\n")
+        .unwrap_or_else(|| panic!("ladder function {function_name} must contain Python"));
+    tail.split_once("\nPY\n")
+        .unwrap_or_else(|| panic!("ladder function {function_name} Python must close"))
+        .0
+        .to_owned()
+}
+
+fn run_seed_trace_matcher(matcher: &str, marker: &str, rows: &serde_json::Value) -> Output {
+    let harness = tempfile::tempdir().expect("create seed matcher fixture directory");
+    let bounded_slice = harness.path().join("bounded-stream.json");
+    fs::write(
+        &bounded_slice,
+        serde_json::to_vec(rows).expect("serialize bounded stream fixture"),
+    )
+    .expect("write bounded stream fixture");
+    let mut child = Command::new("python3")
+        .arg("-")
+        .arg(&bounded_slice)
+        .arg(marker)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start exact seed matcher");
+    child
+        .stdin
+        .take()
+        .expect("open matcher stdin")
+        .write_all(matcher.as_bytes())
+        .expect("write exact seed matcher");
+    child.wait_with_output().expect("wait for seed matcher")
+}
+
 /// The local OTel assertions deliberately live in the shell harness, where
 /// they consume the Collector's raw JSON files.  Keep this test on that real
 /// consumer instead of re-implementing its attribution rules in Rust.
@@ -811,12 +860,27 @@ fn live_local_rung_grades_the_deployed_weather_cases() {
         .find(r#"prove_local_observability_queries "$agent_id""#)
         .map(|offset| product_collector + offset)
         .expect("the local rung must prove observability queries after telemetry");
-    assert!(
-        text.contains(r#"local observability runs --limit 100"#)
-            && text.contains(r#"timestamp = row.get("timestamp")"#)
-            && text.contains(r#"if matched is None:"#),
-        "the live proof must scan a bounded newest-first page and select its first complete typed row without relying on an identity field the list DTO does not promise"
-    );
+    for removed_helper in [
+        "discover_local_observability_trace() {",
+        "assert_local_observability_detail() {",
+    ] {
+        assert!(
+            !text.contains(removed_helper),
+            "a newest-runs selector/raw-dump helper remains ({removed_helper}); variable interpolation must not evade exact-ID discovery"
+        );
+    }
+    for required in [
+        "discover_trace_id_for_seed",
+        "query_exact_seed_trace",
+        "sanitize_exact_trace_read",
+        "seed_ordinary_turn",
+        "seed_approval_resume_turn",
+    ] {
+        assert!(
+            text.contains(required),
+            "the local product proof is missing exact-seed contract {required}"
+        );
+    }
     let contract = r#"echo "=== curie local eval --dry-run (suite parity) ==="
     local eval_args=(local eval)
     if [[ ! -f "$WORKDIR/bundle/evals/trajectory.json" ]]; then
@@ -841,7 +905,7 @@ fn live_local_rung_grades_the_deployed_weather_cases() {
     );
     assert!(
         local_rung
-            .contains("local up_args=(local up)\n        echo \"=== curie ${up_args[*]} ===\""),
+            .contains("local up_args=(local up -f \"$REPO_ROOT/compose.dev.yaml\" --build)\n        echo \"=== curie ${up_args[*]} ===\""),
         "the local rung must start the full profile required by its \
          observability query proof; ladder contents:\n{text}"
     );
@@ -849,6 +913,417 @@ fn live_local_rung_grades_the_deployed_weather_cases() {
         !local_rung.contains("up_args+=(--minimal)"),
         "the local rung must never add --minimal now that its observability \
           proof requires Langfuse/ClickHouse; ladder contents:\n{text}"
+    );
+}
+
+#[test]
+fn exact_seed_matcher_recovers_embedded_marker_once_and_rejects_background() {
+    let matcher = ladder_python_heredoc("discover_trace_id_for_seed");
+    let marker = "curie-seed-ordinary-example";
+    let target_trace = "a".repeat(32);
+    let background_trace = "b".repeat(32);
+    let target = serde_json::json!([
+        "2-0",
+        [
+            "payload",
+            serde_json::json!({"text": format!("ordinary correlation {marker}")}).to_string(),
+            "traceparent",
+            format!("00-{target_trace}-{}-01", "2".repeat(16))
+        ]
+    ]);
+    let background = serde_json::json!([
+        "1-0",
+        [
+            "payload",
+            serde_json::json!({"text": "ordinary correlation another-seed"}).to_string(),
+            "traceparent",
+            format!("00-{background_trace}-{}-01", "1".repeat(16))
+        ]
+    ]);
+
+    let matched = run_seed_trace_matcher(
+        &matcher,
+        marker,
+        &serde_json::json!([background.clone(), target.clone()]),
+    );
+    assert!(
+        matched.status.success(),
+        "representative embedded marker was not recovered: {}",
+        String::from_utf8_lossy(&matched.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&matched.stdout).trim(),
+        target_trace,
+        "background carrier must not substitute for the marker-adjacent carrier"
+    );
+
+    let mismatch = run_seed_trace_matcher(&matcher, marker, &serde_json::json!([background]));
+    assert!(
+        !mismatch.status.success(),
+        "a background payload without the marker must fail closed"
+    );
+    let duplicate = run_seed_trace_matcher(
+        &matcher,
+        marker,
+        &serde_json::json!([
+            target,
+            [
+                "3-0",
+                [
+                    "payload",
+                    serde_json::json!({"text": format!("ordinary correlation {marker}")})
+                        .to_string(),
+                    "traceparent",
+                    format!("00-{}-{}-01", "c".repeat(32), "3".repeat(16))
+                ]
+            ]
+        ]),
+    );
+    assert!(
+        !duplicate.status.success(),
+        "multiple matching adjacent carriers must fail closed"
+    );
+}
+
+#[test]
+fn product_observability_requires_three_valid_seeds_and_count_only_mcp_receipt() {
+    let text = ladder();
+    for required in [
+        "seed_ordinary_turn() {",
+        "seed_mcp_read_turn() {",
+        "seed_approval_resume_turn() {",
+        "seed-invalid",
+        "mcp_receipt_call_count() {",
+        "discover_trace_id_for_seed",
+        "query_exact_seed_trace",
+        "fixtures/mcp-receipt",
+    ] {
+        assert!(
+            text.contains(required),
+            "the product observability oracle must pin independent ordinary, MCP, and approval seed evidence; missing {required}"
+        );
+    }
+
+    let receipt_fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/fixtures/mcp-receipt/server.py");
+    let receipt_source = fs::read_to_string(&receipt_fixture).unwrap_or_default();
+    assert!(
+        receipt_source.contains(r#""tools/call""#),
+        "the hosted MCP fixture must log exactly one private receipt per tools/call"
+    );
+    let receipt = ladder_function("mcp_receipt_call_count");
+    assert!(
+        receipt.contains("docker logs") || receipt.contains("kubectl logs"),
+        "the independent MCP receipt must come from the hosted connector container"
+    );
+    assert!(
+        receipt.contains("count") || receipt.contains("wc -l"),
+        "only an aggregate MCP call count may reach evidence output"
+    );
+
+    let approval = ladder_function("seed_approval_resume_turn");
+    assert!(
+        approval.contains("curie.approval.suspend"),
+        "approval evidence must require the worker's real parked-turn span"
+    );
+    assert!(
+        !approval.contains("curie.approval.wait"),
+        "the oracle must not invent a wait span that no current emitter produces"
+    );
+}
+
+#[test]
+fn product_collector_restore_covers_every_emitter_and_invalid_auth_is_observable() {
+    let pins = ladder_function("pin_local_source_images");
+    for required in [
+        "export CURIE_BASE_TAG=dev",
+        "export CURIE_RUNNER_IMAGE=ghcr.io/curie-eng/curie-runner:dev",
+        "export CURIE_DISPATCHER_IMAGE=ghcr.io/curie-eng/curie-dispatcher:dev",
+    ] {
+        assert!(
+            pins.contains(required),
+            "raw Compose recreation loses {required}"
+        );
+    }
+    assert!(ladder_function("rung_local").contains("pin_local_source_images"));
+    let restore = ladder_function("route_local_observability_to_product_collector");
+    for required in [
+        "curie-api",
+        "curie-dispatcher",
+        "curie-worker",
+        "curie-runner",
+        "assert_product_collector_endpoint",
+        "http/protobuf",
+        "otel-collector:4318",
+    ] {
+        assert!(
+            restore.contains(required),
+            "worker-only exporter restoration can leave {required} routed to the disposable sink"
+        );
+    }
+    assert!(
+        restore.contains("export OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318"),
+        "product restoration must override unrelated shell or ignored-file routing"
+    );
+    assert!(
+        restore.contains("export CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:24318"),
+        "host-network worker must use the collector's published host port"
+    );
+    assert!(
+        restore.contains("export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf"),
+        "product restoration must pin the protocol expected by the task-owned collector"
+    );
+    assert!(
+        !restore.contains("unset OTEL_EXPORTER_OTLP_ENDPOINT"),
+        "unsetting the override permits ignored local configuration to redirect evidence"
+    );
+
+    let negative = ladder_function("case_local_langfuse_invalid_auth");
+    // OTLP/HTTP forbids retries for 401; configured retry/queue settings do not
+    // override that protocol rule. Issue #2204 requires an observable bounded
+    // failure, not replay of a permanently rejected request.
+    // https://opentelemetry.io/docs/specs/otlp/#retryable-response-codes
+    for required in [
+        "INVALID_LANGFUSE_OTLP_AUTH_HEADER",
+        "langfuse-web",
+        "otelcol_receiver_accepted_spans",
+        "otelcol_exporter_send_failed_spans",
+        "otelcol_exporter_queue_size",
+        "assert_product_collector_permanent_auth_rejection",
+        "Ready",
+        "restart",
+        "failed_trace_id",
+    ] {
+        assert!(
+            negative.contains(required),
+            "real pinned-Langfuse invalid-auth proof omits {required}"
+        );
+    }
+    assert!(
+        !negative.contains("down -v"),
+        "the negative must not destroy the backing stack to manufacture absence"
+    );
+    assert!(
+        !negative.contains("same_queued_trace_id"),
+        "a permanent 401 rejection must not be misrepresented as durable replay"
+    );
+
+    let valid_control = negative
+        .find(r#"query_exact_seed_trace local "$LAST_ORDINARY_TRACE_ID""#)
+        .expect("invalid-auth proof must first read an exact known-valid trace");
+    let invalidate = negative
+        .find(r#"export LANGFUSE_OTLP_AUTH_HEADER="$INVALID_LANGFUSE_OTLP_AUTH_HEADER""#)
+        .expect("invalid-auth proof must roll the Collector to the placeholder credential");
+    assert!(
+        valid_control < invalidate,
+        "the valid exact-read control must precede credential invalidation"
+    );
+
+    let query = ladder_function("query_exact_seed_trace");
+    let poll_start = query
+        .find(r#"for attempt in $(seq 1 "$OBSERVABILITY_POLL_ATTEMPTS"); do"#)
+        .expect("exact trace query must use the declared bounded poll count");
+    let poll_end = poll_start
+        + query[poll_start..]
+            .find("\n    done")
+            .expect("exact trace bounded poll must close");
+    let absent_success = query
+        .find("exact trace remained not-found through the full bounded observation poll")
+        .expect("exact trace query must report a bounded absent verdict");
+    assert!(
+        absent_success > poll_end,
+        "absence must stay stable for the full poll bound, not return on the first exit 1"
+    );
+    assert!(
+        query.to_ascii_lowercase().contains("not found")
+            || query.to_ascii_lowercase().contains("not_found"),
+        "only a typed not-found result may satisfy absence; arbitrary exit 1 is not evidence"
+    );
+
+    let absent = negative
+        .find(r#"query_exact_seed_trace local "$failed_trace_id" "" "" absent"#)
+        .expect("the rejected exact ID must be checked absent while auth is invalid");
+    let restored = negative
+        .rfind("restore_local_langfuse_auth")
+        .expect("valid auth must be restored after the failure evidence");
+    let recovered = negative
+        .rfind("seed_ordinary_turn local")
+        .expect("a fresh healthy turn must prove exact ingestion after valid auth returns");
+    assert!(
+        absent < restored && restored < recovered,
+        "fresh-turn recovery must follow bounded rejection evidence and credential restoration"
+    );
+}
+
+#[test]
+fn cluster_product_observability_is_private_preflight_and_query_only() {
+    let preflight = ladder_function("preflight_cluster_product_observability");
+    for required in [
+        "CURIE_NAMESPACE",
+        "CURIE_RELEASE",
+        "default",
+        "curie",
+        "langfuse",
+        "otel-collector",
+        "api",
+        "worker",
+        "runner-prewarm",
+        "imageID",
+        "docker image inspect",
+        "curie-api:local",
+        "curie-worker:local",
+        "curie-runner:latest",
+        "mismatch",
+    ] {
+        assert!(
+            preflight.contains(required),
+            "cluster product preflight omits {required}"
+        );
+    }
+
+    let query = ladder_function("run_cluster_product_observability");
+    let wrapper = ladder_function("rung_cluster_product");
+    for required in [
+        "preflight_cluster_product_observability",
+        "seed_cluster_missing_carrier_control",
+        "cluster_external_ingress_seed",
+        "cluster observability run",
+    ] {
+        assert!(
+            query.contains(required),
+            "cluster query mode omits {required}"
+        );
+    }
+    for mutation in [
+        "cluster up",
+        "cluster down",
+        "helm install",
+        "helm upgrade",
+        "helm uninstall",
+        "kubectl delete",
+    ] {
+        for (helper_name, helper) in [
+            ("preflight", preflight.as_str()),
+            ("query", query.as_str()),
+            ("product wrapper", wrapper.as_str()),
+        ] {
+            assert!(
+                !helper.contains(mutation),
+                "cluster product {helper_name} must never install, upgrade, uninstall, or delete the release: found {mutation}"
+            );
+        }
+    }
+    assert!(
+        wrapper.contains("cluster deploy"),
+        "the product wrapper must retain the intended agent seed deployment"
+    );
+    for manufactured in [
+        "enqueue_cluster_carried_turn",
+        "CLUSTER_SEEDED_TRACE_ID",
+        "secrets.token_hex",
+    ] {
+        assert!(
+            !ladder().contains(manufactured),
+            "cluster correlation evidence must come from real Slack ingress, not harness-manufactured carrier {manufactured}"
+        );
+    }
+    let missing_carrier = ladder_function("seed_cluster_missing_carrier_control");
+    assert!(
+        missing_carrier.contains("cluster message")
+            && missing_carrier.contains("adjacent_traceparent=false"),
+        "the dispatcher-absent cluster message path must remain an explicit executed missing-carrier compatibility negative"
+    );
+    let external = ladder_function("cluster_external_ingress_seed");
+    for required in [
+        "CURIE_E2E_CLUSTER_EXTERNAL_INGRESS_RECEIPT",
+        "CURIE_E2E_PRODUCT_RUN_ID",
+        "reply_observed",
+        "completion_observed",
+        "otelcol_receiver_accepted_spans_delta",
+        "otelcol_exporter_sent_spans_delta",
+        "discover_cluster_external_trace_id",
+    ] {
+        assert!(
+            ladder().contains(required) || external.contains(required),
+            "external Slack cluster evidence omits {required}"
+        );
+    }
+    assert!(
+        !preflight.contains(r#"-o json > "$inventory""#)
+            && !preflight.contains("cluster-product-pods"),
+        "cluster preflight must query Ready/imageID fields directly and never persist full pod JSON containing private spec/env data"
+    );
+}
+
+#[test]
+fn product_sanitizer_and_message_failures_never_dump_private_json() {
+    let sanitizer = ladder_function("sanitize_exact_trace_read");
+    assert!(
+        !sanitizer.contains("if private_fields.intersection(node):\n        pass"),
+        "private-field handling must reject or remove data, not be a no-op"
+    );
+    for private in ["input", "output", "session", "user", "headers"] {
+        assert!(
+            sanitizer.contains(private),
+            "sanitizer must explicitly account for private field {private}"
+        );
+    }
+
+    let finalized = ladder_function("assert_finalized_reply");
+    for raw_dump in [
+        r#"printf '%s\n' "$payload""#,
+        r#"printf "%s\n" "$payload""#,
+        r#"echo "$payload""#,
+    ] {
+        assert!(
+            !finalized.contains(raw_dump),
+            "message parse/finalization failures must emit a bounded verdict, not private raw JSON"
+        );
+    }
+}
+
+#[test]
+fn adopted_component_stop_requires_complete_available_surface_export() {
+    let decision = ladder_function("classify_product_observability_owner");
+    for required in [
+        "raw_emitted_observations",
+        "otelcol_receiver_accepted_spans",
+        "otelcol_exporter_sent_spans",
+        "langfuse_observation_membership",
+        "local",
+        "cluster",
+        "image_ids_match",
+        "seed_valid",
+        "same_id_raw_collector_receipt",
+        "run_id",
+        "adopted-component",
+    ] {
+        assert!(
+            decision.contains(required),
+            "ownership classification omits prerequisite {required}"
+        );
+    }
+    assert!(
+        decision.find("otelcol_exporter_sent_spans") < decision.find("adopted-component"),
+        "the harness cannot blame the adopted backend before proving export success"
+    );
+    assert!(
+        decision.find("langfuse_observation_membership") < decision.find("adopted-component"),
+        "the harness cannot blame the adopted backend before checking exact-ID membership"
+    );
+    for verdict in ["curie-unresolved", "curie-owned", "adopted-component"] {
+        let tail = decision
+            .split(verdict)
+            .nth(1)
+            .unwrap_or_else(|| panic!("classifier omits verdict {verdict}"));
+        assert!(
+            tail.contains("SystemExit(1)"),
+            "blocking verdict {verdict} must terminate the supported run nonzero"
+        );
+    }
+    assert!(
+        decision.contains("curie-clear") && decision.contains("SystemExit(0)"),
+        "only complete exact membership for every exercised surface may exit zero"
     );
 }
 
@@ -1279,7 +1754,7 @@ print(json.dumps({
     "local up --minimal")
         echo "stub: compose stack up"
         ;;
-    "local up")
+    "local up -f "*/compose.dev.yaml" --build")
         echo "stub: full compose stack up"
         ;;
     "--json local deploy --plugin-dir "*)
@@ -1370,7 +1845,7 @@ print(json.dumps({
         fi
         exit "${STUB_EVAL_EXIT:-0}"
         ;;
-    "local down")
+    "local down -f "*/compose.dev.yaml)
         echo "stub: compose stack down"
         ;;
     *)
@@ -1699,6 +2174,33 @@ fn invocation_count(invocations: &str, expected: &str) -> usize {
     invocations.lines().filter(|line| *line == expected).count()
 }
 
+/// The local rung must boot the current source tree rather than the release
+/// compose resolved by the candidate binary. The compose file and `--build`
+/// are both load-bearing parts of this argv.
+fn is_current_source_local_up(invocation: &str) -> bool {
+    let args = invocation.split_whitespace().collect::<Vec<_>>();
+    args.len() == 5
+        && args[..3] == ["local", "up", "-f"]
+        && args[3].ends_with("/compose.dev.yaml")
+        && args[4] == "--build"
+}
+
+/// Teardown must target the same current-source compose file that the rung
+/// brought up; an unqualified `local down` could select a release compose.
+fn is_current_source_local_down(invocation: &str) -> bool {
+    let args = invocation.split_whitespace().collect::<Vec<_>>();
+    args.len() == 4
+        && args[..3] == ["local", "down", "-f"]
+        && args[3].ends_with("/compose.dev.yaml")
+}
+
+fn current_source_local_down_count(invocations: &str) -> usize {
+    invocations
+        .lines()
+        .filter(|line| is_current_source_local_down(line))
+        .count()
+}
+
 fn looks_like_utc_second(value: &str) -> bool {
     let bytes = value.as_bytes();
     bytes.len() == 20
@@ -1713,27 +2215,27 @@ fn looks_like_utc_second(value: &str) -> bool {
 
 /// Pin the public argv the ladder itself must exercise. These are not test-only
 /// probes: every line is a command an operator can paste against the candidate
-/// binary. The bounded newest-page read occurs before the discovered-id detail;
+/// binary. Exact trace discovery is private to the bounded seed stream slice;
 /// the separate agent-filtered list is the unavailable-API negative with its
 /// process environment pointed at a closed endpoint.
 fn assert_observability_candidate_invocations(invocations: &str, trace_id: &str) {
-    let runs = "--json local observability runs --limit 100";
+    let legacy_runs = "--json local observability runs --limit 100";
     let unavailable = format!("--json local observability runs --limit 1 --agent-id {AGENT_ID}");
     let detail = format!("--json local observability run {trace_id}");
     let unknown = format!("--json local observability run {UNKNOWN_OBSERVABILITY_TRACE_ID}");
 
     assert_eq!(
-        invocation_count(invocations, runs),
-        1,
-        "the local rung must issue one bounded newest-runs read for typed client selection; invocations:\n{invocations}"
+        invocation_count(invocations, legacy_runs),
+        0,
+        "the local rung must never let a newest-runs page select an unrelated background trace; invocations:\n{invocations}"
     );
-    assert_eq!(
+    assert!(
         invocations
             .lines()
             .filter(|line| line.starts_with("--json local message "))
-            .count(),
-        2,
-        "the query proof must seed the product Collector with its own finalized turn after the independent sink controls; invocations:\n{invocations}"
+            .count()
+            >= 2,
+        "the query proof must seed the product Collector with independently finalized turns after the raw sink controls; invocations:\n{invocations}"
     );
     assert_eq!(
         invocation_count(invocations, &unavailable),
@@ -1817,17 +2319,17 @@ fn assert_observability_candidate_invocations(invocations: &str, trace_id: &str)
         summary_window, series_window,
         "summary and series must share the one dynamically captured window; invocations:\n{invocations}"
     );
-    let bounded_position = invocations
-        .lines()
-        .position(|line| line == runs)
-        .expect("bounded runs invocation");
     let detail_position = invocations
         .lines()
         .position(|line| line == detail.as_str())
         .expect("discovered trace detail invocation");
+    let seed_position = invocations
+        .lines()
+        .position(|line| line.starts_with("--json local message "))
+        .expect("seed message invocation");
     assert!(
-        bounded_position < detail_position,
-        "the rung must discover the real trace id from the bounded list before querying its complete tree; invocations:\n{invocations}"
+        seed_position < detail_position,
+        "the rung must complete a seed before querying the exact trace ID privately derived from that seed; invocations:\n{invocations}"
     );
 }
 
@@ -1906,12 +2408,12 @@ fn ladder_selects_platform_trajectory_eval_without_overriding_deployed_cases() {
         .lines()
         .filter(|line| line.starts_with("local up"))
         .collect::<Vec<_>>();
-    assert_eq!(trajectory_starts, ["local up"], "{trajectory_invocations}");
+    assert_eq!(trajectory_starts.len(), 1, "{trajectory_invocations}");
     assert!(
         trajectory_starts
             .iter()
-            .all(|line| !line.contains("--minimal")),
-        "trajectory scoring requires the full local profile: {trajectory_invocations}"
+            .all(|line| is_current_source_local_up(line)),
+        "trajectory scoring requires current-source compose.dev.yaml with --build, never --minimal: {trajectory_invocations}"
     );
     for tier in ["local", "cluster"] {
         assert!(
@@ -1945,9 +2447,15 @@ fn ladder_selects_platform_trajectory_eval_without_overriding_deployed_cases() {
         .filter(|line| line.starts_with("local up"))
         .collect::<Vec<_>>();
     assert_eq!(
-        ordinary_starts,
-        ["local up"],
-        "the local rung's observability query proof requires the full profile even when the suite has no trajectory sidecar: {ordinary_invocations}"
+        ordinary_starts.len(),
+        1,
+        "the local rung's observability query proof requires one current-source boot even when the suite has no trajectory sidecar: {ordinary_invocations}"
+    );
+    assert!(
+        ordinary_starts
+            .iter()
+            .all(|line| is_current_source_local_up(line)),
+        "the local rung's observability query proof must pin compose.dev.yaml and --build even when the suite has no trajectory sidecar: {ordinary_invocations}"
     );
 }
 
@@ -1969,18 +2477,23 @@ fn local_rung_proves_observability_queries_with_real_candidate_verbs() {
         unavailable_called,
         "the local rung must actually move CURIE_API_URL to the closed-loopback control and exercise the unavailable-API path through the candidate CLI; invocations:\n{invocations}"
     );
+    let local_starts = invocations
+        .lines()
+        .filter(|line| line.starts_with("local up"))
+        .collect::<Vec<_>>();
     assert_eq!(
-        invocations
-            .lines()
-            .filter(|line| line.starts_with("local up"))
-            .collect::<Vec<_>>(),
-        ["local up"],
-        "observability proof requires the full local profile, never --minimal; invocations:\n{invocations}"
+        local_starts.len(),
+        1,
+        "observability proof requires exactly one local boot, never an additional minimal or release-compose boot; invocations:\n{invocations}"
+    );
+    assert!(
+        local_starts.iter().all(|line| is_current_source_local_up(line)),
+        "observability proof requires current-source compose.dev.yaml with --build, never --minimal; invocations:\n{invocations}"
     );
     assert_eq!(
-        invocation_count(&invocations, "local down"),
+        current_source_local_down_count(&invocations),
         1,
-        "a successful rung must tear down the one stack it claimed exactly once; invocations:\n{invocations}"
+        "a successful rung must tear down the one current-source stack it claimed exactly once; invocations:\n{invocations}"
     );
 }
 
@@ -2011,19 +2524,13 @@ fn local_observability_proof_leaves_a_borrowed_stack_to_its_owner() {
     );
 }
 
-/// #866 NEGATIVE CONTROLS. Move one stub contract at a time while the positive
-/// control above stays green: JSON cardinality, unknown-trace exit 1,
+/// #866 NEGATIVE CONTROLS. Move one candidate query contract at a time while
+/// the positive control above stays green: unknown-trace exit 1,
 /// unavailable-API exit 3, and the mandatory recovery instruction must each
 /// make the real ladder reject the candidate and still run owner teardown.
 #[test]
 fn local_observability_negative_controls_are_falsifiable() {
     let cases: &[(&str, &str, &[&str], bool)] = &[
-        (
-            "STUB_RUNS_EXTRA_JSON",
-            "1",
-            &["runs", "exactly one JSON object"],
-            false,
-        ),
         (
             "STUB_UNKNOWN_TRACE_EXIT",
             "0",
@@ -2062,9 +2569,9 @@ fn local_observability_negative_controls_are_falsifiable() {
             "{variable} exercised the wrong unavailable-API path"
         );
         assert_eq!(
-            invocation_count(&invocations, "local down"),
+            current_source_local_down_count(&invocations),
             1,
-            "the owner-scoped EXIT trap must tear down {variable}; invocations:\n{invocations}"
+            "the owner-scoped EXIT trap must tear down {variable} through compose.dev.yaml; invocations:\n{invocations}"
         );
     }
 }

@@ -14,7 +14,8 @@ import os
 import sys
 
 from aci_protocol import QueuedTurn, parse_queued_turn
-from curie_telemetry import bootstrap_service_telemetry
+from curie_telemetry import bootstrap_service_telemetry, operation_span
+from opentelemetry.trace import SpanKind
 
 from . import __version__
 from .app import build_redis
@@ -32,7 +33,12 @@ def enqueue_payload(
 ) -> str:
     """Validate one frozen turn payload and enqueue it through the producer."""
     turn: QueuedTurn = parse_queued_turn(payload)
-    return enqueue(redis_client, config, turn)
+    with operation_span(
+        "curie.turn.ingress",
+        kind=SpanKind.CONSUMER,
+        attributes={"service.name": "curie-dispatcher", "source": "dispatcher"},
+    ):
+        return enqueue(redis_client, config, turn)
 
 
 def main() -> int:

@@ -45,6 +45,19 @@ def test_hoist_prefers_trace_over_observation() -> None:
     assert hoist_approval_decision(trace, observations) == "approved"
 
 
+def test_hoist_from_later_resume_observation_in_correlated_trace() -> None:
+    # The dispatcher-rooted trace includes spans before and after agent.run.
+    # Observation ordering cannot decide whether the resume is visible.
+    observations = [
+        {"id": "reply", "name": "curie.reply.update"},
+        {"id": "ingress", "metadata": {"gen_ai.approval.decision": ""}},
+        {"id": "invalid", "metadata": {"gen_ai.approval.decision": False}},
+        {"id": "resume", "metadata": {"gen_ai.approval.decision": "approved"}},
+    ]
+    assert hoist_approval_decision({"id": "t1"}, observations) == "approved"
+    assert hoist_approval_decision({"id": "t1"}, observations[:-1]) is None
+
+
 def test_hoist_returns_none_for_an_ordinary_turn() -> None:
     # No approval was resumed this turn -- the ordinary, most common case.
     trace = {"id": "t1", "metadata": {"other": "x"}}
