@@ -18,6 +18,7 @@ import posixpath
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -32,6 +33,7 @@ def load_module():
     spec = importlib.util.spec_from_file_location("release_authorize", SCRIPT)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
+    sys.modules["release_authorize"] = module
     spec.loader.exec_module(module)
     return module
 
@@ -697,6 +699,19 @@ class TestMain:
         monkeypatch.setattr(authorize_module, "REQUIRED_CHECK_NAMES", TEST_REQUIRED_NAMES)
 
     @staticmethod
+    def _stub_green_nightly(monkeypatch) -> None:
+        monkeypatch.setattr(
+            authorize_module._nightly,
+            "fetch_latest_nightly_conclusion",
+            lambda repo, branch: "success",
+        )
+        monkeypatch.setattr(
+            authorize_module._nightly,
+            "fetch_associated_pr_bodies",
+            lambda sha, repo: [],
+        )
+
+    @staticmethod
     def _runs_with_gate_own_in_progress() -> list[dict]:
         return [
             GATE_OWN_IN_PROGRESS,
@@ -710,6 +725,7 @@ class TestMain:
         sha = run_git(git_repo, "rev-parse", "HEAD")
         self._use_test_required_names(monkeypatch)
         self._stub_fetch_check_runs(monkeypatch, self._runs_with_gate_own_in_progress())
+        self._stub_green_nightly(monkeypatch)
         monkeypatch.chdir(git_repo)
         monkeypatch.setenv("GITHUB_RUN_ID", CURRENT_RUN_ID)
 
@@ -728,8 +744,60 @@ class TestMain:
         sha = run_git(git_repo, "rev-parse", "HEAD")
         self._use_test_required_names(monkeypatch)
         self._stub_fetch_check_runs(monkeypatch, self._runs_with_gate_own_in_progress())
+        self._stub_green_nightly(monkeypatch)
         monkeypatch.chdir(git_repo)
         monkeypatch.delenv("GITHUB_RUN_ID", raising=False)
+
+        exit_code = authorize_module.main(
+            [sha, "--repo", "curie-eng/curie", "--reviewed-ref", "main"]
+        )
+
+        assert exit_code == 0
+
+    def test_main_refuses_a_red_nightly_without_a_pr_body_override(
+        self, git_repo, monkeypatch, capsys
+    ):
+        sha = run_git(git_repo, "rev-parse", "HEAD")
+        self._use_test_required_names(monkeypatch)
+        self._stub_fetch_check_runs(monkeypatch, self._runs_with_gate_own_in_progress())
+        monkeypatch.setattr(
+            authorize_module._nightly,
+            "fetch_latest_nightly_conclusion",
+            lambda repo, branch: "failure",
+        )
+        monkeypatch.setattr(
+            authorize_module._nightly,
+            "fetch_associated_pr_bodies",
+            lambda sha, repo: ["cut the release"],
+        )
+        monkeypatch.chdir(git_repo)
+        monkeypatch.setenv("GITHUB_RUN_ID", CURRENT_RUN_ID)
+
+        exit_code = authorize_module.main(
+            [sha, "--repo", "curie-eng/curie", "--reviewed-ref", "main"]
+        )
+
+        assert exit_code == 1
+        assert "nightly" in capsys.readouterr().err.lower()
+
+    def test_main_authorizes_a_red_nightly_when_the_pr_body_records_the_override(
+        self, git_repo, monkeypatch
+    ):
+        sha = run_git(git_repo, "rev-parse", "HEAD")
+        self._use_test_required_names(monkeypatch)
+        self._stub_fetch_check_runs(monkeypatch, self._runs_with_gate_own_in_progress())
+        monkeypatch.setattr(
+            authorize_module._nightly,
+            "fetch_latest_nightly_conclusion",
+            lambda repo, branch: "failure",
+        )
+        monkeypatch.setattr(
+            authorize_module._nightly,
+            "fetch_associated_pr_bodies",
+            lambda sha, repo: ["--allow-red-nightly"],
+        )
+        monkeypatch.chdir(git_repo)
+        monkeypatch.setenv("GITHUB_RUN_ID", CURRENT_RUN_ID)
 
         exit_code = authorize_module.main(
             [sha, "--repo", "curie-eng/curie", "--reviewed-ref", "main"]

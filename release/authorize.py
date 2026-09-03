@@ -39,12 +39,26 @@ see `release/integrity.py` for the same manifest/verify split rationale.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import subprocess
 import sys
 from collections.abc import Sequence
 from pathlib import Path
+
+
+def _load_nightly():
+    path = Path(__file__).resolve().parent / "nightly.py"
+    spec = importlib.util.spec_from_file_location("release_nightly", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["release_nightly"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_nightly = _load_nightly()
 
 PASSING_CONCLUSIONS = {"success", "neutral"}
 
@@ -230,6 +244,9 @@ def authorize(
     cwd: Path | None = None,
     exclude_run_id: str | None = None,
     required_names: frozenset[str] | None = None,
+    nightly_conclusion: str | None = None,
+    allow_red_nightly: bool = False,
+    require_nightly: bool = False,
 ) -> None:
     """Raise AuthorizationError unless `sha` may publish a release."""
     if not reviewed_refs:
@@ -257,6 +274,12 @@ def authorize(
             f"{', '.join(sorted(missing))}. Refusing to authorize this tag "
             "until its required checks are current and green."
         )
+    if require_nightly or nightly_conclusion is not None or allow_red_nightly:
+        reason = _nightly.nightly_refusal_reason(
+            nightly_conclusion, allow_red=allow_red_nightly
+        )
+        if reason:
+            raise AuthorizationError(reason)
 
 
 def fetch_check_runs(
@@ -334,10 +357,41 @@ def main(argv: list[str] | None = None) -> int:
         help="this workflow run's id; its own check-runs are excluded from the gate",
     )
     args = parser.parse_args(argv)
+    branch = "main"
+    nightly_conclusion: str | None = None
 
     try:
         check_runs = fetch_check_runs(args.sha, args.repo)
         authorize(args.sha, check_runs, args.reviewed_ref, exclude_run_id=args.run_id)
+        matching = [
+            ref
+            for ref in args.reviewed_ref
+            if commit_is_on_reviewed_branch(args.sha, ref)
+        ]
+        branch = _nightly.nightly_branch_from_refs(matching)
+        try:
+            nightly_conclusion = _nightly.fetch_latest_nightly_conclusion(
+                args.repo, branch
+            )
+            bodies = _nightly.fetch_associated_pr_bodies(args.sha, args.repo)
+        except (subprocess.CalledProcessError, json.JSONDecodeError, KeyError) as exc:
+            detail = getattr(exc, "stderr", None)
+            suffix = f": {str(detail).strip()}" if detail else ""
+            print(
+                f"ERROR: could not retrieve the nightly conclusion or associated "
+                f"pull request bodies for {args.sha} on {branch} from {args.repo} "
+                f"-- the lookup failed with {type(exc).__name__}{suffix}. "
+                "Refusing to authorize this tag because its nightly status is "
+                "unknown.",
+                file=sys.stderr,
+            )
+            return 1
+        reason = _nightly.nightly_refusal_reason(
+            nightly_conclusion,
+            allow_red=_nightly.allow_red_nightly_from_bodies(bodies),
+        )
+        if reason:
+            raise AuthorizationError(reason)
     except AuthorizationError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
@@ -356,9 +410,16 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
     checked_refs = ", ".join(args.reviewed_ref)
+    if nightly_conclusion == "success":
+        nightly_note = f"the latest nightly on {branch} concluded success"
+    else:
+        nightly_note = (
+            f"the latest nightly on {branch} concluded {nightly_conclusion!r} "
+            "with --allow-red-nightly recorded in an associated pull request body"
+        )
     print(
         f"OK: {args.sha} is reachable from a reviewed ref "
-        f"({checked_refs}) and checked; authorized"
+        f"({checked_refs}), checked, and {nightly_note}; authorized"
     )
     return 0
 
