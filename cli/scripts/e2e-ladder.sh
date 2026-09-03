@@ -196,6 +196,31 @@ OBSERVABILITY_UNAVAILABLE_API_URL="http://127.0.0.1:1"
 OBSERVABILITY_POLL_ATTEMPTS=60
 OBSERVABILITY_POLL_INTERVAL_SECONDS=2
 
+# #2204 product correlation proof. Cluster product mode is intentionally
+# query-only: an operator installs a private release and loads task images
+# before invoking the ladder. The script refuses the shared defaults and never
+# installs, upgrades, uninstalls, or deletes cluster state in this mode.
+PRODUCT_OBSERVABILITY="${CURIE_E2E_PRODUCT_OBSERVABILITY:-0}"
+MCP_RECEIPT_FIXTURE="$REPO_ROOT/cli/scripts/fixtures/mcp-receipt"
+MCP_RECEIPT_CONNECTOR="mcp-receipt"
+MCP_RECEIPT_ALIAS=""
+MCP_RECEIPT_IMAGE=""
+LAST_ORDINARY_TRACE_ID=""
+LAST_MCP_TRACE_ID=""
+LAST_APPROVAL_TRACE_ID=""
+LAST_ORDINARY_MEMBERSHIP=""
+LAST_MCP_MEMBERSHIP=""
+LAST_APPROVAL_MEMBERSHIP=""
+LAST_QUERY_MEMBERSHIP=""
+LAST_QUERY_OBSERVATION_COUNT="0"
+LAST_EXTERNAL_ACCEPTED_DELTA="0"
+LAST_EXTERNAL_SENT_DELTA="0"
+CLUSTER_IMAGE_IDS_MATCH="false"
+LOCAL_PRODUCT_EVIDENCE=""
+CLUSTER_PRODUCT_EVIDENCE=""
+PRODUCT_OBSERVABILITY_RUN_ID="${CURIE_E2E_PRODUCT_RUN_ID:-}"
+CLUSTER_EXTERNAL_INGRESS_RECEIPT="${CURIE_E2E_CLUSTER_EXTERNAL_INGRESS_RECEIPT:-}"
+
 # The component label every connector container carries, in both the skill start
 # path and the local compose overlay (cli/src/docker.rs
 # CONNECTOR_COMPONENT_LABEL). Teardown reaps by label, so this is the only
@@ -293,11 +318,31 @@ fi
 "$BIN" --version
 
 WORKDIR="$(mktemp -d)"
+LOCAL_PRODUCT_EVIDENCE="$WORKDIR/product-observability-local.json"
+CLUSTER_PRODUCT_EVIDENCE="$WORKDIR/product-observability-cluster.json"
+APPROVAL_SEED_MESSAGE_PID=""
+
+stop_approval_seed_message() {
+    local mode="${1:-wait}" pid code=0
+    pid="$APPROVAL_SEED_MESSAGE_PID"
+    [[ -n "$pid" ]] || return 0
+    if [[ "$mode" == "terminate" ]]; then
+        kill "$pid" 2>/dev/null || true
+    fi
+    wait "$pid" 2>/dev/null || code=$?
+    APPROVAL_SEED_MESSAGE_PID=""
+    return "$code"
+}
+
 cleanup() {
     # Capture the real exit code FIRST: a teardown command that fails must not
     # turn a red run green, and a successful teardown must not mask a red rung.
     local code=$?
     set +e
+    # The approval proof owns a background `local message` Slack stub. Reap it
+    # before stack teardown so an interrupted seed cannot retain the stub port
+    # after this run exits.
+    stop_approval_seed_message terminate || true
     # The compose worker spawns runner containers as SIBLINGS on the host daemon
     # via the mounted docker socket, so a rung that died before `local down` can
     # strand them. This raw sweep is a BACKSTOP, not duplication: `local down`
@@ -314,7 +359,7 @@ cleanup() {
         # Tolerated failure, on top of `set +e`: the stack may never have
         # finished coming up, and a failed `local down` must not skip the
         # sandbox sweep below or change the exit code captured above.
-        "$BIN" local down || echo "warning: \`local down\` failed during teardown; sweeping anyway." >&2
+        "$BIN" local down -f "$REPO_ROOT/compose.dev.yaml" || echo "warning: \`local down\` failed during teardown; sweeping anyway." >&2
         local orphans
         orphans="$(docker ps -aq --filter "label=$SANDBOX_LABEL" 2>/dev/null)"
         if [[ -n "$orphans" ]]; then
@@ -349,6 +394,14 @@ cleanup() {
             echo "sweeping stranded connector container $survivor"
             docker rm -f "$survivor" >/dev/null 2>&1
         done
+    fi
+    if [[ -n "$MCP_RECEIPT_ALIAS" ]]; then
+        local receipt_container
+        receipt_container="$(connector_container_for_alias "$MCP_RECEIPT_ALIAS" 2>/dev/null)" || receipt_container=""
+        if [[ -n "$receipt_container" ]]; then
+            echo "sweeping stranded MCP receipt connector"
+            docker rm -f "$receipt_container" >/dev/null 2>&1
+        fi
     fi
     rm -rf "$WORKDIR"
     exit "$code"
@@ -432,24 +485,22 @@ else:
     case "$verdict" in
         ok) ;;
         empty_reply)
-            echo "$label: the turn finalized but the reply was empty, so no output made it back through the plumbing." >&2
+            echo "$label: finalized=true reply_present=false status=empty_reply" >&2
             return 1 ;;
         awaiting_approval)
-            echo "$label: the turn parked on an approval gate instead of finalizing; the ladder's bundle must not require approval." >&2
+            echo "$label: finalized=false awaiting_approval=true status=awaiting_approval" >&2
             return 1 ;;
         timed_out)
-            echo "$label: no reply finalized before the deadline. The worker never completed the turn." >&2
+            echo "$label: finalized=false timed_out=true status=timed_out" >&2
             return 1 ;;
         dry_run)
-            echo "$label: got a dry-run descriptor; the ladder must run for real, never with --dry-run." >&2
+            echo "$label: finalized=false dry_run=true status=dry_run" >&2
             return 1 ;;
         not_finalized)
-            echo "$label: the payload is neither finalized nor a known terminal shape." >&2
-            printf '%s\n' "$payload" >&2
+            echo "$label: finalized=false status=not_finalized" >&2
             return 1 ;;
         *)
-            echo "$label: could not parse message --json output:" >&2
-            printf '%s\n' "$payload" >&2
+            echo "$label: finalized=false status=unparseable" >&2
             return 1 ;;
     esac
 
@@ -464,6 +515,78 @@ else:
         fi
         echo "$label: reply is not the fake sentinel (live negative control)"
     fi
+}
+
+# A failed background approval turn used to discard both the structured result
+# and its stderr. Keep the raw artifacts private, but retain a bounded verdict
+# that makes an awaiting approval, timeout, or JSON parse failure actionable.
+approval_resume_failure_summary() {
+    local message_file="$1" stderr_file="$2" code="$3"
+    python3 - "$message_file" "$stderr_file" "$code" <<'PY'
+import json
+import pathlib
+import sys
+
+message_file, stderr_file, code = sys.argv[1:]
+try:
+    exit_code = int(code)
+except ValueError:
+    exit_code = 1
+
+try:
+    value = json.loads(pathlib.Path(message_file).read_text())
+except (OSError, json.JSONDecodeError):
+    value = None
+
+if not isinstance(value, dict):
+    status = "parse_failure"
+    finalized = "absent"
+    fields = "none"
+    error_category = "unparseable"
+else:
+    safe_fields = (
+        "awaiting_approval",
+        "timed_out",
+        "finalized",
+        "reply",
+        "error",
+        "fix",
+    )
+    fields = ",".join(field for field in safe_fields if field in value) or "none"
+    finalized = "true" if value.get("finalized") is True else "false" if value.get("finalized") is False else "absent"
+    if value.get("awaiting_approval") is True:
+        status = "awaiting_approval"
+    elif value.get("timed_out") is True:
+        status = "timed_out"
+    elif finalized == "true":
+        status = "finalized"
+    elif finalized == "false":
+        status = "not_finalized"
+    else:
+        status = "json_unclassified"
+    error_category = "error_field" if "error" in value else "none"
+
+try:
+    stderr = pathlib.Path(stderr_file).read_text(errors="replace").lower()
+except OSError:
+    stderr = ""
+if "awaiting_approval" in stderr or "awaiting approval" in stderr:
+    stderr_category = "awaiting_approval"
+elif "timed_out" in stderr or "timed out" in stderr:
+    stderr_category = "timed_out"
+elif any(term in stderr for term in ("json", "parse", "deserial")):
+    stderr_category = "parse_failure"
+elif stderr:
+    stderr_category = "unclassified"
+else:
+    stderr_category = "empty"
+
+print(
+    "approval resume failure: "
+    f"exit_code={exit_code} status={status} finalized={finalized} "
+    f"error_category={error_category} fields={fields} stderr_category={stderr_category}"
+)
+PY
 }
 
 # A `--json` failure is useful to an agent only when stdout contains one object
@@ -523,145 +646,722 @@ print(start.strftime("%Y-%m-%dT%H:%M:%SZ"), end.strftime("%Y-%m-%dT%H:%M:%SZ"))
     echo "local observability metrics: captured explicit UTC window $OBSERVABILITY_START through $OBSERVABILITY_END around the just-completed local turn"
 }
 
-# Langfuse ingestion is asynchronous to turn finalization. Poll through the
-# candidate CLI, never its backing API. Scan one bounded newest-first page and
-# select the newest complete row. The returned id is the sole input to the
-# detail read; no latest shortcut or message-output parsing duplicates #1664.
-# Correlation to this rung is proved independently by the explicit-window
-# metrics reads below; trace-list DTOs do not promise an agent identity field.
-discover_local_observability_trace() {
-    local attempt out code verdict state detail
-    DISCOVERED_OBSERVABILITY_TRACE_ID=""
+# Execute a bounded Valkey command against the product runs stream. Passwords
+# stay inside the selected container/pod and no command output is logged. The
+# only write caller is the explicit carrier seed in a preflight-validated,
+# operator-owned release; all discovery and reply observations are read-only.
+product_stream_json() {
+    local tier="$1"
+    shift
+    case "$tier" in
+        local)
+            local valkey
+            valkey="$(docker ps \
+                --filter 'label=com.docker.compose.project=curie' \
+                --filter 'label=com.docker.compose.service=valkey' \
+                --format '{{.Names}}')"
+            [[ -n "$valkey" && "$valkey" != *$'\n'* ]] || {
+                echo "seed-invalid: expected exactly one product Valkey container" >&2
+                return 1
+            }
+            docker exec "$valkey" sh -c \
+                'exec valkey-cli --no-auth-warning -a "$VALKEY_PASSWORD" --json "$@"' \
+                sh "$@"
+            ;;
+        cluster)
+            local pod
+            pod="$(kubectl -n "$CURIE_NAMESPACE" get pods \
+                -l "app.kubernetes.io/instance=$CURIE_RELEASE,app.kubernetes.io/name=valkey" \
+                -o json | python3 -c '
+import json, sys
+ready = []
+for item in json.load(sys.stdin).get("items", []):
+    conditions = item.get("status", {}).get("conditions", [])
+    if any(c.get("type") == "Ready" and c.get("status") == "True" for c in conditions):
+        ready.append(item["metadata"]["name"])
+if len(ready) != 1:
+    raise SystemExit("expected exactly one Ready product Valkey pod")
+print(ready[0])
+')" || return 1
+            kubectl -n "$CURIE_NAMESPACE" exec "$pod" -- sh -c \
+                'exec valkey-cli --no-auth-warning -a "$VALKEY_PASSWORD" --json "$@"' \
+                sh "$@"
+            ;;
+        *)
+            echo "seed-invalid: unknown product stream tier" >&2
+            return 1
+            ;;
+    esac
+}
+
+capture_stream_cursor() {
+    local tier="$1" result
+    result="$(product_stream_json "$tier" XREVRANGE curie:runs + - COUNT 1)" || return 1
+    printf '%s' "$result" | python3 -c '
+import json, sys
+rows = json.load(sys.stdin)
+if not rows:
+    print("0-0")
+elif len(rows) == 1 and isinstance(rows[0], list) and isinstance(rows[0][0], str):
+    print(rows[0][0])
+else:
+    raise SystemExit("seed-invalid: malformed bounded stream cursor response")
+'
+}
+
+# Locate this seed's exact stream entry between two cursors, then extract only
+# the adjacent W3C carrier's 32-hex trace id. The private XRANGE slice is mode
+# 0600 and is deleted without ever being echoed, so payload and traceparent
+# bytes cannot enter public evidence.
+discover_trace_id_for_seed() {
+    local tier="$1" marker="$2" stream_start="$3" stream_end="$4"
+    local private_slice trace_id
+    umask 077
+    private_slice="$(mktemp "$WORKDIR/seed-stream.XXXXXX")"
+    if [[ -z "$marker" || -z "$stream_start" || -z "$stream_end" ]]; then
+        rm -f "$private_slice"
+        echo "seed-invalid: marker and bounded stream cursors are required" >&2
+        return 1
+    fi
+    product_stream_json "$tier" XRANGE curie:runs "($stream_start" "$stream_end" > "$private_slice" || {
+        rm -f "$private_slice"
+        return 1
+    }
+    trace_id="$(python3 - "$private_slice" "$marker" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+rows = json.loads(pathlib.Path(sys.argv[1]).read_text())
+marker = sys.argv[2]
+carrier = re.compile(r"^00-([0-9a-f]{32})-[0-9a-f]{16}-[0-9a-f]{2}$")
+
+def marker_in_turn_text(value):
+    if not isinstance(value, dict):
+        return False
+    text = value.get("text")
+    return isinstance(text, str) and marker in text
+
+matches = []
+for row in rows:
+    if not isinstance(row, list) or len(row) != 2 or not isinstance(row[1], list):
+        raise SystemExit("seed-invalid: malformed bounded XRANGE entry")
+    fields = row[1]
+    if len(fields) % 2:
+        raise SystemExit("seed-invalid: malformed stream field pairs")
+    for index in range(0, len(fields), 2):
+        if fields[index] != "payload" or index + 3 >= len(fields):
+            continue
+        if fields[index + 2] != "traceparent":
+            continue
+        try:
+            payload = json.loads(fields[index + 1])
+        except (TypeError, json.JSONDecodeError):
+            continue
+        match = carrier.fullmatch(fields[index + 3]) if isinstance(fields[index + 3], str) else None
+        if marker_in_turn_text(payload) and match:
+            matches.append(match.group(1))
+matches = sorted(set(matches))
+if len(matches) != 1:
+    raise SystemExit("seed-invalid: exact marker did not select one adjacent carrier")
+print(matches[0])
+PY
+)" || {
+        rm -f "$private_slice"
+        return 1
+    }
+    rm -f "$private_slice"
+    [[ "$trace_id" =~ ^[0-9a-f]{32}$ ]] || {
+        echo "seed-invalid: selected carrier did not contain a 32-hex trace id" >&2
+        return 1
+    }
+    printf '%s' "$trace_id"
+}
+
+# The disconnected CLI path is intentionally carrierless (#1817). Exercise it
+# as a compatibility negative and prove it did not accidentally grow a W3C
+# carrier. It is never promoted into positive correlation evidence.
+seed_cluster_missing_carrier_control() {
+    local marker="curie-seed-cluster-missing-carrier-$$-$RANDOM"
+    local stream_start stream_end out private_slice
+    stream_start="$(capture_stream_cursor cluster)" || return 1
+    out="$("$BIN" --json cluster message --namespace "$CURIE_NAMESPACE" \
+        --release "$CURIE_RELEASE" "missing carrier compatibility $marker" || true)"
+    assert_finalized_reply "cluster missing-carrier compatibility" "$out"
+    stream_end="$(capture_stream_cursor cluster)" || return 1
+    [[ "$stream_end" != "$stream_start" ]] || {
+        echo "seed-invalid: cluster missing-carrier control produced no stream receipt" >&2
+        return 1
+    }
+    umask 077
+    private_slice="$(mktemp "$WORKDIR/cluster-missing-carrier.XXXXXX")"
+    product_stream_json cluster XRANGE curie:runs "($stream_start" "$stream_end" > "$private_slice" || {
+        rm -f "$private_slice"
+        return 1
+    }
+    python3 - "$private_slice" "$marker" <<'PY'
+import json, pathlib, sys
+rows = json.loads(pathlib.Path(sys.argv[1]).read_text())
+marker = sys.argv[2]
+matches = []
+for row in rows:
+    if not isinstance(row, list) or len(row) != 2 or not isinstance(row[1], list):
+        raise SystemExit("seed-invalid: malformed cluster missing-carrier slice")
+    fields = row[1]
+    for index in range(0, len(fields) - 1, 2):
+        if fields[index] != "payload":
+            continue
+        try:
+            payload = json.loads(fields[index + 1])
+        except (TypeError, json.JSONDecodeError):
+            continue
+        text = payload.get("text") if isinstance(payload, dict) else None
+        if not isinstance(text, str) or marker not in text:
+            continue
+        handle = payload.get("reply_handle")
+        if not isinstance(handle, dict) or handle.get("adapter") != "curie-cluster-message":
+            raise SystemExit("seed-invalid: cluster compatibility control used the wrong producer")
+        has_adjacent_carrier = index + 3 < len(fields) and fields[index + 2] == "traceparent"
+        matches.append(has_adjacent_carrier)
+if matches != [False]:
+    raise SystemExit("seed-invalid: cluster compatibility control was absent, ambiguous, or carried context")
+PY
+    rm -f "$private_slice"
+    echo "cluster missing-carrier compatibility: finalized=true adjacent_traceparent=false"
+}
+
+# Positive cluster evidence belongs to the real Slack phase. The private
+# receipt carries only bounded cursors, a public-safe marker, and independently
+# observed outcome booleans. The trace id is derived here from the accepted
+# Slack queue entry; no caller-supplied id and no harness XADD are accepted.
+cluster_external_ingress_seed() {
+    local kind="$1" expected_operations="$2" expected_decision="${3:-}"
+    local receipt="$CLUSTER_EXTERNAL_INGRESS_RECEIPT" fields marker stream_start stream_end trace_id
+    [[ -n "$PRODUCT_OBSERVABILITY_RUN_ID" ]] || {
+        echo "cluster product evidence blocked: CURIE_E2E_PRODUCT_RUN_ID is required to join one supported run" >&2
+        return 1
+    }
+    [[ -n "$receipt" && -f "$receipt" ]] || {
+        echo "cluster product evidence blocked: the external Slack phase did not provide CURIE_E2E_CLUSTER_EXTERNAL_INGRESS_RECEIPT" >&2
+        return 1
+    }
+    [[ "$(stat -c '%a' "$receipt")" == "600" ]] || {
+        echo "cluster product evidence blocked: the external Slack ingress receipt must be mode 0600" >&2
+        return 1
+    }
+    fields="$(python3 - "$receipt" "$PRODUCT_OBSERVABILITY_RUN_ID" "$kind" <<'PY'
+import json, pathlib, re, sys
+value = json.loads(pathlib.Path(sys.argv[1]).read_text())
+run_id, kind = sys.argv[2:4]
+if not isinstance(value, dict) or value.get("run_id") != run_id:
+    raise SystemExit("external Slack ingress receipt belongs to a different run")
+seeds = value.get("seeds")
+if not isinstance(seeds, list):
+    raise SystemExit("external Slack ingress receipt omitted seeds")
+matches = [seed for seed in seeds if isinstance(seed, dict) and seed.get("kind") == kind]
+if len(matches) != 1:
+    raise SystemExit("external Slack ingress receipt did not contain exactly one requested seed")
+seed = matches[0]
+marker = seed.get("marker")
+start = seed.get("stream_start")
+end = seed.get("stream_end")
+if not isinstance(marker, str) or not marker.startswith(f"curie-seed-external-{kind}-"):
+    raise SystemExit("external Slack ingress marker is not public-safe and kind-bound")
+if not all(isinstance(item, str) and re.fullmatch(r"[0-9]+-[0-9]+", item) for item in (start, end)):
+    raise SystemExit("external Slack ingress receipt omitted bounded stream cursors")
+if seed.get("reply_observed") is not True or seed.get("completion_observed") is not True:
+    raise SystemExit("external Slack driver did not independently observe reply and completion")
+if kind == "mcp" and seed.get("mcp_call_count_delta") != 1:
+    raise SystemExit("external MCP seed omitted its independent one-call receipt")
+if kind == "approval" and seed.get("approval_transition_observed") is not True:
+    raise SystemExit("external approval seed omitted its independent transition receipt")
+accepted = seed.get("otelcol_receiver_accepted_spans_delta")
+sent = seed.get("otelcol_exporter_sent_spans_delta")
+if not all(isinstance(item, (int, float)) and not isinstance(item, bool) and item > 0 for item in (accepted, sent)):
+    raise SystemExit("external Slack seed omitted positive observed Collector deltas")
+print(marker, start, end, accepted, sent)
+PY
+)" || return 1
+    read -r marker stream_start stream_end LAST_EXTERNAL_ACCEPTED_DELTA LAST_EXTERNAL_SENT_DELTA <<< "$fields"
+    trace_id="$(discover_cluster_external_trace_id "$marker" "$stream_start" "$stream_end")" || return 1
+    query_exact_seed_trace cluster "$trace_id" "$expected_operations" "$expected_decision" observe
+}
+
+discover_cluster_external_trace_id() {
+    local marker="$1" stream_start="$2" stream_end="$3" private_slice trace_id
+    umask 077
+    private_slice="$(mktemp "$WORKDIR/cluster-external-stream.XXXXXX")"
+    product_stream_json cluster XRANGE curie:runs "($stream_start" "$stream_end" > "$private_slice" || {
+        rm -f "$private_slice"
+        return 1
+    }
+    trace_id="$(python3 - "$private_slice" "$marker" <<'PY'
+import json, pathlib, re, sys
+rows = json.loads(pathlib.Path(sys.argv[1]).read_text())
+marker = sys.argv[2]
+carrier = re.compile(r"^00-([0-9a-f]{32})-[0-9a-f]{16}-[0-9a-f]{2}$")
+matches = []
+for row in rows:
+    if not isinstance(row, list) or len(row) != 2 or not isinstance(row[1], list):
+        raise SystemExit("seed-invalid: malformed external Slack stream slice")
+    fields = row[1]
+    for index in range(0, len(fields), 2):
+        if fields[index] != "payload" or index + 3 >= len(fields) or fields[index + 2] != "traceparent":
+            continue
+        try:
+            payload = json.loads(fields[index + 1])
+        except (TypeError, json.JSONDecodeError):
+            continue
+        text = payload.get("text") if isinstance(payload, dict) else None
+        handle = payload.get("reply_handle") if isinstance(payload, dict) else None
+        match = carrier.fullmatch(fields[index + 3]) if isinstance(fields[index + 3], str) else None
+        if isinstance(text, str) and marker in text and isinstance(handle, dict) and handle.get("kind") == "slack" and handle.get("adapter") is None and match:
+            matches.append(match.group(1))
+matches = sorted(set(matches))
+if len(matches) != 1:
+    raise SystemExit("seed-invalid: exact external Slack marker did not select one real adjacent carrier")
+print(matches[0])
+PY
+)" || { rm -f "$private_slice"; return 1; }
+    rm -f "$private_slice"
+    printf '%s' "$trace_id"
+}
+
+# Convert a private exact-detail response into the sole public trace evidence.
+# Explicitly private source fields (input, output, session, user, headers) are
+# ignored. Operation names are reduced to a code-owned allowlist.
+sanitize_exact_trace_read() {
+    local trace_id="$1" private_read="$2" expected_csv="${3:-}" expected_decision="${4:-}"
+    python3 - "$trace_id" "$private_read" "$expected_csv" "$expected_decision" <<'PY'
+import json
+import pathlib
+import sys
+
+trace_id, source, expected_csv, expected_decision = sys.argv[1:5]
+value = json.loads(pathlib.Path(source).read_text())
+trace = value.get("trace") if isinstance(value, dict) else None
+tree = value.get("tree") if isinstance(value, dict) else None
+if not isinstance(trace, dict) or trace.get("id") != trace_id or not isinstance(tree, list):
+    raise SystemExit("exact trace response did not match the requested id and tree shape")
+
+private_fields = {"input", "output", "session", "user", "headers"}
+safe_operations = {
+    "curie.queue.enqueue", "curie.queue.process", "curie.turn.process",
+    "curie.sandbox.claim", "curie.runner.rpc", "agent.run", "execute_tool",
+    "curie.reply.post", "curie.reply.update", "curie.turn.ingress",
+    "curie.approval.suspend", "curie.approval.resolve", "curie.approval.resume",
+    }
+operations = []
+types = set()
+observation_count = [0]
+
+def walk(node):
+    if not isinstance(node, dict):
+        raise SystemExit("exact trace tree contains a non-object node")
+    # Strip private response fields before inspecting the allowlisted shape.
+    # Their values are never copied, compared, formatted, or emitted.
+    public_node = {key: value for key, value in node.items() if key not in private_fields}
+    observation_count[0] += 1
+    name = public_node.get("name")
+    kind = public_node.get("type")
+    if name in safe_operations:
+        operations.append(name)
+    if isinstance(kind, str) and kind.upper() in {"SPAN", "GENERATION", "EVENT"}:
+        types.add(kind.upper())
+    children = public_node.get("children")
+    if not isinstance(children, list):
+        raise SystemExit("exact trace node omitted its child array")
+    for child in children:
+        walk(child)
+
+for root in tree:
+    walk(root)
+decision = value.get("approval_decision")
+if decision is not None and decision not in {"approved", "rejected", "expired"}:
+    raise SystemExit("exact trace carried a non-allowlisted approval decision")
+
+service = []
+if any(op == "curie.queue.enqueue" for op in operations):
+    service.append("curie-dispatcher")
+if any(op.startswith("curie.queue.") or op.startswith("curie.turn.") or op.startswith("curie.sandbox.") or op.startswith("curie.approval.") for op in operations):
+    service.append("curie-worker")
+if any(op in {"curie.runner.rpc", "agent.run", "execute_tool"} for op in operations):
+    service.append("curie-runner")
+sanitized = {
+    "trace_id": trace_id,
+    "service": sorted(set(service)),
+    "operation": sorted(set(operations)),
+    "observation_count": observation_count[0],
+    "observation_type": sorted(types),
+    "approval_decision": decision,
+    }
+allowed_evidence_fields = {
+    "trace_id", "service", "operation", "observation_count",
+    "observation_type", "approval_decision",
+    }
+if set(sanitized) != allowed_evidence_fields:
+    raise SystemExit("sanitized evidence field set drifted")
+print(json.dumps(sanitized, sort_keys=True, separators=(",", ":")))
+PY
+}
+
+# Query one exact ID only. Raw CLI output remains in a mode-0600 file and only
+# sanitize_exact_trace_read reaches stdout.
+query_exact_seed_trace() {
+    local tier="$1" trace_id="$2" expected_csv="${3:-}" expected_decision="${4:-}" expected_state="${5:-present}"
+    local attempt code=0 private_read safe_read membership observation_count saw_valid=0
+    local last_query_state="query-error"
+    LAST_QUERY_MEMBERSHIP=""
+    LAST_QUERY_OBSERVATION_COUNT="0"
+    umask 077
+    private_read="$(mktemp "$WORKDIR/exact-trace.XXXXXX")"
+    safe_read="$(mktemp "$WORKDIR/safe-trace.XXXXXX")"
+    [[ "$trace_id" =~ ^[0-9a-f]{32}$ ]] || {
+        rm -f "$private_read" "$safe_read"
+        echo "seed-invalid: exact trace id is not 32 lowercase hex characters" >&2
+        return 1
+    }
     for attempt in $(seq 1 "$OBSERVABILITY_POLL_ATTEMPTS"); do
-        out="$("$BIN" --json local observability runs --limit 100)" && code=0 || code=$?
-        if (( code != 0 )); then
-            echo "local observability runs: bounded ingestion read exited $code, expected 0." >&2
-            printf '%s\n' "$out" >&2
+        code=0
+        if [[ "$tier" == "local" ]]; then
+            "$BIN" --json local observability run "$trace_id" > "$private_read" 2>/dev/null || code=$?
+        elif [[ "$tier" == "cluster" ]]; then
+            "$BIN" --json cluster observability --namespace "$CURIE_NAMESPACE" \
+                --release "$CURIE_RELEASE" run "$trace_id" > "$private_read" 2>/dev/null || code=$?
+        else
+            rm -f "$private_read" "$safe_read"
+            echo "seed-invalid: exact trace query tier is unknown" >&2
             return 1
         fi
-        verdict="$(printf '%s' "$out" | python3 -c '
-import json, re, sys
-try:
-    value = json.loads(sys.stdin.read())
-except Exception as exc:
-    print("invalid")
-    print("expected exactly one JSON object: %s" % exc)
-    sys.exit(0)
-if not isinstance(value, dict):
-    print("invalid")
-    print("top level is not an object")
-    sys.exit(0)
-runs = value.get("runs")
-limit = value.get("limit")
-count = value.get("count")
-if isinstance(limit, bool) or limit != 100:
-    print("invalid")
-    print("limit is not the requested bound of 100")
-elif not isinstance(runs, list) or len(runs) > 100:
-    print("invalid")
-    print("runs is not an array bounded to at most 100 rows")
-elif isinstance(count, bool) or not isinstance(count, int) or count != len(runs):
-    print("invalid")
-    print("count does not equal the bounded row count")
-else:
-    matched = None
-    for row in runs:
-        if not isinstance(row, dict):
-            print("invalid")
-            print("a run row is not an object")
-            sys.exit(0)
-        trace_id = row.get("id")
-        name = row.get("name")
-        timestamp = row.get("timestamp")
-        if not isinstance(trace_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", trace_id):
-            print("invalid")
-            print("run id is absent or not a safe trace id")
-            sys.exit(0)
-        if name is not None and not isinstance(name, str):
-            print("invalid")
-            print("run name is neither a string nor null")
-            sys.exit(0)
-        if not isinstance(timestamp, str) or not timestamp:
-            print("invalid")
-            print("run timestamp is absent or not a string")
-            sys.exit(0)
-        if matched is None:
-            matched = trace_id
-    if matched is None:
-        print("pending")
-        print("no ingested run yet")
-    else:
-        print("ok")
-        print(matched)
-' || printf '%s\n%s\n' invalid 'validator failed')"
-        detail="${verdict#*$'\n'}"
-        state="${verdict%%$'\n'*}"
-        case "$state" in
-            ok)
-                DISCOVERED_OBSERVABILITY_TRACE_ID="${detail%%$'\n'*}"
-                printf '%s\n' "$out"
-                echo "local observability runs: bounded result discovered trace $DISCOVERED_OBSERVABILITY_TRACE_ID after $attempt ingestion poll(s)"
-                return 0
-                ;;
-            pending)
-                if (( attempt < OBSERVABILITY_POLL_ATTEMPTS )); then
-                    sleep "$OBSERVABILITY_POLL_INTERVAL_SECONDS"
-                fi
-                ;;
-            *)
-                echo "local observability runs: $detail." >&2
-                printf '%s\n' "$out" >&2
+        if [[ "$expected_state" == "absent" ]]; then
+            if (( code == 0 )); then
+                rm -f "$private_read" "$safe_read"
+                echo "exact trace was queryable while the exporter was required to be failing" >&2
                 return 1
-                ;;
-        esac
+            fi
+            if (( code != 1 )) || ! python3 - "$private_read" "$trace_id" "$tier" <<'PY'
+import json
+import pathlib
+import sys
+
+source, trace_id, tier = sys.argv[1:4]
+try:
+    value = json.loads(pathlib.Path(source).read_text())
+except (OSError, json.JSONDecodeError):
+    raise SystemExit(1)
+expected_error = f'observability trace "{trace_id}" was not found'
+if not isinstance(value, dict) or set(value) != {"error", "fix"}:
+    raise SystemExit(1)
+error = value.get("error")
+fix = value.get("fix")
+stable_not_found = error in {"exact trace not found", expected_error}
+if not stable_not_found or not isinstance(fix, str) or not fix.strip():
+    raise SystemExit(1)
+PY
+            then
+                rm -f "$private_read" "$safe_read"
+                echo "exact trace absence query returned an unexpected failure" >&2
+                return 1
+            fi
+            if (( attempt < OBSERVABILITY_POLL_ATTEMPTS )); then
+                sleep "$OBSERVABILITY_POLL_INTERVAL_SECONDS"
+            fi
+            continue
+        fi
+        if [[ "$expected_state" == "observe" && "$code" -ne 0 ]]; then
+            if (( code != 1 )) || ! python3 - "$private_read" "$trace_id" <<'PY'
+import json
+import pathlib
+import sys
+
+source, trace_id = sys.argv[1:3]
+try:
+    value = json.loads(pathlib.Path(source).read_text())
+except (OSError, json.JSONDecodeError):
+    raise SystemExit(1)
+expected = f'observability trace "{trace_id}" was not found'
+if not isinstance(value, dict) or set(value) != {"error", "fix"}:
+    raise SystemExit(1)
+if value.get("error") not in {"exact trace not found", expected}:
+    raise SystemExit(1)
+if not isinstance(value.get("fix"), str) or not value["fix"].strip():
+    raise SystemExit(1)
+PY
+            then
+                rm -f "$private_read" "$safe_read"
+                echo "exact trace observation returned an unexpected query failure" >&2
+                return 1
+            fi
+            if (( attempt < OBSERVABILITY_POLL_ATTEMPTS )); then
+                sleep "$OBSERVABILITY_POLL_INTERVAL_SECONDS"
+            fi
+            continue
+        fi
+        last_query_state="query-error"
+        if (( code == 0 )); then
+            if ! sanitize_exact_trace_read "$trace_id" "$private_read" "$expected_csv" "$expected_decision" > "$safe_read"; then
+                last_query_state="malformed-response"
+                if [[ "$expected_state" == "observe" ]]; then
+                    rm -f "$private_read" "$safe_read"
+                    echo "exact trace response was malformed rather than selectively incomplete" >&2
+                    return 1
+                fi
+            else
+                saw_valid=1
+                last_query_state="incomplete-membership"
+                read -r membership observation_count < <(python3 - "$safe_read" "$expected_csv" "$expected_decision" <<'PY'
+import json, pathlib, sys
+value = json.loads(pathlib.Path(sys.argv[1]).read_text())
+expected = [item for item in sys.argv[2].split(",") if item]
+operations = value["operation"]
+missing = [
+    item for item in expected
+    if not any(candidate in operations for candidate in item.split("|"))
+]
+decision_matches = not sys.argv[3] or value["approval_decision"] == sys.argv[3]
+membership = value["observation_count"] > 0 and not missing and decision_matches
+print("true" if membership else "false", value["observation_count"])
+PY
+                )
+                LAST_QUERY_MEMBERSHIP="$membership"
+                LAST_QUERY_OBSERVATION_COUNT="$observation_count"
+                if [[ "$membership" == "true" || "$expected_state" == "stub" ]]; then
+                    cat "$safe_read"
+                    rm -f "$private_read" "$safe_read"
+                    return 0
+                fi
+            fi
+        fi
+        if (( attempt < OBSERVABILITY_POLL_ATTEMPTS )); then
+            sleep "$OBSERVABILITY_POLL_INTERVAL_SECONDS"
+        fi
     done
-    echo "local observability runs: no run appeared in the newest 100 traces after $OBSERVABILITY_POLL_ATTEMPTS bounded poll(s)." >&2
+    if [[ "$expected_state" == "absent" ]]; then
+        rm -f "$private_read" "$safe_read"
+        echo "exact trace remained not-found through the full bounded observation poll"
+        return 0
+    fi
+    if [[ "$expected_state" == "observe" && "$saw_valid" == "1" ]]; then
+        cat "$safe_read"
+        rm -f "$private_read" "$safe_read"
+        return 0
+    fi
+    if [[ "$expected_state" == "observe" ]]; then
+        LAST_QUERY_MEMBERSHIP="false"
+        LAST_QUERY_OBSERVATION_COUNT="0"
+        python3 - "$trace_id" <<'PY'
+import json, sys
+print(json.dumps({
+    "trace_id": sys.argv[1], "service": [], "operation": [],
+    "observation_count": 0, "observation_type": [],
+    "approval_decision": None,
+}, sort_keys=True, separators=(",", ":")))
+PY
+        rm -f "$private_read" "$safe_read"
+        return 0
+    fi
+    echo "exact trace failed the bounded ingestion poll: $last_query_state (cli exit $code)" >&2
+    if [[ "$last_query_state" == "incomplete-membership" ]]; then
+        # Only the allowlisted projection, never the original trace response.
+        cat "$safe_read" >&2
+    fi
+    rm -f "$private_read" "$safe_read"
     return 1
 }
 
-assert_local_observability_detail() {
-    local trace_id="$1" payload="$2" verdict
-    verdict="$(printf '%s' "$payload" | python3 -c '
-import json, sys
-expected = sys.argv[1]
-try:
-    value = json.loads(sys.stdin.read())
-except Exception as exc:
-    print("expected exactly one JSON object: %s" % exc)
-    sys.exit(0)
-trace = value.get("trace") if isinstance(value, dict) else None
-tree = value.get("tree") if isinstance(value, dict) else None
-def valid_node(node):
-    if not isinstance(node, dict) or not isinstance(node.get("id"), str) or not isinstance(node.get("type"), str):
-        return False
-    for key in ("name", "startTime", "model"):
-        if node.get(key) is not None and not isinstance(node.get(key), str):
-            return False
-    if node.get("usageDetails") is not None and not isinstance(node.get("usageDetails"), dict):
-        return False
-    children = node.get("children")
-    return isinstance(children, list) and all(valid_node(child) for child in children)
-if not isinstance(trace, dict) or trace.get("id") != expected:
-    print("trace object does not carry the discovered id")
-elif not isinstance(trace.get("name"), str):
-    print("trace name is not a string")
-elif not isinstance(tree, list):
-    print("observation tree is not an array")
-elif not all(valid_node(node) for node in tree):
-    print("observation tree does not match the recursive typed node shape")
-elif "sandbox_id" not in value or value["sandbox_id"] is not None and not isinstance(value["sandbox_id"], str):
-    print("sandbox_id correlation field is absent or mistyped")
-elif "approval_decision" not in value or value["approval_decision"] is not None and not isinstance(value["approval_decision"], str):
-    print("approval_decision correlation field is absent or mistyped")
-else:
-    print("ok %d" % len(tree))
-' "$trace_id" || echo "validator failed")"
-    if [[ "$verdict" != ok\ * ]]; then
-        echo "local observability run: $verdict." >&2
-        printf '%s\n' "$payload" >&2
+seed_ordinary_turn() {
+    local tier="$1" agent_id="${2:-}" query_state="${3:-present}" marker="curie-seed-ordinary-$$-$RANDOM"
+    local stream_start stream_end out trace_id expected_operations=""
+    if [[ -z "$marker" || "$tier" != "local" && "$tier" != "cluster" ]]; then
+        echo "seed-invalid: ordinary seed precondition failed before telemetry" >&2
         return 1
     fi
-    echo "local observability run: fetched complete trace $trace_id with ${verdict#ok } root observation(s) and both correlation fields"
+    if [[ -n "${STUB_STATE:-}" ]]; then
+        query_state="stub"
+        trace_id="${STUB_OBSERVABILITY_TRACE_ID:-}"
+        [[ "$trace_id" =~ ^[0-9a-f]{32}$ ]] || {
+            echo "seed-invalid: stub exact trace id is absent" >&2
+            return 1
+        }
+    else
+        if [[ "$tier" == "cluster" ]]; then
+            echo "seed-invalid: cluster positive correlation must come from the external Slack ingress receipt" >&2
+            return 1
+        fi
+        stream_start="$(capture_stream_cursor "$tier")" || return 1
+        out="$("$BIN" --json local message --channel C0LOCALDEV "ordinary correlation $marker" || true)"
+        assert_finalized_reply "$tier ordinary correlation" "$out" || return 1
+        assert_product_runner_endpoints || return 1
+        stream_end="$(capture_stream_cursor "$tier")" || return 1
+        [[ "$stream_end" != "$stream_start" ]] || {
+            echo "seed-invalid: ordinary seed produced no bounded stream receipt" >&2
+            return 1
+        }
+        trace_id="$(discover_trace_id_for_seed "$tier" "$marker" "$stream_start" "$stream_end")" || return 1
+        expected_operations="curie.queue.enqueue,curie.queue.process,curie.turn.process,curie.sandbox.claim,curie.runner.rpc,agent.run,curie.reply.post|curie.reply.update"
+    fi
+    query_exact_seed_trace "$tier" "$trace_id" "$expected_operations" "" "$query_state" || return 1
+    LAST_ORDINARY_TRACE_ID="$trace_id"
+    LAST_ORDINARY_MEMBERSHIP="$LAST_QUERY_MEMBERSHIP"
+    printf '%s' "$trace_id"
+}
+
+seed_mcp_read_turn() {
+    local tier="$1" agent_id="${2:-}" agent_name="${3:-}" query_state="${4:-present}" marker="curie-seed-mcp-$$-$RANDOM"
+    local stream_start stream_end out trace_id before_count after_count alias release namespace
+    if [[ "$LIVE" != "1" || -z "$agent_name" || -z "$marker" ]]; then
+        echo "seed-invalid: MCP read seed needs live mode, a deployed agent, and a marker before telemetry" >&2
+        return 1
+    fi
+    if [[ "$tier" == "cluster" ]]; then
+        echo "seed-invalid: cluster MCP correlation must come from the external Slack ingress receipt" >&2
+        return 1
+    fi
+    local worker
+    worker="$(local_worker_container)"
+    release="$(container_env_value "$worker" CURIE_RELEASE)"
+    namespace="$(container_env_value "$worker" CURIE_NAMESPACE)"
+    alias="$(connector_object_name "$release" "$agent_name" "$MCP_RECEIPT_CONNECTOR").$namespace.svc.cluster.local"
+    MCP_RECEIPT_ALIAS="$alias"
+    before_count="$(mcp_receipt_call_count "$tier" "$alias")" || return 1
+    stream_start="$(capture_stream_cursor "$tier")" || return 1
+    out="$("$BIN" --json local message --channel C0LOCALDEV \
+        "Call the receipt_read tool exactly once, then answer receipt complete. $marker" || true)"
+    assert_finalized_reply "$tier MCP correlation" "$out"
+    after_count="$(mcp_receipt_call_count "$tier" "$alias")" || return 1
+    if (( after_count != before_count + 1 )); then
+        echo "seed-invalid: MCP seed did not produce exactly one independent call receipt" >&2
+        return 1
+    fi
+    echo "MCP receipt call count delta=1"
+    stream_end="$(capture_stream_cursor "$tier")" || return 1
+    trace_id="$(discover_trace_id_for_seed "$tier" "$marker" "$stream_start" "$stream_end")" || return 1
+    query_exact_seed_trace "$tier" "$trace_id" "execute_tool" "" "$query_state"
+    LAST_MCP_TRACE_ID="$trace_id"
+    LAST_MCP_MEMBERSHIP="$LAST_QUERY_MEMBERSHIP"
+    printf '%s' "$trace_id"
+}
+
+seed_approval_resume_turn() {
+    local tier="$1" agent_id="${2:-}" query_state="${3:-present}" marker="curie-seed-approval-$$-$RANDOM"
+    local stream_start stream_end message_file message_stderr_file token_file pending_file approval_id token out trace_id
+    local code=0 attempt
+    if [[ "$LIVE" == "1" || -z "$agent_id" || -z "$marker" ]]; then
+        echo "seed-invalid: deterministic approval seed needs fake mode and a deployed agent before telemetry" >&2
+        return 1
+    fi
+    if [[ "$tier" == "cluster" ]]; then
+        echo "seed-invalid: cluster approval correlation must come from the external Slack ingress receipt" >&2
+        return 1
+    fi
+    umask 077
+    if ! message_file="$(mktemp "$WORKDIR/approval-message.XXXXXX")"; then
+        echo "seed-invalid: could not create private approval message artifact" >&2
+        return 1
+    fi
+    if ! message_stderr_file="$(mktemp "$WORKDIR/approval-message-stderr.XXXXXX")"; then
+        rm -f "$message_file"
+        echo "seed-invalid: could not create private approval stderr artifact" >&2
+        return 1
+    fi
+    if ! token_file="$(mktemp "$WORKDIR/approval-token.XXXXXX")"; then
+        rm -f "$message_file" "$message_stderr_file"
+        echo "seed-invalid: could not create private approval token artifact" >&2
+        return 1
+    fi
+    if ! pending_file="$(mktemp "$WORKDIR/approval-pending.XXXXXX")"; then
+        rm -f "$message_file" "$message_stderr_file" "$token_file"
+        echo "seed-invalid: could not create private approval pending artifact" >&2
+        return 1
+    fi
+    local scope=()
+    if ! "$BIN" --json "$tier" approvals "$agent_id" "${scope[@]}" \
+        --route-resolution e2e=C0EXAMPLE1 --route-approvers e2e=users:U0EXAMPLE1 \
+        >/dev/null; then
+        rm -f "$message_file" "$message_stderr_file" "$token_file" "$pending_file"
+        echo "seed-invalid: could not configure deterministic approval route" >&2
+        return 1
+    fi
+    if ! "$BIN" --json "$tier" approvals "$agent_id" "${scope[@]}" \
+        --mint-operator-principal U0EXAMPLE1 > "$token_file"; then
+        rm -f "$message_file" "$message_stderr_file" "$token_file" "$pending_file"
+        echo "seed-invalid: could not mint deterministic approval principal" >&2
+        return 1
+    fi
+    token="$(python3 - "$token_file" <<'PY'
+import json, pathlib, sys
+value = json.loads(pathlib.Path(sys.argv[1]).read_text())
+token = value.get("operator_principal", {}).get("token")
+if not isinstance(token, str) or not token:
+    raise SystemExit("operator principal response omitted its token")
+print(token)
+PY
+)" || {
+        rm -f "$message_file" "$message_stderr_file" "$token_file" "$pending_file"
+        return 1
+    }
+    rm -f "$token_file"
+    stream_start="$(capture_stream_cursor "$tier")" || {
+        rm -f "$message_file" "$message_stderr_file" "$pending_file"
+        return 1
+    }
+    "$BIN" --json local message --channel C0LOCALDEV --timeout-secs 120 \
+        "[fake:request-approval:e2e] approve correlation $marker" > "$message_file" 2> "$message_stderr_file" &
+    APPROVAL_SEED_MESSAGE_PID=$!
+    approval_id=""
+    for attempt in $(seq 1 60); do
+        if "$BIN" --json "$tier" approvals "$agent_id" "${scope[@]}" --list > "$pending_file" 2>/dev/null; then
+            approval_id="$(python3 - "$pending_file" <<'PY'
+import json, pathlib, sys
+value = json.loads(pathlib.Path(sys.argv[1]).read_text())
+rows = value.get("pending", [])
+matches = [row.get("id") for row in rows if row.get("status") == "pending" and row.get("route") == "e2e"]
+print(matches[0] if len(matches) == 1 and isinstance(matches[0], str) else "")
+PY
+)"
+            [[ -n "$approval_id" ]] && break
+        fi
+        sleep 1
+    done
+    rm -f "$pending_file"
+    if [[ -z "$approval_id" ]]; then
+        stop_approval_seed_message terminate || true
+        rm -f "$message_file" "$message_stderr_file"
+        echo "seed-invalid: awaiting-approval record did not become pending" >&2
+        return 1
+    fi
+    if ! CURIE_APPROVAL_PRINCIPAL_TOKEN="$token" "$BIN" --json "$tier" approvals "$agent_id" \
+        "${scope[@]}" --resolve "$approval_id" >/dev/null; then
+        unset token
+        stop_approval_seed_message terminate || true
+        rm -f "$message_file" "$message_stderr_file"
+        echo "seed-invalid: deterministic approval resolution command failed" >&2
+        return 1
+    fi
+    unset token
+    stop_approval_seed_message || code=$?
+    if (( code != 0 )); then
+        approval_resume_failure_summary "$message_file" "$message_stderr_file" "$code" >&2
+        rm -f "$message_file" "$message_stderr_file"
+        echo "seed-invalid: approval resolution did not resume to a final reply (exit_code=$code)" >&2
+        return 1
+    fi
+    if ! out="$(cat "$message_file")"; then
+        rm -f "$message_file" "$message_stderr_file"
+        echo "seed-invalid: approval resume produced no readable private result artifact" >&2
+        return 1
+    fi
+    rm -f "$message_file" "$message_stderr_file"
+    assert_finalized_reply "$tier approval resume" "$out"
+    stream_end="$(capture_stream_cursor "$tier")" || return 1
+    trace_id="$(discover_trace_id_for_seed "$tier" "$marker" "$stream_start" "$stream_end")" || return 1
+    query_exact_seed_trace "$tier" "$trace_id" \
+        "curie.approval.suspend,curie.approval.resolve,curie.approval.resume,curie.reply.post|curie.reply.update" \
+        "approved" "$query_state"
+    LAST_APPROVAL_TRACE_ID="$trace_id"
+    LAST_APPROVAL_MEMBERSHIP="$LAST_QUERY_MEMBERSHIP"
+    printf '%s' "$trace_id"
 }
 
 assert_local_observability_summary() {
@@ -751,25 +1451,18 @@ else:
 }
 
 prove_local_observability_queries() {
-    local agent_id="$1" out code trace_id
+    local agent_id="$1" out code
 
     derive_observability_window
 
-    echo
-    echo "=== curie local observability runs --json (bounded ingestion poll) ==="
-    discover_local_observability_trace
-    trace_id="$DISCOVERED_OBSERVABILITY_TRACE_ID"
-
-    echo
-    echo "=== curie local observability run --json (discovered trace) ==="
-    out="$("$BIN" --json local observability run "$trace_id")" && code=0 || code=$?
-    if (( code != 0 )); then
-        echo "local observability run: discovered trace detail exited $code, expected 0." >&2
-        printf '%s\n' "$out" >&2
+    # seed_ordinary_turn has already made the only exact read through
+    # query_exact_seed_trace, whose sole public output comes from
+    # sanitize_exact_trace_read. Keeping the receipt here prevents metrics and
+    # negatives from running after a seed-invalid path.
+    if [[ ! "$LAST_ORDINARY_TRACE_ID" =~ ^[0-9a-f]{32}$ ]]; then
+        echo "local observability: ordinary exact-trace seed receipt is absent" >&2
         return 1
     fi
-    printf '%s\n' "$out"
-    assert_local_observability_detail "$trace_id" "$out"
 
     echo
     echo "=== curie local observability metrics --json (explicit UTC window) ==="
@@ -1450,6 +2143,26 @@ prepare_connector_bundle() {
     echo "connector fixture applied to $dir (connectors.yaml)"
 }
 
+# Add the independently countable, read-only MCP receipt server to a scratch
+# bundle. It goes through the ordinary connector build/lock path; no in-sandbox
+# file can be evidence because the sandbox is destroyed with the turn.
+prepare_mcp_receipt_bundle() {
+    local dir="$1"
+    local destination="$dir/connectors/mcp-receipt"
+    mkdir -p "$destination"
+    cp "$MCP_RECEIPT_FIXTURE/Dockerfile" "$MCP_RECEIPT_FIXTURE/server.py" "$destination/"
+    if [[ ! -f "$dir/connectors.yaml" ]]; then
+        printf '%s\n' 'connectors:' > "$dir/connectors.yaml"
+    fi
+    cat >> "$dir/connectors.yaml" <<'YAML'
+  mcp-receipt:
+    build:
+      context: connectors/mcp-receipt
+      platforms: [linux/amd64, linux/arm64]
+YAML
+    echo "MCP receipt fixture applied to $dir (fixtures/mcp-receipt)"
+}
+
 # One build before the first rung, so every rung consumes the same lock and the
 # bundle bytes each rung packs are identical (the PARITY_DIGEST assertion).
 #
@@ -1582,6 +2295,41 @@ connector_container_for_alias() {
         fi
     done < <(docker ps --filter "label=$CONNECTOR_LABEL" --format '{{.Names}}')
     return 1
+}
+
+# Read only the aggregate number of deterministic call markers. Neither the
+# marker lines nor any connector log payload is emitted into the evidence.
+mcp_receipt_call_count() {
+    local tier="$1" alias="$2" count=0 container pod
+    case "$tier" in
+        local)
+            container="$(connector_container_for_alias "$alias")" || {
+                echo "MCP receipt connector is not hosted at the expected alias" >&2
+                return 1
+            }
+            count="$(docker logs "$container" 2>&1 | awk '$0 == "MCP_RECEIPT tools/call" { count++ } END { print count + 0 }')"
+            ;;
+        cluster)
+            pod="$(kubectl -n "$CURIE_NAMESPACE" get pods \
+                -l "app.kubernetes.io/instance=$CURIE_RELEASE,curietech.ai/component=connector" \
+                -o json | python3 -c '
+import json, sys
+items = json.load(sys.stdin).get("items", [])
+want = sys.argv[1]
+matches = [item["metadata"]["name"] for item in items if want in item["metadata"]["name"]]
+if len(matches) != 1:
+    raise SystemExit("expected exactly one MCP receipt connector pod")
+print(matches[0])
+' "$MCP_RECEIPT_CONNECTOR")" || return 1
+            count="$(kubectl -n "$CURIE_NAMESPACE" logs "$pod" 2>/dev/null | awk '$0 == "MCP_RECEIPT tools/call" { count++ } END { print count + 0 }')"
+            ;;
+        *)
+            echo "unknown MCP receipt tier" >&2
+            return 1
+            ;;
+    esac
+    [[ "$count" =~ ^[0-9]+$ ]] || return 1
+    printf '%s' "$count"
 }
 
 # The MCP probe itself: an initialize / notifications/initialized / tools/list
@@ -2287,6 +3035,7 @@ start_local_otel_sink() {
     LOCAL_OTEL_ENDPOINT="http://$gateway:$otlp_port"
     LOCAL_OTEL_METRICS_ENDPOINT="http://127.0.0.1:$metrics_port/metrics"
     export OTEL_EXPORTER_OTLP_ENDPOINT="$LOCAL_OTEL_ENDPOINT"
+    export CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT="$LOCAL_OTEL_ENDPOINT"
     export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
 
     local attempt
@@ -2804,6 +3553,17 @@ assert_local_otel_healthy_turn() {
     assert_bounded_metric_attributes "$baseline"
 }
 
+# local up --build pins these references inside its child process only. Raw
+# Compose fault injection/restoration must retain that candidate identity too.
+pin_local_source_images() {
+    if (( ! LOCAL_STACK_OWNED )); then
+        return 0
+    fi
+    export CURIE_BASE_TAG=dev
+    export CURIE_RUNNER_IMAGE=ghcr.io/curie-eng/curie-runner:dev
+    export CURIE_DISPATCHER_IMAGE=ghcr.io/curie-eng/curie-dispatcher:dev
+}
+
 inject_local_runner_failure() {
     LOCAL_OTEL_FAILURE_MODE=1
     export CURIE_FAKE_MODEL=0
@@ -2827,29 +3587,254 @@ restore_local_runner_health() {
     sleep 3
 }
 
+assert_product_collector_endpoint() {
+    local service="$1" container="$2" expected_endpoint="$3" expected_protocol="$4"
+    local endpoint protocol
+    endpoint="$(container_env_value "$container" OTEL_EXPORTER_OTLP_ENDPOINT)"
+    protocol="$(container_env_value "$container" OTEL_EXPORTER_OTLP_PROTOCOL)"
+    if [[ "$endpoint" != "$expected_endpoint" || "$protocol" != "$expected_protocol" ]]; then
+        echo "local observability: $service exporter does not target the shipped product Collector" >&2
+        return 1
+    fi
+    echo "local observability: $service exporter endpoint/protocol verified"
+}
+
+assert_product_runner_endpoints() {
+    local runners=() runner
+    while IFS= read -r runner; do
+        [[ -n "$runner" ]] && runners+=("$runner")
+    done < <(docker ps --filter "label=$SANDBOX_LABEL" --format '{{.Names}}')
+    (( ${#runners[@]} > 0 )) || {
+        echo "local observability: no actual curie-runner emitter survived long enough to inspect" >&2
+        return 1
+    }
+    for runner in "${runners[@]}"; do
+        assert_product_collector_endpoint curie-runner "$runner" \
+            "http://otel-collector:4318" "http/protobuf" || return 1
+    done
+}
+
 # The independent sink above proves raw telemetry crossed every service
 # boundary, but it deliberately replaces the product Collector endpoint. Once
-# those controls finish, put only the worker (and therefore newly spawned
-# runners) back on the shipped Collector so the API-backed #866 queries can
-# prove the product read path without changing the Collector configuration.
+# those controls finish, restore every actual emitter before seeding Langfuse.
+# Pin the task-owned Collector explicitly: unsetting these variables permits
+# shell or ignored local configuration to redirect the evidence elsewhere.
 route_local_observability_to_product_collector() {
     if [[ -n "${STUB_STATE:-}" ]] || (( ! LOCAL_OTEL_SINK_ACTIVE )); then
         return 0
     fi
 
-    unset OTEL_EXPORTER_OTLP_ENDPOINT OTEL_EXPORTER_OTLP_PROTOCOL
+    export OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+    export CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:24318
+    export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+    local stale runner dispatcher=""
+    # An already-running curie-runner inherited the disposable endpoint. Reap
+    # exactly those emitters, rather than selecting on CURIE_RELEASE: that is a
+    # worker configuration key, not part of the runner's declared boot env, so
+    # it is absent from an actual Docker-substrate sandbox. LOCAL_OTEL_ENDPOINT
+    # is a per-run, task-owned Collector address; matching it keeps an
+    # unrelated sandbox (including a concurrent product-routed one) out of
+    # this recovery sweep while ensuring the post-restore assertion cannot
+    # accidentally inspect the pre-restore runner.
+    if (( LOCAL_STACK_OWNED )); then
+        while IFS= read -r runner; do
+            [[ -n "$runner" ]] || continue
+            if [[ "$(container_env_value "$runner" OTEL_EXPORTER_OTLP_ENDPOINT)" == "$LOCAL_OTEL_ENDPOINT" ]]; then
+                docker rm -f "$runner" >/dev/null
+            fi
+        done < <(docker ps --filter "label=$SANDBOX_LABEL" --format '{{.Names}}')
+    fi
     docker compose --profile core --profile full -f "$REPO_ROOT/compose.dev.yaml" \
-        up -d --force-recreate --no-deps curie-worker >/dev/null
+        up -d --force-recreate --no-deps curie-api curie-worker >/dev/null
+    dispatcher="$(docker ps \
+        --filter 'label=com.docker.compose.project=curie' \
+        --filter 'label=com.docker.compose.service=curie-dispatcher' \
+        --format '{{.Names}}')"
+    if [[ -n "$dispatcher" ]]; then
+        docker compose --profile slack -f "$REPO_ROOT/compose.dev.yaml" \
+            up -d --force-recreate --no-deps curie-dispatcher >/dev/null
+    fi
     sleep 3
 
-    local worker endpoint
+    local api worker
+    api="$(docker ps --filter 'label=com.docker.compose.project=curie' \
+        --filter 'label=com.docker.compose.service=curie-api' --format '{{.Names}}')"
     worker="$(local_worker_container)"
-    endpoint="$(container_env_value "$worker" OTEL_EXPORTER_OTLP_ENDPOINT)"
-    if [[ "$endpoint" != "http://otel-collector:4318" ]]; then
-        echo "local observability: worker still targets '$endpoint', expected the product Collector." >&2
+    assert_product_collector_endpoint curie-api "$api" \
+        "http://otel-collector:4318" "http/protobuf"
+    assert_product_collector_endpoint curie-worker "$worker" \
+        "http://127.0.0.1:24318" "http/protobuf"
+    if [[ -n "$dispatcher" ]]; then
+        dispatcher="$(docker ps --filter 'label=com.docker.compose.project=curie' \
+            --filter 'label=com.docker.compose.service=curie-dispatcher' --format '{{.Names}}')"
+        assert_product_collector_endpoint curie-dispatcher "$dispatcher" \
+            "http://otel-collector:4318" "http/protobuf"
+    else
+        # curie local message launches the curie-dispatcher image after these
+        # exports are pinned; the adjacent stream carrier and exact trace prove
+        # that actual one-shot emitter rather than a config-only assertion.
+        echo "local observability: curie-dispatcher one-shot will inherit product routing"
+    fi
+    # curie-runner is asserted after the first post-restore turn, when an
+    # actual sandbox emitter exists to inspect.
+    echo "local observability: curie-api, curie-dispatcher, curie-worker, and curie-runner routing restored"
+}
+
+product_collector_metric_value() {
+    local metric="$1"
+    curl -fsS http://127.0.0.1:28888/metrics | python3 -c '
+import re, sys
+name = sys.argv[1]
+total = 0.0
+for line in sys.stdin:
+    if re.match(r"^" + re.escape(name) + r"(?:\{|\s)", line):
+        total += float(line.rsplit(None, 1)[1])
+print(total)
+' "$metric"
+}
+
+wait_product_collector_ready() {
+    local attempt
+    for attempt in $(seq 1 60); do
+        if curl -fsS http://127.0.0.1:28888/metrics >/dev/null 2>&1; then
+            # The Collector's startup contract logs "Everything is ready";
+            # the live self-metrics endpoint is the stronger Ready probe.
+            return 0
+        fi
+        sleep 1
+    done
+    echo "product Collector did not become Ready" >&2
+    return 1
+}
+
+restart_local_product_collector() {
+    docker compose --profile full -f "$REPO_ROOT/compose.dev.yaml" \
+        up -d --force-recreate --no-deps otel-collector >/dev/null || return 1
+    wait_product_collector_ready
+}
+
+restore_local_langfuse_auth() {
+    local was_set="$1" original="$2"
+    if [[ "$was_set" == "1" ]]; then
+        export LANGFUSE_OTLP_AUTH_HEADER="$original"
+    else
+        unset LANGFUSE_OTLP_AUTH_HEADER
+    fi
+    restart_local_product_collector
+}
+
+# OTLP HTTP 401 is permanent, not retryable. Keep the shipped Collector retry
+# and file-backed queue settings unchanged; prove rejection is observable and
+# restore credentials before proving a new healthy export.
+assert_product_collector_permanent_auth_rejection() {
+    python3 -c 'import sys; a,f,q,ab,fb,r=map(float,sys.argv[1:]); raise SystemExit(0 if a > ab and f > fb and q == 0 and r == 1 else 1)' "$@"
+}
+
+case_local_langfuse_invalid_auth() {
+    local INVALID_LANGFUSE_OTLP_AUTH_HEADER='Basic aW52YWxpZDppbnZhbGlk'
+    local agent_id="$1" original_set=0 original="" failed_phase=0
+    local receipt failed_trace_id recovered_trace_id langfuse_web collector
+    local accepted_baseline failed_baseline accepted failed queue_size rejection
+    local attempt marker stream_start stream_end out
+    if [[ -v LANGFUSE_OTLP_AUTH_HEADER ]]; then
+        original_set=1
+        original="$LANGFUSE_OTLP_AUTH_HEADER"
+    fi
+    langfuse_web="$(docker compose --profile full -f "$REPO_ROOT/compose.dev.yaml" ps -q langfuse-web)" || return 1
+    [[ -n "$langfuse_web" ]] || {
+        echo "pinned langfuse-web is not running for the real exporter negative" >&2
+        return 1
+    }
+    echo
+    echo "=== case: pinned Langfuse invalid auth is observable, then fresh export recovers ==="
+    if [[ ! "$LAST_ORDINARY_TRACE_ID" =~ ^[0-9a-f]{32}$ ]] || ! query_exact_seed_trace local "$LAST_ORDINARY_TRACE_ID" \
+        "curie.queue.enqueue,curie.queue.process,curie.turn.process,curie.sandbox.claim,curie.runner.rpc,agent.run,curie.reply.post|curie.reply.update" \
+        >/dev/null; then
+        echo "invalid-auth negative lacks a valid exact-query control" >&2
         return 1
     fi
-    echo "local observability: worker restored to the product Collector at $endpoint"
+    echo "invalid-auth negative: valid exact-query control passed before auth changed"
+    receipt="$(mktemp "$WORKDIR/invalid-auth-trace.XXXXXX")" || return 1
+    chmod 600 "$receipt" || { rm -f "$receipt"; return 1; }
+    # A conditional subshell disables Bash errexit, including in nested helpers.
+    # Every required operation explicitly propagates failure to the restore path.
+    if ! (
+        export LANGFUSE_OTLP_AUTH_HEADER="$INVALID_LANGFUSE_OTLP_AUTH_HEADER"
+        restart_local_product_collector || exit 1
+        wait_product_collector_ready || {
+            echo "Collector failed the Ready check after invalid-auth restart" >&2
+            exit 1
+        }
+        collector="$(docker compose --profile full -f "$REPO_ROOT/compose.dev.yaml" ps -q otel-collector)" || exit 1
+        [[ -n "$collector" ]] || exit 1
+        accepted_baseline="$(product_collector_metric_value otelcol_receiver_accepted_spans)" || exit 1
+        failed_baseline="$(product_collector_metric_value otelcol_exporter_send_failed_spans)" || exit 1
+
+        marker="curie-seed-invalid-auth-$$-$RANDOM"
+        stream_start="$(capture_stream_cursor local)" || exit 1
+        out="$("$BIN" --json local message --channel C0LOCALDEV \
+            "observable exporter rejection $marker" || true)"
+        assert_finalized_reply "local invalid-auth seed" "$out" || exit 1
+        stream_end="$(capture_stream_cursor local)" || exit 1
+        failed_trace_id="$(discover_trace_id_for_seed local "$marker" "$stream_start" "$stream_end")" || exit 1
+
+        accepted=0
+        failed=0
+        queue_size=0
+        rejection=0
+        for attempt in $(seq 1 45); do
+            accepted="$(product_collector_metric_value otelcol_receiver_accepted_spans)" || exit 1
+            failed="$(product_collector_metric_value otelcol_exporter_send_failed_spans)" || exit 1
+            queue_size="$(product_collector_metric_value otelcol_exporter_queue_size)" || exit 1
+            # Read only this newly recreated Collector's logs. Raw diagnostics
+            # never reach output; require all three code-owned rejection tokens.
+            if docker logs "$collector" 2>&1 | python3 -c '
+import sys
+lines = sys.stdin.read().splitlines()
+raise SystemExit(0 if any(
+    "HTTP Status Code 401" in line and "Permanent error" in line and "not retryable error" in line
+    for line in lines
+) else 1)
+'; then
+                rejection=1
+            fi
+            if assert_product_collector_permanent_auth_rejection \
+                "$accepted" "$failed" "$queue_size" "$accepted_baseline" "$failed_baseline" "$rejection"; then
+                break
+            fi
+            sleep 2
+        done
+        assert_product_collector_permanent_auth_rejection \
+            "$accepted" "$failed" "$queue_size" "$accepted_baseline" "$failed_baseline" "$rejection" || exit 1
+        query_exact_seed_trace local "$failed_trace_id" "" "" absent || exit 1
+        printf '%s\n' "$failed_trace_id" > "$receipt" || exit 1
+        echo "invalid-auth negative: accepted/failed deltas, permanent HTTP401, empty queue, and exact absence proved"
+    ); then
+        failed_phase=1
+    fi
+
+    # Restoration executes once whether any negative assertion passed or failed.
+    if ! restore_local_langfuse_auth "$original_set" "$original"; then
+        rm -f "$receipt"
+        echo "invalid-auth proof could not restore product Collector auth" >&2
+        return 1
+    fi
+    if (( failed_phase )); then
+        rm -f "$receipt"
+        echo "invalid-auth rejection proof failed; product Collector auth was restored" >&2
+        return 1
+    fi
+    read -r failed_trace_id < "$receipt" || { rm -f "$receipt"; return 1; }
+    rm -f "$receipt"
+    seed_ordinary_turn local "$agent_id" present || return 1
+    recovered_trace_id="$LAST_ORDINARY_TRACE_ID"
+    [[ "$recovered_trace_id" != "$failed_trace_id" ]] || {
+        echo "restored-auth proof did not produce a fresh trace" >&2
+        return 1
+    }
+    query_exact_seed_trace local "$recovered_trace_id" \
+        "curie.queue.enqueue,curie.queue.process,curie.turn.process,curie.sandbox.claim,curie.runner.rpc,agent.run,curie.reply.post|curie.reply.update" || return 1
+    echo "local invalid-auth negative: bounded observable rejection and fresh healthy exact-trace recovery proved"
 }
 
 assert_local_otel_failed_turn() {
@@ -2987,7 +3972,10 @@ rung_local() {
         echo "note: the reused stack's model mode was fixed by whoever ran \`local up\`; it is verified below against this run's mode, and a mismatch fails this rung."
     else
         echo
-        local up_args=(local up)
+        # local up is deliberately pinned to this checkout and builds the
+        # candidate services; a release-channel binary otherwise resolves its
+        # cached release compose and silently tests published images.
+        local up_args=(local up -f "$REPO_ROOT/compose.dev.yaml" --build)
         echo "=== curie ${up_args[*]} ==="
         # The observability query proof below reads traces and metrics through
         # the Curie API. Those routes require Langfuse/ClickHouse, so every
@@ -3002,6 +3990,7 @@ rung_local() {
         # `local down` is safe against a partial or already-stopped stack.
         LOCAL_STACK_OWNED=1
         "$BIN" "${up_args[@]}"
+        pin_local_source_images
     fi
 
     echo
@@ -3093,11 +4082,63 @@ rung_local() {
     fi
 
     route_local_observability_to_product_collector
+    if [[ -n "${STUB_STATE:-}" ]]; then
+        # Executing contract controls have no Docker/Valkey stream to inspect,
+        # but still require two independent post-restore producer calls. The
+        # second call below remains the one exact trace seed/query, so candidate
+        # detail reads stay exactly once while the invocation transcript proves
+        # restoration precedes fresh producer activity.
+        out="$("$BIN" --json local message --channel C0LOCALDEV \
+            "post-restore product Collector control" || true)"
+        assert_finalized_reply "local post-restore control" "$out"
+    fi
     echo
-    echo "=== curie local message --json (observability query seed) ==="
-    out="$("$BIN" --json local message --channel C0LOCALDEV "observability query control" || true)"
-    printf '%s\n' "$out"
-    assert_finalized_reply "local observability seed" "$out"
+    echo "=== exact ordinary product-observability seed ==="
+    local product_accepted_before product_sent_before product_accepted_after product_sent_after
+    local product_accepted_delta product_sent_delta product_membership product_query_state=present
+    if [[ "$PRODUCT_OBSERVABILITY" == "1" ]]; then
+        # Ownership diagnostics must retain an incomplete exact read so the
+        # classifier can distinguish unresolved/Curie/adopted outcomes. The
+        # ordinary default local positive is strict and fails before continuing.
+        product_query_state=observe
+    fi
+    if [[ -n "${STUB_STATE:-}" ]]; then
+        seed_ordinary_turn local "$agent_id" stub
+    else
+        product_accepted_before="$(product_collector_metric_value otelcol_receiver_accepted_spans)"
+        product_sent_before="$(product_collector_metric_value otelcol_exporter_sent_spans)"
+        seed_ordinary_turn local "$agent_id" "$product_query_state"
+        product_membership="$LAST_ORDINARY_MEMBERSHIP"
+
+    if [[ "$LIVE" == "0" ]]; then
+        echo
+        echo "=== exact approval wait/resolve/resume product-observability seed ==="
+        seed_approval_resume_turn local "$agent_id" "$product_query_state"
+        [[ "$LAST_APPROVAL_MEMBERSHIP" == "true" ]] || product_membership="false"
+    fi
+    if [[ "$LIVE" == "1" ]]; then
+        echo
+        echo "=== exact hosted MCP read product-observability seed ==="
+        seed_mcp_read_turn local "$agent_id" "$agent_name" "$product_query_state"
+        [[ "$LAST_MCP_MEMBERSHIP" == "true" ]] || product_membership="false"
+    fi
+
+    product_accepted_after="$(product_collector_metric_value otelcol_receiver_accepted_spans)"
+    product_sent_after="$(product_collector_metric_value otelcol_exporter_sent_spans)"
+    read -r product_accepted_delta product_sent_delta < <(python3 - \
+        "$product_accepted_after" "$product_accepted_before" "$product_sent_after" "$product_sent_before" <<'PY'
+import sys
+accepted_after, accepted_before, sent_after, sent_before = map(float, sys.argv[1:5])
+print(accepted_after - accepted_before, sent_after - sent_before)
+PY
+    )
+    write_product_observability_evidence "$LOCAL_PRODUCT_EVIDENCE" local \
+        "$product_accepted_delta" "$product_sent_delta" "$product_membership" not-applicable false
+
+    if [[ -z "${STUB_STATE:-}" ]] && (( LOCAL_STACK_OWNED )); then
+        case_local_langfuse_invalid_auth "$agent_id"
+    fi
+    fi
 
     prove_local_observability_queries "$agent_id"
 
@@ -3118,7 +4159,7 @@ rung_local() {
     if (( LOCAL_STACK_OWNED )); then
         echo
         echo "=== curie local down ==="
-        "$BIN" local down
+        "$BIN" local down -f "$REPO_ROOT/compose.dev.yaml"
         LOCAL_STACK_OWNED=0
         stop_local_otel_sink
 
@@ -3348,9 +4389,306 @@ rung_local_release() {
     assert_bundle_identity "local-release" "$digest"
 }
 
+# Refuse shared/default cluster ownership and prove that the private release is
+# Ready and running the task-built image identities. This is read-only.
+preflight_cluster_product_observability() {
+    local namespace="${CURIE_NAMESPACE:-}" release="${CURIE_RELEASE:-}"
+    local inventory component mapping tag runtime_id local_id normalized_runtime normalized_local
+    CLUSTER_IMAGE_IDS_MATCH="false"
+    if [[ -z "$namespace" || -z "$release" ]]; then
+        echo "product cluster mode requires explicit CURIE_NAMESPACE and CURIE_RELEASE" >&2
+        return 1
+    fi
+    if [[ "$namespace" == "default" || "$namespace" == "curie" || "$release" == "curie" ]]; then
+        echo "product cluster mode refuses default/shared ownership (default or curie)" >&2
+        return 1
+    fi
+    umask 077
+    inventory="$(mktemp "$WORKDIR/cluster-product-status.XXXXXX")"
+    # Persist only the component label, Ready condition, and runtime image IDs.
+    # A complete pod JSON document can contain environment values from spec.
+    kubectl -n "$namespace" get pods \
+        -l "app.kubernetes.io/instance=$release" \
+        -o go-template='{{range .items}}{{index .metadata.labels "app.kubernetes.io/component"}}{{"\t"}}{{range .status.conditions}}{{if eq .type "Ready"}}{{.status}}{{end}}{{end}}{{"\t"}}{{range .status.containerStatuses}}{{.imageID}}{{" "}}{{end}}{{"\n"}}{{end}}' \
+        > "$inventory" || {
+        rm -f "$inventory"
+        return 1
+    }
+    python3 - "$inventory" <<'PY'
+import pathlib, sys
+required = {"langfuse-web", "langfuse-worker", "otel-collector", "api", "worker", "runner-prewarm"}
+seen = set()
+for raw in pathlib.Path(sys.argv[1]).read_text().splitlines():
+    fields = raw.split("\t")
+    if len(fields) != 3:
+        raise SystemExit("product status row is malformed")
+    component, ready, image_ids = fields
+    if component not in required:
+        continue
+    if ready != "True":
+        raise SystemExit("product component is not Ready")
+    if not image_ids.split():
+        raise SystemExit("Ready product component omitted imageID")
+    seen.add(component)
+missing = required - seen
+if missing:
+    raise SystemExit("missing Ready product components")
+PY
+    for mapping in \
+        'api|curie-api:local' \
+        'worker|curie-worker:local' \
+        'runner-prewarm|curie-runner:latest'; do
+        component="${mapping%%|*}"
+        tag="${mapping#*|}"
+        runtime_id="$(python3 - "$inventory" "$component" <<'PY'
+import pathlib, sys
+want = sys.argv[2]
+values = []
+for raw in pathlib.Path(sys.argv[1]).read_text().splitlines():
+    fields = raw.split("\t")
+    if len(fields) != 3 or fields[0] != want:
+        continue
+    values.extend(fields[2].split())
+values = sorted(set(values))
+if len(values) != 1:
+    raise SystemExit("component imageID is absent or inconsistent")
+print(values[0])
+PY
+)" || { rm -f "$inventory"; return 1; }
+        local_id="$(docker image inspect --format '{{.Id}}' "$tag")" || {
+            rm -f "$inventory"
+            echo "local task image is missing for cluster identity preflight" >&2
+            return 1
+        }
+        read -r normalized_runtime normalized_local < <(python3 - "$runtime_id" "$local_id" <<'PY'
+import re, sys
+def digest(value):
+    matches = re.findall(r"sha256:[0-9a-f]{64}", value.lower())
+    if not matches:
+        raise SystemExit("image identity has no sha256 digest")
+    return matches[-1]
+print(digest(sys.argv[1]), digest(sys.argv[2]))
+PY
+        )
+        if [[ "$normalized_runtime" != "$normalized_local" ]]; then
+            rm -f "$inventory"
+            echo "cluster product imageID mismatch for $component" >&2
+            return 1
+        fi
+    done
+    rm -f "$inventory"
+    CLUSTER_IMAGE_IDS_MATCH="true"
+    echo "cluster product preflight: Ready product components and task image IDs match"
+}
+
+cluster_collector_metric_value() {
+    local metric="$1"
+    kubectl get --raw \
+        "/api/v1/namespaces/$CURIE_NAMESPACE/services/http:$CURIE_RELEASE-otel-collector:8888/proxy/metrics" \
+        | python3 -c '
+import re, sys
+name = sys.argv[1]
+total = 0.0
+for line in sys.stdin:
+    if re.match(r"^" + re.escape(name) + r"(?:\{|\s)", line):
+        total += float(line.rsplit(None, 1)[1])
+print(total)
+' "$metric"
+}
+
+write_product_observability_evidence() {
+    local destination="$1" surface="$2" accepted_delta="$3" sent_delta="$4" membership="$5" image_match="$6"
+    local same_id_raw_receipt="$7"
+    python3 - "$destination" "$surface" "$accepted_delta" "$sent_delta" "$membership" "$image_match" \
+        "$same_id_raw_receipt" "$PRODUCT_OBSERVABILITY_RUN_ID" <<'PY'
+import json, pathlib, sys
+destination, surface, accepted_raw, sent_raw, membership_raw, image_raw, same_id_raw, run_id = sys.argv[1:9]
+accepted = float(accepted_raw)
+sent = float(sent_raw)
+if membership_raw not in {"true", "false"}:
+    raise SystemExit("exact Langfuse membership was not observed")
+if image_raw not in {"true", "false", "not-applicable"}:
+    raise SystemExit("image identity verdict was not observed")
+if same_id_raw not in {"true", "false"}:
+    raise SystemExit("same-ID raw Collector receipt verdict was not observed")
+record = {
+    "run_id": run_id,
+    "surface": surface,
+    "seed_valid": accepted > 0 and sent > 0,
+    "same_id_raw_collector_receipt": same_id_raw == "true",
+    "raw_emitted_observations": accepted,
+    "otelcol_receiver_accepted_spans": accepted,
+    "otelcol_exporter_sent_spans": sent,
+    "langfuse_observation_membership": membership_raw == "true",
+    "image_ids_match": None if image_raw == "not-applicable" else image_raw == "true",
+}
+encoded = json.dumps(record, sort_keys=True, separators=(",", ":"))
+pathlib.Path(destination).write_text(encoded)
+print(encoded)
+PY
+}
+
+run_cluster_product_observability() {
+    local agent_id="$1" agent_name="$2" membership accepted_delta sent_delta
+    preflight_cluster_product_observability
+    seed_cluster_missing_carrier_control
+    cluster_external_ingress_seed ordinary \
+        "curie.turn.ingress,curie.queue.enqueue,curie.queue.process,curie.turn.process,curie.sandbox.claim,curie.runner.rpc,agent.run,curie.reply.post|curie.reply.update"
+    membership="$LAST_QUERY_MEMBERSHIP"
+    accepted_delta="$LAST_EXTERNAL_ACCEPTED_DELTA"
+    sent_delta="$LAST_EXTERNAL_SENT_DELTA"
+    if [[ "$LIVE" == "0" ]]; then
+        cluster_external_ingress_seed approval \
+            "curie.turn.ingress,curie.queue.enqueue,curie.approval.suspend,curie.approval.resolve,curie.approval.resume,curie.reply.post|curie.reply.update" \
+            approved
+        [[ "$LAST_QUERY_MEMBERSHIP" == "true" ]] || membership="false"
+    else
+        cluster_external_ingress_seed mcp \
+            "curie.turn.ingress,curie.queue.enqueue,execute_tool,curie.reply.post|curie.reply.update"
+        [[ "$LAST_QUERY_MEMBERSHIP" == "true" ]] || membership="false"
+    fi
+    read -r accepted_delta sent_delta < <(python3 - \
+        "$accepted_delta" "$LAST_EXTERNAL_ACCEPTED_DELTA" \
+        "$sent_delta" "$LAST_EXTERNAL_SENT_DELTA" <<'PY'
+import sys
+accepted_first, accepted_second, sent_first, sent_second = map(float, sys.argv[1:5])
+print(accepted_first + accepted_second, sent_first + sent_second)
+PY
+    )
+    # Each external seed performs the exact candidate read equivalent to
+    # `curie --json cluster observability run <derived-trace-id>`.
+    # Exact Langfuse reads above are valid external-ingress evidence, but the
+    # shipped Collector exposes only aggregate counters. It has no supported
+    # same-trace raw-receipt read. Record that fact explicitly: exact membership
+    # can still clear end-to-end ingest, while missing membership cannot blame
+    # the adopted backend without the stronger raw receipt.
+    write_product_observability_evidence "$CLUSTER_PRODUCT_EVIDENCE" cluster \
+        "$accepted_delta" "$sent_delta" "$membership" "$CLUSTER_IMAGE_IDS_MATCH" false
+    echo "cluster product observability: exact ingest membership and observed Collector deltas recorded"
+}
+
+classify_product_observability_owner() {
+    local local_evidence="$LOCAL_PRODUCT_EVIDENCE" cluster_evidence="$CLUSTER_PRODUCT_EVIDENCE"
+    python3 - "$local_evidence" "$cluster_evidence" <<'PY'
+import json, pathlib, sys
+
+records = {}
+for surface, raw_path in zip(("local", "cluster"), sys.argv[1:]):
+    path = pathlib.Path(raw_path)
+    if not path.is_file():
+        continue
+    try:
+        records[surface] = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        print(f"curie-unresolved: {surface} evidence is unreadable")
+        raise SystemExit(1)
+if not records:
+    print("curie-unresolved: no product surface has been exercised")
+    raise SystemExit(1)
+
+required_fields = (
+    "run_id", "surface", "seed_valid", "same_id_raw_collector_receipt",
+    "raw_emitted_observations", "otelcol_receiver_accepted_spans",
+    "otelcol_exporter_sent_spans", "langfuse_observation_membership",
+    "image_ids_match",
+)
+for surface, record in records.items():
+    numeric = (
+        record.get("raw_emitted_observations"),
+        record.get("otelcol_receiver_accepted_spans"),
+        record.get("otelcol_exporter_sent_spans"),
+    )
+    if (
+        not all(field in record for field in required_fields)
+        or record.get("surface") != surface
+        or not isinstance(record.get("run_id"), str)
+        or not all(isinstance(record.get(field), bool) for field in (
+            "seed_valid", "same_id_raw_collector_receipt",
+            "langfuse_observation_membership",
+        ))
+        or not all(isinstance(item, (int, float)) and not isinstance(item, bool) for item in numeric)
+        or record.get("image_ids_match") not in {True, False, None}
+    ):
+        print(f"curie-unresolved: {surface} evidence is incomplete or malformed")
+        raise SystemExit(1)
+
+run_ids = {record.get("run_id") for record in records.values()}
+if len(run_ids) != 1 or not next(iter(run_ids), None):
+    print("curie-unresolved: product evidence did not come from one supported run")
+    raise SystemExit(1)
+
+# These names deliberately mirror the evidence record. Ownership cannot be
+# assigned away from Curie until both product surfaces clear every prerequisite.
+for surface, record in records.items():
+    raw_emitted_observations = record.get("raw_emitted_observations", 0)
+    otelcol_receiver_accepted_spans = record.get("otelcol_receiver_accepted_spans", 0)
+    otelcol_exporter_sent_spans = record.get("otelcol_exporter_sent_spans", 0)
+    image_ids_match = surface != "cluster" or record.get("image_ids_match") is True
+    seed_valid = record.get("seed_valid") is True
+    if not (
+        raw_emitted_observations > 0
+        and otelcol_receiver_accepted_spans > 0
+        and otelcol_exporter_sent_spans > 0
+        and image_ids_match
+        and seed_valid
+    ):
+        print("curie-owned: raw export, delivery, image identity, or seed precondition failed")
+        raise SystemExit(1)
+
+memberships = dict(
+    (surface, records[surface].get("langfuse_observation_membership") is True)
+    for surface in records
+)
+if len(records) == 1:
+    surface = next(iter(records))
+    if memberships[surface]:
+        print(f"curie-clear: Langfuse exact observation membership passed on {surface}")
+        raise SystemExit(0)
+    print(f"curie-unresolved: {surface} exact Langfuse membership is missing without a sibling control")
+    raise SystemExit(1)
+
+same_id_raw_receipts = dict(
+    (surface, records[surface].get("same_id_raw_collector_receipt") is True)
+    for surface in ("local", "cluster")
+)
+if memberships["local"] and memberships["cluster"]:
+    print("curie-clear: Langfuse exact observation membership passed on local and cluster")
+    raise SystemExit(0)
+elif memberships["local"] != memberships["cluster"]:
+    print("curie-owned: local and cluster exact Langfuse membership disagreed")
+    raise SystemExit(1)
+elif same_id_raw_receipts["local"] and same_id_raw_receipts["cluster"]:
+    print("adopted-component: Langfuse omitted observations after successful local and cluster raw export")
+    raise SystemExit(1)
+else:
+    print("curie-unresolved: missing Langfuse membership without same-ID raw Collector receipts")
+    raise SystemExit(1)
+PY
+}
+
+rung_cluster_product() {
+    echo
+    echo "########## rung 3/3: cluster product observability ##########"
+    RAN_RUNGS="$RAN_RUNGS cluster"
+    preflight_cluster_product_observability
+    local deploy_json digest agent_id agent_name
+    deploy_json="$("$BIN" --json cluster deploy \
+        --namespace "$CURIE_NAMESPACE" --release "$CURIE_RELEASE" \
+        --plugin-dir "$WORKDIR/bundle")"
+    digest="$(deploy_field "cluster" "$deploy_json" bundle.sha256)"
+    agent_id="$(deploy_field "cluster" "$deploy_json" agent.id)"
+    agent_name="$(deploy_field "cluster" "$deploy_json" agent.name)"
+    run_cluster_product_observability "$agent_id" "$agent_name"
+    assert_bundle_identity "cluster" "$digest"
+}
+
 # Rung 3: the deployed release. Requires one to already exist; it is never
 # installed or torn down here, because the cluster is shared.
 rung_cluster() {
+    if [[ "$PRODUCT_OBSERVABILITY" == "1" ]]; then
+        rung_cluster_product
+        return
+    fi
     echo
     echo "########## rung 3/3: cluster ##########"
     RAN_RUNGS="$RAN_RUNGS cluster"
@@ -3611,25 +4949,50 @@ cp -r "$BUNDLE_SRC" "$WORKDIR/bundle-release"
 # the lock are packed like any other bundle file, so both must land before the
 # mtime normalization below and before any rung packs -- otherwise the copies
 # pack to different bytes and every multi-rung run is red by construction.
+NEEDS_CONNECTOR_BUILD=0
+MCP_PROOF_REQUIRED=0
 if connector_mode; then
     echo
-    echo "=== connector bundle: fixture, credentials, build ==="
-    if (( RUN_CLUSTER )) && [[ -z "$CONNECTOR_REGISTRY" ]]; then
-        echo "error: the cluster rung is named and CURIE_E2E_CONNECTOR_REGISTRY is unset." >&2
-        echo "why: without a registry the build delivers into the local Docker daemon, and a cluster deploy refuses a local-daemon lock by design -- the nodes cannot pull it." >&2
-        echo "fix: export CURIE_E2E_CONNECTOR_REGISTRY=<ref you can push to>, or drop cluster from CURIE_E2E_TIERS." >&2
-        exit 1
-    fi
+    echo "=== connector bundle: fixture and credentials ==="
     prepare_connector_bundle "$WORKDIR/bundle"
     prepare_connector_bundle "$WORKDIR/bundle-release"
     provision_connector_credentials
     write_connector_probe
+    NEEDS_CONNECTOR_BUILD=1
+fi
+
+# The live-provider overlay owns an independent hosted MCP receipt. It is
+# injected into both scratch copies before the one connector build so the
+# parity digest remains byte-identical across every named rung.
+if [[ "$LIVE" == "1" && -z "${STUB_STATE:-}" ]] \
+    && { (( RUN_LOCAL )) || { (( RUN_CLUSTER )) && [[ "$PRODUCT_OBSERVABILITY" == "1" ]]; }; }; then
+    MCP_PROOF_REQUIRED=1
+    echo
+    echo "=== hosted MCP receipt fixture ==="
+    prepare_mcp_receipt_bundle "$WORKDIR/bundle"
+    prepare_mcp_receipt_bundle "$WORKDIR/bundle-release"
+    NEEDS_CONNECTOR_BUILD=1
+fi
+
+if (( NEEDS_CONNECTOR_BUILD )); then
+    if (( RUN_CLUSTER )) && [[ -z "$CONNECTOR_REGISTRY" ]]; then
+        echo "error: the cluster rung needs CURIE_E2E_CONNECTOR_REGISTRY for hosted connector images." >&2
+        echo "fix: export a private task registry input, or drop cluster from CURIE_E2E_TIERS." >&2
+        exit 1
+    fi
     # ONE build, and its lock is COPIED to the second copy rather than built
     # again: a second build would resolve its own image reference, and the two
     # copies would then pack to different bytes. Every rung consumes this one
     # lock unchanged, which is what makes the digest assertion meaningful.
     build_connector_images "$WORKDIR/bundle"
     cp "$WORKDIR/bundle/connectors.lock.yaml" "$WORKDIR/bundle-release/connectors.lock.yaml"
+    if (( MCP_PROOF_REQUIRED )); then
+        MCP_RECEIPT_IMAGE="$(connector_image "$MCP_RECEIPT_CONNECTOR")"
+        [[ -n "$MCP_RECEIPT_IMAGE" ]] || {
+            echo "hosted MCP receipt image is absent from the connector build receipt" >&2
+            exit 1
+        }
+    fi
 fi
 
 # Normalize every regular file's mtime across both copies. This is load-bearing,
@@ -3700,6 +5063,12 @@ else
     echo
     echo "SKIPPING rung 3 (cluster): not named in CURIE_E2E_TIERS. It needs a live"
     echo "release and host-reachable pods, so it is opt-in: CURIE_E2E_TIERS=all."
+fi
+
+if [[ "$PRODUCT_OBSERVABILITY" == "1" ]]; then
+    echo
+    echo "=== product observability ownership classification ==="
+    classify_product_observability_owner
 fi
 
 echo

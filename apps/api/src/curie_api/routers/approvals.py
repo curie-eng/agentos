@@ -17,8 +17,13 @@ import logging
 import uuid
 from datetime import UTC, datetime, timedelta
 
-from curie_telemetry import operation_span, record_metric
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from curie_telemetry import (
+    TRACEPARENT_STREAM_FIELD,
+    canonicalize_traceparent,
+    operation_span,
+    record_metric,
+)
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from opentelemetry.trace import SpanKind
 from sqlalchemy.exc import IntegrityError
 
@@ -29,7 +34,11 @@ from ..authorizer import authorize_approval
 from ..config import get_settings
 from ..deps import ApproverSetSelectorDep, ResumeQueueDep, SessionDep
 from ..models import Approval, ApprovalStatus
-from ..resumequeue import build_expiry_resume_turn, build_resume_turn
+from ..resumequeue import (
+    approval_trace_context,
+    build_expiry_resume_turn,
+    build_resume_turn,
+)
 from ..schemas import (
     ApprovalAuditOut,
     ApprovalOut,
@@ -93,7 +102,10 @@ def _expired(approval: Approval) -> bool:
     dependencies=[Depends(require_api_key)],
 )
 async def create_approval(
-    data: ApprovalRequestBody, session: SessionDep, response: Response
+    data: ApprovalRequestBody,
+    request: Request,
+    session: SessionDep,
+    response: Response,
 ) -> ApprovalOut:
     """Create a pending approval; idempotent on ``dedupe_key``.
 
@@ -102,8 +114,11 @@ async def create_approval(
     one human decision.
     """
 
+    traceparent = canonicalize_traceparent(
+        request.headers.get(TRACEPARENT_STREAM_FIELD)
+    )
     try:
-        approval = await crud.create_approval(session, data)
+        approval = await crud.create_approval(session, data, traceparent=traceparent)
     except IntegrityError as exc:
         await session.rollback()
         existing = await crud.get_approval_by_dedupe_key(session, data.dedupe_key)
@@ -187,6 +202,7 @@ async def resolve_approval(
     approval = await crud.get_approval(session, approval_id)
     if approval is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "approval not found")
+    stored_parent = approval_trace_context(approval)
 
     # The route binding is read fresh at resolve time (#420), so revoking an
     # approver takes effect on the next click rather than at the next restart.
@@ -235,6 +251,7 @@ async def resolve_approval(
         with operation_span(
             "curie.approval.expire",
             kind=SpanKind.INTERNAL,
+            parent=stored_parent,
             attributes={
                 "service.name": "curie-api",
                 "operation": "expire",
@@ -277,7 +294,9 @@ async def resolve_approval(
             # redelivery of an already-finished turn re-running; it is the CAS,
             # not the shared key, that keeps this wakeup single.
             try:
-                await resume_queue.enqueue(build_expiry_resume_turn(expired))
+                await resume_queue.enqueue(
+                    build_expiry_resume_turn(expired), parent=stored_parent
+                )
                 # Enqueue-first-then-mark (#418): only a wake that reached the
                 # stream is written off, so a failure below leaves resumed_at
                 # NULL and the reconciler re-enqueues it past its grace horizon.
@@ -327,6 +346,7 @@ async def resolve_approval(
     with operation_span(
         "curie.approval.resolve",
         kind=SpanKind.INTERNAL,
+        parent=stored_parent,
         attributes={
             "service.name": "curie-api",
             "operation": "resolve",
@@ -386,7 +406,9 @@ async def resolve_approval(
     # a 200 would silently strand the suspended session -- re-raise instead, so the
     # failure surfaces as a 500 the caller can see (the CAS/audit already committed).
     try:
-        stream_id = await resume_queue.enqueue(build_resume_turn(claimed))
+        stream_id = await resume_queue.enqueue(
+            build_resume_turn(claimed), parent=stored_parent
+        )
     except Exception:  # noqa: BLE001
         logger.warning(
             "approval %s %s by %s; resume enqueue failed, reconciler will retry",

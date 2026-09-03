@@ -116,6 +116,10 @@ pub struct SlackCall {
     /// True when the raw body carried the approval card's Approve action id, i.e.
     /// the worker parked this turn awaiting approval and posted a card (#529).
     pub approval_card: bool,
+    /// The durable approval UUID carried by that card, when its structured
+    /// payload contains a valid id. This is independent of placeholder edit
+    /// ordering, so a card that arrives before its notice can still be resumed.
+    pub approval_id: Option<String>,
 }
 
 /// If this call is a `chat.update` editing `placeholder_ts`, its new text.
@@ -171,6 +175,90 @@ pub fn extract_fields(
             .map(|(_, v)| v.clone())
     };
     (find("channel"), find("ts"), find("text"))
+}
+
+/// Extract a validated durable approval id from a structured approval card.
+///
+/// The worker puts the same UUID in the card's `client_msg_id` and approval
+/// action `value`. Neither copy is authoritative alone: both must be valid UUIDs
+/// and equal, and the action id must start with [`APPROVE_ACTION_ID_PREFIX`].
+/// This keeps incomplete, inconsistent, or ordinary Slack posts from being
+/// mistaken for approval control data.
+pub fn approval_card_id(content_type: &str, body: &str) -> Option<String> {
+    fn valid_uuid(value: &str) -> Option<String> {
+        uuid::Uuid::parse_str(value).ok().map(|_| value.to_string())
+    }
+
+    fn approval_action(value: &serde_json::Value) -> (bool, Option<String>) {
+        match value {
+            serde_json::Value::Array(values) => {
+                let mut seen = false;
+                for value in values {
+                    let (nested_seen, id) = approval_action(value);
+                    seen |= nested_seen;
+                    if id.is_some() {
+                        return (true, id);
+                    }
+                }
+                (seen, None)
+            }
+            serde_json::Value::Object(fields) => {
+                let is_approve = fields
+                    .get("action_id")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|id| id.starts_with(APPROVE_ACTION_ID_PREFIX));
+                if is_approve {
+                    let id = fields
+                        .get("value")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(valid_uuid);
+                    return (true, id);
+                }
+                let mut seen = false;
+                for value in fields.values() {
+                    let (nested_seen, id) = approval_action(value);
+                    seen |= nested_seen;
+                    if id.is_some() {
+                        return (true, id);
+                    }
+                }
+                (seen, None)
+            }
+            _ => (false, None),
+        }
+    }
+
+    let (card_seen, action_id, client_msg_id) = if content_type.contains("application/json") {
+        let root = serde_json::from_str::<serde_json::Value>(body).ok()?;
+        let (seen, action_id) = approval_action(&root);
+        let client_msg_id = root
+            .get("client_msg_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(valid_uuid);
+        (seen, action_id, client_msg_id)
+    } else {
+        let pairs: Vec<(String, String)> = serde_urlencoded::from_str(body).unwrap_or_default();
+        let blocks = pairs
+            .iter()
+            .find(|(key, _)| key == "blocks")
+            .and_then(|(_, value)| serde_json::from_str::<serde_json::Value>(value).ok());
+        let (seen, action_id) = blocks
+            .as_ref()
+            .map(approval_action)
+            .unwrap_or((false, None));
+        let client_msg_id = pairs
+            .iter()
+            .find(|(key, _)| key == "client_msg_id")
+            .and_then(|(_, value)| valid_uuid(value));
+        (seen, action_id, client_msg_id)
+    };
+
+    match (card_seen, action_id, client_msg_id) {
+        (true, Some(action_id), Some(client_msg_id)) if action_id == client_msg_id => {
+            Some(action_id)
+        }
+        _ => None,
+    }
 }
 
 #[derive(Clone)]
@@ -269,6 +357,7 @@ async fn handle_call(
     // which `extract_fields` does not parse -- match it on the raw body so an
     // awaiting-approval turn is detectable regardless of encoding (#529).
     let approval_card = body.contains(APPROVE_ACTION_ID_PREFIX);
+    let approval_id = approval_card_id(content_type, &body);
     // chat.update echoes the existing ts; a hypothetical new-message call has no
     // ts, so synthesize one so the response still looks like Slack.
     let ts_out = ts
@@ -280,6 +369,7 @@ async fn handle_call(
         ts: ts.clone(),
         text: text.clone(),
         approval_card,
+        approval_id,
     });
     Json(json!({ "ok": true, "ts": ts_out, "channel": channel, "text": text }))
 }
@@ -295,9 +385,35 @@ pub enum Outcome {
     /// THIS run's reply endpoint. For `local`/`cluster message` that endpoint is
     /// the CLI's throwaway stub, which dies when the command exits, so the resumed
     /// reply has nowhere to land (#529). Carries the latest placeholder text seen.
-    AwaitingApproval(Option<String>),
+    AwaitingApproval {
+        reply: Option<String>,
+        /// Durable id captured from the approval card when it reaches this stub,
+        /// or from the authoritative route-bound placeholder notice otherwise.
+        approval_id: Option<String>,
+    },
     /// The deadline passed with no completion.
     TimedOut,
+}
+
+/// Classify an acked turn after the final Slack-call drain.
+///
+/// Keeping the card-derived id separate from `latest` is load-bearing: Slack
+/// calls can be observed in either order, and the card may be the only captured
+/// call that carries the UUID needed to wait for the resume turn.
+fn completed_turn_outcome(
+    latest: Option<String>,
+    approval_card_seen: bool,
+    card_approval_id: Option<String>,
+) -> Outcome {
+    let approval_id = card_approval_id.or_else(|| latest.as_deref().and_then(parse_approval_id));
+    if approval_card_seen || approval_id.is_some() {
+        Outcome::AwaitingApproval {
+            reply: latest,
+            approval_id,
+        }
+    } else {
+        latest.map_or(Outcome::CompletedNoEdit, Outcome::Replied)
+    }
 }
 
 /// Wait for the worker to consume and finalize the turn. Terminal signal is the
@@ -335,12 +451,16 @@ pub async fn await_reply(
     // Whether the worker posted an approval card during this turn: the turn parked
     // awaiting approval rather than finalizing normally (#529).
     let mut awaiting_approval = false;
+    let mut card_approval_id: Option<String> = None;
     let mut poll = tokio::time::interval(ACK_POLL_INTERVAL);
     loop {
         tokio::select! {
             call = stub.recv() => {
                 if let Some(call) = call {
                     awaiting_approval |= call.approval_card;
+                    if call.approval_id.is_some() {
+                        card_approval_id = call.approval_id.clone();
+                    }
                     observe_placeholder_update(&call, placeholder_ts, &mut latest, observer);
                 }
             }
@@ -361,17 +481,19 @@ pub async fn await_reply(
                     // Drain any final edit still in flight before deciding.
                     while let Ok(Some(call)) = tokio::time::timeout(FINAL_DRAIN, stub.recv()).await {
                         awaiting_approval |= call.approval_card;
+                        if call.approval_id.is_some() {
+                            card_approval_id = call.approval_id.clone();
+                        }
                         observe_placeholder_update(&call, placeholder_ts, &mut latest, observer);
                     }
                     // Either signal parks the turn: the card seen here, or an
                     // authoritative approval notice in the latest placeholder
                     // text (the route-bound case, where no card reaches us).
-                    if awaiting_approval
-                        || latest.as_deref().and_then(parse_approval_id).is_some()
-                    {
-                        return Outcome::AwaitingApproval(latest);
-                    }
-                    return latest.map_or(Outcome::CompletedNoEdit, Outcome::Replied);
+                    return completed_turn_outcome(
+                        latest,
+                        awaiting_approval,
+                        card_approval_id,
+                    );
                 }
             }
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
@@ -676,6 +798,72 @@ mod tests {
     }
 
     #[test]
+    fn approval_card_id_requires_equal_structured_uuid_copies() {
+        let id = "00000000-0000-4000-8000-000000000220";
+        let body = format!(
+            r#"{{"channel":"C0EXAMPLE1","client_msg_id":"{id}","blocks":[{{"type":"actions","elements":[{{"type":"button","action_id":"{APPROVE_ACTION_ID_PREFIX}","value":"{id}"}}]}}]}}"#
+        );
+        let captured = approval_card_id("application/json", &body);
+        assert_eq!(captured.as_deref(), Some(id));
+
+        // The card can win the Slack-call race while the latest placeholder is
+        // still ordinary text. Preserve that text for output, but carry the
+        // card's durable id independently so the caller enters its resume wait.
+        match completed_turn_outcome(Some("working".into()), true, captured) {
+            Outcome::AwaitingApproval { reply, approval_id } => {
+                assert_eq!(reply.as_deref(), Some("working"));
+                assert_eq!(approval_id.as_deref(), Some(id));
+            }
+            outcome => panic!("approval card was not classified as awaiting: {outcome:?}"),
+        }
+    }
+
+    #[test]
+    fn approval_card_id_rejects_malformed_and_non_card_payloads() {
+        let id = "00000000-0000-4000-8000-000000000220";
+        let non_card = format!(
+            r#"{{"client_msg_id":"{id}","text":"mentions {APPROVE_ACTION_ID_PREFIX}","blocks":[{{"type":"section","text":{{"type":"plain_text","text":"not a card"}}}}]}}"#
+        );
+        assert_eq!(approval_card_id("application/json", &non_card), None);
+
+        let malformed = format!(
+            r#"{{"client_msg_id":"not-a-uuid","blocks":[{{"type":"actions","elements":[{{"type":"button","action_id":"{APPROVE_ACTION_ID_PREFIX}","value":"also-not-a-uuid"}}]}}]}}"#
+        );
+        assert_eq!(approval_card_id("application/json", &malformed), None);
+
+        // The raw action-id signal still reports a parked turn, but malformed
+        // external data is never promoted into an id used for resume lookup.
+        match completed_turn_outcome(None, true, approval_card_id("application/json", &malformed)) {
+            Outcome::AwaitingApproval { approval_id, .. } => assert_eq!(approval_id, None),
+            outcome => panic!("malformed card lost its awaiting status: {outcome:?}"),
+        }
+    }
+
+    #[test]
+    fn approval_card_id_rejects_mismatched_or_missing_uuid_copies() {
+        let client_id = "00000000-0000-4000-8000-000000000220";
+        let action_id = "00000000-0000-4000-8000-000000000221";
+        let mismatched = format!(
+            r#"{{"client_msg_id":"{client_id}","blocks":[{{"type":"actions","elements":[{{"type":"button","action_id":"{APPROVE_ACTION_ID_PREFIX}","value":"{action_id}"}}]}}]}}"#
+        );
+        let missing_client = format!(
+            r#"{{"blocks":[{{"type":"actions","elements":[{{"type":"button","action_id":"{APPROVE_ACTION_ID_PREFIX}","value":"{action_id}"}}]}}]}}"#
+        );
+        let missing_action_value = format!(
+            r#"{{"client_msg_id":"{client_id}","blocks":[{{"type":"actions","elements":[{{"type":"button","action_id":"{APPROVE_ACTION_ID_PREFIX}"}}]}}]}}"#
+        );
+
+        for body in [&mismatched, &missing_client, &missing_action_value] {
+            assert!(body.contains(APPROVE_ACTION_ID_PREFIX));
+            assert_eq!(approval_card_id("application/json", body), None);
+            match completed_turn_outcome(None, true, approval_card_id("application/json", body)) {
+                Outcome::AwaitingApproval { approval_id, .. } => assert_eq!(approval_id, None),
+                outcome => panic!("untrusted card lost its awaiting status: {outcome:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn placeholder_update_text_matches_only_the_right_call() {
         let update = SlackCall {
             method: "chat.update".into(),
@@ -683,6 +871,7 @@ mod tests {
             ts: Some("1.2".into()),
             text: Some("the answer".into()),
             approval_card: false,
+            approval_id: None,
         };
         assert_eq!(placeholder_update_text(&update, "1.2"), Some("the answer"));
         // Wrong ts (a different message).

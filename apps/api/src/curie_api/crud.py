@@ -688,6 +688,7 @@ async def create_publication(
     data: PublicationCreate,
     *,
     patch: bytes,
+    traceparent: str | None = None,
 ) -> tuple[Publication, bool]:
     """Atomically create the durable approval and its private publication.
 
@@ -717,6 +718,7 @@ async def create_publication(
         reply_endpoint=data.reply_endpoint,
         reply_adapter=data.reply_adapter,
         dedupe_key=data.dedupe_key,
+        traceparent=traceparent,
         route=None,
         card_channel=data.reply_channel,
         gate_kind="permission",
@@ -947,7 +949,12 @@ async def claim_action_undo(
     return action
 
 
-async def create_approval(session: AsyncSession, data: "ApprovalRequest") -> Approval:
+async def create_approval(
+    session: AsyncSession,
+    data: "ApprovalRequest",
+    *,
+    traceparent: str | None = None,
+) -> Approval:
     """Insert a pending approval. Raises IntegrityError on a dedupe_key replay;
     the router maps that to the existing record (idempotent creation)."""
 
@@ -973,6 +980,7 @@ async def create_approval(session: AsyncSession, data: "ApprovalRequest") -> App
         reply_endpoint=data.reply_endpoint,
         reply_adapter=data.reply_adapter,
         dedupe_key=data.dedupe_key,
+        traceparent=traceparent,
         route=data.route,
         card_channel=data.card_channel,
         gate_kind=data.gate_kind,

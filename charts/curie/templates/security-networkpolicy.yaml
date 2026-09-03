@@ -46,6 +46,40 @@ per-entry `except:` list, which wins over this auto carve-out.
   {{- end -}}
 {{- end -}}
 {{- end -}}
+{{/*
+Validate one rustfs.egress / rustfs.stsEgress entry. These lists are store
+(and STS) endpoints, not the model allowlist: a default route or a CIDR that
+reaches the cloud metadata address would additively re-open the prompt-injectable
+runner. Require cidr + ports, refuse prefix 0/1, and refuse any CIDR that
+contains 169.254.169.254 or fd00:ec2::254.
+*/}}
+{{- define "curie.objectStore.egressEntry" -}}
+{{- $key := .key -}}
+{{- $cidr := trim (printf "%v" (.entry.cidr | default "")) -}}
+{{- if eq $cidr "" -}}
+{{- fail (printf "%s entries must set cidr" $key) -}}
+{{- end -}}
+{{- if not .entry.ports -}}
+{{- fail (printf "%s entries must set ports" $key) -}}
+{{- end -}}
+{{- $parts := splitList "/" $cidr -}}
+{{- if ne (len $parts) 2 -}}
+{{- fail (printf "%s entry %q is not a CIDR" $key $cidr) -}}
+{{- end -}}
+{{- $ip := index $parts 0 -}}
+{{- $prefixText := index $parts 1 -}}
+{{- if not (regexMatch "^(0|[1-9][0-9]{0,2})$" $prefixText) -}}
+{{- fail (printf "%s entry %q has an invalid prefix length" $key $cidr) -}}
+{{- end -}}
+{{- $prefix := int $prefixText -}}
+{{- if le $prefix 1 -}}
+{{- fail (printf "%s entry %q is a default or equivalently broad route; use a VPC interface endpoint /32 or a regional store/STS prefix, not a default route" $key $cidr) -}}
+{{- end -}}
+{{- $auto := include "curie.metadataExcept" $cidr | trim -}}
+{{- if or $auto (eq $ip "169.254.169.254") (hasPrefix "fd00:ec2:" $ip) -}}
+{{- fail (printf "%s entry %q must not cover the cloud metadata endpoint 169.254.169.254" $key $cidr) -}}
+{{- end -}}
+{{- end -}}
 {{- if and .Values.agentSandbox.deploy .Values.security.networkPolicy.enabled }}
 {{- $np := .Values.security.networkPolicy }}
 {{/*
@@ -162,13 +196,13 @@ spec:
       ports:
         - { protocol: TCP, port: 8000 }
 {{- end }}
-{{- if and .Values.rustfs.deploy (or .Values.agentSandbox.runner.bundleFetch.enabled .Values.agentSandbox.runner.workspace.enabled) }}
+{{- if or .Values.agentSandbox.runner.bundleFetch.enabled .Values.agentSandbox.runner.workspace.enabled }}
+{{- if .Values.rustfs.deploy }}
 ---
 {{/* Allow the runner's bundle-fetch or workspace-fetch init container to reach
      THIS release's in-chart RustFS for its exact object. Mirrors the collector carve out
      above: without it, rail 1's default-deny blocks the S3 fetch and every bound
-     sandbox fails closed. BYO S3 with rustfs.deploy=false is an external host, so it
-     goes through the operator's allowedEgress list instead. */}}
+     sandbox fails closed. */}}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -191,6 +225,61 @@ spec:
               {{- include "curie.selectorLabels" (dict "root" . "component" "rustfs") | nindent 14 }}
       ports:
         - { protocol: TCP, port: 9000 }
+{{- else }}
+{{/* BYO object store (#2213). There is no in-chart rustfs pod to select, and
+     NetworkPolicy cannot target rustfs.host (a DNS name). The operator must
+     declare CIDRs. Empty keeps fail-closed: a model-only allowedEgress list
+     used to install green and then hang every sandbox in Init. On EKS the
+     tight form is VPC interface endpoints for s3 and (key-free) sts with
+     private DNS enabled; see the chart README, "Key-free object store auth". */}}
+{{- if not .Values.rustfs.egress }}
+{{- fail "rustfs.deploy is false: set rustfs.egress to the object-store endpoint CIDRs the runner bundle-fetch must reach. Rail 1 is fail-closed and the in-chart runner-allow-rustfs policy does not render without an in-cluster rustfs pod. NetworkPolicy cannot target rustfs.host. On EKS the tight form is a VPC interface endpoint /32 for S3 with private DNS enabled (see the chart README, 'Key-free object store auth')." }}
+{{- end }}
+{{- if not (include "curie.rustfs.staticCredentials" .) }}
+{{- if not .Values.rustfs.stsEgress }}
+{{- fail "rustfs.deploy is false and rustfs.auth.accessKey is empty: set rustfs.stsEgress to the STS endpoint CIDRs AssumeRoleWithWebIdentity must reach. On EKS the tight form is a VPC interface endpoint /32 for STS with private DNS enabled (see the chart README, 'Key-free object store auth')." }}
+{{- end }}
+{{- end }}
+{{- range .Values.rustfs.egress }}
+{{- include "curie.objectStore.egressEntry" (dict "key" "rustfs.egress" "entry" .) }}
+{{- end }}
+{{- range .Values.rustfs.stsEgress }}
+{{- include "curie.objectStore.egressEntry" (dict "key" "rustfs.stsEgress" "entry" .) }}
+{{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "curie.fullname" . }}-runner-allow-object-store
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: agent-sandbox
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "curie.selectorLabels" (dict "root" . "component" "runner-sandbox") | nindent 6 }}
+  policyTypes: [Egress]
+  egress:
+    {{- range concat (.Values.rustfs.egress | default list) (.Values.rustfs.stsEgress | default list) }}
+    - to:
+        - ipBlock:
+            cidr: {{ .cidr }}
+            {{- if .except }}
+            except:
+              {{- toYaml .except | nindent 14 }}
+            {{- else }}
+            {{- $auto := include "curie.metadataExcept" .cidr | trim }}
+            {{- if $auto }}
+            except:
+              - {{ $auto }}
+            {{- end }}
+            {{- end }}
+      {{- with .ports }}
+      ports:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    {{- end }}
+{{- end }}
 {{- end }}
 {{- if .Values.inference.deploy }}
 ---

@@ -130,17 +130,24 @@ pub fn fake_model_env_override(mode: ModelMode) -> Option<(String, String)> {
 /// resolve. An empty value (not an absent one) is what does it: compose writes
 /// the endpoint as `${OTEL_EXPORTER_OTLP_ENDPOINT-...}`, whose `-` (unset-only)
 /// form substitutes its default only when the var is UNSET, so exporting it
-/// empty resolves to empty and the runner exports nothing. `false` returns
-/// `None` so compose's shipped collector default stands. This is the one place
+/// empty resolves to empty and the runner exports nothing. The host-network
+/// worker's separate override is also cleared. `false` returns no overrides,
+/// so compose's shipped collector defaults stand. This is the one place
 /// that decision is made -- `up_command` and `local comms`'s connect/disconnect
 /// commands all call it instead of each re-deriving the pair inline, the same
 /// drift that let `local comms` fall out of parity with `local up` on the fake
 /// model (issue #450).
-pub fn otel_endpoint_env_override(minimal: bool) -> Option<(String, String)> {
+pub fn otel_endpoint_env_override(minimal: bool) -> Vec<(String, String)> {
     if minimal {
-        Some(("OTEL_EXPORTER_OTLP_ENDPOINT".into(), String::new()))
+        vec![
+            ("OTEL_EXPORTER_OTLP_ENDPOINT".into(), String::new()),
+            (
+                "CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT".into(),
+                String::new(),
+            ),
+        ]
     } else {
-        None
+        Vec::new()
     }
 }
 
@@ -2307,7 +2314,7 @@ mod tests {
         // profile starts no collector); `display` renders env before the program.
         assert_eq!(
             cmd.display(),
-            "OTEL_EXPORTER_OTLP_ENDPOINT= docker compose --profile core -f compose.dev.yaml up -d --wait"
+            "CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT= OTEL_EXPORTER_OTLP_ENDPOINT= docker compose --profile core -f compose.dev.yaml up -d --wait"
         );
     }
 

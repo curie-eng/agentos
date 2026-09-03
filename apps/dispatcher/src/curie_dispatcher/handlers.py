@@ -46,6 +46,8 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from aci_protocol import QueuedTurn, ReplyHandle, TurnSource
+from curie_telemetry import operation_span
+from opentelemetry.trace import SpanKind
 from slack_bolt import App
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web import WebClient
@@ -319,28 +321,33 @@ def process_event(
         drop(log, reason, event_id=slack_event_id, lane=lane)
         return None
 
-    if not claim_event(redis_client, config, slack_event_id):
-        drop(log, DropReason.DUPLICATE_DELIVERY, event_id=slack_event_id)
-        return None
+    with operation_span(
+        "curie.turn.ingress",
+        kind=SpanKind.CONSUMER,
+        attributes={"service.name": "curie-dispatcher", "source": "dispatcher"},
+    ):
+        if not claim_event(redis_client, config, slack_event_id):
+            drop(log, DropReason.DUPLICATE_DELIVERY, event_id=slack_event_id)
+            return None
 
-    return _mint_turn(
-        web_client=web_client,
-        redis_client=redis_client,
-        config=config,
-        log=log,
-        clock=clock,
-        slack_event_id=slack_event_id,
-        delivery_kind="slack event",
-        author=event.get("user", ""),
-        # NOT `event.get("text", "")`: a Block Kit or attachment-shaped post
-        # carries an empty or fallback-only top-level `text` and its real body in
-        # `blocks`/`attachments`, so that read emptied the turn while still
-        # burning a placeholder (#2006). `derive_text` returns a non-empty
-        # top-level text byte-identically, so existing enqueues are unchanged.
-        text=_strip_self_mention(derive_text(event), bot_user_id),
-        channel=channel,
-        thread_ts=thread_ts,
-    )
+        return _mint_turn(
+            web_client=web_client,
+            redis_client=redis_client,
+            config=config,
+            log=log,
+            clock=clock,
+            slack_event_id=slack_event_id,
+            delivery_kind="slack event",
+            author=event.get("user", ""),
+            # NOT `event.get("text", "")`: a Block Kit or attachment-shaped post
+            # carries an empty or fallback-only top-level `text` and its real body in
+            # `blocks`/`attachments`, so that read emptied the turn while still
+            # burning a placeholder (#2006). `derive_text` returns a non-empty
+            # top-level text byte-identically, so existing enqueues are unchanged.
+            text=_strip_self_mention(derive_text(event), bot_user_id),
+            channel=channel,
+            thread_ts=thread_ts,
+        )
 
 
 def action_command(action: dict[str, Any]) -> str:
@@ -420,28 +427,33 @@ def process_action(
         drop(log, DropReason.MALFORMED_ENVELOPE, event_id=interaction_id, missing=missing)
         return None
     slack_event_id = f"action-{interaction}"
-    if not claim_event(redis_client, config, slack_event_id):
-        drop(log, DropReason.DUPLICATE_DELIVERY, event_id=slack_event_id)
-        return None
+    with operation_span(
+        "curie.turn.ingress",
+        kind=SpanKind.CONSUMER,
+        attributes={"service.name": "curie-dispatcher", "source": "dispatcher"},
+    ):
+        if not claim_event(redis_client, config, slack_event_id):
+            drop(log, DropReason.DUPLICATE_DELIVERY, event_id=slack_event_id)
+            return None
 
-    user = (body.get("user") or {}).get("id", "")
+        user = (body.get("user") or {}).get("id", "")
 
-    # The shared tail: same claim -> placeholder -> XADD ordering as
-    # `process_event`, because it IS `process_event`'s, so the same release rule
-    # and the same `QueuedTurn` shape apply on this lane by construction.
-    return _mint_turn(
-        web_client=web_client,
-        redis_client=redis_client,
-        config=config,
-        log=log,
-        clock=clock,
-        slack_event_id=slack_event_id,
-        delivery_kind="block action",
-        author=user,
-        text=command,
-        channel=channel,
-        thread_ts=thread_ts,
-    )
+        # The shared tail: same claim -> placeholder -> XADD ordering as
+        # `process_event`, because it IS `process_event`'s, so the same release rule
+        # and the same `QueuedTurn` shape apply on this lane by construction.
+        return _mint_turn(
+            web_client=web_client,
+            redis_client=redis_client,
+            config=config,
+            log=log,
+            clock=clock,
+            slack_event_id=slack_event_id,
+            delivery_kind="block action",
+            author=user,
+            text=command,
+            channel=channel,
+            thread_ts=thread_ts,
+        )
 
 
 def register_handlers(

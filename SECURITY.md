@@ -37,7 +37,8 @@ The rails are the actual control. Every agent runs inside them:
   runner-sandbox pods is fail-closed: an empty `allowedEgress` means the sandbox
   can resolve DNS and ship traces, but reach nothing else. Arbitrary internet
   and the cloud metadata endpoint `169.254.169.254` are denied. Only
-  explicitly-declared egress is permitted: DNS, the in-chart collector, RustFS,
+  explicitly-declared egress is permitted: DNS, the in-chart collector, RustFS
+  (or `rustfs.egress` / `rustfs.stsEgress` when the object store is BYO),
   and inference when deployed, plus the operator's declared model API and MCP
   hosts via `allowedEgress`.
 - **gVisor kernel isolation** via a RuntimeClass (`security.gvisor.mode`).

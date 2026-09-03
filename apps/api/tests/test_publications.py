@@ -14,7 +14,7 @@ import subprocess
 import tarfile
 import threading
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -46,6 +46,8 @@ WORKER_HEADERS = {"X-Curie-Worker-Token": WORKER_TOKEN}
 PATCH_LIMIT = 900_000
 BASE_SHA = "0123456789abcdef0123456789abcdef01234567"
 CLUSTER_MESSAGE_ADAPTER = "curie-cluster-message"
+_PUBLICATION_TRACEPARENT = "00-7123456789abcdef0123456789abcdef-7123456789abcdef-01"
+_REPLAY_TRACEPARENT = "00-8123456789abcdef0123456789abcdef-8123456789abcdef-01"
 
 
 @pytest.fixture
@@ -240,7 +242,12 @@ def test_builtin_reply_adapter_and_ref_persist_on_both_publication_rows(
     }
 
 
-def _create_publication(client: TestClient, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+def _create_publication(
+    client: TestClient,
+    payload: dict[str, Any],
+    *,
+    request_headers: Mapping[str, str] | None = None,
+) -> tuple[int, dict[str, Any]]:
     selected = client.post(
         f"/v1/internal/workspaces/{payload['deployment_id']}/selection",
         json={
@@ -251,7 +258,11 @@ def _create_publication(client: TestClient, payload: dict[str, Any]) -> tuple[in
         headers=WORKER_HEADERS,
     )
     assert selected.status_code == 200, selected.text
-    response = client.post("/v1/internal/publications", json=payload, headers=WORKER_HEADERS)
+    response = client.post(
+        "/v1/internal/publications",
+        json=payload,
+        headers={**WORKER_HEADERS, **dict(request_headers or {})},
+    )
     assert response.status_code in (200, 201), response.text
     return response.status_code, response.json()
 
@@ -275,6 +286,67 @@ def _counts() -> tuple[int, int]:
         "(SELECT count(*) FROM curie.publications) AS publications"
     )[0]
     return int(row["approvals"]), int(row["publications"])
+
+
+def test_publication_approval_privately_preserves_the_first_inbound_carrier(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    """Publication creation is the approval sibling, including replay privacy."""
+
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    payload = _publication_payload(
+        deployment["id"], dedupe_key="publication-traceparent-example"
+    )
+    payload["traceparent"] = _REPLAY_TRACEPARENT
+
+    first_status, first = _create_publication(
+        client,
+        payload,
+        request_headers={"traceparent": _PUBLICATION_TRACEPARENT},
+    )
+    replay_status, replay = _create_publication(
+        client,
+        payload,
+        request_headers={"traceparent": _REPLAY_TRACEPARENT},
+    )
+
+    assert first_status == 201
+    assert replay_status == 200
+    assert replay["id"] == first["id"]
+    assert "traceparent" not in first
+    assert "traceparent" not in replay
+    stored = _rows(
+        "SELECT a.traceparent FROM curie.approvals a "
+        "JOIN curie.publications p ON p.approval_id = a.id "
+        "WHERE p.id = :id",
+        {"id": uuid.UUID(first["id"])},
+    )
+    assert stored == [{"traceparent": _PUBLICATION_TRACEPARENT}]
+
+
+def test_publication_with_malformed_carrier_persists_null(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    _, publication = _create_publication(
+        client,
+        _publication_payload(deployment["id"]),
+        request_headers={"traceparent": "not-w3c"},
+    )
+
+    stored = _rows(
+        "SELECT a.traceparent FROM curie.approvals a "
+        "JOIN curie.publications p ON p.approval_id = a.id "
+        "WHERE p.id = :id",
+        {"id": uuid.UUID(publication["id"])},
+    )
+    assert stored == [{"traceparent": None}]
 
 
 def test_publication_persistence_refuses_casefolded_git_metadata_path(

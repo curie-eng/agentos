@@ -4,11 +4,15 @@ import json
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
+import pytest
 import redis
 from aci_protocol import QueuedTurn, ReplyHandle
+from curie_dispatcher import handlers as handlers_module
 from curie_dispatcher import queue as queue_module
 from curie_dispatcher.config import DispatcherConfig
+from curie_dispatcher.handlers import process_action, process_event
 from curie_dispatcher.queue import (
     claim_event,
     enqueue,
@@ -16,8 +20,12 @@ from curie_dispatcher.queue import (
     to_stream_fields,
 )
 from curie_telemetry import TRACEPARENT_STREAM_FIELD, extract_trace_context
+from curie_telemetry.tracing import configure_tracer_provider
 from opentelemetry import context as otel_context
 from opentelemetry import trace
+from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags, TraceState
 
 # The committed wire golden the Rust CLI consumer (cli/src/queue.rs) round-trips too.
@@ -59,6 +67,37 @@ def _event(event_id: str = "Ev1") -> QueuedTurn:
         reply_handle=ReplyHandle(kind="slack", channel="C1", placeholder="999.00"),
         received_at="2026-07-05T00:00:00+00:00",
     )
+
+
+class _WebClient:
+    def __init__(self, order: list[str] | None = None) -> None:
+        self.order = order
+        self.placeholder_contexts: list[SpanContext] = []
+
+    def chat_postMessage(self, **_kwargs: Any) -> dict[str, str]:
+        if self.order is not None:
+            self.order.append("placeholder")
+        self.placeholder_contexts.append(trace.get_current_span().get_span_context())
+        return {"ts": "1700000000.000200"}
+
+
+@contextmanager
+def _captured_spans() -> Iterator[InMemorySpanExporter]:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    configure_tracer_provider(provider)
+    try:
+        yield exporter
+    finally:
+        configure_tracer_provider(None)
+        provider.shutdown()
+
+
+def _one_span(exporter: InMemorySpanExporter, name: str) -> ReadableSpan:
+    matches = [span for span in exporter.get_finished_spans() if span.name == name]
+    assert len(matches) == 1, [(span.name, span.context.trace_id) for span in matches]
+    return matches[0]
 
 
 def test_queued_turn_stream_fields_roundtrip() -> None:
@@ -207,3 +246,142 @@ def test_dedupe_decision_is_observed_without_exporting_the_event_id(
         ),
     ]
     assert "Ev-private-example" not in repr(calls)
+
+
+@pytest.mark.parametrize("ingress_kind", ["slack-event", "block-action"])
+def test_accepted_slack_ingress_owns_claim_placeholder_and_enqueue_trace(
+    ingress_kind: str,
+    redis_client: redis.Redis,
+    config: DispatcherConfig,
+) -> None:
+    """Receipt is the single root; both Slack mint sites inherit from it."""
+
+    web_client = _WebClient()
+    with _captured_spans() as exporter:
+        if ingress_kind == "slack-event":
+            result = process_event(
+                body={"event_id": "Ev-ingress-root"},
+                event={
+                    "channel": "C0EXAMPLE1",
+                    "ts": "1700000000.000100",
+                    "user": "U0EXAMPLE1",
+                    "text": "continue",
+                },
+                lane="mention",
+                web_client=web_client,  # type: ignore[arg-type]
+                redis_client=redis_client,
+                config=config,
+            )
+        else:
+            result = process_action(
+                body={
+                    "trigger_id": "trigger-example",
+                    "actions": [{"action_id": "continue", "value": "continue"}],
+                    "channel": {"id": "C0EXAMPLE1"},
+                    "message": {"ts": "1700000000.000100"},
+                    "user": {"id": "U0EXAMPLE1"},
+                },
+                web_client=web_client,  # type: ignore[arg-type]
+                redis_client=redis_client,
+                config=config,
+            )
+
+    assert result is not None
+    receipt = _one_span(exporter, "curie.turn.ingress")
+    claim = _one_span(exporter, "curie.queue.dedupe")
+    producer = _one_span(exporter, "curie.queue.enqueue")
+    assert receipt.parent is None
+    assert claim.context.trace_id == receipt.context.trace_id
+    assert claim.parent is not None and claim.parent.span_id == receipt.context.span_id
+    assert producer.context.trace_id == receipt.context.trace_id
+    assert producer.parent is not None
+    assert producer.parent.span_id == receipt.context.span_id
+    assert web_client.placeholder_contexts == [receipt.context]
+
+    (_entry_id, fields), = redis_client.xrange(config.stream)
+    transported = trace.get_current_span(extract_trace_context(fields)).get_span_context()
+    assert transported.trace_id == receipt.context.trace_id
+    assert transported.span_id == producer.context.span_id
+    assert TRACEPARENT_STREAM_FIELD not in json.loads(fields["payload"])
+
+
+def test_slack_ingress_keeps_claim_placeholder_enqueue_order(
+    redis_client: redis.Redis,
+    config: DispatcherConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#2006 ordering remains claim -> visible placeholder -> durable XADD."""
+
+    order: list[str] = []
+    real_claim = handlers_module.claim_event
+    real_enqueue = handlers_module.enqueue
+
+    def ordered_claim(*args: Any, **kwargs: Any) -> bool:
+        order.append("claim")
+        return real_claim(*args, **kwargs)
+
+    def ordered_enqueue(*args: Any, **kwargs: Any) -> str:
+        order.append("enqueue")
+        return real_enqueue(*args, **kwargs)
+
+    monkeypatch.setattr(handlers_module, "claim_event", ordered_claim)
+    monkeypatch.setattr(handlers_module, "enqueue", ordered_enqueue)
+
+    result = process_event(
+        body={"event_id": "Ev-ordered"},
+        event={
+            "channel": "C0EXAMPLE1",
+            "ts": "1700000000.000100",
+            "user": "U0EXAMPLE1",
+            "text": "continue",
+        },
+        lane="mention",
+        web_client=_WebClient(order),  # type: ignore[arg-type]
+        redis_client=redis_client,
+        config=config,
+    )
+
+    assert result is not None
+    assert order == ["claim", "placeholder", "enqueue"]
+
+
+def test_duplicate_and_refused_slack_inputs_emit_no_enqueue_span(
+    redis_client: redis.Redis,
+    config: DispatcherConfig,
+) -> None:
+    """A receipt may be observed, but refused work must not look dispatched."""
+
+    redis_client.set(
+        config.dedupe_key("Ev-duplicate"),
+        "1",
+        ex=config.dedupe_ttl_seconds,
+    )
+    web_client = _WebClient()
+    with _captured_spans() as exporter:
+        duplicate = process_event(
+            body={"event_id": "Ev-duplicate"},
+            event={
+                "channel": "C0EXAMPLE1",
+                "ts": "1700000000.000100",
+                "user": "U0EXAMPLE1",
+                "text": "continue",
+            },
+            lane="mention",
+            web_client=web_client,  # type: ignore[arg-type]
+            redis_client=redis_client,
+            config=config,
+        )
+        refused = process_event(
+            body={"event_id": "Ev-refused"},
+            event={"user": "U0EXAMPLE1", "text": "missing address"},
+            lane="mention",
+            web_client=web_client,  # type: ignore[arg-type]
+            redis_client=redis_client,
+            config=config,
+        )
+
+    assert duplicate is None
+    assert refused is None
+    assert web_client.placeholder_contexts == []
+    assert redis_client.xlen(config.stream) == 0
+    assert all(span.name != "curie.queue.enqueue" for span in exporter.get_finished_spans())
