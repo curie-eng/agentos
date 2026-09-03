@@ -1191,8 +1191,8 @@ seed_ordinary_turn() {
         fi
         stream_start="$(capture_stream_cursor "$tier")" || return 1
         out="$("$BIN" --json local message --channel C0LOCALDEV "ordinary correlation $marker" || true)"
-        assert_finalized_reply "$tier ordinary correlation" "$out"
-        assert_product_runner_endpoints
+        assert_finalized_reply "$tier ordinary correlation" "$out" || return 1
+        assert_product_runner_endpoints || return 1
         stream_end="$(capture_stream_cursor "$tier")" || return 1
         [[ "$stream_end" != "$stream_start" ]] || {
             echo "seed-invalid: ordinary seed produced no bounded stream receipt" >&2
@@ -1201,7 +1201,7 @@ seed_ordinary_turn() {
         trace_id="$(discover_trace_id_for_seed "$tier" "$marker" "$stream_start" "$stream_end")" || return 1
         expected_operations="curie.queue.enqueue,curie.queue.process,curie.turn.process,curie.sandbox.claim,curie.runner.rpc,agent.run,curie.reply.post|curie.reply.update"
     fi
-    query_exact_seed_trace "$tier" "$trace_id" "$expected_operations" "" "$query_state"
+    query_exact_seed_trace "$tier" "$trace_id" "$expected_operations" "" "$query_state" || return 1
     LAST_ORDINARY_TRACE_ID="$trace_id"
     LAST_ORDINARY_MEMBERSHIP="$LAST_QUERY_MEMBERSHIP"
     printf '%s' "$trace_id"
@@ -3610,7 +3610,7 @@ assert_product_runner_endpoints() {
     }
     for runner in "${runners[@]}"; do
         assert_product_collector_endpoint curie-runner "$runner" \
-            "http://otel-collector:4318" "http/protobuf"
+            "http://otel-collector:4318" "http/protobuf" || return 1
     done
 }
 
@@ -3709,7 +3709,7 @@ wait_product_collector_ready() {
 
 restart_local_product_collector() {
     docker compose --profile full -f "$REPO_ROOT/compose.dev.yaml" \
-        up -d --force-recreate --no-deps otel-collector >/dev/null
+        up -d --force-recreate --no-deps otel-collector >/dev/null || return 1
     wait_product_collector_ready
 }
 
@@ -3723,158 +3723,118 @@ restore_local_langfuse_auth() {
     restart_local_product_collector
 }
 
-# Exercise the pinned Langfuse exporter with temporary invalid auth while the
-# shipped retry_on_failure (5s/30s/5m) and sending_queue/file_storage settings
-# remain unchanged. The queue_size is 1000; no volume is removed.
+# OTLP HTTP 401 is permanent, not retryable. Keep the shipped Collector retry
+# and file-backed queue settings unchanged; prove rejection is observable and
+# restore credentials before proving a new healthy export.
+assert_product_collector_permanent_auth_rejection() {
+    python3 -c 'import sys; a,f,q,ab,fb,r=map(float,sys.argv[1:]); raise SystemExit(0 if a > ab and f > fb and q == 0 and r == 1 else 1)' "$@"
+}
+
 case_local_langfuse_invalid_auth() {
     local INVALID_LANGFUSE_OTLP_AUTH_HEADER='Basic aW52YWxpZDppbnZhbGlk'
-    local agent_id="$1" original_set=0 original="${LANGFUSE_OTLP_AUTH_HEADER-}"
-    local receipt same_queued_trace_id queue_drained accepted accepted_before sent langfuse_web
-    local collector storage_directory accepted_baseline failed failed_baseline queue_size
-    [[ ${LANGFUSE_OTLP_AUTH_HEADER+x} ]] && original_set=1
-    langfuse_web="$(docker compose --profile full -f "$REPO_ROOT/compose.dev.yaml" ps -q langfuse-web)"
+    local agent_id="$1" original_set=0 original="" failed_phase=0
+    local receipt failed_trace_id recovered_trace_id langfuse_web collector
+    local accepted_baseline failed_baseline accepted failed queue_size rejection
+    local attempt marker stream_start stream_end out
+    if [[ -v LANGFUSE_OTLP_AUTH_HEADER ]]; then
+        original_set=1
+        original="$LANGFUSE_OTLP_AUTH_HEADER"
+    fi
+    langfuse_web="$(docker compose --profile full -f "$REPO_ROOT/compose.dev.yaml" ps -q langfuse-web)" || return 1
     [[ -n "$langfuse_web" ]] || {
         echo "pinned langfuse-web is not running for the real exporter negative" >&2
         return 1
     }
-    storage_directory="$(python3 - "$REPO_ROOT/otel/collector-config.yaml" <<'PY'
-import pathlib, re, sys
-text = pathlib.Path(sys.argv[1]).read_text()
-required = {
-    "sending_queue": r"(?m)^\s*sending_queue:\s*$",
-    "file_storage": r"(?m)^\s*storage:\s*file_storage\s*$",
-    "queue_size": r"(?m)^\s*queue_size:\s*1000\s*$",
-    "retry_horizon": r"(?m)^\s*max_elapsed_time:\s*5m\s*$",
-    }
-missing = [name for name, pattern in required.items() if not re.search(pattern, text)]
-directory = re.search(r"(?m)^\s*directory:\s*([^#\s]+)", text)
-if missing or directory is None:
-    raise SystemExit("shipped Collector durable queue configuration is absent")
-print(directory.group(1))
-PY
-)" || return 1
-    collector="$(docker compose --profile full -f "$REPO_ROOT/compose.dev.yaml" ps -q otel-collector)"
-    docker inspect "$collector" --format '{{json .Mounts}}' | python3 -c '
-import json, os, sys
-mounts = json.load(sys.stdin)
-directory = os.path.normpath(sys.argv[1])
-if not any(
-    directory == os.path.normpath(item.get("Destination", ""))
-    or directory.startswith(os.path.normpath(item.get("Destination", "")) + os.sep)
-    for item in mounts
-    if item.get("Type") == "volume" and item.get("Destination")
-):
-    raise SystemExit("file_storage directory is not backed by a Docker volume")
-' "$storage_directory" || return 1
-    receipt="$(mktemp "$WORKDIR/invalid-auth-trace.XXXXXX")"
-    chmod 600 "$receipt"
-
     echo
-    echo "=== case: pinned Langfuse invalid auth queues and recovers the same ID ==="
+    echo "=== case: pinned Langfuse invalid auth is observable, then fresh export recovers ==="
     if [[ ! "$LAST_ORDINARY_TRACE_ID" =~ ^[0-9a-f]{32}$ ]] || ! query_exact_seed_trace local "$LAST_ORDINARY_TRACE_ID" \
         "curie.queue.enqueue,curie.queue.process,curie.turn.process,curie.sandbox.claim,curie.runner.rpc,agent.run,curie.reply.post|curie.reply.update" \
         >/dev/null; then
-        rm -f "$receipt"
         echo "invalid-auth negative lacks a valid exact-query control" >&2
         return 1
     fi
     echo "invalid-auth negative: valid exact-query control passed before auth changed"
+    receipt="$(mktemp "$WORKDIR/invalid-auth-trace.XXXXXX")" || return 1
+    chmod 600 "$receipt" || { rm -f "$receipt"; return 1; }
+    # A conditional subshell disables Bash errexit, including in nested helpers.
+    # Every required operation explicitly propagates failure to the restore path.
     if ! (
-        set -e
         export LANGFUSE_OTLP_AUTH_HEADER="$INVALID_LANGFUSE_OTLP_AUTH_HEADER"
-        restart_local_product_collector
+        restart_local_product_collector || exit 1
         wait_product_collector_ready || {
             echo "Collector failed the Ready check after invalid-auth restart" >&2
             exit 1
         }
-        accepted_baseline="$(product_collector_metric_value otelcol_receiver_accepted_spans)"
-        failed_baseline="$(product_collector_metric_value otelcol_exporter_send_failed_spans)"
+        collector="$(docker compose --profile full -f "$REPO_ROOT/compose.dev.yaml" ps -q otel-collector)" || exit 1
+        [[ -n "$collector" ]] || exit 1
+        accepted_baseline="$(product_collector_metric_value otelcol_receiver_accepted_spans)" || exit 1
+        failed_baseline="$(product_collector_metric_value otelcol_exporter_send_failed_spans)" || exit 1
 
         marker="curie-seed-invalid-auth-$$-$RANDOM"
-        stream_start="$(capture_stream_cursor local)"
+        stream_start="$(capture_stream_cursor local)" || exit 1
         out="$("$BIN" --json local message --channel C0LOCALDEV \
-            "temporary exporter recovery $marker" || true)"
-        assert_finalized_reply "local invalid-auth seed" "$out"
-        stream_end="$(capture_stream_cursor local)"
-        same_queued_trace_id="$(discover_trace_id_for_seed local "$marker" "$stream_start" "$stream_end")"
+            "observable exporter rejection $marker" || true)"
+        assert_finalized_reply "local invalid-auth seed" "$out" || exit 1
+        stream_end="$(capture_stream_cursor local)" || exit 1
+        failed_trace_id="$(discover_trace_id_for_seed local "$marker" "$stream_start" "$stream_end")" || exit 1
 
         accepted=0
         failed=0
         queue_size=0
+        rejection=0
         for attempt in $(seq 1 45); do
-            accepted="$(product_collector_metric_value otelcol_receiver_accepted_spans)"
-            failed="$(product_collector_metric_value otelcol_exporter_send_failed_spans)"
-            queue_size="$(product_collector_metric_value otelcol_exporter_queue_size)"
-            if python3 -c 'import sys; a,f,q,ab,fb=map(float,sys.argv[1:]); raise SystemExit(0 if a > ab and f > fb and 0 < q <= 1000 else 1)' \
-                "$accepted" "$failed" "$queue_size" "$accepted_baseline" "$failed_baseline"; then
+            accepted="$(product_collector_metric_value otelcol_receiver_accepted_spans)" || exit 1
+            failed="$(product_collector_metric_value otelcol_exporter_send_failed_spans)" || exit 1
+            queue_size="$(product_collector_metric_value otelcol_exporter_queue_size)" || exit 1
+            # Read only this newly recreated Collector's logs. Raw diagnostics
+            # never reach output; require all three code-owned rejection tokens.
+            if docker logs "$collector" 2>&1 | python3 -c '
+import sys
+lines = sys.stdin.read().splitlines()
+raise SystemExit(0 if any(
+    "HTTP Status Code 401" in line and "Permanent error" in line and "not retryable error" in line
+    for line in lines
+) else 1)
+'; then
+                rejection=1
+            fi
+            if assert_product_collector_permanent_auth_rejection \
+                "$accepted" "$failed" "$queue_size" "$accepted_baseline" "$failed_baseline" "$rejection"; then
                 break
             fi
             sleep 2
         done
-        python3 -c 'import sys; a,f,q,ab,fb=map(float,sys.argv[1:]); raise SystemExit(0 if a > ab and f > fb and 0 < q <= 1000 else 1)' \
-            "$accepted" "$failed" "$queue_size" "$accepted_baseline" "$failed_baseline"
-        query_exact_seed_trace local "$same_queued_trace_id" "" "" absent
-
-        # Recreate once while auth is still invalid. The file-backed queue must
-        # survive the process boundary and retry the same pending export.
-        restart_local_product_collector
-        queue_size=0
-        failed=0
-        for attempt in $(seq 1 45); do
-            queue_size="$(product_collector_metric_value otelcol_exporter_queue_size)"
-            failed="$(product_collector_metric_value otelcol_exporter_send_failed_spans)"
-            if python3 -c 'import sys; q,f=map(float,sys.argv[1:]); raise SystemExit(0 if 0 < q <= 1000 and f > 0 else 1)' \
-                "$queue_size" "$failed"; then
-                break
-            fi
-            sleep 2
-        done
-        python3 -c 'import sys; q,f=map(float,sys.argv[1:]); raise SystemExit(0 if 0 < q <= 1000 and f > 0 else 1)' \
-            "$queue_size" "$failed"
-        query_exact_seed_trace local "$same_queued_trace_id" "" "" absent
-
-        python3 - "$receipt" "$same_queued_trace_id" "$accepted" <<'PY'
-import json, pathlib, sys
-pathlib.Path(sys.argv[1]).write_text(json.dumps({
-    "trace_id": sys.argv[2],
-    "accepted": float(sys.argv[3]),
-}))
-PY
+        assert_product_collector_permanent_auth_rejection \
+            "$accepted" "$failed" "$queue_size" "$accepted_baseline" "$failed_baseline" "$rejection" || exit 1
+        query_exact_seed_trace local "$failed_trace_id" "" "" absent || exit 1
+        printf '%s\n' "$failed_trace_id" > "$receipt" || exit 1
+        echo "invalid-auth negative: accepted/failed deltas, permanent HTTP401, empty queue, and exact absence proved"
     ); then
-        restore_local_langfuse_auth "$original_set" "$original" || true
-        rm -f "$receipt"
-        echo "invalid-auth queue proof failed; product Collector auth was restored" >&2
-        return 1
+        failed_phase=1
     fi
 
-    read -r same_queued_trace_id accepted_before < <(python3 - "$receipt" <<'PY'
-import json, pathlib, sys
-value = json.loads(pathlib.Path(sys.argv[1]).read_text())
-print(value["trace_id"], value["accepted"])
-PY
-    )
+    # Restoration executes once whether any negative assertion passed or failed.
+    if ! restore_local_langfuse_auth "$original_set" "$original"; then
+        rm -f "$receipt"
+        echo "invalid-auth proof could not restore product Collector auth" >&2
+        return 1
+    fi
+    if (( failed_phase )); then
+        rm -f "$receipt"
+        echo "invalid-auth rejection proof failed; product Collector auth was restored" >&2
+        return 1
+    fi
+    read -r failed_trace_id < "$receipt" || { rm -f "$receipt"; return 1; }
     rm -f "$receipt"
-    restore_local_langfuse_auth "$original_set" "$original"
-    wait_product_collector_ready || {
-        echo "Collector failed the Ready check after valid-auth restart" >&2
+    seed_ordinary_turn local "$agent_id" present || return 1
+    recovered_trace_id="$LAST_ORDINARY_TRACE_ID"
+    [[ "$recovered_trace_id" != "$failed_trace_id" ]] || {
+        echo "restored-auth proof did not produce a fresh trace" >&2
         return 1
     }
-    # The queue-preserving restart must deliver this same_queued_trace_id within
-    # the unchanged five-minute retry horizon; a fresh trace is not a substitute.
-    query_exact_seed_trace local "$same_queued_trace_id"
-    queue_drained=""
-    for attempt in $(seq 1 60); do
-        queue_drained="$(product_collector_metric_value otelcol_exporter_queue_size)"
-        if python3 -c 'import sys; raise SystemExit(0 if float(sys.argv[1]) == 0 else 1)' "$queue_drained"; then
-            break
-        fi
-        sleep 2
-    done
-    python3 -c 'import sys; raise SystemExit(0 if float(sys.argv[1]) == 0 else 1)' "$queue_drained" || {
-        echo "recovered exact trace but the durable sending queue did not drain" >&2
-        return 1
-    }
-    echo "local invalid-auth negative: durable same-ID recovery and queue drain proved"
+    query_exact_seed_trace local "$recovered_trace_id" \
+        "curie.queue.enqueue,curie.queue.process,curie.turn.process,curie.sandbox.claim,curie.runner.rpc,agent.run,curie.reply.post|curie.reply.update" || return 1
+    echo "local invalid-auth negative: bounded observable rejection and fresh healthy exact-trace recovery proved"
 }
 
 assert_local_otel_failed_turn() {

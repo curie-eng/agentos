@@ -890,7 +890,7 @@ query_exact_seed_trace local aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa curie.queue.enqueu
         assert '"operation":["agent.run"]' in result.stderr
 
 
-def test_invalid_langfuse_auth_is_temporary_durable_and_recovers_the_same_id(
+def test_invalid_langfuse_auth_proves_permanent_rejection_and_fresh_recovery(
     tmp_path: Path,
 ) -> None:
     """Pin the real backend negative without redefining exporter semantics."""
@@ -899,35 +899,29 @@ def test_invalid_langfuse_auth_is_temporary_durable_and_recovers_the_same_id(
     negative = _shell_function(source, "case_local_langfuse_invalid_auth")
     query = _shell_function(source, "query_exact_seed_trace")
 
-    # Observed shipped behavior, not an assumed external-API contract:
-    # otel/collector-config.yaml enables retry_on_failure at 5s/30s/5m and a
-    # file_storage-backed sending_queue of 1000. Therefore invalid auth is a
-    # bounded temporary absence, and success means recovery of the same queued
-    # trace ID after restoring auth, never permanent loss or a fresh control ID.
+    # OTLP requires retry for only 429/502/503/504; 401 MUST NOT be retried:
+    # https://opentelemetry.io/docs/specs/otlp/#retryable-response-codes
+    # The pinned Collector reports accepted+failed spans, permanent401 rejection,
+    # and queue0. Restored credentials must admit a NEW complete trace, not
+    # replay a permanently rejected batch.
     for required in (
         "LANGFUSE_OTLP_AUTH_HEADER",
         "INVALID_LANGFUSE_OTLP_AUTH_HEADER",
         "langfuse-web",
         "otelcol_receiver_accepted_spans",
         "otelcol_exporter_send_failed_spans",
-        "sending_queue",
-        "file_storage",
         "queue_size",
         "Ready",
         "restart",
-        "same_queued_trace_id",
+        "failed_trace_id",
+        "recovered_trace_id",
+        "HTTP Status Code 401",
+        "Permanent error",
         "query_exact_seed_trace",
-        "queue_drained",
     ):
         assert required in negative, f"invalid-auth proof omits {required!r}"
     assert "down -v" not in negative
-    assert negative.index("INVALID_LANGFUSE_OTLP_AUTH_HEADER") < negative.index(
-        "same_queued_trace_id"
-    )
-    assert negative.count("same_queued_trace_id") >= 2, (
-        "the ID observed absent while auth is invalid must be the ID recovered "
-        "after the queue-preserving restart"
-    )
+    assert "same_queued_trace_id" not in negative
 
     invalid_auth = negative.index(
         'export LANGFUSE_OTLP_AUTH_HEADER="$INVALID_LANGFUSE_OTLP_AUTH_HEADER"'
@@ -937,21 +931,6 @@ def test_invalid_langfuse_auth_is_temporary_durable_and_recovers_the_same_id(
         "a successful exact read under valid auth must discriminate backend/query "
         "health before the credential is made invalid"
     )
-
-    # Restart once while auth is still invalid, then re-observe both queued
-    # failure and stable absence. Restoring auth is a later, separate restart.
-    before_restore = negative[: negative.index("restore_local_langfuse_auth")]
-    restart_positions = [
-        match.start()
-        for match in re.finditer("restart_local_product_collector", before_restore)
-    ]
-    assert len(restart_positions) >= 2, (
-        "the file-backed queue must survive a Collector restart while auth remains invalid"
-    )
-    after_invalid_restart = before_restore[restart_positions[1] :]
-    assert "otelcol_exporter_queue_size" in after_invalid_restart
-    assert "otelcol_exporter_send_failed_spans" in after_invalid_restart
-    assert "query_exact_seed_trace" in after_invalid_restart
 
     # Execute the production query helper: absence is a bounded observation,
     # not one lucky first poll, and only the stable not-found error is accepted.
@@ -975,11 +954,11 @@ def test_invalid_langfuse_auth_is_temporary_durable_and_recovers_the_same_id(
     )
 
     absent_call = re.search(
-        r'query_exact_seed_trace local "\$same_queued_trace_id"[^\n]*absent',
+        r'query_exact_seed_trace local "\$failed_trace_id"[^\n]*absent',
         negative,
     )
     recovered_call = re.search(
-        r'query_exact_seed_trace local "\$same_queued_trace_id"\s*$',
+        r'query_exact_seed_trace local "\$recovered_trace_id"',
         negative,
         re.MULTILINE,
     )
@@ -987,7 +966,89 @@ def test_invalid_langfuse_auth_is_temporary_durable_and_recovers_the_same_id(
         absent_call
         and recovered_call
         and absent_call.start() < recovered_call.start()
-    ), "the same ID must be absent during failure and present after recovery"
+    ), "the failed ID must be absent before a new complete recovery trace"
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "", "no-failed-metric", "no-rejection-log", "stuck-queue", "restart",
+        "reply", "absence", "restore", "recovery-query",
+    ],
+)
+def test_invalid_auth_requires_every_observation_and_always_restores(
+    tmp_path: Path, failure: str,
+) -> None:
+    """Execute the real gate under conditional Bash semantics (errexit disabled)."""
+    source = LADDER_PATH.read_text()
+    function = _shell_function(source, "assert_product_collector_permanent_auth_rejection")
+    function += _shell_function(source, "case_local_langfuse_invalid_auth")
+    script = r'''
+set -u -o pipefail
+WORKDIR="$1"
+REPO_ROOT="$2"
+FAILURE="$3"
+BIN=true
+LAST_ORDINARY_TRACE_ID=cccccccccccccccccccccccccccccccc
+sleep() { :; }
+docker() {
+    if [[ "$1" == logs ]]; then
+        [[ "$FAILURE" == no-rejection-log ]] ||
+            printf '%s\n' 'Permanent error: HTTP Status Code 401; not retryable error'
+    else
+        printf '%s\n' acme-collector
+    fi
+}
+restart_local_product_collector() { [[ "$FAILURE" != restart ]]; }
+wait_product_collector_ready() { return 0; }
+restore_local_langfuse_auth() {
+    printf '%s\n' restored >> "$WORKDIR/events"
+    [[ "$FAILURE" != restore ]]
+}
+assert_finalized_reply() { [[ "$FAILURE" != reply ]]; }
+assert_product_runner_endpoints() { return 0; }
+seed_ordinary_turn() { LAST_ORDINARY_TRACE_ID=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb; }
+capture_stream_cursor() { printf '%s\n' 1-0; }
+discover_trace_id_for_seed() {
+    if [[ -e "$WORKDIR/seeded" ]]; then
+        printf '%s\n' bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    else
+        touch "$WORKDIR/seeded"
+        printf '%s\n' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    fi
+}
+product_collector_metric_value() {
+    local count=0 file="$WORKDIR/$1"
+    [[ ! -e "$file" ]] || read -r count < "$file"
+    printf '%s\n' "$((count + 1))" > "$file"
+    case "$1" in
+        *queue_size) [[ "$FAILURE" != stuck-queue ]] && echo 0 || echo 1 ;;
+        *send_failed_spans)
+            [[ "$FAILURE" != no-failed-metric && "$count" -gt 0 ]] && echo 10 || echo 0 ;;
+        *accepted_spans) [[ "$count" -gt 0 ]] && echo 10 || echo 0 ;;
+    esac
+}
+query_exact_seed_trace() {
+    printf '%s\n' "query:$2:${3-}:${5-}" >> "$WORKDIR/events"
+    [[ "$2" != bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb || "$FAILURE" != recovery-query ]] || return 1
+    [[ "${5-}" != absent || "$FAILURE" != absence ]]
+}
+'''
+    script += function
+    script += '\nif case_local_langfuse_invalid_auth acme-agent; then exit 0; else exit 1; fi\n'
+    result = subprocess.run(
+        ["bash", "-c", script, "bash", str(tmp_path), str(REPO_ROOT), failure],
+        text=True, capture_output=True, check=False,
+    )
+    events = (tmp_path / "events").read_text()
+    assert events.count("restored") == 1
+    assert result.returncode == (1 if failure else 0), result.stderr
+    recovered = "query:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:curie.queue.enqueue,curie.queue.process"
+    if failure and failure != "recovery-query":
+        assert recovered not in events
+    else:
+        assert recovered in events
+        assert events.index(":absent") < events.index("restored") < events.index(recovered)
 
 
 def test_default_local_exact_positive_rejects_incomplete_membership(

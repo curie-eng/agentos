@@ -1033,7 +1033,7 @@ fn product_observability_requires_three_valid_seeds_and_count_only_mcp_receipt()
 }
 
 #[test]
-fn product_collector_restore_covers_every_emitter_and_invalid_auth_recovers_same_id() {
+fn product_collector_restore_covers_every_emitter_and_invalid_auth_is_observable() {
     let pins = ladder_function("pin_local_source_images");
     for required in [
         "export CURIE_BASE_TAG=dev",
@@ -1079,22 +1079,20 @@ fn product_collector_restore_covers_every_emitter_and_invalid_auth_recovers_same
     );
 
     let negative = ladder_function("case_local_langfuse_invalid_auth");
-    // This contract is grounded in the shipped otel/collector-config.yaml:
-    // retry_on_failure is 5s/30s/5m and sending_queue uses file_storage with
-    // queue_size 1000. Invalid auth is therefore a temporary observed absence;
-    // the proof must recover the same queued ID before the unchanged horizon.
+    // OTLP/HTTP forbids retries for 401; configured retry/queue settings do not
+    // override that protocol rule. Issue #2204 requires an observable bounded
+    // failure, not replay of a permanently rejected request.
+    // https://opentelemetry.io/docs/specs/otlp/#retryable-response-codes
     for required in [
         "INVALID_LANGFUSE_OTLP_AUTH_HEADER",
         "langfuse-web",
         "otelcol_receiver_accepted_spans",
         "otelcol_exporter_send_failed_spans",
-        "sending_queue",
-        "file_storage",
-        "queue_size",
+        "otelcol_exporter_queue_size",
+        "assert_product_collector_permanent_auth_rejection",
         "Ready",
         "restart",
-        "same_queued_trace_id",
-        "queue_drained",
+        "failed_trace_id",
     ] {
         assert!(
             negative.contains(required),
@@ -1103,11 +1101,11 @@ fn product_collector_restore_covers_every_emitter_and_invalid_auth_recovers_same
     }
     assert!(
         !negative.contains("down -v"),
-        "the negative must retain the Collector file queue across restart"
+        "the negative must not destroy the backing stack to manufacture absence"
     );
     assert!(
-        negative.matches("same_queued_trace_id").count() >= 2,
-        "the temporarily absent ID, not a fresh post-recovery control, must become queryable"
+        !negative.contains("same_queued_trace_id"),
+        "a permanent 401 rejection must not be misrepresented as durable replay"
     );
 
     let valid_control = negative
@@ -1120,30 +1118,6 @@ fn product_collector_restore_covers_every_emitter_and_invalid_auth_recovers_same
         valid_control < invalidate,
         "the valid exact-read control must precede credential invalidation"
     );
-
-    let before_restore = negative
-        .split_once("restore_local_langfuse_auth")
-        .map(|(prefix, _)| prefix)
-        .expect("invalid-auth proof must restore valid auth");
-    let invalid_restarts: Vec<_> = before_restore
-        .match_indices("restart_local_product_collector")
-        .map(|(index, _)| index)
-        .collect();
-    assert!(
-        invalid_restarts.len() >= 2,
-        "the file-backed queue must survive a Collector restart while auth is still invalid"
-    );
-    let after_invalid_restart = &before_restore[invalid_restarts[1]..];
-    for required in [
-        "otelcol_exporter_send_failed_spans",
-        "otelcol_exporter_queue_size",
-        "query_exact_seed_trace",
-    ] {
-        assert!(
-            after_invalid_restart.contains(required),
-            "queued failure must be re-observed after the invalid-auth restart: missing {required}"
-        );
-    }
 
     let query = ladder_function("query_exact_seed_trace");
     let poll_start = query
@@ -1167,14 +1141,17 @@ fn product_collector_restore_covers_every_emitter_and_invalid_auth_recovers_same
     );
 
     let absent = negative
-        .find(r#"query_exact_seed_trace local "$same_queued_trace_id" "" "" absent"#)
-        .expect("queued exact ID must be checked absent while auth is invalid");
+        .find(r#"query_exact_seed_trace local "$failed_trace_id" "" "" absent"#)
+        .expect("the rejected exact ID must be checked absent while auth is invalid");
+    let restored = negative
+        .rfind("restore_local_langfuse_auth")
+        .expect("valid auth must be restored after the failure evidence");
     let recovered = negative
-        .rfind(r#"query_exact_seed_trace local "$same_queued_trace_id""#)
-        .expect("the same queued exact ID must be queried after valid auth returns");
+        .rfind("seed_ordinary_turn local")
+        .expect("a fresh healthy turn must prove exact ingestion after valid auth returns");
     assert!(
-        absent < recovered,
-        "same-ID recovery must follow the bounded queued-failure observation"
+        absent < restored && restored < recovered,
+        "fresh-turn recovery must follow bounded rejection evidence and credential restoration"
     );
 }
 
