@@ -368,26 +368,32 @@ workflow (`.github/workflows/release.yaml`) on every push to `main`, as
 `ghcr.io/curie-eng/curie-<service>` tagged with the commit SHA and `latest`.
 All six first-party services build in the matrix: `curie-api`,
 `curie-dispatcher`, `curie-mail-adapter`, `curie-worker`, `curie-ui`, and
-`curie-runner`. The chart defaults every first-party image at its
-`ghcr.io/curie-eng/curie-*` `:latest`, so the bare install (above) pulls from
+`curie-runner`. The chart defaults every first-party image to the chart
+`appVersion` (empty `tag` in values, resolved by the `curie.image` helper), so
+the bare install (above) pulls `ghcr.io/curie-eng/curie-*:<appVersion>` from
 GHCR with no image overrides -- except `curie-mail-adapter`, whose Deployment is
 off by default (`mailAdapter.deploy`), so its image is published and defaulted
-but not pulled until an operator enables the email channel.
+but not pulled until an operator enables the email channel. The workflow still
+publishes a mutable `latest` tag alongside the SHA and version tags; that is a
+fact about the release artifacts, not about what this chart resolves to.
 
 - **Pull policy for the five Deployment-managed services** (api, dispatcher,
-  mail-adapter, worker, ui): `imagePullPolicy: Always` -- they pull once per
-  rollout, so `Always` just keeps a fresh install from serving a stale `latest`
-  a node cached earlier.
+  mail-adapter, worker, ui): `imagePullPolicy: Always`. The default tag is the
+  chart `appVersion`, so this is a cheap no-op on a node that already has that
+  immutable ref, and it still self-heals a node that cached a same-named ref
+  under a different digest.
 - **The runner image is the exception:** it uses `imagePullPolicy: IfNotPresent`
   because a sandbox pod is cold-created per Slack thread, and an `Always`
   (re-)pull inside that boot window blew past the worker's claim timeout and
-  killed runs. Its freshness comes instead from the `runner-prewarm` DaemonSet
+  killed runs. Its presence on the node comes from the `runner-prewarm` DaemonSet
   (`agentSandbox.runner.prewarm`, default on with the sandbox substrate),
-  which pulls the runner image `Always` and keeps it pinned on every node; a
-  Release-revision annotation rolls those pods on every `helm upgrade` so the
-  pin refreshes a churned `latest`.
-- **Pin an immutable tag** for reproducible deploys, where the pull policies
-  are a cheap no-op.
+  which pulls the runner image `Always` and keeps that same `appVersion` ref
+  pinned on every node; a Release-revision annotation rolls those pods on every
+  `helm upgrade` so an upgraded chart's new `appVersion` is pulled before the
+  next claim.
+- **Override `tag` (or set `digest`)** to pin an explicit version. Empty `tag`
+  is the default and resolves to `.Chart.AppVersion`; `digest` wins over `tag`
+  when set.
 
 A GHCR package inherits its repo's visibility, so on a **private** repo the image
 is not anonymously pullable and the node needs credentials. Two supported paths:
@@ -586,6 +592,7 @@ rustfs:
   host: s3.us-east-1.amazonaws.com
   port: 443
   region: us-east-1
+  bucket: langfuse           # Langfuse event and media uploads
   auth:
     accessKey: ""            # selects the key-free path
   # Rail 1 is fail-closed. The in-chart runner-allow-rustfs policy selects the
@@ -605,15 +612,28 @@ api:
     annotations:
       eks.amazonaws.com/role-arn: arn:aws:iam::000000000000:role/curie-api
 worker:
+  workspace:
+    bucket: curie-workspaces # repository workspace archives
   serviceAccount:
     annotations:
       eks.amazonaws.com/role-arn: arn:aws:iam::000000000000:role/curie-worker
 agentSandbox:
   runner:
+    bundleFetch:
+      bucket: curie-bundles  # plugin bundles (API writes, runner reads)
     serviceAccount:
       annotations:
         eks.amazonaws.com/role-arn: arn:aws:iam::000000000000:role/curie-runner
 ```
+
+The chart talks to **three buckets** on that same endpoint, not one. Create them
+before install; the in-chart RustFS Job creates them only while `rustfs.deploy`
+is true. The defaults are three distinct names, so a single-bucket BYO install
+fails on two of the three paths.
+
+- `rustfs.bucket` (default `langfuse`): Langfuse event and media uploads.
+- `worker.workspace.bucket` (default `curie-workspaces`): repository workspace archives.
+- `agentSandbox.runner.bundleFetch.bucket` (default `curie-bundles`): plugin bundles.
 
 The bundle fetch uses path style addressing, so it appends
 `agentSandbox.runner.bundleFetch.bucket` to this endpoint. For another AWS
@@ -644,10 +664,20 @@ give the sandbox a unicast address to allow. Static-key BYO still needs
 Opting out of Rail 1 (`security.networkPolicy.enabled: false`) skips both
 requirements because there is then no runner NetworkPolicy to satisfy.
 
-Scope the runner's role to the bundle bucket, **read-only**. NetworkPolicy
-selects pods rather than containers, so any identity the bundle-fetch init
-container can assume is equally reachable by the runner beside it, and the
-runner is prompt-injectable by design.
+Scope each role to the bucket it actually uses:
+
+- **API role:** read/write on the bundle bucket. The API writes each uploaded bundle.
+- **Worker role:** read/write on the workspace bucket, and read on the bundle
+  bucket (the eval lane fetches the same objects the API wrote).
+- **Runner role:** read-only on the bundle bucket. NetworkPolicy selects pods
+  rather than containers, so any identity the bundle-fetch init container can
+  assume is equally reachable by the runner beside it, and the runner is
+  prompt-injectable by design.
+- **Langfuse:** `rustfs.bucket` for the `events/` and `media/` prefixes. Langfuse
+  still consumes `rustfs.auth` static keys for that bucket; the key-free path
+  only omits credentials from the API, the worker, and the sandbox bundle-fetch
+  init container. Scope those keys (or a Langfuse-specific IAM user) to
+  `rustfs.bucket`.
 
 Two constraints are worth stating plainly.
 
@@ -676,8 +706,11 @@ around.
 
 ## The two preflights
 
-Both run as Helm hooks (blocking a broken install) and are re-runnable via
-`helm test <release> -n <ns>`.
+(a) is a blocking `pre-install,pre-upgrade` hook. (b) is a `helm test` that
+must be run explicitly; it never runs during `helm install`. A green
+`helm install` does not prove NetworkPolicy is enforced, so run
+`helm test <release> -n <ns>` before treating the security rails as live.
+Both are re-runnable via that same `helm test` command.
 
 **(a) CPU-AVX / ClickHouse-pin check** (`preflights.avxCheck`). A pre-install /
 pre-upgrade hook Job.
@@ -986,9 +1019,9 @@ to install only the control plane + backing stores without the runner substrate.
   with an externally-managed controller) given the residual cluster-wide
   pod/service/PVC reach.
 - **Runner image**: the pool runs `curie-runner`, defaulting to
-  `ghcr.io/curie-eng/curie-runner:latest` with `imagePullPolicy: IfNotPresent`
+  `ghcr.io/curie-eng/curie-runner:<appVersion>` with `imagePullPolicy: IfNotPresent`
   (per-thread cold boots must not contain a pull; the `runner-prewarm` DaemonSet
-  keeps the image fresh on every node -- see "Publishing and pulling images").
+  keeps the image on every node -- see "Publishing and pulling images").
   For offline
   dev/e2e, `-f values-dev.yaml` overrides it to a locally-built, cluster-imported
   tag with `imagePullPolicy: Never` (`docker build -f runner/Dockerfile -t
