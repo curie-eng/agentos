@@ -181,6 +181,7 @@ testpaths = [
     "tools/ci-workflow-paths/tests",
     "tools/e2e-ci-selection/tests",
     "tools/sdk-lock-gate/tests",
+    "tools/fix-pin-ci/tests",
 ]
 
 [tool.ruff]

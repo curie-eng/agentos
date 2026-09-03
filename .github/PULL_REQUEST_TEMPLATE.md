@@ -32,6 +32,14 @@ Fix pin: <supported selector>
      reason:
 Fix pin: n/a - <reason>
 
+     The pin's tier is derived from the selector's location, not from prose:
+     unit tests, charts/curie/ci/* (cluster helm-render), or test_live.py
+     (live). If the closed issue carries found:unit, found:local,
+     found:cluster, or found:live and the pin is below that surface, add:
+Fix pin waiver: <reason>
+
+     A unit pin for a found:live issue fails without that waiver.
+
      For a non fix pull request that does not close a bug-labeled issue, leave
      this section empty. -->
 
