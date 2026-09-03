@@ -199,6 +199,8 @@ pub struct SreBotInstallOpts {
     pub namespace: String,
     pub release: String,
     pub observability_namespace: String,
+    /// Repeatable `owner/repo` or `owner/*` entries for `api.githubRepoAllowlist`.
+    pub workspace_repo: Vec<String>,
 }
 
 struct InstallIdentity {
@@ -462,6 +464,10 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
             "the SRE bot example installer currently requires --observability",
         ));
     }
+    for entry in &opts.workspace_repo {
+        crate::api::validate_allowlist_entry(entry)
+            .map_err(|err| crate::exit::usage(err.to_string()))?;
+    }
 
     let identity = InstallIdentity::from_opts(&opts);
 
@@ -488,7 +494,7 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
             identity.observability_namespace
         ));
         lines.extend(stack_commands.iter().map(|command| command.display(&chart)));
-        lines.extend(apply_curie_platform(&chart, true, &identity).await?);
+        lines.extend(apply_curie_platform(&chart, true, &identity, &opts.workspace_repo).await?);
         lines.push(integration_command.display(&chart));
         lines.push(read_access_command.display(&chart));
         lines.push(format!(
@@ -572,7 +578,7 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
     // Before the apply, not after: the point is to refuse while the credential
     // still exists.
     refuse_to_drop_a_recorded_model_credential(&identity).await?;
-    apply_curie_platform(&chart, false, &identity).await?;
+    apply_curie_platform(&chart, false, &identity, &opts.workspace_repo).await?;
     run_install_command(&integration_command, &workspace, &chart).await?;
     run_install_command(&read_access_command, &workspace, &chart).await?;
     let kubeconfig = kubernetes_connector_kubeconfig(&identity.namespace).await?;
@@ -703,10 +709,19 @@ async fn refuse_to_drop_a_recorded_model_credential(identity: &InstallIdentity) 
     )))
 }
 
+fn github_repo_allowlist_sets(repos: &[String]) -> BTreeMap<String, String> {
+    repos
+        .iter()
+        .enumerate()
+        .map(|(index, repo)| (format!("api.githubRepoAllowlist[{index}]"), repo.clone()))
+        .collect()
+}
+
 async fn apply_curie_platform(
     chart: &Path,
     dry_run: bool,
     identity: &InstallIdentity,
+    workspace_repo: &[String],
 ) -> Result<Vec<String>> {
     let installation = crate::installation::Installation {
         version: crate::installation::SUPPORTED_VERSION,
@@ -717,7 +732,7 @@ async fn apply_curie_platform(
         platform: crate::installation::Platform::default(),
         credentials: crate::installation::Credentials::default(),
         comms: crate::installation::Comms::default(),
-        set: BTreeMap::new(),
+        set: github_repo_allowlist_sets(workspace_repo),
     };
     let local = crate::installation::plan_installation(installation, dry_run)?;
     match crate::installation::apply(crate::installation::ApplyOpts {
