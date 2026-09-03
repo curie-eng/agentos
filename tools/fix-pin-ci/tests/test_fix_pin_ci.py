@@ -41,8 +41,9 @@ def _write_event(
     *,
     action: str = "opened",
     include_body: bool = True,
+    base_ref: str = "next",
 ) -> Path:
-    pull_request: dict[str, object] = {}
+    pull_request: dict[str, object] = {"base": {"ref": base_ref}}
     if include_body:
         pull_request["body"] = body
     event_path = tmp_path / "event.json"
@@ -106,11 +107,15 @@ def _write_fake_curie(tmp_path: Path) -> tuple[Path, Path]:
     )
 
 
-def _gh_issue_payload(gh_labels: str, gh_body: str = "") -> str:
-    """The gate reads `{labels, body}` so a found:* form field is visible."""
+def _gh_issue_payload(
+    gh_labels: str, gh_body: str = "", gh_milestone: str | None = "v0.9.0"
+) -> str:
+    """The gate reads `{labels, body, milestone}` so found:* and train mapping work."""
     parsed = json.loads(gh_labels)
     if isinstance(parsed, list):
-        return json.dumps({"labels": parsed, "body": gh_body})
+        return json.dumps(
+            {"labels": parsed, "body": gh_body, "milestone": gh_milestone}
+        )
     return gh_labels
 
 
@@ -139,10 +144,14 @@ def _run_checker(
     timeout: float | None = None,
     gh_labels: str = "[]",
     gh_body: str = "",
+    gh_milestone: str | None = "v0.9.0",
     gh_exit: int = 0,
     gh_on_path: bool = True,
+    base_ref: str = "next",
 ) -> tuple[subprocess.CompletedProcess[str], Path]:
-    event_path = _write_event(tmp_path, body, action=action, include_body=include_body)
+    event_path = _write_event(
+        tmp_path, body, action=action, include_body=include_body, base_ref=base_ref
+    )
     curie, call_log = _write_fake_curie(tmp_path)
     binaries, gh_call_log = _write_fake_gh(tmp_path)
     environment = {
@@ -151,7 +160,7 @@ def _run_checker(
         "FIX_PIN_EXIT": str(verifier_exit),
         "FIX_PIN_OUTPUT": verifier_stdout,
         "FIX_PIN_GH_CALL_LOG": str(gh_call_log),
-        "FIX_PIN_GH_LABELS": _gh_issue_payload(gh_labels, gh_body),
+        "FIX_PIN_GH_LABELS": _gh_issue_payload(gh_labels, gh_body, gh_milestone),
         "FIX_PIN_GH_EXIT": str(gh_exit),
         "GITHUB_REPOSITORY": "curie-eng/curie",
         # An empty PATH is how "gh is not installed" is expressed; the checker
@@ -887,7 +896,7 @@ def test_closing_a_bug_issue_without_a_declaration_fails_and_names_the_issue(
         "api",
         "repos/curie-eng/curie/issues/12",
         "--jq",
-        "{labels:[.labels[].name],body:.body}",
+        "{labels:[.labels[].name],body:.body,milestone:.milestone.title}",
     ]
 
 
@@ -1262,3 +1271,139 @@ def test_pull_request_template_documents_the_tier_waiver() -> None:
     template = PR_TEMPLATE.read_text(encoding="utf-8")
     assert "Fix pin waiver: <reason>" in template
     assert "found:live" in template
+
+
+FEATURE_MILESTONE = "v0.9.0"
+PATCH_MILESTONE = "v0.8.5"
+MAPPING_PATH = REPO_ROOT / "tools" / "fix-pin-ci" / "milestone-trains.json"
+NA_BODY = "Closes #12\n\nFix pin: n/a - the fix is a chart template with no test surface\n"
+
+
+def test_matching_milestone_train_passes(tmp_path: Path) -> None:
+    completed, call_log = _run_checker(
+        tmp_path,
+        NA_BODY,
+        gh_labels=BUG_LABELS,
+        gh_milestone=FEATURE_MILESTONE,
+        base_ref="next",
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.startswith("SKIPPED: Fix pin declared not applicable")
+    assert _gh_call_log(tmp_path).exists(), "a closed issue must be looked up even when excused"
+    assert not call_log.exists(), "an excused declaration must not run curie"
+
+
+def test_matching_patch_milestone_on_main_passes(tmp_path: Path) -> None:
+    completed, call_log = _run_checker(
+        tmp_path,
+        NA_BODY,
+        gh_labels=BUG_LABELS,
+        gh_milestone=PATCH_MILESTONE,
+        base_ref="main",
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.startswith("SKIPPED: Fix pin declared not applicable")
+    assert _gh_call_log(tmp_path).exists(), "a closed issue must be looked up even when excused"
+    assert not call_log.exists(), "an excused declaration must not run curie"
+
+
+def test_mismatched_milestone_train_fails(tmp_path: Path) -> None:
+    completed, call_log = _run_checker(
+        tmp_path,
+        NA_BODY,
+        gh_labels=BUG_LABELS,
+        gh_milestone=PATCH_MILESTONE,
+        base_ref="next",
+    )
+    shown = f"{completed.stdout}\n{completed.stderr}"
+
+    assert completed.returncode != 0, shown
+    assert "#12" in completed.stderr, shown
+    assert PATCH_MILESTONE in completed.stderr, shown
+    assert "main" in completed.stderr, shown
+    assert "next" in completed.stderr, shown
+    assert not call_log.exists(), "a train mismatch must not reach curie"
+
+
+def test_missing_milestone_on_a_bug_fails(tmp_path: Path) -> None:
+    completed, call_log = _run_checker(
+        tmp_path,
+        NA_BODY,
+        gh_labels=BUG_LABELS,
+        gh_milestone=None,
+        base_ref="next",
+    )
+    shown = f"{completed.stdout}\n{completed.stderr}"
+
+    assert completed.returncode != 0, shown
+    assert "#12" in completed.stderr, shown
+    assert "milestone" in completed.stderr.lower(), shown
+    assert not call_log.exists(), "a bug without a milestone must not reach curie"
+
+
+def test_missing_milestone_on_a_non_bug_is_allowed(tmp_path: Path) -> None:
+    completed, call_log = _run_checker(
+        tmp_path,
+        "Closes #12\n",
+        gh_labels='["enhancement"]',
+        gh_milestone=None,
+        base_ref="next",
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "SKIPPED: no Fix pin declaration"
+    assert not call_log.exists(), "a non bug without a milestone must not run curie"
+
+
+def test_mismatched_train_fails_even_when_a_selector_is_declared(tmp_path: Path) -> None:
+    completed, call_log = _run_checker(
+        tmp_path,
+        f"Closes #12\n\nFix pin: {VALID_SELECTOR}\n",
+        gh_labels=BUG_LABELS,
+        gh_milestone=PATCH_MILESTONE,
+        base_ref="next",
+    )
+    shown = f"{completed.stdout}\n{completed.stderr}"
+
+    assert completed.returncode != 0, shown
+    assert PATCH_MILESTONE in completed.stderr, shown
+    assert not call_log.exists(), "a train mismatch must not reach the verifier"
+
+
+def test_unknown_milestone_fails_closed(tmp_path: Path) -> None:
+    completed, call_log = _run_checker(
+        tmp_path,
+        NA_BODY,
+        gh_labels=BUG_LABELS,
+        gh_milestone="v9.9.9",
+        base_ref="next",
+    )
+    shown = f"{completed.stdout}\n{completed.stderr}"
+
+    assert completed.returncode != 0, shown
+    assert "v9.9.9" in completed.stderr, shown
+    assert not call_log.exists(), "an unmapped milestone must not open the gate"
+
+
+def test_milestone_mapping_sends_patch_to_main_and_feature_to_next() -> None:
+    mapping = json.loads(MAPPING_PATH.read_text(encoding="utf-8"))
+    trains = mapping["trains"]
+    milestones = mapping["milestones"]
+
+    assert trains == {"patch": "main", "feature": "next"}
+    assert milestones[FEATURE_MILESTONE] == "feature"
+    assert milestones[PATCH_MILESTONE] == "patch"
+    assert set(trains.values()) == {"main", "next"}
+    assert set(milestones.values()) <= {"patch", "feature"}
+
+
+def test_agents_md_cites_the_mapping_next_to_the_release_train_table() -> None:
+    agents = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    heading = "## Release train, branch, and commit conventions"
+    start = agents.index(heading)
+    window = agents[start : start + 2500]
+
+    assert "milestone-trains.json" in window
+    assert "`main`" in window and "`next`" in window

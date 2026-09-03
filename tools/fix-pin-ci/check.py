@@ -71,14 +71,17 @@ DISCOVERY_FIELD = re.compile(
     re.MULTILINE,
 )
 WAIVER = re.compile(r"^Fix pin waiver:\s*(?P<reason>.*)$")
+ISSUE_JQ = "{labels:[.labels[].name],body:.body,milestone:.milestone.title}"
+MAPPING_PATH = Path(__file__).resolve().with_name("milestone-trains.json")
 
 
 @dataclass(frozen=True)
 class IssueRecord:
-    """Labels and body of a closed GitHub issue the gate inspects."""
+    """Labels, body, and milestone of a closed GitHub issue the gate inspects."""
 
     labels: list[str]
     body: str
+    milestone: str | None
 
 
 @dataclass(frozen=True)
@@ -133,6 +136,47 @@ def _repository(event: dict[str, object]) -> str | None:
         if isinstance(full_name, str) and full_name:
             return full_name
     return os.environ.get("GITHUB_REPOSITORY") or None
+
+
+def _base_ref(event: dict[str, object]) -> str:
+    pull_request = event.get("pull_request")
+    if not isinstance(pull_request, dict):
+        raise ValueError("pull request event is missing pull_request")
+    base = pull_request.get("base")
+    if not isinstance(base, dict):
+        raise ValueError("pull request is missing base")
+    ref = base.get("ref")
+    if not isinstance(ref, str) or not ref:
+        raise ValueError("pull request base ref is missing")
+    return ref
+
+
+def _milestone_trains(path: Path = MAPPING_PATH) -> dict[str, str]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"could not read {path.name}: {error}") from error
+    if not isinstance(raw, dict):
+        raise ValueError(f"{path.name} must be an object")
+
+    trains = raw.get("trains")
+    milestones = raw.get("milestones")
+    if not isinstance(trains, dict) or not all(
+        isinstance(kind, str) and isinstance(branch, str) for kind, branch in trains.items()
+    ):
+        raise ValueError(f"{path.name} trains must map kind names to branches")
+    if not isinstance(milestones, dict) or not all(
+        isinstance(name, str) and isinstance(kind, str) for name, kind in milestones.items()
+    ):
+        raise ValueError(f"{path.name} milestones must map titles to train kinds")
+
+    mapping: dict[str, str] = {}
+    for name, kind in milestones.items():
+        branch = trains.get(kind)
+        if not isinstance(branch, str) or not branch:
+            raise ValueError(f"{path.name} milestone {name!r} has unknown train kind {kind!r}")
+        mapping[name] = branch
+    return mapping
 
 
 def _declaration(body: str) -> Declaration:
@@ -262,7 +306,7 @@ def _issue_record(repository: str | None, issue: int) -> IssueRecord:
             "api",
             f"repos/{repository}/issues/{issue}",
             "--jq",
-            "{labels:[.labels[].name],body:.body}",
+            ISSUE_JQ,
         ],
         capture_output=True,
         check=False,
@@ -286,7 +330,15 @@ def _issue_record(repository: str | None, issue: int) -> IssueRecord:
         body = ""
     if not isinstance(body, str):
         raise ValueError(f"could not parse the body of issue #{issue}: not a string")
-    return IssueRecord(labels=[label for label in labels if isinstance(label, str)], body=body)
+    milestone = payload.get("milestone")
+    if milestone is not None and not isinstance(milestone, str):
+        raise ValueError(f"could not parse the milestone of issue #{issue}")
+    title = milestone.strip() if isinstance(milestone, str) and milestone.strip() else None
+    return IssueRecord(
+        labels=[label for label in labels if isinstance(label, str)],
+        body=body,
+        milestone=title,
+    )
 
 
 def _closed_issue_records(
@@ -297,6 +349,34 @@ def _closed_issue_records(
         return []
     repository = _repository(event)
     return [(issue, _issue_record(repository, issue)) for issue in issues]
+
+
+def _check_milestone_trains(
+    event: dict[str, object], records: list[tuple[int, IssueRecord]]
+) -> None:
+    if not records:
+        return
+    base = _base_ref(event)
+    trains = _milestone_trains()
+    for number, record in records:
+        if record.milestone is None:
+            if BUG_LABEL in record.labels:
+                raise ValueError(
+                    f"bug issue #{number} has no milestone; "
+                    "assign a patch milestone (main) or a feature milestone (next)"
+                )
+            continue
+        train = trains.get(record.milestone)
+        if train is None:
+            raise ValueError(
+                f"issue #{number} milestone {record.milestone!r} is not in "
+                f"{MAPPING_PATH.name}; add it as patch (main) or feature (next)"
+            )
+        if train != base:
+            raise ValueError(
+                f"issue #{number} milestone {record.milestone} maps to {train}, "
+                f"but this pull request targets {base}"
+            )
 
 
 def _closed_bugs(event: dict[str, object], body: str) -> list[int]:
@@ -344,6 +424,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             else "Fix pin declaration error"
         )
         print(f"{prefix}: {message}", file=sys.stderr)
+        return 1
+
+    try:
+        records = _closed_issue_records(event, body)
+    except ValueError as error:
+        print(f"Fix pin requirement error: {error}", file=sys.stderr)
+        return 1
+
+    try:
+        _check_milestone_trains(event, records)
+    except ValueError as error:
+        print(f"Milestone train error: {error}", file=sys.stderr)
         return 1
 
     if declaration.not_applicable is not None:
