@@ -588,6 +588,18 @@ rustfs:
   region: us-east-1
   auth:
     accessKey: ""            # selects the key-free path
+  # Rail 1 is fail-closed. The in-chart runner-allow-rustfs policy selects the
+  # in-cluster rustfs pod and does not render here. NetworkPolicy cannot
+  # target rustfs.host (a DNS name), so these CIDRs are required at render.
+  # On EKS the tight form is VPC interface endpoints for s3 and sts with
+  # private DNS enabled, which turns each requirement into a /32 rather than
+  # an AWS public service CIDR range.
+  egress:
+    - cidr: 192.0.2.10/32    # S3 VPC interface endpoint
+      ports: [{ protocol: TCP, port: 443 }]
+  stsEgress:
+    - cidr: 192.0.2.11/32    # STS VPC interface endpoint
+      ports: [{ protocol: TCP, port: 443 }]
 api:
   serviceAccount:
     annotations:
@@ -608,6 +620,28 @@ The bundle fetch uses path style addressing, so it appends
 region, change the region in `rustfs.host` and set `rustfs.region` to control
 the SigV4 signing region used by the bundle fetch init container. This setting
 does not configure the API or worker S3 clients.
+
+**Runner egress is a separate required list.** Rail 1 default-denies the
+sandbox, and the in-chart `runner-allow-rustfs` policy is a pod selector on
+this release's rustfs component, so it does not render when
+`rustfs.deploy` is false. Putting S3 in `security.networkPolicy.allowedEgress`
+alongside the model API used to be the only workaround, and a model-only
+allowlist then installed green while every sandbox hung in `Init` on the first
+turn. The chart now refuses that shape at render: `rustfs.egress` must cover
+the object-store endpoint, and on this key-free path `rustfs.stsEgress` must
+cover STS (`AssumeRoleWithWebIdentity`). Both are `{cidr, ports}` entries like
+`allowedEgress`. Do not put a DNS name here; NetworkPolicy has no hostname
+peer. A default route or a CIDR that reaches `169.254.169.254` is refused:
+these lists are store endpoints, not a second model allowlist.
+
+On EKS, create VPC **interface** endpoints for `s3` and `sts` in the cluster
+VPC with private DNS enabled, then put each endpoint's ENI address in as a
+`/32` on TCP 443. That keeps the fail-closed posture meaningful instead of
+opening an AWS public service CIDR range. Gateway endpoints for S3 do not
+give the sandbox a unicast address to allow. Static-key BYO still needs
+`rustfs.egress` (the fetch talks to S3) and does not need `rustfs.stsEgress`.
+Opting out of Rail 1 (`security.networkPolicy.enabled: false`) skips both
+requirements because there is then no runner NetworkPolicy to satisfy.
 
 Scope the runner's role to the bundle bucket, **read-only**. NetworkPolicy
 selects pods rather than containers, so any identity the bundle-fetch init
@@ -761,7 +795,10 @@ sandbox and renders whenever an in-chart store is deployed.
 **Fail-closed egress.** `security.networkPolicy.allowedEgress` is EMPTY by
 default: a fresh install denies all egress except DNS until the operator declares
 where the model API and MCP endpoints live (`{cidr, ports}` entries). An unset
-allowlist never means allow-all.
+allowlist never means allow-all. A BYO object store is not on that list: set
+`rustfs.egress` (and `rustfs.stsEgress` on the key-free path) so the sandbox
+bundle-fetch can reach S3 and STS without opening the model allowlist. See
+**Key-free object store auth** above.
 
 **The controller does not get a second vote on egress (#765, ADR-0067).**
 NetworkPolicy allows are additive across objects selecting the same pods -- Rail
