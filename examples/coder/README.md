@@ -36,3 +36,22 @@ pending, and never pushes from the sandbox. The requester may approve the card;
 the platform publishes from outside the sandbox and posts the pull-request URL
 back to the thread. The sandbox never receives the operator GitHub credential,
 and publication does not depend on a synchronous Slack reply.
+
+## Evals
+
+`evals/cases.json` grades this skill-less bundle the same way at every tier.
+Coding tools are a built-in session surface (ruling #2154), so the cases exercise
+that runtime: the publication tool is named, git must not push, publication
+without a managed workspace refuses, and file tools inspect /workspace.
+They do not treat a coder skill or an SRE-bot merge as the capability.
+
+With a live-model runner up from this directory, run:
+
+```bash
+curie skill eval
+```
+
+The cases are written to be falsifiable: a null agent and an input-parrot both
+go red, and no expected token is present in its case's input. The
+no-mount publication case grades a generic session; a cluster turn that already
+acquired an allowlisted checkout takes the approval-card path instead.
