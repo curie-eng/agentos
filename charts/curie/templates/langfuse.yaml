@@ -25,6 +25,11 @@ metadata:
     {{- include "curie.labels" . | nindent 4 }}
 spec:
   replicas: 1
+  # Boot migrations (Prisma + ClickHouse) have no cross-process lock. Recreate
+  # stops the old pod before the new one starts so two versions never migrate
+  # the same database at once (#2216).
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       {{- include "curie.selectorLabels" (dict "root" . "component" "langfuse-web") | nindent 6 }}
@@ -193,6 +198,10 @@ metadata:
     {{- include "curie.labels" . | nindent 4 }}
 spec:
   replicas: 1
+  # Same boot-migration race as langfuse-web (#2216): Recreate so an image
+  # change never runs two worker pods against the same stores at once.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       {{- include "curie.selectorLabels" (dict "root" . "component" "langfuse-worker") | nindent 6 }}

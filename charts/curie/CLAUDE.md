@@ -30,6 +30,18 @@ component and rail detail in `charts/curie/README.md`.
     when it lands, this exception is removed rather than extended. Do not
     generalize it into a rule about stateful services -- one named file, one
     named reason.
+  - **Second named exception: `templates/langfuse.yaml`**, which hardcodes
+    `replicas: 1` and `strategy: type: Recreate` on both the web and worker
+    Deployments. The reason is correctness, not sizing: both images run Prisma
+    and ClickHouse migrations at container boot with no cross-process lock, so
+    a RollingUpdate of a single replica (default `maxSurge: 25%`, which rounds
+    up to one extra pod) can apply two migration sets to the same database and
+    leave Prisma in a failed state (#2216). Any count other than 1, or any
+    strategy other than Recreate, is wrong at every cluster size. There is
+    deliberately **no `langfuse.web.replicas` / `langfuse.worker.replicas` /
+    strategy values key**. Pinned by `ci/langfuse-recreate-assertions.sh`.
+    Horizontal scale for Langfuse needs an Accepted out-of-band migrator; when
+    that lands, this exception is removed rather than extended.
 - **Mail-adapter egress is a separate fail-closed rail.** Enabling
   `mailAdapter.deploy` requires at least one
   `mailAdapter.agentmail.httpsCidrs` entry. Its single egress-only policy allows
