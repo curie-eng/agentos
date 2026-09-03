@@ -154,31 +154,40 @@ jobs:
       # seam. This prints the real ones on every run, for the price of 25 lines.
       - name: Pytest
         run: uv run pytest -q --durations=25
-      # Build ONLY when the body actually carries a declaration. tools/fix-pin-ci/
-      # check.py reaches the binary at exactly one place, the
+      # Build ONLY when the declaration parser would invoke the curie binary.
+      # tools/fix-pin-ci/check.py reaches it at exactly one place, the
       # `curie dev verify-fix-pin` call, and only once `declaration.selector` is
-      # set; `n/a`, no declaration, a near-miss marker like `Fix-pin:`, and the
-      # bug-without-declaration rejection all return before touching it. So on
-      # every pull request that declares nothing -- the overwhelming majority --
-      # this was a 213s cold `cargo build --release` for a binary nothing ran,
-      # inside the longest job on the graph.
+      # set; `n/a`, no declaration, a near-miss marker like `Fix-pin:`, HTML
+      # comments in the pull request template, and the bug-without-declaration
+      # rejection all return before touching it.
       #
-      # `contains()` is case-insensitive and DECLARATION is the exact-case
-      # `Fix pin: <selector>`, so this condition is a strict superset of the
-      # cases that reach the binary: it cannot skip a build the gate then needs.
-      # It builds a few times it need not (`Fix pin: n/a`, a near miss), which is
-      # the safe direction. This stays a direct build inside the required Python
-      # status: no `needs`, no downloaded artifact, no Cargo cache, so nothing
-      # the gate's contract protects is traded away for the time.
+      # `#2228` gated cargo with `contains(..., 'Fix pin:')`. That is true for
+      # every pull request that keeps the default template, because the template
+      # embeds those exact bytes inside `<!-- -->`. The probe reuses
+      # `_declaration` so a commented example cannot trigger a cold
+      # `cargo build --release` inside the longest job on the graph, and a live
+      # selector line cannot skip it.
+      #
+      # `n/a` used to pay that extra build as a safe over-match. The parser does
+      # not invoke curie for `n/a`, so the probe reports needed=false. This
+      # stays a direct build inside the required Python status: no `needs`, no
+      # downloaded artifact, no Cargo cache.
+      - name: Decide whether the current curie binary is needed
+        id: fix-pin-curie
+        if: github.event_name == 'pull_request'
+        run: >-
+          python3 tools/fix-pin-ci/check.py
+          --event "$GITHUB_EVENT_PATH"
+          --needs-curie
       - name: Build the current curie binary for fix pin verification
         if: >-
           github.event_name == 'pull_request'
-          && contains(github.event.pull_request.body, 'Fix pin:')
+          && steps.fix-pin-curie.outputs.needed == 'true'
         run: cargo build --release --locked --manifest-path cli/Cargo.toml
       - name: Install Helm for fix pin verification
         if: >-
           github.event_name == 'pull_request'
-          && contains(github.event.pull_request.body, 'Fix pin:')
+          && steps.fix-pin-curie.outputs.needed == 'true'
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
         with:
           version: v3.16.4
