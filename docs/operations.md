@@ -869,10 +869,10 @@ next operator.
 - **Give long-lived releases separate Slack Socket Mode apps.** Slack permits
   up to ten connections for one app and may send each payload to any connection
   without a predictable distribution pattern. During a temporary overlap, a
-  non-owning Curie release leaves an absent approval unchanged and asks the
-  approver to retry; a retry may be needed before the owning release receives
-  the interaction. Stop the local dispatcher after testing rather than leaving
-  it competing with the in-cluster release. See
+  non-owning Curie release leaves the Socket Mode envelope unacked so Slack
+  retries the owner; the non-owner does not resolve, reject, or mutate the
+  card. Stop the local dispatcher after testing rather than leaving it
+  competing with the in-cluster release. See
   [Slack's multiple-connections contract](https://docs.slack.dev/apis/events-api/using-socket-mode/#using-multiple-connections).
 - **kube-router applies NetworkPolicy a few seconds after pod start.** A
   brand-new pod can see open egress for the first seconds before the policy

@@ -21,10 +21,10 @@ when the selected approver set admits them.
 
 Slack may distribute one app's interactive payloads across any of its open
 Socket Mode connections. If two Curie releases share that app, the release whose
-API does not contain the approval acknowledges the interaction without changing
-the approval or Slack card and asks the approver to retry; only the release whose
-API owns the row can pass the existing compare-and-set. Separate Slack apps per
-long-lived release avoid the retry UX.
+API does not contain the approval leaves the Socket Mode envelope unacked, so
+Slack retries another connection; only the release whose API owns the row
+acknowledges and can pass the existing compare-and-set. Separate Slack apps per
+long-lived release still avoid sharing a connection pool.
 
 ## What is ingested, and what is refused
 
