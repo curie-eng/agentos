@@ -603,9 +603,20 @@ def test_late_workspace_selection_replaces_generic_sandbox_and_stays_sticky(
     make_harness,
 ) -> None:
     deployment_id = uuid.uuid4()
+    session_id = "agent-session-tLateWorkspace"
+    history_ref = "https://api.example.com/state/transcript/tLateWorkspace"
 
     async def go() -> None:
-        async with make_harness(binding=_workspace_binding(deployment_id)) as h:
+        async with make_harness(
+            binding=_workspace_binding(
+                deployment_id,
+                boot_env_override={
+                    "CURIE_RUNNER_TOKEN": "workspace-test-token",
+                    "CURIE_SESSION_ID": session_id,
+                    "CURIE_HISTORY_REF": history_ref,
+                },
+            )
+        ) as h:
             class WorkspaceProbe:
                 selected: str | None = None
                 handoffs = 0
@@ -621,10 +632,16 @@ def test_late_workspace_selection_replaces_generic_sandbox_and_stays_sticky(
                     self.handoffs += 1
                     old = kwargs["replace_handle"]
                     assert old is not None
+                    raw_env = kwargs["env"]
+                    assert isinstance(raw_env, dict)
                     handle = h.substrate.handoff(
                         _thread_key("tLateWorkspace"),
                         expected=old,
-                        env={"CURIE_WORKSPACE_REF": "workspace/private-base"},
+                        env={
+                            **raw_env,
+                            "CURIE_WORKSPACE_REF": "workspace/private-base",
+                            "CURIE_WORKSPACE_SHA256": "d" * 64,
+                        },
                         workspace_repo=str(kwargs["repo_full_name"]),
                     )
                     return SimpleNamespace(handle=handle, prepared=None)
@@ -639,6 +656,10 @@ def test_late_workspace_selection_replaces_generic_sandbox_and_stays_sticky(
             await h.kernel.process_event(_qevent("hello", thread="tLateWorkspace"))
             generic = h.substrate.lookup(_thread_key("tLateWorkspace"))
             assert generic is not None and generic.workspace_repo is None
+            # The durable pointer and logical session on the route must match
+            # the runner boot. A late replacement is built from this handle.
+            assert generic.session_id == session_id
+            assert generic.history_ref == history_ref
 
             await h.kernel.process_event(
                 _qevent(
@@ -649,7 +670,8 @@ def test_late_workspace_selection_replaces_generic_sandbox_and_stays_sticky(
             workspace = h.substrate.lookup(_thread_key("tLateWorkspace"))
             assert workspace is not None
             assert workspace.claim_name != generic.claim_name
-            assert workspace.session_id == generic.session_id
+            assert workspace.session_id == generic.session_id == session_id
+            assert workspace.history_ref == generic.history_ref == history_ref
             assert workspace.workspace_repo == "acme-corp/acme-bot"
             assert workspace.generation == generic.generation + 1
 
@@ -666,10 +688,31 @@ def test_late_workspace_selection_replaces_generic_sandbox_and_stays_sticky(
             ]
             claim_env = h.fake_k8s.claim_envs[-1] or {}
             assert claim_env["CURIE_WORKSPACE_REF"] == "workspace/private-base"
+            assert claim_env["CURIE_WORKSPACE_SHA256"] == "d" * 64
+            assert claim_env["CURIE_SESSION_ID"] == session_id
+            assert claim_env["CURIE_HISTORY_REF"] == history_ref
+            # This durable pointer is the worker-side proof that the first
+            # model turn remains available to the cold replacement. Replay is
+            # asserted at the runner store consumer, not simulated here.
+            assert h.runner.opened[:2] == [
+                "hello",
+                "Use https://github.com/acme-corp/acme-bot",
+            ]
+            forbidden_names = {
+                "CURIE_INTERNAL_WORKER_TOKEN",
+                "CURIE_API_KEY",
+                "S3_ACCESS_KEY",
+                "S3_SECRET_KEY",
+                "AWS_ACCESS_KEY_ID",
+                "AWS_SECRET_ACCESS_KEY",
+                "GITHUB_TOKEN",
+            }
+            assert forbidden_names.isdisjoint(claim_env)
             assert not any(
                 marker in f"{name}={value}".upper()
                 for name, value in claim_env.items()
                 for marker in ("AUTHORIZATION", "PASSWORD", "TOKEN", "SECRET")
+                if name != "CURIE_RUNNER_TOKEN"
             )
 
     asyncio.run(go())
@@ -856,7 +899,11 @@ def test_a_selection_refusal_is_logged_so_an_operator_can_find_it(
 # the missing half.
 
 
-def _workspace_binding(deployment_id: uuid.UUID | None) -> object:
+def _workspace_binding(
+    deployment_id: uuid.UUID | None,
+    *,
+    boot_env_override: dict[str, str] | None = None,
+) -> object:
     """A binding carrying a fixed deployment id and the legacy flag.
 
     Fixed on purpose: the id is what an operator greps for, so the tests assert
@@ -882,7 +929,10 @@ def _workspace_binding(deployment_id: uuid.UUID | None) -> object:
             kind: str | None = None,
             address: str | None = None,
         ) -> dict[str, str]:
-            return {"CURIE_RUNNER_TOKEN": "workspace-test-token"}
+            return dict(
+                boot_env_override
+                or {"CURIE_RUNNER_TOKEN": "workspace-test-token"}
+            )
 
         def packs_for(self, _resolved: object) -> BehaviorPacks:
             return BehaviorPacks()

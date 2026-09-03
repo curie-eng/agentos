@@ -930,7 +930,11 @@ def test_late_handoff_uses_substrate_handoff_and_keeps_credentials_out_of_claim_
     result = coordinator.claim_or_resume_with_handle(
         thread_key="1700000000.000100",
         deployment_id=DEPLOYMENT_ID,
-        env={"CURIE_RUNNER_TOKEN": "workspace-test-token"},
+        env={
+            "CURIE_RUNNER_TOKEN": "workspace-test-token",
+            "CURIE_SESSION_ID": "logical-session",
+            "CURIE_HISTORY_REF": "https://api.example.com/state/transcript/thread-1",
+        },
         agent_name="acme-bot",
         repo_full_name="acme-corp/acme-bot",
         replace_handle=old_handle,
@@ -946,6 +950,19 @@ def test_late_handoff_uses_substrate_handoff_and_keeps_credentials_out_of_claim_
     assert handoff["env"]["CURIE_WORKSPACE_REF"] == workspace_env["CURIE_WORKSPACE_REF"]
     assert handoff["env"]["CURIE_WORKSPACE_SHA256"] == workspace_env["CURIE_WORKSPACE_SHA256"]
     assert handoff["env"]["CURIE_RUNNER_TOKEN"] == "workspace-test-token"
+    assert handoff["env"]["CURIE_SESSION_ID"] == "logical-session"
+    assert handoff["env"]["CURIE_HISTORY_REF"] == (
+        "https://api.example.com/state/transcript/thread-1"
+    )
+    assert {
+        "CURIE_INTERNAL_WORKER_TOKEN",
+        "CURIE_API_KEY",
+        "S3_ACCESS_KEY",
+        "S3_SECRET_KEY",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "GITHUB_TOKEN",
+    }.isdisjoint(handoff["env"])
     assert GIT_CREDENTIAL not in json.dumps(handoff["env"])
     assert "redeemed-credential-value" not in json.dumps(handoff["env"])
     assert not any(
@@ -1288,13 +1305,25 @@ def test_workspace_claim_env_never_carries_worker_auth_object_store_or_git_crede
     workspace: Any, tmp_path: Path
 ) -> None:
     preparer, _, _ = _preparer(workspace, tmp_path)
-    prepared = _prepare(preparer)
-    env = {
-        **prepared.claim_env(),
-        "CURIE_BUNDLE_REF": "bundles/first",
-    }
+    substrate = _RecordingSubstrate()
+    coordinator = workspace.WorkspaceClaimCoordinator(
+        preparer=preparer,
+        substrate=substrate,
+    )
+    result = coordinator.claim_or_resume_with_handle(
+        thread_key="1700000000.000100",
+        deployment_id=DEPLOYMENT_ID,
+        env={
+            "CURIE_BUNDLE_REF": "bundles/first",
+            "CURIE_SESSION_ID": "logical-session",
+            "CURIE_HISTORY_REF": "https://api.example.com/state/transcript/thread-1",
+        },
+        repo_full_name="acme-corp/acme-bot",
+    )
+    env = substrate.calls[0][2]
     forbidden = {
         "CURIE_INTERNAL_WORKER_TOKEN",
+        "CURIE_API_KEY",
         "S3_ACCESS_KEY",
         "S3_SECRET_KEY",
         "AWS_ACCESS_KEY_ID",
@@ -1305,6 +1334,14 @@ def test_workspace_claim_env_never_carries_worker_auth_object_store_or_git_crede
     assert forbidden.isdisjoint(env)
     assert WORKER_AUTH not in env.values()
     assert GIT_CREDENTIAL not in env.values()
+    assert env["CURIE_SESSION_ID"] == "logical-session"
+    assert env["CURIE_HISTORY_REF"] == (
+        "https://api.example.com/state/transcript/thread-1"
+    )
+    assert env["CURIE_WORKSPACE_REF"] == result.prepared.claim_env()[
+        "CURIE_WORKSPACE_REF"
+    ]
+    assert env["CURIE_WORKSPACE_SHA256"] == result.prepared.sha256
 
 
 def test_two_clone_slots_bound_concurrency_and_a_third_waits(workspace: Any) -> None:

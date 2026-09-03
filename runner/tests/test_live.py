@@ -28,6 +28,7 @@ from curie_runner.adapter import (
 )
 from curie_runner.history import (
     ConversationMessage,
+    ConversationReplay,
     HarnessReplayState,
     TurnRecord,
     build_conversation_replay,
@@ -37,6 +38,10 @@ from curie_runner.session import SessionRunner
 _HAS_CRED = bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or os.environ.get("ANTHROPIC_API_KEY"))
 _OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 _LIVE_REQUESTED = os.environ.get("CURIE_E2E_LIVE") == "1"
+
+_WORKSPACE_REQUIRED_TOOLS = frozenset(
+    {"Read", "Edit", "Bash", "mcp__curie__publish_changes"}
+)
 
 
 class _LiveTranscriptStore:
@@ -48,6 +53,231 @@ class _LiveTranscriptStore:
 
     async def append(self, record: TurnRecord) -> None:
         self.records.append(record)
+
+
+def _production_sre_source() -> Path:
+    return Path(__file__).parents[2] / "examples" / "sre-bot"
+
+
+def _production_sre_bundle(tmp_path: Path) -> Path:
+    source = _production_sre_source()
+    bundle = tmp_path / "sre-bot"
+    (bundle / ".claude-plugin").mkdir(parents=True)
+    (bundle / "skills" / "sre-bot").mkdir(parents=True)
+    (bundle / ".claude-plugin" / "plugin.json").write_text(
+        (source / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    (bundle / "skills" / "sre-bot" / "SKILL.md").write_text(
+        (source / "skills" / "sre-bot" / "SKILL.md").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    # The checked-in example's connector build declarations require the
+    # deploy-generated connectors.lock.yaml. This runner fixture preserves the
+    # exact SRE manifest, skill, toolPolicy, and approvalPolicy while keeping
+    # the policy's direct connector namespace. Non-build URL connectors need no
+    # generated lock file. Loopback port 9 refuses promptly if probed.
+    (bundle / "connectors.yaml").write_text(
+        "connectors:\n"
+        "  kubernetes:\n"
+        "    url: http://127.0.0.1:9/kubernetes\n"
+        "  self-upgrade:\n"
+        "    url: http://127.0.0.1:9/self-upgrade\n",
+        encoding="utf-8",
+    )
+    manifest = json.loads(
+        (bundle / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8")
+    )
+    assert manifest["name"] == "sre-bot"
+    assert manifest["toolPolicy"]["enforcement"] == "curie/mcp-tool-policy@1"
+    assert manifest["approvalPolicy"]["gates"]
+    return bundle
+
+
+def _assert_production_workspace_init(
+    init: dict[str, Any], *, bundle: Path
+) -> None:
+    """Require the real mounted catalogue, not an options-only substitute."""
+
+    source = _production_sre_source()
+    manifest = bundle / ".claude-plugin" / "plugin.json"
+    skill = bundle / "skills" / "sre-bot" / "SKILL.md"
+    assert (
+        manifest.is_file()
+        and skill.is_file()
+        and manifest.read_text(encoding="utf-8")
+        == (source / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8")
+        and skill.read_text(encoding="utf-8")
+        == (source / "skills" / "sre-bot" / "SKILL.md").read_text(encoding="utf-8")
+        and (bundle / "connectors.yaml").is_file()
+        and not (bundle / ".mcp.json").exists()
+    ), (
+        "generic or plugin-less bundle cannot satisfy SRE workspace acceptance"
+    )
+    raw_tools = init.get("tools")
+    assert isinstance(raw_tools, list), "SDK init carried no concrete tools catalogue"
+    tools = {str(tool) for tool in raw_tools}
+    missing = sorted(_WORKSPACE_REQUIRED_TOOLS - tools)
+    assert not missing, f"mounted SDK init catalogue missing required tools: {missing}"
+    assert init.get("cwd") == "/workspace", (
+        f"mounted SDK init cwd was {init.get('cwd')!r}, expected '/workspace'"
+    )
+
+
+def _catalog_config(bundle: Path, session_id: str):
+    from curie_runner.config import RunnerConfig
+
+    env = {
+        "CURIE_PLUGIN_DIR": str(bundle),
+        "CURIE_SESSION_ID": session_id,
+        "CURIE_SANDBOX_ID": f"sandbox-{session_id}",
+        "CURIE_BUDGET": (
+            '{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}'
+        ),
+    }
+    if model := os.environ.get("CURIE_MODEL"):
+        env["CURIE_MODEL"] = model
+    return RunnerConfig.from_env(env)
+
+
+def _install_init_observer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[dict[str, Any]]:
+    from claude_agent_sdk import SystemMessage
+    from curie_runner import __main__ as boot
+
+    init_messages: list[dict[str, Any]] = []
+
+    class InitObservingSession(ClaudeAgentSession):
+        def receive_turn(self):
+            upstream = super().receive_turn()
+
+            async def observe():
+                async for message in upstream:
+                    # claude-agent-sdk 0.2.135 message_parser.py preserves the
+                    # CLI init frame as SystemMessage(subtype="init"). The
+                    # catalogue and cwd are observed SDK output, not inferred
+                    # from ClaudeAgentOptions.
+                    if isinstance(message, SystemMessage) and message.subtype == "init":
+                        init_messages.append(dict(message.data))
+                    yield message
+
+            return observe()
+
+    monkeypatch.setattr(boot, "ClaudeAgentSession", InitObservingSession)
+    return init_messages
+
+
+def _drive_live_catalog(runner: SessionRunner) -> Final:
+    async def go() -> Final:
+        await runner.start()
+        final: Final | None = None
+        try:
+            async for line in runner.run_turn(
+                Event(
+                    type="message",
+                    text="Reply with only: workspace-ready. Do not call any tool.",
+                    user="U0EXAMPLE",
+                    ts="1",
+                )
+            ):
+                parsed = parse_ndjson_line(line)
+                if isinstance(parsed, Final):
+                    final = parsed
+        finally:
+            await runner.close()
+        assert final is not None, "real SDK turn emitted no terminal Final"
+        return final
+
+    return anyio.run(go)
+
+
+def test_workspace_catalog_assertion_rejects_missing_and_pluginless_init(
+    tmp_path: Path,
+) -> None:
+    bundle = _production_sre_bundle(tmp_path / "production")
+    complete = list(_WORKSPACE_REQUIRED_TOOLS)
+    without_bash = [tool for tool in complete if tool != "Bash"]
+    with pytest.raises(AssertionError, match="missing required tools.*Bash"):
+        _assert_production_workspace_init(
+            {"tools": without_bash, "cwd": "/workspace"}, bundle=bundle
+        )
+
+    generic = tmp_path / "generic-plugin"
+    generic.mkdir()
+    with pytest.raises(AssertionError, match="generic or plugin-less bundle"):
+        _assert_production_workspace_init(
+            {"tools": complete, "cwd": "/workspace"}, bundle=generic
+        )
+
+
+@pytest.mark.skipif(
+    not _LIVE_REQUESTED,
+    reason="set CURIE_E2E_LIVE=1 for real SDK mounted workspace catalogue evidence",
+)
+def test_live_claim_time_workspace_init_catalogue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from curie_runner import __main__ as boot
+
+    workspace = Path("/workspace")
+    assert workspace.is_dir() and (workspace / ".git").exists(), (
+        "CURIE_E2E_LIVE=1 workspace catalogue proof requires a mounted "
+        "/workspace checkout"
+    )
+    bundle = _production_sre_bundle(tmp_path)
+    init_messages = _install_init_observer(monkeypatch)
+    runner = boot.build_runner(
+        _catalog_config(bundle, f"claim-{uuid4()}"),
+        workspace_path=workspace,
+    )
+
+    final = _drive_live_catalog(runner)
+
+    assert final.status is SessionStatus.DONE
+    assert init_messages, "real SDK claim-time boot emitted no init frame"
+    _assert_production_workspace_init(init_messages[-1], bundle=bundle)
+
+
+@pytest.mark.skipif(
+    not _LIVE_REQUESTED,
+    reason="set CURIE_E2E_LIVE=1 for real SDK late workspace catalogue evidence",
+)
+def test_live_late_workspace_replacement_init_catalogue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from curie_runner import __main__ as boot
+
+    workspace = Path("/workspace")
+    assert workspace.is_dir() and (workspace / ".git").exists(), (
+        "CURIE_E2E_LIVE=1 workspace catalogue proof requires a mounted "
+        "/workspace checkout"
+    )
+    bundle = _production_sre_bundle(tmp_path)
+    session_id = f"late-{uuid4()}"
+    config = _catalog_config(bundle, session_id)
+
+    # The first claim is the idle, unmounted standing-by session. It has the
+    # same thread identity and production bundle, but its options-only shape is
+    # deliberately not accepted as catalogue evidence. The fresh replacement
+    # below is the only runner driven through a real SDK init frame.
+    boot.build_runner(
+        config,
+        conversation_replay=ConversationReplay(),
+        workspace_path=None,
+    )
+    init_messages = _install_init_observer(monkeypatch)
+    replacement = boot.build_runner(
+        config,
+        conversation_replay=ConversationReplay(),
+        workspace_path=workspace,
+    )
+
+    final = _drive_live_catalog(replacement)
+
+    assert final.status is SessionStatus.DONE
+    assert init_messages, "fresh late workspace runner emitted no SDK init frame"
+    _assert_production_workspace_init(init_messages[-1], bundle=bundle)
 
 
 @pytest.mark.skipif(
