@@ -152,7 +152,11 @@ def test_create_claim_fetches_and_unwraps_bundle() -> None:
     client.create_claim(
         "t1",
         pool="pool",
-        env={"CURIE_BUNDLE_REF": "bundles/b.tar.gz", "CURIE_PLUGIN_DIR": "/bundles/current"},
+        env={
+            "CURIE_BUNDLE_REF": "bundles/b.tar.gz",
+            "CURIE_PLUGIN_DIR": "/bundles/current",
+            "CURIE_BUNDLE_VERSION": "abc123def456",
+        },
     )
     assert store.requested == ["bundles/b.tar.gz"]  # the worker fetched the bundle
     mounts = _flag_values(client.calls[0], "-v")
@@ -162,8 +166,12 @@ def test_create_claim_fetches_and_unwraps_bundle() -> None:
     assert mode == "ro"
     # Unwrapped: the manifest sits at the mount root, not under the wrapper dir.
     assert (Path(host_dir) / ".claude-plugin" / "plugin.json").is_file()
+    child_env = _flag_values(client.calls[0], "-e")
     # The RustFS object key itself is not forwarded into the container env.
-    assert all("CURIE_BUNDLE_REF" not in e for e in _flag_values(client.calls[0], "-e"))
+    # Updated deliberately (#2174): keep stripping the object key, and forward
+    # the platform-tracked version_label so a sandboxed agent can name itself.
+    assert all("CURIE_BUNDLE_REF" not in e for e in child_env)
+    assert "CURIE_BUNDLE_VERSION=abc123def456" in child_env
 
 
 def test_create_claim_without_bundle_ref_mounts_nothing() -> None:

@@ -29,7 +29,7 @@ of a deprecated model.
 | | What it is | Where to read it |
 |---|---|---|
 | **Platform version** | The Curie release this install runs | `app.kubernetes.io/version` / `helm.sh/chart` on the platform's own objects (api, dispatcher, worker), via `resources_get` or `resources_list` |
-| **Your bundle version** | The agent bundle *you* are, deployed from its repository | your own agent version, which the platform tracks; the platform's objects do not carry it |
+| **Your bundle version** | The agent bundle *you* are, deployed from its repository | `CURIE_BUNDLE_VERSION` in this sandbox's environment. That is the platform-tracked version_label of the bundle you booted with. The platform's Kubernetes objects do not carry it, and `CURIE_BUNDLE_REF` is an internal fetch key, not a version to report. |
 
 They move independently. A newer platform does not update you, and upgrading
 yourself does not touch the platform.
