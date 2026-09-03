@@ -731,18 +731,36 @@ async def test_existing_remote_pr_is_adopted_before_recreating_a_missing_job(
 async def test_non_slack_publication_result_uses_the_stored_adapter_route_without_model(
     publication: Any,
 ) -> None:
-    loop, store, _, _, _, replies = _loop(publication)
+    transcript = _Transcript()
+    loop, store, _, _, _, replies = _loop(publication, transcript=transcript)
     work = _work(publication, kind="email")
     store.target = work.target
     store.route = work.route
+    email_workspace_conversation_id = scoped_conversation_id(
+        work.target.kind,
+        work.target.address,
+        work.target.conversation_id,
+    )
+    store.workspace_conversation_id = email_workspace_conversation_id
 
     await loop.reconcile(work)
 
     event, route = replies.events[0]
     assert event.target.kind == "email"
+    assert event.target.address == "agent@example.test"
+    assert event.target.conversation_id == CONVERSATION_ID
     assert route == TargetRoute(
         endpoint="https://adapter.example.com/replies", adapter="agentmail-sandbox"
     )
+    assert transcript.records == [
+        (
+            AGENT_ID,
+            email_workspace_conversation_id,
+            PUBLICATION_ID,
+            f"Published the approved changes: {PR_URL}",
+        )
+    ]
+    assert all(record[1] != WORKSPACE_CONVERSATION_ID for record in transcript.records)
     assert PR_URL in event.text
     assert store.completed[PUBLICATION_ID] == ("published", PR_URL)
     assert not hasattr(loop, "runner") and not hasattr(loop, "model")

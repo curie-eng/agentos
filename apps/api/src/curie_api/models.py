@@ -360,8 +360,9 @@ class Approval(Base):
         index=True,
         default=None,
     )
-    # The thread key routing keeps one live session per (the worker's
-    # conversation_id); the resume turn is enqueued back onto it.
+    # Adapter-native, bare conversation identity. The resume path combines it
+    # with the stored reply kind/channel when it needs the worker's scoped
+    # thread key; adapter egress continues to receive this unmodified value.
     conversation_id: Mapped[str] = mapped_column(index=True)
     # Who authored the turn that raised the request. ADR-0106 permits that same
     # authenticated principal to resolve only when the selected set admits it.
@@ -463,6 +464,10 @@ class Publication(Base):
     deployment_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey(f"{SCHEMA}.deployments.id", ondelete="CASCADE")
     )
+    # Private authorization/history snapshot. New writers derive this from the
+    # reply tuple; NULL denotes a successful pre-scoping row whose Approval
+    # conversation remains the only honest historical identity.
+    workspace_conversation_id: Mapped[str | None] = mapped_column(default=None)
     repo_full_name: Mapped[str]
     status: Mapped[str] = mapped_column(server_default="pending")
     version: Mapped[int] = mapped_column(server_default="1", default=1)

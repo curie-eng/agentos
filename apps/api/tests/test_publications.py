@@ -1927,15 +1927,15 @@ def test_kernel_publications_isolate_same_timestamp_across_slack_channels(
     that loop will consume: both the stored approval target and every kernel
     reply remain channel-local while workspace/history authority stays scoped.
     """
-    from aci_protocol import QueuedTurn, ReplyHandle, SessionStatus
+    from aci_protocol import Final, QueuedTurn, ReplyHandle, SessionStatus
+    from aiohttp import web
     from curie_worker.approvals import ApprovalClient
     from curie_worker.behaviorpacks import BehaviorPacks
     from curie_worker.binding import HISTORY_REF_ENV, BindingResolver
-    from curie_worker.kernel import TurnOutcome
     from curie_worker.runner_client import RunnerWorkspaceSnapshot
     from curie_worker.workspace import WorkspaceClaimCoordinator, WorkspaceCredentialClient
 
-    from apps.worker.tests.kernel.conftest import kernel_harness, make_config
+    from apps.worker.tests.kernel.conftest import FakeRunner, kernel_harness, make_config
 
     client, _ = publication_stack
     deployment = _create_deployment(client, auth_headers, channel="C0EXAMPLE1")
@@ -2073,6 +2073,40 @@ def test_kernel_publications_isolate_same_timestamp_across_slack_channels(
             )
 
         binding = RecordingBinding(BindingResolver(engine, worker_config))
+        controlled_runner = FakeRunner()
+        controlled_runner.default_script = [
+            Final(
+                text="Prepared repository changes",
+                status=SessionStatus.AWAITING_APPROVAL,
+                approval_summary="Publish the prepared changes",
+                approval_gate_kind="permission",
+                approval_granted_tool="mcp__curie__publish_changes",
+            )
+        ]
+
+        async def snapshot(_request: web.Request) -> web.Response:
+            assert controlled_runner.opened
+            matching_channels = [
+                channel
+                for channel, repo_full_name in repos.items()
+                if repo_full_name in controlled_runner.opened[-1]
+            ]
+            assert len(matching_channels) == 1
+            captured = snapshots[matching_channels[0]]
+            return web.json_response(
+                {
+                    "repo_full_name": captured.repo_full_name,
+                    "base_sha": captured.base_sha,
+                    "patch_base64": base64.b64encode(captured.patch).decode("ascii"),
+                    "changed_paths": list(captured.changed_paths),
+                    "contains_workflow_files": captured.contains_workflow_files,
+                    "patch_size_bytes": len(captured.patch),
+                    "publication_title": captured.publication_title,
+                    "publication_body": captured.publication_body,
+                }
+            )
+
+        controlled_runner.app.add_routes([web.post("/v1/snapshot", snapshot)])
         try:
             async with httpx.AsyncClient(
                 transport=httpx.MockTransport(approval_transport),
@@ -2097,6 +2131,7 @@ def test_kernel_publications_isolate_same_timestamp_across_slack_channels(
                     publication_creator=creator,
                     api_base_url="https://api.example.test",
                     workspace_scratch_root=str(validation_scratch),
+                    runner_app=controlled_runner.app,
                 ) as harness:
                     preparer = _LocalWorkspacePreparer(
                         __import__("curie_worker.workspace", fromlist=["workspace"]),
@@ -2110,25 +2145,6 @@ def test_kernel_publications_isolate_same_timestamp_across_slack_channels(
                         )
                     )
                     harness.kernel._workspace = workspace  # type: ignore[assignment]
-
-                    async def publication_attempt(
-                        qevent: QueuedTurn,
-                        _route: Any,
-                        release_order: Any,
-                        *_args: Any,
-                        **_kwargs: Any,
-                    ) -> TurnOutcome:
-                        release_order()
-                        return TurnOutcome(
-                            terminal_ok=False,
-                            text=f"Prepared {qevent.reply_handle.channel} repository changes",
-                            status=SessionStatus.AWAITING_APPROVAL,
-                            approval_gate_kind="permission",
-                            approval_granted_tool="mcp__curie__publish_changes",
-                            publication_snapshot=snapshots[qevent.reply_handle.channel],
-                        )
-
-                    harness.kernel._attempt = publication_attempt  # type: ignore[method-assign]
                     for event in events:
                         await harness.kernel.process_event(event)
 
@@ -2155,14 +2171,27 @@ def test_kernel_publications_isolate_same_timestamp_across_slack_channels(
     statuses, requests, release_keys, claims, history_keys, routed_events = asyncio.run(
         exercise()
     )
-    assert statuses == [201, 201]
-    assert len(requests) == 2
-    assert all("workspace_conversation_id" not in request for request in requests)
-
     scoped_by_channel = {
         channel: scoped_conversation_id("slack", channel, shared_timestamp)
         for channel in repos
     }
+    workspace_rows = _rows(
+        "SELECT agent_id, selected_by_deployment_id, conversation_id, repo_full_name "
+        "FROM curie.thread_workspaces ORDER BY conversation_id"
+    )
+    assert workspace_rows == [
+        {
+            "agent_id": uuid.UUID(deployment["agent_id"]),
+            "selected_by_deployment_id": uuid.UUID(deployment["id"]),
+            "conversation_id": scoped_by_channel[channel],
+            "repo_full_name": repos[channel],
+        }
+        for channel in sorted(repos, key=scoped_by_channel.__getitem__)
+    ]
+    assert statuses == [201, 201]
+    assert len(requests) == 2
+    assert all("workspace_conversation_id" not in request for request in requests)
+
     scoped_identities = set(scoped_by_channel.values())
     assert len(scoped_identities) == 2
     assert len(claims) == 2
@@ -2177,15 +2206,6 @@ def test_kernel_publications_isolate_same_timestamp_across_slack_channels(
     } == {
         (channel, scoped, scoped)
         for channel, scoped in scoped_by_channel.items()
-    }
-
-    workspace_rows = _rows(
-        "SELECT conversation_id, repo_full_name FROM curie.thread_workspaces "
-        "ORDER BY conversation_id"
-    )
-    assert {row["conversation_id"]: row["repo_full_name"] for row in workspace_rows} == {
-        scoped_by_channel[channel]: repo_full_name
-        for channel, repo_full_name in repos.items()
     }
 
     durable_rows = _rows(

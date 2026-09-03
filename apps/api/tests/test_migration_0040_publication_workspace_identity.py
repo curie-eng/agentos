@@ -28,6 +28,8 @@ def _sql(statement: str, params: dict[str, Any] | None = None) -> list[dict[str,
         try:
             async with engine.begin() as connection:
                 result = await connection.execute(text(statement), params or {})
+                if not result.returns_rows:
+                    return []
                 return [dict(row) for row in result.mappings().all()]
         finally:
             await engine.dispose()

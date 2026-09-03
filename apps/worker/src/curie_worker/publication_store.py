@@ -28,6 +28,7 @@ class PublicationResult:
     publication_id: uuid.UUID
     approval_id: uuid.UUID
     agent_id: uuid.UUID
+    workspace_conversation_id: str
     outcome: str
     pr_url: str | None
     error: str | None
@@ -475,6 +476,8 @@ class PostgresPublicationStore:
             SELECT p.id, p.approval_id, p.status, p.result_url, p.error, p.version,
                    p.result_delivery_attempts, p.reply_kind, p.reply_channel,
                    p.reply_placeholder, p.reply_endpoint, p.reply_adapter,
+                   COALESCE(p.workspace_conversation_id, a.conversation_id)
+                       AS workspace_conversation_id,
                    a.agent_id, a.conversation_id, a.resolved_by, a.resolution_note
               FROM {self._table} p
               JOIN {self._approvals} a ON a.id = p.approval_id
@@ -561,6 +564,7 @@ class PostgresPublicationStore:
             publication_id=result_id,
             approval_id=uuid.UUID(str(row["approval_id"])),
             agent_id=uuid.UUID(str(row["agent_id"])),
+            workspace_conversation_id=str(row["workspace_conversation_id"]),
             outcome="published" if status == "succeeded" else status,
             pr_url=row["result_url"],
             error=row["error"],

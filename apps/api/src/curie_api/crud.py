@@ -6,6 +6,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from channel_protocol import scoped_conversation_id
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
@@ -55,9 +56,9 @@ async def _adopt_publication_replay(
     session: AsyncSession,
     data: PublicationCreate,
     patch: bytes,
-    *,
-    agent_id: uuid.UUID,
 ) -> Publication | None:
+    """Adopt an exact replay only through its persisted authorization lane."""
+
     approval = await get_approval_by_dedupe_key(session, data.dedupe_key)
     if approval is None:
         return None
@@ -66,9 +67,17 @@ async def _adopt_publication_replay(
         raise PublicationReplayConflict(
             "publication dedupe key belongs to a non-publication approval"
         )
+    deployment = await get_deployment(session, data.deployment_id)
+    if deployment is None:
+        raise LookupError("deployment not found")
     if (
-        approval.agent_id != agent_id
+        approval.agent_id != deployment.agent_id
         or approval.conversation_id != data.conversation_id
+        or approval.reply_kind != data.reply_kind
+        or approval.reply_channel != data.reply_channel
+        or approval.reply_placeholder != data.reply_placeholder
+        or approval.reply_endpoint != data.reply_endpoint
+        or approval.reply_adapter != data.reply_adapter
         or publication.deployment_id != data.deployment_id
         or publication.repo_full_name.casefold() != data.repo_full_name.casefold()
         or publication.base_sha != data.base_sha
@@ -76,25 +85,49 @@ async def _adopt_publication_replay(
         or publication.changed_paths != data.changed_paths
         or publication.title != (data.title or data.summary)
         or publication.body != (data.body or "Approved platform publication.")
+        or publication.reply_kind != data.reply_kind
+        or publication.reply_channel != data.reply_channel
+        or publication.reply_placeholder != data.reply_placeholder
+        or publication.reply_endpoint != data.reply_endpoint
+        or publication.reply_adapter != data.reply_adapter
     ):
         raise PublicationReplayConflict(
             "publication dedupe key was replayed with different snapshot facts"
         )
+    # A NULL snapshot is an explicit pre-scoping lane. Choose it before any new
+    # derived lookup so a valid historical replay is authorized against the
+    # bare workspace row it originally used.
+    workspace_conversation_id = (
+        publication.workspace_conversation_id
+        if publication.workspace_conversation_id is not None
+        else approval.conversation_id
+    )
+    await _require_current_publication_workspace(
+        session,
+        data,
+        conversation_id=workspace_conversation_id,
+        deployment=deployment,
+    )
     return publication
 
 
 async def _require_current_publication_workspace(
-    session: AsyncSession, data: PublicationCreate
+    session: AsyncSession,
+    data: PublicationCreate,
+    *,
+    conversation_id: str,
+    deployment: Deployment | None = None,
 ) -> tuple[Deployment, ThreadWorkspace]:
     """Authorize the request against current deployment and thread policy."""
 
-    deployment = await get_deployment(session, data.deployment_id)
+    if deployment is None:
+        deployment = await get_deployment(session, data.deployment_id)
     if deployment is None:
         raise LookupError("deployment not found")
     thread_workspace = await get_thread_workspace(
         session,
         agent_id=deployment.agent_id,
-        conversation_id=data.conversation_id,
+        conversation_id=conversation_id,
     )
     if thread_workspace is None:
         raise ValueError("conversation has no selected repository workspace")
@@ -697,10 +730,20 @@ async def create_publication(
     conflict and can never replace bytes that were already approved.
     """
 
-    deployment, thread_workspace = await _require_current_publication_workspace(session, data)
-    existing = await _adopt_publication_replay(session, data, patch, agent_id=deployment.agent_id)
+    existing = await _adopt_publication_replay(session, data, patch)
     if existing is not None:
         return existing, False
+
+    workspace_conversation_id = scoped_conversation_id(
+        data.reply_kind,
+        data.reply_channel,
+        data.conversation_id,
+    )
+    deployment, thread_workspace = await _require_current_publication_workspace(
+        session,
+        data,
+        conversation_id=workspace_conversation_id,
+    )
 
     expires_at = None
     if data.expires_in_seconds is not None:
@@ -731,16 +774,14 @@ async def create_publication(
         await session.flush()
     except IntegrityError:
         await session.rollback()
-        deployment, _ = await _require_current_publication_workspace(session, data)
-        existing = await _adopt_publication_replay(
-            session, data, patch, agent_id=deployment.agent_id
-        )
+        existing = await _adopt_publication_replay(session, data, patch)
         if existing is None:
             raise
         return existing, False
     publication = Publication(
         approval_id=approval.id,
         deployment_id=deployment.id,
+        workspace_conversation_id=workspace_conversation_id,
         repo_full_name=thread_workspace.repo_full_name,
         status="pending",
         version=1,
@@ -763,10 +804,7 @@ async def create_publication(
         # unique approval dedupe key is the arbiter; after rolling back the
         # losing INSERT, re-read and adopt only an exact private-fact replay.
         await session.rollback()
-        deployment, _ = await _require_current_publication_workspace(session, data)
-        existing = await _adopt_publication_replay(
-            session, data, patch, agent_id=deployment.agent_id
-        )
+        existing = await _adopt_publication_replay(session, data, patch)
         if existing is None:
             raise
         return existing, False

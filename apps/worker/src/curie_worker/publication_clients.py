@@ -35,11 +35,11 @@ class PublicationTranscriptClient:
     async def record_result(
         self,
         agent_id: uuid.UUID,
-        conversation_id: str,
+        workspace_conversation_id: str,
         publication_id: uuid.UUID,
         text: str,
     ) -> None:
-        key = quote(conversation_id, safe="")
+        key = quote(workspace_conversation_id, safe="")
         url = f"{self._base}/agents/{agent_id}/state/transcript/{key}"
         marker = str(publication_id)
         item = {

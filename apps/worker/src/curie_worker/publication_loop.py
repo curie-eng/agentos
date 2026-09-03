@@ -161,7 +161,7 @@ class PublicationTranscript(Protocol):
     def record_result(
         self,
         agent_id: uuid.UUID,
-        conversation_id: str,
+        workspace_conversation_id: str,
         publication_id: uuid.UUID,
         text: str,
     ) -> None | Awaitable[None]: ...
@@ -416,7 +416,6 @@ class PublicationReconciler:
             )
         else:
             text = f"Publication failed safely after approval: {result.error}"
-        conversation_id = result.target.conversation_id
         card_ref: ApprovalCardRef | None = None
         approval_id = str(result.approval_id)
         transcript_retry_error: Exception | None = None
@@ -430,7 +429,7 @@ class PublicationReconciler:
                     await _resolve(
                         self._transcript.record_result(
                             result.agent_id,
-                            conversation_id,
+                            result.workspace_conversation_id,
                             result.publication_id,
                             text,
                         )
