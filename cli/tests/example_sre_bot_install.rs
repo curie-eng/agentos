@@ -788,6 +788,10 @@ fn clap_routes_the_one_command_and_exposes_no_operator_configuration_or_credenti
         text.contains("--slack-channel"),
         "the install surface must permit the optional Slack binding: {text}"
     );
+    assert!(
+        text.contains("--workspace-repo"),
+        "the install surface must expose the runtime GitHub allowlist flag: {text}"
+    );
     for required in ["--namespace", "--release", "--observability-namespace"] {
         assert!(
             text.contains(required),
@@ -2018,6 +2022,58 @@ fn assert_no_default_curie_or_observability_targets(lines: &[String]) {
             "custom targeting must not retain default identity `{forbidden}`: {lines:?}"
         );
     }
+}
+
+#[test]
+fn workspace_repo_flags_set_github_repo_allowlist_in_the_dry_run_plan() {
+    let fixture = Fixture::new(nodes(vec![node("node-a", "4Gi", true)]), pods(vec![]));
+    let output = fixture.run(&[
+        "--dry-run",
+        "--json",
+        "--workspace-repo",
+        "acme-corp/acme-bot",
+        "--workspace-repo",
+        "acme-labs/*",
+    ]);
+    let text = shown(&output);
+    assert!(
+        output.status.success(),
+        "workspace-repo dry run must succeed: {text}"
+    );
+    let lines = dry_run_plan_lines(&output);
+    let plan = lines.join("\n");
+    assert!(
+        plan.contains("api.githubRepoAllowlist[0]=acme-corp/acme-bot"),
+        "first --workspace-repo must become allowlist index 0: {lines:?}"
+    );
+    assert!(
+        plan.contains("api.githubRepoAllowlist[1]=acme-labs/*"),
+        "second --workspace-repo must become allowlist index 1: {lines:?}"
+    );
+}
+
+#[test]
+fn workspace_repo_flag_rejects_a_malformed_entry_before_cluster_reads() {
+    let fixture = Fixture::with_modes(
+        nodes(vec![node("node-a", "4Gi", true)]),
+        pods(vec![]),
+        "success",
+        "success",
+        "success",
+    );
+    let output = fixture.run(&["--workspace-repo", "not a repo"]);
+    let text = shown(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "malformed --workspace-repo must be a usage error: {text}"
+    );
+    assert!(
+        text.contains("owner/repo") || text.contains("allowlist"),
+        "usage error must name the expected allowlist shape: {text}"
+    );
+    assert!(fixture.kubectl_calls().is_empty());
+    assert!(fixture.helm_calls().is_empty());
 }
 
 #[test]

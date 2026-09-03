@@ -955,6 +955,11 @@ enum SreBotAction {
         /// Kubernetes namespace of the retained observability stack. Default: observability.
         #[arg(long, default_value = "observability")]
         observability_namespace: String,
+        /// Allow this GitHub repository, or `owner/*`, for runtime workspace
+        /// selection. Repeatable. Sets `api.githubRepoAllowlist` on the Curie
+        /// install.
+        #[arg(long = "workspace-repo", value_name = "OWNER/REPO")]
+        workspace_repo: Vec<String>,
     },
 }
 
@@ -2861,6 +2866,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                             namespace,
                             release,
                             observability_namespace,
+                            workspace_repo,
                         },
                 },
         }) => match curie::examples::install_sre_bot(curie::examples::SreBotInstallOpts {
@@ -2871,6 +2877,7 @@ async fn run(command: Option<Command>) -> Result<()> {
             namespace,
             release,
             observability_namespace,
+            workspace_repo,
         })
         .await?
         {
@@ -4062,6 +4069,9 @@ async fn run(command: Option<Command>) -> Result<()> {
                 secret,
                 api_local_port,
             } => {
+                if workspace {
+                    commands::warn_if_empty_github_repo_allowlist(&namespace, &release).await;
+                }
                 let api_key = commands::normalize_deploy_api_key(api_key);
                 // ADR-0057 (supersedes ADR-0024's deploy transport): with no
                 // explicit --api-key, discover the release's strong Secret key;

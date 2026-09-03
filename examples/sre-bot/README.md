@@ -37,6 +37,20 @@ stores the credential outside bundle content:
 curie example sre-bot install --observability
 ```
 
+Runtime repository workspaces need `api.githubRepoAllowlist`. The chart default
+is empty and denies every selection, including after `curie cluster deploy
+--workspace` (that flag is a deprecated compatibility no-op; the allowlist is
+the real control). Pass `--workspace-repo owner/repo` (repeatable; `owner/*`
+is also accepted), or set the chart value yourself:
+
+```bash
+curie example sre-bot install --observability \
+  --workspace-repo acme-corp/acme-bot
+curie cluster up --set 'api.githubRepoAllowlist[0]=acme-corp/acme-bot'
+```
+
+`curie cluster deploy --workspace` warns when the allowlist is empty.
+
 Inspect the mutation plan first with `--dry-run`. Add `--platform-upgrade` only
 after reading `manifests/platform-upgrade-role.yaml`; it creates a separate,
 purpose-built upgrade path with much wider authority.

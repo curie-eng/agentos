@@ -515,7 +515,8 @@ def test_unallowlisted_runtime_repo_is_terminal_before_claim_or_model(
                     assert kwargs["deployment_id"] == deployment_id
                     assert kwargs["repo_full_name"] == "attacker/other-bot"
                     raise WorkspaceSelectionRefused(
-                        "That repository is not authorized for this installation."
+                        "That repository is not in api.githubRepoAllowlist for this installation; "
+                        "allow `owner/repo` or `owner/*` in the chart values."
                     )
 
                 def claim_or_resume_with_handle(self, **_kwargs: object) -> object:
@@ -535,7 +536,8 @@ def test_unallowlisted_runtime_repo_is_terminal_before_claim_or_model(
             assert h.runner.opened == []
             assert h.fake_k8s.claim_envs == []
             assert h.sink.last_text == (
-                "That repository is not authorized for this installation."
+                "That repository is not in api.githubRepoAllowlist for this installation; "
+                "allow `owner/repo` or `owner/*` in the chart values."
             )
 
     asyncio.run(go())

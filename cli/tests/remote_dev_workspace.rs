@@ -75,6 +75,18 @@ fn deploy_response(req: &support::Request, existing: ExistingAgent) -> Response 
             })
             .to_string(),
         ),
+        ("GET", path) if path.contains("/versions/") && path.contains("/connectors?") => {
+            Response::json(
+                200,
+                &json!({
+                    "manifests": [],
+                    "owned_secret_name": "",
+                    "owned_secret_keys": [],
+                    "mcp_entries": {}
+                })
+                .to_string(),
+            )
+        }
         ("POST", "/deployments") => {
             let body: Value = serde_json::from_slice(&req.body).expect("deployment body is JSON");
             let mut result = json!({
@@ -193,6 +205,26 @@ fn workspace_and_no_workspace_are_mutually_exclusive_on_both_tiers() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("cannot be used with"), "{tier}: {stderr}");
     }
+}
+
+fn write_helm_values_stub(dir: &Path, values: &str) {
+    let path = dir.join("helm");
+    let script = format!(
+        r#"#!/bin/sh
+case "$*" in
+  *"get values"*" -o json"|*"get values"*"-o json"*)
+    printf '%s\n' '{values}' ;;
+  *) printf 'unexpected helm invocation: %s\n' "$*" >&2; exit 64 ;;
+esac
+"#,
+        values = values.replace('\'', "'\\''")
+    );
+    fs::write(&path, script).expect("write helm stub");
+    let mut permissions = fs::metadata(&path)
+        .expect("helm stub metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&path, permissions).expect("make helm stub executable");
 }
 
 fn write_kubectl_stub(dir: &Path) -> PathBuf {
@@ -360,6 +392,55 @@ fn run_fanout(
     (command.output().expect("run cluster fanout"), server)
 }
 
+fn run_cluster_workspace_with_helm(
+    helm_values: Value,
+    workspace_flag: bool,
+) -> (Output, MockServer) {
+    let plugin = tempfile::tempdir().expect("plugin tempdir");
+    scaffold(plugin.path(), "acme-bot").expect("scaffold bundle");
+    let tools = tempfile::tempdir().expect("tool tempdir");
+    write_kubectl_stub(tools.path());
+    write_helm_values_stub(tools.path(), &helm_values.to_string());
+    let mut paths = vec![tools.path().to_path_buf()];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let path = std::env::join_paths(paths).expect("join PATH");
+    let server = serve(move |req| deploy_response(req, ExistingAgent::Unbound));
+    let mut command = Command::new(bin());
+    command
+        .args(["cluster", "deploy", "--plugin-dir"])
+        .arg(plugin.path())
+        .args([
+            "--api-url",
+            &server.base_url,
+            "--api-key",
+            "test-key",
+            "--namespace",
+            "curie",
+            "--release",
+            "curie",
+            "--agent",
+            "acme-bot",
+            "--env",
+            "dev",
+            "--slack-channel",
+            "C0EXAMPLE1",
+            "--label",
+            LABEL,
+        ])
+        .env("PATH", path)
+        .env_remove("CURIE_API_URL")
+        .env_remove("CURIE_API_KEY");
+    if workspace_flag {
+        command.arg("--workspace");
+    }
+    (
+        command.output().expect("run cluster workspace deploy"),
+        server,
+    )
+}
+
 #[test]
 fn all_targets_serialize_legacy_workspace_true_independently() {
     let (output, server) = run_fanout(
@@ -426,6 +507,60 @@ fn deploy_args(manifest: &Value, tier: &str) -> Vec<Value> {
         .as_array()
         .expect("deploy args")
         .clone()
+}
+
+#[test]
+fn cluster_workspace_warns_when_github_repo_allowlist_is_empty() {
+    let (output, _server) =
+        run_cluster_workspace_with_helm(json!({"api": {"githubRepoAllowlist": []}}), true);
+    assert!(
+        output.status.success(),
+        "deploy failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("api.githubRepoAllowlist"),
+        "empty allowlist must name the chart key: {stderr}"
+    );
+    assert!(
+        stderr.contains("empty") || stderr.contains("denies"),
+        "warning must say the empty allowlist denies selection: {stderr}"
+    );
+}
+
+#[test]
+fn cluster_workspace_stays_quiet_when_github_repo_allowlist_has_entries() {
+    let (output, _server) = run_cluster_workspace_with_helm(
+        json!({"api": {"githubRepoAllowlist": ["acme-corp/acme-bot"]}}),
+        true,
+    );
+    assert!(
+        output.status.success(),
+        "deploy failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("api.githubRepoAllowlist is empty"),
+        "a populated allowlist must not warn: {stderr}"
+    );
+}
+
+#[test]
+fn cluster_deploy_without_workspace_does_not_warn_on_empty_allowlist() {
+    let (output, _server) =
+        run_cluster_workspace_with_helm(json!({"api": {"githubRepoAllowlist": []}}), false);
+    assert!(
+        output.status.success(),
+        "deploy failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("api.githubRepoAllowlist"),
+        "omitting --workspace must not inspect or warn about the allowlist: {stderr}"
+    );
 }
 
 #[test]

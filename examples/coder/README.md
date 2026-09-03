@@ -22,6 +22,11 @@ curie cluster deploy --plugin-dir examples/coder \
   --agent acme-dev --env dev --slack-channel C0EXAMPLE1
 ```
 
+The chart default `api.githubRepoAllowlist: []` denies every runtime selection.
+`curie cluster deploy --workspace` warns when that list is empty. The retained
+`--workspace` flag is a deprecated compatibility no-op; the allowlist is the
+real control. `owner/*` allows every repository under that owner.
+
 Invite the bot to the channel. In the opening message, include the single
 allowed root repository URL, for example
 `https://github.com/acme-corp/acme-bot`, together with a focused change. Curie

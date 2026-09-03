@@ -4433,6 +4433,42 @@ pub enum DeployTier {
 
 pub use crate::api::WorkspaceIntent;
 
+pub const EMPTY_GITHUB_REPO_ALLOWLIST_WARNING: &str =
+    "api.githubRepoAllowlist is empty, so runtime workspace selection denies every repository. \
+     Allow `owner/repo` or `owner/*` in the chart values, for example \
+     `curie cluster up --set 'api.githubRepoAllowlist[0]=owner/repo'`";
+
+pub fn github_repo_allowlist_is_empty(values: &serde_json::Value) -> bool {
+    match values.pointer("/api/githubRepoAllowlist") {
+        None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::Array(items)) => items.iter().all(|item| {
+            item.as_str()
+                .map(|entry| entry.trim().is_empty())
+                .unwrap_or(true)
+        }),
+        Some(serde_json::Value::String(raw)) => {
+            let trimmed = raw.trim();
+            trimmed.is_empty() || trimmed == "[]"
+        }
+        Some(_) => false,
+    }
+}
+
+/// Best-effort warning when `--workspace` is passed against an empty chart allowlist.
+pub async fn warn_if_empty_github_repo_allowlist(namespace: &str, release: &str) {
+    let opts = crate::ops::CommonOpts {
+        namespace: namespace.to_string(),
+        release: release.to_string(),
+        dry_run: false,
+    };
+    let Ok(Some(values)) = crate::ops::fetch_release_computed_values(&opts).await else {
+        return;
+    };
+    if github_repo_allowlist_is_empty(&values) {
+        crate::ui::ui().warn(EMPTY_GITHUB_REPO_ALLOWLIST_WARNING);
+    }
+}
+
 /// The declared connector-secret NAMES not present in the operator's bound
 /// `--secret` set (#464). A non-empty result is a deploy-time gap: the bundle
 /// expects a secret nothing will bind, which would surface at runtime as an
@@ -7630,16 +7666,38 @@ pub fn skill_approval_routes_unavailable() -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        absent_container_note, merge_secret_env, model_credential_summary,
-        parse_credential_env_file, parse_manifest_gates, plan_recorded_state,
-        plan_recorded_teardown, plan_skill_down, recorded_ids_match, replace_first_line,
-        report_sweep, resolve_cases_path, resolve_env_file_credentials, routing_warning,
-        seed_env_if_missing, select_in_force_deployment, select_passthrough_env, sweep_json_row,
-        sweep_table_row, validate_channel_binding, ApprovalGateDecl, DownPlan, EnvSeed,
-        RecordedStatePlan, RecordedStateQuery, RecordedTeardown, SweepRow,
+        absent_container_note, github_repo_allowlist_is_empty, merge_secret_env,
+        model_credential_summary, parse_credential_env_file, parse_manifest_gates,
+        plan_recorded_state, plan_recorded_teardown, plan_skill_down, recorded_ids_match,
+        replace_first_line, report_sweep, resolve_cases_path, resolve_env_file_credentials,
+        routing_warning, seed_env_if_missing, select_in_force_deployment, select_passthrough_env,
+        sweep_json_row, sweep_table_row, validate_channel_binding, ApprovalGateDecl, DownPlan,
+        EnvSeed, RecordedStatePlan, RecordedStateQuery, RecordedTeardown, SweepRow,
     };
     use serde::Deserialize;
+    use serde_json::json;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn github_repo_allowlist_is_empty_for_missing_null_and_empty_values() {
+        assert!(github_repo_allowlist_is_empty(&json!({})));
+        assert!(github_repo_allowlist_is_empty(&json!({"api": {}})));
+        assert!(github_repo_allowlist_is_empty(
+            &json!({"api": {"githubRepoAllowlist": serde_json::Value::Null}})
+        ));
+        assert!(github_repo_allowlist_is_empty(
+            &json!({"api": {"githubRepoAllowlist": []}})
+        ));
+        assert!(github_repo_allowlist_is_empty(
+            &json!({"api": {"githubRepoAllowlist": ["", "  "]}})
+        ));
+        assert!(!github_repo_allowlist_is_empty(
+            &json!({"api": {"githubRepoAllowlist": ["acme-corp/acme-bot"]}})
+        ));
+        assert!(!github_repo_allowlist_is_empty(
+            &json!({"api": {"githubRepoAllowlist": ["acme-labs/*"]}})
+        ));
+    }
 
     // --- the eval exit-code contract (#2007) --------------------------------
     //
