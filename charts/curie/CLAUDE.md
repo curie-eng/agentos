@@ -75,7 +75,10 @@ component and rail detail in `charts/curie/README.md`.
 - **Fail-closed egress, always.** `security.networkPolicy.allowedEgress` is
   empty by default; an unset allowlist must never mean allow-all. If you add
   a new egress destination the runner needs, it goes into this allowlist
-  explicitly -- never widen the default-deny baseline itself.
+  explicitly -- never widen the default-deny baseline itself. The exception
+  is a BYO object store (`rustfs.deploy: false`): that allow is
+  `rustfs.egress` (and `rustfs.stsEgress` on the key-free path), required at
+  render, not mixed into the model-API allowlist.
 - **NetworkPolicy allows are additive, never restrictive-intersecting
   (#765, ADR-0067).** A second NetworkPolicy selecting the same pods can only
   widen what Rail 1 permits, never narrow it -- there is no such thing as one

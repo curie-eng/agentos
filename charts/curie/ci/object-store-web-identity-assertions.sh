@@ -64,6 +64,16 @@ rustfs:
   port: 443
   auth:
     accessKey: ""
+  # Dedicated runner allows for the BYO store and STS (#2213). TEST-NET-1
+  # stands in for VPC interface-endpoint /32s. The broad allowedEgress list
+  # below is a separate Rail 1 pin: it is the configuration in which the IMDS
+  # carve-out is observable.
+  egress:
+    - cidr: 192.0.2.10/32
+      ports: [{ protocol: TCP, port: 443 }]
+  stsEgress:
+    - cidr: 192.0.2.11/32
+      ports: [{ protocol: TCP, port: 443 }]
 # A key-free BYO store still has to be REACHABLE, so this overlay carries the
 # broad allowlist such an install realistically sets. That is also the only
 # configuration in which Rail 1's IMDS carve-out is observable: with an empty
