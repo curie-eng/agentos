@@ -559,7 +559,15 @@ forward merge from `main` into `next` happens at release candidate prep, not
 after every individual fix. Do not routinely cherry pick fixes between release
 lines.
 
-When a release candidate is accepted, merge `next` into `main`, then run every
+When a release candidate is accepted, merge `next` into `main` through a pull
+request whose head is a short-lived `task/release-*` branch cut from `next`,
+not through a pull request whose head is `next` itself. Repository auto-delete
+of merged heads stays enabled so task branches still clean up; an ordinary
+`next` to `main` PR therefore deletes `next` when the merger can bypass the
+deletion ruleset (issue #2090). Run
+`python3 release/preserve_next.py --repo <owner/name>` before enabling
+auto-merge: it refuses that ordinary path until the head is not `next` or an
+active deletion ruleset covers `next` with an empty bypass list. Then run every
 parity ladder rung on the resulting `main` commit:
 
 ```bash
