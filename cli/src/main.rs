@@ -979,6 +979,11 @@ enum DevAction {
     /// Run the cold-start parity ladder across the skill, local, and cluster
     /// tiers, fake model by default (#690, `bash cli/scripts/e2e-ladder.sh`).
     E2eLadder,
+    /// Nightly SRE demo e2e: six assertions on kind with the pinned Kubernetes
+    /// MCP server, a CI-only Socket Mode Slack app, a live provider, and an
+    /// allowlisted throwaway repo (#2246, `bash cli/scripts/sre-demo-e2e.sh`).
+    /// Missing those CI secrets skip with the reason in the run summary.
+    SreDemoE2e,
     /// Select the end to end tiers CI would run for paths or revisions.
     E2eCiSelection {
         /// Changed path. Repeat for every path in the candidate change.
@@ -2937,6 +2942,7 @@ async fn run(command: Option<Command>) -> Result<()> {
             }
             DevAction::E2e => commands::dev_script("cli/scripts/e2e.sh", &[]).await,
             DevAction::E2eLadder => commands::dev_script("cli/scripts/e2e-ladder.sh", &[]).await,
+            DevAction::SreDemoE2e => commands::dev_script("cli/scripts/sre-demo-e2e.sh", &[]).await,
             DevAction::E2eCiSelection {
                 path,
                 base,
@@ -5435,6 +5441,14 @@ mod tests {
             cli.command,
             Some(Command::Dev {
                 action: DevAction::E2eLadder
+            })
+        ));
+        let cli = Cli::try_parse_from(["curie", "dev", "sre-demo-e2e"])
+            .expect("dev sre-demo-e2e should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Dev {
+                action: DevAction::SreDemoE2e
             })
         ));
         let cli = Cli::try_parse_from(["curie", "dev", "chart-runtime-e2e"])

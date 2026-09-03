@@ -5248,6 +5248,11 @@ export const commandManifest = {
           "name": "e2e-ladder"
         },
         {
+          "about": "Nightly SRE demo e2e: six assertions on kind with the pinned Kubernetes MCP server, a CI-only Socket Mode Slack app, a live provider, and an allowlisted throwaway repo (#2246, `bash cli/scripts/sre-demo-e2e.sh`). Missing those CI secrets skip with the reason in the run summary",
+          "hidden": false,
+          "name": "sre-demo-e2e"
+        },
+        {
           "about": "Select the end to end tiers CI would run for paths or revisions",
           "args": [
             {
