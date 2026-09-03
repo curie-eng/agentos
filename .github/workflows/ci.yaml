@@ -783,6 +783,25 @@ jobs:
           bash scripts/check-commit-messages.sh \
             "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
 
+  # Issue #2090: an ordinary next to main merge deletes protected next when
+  # delete_branch_on_merge is on and the deletion ruleset is bypassable. This
+  # job never skips (a skipped required check is not a pass; see issue #1470)
+  # and refuses only that ordinary release path. Task-branch PRs, including
+  # this gate's own, succeed without an admin settings change.
+  preserve-next:
+    name: Preserve next on release merge
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Refuse an ordinary next-to-main merge that would delete next
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 release/preserve_next.py --repo "$GITHUB_REPOSITORY"
+
   # The three image builds here are GHA-layer-cached via a buildx builder that
   # is created but NOT made the default (`setup-buildx-action` with
   # `use: false`): two of the tags are consumed as Dockerfile FROM bases by a
