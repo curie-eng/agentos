@@ -46,14 +46,14 @@ pub async fn valkey_or_skip(test: &str) -> Option<redis::aio::MultiplexedConnect
 }
 
 /// Builds a unique test-scoped stream name under the given prefix (e.g.
-/// `"curie:test:chat:"`), so concurrent test runs never collide and each
-/// suite keeps its own distinct stream namespace.
+/// `"curie:test:chat:"`), so concurrent tests and processes never collide
+/// and each suite keeps its own distinct stream namespace.
+///
+/// Names include a UUID v4, not `SystemTime` nanos alone. Parallel tests on
+/// the hosted runner and on a separately owned Valkey collided when the
+/// suffix was timestamp-only (#2086).
 pub fn unique_stream(prefix: &str) -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    format!("{prefix}{nanos}")
+    format!("{prefix}{}", uuid::Uuid::new_v4())
 }
 
 #[derive(Debug, Clone)]
