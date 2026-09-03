@@ -11,7 +11,6 @@ from typing import Any
 import httpx
 import pytest
 from curie_api.config import get_settings
-from curie_api.main import create_app
 from fastapi.testclient import TestClient
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.sdk.resources import Resource
@@ -64,21 +63,20 @@ def _max_depth(nodes: list[dict[str, Any]]) -> int:
 
 @pytest.mark.skipif(not _stack_up(), reason="dev compose stack not reachable")
 def test_proxy_returns_reconstructed_tree_for_seeded_trace(
-    auth_headers: dict[str, str],
+    client: TestClient, auth_headers: dict[str, str],
 ) -> None:
     trace_id = _emit_three_level_trace()
 
     deadline = time.time() + 60
     body: dict[str, Any] | None = None
-    with TestClient(create_app()) as client:
-        while time.time() < deadline:
-            resp = client.get(
-                f"/langfuse/traces/{trace_id}", headers=auth_headers
-            )
-            if resp.status_code == 200 and _max_depth(resp.json()["tree"]) >= 3:
-                body = resp.json()
-                break
-            time.sleep(2)
+    while time.time() < deadline:
+        resp = client.get(
+            f"/langfuse/traces/{trace_id}", headers=auth_headers
+        )
+        if resp.status_code == 200 and _max_depth(resp.json()["tree"]) >= 3:
+            body = resp.json()
+            break
+        time.sleep(2)
 
     assert body is not None, "seeded trace never reached the proxy with depth >= 3"
     assert _max_depth(body["tree"]) >= 3
@@ -97,7 +95,7 @@ def test_proxy_returns_reconstructed_tree_for_seeded_trace(
 @pytest.mark.skipif(not _stack_up(), reason="dev compose stack not reachable")
 @pytest.mark.parametrize("decision", ["approved", None])
 def test_proxy_reads_approval_on_non_root_observation(
-    auth_headers: dict[str, str], decision: str | None,
+    client: TestClient, auth_headers: dict[str, str], decision: str | None,
 ) -> None:
     provider = TracerProvider(
         resource=Resource.create({"service.name": "approval-correlation-integration"})
@@ -119,21 +117,20 @@ def test_proxy_reads_approval_on_non_root_observation(
 
     deadline = time.time() + 60
     body: dict[str, Any] | None = None
-    with TestClient(create_app()) as client:
-        while time.time() < deadline:
-            resp = client.get(f"/langfuse/traces/{trace_id}", headers=auth_headers)
-            if resp.status_code == 200:
-                candidate = resp.json()
-                tree = candidate["tree"]
-                if (
-                    len(tree) == 1
-                    and tree[0]["name"] == "curie.queue.enqueue"
-                    and {child["name"] for child in tree[0]["children"]}
-                    == {"agent.run", "curie.reply.update"}
-                    and candidate["approval_decision"] == decision
-                ):
-                    body = candidate
-                    break
-            time.sleep(2)
+    while time.time() < deadline:
+        resp = client.get(f"/langfuse/traces/{trace_id}", headers=auth_headers)
+        if resp.status_code == 200:
+            candidate = resp.json()
+            tree = candidate["tree"]
+            if (
+                len(tree) == 1
+                and tree[0]["name"] == "curie.queue.enqueue"
+                and {child["name"] for child in tree[0]["children"]}
+                == {"agent.run", "curie.reply.update"}
+                and candidate["approval_decision"] == decision
+            ):
+                body = candidate
+                break
+        time.sleep(2)
     assert body is not None, "correlated approval metadata did not reach the exact proxy read"
     assert body["approval_decision"] == decision
