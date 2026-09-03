@@ -81,9 +81,11 @@ logger = logging.getLogger(__name__)
 # dropped. ``env_key`` raises on an unknown field, so a typo fails at import.
 #
 # CURIE_BUNDLE_REF is the RustFS object key sandbox provisioning fetches into
-# CURIE_PLUGIN_DIR (a runner/chart handoff); the rest are the frozen ACI
-# SessionConfig env.
+# CURIE_PLUGIN_DIR (a runner/chart handoff). CURIE_BUNDLE_VERSION is the
+# agent-readable version_label of that same bundle (#2174). The rest are the
+# frozen ACI SessionConfig env.
 BUNDLE_REF_ENV = BootEnv.env_key("bundle_ref")
+BUNDLE_VERSION_ENV = BootEnv.env_key("bundle_version")
 PLUGIN_DIR_ENV = BootEnv.env_key("plugin_dir")
 BUDGET_ENV = BootEnv.env_key("budget")
 SESSION_ID_ENV = BootEnv.env_key("session_id")
@@ -755,6 +757,9 @@ class BindingResolver:
             memory_ref=memory_ref,
             history_ref=history_ref,
             bundle_ref=resolved.bundle_ref,
+            # Agent-readable identity (#2174): the platform-tracked
+            # version_label, not the RustFS object key. Blank is omitted.
+            bundle_version=resolved.version_label or None,
             # Not a model credential, so the model keys never see it; minted
             # fresh per claim and enforced by the runner on its ACI POST routes.
             runner_token=secrets.token_urlsafe(32),

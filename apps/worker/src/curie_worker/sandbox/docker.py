@@ -122,7 +122,8 @@ _OAUTH_TOKEN_PREFIX = "sk-ant-oat"
 # value loop must not also emit them: the plugin dir and sandbox id are set
 # explicitly, the bundle ref named a RustFS object the worker already fetched
 # (the runner never fetches), and the credential is forwarded by name (never as
-# a value in the argv).
+# a value in the argv). CURIE_BUNDLE_VERSION is deliberately not in this set:
+# it is the agent-readable version_label and must reach the child env (#2174).
 _WORKER_OWNED_ENV = frozenset({BUNDLE_REF_ENV, PLUGIN_DIR_ENV, "CURIE_SANDBOX_ID", CREDENTIALS_ENV})
 
 
