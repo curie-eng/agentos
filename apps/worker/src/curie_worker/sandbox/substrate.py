@@ -626,8 +626,14 @@ class SandboxSubstrate:
             namespace=config.namespace,
             service_fqdn=bound.service_fqdn or "",
             port=bound.port if bound.port is not None else config.runner_port,
-            session_id=session_id or f"thread-{thread_hash}",
-            history_ref=history_ref,
+            # The route must describe the runner that actually booted.  Bound
+            # claims receive their authoritative identity in this exact env;
+            # the explicit values remain fallbacks for lifecycle callers that
+            # preserve identity without carrying those optional env entries.
+            session_id=(env or {}).get(SESSION_ENV)
+            or session_id
+            or f"thread-{thread_hash}",
+            history_ref=(env or {}).get(HISTORY_ENV) or history_ref,
             token=(env or {}).get(RUNNER_TOKEN_ENV, ""),
             workspace_repo=workspace_repo,
             generation=generation,
