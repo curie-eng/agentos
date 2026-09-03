@@ -7,8 +7,9 @@
 # requests here is ~1.7 GB, leaving headroom for the kubelet/system and for
 # ClickHouse/Langfuse to burst toward their limits. Everything is single-replica
 # and ClickHouse cluster mode is off. This mirrors compose.dev.yaml (same
-# images, same :24.8 ClickHouse pin) so V1 (compose) and V3 (chart) verify the
-# same stack.
+# Langfuse pin; chart ClickHouse default is 25.12 / AVX-required, compose stays
+# 24.8 for SSE4.2-only local hosts) so V1 (compose) and V3 (chart) verify the
+# same application stack.
 
 langfuse:
   web:
@@ -39,7 +40,8 @@ valkey:
     limits: { cpu: 250m, memory: 256Mi }
 
 clickhouse:
-  # Keep the :24.8 SSE4.2-safe pin. Cluster mode off for single-node.
+  # Inherits the chart-default :25.12 pin (AVX required, coupled to Langfuse).
+  # Cluster mode off for single-node.
   clusterEnabled: false
   persistence:
     size: 3Gi

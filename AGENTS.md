@@ -198,9 +198,13 @@ Host ports (non-default host ports to avoid local collisions):
 Config lives in `.env.example` (copy to the gitignored `.env` to override; the
 stack runs on the baked defaults without one). Load-bearing facts:
 
-- **ClickHouse is pinned to `:24.8`.** Newer ClickHouse requires AVX and SIGILLs
-  with exit 132 on CPUs without it. Keep the pin unless every target CPU has AVX.
-  `charts/curie` turns this into a chart preflight (`preflights.avxCheck`).
+- **ClickHouse:** `compose.dev.yaml` stays on `:24.8` so an SSE4.2-only
+  developer host can still boot the local stack (Langfuse `3.225.5` still
+  applies on 24.8). The Helm chart default is `:25.12`, required by the
+  Langfuse pin's ClickHouse migrations from 39 onward; AVX is a chart-default
+  requirement. `preflights.avxCheck` fails an AVX-less node unless the
+  operator pins a tag in `clickhouse.sse42SafeTags`. Do not move the two
+  chart pins independently (#2210).
 - **Langfuse OTLP ingest is HTTP-only** (gRPC is silently unsupported). Services
   may emit OTLP over gRPC or HTTP to the OTel Collector (4317/4318); the
   collector always exports to Langfuse over HTTP. Send app traces to the
@@ -559,7 +563,15 @@ forward merge from `main` into `next` happens at release candidate prep, not
 after every individual fix. Do not routinely cherry pick fixes between release
 lines.
 
-When a release candidate is accepted, merge `next` into `main`, then run every
+When a release candidate is accepted, merge `next` into `main` through a pull
+request whose head is a short-lived `task/release-*` branch cut from `next`,
+not through a pull request whose head is `next` itself. Repository auto-delete
+of merged heads stays enabled so task branches still clean up; an ordinary
+`next` to `main` PR therefore deletes `next` when the merger can bypass the
+deletion ruleset (issue #2090). Run
+`python3 release/preserve_next.py --repo <owner/name>` before enabling
+auto-merge: it refuses that ordinary path until the head is not `next` or an
+active deletion ruleset covers `next` with an empty bypass list. Then run every
 parity ladder rung on the resulting `main` commit:
 
 ```bash
@@ -594,22 +606,33 @@ branch list, restores the `RELEASE_NEXT_BRANCH` environment alias and the
   inert. Run `scripts/check-pr-body.sh <body-file>` before opening or editing a
   PR.
 - **Never mention any AI assistant (Claude, Codex, GPT, etc.) or AI in general in
-  commit messages, and never add `Co-Authored-By` lines referencing AI.**
-  CI enforces this on every PR (issue #962); check before pushing with:
+  commit messages OR pull request bodies, and never add `Co-Authored-By` lines
+  referencing AI.** This applies to the PR body as much as to the commits: many
+  assistants append a "Generated with" footer to a PR description by default, and
+  that footer is a claim of authorship on the artifact a reviewer reads first.
+  Strip it. CI enforces both surfaces on every PR (issue #962); check before
+  pushing with:
 
   ```bash
   scripts/check-commit-messages.sh origin/<base>..HEAD
+  scripts/check-pr-body.sh <body-file>
   scripts/check-commit-messages.sh --self-test
+  scripts/check-pr-body.sh --self-test
   ```
+
+  Both surfaces run ONE matcher: `check-pr-body.sh` delegates to
+  `check-commit-messages.sh --message-file`, so a vendor added in one place is
+  covered in the other and the two cannot drift apart.
 
   The gate flags *attribution*, not mention: a `Co-Authored-By` trailer naming an
   assistant, the robot-emoji "Generated with" footer, or an attribution phrase next
   to a bare assistant name. Technical references (`CLAUDE.md`, `claude_agent_sdk`,
   `claude-sonnet-5`, `harness.claude`) are deliberately fine, and the script's
-  `--self-test` pins both halves so the distinction cannot silently rot. A commit
-  range the script cannot resolve is a hard failure naming the range, not a silent
-  pass. It checks only the PR's own commits, so pre-gate history is not
-  retroactively enforced.
+  `--self-test` pins both halves so the distinction cannot silently rot. Scanning
+  the last 150 merged PR bodies flags exactly one, and it is a real footer, so the
+  body half is not a broad net either. A commit range the script cannot resolve is
+  a hard failure naming the range, not a silent pass. It checks only the PR's own
+  commits, so pre-gate history is not retroactively enforced.
 - No dashes/emdashes in prose content; no emojis in code or docs.
 
 ## Ticket implementation

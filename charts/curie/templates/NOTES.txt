@@ -17,7 +17,14 @@ Components deployed:
   - Valkey: BYO at {{ .Values.valkey.host }}:{{ .Values.valkey.port }}
 {{- end }}
 {{- if .Values.clickhouse.deploy }}
-  - ClickHouse ({{ .Values.clickhouse.image.repository }}:{{ .Values.clickhouse.image.tag }})  [SSE4.2-pinned]
+{{- $chTag := .Values.clickhouse.image.tag | toString }}
+{{- $sse42 := false }}
+{{- range .Values.clickhouse.sse42SafeTags }}
+{{- if or (eq $chTag .) (hasPrefix (printf "%s." .) $chTag) (hasPrefix (printf "%s-" .) $chTag) }}
+{{- $sse42 = true }}
+{{- end }}
+{{- end }}
+  - ClickHouse ({{ .Values.clickhouse.image.repository }}:{{ $chTag }}){{ if $sse42 }}  [SSE4.2-safe override]{{ else }}  [AVX required]{{ end }}
 {{- else }}
   - ClickHouse: BYO at {{ .Values.clickhouse.host }}
 {{- end }}
@@ -25,6 +32,7 @@ Components deployed:
   - RustFS ({{ .Values.rustfs.image }})
 {{- else }}
   - S3: BYO at {{ .Values.rustfs.host }}:{{ .Values.rustfs.port }}
+    Runner bundle-fetch egress: rustfs.egress{{ if not (include "curie.rustfs.staticCredentials" .) }} and rustfs.stsEgress{{ end }} (VPC interface endpoint /32s on EKS).
 {{- end }}
 {{- if .Values.otelCollector.deploy }}
   - OTel Collector ({{ .Values.otelCollector.image }}) at http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.service.httpPort }}

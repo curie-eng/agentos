@@ -3,9 +3,10 @@ name: PR body guard
 on:
   pull_request:
     branches: [main, next]
-    # A PR body can be edited without a new commit. Re-run the literal-newline
-    # guard on that event so a formerly valid closing keyword cannot become
-    # inert after the rest of CI has already passed.
+    # A PR body can be edited without a new commit. Re-run the body guards on
+    # that event so a formerly valid closing keyword cannot become inert, and so
+    # an AI attribution footer cannot be pasted in, after the rest of CI has
+    # already passed.
     types: [opened, synchronize, reopened, edited]
 
 concurrency:
@@ -42,7 +43,7 @@ jobs:
       # its verdict against the event payload.
       - name: PR body guard self-test
         run: bash scripts/check-pr-body.sh --self-test
-      - name: Reject literal newline escapes in the pull request body
+      - name: Reject literal newline escapes and AI attribution in the pull request body
         env:
           PR_BODY_FILE: ${{ runner.temp }}/curie-pr-body.md
         run: |

@@ -144,13 +144,41 @@ jobs:
           git fetch --no-tags --depth=1 origin "${{ github.base_ref || 'main' }}" || true
           git show "origin/${{ github.base_ref || 'main' }}:packages/aci-protocol/schema/wire.lock" > /tmp/base-wire.lock 2>/dev/null || true
           uv run python -m aci_protocol.wire_lock --check-base /tmp/base-wire.lock
+      # --durations is why this line is not a bare `-q`. The suite is the largest
+      # single cost on the critical path (848s on run 33690551116, serial, 1370
+      # test files) and nothing in CI recorded where that time went, so the only
+      # profile available was a local one -- which turned out to be a bad proxy.
+      # Two tests read as ~59s each locally and about 4s on Linux, because a
+      # bound unlistening port is dropped on macOS and refused on Linux (#2233).
+      # Sharding on numbers like those would have split the suite along the wrong
+      # seam. This prints the real ones on every run, for the price of 25 lines.
       - name: Pytest
-        run: uv run pytest -q
+        run: uv run pytest -q --durations=25
+      # Build ONLY when the body actually carries a declaration. tools/fix-pin-ci/
+      # check.py reaches the binary at exactly one place, the
+      # `curie dev verify-fix-pin` call, and only once `declaration.selector` is
+      # set; `n/a`, no declaration, a near-miss marker like `Fix-pin:`, and the
+      # bug-without-declaration rejection all return before touching it. So on
+      # every pull request that declares nothing -- the overwhelming majority --
+      # this was a 213s cold `cargo build --release` for a binary nothing ran,
+      # inside the longest job on the graph.
+      #
+      # `contains()` is case-insensitive and DECLARATION is the exact-case
+      # `Fix pin: <selector>`, so this condition is a strict superset of the
+      # cases that reach the binary: it cannot skip a build the gate then needs.
+      # It builds a few times it need not (`Fix pin: n/a`, a near miss), which is
+      # the safe direction. This stays a direct build inside the required Python
+      # status: no `needs`, no downloaded artifact, no Cargo cache, so nothing
+      # the gate's contract protects is traded away for the time.
       - name: Build the current curie binary for fix pin verification
-        if: github.event_name == 'pull_request'
+        if: >-
+          github.event_name == 'pull_request'
+          && contains(github.event.pull_request.body, 'Fix pin:')
         run: cargo build --release --locked --manifest-path cli/Cargo.toml
       - name: Install Helm for fix pin verification
-        if: github.event_name == 'pull_request'
+        if: >-
+          github.event_name == 'pull_request'
+          && contains(github.event.pull_request.body, 'Fix pin:')
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
         with:
           version: v3.16.4
@@ -531,8 +559,21 @@ jobs:
           platforms: ${{ matrix.platforms }}
           push: false
           load: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Scope the layer cache per image. Every leg of this matrix runs at
+          # once, and an unscoped `type=gha` puts all ten of them in ONE cache
+          # namespace, where they contend for the same reservation instead of
+          # sharing anything: the legs build different Dockerfiles, so there is
+          # no cross-image reuse to give up by separating them. Left unscoped,
+          # the export -- not the build -- became the job. On run 33690551116
+          # sre-bot-tempo built in 80.5s and then spent 1057.7s writing a single
+          # layer into the shared namespace, for a 19 minute job on a 2 minute
+          # image, while the same run logged `Unable to reserve cache with key
+          # docker.io--tonistiigi--binfmt-latest-linux-x64, another job may be
+          # creating this cache`. The ladder jobs below already scope their
+          # builds this way (`scope=ladder-runner`); this matrix was the one
+          # place left on the default.
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
 
   # The worker-local overlay is FROM the published curie-worker image, so it
   # cannot be built purely from the checkout. Build the base worker image
@@ -741,6 +782,25 @@ jobs:
         run: |
           bash scripts/check-commit-messages.sh \
             "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+
+  # Issue #2090: an ordinary next to main merge deletes protected next when
+  # delete_branch_on_merge is on and the deletion ruleset is bypassable. This
+  # job never skips (a skipped required check is not a pass; see issue #1470)
+  # and refuses only that ordinary release path. Task-branch PRs, including
+  # this gate's own, succeed without an admin settings change.
+  preserve-next:
+    name: Preserve next on release merge
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Refuse an ordinary next-to-main merge that would delete next
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 release/preserve_next.py --repo "$GITHUB_REPOSITORY"
 
   # The three image builds here are GHA-layer-cached via a buildx builder that
   # is created but NOT made the default (`setup-buildx-action` with

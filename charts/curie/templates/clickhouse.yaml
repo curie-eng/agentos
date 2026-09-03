@@ -85,7 +85,8 @@ spec:
         {{- end }}
       containers:
         - name: clickhouse
-          # Pinned tag; the AVX preflight validates it against the node's CPU.
+          # Pinned tag (coupled to langfuse.image.tag); the AVX preflight
+          # validates it against the node's CPU.
           image: "{{ .Values.clickhouse.image.repository }}:{{ .Values.clickhouse.image.tag }}"
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
           {{- with .Values.clickhouse.containerSecurityContext }}

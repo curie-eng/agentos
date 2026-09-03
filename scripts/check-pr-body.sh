@@ -1,14 +1,24 @@
 #!/usr/bin/env bash
-# Reject PR bodies that contain a literal "\\n" escape. GitHub displays that
-# escape as text rather than a line break, so a following `Closes #<issue>` is
-# not parsed as a closing keyword.
+# Two guards on a pull request body.
+#
+# 1. Reject a literal "\\n" escape. GitHub displays that escape as text rather
+#    than a line break, so a following `Closes #<issue>` is not parsed as a
+#    closing keyword.
+# 2. Reject AI attribution, delegating to check-commit-messages.sh
+#    --message-file so both surfaces share ONE matcher. AGENTS.md forbids
+#    attribution in commit messages and pull request bodies alike, but only the
+#    commit half was enforced, so agent-authored bodies kept arriving with the
+#    robot-emoji footer and were merged (#2225). The body is the half a human
+#    reviewer sees first and the half no rebase can rewrite.
 #
 # Usage:
 #   scripts/check-pr-body.sh <body-file>
 #   scripts/check-pr-body.sh --self-test
 set -euo pipefail
 
-SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_PATH="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
+COMMIT_GATE="$SCRIPT_DIR/check-commit-messages.sh"
 
 usage() {
     echo "Usage: scripts/check-pr-body.sh <body-file>" >&2
@@ -42,19 +52,38 @@ check_body_file() {
         fi
     fi
 
-    echo "PR body check passed: no literal \\n escape sequences"
+    if [[ ! -x "$COMMIT_GATE" && ! -r "$COMMIT_GATE" ]]; then
+        echo "PR body check failed: cannot read '$COMMIT_GATE'" >&2
+        return 1
+    fi
+    if ! bash "$COMMIT_GATE" --message-file "$body_file" >/dev/null; then
+        echo "PR body check failed: the body claims AI authorship." >&2
+        echo "AGENTS.md forbids AI attribution in commit messages and PR bodies alike." >&2
+        return 1
+    fi
+
+    echo "PR body check passed: real newlines, no AI attribution"
 }
 
 self_test() {
-    local temp_dir real_newline_body literal_escape_body
+    local temp_dir real_newline_body literal_escape_body attributed_body footer_no_newline_body
 
     temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/curie-pr-body-check.XXXXXX")"
     trap 'rm -rf -- "$temp_dir"' RETURN
     real_newline_body="$temp_dir/real-newline.md"
     literal_escape_body="$temp_dir/literal-escape.md"
 
+    attributed_body="$temp_dir/attributed.md"
+    footer_no_newline_body="$temp_dir/footer-no-newline.md"
+
     printf 'Describe a fix.\n\nCloses #1713\n' >"$real_newline_body"
     printf 'Describe a fix.\\n\\nCloses #1713\n' >"$literal_escape_body"
+    # The exact footer that reached #2225, and the same footer with no trailing
+    # newline, which is the shape a body pasted from a tool actually has.
+    printf 'Describe a fix.\n\n\xf0\x9f\xa4\x96 Generated with [Claude Code](https://claude.com/claude-code)\n' \
+        >"$attributed_body"
+    printf 'Describe a fix.\n\n\xf0\x9f\xa4\x96 Generated with [Claude Code](https://claude.com/claude-code)' \
+        >"$footer_no_newline_body"
 
     if ! bash "$SCRIPT_PATH" "$real_newline_body" >/dev/null; then
         echo "PR body check self-test failed: real newlines were rejected" >&2
@@ -65,7 +94,16 @@ self_test() {
         return 1
     fi
 
-    echo "PR body check self-test passed: real newlines accepted, literal \\n rejected"
+    if bash "$SCRIPT_PATH" "$attributed_body" >/dev/null 2>&1; then
+        echo "PR body check self-test failed: AI attribution footer was accepted" >&2
+        return 1
+    fi
+    if bash "$SCRIPT_PATH" "$footer_no_newline_body" >/dev/null 2>&1; then
+        echo "PR body check self-test failed: unterminated AI attribution footer was accepted" >&2
+        return 1
+    fi
+
+    echo "PR body check self-test passed: clean body accepted, literal \\n and AI attribution rejected"
 }
 
 if [[ "${1:-}" == "--self-test" ]]; then
