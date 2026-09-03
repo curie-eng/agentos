@@ -11,6 +11,8 @@ hand-maintained compose.release.yaml, which has drifted from dev.
 """
 
 import importlib.util
+import json
+import os
 import re
 import shutil
 import subprocess
@@ -292,12 +294,12 @@ def resolve_shell_default(value):
     UNSET. The endpoint uses the `-` form specifically so `curie local up
     --minimal` can suppress it with an explicit empty override; under `:-` an
     empty value could never mean "no endpoint". Still intentionally narrow: no
-    `${VAR}`, `${VAR:?err}`, or nested forms.
+    `${VAR}` or `${VAR:?err}` forms. Nested defaults recurse.
     """
     if value is None:
         return None
     match = SHELL_DEFAULT_RE.match(value)
-    return match.group(1) if match else value
+    return resolve_shell_default(match.group(1)) if match else value
 
 
 def resolve_shell_interpolation(value, environ):
@@ -307,10 +309,10 @@ def resolve_shell_interpolation(value, environ):
         return value
     name = match.group("name")
     if name not in environ:
-        return match.group("default")
+        return resolve_shell_interpolation(match.group("default"), environ)
     resolved = environ[name]
     if match.group("colon") and resolved == "":
-        return match.group("default")
+        return resolve_shell_interpolation(match.group("default"), environ)
     return resolved
 
 
@@ -500,18 +502,25 @@ def test_worker_traces_to_shipped_collector_by_default():
     exporting it empty -- see `up_minimal_suppresses_otel_endpoint` in
     cli/src/local.rs, which is where the profile choice lives.
     """
-    expected = f"http://otel-collector:{collector_http_port()}"
+    expected_runner = f"http://otel-collector:{collector_http_port()}"
+    expected_worker = "http://127.0.0.1:24318"
     for label, doc in compose_docs():
         assert "otel-collector" in doc["services"], (
             f"{label}: otel-collector service not found in the compose document"
         )
         env = env_map(doc["services"]["curie-worker"])
         otel_endpoint = resolve_shell_default(env.get("OTEL_EXPORTER_OTLP_ENDPOINT"))
-        assert otel_endpoint == expected, (
+        assert otel_endpoint == expected_worker, (
             f"{label}: curie-worker OTEL_EXPORTER_OTLP_ENDPOINT resolves to "
-            f"{otel_endpoint!r}, expected {expected!r} (the collector's own "
-            f"OTLP/HTTP receiver); traces from spawned sandbox containers have "
-            f"nowhere to go"
+            f"{otel_endpoint!r}, expected {expected_worker!r}; the host-network "
+            "worker cannot resolve a Compose service name"
+        )
+        runner_endpoint = resolve_shell_default(
+            env.get("CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT")
+        )
+        assert runner_endpoint == expected_runner, (
+            f"{label}: runner OTLP endpoint resolves to {runner_endpoint!r}, "
+            f"expected {expected_runner!r} on the isolated runner network"
         )
         docker_network = resolve_shell_default(env.get("CURIE_DOCKER_NETWORK"))
         assert docker_network == "curie_runner", (
@@ -523,7 +532,7 @@ def test_worker_traces_to_shipped_collector_by_default():
         )
 
 
-@pytest.mark.parametrize("service_name", ["curie-api", "curie-dispatcher", "curie-worker"])
+@pytest.mark.parametrize("service_name", ["curie-api", "curie-dispatcher"])
 def test_platform_services_export_to_shipped_collector_by_default(service_name):
     """Every long-lived Python service gets the standard OTLP endpoint.
 
@@ -548,7 +557,59 @@ def test_platform_services_export_to_shipped_collector_by_default(service_name):
         )
 
 
-@pytest.mark.parametrize("service_name", ["curie-api", "curie-dispatcher", "curie-worker"])
+@pytest.mark.parametrize(
+    ("overrides", "worker_endpoint", "runner_endpoint"),
+    [
+        ({}, "http://127.0.0.1:24318", "http://otel-collector:4318"),
+        ({"OTEL_EXPORTER_OTLP_ENDPOINT": ""}, "", ""),
+        (
+            {"OTEL_EXPORTER_OTLP_ENDPOINT": "http://collector.example.com:4318"},
+            "http://collector.example.com:4318", "http://collector.example.com:4318",
+        ),
+        (
+            {
+                "OTEL_EXPORTER_OTLP_ENDPOINT": "http://collector.example.com:4318",
+                "CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT": "",
+            },
+            "", "http://collector.example.com:4318",
+        ),
+        (
+            {
+                "OTEL_EXPORTER_OTLP_ENDPOINT": "http://otel-collector:4318",
+                "CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:24318",
+            },
+            "http://127.0.0.1:24318", "http://otel-collector:4318",
+        ),
+    ],
+)
+def test_worker_endpoint_split_executes_compose_interpolation(
+    tmp_path, overrides, worker_endpoint, runner_endpoint
+):
+    """Use actual Compose interpolation, including explicit-empty negative paths."""
+    for label, doc in compose_docs():
+        worker_env = env_map(doc["services"]["curie-worker"])
+        selected = {
+            key: worker_env[key]
+            for key in ("OTEL_EXPORTER_OTLP_ENDPOINT", "CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT")
+        }
+        config = tmp_path / label
+        config.write_text(yaml.safe_dump({
+            "services": {"worker": {"image": "example-worker", "environment": selected}}
+        }))
+        clean_env = {key: value for key, value in os.environ.items() if key not in (
+            "OTEL_EXPORTER_OTLP_ENDPOINT", "CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT"
+        )}
+        result = subprocess.run(
+            ["docker", "compose", "--env-file", "/dev/null", "-f", str(config),
+             "config", "--format", "json"],
+            env={**clean_env, **overrides}, capture_output=True, text=True, check=True,
+        )
+        rendered = json.loads(result.stdout)["services"]["worker"]["environment"]
+        assert rendered["OTEL_EXPORTER_OTLP_ENDPOINT"] == worker_endpoint
+        assert rendered["CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT"] == runner_endpoint
+
+
+@pytest.mark.parametrize("service_name", ["curie-api", "curie-dispatcher"])
 def test_platform_service_endpoint_explicit_empty_disables_export(service_name):
     """The minimal/core path can explicitly suppress the full-stack default.
 

@@ -1034,6 +1034,18 @@ fn product_observability_requires_three_valid_seeds_and_count_only_mcp_receipt()
 
 #[test]
 fn product_collector_restore_covers_every_emitter_and_invalid_auth_recovers_same_id() {
+    let pins = ladder_function("pin_local_source_images");
+    for required in [
+        "export CURIE_BASE_TAG=dev",
+        "export CURIE_RUNNER_IMAGE=ghcr.io/curie-eng/curie-runner:dev",
+        "export CURIE_DISPATCHER_IMAGE=ghcr.io/curie-eng/curie-dispatcher:dev",
+    ] {
+        assert!(
+            pins.contains(required),
+            "raw Compose recreation loses {required}"
+        );
+    }
+    assert!(ladder_function("rung_local").contains("pin_local_source_images"));
     let restore = ladder_function("route_local_observability_to_product_collector");
     for required in [
         "curie-api",
@@ -1052,6 +1064,10 @@ fn product_collector_restore_covers_every_emitter_and_invalid_auth_recovers_same
     assert!(
         restore.contains("export OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318"),
         "product restoration must override unrelated shell or ignored-file routing"
+    );
+    assert!(
+        restore.contains("export CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:24318"),
+        "host-network worker must use the collector's published host port"
     );
     assert!(
         restore.contains("export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf"),

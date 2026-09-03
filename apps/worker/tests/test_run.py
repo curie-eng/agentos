@@ -344,7 +344,7 @@ def test_docker_without_otlp_endpoint_warns(caplog) -> None:
     assert isinstance(client, DockerSandboxClient)
     warnings = [
         r for r in caplog.records
-        if r.name == "curie_worker.run" and "OTEL_EXPORTER_OTLP_ENDPOINT" in r.getMessage()
+        if r.name == "curie_worker.run" and "runner OTLP endpoint" in r.getMessage()
     ]
     assert warnings and all(r.levelno == logging.WARNING for r in warnings)
 
@@ -362,8 +362,44 @@ def test_docker_with_otlp_endpoint_does_not_warn(caplog) -> None:
     assert isinstance(client, DockerSandboxClient)
     assert not [
         r for r in caplog.records
-        if r.name == "curie_worker.run" and "OTEL_EXPORTER_OTLP_ENDPOINT" in r.getMessage()
+        if r.name == "curie_worker.run" and "runner OTLP endpoint" in r.getMessage()
     ]
+
+
+@pytest.mark.parametrize(
+    ("runner_endpoint", "expected_endpoint"),
+    [
+        ("http://otel-collector:4318", "http://otel-collector:4318"),
+        ("", None),
+        (None, "http://collector.example.com:4318"),
+    ],
+)
+def test_docker_runner_uses_its_network_specific_otlp_endpoint(
+    monkeypatch, runner_endpoint: str | None, expected_endpoint: str | None
+) -> None:
+    calls: list[list[str]] = []
+    monkeypatch.setattr(DockerSandboxClient, "ensure_image", lambda self: None)
+    monkeypatch.setattr(
+        DockerSandboxClient, "_docker", lambda self, args: calls.append(args) or ""
+    )
+    env = {
+        "CURIE_SANDBOX_SUBSTRATE": "docker",
+        "OTEL_EXPORTER_OTLP_ENDPOINT": "http://collector.example.com:4318",
+    }
+    if runner_endpoint is not None:
+        env["CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT"] = runner_endpoint
+    client = _sandbox_client(
+        WorkerConfig(fake_model=True),
+        env,
+        _SUB,
+    )
+    assert isinstance(client, DockerSandboxClient)
+    client.create_claim("acme-sandbox", pool="pool", env={"CURIE_FAKE_MODEL": "1"})
+    assert len(calls) == 1
+    endpoint_args = [arg for arg in calls[0] if arg.startswith("OTEL_EXPORTER_OTLP_ENDPOINT=")]
+    assert endpoint_args == (
+        [f"OTEL_EXPORTER_OTLP_ENDPOINT={expected_endpoint}"] if expected_endpoint else []
+    )
 
 
 def test_sandbox_client_docker_prepulls_image(monkeypatch) -> None:

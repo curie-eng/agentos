@@ -1011,6 +1011,7 @@ PY
 query_exact_seed_trace() {
     local tier="$1" trace_id="$2" expected_csv="${3:-}" expected_decision="${4:-}" expected_state="${5:-present}"
     local attempt code=0 private_read safe_read membership observation_count saw_valid=0
+    local last_query_state="query-error"
     LAST_QUERY_MEMBERSHIP=""
     LAST_QUERY_OBSERVATION_COUNT="0"
     umask 077
@@ -1097,8 +1098,10 @@ PY
             fi
             continue
         fi
+        last_query_state="query-error"
         if (( code == 0 )); then
             if ! sanitize_exact_trace_read "$trace_id" "$private_read" "$expected_csv" "$expected_decision" > "$safe_read"; then
+                last_query_state="malformed-response"
                 if [[ "$expected_state" == "observe" ]]; then
                     rm -f "$private_read" "$safe_read"
                     echo "exact trace response was malformed rather than selectively incomplete" >&2
@@ -1106,6 +1109,7 @@ PY
                 fi
             else
                 saw_valid=1
+                last_query_state="incomplete-membership"
                 read -r membership observation_count < <(python3 - "$safe_read" "$expected_csv" "$expected_decision" <<'PY'
 import json, pathlib, sys
 value = json.loads(pathlib.Path(sys.argv[1]).read_text())
@@ -1157,8 +1161,12 @@ PY
         rm -f "$private_read" "$safe_read"
         return 0
     fi
+    echo "exact trace failed the bounded ingestion poll: $last_query_state (cli exit $code)" >&2
+    if [[ "$last_query_state" == "incomplete-membership" ]]; then
+        # Only the allowlisted projection, never the original trace response.
+        cat "$safe_read" >&2
+    fi
     rm -f "$private_read" "$safe_read"
-    echo "exact trace did not become queryable inside the bounded ingestion poll" >&2
     return 1
 }
 
@@ -3027,6 +3035,7 @@ start_local_otel_sink() {
     LOCAL_OTEL_ENDPOINT="http://$gateway:$otlp_port"
     LOCAL_OTEL_METRICS_ENDPOINT="http://127.0.0.1:$metrics_port/metrics"
     export OTEL_EXPORTER_OTLP_ENDPOINT="$LOCAL_OTEL_ENDPOINT"
+    export CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT="$LOCAL_OTEL_ENDPOINT"
     export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
 
     local attempt
@@ -3544,6 +3553,17 @@ assert_local_otel_healthy_turn() {
     assert_bounded_metric_attributes "$baseline"
 }
 
+# local up --build pins these references inside its child process only. Raw
+# Compose fault injection/restoration must retain that candidate identity too.
+pin_local_source_images() {
+    if (( ! LOCAL_STACK_OWNED )); then
+        return 0
+    fi
+    export CURIE_BASE_TAG=dev
+    export CURIE_RUNNER_IMAGE=ghcr.io/curie-eng/curie-runner:dev
+    export CURIE_DISPATCHER_IMAGE=ghcr.io/curie-eng/curie-dispatcher:dev
+}
+
 inject_local_runner_failure() {
     LOCAL_OTEL_FAILURE_MODE=1
     export CURIE_FAKE_MODEL=0
@@ -3605,6 +3625,7 @@ route_local_observability_to_product_collector() {
     fi
 
     export OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+    export CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:24318
     export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
     local stale runner dispatcher=""
     # An already-running curie-runner inherited the disposable endpoint. Reap
@@ -3642,7 +3663,7 @@ route_local_observability_to_product_collector() {
     assert_product_collector_endpoint curie-api "$api" \
         "http://otel-collector:4318" "http/protobuf"
     assert_product_collector_endpoint curie-worker "$worker" \
-        "http://otel-collector:4318" "http/protobuf"
+        "http://127.0.0.1:24318" "http/protobuf"
     if [[ -n "$dispatcher" ]]; then
         dispatcher="$(docker ps --filter 'label=com.docker.compose.project=curie' \
             --filter 'label=com.docker.compose.service=curie-dispatcher' --format '{{.Names}}')"
@@ -4009,6 +4030,7 @@ rung_local() {
         # `local down` is safe against a partial or already-stopped stack.
         LOCAL_STACK_OWNED=1
         "$BIN" "${up_args[@]}"
+        pin_local_source_images
     fi
 
     echo

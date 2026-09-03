@@ -1184,6 +1184,10 @@ const COMPOSE_CONFIG_FILES_LABEL: &str = "com.docker.compose.project.config_file
 const COMPOSE_DISPATCHER_SERVICE: &str = "curie-dispatcher";
 const DISPATCHER_ENQUEUE_MODULE: &str = "curie_dispatcher.enqueue_once";
 const DISPATCHER_ENQUEUE_TIMEOUT: Duration = Duration::from_secs(30);
+// The one-shot dispatcher shares the runner's bridge network, not the
+// worker's host network. Inspect this separately; it is never forwarded as a
+// Curie configuration key into the dispatcher.
+const BRIDGE_OTEL_ENDPOINT_KEY: &str = "CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT";
 const OTEL_EXPORTER_ENV_KEYS: [&str; 38] = [
     "OTEL_EXPORTER_OTLP_ENDPOINT",
     "OTEL_EXPORTER_OTLP_PROTOCOL",
@@ -1302,6 +1306,7 @@ fn worker_otel_exporter_env_command(container: &str) -> OpsCommand {
     for name in OTEL_EXPORTER_ENV_KEYS {
         template.push_str(&format!("(eq $name \"{name}\") "));
     }
+    template.push_str(&format!("(eq $name \"{BRIDGE_OTEL_ENDPOINT_KEY}\") "));
     template.push_str("}}{{json $entry}}{{println}}{{end}}{{end}}");
     OpsCommand::new(
         "docker",
@@ -1316,6 +1321,7 @@ fn worker_otel_exporter_env_command(container: &str) -> OpsCommand {
 
 fn parse_worker_otel_env(stdout: &str) -> Result<Vec<(String, String)>> {
     let mut selected = Vec::new();
+    let mut bridge_endpoint = None;
     for (index, line) in stdout
         .lines()
         .filter(|line| !line.trim().is_empty())
@@ -1341,9 +1347,17 @@ fn parse_worker_otel_env(stdout: &str) -> Result<Vec<(String, String)>> {
         };
         // Keep the same allowlist here as defense in depth if the Docker
         // formatting boundary ever changes independently.
-        if OTEL_EXPORTER_ENV_KEYS.contains(&name) {
+        if name == BRIDGE_OTEL_ENDPOINT_KEY {
+            bridge_endpoint = Some(value.to_string());
+        } else if OTEL_EXPORTER_ENV_KEYS.contains(&name) {
             selected.push((name.to_string(), value.to_string()));
         }
+    }
+    if let Some(endpoint) = bridge_endpoint {
+        // An explicit empty value disables export; absence retains legacy
+        // behavior. Signal-specific exporter overrides remain unchanged.
+        selected.retain(|(name, _)| name != "OTEL_EXPORTER_OTLP_ENDPOINT");
+        selected.push(("OTEL_EXPORTER_OTLP_ENDPOINT".to_string(), endpoint));
     }
     Ok(selected)
 }
@@ -4598,10 +4612,69 @@ mod tests {
         for name in EXPECTED_OTEL_EXPORTER_ENV_KEYS {
             assert!(template.contains(name), "inspect template omitted {name}");
         }
+        assert!(template.contains("CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT"));
         assert!(!template.contains("{{json .Config.Env}}"));
         assert!(!template.contains("UNRELATED_SECRET"));
         assert!(!template.contains("println ."));
         assert!(!template.contains("range .Config.Env}}{{println"));
+    }
+
+    #[test]
+    fn local_dispatcher_uses_bridge_exporter_endpoint_and_preserves_empty_override() {
+        for (bridge, expected) in [
+            (
+                Some("http://otel-collector:4318"),
+                "http://otel-collector:4318",
+            ),
+            (Some(""), ""),
+            (None, "http://127.0.0.1:24318"),
+        ] {
+            let mut inspected = String::new();
+            // The override must win regardless of Docker's environment order.
+            if let Some(value) = bridge {
+                inspected.push_str(&format!(
+                    "CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT={value}\n"
+                ));
+            }
+            inspected.push_str(concat!(
+                "OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:24318\n",
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=https://traces.example.com/v1/traces\n",
+                "OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf\n",
+                "UNRELATED_SECRET=must-not-forward\n",
+            ));
+            let command = dispatcher_enqueue_command(
+                &["/tmp/compose.yaml".to_string()],
+                "curie-dispatcher-enqueue-test",
+                "test:curie:runs",
+                "example-password",
+                &parse_worker_otel_env(&inspected).unwrap(),
+                None,
+            );
+            // Execute the subprocess environment the dispatcher receives;
+            // checking only the parsed vector would miss command forwarding.
+            let output = std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    concat!(
+                        "printf '%s\\n' \"$OTEL_EXPORTER_OTLP_ENDPOINT\" ",
+                        "\"$OTEL_EXPORTER_OTLP_TRACES_ENDPOINT\" ",
+                        "\"$OTEL_EXPORTER_OTLP_PROTOCOL\" ",
+                        "\"${CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT-unset}\" ",
+                        "\"${UNRELATED_SECRET-unset}\"",
+                    ),
+                ])
+                .env_clear()
+                .envs(command.env.iter().chain(command.secret_env.iter()).cloned())
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap(),
+                format!("{expected}\nhttps://traces.example.com/v1/traces\nhttp/protobuf\nunset\nunset\n")
+            );
+            assert!(!command.display().contains("http://otel-collector:4318"));
+            assert!(!command.display().contains("http://127.0.0.1:24318"));
+        }
     }
 
     #[test]

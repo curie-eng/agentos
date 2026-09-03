@@ -15,6 +15,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -809,10 +810,84 @@ def test_product_collector_restore_restarts_and_verifies_every_seed_emitter() ->
     assert (
         "export OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318" in restore
     )
+    assert (
+        "export CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:24318"
+        in restore
+    )
     assert "export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf" in restore
     assert "unset OTEL_EXPORTER_OTLP_ENDPOINT" not in restore
     for protocol in ("http/protobuf", "otel-collector:4318"):
         assert protocol in restore
+
+
+@pytest.mark.parametrize("owned", [0, 1])
+def test_current_source_images_survive_raw_compose_recreation(owned: int) -> None:
+    source = LADDER_PATH.read_text()
+    function = _shell_function(source, "pin_local_source_images")
+    keys = ("CURIE_BASE_TAG", "CURIE_RUNNER_IMAGE", "CURIE_DISPATCHER_IMAGE")
+    initial = dict.fromkeys(keys, "stale-example")
+    initial["OTEL_EXPORTER_OTLP_ENDPOINT"] = "http://collector.example.com:4318"
+    script = function + "\nLOCAL_STACK_OWNED=\"$1\"\npin_local_source_images\n"
+    script += (
+        "exec python3 -c 'import json,os; "
+        'print(json.dumps({key: os.environ[key] for key in '
+        '["CURIE_BASE_TAG", "CURIE_RUNNER_IMAGE", "CURIE_DISPATCHER_IMAGE", '
+        '"OTEL_EXPORTER_OTLP_ENDPOINT"]}))' + "'\n"
+    )
+    result = subprocess.run(
+        ["bash", "-c", script, "bash", str(owned)],
+        env={**os.environ, **initial}, text=True, capture_output=True, check=True,
+    )
+    child_env = json.loads(result.stdout)
+    expected = {
+        "CURIE_BASE_TAG": "dev",
+        "CURIE_RUNNER_IMAGE": "ghcr.io/curie-eng/curie-runner:dev",
+        "CURIE_DISPATCHER_IMAGE": "ghcr.io/curie-eng/curie-dispatcher:dev",
+    } if owned else {key: initial[key] for key in keys}
+    assert {key: child_env[key] for key in keys} == expected
+    assert child_env["OTEL_EXPORTER_OTLP_ENDPOINT"] == initial["OTEL_EXPORTER_OTLP_ENDPOINT"]
+    rung = _shell_function(source, "rung_local")
+    assert rung.index('"$BIN" "${up_args[@]}"') < rung.index("pin_local_source_images")
+    assert rung.index("pin_local_source_images") < rung.index("case_local_otel")
+
+
+@pytest.mark.parametrize(
+    ("response", "exit_code", "category"),
+    [
+        ({"error": "private-error-canary", "fix": "private-fix-canary"}, 3, "query-error"),
+        ({"trace": {}, "tree": []}, 0, "malformed-response"),
+        ({"trace": {"id": "a" * 32}, "tree": [{
+            "name": "agent.run", "type": "SPAN", "children": [],
+            "input": "private-input-canary",
+        }]}, 0, "incomplete-membership"),
+    ],
+)
+def test_exact_query_failure_reports_sanitized_reason(
+    tmp_path: Path, response: dict, exit_code: int, category: str
+) -> None:
+    source = LADDER_PATH.read_text()
+    fake_bin = tmp_path / "curie"
+    fake_bin.write_text('#!/bin/sh\nprintf "%s\\n" "$FAKE_RESPONSE"\nexit "$FAKE_EXIT"\n')
+    fake_bin.chmod(0o700)
+    script = _shell_function(source, "sanitize_exact_trace_read")
+    script += _shell_function(source, "query_exact_seed_trace")
+    script += '''
+WORKDIR="$1"
+BIN="$2"
+OBSERVABILITY_POLL_ATTEMPTS=1
+OBSERVABILITY_POLL_INTERVAL_SECONDS=0
+query_exact_seed_trace local aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa curie.queue.enqueue "" present
+'''
+    result = subprocess.run(
+        ["bash", "-c", script, "bash", str(tmp_path), str(fake_bin)],
+        env={**os.environ, "FAKE_RESPONSE": json.dumps(response), "FAKE_EXIT": str(exit_code)},
+        text=True, capture_output=True, check=False,
+    )
+    assert result.returncode == 1
+    assert category in result.stderr
+    assert "private-" not in result.stderr + result.stdout
+    if category == "incomplete-membership":
+        assert '"operation":["agent.run"]' in result.stderr
 
 
 def test_invalid_langfuse_auth_is_temporary_durable_and_recovers_the_same_id(
