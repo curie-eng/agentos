@@ -30,6 +30,18 @@ component and rail detail in `charts/curie/README.md`.
     when it lands, this exception is removed rather than extended. Do not
     generalize it into a rule about stateful services -- one named file, one
     named reason.
+  - **Second named exception: `templates/langfuse.yaml`**, which hardcodes
+    `replicas: 1` and `strategy: type: Recreate` on both the web and worker
+    Deployments. The reason is correctness, not sizing: both images run Prisma
+    and ClickHouse migrations at container boot with no cross-process lock, so
+    a RollingUpdate of a single replica (default `maxSurge: 25%`, which rounds
+    up to one extra pod) can apply two migration sets to the same database and
+    leave Prisma in a failed state (#2216). Any count other than 1, or any
+    strategy other than Recreate, is wrong at every cluster size. There is
+    deliberately **no `langfuse.web.replicas` / `langfuse.worker.replicas` /
+    strategy values key**. Pinned by `ci/langfuse-recreate-assertions.sh`.
+    Horizontal scale for Langfuse needs an Accepted out-of-band migrator; when
+    that lands, this exception is removed rather than extended.
 - **Mail-adapter egress is a separate fail-closed rail.** Enabling
   `mailAdapter.deploy` requires at least one
   `mailAdapter.agentmail.httpsCidrs` entry. Its single egress-only policy allows
@@ -75,7 +87,10 @@ component and rail detail in `charts/curie/README.md`.
 - **Fail-closed egress, always.** `security.networkPolicy.allowedEgress` is
   empty by default; an unset allowlist must never mean allow-all. If you add
   a new egress destination the runner needs, it goes into this allowlist
-  explicitly -- never widen the default-deny baseline itself.
+  explicitly -- never widen the default-deny baseline itself. The exception
+  is a BYO object store (`rustfs.deploy: false`): that allow is
+  `rustfs.egress` (and `rustfs.stsEgress` on the key-free path), required at
+  render, not mixed into the model-API allowlist.
 - **NetworkPolicy allows are additive, never restrictive-intersecting
   (#765, ADR-0067).** A second NetworkPolicy selecting the same pods can only
   widen what Rail 1 permits, never narrow it -- there is no such thing as one

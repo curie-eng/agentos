@@ -228,6 +228,13 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/clickhouse-langfuse-pin-assertions.sh
 
+      # Prove both Langfuse Deployments use Recreate so an image change never
+      # runs two boot migrations against the same database (#2216).
+      - name: helm render assertions (langfuse Recreate strategy)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/langfuse-recreate-assertions.sh
+
       # Prove Langfuse startup is gated on ClickHouse being up (issue #2009). A
       # Helm upgrade that recreates the ClickHouse Service otherwise lets the new
       # Langfuse pods start their migrations against an unresolvable name, so the
@@ -469,6 +476,15 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/object-store-web-identity-assertions.sh
+
+      # Prove a BYO object store gets a runner egress allow for S3 (and STS on
+      # the key-free path). Rail 1 is fail-closed and the in-chart rustfs pod
+      # selector does not render when rustfs.deploy is false, so a default-shaped
+      # BYO install used to hang every sandbox in Init (#2213).
+      - name: helm render assertions (BYO object store runner egress)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/object-store-byo-egress-assertions.sh
 
       - name: helm template + kubeconform (values-dev overlay)
         run: |

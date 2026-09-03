@@ -989,6 +989,30 @@ class TestReleaseWorkflowContract:
         )
         assert "Build sre-bot-tempo image (no push)" in authorize_module.REQUIRED_CHECK_NAMES
 
+    def test_image_matrix_scopes_its_layer_cache_per_image(self):
+        """Every leg of the images matrix must name its own gha cache scope.
+
+        All ten legs run concurrently and build different Dockerfiles, so an
+        unscoped ``type=gha`` gives them one shared namespace with nothing to
+        share: they only contend for the same reservation. Unscoped, the cache
+        export outgrew the build it was meant to save -- sre-bot-tempo built in
+        80.5s and spent 1057.7s writing one layer, turning a 2 minute image into
+        a 19 minute job on the critical path.
+        """
+        workflow = yaml.load(CI_YAML.read_text(), Loader=yaml.BaseLoader)
+        image_job = workflow["jobs"]["images"]
+        build_step = next(
+            step for step in image_job["steps"] if step.get("name") == "Build (no push)"
+        )
+
+        assert build_step["with"]["cache-from"] == "type=gha,scope=${{ matrix.name }}"
+        assert build_step["with"]["cache-to"] == "type=gha,mode=max,scope=${{ matrix.name }}"
+
+        # The scope is only per image if the key it reads is unique per leg, so
+        # assert the matrix names are distinct rather than trusting the template.
+        names = [row["name"] for row in image_job["strategy"]["matrix"]["include"]]
+        assert len(names) == len(set(names)), f"image matrix names must be unique: {names}"
+
     def test_observability_stack_assertions_run_in_helm_ci(self):
         workflow = yaml.load(HELM_CI_YAML.read_text(), Loader=yaml.BaseLoader)
         chart_steps = workflow["jobs"]["helm"]["steps"]

@@ -955,8 +955,12 @@ livenessProbe:
       key: valkeyPassword
 - name: LANGFUSE_S3_EVENT_UPLOAD_BUCKET
   value: {{ .Values.rustfs.bucket | quote }}
+{{- /* Both upload regions come from rustfs.region, never the literal
+       `auto` that in-chart RustFS accepts. Real S3 rejects `auto` with
+       AuthorizationHeaderMalformed and drops every trace while the
+       release reports healthy. See #2214. */}}
 - name: LANGFUSE_S3_EVENT_UPLOAD_REGION
-  value: auto
+  value: {{ .Values.rustfs.region | quote }}
 - name: LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID
   value: {{ .Values.rustfs.auth.accessKey | quote }}
 - name: LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY
@@ -978,7 +982,7 @@ livenessProbe:
 - name: LANGFUSE_S3_MEDIA_UPLOAD_BUCKET
   value: {{ .Values.rustfs.bucket | quote }}
 - name: LANGFUSE_S3_MEDIA_UPLOAD_REGION
-  value: auto
+  value: {{ .Values.rustfs.region | quote }}
 - name: LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID
   value: {{ .Values.rustfs.auth.accessKey | quote }}
 - name: LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY

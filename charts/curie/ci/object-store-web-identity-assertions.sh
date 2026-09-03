@@ -64,6 +64,16 @@ rustfs:
   port: 443
   auth:
     accessKey: ""
+  # Dedicated runner allows for the BYO store and STS (#2213). TEST-NET-1
+  # stands in for VPC interface-endpoint /32s. The broad allowedEgress list
+  # below is a separate Rail 1 pin: it is the configuration in which the IMDS
+  # carve-out is observable.
+  egress:
+    - cidr: 192.0.2.10/32
+      ports: [{ protocol: TCP, port: 443 }]
+  stsEgress:
+    - cidr: 192.0.2.11/32
+      ports: [{ protocol: TCP, port: 443 }]
 # A key-free BYO store still has to be REACHABLE, so this overlay carries the
 # broad allowlist such an install realistically sets. That is also the only
 # configuration in which Rail 1's IMDS carve-out is observable: with an empty
@@ -274,10 +284,67 @@ def assert_bundle_fetch_region(path, expected_region):
     print(f"ok: bundle-fetch AWS_DEFAULT_REGION renders {expected_region}")
 
 
+LANGFUSE_REGION_KEYS = (
+    "LANGFUSE_S3_EVENT_UPLOAD_REGION",
+    "LANGFUSE_S3_MEDIA_UPLOAD_REGION",
+)
+
+
+def langfuse_envs(path):
+    """Langfuse web and worker env, selected by container name.
+
+    The two Langfuse Deployment suffixes are more specific than `-worker`,
+    which also matches langfuse-worker. Container name, not index, is the
+    application container.
+    """
+    web = worker = None
+    with open(path) as fh:
+        for doc in yaml.safe_load_all(fh):
+            if not doc or doc.get("kind") != "Deployment":
+                continue
+            name = doc.get("metadata", {}).get("name", "")
+            containers = doc["spec"]["template"]["spec"].get("containers", [])
+            if name.endswith("-langfuse-web"):
+                matches = [c for c in containers if c.get("name") == "langfuse-web"]
+                assert len(matches) == 1, (
+                    f"{name} must render exactly one langfuse-web container, "
+                    f"got {len(matches)}"
+                )
+                web = env_for(matches[0])
+            elif name.endswith("-langfuse-worker"):
+                matches = [c for c in containers if c.get("name") == "langfuse-worker"]
+                assert len(matches) == 1, (
+                    f"{name} must render exactly one langfuse-worker container, "
+                    f"got {len(matches)}"
+                )
+                worker = env_for(matches[0])
+    assert web is not None, "langfuse-web Deployment not rendered"
+    assert worker is not None, "langfuse-worker Deployment not rendered"
+    return web, worker
+
+
+def assert_langfuse_upload_regions(path, expected_region):
+    web, worker = langfuse_envs(path)
+    for label, env in (("langfuse-web", web), ("langfuse-worker", worker)):
+        for key in LANGFUSE_REGION_KEYS:
+            rendered = env.get(key, {}).get("value")
+            assert rendered == expected_region, (
+                f"{label} {key} rendered as {rendered!r}; expected "
+                f"{expected_region!r} from rustfs.region"
+            )
+    print(
+        f"ok: langfuse event/media upload regions render {expected_region} "
+        "on web and worker"
+    )
+
+
 assert_static(sys.argv[1])
 assert_web_identity(sys.argv[2])
 assert_bundle_fetch_region(sys.argv[1], "us-east-1")
 assert_bundle_fetch_region(sys.argv[3], "eu-west-1")
+assert_langfuse_upload_regions(sys.argv[1], "us-east-1")
+assert_langfuse_upload_regions(sys.argv[2], "us-east-1")
+assert_langfuse_upload_regions(sys.argv[3], "eu-west-1")
 PY
 
 # Everything above reads the rendered YAML. That is necessary and not

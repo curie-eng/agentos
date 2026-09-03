@@ -32,6 +32,7 @@ Components deployed:
   - RustFS ({{ .Values.rustfs.image }})
 {{- else }}
   - S3: BYO at {{ .Values.rustfs.host }}:{{ .Values.rustfs.port }}
+    Runner bundle-fetch egress: rustfs.egress{{ if not (include "curie.rustfs.staticCredentials" .) }} and rustfs.stsEgress{{ end }} (VPC interface endpoint /32s on EKS).
 {{- end }}
 {{- if .Values.otelCollector.deploy }}
   - OTel Collector ({{ .Values.otelCollector.image }}) at http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.service.httpPort }}

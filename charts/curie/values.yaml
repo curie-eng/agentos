@@ -498,7 +498,8 @@ rustfs:
   # and Langfuse's event/media upload endpoints): an external RustFS on port 443 uses HTTPS. All other configurations use HTTP.
   host: ""
   port: 9000
-  # Signing region for sandbox bundle fetches. Keep it aligned with the regional S3 endpoint.
+  # Signing region for sandbox bundle fetches and Langfuse event/media uploads.
+  # Keep it aligned with the regional S3 endpoint.
   region: us-east-1
   consolePort: 9001
   bucket: langfuse
@@ -525,6 +526,28 @@ rustfs:
     accessKey: rustfs
     secretKey: rustfssecret
   existingSecret: ""
+  # Runner sandbox egress to a BYO object store (#2213). Rail 1 is fail-closed,
+  # and the in-chart runner-allow-rustfs policy selects this release's rustfs
+  # pod, so it does not render when deploy is false. Each entry is
+  # {cidr, ports, except?} like security.networkPolicy.allowedEgress.
+  # NetworkPolicy cannot target a DNS name, so rustfs.host is not enough.
+  # Empty (the default) keeps fail-closed: a BYO install with Rail 1 on and
+  # bundle-fetch or workspace enabled is refused at render until these CIDRs
+  # are set. Each entry must set cidr and ports. Default routes and CIDRs that
+  # reach 169.254.169.254 are refused: this is a store-endpoint list, not a
+  # second model allowlist. On EKS the tight form is VPC interface endpoints
+  # for s3 (and sts on the key-free path) with private DNS enabled, which
+  # turns each requirement into a /32 rather than an AWS public service CIDR
+  # range. See the chart README, "Key-free object store auth".
+  egress: []
+  #  - cidr: 192.0.2.10/32
+  #    ports: [{ protocol: TCP, port: 443 }]
+  # Extra CIDRs for STS. Required when deploy is false and accessKey is empty,
+  # because AssumeRoleWithWebIdentity talks to STS, not S3. Unused on the
+  # static-key path.
+  stsEgress: []
+  #  - cidr: 192.0.2.11/32
+  #    ports: [{ protocol: TCP, port: 443 }]
   # RustFS runs as uid 10001. The matching group owns the mounted data volume.
   # Operators using another image can override both security context blocks.
   podSecurityContext:

@@ -4,9 +4,10 @@ description: >-
   Curie (Relay) umbrella chart. Installs the whole self-hosted stack on a
   single node: Langfuse v3 (web + worker) plus its ClickHouse, Valkey, Postgres,
   and RustFS backing stores, and the OTel Collector that adapts app traces into
-  Langfuse. Every backing store is condition-gated with a bring-your-own block,
-  and two install-time preflights ship baked in: a CPU-AVX / ClickHouse-pin
-  check and a NetworkPolicy-enforcement probe.
+  Langfuse. Every backing store is condition-gated with a bring-your-own block.
+  A CPU-AVX / ClickHouse-pin check runs as a blocking pre-install, pre-upgrade
+  hook; a NetworkPolicy-enforcement probe ships as a helm test that must be run
+  explicitly.
 type: application
 version: 0.8.4
 appVersion: "0.8.4"
