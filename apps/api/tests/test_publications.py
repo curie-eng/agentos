@@ -26,11 +26,11 @@ from types import SimpleNamespace
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
+import channel_protocol
 import httpx
 import pytest
 import redis
 import redis.asyncio as aioredis
-from channel_protocol import scoped_conversation_id
 from curie_api import approval_principal, crud
 from curie_api.config import get_settings
 from curie_api.github_app import _RESOLVERS
@@ -146,7 +146,7 @@ def _publication_payload(
 def _workspace_identity(payload: Mapping[str, Any]) -> str:
     """Derive the authorization key from the unchanged adapter reply tuple."""
 
-    return scoped_conversation_id(
+    return channel_protocol.scoped_conversation_id(
         str(payload["reply_kind"]),
         str(payload["reply_channel"]),
         str(payload["conversation_id"]),
@@ -1333,7 +1333,7 @@ def test_publication_turn_is_done_before_card_delivery_and_never_replays_model(
     selected = client.post(
         f"/v1/internal/workspaces/{deployment['id']}/selection",
         json={
-            "conversation_id": scoped_conversation_id(
+            "conversation_id": channel_protocol.scoped_conversation_id(
                 "slack", "C0EXAMPLE1", "1700000000.000100"
             ),
             "author": "U0REQUEST1",
@@ -1875,7 +1875,9 @@ def test_coder_path_reaches_the_publication_boundary_through_real_runner_and_api
             sync_redis.close()
 
     statuses, requests, release_keys, reply_targets, claims = asyncio.run(exercise())
-    scoped = scoped_conversation_id("slack", "C0EXAMPLE1", conversation_id)
+    # Keep the expected identity independent of the production helper so the
+    # fix-pin reversal reaches the publication boundary and fails on its 409.
+    scoped = f"slack:C0EXAMPLE1:{conversation_id}"
     rows = _rows(
         "SELECT p.id, p.status, p.base_sha, p.patch_bytes, p.changed_paths, p.title, p.body, "
         "p.workspace_conversation_id, p.reply_kind, p.reply_channel, "
@@ -2172,7 +2174,9 @@ def test_kernel_publications_isolate_same_timestamp_across_slack_channels(
         exercise()
     )
     scoped_by_channel = {
-        channel: scoped_conversation_id("slack", channel, shared_timestamp)
+        channel: channel_protocol.scoped_conversation_id(
+            "slack", channel, shared_timestamp
+        )
         for channel in repos
     }
     workspace_rows = _rows(
