@@ -49,6 +49,7 @@ from .history import (
     NullTranscriptStore,
     TranscriptStore,
     TurnRecord,
+    bound_turn_record,
     close_suspended_tool_calls,
 )
 from .memory import (
@@ -343,7 +344,7 @@ class SessionRunner:
                     exc,
                 )
         try:
-            await self._history.append(
+            record = bound_turn_record(
                 TurnRecord(
                     user=event.text,
                     assistant=state.final_text,
@@ -372,6 +373,7 @@ class SessionRunner:
                     harness_replay=harness_replay,
                 )
             )
+            await self._history.append(record)
             self._history_durable = True
         except Exception as exc:  # noqa: BLE001 - best-effort; never fail a completed turn
             self._history_durable = False
