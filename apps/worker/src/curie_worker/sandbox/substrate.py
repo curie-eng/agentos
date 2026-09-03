@@ -26,6 +26,7 @@ import logging
 import secrets
 import time
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
 from aci_protocol import BootEnv
@@ -253,6 +254,7 @@ class SandboxSubstrate:
         env: dict[str, str],
         workspace_repo: str,
         agent_name: str | None = None,
+        validate_candidate: Callable[[SandboxHandle], None] | None = None,
     ) -> SandboxHandle:
         """Cold-create a workspace runner, then CAS it over one generic route.
 
@@ -277,6 +279,15 @@ class SandboxSubstrate:
             generation=expected.generation + 1,
             publish=False,
         )
+        try:
+            if validate_candidate is not None:
+                validate_candidate(candidate)
+        except Exception:
+            # The candidate is ready but still unrouted. Refusal retires only
+            # that unexposed claim; the old route remains authoritative until
+            # the generation CAS below succeeds.
+            self._k8s.delete_claim(candidate.claim_name)
+            raise
         record = RouteRecord(handle=candidate, state=RouteState.LIVE)
         if not self._affinity.replace_if_generation(
             thread_key,

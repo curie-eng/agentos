@@ -64,7 +64,7 @@ from .otel import RunTracer, build_tracer_provider
 from .plugin import load_bundle_web_search_enabled
 from .redact import install_stdout_redaction
 from .sdk_auth import UnsupportedCredentialError
-from .server import create_app
+from .server import bind_status_attestation, create_app
 from .session import SessionRunner
 from .side_effects import SideEffectClassifier
 from .state import STATE_SERVER_NAME, build_state_server, resolve_state_client
@@ -435,28 +435,33 @@ def build_runner(
         config.session.session_id,
         config.session.sandbox_id,
     )
-    return SessionRunner(
-        session_factory=factory,
-        ceiling=config.ceiling,
-        tracer=RunTracer(provider),
-        classifier=SideEffectClassifier(
-            readonly_tools=harness.readonly_tools
-            | (
-                observed_readonly_tools - approval_gate.required
-                if approval_gate is not None
-                else observed_readonly_tools
-            )
+    return bind_status_attestation(
+        SessionRunner(
+            session_factory=factory,
+            ceiling=config.ceiling,
+            tracer=RunTracer(provider),
+            classifier=SideEffectClassifier(
+                readonly_tools=harness.readonly_tools
+                | (
+                    observed_readonly_tools - approval_gate.required
+                    if approval_gate is not None
+                    else observed_readonly_tools
+                )
+            ),
+            trace_name=f"curie-run:{config.session.session_id}",
+            session_id=config.session.session_id,
+            model=config.model,
+            memory_store=memory_store,
+            history_store=history_store,
+            approval_gate=approval_gate,
+            approval_resumed_kind=config.approval_resumed_kind,
+            approval_decision=config.approval_decision,
+            false_completion_check=config.false_completion_check,
+            history_resumed=conversation_replay.present,
         ),
-        trace_name=f"curie-run:{config.session.session_id}",
         session_id=config.session.session_id,
-        model=config.model,
-        memory_store=memory_store,
-        history_store=history_store,
-        approval_gate=approval_gate,
-        approval_resumed_kind=config.approval_resumed_kind,
-        approval_decision=config.approval_decision,
-        false_completion_check=config.false_completion_check,
-        history_resumed=conversation_replay.present,
+        sandbox_id=config.session.sandbox_id,
+        cwd=workspace_cwd,
     )
 
 

@@ -2691,6 +2691,45 @@ class Kernel:
         return (
             status.get("turn_active") is False
             and status.get("history_durable") is True
+            and status.get("status")
+            in {
+                SessionStatus.DONE.value,
+                SessionStatus.IDLE_AWAITING_INPUT.value,
+            }
+        )
+
+    async def _workspace_candidate_ready(
+        self, handle: SandboxHandle, *, remaining_s: float | None = None
+    ) -> bool:
+        """Fail closed unless this exact candidate booted the managed checkout."""
+
+        if not handle.token:
+            logger.warning(
+                "workspace handoff refused an unauthenticated candidate runner at %s",
+                handle.base_url,
+            )
+            return False
+        try:
+            status = await self._runner.status(
+                handle.base_url,
+                token=handle.token,
+                remaining_s=remaining_s,
+            )
+        except Exception as exc:  # noqa: BLE001 - unreadable is never safe to expose
+            logger.warning(
+                "could not attest workspace handoff candidate at %s: %r",
+                handle.base_url,
+                exc,
+            )
+            return False
+        return (
+            status.get("session_id") == handle.session_id
+            and status.get("sandbox_id") == handle.sandbox_id
+            and status.get("managed_workspace") is True
+            and status.get("cwd") == "/workspace"
+            and status.get("ready") is True
+            and status.get("turn_active") is False
+            and status.get("history_durable") is True
             and status.get("status") == SessionStatus.IDLE_AWAITING_INPUT.value
         )
 
@@ -2736,6 +2775,7 @@ class Kernel:
                 )
                 return existing
             handoff_revalidation: Callable[[], None] | None = None
+            candidate_validation: Callable[[SandboxHandle], None] | None = None
             if replace_handle is not None:
                 loop = asyncio.get_running_loop()
 
@@ -2775,6 +2815,42 @@ class Kernel:
                         )
 
                 handoff_revalidation = revalidate_before_handoff
+
+                def validate_candidate(candidate: SandboxHandle) -> None:
+                    """Attest the newly ready runner before the substrate route CAS."""
+
+                    probe_remaining_s = handoff_remaining()
+                    probe = asyncio.run_coroutine_threadsafe(
+                        self._workspace_candidate_ready(
+                            candidate, remaining_s=probe_remaining_s
+                        ),
+                        loop,
+                    )
+                    request_ceiling = self._config.runner_total_timeout_s
+                    if probe_remaining_s is not None:
+                        request_ceiling = max(
+                            0.0, min(request_ceiling, probe_remaining_s)
+                        )
+                    try:
+                        ready = probe.result(
+                            timeout=(
+                                request_ceiling
+                                + _HANDOFF_REVALIDATION_BRIDGE_GRACE_S
+                            )
+                        )
+                    except Exception as exc:
+                        probe.cancel()
+                        raise ThreadBusyError(
+                            f"thread {thread_key} workspace handoff candidate "
+                            "could not be attested"
+                        ) from exc
+                    if not ready:
+                        raise ThreadBusyError(
+                            f"thread {thread_key} workspace handoff candidate "
+                            "did not attest the expected managed checkout"
+                        )
+
+                candidate_validation = validate_candidate
             # Prepare once, then let the substrate decide cold claim versus
             # suspended-route resume. Either branch materializes the same fresh,
             # verified archive before the runner can start.
@@ -2787,6 +2863,7 @@ class Kernel:
                 repo_full_name=workspace_repo,
                 replace_handle=replace_handle,
                 revalidate_before_handoff=handoff_revalidation,
+                validate_candidate=candidate_validation,
             )
             if not isinstance(workspace_claim.handle, SandboxHandle):
                 raise WorkspacePreparationError(
