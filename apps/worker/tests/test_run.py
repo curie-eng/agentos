@@ -396,6 +396,9 @@ def test_docker_runner_uses_its_network_specific_otlp_endpoint(
     assert isinstance(client, DockerSandboxClient)
     client.create_claim("acme-sandbox", pool="pool", env={"CURIE_FAKE_MODEL": "1"})
     assert len(calls) == 1
+    assert not any(
+        arg.startswith("CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT=") for arg in calls[0]
+    )
     endpoint_args = [arg for arg in calls[0] if arg.startswith("OTEL_EXPORTER_OTLP_ENDPOINT=")]
     assert endpoint_args == (
         [f"OTEL_EXPORTER_OTLP_ENDPOINT={expected_endpoint}"] if expected_endpoint else []

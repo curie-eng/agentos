@@ -220,6 +220,10 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # declared boot keys, rendered from the declaration). It is a worker-side
         # knob for what URL those refs carry, never itself a sandbox boot key.
         "CURIE_RUNNER_API_URL",
+        # Worker-side Docker routing override. The substrate translates its
+        # value into the existing OTEL_EXPORTER_OTLP_ENDPOINT boot key; this
+        # configuration name itself is never injected into a sandbox.
+        "CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT",
         # The local-model demo base URL: an operator knob on the WORKER and on the
         # runner's sdk_auth mapping. It is not a BootEnv field; the boot key the
         # worker actually emits from it is ANTHROPIC_BASE_URL.
