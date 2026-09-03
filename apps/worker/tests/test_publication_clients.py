@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 import uuid
 from collections.abc import Callable
+from urllib.parse import quote
 
 import httpx
 import pytest
+from channel_protocol import scoped_conversation_id
 from curie_worker.publication_clients import (
     GitHubPublicationLookup,
     PublicationTranscriptClient,
@@ -101,6 +103,46 @@ async def test_publication_result_is_appended_once_to_the_durable_transcript() -
     assert isinstance(item, dict)
     assert item["publication_id"] == publication_id
     assert item["assistant"] == f"Published the approved changes: {PR_URL}"
+
+
+async def test_transcript_path_quotes_the_raw_canonical_workspace_identity_once() -> None:
+    publication_id = uuid.UUID("22222222-2222-4222-8222-222222222222")
+    agent_id = uuid.UUID("11111111-1111-4111-8111-111111111111")
+    canonical = scoped_conversation_id(
+        "slack:socket",
+        "C0EXAMPLE1/alerts",
+        "1700000000.000100%followup",
+    )
+    encoded = quote(canonical, safe="")
+    paths: list[tuple[str, bytes]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append((request.url.path, request.url.raw_path))
+        if request.method == "GET":
+            return httpx.Response(404)
+        return httpx.Response(200, json={"value": [json.loads(request.content)["item"]]})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        transcript = PublicationTranscriptClient(
+            api_base_url="https://api.example.com",
+            api_key="platform-key",
+            client=client,
+        )
+        await transcript.record_result(
+            agent_id,
+            canonical,
+            publication_id,
+            f"Published the approved changes: {PR_URL}",
+        )
+
+    expected_path = f"/agents/{agent_id}/state/transcript/{encoded}"
+    assert paths == [
+        (f"/agents/{agent_id}/state/transcript/{canonical}", expected_path.encode()),
+        (
+            f"/agents/{agent_id}/state/transcript/{canonical}/append",
+            f"{expected_path}/append".encode(),
+        ),
+    ]
 
 
 async def test_existing_publication_transcript_record_is_not_appended_again() -> None:

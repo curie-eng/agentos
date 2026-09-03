@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import subprocess
 import tarfile
 import threading
+import time
 import uuid
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -22,10 +24,13 @@ from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
+import httpx
 import pytest
 import redis
 import redis.asyncio as aioredis
+from channel_protocol import scoped_conversation_id
 from curie_api import approval_principal, crud
 from curie_api.config import get_settings
 from curie_api.github_app import _RESOLVERS
@@ -136,6 +141,16 @@ def _publication_payload(
         "changed_paths": ["README.md"],
         "expires_in_seconds": expires_in_seconds,
     }
+
+
+def _workspace_identity(payload: Mapping[str, Any]) -> str:
+    """Derive the authorization key from the unchanged adapter reply tuple."""
+
+    return scoped_conversation_id(
+        str(payload["reply_kind"]),
+        str(payload["reply_channel"]),
+        str(payload["conversation_id"]),
+    )
 
 
 def test_publication_schema_refuses_github_workflow_changes() -> None:
@@ -251,7 +266,7 @@ def _create_publication(
     selected = client.post(
         f"/v1/internal/workspaces/{payload['deployment_id']}/selection",
         json={
-            "conversation_id": payload["conversation_id"],
+            "conversation_id": _workspace_identity(payload),
             "author": payload["author"],
             "repo_full_name": payload["repo_full_name"],
         },
@@ -278,6 +293,42 @@ def _rows(query: str, params: dict[str, Any] | None = None) -> list[dict[str, An
             await engine.dispose()
 
     return asyncio.run(run())
+
+
+def _execute(query: str, params: dict[str, Any] | None = None) -> None:
+    async def run() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(text(query), params or {})
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+def _make_publication_legacy(
+    publication_id: str,
+    deployment_id: str,
+    payload: Mapping[str, Any],
+) -> None:
+    """Model an exact pre-scoping row without inventing a canonical identity."""
+
+    _execute(
+        "UPDATE curie.publications SET workspace_conversation_id = NULL "
+        "WHERE id = :publication_id",
+        {"publication_id": publication_id},
+    )
+    _execute(
+        "UPDATE curie.thread_workspaces SET conversation_id = :bare "
+        "WHERE selected_by_deployment_id = :deployment_id "
+        "AND conversation_id = :scoped",
+        {
+            "bare": payload["conversation_id"],
+            "deployment_id": deployment_id,
+            "scoped": _workspace_identity(payload),
+        },
+    )
 
 
 def _counts() -> tuple[int, int]:
@@ -500,12 +551,90 @@ def test_publication_replay_refuses_a_changed_conversation_or_agent_identity(
     )
     assert rejected_thread.status_code == 409
 
+    wrong_channel = dict(payload, reply_channel="C0EXAMPLE2")
+    rejected_channel = client.post(
+        "/v1/internal/publications", json=wrong_channel, headers=WORKER_HEADERS
+    )
+    assert rejected_channel.status_code == 409
+
+    wrong_kind = dict(payload, reply_kind="email")
+    rejected_kind = client.post(
+        "/v1/internal/publications", json=wrong_kind, headers=WORKER_HEADERS
+    )
+    assert rejected_kind.status_code == 409
+
     other_deployment = _create_deployment(client, auth_headers, channel="C0EXAMPLE2")
     wrong_agent = dict(payload, deployment_id=other_deployment["id"])
     rejected_agent = client.post(
         "/v1/internal/publications", json=wrong_agent, headers=WORKER_HEADERS
     )
     assert rejected_agent.status_code == 409
+    assert _counts() == (1, 1)
+
+
+def test_legacy_publication_replay_uses_only_its_bare_authorization_lane(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    payload = _publication_payload(deployment["id"], dedupe_key="legacy-exact-replay")
+    _, publication = _create_publication(client, payload)
+    _make_publication_legacy(publication["id"], deployment["id"], payload)
+
+    exact = client.post(
+        "/v1/internal/publications", json=payload, headers=WORKER_HEADERS
+    )
+    assert exact.status_code == 200, exact.text
+    assert exact.json()["id"] == publication["id"]
+    assert _rows(
+        "SELECT workspace_conversation_id FROM curie.publications WHERE id = :id",
+        {"id": publication["id"]},
+    ) == [{"workspace_conversation_id": None}], "legacy replay must not fabricate history"
+
+    crossed = client.post(
+        "/v1/internal/publications",
+        json={**payload, "reply_channel": "C0EXAMPLE2"},
+        headers=WORKER_HEADERS,
+    )
+    assert crossed.status_code == 409
+
+    _execute(
+        "DELETE FROM curie.thread_workspaces "
+        "WHERE selected_by_deployment_id = :deployment_id "
+        "AND conversation_id = :conversation_id",
+        {
+            "deployment_id": deployment["id"],
+            "conversation_id": payload["conversation_id"],
+        },
+    )
+    revoked = client.post(
+        "/v1/internal/publications", json=payload, headers=WORKER_HEADERS
+    )
+    assert revoked.status_code == 409
+    assert _counts() == (1, 1)
+
+
+def test_legacy_publication_replay_rechecks_the_current_allowlist(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    payload = _publication_payload(deployment["id"], dedupe_key="legacy-allowlist-replay")
+    _, publication = _create_publication(client, payload)
+    _make_publication_legacy(publication["id"], deployment["id"], payload)
+    monkeypatch.setenv("GITHUB_REPO_ALLOWLIST", "[]")
+    get_settings.cache_clear()
+
+    replay = client.post(
+        "/v1/internal/publications", json=payload, headers=WORKER_HEADERS
+    )
+    assert replay.status_code == 409
+    assert _counts() == (1, 1)
 
 
 def test_exact_publication_replay_rechecks_the_current_thread_selection(
@@ -530,7 +659,7 @@ def test_exact_publication_replay_rechecks_the_current_thread_selection(
                     ),
                     {
                         "deployment_id": deployment["id"],
-                        "conversation_id": payload["conversation_id"],
+                        "conversation_id": _workspace_identity(payload),
                     },
                 )
         finally:
@@ -540,7 +669,7 @@ def test_exact_publication_replay_rechecks_the_current_thread_selection(
     reselected = client.post(
         f"/v1/internal/workspaces/{deployment['id']}/selection",
         json={
-            "conversation_id": payload["conversation_id"],
+            "conversation_id": _workspace_identity(payload),
             "author": payload["author"],
             "repo_full_name": "acme-corp/acme-api",
         },
@@ -632,7 +761,7 @@ def test_publication_repo_must_match_the_thread_selection(
     selected = client.post(
         f"/v1/internal/workspaces/{deployment['id']}/selection",
         json={
-            "conversation_id": payload["conversation_id"],
+            "conversation_id": _workspace_identity(payload),
             "author": payload["author"],
             "repo_full_name": REPO,
         },
@@ -645,6 +774,62 @@ def test_publication_repo_must_match_the_thread_selection(
 
     assert refused.status_code == 409
     assert "differs" in refused.json()["detail"]
+    assert _counts() == (0, 0)
+
+
+def test_publication_without_a_selected_workspace_is_inert(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    payload = _publication_payload(deployment["id"], dedupe_key="generic-no-selection")
+
+    refused = client.post(
+        "/v1/internal/publications", json=payload, headers=WORKER_HEADERS
+    )
+
+    assert refused.status_code == 409
+    assert _counts() == (0, 0)
+
+
+@pytest.mark.parametrize(
+    "changed_route",
+    [
+        {"reply_kind": "email"},
+        {"reply_channel": "C0EXAMPLE2"},
+        {"conversation_id": "1700000000.000200"},
+    ],
+)
+def test_publication_route_substitution_derives_an_unselected_identity(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+    changed_route: dict[str, str],
+) -> None:
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    payload = _publication_payload(deployment["id"], dedupe_key="route-substitution")
+    payload["conversation_id"] = "1700000000.000100"
+    selected = client.post(
+        f"/v1/internal/workspaces/{deployment['id']}/selection",
+        json={
+            "conversation_id": _workspace_identity(payload),
+            "author": payload["author"],
+            "repo_full_name": payload["repo_full_name"],
+        },
+        headers=WORKER_HEADERS,
+    )
+    assert selected.status_code == 200, selected.text
+
+    refused = client.post(
+        "/v1/internal/publications",
+        json={**payload, **changed_route},
+        headers=WORKER_HEADERS,
+    )
+
+    assert refused.status_code == 409
     assert _counts() == (0, 0)
 
 
@@ -755,6 +940,53 @@ def test_publication_card_outbox_dead_letters_to_terminal_result(
         "dead_lettered": True,
         "approval_status": "expired",
     }
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_publication_result_store_separates_history_identity_from_bare_reply_route(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+    legacy: bool,
+) -> None:
+    from curie_worker.publication_store import PostgresPublicationStore
+
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    payload = _publication_payload(
+        deployment["id"], dedupe_key=f"history-identity-{'legacy' if legacy else 'scoped'}"
+    )
+    payload["conversation_id"] = "1700000000.000100"
+    _, publication = _create_publication(client, payload)
+    if legacy:
+        _make_publication_legacy(publication["id"], deployment["id"], payload)
+    _execute(
+        "UPDATE curie.publications SET status = 'failed', patch_bytes = NULL, "
+        "terminal_at = now(), approval_card_delivery_dead_lettered_at = now(), "
+        "resource_cleanup_completed_at = now() WHERE id = :id",
+        {"id": publication["id"]},
+    )
+
+    async def claim() -> Any:
+        engine = create_async_engine(get_settings().database_url)
+        store = PostgresPublicationStore(
+            engine,
+            schema="curie",
+            lease_owner=f"history-identity-{'legacy' if legacy else 'scoped'}",
+        )
+        try:
+            return await store.pending_result(uuid.UUID(publication["id"]))
+        finally:
+            await engine.dispose()
+
+    result = asyncio.run(claim())
+    assert result is not None
+    assert result.workspace_conversation_id == (
+        payload["conversation_id"] if legacy else _workspace_identity(payload)
+    )
+    assert result.target.kind == payload["reply_kind"]
+    assert result.target.address == payload["reply_channel"]
+    assert result.target.conversation_id == payload["conversation_id"]
 
 
 def test_publication_card_and_result_claims_survive_process_replacement(
@@ -1101,7 +1333,9 @@ def test_publication_turn_is_done_before_card_delivery_and_never_replays_model(
     selected = client.post(
         f"/v1/internal/workspaces/{deployment['id']}/selection",
         json={
-            "conversation_id": "1700000000.000100",
+            "conversation_id": scoped_conversation_id(
+                "slack", "C0EXAMPLE1", "1700000000.000100"
+            ),
             "author": "U0REQUEST1",
             "repo_full_name": REPO,
         },
@@ -1228,11 +1462,163 @@ def test_publication_turn_is_done_before_card_delivery_and_never_replays_model(
     ]
 
 
+class _MemoryWorkspaceObjects:
+    """Small private-object-store port around real workspace coordination."""
+
+    def __init__(self) -> None:
+        self.objects: dict[str, bytes] = {}
+
+    def put_stream(self, key: str, chunks: Iterable[bytes]) -> None:
+        self.objects[key] = b"".join(chunks)
+
+    def get_stream(self, key: str) -> Iterator[bytes]:
+        yield self.objects[key]
+
+    def delete(self, key: str) -> None:
+        self.objects.pop(key, None)
+
+    def list_keys(self, prefix: str) -> Iterator[str]:
+        needle = f"{prefix.strip('/')}/"
+        yield from sorted(key for key in self.objects if key.startswith(needle))
+
+
+class _LocalWorkspacePreparer:
+    """Provide local archives while keeping API credential clients production-real."""
+
+    def __init__(
+        self,
+        workspace_module: Any,
+        credentials: Any,
+        assets: Mapping[str, tuple[str, bytes]],
+    ) -> None:
+        self._workspace = workspace_module
+        self.credentials = credentials
+        self._assets = assets
+        self.objects = _MemoryWorkspaceObjects()
+        self.limits = SimpleNamespace(max_archive_bytes=1_000_000)
+
+    def prepare(
+        self,
+        *,
+        deployment_id: uuid.UUID,
+        thread_key: str,
+        generation: str,
+    ) -> Any:
+        credential = self.credentials.redeem(deployment_id, thread_key)
+        base_sha, archive = self._assets[credential.repo_full_name]
+        digest = hashlib.sha256(archive).hexdigest()
+        object_key = f"workspaces/{hashlib.sha256(thread_key.encode()).hexdigest()}/{generation}"
+        self.objects.put_stream(object_key, (archive,))
+        return self._workspace.PreparedWorkspace(
+            object_key=object_key,
+            sha256=digest,
+            clean_clone_url=credential.clone_url,
+            repo_full_name=credential.repo_full_name,
+            base_sha=base_sha,
+            checkout_mode=0o700,
+            reference=self._workspace.WorkspaceRef(
+                url=f"https://objects.example.test/{object_key}",
+                sha256=digest,
+                expires_at_epoch=int(time.time()) + 300,
+            ),
+        )
+
+    def verify(self, prepared: Any) -> None:
+        assert hashlib.sha256(self.objects.objects[prepared.object_key]).hexdigest() == (
+            prepared.sha256
+        )
+
+    def delete(self, prepared: Any) -> None:
+        self.objects.delete(prepared.object_key)
+
+
+class _RecordingWorkspaceCoordinator:
+    """Observe keys while delegating every workspace operation to production."""
+
+    def __init__(self, coordinator: Any) -> None:
+        self._coordinator = coordinator
+        self.preparer = coordinator.preparer
+        self.release_keys: list[str] = []
+        self.claims: list[tuple[str, Any | None, Any]] = []
+
+    def select_repository(self, **kwargs: Any) -> str | None:
+        return self._coordinator.select_repository(**kwargs)
+
+    def claim_or_resume_with_handle(self, **kwargs: Any) -> Any:
+        result = self._coordinator.claim_or_resume_with_handle(**kwargs)
+        self.claims.append((str(kwargs["thread_key"]), kwargs.get("replace_handle"), result.handle))
+        return result
+
+    def current(self, thread_key: str) -> Any:
+        return self._coordinator.current(thread_key)
+
+    def stream_current_base(self, thread_key: str) -> Iterator[bytes]:
+        yield from self._coordinator.stream_current_base(thread_key)
+
+    def touch(self, thread_key: str, *, ttl_seconds: int) -> bool:
+        return self._coordinator.touch(thread_key, ttl_seconds=ttl_seconds)
+
+    def release(self, thread_key: str) -> None:
+        self.release_keys.append(thread_key)
+        self._coordinator.release(thread_key)
+
+
+def _testclient_transport(client: TestClient) -> Any:
+    def transport(**request: Any) -> Any:
+        parsed = urlsplit(str(request["url"]))
+        response = client.request(
+            str(request["method"]),
+            parsed.path,
+            headers=dict(request["headers"]),
+            content=request.get("body"),
+            follow_redirects=bool(request.get("allow_redirects", False)),
+        )
+        return SimpleNamespace(
+            status=response.status_code,
+            headers=dict(response.headers),
+            body=response.content,
+        )
+
+    return transport
+
+
+def _local_publication_repository(
+    root: Path, repo_full_name: str
+) -> tuple[Path, str, bytes]:
+    repo = root / repo_full_name.replace("/", "-")
+    repo.mkdir()
+    subprocess.run(["git", "init", "--quiet"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "coder@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Coder Test"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "remote", "add", "origin", f"https://github.com/{repo_full_name}.git"],
+        cwd=repo,
+        check=True,
+    )
+    (repo / "README.md").write_text(f"before {repo_full_name}\n")
+    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "--quiet", "-m", "base"], cwd=repo, check=True)
+    base_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    base_archive = BytesIO()
+    with tarfile.open(fileobj=base_archive, mode="w:gz") as archive:
+        archive.add(repo / "README.md", arcname="README.md")
+    (repo / "README.md").write_text(f"after {repo_full_name}\n")
+    return repo, base_sha, base_archive.getvalue()
+
+
+@pytest.mark.parametrize("late_handoff", [False, True], ids=["initial", "late-handoff"])
 def test_coder_path_reaches_the_publication_boundary_through_real_runner_and_api(
     publication_stack: tuple[TestClient, str],
     auth_headers: dict[str, str],
     clean_db: None,
     tmp_path: Path,
+    late_handoff: bool,
 ) -> None:
     """The coder's publish tool crosses runner -> kernel -> API, not a test-only _attempt.
 
@@ -1251,9 +1637,10 @@ def test_coder_path_reaches_the_publication_boundary_through_real_runner_and_api
     from curie_runner.session import SessionRunner
     from curie_runner.side_effects import SideEffectClassifier
     from curie_runner.workspace_snapshot import capture_workspace_snapshot
-    from curie_worker.approvals import CreatedPublication, PublicationCreateRequest
+    from curie_worker.approvals import ApprovalClient
     from curie_worker.behaviorpacks import BehaviorPacks
     from curie_worker.binding import ResolvedDeployment
+    from curie_worker.workspace import WorkspaceClaimCoordinator, WorkspaceCredentialClient
 
     from apps.worker.tests.kernel.conftest import kernel_harness
 
@@ -1261,75 +1648,10 @@ def test_coder_path_reaches_the_publication_boundary_through_real_runner_and_api
     runner_token = "coder-publication-runner-token"
     deployment = _create_deployment(client, auth_headers)
     conversation_id = "1700000000.000100"
-    selected = client.post(
-        f"/v1/internal/workspaces/{deployment['id']}/selection",
-        json={
-            "conversation_id": conversation_id,
-            "author": "U0REQUEST1",
-            "repo_full_name": REPO,
-        },
-        headers=WORKER_HEADERS,
-    )
-    assert selected.status_code == 200, selected.text
 
     # A real, credential-free checkout supplies both the runner snapshot and
     # the worker's independently rehashed retained base.
-    repo = tmp_path / "workspace"
-    repo.mkdir()
-    subprocess.run(["git", "init", "--quiet"], cwd=repo, check=True)
-    subprocess.run(["git", "config", "user.email", "coder@example.com"], cwd=repo, check=True)
-    subprocess.run(["git", "config", "user.name", "Coder Test"], cwd=repo, check=True)
-    subprocess.run(
-        ["git", "remote", "add", "origin", f"https://github.com/{REPO}.git"],
-        cwd=repo,
-        check=True,
-    )
-    (repo / "README.md").write_text("before\n")
-    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
-    subprocess.run(["git", "commit", "--quiet", "-m", "base"], cwd=repo, check=True)
-    base_sha = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
-    ).stdout.strip()
-    base_archive = BytesIO()
-    with tarfile.open(fileobj=base_archive, mode="w:gz") as archive:
-        archive.add(repo / "README.md", arcname="README.md")
-    (repo / "README.md").write_text("after\n")
-
-    class RetainedWorkspace:
-        preparer = SimpleNamespace(limits=SimpleNamespace(max_archive_bytes=1_000_000))
-
-        def current(self, thread_key: str) -> object:
-            return SimpleNamespace(repo_full_name=REPO, base_sha=base_sha)
-
-        def stream_current_base(self, thread_key: str):
-            yield base_archive.getvalue()
-
-        def select_repository(self, **_kwargs: Any) -> str:
-            return REPO
-
-        def claim_or_resume_with_handle(
-            self,
-            *,
-            thread_key: str,
-            env: dict[str, str],
-            agent_name: str | None,
-            repo_full_name: str,
-            **_kwargs: Any,
-        ) -> object:
-            return SimpleNamespace(
-                handle=self.substrate.claim(
-                    thread_key,
-                    env=env,
-                    agent_name=agent_name,
-                    workspace_repo=repo_full_name,
-                )
-            )
-
-        def touch(self, thread_key: str, *, ttl_seconds: int) -> None:
-            del thread_key, ttl_seconds
-
-        def release(self, thread_key: str) -> None:
-            del thread_key
+    repo, base_sha, base_archive = _local_publication_repository(tmp_path, REPO)
 
     class WorkspaceBinding:
         async def resolve(self, kind: str, address: str) -> ResolvedDeployment:
@@ -1367,8 +1689,24 @@ def test_coder_path_reaches_the_publication_boundary_through_real_runner_and_api
             return replace(decision, interrupt=False)
         return decision
 
-    model = FakeModelSession(
-        lambda: [
+    def scripted_turn() -> list[Any]:
+        if "https://github.com/" not in model.queries[-1]:
+            return [
+                AssistantMessage(
+                    content=[TextBlock(text="Ready for a repository when you are.")],
+                    model="fake-model",
+                ),
+                ResultMessage(
+                    subtype="success",
+                    duration_ms=1,
+                    duration_api_ms=1,
+                    is_error=False,
+                    num_turns=1,
+                    session_id="fake",
+                    result="Ready for a repository when you are.",
+                ),
+            ]
+        return [
             AssistantMessage(
                 content=[
                     TextBlock(text="Prepared README."),
@@ -1389,7 +1727,10 @@ def test_coder_path_reaches_the_publication_boundary_through_real_runner_and_api
                 session_id="fake",
                 result="Prepared README.",
             ),
-        ],
+        ]
+
+    model = FakeModelSession(
+        scripted_turn,
         can_use_tool=record_publish_gate,
         approval_gate=gate,
     )
@@ -1402,24 +1743,13 @@ def test_coder_path_reaches_the_publication_boundary_through_real_runner_and_api
         approval_gate=gate,
     )
 
-    class DatabasePublicationCreator:
-        def __init__(self, engine: Any) -> None:
-            self.engine = engine
-
-        async def create_publication(self, request: PublicationCreateRequest) -> CreatedPublication:
-            sessionmaker = async_sessionmaker(self.engine, expire_on_commit=False)
-            async with sessionmaker() as session:
-                data = PublicationCreate.model_validate(request.to_json())
-                publication, _ = await crud.create_publication(
-                    session, data, patch=data.decoded_patch()
-                )
-                return CreatedPublication(
-                    id=str(publication.id),
-                    approval_id=str(publication.approval_id),
-                    status=publication.status,
-                )
-
-    async def exercise() -> None:
+    async def exercise() -> tuple[
+        list[int],
+        list[dict[str, Any]],
+        list[str],
+        list[Any],
+        list[tuple[str, Any | None, Any]],
+    ]:
         await runner.start()
         suffix = uuid.uuid4().hex
         names = {
@@ -1431,51 +1761,138 @@ def test_coder_path_reaches_the_publication_boundary_through_real_runner_and_api
         sync_redis = connect_or_skip(decode_responses=True)
         validation_scratch = tmp_path / "publication-validation"
         validation_scratch.mkdir()
-        engine = create_async_engine(get_settings().database_url)
+        statuses: list[int] = []
+        requests: list[dict[str, Any]] = []
+
+        def approval_transport(request: httpx.Request) -> httpx.Response:
+            response = client.request(
+                request.method,
+                request.url.path,
+                headers=dict(request.headers),
+                content=request.content,
+            )
+            if request.url.path == "/v1/internal/publications":
+                statuses.append(response.status_code)
+                requests.append(json.loads(request.content))
+            return httpx.Response(
+                response.status_code,
+                headers=dict(response.headers),
+                content=response.content,
+            )
+
         try:
-            creator = DatabasePublicationCreator(engine)
-            async with kernel_harness(
-                names,
-                sync_redis,
-                binding=WorkspaceBinding(),
-                publication_creator=creator,
-                workspace_scratch_root=str(validation_scratch),
-                runner_app=create_runner_app(
-                    runner,
-                    token=runner_token,
-                    snapshotter=lambda: capture_workspace_snapshot(
-                        repo,
-                        expected_repo=REPO,
-                        publication_title="Update README",
-                        publication_body="Prepared by coder.",
-                    ),
-                ),
-            ) as harness:
-                workspace = RetainedWorkspace()
-                workspace.substrate = harness.substrate
-                harness.kernel._workspace = workspace  # type: ignore[assignment]
-                await harness.kernel.process_event(
-                    QueuedTurn(
-                        event_id="coder-publication-boundary",
-                        conversation_id=conversation_id,
-                        author="U0REQUEST1",
-                        text="publish the README change",
-                        reply_handle=ReplyHandle(
-                            kind="slack",
-                            channel="C0EXAMPLE1",
-                            placeholder="1700000000.000001",
-                        ),
-                        received_at="2026-09-01T00:00:00+00:00",
-                    )
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(approval_transport),
+                base_url="https://api.example.test",
+            ) as api_client:
+                creator = ApprovalClient(
+                    api_base_url="https://api.example.test",
+                    api_key=get_settings().api_key,
+                    client=api_client,
+                    read_timeout_s=2,
+                    worker_token=WORKER_TOKEN,
                 )
+                credentials = WorkspaceCredentialClient(
+                    api_url="https://api.example.test",
+                    worker_token=WORKER_TOKEN,
+                    transport=_testclient_transport(client),
+                )
+                async with kernel_harness(
+                    names,
+                    sync_redis,
+                    binding=WorkspaceBinding(),
+                    publication_creator=creator,
+                    workspace_scratch_root=str(validation_scratch),
+                    runner_app=create_runner_app(
+                        runner,
+                        token=runner_token,
+                        snapshotter=lambda: capture_workspace_snapshot(
+                            repo,
+                            expected_repo=REPO,
+                            publication_title="Update README",
+                            publication_body="Prepared by coder.",
+                        ),
+                    ),
+                ) as harness:
+                    preparer = _LocalWorkspacePreparer(
+                        __import__("curie_worker.workspace", fromlist=["workspace"]),
+                        credentials,
+                        {REPO: (base_sha, base_archive)},
+                    )
+                    workspace = _RecordingWorkspaceCoordinator(
+                        WorkspaceClaimCoordinator(
+                            preparer=preparer,
+                            substrate=harness.substrate,
+                        )
+                    )
+                    harness.kernel._workspace = workspace  # type: ignore[assignment]
+                    if late_handoff:
+                        await harness.kernel.process_event(
+                            QueuedTurn(
+                                event_id="coder-publication-generic-first",
+                                conversation_id=conversation_id,
+                                author="U0REQUEST1",
+                                text="Please get ready to edit a repository.",
+                                reply_handle=ReplyHandle(
+                                    kind="slack",
+                                    channel="C0EXAMPLE1",
+                                    placeholder="1700000000.000001",
+                                ),
+                                received_at="2026-09-01T00:00:00+00:00",
+                            )
+                        )
+                    await harness.kernel.process_event(
+                        QueuedTurn(
+                            event_id="coder-publication-boundary",
+                            conversation_id=conversation_id,
+                            author="U0REQUEST1",
+                            text=f"Publish the README change from https://github.com/{REPO}",
+                            reply_handle=ReplyHandle(
+                                kind="slack",
+                                channel="C0EXAMPLE1",
+                                placeholder="1700000000.000002",
+                            ),
+                            received_at="2026-09-01T00:00:00+00:00",
+                        )
+                    )
+                    reply_targets = [
+                        event.target
+                        for event, _route, _best_effort in harness.sink.events
+                        if hasattr(event, "target")
+                    ]
+                    return (
+                        statuses,
+                        requests,
+                        workspace.release_keys,
+                        reply_targets,
+                        workspace.claims,
+                    )
         finally:
-            await engine.dispose()
+            await runner.close()
+            keys = list(sync_redis.scan_iter(match=f"*{suffix}*"))
+            if keys:
+                sync_redis.delete(*keys)
             sync_redis.close()
 
-    asyncio.run(exercise())
+    statuses, requests, release_keys, reply_targets, claims = asyncio.run(exercise())
+    scoped = scoped_conversation_id("slack", "C0EXAMPLE1", conversation_id)
     rows = _rows(
-        "SELECT status, base_sha, patch_bytes, changed_paths, title, body FROM curie.publications"
+        "SELECT p.id, p.status, p.base_sha, p.patch_bytes, p.changed_paths, p.title, p.body, "
+        "p.workspace_conversation_id, p.reply_kind, p.reply_channel, "
+        "a.conversation_id FROM curie.publications p "
+        "JOIN curie.approvals a ON a.id = p.approval_id"
     )
+    assert statuses == [201]
+    assert len(requests) == 1
+    assert "workspace_conversation_id" not in requests[0]
+    assert requests[0]["conversation_id"] == conversation_id
+    assert release_keys == [scoped]
+    assert len(claims) == 1
+    assert claims[0][0] == scoped
+    assert (claims[0][1] is not None) is late_handoff
+    assert reply_targets
+    assert all(target.address == "C0EXAMPLE1" for target in reply_targets)
+    assert all(target.conversation_id == conversation_id for target in reply_targets)
     assert len(rows) == 1
     boundary = rows[0]
     assert boundary["status"] == "pending"
@@ -1483,7 +1900,354 @@ def test_coder_path_reaches_the_publication_boundary_through_real_runner_and_api
     assert boundary["changed_paths"] == ["README.md"]
     assert boundary["title"] == "Update README"
     assert boundary["body"] == "Prepared by coder."
-    assert boundary["patch_bytes"].endswith(b"@@ -1 +1 @@\n-before\n+after\n")
+    assert boundary["workspace_conversation_id"] == scoped
+    assert boundary["conversation_id"] == conversation_id
+    assert (boundary["reply_kind"], boundary["reply_channel"]) == (
+        "slack",
+        "C0EXAMPLE1",
+    )
+    assert boundary["patch_bytes"].endswith(
+        f"@@ -1 +1 @@\n-before {REPO}\n+after {REPO}\n".encode()
+    )
+    public = client.get(f"/publications/{boundary['id']}", headers=auth_headers)
+    assert public.status_code == 200, public.text
+    assert "workspace_conversation_id" not in public.json()
+
+
+def test_kernel_publications_isolate_same_timestamp_across_slack_channels(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+    tmp_path: Path,
+) -> None:
+    """One bare Slack timestamp cannot join publication authority across channels.
+
+    The full terminal publication loop has its own store/reconciler coverage.
+    This kernel pin stops at the durable outbox boundary and proves the route
+    that loop will consume: both the stored approval target and every kernel
+    reply remain channel-local while workspace/history authority stays scoped.
+    """
+    from aci_protocol import QueuedTurn, ReplyHandle, SessionStatus
+    from curie_worker.approvals import ApprovalClient
+    from curie_worker.behaviorpacks import BehaviorPacks
+    from curie_worker.binding import HISTORY_REF_ENV, BindingResolver
+    from curie_worker.kernel import TurnOutcome
+    from curie_worker.runner_client import RunnerWorkspaceSnapshot
+    from curie_worker.workspace import WorkspaceClaimCoordinator, WorkspaceCredentialClient
+
+    from apps.worker.tests.kernel.conftest import kernel_harness, make_config
+
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers, channel="C0EXAMPLE1")
+    second_binding = client.post(
+        f"/agents/{deployment['agent_id']}/channels",
+        json={"kind": "slack", "address": "C0EXAMPLE2"},
+        headers=auth_headers,
+    )
+    assert second_binding.status_code == 201, second_binding.text
+
+    shared_timestamp = "1700000000.000100"
+    repos = {
+        "C0EXAMPLE1": "acme-corp/acme-bot-a",
+        "C0EXAMPLE2": "acme-corp/acme-bot-b",
+    }
+    placeholders = {
+        "C0EXAMPLE1": "1700000000.000101",
+        "C0EXAMPLE2": "1700000000.000102",
+    }
+    repository_assets: dict[str, tuple[str, bytes]] = {}
+    snapshots: dict[str, RunnerWorkspaceSnapshot] = {}
+    for channel, repo_full_name in repos.items():
+        _repo, base_sha, base_archive = _local_publication_repository(
+            tmp_path, repo_full_name
+        )
+        repository_assets[repo_full_name] = (base_sha, base_archive)
+        snapshots[channel] = RunnerWorkspaceSnapshot(
+            repo_full_name=repo_full_name,
+            base_sha=base_sha,
+            patch=(
+                "diff --git a/README.md b/README.md\n"
+                "--- a/README.md\n"
+                "+++ b/README.md\n"
+                "@@ -1 +1 @@\n"
+                f"-before {repo_full_name}\n"
+                f"+after {repo_full_name}\n"
+            ).encode(),
+            changed_paths=("README.md",),
+            contains_workflow_files=False,
+            publication_title=f"Update {channel} README",
+            publication_body="Approved platform publication.",
+        )
+
+    token = uuid.uuid4().hex
+    names = {
+        "stream": f"test:curie:publication-collision:{token}",
+        "group": f"g-{token}",
+        "prefix": f"test:curie:publication-collision:{token}:",
+        "sandbox_prefix": f"test:curie:publication-collision-sandbox:{token}:",
+    }
+    validation_scratch = tmp_path / "publication-collision-validation"
+    validation_scratch.mkdir()
+    worker_config = make_config(
+        names,
+        api_base_url="https://api.example.test",
+        workspace_scratch_root=str(validation_scratch),
+    )
+
+    class RecordingBinding:
+        """Observe the production resolver's canonical history identity."""
+
+        def __init__(self, resolver: BindingResolver) -> None:
+            self._resolver = resolver
+            self.history_keys: list[tuple[str, str, str]] = []
+
+        async def resolve(self, kind: str, address: str) -> Any:
+            return await self._resolver.resolve(kind, address)
+
+        def boot_env(
+            self,
+            resolved: Any,
+            thread_key: str,
+            *,
+            kind: str | None = None,
+            address: str | None = None,
+        ) -> dict[str, str]:
+            env = self._resolver.boot_env(
+                resolved,
+                thread_key,
+                kind=kind,
+                address=address,
+            )
+            history_segment = unquote(
+                urlsplit(env[HISTORY_REF_ENV]).path.rsplit("/", 1)[-1]
+            )
+            self.history_keys.append((address or "", thread_key, history_segment))
+            return env
+
+        def packs_for(self, resolved: Any) -> BehaviorPacks:
+            return self._resolver.packs_for(resolved)
+
+    events = [
+        QueuedTurn(
+            event_id=f"publication-collision-{channel}",
+            conversation_id=shared_timestamp,
+            author="U0REQUEST1",
+            text=f"Publish the README change from https://github.com/{repo_full_name}",
+            reply_handle=ReplyHandle(
+                kind="slack",
+                channel=channel,
+                placeholder=placeholders[channel],
+            ),
+            received_at="2026-09-01T00:00:00+00:00",
+        )
+        for channel, repo_full_name in repos.items()
+    ]
+
+    async def exercise() -> tuple[
+        list[int],
+        list[dict[str, Any]],
+        list[str],
+        list[tuple[str, Any | None, Any]],
+        list[tuple[str, str, str]],
+        list[tuple[str, Any]],
+    ]:
+        engine = create_async_engine(get_settings().database_url)
+        sync_redis = connect_or_skip(decode_responses=True)
+        statuses: list[int] = []
+        requests: list[dict[str, Any]] = []
+
+        def approval_transport(request: httpx.Request) -> httpx.Response:
+            response = client.request(
+                request.method,
+                request.url.path,
+                headers=dict(request.headers),
+                content=request.content,
+            )
+            if request.url.path == "/v1/internal/publications":
+                statuses.append(response.status_code)
+                requests.append(json.loads(request.content))
+            return httpx.Response(
+                response.status_code,
+                headers=dict(response.headers),
+                content=response.content,
+            )
+
+        binding = RecordingBinding(BindingResolver(engine, worker_config))
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(approval_transport),
+                base_url="https://api.example.test",
+            ) as api_client:
+                creator = ApprovalClient(
+                    api_base_url="https://api.example.test",
+                    api_key=get_settings().api_key,
+                    client=api_client,
+                    read_timeout_s=2,
+                    worker_token=WORKER_TOKEN,
+                )
+                credentials = WorkspaceCredentialClient(
+                    api_url="https://api.example.test",
+                    worker_token=WORKER_TOKEN,
+                    transport=_testclient_transport(client),
+                )
+                async with kernel_harness(
+                    names,
+                    sync_redis,
+                    binding=binding,
+                    publication_creator=creator,
+                    api_base_url="https://api.example.test",
+                    workspace_scratch_root=str(validation_scratch),
+                ) as harness:
+                    preparer = _LocalWorkspacePreparer(
+                        __import__("curie_worker.workspace", fromlist=["workspace"]),
+                        credentials,
+                        repository_assets,
+                    )
+                    workspace = _RecordingWorkspaceCoordinator(
+                        WorkspaceClaimCoordinator(
+                            preparer=preparer,
+                            substrate=harness.substrate,
+                        )
+                    )
+                    harness.kernel._workspace = workspace  # type: ignore[assignment]
+
+                    async def publication_attempt(
+                        qevent: QueuedTurn,
+                        _route: Any,
+                        release_order: Any,
+                        *_args: Any,
+                        **_kwargs: Any,
+                    ) -> TurnOutcome:
+                        release_order()
+                        return TurnOutcome(
+                            terminal_ok=False,
+                            text=f"Prepared {qevent.reply_handle.channel} repository changes",
+                            status=SessionStatus.AWAITING_APPROVAL,
+                            approval_gate_kind="permission",
+                            approval_granted_tool="mcp__curie__publish_changes",
+                            publication_snapshot=snapshots[qevent.reply_handle.channel],
+                        )
+
+                    harness.kernel._attempt = publication_attempt  # type: ignore[method-assign]
+                    for event in events:
+                        await harness.kernel.process_event(event)
+
+                    routed_events = [
+                        (event.event, event.target)
+                        for event, _route, _best_effort in harness.sink.events
+                        if hasattr(event, "target")
+                    ]
+                    return (
+                        statuses,
+                        requests,
+                        workspace.release_keys,
+                        workspace.claims,
+                        binding.history_keys,
+                        routed_events,
+                    )
+        finally:
+            await engine.dispose()
+            keys = list(sync_redis.scan_iter(match=f"*{token}*"))
+            if keys:
+                sync_redis.delete(*keys)
+            sync_redis.close()
+
+    statuses, requests, release_keys, claims, history_keys, routed_events = asyncio.run(
+        exercise()
+    )
+    assert statuses == [201, 201]
+    assert len(requests) == 2
+    assert all("workspace_conversation_id" not in request for request in requests)
+
+    scoped_by_channel = {
+        channel: scoped_conversation_id("slack", channel, shared_timestamp)
+        for channel in repos
+    }
+    scoped_identities = set(scoped_by_channel.values())
+    assert len(scoped_identities) == 2
+    assert len(claims) == 2
+    assert {claim[0] for claim in claims} == scoped_identities
+    assert all(claim[1] is None for claim in claims)
+    assert len(release_keys) == 2
+    assert set(release_keys) == scoped_identities
+    assert len(history_keys) == 2
+    assert {
+        (address, thread_key, history_key)
+        for address, thread_key, history_key in history_keys
+    } == {
+        (channel, scoped, scoped)
+        for channel, scoped in scoped_by_channel.items()
+    }
+
+    workspace_rows = _rows(
+        "SELECT conversation_id, repo_full_name FROM curie.thread_workspaces "
+        "ORDER BY conversation_id"
+    )
+    assert {row["conversation_id"]: row["repo_full_name"] for row in workspace_rows} == {
+        scoped_by_channel[channel]: repo_full_name
+        for channel, repo_full_name in repos.items()
+    }
+
+    durable_rows = _rows(
+        "SELECT p.workspace_conversation_id, p.repo_full_name, "
+        "a.conversation_id, a.reply_kind, a.reply_channel, a.reply_placeholder "
+        "FROM curie.publications p "
+        "JOIN curie.approvals a ON a.id = p.approval_id "
+        "ORDER BY a.reply_channel"
+    )
+    assert len(durable_rows) == 2
+    for row in durable_rows:
+        channel = row["reply_channel"]
+        assert row["workspace_conversation_id"] == scoped_by_channel[channel]
+        assert row["repo_full_name"] == repos[channel]
+        assert row["conversation_id"] == shared_timestamp
+        assert row["reply_kind"] == "slack"
+        assert row["reply_placeholder"] == placeholders[channel]
+
+    reply_targets = [target for _event, target in routed_events]
+    for channel in repos:
+        channel_targets = [target for target in reply_targets if target.address == channel]
+        assert channel_targets, f"nothing was addressed to {channel}"
+        assert all(target.kind == "slack" for target in channel_targets)
+        assert all(target.conversation_id == shared_timestamp for target in channel_targets)
+        assert all(target.reply_ref == placeholders[channel] for target in channel_targets)
+    assert len(reply_targets) == sum(
+        1 for target in reply_targets if target.address in repos
+    )
+    completion_targets = [
+        target for event_name, target in routed_events if event_name == "turn.completed"
+    ]
+    assert len(completion_targets) == 2
+    assert {
+        (target.address, target.conversation_id, target.reply_ref)
+        for target in completion_targets
+    } == {
+        (channel, shared_timestamp, placeholder)
+        for channel, placeholder in placeholders.items()
+    }
+
+    request_by_channel = {request["reply_channel"]: request for request in requests}
+    before_crossed = _counts()
+    crossed_requests = [
+        {
+            **request_by_channel["C0EXAMPLE1"],
+            "reply_channel": "C0EXAMPLE2",
+            "dedupe_key": "publication-collision-crossed-route",
+        },
+        {
+            **request_by_channel["C0EXAMPLE1"],
+            "repo_full_name": repos["C0EXAMPLE2"],
+            "dedupe_key": "publication-collision-crossed-repository",
+        },
+    ]
+    for crossed in crossed_requests:
+        refused = client.post(
+            "/v1/internal/publications",
+            json=crossed,
+            headers=WORKER_HEADERS,
+        )
+        assert refused.status_code == 409, refused.text
+        assert _counts() == before_crossed
 
 
 def test_publication_insert_failure_rolls_back_the_approval(
@@ -1534,7 +2298,7 @@ def test_publication_insert_failure_rolls_back_the_approval(
         selected = client.post(
             f"/v1/internal/workspaces/{deployment['id']}/selection",
             json={
-                "conversation_id": payload["conversation_id"],
+                "conversation_id": _workspace_identity(payload),
                 "author": payload["author"],
                 "repo_full_name": REPO,
             },
@@ -1569,7 +2333,7 @@ def test_publication_patch_cap_counts_decoded_raw_bytes_exactly(
     selected = client.post(
         f"/v1/internal/workspaces/{deployment['id']}/selection",
         json={
-            "conversation_id": payload["conversation_id"],
+            "conversation_id": _workspace_identity(payload),
             "author": payload["author"],
             "repo_full_name": REPO,
         },
@@ -1858,6 +2622,53 @@ def test_publication_credential_is_approved_only_server_derived_and_audited(
     assert "ghp_publication_operator" not in json.dumps(audit, default=str)
 
 
+@pytest.mark.parametrize("legacy", [False, True])
+def test_publication_credential_rechecks_the_current_scoped_or_legacy_selection(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+    legacy: bool,
+) -> None:
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    payload = _publication_payload(
+        deployment["id"], dedupe_key=f"credential-selection-{'legacy' if legacy else 'scoped'}"
+    )
+    payload["conversation_id"] = "1700000000.000100"
+    _, publication = _create_publication(client, payload)
+    if legacy:
+        _make_publication_legacy(publication["id"], deployment["id"], payload)
+    approved = _resolve(client, auth_headers, publication["approval_id"])
+    assert approved.status_code == 200, approved.text
+    url = f"/v1/internal/publications/{publication['id']}/credential"
+
+    issued = client.post(url, headers=WORKER_HEADERS)
+    assert issued.status_code == 200, issued.text
+
+    _execute(
+        "DELETE FROM curie.thread_workspaces "
+        "WHERE selected_by_deployment_id = :deployment_id "
+        "AND conversation_id = :conversation_id",
+        {
+            "deployment_id": deployment["id"],
+            "conversation_id": (
+                payload["conversation_id"] if legacy else _workspace_identity(payload)
+            ),
+        },
+    )
+    refused = client.post(url, headers=WORKER_HEADERS)
+
+    assert refused.status_code == 403
+    assert refused.headers["cache-control"] == "no-store"
+    audit = _rows(
+        "SELECT outcome, detail FROM curie.credential_redemption_audit_entries "
+        "WHERE publication_id = :id ORDER BY created_at, id",
+        {"id": publication["id"]},
+    )
+    assert [row["outcome"] for row in audit] == ["issued", "refused"]
+    assert "ghp_publication_operator" not in json.dumps(audit, default=str)
+
+
 def test_disabled_deployment_flag_still_allows_authorized_publication(
     publication_stack: tuple[TestClient, str],
     auth_headers: dict[str, str],
@@ -1919,6 +2730,18 @@ def test_allowlist_revocation_stops_an_approved_publication_credential(
     assert refused.status_code == 403
     assert refused.headers["cache-control"] == "no-store"
     assert "authorized" in refused.json()["detail"]
+    audit = _rows(
+        "SELECT outcome, detail FROM curie.credential_redemption_audit_entries "
+        "WHERE publication_id = :id ORDER BY created_at, id",
+        {"id": publication["id"]},
+    )
+    assert audit == [
+        {
+            "outcome": "refused",
+            "detail": "publication repository is no longer authorized for this thread",
+        }
+    ]
+    assert "ghp_publication_operator" not in json.dumps(audit, default=str)
 
 
 def test_terminal_patch_retention_reaps_bytes_but_keeps_public_metadata(
