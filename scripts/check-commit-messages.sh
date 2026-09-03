@@ -25,8 +25,15 @@
 #      never trip it.
 #
 # Usage:
-#   scripts/check-commit-messages.sh [<range>]   # default: origin/main..HEAD
-#   scripts/check-commit-messages.sh --self-test # prove the matcher is not vacuous
+#   scripts/check-commit-messages.sh [<range>]        # default: origin/main..HEAD
+#   scripts/check-commit-messages.sh --message-file <path>
+#   scripts/check-commit-messages.sh --self-test      # prove the matcher is not vacuous
+#
+# `--message-file` runs the SAME matcher over one file of message text instead of
+# a commit range. It exists so scripts/check-pr-body.sh can apply this rule to a
+# pull request body without a second copy of the regexes: the vendor lists and
+# the bare-name boundary above are the part most likely to rot, and two copies
+# rot apart. The caller owns the file; this mode only reads it.
 #
 # An unresolvable range is a hard failure, never a silent pass, so `--self-test`
 # re-invokes this script once with a bogus range and must run inside a git repo.
@@ -146,8 +153,54 @@ self_test() {
     echo "commit-message gate self-test: ${#bad[@]} caught, ${#good[@]} correctly ignored"
 }
 
+# Scan one file of message text. Shares offending_reason() with the range mode,
+# so a vendor added to the matcher is covered in both places at once.
+check_message_file() {
+    local message_file="$1"
+    local line reason violations=0
+
+    if [[ ! -f "$message_file" ]]; then
+        echo "message-file check failed: '$message_file' is not a regular file" >&2
+        return 1
+    fi
+    if [[ ! -r "$message_file" ]]; then
+        echo "message-file check failed: '$message_file' is not readable" >&2
+        return 1
+    fi
+
+    # A final line with no trailing newline is still a line: `read` returns
+    # non-zero on it while leaving it in the variable, so the loop body must run
+    # once more for a footer appended without a newline.
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        reason="$(offending_reason "$line")"
+        if [[ -n "$reason" ]]; then
+            if ((violations == 0)); then
+                echo "AGENTS.md forbids AI attribution in commit messages and pull" >&2
+                echo "request bodies (#962). Offending:" >&2
+            fi
+            violations=$((violations + 1))
+            echo "  [$reason] $line" >&2
+        fi
+    done <"$message_file"
+
+    if ((violations)); then
+        echo "Remove the attribution above and try again." >&2
+        return 1
+    fi
+    echo "message text clean: no AI attribution in '$message_file'"
+}
+
 if [[ "${1:-}" == "--self-test" ]]; then
     self_test
+    exit 0
+fi
+
+if [[ "${1:-}" == "--message-file" ]]; then
+    if (($# != 2)); then
+        echo "Usage: scripts/check-commit-messages.sh --message-file <path>" >&2
+        exit 2
+    fi
+    check_message_file "$2"
     exit 0
 fi
 
