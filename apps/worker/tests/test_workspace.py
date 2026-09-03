@@ -918,7 +918,21 @@ def test_late_handoff_uses_substrate_handoff_and_keeps_credentials_out_of_claim_
     workspace: Any, tmp_path: Path
 ) -> None:
     preparer, commands, _objects = _preparer(workspace, tmp_path)
-    substrate = _RecordingSubstrate()
+    ordering: list[str] = []
+    real_verify = preparer.verify
+
+    def verify(prepared: Any) -> None:
+        real_verify(prepared)
+        ordering.append("verified")
+
+    preparer.verify = verify
+
+    class OrderingSubstrate(_RecordingSubstrate):
+        def handoff(self, *args: Any, **kwargs: Any) -> object:
+            ordering.append("handoff")
+            return super().handoff(*args, **kwargs)
+
+    substrate = OrderingSubstrate()
     coordinator = workspace.WorkspaceClaimCoordinator(
         preparer=preparer,
         substrate=substrate,
@@ -938,8 +952,10 @@ def test_late_handoff_uses_substrate_handoff_and_keeps_credentials_out_of_claim_
         agent_name="acme-bot",
         repo_full_name="acme-corp/acme-bot",
         replace_handle=old_handle,
+        revalidate_before_handoff=lambda: ordering.append("revalidated"),
     )
 
+    assert ordering == ["verified", "revalidated", "handoff"]
     assert substrate.calls[0][0] == "handoff"
     assert [kind for kind, _thread, _env in substrate.calls] == ["handoff"]
     handoff = substrate.handoff_calls[0]
@@ -972,6 +988,79 @@ def test_late_handoff_uses_substrate_handoff_and_keeps_credentials_out_of_claim_
         if name != "CURIE_RUNNER_TOKEN"
     )
     assert "clone" in commands.events
+
+
+def test_late_handoff_revalidation_refusal_restores_ownership_and_old_route(
+    workspace: Any, tmp_path: Path
+) -> None:
+    preparer, _, objects = _preparer(workspace, tmp_path)
+    thread_key = "1700000000.000100"
+    old_route = object()
+    ordering: list[str] = []
+
+    class RouteSubstrate(_RecordingSubstrate):
+        current_route = old_route
+
+        def handoff(self, *args: Any, **kwargs: Any) -> object:
+            ordering.append("handoff")
+            self.current_route = object()
+            return super().handoff(*args, **kwargs)
+
+    substrate = RouteSubstrate()
+    coordinator = workspace.WorkspaceClaimCoordinator(
+        preparer=preparer,
+        substrate=substrate,
+        ownership_ttl_seconds=60,
+        wall_clock=lambda: 1000.0,
+    )
+    previous = coordinator.claim_or_resume_with_handle(
+        thread_key=thread_key,
+        deployment_id=DEPLOYMENT_ID,
+    ).prepared
+    substrate.calls.clear()
+    substrate.handoff_calls.clear()
+
+    real_verify = preparer.verify
+
+    def verify(prepared: Any) -> None:
+        real_verify(prepared)
+        ordering.append("verified")
+
+    preparer.verify = verify
+
+    def refuse_revalidation() -> None:
+        staged = coordinator.current(thread_key)
+        assert staged is not None and staged != previous
+        ordering.append("revalidated-refused")
+        raise RuntimeError("workspace handoff boundary changed")
+
+    with pytest.raises(RuntimeError, match="handoff boundary changed"):
+        coordinator.claim_or_resume_with_handle(
+            thread_key=thread_key,
+            deployment_id=DEPLOYMENT_ID,
+            repo_full_name="acme-corp/acme-bot",
+            replace_handle=old_route,
+            revalidate_before_handoff=refuse_revalidation,
+        )
+
+    assert ordering == ["verified", "revalidated-refused"]
+    assert substrate.handoff_calls == []
+    assert substrate.current_route is old_route
+
+    restarted = workspace.WorkspaceClaimCoordinator(
+        preparer=preparer,
+        substrate=_RecordingSubstrate(),
+        ownership_ttl_seconds=60,
+        wall_clock=lambda: 1001.0,
+    )
+    assert restarted.current(thread_key) == previous
+    assert previous.object_key in objects.objects
+    archive_keys = [key for key in objects.objects if not key.startswith("_ownership/")]
+    assert archive_keys == [previous.object_key]
+    assert any(
+        key != previous.object_key and not key.startswith("_ownership/")
+        for key in objects.deleted
+    )
 
 
 def test_late_handoff_without_a_selected_repository_never_touches_the_substrate(

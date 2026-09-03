@@ -174,6 +174,60 @@ def test_create_claim_fetches_and_unwraps_bundle() -> None:
     assert "CURIE_BUNDLE_VERSION=abc123def456" in child_env
 
 
+def test_create_claim_prefetches_workspace_without_forwarding_capability_env(
+    tmp_path: Path,
+) -> None:
+    """Docker consumes workspace capabilities at the trusted worker boundary.
+
+    Kubernetes gives these values only to its trusted init containers
+    (``test_workspace_capability_targets_only_workspace_init_containers``).
+    Docker has no init container, so its worker performs the equivalent fetch
+    before mounting the checkout. Neither opaque capability may survive in the
+    untrusted runner's environment.
+    """
+
+    checkout = tmp_path / "trusted-checkout"
+    checkout.mkdir()
+    workspace_ref = "opaque-presigned-workspace-reference"
+    workspace_sha256 = "a" * 64
+
+    class _WorkspacePreparingDocker(_RecordingDocker):
+        def __init__(self, **kwargs: object) -> None:
+            super().__init__(**kwargs)
+            self.prepared: list[tuple[str, str, str]] = []
+
+        def _prepare_workspace(
+            self, name: str, encoded_ref: str, expected_sha256: str
+        ) -> str:
+            self.prepared.append((name, encoded_ref, expected_sha256))
+            return str(checkout)
+
+    client = _WorkspacePreparingDocker(
+        image="curie-runner", bundle_store=_FakeBundleStore()
+    )
+    client.create_claim(
+        "thread-workspace",
+        pool="pool",
+        env={
+            "CURIE_BUDGET": "{}",
+            "CURIE_WORKSPACE_REF": workspace_ref,
+            "CURIE_WORKSPACE_SHA256": workspace_sha256,
+        },
+    )
+
+    assert client.prepared == [
+        ("thread-workspace", workspace_ref, workspace_sha256)
+    ]
+    argv = client.calls[0]
+    assert f"{checkout}:/workspace:rw" in _flag_values(argv, "-v")
+    child_env = _flag_values(argv, "-e")
+    child_env_names = {entry.partition("=")[0] for entry in child_env}
+    assert "CURIE_WORKSPACE_REF" not in child_env_names
+    assert "CURIE_WORKSPACE_SHA256" not in child_env_names
+    assert all(workspace_ref not in entry for entry in child_env)
+    assert all(workspace_sha256 not in entry for entry in child_env)
+
+
 def test_create_claim_without_bundle_ref_mounts_nothing() -> None:
     client = _RecordingDocker(image="curie-runner", bundle_store=_FakeBundleStore())
     client.create_claim("t1", pool="pool", env={"CURIE_FAKE_MODEL": "1"})

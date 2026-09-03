@@ -698,6 +698,94 @@ def test_irreducibly_large_turn_fails_durability_before_store_append(caplog) -> 
     )
 
 
+def test_history_durability_failure_is_sticky_after_later_successful_append() -> None:
+    """A later turn cannot make an earlier dropped turn safe to hand off."""
+
+    from aci_protocol import Event, Final, SessionStatus, parse_ndjson_line
+    from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
+
+    class CountingStore(_RecordingStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.append_attempts = 0
+
+        async def append(self, record: TurnRecord) -> None:
+            self.append_attempts += 1
+            await super().append(record)
+
+    oversized_messages = 3_000
+    scripts = iter(
+        (
+            [
+                *(
+                    AssistantMessage(content=[], model="fake-model")
+                    for _ in range(oversized_messages)
+                ),
+                ResultMessage(
+                    subtype="success",
+                    duration_ms=1,
+                    duration_api_ms=1,
+                    is_error=False,
+                    num_turns=1,
+                    session_id="fake-session",
+                    result="first answer",
+                    usage={"input_tokens": 1, "output_tokens": 1},
+                ),
+            ],
+            [
+                AssistantMessage(
+                    content=[TextBlock(text="small answer")], model="fake-model"
+                ),
+                ResultMessage(
+                    subtype="success",
+                    duration_ms=1,
+                    duration_api_ms=1,
+                    is_error=False,
+                    num_turns=1,
+                    session_id="fake-session",
+                    result="small answer",
+                    usage={"input_tokens": 1, "output_tokens": 1},
+                ),
+            ],
+        )
+    )
+    store = CountingStore()
+    runner = _recording_runner(store, script=lambda: next(scripts))
+
+    async def go() -> None:
+        await runner.start()
+        first_lines = [
+            line
+            async for line in runner.run_inbound(
+                Event(type="message", text="oversized turn", user="U", ts="1")
+            )
+        ]
+        first_final = parse_ndjson_line(first_lines[-1])
+        assert isinstance(first_final, Final)
+        assert first_final.status is SessionStatus.DONE
+        assert runner.history_durable is False
+        assert store.append_attempts == 0
+
+        second_lines = [
+            line
+            async for line in runner.run_inbound(
+                Event(type="message", text="small turn", user="U", ts="2")
+            )
+        ]
+        second_final = parse_ndjson_line(second_lines[-1])
+        assert isinstance(second_final, Final)
+        assert second_final.status is SessionStatus.DONE
+        assert store.append_attempts == 1
+        assert len(store.turns) == 1
+        assert store.turns[0].assistant == "small answer"
+
+        # The earlier missing turn still makes replacement unsafe even though
+        # this append succeeded.
+        assert runner.history_durable is False
+
+    anyio.run(go)
+
+
 def test_state_store_load_rejects_non_array() -> None:
     app = web.Application()
 

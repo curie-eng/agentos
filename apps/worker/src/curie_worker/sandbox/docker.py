@@ -120,11 +120,21 @@ _SDK_PASSTHROUGH_ENV = (
 _OAUTH_TOKEN_PREFIX = "sk-ant-oat"
 # Env keys the worker sets explicitly or forwards specially, so the generic
 # value loop must not also emit them: the plugin dir and sandbox id are set
-# explicitly, the bundle ref named a RustFS object the worker already fetched
-# (the runner never fetches), and the credential is forwarded by name (never as
-# a value in the argv). CURIE_BUNDLE_VERSION is deliberately not in this set:
-# it is the agent-readable version_label and must reach the child env (#2174).
-_WORKER_OWNED_ENV = frozenset({BUNDLE_REF_ENV, PLUGIN_DIR_ENV, "CURIE_SANDBOX_ID", CREDENTIALS_ENV})
+# explicitly, the bundle ref names a RustFS object the worker already fetched,
+# workspace ref/digest name the archive the worker already fetched and mounted,
+# and the credential is forwarded by name (never as a value in the argv).
+# CURIE_BUNDLE_VERSION is deliberately not in this set: it is the agent-readable
+# version_label and must reach the child env (#2174).
+_WORKER_OWNED_ENV = frozenset(
+    {
+        BUNDLE_REF_ENV,
+        PLUGIN_DIR_ENV,
+        "CURIE_SANDBOX_ID",
+        CREDENTIALS_ENV,
+        WORKSPACE_REF_ENV,
+        WORKSPACE_SHA256_ENV,
+    }
+)
 
 
 def _parse_created(raw: str) -> datetime | None:

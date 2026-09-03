@@ -779,6 +779,141 @@ def test_late_workspace_selection_defers_without_steering_until_boundary_is_safe
     asyncio.run(go())
 
 
+@pytest.mark.parametrize(
+    "status_payload",
+    [
+        pytest.param(
+            {"turn_active": False, "history_durable": True},
+            id="missing-status",
+        ),
+        pytest.param(
+            {
+                "status": "newer-runner-status",
+                "turn_active": False,
+                "history_durable": True,
+            },
+            id="unrecognized-status",
+        ),
+    ],
+)
+def test_workspace_handoff_boundary_rejects_missing_or_unrecognized_status(
+    make_harness,
+    status_payload: dict[str, object],
+) -> None:
+    """A shape-drifted status is not evidence that replacement is safe."""
+
+    async def go() -> None:
+        async with make_harness() as h:
+            old = h.substrate.claim(
+                _thread_key("tUnknownHandoffStatus"),
+                env={"CURIE_RUNNER_TOKEN": "workspace-test-token"},
+            )
+
+            async def status(*_args: object, **_kwargs: object) -> dict[str, object]:
+                return dict(status_payload)
+
+            h.kernel._runner.status = status  # type: ignore[method-assign]
+
+            assert not await h.kernel._workspace_handoff_ready(old)
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    "unsafe_status",
+    [
+        pytest.param(
+            {
+                "status": "idle-awaiting-input",
+                "turn_active": True,
+                "history_durable": True,
+            },
+            id="became-busy",
+        ),
+        pytest.param(
+            {
+                "status": "idle-awaiting-input",
+                "turn_active": False,
+                "history_durable": False,
+            },
+            id="became-undurable",
+        ),
+    ],
+)
+def test_late_workspace_handoff_revalidates_boundary_before_route_replacement(
+    make_harness,
+    unsafe_status: dict[str, object],
+) -> None:
+    """Preparation latency cannot spend a one-shot safe-boundary observation."""
+
+    deployment_id = uuid.uuid4()
+
+    async def go() -> None:
+        async with make_harness(binding=_workspace_binding(deployment_id)) as h:
+            thread_key = _thread_key("tBoundaryChangedDuringPreparation")
+            old = h.substrate.claim(
+                thread_key,
+                env={"CURIE_RUNNER_TOKEN": "workspace-test-token"},
+            )
+            status_payloads = [
+                {
+                    "status": "idle-awaiting-input",
+                    "turn_active": False,
+                    "history_durable": True,
+                },
+                unsafe_status,
+            ]
+            status_reads = 0
+            ordering: list[str] = []
+
+            async def status(*_args: object, **_kwargs: object) -> dict[str, object]:
+                nonlocal status_reads
+                status_reads += 1
+                ordering.append(f"status-{status_reads}")
+                return dict(status_payloads[min(status_reads - 1, 1)])
+
+            h.kernel._runner.status = status  # type: ignore[method-assign]
+
+            class WorkspaceProbe:
+                replacements = 0
+
+                def select_repository(self, **_kwargs: object) -> str:
+                    return "acme-corp/acme-bot"
+
+                def claim_or_resume_with_handle(self, **_kwargs: object) -> object:
+                    self.replacements += 1
+                    ordering.append("prepared-and-verified")
+                    revalidate = _kwargs.get("revalidate_before_handoff")
+                    assert callable(revalidate), (
+                        "late handoff must pass a post-preparation revalidation callback"
+                    )
+                    revalidate()
+                    ordering.append("handoff")
+                    raise AssertionError(
+                        "a refused revalidation must prevent route replacement"
+                    )
+
+            probe = WorkspaceProbe()
+            h.kernel._workspace = probe  # type: ignore[assignment]
+
+            with pytest.raises(ThreadBusyError):
+                await h.kernel.process_event(
+                    _qevent(
+                        "Use https://github.com/acme-corp/acme-bot",
+                        thread="tBoundaryChangedDuringPreparation",
+                    )
+                )
+
+            assert status_reads == 2
+            assert probe.replacements == 1
+            assert ordering == ["status-1", "prepared-and-verified", "status-2"]
+            assert h.substrate.lookup(thread_key) == old
+            assert len(h.fake_k8s.claim_envs) == 1
+            assert h.runner.opened == []
+
+    asyncio.run(go())
+
+
 def test_workspace_route_metadata_mismatch_fails_closed_without_claim_or_model(
     make_harness,
 ) -> None:

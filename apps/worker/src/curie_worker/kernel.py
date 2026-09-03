@@ -328,6 +328,14 @@ _MIN_ATTEMPT_BUDGET_S = 5.0
 _RECLAIM_PREFLIGHT_IDLE_TIMEOUT_S = 5.0
 _RECLAIM_PREFLIGHT_POLL_S = 0.05
 
+# ``WorkspaceClaimCoordinator`` performs blocking clone/archive/upload work on
+# a worker thread. Its final handoff guard schedules one bounded runner-status
+# read back onto the owning asyncio loop, then waits on that thread. The HTTP
+# request already has the runner client's delivery-clamped timeout; this small
+# grace covers scheduling and returning its result without leaving a worker
+# thread blocked forever if the loop stops servicing callbacks.
+_HANDOFF_REVALIDATION_BRIDGE_GRACE_S = 1.0
+
 
 class ReclaimPreflightUnsafe(RuntimeError):
     """A transferred delivery could not be proven safe to re-execute.
@@ -2538,6 +2546,7 @@ class Kernel:
                 else None
             ),
             agent_name=agent_name,
+            remaining_s=remaining_s,
         )
         retained_live_route = existing_handle is not None and handle == existing_handle
         claim_ms = round((time.monotonic() - claim_started) * 1000)
@@ -2682,7 +2691,7 @@ class Kernel:
         return (
             status.get("turn_active") is False
             and status.get("history_durable") is True
-            and status.get("status") != SessionStatus.AWAITING_APPROVAL.value
+            and status.get("status") == SessionStatus.IDLE_AWAITING_INPUT.value
         )
 
     async def _claim_or_resume(
@@ -2694,6 +2703,7 @@ class Kernel:
         workspace_repo: str | None = None,
         replace_handle: SandboxHandle | None = None,
         agent_name: str | None = None,
+        remaining_s: float | None = None,
     ) -> SandboxHandle:
         # A live route is an adopt/steer, not a session start. Preparing before
         # this check would clone on every threaded steer and could even replace
@@ -2703,6 +2713,16 @@ class Kernel:
         # lookup-then-claim gap, where the route could disappear and ``claim``
         # would create a sandbox without a freshly prepared workspace ref.
         if workspace_deployment_id is not None:
+            handoff_budget_started = time.monotonic()
+
+            def handoff_remaining() -> float | None:
+                if remaining_s is None:
+                    return None
+                return max(
+                    0.0,
+                    remaining_s - (time.monotonic() - handoff_budget_started),
+                )
+
             if self._workspace is None:
                 raise WorkspacePreparationError(
                     "wiring", "selected workspace has no trusted claim-time preparer"
@@ -2715,6 +2735,46 @@ class Kernel:
                     ttl_seconds=self._route_ttl_seconds,
                 )
                 return existing
+            handoff_revalidation: Callable[[], None] | None = None
+            if replace_handle is not None:
+                loop = asyncio.get_running_loop()
+
+                def revalidate_before_handoff() -> None:
+                    """Bridge the coordinator thread back to the runner's loop.
+
+                    The coordinator invokes this after preparation and durable
+                    ownership staging, immediately before ``substrate.handoff``.
+                    Blocking here is safe: ``_claim_or_resume`` is awaiting the
+                    coordinator via ``to_thread``, so the owning event loop is
+                    free to service the authenticated status request.
+                    """
+
+                    probe_remaining_s = handoff_remaining()
+                    probe = asyncio.run_coroutine_threadsafe(
+                        self._workspace_handoff_ready(
+                            replace_handle, remaining_s=probe_remaining_s
+                        ),
+                        loop,
+                    )
+                    request_ceiling = self._config.runner_total_timeout_s
+                    if probe_remaining_s is not None:
+                        request_ceiling = max(0.0, min(request_ceiling, probe_remaining_s))
+                    try:
+                        ready = probe.result(
+                            timeout=(request_ceiling + _HANDOFF_REVALIDATION_BRIDGE_GRACE_S)
+                        )
+                    except Exception as exc:
+                        probe.cancel()
+                        raise ThreadBusyError(
+                            f"thread {thread_key} workspace handoff fence could not be revalidated"
+                        ) from exc
+                    if not ready:
+                        raise ThreadBusyError(
+                            f"thread {thread_key} lost its durable workspace "
+                            "handoff boundary during preparation"
+                        )
+
+                handoff_revalidation = revalidate_before_handoff
             # Prepare once, then let the substrate decide cold claim versus
             # suspended-route resume. Either branch materializes the same fresh,
             # verified archive before the runner can start.
@@ -2726,6 +2786,7 @@ class Kernel:
                 agent_name=agent_name,
                 repo_full_name=workspace_repo,
                 replace_handle=replace_handle,
+                revalidate_before_handoff=handoff_revalidation,
             )
             if not isinstance(workspace_claim.handle, SandboxHandle):
                 raise WorkspacePreparationError(

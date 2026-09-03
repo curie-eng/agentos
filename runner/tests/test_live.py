@@ -168,7 +168,11 @@ def _install_init_observer(
     return init_messages
 
 
-def _drive_live_catalog(runner: SessionRunner) -> Final:
+def _drive_live_catalog(
+    runner: SessionRunner,
+    *,
+    prompt: str = "Reply with only: workspace-ready. Do not call any tool.",
+) -> Final:
     async def go() -> Final:
         await runner.start()
         final: Final | None = None
@@ -176,7 +180,7 @@ def _drive_live_catalog(runner: SessionRunner) -> Final:
             async for line in runner.run_turn(
                 Event(
                     type="message",
-                    text="Reply with only: workspace-ready. Do not call any tool.",
+                    text=prompt,
                     user="U0EXAMPLE",
                     ts="1",
                 )
@@ -246,7 +250,9 @@ def test_live_claim_time_workspace_init_catalogue(
 def test_live_late_workspace_replacement_init_catalogue(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from aci_protocol import BootEnv
     from curie_runner import __main__ as boot
+    from curie_runner.config import RunnerConfig
 
     workspace = Path("/workspace")
     assert workspace.is_dir() and (workspace / ".git").exists(), (
@@ -254,28 +260,85 @@ def test_live_late_workspace_replacement_init_catalogue(
         "/workspace checkout"
     )
     bundle = _production_sre_bundle(tmp_path)
-    session_id = f"late-{uuid4()}"
-    config = _catalog_config(bundle, session_id)
-
-    # The first claim is the idle, unmounted standing-by session. It has the
-    # same thread identity and production bundle, but its options-only shape is
-    # deliberately not accepted as catalogue evidence. The fresh replacement
-    # below is the only runner driven through a real SDK init frame.
-    boot.build_runner(
-        config,
-        conversation_replay=ConversationReplay(),
-        workspace_path=None,
+    logical_session_id = f"agent-acme-thread-{uuid4()}"
+    history_ref = (
+        "http://api.example.com/agents/acme-agent/state/transcript/"
+        f"thread-{uuid4()}"
     )
+    base_config = _catalog_config(bundle, logical_session_id)
+
+    # SandboxSubstrate.handoff carries the standing claim's exact logical
+    # session and history identities into the replacement boot env. Render the
+    # same worker-owned shape rather than constructing runner options directly;
+    # the substrate adds only its fresh sandbox identity.
+    handoff_env = BootEnv.render_worker(
+        plugin_dir=str(bundle),
+        session_id=logical_session_id,
+        budget=base_config.session.budget,
+        memory_ref="http://api.example.com/agents/acme-agent/state/memory",
+        history_ref=history_ref,
+        model=os.environ.get("CURIE_MODEL"),
+    )
+    handoff_env[BootEnv.env_key("sandbox_id")] = "sandbox-acme-workspace-replacement"
+    config = RunnerConfig.from_env(handoff_env)
+    assert config.session.session_id == logical_session_id
+    assert config.history_ref == history_ref
+
+    history_marker = f"prior-workspace-context-{uuid4().hex}"
+    prior_turn = TurnRecord(
+        user=f"Retain this exact marker for the next turn: {history_marker}",
+        assistant="I will retain that exact marker for the next turn.",
+        ts="2026-09-03T00:00:00Z",
+        messages=(
+            ConversationMessage(
+                role="user",
+                content=f"Retain this exact marker for the next turn: {history_marker}",
+            ),
+            ConversationMessage(
+                role="assistant",
+                content=[
+                    {
+                        "type": "text",
+                        "text": "I will retain that exact marker for the next turn.",
+                    }
+                ],
+            ),
+        ),
+    )
+    store = _LiveTranscriptStore()
+
+    async def seed_durable_replay() -> ConversationReplay:
+        await store.append(prior_turn)
+        records = await store.load()
+        replay, summary = build_conversation_replay(
+            records, max_turns=None, max_bytes=None
+        )
+        assert summary is None
+        return replay
+
+    replay = anyio.run(seed_durable_replay)
+    assert replay.present
+
     init_messages = _install_init_observer(monkeypatch)
     replacement = boot.build_runner(
         config,
-        conversation_replay=ConversationReplay(),
+        history_store=store,
+        conversation_replay=replay,
         workspace_path=workspace,
     )
 
-    final = _drive_live_catalog(replacement)
+    final = _drive_live_catalog(
+        replacement,
+        prompt=(
+            "Reply with only the exact marker I asked you to retain in the "
+            "immediately prior turn. Do not call any tool."
+        ),
+    )
 
     assert final.status is SessionStatus.DONE
+    assert history_marker in final.text, (
+        "late workspace replacement did not use its durable prior-turn context"
+    )
     assert init_messages, "fresh late workspace runner emitted no SDK init frame"
     _assert_production_workspace_init(init_messages[-1], bundle=bundle)
 
