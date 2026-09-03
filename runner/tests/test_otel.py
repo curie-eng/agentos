@@ -1355,6 +1355,37 @@ def test_interrupt_requested_wins_over_error_result_and_sdk_abort_reason() -> No
     assert root.attributes["curie.terminal.status"] == "cancelled"
 
 
+def test_runner_timeout_is_a_closed_error_terminal_and_is_first_store_stable() -> None:
+    """The private timeout control is a failure, never an ACI cancellation.
+
+    Timeout has higher precedence than an ordinary interrupt when both race, and
+    the existing idempotent terminal guard must keep a later abandonment fallback
+    from replacing the first stored cause.
+    """
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+
+    with RunTracer(provider).run_span("curie-run:test", "fake-model") as gen:
+        gen.query_observed()
+        gen.finish_turn(
+            timeout_requested=True,
+            interrupt_requested=True,
+            classified_failure=True,
+        )
+        gen.set_abandoned()
+
+    spans = _spans_by_name(list(exporter.get_finished_spans()))
+    root = spans["agent.run"][0]
+    generation = spans["llm.generation"][0]
+    assert root.attributes["curie.terminal.cause"] == "runner_timeout"
+    assert root.attributes["curie.terminal.status"] == "failed"
+    assert root.status.status_code is StatusCode.ERROR
+    assert generation.status.status_code is StatusCode.ERROR
+    assert generation.attributes["curie.phase.end_kind"] == "terminal_inferred"
+
+
 def test_exhausted_stream_is_abandoned_not_a_false_success() -> None:
     _, spans = _run_and_export(lambda: FakeModelSession(lambda: []))
     root = spans["agent.run"][0]

@@ -108,7 +108,7 @@ _SANDBOX_INVENTORY_ATTRIBUTES = {
 }
 _RUNNER_RPC_ATTRIBUTES = {
     "service.name": ["curie-worker"],
-    "operation": ["event", "steer", "interrupt", "reset", "status"],
+    "operation": ["event", "steer", "interrupt", "reset", "status", "timeout"],
     "role": ["client"],
     "outcome": ["success", "failure", "conflict", "timeout"],
 }

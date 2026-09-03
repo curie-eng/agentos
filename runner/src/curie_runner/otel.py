@@ -496,12 +496,15 @@ class _GenerationSpan:
         *,
         interrupt_requested: bool,
         classified_failure: bool,
+        timeout_requested: bool = False,
         approval_paused: bool = False,
         completed_without_result: bool = False,
     ) -> None:
         """Apply the closed terminal mapping after the ACI final is decided."""
 
-        if interrupt_requested:
+        if timeout_requested:
+            self._finish("runner_timeout", "failed", failed=True)
+        elif interrupt_requested:
             self._finish("interrupt_requested", "cancelled", failed=False)
         elif approval_paused:
             self._finish("approval_required", "paused", failed=False)
