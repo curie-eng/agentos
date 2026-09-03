@@ -113,7 +113,10 @@ def _assert_selection(
         ("apps/worker/example.py", ("local", "local-release", "cluster")),
         ("otel/collector.yaml", ("local", "local-release")),
         ("cli/example.rs", BASE_TIERS),
+        ("cli/src/main.rs", BASE_TIERS),
         ("packages/example.py", BASE_TIERS),
+        ("packages/aci-protocol/src/aci_protocol/wire.py", BASE_TIERS),
+        ("packages/plugin-format/src/plugin_format/manifest.py", BASE_TIERS),
         ("pyproject.toml", BASE_TIERS),
         ("uv.lock", BASE_TIERS),
     ],
@@ -196,14 +199,41 @@ def test_genuine_documentation_only_selects_no_runtime_e2e_tiers(
 
 
 @pytest.mark.parametrize(
+    "path",
+    [
+        "apps/ui/package.json",
+        "apps/ui/pnpm-lock.yaml",
+        "apps/dispatcher/src/curie_dispatcher/app.py",
+        "scripts/README.md",
+        "scripts/check-docs.sh",
+        "scripts/check-pr-body.sh",
+        ".github/workflows/pr-body.yaml",
+        "packages/test-support/src/curie_test_support/valkey.py",
+        "examples/coder/evals/cases.json",
+    ],
+)
+def test_known_non_runtime_paths_select_no_e2e_tiers(tmp_path: Path, path: str) -> None:
+    _assert_selection(tmp_path, path, ())
+
+
+def test_unapproved_markdown_fallback_selects_all_base_tiers(tmp_path: Path) -> None:
+    _assert_selection(tmp_path, "UNAPPROVED.md", BASE_TIERS)
+
+
+def test_charts_curie_still_selects_cluster(tmp_path: Path) -> None:
+    completed, output = _invoke_selector(tmp_path, "charts/curie/values.yaml")
+    assert completed.returncode == 0, completed.stderr
+    outputs = dict(line.split("=", maxsplit=1) for line in output.splitlines())
+    assert outputs["cluster"] == "true"
+
+
+@pytest.mark.parametrize(
     ("path", "selected"),
     [
         (".github/e2e-selection.yaml", TIERS),
         (".github/workflows/ci.yaml", TIERS),
         (".github/workflows/README.md", BASE_TIERS),
         (".github/action.yml", BASE_TIERS),
-        ("scripts/README.md", BASE_TIERS),
-        ("scripts/check-docs.sh", BASE_TIERS),
         ("apps/api/README.md", ("local", "local-release", "cluster")),
         ("apps/api/runtime-config.yaml", ("local", "local-release", "cluster")),
         ("packages/plugin-format/README.md", BASE_TIERS),
@@ -389,6 +419,24 @@ def test_selector_rejects_invalid_registries(
     registry.write_text(registry_text)
     completed, _output = _invoke_selector(tmp_path, "charts/example.yaml", registry=registry)
     assert completed.returncode != 0
+
+
+def test_more_specific_ignored_child_of_selected_prefix_is_allowed(tmp_path: Path) -> None:
+    registry = tmp_path / "registry.yaml"
+    registry.write_text(
+        VALID_REGISTRY.replace("    docs: []", "    docs: []\n    charts/ci: []")
+    )
+    ignored, ignored_output = _invoke_selector(
+        tmp_path, "charts/ci/probe.sh", registry=registry
+    )
+    assert ignored.returncode == 0, ignored.stderr
+    assert ignored_output == _expected_output()
+
+    selected, selected_output = _invoke_selector(
+        tmp_path, "charts/curie/values.yaml", registry=registry
+    )
+    assert selected.returncode == 0, selected.stderr
+    assert selected_output == _expected_output("cluster", "released-upgrade")
 
 
 AGGREGATE_EXPRESSIONS = {
