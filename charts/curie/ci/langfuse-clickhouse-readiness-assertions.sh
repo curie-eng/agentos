@@ -191,6 +191,9 @@ python3 "$TMP/extract.py" "$TOLERANT" > "$TMP/gate-tolerant.sh"
 [[ -s "$TMP/gate-patient.sh" && -s "$TMP/gate-fast.sh" && -s "$TMP/gate-tolerant.sh" ]] || fail "an extracted gate script is empty"
 
 # A free port that nothing is listening on: the delayed/absent ClickHouse.
+# There is an unavoidable gap between choosing the port here and the stub taking
+# it, so the stub binds immediately and delays only its listen() (see stub.py).
+# That shrinks the window from the length of the delay to one interpreter start.
 PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
 
 # Stub ClickHouse. $1 = seconds to stay down before binding, $2 = /ping status,
@@ -225,8 +228,23 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
 
 
+# Hold the port for the whole delay, do not leave it free and re-take it later.
+# `bind_and_activate=False` lets us bind now and listen() only after the delay.
+# A bound-but-not-listening socket refuses connections exactly as an unbound
+# port does, so the gate still sees the dependency as DOWN -- which is what
+# assertion 2 is for -- while no other process on the machine can be handed the
+# port in the meantime.
+#
+# Releasing it was the flake: the caller picks the port with bind(0) + close(),
+# and binding here only after `time.sleep(delay)` left that ephemeral port free
+# for the full delay (4s in assertion 2). On a busy runner something else can
+# take it in that window and answer the probe, which is what "ClickHouse ready
+# after 1 attempt(s)" against a supposedly-down dependency means.
+server = HTTPServer(("127.0.0.1", port), Handler, bind_and_activate=False)
+server.server_bind()
 time.sleep(delay)
-HTTPServer(("127.0.0.1", port), Handler).serve_forever()
+server.server_activate()
+server.serve_forever()
 PY
 
 run_gate() {  # run_gate <gate-script> <outfile>; returns the gate's exit status
