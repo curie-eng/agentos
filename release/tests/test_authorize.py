@@ -1437,6 +1437,7 @@ class TestLegitimateSkips:
             "cluster=true",
             "released_upgrade=true",
             "skill_local_tiers=skill,local",
+            "pytest=true",
         ], (
             "ci.yaml's push selection no longer emits the complete tier contract: "
             f"{github_output.read_text()!r}"
