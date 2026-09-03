@@ -54,6 +54,31 @@ SELECTOR = re.compile(
     r")"
 )
 BUG_LABEL = "bug"
+# Discovery surfaces and pin tiers share this order. A pin whose location maps
+# below the closed issue's found:* label fails unless the body also carries
+# `Fix pin waiver: <reason>`. Location, not prose, decides the pin tier:
+# */test_live.py -> live, charts/curie/ci/* -> cluster, everything else that
+# the selector grammar admits -> unit. Ladder rungs are not a declared
+# selector form yet, so a found:local issue with a unit pin needs a waiver.
+TIERS = ("unit", "local", "cluster", "live")
+TIER_RANK = {name: index for index, name in enumerate(TIERS)}
+FOUND_LABELS = {f"found:{name}": name for name in TIERS}
+# GitHub issue forms render the required dropdown as a heading plus the
+# selected option. Scan only that section so a narrative "not found:live" in
+# the reproduction notes cannot raise the floor.
+DISCOVERY_FIELD = re.compile(
+    r"^### Discovery surface[ \t]*\r?\n+(?:[ \t]*\r?\n)*found:(?P<tier>unit|local|cluster|live)\b",
+    re.MULTILINE,
+)
+WAIVER = re.compile(r"^Fix pin waiver:\s*(?P<reason>.*)$")
+
+
+@dataclass(frozen=True)
+class IssueRecord:
+    """Labels and body of a closed GitHub issue the gate inspects."""
+
+    labels: list[str]
+    body: str
 
 
 @dataclass(frozen=True)
@@ -134,6 +159,46 @@ def _declaration(body: str) -> Declaration:
     return Declaration(selector=selector)
 
 
+def _waiver(body: str) -> str | None:
+    uncommented = COMMENT.sub("", body)
+    reasons = [
+        match.group("reason").strip()
+        for line in uncommented.splitlines()
+        if (match := WAIVER.fullmatch(line)) is not None
+    ]
+    if not reasons:
+        return None
+    if len(reasons) != 1:
+        raise ValueError("Fix pin waiver must be exactly one unindented line")
+    if not reasons[0]:
+        raise ValueError("Fix pin waiver must state why, as `Fix pin waiver: <reason>`")
+    return reasons[0]
+
+
+def _pin_tier(selector: str) -> str:
+    path = selector.split("::", 1)[0]
+    filename = path.rsplit("/", 1)[-1]
+    # Location only. test_live.py is the live pin the ticket names; the Python
+    # CI job does not currently export CURIE_E2E_LIVE, so a live selector still
+    # has to survive verify-fix-pin on its own. Until that job can run live
+    # tests, a found:live bug is expected to use a lower-tier pin plus
+    # `Fix pin waiver:`.
+    if filename == "test_live.py":
+        return "live"
+    if path.startswith("charts/curie/ci/"):
+        return "cluster"
+    return "unit"
+
+
+def _discovery_tier(labels: Sequence[str], body: str = "") -> str | None:
+    found = [FOUND_LABELS[label] for label in labels if label in FOUND_LABELS]
+    if (field := DISCOVERY_FIELD.search(body)) is not None:
+        found.append(field.group("tier"))
+    if not found:
+        return None
+    return max(found, key=lambda tier: TIER_RANK[tier])
+
+
 def _closed_issues(body: str) -> list[int]:
     uncommented = COMMENT.sub("", body)
     numbers: list[int] = []
@@ -145,7 +210,7 @@ def _closed_issues(body: str) -> list[int]:
     return numbers
 
 
-def _labels(repository: str | None, issue: int) -> list[str]:
+def _issue_record(repository: str | None, issue: int) -> IssueRecord:
     gh = shutil.which("gh")
     if gh is None:
         raise ValueError(f"gh is not on PATH, so the labels of issue #{issue} cannot be read")
@@ -155,7 +220,13 @@ def _labels(repository: str | None, issue: int) -> list[str]:
         )
 
     completed = subprocess.run(
-        [gh, "api", f"repos/{repository}/issues/{issue}", "--jq", "[.labels[].name]"],
+        [
+            gh,
+            "api",
+            f"repos/{repository}/issues/{issue}",
+            "--jq",
+            "{labels:[.labels[].name],body:.body}",
+        ],
         capture_output=True,
         check=False,
     )
@@ -164,21 +235,55 @@ def _labels(repository: str | None, issue: int) -> list[str]:
         raise ValueError(f"could not read the labels of issue #{issue}: {detail}")
 
     try:
-        labels = json.loads(completed.stdout.decode("utf-8"))
+        payload = json.loads(completed.stdout.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError(f"could not parse the labels of issue #{issue}: {error}") from error
 
+    if not isinstance(payload, dict):
+        raise ValueError(f"could not parse the labels of issue #{issue}: not an object")
+    labels = payload.get("labels")
     if not isinstance(labels, list) or not all(isinstance(label, str) for label in labels):
         raise ValueError(f"could not parse the labels of issue #{issue}: not a list of names")
-    return [label for label in labels if isinstance(label, str)]
+    body = payload.get("body")
+    if body is None:
+        body = ""
+    if not isinstance(body, str):
+        raise ValueError(f"could not parse the body of issue #{issue}: not a string")
+    return IssueRecord(labels=[label for label in labels if isinstance(label, str)], body=body)
 
 
-def _closed_bugs(event: dict[str, object], body: str) -> list[int]:
+def _closed_issue_records(
+    event: dict[str, object], body: str
+) -> list[tuple[int, IssueRecord]]:
     issues = _closed_issues(body)
     if not issues:
         return []
     repository = _repository(event)
-    return [issue for issue in issues if BUG_LABEL in _labels(repository, issue)]
+    return [(issue, _issue_record(repository, issue)) for issue in issues]
+
+
+def _closed_bugs(event: dict[str, object], body: str) -> list[int]:
+    return [
+        issue
+        for issue, record in _closed_issue_records(event, body)
+        if BUG_LABEL in record.labels
+    ]
+
+
+def _required_discovery(
+    event: dict[str, object], body: str
+) -> str | None:
+    """Highest found:* label or body field among closed bug issues."""
+    found: list[str] = []
+    for _issue, record in _closed_issue_records(event, body):
+        if BUG_LABEL not in record.labels:
+            continue
+        tier = _discovery_tier(record.labels, record.body)
+        if tier is not None:
+            found.append(tier)
+    if not found:
+        return None
+    return max(found, key=lambda tier: TIER_RANK[tier])
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -188,8 +293,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         event = _event(arguments.event)
         body = _body(event)
         declaration = _declaration(body)
+        waiver = _waiver(body)
     except ValueError as error:
-        print(f"Fix pin declaration error: {error}", file=sys.stderr)
+        message = str(error)
+        prefix = (
+            "Fix pin waiver error"
+            if message.startswith("Fix pin waiver")
+            else "Fix pin declaration error"
+        )
+        print(f"{prefix}: {message}", file=sys.stderr)
         return 1
 
     if declaration.not_applicable is not None:
@@ -213,6 +325,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 1
         print("SKIPPED: no Fix pin declaration")
         return 0
+
+    try:
+        required = _required_discovery(event, body)
+    except ValueError as error:
+        print(f"Fix pin requirement error: {error}", file=sys.stderr)
+        return 1
+    if required is not None:
+        pin = _pin_tier(declaration.selector)
+        if TIER_RANK[pin] < TIER_RANK[required] and waiver is None:
+            print(
+                f"Fix pin tier error: selector {declaration.selector} is a {pin} "
+                f"pin, which is below the discovery surface found:{required}. "
+                f"Pin at found:{required} or add a `Fix pin waiver: <reason>` line.",
+                file=sys.stderr,
+            )
+            return 1
 
     completed = subprocess.run(
         [arguments.curie, "dev", "verify-fix-pin", arguments.ref, declaration.selector],
