@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import replace
 from pathlib import Path
 
 import anyio
@@ -381,6 +382,8 @@ def build_runner(
             policy_disallowed_tools=policy_hidden_tools,
         )
 
+    sdk_generation = 0
+
     def factory() -> ModelSession:
         if fake_model:
             # The offline fake honors the same permission gate (#245) the real
@@ -399,7 +402,33 @@ def build_runner(
                 replay_messages=conversation_replay.messages,
             )
         assert real_options is not None
-        return ClaudeAgentSession(real_options)
+        nonlocal sdk_generation
+        generation = sdk_generation
+        sdk_generation += 1
+        # Boot keeps the deterministic structured-resume envelope so a
+        # CURIE_HISTORY_REF reconnect hits the same SDK session id. Reset is
+        # not a process restart: it must mint a new id. Reusing the boot id
+        # after a completed turn makes Claude Code refuse reconnect with
+        # "Session ID ... is already in use" and POST /v1/reset returns 500
+        # (#2221). Native checkpoint entries carry the previous id, so later
+        # generations rematerialize portable messages only.
+        if generation == 0:
+            return ClaudeAgentSession(real_options)
+        envelope = build_structured_resume(
+            conversation_replay.messages,
+            curie_session_id=f"{config.session.session_id}:reset:{generation}",
+            cwd=workspace_cwd,
+            harness_replay=None,
+        )
+        return ClaudeAgentSession(
+            replace(
+                real_options,
+                resume=envelope.resume,
+                session_id=envelope.session_id if envelope.resume is None else None,
+                session_store=envelope.session_store,
+                session_store_flush="eager" if envelope.session_store is not None else "batched",
+            )
+        )
 
     provider = build_tracer_provider(
         config.session.otel,
