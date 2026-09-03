@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
 # Pointing the bundle store at a real cloud object store used to REQUIRE static
-# access keys: the api, the worker, and the sandbox bundle-fetch init container
-# each supplied explicit credentials unconditionally, so an ambient role was
-# never consulted (#1325).
+# access keys: the api, the worker, the sandbox bundle-fetch init container, and
+# Langfuse each supplied explicit credentials unconditionally, so an ambient
+# role was never consulted (#1325, #2211).
 #
 # Clearing `rustfs.auth.accessKey` now selects a key-free path: every credential
 # env var is omitted so the AWS SDK falls through its provider chain to the
@@ -42,13 +42,15 @@ CHART=${CHART:-charts/curie}
 STATIC_RENDERED=""
 WEB_IDENTITY_RENDERED=""
 REGION_OVERRIDE_RENDERED=""
+CREATE_FALSE_RENDERED=""
 WEB_IDENTITY_VALUES=""
 WEB_IDENTITY_TOKEN=""
-trap 'rm -f "${STATIC_RENDERED:-}" "${WEB_IDENTITY_RENDERED:-}" "${REGION_OVERRIDE_RENDERED:-}" "${WEB_IDENTITY_VALUES:-}" "${WEB_IDENTITY_TOKEN:-}"' EXIT
+trap 'rm -f "${STATIC_RENDERED:-}" "${WEB_IDENTITY_RENDERED:-}" "${REGION_OVERRIDE_RENDERED:-}" "${CREATE_FALSE_RENDERED:-}" "${WEB_IDENTITY_VALUES:-}" "${WEB_IDENTITY_TOKEN:-}"' EXIT
 
 STATIC_RENDERED=$(mktemp)
 WEB_IDENTITY_RENDERED=$(mktemp)
 REGION_OVERRIDE_RENDERED=$(mktemp)
+CREATE_FALSE_RENDERED=$(mktemp)
 WEB_IDENTITY_VALUES=$(mktemp)
 # Stands in for the projected ServiceAccount token the EKS pod-identity webhook
 # mounts. Its CONTENT is never read here: the web-identity provider hands back
@@ -99,6 +101,10 @@ agentSandbox:
     serviceAccount:
       annotations:
         eks.amazonaws.com/role-arn: arn:aws:iam::000000000000:role/curie-runner
+langfuse:
+  serviceAccount:
+    annotations:
+      eks.amazonaws.com/role-arn: arn:aws:iam::000000000000:role/curie-langfuse
 EOF
 
 helm template curie "$CHART" --namespace dev > "$STATIC_RENDERED"
@@ -106,6 +112,14 @@ helm template curie "$CHART" --namespace dev \
   --values "$WEB_IDENTITY_VALUES" > "$WEB_IDENTITY_RENDERED"
 helm template curie "$CHART" --namespace dev \
   --set rustfs.region=eu-west-1 > "$REGION_OVERRIDE_RENDERED"
+# create: false plus a custom name is the BYO ServiceAccount path the values
+# block advertises. It must bind both Langfuse Deployments to that name and
+# must not emit a chart-owned Langfuse ServiceAccount.
+helm template curie "$CHART" --namespace dev \
+  --values "$WEB_IDENTITY_VALUES" \
+  --set langfuse.serviceAccount.create=false \
+  --set langfuse.serviceAccount.name=byo-langfuse-sa \
+  > "$CREATE_FALSE_RENDERED"
 
 # Assertion 1: clearing the access key while the in-chart RustFS is deployed is
 # refused at render. That store is configured with those very credentials and
@@ -138,10 +152,20 @@ if ! helm template curie "$CHART" --namespace dev \
 fi
 echo "ok: an existing RustFS Secret with an empty rustfs.auth.secretKey renders"
 
-python3 - "$STATIC_RENDERED" "$WEB_IDENTITY_RENDERED" "$REGION_OVERRIDE_RENDERED" <<'PY'
+python3 - "$STATIC_RENDERED" "$WEB_IDENTITY_RENDERED" "$REGION_OVERRIDE_RENDERED" "$CREATE_FALSE_RENDERED" <<'PY'
 import ipaddress, sys, yaml
 
 CREDENTIAL_KEYS = ("S3_ACCESS_KEY", "S3_SECRET_KEY")
+# Langfuse uses the AWS SDK for JavaScript under LANGFUSE_S3_* names, not the
+# S3_ACCESS_KEY pair the api and worker carry. An empty access-key id here is
+# the same trap: the SDK treats it as an explicit credential and never reaches
+# the web-identity provider (#2211).
+LANGFUSE_CREDENTIAL_KEYS = (
+    "LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID",
+    "LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY",
+    "LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID",
+    "LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY",
+)
 # The metadata address Rail 1 denies. An instance-role path would need this
 # reachable; the web-identity path must not make it so.
 IMDS = ipaddress.ip_address("169.254.169.254")
@@ -151,10 +175,29 @@ def env_for(container):
     return {entry["name"]: entry for entry in container.get("env", [])}
 
 
+def named_container_env(deployment, container_name):
+    """The application container's env, chosen by name, never by index.
+
+    Indexing containers[0] reads whichever container the pod spec lists first.
+    A sidecar prepended to the spec would carry no S3 credential env, so the
+    gate would pass while the real application container kept its keys.
+    """
+    containers = deployment["spec"]["template"]["spec"].get("containers", []) or []
+    matches = [c for c in containers if c.get("name") == container_name]
+    assert len(matches) == 1, (
+        f"Deployment {deployment['metadata']['name']} must run exactly one "
+        f"container named {container_name!r}, but it renders "
+        f"{[c.get('name') for c in containers]}"
+    )
+    return env_for(matches[0])
+
+
 def read(path):
-    api = worker = bundle_fetch = None
+    api = worker = bundle_fetch = langfuse_web = langfuse_worker = None
+    langfuse_web_sa = langfuse_worker_sa = None
     fetch_command = ""
     service_accounts = {}
+    sa_automount = {}
     egress_excepts = []
     with open(path) as fh:
         for doc in yaml.safe_load_all(fh):
@@ -165,12 +208,24 @@ def read(path):
             if kind == "Deployment":
                 containers = doc["spec"]["template"]["spec"].get("containers", [])
                 assert containers, f"{name} Deployment has no containers"
-                if name.endswith("-api"):
+                sa_name = doc["spec"]["template"]["spec"].get("serviceAccountName")
+                # `-langfuse-worker` must be matched before `-worker`: the
+                # suffix `-worker` also matches `<release>-langfuse-worker`,
+                # which is why this script used to read past Langfuse (#1500,
+                # #2211).
+                if name.endswith("-langfuse-web"):
+                    langfuse_web = named_container_env(doc, "langfuse-web")
+                    langfuse_web_sa = sa_name
+                elif name.endswith("-langfuse-worker"):
+                    langfuse_worker = named_container_env(doc, "langfuse-worker")
+                    langfuse_worker_sa = sa_name
+                elif name.endswith("-api"):
                     api = env_for(containers[0])
                 elif name.endswith("-worker"):
                     worker = env_for(containers[0])
             elif kind == "ServiceAccount":
                 service_accounts[name] = doc["metadata"].get("annotations") or {}
+                sa_automount[name] = doc.get("automountServiceAccountToken")
             elif kind == "SandboxTemplate":
                 pod_spec = doc["spec"]["podTemplate"]["spec"]
                 matches = [
@@ -192,13 +247,45 @@ def read(path):
     assert api is not None, "api Deployment not rendered"
     assert worker is not None, "worker Deployment not rendered"
     assert bundle_fetch is not None, "SandboxTemplate bundle-fetch not rendered"
-    return api, worker, bundle_fetch, fetch_command, service_accounts, egress_excepts
+    assert langfuse_web is not None, "langfuse-web Deployment not rendered"
+    assert langfuse_worker is not None, "langfuse-worker Deployment not rendered"
+    return (
+        api,
+        worker,
+        bundle_fetch,
+        fetch_command,
+        service_accounts,
+        egress_excepts,
+        langfuse_web,
+        langfuse_worker,
+        langfuse_web_sa,
+        langfuse_worker_sa,
+        sa_automount,
+    )
 
 
 def assert_static(path):
-    api, worker, bundle_fetch, fetch_command, _, _ = read(path)
+    (
+        api,
+        worker,
+        bundle_fetch,
+        fetch_command,
+        _,
+        _,
+        langfuse_web,
+        langfuse_worker,
+        langfuse_web_sa,
+        langfuse_worker_sa,
+        sa_automount,
+    ) = read(path)
     for label, env in (("api", api), ("worker", worker), ("bundle-fetch", bundle_fetch)):
         missing = [key for key in CREDENTIAL_KEYS if key not in env]
+        assert not missing, (
+            f"the DEFAULT install must keep static credentials; {label} is missing {missing}. "
+            "The in-chart RustFS accepts nothing else."
+        )
+    for label, env in (("langfuse-web", langfuse_web), ("langfuse-worker", langfuse_worker)):
+        missing = [key for key in LANGFUSE_CREDENTIAL_KEYS if key not in env]
         assert not missing, (
             f"the DEFAULT install must keep static credentials; {label} is missing {missing}. "
             "The in-chart RustFS accepts nothing else."
@@ -206,11 +293,35 @@ def assert_static(path):
     assert "AWS_ACCESS_KEY_ID" in fetch_command, (
         "the default bundle-fetch must still export AWS_ACCESS_KEY_ID"
     )
-    print("ok: static: api, worker, and bundle-fetch all carry S3_ACCESS_KEY and S3_SECRET_KEY")
+    # The dedicated SA is created on the default path too, so adding a role
+    # annotation later does not change which identity the pods run as.
+    assert langfuse_web_sa == "curie-langfuse", (
+        f"static: langfuse-web binds {langfuse_web_sa!r}, expected 'curie-langfuse'"
+    )
+    assert langfuse_worker_sa == "curie-langfuse", (
+        f"static: langfuse-worker binds {langfuse_worker_sa!r}, expected 'curie-langfuse'"
+    )
+    assert sa_automount.get("curie-langfuse") is False, (
+        "static: Langfuse ServiceAccount must set automountServiceAccountToken: false; "
+        f"got {sa_automount.get('curie-langfuse')!r}"
+    )
+    print("ok: static: api, worker, bundle-fetch, and both Langfuse Deployments carry static S3 credentials")
 
 
 def assert_web_identity(path):
-    api, worker, bundle_fetch, fetch_command, service_accounts, egress_excepts = read(path)
+    (
+        api,
+        worker,
+        bundle_fetch,
+        fetch_command,
+        service_accounts,
+        egress_excepts,
+        langfuse_web,
+        langfuse_worker,
+        langfuse_web_sa,
+        langfuse_worker_sa,
+        sa_automount,
+    ) = read(path)
 
     # Omission is complete: not present, not empty-valued. An empty explicit
     # credential stops the provider chain just as a real one does, so it would
@@ -221,6 +332,13 @@ def assert_web_identity(path):
             f"{label} still carries {present} on the key-free path. The env var must be "
             "ABSENT, not empty: the SDK treats an empty explicit credential as a credential "
             "and never reaches the web-identity provider."
+        )
+    for label, env in (("langfuse-web", langfuse_web), ("langfuse-worker", langfuse_worker)):
+        present = [key for key in LANGFUSE_CREDENTIAL_KEYS if key in env]
+        assert not present, (
+            f"{label} still carries {present} on the key-free path. The env var must be "
+            "ABSENT, not empty: Langfuse's AWS SDK treats an empty explicit credential as "
+            "a credential and never reaches the web-identity provider."
         )
 
     for name in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"):
@@ -237,6 +355,14 @@ def assert_web_identity(path):
     assert api.get("S3_ENDPOINT_URL", {}).get("value") == "https://s3.example.com:443", (
         f"api lost its endpoint: {api.get('S3_ENDPOINT_URL')}"
     )
+    for label, env in (("langfuse-web", langfuse_web), ("langfuse-worker", langfuse_worker)):
+        for key in (
+            "LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT",
+            "LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT",
+        ):
+            assert env.get(key, {}).get("value") == "https://s3.example.com:443", (
+                f"{label} lost {key}: {env.get(key)}"
+            )
 
     # The role binds on the ServiceAccount, so an annotation that does not render
     # means there is no way to name an identity at all.
@@ -245,12 +371,31 @@ def assert_web_identity(path):
         for name, annotations in service_accounts.items()
         if "eks.amazonaws.com/role-arn" in annotations
     }
-    for suffix in ("-api", "-worker", "-runner"):
+    for suffix in ("-api", "-worker", "-runner", "-langfuse"):
         matches = [name for name in annotated if name.endswith(suffix)]
         assert matches, (
             f"no ServiceAccount ending in {suffix} carries eks.amazonaws.com/role-arn. "
             "Without it the key-free path has no identity to assume."
         )
+    # Follow the Deployment binding rather than suffix-matching alone: a
+    # rendered SA with an annotation is not the identity these pods run as
+    # unless serviceAccountName names it. Pin the exact default name so an
+    # empty-name fallback cannot silently change while a `-langfuse` suffix
+    # still matches.
+    assert langfuse_web_sa == "curie-langfuse", (
+        f"langfuse-web binds {langfuse_web_sa!r}, expected 'curie-langfuse'"
+    )
+    assert langfuse_worker_sa == "curie-langfuse", (
+        f"langfuse-worker binds {langfuse_worker_sa!r}, expected 'curie-langfuse'"
+    )
+    assert langfuse_web_sa in annotated, (
+        f"Langfuse ServiceAccount {langfuse_web_sa} carries no eks.amazonaws.com/role-arn. "
+        "Without it the key-free path has no identity to assume."
+    )
+    assert sa_automount.get("curie-langfuse") is False, (
+        "web-identity: Langfuse ServiceAccount must set automountServiceAccountToken: false; "
+        f"got {sa_automount.get('curie-langfuse')!r}"
+    )
     print(f"ok: web-identity: {len(annotated)} ServiceAccounts carry a role-arn annotation")
 
     # Rail 1 must be untouched by any of the above. Assert CONTAINMENT rather
@@ -275,7 +420,7 @@ def assert_web_identity(path):
 
 
 def assert_bundle_fetch_region(path, expected_region):
-    _, _, bundle_fetch, _, _, _ = read(path)
+    _, _, bundle_fetch, _, _, _, _, _, _, _, _ = read(path)
     rendered = bundle_fetch.get("AWS_DEFAULT_REGION", {}).get("value")
     assert rendered == expected_region, (
         f"bundle-fetch AWS_DEFAULT_REGION rendered as {rendered!r}; expected "
@@ -338,6 +483,37 @@ def assert_langfuse_upload_regions(path, expected_region):
     )
 
 
+def assert_create_false(path):
+    (
+        _,
+        _,
+        _,
+        _,
+        service_accounts,
+        _,
+        _,
+        _,
+        langfuse_web_sa,
+        langfuse_worker_sa,
+        _,
+    ) = read(path)
+    assert langfuse_web_sa == "byo-langfuse-sa", (
+        f"create=false: langfuse-web binds {langfuse_web_sa!r}, expected 'byo-langfuse-sa'"
+    )
+    assert langfuse_worker_sa == "byo-langfuse-sa", (
+        f"create=false: langfuse-worker binds {langfuse_worker_sa!r}, expected 'byo-langfuse-sa'"
+    )
+    chart_owned = [name for name in service_accounts if name.endswith("-langfuse")]
+    assert not chart_owned, (
+        f"create=false must not render a chart-owned Langfuse ServiceAccount; got {chart_owned}"
+    )
+    assert "byo-langfuse-sa" not in service_accounts, (
+        "create=false must not emit the operator-named ServiceAccount; the chart binds it, "
+        "it does not create it"
+    )
+    print("ok: create=false: both Langfuse Deployments bind byo-langfuse-sa and the chart emits no Langfuse ServiceAccount")
+
+
 assert_static(sys.argv[1])
 assert_web_identity(sys.argv[2])
 assert_bundle_fetch_region(sys.argv[1], "us-east-1")
@@ -345,6 +521,7 @@ assert_bundle_fetch_region(sys.argv[3], "eu-west-1")
 assert_langfuse_upload_regions(sys.argv[1], "us-east-1")
 assert_langfuse_upload_regions(sys.argv[2], "us-east-1")
 assert_langfuse_upload_regions(sys.argv[3], "eu-west-1")
+assert_create_false(sys.argv[4])
 PY
 
 # Everything above reads the rendered YAML. That is necessary and not
@@ -382,6 +559,16 @@ uv run --python 3.13 python - "$STATIC_RENDERED" "$WEB_IDENTITY_RENDERED" "$WEB_
 import base64, os, sys, boto3, yaml
 
 ROLE_ANNOTATION = "eks.amazonaws.com/role-arn"
+LANGFUSE_CREDENTIAL_KEYS = (
+    "LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID",
+    "LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY",
+    "LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID",
+    "LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY",
+)
+LANGFUSE_WORKLOADS = (
+    ("langfuse-web", "curie-langfuse-web", "langfuse-web"),
+    ("langfuse-worker", "curie-langfuse-worker", "langfuse-worker"),
+)
 
 
 def load_manifest(path):
@@ -628,7 +815,36 @@ for label, workload, container_name, build_client in WORKLOADS:
         "credential at all."
     )
     print(f"ok: key-free: {label} resolves credentials via {method}")
+
+# Langfuse uses the AWS SDK for JavaScript, not boto3 BundleStore, so this
+# block cannot ask a constructed client which provider won. It still follows
+# the rendered env (secretKeyRefs resolved) and the ServiceAccount each
+# Deployment actually names, which is the same identity path the api/worker
+# checks use before they build a client. An empty access-key id paired with a
+# chart Secret is the #2211 failure; it must not survive this resolution.
+for label, workload, container_name in LANGFUSE_WORKLOADS:
+    deployment = deployment_for(static_deployments, workload)
+    manifest_env = resolve_env(label, deployment, container_name, static_secrets)
+    missing = [key for key in LANGFUSE_CREDENTIAL_KEYS if key not in manifest_env]
+    assert not missing, (
+        f"static: {label} is missing {missing}; the default install must keep "
+        "static Langfuse S3 credentials"
+    )
+    account = deployment["spec"]["template"]["spec"].get("serviceAccountName")
+    assert account, f"static: {label} Deployment names no serviceAccountName"
+    print(f"ok: static: {label} carries static S3 credentials and binds {account}")
+
+for label, workload, container_name in LANGFUSE_WORKLOADS:
+    deployment = deployment_for(free_deployments, workload)
+    manifest_env = resolve_env(label, deployment, container_name, free_secrets)
+    present = [key for key in LANGFUSE_CREDENTIAL_KEYS if key in manifest_env]
+    assert not present, (
+        f"key-free: {label} still carries {present} after secretKeyRef resolution. "
+        "The env var must be ABSENT, not empty."
+    )
+    arn = resolve_role_arn(label, deployment, free_accounts)
+    print(f"ok: key-free: {label} omits S3 credentials and binds role {arn}")
 PY
 
 echo
-echo "PASS: the default install keeps static object-store credentials and still signs with the access key its manifest carries; clearing rustfs.auth.accessKey omits every credential env and shell export across api, worker, and bundle-fetch, binds identity through ServiceAccount annotations, is refused against the in-chart RustFS, leaves Rail 1's IMDS denial intact, and makes the api and worker BundleStore objects resolve real credentials through the web-identity provider rather than an explicit key."
+echo "PASS: the default install keeps static object-store credentials and still signs with the access key its manifest carries; clearing rustfs.auth.accessKey omits every credential env and shell export across api, worker, bundle-fetch, and both Langfuse Deployments, binds identity through ServiceAccount annotations (including Langfuse), is refused against the in-chart RustFS, leaves Rail 1's IMDS denial intact, and makes the api and worker BundleStore objects resolve real credentials through the web-identity provider rather than an explicit key."

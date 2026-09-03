@@ -148,6 +148,18 @@ langfuse:
   salt: dev-salt-change-me
   nextauthSecret: dev-nextauth-secret-change-me
   existingSecret: ""
+  # Shared ServiceAccount for both Langfuse Deployments (web and worker).
+  # The key-free object store path (#1325 / #2211) binds its IAM role here,
+  # e.g. `eks.amazonaws.com/role-arn: arn:aws:iam::<account>:role/<role>`.
+  # The chart-created account sets automountServiceAccountToken: false:
+  # Langfuse does not call the Kubernetes API, and IRSA uses a separate
+  # projected token.
+  serviceAccount:
+    create: true
+    # Empty -> <release>-langfuse. Set to bind a pre-created ServiceAccount
+    # (`create: false`).
+    name: ""
+    annotations: {}
   # Headless bootstrap seeds a fixed org/project on first boot. The project
   # secret key and user password are first boot inputs. Fresh chart installs
   # generate them unless development defaults are enabled; changing them during
@@ -499,12 +511,13 @@ rustfs:
   #
   # Clearing `accessKey` selects the key-free path (#1325), valid only with
   # `deploy: false` and an external store: every S3 credential env var is
-  # omitted from the api, the worker, and the sandbox bundle-fetch init
-  # container, so the AWS SDK falls through its provider chain to the
+  # omitted from the api, the worker, the sandbox bundle-fetch init container,
+  # and Langfuse, so the AWS SDK falls through its provider chain to the
   # web-identity provider (`AWS_ROLE_ARN` + `AWS_WEB_IDENTITY_TOKEN_FILE`) fed
   # by a projected ServiceAccount token. Bind the role with the
-  # `serviceAccount.annotations` blocks on `api`, `worker`, and
-  # `agentSandbox.runner`. Clearing it with `deploy: true` is refused at render.
+  # `serviceAccount.annotations` blocks on `api`, `worker`,
+  # `agentSandbox.runner`, and `langfuse`. Clearing it with `deploy: true` is
+  # refused at render.
   #
   # The instance role is NOT an option here, deliberately. Rail 1 denies
   # 169.254.169.254 by construction and computes an `except` so a broad
