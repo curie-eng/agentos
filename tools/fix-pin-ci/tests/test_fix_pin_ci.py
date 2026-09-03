@@ -629,6 +629,63 @@ def test_ci_keeps_the_required_python_status_and_calls_fix_pin_after_pytest() ->
     assert gate_index < diagnostic_index
 
 
+DECLARATION_GUARD = "contains(github.event.pull_request.body, 'Fix pin:')"
+
+
+def test_selector_tooling_builds_only_when_the_body_declares_a_fix_pin() -> None:
+    """The cargo build must be gated on a declaration, and gated the safe way.
+
+    check.py reaches the binary at exactly one place, the `curie dev
+    verify-fix-pin` call, and only once `declaration.selector` is set. `n/a`, no
+    declaration, a near-miss marker and the bug-without-declaration rejection all
+    return first. Building unconditionally therefore spent a cold
+    `cargo build --release` inside the longest job on the graph for a binary that
+    the majority of pull requests never run.
+
+    The guard must stay a strict SUPERSET of the cases that reach the binary.
+    `contains()` is case-insensitive and DECLARATION is the exact-case
+    `Fix pin: <selector>`, so a body that reaches the binary always contains the
+    substring. Skipping a build the gate then needs would be the unsafe
+    direction, and this pins that it cannot happen.
+    """
+    document = _load_ci()
+    _, steps = _python_job(document)
+
+    for description, predicate in (
+        (
+            "direct current release build",
+            lambda step: _string(step, "run").strip()
+            == "cargo build --release --locked --manifest-path cli/Cargo.toml",
+        ),
+        (
+            "pinned Helm setup",
+            lambda step: _string(step, "uses")
+            == "azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310",
+        ),
+    ):
+        step = steps[_single_step_index(steps, predicate, description)]
+        condition = _string(step, "if")
+        assert PR_CONDITION.search(condition), f"{description} must stay pull-request only"
+        assert DECLARATION_GUARD in condition, (
+            f"{description} must build only when the body declares a Fix pin: {condition!r}"
+        )
+
+    # The gate itself must NOT carry the guard. It is the step that decides a
+    # missing declaration is acceptable, and a body-shaped `if` on it would turn
+    # the "closes a bug with no declaration" rejection into a skipped step.
+    gate = steps[
+        _single_step_index(
+            steps,
+            lambda step: "tools/fix-pin-ci/check.py" in _string(step, "run"),
+            "fix pin caller",
+        )
+    ]
+    assert DECLARATION_GUARD not in _string(gate, "if"), (
+        "the gate must still run for a body with no declaration, or the "
+        "bug-without-declaration rejection can never fire"
+    )
+
+
 def test_pull_request_template_documents_the_required_declaration() -> None:
     template = PR_TEMPLATE.read_text(encoding="utf-8")
 

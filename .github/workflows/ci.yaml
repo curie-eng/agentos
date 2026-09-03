@@ -146,11 +146,31 @@ jobs:
           uv run python -m aci_protocol.wire_lock --check-base /tmp/base-wire.lock
       - name: Pytest
         run: uv run pytest -q
+      # Build ONLY when the body actually carries a declaration. tools/fix-pin-ci/
+      # check.py reaches the binary at exactly one place, the
+      # `curie dev verify-fix-pin` call, and only once `declaration.selector` is
+      # set; `n/a`, no declaration, a near-miss marker like `Fix-pin:`, and the
+      # bug-without-declaration rejection all return before touching it. So on
+      # every pull request that declares nothing -- the overwhelming majority --
+      # this was a 213s cold `cargo build --release` for a binary nothing ran,
+      # inside the longest job on the graph.
+      #
+      # `contains()` is case-insensitive and DECLARATION is the exact-case
+      # `Fix pin: <selector>`, so this condition is a strict superset of the
+      # cases that reach the binary: it cannot skip a build the gate then needs.
+      # It builds a few times it need not (`Fix pin: n/a`, a near miss), which is
+      # the safe direction. This stays a direct build inside the required Python
+      # status: no `needs`, no downloaded artifact, no Cargo cache, so nothing
+      # the gate's contract protects is traded away for the time.
       - name: Build the current curie binary for fix pin verification
-        if: github.event_name == 'pull_request'
+        if: >-
+          github.event_name == 'pull_request'
+          && contains(github.event.pull_request.body, 'Fix pin:')
         run: cargo build --release --locked --manifest-path cli/Cargo.toml
       - name: Install Helm for fix pin verification
-        if: github.event_name == 'pull_request'
+        if: >-
+          github.event_name == 'pull_request'
+          && contains(github.event.pull_request.body, 'Fix pin:')
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
         with:
           version: v3.16.4
