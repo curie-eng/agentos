@@ -52,7 +52,8 @@ git history (`git log -- docs/`).
   operator-facing findings from early installs.
 - [`release-verification.md`](release-verification.md): what every release asset
   carries (checksums, signature, provenance, SBOM) and how to verify one before
-  you run it.
+  you run it, plus the patch-release rule that the cut names its defect trigger
+  and a live proof.
 - [`design/multi-dev-shared-cluster.md`](design/multi-dev-shared-cluster.md): the
   design pass for many developers iterating against one shared cluster (isolation,
   targeting, ambient context), answering epic #44's deferred open questions.
