@@ -265,7 +265,11 @@ jobs:
       TEST_VALKEY_URL: redis://localhost:26379
     services:
       valkey:
-        image: valkey/valkey:8-alpine
+        # Must equal `valkey.image` in charts/curie/values.yaml and the valkey
+        # service in compose.dev.yaml so the valkey_or_skip tests cover the
+        # shipped default rather than a different build (#2319);
+        # compose/tests/test_generate_release_compose.py asserts the three agree.
+        image: valkey/valkey:8.1.10-alpine
         ports:
           - 26379:6379
         options: >-

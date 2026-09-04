@@ -28,6 +28,10 @@ on:
       - "apps/worker/src/curie_worker/bundle_store.py"
       - "uv.lock"
       - "pyproject.toml"
+      # The unpinned-image gate (#2319) and the Langfuse image-pin gate
+      # (#2190) both read compose.dev.yaml to check third-party image tags,
+      # so a compose-only edit that unpins one must run this workflow too.
+      - "compose.dev.yaml"
 
 permissions:
   contents: read
@@ -220,14 +224,25 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/langfuse-image-pin-assertions.sh
 
-      # Refuse untagged and :latest image references in values *Image keys
-      # and in rendered container image fields (#2318). The security probe's
-      # netshoot image was the first miss: a bare repository pulls :latest
-      # with implicit Always.
+      # Refuse untagged, :latest and major/minor-alias image references in
+      # values *Image keys, in rendered container image fields, and in
+      # compose.dev.yaml services (#2318, #2319). The security probe's netshoot
+      # image was the first miss: a bare repository pulls :latest with implicit
+      # Always. An alias like postgres:16-alpine is the subtler one -- it has a
+      # tag, but upstream republishes it under the chart version.
       - name: helm render assertions (unpinned images)
         run: |
           set -euo pipefail
           bash charts/curie/ci/unpinned-image-assertions.sh
+
+      # Prove postgres.podSecurityContext.fsGroup is the gid of the `postgres`
+      # user inside the digest-pinned image, by running that image (#2319). The
+      # chart shipped the Debian 999 against an Alpine build where it is 70,
+      # which no render-only assertion can see.
+      - name: helm render assertions (postgres fsGroup matches the image)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/postgres-fsgroup-assertions.sh
 
       # Keep the chart ClickHouse default and Langfuse pin as one supported
       # pair. ClickHouse 24.8 cannot apply Langfuse 3.225.x migration 39, so
