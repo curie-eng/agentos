@@ -136,7 +136,11 @@ async def redeem_publication_credential(
     selected = await crud.get_thread_workspace(
         session,
         agent_id=deployment.agent_id,
-        conversation_id=approval.conversation_id,
+        conversation_id=(
+            publication.workspace_conversation_id
+            if publication.workspace_conversation_id is not None
+            else approval.conversation_id
+        ),
     )
     settings = get_settings()
     if (

@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from channel_protocol import scoped_conversation_id
 from channel_protocol.reply import ReplyAck, ReplyTarget
 from curie_worker.approval_cards import ApprovalCardRef
 from curie_worker.reply_sink import TargetRoute
@@ -21,6 +22,10 @@ AGENT_ID = uuid.UUID("11111111-1111-4111-8111-111111111111")
 PR_URL = "https://github.com/acme-corp/acme-bot/pull/123"
 RESOLVER = "U0APPROVE1"
 RESOLUTION_NOTE = "Ready to publish."
+CONVERSATION_ID = "1700000000.000100"
+WORKSPACE_CONVERSATION_ID = scoped_conversation_id(
+    "slack", "C0EXAMPLE1", CONVERSATION_ID
+)
 
 pytestmark = pytest.mark.anyio
 
@@ -44,6 +49,7 @@ class _Store:
         self.retries: list[tuple[uuid.UUID, str]] = []
         self.delivery_retries: list[tuple[uuid.UUID, str]] = []
         self.target = _target()
+        self.workspace_conversation_id = WORKSPACE_CONVERSATION_ID
         self.route = TargetRoute(endpoint=None, adapter=None)
         self.retry_terminal_after = 99
         self.card_pending: Any | None = None
@@ -121,6 +127,7 @@ class _Store:
             publication_id=publication_id,
             approval_id=APPROVAL_ID,
             agent_id=AGENT_ID,
+            workspace_conversation_id=self.workspace_conversation_id,
             target=self.target,
             route=self.route,
             attempt=1,
@@ -374,7 +381,7 @@ def _target(kind: str = "slack") -> ReplyTarget:
     return ReplyTarget(
         kind=kind,
         address="C0EXAMPLE1" if kind == "slack" else "agent@example.test",
-        conversation_id="1700000000.000100",
+        conversation_id=CONVERSATION_ID,
         reply_ref=None,
     )
 
@@ -478,8 +485,10 @@ async def test_publication_card_outbox_posts_and_remembers_before_ack(
     assert event.message.interaction.id == str(APPROVAL_ID)
 
 
+@pytest.mark.parametrize("legacy", [False, True], ids=["scoped", "legacy"])
 async def test_terminal_result_is_recorded_for_the_next_model_turn(
     publication: Any,
+    legacy: bool,
 ) -> None:
     transcript = _Transcript()
     loop, store, _, _, _, replies = _loop(publication, transcript=transcript)
@@ -489,18 +498,22 @@ async def test_terminal_result_is_recorded_for_the_next_model_turn(
         "pr_url": PR_URL,
         "error": None,
     }
+    if legacy:
+        store.workspace_conversation_id = CONVERSATION_ID
 
     assert await loop.deliver_pending_result(PUBLICATION_ID) is True
 
     assert transcript.records == [
         (
             AGENT_ID,
-            "1700000000.000100",
+            CONVERSATION_ID if legacy else WORKSPACE_CONVERSATION_ID,
             PUBLICATION_ID,
             f"Published the approved changes: {PR_URL}",
         )
     ]
     assert PR_URL in replies.events[0][0].text
+    assert replies.events[0][0].target.address == "C0EXAMPLE1"
+    assert replies.events[0][0].target.conversation_id == CONVERSATION_ID
 
 
 async def test_transient_transcript_failure_delivers_and_settles_before_retry(
@@ -718,18 +731,36 @@ async def test_existing_remote_pr_is_adopted_before_recreating_a_missing_job(
 async def test_non_slack_publication_result_uses_the_stored_adapter_route_without_model(
     publication: Any,
 ) -> None:
-    loop, store, _, _, _, replies = _loop(publication)
+    transcript = _Transcript()
+    loop, store, _, _, _, replies = _loop(publication, transcript=transcript)
     work = _work(publication, kind="email")
     store.target = work.target
     store.route = work.route
+    email_workspace_conversation_id = scoped_conversation_id(
+        work.target.kind,
+        work.target.address,
+        work.target.conversation_id,
+    )
+    store.workspace_conversation_id = email_workspace_conversation_id
 
     await loop.reconcile(work)
 
     event, route = replies.events[0]
     assert event.target.kind == "email"
+    assert event.target.address == "agent@example.test"
+    assert event.target.conversation_id == CONVERSATION_ID
     assert route == TargetRoute(
         endpoint="https://adapter.example.com/replies", adapter="agentmail-sandbox"
     )
+    assert transcript.records == [
+        (
+            AGENT_ID,
+            email_workspace_conversation_id,
+            PUBLICATION_ID,
+            f"Published the approved changes: {PR_URL}",
+        )
+    ]
+    assert all(record[1] != WORKSPACE_CONVERSATION_ID for record in transcript.records)
     assert PR_URL in event.text
     assert store.completed[PUBLICATION_ID] == ("published", PR_URL)
     assert not hasattr(loop, "runner") and not hasattr(loop, "model")

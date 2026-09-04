@@ -35,7 +35,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
-from urllib.parse import quote, urlsplit
+from urllib.parse import urlsplit
 
 import aiohttp
 from aci_protocol import (
@@ -56,6 +56,7 @@ from channel_protocol import (
     Action,
     ConfirmIntent,
     OutboundMessage,
+    scoped_conversation_id,
 )
 from channel_protocol.reply import (
     REPLY_WIRE_VERSION,
@@ -246,9 +247,10 @@ def _thread_key_for(qevent: QueuedTurn) -> str:
     moving a separator. The key is only ever compared, never parsed back.
     """
     handle = qevent.reply_handle
-    return ":".join(
-        quote(part, safe="")
-        for part in (handle.kind, handle.channel, qevent.conversation_id)
+    return scoped_conversation_id(
+        handle.kind,
+        handle.channel,
+        qevent.conversation_id,
     )
 
 
@@ -3246,22 +3248,22 @@ class Kernel:
             return
 
         if self._workspace is not None:
-            async with self._lock.hold(self._config.lock_key(thread)):
+            async with self._lock.hold(self._config.lock_key(thread_key)):
                 retain_workspace = not is_publication
                 if is_publication:
                     try:
-                        await asyncio.to_thread(self._workspace.release, thread)
+                        await asyncio.to_thread(self._workspace.release, thread_key)
                     except Exception as exc:  # noqa: BLE001 - patch is already durable
                         retain_workspace = True
                         logger.warning(
                             "publication base-object cleanup failed for thread %s: %s",
-                            thread,
+                            thread_key,
                             exc,
                         )
                 if retain_workspace:
                     await asyncio.to_thread(
                         self._workspace.touch,
-                        thread,
+                        thread_key,
                         ttl_seconds=self._suspended_route_ttl_seconds,
                     )
         record_metric(
@@ -3346,7 +3348,7 @@ class Kernel:
             # never reclaimed through the model merely because Slack is down.
             logger.info(
                 "thread %s suspended awaiting publication approval %s; card queued",
-                thread,
+                thread_key,
                 created.id,
             )
             return
