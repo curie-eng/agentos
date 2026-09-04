@@ -88,10 +88,11 @@ The bundle ships the sanctioned placeholder:
 K8S_WRITE_ALLOWLIST: <namespace>/<deployment>
 ```
 
-Staging uses:
+A real install sets one entry per Deployment the bot may restart, comma
+separated, all in the namespace Curie itself runs in:
 
 ```
-K8S_WRITE_ALLOWLIST: curie-staging/curie-staging-api,curie-staging/curie-staging-worker,curie-staging/curie-staging-dispatcher
+K8S_WRITE_ALLOWLIST: <namespace>/<namespace>-api,<namespace>/<namespace>-worker,<namespace>/<namespace>-dispatcher
 ```
 
 **This value and `manifests/write-role.yaml`'s `resourceNames` must be edited
