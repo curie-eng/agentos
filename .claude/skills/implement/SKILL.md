@@ -293,6 +293,27 @@ Before completion, run the full affected test suite plus the relevant type check
 lint. Check sibling paths when the change touches a known seam or guard. Demonstrate
 that a new or modified guard rejects violating input through its real consumer path.
 
+### P0, release-blocker, and sre-bot-e2e-demo Closes
+
+When the pull request this run will open uses a GitHub closing keyword
+(`Closes`, `Fixes`, `Resolves`, and their past-tense forms) on an issue labeled
+`P0`, `release-blocker`, or `sre-bot-e2e-demo`, the review stage adds one extra
+read-only spec-vs-impl pass. That pass's only job is: each issue acceptance
+criterion is visible in the product diff, not only in the e2e table or the Fix
+pin selector. Scope review already asks whether each hunk traces to an AC; this
+pass asks the converse, whether each AC is in the diff.
+
+A string or refusal-text test cannot be the sole pin for a routing, catalog, or
+live-trace AC. The documented insufficient pin is #2209, which closed #2202 with
+a message-only Fix pin on the record-miss copy; #2248 reopened the routing AC.
+
+If the diff does not implement an AC, the PR uses `Ref` and leaves the issue
+open.
+
+Ordinary bugfixes that close neither of those labels are unchanged: the existing
+code review, scope review, and Fix pin rules still apply, and this extra pass
+does not run.
+
 ## Stop and escalate
 
 Hand the decision back rather than pressing on when reviews cannot converge after
@@ -334,6 +355,10 @@ an item nobody had to answer for is an item nobody checked.
       falsifiable negative or a second independent path
 - [ ] The change does not undo an earlier deliberate decision, per Prior intent
 - [ ] Full affected test suite, type check, and lint pass on the final code
+- [ ] If this PR closes a `P0`, `release-blocker`, or `sre-bot-e2e-demo` issue,
+      spec-vs-impl confirmed each issue AC against the diff, not only the e2e
+      table or the Fix pin selector. Ordinary bugfixes that close neither label
+      mark this n/a.
 
 A quick path change marks the failing tests, separate contexts, and prior intent
 items not applicable. A direct path change applies only the suite and lint items.
