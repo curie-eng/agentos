@@ -1540,13 +1540,27 @@ class _RecordingWorkspaceCoordinator:
         self.preparer = coordinator.preparer
         self.release_keys: list[str] = []
         self.claims: list[tuple[str, Any | None, Any]] = []
+        self.validating_candidate: Any | None = None
 
     def select_repository(self, **kwargs: Any) -> str | None:
         return self._coordinator.select_repository(**kwargs)
 
     def claim_or_resume_with_handle(self, **kwargs: Any) -> Any:
+        validate_candidate = kwargs.get("validate_candidate")
+        if callable(validate_candidate):
+
+            def observe_candidate(candidate: Any) -> None:
+                self.validating_candidate = candidate
+                try:
+                    validate_candidate(candidate)
+                finally:
+                    self.validating_candidate = None
+
+            kwargs = {**kwargs, "validate_candidate": observe_candidate}
         result = self._coordinator.claim_or_resume_with_handle(**kwargs)
-        self.claims.append((str(kwargs["thread_key"]), kwargs.get("replace_handle"), result.handle))
+        self.claims.append(
+            (str(kwargs["thread_key"]), kwargs.get("replace_handle"), result.handle)
+        )
         return result
 
     def current(self, thread_key: str) -> Any:
@@ -1749,6 +1763,7 @@ def test_coder_path_reaches_the_publication_boundary_through_real_runner_and_api
         list[str],
         list[Any],
         list[tuple[str, Any | None, Any]],
+        list[dict[str, object]],
     ]:
         await runner.start()
         suffix = uuid.uuid4().hex
@@ -1826,6 +1841,38 @@ def test_coder_path_reaches_the_publication_boundary_through_real_runner_and_api
                         )
                     )
                     harness.kernel._workspace = workspace  # type: ignore[assignment]
+                    real_status = harness.kernel._runner.status
+                    candidate_status_attestations: list[dict[str, object]] = []
+
+                    async def attested_status(
+                        base_url: str,
+                        *,
+                        token: str | None = None,
+                        remaining_s: float | None = None,
+                    ) -> dict[str, object]:
+                        status = await real_status(
+                            base_url,
+                            token=token,
+                            remaining_s=remaining_s,
+                        )
+                        candidate = workspace.validating_candidate
+                        if candidate is None:
+                            return status
+                        attested_status = {
+                            **status,
+                            "session_id": candidate.session_id,
+                            "sandbox_id": candidate.sandbox_id,
+                            "managed_workspace": True,
+                            "cwd": "/workspace",
+                            "ready": True,
+                            "turn_active": False,
+                            "history_durable": True,
+                            "status": "idle-awaiting-input",
+                        }
+                        candidate_status_attestations.append(attested_status)
+                        return attested_status
+
+                    harness.kernel._runner.status = attested_status  # type: ignore[method-assign]
                     if late_handoff:
                         await harness.kernel.process_event(
                             QueuedTurn(
@@ -1866,6 +1913,7 @@ def test_coder_path_reaches_the_publication_boundary_through_real_runner_and_api
                         workspace.release_keys,
                         reply_targets,
                         workspace.claims,
+                        candidate_status_attestations,
                     )
         finally:
             await runner.close()
@@ -1874,7 +1922,14 @@ def test_coder_path_reaches_the_publication_boundary_through_real_runner_and_api
                 sync_redis.delete(*keys)
             sync_redis.close()
 
-    statuses, requests, release_keys, reply_targets, claims = asyncio.run(exercise())
+    (
+        statuses,
+        requests,
+        release_keys,
+        reply_targets,
+        claims,
+        candidate_status_attestations,
+    ) = asyncio.run(exercise())
     # Keep the expected identity independent of the production helper so the
     # fix-pin reversal reaches the publication boundary and fails on its 409.
     scoped = f"slack:C0EXAMPLE1:{conversation_id}"
@@ -1892,6 +1947,22 @@ def test_coder_path_reaches_the_publication_boundary_through_real_runner_and_api
     assert len(claims) == 1
     assert claims[0][0] == scoped
     assert (claims[0][1] is not None) is late_handoff
+    assert candidate_status_attestations == (
+        [
+            {
+                "session_id": claims[0][2].session_id,
+                "sandbox_id": claims[0][2].sandbox_id,
+                "managed_workspace": True,
+                "cwd": "/workspace",
+                "ready": True,
+                "turn_active": False,
+                "history_durable": True,
+                "status": "idle-awaiting-input",
+            }
+        ]
+        if late_handoff
+        else []
+    )
     assert reply_targets
     assert all(target.address == "C0EXAMPLE1" for target in reply_targets)
     assert all(target.conversation_id == conversation_id for target in reply_targets)
