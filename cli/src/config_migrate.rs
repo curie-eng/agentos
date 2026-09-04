@@ -118,24 +118,6 @@ pub fn extra_env_successors() -> &'static [(&'static str, &'static str)] {
     PAIRS
 }
 
-#[cfg(test)]
-mod successor_table_tests {
-    use super::*;
-
-    #[test]
-    fn public_successor_table_matches_promotion_table() {
-        assert_eq!(EXTRA_ENV_SUCCESSORS.len(), extra_env_successors().len());
-        for (env, key, _) in EXTRA_ENV_SUCCESSORS {
-            assert!(
-                extra_env_successors()
-                    .iter()
-                    .any(|(public_env, public_key)| public_env == env && public_key == key),
-                "extra_env_successors() missing {env} -> {key}"
-            );
-        }
-    }
-}
-
 /// Migrate user-supplied Helm values from a supported v0.8.x install to the
 /// v0.9.0 schema. Pure: no cluster I/O.
 pub fn migrate_installed_config(
@@ -444,5 +426,23 @@ fn remove_path(value: &mut Value, dotted: &str) {
     }
     if let Some(obj) = cursor.as_object_mut() {
         obj.remove(last);
+    }
+}
+
+#[cfg(test)]
+mod successor_table_tests {
+    use super::*;
+
+    #[test]
+    fn public_successor_table_matches_promotion_table() {
+        assert_eq!(EXTRA_ENV_SUCCESSORS.len(), extra_env_successors().len());
+        for (env, key, _) in EXTRA_ENV_SUCCESSORS {
+            assert!(
+                extra_env_successors()
+                    .iter()
+                    .any(|(public_env, public_key)| public_env == env && public_key == key),
+                "extra_env_successors() missing {env} -> {key}"
+            );
+        }
     }
 }
