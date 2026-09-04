@@ -4,7 +4,7 @@ Components deployed:
 {{- if .Values.langfuse.deploy }}
   - Langfuse web + worker (v{{ .Values.langfuse.image.tag }})
 {{- else }}
-  - Langfuse: BYO at http://{{ include "curie.langfuse.webHost" . }}:{{ .Values.langfuse.web.service.port }}
+  - Langfuse: BYO at {{ include "curie.langfuse.url" . }}
 {{- end }}
 {{- if .Values.postgres.deploy }}
   - Postgres ({{ .Values.postgres.image }})

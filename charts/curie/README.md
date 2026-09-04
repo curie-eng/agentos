@@ -474,10 +474,22 @@ Flipping any to `false` removes its resources from the render; consumers
 fields on the same block (`host`/`port` for stores, `otelCollector.endpoint`
 for an external collector).
 
+BYO ClickHouse picks its URL scheme the same way: `clickhouse.scheme` governs
+`CLICKHOUSE_URL` for both Langfuse deployments and their readiness gate, derived
+as `https` when `clickhouse.deploy: false` and `httpPort` is 8443 and `http`
+otherwise, with an explicit `http`/`https` winning. `https` additionally enables
+TLS for the Langfuse migration connection on `nativePort`. A TLS ClickHouse
+needs both ports set -- `httpPort: 8443` and `nativePort: 9440` (the migration
+DSN uses `nativePort` and only the flag changes, not the port) -- or an
+explicit `scheme: https` plus both ports.
+
 BYO Langfuse requires a bare external hostname in `langfuse.host`. Consumers
 compose its URL as
-`http://<langfuse.host>:<langfuse.web.service.port>`; do not include a scheme,
-port, or path in `langfuse.host`. With `langfuse.deploy: false`, the chart omits
+`<scheme>://<langfuse.host>:<langfuse.web.service.port>`, where the scheme is
+`langfuse.scheme` when set (`http` or `https` only) and otherwise derived --
+`https` when the port is 443, `http` otherwise. Set `langfuse.scheme: https`
+for a TLS endpoint on any other port. Do not include a scheme, port, or path in
+`langfuse.host`. With `langfuse.deploy: false`, the chart omits
 the Langfuse Service, web and worker Deployments, and model-pricing Job. Helm
 rendering fails with an error naming `langfuse.host` when that value is missing
 or empty, instead of emitting the hostname of a Service the chart did not
@@ -504,10 +516,12 @@ complete `otlpAuthHeader` value. As an alternative for collector
 authentication, set `otelCollector.otlpAuthHeader` explicitly; see the
 credential details below.
 
-This BYO path currently composes HTTP only and has no HTTPS/TLS selector.
-Deploy it only across a trusted private transport or through a proxy that
-provides the required protection: an on-path observer can recover the full
-project credential because the Basic header is encoded, not encrypted.
+The URL scheme is selected by `langfuse.scheme`: derived as `https` when the
+port is 443 and `http` otherwise, with an explicit value winning. On the
+cleartext path (`http`), the Basic header warning still applies -- deploy a
+cleartext BYO Langfuse only across a trusted private transport or behind a
+proxy that provides TLS: an on-path observer can recover the full project
+credential because the Basic header is encoded, not encrypted.
 
 ### Langfuse Postgres startup readiness
 

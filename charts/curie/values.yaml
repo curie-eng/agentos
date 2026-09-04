@@ -107,9 +107,18 @@ priorityClasses:
 # ---------------------------------------------------------------------------
 langfuse:
   deploy: true
-  # Bare external hostname required only when deploy is false. Consumers append
-  # langfuse.web.service.port; do not include a scheme or port here.
+  # Bare external hostname required only when deploy is false. Consumers build
+  # the URL as <langfuse.scheme>://<host>:<langfuse.web.service.port>, with the
+  # scheme coming from `langfuse.scheme` below; do not include a scheme or port
+  # here.
   host: ""
+  # URL scheme every Langfuse consumer uses (#2314). Empty derives it: `http`
+  # for the chart-owned Service, and with `deploy: false`, `https` when
+  # `langfuse.web.service.port` is 443 and `http` otherwise -- the same
+  # derivation `rustfs.scheme` uses (#1447). Set `https` explicitly for a TLS
+  # endpoint on any other port, or `http` to force cleartext on 443. Only
+  # `http` and `https` are accepted.
+  scheme: ""
   image:
     web: langfuse/langfuse
     worker: langfuse/langfuse-worker
@@ -399,6 +408,18 @@ clickhouse:
   host: ""
   httpPort: 8123
   nativePort: 9000
+  # URL scheme Langfuse uses to reach ClickHouse (#2314). Empty derives it:
+  # `http` for the chart-owned server, and with `deploy: false`, `https` when
+  # `httpPort` is 8443 and `http` otherwise -- the same derivation
+  # `rustfs.scheme` uses (#1447). `https` also switches the Langfuse migration
+  # connection on `nativePort` to TLS (rendered as CLICKHOUSE_MIGRATION_SSL=true;
+  # Langfuse's migrator builds its own query string from that flag, so the URL
+  # stays bare). Set `https` explicitly for TLS on any other port, or `http` to
+  # force cleartext on 8443. Only `http` and `https` are accepted. A TLS
+  # ClickHouse needs both ports set: `httpPort: 8443` and `nativePort: 9440`
+  # (the migration DSN uses `nativePort` and only the flag changes, not the
+  # port), or an explicit `scheme: https` plus both ports.
+  scheme: ""
   auth:
     username: default
     password: clickhouse
