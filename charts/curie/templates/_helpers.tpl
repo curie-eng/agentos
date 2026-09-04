@@ -710,7 +710,7 @@ http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.
           truthy and ship the published default -- a fail-OPEN regression.
        2. Explicit override: if the operator/CLI supplied a value that differs from
           the published default (`ne value default`), it wins even on `helm
-          upgrade`. For the nine non init credentials, this supports rotation or
+          upgrade`. For the eleven non init credentials, this supports rotation or
           recovery. The Langfuse init credentials are first boot inputs, so an
           upgrade only changes the Secret; it does not rotate Langfuse records.
           The override must sit ahead of the persist branch or an explicit value

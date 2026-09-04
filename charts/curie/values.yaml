@@ -7,10 +7,11 @@
 #     bring-your-own block on the SAME object: to use an external instance, set
 #     `deploy: false` and fill `host` / `port` / `auth` (or `existingSecret`).
 #
-# SIZING: the defaults below carry a modest single-node footprint (sum of memory
-# requests ~1.7 GB) so a bare `helm install` schedules on an 8-16 GB node without
-# any overlay. This is NOT sized for production load -- for production raise every
-# `resources` block and persistence size, supply real secrets (or `existingSecret`),
+# SIZING: the defaults below carry a modest single-node footprint (sum of
+# steady-state memory requests 2512 Mi, ~2.45 GiB) so a bare `helm install`
+# schedules on an 8-16 GB node without any overlay. This is NOT sized for
+# production load -- for production raise every `resources` block and
+# persistence size, supply real secrets (or `existingSecret`),
 # and point the stores at managed services via the BYO blocks. For a laptop / fully
 # offline cluster use `-f values-dev.yaml`, which additionally swaps every image for
 # a locally-built, cluster-imported tag.
@@ -77,9 +78,12 @@ placement:
 #
 # Both names are cluster-scoped (PriorityClass has no namespace), so installing
 # a second curie release into the SAME cluster must override one release's
-# names to avoid an ownership conflict. `sandbox.name` is also the intended
-# `scopeSelector` handle for the sandbox-namespace ResourceQuota (issue #758) --
-# keep the two in sync if you rename it.
+# names to avoid an ownership conflict. The sandbox-namespace ResourceQuota
+# scope derives from `sandbox.name` when `resourceQuota.sandboxPriorityClassName`
+# is empty (the default). Do not pin that override to "keep them in sync" --
+# pinning it is what lets a later rename leave the quota scoped to a class
+# nothing carries. Set the override only for a PriorityClass managed outside
+# this chart.
 # ---------------------------------------------------------------------------
 priorityClasses:
   platform:
@@ -1616,8 +1620,10 @@ ui:
       type: RuntimeDefault
 
 # ---------------------------------------------------------------------------
-# Install-time preflights. Both are Helm hooks that block a broken install, and
-# both are re-runnable via `helm test`.
+# Install-time preflights. (a) AVX is a pre-install/pre-upgrade hook, (b)
+# NetworkPolicy is a helm test that never runs during helm install, and (c)
+# controllerReady is a post-install/post-upgrade hook. All three are
+# re-runnable via `helm test`.
 # ---------------------------------------------------------------------------
 preflights:
   # (a) CPU-AVX / ClickHouse-pin check. Runs as a pre-install/pre-upgrade hook
@@ -2091,13 +2097,15 @@ security:
   # chart credentials once its design pass lands.)
   checkDefaultCredentials: false
   # Auto-generate per-release chart credentials (issue #195). Default false: a
-  # no-override `helm install` generates strong random values for the eleven
+  # no-override `helm install` generates strong random values for the thirteen
   # chart owned credentials: the backing store passwords, Langfuse
-  # salt/encryptionKey/nextauthSecret, the two init credentials, and the
-  # api/webhook keys. Set true (values-dev.yaml does) for a deterministic dev/CI
-  # render that keeps the published defaults byte-for-byte. The nine non init
-  # credentials persist via `lookup`, so `helm upgrade` re-uses them. Their
-  # explicit `--set` overrides and per store `existingSecret` values support
+  # salt/encryptionKey/nextauthSecret, the two init credentials, the
+  # api/webhook keys, worker.internalWorkerToken, and
+  # api.approvalChatAttesterSecret. Set true (values-dev.yaml does) for a
+  # deterministic dev/CI render that keeps the published defaults
+  # byte-for-byte. The eleven non init credentials persist via `lookup`, so
+  # `helm upgrade` re-uses them. Their explicit `--set` overrides and per
+  # store `existingSecret` values support
   # rotation and recovery. The two Langfuse init credentials are first boot
   # inputs: changing them during an upgrade does not rotate initialized records.
   # Caveat: generation relies on Helm `lookup`, which is empty under client-side

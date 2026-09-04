@@ -3,7 +3,7 @@
 The umbrella Helm chart that installs the whole Curie (Relay) stack on a
 single node. It installs the backing-store stack (Langfuse + Postgres + Valkey +
 ClickHouse + RustFS + OTel Collector, dev profile, BYO (bring-your-own)
-toggles, the two preflights) plus the security rails as chart defaults.
+toggles, the three preflights) plus the security rails as chart defaults.
 
 The chart is a direct port of the proven `compose.dev.yaml` dev stack: same
 images and the same headless-bootstrapped Langfuse dev project. The chart
@@ -513,14 +513,15 @@ authentication and migrations: bad credentials and permanent migration failures
 are terminal there and are not retried by this gate.
 
 Secrets: all credentials are written to one `<release>-secrets` Secret. A sealed
-`helm install` (the default) generates strong random values for all eleven
+`helm install` (the default) generates strong random values for all thirteen
 chart owned credentials: the backing store passwords, Langfuse
-salt/encryptionKey/nextauthSecret, the two Langfuse init credentials, and the
-api/webhook keys. Set `security.allowDevDefaults: true` (values-dev.yaml, i.e.
-`curie cluster up --dev`) to keep the deterministic published defaults for
-dev/CI.
+salt/encryptionKey/nextauthSecret, the two Langfuse init credentials, the
+api/webhook keys, `worker.internalWorkerToken`, and
+`api.approvalChatAttesterSecret`. Set `security.allowDevDefaults: true`
+(values-dev.yaml, i.e. `curie cluster up --dev`) to keep the deterministic
+published defaults for dev/CI.
 
-The nine non init credentials persist through `lookup`, so `helm upgrade`
+The eleven non init credentials persist through `lookup`, so `helm upgrade`
 re-uses them. Their explicit `--set` overrides and per store `existingSecret`
 values take precedence for rotation or recovery. The Langfuse init project
 secret and user password are first boot inputs. A fresh install generates them,
@@ -709,13 +710,17 @@ that is in place, static keys in a Secret remain the supported choice, and they
 are the safer of the two available options rather than a limitation to route
 around.
 
-## The two preflights
+## The three preflights
 
-(a) is a blocking `pre-install,pre-upgrade` hook. (b) is a `helm test` that
-must be run explicitly; it never runs during `helm install`. A green
+The chart ships three default-on preflights under `preflights.*`, plus a
+conditional gVisor RuntimeClass preflight under `security.gvisor` (described
+under the security rails; it is not in this block and does not run on the
+fake-model default). (a) is a blocking `pre-install,pre-upgrade` hook. (b) is
+a `helm test` that must be run explicitly; it never runs during
+`helm install`. (c) is a blocking `post-install,post-upgrade` hook. A green
 `helm install` does not prove NetworkPolicy is enforced, so run
 `helm test <release> -n <ns>` before treating the security rails as live.
-Both are re-runnable via that same `helm test` command.
+All three are re-runnable via that same `helm test` command.
 
 **(a) CPU-AVX / ClickHouse-pin check** (`preflights.avxCheck`). A pre-install /
 pre-upgrade hook Job.
@@ -741,6 +746,26 @@ does a before/after egress check -- reach an external target with no policy
 private ranges stay allowed so the control path survives; the public target is
 denied), retry (expect blocked). It reports `enforcement=true` only if the after
 egress is actually blocked, and `enforcement=false` (fails loudly) otherwise.
+
+**(c) Controller-ready gate** (`preflights.controllerReady`). A post-install /
+post-upgrade hook Job, also re-runnable via `helm test`. Default `enabled:
+true`, gated also on `agentSandbox.controller.deploy` (also default true).
+
+- The vendored agent-sandbox controller runs a cluster-scope NetworkPolicy
+  informer. If its RBAC cannot satisfy that cluster LIST, the manager
+  crash-loops and no SandboxClaim ever binds. The Deployment has no
+  readiness probe, so `rollout status` can pass while the manager still
+  blocks on cache sync. The load-bearing signal is the "Starting workers"
+  log line.
+- The Job fails the Helm operation unless the controller becomes Available
+  and logs "Starting workers" within
+  `preflights.controllerReady.timeoutSeconds` (default 180).
+- An upgrade over a crash-looping controller may need a manual pod delete
+  plus `helm test`, because the hook waits for a healthy controller that
+  never arrives.
+- Skipped when `agentSandbox.controller.deploy: false` (BYO controller) or
+  `preflights.controllerReady.enabled: false`.
+- Read the verdict: `kubectl logs -n <ns> job/<release>-preflight-controller`.
 
 ## Single-node footprint (measured on a disposable single-node k3s cluster, 4 GB / 4 core)
 
@@ -908,12 +933,16 @@ a reachability boundary (namespace-per-tenant compute); the `ResourceQuota` and
 `LimitRange` complete it with a bound on consumption, since nodes are shared
 beneath the namespace and one tenant's sandboxes can otherwise exhaust node
 capacity another tenant's sandboxes depend on. The `ResourceQuota` is scoped
-via `scopeSelector` to the sandbox `PriorityClass` name
-(`resourceQuota.sandboxPriorityClassName`, default `curie-sandbox` -- the
-name ADR-0059 decision 5's `PriorityClass` is expected to define), so it binds
-only sandbox pods and not the control plane or data tier that, in the N=1
-self-host topology, share this same release namespace. The `LimitRange` has no
-scope (Kubernetes does not support one on `LimitRange`) and so applies
+via `scopeSelector` to the sandbox `PriorityClass` name. That name derives
+from `priorityClasses.sandbox.name` when
+`resourceQuota.sandboxPriorityClassName` is empty (the default -- empty
+means derive). Set the override only for a PriorityClass managed outside
+this chart whose name differs from `priorityClasses.sandbox.name`; pinning
+it is what lets a later rename leave the quota scoped to a class nothing
+carries. The quota then binds only sandbox pods and not the control plane
+or data tier that, in the N=1 self-host topology, share this same release
+namespace. The `LimitRange` has no scope (Kubernetes does not support one
+on `LimitRange`) and so applies
 namespace-wide, but ships `default`/`defaultRequest` only -- never `min`/`max`
 -- so it only ever fills a resource dimension a container leaves undeclared
 (today, `ephemeral-storage` everywhere in the chart) and can never reject an
@@ -1314,7 +1343,7 @@ restarts.
 
 The GitHub App key was the first of twelve credential keys read straight from
 `.Values` with no in-chart generation (`charts/curie/templates/secrets.yaml`
-calls these direct passthrough, as opposed to the eleven keys
+calls these direct passthrough, as opposed to the thirteen keys
 `curie.managedSecret` generates and persists). Issue #1759 gave the other
 eleven the same `existingSecret` / `existingSecretKey` escape, one pair per
 key, all winning over their plain value when set:

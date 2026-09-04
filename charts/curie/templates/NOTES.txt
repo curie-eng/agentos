@@ -99,6 +99,10 @@ Preflights:
       helm test {{ .Release.Name }} -n {{ .Release.Namespace }}
       kubectl logs -n {{ .Release.Namespace }} job/{{ include "curie.fullname" . }}-netpol-probe
 {{- end }}
+{{- if and .Values.agentSandbox.controller.deploy .Values.preflights.controllerReady.enabled }}
+  - Controller-ready check ran as a post-install hook. Read its verdict:
+      kubectl logs -n {{ .Release.Namespace }} job/{{ include "curie.fullname" . }}-preflight-controller
+{{- end }}
 
 Check rollout:
   kubectl get pods -n {{ .Release.Namespace }} -w

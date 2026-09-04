@@ -211,7 +211,7 @@ Cluster verification (a disposable local cluster, `kind` or `k3s`):
 helm install curie-dev charts/curie -n curie-dev --create-namespace \
   -f charts/curie/values-dev.yaml
 kubectl get pods -n curie-dev -w
-helm test curie-dev -n curie-dev                              # re-runs both preflights + the security probe suite
+helm test curie-dev -n curie-dev                              # re-runs the three preflights + the security probe suite
 kubectl logs -n curie-dev job/curie-dev-preflight-avx
 kubectl logs -n curie-dev job/curie-dev-security-probe        # rails 1, 2, 4
 kubectl logs -n curie-dev curie-dev-security-probe-hardening  # rail 3
