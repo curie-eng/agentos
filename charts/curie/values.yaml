@@ -694,9 +694,18 @@ inference:
 otelCollector:
   deploy: true
   image: otel/opentelemetry-collector-contrib:0.119.0
-  # Chart-owned external OTLP endpoint used when deploy is false. Wired to API,
-  # dispatcher, worker, and runner. Ignored while deploy is true (in-cluster
-  # collector wins). extraEnv remains a per-workload override.
+  # Chart-owned external OTLP endpoint used when deploy is false. Wired to
+  # every workload that includes the curie.env.otel helper; that set is
+  # recorded in charts/curie/CLAUDE.md rather than counted here. Ignored while
+  # deploy is true (in-cluster collector wins). extraEnv remains a per-workload
+  # override where the workload exposes one.
+  #
+  # One asymmetry an operator hits here: the mail adapter is the only
+  # first-party service with its own egress NetworkPolicy, and that policy has
+  # no peer for an external endpoint (an address the chart cannot know). An
+  # install using this key with mailAdapter.deploy true needs an operator-
+  # supplied egress policy selecting the adapter, or its exports are dropped
+  # while every other workload's succeed.
   endpoint: ""
   protocol: http/protobuf
   # Optional OTEL_EXPORTER_OTLP_HEADERS. Prefer headersExistingSecret for
