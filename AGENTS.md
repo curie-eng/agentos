@@ -480,8 +480,18 @@ required and proved, not carried on the original classification.
 | local | compose services, dispatcher, worker, or API wiring, boot env crossing a service boundary, the console UI, or any `curie` verb whose output, exit code, or `--json` shape changed | `CURIE_E2E_TIERS=local curie dev e2e-ladder` |
 | local-release | released binary or image identity, the install path, version pins, release compose | `CURIE_E2E_TIERS=local-release curie dev e2e-ladder` |
 | cluster | chart templates, RBAC, securityContext, NetworkPolicy, sandbox claims, init containers | `CURIE_E2E_TIERS=cluster curie dev e2e-ladder`, or `curie dev chart-runtime-e2e` for a chart, sandbox, or bundle slice |
-| live provider | model routing, credential resolution, provider auth, token or cost accounting, meaning the product's own model and integration credentials, never the agent tooling that runs this workflow | the required rungs with `CURIE_E2E_LIVE=1`, since a fake-tier pass proves wiring and nothing about a real model |
-| external integration | Slack, git push webhooks, connector OAuth, or any third-party API shape | drive the real integration; a replayed fixture or a fake does not close this tier |
+| live provider | model routing, credential resolution, provider auth, token or cost accounting, meaning the product's own model and integration credentials, never the agent tooling that runs this workflow; also the MCP/workspace/coding-tool path set below | the required rungs with `CURIE_E2E_LIVE=1`, since a fake-tier pass proves wiring and nothing about a real model |
+| external integration | Slack, git push webhooks, connector OAuth, or any third-party API shape; Slack is required on the MCP/workspace/coding-tool path set below | drive the real integration; a replayed fixture or a fake does not close this tier |
+
+The path set is runner MCP catalog projection, unscoped PreToolUse,
+in-process platform MCP tools, workspace publication, and
+built-in coding-tool session capability. A behavior-bearing change that
+reaches any of those reaches both live-provider and Slack external-integration.
+Those two rows are required on that path. "No model routing change" is not a valid n/a reason.
+Fake-model kind, skill ladder, and helper-only tests remain useful and are
+not sufficient for those acceptance criteria. Leave the required-tier item
+open when the evidence is missing; do not close it by marking the row n/a.
+This rule does not pull the live e2e ladder onto unrelated pull requests.
 
 ### Evidence per acceptance criterion
 

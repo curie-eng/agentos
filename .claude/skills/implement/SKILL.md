@@ -156,6 +156,16 @@ required tier, and a change that bears no runtime behavior records that reason
 once instead. A direct path change makes no behavior change and classifies
 nothing.
 
+The path set is runner MCP catalog projection, unscoped PreToolUse,
+in-process platform MCP tools, workspace publication, and
+built-in coding-tool session capability. A behavior-bearing change that
+reaches any of those reaches both live-provider and Slack external-integration.
+Those two rows are required on that path. "No model routing change" is not a valid n/a reason.
+Fake-model kind, skill ladder, and helper-only tests remain useful and are
+not sufficient for those acceptance criteria. Leave the required-tier item
+open when the evidence is missing; do not close it by marking the row n/a.
+This rule does not pull the live e2e ladder onto unrelated pull requests.
+
 ## Build rules
 
 For a behavior change, write or update the test first and confirm it fails for the
