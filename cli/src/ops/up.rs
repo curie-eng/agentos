@@ -227,7 +227,10 @@ pub(super) fn operator_set_entries(sets: &[String]) -> Vec<(&str, &str)> {
 /// byte except credential values, which are replaced by their standard mask.
 pub(super) fn mask_helm_set_expression(expression: &str) -> String {
     let render_part = |part: &str| match operator_set_entry(part) {
-        Some((key, value)) if !value.is_empty() && is_secret_value_key(key.trim()) => {
+        Some((key, value))
+            if !value.is_empty()
+                && (is_secret_value_key(key.trim()) || is_extra_env_value_key(key.trim())) =>
+        {
             format!("{key}={}", mask_secret(value))
         }
         _ => part.to_string(),
@@ -1606,8 +1609,23 @@ fn complete_up_opts_without_runner_egress(
     existing: Option<&serde_json::Value>,
     github_token: Option<&str>,
     clear_github_token: bool,
+    overlay_live: bool,
 ) -> Result<UpOpts> {
     let operator_sets = opts.operator_sets();
+    let migrated_owned;
+    let existing = if let Some(values) = existing {
+        let outcome = crate::config_migrate::migrate_installed_config(values.clone(), None)?;
+        stamp_config_schema(&mut opts, &outcome);
+        overlay_migration_results(&mut opts, &outcome.values, &operator_sets);
+        if overlay_live {
+            overlay_live_operator_values(&mut opts, &outcome.values, &operator_sets);
+        }
+        migrated_owned = Some(outcome.values);
+        migrated_owned.as_ref()
+    } else {
+        stamp_target_schema(&mut opts);
+        existing
+    };
     resolve_preserved_runner_identity_values(&mut opts, existing, &operator_sets);
     resolve_preserved_gvisor_mode_value(&mut opts, existing, &operator_sets);
     resolve_preserved_worker_extra_env_values(&mut opts, existing, &operator_sets);
@@ -1632,6 +1650,210 @@ fn complete_up_opts_without_runner_egress(
     Ok(opts)
 }
 
+fn stamp_target_schema(opts: &mut UpOpts) {
+    if operator_set_keys(&opts.operator_sets()).contains("config.schemaVersion") {
+        return;
+    }
+    opts.set_string.push(format!(
+        "config.schemaVersion={}",
+        crate::config_migrate::TARGET_SCHEMA_VERSION
+    ));
+}
+
+fn stamp_config_schema(opts: &mut UpOpts, outcome: &crate::config_migrate::MigrationOutcome) {
+    stamp_target_schema(opts);
+    if let Some(from) = &outcome.migrated_from {
+        if !operator_set_keys(&opts.operator_sets()).contains("config.migratedFrom") {
+            opts.set_string.push(format!("config.migratedFrom={from}"));
+        }
+    }
+}
+
+fn is_external_secret_ref_key(key: &str) -> bool {
+    let leaf = key.rsplit('.').next().unwrap_or(key);
+    leaf == "existingSecret"
+        || leaf.ends_with("ExistingSecret")
+        || leaf.ends_with("ExistingSecretKey")
+        || leaf == "headersSecretKey"
+}
+
+fn is_extra_env_value_key(key: &str) -> bool {
+    key.contains(".extraEnv[") && (key.ends_with(".value") || key.contains(".valueFrom"))
+}
+
+/// Stamp first-class extraEnv successors and external Secret references from
+/// the migrated document. Shared by `cluster up` and `apply` so a legacy
+/// extraEnv entry is promoted even when `curie.yaml` does not mention it.
+fn overlay_migration_results(
+    opts: &mut UpOpts,
+    values: &serde_json::Value,
+    operator_sets: &[String],
+) {
+    let overridden = operator_set_keys(operator_sets);
+    for (_, helm_key) in crate::config_migrate::extra_env_successors() {
+        if overridden.contains(*helm_key)
+            || overridden
+                .iter()
+                .any(|key| key_is_or_descends_from(key, helm_key))
+        {
+            continue;
+        }
+        overlay_leaf(opts, values, helm_key, &overridden);
+    }
+    overlay_secret_refs(opts, values, "", &overridden);
+}
+
+/// Overlay remaining live operator values on `cluster up` only. `apply`/`diff`
+/// keep `curie.yaml` as whole intent (ADR-0097) and must not copy undeclared
+/// live keys into the desired plan.
+fn overlay_live_operator_values(
+    opts: &mut UpOpts,
+    values: &serde_json::Value,
+    operator_sets: &[String],
+) {
+    let overridden = operator_set_keys(operator_sets);
+    overlay_json(opts, values, "", &overridden);
+}
+
+fn overlay_family_is_managed(key: &str) -> bool {
+    key_is_or_descends_from(key, MODEL_CREDENTIAL_KEY)
+        || key_is_or_descends_from(key, RUNNER_MODEL_KEY)
+        || key_is_or_descends_from(key, FAKE_MODEL_KEY)
+        || key_is_or_descends_from(key, GVISOR_MODE_KEY)
+        || key_is_or_descends_from(key, ALLOWED_EGRESS_KEY)
+        || key_is_or_descends_from(key, SLACK_TRUSTED_ORIGINS_KEY)
+        || key_is_or_descends_from(key, WORKER_EXTRA_ENV_KEY)
+        || key_is_or_descends_from(key, "api.extraEnv")
+        || key_is_or_descends_from(key, "dispatcher.extraEnv")
+        || key_is_or_descends_from(key, "agentSandbox.runner.extraEnv")
+        || COMMS_MANAGED_KEYS
+            .iter()
+            .any(|managed| key_is_or_descends_from(key, managed))
+        || GITHUB_APP_MANAGED_KEYS
+            .iter()
+            .any(|managed| key_is_or_descends_from(key, managed))
+        || REQUIRED_SECRETS
+            .iter()
+            .any(|(managed, _)| key_is_or_descends_from(key, managed))
+        || crate::sealing::SEALING_MANAGED_KEYS
+            .iter()
+            .any(|managed| key_is_or_descends_from(key, managed))
+        || key_is_or_descends_from(key, GITHUB_TOKEN_KEY)
+}
+
+fn overlay_secret_refs(
+    opts: &mut UpOpts,
+    value: &serde_json::Value,
+    prefix: &str,
+    overridden: &std::collections::HashSet<String>,
+) {
+    let Some(map) = value.as_object() else {
+        return;
+    };
+    for (key, child) in map {
+        let path = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        if is_external_secret_ref_key(&path) && !overridden.contains(&path) {
+            match child {
+                serde_json::Value::String(raw) if raw.is_empty() => {}
+                serde_json::Value::String(raw) => opts
+                    .set_string
+                    .push(format!("{path}={}", escape_helm_set_string_value(raw))),
+                _ => {}
+            }
+        }
+        if child.is_object() {
+            overlay_secret_refs(opts, child, &path, overridden);
+        }
+    }
+}
+
+fn overlay_leaf(
+    opts: &mut UpOpts,
+    root: &serde_json::Value,
+    path: &str,
+    overridden: &std::collections::HashSet<String>,
+) {
+    if overridden.contains(path) {
+        return;
+    }
+    let mut cursor = root;
+    for part in path.split('.') {
+        let Some(next) = cursor.get(part) else {
+            return;
+        };
+        cursor = next;
+    }
+    match cursor {
+        serde_json::Value::String(raw) if raw.is_empty() => {}
+        serde_json::Value::String(raw) => opts
+            .set_string
+            .push(format!("{path}={}", escape_helm_set_string_value(raw))),
+        serde_json::Value::Bool(flag) => opts.set.push(format!("{path}={flag}")),
+        serde_json::Value::Number(number) => opts.set.push(format!("{path}={number}")),
+        _ => {}
+    }
+}
+
+fn overlay_json(
+    opts: &mut UpOpts,
+    value: &serde_json::Value,
+    prefix: &str,
+    overridden: &std::collections::HashSet<String>,
+) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                let path = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{prefix}.{key}")
+                };
+                overlay_json(opts, child, &path, overridden);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                overlay_json(opts, child, &format!("{prefix}[{index}]"), overridden);
+            }
+        }
+        serde_json::Value::Null => {}
+        other => {
+            if prefix.is_empty() {
+                return;
+            }
+            if prefix == "config.schemaVersion" || prefix == "config.migratedFrom" {
+                return;
+            }
+            if overridden.contains(prefix)
+                || overridden.iter().any(|key| {
+                    key_is_or_descends_from(prefix, key) || key_is_or_descends_from(key, prefix)
+                })
+            {
+                return;
+            }
+            if overlay_family_is_managed(prefix) && !is_external_secret_ref_key(prefix) {
+                return;
+            }
+            if is_secret_value_key(prefix) && !is_external_secret_ref_key(prefix) {
+                return;
+            }
+            match other {
+                serde_json::Value::String(raw) if raw.is_empty() => {}
+                serde_json::Value::String(raw) => opts
+                    .set_string
+                    .push(format!("{prefix}={}", escape_helm_set_string_value(raw))),
+                serde_json::Value::Bool(flag) => opts.set.push(format!("{prefix}={flag}")),
+                serde_json::Value::Number(number) => opts.set.push(format!("{prefix}={number}")),
+                _ => {}
+            }
+        }
+    }
+}
+
 /// Finish an already validated up plan with the one live values read and, when
 /// requested, resolved provider addresses. This is kept separate from command
 /// execution so apply and diff can compare the same completed values.
@@ -1642,8 +1864,13 @@ pub(crate) fn complete_up_opts(
     clear_github_token: bool,
     resolve_provider_egress: bool,
 ) -> Result<UpOpts> {
-    let mut opts =
-        complete_up_opts_without_runner_egress(opts, existing, github_token, clear_github_token)?;
+    let mut opts = complete_up_opts_without_runner_egress(
+        opts,
+        existing,
+        github_token,
+        clear_github_token,
+        false,
+    )?;
     let operator_sets = opts.operator_sets();
     resolve_preserved_runner_egress_values(&mut opts, existing, &operator_sets, false);
     resolve_provider_egress_for_up(&mut opts, resolve_provider_egress)?;
@@ -3313,6 +3540,7 @@ pub async fn up(
         existing.as_ref(),
         github_token.as_deref(),
         clear_github_token,
+        true,
     )?;
     validate_credential_egress_consistency(&opts)?;
     let completed_identity_plan = up_value_plan(&opts);
@@ -3796,6 +4024,7 @@ mod tests {
             Some(&existing),
             None,
             false,
+            true,
         )
         .unwrap();
 
@@ -3852,6 +4081,7 @@ mod tests {
             Some(&existing),
             None,
             false,
+            true,
         )
         .unwrap();
 
@@ -3903,6 +4133,7 @@ mod tests {
             Some(&existing),
             None,
             false,
+            true,
         )
         .unwrap();
 
@@ -3919,6 +4150,100 @@ mod tests {
         assert!(
             argv.contains(&"worker.extraEnv[0].value=10.0.0.0/8\\,localhost".into()),
             "recorded worker extraEnv values must escape commas for Helm: {argv:?}"
+        );
+    }
+
+    /// Issue #2299: a released v0.8.x user-values overlay is migrated and
+    /// re-supplied without `--reuse-values`, with schema version visible and
+    /// inline credentials omitted when an external Secret is the source.
+    #[test]
+    fn upgrade_overlay_promotes_timeout_stamps_schema_and_keeps_secret_refs() {
+        let existing = serde_json::json!({
+            "ui": {"deploy": false},
+            "worker": {
+                "extraEnv": [
+                    {"name": "CURIE_RUNNER_TOTAL_TIMEOUT_S", "value": "120"},
+                    {"name": "PROVIDER_BASE_URL", "value": "https://provider.example.com/v1"}
+                ]
+            },
+            "dispatcher": {
+                "slack": {
+                    "botTokenExistingSecret": "acme-slack",
+                    "botTokenExistingSecretKey": "botToken",
+                    "botToken": "xoxb-test-token-must-not-leak"
+                }
+            }
+        });
+        let opts = complete_up_opts_without_runner_egress(
+            UpOpts {
+                common: common(),
+                github_token: GithubTokenPlan::Untouched,
+                allow_egress_host: vec![],
+                resolved_egress_cidrs: vec![],
+                chart: "charts/curie".into(),
+                secrets: vec![],
+                dev: false,
+                no_expose: true,
+                set: vec![],
+                set_string: vec![],
+                allow_web_egress: vec![],
+                fake_model: false,
+                credentials: None,
+                local_model: None,
+                model: None,
+            },
+            Some(&existing),
+            None,
+            false,
+            true,
+        )
+        .unwrap();
+
+        let effective = up_value_plan(&opts).effective_values();
+        assert_eq!(
+            effective.get("config.schemaVersion").map(String::as_str),
+            Some("0.9.0")
+        );
+        assert_eq!(
+            effective
+                .get("worker.runnerTotalTimeoutSeconds")
+                .map(String::as_str),
+            Some("120")
+        );
+        assert_eq!(
+            effective
+                .get("dispatcher.slack.botTokenExistingSecret")
+                .map(String::as_str),
+            Some("acme-slack")
+        );
+        assert_eq!(
+            effective
+                .get("dispatcher.slack.botTokenExistingSecretKey")
+                .map(String::as_str),
+            Some("botToken")
+        );
+        assert!(
+            effective
+                .keys()
+                .all(|key| !key.contains("botToken") || key.contains("Existing")),
+            "inline botToken must not return on the overlay: {effective:?}"
+        );
+
+        let (materialized, _guards) = up_commands(&opts)[0].materialize_secret_files().unwrap();
+        let argv = materialized.argv().join(" ");
+        let display = up_commands(&opts)[0].display();
+        assert!(
+            !argv.contains("--reuse-values") && !display.contains("--reuse-values"),
+            "upgrade must remain a full Helm upgrade: {display}"
+        );
+        assert!(
+            display.contains("config.schemaVersion=0.9.0"),
+            "redacted plan must expose the schema version: {display}"
+        );
+        assert!(
+            !display.contains("xoxb-test-token-must-not-leak")
+                && !argv.contains("xoxb-test-token-must-not-leak"),
+            "inline token must not appear in plan or argv: {display}"
         );
     }
 
@@ -3951,6 +4276,7 @@ mod tests {
             Some(&existing),
             None,
             false,
+            true,
         )
         .unwrap();
 
@@ -3995,6 +4321,7 @@ mod tests {
             Some(&existing),
             None,
             false,
+            true,
         )
         .unwrap();
 
@@ -4039,6 +4366,7 @@ mod tests {
             Some(&existing),
             None,
             false,
+            true,
         )
         .unwrap();
 
@@ -4084,6 +4412,7 @@ mod tests {
             Some(&existing),
             None,
             false,
+            true,
         )
         .unwrap();
 
@@ -4138,6 +4467,7 @@ mod tests {
                 existing.as_ref(),
                 None,
                 false,
+                true,
             )
             .unwrap();
 
@@ -5087,6 +5417,7 @@ mod tests {
             existing,
             None,
             false,
+            true,
         )
         .unwrap()
     }

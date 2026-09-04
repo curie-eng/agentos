@@ -2,6 +2,20 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "type": "object",
   "properties": {
+    "config": {
+      "type": "object",
+      "description": "Installed configuration schema stamp written by the CLI on every install and upgrade (issue #2299).",
+      "properties": {
+        "schemaVersion": {
+          "type": "string",
+          "description": "Configuration schema version persisted with the Helm release."
+        },
+        "migratedFrom": {
+          "type": "string",
+          "description": "Schema or chart version the previous document was migrated from. Empty on a fresh current-schema install."
+        }
+      }
+    },
     "api": {
       "type": "object",
       "properties": {
