@@ -83,6 +83,7 @@ from .approvals import (
     CreatedApproval,
     PublicationCreateRequest,
     PublicationCreator,
+    PublicationLineage,
 )
 from .behaviorpacks import (
     BehaviorPacks,
@@ -590,6 +591,18 @@ class ThreadBusyError(RuntimeError):
     bounded outcome rather than a silent one, and issue #268 owns replacing it
     with a real idle-aware policy when cron schedules land.
     """
+
+
+class PendingPublicationError(ThreadBusyError):
+    """A thread-owned publication must settle before another turn can start."""
+
+    public_detail = (
+        "This thread already has a publication awaiting approval or completion. "
+        "Resolve it before continuing."
+    )
+
+    def __init__(self, thread_key: str) -> None:
+        super().__init__(f"thread {thread_key} has a pending publication revision")
 
 
 @dataclass
@@ -2280,6 +2293,17 @@ class Kernel:
                 ),
             )
             return TurnOutcome(terminal_ok=True)
+        except PendingPublicationError as exc:
+            release_order()
+            logger.info(
+                "pending publication refused a new turn for agent=%s deployment=%s "
+                "thread=%s",
+                agent_name,
+                workspace_deployment_id,
+                thread_key,
+            )
+            await self._reply_for(qevent, route, exc.public_detail)
+            return TurnOutcome(terminal_ok=True)
         except WorkspaceSelectionRefused as exc:
             release_order()
             # LOG it, not only reply (#2004). This was the one turn-ending branch
@@ -2460,6 +2484,12 @@ class Kernel:
         agent_name: str | None = None,
         source: TurnSource = TurnSource.SLACK,
         remaining_s: float | None = None,
+        lineage_branch: str | None = None,
+        lineage_head: str | None = None,
+        lineage_base_sha: str | None = None,
+        publication_visible_outcome_revision: int | None = None,
+        force_lineage_replacement: bool = False,
+        pending_publication_approval: bool = False,
     ) -> _RouteResult:
         # A workspace-enabled thread must establish (or confirm) its repository
         # before any platform response path. This deliberately precedes the
@@ -2480,6 +2510,44 @@ class Kernel:
                 author=event.user,
                 repo_full_name=repo_fact,
             )
+            if (
+                lineage_branch is None
+                and workspace_repo is not None
+                and getattr(self, "_publication_creator", None) is not None
+            ):
+                reader = getattr(
+                    self._publication_creator, "get_publication_lineage", None
+                )
+                if reader is not None:
+                    lineage: PublicationLineage | None = await reader(
+                        workspace_deployment_id, thread_key, workspace_repo
+                    )
+                    if lineage is not None and lineage.state != "open":
+                        raise WorkspaceSelectionRefused(
+                            "This pull request is already terminal. Start a new thread."
+                        )
+                    if lineage is not None and (
+                        lineage.has_pending_revision or lineage.has_pending_outcome
+                    ):
+                        # A first revision has no accepted head yet, but it still
+                        # owns the thread's publication boundary. Its terminal
+                        # outcome must also reach durable history before a later
+                        # turn can observe it. Refuse before lookup/adopt so a
+                        # failed suspend cannot reuse the dirty runner across
+                        # either boundary.
+                        raise PendingPublicationError(thread_key)
+                    if lineage is not None and lineage.head_sha is not None:
+                        lineage_branch = lineage.branch
+                        lineage_head = lineage.head_sha
+                    if lineage is not None:
+                        publication_visible_outcome_revision = (
+                            lineage.visible_outcome_revision
+                        )
+                        if (
+                            lineage.head_sha is None
+                            and lineage.visible_outcome_revision > 0
+                        ):
+                            lineage_base_sha = lineage.base_sha
         # Greeting/help pre-model short-circuit (ADR-0018): under the per-thread
         # route lock, if an enabled greeting/help pack matches the message text AND
         # the thread has no existing route, it is provably a NEW turn (it cannot be
@@ -2494,8 +2562,37 @@ class Kernel:
         # mere presence of an affinity record as proof that a live route was
         # retained.
         existing_handle = await asyncio.to_thread(self._substrate.lookup, thread_key)
+        materialized_lineage_head = lineage_head or lineage_base_sha
         if (
-            workspace_repo is not None
+            materialized_lineage_head is not None
+            or publication_visible_outcome_revision is not None
+        ):
+            force_lineage_replacement = force_lineage_replacement or (
+                existing_handle is None
+                or (
+                    materialized_lineage_head is not None
+                    and existing_handle.workspace_materialized_head
+                    != materialized_lineage_head
+                )
+                or existing_handle.publication_visible_outcome_revision
+                != publication_visible_outcome_revision
+            )
+        if (
+            force_lineage_replacement
+            and existing_handle is not None
+            and not await self._workspace_handoff_ready(
+                existing_handle,
+                remaining_s=remaining_s,
+                lineage_reconciliation=True,
+                pending_publication_approval=pending_publication_approval,
+            )
+        ):
+            raise ThreadBusyError(
+                f"thread {thread_key} has not reached a durable lineage handoff boundary"
+            )
+        if (
+            not force_lineage_replacement
+            and workspace_repo is not None
             and existing_handle is not None
             and existing_handle.workspace_repo is not None
             and existing_handle.workspace_repo != workspace_repo
@@ -2504,7 +2601,8 @@ class Kernel:
                 "route-fence", "live workspace route does not match sticky repository"
             )
         if (
-            workspace_repo is not None
+            not force_lineage_replacement
+            and workspace_repo is not None
             and existing_handle is not None
             and existing_handle.workspace_repo is None
             and not await self._workspace_handoff_ready(
@@ -2542,11 +2640,19 @@ class Kernel:
             workspace_repo=workspace_repo,
             replace_handle=(
                 existing_handle
-                if workspace_repo is not None
-                and existing_handle is not None
-                and existing_handle.workspace_repo is None
+                if workspace_repo is not None and existing_handle is not None and (
+                    force_lineage_replacement or existing_handle.workspace_repo is None
+                )
                 else None
             ),
+            lineage_branch=lineage_branch,
+            lineage_head=lineage_head,
+            lineage_base_sha=lineage_base_sha,
+            publication_visible_outcome_revision=(
+                publication_visible_outcome_revision or 0
+            ),
+            force_lineage_replacement=force_lineage_replacement,
+            pending_publication_approval=pending_publication_approval,
             agent_name=agent_name,
             remaining_s=remaining_s,
         )
@@ -2671,7 +2777,12 @@ class Kernel:
         return active
 
     async def _workspace_handoff_ready(
-        self, handle: SandboxHandle, *, remaining_s: float | None = None
+        self,
+        handle: SandboxHandle,
+        *,
+        remaining_s: float | None = None,
+        lineage_reconciliation: bool = False,
+        pending_publication_approval: bool = False,
     ) -> bool:
         """Fail closed unless the old runner is idle with durable replay state."""
 
@@ -2693,11 +2804,18 @@ class Kernel:
         return (
             status.get("turn_active") is False
             and status.get("history_durable") is True
-            and status.get("status")
-            in {
-                SessionStatus.DONE.value,
-                SessionStatus.IDLE_AWAITING_INPUT.value,
-            }
+            and not pending_publication_approval
+            and (
+                status.get("status")
+                in {
+                    SessionStatus.DONE.value,
+                    SessionStatus.IDLE_AWAITING_INPUT.value,
+                }
+                or (
+                    lineage_reconciliation
+                    and status.get("status") == SessionStatus.AWAITING_APPROVAL.value
+                )
+            )
         )
 
     async def _workspace_candidate_ready(
@@ -2743,6 +2861,12 @@ class Kernel:
         workspace_deployment_id: uuid.UUID | None = None,
         workspace_repo: str | None = None,
         replace_handle: SandboxHandle | None = None,
+        lineage_branch: str | None = None,
+        lineage_head: str | None = None,
+        lineage_base_sha: str | None = None,
+        publication_visible_outcome_revision: int = 0,
+        force_lineage_replacement: bool = False,
+        pending_publication_approval: bool = False,
         agent_name: str | None = None,
         remaining_s: float | None = None,
     ) -> SandboxHandle:
@@ -2768,7 +2892,9 @@ class Kernel:
                 raise WorkspacePreparationError(
                     "wiring", "selected workspace has no trusted claim-time preparer"
                 )
-            existing = await asyncio.to_thread(self._substrate.adopt, thread_key)
+            existing = None
+            if not force_lineage_replacement:
+                existing = await asyncio.to_thread(self._substrate.adopt, thread_key)
             if existing is not None and existing.workspace_repo == workspace_repo:
                 await asyncio.to_thread(
                     self._workspace.touch,
@@ -2822,7 +2948,10 @@ class Kernel:
 
                     ready = run_status_probe(
                         lambda probe_remaining_s: self._workspace_handoff_ready(
-                            replace_handle, remaining_s=probe_remaining_s
+                            replace_handle,
+                            remaining_s=probe_remaining_s,
+                            lineage_reconciliation=force_lineage_replacement,
+                            pending_publication_approval=pending_publication_approval,
                         ),
                         failure=(
                             f"thread {thread_key} workspace handoff fence "
@@ -2869,6 +2998,12 @@ class Kernel:
                 replace_handle=replace_handle,
                 revalidate_before_handoff=handoff_revalidation,
                 validate_candidate=candidate_validation,
+                lineage_branch=lineage_branch,
+                lineage_head=lineage_head,
+                lineage_base_sha=lineage_base_sha,
+                publication_visible_outcome_revision=(
+                    publication_visible_outcome_revision
+                ),
             )
             if not isinstance(workspace_claim.handle, SandboxHandle):
                 raise WorkspacePreparationError(
@@ -3069,10 +3204,9 @@ class Kernel:
         """
 
         # Both identities are live in this function and they are not
-        # interchangeable: ``thread`` is the BARE adapter conversation id, which
-        # the durable record persists and the resume turn carries back onto the
-        # wire; ``thread_key`` is the worker's scoped key, which names the
-        # sandbox this suspends and the card slot it remembers.
+        # interchangeable: ``thread`` is the BARE adapter conversation id used
+        # only for replies; ``thread_key`` is the canonical server identity that
+        # owns the workspace, publication lineage, sandbox, and card slot.
         thread = qevent.conversation_id
         thread_key = _thread_key_for(qevent)
         summary = outcome.approval_summary or outcome.text or "Approval requested"
@@ -3168,7 +3302,8 @@ class Kernel:
                 published = await publication_creator.create_publication(
                     PublicationCreateRequest(
                         deployment_id=deployment_id,
-                        conversation_id=thread,
+                        conversation_id=thread_key,
+                        reply_conversation_id=thread,
                         repo_full_name=snapshot.repo_full_name,
                         author=qevent.author,
                         summary=summary,
@@ -3231,6 +3366,16 @@ class Kernel:
                         granted_tool=outcome.approval_granted_tool,
                     )
                 )
+        except WorkspaceSelectionRefused as exc:
+            logger.info(
+                "publication refused for agent=%s deployment=%s thread=%s: %s",
+                agent_id,
+                deployment_id,
+                thread_key,
+                exc.public_detail,
+            )
+            await self._reply_for(qevent, route, exc.public_detail)
+            return
         except (ApprovalBackendError, ValidationError) as exc:
             # ValidationError: the shared model rejected the payload at
             # construction (#492) -- an unknown gate_kind, or an empty

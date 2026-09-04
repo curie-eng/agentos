@@ -630,6 +630,7 @@ class PreparedWorkspace:
     clean_clone_url: str
     repo_full_name: str
     base_sha: str
+    materialized_head: str
     checkout_mode: int
     reference: WorkspaceRef
 
@@ -666,6 +667,7 @@ class _WorkspaceOwnership:
                     "clean_clone_url": prepared.clean_clone_url,
                     "repo_full_name": prepared.repo_full_name,
                     "base_sha": prepared.base_sha,
+                    "materialized_head": prepared.materialized_head,
                     "checkout_mode": prepared.checkout_mode,
                     "reference": prepared.reference.encode(),
                 },
@@ -695,6 +697,9 @@ class _WorkspaceOwnership:
                 clean_clone_url=str(prepared_raw["clean_clone_url"]),
                 repo_full_name=str(prepared_raw["repo_full_name"]),
                 base_sha=str(prepared_raw["base_sha"]),
+                materialized_head=str(
+                    prepared_raw.get("materialized_head", prepared_raw["base_sha"])
+                ),
                 checkout_mode=int(prepared_raw["checkout_mode"]),
                 reference=WorkspaceRef.decode(str(prepared_raw["reference"])),
             )
@@ -883,7 +888,14 @@ class WorkspacePreparer:
         self.limiter = limiter or WorkspaceCloneLimiter(max_concurrent=limits.max_concurrent_clones)
 
     def prepare(
-        self, *, deployment_id: uuid.UUID, thread_key: str, generation: str
+        self,
+        *,
+        deployment_id: uuid.UUID,
+        thread_key: str,
+        generation: str,
+        branch: str | None = None,
+        expected_head: str | None = None,
+        detached_head: str | None = None,
     ) -> PreparedWorkspace:
         started = self.clock()
         real_started = time.monotonic()
@@ -919,22 +931,49 @@ class WorkspacePreparer:
                     "GIT_CONFIG_VALUE_1": f"Authorization: {credential.authorization_header}",
                 }
                 try:
+                    clone_argv = [
+                        "git",
+                        "clone",
+                        "--depth=1",
+                        "--single-branch",
+                        "--no-tags",
+                    ]
+                    if branch is not None:
+                        clone_argv.extend(["--branch", branch])
+                    clone_argv.extend([credential.clone_url, str(checkout)])
                     self.commands.run(
-                        [
-                            "git",
-                            "clone",
-                            "--depth=1",
-                            "--single-branch",
-                            "--no-tags",
-                            credential.clone_url,
-                            str(checkout),
-                        ],
+                        clone_argv,
                         env=clone_env,
                         timeout_seconds=min(
                             self.limits.clone_timeout_seconds,
                             self._real_remaining(real_started),
                         ),
                     )
+                    if detached_head is not None:
+                        self.commands.run(
+                            [
+                                "git",
+                                "fetch",
+                                "--depth=1",
+                                "--no-tags",
+                                "origin",
+                                detached_head,
+                            ],
+                            cwd=checkout,
+                            env=clone_env,
+                            timeout_seconds=min(
+                                self.limits.clone_timeout_seconds,
+                                self._real_remaining(real_started),
+                            ),
+                        )
+                        self.commands.run(
+                            ["git", "checkout", "--detach", detached_head],
+                            cwd=checkout,
+                            timeout_seconds=min(
+                                self.limits.clone_timeout_seconds,
+                                self._real_remaining(real_started),
+                            ),
+                        )
                 except TimeoutError as exc:
                     raise WorkspaceStageTimeout("clone", self.limits.clone_timeout_seconds) from exc
                 except WorkspacePreparationError as exc:
@@ -963,6 +1002,11 @@ class WorkspacePreparer:
                     cwd=checkout,
                     timeout_seconds=self.limits.archive_timeout_seconds,
                 ).stdout.strip()
+                if expected_head is not None and base_sha != expected_head:
+                    raise WorkspacePreparationError(
+                        "lineage-checkout",
+                        "checkout does not match the expected lineage head",
+                    )
 
                 checkout_bytes = self._checkout_size(checkout)
                 if checkout_bytes > self.limits.max_checkout_bytes:
@@ -1030,6 +1074,7 @@ class WorkspacePreparer:
                 clean_clone_url=credential.clone_url,
                 repo_full_name=credential.repo_full_name,
                 base_sha=base_sha,
+                materialized_head=base_sha,
                 checkout_mode=checkout.stat().st_mode,
                 reference=reference,
             )
@@ -1042,6 +1087,51 @@ class WorkspacePreparer:
             raise
         finally:
             shutil.rmtree(scratch, ignore_errors=True)
+
+    def prepare_lineage(
+        self,
+        *,
+        deployment_id: uuid.UUID,
+        thread_key: str,
+        generation: str,
+        branch: str,
+        expected_head: str,
+    ) -> PreparedWorkspace:
+        """Materialize one stored lineage branch at its exact fenced head."""
+
+        if not branch or re.fullmatch(r"[0-9a-f]{40}", expected_head) is None:
+            raise WorkspacePreparationError(
+                "lineage-checkout", "lineage branch or expected head is invalid"
+            )
+        return self.prepare(
+            deployment_id=deployment_id,
+            thread_key=thread_key,
+            generation=generation,
+            branch=branch,
+            expected_head=expected_head,
+        )
+
+    def prepare_lineage_base(
+        self,
+        *,
+        deployment_id: uuid.UUID,
+        thread_key: str,
+        generation: str,
+        expected_base: str,
+    ) -> PreparedWorkspace:
+        """Materialize a headless lineage at its proposal base without a branch."""
+
+        if re.fullmatch(r"[0-9a-f]{40}", expected_base) is None:
+            raise WorkspacePreparationError(
+                "lineage-checkout", "lineage base is invalid"
+            )
+        return self.prepare(
+            deployment_id=deployment_id,
+            thread_key=thread_key,
+            generation=generation,
+            expected_head=expected_base,
+            detached_head=expected_base,
+        )
 
     def _check_total(self, started: float) -> None:
         if self.clock() - started > self.limits.total_timeout_seconds:
@@ -1220,6 +1310,10 @@ class WorkspaceClaimCoordinator:
         replace_handle: Any | None = None,
         revalidate_before_handoff: Callable[[], None] | None = None,
         validate_candidate: Callable[[Any], None] | None = None,
+        lineage_branch: str | None = None,
+        lineage_head: str | None = None,
+        lineage_base_sha: str | None = None,
+        publication_visible_outcome_revision: int = 0,
     ) -> WorkspaceClaimResult:
         """Prepare once, then cold-claim or resume a suspended route.
 
@@ -1232,11 +1326,36 @@ class WorkspaceClaimCoordinator:
         ready but before its route CAS; refusal follows the same rollback path.
         """
 
-        prepared = self.preparer.prepare(
-            deployment_id=deployment_id,
-            thread_key=thread_key,
-            generation=uuid.uuid4().hex,
-        )
+        generation = uuid.uuid4().hex
+        if (lineage_branch is None) != (lineage_head is None):
+            raise WorkspacePreparationError(
+                "lineage-checkout", "lineage branch and head must be supplied together"
+            )
+        if lineage_base_sha is not None and lineage_head is not None:
+            raise WorkspacePreparationError(
+                "lineage-checkout", "lineage head and base are mutually exclusive"
+            )
+        if lineage_branch is not None and lineage_head is not None:
+            prepared = self.preparer.prepare_lineage(
+                deployment_id=deployment_id,
+                thread_key=thread_key,
+                generation=generation,
+                branch=lineage_branch,
+                expected_head=lineage_head,
+            )
+        elif lineage_base_sha is not None:
+            prepared = self.preparer.prepare_lineage_base(
+                deployment_id=deployment_id,
+                thread_key=thread_key,
+                generation=generation,
+                expected_base=lineage_base_sha,
+            )
+        else:
+            prepared = self.preparer.prepare(
+                deployment_id=deployment_id,
+                thread_key=thread_key,
+                generation=generation,
+            )
         previous_ownership: _WorkspaceOwnership | None = None
         ownership_staged = False
         sandbox_exposed = False
@@ -1267,6 +1386,10 @@ class WorkspaceClaimCoordinator:
                     expected=replace_handle,
                     env=claim_env,
                     workspace_repo=repo_full_name,
+                    workspace_materialized_head=prepared.materialized_head,
+                    publication_visible_outcome_revision=(
+                        publication_visible_outcome_revision
+                    ),
                     agent_name=agent_name,
                     **candidate_guard,
                 )
@@ -1277,6 +1400,10 @@ class WorkspaceClaimCoordinator:
                         env=claim_env,
                         agent_name=agent_name,
                         workspace_repo=repo_full_name,
+                        workspace_materialized_head=prepared.materialized_head,
+                        publication_visible_outcome_revision=(
+                            publication_visible_outcome_revision
+                        ),
                     )
                 except Exception as exc:
                     # The substrate signal is injected to keep this worker-local
@@ -1284,7 +1411,14 @@ class WorkspaceClaimCoordinator:
                     if not isinstance(exc, self._suspended_errors):
                         raise
                     handle = self.substrate.resume(
-                        thread_key, env=claim_env, agent_name=agent_name
+                        thread_key,
+                        env=claim_env,
+                        agent_name=agent_name,
+                        workspace_repo=repo_full_name,
+                        workspace_materialized_head=prepared.materialized_head,
+                        publication_visible_outcome_revision=(
+                            publication_visible_outcome_revision
+                        ),
                     )
             sandbox_exposed = True
             self._commit_ownership(thread_key, prepared)

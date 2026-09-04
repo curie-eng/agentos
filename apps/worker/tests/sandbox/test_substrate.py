@@ -108,6 +108,8 @@ def test_handoff_cold_claims_then_atomically_replaces_and_retires_old_route(
             "CURIE_WORKSPACE_SHA256": "a" * 64,
         },
         workspace_repo="acme-corp/acme-bot",
+        workspace_materialized_head="a" * 40,
+        publication_visible_outcome_revision=1,
     )
 
     # The route is the continuity record used to construct a later replacement.
@@ -116,6 +118,8 @@ def test_handoff_cold_claims_then_atomically_replaces_and_retires_old_route(
     assert claimed.session_id == "logical-session"
     assert claimed.history_ref == history_ref
     assert claimed.workspace_repo == "acme-corp/acme-bot"
+    assert claimed.workspace_materialized_head == "a" * 40
+    assert claimed.publication_visible_outcome_revision == 1
     claim_env = fake_k8s.claims[claimed.claim_name].env
     assert claim_env[SESSION_ENV] == "logical-session"
     assert claim_env[HISTORY_ENV] == history_ref
@@ -132,12 +136,16 @@ def test_handoff_cold_claims_then_atomically_replaces_and_retires_old_route(
             "CURIE_WORKSPACE_SHA256": "b" * 64,
         },
         workspace_repo="acme-corp/acme-bot",
+        workspace_materialized_head="b" * 40,
+        publication_visible_outcome_revision=2,
     )
 
     assert replacement.claim_name != claimed.claim_name
     assert replacement.session_id == claimed.session_id == "logical-session"
     assert replacement.history_ref == claimed.history_ref == history_ref
     assert replacement.workspace_repo == "acme-corp/acme-bot"
+    assert replacement.workspace_materialized_head == "b" * 40
+    assert replacement.publication_visible_outcome_revision == 2
     assert replacement.generation == 1
     assert affinity.get("T1") == RouteRecord(handle=replacement)
     candidate_env = fake_k8s.claims[replacement.claim_name].env
@@ -497,7 +505,12 @@ def test_lost_race_adopts_winner_and_retires_loser(
 def test_suspend_resume_rehydrates_from_history(
     substrate: SandboxSubstrate, fake_k8s: FakeSandboxClient, affinity: AffinityStore
 ) -> None:
-    first = substrate.claim("T1")
+    first = substrate.claim(
+        "T1",
+        workspace_repo="acme-corp/acme-bot",
+        workspace_materialized_head="a" * 40,
+        publication_visible_outcome_revision=1,
+    )
     substrate.suspend("T1", history_ref="sdk-session-abc")
 
     # Suspended: mode flipped, route no longer live.
@@ -508,10 +521,18 @@ def test_suspend_resume_rehydrates_from_history(
     # A claim() while suspended must not silently fork a second live session
     # for the thread without the history; the kernel resumes explicitly.
 
-    resumed = substrate.resume("T1")
+    resumed = substrate.resume(
+        "T1",
+        workspace_repo="acme-corp/acme-bot",
+        workspace_materialized_head="b" * 40,
+        publication_visible_outcome_revision=2,
+    )
     assert resumed.claim_name != first.claim_name
     assert resumed.session_id == first.session_id
     assert resumed.history_ref == "sdk-session-abc"
+    assert resumed.workspace_repo == "acme-corp/acme-bot"
+    assert resumed.workspace_materialized_head == "b" * 40
+    assert resumed.publication_visible_outcome_revision == 2
     # The new claim injects the rehydrate env for the replacement runner.
     env = fake_k8s.claims[resumed.claim_name].env
     assert env[HISTORY_ENV] == "sdk-session-abc"

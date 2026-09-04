@@ -130,6 +130,13 @@ class SandboxHandle:
     token: str = ""
     # Worker-internal late-acquisition fence. These facts never cross ACI.
     workspace_repo: str | None = None
+    # Exact commit extracted into /workspace for this runner. A verified PR
+    # lineage can reuse the route only while this still matches its remote head.
+    workspace_materialized_head: str | None = None
+    # Highest publication result already present in durable transcript history
+    # when this runner booted. Advancing it requires one cold rehydrate even
+    # when a denied/failed revision leaves the git head unchanged.
+    publication_visible_outcome_revision: int = 0
     generation: int = 0
 
     @property

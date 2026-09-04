@@ -22,6 +22,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
@@ -430,13 +431,86 @@ class Approval(Base):
     publication: Mapped[Publication | None] = relationship(back_populates="approval", uselist=False)
 
 
+class ThreadPublicationLineage(Base):
+    """One durable pull-request identity owned by an agent conversation."""
+
+    __tablename__ = "thread_publication_lineages"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('open', 'merged', 'closed')",
+            name="thread_publication_lineages_status_ck",
+        ),
+        CheckConstraint(
+            "version >= 1",
+            name="thread_publication_lineages_version_ck",
+        ),
+        CheckConstraint(
+            "latest_revision >= 1",
+            name="thread_publication_lineages_latest_revision_ck",
+        ),
+        CheckConstraint(
+            "(pr_number IS NULL) = (pr_url IS NULL)",
+            name="thread_publication_lineages_pr_identity_ck",
+        ),
+        Index(
+            "uq_active_thread_publication_lineage",
+            "agent_id",
+            "conversation_id",
+            "repo_full_name",
+            unique=True,
+            postgresql_where=text("status = 'open'"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"), index=True
+    )
+    deployment_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.deployments.id", ondelete="CASCADE"), index=True
+    )
+    conversation_id: Mapped[str] = mapped_column(index=True)
+    repo_full_name: Mapped[str]
+    base_sha: Mapped[str]
+    branch: Mapped[str] = mapped_column(unique=True)
+    pr_number: Mapped[int | None] = mapped_column(default=None)
+    pr_url: Mapped[str | None] = mapped_column(default=None)
+    head_sha: Mapped[str | None] = mapped_column(default=None)
+    status: Mapped[str] = mapped_column(server_default="open", default="open")
+    version: Mapped[int] = mapped_column(server_default="1", default=1)
+    latest_revision: Mapped[int] = mapped_column(server_default="1", default=1)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+
+    publications: Mapped[list[Publication]] = relationship(back_populates="lineage")
+
+
 class Publication(Base):
     """Private patch state settled by the platform publication reconciler."""
 
     __tablename__ = "publications"
     __table_args__ = (
+        CheckConstraint(
+            "status NOT IN ('pending', 'approved', 'launching', 'running') "
+            "OR lineage_id IS NOT NULL",
+            name="publications_active_lineage_ck",
+        ),
         Index("ix_publications_status_lease", "status", "lease_expires_at"),
         Index("ix_publications_deployment_id", "deployment_id"),
+        Index(
+            "uq_publications_lineage_revision",
+            "lineage_id",
+            "revision_number",
+            unique=True,
+        ),
+        Index(
+            "uq_active_publication_per_lineage",
+            "lineage_id",
+            unique=True,
+            postgresql_where=text(
+                "status IN ('pending', 'approved', 'launching', 'running')"
+            ),
+        ),
         Index(
             "ix_publications_approval_card_delivery",
             "approval_card_reported_at",
@@ -468,6 +542,12 @@ class Publication(Base):
     # reply tuple; NULL denotes a successful pre-scoping row whose Approval
     # conversation remains the only honest historical identity.
     workspace_conversation_id: Mapped[str | None] = mapped_column(default=None)
+    lineage_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(f"{SCHEMA}.thread_publication_lineages.id", ondelete="SET NULL"),
+        default=None,
+    )
+    revision_number: Mapped[int | None] = mapped_column(default=None)
+    expected_prior_head: Mapped[str | None] = mapped_column(default=None)
     repo_full_name: Mapped[str]
     status: Mapped[str] = mapped_column(server_default="pending")
     version: Mapped[int] = mapped_column(server_default="1", default=1)
@@ -510,6 +590,11 @@ class Publication(Base):
     # delivery. These fields form the durable result outbox so a transient
     # adapter failure cannot resurrect publication work or retain patch bytes.
     result_reported_at: Mapped[datetime | None] = mapped_column(default=None)
+    # A terminal publication does not release its thread fence until the
+    # platform-authored outcome is durable in the transcript the next sandbox
+    # rehydrates. Result delivery to Slack is a separate, independently retrying
+    # obligation and must not stand in for this acknowledgement.
+    outcome_history_ready_at: Mapped[datetime | None] = mapped_column(default=None)
     result_delivery_attempts: Mapped[int] = mapped_column(server_default="0", default=0)
     result_delivery_error: Mapped[str | None] = mapped_column(Text, default=None)
     result_delivery_dead_lettered_at: Mapped[datetime | None] = mapped_column(default=None)
@@ -520,6 +605,37 @@ class Publication(Base):
     terminal_at: Mapped[datetime | None] = mapped_column(default=None)
 
     approval: Mapped[Approval] = relationship(back_populates="publication")
+    lineage: Mapped[ThreadPublicationLineage | None] = relationship(
+        back_populates="publications"
+    )
+
+    @property
+    def lineage_base_sha(self) -> str | None:
+        return self.lineage.base_sha if self.lineage is not None else None
+
+    @property
+    def lineage_head_sha(self) -> str | None:
+        return self.lineage.head_sha if self.lineage is not None else None
+
+    @property
+    def lineage_state(self) -> str | None:
+        return self.lineage.status if self.lineage is not None else None
+
+    @property
+    def lineage_version(self) -> int | None:
+        return self.lineage.version if self.lineage is not None else None
+
+    @property
+    def branch(self) -> str | None:
+        return self.lineage.branch if self.lineage is not None else None
+
+    @property
+    def pr_number(self) -> int | None:
+        return self.lineage.pr_number if self.lineage is not None else None
+
+    @property
+    def pr_url(self) -> str | None:
+        return self.lineage.pr_url if self.lineage is not None else None
 
 
 class CredentialRedemptionAuditEntry(Base):
