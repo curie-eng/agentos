@@ -1159,7 +1159,10 @@ assert_env_value "$on_dir" OTEL_EXPORTER_OTLP_PROTOCOL "http/protobuf" \
 # silently ignore the operator here.
 otel_external_dir="$(render otel-external "${ON[@]}" "${CREDS[@]}" \
   --set otelCollector.deploy=false \
-  --set otelCollector.endpoint=https://otel.example.com:4318)"
+  --set otelCollector.endpoint=https://otel.example.com:4318 \
+  --set 'otelCollector.egress[0].cidr=192.0.2.40/32' \
+  --set 'otelCollector.egress[0].ports[0].protocol=TCP' \
+  --set 'otelCollector.egress[0].ports[0].port=4318')"
 assert_env_value "$otel_external_dir" OTEL_EXPORTER_OTLP_ENDPOINT "https://otel.example.com:4318" \
   "otelCollector.endpoint must render verbatim on the adapter, exactly as it does on the other instrumented workloads."
 assert_env_value "$otel_external_dir" OTEL_EXPORTER_OTLP_PROTOCOL "http/protobuf" \
