@@ -13,6 +13,8 @@ import base64
 import hashlib
 import hmac
 import json
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -31,6 +33,9 @@ from curie_dispatcher.approval_actions import (
 )
 from curie_dispatcher.approval_principal import mint_chat_principal
 from curie_dispatcher.config import DispatcherConfig
+from opentelemetry import context as otel_context
+from opentelemetry import trace
+from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags, TraceState
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk.socket_mode.request import SocketModeRequest
@@ -41,6 +46,25 @@ from .conftest import FakeSocketClient, _authorize
 APPROVAL_ID = "9a1e8a10-0000-0000-0000-000000000246"
 _PLATFORM_API_KEY = "platform-api-test-key"
 _CHAT_ATTESTER_SECRET = "dispatcher-attester-test-secret"
+_RESOLVE_TRACE_ID = int("4123456789abcdef0123456789abcdef", 16)
+_RESOLVE_SPAN_ID = int("4123456789abcdef", 16)
+_RESOLVE_TRACEPARENT = "00-4123456789abcdef0123456789abcdef-4123456789abcdef-01"
+
+
+@contextmanager
+def _resolve_parent() -> Iterator[None]:
+    parent = SpanContext(
+        trace_id=_RESOLVE_TRACE_ID,
+        span_id=_RESOLVE_SPAN_ID,
+        is_remote=True,
+        trace_flags=TraceFlags.SAMPLED,
+        trace_state=TraceState(),
+    )
+    token = otel_context.attach(trace.set_span_in_context(NonRecordingSpan(parent)))
+    try:
+        yield
+    finally:
+        otel_context.detach(token)
 
 
 def test_dispatcher_minter_matches_the_api_wire_vector() -> None:
@@ -579,6 +603,32 @@ def test_immediate_click_posts_only_decision_with_an_authenticated_chat_principa
         )
     )
     assert token not in rendered
+
+
+def test_resolve_request_carries_the_dispatcher_action_parent() -> None:
+    """The Slack action trace is forwarded as HTTP metadata, never body authority."""
+
+    captured = _CapturingHttpClient()
+    resolver = ApprovalResolveClient(
+        api_base_url="https://api.example.test",
+        api_key=_PLATFORM_API_KEY,
+        approval_chat_attester_secret=_CHAT_ATTESTER_SECRET,
+        client=captured,  # type: ignore[arg-type]
+    )
+
+    with _resolve_parent():
+        outcome = resolver.resolve(
+            APPROVAL_ID,
+            decision="approved",
+            attested_user="U_MANAGER",
+            attested_channel="C_MGRS",
+        )
+
+    assert outcome.status_code == 200
+    assert len(captured.requests) == 1
+    request = captured.requests[0]
+    assert request["headers"]["traceparent"] == _RESOLVE_TRACEPARENT
+    assert "traceparent" not in request["json"]
 
 
 def test_non_json_403_body_is_not_captured_as_detail() -> None:

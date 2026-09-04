@@ -6,7 +6,8 @@ GitHub side effects belong to the trusted worker publication reconciler.
 
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from curie_telemetry import TRACEPARENT_STREAM_FIELD, canonicalize_traceparent
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from starlette.concurrency import run_in_threadpool
 
 from .. import crud
@@ -38,6 +39,7 @@ internal_router = APIRouter(
 )
 async def create_publication(
     data: PublicationCreate,
+    request: Request,
     session: SessionDep,
     response: Response,
 ) -> PublicationOut:
@@ -51,8 +53,16 @@ async def create_publication(
             status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             f"publication patch exceeds the {patch_limit_bytes}-byte limit",
         )
+    traceparent = canonicalize_traceparent(
+        request.headers.get(TRACEPARENT_STREAM_FIELD)
+    )
     try:
-        publication, created = await crud.create_publication(session, data, patch=patch)
+        publication, created = await crud.create_publication(
+            session,
+            data,
+            patch=patch,
+            traceparent=traceparent,
+        )
     except crud.PublicationReplayConflict as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     except LookupError as exc:

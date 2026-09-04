@@ -67,8 +67,13 @@ class Declaration:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--event", type=Path, required=True)
-    parser.add_argument("--curie", required=True)
-    parser.add_argument("--ref", required=True)
+    parser.add_argument("--curie")
+    parser.add_argument("--ref")
+    parser.add_argument(
+        "--needs-curie",
+        action="store_true",
+        help="report whether this body would invoke the curie binary",
+    )
     return parser
 
 
@@ -134,6 +139,37 @@ def _declaration(body: str) -> Declaration:
     return Declaration(selector=selector)
 
 
+def _needs_curie(body: str) -> bool:
+    """True iff ``main`` would invoke the curie binary for this body."""
+    try:
+        return _declaration(body).selector is not None
+    except ValueError:
+        return False
+
+
+def _report_needs_curie(event_path: Path) -> int:
+    output_path = os.environ.get("GITHUB_OUTPUT")
+    if not output_path:
+        print("Fix pin cargo guard error: GITHUB_OUTPUT is required", file=sys.stderr)
+        return 1
+
+    try:
+        needed = _needs_curie(_body(_event(event_path)))
+    except ValueError as error:
+        print(f"Fix pin declaration error: {error}", file=sys.stderr)
+        return 1
+
+    line = f"needed={'true' if needed else 'false'}\n"
+    try:
+        with Path(output_path).open("a", encoding="utf-8") as stream:
+            stream.write(line)
+    except OSError as error:
+        print(f"Fix pin cargo guard error: could not write GITHUB_OUTPUT: {error}", file=sys.stderr)
+        return 1
+    sys.stdout.write(line)
+    return 0
+
+
 def _closed_issues(body: str) -> list[int]:
     uncommented = COMMENT.sub("", body)
     numbers: list[int] = []
@@ -183,6 +219,11 @@ def _closed_bugs(event: dict[str, object], body: str) -> list[int]:
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
+    if arguments.needs_curie:
+        return _report_needs_curie(arguments.event)
+    if not arguments.curie or not arguments.ref:
+        print("Fix pin invocation error: --curie and --ref are required", file=sys.stderr)
+        return 2
 
     try:
         event = _event(arguments.event)

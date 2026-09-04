@@ -198,9 +198,13 @@ Host ports (non-default host ports to avoid local collisions):
 Config lives in `.env.example` (copy to the gitignored `.env` to override; the
 stack runs on the baked defaults without one). Load-bearing facts:
 
-- **ClickHouse is pinned to `:24.8`.** Newer ClickHouse requires AVX and SIGILLs
-  with exit 132 on CPUs without it. Keep the pin unless every target CPU has AVX.
-  `charts/curie` turns this into a chart preflight (`preflights.avxCheck`).
+- **ClickHouse:** `compose.dev.yaml` stays on `:24.8` so an SSE4.2-only
+  developer host can still boot the local stack (Langfuse `3.225.5` still
+  applies on 24.8). The Helm chart default is `:25.12`, required by the
+  Langfuse pin's ClickHouse migrations from 39 onward; AVX is a chart-default
+  requirement. `preflights.avxCheck` fails an AVX-less node unless the
+  operator pins a tag in `clickhouse.sse42SafeTags`. Do not move the two
+  chart pins independently (#2210).
 - **Langfuse OTLP ingest is HTTP-only** (gRPC is silently unsupported). Services
   may emit OTLP over gRPC or HTTP to the OTel Collector (4317/4318); the
   collector always exports to Langfuse over HTTP. Send app traces to the
@@ -476,8 +480,18 @@ required and proved, not carried on the original classification.
 | local | compose services, dispatcher, worker, or API wiring, boot env crossing a service boundary, the console UI, or any `curie` verb whose output, exit code, or `--json` shape changed | `CURIE_E2E_TIERS=local curie dev e2e-ladder` |
 | local-release | released binary or image identity, the install path, version pins, release compose | `CURIE_E2E_TIERS=local-release curie dev e2e-ladder` |
 | cluster | chart templates, RBAC, securityContext, NetworkPolicy, sandbox claims, init containers | `CURIE_E2E_TIERS=cluster curie dev e2e-ladder`, or `curie dev chart-runtime-e2e` for a chart, sandbox, or bundle slice |
-| live provider | model routing, credential resolution, provider auth, token or cost accounting, meaning the product's own model and integration credentials, never the agent tooling that runs this workflow | the required rungs with `CURIE_E2E_LIVE=1`, since a fake-tier pass proves wiring and nothing about a real model |
-| external integration | Slack, git push webhooks, connector OAuth, or any third-party API shape | drive the real integration; a replayed fixture or a fake does not close this tier |
+| live provider | model routing, credential resolution, provider auth, token or cost accounting, meaning the product's own model and integration credentials, never the agent tooling that runs this workflow; also the MCP/workspace/coding-tool path set below | the required rungs with `CURIE_E2E_LIVE=1`, since a fake-tier pass proves wiring and nothing about a real model |
+| external integration | Slack, git push webhooks, connector OAuth, or any third-party API shape; Slack is required on the MCP/workspace/coding-tool path set below | drive the real integration; a replayed fixture or a fake does not close this tier |
+
+The path set is runner MCP catalog projection, unscoped PreToolUse,
+in-process platform MCP tools, workspace publication, and
+built-in coding-tool session capability. A behavior-bearing change that
+reaches any of those reaches both live-provider and Slack external-integration.
+Those two rows are required on that path. "No model routing change" is not a valid n/a reason.
+Fake-model kind, skill ladder, and helper-only tests remain useful and are
+not sufficient for those acceptance criteria. Leave the required-tier item
+open when the evidence is missing; do not close it by marking the row n/a.
+This rule does not pull the live e2e ladder onto unrelated pull requests.
 
 ### Evidence per acceptance criterion
 
@@ -559,7 +573,15 @@ forward merge from `main` into `next` happens at release candidate prep, not
 after every individual fix. Do not routinely cherry pick fixes between release
 lines.
 
-When a release candidate is accepted, merge `next` into `main`, then run every
+When a release candidate is accepted, merge `next` into `main` through a pull
+request whose head is a short-lived `task/release-*` branch cut from `next`,
+not through a pull request whose head is `next` itself. Repository auto-delete
+of merged heads stays enabled so task branches still clean up; an ordinary
+`next` to `main` PR therefore deletes `next` when the merger can bypass the
+deletion ruleset (issue #2090). Run
+`python3 release/preserve_next.py --repo <owner/name>` before enabling
+auto-merge: it refuses that ordinary path until the head is not `next` or an
+active deletion ruleset covers `next` with an empty bypass list. Then run every
 parity ladder rung on the resulting `main` commit:
 
 ```bash

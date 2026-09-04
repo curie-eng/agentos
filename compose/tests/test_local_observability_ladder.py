@@ -8,13 +8,20 @@ exported signal files, and run both healthy and injected-failure controls.
 
 from __future__ import annotations
 
+import json
+import os
+import re
+import subprocess
+import sys
 from pathlib import Path
 
+import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LADDER_PATH = REPO_ROOT / "cli" / "scripts" / "e2e-ladder.sh"
 SINK_CONFIG_PATH = REPO_ROOT / "cli" / "scripts" / "fixtures" / "otel-e2e-sink-config.yaml"
+MCP_RECEIPT_FIXTURE = REPO_ROOT / "cli" / "scripts" / "fixtures" / "mcp-receipt"
 
 
 def _function_body(source: str, name: str, next_marker: str) -> str:
@@ -23,6 +30,162 @@ def _function_body(source: str, name: str, next_marker: str) -> str:
     start = source.index(start_marker)
     end = source.index(next_marker, start)
     return source[start:end]
+
+
+def _shell_function(source: str, name: str) -> str:
+    """Return one top-level shell function without depending on its successor."""
+
+    start_marker = f"{name}() {{"
+    assert start_marker in source, f"{LADDER_PATH}: missing {name}"
+    start = source.index(start_marker)
+    end = source.index("\n}\n", start) + len("\n}\n")
+    return source[start:end]
+
+
+def _python_heredoc(function: str) -> str:
+    """Extract the sole quoted Python heredoc from a shell function."""
+
+    start = function.index("<<'PY'\n") + len("<<'PY'\n")
+    end = function.index("\nPY\n", start)
+    return function[start:end]
+
+
+def _run_seed_matcher(
+    tmp_path: Path, matcher: str, marker: str, rows: list[object]
+) -> subprocess.CompletedProcess[str]:
+    private_slice = tmp_path / "bounded-stream.json"
+    private_slice.write_text(json.dumps(rows))
+    return subprocess.run(
+        [sys.executable, "-", str(private_slice), marker],
+        input=matcher,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def _run_absent_trace_query(
+    tmp_path: Path, query: str, *, error: str
+) -> tuple[subprocess.CompletedProcess[str], int]:
+    """Run the real shell helper against a deterministic failing candidate CLI."""
+
+    count = tmp_path / "query-count"
+    fake_bin = tmp_path / "curie"
+    fake_bin.write_text(
+        "#!/bin/sh\n"
+        'count="$(cat "$FAKE_COUNT" 2>/dev/null || printf 0)"\n'
+        'count=$((count + 1))\n'
+        'printf "%s" "$count" > "$FAKE_COUNT"\n'
+        'printf \'{"error":"%s","fix":"retry exact id"}\\n\' "$FAKE_ERROR"\n'
+        "exit 1\n"
+    )
+    fake_bin.chmod(0o700)
+    script = f"""set -u
+sanitize_exact_trace_read() {{ return 1; }}
+{query}
+WORKDIR="$1"
+BIN="$2"
+OBSERVABILITY_POLL_ATTEMPTS=3
+OBSERVABILITY_POLL_INTERVAL_SECONDS=0
+CURIE_NAMESPACE=acme-observability
+CURIE_RELEASE=acme-observability
+query_exact_seed_trace local aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa "" "" absent
+"""
+    result = subprocess.run(
+        ["bash", "-c", script, "bash", str(tmp_path), str(fake_bin)],
+        env={**os.environ, "FAKE_COUNT": str(count), "FAKE_ERROR": error},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return result, int(count.read_text()) if count.exists() else 0
+
+
+def _run_product_classifier(
+    tmp_path: Path,
+    *,
+    local: dict[str, object] | None,
+    cluster: dict[str, object] | None,
+) -> subprocess.CompletedProcess[str]:
+    """Execute the production ownership classifier against explicit evidence."""
+
+    function = _shell_function(
+        LADDER_PATH.read_text(), "classify_product_observability_owner"
+    )
+    local_path = tmp_path / "local.json"
+    cluster_path = tmp_path / "cluster.json"
+    if local is not None:
+        local_path.write_text(json.dumps({**local, "surface": "local"}))
+    if cluster is not None:
+        cluster_path.write_text(json.dumps({**cluster, "surface": "cluster"}))
+    script = f"""set -u
+{function}
+LOCAL_PRODUCT_EVIDENCE="$1"
+CLUSTER_PRODUCT_EVIDENCE="$2"
+classify_product_observability_owner
+"""
+    return subprocess.run(
+        ["bash", "-c", script, "bash", str(local_path), str(cluster_path)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def _run_local_exact_positive(
+    tmp_path: Path,
+    *,
+    operations: tuple[str, ...],
+    expected_state: str = "present",
+) -> subprocess.CompletedProcess[str]:
+    """Drive the production local exact-read positive against a candidate CLI."""
+
+    source = LADDER_PATH.read_text()
+    sanitizer = _shell_function(source, "sanitize_exact_trace_read")
+    query = _shell_function(source, "query_exact_seed_trace")
+    trace_id = "a" * 32
+    response = tmp_path / "response.json"
+    response.write_text(
+        json.dumps(
+            {
+                "trace": {"id": trace_id},
+                "tree": [
+                    {"name": operation, "type": "SPAN", "children": []}
+                    for operation in operations
+                ],
+                "approval_decision": None,
+            }
+        )
+    )
+    fake_bin = tmp_path / "curie"
+    fake_bin.write_text('#!/bin/sh\ncat "$FAKE_TRACE_RESPONSE"\n')
+    fake_bin.chmod(0o700)
+    script = f"""set -u
+{sanitizer}
+{query}
+WORKDIR="$1"
+BIN="$2"
+OBSERVABILITY_POLL_ATTEMPTS=1
+OBSERVABILITY_POLL_INTERVAL_SECONDS=0
+CURIE_NAMESPACE=acme-observability
+CURIE_RELEASE=acme-observability
+query_exact_seed_trace local {trace_id} "curie.queue.enqueue,curie.reply.post" "" "$3"
+"""
+    return subprocess.run(
+        [
+            "bash",
+            "-c",
+            script,
+            "bash",
+            str(tmp_path),
+            str(fake_bin),
+            expected_state,
+        ],
+        env={**os.environ, "FAKE_TRACE_RESPONSE": str(response)},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
 
 
 def test_local_ladder_owns_a_real_queryable_otlp_sink() -> None:
@@ -49,7 +212,9 @@ def test_local_ladder_owns_a_real_queryable_otlp_sink() -> None:
     # The sink has to exist before `local up`, because service startup telemetry
     # and the ingress root are part of the proof. The query belongs after the
     # real turn finalized, not beside static compose/config assertions.
-    assert rung.index("start_local_otel_sink") < rung.index("local up)")
+    local_up = 'local up -f "$REPO_ROOT/compose.dev.yaml" --build'
+    assert local_up in rung, "the local rung must build the current compose source"
+    assert rung.index("start_local_otel_sink") < rung.index(local_up)
     assert rung.index("assert_local_otel_healthy_turn") > rung.index(
         'assert_finalized_reply "local"'
     )
@@ -243,3 +408,929 @@ def test_local_otel_controls_distinguish_a_live_sink_from_a_turn() -> None:
     assert "sleep 12" in helper, (
         "the failure baseline must outwait the 10-second metric export interval"
     )
+
+
+def test_product_oracle_discovers_only_the_seed_trace_from_bounded_transport(
+    tmp_path: Path,
+) -> None:
+    """A background/newest trace must be unable to satisfy the turn oracle."""
+
+    source = LADDER_PATH.read_text()
+    # The unavailable-API negative may still exercise the public runs verb, but
+    # no helper may select a turn from that list or dump a selected row. Inspect
+    # whole function bodies so `--limit "$limit"` cannot evade this contract.
+    functions = {
+        match.group(1): _shell_function(source, match.group(1))
+        for match in re.finditer(r"(?m)^([A-Za-z0-9_]+)\(\) \{$", source)
+    }
+    forbidden_selectors = {
+        name: body
+        for name, body in functions.items()
+        if "local observability runs" in body
+        and name != "prove_local_observability_queries"
+    }
+    assert not forbidden_selectors, (
+        "a newest-runs selector/raw-dump helper can choose an unrelated background "
+        f"trace regardless of limit interpolation: {sorted(forbidden_selectors)}"
+    )
+    for removed_helper in (
+        "discover_local_observability_trace",
+        "assert_local_observability_detail",
+    ):
+        assert removed_helper not in functions, (
+            f"obsolete raw selector/detail helper remains: {removed_helper}"
+        )
+
+    discover = _shell_function(source, "discover_trace_id_for_seed")
+    for required in (
+        "stream_start",
+        "stream_end",
+        "marker",
+        "XRANGE",
+        "traceparent",
+        "[0-9a-f]{32}",
+        "umask 077",
+    ):
+        assert required in discover, (
+            "exact discovery must inspect only the marker's bounded stream slice, "
+            f"validate its adjacent W3C carrier, and keep raw fields private; missing {required!r}"
+        )
+    assert "printf '%s\\n' \"$payload\"" not in discover
+    assert "printf '%s\\n' \"$traceparent\"" not in discover
+
+    matcher = _python_heredoc(discover)
+    marker = "curie-seed-ordinary-example"
+    target_trace = "a" * 32
+    background_trace = "b" * 32
+    background = [
+        "1-0",
+        [
+            "payload",
+            json.dumps({"text": "ordinary correlation another-seed"}),
+            "traceparent",
+            f"00-{background_trace}-{'1' * 16}-01",
+        ],
+    ]
+    target = [
+        "2-0",
+        [
+            "payload",
+            json.dumps({"text": f"ordinary correlation {marker}"}),
+            "traceparent",
+            f"00-{target_trace}-{'2' * 16}-01",
+        ],
+    ]
+    matched = _run_seed_matcher(tmp_path, matcher, marker, [background, target])
+    assert matched.returncode == 0, matched.stderr
+    assert matched.stdout.strip() == target_trace, (
+        "the real matcher must recover the carrier adjacent to a marker embedded "
+        "in representative QueuedTurn.text, never the background carrier"
+    )
+
+    mismatch = _run_seed_matcher(tmp_path, matcher, marker, [background])
+    assert mismatch.returncode != 0, (
+        "a background entry without the marker must not satisfy exact discovery"
+    )
+    duplicate = _run_seed_matcher(
+        tmp_path,
+        matcher,
+        marker,
+        [
+            target,
+            [
+                "3-0",
+                [
+                    "payload",
+                    json.dumps({"text": f"ordinary correlation {marker}"}),
+                    "traceparent",
+                    f"00-{'c' * 32}-{'3' * 16}-01",
+                ],
+            ],
+        ],
+    )
+    assert duplicate.returncode != 0, (
+        "more than one matching adjacent carrier must fail closed"
+    )
+
+    query = _shell_function(source, "query_exact_seed_trace")
+    assert 'observability run "$trace_id"' in query
+    assert "sanitize_exact_trace_read" in query
+    assert "observability runs" not in query
+    assert "printf '%s\\n' \"$out\"" not in query, (
+        "raw Langfuse JSON may contain prompt, user, session, and deployment fields"
+    )
+    sanitizer = _shell_function(source, "sanitize_exact_trace_read")
+    for allowed in (
+        "trace_id",
+        "service",
+        "operation",
+        "observation_count",
+        "observation_type",
+        "approval_decision",
+    ):
+        assert allowed in sanitizer, f"sanitized evidence omits safe field {allowed!r}"
+    for private in ("input", "output", "session", "user", "headers"):
+        assert private in sanitizer, (
+            f"sanitizer must explicitly prevent raw {private!r} from reaching stdout"
+        )
+    assert "if private_fields.intersection(node):\n        pass" not in sanitizer, (
+        "private-field handling must reject or remove data, not be a no-op"
+    )
+
+
+def test_product_evidence_sanitizer_and_failure_paths_never_dump_private_json(
+    tmp_path: Path,
+) -> None:
+    """Raw replies and private Langfuse fields stay in task-owned artifacts."""
+
+    source = LADDER_PATH.read_text()
+    sanitizer = _shell_function(source, "sanitize_exact_trace_read")
+    sanitizer_python = _python_heredoc(sanitizer)
+    trace_id = "d" * 32
+    private_sentinels = {
+        "input": "PRIVATE_PROMPT_SENTINEL",
+        "output": "PRIVATE_REPLY_SENTINEL",
+        "session": "PRIVATE_SESSION_SENTINEL",
+        "user": "PRIVATE_USER_SENTINEL",
+        "headers": {"authorization": "PRIVATE_HEADER_SENTINEL"},
+    }
+    raw = tmp_path / "raw-trace.json"
+    raw.write_text(
+        json.dumps(
+            {
+                "trace": {"id": trace_id},
+                "tree": [
+                    {
+                        "name": "curie.queue.enqueue",
+                        "type": "SPAN",
+                        "children": [],
+                        **private_sentinels,
+                    }
+                ],
+                "approval_decision": None,
+            }
+        )
+    )
+    result = subprocess.run(
+        [sys.executable, "-", trace_id, str(raw), "curie.queue.enqueue", ""],
+        input=sanitizer_python,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    evidence = json.loads(result.stdout)
+    assert set(evidence) == {
+        "trace_id",
+        "service",
+        "operation",
+        "observation_count",
+        "observation_type",
+        "approval_decision",
+    }
+    combined_output = result.stdout + result.stderr
+    for private_value in (
+        "PRIVATE_PROMPT_SENTINEL",
+        "PRIVATE_REPLY_SENTINEL",
+        "PRIVATE_SESSION_SENTINEL",
+        "PRIVATE_USER_SENTINEL",
+        "PRIVATE_HEADER_SENTINEL",
+    ):
+        assert private_value not in combined_output
+
+    finalized = _shell_function(source, "assert_finalized_reply")
+    for raw_dump in (
+        'printf \'%s\\n\' "$payload"',
+        'printf "%s\\n" "$payload"',
+        'echo "$payload"',
+    ):
+        assert raw_dump not in finalized, (
+            "message parse/finalization failures must report a bounded verdict, "
+            "not the private message JSON"
+        )
+
+
+def test_ordinary_mcp_and_approval_seeds_have_independent_receipts() -> None:
+    """An unexercised seed is seed-invalid before telemetry is interpreted."""
+
+    source = LADDER_PATH.read_text()
+    for name, required in {
+        "seed_ordinary_turn": ("assert_finalized_reply", "ordinary", "seed-invalid"),
+        "seed_mcp_read_turn": ("mcp_receipt_call_count", "seed-invalid"),
+        "seed_approval_resume_turn": (
+            "awaiting-approval",
+            "pending",
+            "resolve",
+            "assert_finalized_reply",
+            "seed-invalid",
+        ),
+    }.items():
+        body = _shell_function(source, name)
+        missing = [marker for marker in required if marker not in body]
+        assert not missing, f"{name} lacks independent outcome evidence: {missing}"
+        assert "discover_trace_id_for_seed" in body
+        assert "query_exact_seed_trace" in body
+
+    approval = _shell_function(source, "seed_approval_resume_turn")
+    assert "curie.approval.suspend" in approval, (
+        "the approval oracle must require the worker's real parked-turn span"
+    )
+    assert "curie.approval.wait" not in approval, (
+        "the oracle must not invent a wait span that no current emitter produces"
+    )
+
+    assert "seed-invalid" in source
+    assert MCP_RECEIPT_FIXTURE.is_dir(), (
+        "the MCP observation needs a hosted fixture whose container log is an "
+        "independent tools/call receipt ledger"
+    )
+    server = MCP_RECEIPT_FIXTURE / "server.py"
+    assert server.is_file()
+    fixture_source = server.read_text()
+    assert '"tools/call"' in fixture_source
+    assert "print(" in fixture_source
+    assert "flush=True" in fixture_source
+
+    receipt = _shell_function(source, "mcp_receipt_call_count")
+    assert "connector_container_for_alias" in receipt
+    assert "docker logs" in receipt or "kubectl logs" in receipt
+    assert "wc -l" in receipt or "count" in receipt
+    for forbidden in ("tool input", "arguments", "receipt line"):
+        assert forbidden not in receipt.lower(), (
+            "public evidence may expose only an aggregate MCP call count"
+        )
+
+
+def test_approval_resume_failure_evidence_is_bounded_and_private_artifacts_are_cleaned(
+    tmp_path: Path,
+) -> None:
+    """A failed background approval turn reports only a safe terminal verdict."""
+
+    source = LADDER_PATH.read_text()
+    approval = _shell_function(source, "seed_approval_resume_turn")
+    summary = _shell_function(source, "approval_resume_failure_summary")
+
+    assert 'message_stderr_file="$(mktemp "$WORKDIR/approval-message-stderr.XXXXXX")"' in approval
+    assert '2> "$message_stderr_file" &' in approval
+    assert (
+        'approval_resume_failure_summary "$message_file" "$message_stderr_file" "$code" >&2'
+        in approval
+    )
+    for cleanup in (
+        'rm -f "$message_file" "$message_stderr_file" "$token_file" "$pending_file"',
+        'rm -f "$message_file" "$message_stderr_file" "$pending_file"',
+        'rm -f "$message_file" "$message_stderr_file"',
+    ):
+        assert cleanup in approval, (
+            "every post-allocation approval failure path must remove the private "
+            "stdout and stderr artifacts"
+        )
+
+    private_stdout = tmp_path / "approval-message"
+    private_stderr = tmp_path / "approval-message-stderr"
+    private_stdout.write_text(
+        json.dumps(
+            {
+                "awaiting_approval": True,
+                "finalized": False,
+                "reply": "PRIVATE_REPLY_SENTINEL",
+                "error": "PRIVATE_TOKEN_SENTINEL",
+            }
+        )
+    )
+    private_stderr.write_text("timed out PRIVATE_STDERR_SENTINEL")
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            summary + '\napproval_resume_failure_summary "$1" "$2" 23\n',
+            "bash",
+            str(private_stdout),
+            str(private_stderr),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "exit_code=23" in result.stdout
+    assert "status=awaiting_approval" in result.stdout
+    assert "finalized=false" in result.stdout
+    assert "error_category=error_field" in result.stdout
+    assert "stderr_category=timed_out" in result.stdout
+    assert "PRIVATE_REPLY_SENTINEL" not in result.stdout + result.stderr
+    assert "PRIVATE_TOKEN_SENTINEL" not in result.stdout + result.stderr
+    assert "PRIVATE_STDERR_SENTINEL" not in result.stdout + result.stderr
+
+    private_stdout.write_text("PRIVATE_PARSE_SENTINEL")
+    private_stderr.write_text("could not parse PRIVATE_PARSE_STDERR_SENTINEL")
+    parse_result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            summary + '\napproval_resume_failure_summary "$1" "$2" 24\n',
+            "bash",
+            str(private_stdout),
+            str(private_stderr),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert parse_result.returncode == 0, parse_result.stderr
+    assert "status=parse_failure" in parse_result.stdout
+    assert "stderr_category=parse_failure" in parse_result.stdout
+    assert "PRIVATE_PARSE_SENTINEL" not in parse_result.stdout + parse_result.stderr
+    assert "PRIVATE_PARSE_STDERR_SENTINEL" not in parse_result.stdout + parse_result.stderr
+
+
+def test_approval_seed_background_message_is_owned_by_global_cleanup() -> None:
+    """Every approval-seed exit path must release its Slack stub before teardown."""
+
+    source = LADDER_PATH.read_text()
+    trap = _shell_function(source, "cleanup")
+    approval = _shell_function(source, "seed_approval_resume_turn")
+
+    assert "APPROVAL_SEED_MESSAGE_PID=$!" in approval
+    assert "stop_approval_seed_message terminate || true" in trap
+    assert trap.index("stop_approval_seed_message terminate || true") < trap.index(
+        '"$BIN" local down'
+    ), "the background Slack stub must stop before its stack is torn down"
+    assert approval.count("stop_approval_seed_message terminate || true") == 2
+    assert "stop_approval_seed_message || code=$?" in approval
+    for stale_local_wait in ('kill "$message_pid"', 'wait "$message_pid"'):
+        assert stale_local_wait not in approval
+
+
+def test_approval_seed_cleanup_terminates_and_clears_a_stale_pid() -> None:
+    """An interrupted seed cannot leave its background Slack stub alive."""
+
+    source = LADDER_PATH.read_text()
+    stop = _shell_function(source, "stop_approval_seed_message")
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f"""set -u
+{stop}
+APPROVAL_SEED_MESSAGE_PID=""
+sleep 30 &
+stale_pid=$!
+APPROVAL_SEED_MESSAGE_PID="$stale_pid"
+stop_approval_seed_message terminate || true
+[[ -z "$APPROVAL_SEED_MESSAGE_PID" ]]
+if kill -0 "$stale_pid" 2>/dev/null; then
+    exit 9
+fi
+""",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_product_collector_restore_restarts_and_verifies_every_seed_emitter() -> None:
+    """Worker-only restore cannot prove dispatcher, API, or runner delivery."""
+
+    source = LADDER_PATH.read_text()
+    restore = _shell_function(source, "route_local_observability_to_product_collector")
+    for service in (
+        "curie-api",
+        "curie-dispatcher",
+        "curie-worker",
+        "curie-runner",
+    ):
+        assert service in restore, (
+            f"{service} can keep the disposable sink endpoint unless it is recreated "
+            "or launched after product routing is restored"
+        )
+    assert "assert_product_collector_endpoint" in restore
+    assert (
+        "export OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318" in restore
+    )
+    assert (
+        "export CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:24318"
+        in restore
+    )
+    assert "export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf" in restore
+    assert "unset OTEL_EXPORTER_OTLP_ENDPOINT" not in restore
+    for protocol in ("http/protobuf", "otel-collector:4318"):
+        assert protocol in restore
+
+
+@pytest.mark.parametrize("owned", [0, 1])
+def test_current_source_images_survive_raw_compose_recreation(owned: int) -> None:
+    source = LADDER_PATH.read_text()
+    function = _shell_function(source, "pin_local_source_images")
+    keys = ("CURIE_BASE_TAG", "CURIE_RUNNER_IMAGE", "CURIE_DISPATCHER_IMAGE")
+    initial = dict.fromkeys(keys, "stale-example")
+    initial["OTEL_EXPORTER_OTLP_ENDPOINT"] = "http://collector.example.com:4318"
+    script = function + "\nLOCAL_STACK_OWNED=\"$1\"\npin_local_source_images\n"
+    script += (
+        "exec python3 -c 'import json,os; "
+        'print(json.dumps({key: os.environ[key] for key in '
+        '["CURIE_BASE_TAG", "CURIE_RUNNER_IMAGE", "CURIE_DISPATCHER_IMAGE", '
+        '"OTEL_EXPORTER_OTLP_ENDPOINT"]}))' + "'\n"
+    )
+    result = subprocess.run(
+        ["bash", "-c", script, "bash", str(owned)],
+        env={**os.environ, **initial}, text=True, capture_output=True, check=True,
+    )
+    child_env = json.loads(result.stdout)
+    expected = {
+        "CURIE_BASE_TAG": "dev",
+        "CURIE_RUNNER_IMAGE": "ghcr.io/curie-eng/curie-runner:dev",
+        "CURIE_DISPATCHER_IMAGE": "ghcr.io/curie-eng/curie-dispatcher:dev",
+    } if owned else {key: initial[key] for key in keys}
+    assert {key: child_env[key] for key in keys} == expected
+    assert child_env["OTEL_EXPORTER_OTLP_ENDPOINT"] == initial["OTEL_EXPORTER_OTLP_ENDPOINT"]
+    rung = _shell_function(source, "rung_local")
+    assert rung.index('"$BIN" "${up_args[@]}"') < rung.index("pin_local_source_images")
+    assert rung.index("pin_local_source_images") < rung.index("case_local_otel")
+
+
+@pytest.mark.parametrize(
+    ("response", "exit_code", "category"),
+    [
+        ({"error": "private-error-canary", "fix": "private-fix-canary"}, 3, "query-error"),
+        ({"trace": {}, "tree": []}, 0, "malformed-response"),
+        ({"trace": {"id": "a" * 32}, "tree": [{
+            "name": "agent.run", "type": "SPAN", "children": [],
+            "input": "private-input-canary",
+        }]}, 0, "incomplete-membership"),
+    ],
+)
+def test_exact_query_failure_reports_sanitized_reason(
+    tmp_path: Path, response: dict, exit_code: int, category: str
+) -> None:
+    source = LADDER_PATH.read_text()
+    fake_bin = tmp_path / "curie"
+    fake_bin.write_text('#!/bin/sh\nprintf "%s\\n" "$FAKE_RESPONSE"\nexit "$FAKE_EXIT"\n')
+    fake_bin.chmod(0o700)
+    script = _shell_function(source, "sanitize_exact_trace_read")
+    script += _shell_function(source, "query_exact_seed_trace")
+    script += '''
+WORKDIR="$1"
+BIN="$2"
+OBSERVABILITY_POLL_ATTEMPTS=1
+OBSERVABILITY_POLL_INTERVAL_SECONDS=0
+query_exact_seed_trace local aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa curie.queue.enqueue "" present
+'''
+    result = subprocess.run(
+        ["bash", "-c", script, "bash", str(tmp_path), str(fake_bin)],
+        env={**os.environ, "FAKE_RESPONSE": json.dumps(response), "FAKE_EXIT": str(exit_code)},
+        text=True, capture_output=True, check=False,
+    )
+    assert result.returncode == 1
+    assert category in result.stderr
+    assert "private-" not in result.stderr + result.stdout
+    if category == "incomplete-membership":
+        assert '"operation":["agent.run"]' in result.stderr
+
+
+def test_invalid_langfuse_auth_proves_permanent_rejection_and_fresh_recovery(
+    tmp_path: Path,
+) -> None:
+    """Pin the real backend negative without redefining exporter semantics."""
+
+    source = LADDER_PATH.read_text()
+    negative = _shell_function(source, "case_local_langfuse_invalid_auth")
+    query = _shell_function(source, "query_exact_seed_trace")
+
+    # OTLP requires retry for only 429/502/503/504; 401 MUST NOT be retried:
+    # https://opentelemetry.io/docs/specs/otlp/#retryable-response-codes
+    # The pinned Collector reports accepted+failed spans, permanent401 rejection,
+    # and queue0. Restored credentials must admit a NEW complete trace, not
+    # replay a permanently rejected batch.
+    for required in (
+        "LANGFUSE_OTLP_AUTH_HEADER",
+        "INVALID_LANGFUSE_OTLP_AUTH_HEADER",
+        "langfuse-web",
+        "otelcol_receiver_accepted_spans",
+        "otelcol_exporter_send_failed_spans",
+        "queue_size",
+        "Ready",
+        "restart",
+        "failed_trace_id",
+        "recovered_trace_id",
+        "HTTP Status Code 401",
+        "Permanent error",
+        "query_exact_seed_trace",
+    ):
+        assert required in negative, f"invalid-auth proof omits {required!r}"
+    assert "down -v" not in negative
+    assert "same_queued_trace_id" not in negative
+
+    invalid_auth = negative.index(
+        'export LANGFUSE_OTLP_AUTH_HEADER="$INVALID_LANGFUSE_OTLP_AUTH_HEADER"'
+    )
+    control = negative.find('query_exact_seed_trace local "$LAST_ORDINARY_TRACE_ID"')
+    assert 0 <= control < invalid_auth, (
+        "a successful exact read under valid auth must discriminate backend/query "
+        "health before the credential is made invalid"
+    )
+
+    # Execute the production query helper: absence is a bounded observation,
+    # not one lucky first poll, and only the stable not-found error is accepted.
+    stable_absence_dir = tmp_path / "stable-absence"
+    stable_absence_dir.mkdir()
+    absent, polls = _run_absent_trace_query(
+        stable_absence_dir, query, error="exact trace not found"
+    )
+    assert absent.returncode == 0, absent.stderr
+    assert polls == 3, (
+        "temporary absence must remain not-found for the full declared poll bound"
+    )
+
+    wrong_failure_dir = tmp_path / "wrong-failure"
+    wrong_failure_dir.mkdir()
+    wrong_failure, _ = _run_absent_trace_query(
+        wrong_failure_dir, query, error="Langfuse authorization failed"
+    )
+    assert wrong_failure.returncode != 0, (
+        "an arbitrary candidate-CLI exit 1 must not masquerade as stable not-found"
+    )
+
+    absent_call = re.search(
+        r'query_exact_seed_trace local "\$failed_trace_id"[^\n]*absent',
+        negative,
+    )
+    recovered_call = re.search(
+        r'query_exact_seed_trace local "\$recovered_trace_id"',
+        negative,
+        re.MULTILINE,
+    )
+    assert (
+        absent_call
+        and recovered_call
+        and absent_call.start() < recovered_call.start()
+    ), "the failed ID must be absent before a new complete recovery trace"
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "", "no-failed-metric", "no-rejection-log", "stuck-queue", "restart",
+        "reply", "absence", "restore", "recovery-query",
+    ],
+)
+def test_invalid_auth_requires_every_observation_and_always_restores(
+    tmp_path: Path, failure: str,
+) -> None:
+    """Execute the real gate under conditional Bash semantics (errexit disabled)."""
+    source = LADDER_PATH.read_text()
+    function = _shell_function(source, "assert_product_collector_permanent_auth_rejection")
+    function += _shell_function(source, "case_local_langfuse_invalid_auth")
+    script = r'''
+set -u -o pipefail
+WORKDIR="$1"
+REPO_ROOT="$2"
+FAILURE="$3"
+BIN=true
+LAST_ORDINARY_TRACE_ID=cccccccccccccccccccccccccccccccc
+sleep() { :; }
+docker() {
+    if [[ "$1" == logs ]]; then
+        [[ "$FAILURE" == no-rejection-log ]] ||
+            printf '%s\n' 'Permanent error: HTTP Status Code 401; not retryable error'
+    else
+        printf '%s\n' acme-collector
+    fi
+}
+restart_local_product_collector() { [[ "$FAILURE" != restart ]]; }
+wait_product_collector_ready() { return 0; }
+restore_local_langfuse_auth() {
+    printf '%s\n' restored >> "$WORKDIR/events"
+    [[ "$FAILURE" != restore ]]
+}
+assert_finalized_reply() { [[ "$FAILURE" != reply ]]; }
+assert_product_runner_endpoints() { return 0; }
+seed_ordinary_turn() { LAST_ORDINARY_TRACE_ID=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb; }
+capture_stream_cursor() { printf '%s\n' 1-0; }
+discover_trace_id_for_seed() {
+    if [[ -e "$WORKDIR/seeded" ]]; then
+        printf '%s\n' bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    else
+        touch "$WORKDIR/seeded"
+        printf '%s\n' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    fi
+}
+product_collector_metric_value() {
+    local count=0 file="$WORKDIR/$1"
+    [[ ! -e "$file" ]] || read -r count < "$file"
+    printf '%s\n' "$((count + 1))" > "$file"
+    case "$1" in
+        *queue_size) [[ "$FAILURE" != stuck-queue ]] && echo 0 || echo 1 ;;
+        *send_failed_spans)
+            [[ "$FAILURE" != no-failed-metric && "$count" -gt 0 ]] && echo 10 || echo 0 ;;
+        *accepted_spans) [[ "$count" -gt 0 ]] && echo 10 || echo 0 ;;
+    esac
+}
+query_exact_seed_trace() {
+    printf '%s\n' "query:$2:${3-}:${5-}" >> "$WORKDIR/events"
+    [[ "$2" != bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb || "$FAILURE" != recovery-query ]] || return 1
+    [[ "${5-}" != absent || "$FAILURE" != absence ]]
+}
+'''
+    script += function
+    script += '\nif case_local_langfuse_invalid_auth acme-agent; then exit 0; else exit 1; fi\n'
+    result = subprocess.run(
+        ["bash", "-c", script, "bash", str(tmp_path), str(REPO_ROOT), failure],
+        text=True, capture_output=True, check=False,
+    )
+    events = (tmp_path / "events").read_text()
+    assert events.count("restored") == 1
+    assert result.returncode == (1 if failure else 0), result.stderr
+    recovered = "query:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:curie.queue.enqueue,curie.queue.process"
+    if failure and failure != "recovery-query":
+        assert recovered not in events
+    else:
+        assert recovered in events
+        assert events.index(":absent") < events.index("restored") < events.index(recovered)
+
+
+def test_default_local_exact_positive_rejects_incomplete_membership(
+    tmp_path: Path,
+) -> None:
+    """Normal local is strict; only ownership diagnostics may retain a miss."""
+
+    source = LADDER_PATH.read_text()
+    rung = _function_body(source, "rung_local", "# local-release mode:")
+    assert "product_query_state=present" in rung
+    assert 'if [[ "$PRODUCT_OBSERVABILITY" == "1" ]]' in rung
+    assert rung.count("product_query_state=observe") == 1
+    assert 'seed_ordinary_turn local "$agent_id" "$product_query_state"' in rung
+    assert "invalid-auth negative skipped" not in rung
+
+    complete_dir = tmp_path / "complete"
+    complete_dir.mkdir()
+    complete = _run_local_exact_positive(
+        complete_dir,
+        operations=("curie.queue.enqueue", "curie.reply.post"),
+    )
+    assert complete.returncode == 0, complete.stderr
+
+    incomplete_dir = tmp_path / "incomplete"
+    incomplete_dir.mkdir()
+    incomplete = _run_local_exact_positive(
+        incomplete_dir,
+        operations=("curie.queue.enqueue",),
+    )
+    assert incomplete.returncode != 0, (
+        "the default local positive must fail when exact Langfuse membership is incomplete"
+    )
+
+    diagnostic_dir = tmp_path / "diagnostic"
+    diagnostic_dir.mkdir()
+    diagnostic = _run_local_exact_positive(
+        diagnostic_dir,
+        operations=("curie.queue.enqueue",),
+        expected_state="observe",
+    )
+    assert diagnostic.returncode == 0, (
+        "only explicit product ownership diagnostics may retain incomplete membership"
+    )
+
+
+def test_cluster_product_observability_is_private_preflight_and_query_only() -> None:
+    """The ladder may inspect a task release but must never install or remove it."""
+
+    source = LADDER_PATH.read_text()
+    preflight = _shell_function(source, "preflight_cluster_product_observability")
+    for required in (
+        "CURIE_NAMESPACE",
+        "CURIE_RELEASE",
+        "default",
+        "curie",
+        "langfuse",
+        "otel-collector",
+        "api",
+        "worker",
+        "runner-prewarm",
+        "imageID",
+        "docker image inspect",
+        "curie-api:local",
+        "curie-worker:local",
+        "curie-runner:latest",
+        "mismatch",
+    ):
+        assert required in preflight, f"cluster preflight omits {required!r}"
+
+    mode = _shell_function(source, "run_cluster_product_observability")
+    wrapper = _shell_function(source, "rung_cluster_product")
+    assert "preflight_cluster_product_observability" in mode
+    assert "seed_cluster_missing_carrier_control" in mode
+    assert "cluster_external_ingress_seed" in mode
+    assert "CURIE_E2E_CLUSTER_EXTERNAL_INGRESS_RECEIPT" in source
+    assert "CURIE_E2E_PRODUCT_RUN_ID" in source
+    assert "otelcol_receiver_accepted_spans_delta" in source
+    assert "otelcol_exporter_sent_spans_delta" in source
+    assert "cluster observability run" in mode
+    for manufactured in (
+        "enqueue_cluster_carried_turn",
+        "CLUSTER_SEEDED_TRACE_ID",
+        "secrets.token_hex",
+    ):
+        assert manufactured not in source, (
+            "cluster correlation evidence must be derived from a real accepted "
+            f"ingress path, not manufactured by the harness: {manufactured}"
+        )
+    assert "cluster deploy" in wrapper, (
+        "the wrapper must retain the intended agent seed deployment"
+    )
+    for mutating in (
+        "cluster up",
+        "cluster down",
+        "helm install",
+        "helm upgrade",
+        "helm uninstall",
+        "kubectl delete",
+    ):
+        for helper_name, helper in (
+            ("preflight", preflight),
+            ("query", mode),
+            ("product wrapper", wrapper),
+        ):
+            assert mutating not in helper, (
+                "product-observability preflight/query/wrapper must not manage the "
+                f"release; found {mutating!r} in {helper_name}"
+            )
+    assert '-o json > "$inventory"' not in preflight, (
+        "preflight must query Ready/imageID fields directly, not persist full pod "
+        "JSON that may contain private environment values"
+    )
+    assert "cluster-product-pods" not in preflight, (
+        "full pod specifications must not be persisted even in a mode-0600 artifact"
+    )
+
+
+def test_cluster_carrierless_control_and_external_slack_carrier_are_executed(
+    tmp_path: Path,
+) -> None:
+    """The fake cluster path stays negative; only Slack ingress can be positive."""
+
+    source = LADDER_PATH.read_text()
+    marker = "curie-seed-external-ordinary-example"
+    trace_id = "a" * 32
+    span_id = "b" * 16
+    payload_only = [
+        "2-0",
+        [
+            "payload",
+            json.dumps(
+                {
+                    "text": f"missing carrier compatibility {marker}",
+                    "reply_handle": {"adapter": "curie-cluster-message"},
+                }
+            ),
+        ],
+    ]
+    carried_slack = [
+        "3-0",
+        [
+            "payload",
+            json.dumps(
+                {
+                    "text": f"ordinary correlation {marker}",
+                    "reply_handle": {"kind": "slack", "adapter": None},
+                }
+            ),
+            "traceparent",
+            f"00-{trace_id}-{span_id}-01",
+        ],
+    ]
+
+    negative = _run_seed_matcher(
+        tmp_path,
+        _python_heredoc(_shell_function(source, "seed_cluster_missing_carrier_control")),
+        marker,
+        [payload_only],
+    )
+    assert negative.returncode == 0, negative.stderr
+
+    external_matcher = _python_heredoc(
+        _shell_function(source, "discover_cluster_external_trace_id")
+    )
+    positive = _run_seed_matcher(tmp_path, external_matcher, marker, [carried_slack])
+    assert positive.returncode == 0, positive.stderr
+    assert positive.stdout.strip() == trace_id
+
+    forged = _run_seed_matcher(
+        tmp_path,
+        external_matcher,
+        marker,
+        [
+            [
+                "4-0",
+                [
+                    "payload",
+                    json.dumps(
+                        {
+                            "text": f"ordinary correlation {marker}",
+                            "reply_handle": {"adapter": "curie-cluster-message"},
+                        }
+                    ),
+                    "traceparent",
+                    f"00-{trace_id}-{span_id}-01",
+                ],
+            ]
+        ],
+    )
+    assert forged.returncode != 0, (
+        "a harness/cluster-message-shaped entry must not satisfy real Slack ingress"
+    )
+
+
+def test_adopted_component_stop_requires_successful_export_on_both_product_surfaces(
+    tmp_path: Path,
+) -> None:
+    """Selective ingest loss is a dependency blocker only after Curie is cleared."""
+
+    source = LADDER_PATH.read_text()
+    decision = _shell_function(source, "classify_product_observability_owner")
+    for required in (
+        "raw_emitted_observations",
+        "otelcol_receiver_accepted_spans",
+        "otelcol_exporter_sent_spans",
+        "langfuse_observation_membership",
+        "local",
+        "cluster",
+        "image_ids_match",
+        "seed_valid",
+        "same_id_raw_collector_receipt",
+        "run_id",
+        "adopted-component",
+    ):
+        assert required in decision, f"ownership classification omits {required!r}"
+    assert decision.index("otelcol_exporter_sent_spans") < decision.index(
+        "adopted-component"
+    )
+    assert decision.index("langfuse_observation_membership") < decision.index(
+        "adopted-component"
+    )
+
+    def record(
+        *,
+        membership: bool,
+        same_id_raw: bool = True,
+        run_id: str = "run-example",
+    ) -> dict[str, object]:
+        return {
+            "run_id": run_id,
+            "seed_valid": True,
+            "same_id_raw_collector_receipt": same_id_raw,
+            "raw_emitted_observations": 3,
+            "otelcol_receiver_accepted_spans": 3,
+            "otelcol_exporter_sent_spans": 3,
+            "langfuse_observation_membership": membership,
+            "image_ids_match": True,
+        }
+
+    cases = (
+        (None, None, "curie-unresolved", False),
+        (record(membership=True, same_id_raw=False), None, "curie-clear", True),
+        (None, record(membership=True, same_id_raw=False), "curie-clear", True),
+        (record(membership=False, same_id_raw=False), None, "curie-unresolved", False),
+        (
+            {
+                key: value
+                for key, value in record(membership=True).items()
+                if key != "langfuse_observation_membership"
+            },
+            record(membership=True),
+            "curie-unresolved",
+            False,
+        ),
+        (
+            record(membership=True, run_id="run-one"),
+            record(membership=True, run_id="run-two"),
+            "curie-unresolved",
+            False,
+        ),
+        (record(membership=False), record(membership=False), "adopted-component", False),
+        (
+            record(membership=False, same_id_raw=False),
+            record(membership=False, same_id_raw=False),
+            "curie-unresolved",
+            False,
+        ),
+        (record(membership=True), record(membership=False), "curie-owned", False),
+        (
+            record(membership=True, same_id_raw=False),
+            record(membership=True),
+            "curie-clear",
+            True,
+        ),
+        (record(membership=True), record(membership=True), "curie-clear", True),
+    )
+    for index, (local, cluster, verdict, succeeds) in enumerate(cases):
+        case_dir = tmp_path / str(index)
+        case_dir.mkdir()
+        result = _run_product_classifier(case_dir, local=local, cluster=cluster)
+        assert verdict in result.stdout
+        assert (result.returncode == 0) is succeeds, (
+            "only complete same-run, positive export and exact membership may "
+            f"clear the STOP; verdict={verdict} stdout={result.stdout!r}"
+        )

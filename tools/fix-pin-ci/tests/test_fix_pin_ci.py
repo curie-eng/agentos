@@ -170,6 +170,54 @@ def _gh_call_log(tmp_path: Path) -> Path:
     return tmp_path / "gh-argv.json"
 
 
+def _github_output(tmp_path: Path) -> Path:
+    return tmp_path / "github-output.txt"
+
+
+def _run_needs_curie(
+    tmp_path: Path,
+    body: str | None,
+    *,
+    include_body: bool = True,
+    github_output: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    """Invoke the cargo-guard probe. It must reuse the declaration parser."""
+    event_path = _write_event(tmp_path, body, include_body=include_body)
+    environment = {**os.environ}
+    if github_output:
+        environment["GITHUB_OUTPUT"] = str(_github_output(tmp_path))
+    else:
+        environment.pop("GITHUB_OUTPUT", None)
+    return subprocess.run(
+        [
+            sys.executable,
+            str(CHECKER),
+            "--event",
+            str(event_path),
+            "--needs-curie",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        check=False,
+        env=environment,
+        text=True,
+    )
+
+
+def _needed_output(tmp_path: Path) -> str:
+    return _github_output(tmp_path).read_text(encoding="utf-8")
+
+
+def _is_fix_pin_gate(step: dict[str, Any]) -> bool:
+    run = _string(step, "run")
+    return "tools/fix-pin-ci/check.py" in run and "--needs-curie" not in run
+
+
+def _is_fix_pin_probe(step: dict[str, Any]) -> bool:
+    run = _string(step, "run")
+    return "tools/fix-pin-ci/check.py" in run and "--needs-curie" in run
+
+
 @pytest.mark.parametrize(
     ("body", "include_body"),
     [
@@ -580,11 +628,8 @@ def test_ci_keeps_the_required_python_status_and_calls_fix_pin_after_pytest() ->
         "the Python suite must run unfiltered: only reporting flags may be added "
         f"to `uv run pytest -q`, got {pytest_command!r}"
     )
-    gate_index = _single_step_index(
-        steps,
-        lambda step: "tools/fix-pin-ci/check.py" in _string(step, "run"),
-        "fix pin caller",
-    )
+    probe_index = _single_step_index(steps, _is_fix_pin_probe, "fix pin cargo probe")
+    gate_index = _single_step_index(steps, _is_fix_pin_gate, "fix pin caller")
     gate = steps[gate_index]
     assert _pull_request_only(gate), "the verifier must not run for pushes"
     assert stack_index < migration_index < pytest_index < gate_index
@@ -605,6 +650,21 @@ def test_ci_keeps_the_required_python_status_and_calls_fix_pin_after_pytest() ->
     ]
     assert '--event "$GITHUB_EVENT_PATH"' in _string(gate, "run")
 
+    probe = steps[probe_index]
+    assert _string(probe, "if") == "github.event_name == 'pull_request'", (
+        "the cargo probe must run for every pull request, including bodies with "
+        "no live selector; gating it on its own output would skip the decision"
+    )
+    assert probe.get("id") == "fix-pin-curie"
+    assert shlex.split(_string(probe, "run")) == [
+        "python3",
+        "tools/fix-pin-ci/check.py",
+        "--event",
+        "$GITHUB_EVENT_PATH",
+        "--needs-curie",
+    ]
+    assert '--event "$GITHUB_EVENT_PATH"' in _string(probe, "run")
+
     release_build_index = _single_step_index(
         steps,
         lambda step: _string(step, "run").strip()
@@ -621,7 +681,7 @@ def test_ci_keeps_the_required_python_status_and_calls_fix_pin_after_pytest() ->
     for index in (release_build_index, helm_index):
         assert _pull_request_only(steps[index]), "selector tooling must not affect push runs"
         assert pytest_index < index < gate_index
-    assert release_build_index < helm_index < gate_index
+    assert pytest_index < probe_index < release_build_index < helm_index < gate_index
     assert not any(
         _string(step, "uses") == "Swatinem/rust-cache@v2" for step in steps
     ), "the Python job must build directly without a Cargo cache dependency"
@@ -634,34 +694,39 @@ def test_ci_keeps_the_required_python_status_and_calls_fix_pin_after_pytest() ->
 
     diagnostic_index = _single_step_index(
         steps,
-        lambda step: "docker compose -f compose.dev.yaml logs" in _string(step, "run")
-        and _string(step, "if") == "failure()",
+        lambda step: "docker compose -f compose.dev.yaml logs" in _string(step, "run"),
         "failure stack diagnostic",
     )
+    diagnostic_if = _string(steps[diagnostic_index], "if")
+    assert "failure()" in diagnostic_if
+    assert "steps.python-runtime.outputs.pytest == 'true'" in diagnostic_if
     assert gate_index < diagnostic_index
 
 
-DECLARATION_GUARD = "contains(github.event.pull_request.body, 'Fix pin:')"
+CARGO_NEEDED_GUARD = "steps.fix-pin-curie.outputs.needed == 'true'"
+SUBSTRING_GUARD = "contains(github.event.pull_request.body, 'Fix pin:')"
 
 
-def test_selector_tooling_builds_only_when_the_body_declares_a_fix_pin() -> None:
-    """The cargo build must be gated on a declaration, and gated the safe way.
+def test_selector_tooling_builds_only_when_the_parser_would_invoke_curie() -> None:
+    """The cargo build must be gated on the declaration parser, not a substring.
 
     check.py reaches the binary at exactly one place, the `curie dev
     verify-fix-pin` call, and only once `declaration.selector` is set. `n/a`, no
-    declaration, a near-miss marker and the bug-without-declaration rejection all
-    return first. Building unconditionally therefore spent a cold
-    `cargo build --release` inside the longest job on the graph for a binary that
-    the majority of pull requests never run.
+    declaration, a near-miss marker, HTML-comment examples in the pull request
+    template, and the bug-without-declaration rejection all return first.
 
-    The guard must stay a strict SUPERSET of the cases that reach the binary.
-    `contains()` is case-insensitive and DECLARATION is the exact-case
-    `Fix pin: <selector>`, so a body that reaches the binary always contains the
-    substring. Skipping a build the gate then needs would be the unsafe
-    direction, and this pins that it cannot happen.
+    `#2228` gated cargo with `contains(..., 'Fix pin:')`. The default template
+    embeds those exact bytes inside `<!-- -->`, so the 3.5 min release build
+    still ran on every pull request that kept the template. The probe must
+    reuse `_declaration` so a commented example cannot trigger the build, and
+    a live `Fix pin: <selector>` line still cannot skip it.
     """
     document = _load_ci()
     _, steps = _python_job(document)
+
+    probe = steps[_single_step_index(steps, _is_fix_pin_probe, "fix pin cargo probe")]
+    assert probe.get("id") == "fix-pin-curie"
+    assert "--needs-curie" in shlex.split(_string(probe, "run"))
 
     for description, predicate in (
         (
@@ -678,24 +743,84 @@ def test_selector_tooling_builds_only_when_the_body_declares_a_fix_pin() -> None
         step = steps[_single_step_index(steps, predicate, description)]
         condition = _string(step, "if")
         assert PR_CONDITION.search(condition), f"{description} must stay pull-request only"
-        assert DECLARATION_GUARD in condition, (
-            f"{description} must build only when the body declares a Fix pin: {condition!r}"
+        assert CARGO_NEEDED_GUARD in condition, (
+            f"{description} must build only when the parser says the binary "
+            f"is needed: {condition!r}"
+        )
+        assert SUBSTRING_GUARD not in condition, (
+            f"{description} must not use the template-matching substring: {condition!r}"
         )
 
-    # The gate itself must NOT carry the guard. It is the step that decides a
-    # missing declaration is acceptable, and a body-shaped `if` on it would turn
-    # the "closes a bug with no declaration" rejection into a skipped step.
-    gate = steps[
-        _single_step_index(
-            steps,
-            lambda step: "tools/fix-pin-ci/check.py" in _string(step, "run"),
-            "fix pin caller",
-        )
-    ]
-    assert DECLARATION_GUARD not in _string(gate, "if"), (
+    # The gate itself must NOT carry the cargo guard. It is the step that
+    # decides a missing declaration is acceptable, and a body-shaped `if` on it
+    # would turn the "closes a bug with no declaration" rejection into a
+    # skipped step.
+    gate = steps[_single_step_index(steps, _is_fix_pin_gate, "fix pin caller")]
+    assert CARGO_NEEDED_GUARD not in _string(gate, "if"), (
         "the gate must still run for a body with no declaration, or the "
         "bug-without-declaration rejection can never fire"
     )
+    assert SUBSTRING_GUARD not in _string(gate, "if")
+
+
+def test_default_template_body_does_not_need_curie(tmp_path: Path) -> None:
+    """The template's commented `Fix pin:` examples must not trigger cargo."""
+    completed = _run_needs_curie(tmp_path, PR_TEMPLATE.read_text(encoding="utf-8"))
+
+    assert completed.returncode == 0, completed.stderr
+    assert _needed_output(tmp_path) == "needed=false\n"
+
+
+def test_real_selector_line_needs_curie(tmp_path: Path) -> None:
+    completed = _run_needs_curie(tmp_path, f"Fix pin: {VALID_SELECTOR}\n")
+
+    assert completed.returncode == 0, completed.stderr
+    assert _needed_output(tmp_path) == "needed=true\n"
+
+
+def test_template_plus_real_selector_still_needs_curie(tmp_path: Path) -> None:
+    body = PR_TEMPLATE.read_text(encoding="utf-8") + f"\nFix pin: {VALID_SELECTOR}\n"
+    completed = _run_needs_curie(tmp_path, body)
+
+    assert completed.returncode == 0, completed.stderr
+    assert _needed_output(tmp_path) == "needed=true\n"
+
+
+def test_not_applicable_does_not_need_curie(tmp_path: Path) -> None:
+    """`n/a` skips the verifier today, so cargo is extra work, not a requirement.
+
+    `#2228` documented building on `n/a` as a safe extra because `contains()`
+    could not tell it from a selector. The parser can, and the binary is not
+    invoked, so the probe reports needed=false.
+    """
+    completed = _run_needs_curie(
+        tmp_path, "Fix pin: n/a - the fix is a chart template with no test surface\n"
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert _needed_output(tmp_path) == "needed=false\n"
+
+
+def test_html_comment_selector_does_not_need_curie(tmp_path: Path) -> None:
+    completed = _run_needs_curie(tmp_path, f"<!-- Fix pin: {VALID_SELECTOR} -->\n")
+
+    assert completed.returncode == 0, completed.stderr
+    assert _needed_output(tmp_path) == "needed=false\n"
+
+
+def test_malformed_declaration_does_not_need_curie(tmp_path: Path) -> None:
+    """A declaration error fails the gate without calling curie."""
+    completed = _run_needs_curie(tmp_path, f" Fix pin: {VALID_SELECTOR}\n")
+
+    assert completed.returncode == 0, completed.stderr
+    assert _needed_output(tmp_path) == "needed=false\n"
+
+
+def test_needs_curie_fails_closed_without_github_output(tmp_path: Path) -> None:
+    completed = _run_needs_curie(tmp_path, f"Fix pin: {VALID_SELECTOR}\n", github_output=False)
+
+    assert completed.returncode != 0
+    assert "GITHUB_OUTPUT" in completed.stderr
 
 
 def test_pull_request_template_documents_the_required_declaration() -> None:

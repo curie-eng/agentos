@@ -32,6 +32,31 @@ class _MappingGetter(Getter[Mapping[str, str]]):
 _GETTER = _MappingGetter()
 
 
+def canonicalize_traceparent(value: str | None) -> str | None:
+    """Return a canonical W3C carrier, or ``None`` for unsafe input.
+
+    Validation is delegated to OpenTelemetry's W3C propagator so this helper
+    cannot drift into a second, partial implementation of the standard.  A
+    clean base also keeps invalid input from falling back to ambient context.
+    """
+
+    if value is None:
+        return None
+    candidate = value.strip()
+    if not candidate:
+        return None
+    extracted = _PROPAGATOR.extract(
+        {TRACEPARENT_STREAM_FIELD: candidate},
+        context=Context(),
+        getter=_GETTER,
+    )
+    if not trace.get_current_span(extracted).get_span_context().is_valid:
+        return None
+    canonical: dict[str, str] = {}
+    _PROPAGATOR.inject(canonical, context=_normalize_trace_context(extracted))
+    return canonical.get(TRACEPARENT_STREAM_FIELD)
+
+
 def _normalize_trace_context(context: Context | None = None) -> Context:
     """Normalize trace flags while retaining the active Context and its values."""
 

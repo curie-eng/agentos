@@ -152,13 +152,13 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/clickhouse-logging-assertions.sh
 
-      # Prove Langfuse honors valkey.existingSecret on a BYO valkey install
-      # (#2052). A supported BYO install (valkey.deploy=false + host +
-      # existingSecret) had every component read the operator's Secret except
-      # Langfuse, which stayed pinned to the chart-managed Secret -- so trace
-      # ingestion died alone while the rest of the release stayed healthy,
-      # which is why nothing pointed at the cause.
-      - name: helm render assertions (langfuse valkey existingSecret)
+      # Prove Langfuse honors existingSecret for BYO valkey, postgres, and its
+      # own app keys (#2052, #2327). A supported BYO install has every other
+      # component read the operator's Secret except Langfuse: api and worker
+      # authenticate against the real postgres while both Langfuse Deployments
+      # present the chart-generated password and crash-loop at Prisma auth --
+      # so ingestion dies alone while the rest of the release stays healthy.
+      - name: helm render assertions (langfuse store existingSecret)
         run: |
           set -euo pipefail
           bash charts/curie/ci/valkey-existing-secret-assertions.sh
@@ -219,6 +219,30 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/langfuse-image-pin-assertions.sh
+
+      # Refuse untagged and :latest image references in values *Image keys
+      # and in rendered container image fields (#2318). The security probe's
+      # netshoot image was the first miss: a bare repository pulls :latest
+      # with implicit Always.
+      - name: helm render assertions (unpinned images)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/unpinned-image-assertions.sh
+
+      # Keep the chart ClickHouse default and Langfuse pin as one supported
+      # pair. ClickHouse 24.8 cannot apply Langfuse 3.225.x migration 39, so
+      # the default must stay on 25.12 and AVX-required (#2210).
+      - name: helm render assertions (clickhouse langfuse pin pair)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/clickhouse-langfuse-pin-assertions.sh
+
+      # Prove both Langfuse Deployments use Recreate so an image change never
+      # runs two boot migrations against the same database (#2216).
+      - name: helm render assertions (langfuse Recreate strategy)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/langfuse-recreate-assertions.sh
 
       # Prove Langfuse startup is gated on ClickHouse being up (issue #2009). A
       # Helm upgrade that recreates the ClickHouse Service otherwise lets the new
@@ -351,9 +375,12 @@ jobs:
           bash charts/curie/ci/sandbox-emptydir-sizelimit-assertions.sh
 
       # Prove the dispatcher is told where the platform API is and how to
-      # authenticate to it (issue #442). Unwired, it falls back to its code
-      # default http://localhost:8000 -- itself -- and every Slack Approve click
-      # dead-ends with only a warning.
+      # authenticate to it (issue #442), and that the UI's CURIE_API_TARGET
+      # uses the same helper (issue #2316). Unwired, the dispatcher falls back
+      # to its code default http://localhost:8000 -- itself -- and every Slack
+      # Approve click dead-ends with only a warning. An unwired UI stays Ready
+      # while every /api/ request fails at the proxy, so api.deploy=false with
+      # an empty ui.apiBaseUrl must fail the render closed.
       - name: helm render assertions (dispatcher API wiring)
         run: |
           set -euo pipefail
@@ -447,20 +474,39 @@ jobs:
       - name: Sync workspace
         run: uv sync
 
-      # Prove the key-free object store path (#1325). Pointing the bundle store
-      # at a real cloud object store used to REQUIRE static access keys: all
-      # three consumers supplied explicit credentials unconditionally, so an
-      # ambient role was never consulted. Clearing rustfs.auth.accessKey now
-      # omits every credential env and shell export, which only works if the
-      # omission is COMPLETE -- an empty AWS_ACCESS_KEY_ID is still a credential
-      # to the SDK, so it stops the provider chain and the web-identity provider
-      # is never reached. Also asserts the instance-role shortcut stays shut:
-      # NetworkPolicy selects pods and not containers, so opening IMDS for
-      # bundle-fetch would hand the node's IAM role to the runner as well.
+      # Prove the key-free object store path (#1325, #2211). Pointing the bundle
+      # store at a real cloud object store used to REQUIRE static access keys:
+      # all four consumers (api, worker, bundle-fetch, Langfuse) supplied
+      # explicit credentials unconditionally, so an ambient role was never
+      # consulted. Clearing rustfs.auth.accessKey now omits every credential env
+      # and shell export, which only works if the omission is COMPLETE -- an
+      # empty AWS_ACCESS_KEY_ID is still a credential to the SDK, so it stops
+      # the provider chain and the web-identity provider is never reached. Also
+      # asserts the instance-role shortcut stays shut: NetworkPolicy selects
+      # pods and not containers, so opening IMDS for bundle-fetch would hand
+      # the node's IAM role to the runner as well.
       - name: helm render assertions (object store web identity)
         run: |
           set -euo pipefail
           bash charts/curie/ci/object-store-web-identity-assertions.sh
+
+      # Prove a BYO object store gets a runner egress allow for S3 (and STS on
+      # the key-free path). Rail 1 is fail-closed and the in-chart rustfs pod
+      # selector does not render when rustfs.deploy is false, so a default-shaped
+      # BYO install used to hang every sandbox in Init (#2213).
+      - name: helm render assertions (BYO object store runner egress)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/object-store-byo-egress-assertions.sh
+
+      # Prove a nil worker.publication.githubHttpsCidrs cannot collapse the
+      # tokenless publication job's GitHub egress rule to an empty to: (allow-all
+      # on 443). Also rejects that empty-to shape on every rendered
+      # NetworkPolicy, not just this one template (#2321).
+      - name: helm render assertions (NetworkPolicy empty egress to)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/networkpolicy-empty-to-assertions.sh
 
       - name: helm template + kubeconform (values-dev overlay)
         run: |

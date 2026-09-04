@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import httpx
+from curie_telemetry import inject_trace_context
 from slack_sdk.web import WebClient
 
 from .approval_principal import mint_chat_principal
@@ -233,6 +234,7 @@ class ApprovalResolveClient:
                 approval_id=approval_id,
             ),
         }
+        inject_trace_context(headers)
         try:
             response = self._client.post(
                 f"{self._base}/approvals/{approval_id}/resolve",

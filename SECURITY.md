@@ -37,7 +37,8 @@ The rails are the actual control. Every agent runs inside them:
   runner-sandbox pods is fail-closed: an empty `allowedEgress` means the sandbox
   can resolve DNS and ship traces, but reach nothing else. Arbitrary internet
   and the cloud metadata endpoint `169.254.169.254` are denied. Only
-  explicitly-declared egress is permitted: DNS, the in-chart collector, RustFS,
+  explicitly-declared egress is permitted: DNS, the in-chart collector, RustFS
+  (or `rustfs.egress` / `rustfs.stsEgress` when the object store is BYO),
   and inference when deployed, plus the operator's declared model API and MCP
   hosts via `allowedEgress`.
 - **gVisor kernel isolation** via a RuntimeClass (`security.gvisor.mode`).
@@ -140,8 +141,8 @@ admins maintain (issue #632).
   workflow runs `cargo audit` (Rust), `pip-audit` (the uv/Python workspace), and
   `pnpm audit` (the `apps/ui` JavaScript workspace) as advisory checks.
 - **CodeQL** static analysis over the Python and JavaScript/TypeScript code.
-- **Dependabot** keeps the four ecosystems (GitHub Actions, Cargo, uv, npm)
-  current through grouped weekly PRs (`.github/dependabot.yml`).
+- **Dependabot** keeps the five ecosystems (GitHub Actions, Cargo, uv, npm,
+  Docker) current through grouped weekly PRs (`.github/dependabot.yml`).
 - **Third-party actions and scanner images on sensitive workflows are pinned to
   immutable revisions** — a commit SHA for actions, a digest for images;
   first-party `actions/*` are referenced by major-version tag.

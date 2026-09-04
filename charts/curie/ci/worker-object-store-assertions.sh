@@ -30,6 +30,11 @@ rustfs:
   deploy: false
   host: s3.example.com
   port: 443
+  # Required once Rail 1 is on: the in-chart rustfs pod selector does not
+  # render on the BYO path (#2213). TEST-NET-1 stands in for the store CIDR.
+  egress:
+    - cidr: 192.0.2.10/32
+      ports: [{ protocol: TCP, port: 443 }]
 EOF
 
 # Capture Helm output in Python so a large manifest cannot be truncated by a
@@ -70,6 +75,8 @@ def assert_external_store_requires_hostname():
         "dev",
         "--set",
         "rustfs.deploy=false",
+        "--set",
+        "rustfs.egress[0].cidr=192.0.2.10/32",
     ]
     rendered = subprocess.run(command, capture_output=True, text=True)
     if rendered.returncode == 0:

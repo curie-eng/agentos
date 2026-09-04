@@ -266,16 +266,20 @@ def _sandbox_client(
                 "endpoint for local-model mode, or set CURIE_FAKE_MODEL=1 for an "
                 "offline/test run."
             )
-        if not env.get("OTEL_EXPORTER_OTLP_ENDPOINT"):
+        runner_otel_endpoint = env.get(
+            "CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT",
+            env.get("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
+        )
+        if not runner_otel_endpoint:
             logger.warning(
-                "Docker substrate selected but OTEL_EXPORTER_OTLP_ENDPOINT is "
-                "unset; runner traces will not be exported"
+                "Docker substrate selected but the runner OTLP endpoint is unset; "
+                "runner traces will not be exported"
             )
         client = DockerSandboxClient(
             image=env.get("CURIE_RUNNER_IMAGE", "curie-runner"),
             bundle_store=bundle_store,
             network=env.get("CURIE_DOCKER_NETWORK") or None,
-            otel_endpoint=env.get("OTEL_EXPORTER_OTLP_ENDPOINT") or None,
+            otel_endpoint=runner_otel_endpoint or None,
             default_plugin_dir=config.bundle_plugin_dir,
             # Container isolation for every spawned runner (#631): read-only
             # rootfs, dropped caps, no-new-privileges, bounded resources. Mirrors
