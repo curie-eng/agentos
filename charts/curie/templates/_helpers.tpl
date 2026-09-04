@@ -1204,6 +1204,35 @@ securityContext:
      This does NOT replace the worker's boot validator, which remains the
      backstop for the non-Helm substrates (Compose, bare env). It only moves the
      Helm-shaped failure from pod boot to render time, where it is actionable. */}}
+{{/* Drop extraEnv entries whose names collide with first-class worker timeout
+     and delivery-budget env. A v0.8.4 retained worker.extraEnv override of
+     CURIE_RUNNER_TOTAL_TIMEOUT_S used to render a second copy next to the
+     first-class key; Kubernetes then rejected the Deployment patch after Helm
+     had begun applying other resources (#2097, 2026-09-04 soak). First-class
+     values win. Non-colliding extraEnv entries still render. */}}
+{{- define "curie.worker.extraEnv" -}}
+{{- $reserved := dict
+  "CURIE_CLAIM_TIMEOUT_SECONDS" true
+  "CURIE_ROUTE_TTL_SECONDS" true
+  "CURIE_SUSPENDED_ROUTE_TTL_SECONDS" true
+  "CURIE_DELIVERY_BUDGET_S" true
+  "CURIE_RUNNER_TOTAL_TIMEOUT_S" true
+  "CURIE_DELIVERY_LEASE_TTL_S" true
+  "CURIE_DELIVERY_LEASE_HEARTBEAT_S" true
+  "CURIE_DELIVERY_SHUTDOWN_RESERVE_S" true
+  "CURIE_TERMINATION_GRACE_PERIOD_S" true
+-}}
+{{- $kept := list -}}
+{{- range .Values.worker.extraEnv }}
+{{- if and .name (not (hasKey $reserved .name)) -}}
+{{- $kept = append $kept . -}}
+{{- end -}}
+{{- end -}}
+{{- if $kept -}}
+{{- toYaml $kept -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "curie.worker.validateDrainBudget" -}}
 {{- $grace := int64 .Values.worker.terminationGracePeriodSeconds -}}
 {{- $budget := int64 .Values.worker.deliveryBudgetSeconds -}}

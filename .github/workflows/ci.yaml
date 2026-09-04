@@ -1415,13 +1415,15 @@ jobs:
             --ignore-not-found --wait=false 2>/dev/null || true
 
   # RELEASED CHART UPGRADE REGRESSION (issues #2097 and #2194). This is separate
-  # from the fresh install cluster rung because it starts from the exact public
-  # v0.8.2 chart and its published images. The candidate chart is then applied
-  # over retained release values on the same disposable kind cluster. The
-  # selector keeps this expensive history bearing path limited to chart,
-  # migration, and worker state key changes.
+  # from the fresh install cluster rung because it starts from published charts
+  # and their published image tags. v0.8.2 covers placement-null and blank
+  # attester retention. v0.8.4 covers the 2026-09-04 extraEnv timeout collision
+  # with live-manifest and target-version convergence. The candidate chart is
+  # then applied over retained release values on the same disposable kind
+  # cluster. The selector keeps this expensive history bearing path limited to
+  # chart, migration, and worker state key changes.
   e2e-released-upgrade:
-    name: E2E released chart upgrade (v0.8.2 to candidate)
+    name: E2E released chart upgrade (released install to candidate)
     runs-on: ubuntu-latest
     needs: [rust-build, changes]
     if: ${{ needs.changes.outputs.released_upgrade == 'true' }}
@@ -1567,6 +1569,16 @@ jobs:
             | sha256sum --check --strict
           test "$(helm show chart "$released_chart" | awk '$1 == "version:" {print $2}')" = "0.8.2"
           echo "RELEASED_CHART=$released_chart" >> "$GITHUB_ENV"
+      - name: Download and verify the exact public v0.8.4 chart
+        run: |
+          set -euo pipefail
+          released_chart_084="$RUNNER_TEMP/curie-0.8.4.tgz"
+          curl -fsSL -o "$released_chart_084" \
+            https://github.com/curie-eng/curie/releases/download/v0.8.4/curie-0.8.4.tgz
+          echo "fee20ab73c05d7a888165f980fb82d25150fcba509f19218bafc4c187a9044bb  $released_chart_084" \
+            | sha256sum --check --strict
+          test "$(helm show chart "$released_chart_084" | awk '$1 == "version:" {print $2}')" = "0.8.4"
+          echo "RELEASED_CHART_084=$released_chart_084" >> "$GITHUB_ENV"
       - name: Write the legacy retained values fixture
         run: |
           cat > "$RUNNER_TEMP/legacy-values.yaml" <<'EOF'
@@ -1581,6 +1593,18 @@ jobs:
           placement: null
           EOF
           echo "LEGACY_VALUES=$RUNNER_TEMP/legacy-values.yaml" >> "$GITHUB_ENV"
+      - name: Write the v0.8.4 retained timeout values fixture
+        run: |
+          cat > "$RUNNER_TEMP/v084-retained-timeout.yaml" <<'EOF'
+          security:
+            gvisor:
+              mode: "off"
+          worker:
+            extraEnv:
+              - name: CURIE_RUNNER_TOTAL_TIMEOUT_S
+                value: "1700"
+          EOF
+          echo "RELEASED_V084_VALUES=$RUNNER_TEMP/v084-retained-timeout.yaml" >> "$GITHUB_ENV"
       - name: Write the managed attester verifier
         run: |
           cat > "$RUNNER_TEMP/verify-managed-attester.sh" <<'EOF'
@@ -1733,6 +1757,51 @@ jobs:
             placement: .placement
           }' > "$RUNNER_TEMP/second-retained-values.json"
           cmp "$RUNNER_TEMP/retained-values.json" "$RUNNER_TEMP/second-retained-values.json"
+      - name: Replace the upgraded v0.8.2 release with the v0.8.4 baseline
+        run: |
+          set -euo pipefail
+          helm uninstall curie -n curie --wait --timeout 5m
+          kubectl delete namespace curie --wait=true --timeout=300s
+      - name: Install the exact public v0.8.4 release
+        run: |
+          set -euo pipefail
+          helm install curie "$RELEASED_CHART_084" \
+            -n curie --create-namespace -f "$RELEASED_V084_VALUES" --timeout 15m \
+            --set api.image.tag=0.8.4 --set api.image.digest=sha256:8804a35d0c96e9bb2ed0d4f6a990015aab9e9343f6c1ae0b5dc7307e37b50aaf \
+            --set dispatcher.image.tag=0.8.4 --set dispatcher.image.digest=sha256:ab6766db1f7d211e86f6bd816bb5c73ebfe6ee6cbcdf3dc9de9f9a26848bef47 \
+            --set worker.image.tag=0.8.4 --set worker.image.digest=sha256:c3117c30ac0a4cdd626c1170a8c976911da601f55781c9ffea6f1d85d4f02656 \
+            --set ui.image.tag=0.8.4 --set ui.image.digest=sha256:7e22c984e53478df9d70e96ec1fd3c73601396a23b378f7b9483ef8bf498477b \
+            --set agentSandbox.runner.tag=0.8.4 --set agentSandbox.runner.digest=sha256:4e19b285d4161d4667145ce9ea6e3efd11c1a9e22b1f1f2f49167994515b0b88
+          kubectl rollout status deploy/curie-api -n curie --timeout=600s
+          kubectl rollout status deploy/curie-dispatcher -n curie --timeout=600s
+          kubectl rollout status deploy/curie-worker -n curie --timeout=600s
+      - name: Upgrade the v0.8.4 release to the candidate chart
+        run: |
+          set -euo pipefail
+          helm upgrade curie charts/curie -n curie \
+            --reset-then-reuse-values --timeout 15m \
+            --set api.image.repository=curie-api --set api.image.tag=upgrade-candidate --set api.image.digest= --set api.image.pullPolicy=Never \
+            --set dispatcher.image.repository=curie-dispatcher --set dispatcher.image.tag=upgrade-candidate --set dispatcher.image.digest= --set dispatcher.image.pullPolicy=Never \
+            --set worker.image.repository=curie-worker --set worker.image.tag=upgrade-candidate --set worker.image.digest= --set worker.image.pullPolicy=Never \
+            --set ui.image.repository=curie-ui --set ui.image.tag=upgrade-candidate --set ui.image.digest= --set ui.image.pullPolicy=Never \
+            --set agentSandbox.runner.image=curie-runner --set agentSandbox.runner.tag=upgrade-candidate --set agentSandbox.runner.digest= --set agentSandbox.runner.imagePullPolicy=Never \
+            --set agentSandbox.runner.prewarm.imagePullPolicy=Never
+          kubectl rollout status deploy/curie-api -n curie --timeout=600s
+          kubectl rollout status deploy/curie-dispatcher -n curie --timeout=600s
+          kubectl rollout status deploy/curie-worker -n curie --timeout=600s
+      - name: Verify live-manifest parity and target-version convergence
+        run: |
+          set -euo pipefail
+          python3 -c "import yaml" 2>/dev/null || pip install --quiet pyyaml
+          helm get manifest curie -n curie > "$RUNNER_TEMP/helm-manifest.yaml"
+          kubectl get deploy curie-worker -n curie -o yaml > "$RUNNER_TEMP/live-worker.yaml"
+          helm get metadata curie -n curie > "$RUNNER_TEMP/helm-metadata.txt"
+          python3 charts/curie/ci/live_manifest_parity.py \
+            --helm-manifest "$RUNNER_TEMP/helm-manifest.yaml" \
+            --live-deploy "$RUNNER_TEMP/live-worker.yaml" \
+            --helm-metadata "$RUNNER_TEMP/helm-metadata.txt" \
+            --chart-yaml charts/curie/Chart.yaml \
+            --expect-env CURIE_RUNNER_TOTAL_TIMEOUT_S
       - name: Existing cluster rung smoke on the upgraded candidate
         env:
           CURIE_BIN: cli/target/release/curie

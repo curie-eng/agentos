@@ -641,6 +641,93 @@ fi'''
     assert named_steps["Tear down the disposable upgrade cluster"]["if"] == "always()"
 
 
+def test_released_upgrade_workflow_pins_issue_2097_live_manifest_parity() -> None:
+    workflow = yaml.safe_load(WORKFLOW.read_text())
+    job = workflow["jobs"]["e2e-released-upgrade"]
+    named_steps = {
+        step["name"]: step for step in job["steps"] if isinstance(step.get("name"), str)
+    }
+
+    download_run = named_steps["Download and verify the exact public v0.8.4 chart"][
+        "run"
+    ]
+    assert (
+        "https://github.com/curie-eng/curie/releases/download/"
+        "v0.8.4/curie-0.8.4.tgz"
+    ) in download_run
+    assert (
+        "fee20ab73c05d7a888165f980fb82d25150fcba509f19218bafc4c187a9044bb"
+    ) in download_run
+    assert 'sha256sum --check --strict' in download_run
+    assert 'test "$(helm show chart "$released_chart_084"' in download_run
+    assert ')" = "0.8.4"' in download_run
+
+    fixture_run = named_steps["Write the v0.8.4 retained timeout values fixture"]["run"]
+    for exact_line in (
+        "worker:",
+        "  extraEnv:",
+        "    - name: CURIE_RUNNER_TOTAL_TIMEOUT_S",
+        '      value: "1700"',
+        '    mode: "off"',
+    ):
+        assert exact_line in fixture_run
+
+    published_image_pins = (
+        "--set api.image.tag=0.8.4 --set api.image.digest="
+        "sha256:8804a35d0c96e9bb2ed0d4f6a990015aab9e9343f6c1ae0b5dc7307e37b50aaf",
+        "--set dispatcher.image.tag=0.8.4 --set dispatcher.image.digest="
+        "sha256:ab6766db1f7d211e86f6bd816bb5c73ebfe6ee6cbcdf3dc9de9f9a26848bef47",
+        "--set worker.image.tag=0.8.4 --set worker.image.digest="
+        "sha256:c3117c30ac0a4cdd626c1170a8c976911da601f55781c9ffea6f1d85d4f02656",
+        "--set ui.image.tag=0.8.4 --set ui.image.digest="
+        "sha256:7e22c984e53478df9d70e96ec1fd3c73601396a23b378f7b9483ef8bf498477b",
+        "--set agentSandbox.runner.tag=0.8.4 --set agentSandbox.runner.digest="
+        "sha256:4e19b285d4161d4667145ce9ea6e3efd11c1a9e22b1f1f2f49167994515b0b88",
+    )
+    install_run = named_steps["Install the exact public v0.8.4 release"]["run"]
+    assert "helm install" in install_run
+    for pin in published_image_pins:
+        assert pin in install_run
+    assert "$RELEASED_V084_VALUES" in install_run
+
+    upgrade_run = named_steps["Upgrade the v0.8.4 release to the candidate chart"]["run"]
+    assert "helm upgrade curie charts/curie -n curie" in upgrade_run
+    assert "--reset-then-reuse-values" in upgrade_run
+    assert (
+        "--set worker.image.repository=curie-worker "
+        "--set worker.image.tag=upgrade-candidate"
+    ) in upgrade_run
+
+    parity_run = named_steps[
+        "Verify live-manifest parity and target-version convergence"
+    ]["run"]
+    assert "charts/curie/ci/live_manifest_parity.py" in parity_run
+    assert "helm get manifest" in parity_run
+    assert "kubectl get deploy" in parity_run
+    assert "helm get metadata" in parity_run
+    assert "charts/curie/Chart.yaml" in parity_run
+    assert "CURIE_RUNNER_TOTAL_TIMEOUT_S" in parity_run
+
+    smoke = named_steps["Existing cluster rung smoke on the upgraded candidate"]
+    assert smoke["env"]["CURIE_E2E_TIERS"] == "cluster"
+    assert "bash cli/scripts/e2e-ladder.sh" in smoke["run"]
+    install_names = [step.get("name") for step in job["steps"]]
+    assert install_names.index("Install the exact public v0.8.4 release") < (
+        install_names.index("Existing cluster rung smoke on the upgraded candidate")
+    )
+    assert "Nil unsafe helper negative control" in named_steps
+
+    helm_ci = yaml.safe_load(
+        (REPO_ROOT / ".github" / "workflows" / "helm-ci.yaml").read_text()
+    )
+    helm_runs = "\n".join(
+        step.get("run", "")
+        for step in helm_ci["jobs"]["helm"]["steps"]
+        if isinstance(step.get("run"), str)
+    )
+    assert "charts/curie/ci/live_manifest_parity.py --self-test" in helm_runs
+
+
 def _aggregate_contract() -> tuple[str, dict[str, str]]:
     workflow = yaml.safe_load(WORKFLOW.read_text())
     job = workflow["jobs"]["e2e-required"]
