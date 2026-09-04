@@ -1025,6 +1025,7 @@ expected = {
     ("Deployment", f"{prefix}-otel-collector"): "platform",
     ("Deployment", f"{prefix}-langfuse-web"): "platform",
     ("Deployment", f"{prefix}-langfuse-worker"): "platform",
+    ("Deployment", f"{prefix}-mail-adapter"): "platform",
     ("StatefulSet", f"{prefix}-postgres"): "data",
     ("StatefulSet", f"{prefix}-valkey"): "data",
     ("StatefulSet", f"{prefix}-clickhouse"): "data",
@@ -1041,6 +1042,9 @@ expected = {
     # The pre-upgrade drain gate and its post-upgrade release (issue #2010).
     ("Job", f"{prefix}-upgrade-drain"): "hooks",
     ("Job", f"{prefix}-upgrade-drain-release"): "hooks",
+    ("Job", f"{prefix}-grafana-token-updater"): "hooks",
+    ("Job", f"{prefix}-grafana-token-cleanup"): "hooks",
+    ("Job", f"{prefix}-mail-persistence-preflight"): "hooks",
     ("Pod", f"{prefix}-security-probe-hardening"): "hooks",
     ("Deployment", "agent-sandbox-controller"): "controller",
 }
@@ -1174,12 +1178,19 @@ else:
 PYEOF
 
 # Enable every conditional pod surface so the expected inventory is exhaustive.
+# mailAdapter.deploy also needs a narrow provider CIDR (fail-closed egress) and
+# an existingClaim so the persistence preflight Job actually renders. The Job
+# name is mail-persistence-preflight, not mail-adapter-persistence.
 PLACEMENT_HELM_ARGS=(
   --set dispatcher.slack.appToken=xapp-placement-render
   --set dispatcher.slack.botToken=xoxb-placement-render
   --set inference.deploy=true
   --set inference.persistence.enabled=true
   --set security.gvisor.mode=require
+  --set mailAdapter.deploy=true
+  --set 'mailAdapter.agentmail.httpsCidrs[0]=203.0.113.0/24'
+  --set mailAdapter.persistence.existingClaim=placement-render-mail-state
+  --set grafanaConnector.enabled=true
 )
 
 PLACEMENT_OUT="$(mktemp -d -p "$TMP")"
