@@ -88,13 +88,20 @@ class SessionStatus(StrEnum):
 
 
 class Event(_AciModel):
-    """An inbound event delivered into a live session (initial or follow-up)."""
+    """An inbound event delivered into a live session (initial or follow-up).
+
+    ``session_id`` and ``history_ref`` carry conversation-scoped identity to a
+    runner after its sandbox is bound. Both remain optional so older producers
+    can omit them and tolerant consumers can adopt the additive wire shape.
+    """
 
     kind: Literal["event"] = "event"
     type: Literal["message", "job", "eval_case"]
     text: str
     user: str
     ts: str
+    session_id: str | None = None
+    history_ref: str | None = None
 
 
 class Interrupt(_AciModel):

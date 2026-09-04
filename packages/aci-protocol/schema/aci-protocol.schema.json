@@ -776,12 +776,36 @@
       "type": "object"
     },
     "Event": {
-      "description": "An inbound event delivered into a live session (initial or follow-up).",
+      "description": "An inbound event delivered into a live session (initial or follow-up).\n\n``session_id`` and ``history_ref`` carry conversation-scoped identity to a\nrunner after its sandbox is bound. Both remain optional so older producers\ncan omit them and tolerant consumers can adopt the additive wire shape.",
       "properties": {
+        "history_ref": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "History Ref"
+        },
         "kind": {
           "const": "event",
           "title": "Kind",
           "type": "string"
+        },
+        "session_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Session Id"
         },
         "text": {
           "title": "Text",
@@ -1372,6 +1396,6 @@
   },
   "$id": "https://curietech.ai/schemas/aci-protocol.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "protocolVersion": "0.4.3",
-  "title": "ACI Protocol v0.4.3"
+  "protocolVersion": "0.4.4",
+  "title": "ACI Protocol v0.4.4"
 }

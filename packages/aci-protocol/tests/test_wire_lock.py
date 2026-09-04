@@ -173,3 +173,11 @@ def test_committed_lock_matches_the_current_wire() -> None:
     lock = json.loads(lock_path.read_text(encoding="utf-8"))
     assert lock["protocol_version"] == PROTOCOL_VERSION
     assert lock["wire_sha256"] == wire_fingerprint()
+
+
+def test_event_session_context_contract_uses_patch_version_0_4_4() -> None:
+    lock_path = schema_export.schema_path().parent / "wire.lock"
+    lock = json.loads(lock_path.read_text(encoding="utf-8"))
+
+    assert PROTOCOL_VERSION == "0.4.4"
+    assert lock["protocol_version"] == "0.4.4"
