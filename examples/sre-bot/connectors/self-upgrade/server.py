@@ -1,4 +1,11 @@
-"""A write connector that can do exactly one thing: start this bot's upgrade.
+"""Two gated upgrade buttons and one read. None of them takes an argument.
+
+`upgrade_self` redeploys this bot's own bundle. `upgrade_platform` moves the
+Curie release underneath it. `latest_release` says what version is available.
+
+The two writes are the same mechanism pointed at different operator-written
+CronJob templates, which is why they share `_start_job_from` rather than being
+two files kept in step.
 
 Why the bot cannot just do the upgrade itself
 ---------------------------------------------
@@ -16,12 +23,28 @@ start that one Job and learn its name. It cannot say what the Job runs.
 
 Why a separate server, and why zero arguments
 ----------------------------------------------
-This connector exposes one zero-argument tool, so there is no second action for
-a gate to miss and no parameter through which a caller could reach an image, an
+There is no parameter through which a caller could reach an image, an
 environment variable, or a command. The repository, the branch, the agent
 name, the image and the command all come from the CronJob's own `jobTemplate`,
 read from the cluster at call time. There is no field a caller can influence, so
 there is nothing to validate and nothing to escape.
+
+There are three tools here now, and the "nothing for a gate to miss" argument
+holds differently than it did with one. Both writes are gated, and both are
+zero-argument buttons that copy a template verbatim -- so the property that
+matters is not the COUNT of tools but that no tool takes caller input. A gate
+cannot be missed here because there is no unclassified verb: two writes, two
+gates, one read that changes nothing and holds no credential.
+
+What would break it is a tool growing a parameter. That is the line, and it is
+worth restating because the obvious next request -- "let me name the version" --
+is exactly that.
+
+It lives here rather than in its own connector because it answers the same
+question from the other side. "What version is available" is what a person asks
+immediately before "can we upgrade", and splitting them across two images, two
+publish jobs and two declarations buys separation between a read and a write
+that share a repository, a domain, and no credential at all.
 
 The grant RBAC cannot narrow, and what stands in for it
 --------------------------------------------------------
@@ -35,7 +58,7 @@ template verbatim, and the CronJob is named by operator configuration
 Read that grant honestly when reviewing this: a leaked credential from this pod
 could create an arbitrary Job in this namespace. It is bounded by the same thing
 every other connector's credential is bounded by -- it never leaves the pod, and
-the pod exposes one no-argument tool.
+no tool takes caller input.
 
 NOT REVERSIBLE, and it says so
 -------------------------------
