@@ -71,6 +71,12 @@ banned in this contract, so all three tiers are written out in full:
 - local tier: `curie local status --json` then `curie local eval --json`
 - cluster tier: `curie cluster status --json` then `curie cluster eval --json`
 
+**After `curie cluster upgrade --to 0.9.0 --json`:** `status` is `"succeeded"`
+only when `convergence.exact` is true and `canary.passed` is true. A failed
+attempt reports `previous_serving` or one `fail_forward.command`. Resume by
+re-running the same command. `curie cluster status --json` reports the current
+upgrade phase and `known_good_version`.
+
 At the skill tier the bundle is the session, so there is no separate deploy
 <!-- doclint:ignore-line -->
 step. `eval` runs the bundle's OWN `evals/cases.json` at every tier. Default

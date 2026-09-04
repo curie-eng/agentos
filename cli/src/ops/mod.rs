@@ -1,4 +1,4 @@
-//! `curie cluster up | cluster status | cluster rollback | cluster down`: the operator
+//! `curie cluster up | cluster upgrade | cluster status | cluster rollback | cluster down`: the operator
 //! day-1 lifecycle, wrapping the Helm chart and `kubectl` the way linkerd or
 //! cilium wrap theirs -- a deliberately thin CLI over the chart, which stays the
 //! source of truth. Every verb shells out to the `helm`/`kubectl` binaries; the
@@ -12,11 +12,13 @@
 mod command;
 mod providers;
 mod up;
+mod upgrade;
 mod verbs;
 
 pub use command::*;
 pub use providers::*;
 pub use up::*;
+pub use upgrade::*;
 pub use verbs::*;
 
 /// Fixtures shared by more than one submodule's `mod tests`. They live

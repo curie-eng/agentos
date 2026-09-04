@@ -1064,7 +1064,7 @@ use curie::local::{
 };
 use curie::ops::{
     ClusterDownOutput, ClusterRollbackOutput, ClusterStatus, ClusterStatusOutput, ClusterUpOutput,
-    PodRow,
+    ClusterUpgradeOutput, PodRow,
 };
 use curie::secrets::SecretsListOutput;
 
@@ -2396,6 +2396,7 @@ fn cluster_status_output_validates_both_variants() {
         unhealthy: vec![],
         pods_listed: true,
         urls: vec![],
+        upgrade: curie::ops::UpgradeStatusView::idle(Some("0.8.6".into())),
     };
     let out = ClusterStatusOutput::Status(Box::new(status));
     assert_valid("cluster-status.schema.json", &out.to_json());
@@ -2463,6 +2464,73 @@ fn cluster_rollback_output_validates_all_variants() {
         forced: true,
     };
     assert_valid("cluster-rollback.schema.json", &forced.to_json());
+}
+
+#[test]
+fn cluster_upgrade_output_validates_dry_run_success_and_failure() {
+    let dry = ClusterUpgradeOutput::DryRun(DryRunPlan {
+        lines: vec!["phase plan: 0.8.6 -> 0.9.0".to_string()],
+    });
+    assert_valid("cluster-upgrade.schema.json", &dry.to_json());
+    let succeeded = ClusterUpgradeOutput::Completed {
+        status: "succeeded".into(),
+        phase: "commit".into(),
+        target_version: "0.9.0".into(),
+        from_version: Some("0.8.6".into()),
+        known_good_version: Some("0.9.0".into()),
+        resumed: false,
+        previous_serving: true,
+        unchanged: false,
+        plan: vec!["phase plan: 0.8.6 -> 0.9.0".into()],
+        convergence: Some(curie::ops::Convergence {
+            exact: true,
+            images: true,
+            generations: true,
+            replicas: true,
+            unavailable_zero: true,
+            hooks_healthy: true,
+            queues_drained: true,
+            manifest_matches: true,
+        }),
+        canary: Some(curie::ops::Canary { passed: true }),
+        fail_forward: None,
+    };
+    assert_valid("cluster-upgrade.schema.json", &succeeded.to_json());
+    let failed = ClusterUpgradeOutput::Completed {
+        status: "failed".into(),
+        phase: "canary".into(),
+        target_version: "0.9.0".into(),
+        from_version: Some("0.8.6".into()),
+        known_good_version: Some("0.8.6".into()),
+        resumed: false,
+        previous_serving: true,
+        unchanged: false,
+        plan: vec!["phase plan: 0.8.6 -> 0.9.0".into()],
+        convergence: Some(curie::ops::Convergence {
+            exact: true,
+            images: true,
+            generations: true,
+            replicas: true,
+            unavailable_zero: true,
+            hooks_healthy: true,
+            queues_drained: true,
+            manifest_matches: true,
+        }),
+        canary: Some(curie::ops::Canary { passed: false }),
+        fail_forward: Some(curie::ops::FailForward {
+            command: "curie cluster rollback --yes".into(),
+            reason: "canary failed".into(),
+        }),
+    };
+    assert_valid("cluster-upgrade.schema.json", &failed.to_json());
+    let mut bad = succeeded.to_json();
+    bad["canary"]["passed"] = serde_json::json!(false);
+    let schema = load_schema("cluster-upgrade.schema.json");
+    let v = validator(&schema);
+    assert!(
+        !v.is_valid(&bad),
+        "success without a passing canary must not validate"
+    );
 }
 
 #[test]

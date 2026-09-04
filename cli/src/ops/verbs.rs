@@ -600,6 +600,7 @@ pub struct ClusterStatus {
     pub unhealthy: Vec<String>,
     pub pods_listed: bool,
     pub urls: Vec<ServiceUrl>,
+    pub upgrade: super::upgrade::UpgradeStatusView,
 }
 
 impl crate::ui::CliOutput for ClusterStatusOutput {
@@ -621,6 +622,7 @@ impl crate::ui::CliOutput for ClusterStatusOutput {
                     },
                     "urls": s.urls.iter().map(ServiceUrl::to_json).collect::<Vec<_>>(),
                     "healthy": healthy,
+                    "upgrade": s.upgrade.to_json(),
                 })
             }
         }
@@ -644,6 +646,12 @@ impl crate::ui::CliOutput for ClusterStatusOutput {
                 for url in &s.urls {
                     url.render(ui);
                 }
+                ui.payload(&format!(
+                    "upgrade {} · phase {} · known-good {}",
+                    s.upgrade.status,
+                    s.upgrade.phase.as_deref().unwrap_or("idle"),
+                    s.upgrade.known_good_version.as_deref().unwrap_or("none")
+                ));
                 if s.total > 0 && s.ready == s.total && s.unhealthy.is_empty() {
                     ui.success(&format!("healthy ({}/{} pods ready)", s.ready, s.total));
                 } else if s.total == 0 {
@@ -725,6 +733,14 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
         resolve_service_url(&opts, &fullname, "langfuse-web", "Langfuse", &host, false).await,
     ];
 
+    let chart_version = helm_ok.then(|| field("CHART:", "").trim().to_string());
+    let upgrade = super::upgrade::load_upgrade_status(
+        &opts.namespace,
+        &opts.release,
+        chart_version.filter(|v| !v.is_empty()),
+    )
+    .await;
+
     Ok(ClusterStatusOutput::Status(Box::new(ClusterStatus {
         namespace: opts.namespace.clone(),
         revision,
@@ -737,6 +753,7 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
         unhealthy,
         pods_listed: ok,
         urls,
+        upgrade,
     })))
 }
 
