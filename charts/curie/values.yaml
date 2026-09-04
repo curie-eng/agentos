@@ -119,6 +119,14 @@ langfuse:
     # 39 onward need that ClickHouse version. Do not advance this pin without
     # it, and do not move ClickHouse off 25.12 while this pin stays (#2210).
     tag: "3.225.5"
+    # Optional immutable content digest per image (#2332). Set one and it wins
+    # over `tag` for that image, rendering `repo@sha256:...`; empty (the
+    # default) keeps the reviewed tag path above byte-for-byte. Give the bare
+    # `sha256:<64 hex>` form only -- a full `repo@sha256:...` here renders
+    # `repo@sha256:...@sha256:...` and the kubelet rejects it as
+    # InvalidImageName, which is the failure this key exists to end.
+    webDigest: ""
+    workerDigest: ""
   telemetryEnabled: false
   enableExperimentalFeatures: true
   # Startup gate on the ClickHouse endpoint Langfuse boots against (issue
@@ -371,6 +379,14 @@ clickhouse:
   image:
     repository: clickhouse/clickhouse-server
     tag: "25.12"
+    # Optional immutable content digest (#2332). Set it and it wins over `tag`,
+    # rendering `repo@sha256:...`; empty (the default) keeps the pinned tag
+    # path byte-for-byte. Bare `sha256:<64 hex>` only -- a full
+    # `repo@sha256:...` renders an InvalidImageName reference. The AVX
+    # preflight still evaluates `clickhouse.image.tag` against `sse42SafeTags`,
+    # so keep `tag` set to the version these bytes correspond to when pinning
+    # by digest, or the preflight judges the wrong build.
+    digest: ""
   # Tags whose upstream binaries still ship an SSE4.2 build (no AVX required).
   # The AVX preflight passes an AVX-less node only if the configured tag begins
   # with one of these. Not a supported default: 25.12 is required by the
