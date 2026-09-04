@@ -819,6 +819,7 @@ python3 "$RUNNER_API_CHECK" "$RUNNER_API_OUT" present \
 RUNNER_API_OFF_OUT="$(mktemp -d -p "$TMP")"
 helm template runner-api-render "$CHART" --namespace runner-api-namespace \
   --set api.deploy=false \
+  --set ui.deploy=false \
   --output-dir "$RUNNER_API_OFF_OUT" > /dev/null
 python3 "$RUNNER_API_CHECK" "$RUNNER_API_OFF_OUT" absent \
   || fail "api.deploy=false did not remove the runner sandbox API egress allowance."
@@ -1476,6 +1477,8 @@ cat > "$WORKER_API_BYO" <<'EOF'
 api:
   deploy: false
 dispatcher:
+  apiBaseUrl: https://byo-api.example
+ui:
   apiBaseUrl: https://byo-api.example
 EOF
 assert_worker_api byo curie https://byo-api.example chart -f "$WORKER_API_BYO"

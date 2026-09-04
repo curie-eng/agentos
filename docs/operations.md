@@ -537,6 +537,8 @@ independently; the chart cannot safely infer IP ranges from a hostname:
 ```yaml
 api:
   deploy: false
+ui:
+  apiBaseUrl: https://api.example.com:8443
 mailAdapter:
   apiBaseUrl: https://api.example.com:8443
   apiEgress:

@@ -312,6 +312,7 @@ assert_env_value "$api_port_dir" CURIE_API_URL "http://curie-api:9999" \
   "The port must come from .Values.api.service.port, not a hardcoded 8000."
 byo_api_dir="$(render byo-api "${ON[@]}" "${CREDS[@]}" \
   --set api.deploy=false \
+  --set ui.deploy=false \
   --set mailAdapter.apiBaseUrl=https://byo-api.example:8443 \
   --set 'mailAdapter.apiEgress.httpsCidrs[0]=198.51.100.0/24' \
   --set mailAdapter.apiEgress.port=8443)"
@@ -755,10 +756,12 @@ assert_render_fails_named \
   "mailAdapter.apiEgress.httpsCidrs" \
   "${ON[@]}" "${CREDS[@]}" \
   --set api.deploy=false \
+  --set ui.deploy=false \
   --set mailAdapter.apiBaseUrl=https://byo-api.example:8443
 
 byo_api_default_port_dir="$(render byo-api-default-port "${ON[@]}" "${CREDS[@]}" \
   --set api.deploy=false \
+  --set ui.deploy=false \
   --set mailAdapter.apiBaseUrl=http://byo-api.example:8000 \
   --set 'mailAdapter.apiEgress.httpsCidrs[0]=198.51.100.128/25')"
 
@@ -846,6 +849,7 @@ assert_render_fails_named \
   "mailAdapter.apiEgress.httpsCidrs" \
   "${ON[@]}" "${CREDS[@]}" \
   --set api.deploy=false \
+  --set ui.deploy=false \
   --set mailAdapter.apiBaseUrl=https://byo-api.example:8443 \
   --set-string 'mailAdapter.apiEgress.httpsCidrs[0]=0.0.0.0/1' \
   --set-string 'mailAdapter.apiEgress.httpsCidrs[1]=128.0.0.0/1' \
