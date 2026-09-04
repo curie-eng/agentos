@@ -344,11 +344,8 @@ spec:
 # below for the current set rather than trusting a count in prose.
 #
 # With otelCollector.deploy false and an external otelCollector.endpoint set,
-# this policy has no peer for that address and the adapter's OTLP export is
-# dropped here; it is the only first-party service with an egress policy, so
-# api/dispatcher/worker are unaffected. NetworkPolicies union, so the operator
-# applies their own additional egress policy selecting this adapter's labels.
-# The chart deliberately invents no broad allow for an address it cannot know.
+# this policy has no peer for that address and OTLP export is dropped; see
+# charts/curie/README.md for the operator remedy.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
