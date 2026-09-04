@@ -566,7 +566,12 @@ def quantity_is_finite(value):
 
 
 def workload_containers(path):
-    """Return the four first-party Python workload containers by role."""
+    """Return the api/dispatcher/worker Deployments and the runner SandboxTemplate container, by role.
+
+    Not the authoritative instrumented set: the mail adapter also carries the
+    shared OTLP env and is pinned in ci/mail-adapter-wiring-assertions.sh. It
+    cannot appear here because these renders never set mailAdapter.deploy.
+    """
     selected = {}
     for doc in documents(path):
         kind = doc.get("kind")

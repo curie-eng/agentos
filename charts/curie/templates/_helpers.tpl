@@ -509,8 +509,11 @@ http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.
 
 {{/* Fail closed on contradictory OTEL values always. Fail closed on accidental
      missing only when security.checkDefaultCredentials is on: local/offline
-     no-endpoint remains valid outside that gate. extraEnv-only does not satisfy
-     the production gate because the four workloads can drift. */}}
+     no-endpoint remains valid outside that gate. The instrumented set is
+     exactly the workloads that include curie.env.otel, recorded in
+     charts/curie/CLAUDE.md; extraEnv-only does not satisfy the production gate
+     because it would configure each of them independently and any one can
+     drift. */}}
 {{- define "curie.otel.validate" -}}
 {{- $otel := .Values.otelCollector -}}
 {{- if and $otel.telemetryDisabled $otel.deploy -}}
