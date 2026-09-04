@@ -725,7 +725,7 @@ def test_released_upgrade_workflow_pins_issue_2097_live_manifest_parity() -> Non
         for step in helm_ci["jobs"]["helm"]["steps"]
         if isinstance(step.get("run"), str)
     )
-    assert "charts/curie/ci/live_manifest_parity.py --self-test" in helm_runs
+    assert "charts/curie/ci/live-manifest-parity-assertions.sh" in helm_runs
 
 
 def _aggregate_contract() -> tuple[str, dict[str, str]]:

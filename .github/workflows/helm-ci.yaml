@@ -436,7 +436,7 @@ jobs:
       - name: live-manifest parity verifier self-test
         run: |
           set -euo pipefail
-          python3 charts/curie/ci/live_manifest_parity.py --self-test
+          bash charts/curie/ci/live-manifest-parity-assertions.sh
 
       # Prove the API and the worker agree about the object store. The API writes
       # each uploaded plugin bundle to the bundle bucket and the worker reads it

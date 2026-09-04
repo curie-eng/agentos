@@ -1762,6 +1762,10 @@ jobs:
           set -euo pipefail
           helm uninstall curie -n curie --wait --timeout 5m
           kubectl delete namespace curie --wait=true --timeout=300s
+      # v0.8.4 deploys the dispatcher only when Slack tokens are set, and the
+      # retained extraEnv timeout crash-loops the worker on this baseline
+      # (1700 above delivery budget 600). Wait for the API only; worker
+      # health is asserted after the candidate upgrade drops the duplicate.
       - name: Install the exact public v0.8.4 release
         run: |
           set -euo pipefail
@@ -1773,8 +1777,6 @@ jobs:
             --set ui.image.tag=0.8.4 --set ui.image.digest=sha256:7e22c984e53478df9d70e96ec1fd3c73601396a23b378f7b9483ef8bf498477b \
             --set agentSandbox.runner.tag=0.8.4 --set agentSandbox.runner.digest=sha256:4e19b285d4161d4667145ce9ea6e3efd11c1a9e22b1f1f2f49167994515b0b88
           kubectl rollout status deploy/curie-api -n curie --timeout=600s
-          kubectl rollout status deploy/curie-dispatcher -n curie --timeout=600s
-          kubectl rollout status deploy/curie-worker -n curie --timeout=600s
       - name: Upgrade the v0.8.4 release to the candidate chart
         run: |
           set -euo pipefail
@@ -1787,7 +1789,6 @@ jobs:
             --set agentSandbox.runner.image=curie-runner --set agentSandbox.runner.tag=upgrade-candidate --set agentSandbox.runner.digest= --set agentSandbox.runner.imagePullPolicy=Never \
             --set agentSandbox.runner.prewarm.imagePullPolicy=Never
           kubectl rollout status deploy/curie-api -n curie --timeout=600s
-          kubectl rollout status deploy/curie-dispatcher -n curie --timeout=600s
           kubectl rollout status deploy/curie-worker -n curie --timeout=600s
       - name: Verify live-manifest parity and target-version convergence
         run: |
