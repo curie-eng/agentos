@@ -151,7 +151,7 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0119 | [A resumed thread rebuilds its prefix so the prompt cache still hits](0119-a-resumed-thread-rebuilds-its-prefix-so-the-prompt-cache-still-hits.md) | Accepted |
 | 0120 | [First-party email delivery state is local durable single-writer state](0120-durable-first-party-email-state.md) | Accepted |
 | 0121 | [A restore is the connector's own verb, run under the same pinned connector](0121-a-restore-is-the-connectors-own-verb-run-under-the-same-pinned-connector.md) | Draft |
-| 0122 | [A warm pool's runner token is per version, not per pod](0122-a-warm-pools-runner-token-is-per-version-not-per-pod.md) | Draft |
+| 0122 | [A warm pool's runner token is per version, not per pod](0122-a-warm-pools-runner-token-is-per-version-not-per-pod.md) | Accepted |
 | 0123 | [A pending approval's approver set does not follow its route binding](0123-a-pending-approvals-approver-set-does-not-follow-its-route-binding.md) | Accepted |
 | 0124 | [A snapshot is sealed to the connector that wrote it](0124-a-snapshot-is-sealed-to-the-connector-that-wrote-it.md) | Draft |
 | 0125 | [Managed repository workspaces and approval-gated publication are platform capabilities](0125-managed-repository-workspaces-and-approval-gated-publication.md) | Accepted |
