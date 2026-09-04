@@ -641,6 +641,26 @@ fi'''
     assert named_steps["Tear down the disposable upgrade cluster"]["if"] == "always()"
 
 
+def test_released_upgrade_candidate_images_opt_into_forward_only_migrations() -> None:
+    workflow = yaml.safe_load(WORKFLOW.read_text())
+    steps = workflow["jobs"]["e2e-released-upgrade"]["steps"]
+    named_steps = {
+        step["name"]: step for step in steps if isinstance(step.get("name"), str)
+    }
+
+    candidate_upgrade_steps = (
+        "Upgrade the legacy release to the candidate chart",
+        "Upgrade a second time and preserve the generated attester",
+        "Upgrade the v0.8.4 release to the candidate chart",
+        "Existing cluster rung smoke on the upgraded candidate",
+    )
+    for name in candidate_upgrade_steps:
+        run = named_steps[name]["run"]
+        assert "helm upgrade curie charts/curie -n curie" in run
+        assert "--set api.image.tag=upgrade-candidate" in run
+        assert "--set api.migrate.forwardOnly=true" in run
+
+
 def test_released_upgrade_workflow_pins_issue_2097_live_manifest_parity() -> None:
     workflow = yaml.safe_load(WORKFLOW.read_text())
     job = workflow["jobs"]["e2e-released-upgrade"]

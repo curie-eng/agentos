@@ -1690,6 +1690,7 @@ jobs:
           set -euo pipefail
           helm upgrade curie charts/curie -n curie \
             --reset-then-reuse-values --timeout 15m \
+            --set api.migrate.forwardOnly=true \
             --set api.image.repository=curie-api --set api.image.tag=upgrade-candidate --set api.image.digest= --set api.image.pullPolicy=Never \
             --set dispatcher.image.repository=curie-dispatcher --set dispatcher.image.tag=upgrade-candidate --set dispatcher.image.digest= --set dispatcher.image.pullPolicy=Never \
             --set worker.image.repository=curie-worker --set worker.image.tag=upgrade-candidate --set worker.image.digest= --set worker.image.pullPolicy=Never \
@@ -1735,6 +1736,7 @@ jobs:
           set -euo pipefail
           helm upgrade curie charts/curie -n curie \
             --reset-then-reuse-values --timeout 15m \
+            --set api.migrate.forwardOnly=true \
             --set api.image.repository=curie-api --set api.image.tag=upgrade-candidate --set api.image.digest= --set api.image.pullPolicy=Never \
             --set dispatcher.image.repository=curie-dispatcher --set dispatcher.image.tag=upgrade-candidate --set dispatcher.image.digest= --set dispatcher.image.pullPolicy=Never \
             --set worker.image.repository=curie-worker --set worker.image.tag=upgrade-candidate --set worker.image.digest= --set worker.image.pullPolicy=Never \
@@ -1788,6 +1790,7 @@ jobs:
           kubectl delete deploy/curie-worker -n curie --wait=true --timeout=120s
           helm upgrade curie charts/curie -n curie \
             --reset-then-reuse-values --timeout 15m \
+            --set api.migrate.forwardOnly=true \
             --set api.image.repository=curie-api --set api.image.tag=upgrade-candidate --set api.image.digest= --set api.image.pullPolicy=Never \
             --set dispatcher.image.repository=curie-dispatcher --set dispatcher.image.tag=upgrade-candidate --set dispatcher.image.digest= --set dispatcher.image.pullPolicy=Never \
             --set worker.image.repository=curie-worker --set worker.image.tag=upgrade-candidate --set worker.image.digest= --set worker.image.pullPolicy=Never \
@@ -1817,6 +1820,7 @@ jobs:
           set -euo pipefail
           helm upgrade curie charts/curie -n curie \
             --reset-then-reuse-values --timeout 15m \
+            --set api.migrate.forwardOnly=true \
             --set dispatcher.deploy=false \
             --set dispatcher.image.repository=curie-dispatcher --set dispatcher.image.tag=upgrade-candidate --set dispatcher.image.digest= --set dispatcher.image.pullPolicy=Never \
             --set ui.service.type=NodePort --set ui.service.nodePort=30080 \
