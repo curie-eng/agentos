@@ -1314,14 +1314,15 @@ securityContext:
      ClickHouse that answers slowly needs a longer timeout, not a patched chart.
 
      Call with a dict: `root` (the chart context), `image` (the component's
-     image repository), `containerSecurityContext` and `resources` (the
+     fully-rendered image reference, built by curie.image so a digest pin
+     reaches the gate too), `containerSecurityContext` and `resources` (the
      component's, so the gate inherits the same posture and the pod's effective
      request is unchanged -- init and app container requests are maxed, not
      summed). */}}
 {{- define "curie.langfuse.clickhouseGate" -}}
 {{- $root := .root -}}
 - name: wait-for-clickhouse
-  image: "{{ .image }}:{{ $root.Values.langfuse.image.tag }}"
+  image: {{ .image | quote }}
   imagePullPolicy: {{ $root.Values.global.imagePullPolicy }}
   {{- with .containerSecurityContext }}
   securityContext:
