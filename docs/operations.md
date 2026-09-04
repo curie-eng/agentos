@@ -145,6 +145,7 @@ curie cluster up
 | `--clear-github-token` | Remove the stored GitHub credential. Not a revocation: the running API keeps the old token until its pod restarts (`cluster up` prints the restart command), and the token itself stays valid at GitHub until you revoke it there. |
 | `--allow-egress-host <provider>` (repeatable) | Explicitly open runner egress on TCP 443 to one named model provider: `anthropic`, `openrouter`, `zhipu`, `moonshot`, or `deepseek`. Names are lowercase exact. An explicit list must include the provider detected from an `sk-ant-` or `sk-or-` credential. |
 | `--allow-web-egress <CIDR>` (repeatable) | Open runner egress on TCP 443 to an arbitrary CIDR (Classless Inter-Domain Routing block) -- for skill/tool web access, or a provider not covered above. |
+| `--forward-only` | Apply contract or irreversible schema migrations during this upgrade. The default refuses those migrations before mutation so a patch rollback window stays intact. Expand-only patch migrations do not need the flag. |
 
 A downloaded release binary needs no repo checkout; the chart resolves from
 the version-pinned release asset by default.

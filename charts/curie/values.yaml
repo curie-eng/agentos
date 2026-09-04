@@ -965,11 +965,15 @@ api:
       # A Secret you supply, or one cert-manager creates from the annotation
       # above. Empty means "use the controller's default certificate".
       secretName: ""
-  # Run `alembic upgrade head` in an init container before the server starts, so
-  # a fresh Postgres gets the `curie` schema + tables. Disable only when an
-  # external migration step owns the DB.
+  # Schema migrations run in one upgrade Job (templates/schema-migrate.yaml),
+  # not in every API pod. The API init container waits until the live revision
+  # is inside this image's declared window. Disable only when an external
+  # migration step owns the DB.
   migrate:
     enabled: true
+    # Apply contract/irreversible migrations. Default false refuses them
+    # before mutation so a patch rollback window stays intact (#2300).
+    forwardOnly: false
   # Resume reconciler (#411): the background loop that re-enqueues resume turns
   # for approvals whose inline enqueue failed, so a suspended session is never
   # permanently stranded. `enabled` is the off-switch -- with it false the loop

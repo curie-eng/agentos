@@ -342,6 +342,13 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/upgrade-drain-assertions.sh
 
+      # Schema migrations run in one hook Job (#2300). Prove the Job is the
+      # migrator, the API init only waits, and forward-only is opt-in.
+      - name: helm render assertions (schema migrate phase)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/schema-migrate-assertions.sh
+
       # The resume reconciler may enqueue a replacement turn only after the
       # prior delivery has exhausted both its delivery budget and terminal
       # settlement reserve. Prove the default derives from that floor and an

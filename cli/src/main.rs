@@ -2050,6 +2050,11 @@ enum ClusterAction {
         /// Print the helm command that would run and exit without executing.
         #[arg(long)]
         dry_run: bool,
+        /// Apply contract or irreversible schema migrations. Without this flag
+        /// the upgrade Job refuses those migrations before mutation so a patch
+        /// rollback window stays intact (#2300).
+        #[arg(long = "forward-only")]
+        forward_only: bool,
     },
     /// Uninstall the release and sweep its runtime namespaces, running helm
     /// uninstall followed by kubectl delete namespace. The namespace delete
@@ -3676,7 +3681,12 @@ async fn run(command: Option<Command>) -> Result<()> {
                 set,
                 dev,
                 dry_run,
+                forward_only,
             } => {
+                let mut set = set;
+                if forward_only {
+                    set.push("api.migrate.forwardOnly=true".to_string());
+                }
                 let resolved = artifacts::resolve_chart(
                     chart.as_deref(),
                     artifacts::Channel::current(),
