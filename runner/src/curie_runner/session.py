@@ -40,7 +40,7 @@ from claude_agent_sdk import AssistantMessage, ResultMessage
 from curie_telemetry import record_metric
 from opentelemetry.context import Context
 
-from .adapter import ModelSession, PartialMessageBoundary
+from .adapter import ModelSession, PartialMessageBoundary, StreamedToolUseBoundary
 from .approval import ApprovalGate
 from .budget import BUDGET_CLASSIFICATION, BudgetTracker
 from .history import NullTranscriptStore, TranscriptStore, TurnRecord
@@ -720,6 +720,14 @@ class SessionRunner:
         gen.query_observed()
         await self._session.query(event.text)
         async for message in self._session.receive_turn():
+            if isinstance(message, StreamedToolUseBoundary):
+                gen.record_first_response_boundary()
+                gen.streamed_tool_use(
+                    message.call_id,
+                    message.tool_name,
+                    observed_time_ns=message.observed_time_ns,
+                )
+                continue
             if isinstance(message, PartialMessageBoundary):
                 gen.record_first_response_boundary()
                 continue
