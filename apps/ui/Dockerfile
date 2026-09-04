@@ -44,6 +44,16 @@ server {
     root /usr/share/nginx/html;
     index index.html;
 
+    # Compress static text payloads. The single Vite JS bundle is about
+    # 567 kB raw and about 155 kB gzipped, and it is render-blocking for the
+    # SPA, so shrinking it on the wire is worth the CPU. text/html is always
+    # gzipped by nginx and cannot be listed here.
+    gzip on;
+    gzip_vary on;
+    gzip_comp_level 6;
+    gzip_min_length 1024;
+    gzip_types application/javascript text/javascript text/css application/json image/svg+xml;
+
     # Internal worker routes are never exposed through the browser-facing
     # reverse proxy, even when a client knows their path.
     location = /api/v1/internal {
@@ -55,6 +65,12 @@ server {
 
     # Reverse-proxy operator API calls, stripping the /api prefix.
     location /api/ {
+        # gzip is on at server scope and application/json is in gzip_types,
+        # so proxied API responses would otherwise get compressed here.
+        # gzip off keeps them byte-identical to what the upstream sent.
+        # Buffering is left at its default on purpose; streaming behavior
+        # is unchanged from before this commit.
+        gzip off;
         proxy_pass ${CURIE_API_TARGET}/;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
@@ -62,8 +78,20 @@ server {
         proxy_set_header X-Forwarded-Proto $scheme;
     }
 
+    # Vite emits content-hashed filenames for build assets, so a new build is
+    # a new URL and these can be cached for a year without ever going stale.
+    location ^~ /assets/ {
+        add_header Cache-Control "public, max-age=31536000, immutable";
+        # A missing hashed asset must 404, not fall through to index.html and
+        # get cached for a year as an HTML body.
+        try_files $uri =404;
+    }
+
     # SPA fallback.
     location / {
+        # index.html is the pointer at the hashed assets, so a redeploy is
+        # only picked up if it is revalidated on every request.
+        add_header Cache-Control "no-cache" always;
         try_files $uri $uri/ /index.html;
     }
 }
