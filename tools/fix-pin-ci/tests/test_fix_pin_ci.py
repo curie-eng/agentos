@@ -1273,7 +1273,7 @@ def test_pull_request_template_documents_the_tier_waiver() -> None:
     assert "found:live" in template
 
 
-FEATURE_MILESTONE = "v0.9.0"
+FEATURE_MILESTONE = "v0.8.6"
 PATCH_MILESTONE = "v0.8.5"
 MAPPING_PATH = REPO_ROOT / "tools" / "fix-pin-ci" / "milestone-trains.json"
 NA_BODY = "Closes #12\n\nFix pin: n/a - the fix is a chart template with no test surface\n"

@@ -1218,8 +1218,19 @@ class WorkspaceClaimCoordinator:
         agent_name: str | None = None,
         repo_full_name: str | None = None,
         replace_handle: Any | None = None,
+        revalidate_before_handoff: Callable[[], None] | None = None,
+        validate_candidate: Callable[[Any], None] | None = None,
     ) -> WorkspaceClaimResult:
-        """Prepare once, then cold-claim or resume a suspended route."""
+        """Prepare once, then cold-claim or resume a suspended route.
+
+        ``revalidate_before_handoff`` is the late-replacement linearization
+        guard. It runs after the archive is verified and durably staged,
+        immediately before the substrate begins replacing the old route. A
+        refusal raises through the ordinary pre-exposure rollback path, so the
+        old route stays authoritative and the newly staged archive is not
+        orphaned. ``validate_candidate`` runs after the replacement runner is
+        ready but before its route CAS; refusal follows the same rollback path.
+        """
 
         prepared = self.preparer.prepare(
             deployment_id=deployment_id,
@@ -1244,12 +1255,20 @@ class WorkspaceClaimCoordinator:
                     raise WorkspacePreparationError(
                         "claim", "late workspace handoff requires a selected repository"
                     )
+                if revalidate_before_handoff is not None:
+                    revalidate_before_handoff()
+                candidate_guard = (
+                    {"validate_candidate": validate_candidate}
+                    if validate_candidate is not None
+                    else {}
+                )
                 handle = self.substrate.handoff(
                     thread_key,
                     expected=replace_handle,
                     env=claim_env,
                     workspace_repo=repo_full_name,
                     agent_name=agent_name,
+                    **candidate_guard,
                 )
             else:
                 try:

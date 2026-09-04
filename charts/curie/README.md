@@ -1233,12 +1233,17 @@ One allowed root `https://github.com/owner/repository` URL in the initial
 message establishes the thread's selection and causes the worker to acquire its
 managed workspace at claim time. An initial message without a repository URL
 uses a generic sandbox and does not redeem a repository credential. If a root
-URL arrives after that generic route is already running, Curie refuses it
-before selection, credential redemption, or a second claim; the fenced
-same-thread replacement described by Draft
-[ADR 0136](../../docs/adr/0136-a-late-workspace-handoff-replaces-the-sandbox-at-a-fenced-turn-boundary.md)
-is not yet available. The first established selection remains pinned to the
-agent and thread, and choosing another repository requires a new thread.
+URL arrives after that generic route is already running, Curie may acquire the
+workspace only at an authenticated idle boundary where no turn can accept a
+steer, the latest structured history is durable, and no approval suspension or
+unresolved side-effect boundary is active. It prepares and verifies the
+workspace, cold-claims a replacement with the same logical session and history
+reference, and only then atomically fences the old route. If that safe
+boundary cannot be verified, Curie refuses the handoff and keeps the old route
+authoritative, as required by Accepted
+[ADR 0136](../../docs/adr/0136-a-late-workspace-handoff-replaces-the-sandbox-at-a-fenced-turn-boundary.md).
+The first established selection remains pinned to the agent and thread, and
+choosing another repository requires a new thread.
 
 Set `api.githubRepoAllowlist` to exact `owner/repository` entries or explicit
 owner-wide `owner/*` entries. Empty is deny-all. Curie checks this policy before

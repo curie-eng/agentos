@@ -22,7 +22,7 @@ import stat
 import tarfile
 import threading
 import uuid
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -787,8 +787,10 @@ class _RecordingSubstrate:
         env: dict[str, str] | None = None,
         workspace_repo: str,
         agent_name: str | None = None,
+        validate_candidate: Callable[[object], None] | None = None,
     ) -> object:
         payload = dict(env or {})
+        candidate = object()
         self.calls.append(("handoff", thread_key, payload))
         self.handoff_calls.append(
             {
@@ -797,9 +799,12 @@ class _RecordingSubstrate:
                 "env": payload,
                 "workspace_repo": workspace_repo,
                 "agent_name": agent_name,
+                "candidate": candidate,
             }
         )
-        return object()
+        if validate_candidate is not None:
+            validate_candidate(candidate)
+        return candidate
 
 
 def test_workspace_ownership_is_durable_before_the_sandbox_claim_is_exposed(
@@ -918,7 +923,21 @@ def test_late_handoff_uses_substrate_handoff_and_keeps_credentials_out_of_claim_
     workspace: Any, tmp_path: Path
 ) -> None:
     preparer, commands, _objects = _preparer(workspace, tmp_path)
-    substrate = _RecordingSubstrate()
+    ordering: list[str] = []
+    real_verify = preparer.verify
+
+    def verify(prepared: Any) -> None:
+        real_verify(prepared)
+        ordering.append("verified")
+
+    preparer.verify = verify
+
+    class OrderingSubstrate(_RecordingSubstrate):
+        def handoff(self, *args: Any, **kwargs: Any) -> object:
+            ordering.append("handoff")
+            return super().handoff(*args, **kwargs)
+
+    substrate = OrderingSubstrate()
     coordinator = workspace.WorkspaceClaimCoordinator(
         preparer=preparer,
         substrate=substrate,
@@ -930,12 +949,18 @@ def test_late_handoff_uses_substrate_handoff_and_keeps_credentials_out_of_claim_
     result = coordinator.claim_or_resume_with_handle(
         thread_key="1700000000.000100",
         deployment_id=DEPLOYMENT_ID,
-        env={"CURIE_RUNNER_TOKEN": "workspace-test-token"},
+        env={
+            "CURIE_RUNNER_TOKEN": "workspace-test-token",
+            "CURIE_SESSION_ID": "logical-session",
+            "CURIE_HISTORY_REF": "https://api.example.com/state/transcript/thread-1",
+        },
         agent_name="acme-bot",
         repo_full_name="acme-corp/acme-bot",
         replace_handle=old_handle,
+        revalidate_before_handoff=lambda: ordering.append("revalidated"),
     )
 
+    assert ordering == ["verified", "revalidated", "handoff"]
     assert substrate.calls[0][0] == "handoff"
     assert [kind for kind, _thread, _env in substrate.calls] == ["handoff"]
     handoff = substrate.handoff_calls[0]
@@ -946,6 +971,19 @@ def test_late_handoff_uses_substrate_handoff_and_keeps_credentials_out_of_claim_
     assert handoff["env"]["CURIE_WORKSPACE_REF"] == workspace_env["CURIE_WORKSPACE_REF"]
     assert handoff["env"]["CURIE_WORKSPACE_SHA256"] == workspace_env["CURIE_WORKSPACE_SHA256"]
     assert handoff["env"]["CURIE_RUNNER_TOKEN"] == "workspace-test-token"
+    assert handoff["env"]["CURIE_SESSION_ID"] == "logical-session"
+    assert handoff["env"]["CURIE_HISTORY_REF"] == (
+        "https://api.example.com/state/transcript/thread-1"
+    )
+    assert {
+        "CURIE_INTERNAL_WORKER_TOKEN",
+        "CURIE_API_KEY",
+        "S3_ACCESS_KEY",
+        "S3_SECRET_KEY",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "GITHUB_TOKEN",
+    }.isdisjoint(handoff["env"])
     assert GIT_CREDENTIAL not in json.dumps(handoff["env"])
     assert "redeemed-credential-value" not in json.dumps(handoff["env"])
     assert not any(
@@ -955,6 +993,156 @@ def test_late_handoff_uses_substrate_handoff_and_keeps_credentials_out_of_claim_
         if name != "CURIE_RUNNER_TOKEN"
     )
     assert "clone" in commands.events
+
+
+def test_late_handoff_revalidation_refusal_restores_ownership_and_old_route(
+    workspace: Any, tmp_path: Path
+) -> None:
+    preparer, _, objects = _preparer(workspace, tmp_path)
+    thread_key = "1700000000.000100"
+    old_route = object()
+    ordering: list[str] = []
+
+    class RouteSubstrate(_RecordingSubstrate):
+        current_route = old_route
+
+        def handoff(self, *args: Any, **kwargs: Any) -> object:
+            ordering.append("handoff")
+            self.current_route = object()
+            return super().handoff(*args, **kwargs)
+
+    substrate = RouteSubstrate()
+    coordinator = workspace.WorkspaceClaimCoordinator(
+        preparer=preparer,
+        substrate=substrate,
+        ownership_ttl_seconds=60,
+        wall_clock=lambda: 1000.0,
+    )
+    previous = coordinator.claim_or_resume_with_handle(
+        thread_key=thread_key,
+        deployment_id=DEPLOYMENT_ID,
+    ).prepared
+    substrate.calls.clear()
+    substrate.handoff_calls.clear()
+
+    real_verify = preparer.verify
+
+    def verify(prepared: Any) -> None:
+        real_verify(prepared)
+        ordering.append("verified")
+
+    preparer.verify = verify
+
+    def refuse_revalidation() -> None:
+        staged = coordinator.current(thread_key)
+        assert staged is not None and staged != previous
+        ordering.append("revalidated-refused")
+        raise RuntimeError("workspace handoff boundary changed")
+
+    with pytest.raises(RuntimeError, match="handoff boundary changed"):
+        coordinator.claim_or_resume_with_handle(
+            thread_key=thread_key,
+            deployment_id=DEPLOYMENT_ID,
+            repo_full_name="acme-corp/acme-bot",
+            replace_handle=old_route,
+            revalidate_before_handoff=refuse_revalidation,
+        )
+
+    assert ordering == ["verified", "revalidated-refused"]
+    assert substrate.handoff_calls == []
+    assert substrate.current_route is old_route
+
+    restarted = workspace.WorkspaceClaimCoordinator(
+        preparer=preparer,
+        substrate=_RecordingSubstrate(),
+        ownership_ttl_seconds=60,
+        wall_clock=lambda: 1001.0,
+    )
+    assert restarted.current(thread_key) == previous
+    assert previous.object_key in objects.objects
+    archive_keys = [key for key in objects.objects if not key.startswith("_ownership/")]
+    assert archive_keys == [previous.object_key]
+    assert any(
+        key != previous.object_key and not key.startswith("_ownership/")
+        for key in objects.deleted
+    )
+
+
+def test_late_handoff_candidate_refusal_restores_prior_durable_ownership(
+    workspace: Any, tmp_path: Path
+) -> None:
+    preparer, _, objects = _preparer(workspace, tmp_path)
+    thread_key = "1700000000.000100"
+    old_route = object()
+    ordering: list[str] = []
+    observed_candidates: list[object] = []
+
+    class CandidateSubstrate(_RecordingSubstrate):
+        current_route = old_route
+
+        def handoff(self, *args: Any, **kwargs: Any) -> object:
+            candidate = super().handoff(*args, **kwargs)
+            self.current_route = candidate
+            return candidate
+
+    substrate = CandidateSubstrate()
+    coordinator = workspace.WorkspaceClaimCoordinator(
+        preparer=preparer,
+        substrate=substrate,
+        ownership_ttl_seconds=60,
+        wall_clock=lambda: 1000.0,
+    )
+    previous = coordinator.claim_or_resume_with_handle(
+        thread_key=thread_key,
+        deployment_id=DEPLOYMENT_ID,
+    ).prepared
+    substrate.calls.clear()
+    substrate.handoff_calls.clear()
+
+    real_verify = preparer.verify
+
+    def verify(prepared: Any) -> None:
+        real_verify(prepared)
+        ordering.append("verified")
+
+    preparer.verify = verify
+
+    def refuse_candidate(candidate: object) -> None:
+        staged = coordinator.current(thread_key)
+        assert staged is not None and staged != previous
+        observed_candidates.append(candidate)
+        ordering.append("candidate-refused")
+        raise RuntimeError("candidate runner attestation mismatch")
+
+    with pytest.raises(RuntimeError, match="candidate runner attestation mismatch"):
+        coordinator.claim_or_resume_with_handle(
+            thread_key=thread_key,
+            deployment_id=DEPLOYMENT_ID,
+            repo_full_name="acme-corp/acme-bot",
+            replace_handle=old_route,
+            revalidate_before_handoff=lambda: ordering.append("old-revalidated"),
+            validate_candidate=refuse_candidate,
+        )
+
+    assert ordering == ["verified", "old-revalidated", "candidate-refused"]
+    assert len(substrate.handoff_calls) == 1
+    assert observed_candidates == [substrate.handoff_calls[0]["candidate"]]
+    assert substrate.current_route is old_route
+
+    restarted = workspace.WorkspaceClaimCoordinator(
+        preparer=preparer,
+        substrate=_RecordingSubstrate(),
+        ownership_ttl_seconds=60,
+        wall_clock=lambda: 1001.0,
+    )
+    assert restarted.current(thread_key) == previous
+    assert previous.object_key in objects.objects
+    archive_keys = [key for key in objects.objects if not key.startswith("_ownership/")]
+    assert archive_keys == [previous.object_key]
+    assert any(
+        key != previous.object_key and not key.startswith("_ownership/")
+        for key in objects.deleted
+    )
 
 
 def test_late_handoff_without_a_selected_repository_never_touches_the_substrate(
@@ -1288,13 +1476,25 @@ def test_workspace_claim_env_never_carries_worker_auth_object_store_or_git_crede
     workspace: Any, tmp_path: Path
 ) -> None:
     preparer, _, _ = _preparer(workspace, tmp_path)
-    prepared = _prepare(preparer)
-    env = {
-        **prepared.claim_env(),
-        "CURIE_BUNDLE_REF": "bundles/first",
-    }
+    substrate = _RecordingSubstrate()
+    coordinator = workspace.WorkspaceClaimCoordinator(
+        preparer=preparer,
+        substrate=substrate,
+    )
+    result = coordinator.claim_or_resume_with_handle(
+        thread_key="1700000000.000100",
+        deployment_id=DEPLOYMENT_ID,
+        env={
+            "CURIE_BUNDLE_REF": "bundles/first",
+            "CURIE_SESSION_ID": "logical-session",
+            "CURIE_HISTORY_REF": "https://api.example.com/state/transcript/thread-1",
+        },
+        repo_full_name="acme-corp/acme-bot",
+    )
+    env = substrate.calls[0][2]
     forbidden = {
         "CURIE_INTERNAL_WORKER_TOKEN",
+        "CURIE_API_KEY",
         "S3_ACCESS_KEY",
         "S3_SECRET_KEY",
         "AWS_ACCESS_KEY_ID",
@@ -1305,6 +1505,14 @@ def test_workspace_claim_env_never_carries_worker_auth_object_store_or_git_crede
     assert forbidden.isdisjoint(env)
     assert WORKER_AUTH not in env.values()
     assert GIT_CREDENTIAL not in env.values()
+    assert env["CURIE_SESSION_ID"] == "logical-session"
+    assert env["CURIE_HISTORY_REF"] == (
+        "https://api.example.com/state/transcript/thread-1"
+    )
+    assert env["CURIE_WORKSPACE_REF"] == result.prepared.claim_env()[
+        "CURIE_WORKSPACE_REF"
+    ]
+    assert env["CURIE_WORKSPACE_SHA256"] == result.prepared.sha256
 
 
 def test_two_clone_slots_bound_concurrency_and_a_third_waits(workspace: Any) -> None:

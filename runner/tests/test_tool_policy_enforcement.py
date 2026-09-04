@@ -13,18 +13,23 @@ permissions, and every other test here would still pass.
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import anyio
 import pytest
-from claude_agent_sdk.types import PermissionResultDeny
+from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
 from curie_runner import mcp_tool_capability
 from curie_runner.approval import (
+    APPROVAL_TOOL_NAME,
+    PUBLISH_TOOL_NAME,
     ApprovalGate,
+    build_approval_gate,
     build_approval_hook,
     build_can_use_tool,
     policy_disallowed_tools,
+    resolve_approval_policy,
 )
 from mcp import Tool
 from mcp.types import ToolAnnotations
@@ -50,12 +55,16 @@ def _gate(policy: ToolPolicy | None, **kwargs: Any) -> ApprovalGate:
     )
 
 
-def _hook_call(gate: ApprovalGate, tool_name: str) -> dict[str, Any]:
+def _hook_call(
+    gate: ApprovalGate,
+    tool_name: str,
+    tool_input: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     hooks = build_approval_hook(gate)
     matcher = hooks["PreToolUse"][0]
     callback = matcher.hooks[0]
     return anyio.run(
-        callback, {"tool_name": tool_name, "tool_input": {}}, None, None
+        callback, {"tool_name": tool_name, "tool_input": tool_input or {}}, None, None
     )
 
 
@@ -79,6 +88,26 @@ def _catalog_gate() -> ApprovalGate:
         mcp_servers={"operations", "failed"},
         connector_servers={"operations"},
     )
+
+
+def _production_sre_gate(*, managed_workspace: bool) -> ApprovalGate:
+    """Build the gate from the exact production SRE bundle policy and skill."""
+
+    bundle = Path(__file__).parents[2] / "examples" / "sre-bot"
+    assert (bundle / "skills" / "sre-bot" / "SKILL.md").is_file()
+    resolution = resolve_approval_policy(str(bundle))
+    gate = build_approval_gate(
+        operator_tools=None,
+        policy_routes=resolution.route_by_tool,
+        grantable_by_route=resolution.grantable_by_route,
+        bundle_name=resolution.bundle_name,
+        mcp_servers=resolution.mcp_servers,
+        connector_servers=resolution.connector_servers,
+        managed_workspace=managed_workspace,
+        tool_policy=resolution.tool_policy,
+    )
+    assert gate is not None
+    return gate
 
 
 def _assert_no_approval_was_recorded(gate: ApprovalGate) -> None:
@@ -275,6 +304,48 @@ def test_a_builtin_is_untouched_by_a_policy_about_connectors() -> None:
     ships a policy."""
     gate = _gate(_policy(deny=["k8s-write/*"]))
     assert _hook_call(gate, "Bash") == {}
+
+
+@pytest.mark.parametrize("interceptor", ["hook", "callback"])
+def test_platform_publish_reaches_approval_gate_under_production_sre_tool_policy(
+    interceptor: str,
+) -> None:
+    """Bundle MCP policy must not swallow Curie's platform-owned publish gate."""
+
+    gate = _production_sre_gate(managed_workspace=True)
+    tool_input = {"title": "Workspace tool check", "body": "prior-turn marker"}
+    if interceptor == "hook":
+        result = _hook_call(gate, PUBLISH_TOOL_NAME, tool_input)
+        assert _denied(result)
+        reason = _reason(result)
+    else:
+        result = anyio.run(
+            build_can_use_tool(gate), PUBLISH_TOOL_NAME, tool_input, None
+        )
+        assert isinstance(result, PermissionResultDeny)
+        reason = result.message
+
+    assert gate.pending_gate_kind == "permission"
+    assert gate.pending_granted_tool == PUBLISH_TOOL_NAME
+    assert gate.publication_title == "Workspace tool check"
+    assert gate.publication_body == "prior-turn marker"
+    assert "denied by this agent's tool policy" not in reason
+
+
+@pytest.mark.parametrize("interceptor", ["hook", "callback"])
+def test_platform_request_approval_is_outside_production_sre_tool_policy(
+    interceptor: str,
+) -> None:
+    """The sibling Curie MCP tool remains governed by its in-process route logic."""
+
+    gate = _production_sre_gate(managed_workspace=True)
+    if interceptor == "hook":
+        assert _hook_call(gate, APPROVAL_TOOL_NAME) == {}
+    else:
+        result = anyio.run(build_can_use_tool(gate), APPROVAL_TOOL_NAME, {}, None)
+        assert isinstance(result, PermissionResultAllow)
+
+    _assert_no_approval_was_recorded(gate)
 
 
 def test_an_allowed_tool_falls_through_to_the_existing_gate() -> None:

@@ -28,8 +28,9 @@ from __future__ import annotations
 import contextlib
 import hmac
 import inspect
-from collections.abc import Awaitable, Callable
-from typing import cast
+from collections.abc import Awaitable, Callable, Mapping
+from types import MappingProxyType
+from typing import TypedDict, cast
 
 from aci_protocol import Event, Interrupt, parse_inbound
 from aiohttp import web
@@ -52,6 +53,41 @@ _GATED_PATHS = frozenset(
 RUNNER: web.AppKey[SessionRunner] = web.AppKey("runner", SessionRunner)
 Snapshotter = Callable[[], WorkspaceSnapshot | Awaitable[WorkspaceSnapshot]]
 SNAPSHOTTER: web.AppKey[object] = web.AppKey("snapshotter", object)
+STATUS_ATTESTATION: web.AppKey[object] = web.AppKey("status_attestation", object)
+
+
+class _StatusAttestation(TypedDict):
+    session_id: str
+    sandbox_id: str
+    managed_workspace: bool
+    cwd: str | None
+
+
+_STATUS_ATTESTATION_ATTR = "_curie_control_status_attestation"
+
+
+def bind_status_attestation(
+    runner: SessionRunner,
+    *,
+    session_id: str,
+    sandbox_id: str,
+    cwd: str | None,
+) -> SessionRunner:
+    """Bind credential-free boot facts for the authenticated worker status."""
+
+    attestation: _StatusAttestation = {
+        "session_id": session_id,
+        "sandbox_id": sandbox_id,
+        "managed_workspace": cwd is not None,
+        "cwd": cwd,
+    }
+    setattr(runner, _STATUS_ATTESTATION_ATTR, MappingProxyType(attestation))
+    return runner
+
+
+def _bound_status_attestation(runner: SessionRunner) -> Mapping[str, object] | None:
+    value = getattr(runner, _STATUS_ATTESTATION_ATTR, None)
+    return cast("Mapping[str, object]", value) if isinstance(value, Mapping) else None
 
 
 def _auth_middleware(token: str) -> Middleware:
@@ -103,6 +139,9 @@ def create_app(
     app = web.Application(middlewares=middlewares)
     app[RUNNER] = runner
     app[SNAPSHOTTER] = snapshotter
+    # An identity-bearing response exists only when middleware above enforces a
+    # non-empty bearer. Legacy/tokenless apps keep both status routes probe-only.
+    app[STATUS_ATTESTATION] = _bound_status_attestation(runner) if token else None
     app.add_routes(
         [
             web.get("/healthz", _healthz),
@@ -129,14 +168,17 @@ async def _healthz(_request: web.Request) -> web.Response:
 
 async def _status(request: web.Request) -> web.Response:
     runner: SessionRunner = request.app[RUNNER]
-    return web.json_response(
-        {
-            "status": runner.status.value,
-            "ready": runner.ready,
-            "turn_active": runner.turn_active,
-            "history_durable": runner.history_durable,
-        }
-    )
+    body: dict[str, object] = {
+        "status": runner.status.value,
+        "ready": runner.ready,
+        "turn_active": runner.turn_active,
+        "history_durable": runner.history_durable,
+    }
+    if request.path == "/v1/status":
+        attestation = cast("Mapping[str, object] | None", request.app[STATUS_ATTESTATION])
+        if attestation is not None:
+            body.update(attestation)
+    return web.json_response(body)
 
 
 async def _snapshot(request: web.Request) -> web.Response:

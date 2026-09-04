@@ -63,6 +63,21 @@ class StructuredReplayUnsupported(HistoryError):
 
 JsonContent = str | list[dict[str, Any]]
 
+# The state API caps one JSON value at 64 KiB. Transcript appends store a JSON
+# array, so a turn must fit with that array's brackets rather than merely fit as
+# a standalone object. Accumulated-log compaction is a separate concern: this
+# bound prevents a single large first turn from being rejected before any
+# durable conversation exists.
+HISTORY_VALUE_MAX_BYTES = 65_536
+
+_STRUCTURAL_BLOCK_FIELDS = {
+    "type",
+    "id",
+    "tool_use_id",
+    "name",
+    "is_error",
+}
+
 
 def _json_copy(value: JsonContent) -> JsonContent:
     """Return a detached JSON-safe copy of message content."""
@@ -263,6 +278,208 @@ class TurnRecord:
                 else None
             ),
         )
+
+
+def _state_value_size(record: Mapping[str, Any]) -> int:
+    """Return the state API's encoded size for a one-record transcript."""
+
+    return len(json.dumps([record], separators=(",", ":")).encode("utf-8"))
+
+
+def _digest_marker(value: str) -> str:
+    encoded = value.encode("utf-8")
+    digest = hashlib.sha256(encoded).hexdigest()
+    return (
+        "[history payload omitted; "
+        f"sha256={digest}; original_bytes={len(encoded)}]"
+    )
+
+
+def _collect_text_payloads(
+    value: Any,
+    *,
+    path: tuple[str | int, ...],
+    priority: int,
+    candidates: dict[str, tuple[int, list[tuple[str | int, ...]]]],
+) -> None:
+    """Collect replaceable string leaves without touching structural fields."""
+
+    if isinstance(value, str):
+        existing = candidates.get(value)
+        if existing is None:
+            candidates[value] = (priority, [path])
+        else:
+            existing_priority, paths = existing
+            paths.append(path)
+            candidates[value] = (min(existing_priority, priority), paths)
+        return
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            _collect_text_payloads(
+                item,
+                path=(*path, index),
+                priority=priority,
+                candidates=candidates,
+            )
+        return
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            _collect_text_payloads(
+                item,
+                path=(*path, str(key)),
+                priority=priority,
+                candidates=candidates,
+            )
+
+
+def _turn_text_payloads(
+    record: dict[str, Any],
+) -> dict[str, tuple[int, list[tuple[str | int, ...]]]]:
+    """Index portable text by reduction priority and stable object path."""
+
+    candidates: dict[str, tuple[int, list[tuple[str | int, ...]]]] = {}
+
+    # The legacy pair mirrors the structured messages. Grouping by value means
+    # both projections receive the same marker if either copy must be bounded.
+    for field in ("user", "assistant"):
+        value = record.get(field)
+        if isinstance(value, str):
+            _collect_text_payloads(
+                value,
+                path=(field,),
+                priority=3,
+                candidates=candidates,
+            )
+
+    approval = record.get("approval")
+    if isinstance(approval, Mapping) and isinstance(approval.get("summary"), str):
+        _collect_text_payloads(
+            approval["summary"],
+            path=("approval", "summary"),
+            priority=2,
+            candidates=candidates,
+        )
+
+    messages = record.get("messages")
+    if not isinstance(messages, list):
+        return candidates
+    for message_index, message in enumerate(messages):
+        if not isinstance(message, Mapping):
+            continue
+        content = message.get("content")
+        content_path: tuple[str | int, ...] = (
+            "messages",
+            message_index,
+            "content",
+        )
+        if isinstance(content, str):
+            _collect_text_payloads(
+                content,
+                path=content_path,
+                priority=3,
+                candidates=candidates,
+            )
+            continue
+        if not isinstance(content, list):
+            continue
+        for block_index, block in enumerate(content):
+            if not isinstance(block, Mapping):
+                continue
+            block_path = (*content_path, block_index)
+            block_type = block.get("type")
+            if block_type == "tool_result" and "content" in block:
+                _collect_text_payloads(
+                    block["content"],
+                    path=(*block_path, "content"),
+                    priority=0,
+                    candidates=candidates,
+                )
+            elif block_type == "text" and "text" in block:
+                _collect_text_payloads(
+                    block["text"],
+                    path=(*block_path, "text"),
+                    priority=1,
+                    candidates=candidates,
+                )
+
+            for key, item in block.items():
+                if key in _STRUCTURAL_BLOCK_FIELDS:
+                    continue
+                if block_type == "tool_result" and key == "content":
+                    continue
+                if block_type == "text" and key == "text":
+                    continue
+                _collect_text_payloads(
+                    item,
+                    path=(*block_path, str(key)),
+                    priority=2,
+                    candidates=candidates,
+                )
+    return candidates
+
+
+def _replace_path(
+    root: dict[str, Any], path: tuple[str | int, ...], replacement: str
+) -> None:
+    target: Any = root
+    for part in path[:-1]:
+        target = target[part]
+    target[path[-1]] = replacement
+
+
+def bound_turn_record(
+    record: TurnRecord, *, max_value_bytes: int = HISTORY_VALUE_MAX_BYTES
+) -> TurnRecord:
+    """Bound one turn for a whole state value without losing message order.
+
+    Native harness replay is discarded first because portable messages are the
+    authority across sandbox replacement. If that is insufficient, textual
+    payloads are replaced with deterministic digest and byte-count markers:
+    tool results first, then assistant text and other content, while role,
+    message, and block order remain intact. If that irreducible structure alone
+    exceeds the cap, fail before the transcript store sees an append.
+    """
+
+    if max_value_bytes <= 0:
+        raise HistoryError("history value byte cap must be positive")
+
+    raw = record.to_dict()
+    if _state_value_size(raw) <= max_value_bytes:
+        return record
+
+    raw["harness_replay"] = None
+    if _state_value_size(raw) <= max_value_bytes:
+        return TurnRecord.from_dict(raw)
+
+    candidates = _turn_text_payloads(raw)
+    ordered: list[tuple[int, int, str, str, list[tuple[str | int, ...]]]] = []
+    for original, (priority, paths) in candidates.items():
+        marker = _digest_marker(original)
+        original_size = len(json.dumps(original).encode("utf-8"))
+        marker_size = len(json.dumps(marker).encode("utf-8"))
+        savings = (original_size - marker_size) * len(paths)
+        if savings > 0:
+            ordered.append(
+                (
+                    priority,
+                    -savings,
+                    hashlib.sha256(original.encode("utf-8")).hexdigest(),
+                    marker,
+                    paths,
+                )
+            )
+
+    for _priority, _negative_savings, _digest, marker, paths in sorted(ordered):
+        for path in paths:
+            _replace_path(raw, path, marker)
+        if _state_value_size(raw) <= max_value_bytes:
+            return TurnRecord.from_dict(raw)
+
+    irreducible_size = _state_value_size(raw)
+    raise HistoryError(
+        "history turn cannot fit without dropping portable message roles or order: "
+        f"minimum value is {irreducible_size} bytes, cap is {max_value_bytes} bytes"
+    )
 
 
 @dataclass(frozen=True)

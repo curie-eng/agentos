@@ -7,6 +7,9 @@ round-trip over real HTTP without the API. The write side is exercised by drivin
 a real turn through the SessionRunner with the fake model.
 """
 
+import hashlib
+import json
+
 import anyio
 import pytest
 from aiohttp import web
@@ -49,6 +52,58 @@ def _fake_state_app() -> tuple[web.Application, list]:
     app.router.add_get(key, get_key)
     app.router.add_post(f"{key}/append", append_key)
     return app, log
+
+
+_STATE_VALUE_MAX_BYTES = 65_536
+
+
+def _capped_state_app() -> tuple[web.Application, list, list[int]]:
+    """A state-key fake that enforces the API's whole-value JSON byte cap."""
+
+    log: list = []
+    rejected_sizes: list[int] = []
+    app = web.Application()
+    key = "/agents/A/state/transcript/t1"
+
+    async def get_key(_request: web.Request) -> web.Response:
+        if not log:
+            return web.json_response({"detail": "not found"}, status=404)
+        return web.json_response(
+            {"namespace": "transcript", "key": "t1", "value": list(log), "version": 1}
+        )
+
+    async def append_key(request: web.Request) -> web.Response:
+        body = await request.json()
+        candidate = [*log, body["item"]]
+        encoded_size = len(
+            json.dumps(candidate, separators=(",", ":")).encode("utf-8")
+        )
+        if encoded_size > _STATE_VALUE_MAX_BYTES:
+            rejected_sizes.append(encoded_size)
+            return web.json_response(
+                {
+                    "detail": (
+                        f"value is {encoded_size} bytes, over the "
+                        f"{_STATE_VALUE_MAX_BYTES}-byte per-value cap"
+                    )
+                },
+                status=413,
+            )
+        log.append(body["item"])
+        return web.json_response(
+            {"namespace": "transcript", "key": "t1", "value": list(log), "version": 1}
+        )
+
+    app.router.add_get(key, get_key)
+    app.router.add_post(f"{key}/append", append_key)
+    return app, log, rejected_sizes
+
+
+def _assert_digest_marker(value: object, original: str) -> None:
+    assert isinstance(value, str)
+    assert original not in value
+    assert hashlib.sha256(original.encode("utf-8")).hexdigest() in value
+    assert str(len(original.encode("utf-8"))) in value
 
 
 def test_turn_record_round_trip() -> None:
@@ -392,6 +447,341 @@ def test_state_store_append_then_load_round_trip() -> None:
                 TurnRecord(user="q2", assistant="a2"),
             ]
             assert len(log) == 2
+
+    anyio.run(go)
+
+
+def test_oversized_first_turn_is_bounded_before_append_and_cold_replays_in_order() -> None:
+    """The live-sized first record must fit before the state API sees it (#2271)."""
+
+    from aci_protocol import Event, Final, SessionStatus, parse_ndjson_line
+    from claude_agent_sdk import (
+        AssistantMessage,
+        ResultMessage,
+        TextBlock,
+        ToolResultBlock,
+        ToolUseBlock,
+        UserMessage,
+    )
+    from curie_runner import RunTracer, SideEffectClassifier
+    from curie_runner.fake import FakeModelSession
+    from curie_runner.session import SessionRunner
+
+    tool_payload = "tool-output-" + ("x" * 42_000)
+    assistant_payload = "assistant-output-" + ("y" * 42_000)
+    native_payload = "native-checkpoint-" + ("z" * 42_000)
+    harness_replay = HarnessReplayState(
+        harness="claude",
+        kind="checkpoint",
+        entries=({"type": "assistant", "payload": native_payload},),
+    )
+    raw_record = TurnRecord(
+        user="inspect the example workspace",
+        assistant=assistant_payload,
+        messages=(
+            ConversationMessage(role="user", content="inspect the example workspace"),
+            ConversationMessage(
+                role="assistant",
+                content=[
+                    {
+                        "type": "tool_use",
+                        "id": "call-example",
+                        "name": "Read",
+                        "input": {"path": "example.txt"},
+                    }
+                ],
+            ),
+            ConversationMessage(
+                role="user",
+                content=[
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call-example",
+                        "content": tool_payload,
+                    }
+                ],
+            ),
+            ConversationMessage(
+                role="assistant",
+                content=[{"type": "text", "text": assistant_payload}],
+            ),
+        ),
+        harness_replay=harness_replay,
+    )
+    raw_value_size = len(
+        json.dumps([raw_record.to_dict()], separators=(",", ":")).encode("utf-8")
+    )
+    raw_without_native = TurnRecord(
+        user=raw_record.user,
+        assistant=raw_record.assistant,
+        messages=raw_record.messages,
+    )
+    assert raw_value_size > 84 * 1024
+    assert (
+        len(
+            json.dumps(
+                [raw_without_native.to_dict()], separators=(",", ":")
+            ).encode("utf-8")
+        )
+        > _STATE_VALUE_MAX_BYTES
+    )
+
+    class ReplayExportingFake(FakeModelSession):
+        async def export_replay_state(self) -> HarnessReplayState:
+            return harness_replay
+
+    script = lambda: [  # noqa: E731 - compact fixed SDK transcript fixture
+        AssistantMessage(
+            content=[
+                ToolUseBlock(
+                    id="call-example",
+                    name="Read",
+                    input={"path": "example.txt"},
+                )
+            ],
+            model="fake-model",
+        ),
+        UserMessage(
+            content=[
+                ToolResultBlock(
+                    tool_use_id="call-example",
+                    content=tool_payload,
+                    is_error=False,
+                )
+            ]
+        ),
+        AssistantMessage(
+            content=[TextBlock(text=assistant_payload)], model="fake-model"
+        ),
+        ResultMessage(
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=False,
+            num_turns=1,
+            session_id="fake-session",
+            result=assistant_payload,
+            usage={"input_tokens": 1, "output_tokens": 1},
+        ),
+    ]
+    app, log, rejected_sizes = _capped_state_app()
+
+    async def go() -> None:
+        async with TestServer(app) as server:
+            key_url = str(server.make_url("/agents/A/state/transcript/t1"))
+            session = ReplayExportingFake(script)
+            runner = SessionRunner(
+                session_factory=lambda: session,
+                ceiling=0,
+                tracer=RunTracer(None),
+                classifier=SideEffectClassifier(),
+                trace_name="bounded-history",
+                session_id="session-example",
+                history_store=StateApiTranscriptStore(key_url, token=None),
+            )
+            await runner.start()
+            lines = [
+                line
+                async for line in runner.run_inbound(
+                    Event(
+                        type="message",
+                        text="inspect the example workspace",
+                        user="U",
+                        ts="1",
+                    )
+                )
+            ]
+            final = parse_ndjson_line(lines[-1])
+            assert isinstance(final, Final)
+            assert final.status is SessionStatus.DONE
+            assert runner.history_durable is True
+
+            # Bounding is pre-append: the API must never reject a raw attempt.
+            assert rejected_sizes == []
+            assert len(log) == 1
+            assert (
+                len(json.dumps(log, separators=(",", ":")).encode("utf-8"))
+                <= _STATE_VALUE_MAX_BYTES
+            )
+
+            cold_store = StateApiTranscriptStore(key_url, token=None)
+            cold_records = await cold_store.load()
+            replay, summary = build_conversation_replay(
+                cold_records, max_turns=None, max_bytes=None
+            )
+            assert summary is None
+            assert replay.present is True
+            assert [message.role for message in replay.messages] == [
+                "user",
+                "assistant",
+                "user",
+                "assistant",
+            ]
+
+            bounded = cold_records[0]
+            assert isinstance(bounded, TurnRecord)
+            assert bounded.harness_replay is None
+            assert bounded.user == "inspect the example workspace"
+            _assert_digest_marker(bounded.assistant, assistant_payload)
+            tool_result = bounded.messages[2].content
+            assert isinstance(tool_result, list)
+            _assert_digest_marker(tool_result[0]["content"], tool_payload)
+            assistant_text = bounded.messages[3].content
+            assert isinstance(assistant_text, list)
+            _assert_digest_marker(assistant_text[0]["text"], assistant_payload)
+
+    anyio.run(go)
+
+
+def test_irreducibly_large_turn_fails_durability_before_store_append(caplog) -> None:
+    """Role/order overhead cannot be dropped merely to manufacture a small record."""
+
+    from aci_protocol import Event, SessionStatus
+    from claude_agent_sdk import AssistantMessage, ResultMessage
+
+    class CountingStore(_RecordingStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.append_attempts = 0
+
+        async def append(self, record: TurnRecord) -> None:
+            self.append_attempts += 1
+            await super().append(record)
+
+    empty_assistant_messages = 3_000
+    script = lambda: [  # noqa: E731 - compact fixed SDK transcript fixture
+        *(
+            AssistantMessage(content=[], model="fake-model")
+            for _ in range(empty_assistant_messages)
+        ),
+        ResultMessage(
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=False,
+            num_turns=1,
+            session_id="fake-session",
+            result="answer",
+            usage={"input_tokens": 1, "output_tokens": 1},
+        ),
+    ]
+    irreducible = TurnRecord(
+        user="q",
+        assistant="answer",
+        messages=(
+            ConversationMessage(role="user", content="q"),
+            *(
+                ConversationMessage(role="assistant", content=[])
+                for _ in range(empty_assistant_messages)
+            ),
+        ),
+    )
+    assert (
+        len(json.dumps([irreducible.to_dict()], separators=(",", ":")).encode("utf-8"))
+        > _STATE_VALUE_MAX_BYTES
+    )
+
+    store = CountingStore()
+    runner = _recording_runner(store, script=script)
+    final = _run_recording_turn(
+        runner, Event(type="message", text="q", user="U", ts="1")
+    )
+
+    assert final.status is SessionStatus.DONE
+    assert runner.history_durable is False
+    assert store.append_attempts == 0
+    assert store.turns == []
+    assert any(
+        "history append failed" in record.getMessage()
+        and "HistoryError" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_history_durability_failure_is_sticky_after_later_successful_append() -> None:
+    """A later turn cannot make an earlier dropped turn safe to hand off."""
+
+    from aci_protocol import Event, Final, SessionStatus, parse_ndjson_line
+    from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
+
+    class CountingStore(_RecordingStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.append_attempts = 0
+
+        async def append(self, record: TurnRecord) -> None:
+            self.append_attempts += 1
+            await super().append(record)
+
+    oversized_messages = 3_000
+    scripts = iter(
+        (
+            [
+                *(
+                    AssistantMessage(content=[], model="fake-model")
+                    for _ in range(oversized_messages)
+                ),
+                ResultMessage(
+                    subtype="success",
+                    duration_ms=1,
+                    duration_api_ms=1,
+                    is_error=False,
+                    num_turns=1,
+                    session_id="fake-session",
+                    result="first answer",
+                    usage={"input_tokens": 1, "output_tokens": 1},
+                ),
+            ],
+            [
+                AssistantMessage(
+                    content=[TextBlock(text="small answer")], model="fake-model"
+                ),
+                ResultMessage(
+                    subtype="success",
+                    duration_ms=1,
+                    duration_api_ms=1,
+                    is_error=False,
+                    num_turns=1,
+                    session_id="fake-session",
+                    result="small answer",
+                    usage={"input_tokens": 1, "output_tokens": 1},
+                ),
+            ],
+        )
+    )
+    store = CountingStore()
+    runner = _recording_runner(store, script=lambda: next(scripts))
+
+    async def go() -> None:
+        await runner.start()
+        first_lines = [
+            line
+            async for line in runner.run_inbound(
+                Event(type="message", text="oversized turn", user="U", ts="1")
+            )
+        ]
+        first_final = parse_ndjson_line(first_lines[-1])
+        assert isinstance(first_final, Final)
+        assert first_final.status is SessionStatus.DONE
+        assert runner.history_durable is False
+        assert store.append_attempts == 0
+
+        second_lines = [
+            line
+            async for line in runner.run_inbound(
+                Event(type="message", text="small turn", user="U", ts="2")
+            )
+        ]
+        second_final = parse_ndjson_line(second_lines[-1])
+        assert isinstance(second_final, Final)
+        assert second_final.status is SessionStatus.DONE
+        assert store.append_attempts == 1
+        assert len(store.turns) == 1
+        assert store.turns[0].assistant == "small answer"
+
+        # The earlier missing turn still makes replacement unsafe even though
+        # this append succeeded.
+        assert runner.history_durable is False
 
     anyio.run(go)
 
