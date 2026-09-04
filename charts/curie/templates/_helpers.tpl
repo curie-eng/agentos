@@ -910,22 +910,32 @@ livenessProbe:
 {{/* ---- Langfuse shared environment (mirrors compose.dev.yaml's
         x-langfuse-env anchor). Rendered into both web and worker. ---- */}}
 {{- define "curie.langfuse.env" -}}
+{{- /* These three honour their store's own existingSecret, the same escape
+       curie.env.postgres and the CLICKHOUSE_PASSWORD/REDIS_AUTH refs below
+       already use. They were pinned to the chart Secret while every sibling
+       read the BYO one. On a BYO-Postgres install the api and worker
+       authenticated against the real instance while both Langfuse Deployments
+       presented the chart-generated password and crash-looped at Prisma auth,
+       with every other component green. On a BYO langfuse.existingSecret
+       install the operator's langfuseEncryptionKey was silently unused, and a
+       later regeneration of the chart Secret left previously written encrypted
+       columns undecryptable. See #2327. */}}
 - name: POSTGRES_PASSWORD
   valueFrom:
     secretKeyRef:
-      name: {{ include "curie.secretName" . }}
+      name: {{ .Values.postgres.existingSecret | default (include "curie.secretName" .) }}
       key: postgresPassword
 - name: DATABASE_URL
   value: postgresql://{{ .Values.postgres.auth.username }}:$(POSTGRES_PASSWORD)@{{ include "curie.postgres.host" . }}:{{ .Values.postgres.port }}/{{ .Values.postgres.auth.database }}
 - name: SALT
   valueFrom:
     secretKeyRef:
-      name: {{ include "curie.secretName" . }}
+      name: {{ .Values.langfuse.existingSecret | default (include "curie.secretName" .) }}
       key: langfuseSalt
 - name: ENCRYPTION_KEY
   valueFrom:
     secretKeyRef:
-      name: {{ include "curie.secretName" . }}
+      name: {{ .Values.langfuse.existingSecret | default (include "curie.secretName" .) }}
       key: langfuseEncryptionKey
 - name: TELEMETRY_ENABLED
   value: {{ .Values.langfuse.telemetryEnabled | quote }}
