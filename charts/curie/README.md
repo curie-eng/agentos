@@ -1268,7 +1268,9 @@ curie cluster github-app --app-id 1234567 --existing-secret my-github-app
 
 `--existing-secret-key` defaults to `privateKey`, the same default as the
 chart — pass it explicitly if your Secret uses a different key, since the CLI
-always sets this field. The command also rolls the API deployment onto the
+always sets this field. The command signs a JWT and calls GitHub `GET /app`
+before the helm upgrade; a 401 or App-id mismatch leaves the last known-good
+credential in place. The command also rolls the API deployment onto the
 referenced Secret, so there is nothing further to restart.
 
 **Quick trial — let the chart hold it.** `curie cluster github-app --app-id …
