@@ -623,7 +623,62 @@ inference:
   persistence:
     enabled: false
     size: 10Gi
-  resources: {}
+  # Sized for `model` above, NOT left to the namespace LimitRange (#2329). The
+  # chart ships a default-on LimitRange whose per-container `default` is
+  # `cpu: "1"` / `memory: 1Gi`; a container that declares no resources of its
+  # own inherits that, and a 1 GiB ceiling OOMKills a 4B-parameter model on its
+  # first inference -- presenting as a model-server crash rather than as a chart
+  # capacity default. So the memory limit here must stay comfortably ABOVE that
+  # LimitRange default, or the ceiling is itself the bug.
+  #
+  # The memory REQUEST has to cover the weights on its own, because that is what
+  # the scheduler packs against: a request below the model's resident size will
+  # happily place this pod on a node that cannot hold it, and the kill then
+  # arrives under node pressure instead of at the limit -- the same
+  # "model-server crash" symptom, just from packing rather than the LimitRange.
+  # qwen3:4b is ~2.6Gi of weights at the default quantisation, so 4Gi requested.
+  # 6Gi limit adds room for the KV cache and the runtime's own arena. That is
+  # sized for the default context window; a much longer `num_ctx` grows the KV
+  # cache roughly linearly and wants a higher limit.
+  #
+  # Raise BOTH for a bigger `model` -- weights scale roughly with parameter
+  # count, and the limit, not the request, is what the OOM killer enforces.
+  # docs/local-model.md carries the per-model figures and the override flags.
+  #
+  # The cpu limit is deliberately 1, not 2, for the reason spelled out at
+  # clickhouse.resources: on a 2-vCPU node a limit of 2 is the whole machine,
+  # and under contention the kernel divides CPU in proportion to REQUESTS, where
+  # the critical-path sandbox containers ask for 50m each. That chart already
+  # walked a neighbour of exactly this shape back from 2 to 1 after it starved
+  # sandbox claims past their 90s bind deadline; a bursty demo model server is
+  # not the component to re-learn it on. Raise it on a node with cores to spare.
+  resources:
+    requests: { cpu: 500m, memory: 4Gi }
+    limits: { cpu: "1", memory: 6Gi }
+  # Container securityContext (issue #67). Safe subset only, and the reason is
+  # the image: `ollama/ollama` declares no USER, so the server runs as uid 0 and
+  # keeps its model store under $HOME (/root/.ollama, the mount path in
+  # inference.yaml). Setting runAsNonRoot / runAsUser here would need the model
+  # store relocated off /root and the volume re-owned, so it is deliberately NOT
+  # set -- full restricted-PSS on this workload is a separate change with a
+  # validated uid. readOnlyRootFilesystem stays false for the same reason: only
+  # the model store is a mounted volume, and the server and its postStart pull
+  # still write elsewhere on the rootfs.
+  #
+  # What IS safe on this image: the entrypoint is the single `ollama` binary
+  # (no chown/gosu wrapper, so no privilege manipulation to preserve) and the
+  # server binds an unprivileged port, so it needs no Linux capabilities and
+  # must never gain privileges. Those, plus the RuntimeDefault seccomp profile,
+  # are enough for Pod Security Standards `baseline`; `restricted` additionally
+  # requires runAsNonRoot and is not met, by the documented exception above.
+  # Override fields or set the whole block to null to opt out.
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: false
+    capabilities:
+      drop: [ALL]
+    seccompProfile:
+      type: RuntimeDefault
   service:
     port: 11434
 
