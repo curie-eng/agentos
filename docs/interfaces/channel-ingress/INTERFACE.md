@@ -142,7 +142,7 @@ tests assert the two sets equal in both directions.
 | `DropReason` | Documented rationale |
 |---|---|
 | `UNSUBSCRIBED_LANE` | The delivered envelope is outside the adapter's declared subscription surface — `apps/dispatcher/slack-app-manifest.yaml` subscribes to `app_mention` and `message.im` only, so a message event on any other channel type cannot legitimately arrive, and refusing it is envelope validation rather than a relevance judgement. |
-| `BOT_AUTHORED_THREAD_REPLY` | Loop guard across installations: Curie's own replies and placeholders are always threaded, so admitting a bot-authored mention that carries a thread timestamp would let two Curie installations in one workspace mention-loop each other indefinitely, which Bolt's self filter cannot stop because the two bot identities differ. |
+| `BOT_AUTHORED_THREAD_REPLY` | Loop guard across installations: Curie's own replies and placeholders are always threaded, so admitting a bot-authored mention that carries a thread timestamp would let two Curie installations in one workspace mention-loop each other indefinitely, which Bolt's self filter cannot stop because the two bot identities differ. An exact operator-trusted sender/channel pair may bypass this refusal; self-event suppression remains mandatory. |
 | `NON_CONTENT_SUBTYPE` | The subtype marks something other than new user content: an edit, a delete, a tombstone, a body redacted by Enterprise Key Management, or an assistant thread-start marker. |
 | `DUPLICATE_DELIVERY` | Slack redelivered a delivery whose idempotency key was already claimed, so processing it again would post a second placeholder and mint a second turn for one message. |
 | `NO_ACTION_IN_PAYLOAD` | A block-action payload carrying no actions names no command and addresses nothing, so there is no turn to mint from it. |
@@ -207,11 +207,15 @@ absent — it is *handled* by the dedicated approval listener, not dropped.
   typically arrives as Block Kit and is normalized by
   `apps/dispatcher/src/curie_dispatcher/inbound_text.py::derive_text` rather than read off
   an empty top-level `text`. A bot-authored mention carrying `thread_ts` is refused as
-  `BOT_AUTHORED_THREAD_REPLY` for the cross-installation loop above; on the DM lane bot
-  authorship is not consulted at all. The accepted cost, stated rather than discovered
-  later: an alert bot that replies *inside* a thread with a mention is not ingested.
-  Root-only admission is what separates the ticket's case from the loop without a new
-  `QueuedTurn` field or a bot allowlist.
+  `BOT_AUTHORED_THREAD_REPLY` for the cross-installation loop above, unless the event's
+  exact channel/bot pair is in `CURIE_SLACK_THREADED_BOT_ALLOWLIST`; on the DM lane bot
+  authorship is not consulted at all. The allowlist defaults to empty and malformed
+  entries fail dispatcher configuration. Only trust a dedicated sender that does not
+  automatically respond to Curie: an allowlisted second Curie installation could loop.
+  Bolt still drops this installation's own bot even when it is listed. Exact-pair,
+  cross-product, self-bot, content-filter and duplicate outcomes are exercised through
+  Bolt and real Valkey in `apps/dispatcher/tests/test_threaded_bot_allowlist.py`.
+  See `apps/dispatcher/README.md` for configuration and the live-proof boundary.
 
   Its known consequence, stated here rather than left to be found: a bot-authored event
   normally carries no human `user`, so the turn is queued with an empty `author` while its
