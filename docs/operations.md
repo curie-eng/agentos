@@ -212,7 +212,37 @@ Reports whether the release is healthy, which pods are ready, and the URLs
 to reach it -- including the web console, where you can see your agents,
 their deployed versions, and their run history. That console URL includes a
 `?api=1` parameter; leave it as-is when you open it, it's just what points
-the console at this release's Curie API.
+the console at this release's Curie API. `--json` also reports the current
+upgrade phase and the last known-good version.
+
+### `curie cluster upgrade`
+
+```bash
+curie cluster upgrade --to 0.9.0
+```
+
+| Flag | What it does |
+|---|---|
+| `--to <version>` | Target Curie version. Required. |
+| `--chart` | Chart path or ref override. |
+| `--yes` | Skip the confirmation prompt. |
+| `--dry-run` | Print the redacted plan and exit without mutating. |
+
+One resumable lifecycle: inspect and plan, validate configuration and
+compatibility, drain accepted work, checkpoint, migrate once, apply, wait
+for exact convergence, run a target-version canary, then record the new
+known-good version. The command chooses the values overlay; do not pass
+`--reuse-values` or `--reset-then-reuse-values`.
+
+`--json` reports the current phase, the last known-good version, whether
+the previous version is still serving, and at most one fail-forward
+command. Success is refused unless convergence is exact and the canary
+passed. Re-run the same command to resume after an interruption.
+
+This composes configuration migration (issue 2299) and schema
+compatibility (issue 2300) rather than adding Helm special cases. The
+pre-upgrade drain is the existing worker gate (issue 2010): a resume
+after a completed drain does not drain accepted work again.
 
 ### `curie cluster down`
 

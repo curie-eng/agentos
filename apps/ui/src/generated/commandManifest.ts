@@ -2770,6 +2770,77 @@ export const commandManifest = {
           "name": "rollback"
         },
         {
+          "about": "Run the resumable cluster upgrade lifecycle to a target version",
+          "args": [
+            {
+              "global": false,
+              "help": "Target Curie version (chart/app version) to upgrade to",
+              "id": "to",
+              "long": "to",
+              "positional": false,
+              "required": true
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "env": "CURIE_NAMESPACE",
+              "global": false,
+              "help": "Kubernetes namespace",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": false,
+              "help": "Helm release name",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Helm chart. Default: the version-pinned chart for `--to` on release builds; local `charts/curie` on dev builds",
+              "id": "chart",
+              "long": "chart",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Skip the interactive confirmation prompt",
+              "id": "yes",
+              "long": "yes",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Print the redacted upgrade plan and exit without mutating",
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "long_about": "Run the resumable cluster upgrade lifecycle to a target version.\n\nPlans, validates, drains accepted work, checkpoints, migrates, applies, proves exact convergence, runs a target-version canary, and records the new known-good revision. The operator does not pass Helm merge flags. A failed attempt either leaves the previous known-good version serving or returns one fail-forward command. See issue #2301.",
+          "name": "upgrade"
+        },
+        {
           "about": "Carry bundle objects across a chart upgrade that renames the object store (issue #1324)",
           "args": [
             {

@@ -19,7 +19,7 @@ use curie::docker;
 use curie::github_app as crate_github_app;
 use curie::local::{self, LocalDownOpts, LocalOpts};
 use curie::message::{self, MessageOpts};
-use curie::ops::{self, CommonOpts, DownOpts, RollbackOpts, UpOpts};
+use curie::ops::{self, CommonOpts, DownOpts, RollbackOpts, UpOpts, UpgradeOpts};
 use curie::secrets;
 use curie::state::{apply_continue, load_turn, CliTurnArgs, TurnVerb};
 use curie::ui::{self, ColorFlag, Ui};
@@ -2107,6 +2107,34 @@ enum ClusterAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Run the resumable cluster upgrade lifecycle to a target version.
+    ///
+    /// Plans, validates, drains accepted work, checkpoints, migrates, applies,
+    /// proves exact convergence, runs a target-version canary, and records the
+    /// new known-good revision. The operator does not pass Helm merge flags.
+    /// A failed attempt either leaves the previous known-good version serving
+    /// or returns one fail-forward command. See issue #2301.
+    Upgrade {
+        /// Target Curie version (chart/app version) to upgrade to.
+        #[arg(long = "to", value_name = "VERSION")]
+        to: String,
+        /// Kubernetes namespace.
+        #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
+        namespace: String,
+        /// Helm release name.
+        #[arg(long, default_value = "curie")]
+        release: String,
+        /// Helm chart. Default: the version-pinned chart for `--to` on release
+        /// builds; local `charts/curie` on dev builds.
+        #[arg(long)]
+        chart: Option<String>,
+        /// Skip the interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+        /// Print the redacted upgrade plan and exit without mutating.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Carry bundle objects across a chart upgrade that renames the object
     /// store (issue #1324).
     ///
@@ -3740,6 +3768,26 @@ async fn run(command: Option<Command>) -> Result<()> {
                 })
                 .await?,
             ),
+            ClusterAction::Upgrade {
+                to,
+                namespace,
+                release,
+                chart,
+                yes,
+                dry_run,
+            } => emit(
+                ops::upgrade(UpgradeOpts {
+                    common: CommonOpts {
+                        namespace,
+                        release,
+                        dry_run,
+                    },
+                    to,
+                    chart,
+                    yes,
+                })
+                .await?,
+            ),
             ClusterAction::Status {
                 namespace,
                 release,
@@ -4995,6 +5043,31 @@ mod tests {
             ),
             _ => panic!("expected cluster up"),
         }
+    }
+
+    #[test]
+    fn cluster_upgrade_requires_to_and_reads_namespace_env() {
+        let parsed =
+            Cli::try_parse_from(["curie", "cluster", "upgrade", "--to", "0.9.0", "--dry-run"])
+                .expect("cluster upgrade --to should parse");
+        match parsed.command {
+            Some(Command::Cluster {
+                action:
+                    ClusterAction::Upgrade {
+                        to,
+                        namespace,
+                        dry_run,
+                        ..
+                    },
+            }) => {
+                assert_eq!(to, "0.9.0");
+                assert_eq!(namespace, "curie");
+                assert!(dry_run);
+            }
+            _ => panic!("expected cluster upgrade"),
+        }
+        let missing = Cli::try_parse_from(["curie", "cluster", "upgrade"]);
+        assert!(missing.is_err(), "--to is required");
     }
 
     #[test]

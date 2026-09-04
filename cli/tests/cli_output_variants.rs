@@ -52,6 +52,7 @@ use curie::migrate_store::MigrateStoreOutput;
 use curie::observability::{Endpoint, ObservabilityMetricsOutput, ObservabilityOutput};
 use curie::ops::{
     ClusterDownOutput, ClusterRollbackOutput, ClusterStatus, ClusterStatusOutput, ClusterUpOutput,
+    ClusterUpgradeOutput,
 };
 use curie::ui::{CliOutput, DryRunPlan};
 
@@ -198,6 +199,7 @@ fn cluster_status() -> Box<ClusterStatus> {
         unhealthy: Vec::new(),
         pods_listed: true,
         urls: Vec::new(),
+        upgrade: curie::ops::UpgradeStatusView::idle(None),
     })
 }
 
@@ -536,6 +538,35 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 to_revision: 19,
                 skipped: vec![20],
                 forced: false,
+            },
+        ],
+    );
+    m.insert(
+        "ClusterUpgradeOutput",
+        samples![
+            "DryRun" => ClusterUpgradeOutput::DryRun(plan()),
+            "Completed" => ClusterUpgradeOutput::Completed {
+                status: "succeeded".into(),
+                phase: "commit".into(),
+                target_version: "0.9.0".into(),
+                from_version: Some("0.8.6".into()),
+                known_good_version: Some("0.9.0".into()),
+                resumed: false,
+                previous_serving: true,
+                unchanged: false,
+                plan: vec!["phase plan: 0.8.6 -> 0.9.0".into()],
+                convergence: Some(curie::ops::Convergence {
+                    exact: true,
+                    images: true,
+                    generations: true,
+                    replicas: true,
+                    unavailable_zero: true,
+                    hooks_healthy: true,
+                    queues_drained: true,
+                    manifest_matches: true,
+                }),
+                canary: Some(curie::ops::Canary { passed: true }),
+                fail_forward: None,
             },
         ],
     );

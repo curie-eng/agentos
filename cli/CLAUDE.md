@@ -7,7 +7,7 @@ local runner container via Docker. Three command families: `skill` drives a
 plugin against a local runner with `up`, `down`, `status`, `message`, and
 `eval`; `local` wraps the compose stack and local API with `up`, `down`,
 `status`, `comms`, `message`, `deploy`, and `observability`; `cluster` wraps
-Helm and the deployed release with `up`, `status`, `down`, `comms`, `message`,
+Helm and the deployed release with `up`, `upgrade`, `status`, `down`, `comms`, `message`,
 `deploy`, and `observability`. Full command reference in
 `cli/README.md`.
 
