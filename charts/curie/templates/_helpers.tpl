@@ -1377,3 +1377,39 @@ securityContext:
   resources:
     {{- toYaml .resources | nindent 4 }}
 {{- end -}}
+{{/*
+Render the runner-sandbox egress rules for a list of {cidr, ports, except?}
+entries. The dot IS the entry list, and the caller supplies the indentation:
+
+    {{- include "curie.egress.ipBlockRules" .Values.api.egress | trim | nindent 4 }}
+
+Every ipBlock peer rail 1 renders goes through here, so the metadata carve-out
+is stated ONCE. That carve-out is the security invariant: NetworkPolicy allows
+are additive, so an entry broad enough to contain 169.254.169.254 re-permits the
+cloud metadata endpoint rail 1 otherwise denies. An explicit per-entry `except:`
+list wins (including an empty one, a deliberate operator override); otherwise
+curie.metadataExcept returns a same-family, subset-safe carve-out for ANY CIDR
+that contains the metadata address -- not just an exact /0 -- and "" for CIDRs
+that cannot reach it. See that helper for the containment/family rules.
+*/}}
+{{- define "curie.egress.ipBlockRules" -}}
+{{- range . }}
+- to:
+    - ipBlock:
+        cidr: {{ .cidr }}
+        {{- if .except }}
+        except:
+          {{- toYaml .except | nindent 10 }}
+        {{- else }}
+        {{- $auto := include "curie.metadataExcept" .cidr | trim }}
+        {{- if $auto }}
+        except:
+          - {{ $auto }}
+        {{- end }}
+        {{- end }}
+  {{- with .ports }}
+  ports:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}
+{{- end -}}

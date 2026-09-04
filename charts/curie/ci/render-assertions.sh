@@ -1487,6 +1487,11 @@ WORKER_API_BYO="$TMP/worker_api_byo.yaml"
 cat > "$WORKER_API_BYO" <<'EOF'
 api:
   deploy: false
+  # Rail 1 needs a CIDR peer for a BYO API (#2317); this fixture only cares
+  # about the worker's CURIE_API_URL.
+  egress:
+    - cidr: 192.0.2.41/32
+      ports: [{ protocol: TCP, port: 443 }]
 dispatcher:
   apiBaseUrl: https://byo-api.example
 ui:

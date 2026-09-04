@@ -707,6 +707,24 @@ otelCollector:
   # supplied egress policy selecting the adapter, or its exports are dropped
   # while every other workload's succeed.
   endpoint: ""
+  # Runner sandbox egress to a BYO collector endpoint (#2317). Rail 1 is
+  # fail-closed, and the in-chart runner-allow-collector policy selects this
+  # release's collector pod, so it does not render when deploy is false. Each
+  # entry is {cidr, ports, except?} like security.networkPolicy.allowedEgress.
+  # NetworkPolicy cannot target a DNS name, so the `endpoint` above is not
+  # enough. Required only when deploy is false, Rail 1 is on, and the resolved
+  # endpoint is non-empty; a telemetry-disabled or endpoint-less install needs
+  # nothing here because there is nothing for the runner to reach. It is read
+  # ONLY on that BYO branch: setting it while deploy is true is refused at
+  # render rather than silently ignored. Empty (the
+  # default) keeps fail-closed: otherwise the install is green, every other
+  # workload's traces flow, and only the sandbox's spans are silently dropped.
+  # Each entry must set cidr and ports. Default routes and CIDRs that reach
+  # 169.254.169.254 are refused: this is one collector endpoint, not a second
+  # model allowlist.
+  egress: []
+  #  - cidr: 192.0.2.10/32
+  #    ports: [{ protocol: TCP, port: 4318 }]
   protocol: http/protobuf
   # Optional OTEL_EXPORTER_OTLP_HEADERS. Prefer headersExistingSecret for
   # credentials so they never enter Helm values. The two sources are mutually
@@ -861,6 +879,27 @@ grafanaConnector:
 # ---------------------------------------------------------------------------
 api:
   deploy: true
+  # Runner sandbox egress to a BYO API endpoint (#2317). Rail 1 is fail-closed,
+  # and the in-chart runner-allow-api policy selects this release's api pod, so
+  # it does not render when deploy is false. Each entry is
+  # {cidr, ports, except?} like security.networkPolicy.allowedEgress.
+  # NetworkPolicy cannot target a DNS name, so dispatcher.apiBaseUrl is not
+  # enough. Required when deploy is false, Rail 1 is on, and
+  # dispatcher.apiBaseUrl names an external API; deploy false with no base URL
+  # at all names nothing for the runner to reach and that install already
+  # dead-ends loudly at dispatcher boot. It is read ONLY on that BYO branch:
+  # setting it while deploy is true is refused at render rather than silently
+  # ignored, and an external destination reached while the in-chart API is
+  # still deployed stays governed by security.networkPolicy.allowedEgress.
+  # Empty (the default) keeps fail-closed: otherwise the install is green and
+  # agents boot with no memory and no thread history, with only a warning line
+  # inside the sandbox to show for it. Each entry must set cidr and ports.
+  # Default routes and CIDRs that reach 169.254.169.254 are refused: this is
+  # one API endpoint, not a second model allowlist.
+  # mailAdapter.apiEgress.httpsCidrs is the same idea for the mail adapter pod.
+  egress: []
+  #  - cidr: 192.0.2.11/32
+  #    ports: [{ protocol: TCP, port: 443 }]
   replicas: 1
   image:
     repository: ghcr.io/curie-eng/curie-api

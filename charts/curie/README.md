@@ -154,6 +154,19 @@ because the API's `/health` is unauthenticated, that first preflight proves only
 reachability. The following authenticated `/agents` discovery refuses startup
 when a BYO API expects a different key. Match `apiKey` to the API you point at.
 
+`api.deploy: false` also moves the runner sandbox's memory, history and state
+calls onto that external host, and the sandbox is under Rail 1's default-deny
+egress. The in-chart `runner-allow-api` policy selects this release's API pods,
+so it does not render, and NetworkPolicy has no hostname peer to derive from
+`dispatcher.apiBaseUrl`. Set `api.egress` to the endpoint's CIDRs (`{cidr,
+ports}` entries, same shape as the allowlist); the chart requires it at render
+whenever `dispatcher.apiBaseUrl` names an external API, because the failure it
+prevents is silent — agents boot with no
+prior memory and no thread transcript, `remember` writes never persist, and the
+only symptom is a warning line inside the sandbox.
+`mailAdapter.apiEgress.httpsCidrs` above is the same idea for the mail adapter
+pod: one BYO peer, declared explicitly, per pod that has an egress policy.
+
 **Cluster variants:**
 
 - **Cluster already runs the agent-sandbox controller** (cluster-scoped, one per
@@ -889,10 +902,15 @@ sandbox and renders whenever an in-chart store is deployed.
 **Fail-closed egress.** `security.networkPolicy.allowedEgress` is EMPTY by
 default: a fresh install denies all egress except DNS until the operator declares
 where the model API and MCP endpoints live (`{cidr, ports}` entries). An unset
-allowlist never means allow-all. A BYO object store is not on that list: set
+allowlist never means allow-all. The BYO in-chart peers are not on that list
+either, because each names one endpoint rather than a class of destinations: set
 `rustfs.egress` (and `rustfs.stsEgress` on the key-free path) so the sandbox
-bundle-fetch can reach S3 and STS without opening the model allowlist. See
-**Key-free object store auth** above.
+bundle-fetch can reach S3 and STS, `otelCollector.egress` when
+`otelCollector.deploy: false` points the runner at an external collector, and
+`api.egress` when `api.deploy: false` points it at an external API. Each is
+required at render on its BYO path, so the install fails loudly instead of
+shipping a sandbox holding an address it can never reach. See **Key-free object
+store auth** above.
 
 **The controller does not get a second vote on egress (#765, ADR-0067).**
 NetworkPolicy allows are additive across objects selecting the same pods -- Rail
@@ -1100,7 +1118,11 @@ to install only the control plane + backing stores without the runner substrate.
 - Traces flow to `<release>-otel-collector:4318` (HTTP) when the chart collector
   is deployed, or to `otelCollector.endpoint` when that BYO field is set. The
   env block is omitted only for explicit `telemetryDisabled` or local/offline
-  no-endpoint mode.
+  no-endpoint mode. The runner is under Rail 1, so on the BYO path the endpoint
+  alone gets it nowhere: `otelCollector.egress` must name the collector's CIDRs
+  or the default-deny drops every sandbox span while api, dispatcher and worker
+  keep exporting normally. The chart requires it at render rather than letting
+  that asymmetry ship silently.
 
 ## Deploying without inbound access
 

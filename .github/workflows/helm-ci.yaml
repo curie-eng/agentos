@@ -499,6 +499,16 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/object-store-byo-egress-assertions.sh
 
+      # Prove the same for the other two in-chart runner carve-outs: a BYO
+      # collector or API endpoint renders its own ipBlock allow and is refused
+      # at render without one. Assertion 10 is the class guard -- a future
+      # `.deploy` carve-out added without a BYO else branch fails here rather
+      # than in a customer's silently trace-less or amnesiac install (#2317).
+      - name: helm render assertions (BYO collector/API runner egress)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/byo-endpoint-egress-assertions.sh
+
       # Prove a nil worker.publication.githubHttpsCidrs cannot collapse the
       # tokenless publication job's GitHub egress rule to an empty to: (allow-all
       # on 443). Also rejects that empty-to shape on every rendered
