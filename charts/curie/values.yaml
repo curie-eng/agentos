@@ -1570,7 +1570,10 @@ worker:
   adapterCredentialsExistingSecretKey: adapterCredentials
   # Extra env for the worker container, list of {name, value}. For SLACK_API_BASE_URL
   # prefer the first-class slackApiBaseUrl above; use extraEnv for any other
-  # worker override the fixed env block does not cover. Per-workload
+  # worker override the fixed env block does not cover. Names that collide with
+  # first-class timeout/budget env (CURIE_RUNNER_TOTAL_TIMEOUT_S and the rest of
+  # that family) are dropped at render so a retained pre-first-class override
+  # cannot duplicate the key on upgrade (#2097). Per-workload
   # OTEL_EXPORTER_OTLP_* overrides still win over the chart-owned collector
   # endpoint.
   extraEnv: []

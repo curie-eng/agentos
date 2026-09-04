@@ -440,6 +440,11 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/worker-ttl-bounds-assertions.sh
 
+      - name: live-manifest parity verifier self-test
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/live-manifest-parity-assertions.sh
+
       # Prove the API and the worker agree about the object store. The API writes
       # each uploaded plugin bundle to the bundle bucket and the worker reads it
       # back, so a disagreement -- or an omission -- makes every bundle
