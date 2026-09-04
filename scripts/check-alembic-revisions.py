@@ -1,5 +1,6 @@
 import argparse
 import ast
+import json
 import re
 import sys
 from collections import defaultdict
@@ -11,6 +12,15 @@ FILENAME_PATTERN = re.compile(r"^(\d+[a-z]?)_.+\.py$")
 DEFAULT_SCRIPT_LOCATION = (
     Path(__file__).resolve().parents[1] / "apps" / "api" / "alembic"
 )
+DEFAULT_KINDS_FILE = (
+    Path(__file__).resolve().parents[1]
+    / "apps"
+    / "api"
+    / "src"
+    / "curie_api"
+    / "revision_kinds.json"
+)
+_VALID_KINDS = {"expand", "contract", "irreversible"}
 
 
 def _revision_id(path: Path) -> str | None:
@@ -189,6 +199,41 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
+
+    if script_location.resolve() == DEFAULT_SCRIPT_LOCATION.resolve():
+        try:
+            kinds_payload = json.loads(DEFAULT_KINDS_FILE.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            print(
+                f"Alembic revision gate failed: could not read {DEFAULT_KINDS_FILE}: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+        graph_ids = {
+            rev.revision
+            for rev in ScriptDirectory(str(script_location)).walk_revisions()
+        }
+        declared = set(kinds_payload)
+        missing = sorted(graph_ids - declared)
+        extra = sorted(declared - graph_ids)
+        invalid = sorted(
+            f"{rev}={kind}"
+            for rev, kind in kinds_payload.items()
+            if kind not in _VALID_KINDS
+        )
+        if missing or extra or invalid:
+            print(
+                "Alembic revision gate failed: revision_kinds.json must classify "
+                "every revision as expand, contract, or irreversible (#2300).",
+                file=sys.stderr,
+            )
+            if missing:
+                print(f"  missing kinds: {', '.join(missing)}", file=sys.stderr)
+            if extra:
+                print(f"  extra kinds: {', '.join(extra)}", file=sys.stderr)
+            if invalid:
+                print(f"  invalid kinds: {', '.join(invalid)}", file=sys.stderr)
+            return 1
 
     print(f"Alembic revision gate passed with head {heads[0]}.")
     return 0

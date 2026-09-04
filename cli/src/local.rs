@@ -394,8 +394,8 @@ pub struct SourceImage {
 /// profiles alone left the main dev-loop verb still failing with
 /// `No module named curie_dispatcher.enqueue_once` -- observed, not theorised.
 ///
-/// `curie-api` covers `curie-migrate` too: same image, and it is what applies
-/// the migrations, which is how a stale one leaves the database behind the tree.
+/// `curie-api` covers `curie-migrate` too: same image, and that one-shot is the
+/// compose upgrade phase (`python -m curie_api.schema_compat upgrade`, #2300).
 pub fn source_images(o: &LocalOpts) -> Vec<SourceImage> {
     source_images_for(o.minimal)
 }

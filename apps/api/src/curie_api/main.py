@@ -62,6 +62,7 @@ from .routers import (
     state,
     workspaces,
 )
+from .schema_compat import assert_servable
 from .slack_approvers import SlackApproverSetSelector
 from .slack_usergroups import SlackUserGroupClient
 from .storage import BundleStore
@@ -74,6 +75,9 @@ _LOG = logging.getLogger("curie_api")
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
+    # Fail closed when this image cannot serve the live schema. Migrations are
+    # applied by the upgrade Job / curie-migrate, never here (#2300).
+    await assert_servable()
     engine = create_engine()
     app.state.engine = engine
     app.state.sessionmaker = create_sessionmaker(engine)

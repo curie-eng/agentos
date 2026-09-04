@@ -96,9 +96,9 @@ echo "upgraded ${RELEASE} from ${installed} to ${landed}"
 
 # RECOVERY IS NOT AUTOMATIC, AND SAYING SO IS THE POINT.
 #
-# `helm rollback` restores objects; it does not restore the database. Migrations
-# run as the api initContainer (`alembic upgrade head`) and rollback does not run
-# `alembic downgrade`. For a version pair that migrated, recovery is
-# restore-from-backup, and a rollback alone would leave old code against a new
-# schema. So this Job does not roll back, and the runbook must not imply it can.
+# `helm rollback` restores objects; it does not restore the database.
+# Migrations run in the schema-migrate Job, not in every API pod (#2300).
+# Expand-only patches keep application N-1 serving against the new schema.
+# Contract/irreversible migrations are forward-only; recovery there is
+# restore-from-backup. This Job does not roll back.
 echo "note: rollback is an operator action; see docs/PERMISSION-MAP.md entry 4"
