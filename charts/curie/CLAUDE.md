@@ -175,7 +175,11 @@ component and rail detail in `charts/curie/README.md`.
     can store `placement: null`, and `--reuse-values` on upgrade replays
     it, deleting the key -- and the `curie.placement.class` helper (see
     the values-keys invariant above) is its template-level backstop
-    (#2008).
+    (#2008). `worker.publication.githubHttpsCidrs` is a third instance:
+    `minItems: 1` catches `[]`, but a coalesced nil deletes the key and a
+    `range` over it used to emit an empty `to:` (allow-all on 443 for the
+    tokenless publication job). The template `fail` in
+    `publication-owner.yaml` is the backstop (#2321).
 
 ## Verify
 
