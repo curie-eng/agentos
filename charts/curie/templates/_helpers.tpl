@@ -178,6 +178,51 @@ ANTHROPIC_BASE_URL ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKE
 {{- end -}}
 {{- end -}}
 
+{{/* URL scheme for the ClickHouse endpoint Langfuse connects to (#2314).
+     Same shape as curie.rustfs.scheme (#1447): an explicit clickhouse.scheme
+     wins, otherwise a BYO server on the conventional ClickHouse HTTPS port
+     (8443) is assumed to speak TLS and everything else stays cleartext. The
+     chart-owned server is always http. */}}
+{{- define "curie.clickhouse.scheme" -}}
+{{- $scheme := .Values.clickhouse.scheme | default "" -}}
+{{- if $scheme -}}
+{{- if not (has $scheme (list "http" "https")) -}}
+{{- fail (printf "clickhouse.scheme must be either \"http\" or \"https\", got %q" $scheme) -}}
+{{- end -}}
+{{- $scheme -}}
+{{- else if and (not .Values.clickhouse.deploy) (eq (printf "%v" .Values.clickhouse.httpPort) "8443") -}}
+https
+{{- else -}}
+http
+{{- end -}}
+{{- end -}}
+
+{{/* The one HTTP endpoint every ClickHouse consumer uses. Call sites include
+     this helper rather than re-composing scheme://host:port (#2314). */}}
+{{- define "curie.clickhouse.httpUrl" -}}
+{{- include "curie.clickhouse.scheme" . }}://{{ include "curie.clickhouse.host" . }}:{{ .Values.clickhouse.httpPort }}
+{{- end -}}
+
+{{/* Langfuse's ClickHouse migration DSN, on the native port. Deliberately
+     bare: Langfuse's `up.sh` appends its own query string
+     (`${CLICKHOUSE_MIGRATION_URL}?username=...`), so anything added here would
+     produce two `?` and break the migration. TLS is selected out of band by
+     CLICKHOUSE_MIGRATION_SSL (curie.clickhouse.migrationSsl). */}}
+{{- define "curie.clickhouse.migrationUrl" -}}
+clickhouse://{{ include "curie.clickhouse.host" . }}:{{ .Values.clickhouse.nativePort }}
+{{- end -}}
+
+{{/* Whether the Langfuse migration connection on the native port uses TLS
+     (#2314). Tracks the HTTP scheme: a TLS ClickHouse endpoint terminates TLS
+     on both ports. */}}
+{{- define "curie.clickhouse.migrationSsl" -}}
+{{- if eq (include "curie.clickhouse.scheme" .) "https" -}}
+true
+{{- else -}}
+false
+{{- end -}}
+{{- end -}}
+
 {{- define "curie.clickhouse.loggingConfig" -}}
 <clickhouse>
   <logger>
@@ -284,6 +329,31 @@ true
 {{- else -}}
 {{- required "langfuse.deploy is false: set langfuse.host to your external Langfuse hostname" .Values.langfuse.host -}}
 {{- end -}}
+{{- end -}}
+
+{{/* URL scheme for the Langfuse endpoint every consumer talks to (#2314).
+     Same shape as curie.rustfs.scheme (#1447): an explicit langfuse.scheme
+     wins, otherwise a BYO endpoint on 443 is assumed to speak TLS and
+     everything else stays cleartext. The chart-owned Service is always http. */}}
+{{- define "curie.langfuse.scheme" -}}
+{{- $scheme := .Values.langfuse.scheme | default "" -}}
+{{- if $scheme -}}
+{{- if not (has $scheme (list "http" "https")) -}}
+{{- fail (printf "langfuse.scheme must be either \"http\" or \"https\", got %q" $scheme) -}}
+{{- end -}}
+{{- $scheme -}}
+{{- else if and (not .Values.langfuse.deploy) (eq (printf "%v" .Values.langfuse.web.service.port) "443") -}}
+https
+{{- else -}}
+http
+{{- end -}}
+{{- end -}}
+
+{{/* The one Langfuse base URL. Call sites include this helper rather than
+     re-composing scheme://host:port, which is how the hardcoded `http://`
+     reached five consumers at once (#2314). */}}
+{{- define "curie.langfuse.url" -}}
+{{- include "curie.langfuse.scheme" . }}://{{ include "curie.langfuse.webHost" . }}:{{ .Values.langfuse.web.service.port }}
 {{- end -}}
 
 {{/* Shared ServiceAccount name for both Langfuse Deployments. Empty
@@ -439,7 +509,7 @@ processors:
   batch: {}
 exporters:
   otlphttp/langfuse:
-    endpoint: http://{{ include "curie.langfuse.webHost" . }}:{{ .Values.langfuse.web.service.port }}/api/public/otel
+    endpoint: {{ include "curie.langfuse.url" . }}/api/public/otel
     headers:
       Authorization: ${env:LANGFUSE_OTLP_AUTH_HEADER}
     retry_on_failure:
@@ -945,9 +1015,17 @@ livenessProbe:
 - name: LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES
   value: {{ .Values.langfuse.enableExperimentalFeatures | quote }}
 - name: CLICKHOUSE_MIGRATION_URL
-  value: clickhouse://{{ include "curie.clickhouse.host" . }}:{{ .Values.clickhouse.nativePort }}
+  value: {{ include "curie.clickhouse.migrationUrl" . }}
 - name: CLICKHOUSE_URL
-  value: http://{{ include "curie.clickhouse.host" . }}:{{ .Values.clickhouse.httpPort }}
+  value: {{ include "curie.clickhouse.httpUrl" . }}
+{{- if eq (include "curie.clickhouse.migrationSsl" .) "true" }}
+{{- /* Langfuse's documented switch for a TLS migration connection on the
+       native port; its migrator appends `secure=true` to the DSN itself, which
+       is why CLICKHOUSE_MIGRATION_URL above stays bare. Rendered only on the
+       https path so a cleartext install is byte-identical (#2314). */}}
+- name: CLICKHOUSE_MIGRATION_SSL
+  value: "true"
+{{- end }}
 - name: CLICKHOUSE_USER
   value: {{ .Values.clickhouse.auth.username | quote }}
 {{- /* Both of these honour the store's own existingSecret, the same escape
@@ -1350,8 +1428,8 @@ securityContext:
       probe_timeout_ms={{ mulf $root.Values.langfuse.clickhouseReadiness.timeoutSeconds 1000 | int }}
       while [ "$attempt" -le "$max_attempts" ]; do
         if PROBE_TIMEOUT_MS="$probe_timeout_ms" node -e '
-      const http = require("http");
-      const request = http.get(process.env.CLICKHOUSE_URL + "/ping", { timeout: Number(process.env.PROBE_TIMEOUT_MS) }, (response) => {
+      const client = require(process.env.CLICKHOUSE_URL.startsWith("https:") ? "https" : "http");
+      const request = client.get(process.env.CLICKHOUSE_URL + "/ping", { timeout: Number(process.env.PROBE_TIMEOUT_MS) }, (response) => {
         response.resume();
         process.exit(response.statusCode === 200 ? 0 : 1);
       });
@@ -1373,7 +1451,7 @@ securityContext:
       exit 1
   env:
     - name: CLICKHOUSE_URL
-      value: http://{{ include "curie.clickhouse.host" $root }}:{{ $root.Values.clickhouse.httpPort }}
+      value: {{ include "curie.clickhouse.httpUrl" $root }}
   resources:
     {{- toYaml .resources | nindent 4 }}
 {{- end -}}
