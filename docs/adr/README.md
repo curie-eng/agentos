@@ -164,4 +164,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0132 | [Gate evals on the worst cohort and require cross-family verifiers](0132-worst-cohort-eval-gates-and-cross-family-verifiers.md) | Draft |
 | 0133 | [The control agent renders screens; a human presses the buttons](0133-the-control-agent-renders-screens-a-human-presses.md) | Draft |
 | 0134 | [A hook shares one thread per partition](0134-a-hook-shares-one-thread-per-partition.md) | Draft |
+| 0143 | [A custom connector is a bundle-built HTTP MCP server that holds its own credential](0143-a-custom-connector-is-a-bundle-built-http-mcp-server-that-holds-its-own-credential.md) | Draft |
 <!-- END GENERATED: adr-index -->
