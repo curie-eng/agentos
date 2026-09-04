@@ -29,7 +29,7 @@ import logging
 import re
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -2779,6 +2779,35 @@ class Kernel:
             if replace_handle is not None:
                 loop = asyncio.get_running_loop()
 
+                def run_status_probe(
+                    probe_factory: Callable[
+                        [float | None], Coroutine[Any, Any, bool]
+                    ],
+                    *,
+                    failure: str,
+                ) -> bool:
+                    """Run one bounded runner probe from the coordinator thread."""
+
+                    probe_remaining_s = handoff_remaining()
+                    probe = asyncio.run_coroutine_threadsafe(
+                        probe_factory(probe_remaining_s), loop
+                    )
+                    request_ceiling = self._config.runner_total_timeout_s
+                    if probe_remaining_s is not None:
+                        request_ceiling = max(
+                            0.0, min(request_ceiling, probe_remaining_s)
+                        )
+                    try:
+                        return probe.result(
+                            timeout=(
+                                request_ceiling
+                                + _HANDOFF_REVALIDATION_BRIDGE_GRACE_S
+                            )
+                        )
+                    except Exception as exc:
+                        probe.cancel()
+                        raise ThreadBusyError(failure) from exc
+
                 def revalidate_before_handoff() -> None:
                     """Bridge the coordinator thread back to the runner's loop.
 
@@ -2789,25 +2818,15 @@ class Kernel:
                     free to service the authenticated status request.
                     """
 
-                    probe_remaining_s = handoff_remaining()
-                    probe = asyncio.run_coroutine_threadsafe(
-                        self._workspace_handoff_ready(
+                    ready = run_status_probe(
+                        lambda probe_remaining_s: self._workspace_handoff_ready(
                             replace_handle, remaining_s=probe_remaining_s
                         ),
-                        loop,
+                        failure=(
+                            f"thread {thread_key} workspace handoff fence "
+                            "could not be revalidated"
+                        ),
                     )
-                    request_ceiling = self._config.runner_total_timeout_s
-                    if probe_remaining_s is not None:
-                        request_ceiling = max(0.0, min(request_ceiling, probe_remaining_s))
-                    try:
-                        ready = probe.result(
-                            timeout=(request_ceiling + _HANDOFF_REVALIDATION_BRIDGE_GRACE_S)
-                        )
-                    except Exception as exc:
-                        probe.cancel()
-                        raise ThreadBusyError(
-                            f"thread {thread_key} workspace handoff fence could not be revalidated"
-                        ) from exc
                     if not ready:
                         raise ThreadBusyError(
                             f"thread {thread_key} lost its durable workspace "
@@ -2819,31 +2838,15 @@ class Kernel:
                 def validate_candidate(candidate: SandboxHandle) -> None:
                     """Attest the newly ready runner before the substrate route CAS."""
 
-                    probe_remaining_s = handoff_remaining()
-                    probe = asyncio.run_coroutine_threadsafe(
-                        self._workspace_candidate_ready(
+                    ready = run_status_probe(
+                        lambda probe_remaining_s: self._workspace_candidate_ready(
                             candidate, remaining_s=probe_remaining_s
                         ),
-                        loop,
-                    )
-                    request_ceiling = self._config.runner_total_timeout_s
-                    if probe_remaining_s is not None:
-                        request_ceiling = max(
-                            0.0, min(request_ceiling, probe_remaining_s)
-                        )
-                    try:
-                        ready = probe.result(
-                            timeout=(
-                                request_ceiling
-                                + _HANDOFF_REVALIDATION_BRIDGE_GRACE_S
-                            )
-                        )
-                    except Exception as exc:
-                        probe.cancel()
-                        raise ThreadBusyError(
+                        failure=(
                             f"thread {thread_key} workspace handoff candidate "
                             "could not be attested"
-                        ) from exc
+                        ),
+                    )
                     if not ready:
                         raise ThreadBusyError(
                             f"thread {thread_key} workspace handoff candidate "
