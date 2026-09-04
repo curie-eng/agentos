@@ -29,7 +29,7 @@ import logging
 import re
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -329,6 +329,14 @@ _MIN_ATTEMPT_BUDGET_S = 5.0
 # window is treated as an unreadable runner, which fails closed.
 _RECLAIM_PREFLIGHT_IDLE_TIMEOUT_S = 5.0
 _RECLAIM_PREFLIGHT_POLL_S = 0.05
+
+# ``WorkspaceClaimCoordinator`` performs blocking clone/archive/upload work on
+# a worker thread. Its final handoff guard schedules one bounded runner-status
+# read back onto the owning asyncio loop, then waits on that thread. The HTTP
+# request already has the runner client's delivery-clamped timeout; this small
+# grace covers scheduling and returning its result without leaving a worker
+# thread blocked forever if the loop stops servicing callbacks.
+_HANDOFF_REVALIDATION_BRIDGE_GRACE_S = 1.0
 
 
 class ReclaimPreflightUnsafe(RuntimeError):
@@ -2540,6 +2548,7 @@ class Kernel:
                 else None
             ),
             agent_name=agent_name,
+            remaining_s=remaining_s,
         )
         retained_live_route = existing_handle is not None and handle == existing_handle
         claim_ms = round((time.monotonic() - claim_started) * 1000)
@@ -2684,7 +2693,46 @@ class Kernel:
         return (
             status.get("turn_active") is False
             and status.get("history_durable") is True
-            and status.get("status") != SessionStatus.AWAITING_APPROVAL.value
+            and status.get("status")
+            in {
+                SessionStatus.DONE.value,
+                SessionStatus.IDLE_AWAITING_INPUT.value,
+            }
+        )
+
+    async def _workspace_candidate_ready(
+        self, handle: SandboxHandle, *, remaining_s: float | None = None
+    ) -> bool:
+        """Fail closed unless this exact candidate booted the managed checkout."""
+
+        if not handle.token:
+            logger.warning(
+                "workspace handoff refused an unauthenticated candidate runner at %s",
+                handle.base_url,
+            )
+            return False
+        try:
+            status = await self._runner.status(
+                handle.base_url,
+                token=handle.token,
+                remaining_s=remaining_s,
+            )
+        except Exception as exc:  # noqa: BLE001 - unreadable is never safe to expose
+            logger.warning(
+                "could not attest workspace handoff candidate at %s: %r",
+                handle.base_url,
+                exc,
+            )
+            return False
+        return (
+            status.get("session_id") == handle.session_id
+            and status.get("sandbox_id") == handle.sandbox_id
+            and status.get("managed_workspace") is True
+            and status.get("cwd") == "/workspace"
+            and status.get("ready") is True
+            and status.get("turn_active") is False
+            and status.get("history_durable") is True
+            and status.get("status") == SessionStatus.IDLE_AWAITING_INPUT.value
         )
 
     async def _claim_or_resume(
@@ -2696,6 +2744,7 @@ class Kernel:
         workspace_repo: str | None = None,
         replace_handle: SandboxHandle | None = None,
         agent_name: str | None = None,
+        remaining_s: float | None = None,
     ) -> SandboxHandle:
         # A live route is an adopt/steer, not a session start. Preparing before
         # this check would clone on every threaded steer and could even replace
@@ -2705,6 +2754,16 @@ class Kernel:
         # lookup-then-claim gap, where the route could disappear and ``claim``
         # would create a sandbox without a freshly prepared workspace ref.
         if workspace_deployment_id is not None:
+            handoff_budget_started = time.monotonic()
+
+            def handoff_remaining() -> float | None:
+                if remaining_s is None:
+                    return None
+                return max(
+                    0.0,
+                    remaining_s - (time.monotonic() - handoff_budget_started),
+                )
+
             if self._workspace is None:
                 raise WorkspacePreparationError(
                     "wiring", "selected workspace has no trusted claim-time preparer"
@@ -2717,6 +2776,86 @@ class Kernel:
                     ttl_seconds=self._route_ttl_seconds,
                 )
                 return existing
+            handoff_revalidation: Callable[[], None] | None = None
+            candidate_validation: Callable[[SandboxHandle], None] | None = None
+            if replace_handle is not None:
+                loop = asyncio.get_running_loop()
+
+                def run_status_probe(
+                    probe_factory: Callable[
+                        [float | None], Coroutine[Any, Any, bool]
+                    ],
+                    *,
+                    failure: str,
+                ) -> bool:
+                    """Run one bounded runner probe from the coordinator thread."""
+
+                    probe_remaining_s = handoff_remaining()
+                    probe = asyncio.run_coroutine_threadsafe(
+                        probe_factory(probe_remaining_s), loop
+                    )
+                    request_ceiling = self._config.runner_total_timeout_s
+                    if probe_remaining_s is not None:
+                        request_ceiling = max(
+                            0.0, min(request_ceiling, probe_remaining_s)
+                        )
+                    try:
+                        return probe.result(
+                            timeout=(
+                                request_ceiling
+                                + _HANDOFF_REVALIDATION_BRIDGE_GRACE_S
+                            )
+                        )
+                    except Exception as exc:
+                        probe.cancel()
+                        raise ThreadBusyError(failure) from exc
+
+                def revalidate_before_handoff() -> None:
+                    """Bridge the coordinator thread back to the runner's loop.
+
+                    The coordinator invokes this after preparation and durable
+                    ownership staging, immediately before ``substrate.handoff``.
+                    Blocking here is safe: ``_claim_or_resume`` is awaiting the
+                    coordinator via ``to_thread``, so the owning event loop is
+                    free to service the authenticated status request.
+                    """
+
+                    ready = run_status_probe(
+                        lambda probe_remaining_s: self._workspace_handoff_ready(
+                            replace_handle, remaining_s=probe_remaining_s
+                        ),
+                        failure=(
+                            f"thread {thread_key} workspace handoff fence "
+                            "could not be revalidated"
+                        ),
+                    )
+                    if not ready:
+                        raise ThreadBusyError(
+                            f"thread {thread_key} lost its durable workspace "
+                            "handoff boundary during preparation"
+                        )
+
+                handoff_revalidation = revalidate_before_handoff
+
+                def validate_candidate(candidate: SandboxHandle) -> None:
+                    """Attest the newly ready runner before the substrate route CAS."""
+
+                    ready = run_status_probe(
+                        lambda probe_remaining_s: self._workspace_candidate_ready(
+                            candidate, remaining_s=probe_remaining_s
+                        ),
+                        failure=(
+                            f"thread {thread_key} workspace handoff candidate "
+                            "could not be attested"
+                        ),
+                    )
+                    if not ready:
+                        raise ThreadBusyError(
+                            f"thread {thread_key} workspace handoff candidate "
+                            "did not attest the expected managed checkout"
+                        )
+
+                candidate_validation = validate_candidate
             # Prepare once, then let the substrate decide cold claim versus
             # suspended-route resume. Either branch materializes the same fresh,
             # verified archive before the runner can start.
@@ -2728,6 +2867,8 @@ class Kernel:
                 agent_name=agent_name,
                 repo_full_name=workspace_repo,
                 replace_handle=replace_handle,
+                revalidate_before_handoff=handoff_revalidation,
+                validate_candidate=candidate_validation,
             )
             if not isinstance(workspace_claim.handle, SandboxHandle):
                 raise WorkspacePreparationError(

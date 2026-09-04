@@ -98,27 +98,183 @@ def test_handoff_cold_claims_then_atomically_replaces_and_retires_old_route(
     fake_k8s: FakeSandboxClient,
     affinity: AffinityStore,
 ) -> None:
-    claimed = substrate.claim("T1", env={SESSION_ENV: "logical-session"})
-    old = replace(claimed, history_ref="history/private-base")
-    affinity.replace("T1", RouteRecord(handle=old), ttl_seconds=60)
+    history_ref = "https://api.example.com/state/transcript/T1"
+    claimed = substrate.claim(
+        "T1",
+        env={
+            SESSION_ENV: "logical-session",
+            HISTORY_ENV: history_ref,
+            "CURIE_WORKSPACE_REF": "workspace/claim-time",
+            "CURIE_WORKSPACE_SHA256": "a" * 64,
+        },
+        workspace_repo="acme-corp/acme-bot",
+    )
+
+    # The route is the continuity record used to construct a later replacement.
+    # It must describe the runner that actually booted, rather than synthesizing
+    # a different session id and dropping the durable transcript identity.
+    assert claimed.session_id == "logical-session"
+    assert claimed.history_ref == history_ref
+    assert claimed.workspace_repo == "acme-corp/acme-bot"
+    claim_env = fake_k8s.claims[claimed.claim_name].env
+    assert claim_env[SESSION_ENV] == "logical-session"
+    assert claim_env[HISTORY_ENV] == history_ref
+    assert claim_env["CURIE_WORKSPACE_REF"] == "workspace/claim-time"
+    assert claim_env["CURIE_WORKSPACE_SHA256"] == "a" * 64
+
+    replacement = substrate.handoff(
+        "T1",
+        expected=claimed,
+        env={
+            SESSION_ENV: claimed.session_id,
+            HISTORY_ENV: history_ref,
+            "CURIE_WORKSPACE_REF": "workspace/late-handoff",
+            "CURIE_WORKSPACE_SHA256": "b" * 64,
+        },
+        workspace_repo="acme-corp/acme-bot",
+    )
+
+    assert replacement.claim_name != claimed.claim_name
+    assert replacement.session_id == claimed.session_id == "logical-session"
+    assert replacement.history_ref == claimed.history_ref == history_ref
+    assert replacement.workspace_repo == "acme-corp/acme-bot"
+    assert replacement.generation == 1
+    assert affinity.get("T1") == RouteRecord(handle=replacement)
+    candidate_env = fake_k8s.claims[replacement.claim_name].env
+    assert candidate_env[SESSION_ENV] == "logical-session"
+    assert candidate_env[HISTORY_ENV] == history_ref
+    assert candidate_env["CURIE_WORKSPACE_REF"] == "workspace/late-handoff"
+    assert candidate_env["CURIE_WORKSPACE_SHA256"] == "b" * 64
+    assert claimed.claim_name in fake_k8s.deleted
+    assert replacement.claim_name not in fake_k8s.deleted
+
+
+def test_handoff_validates_the_ready_candidate_before_route_cas(
+    substrate: SandboxSubstrate,
+    fake_k8s: FakeSandboxClient,
+    affinity: AffinityStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old = substrate.claim(
+        "T1",
+        env={SESSION_ENV: "logical-session", HISTORY_ENV: "history/T1"},
+    )
+    ordering: list[str] = []
+    observed: list[SandboxHandle] = []
+    real_replace = affinity.replace_if_generation
+
+    def replace_if_generation(
+        thread_key: str,
+        *,
+        expected_claim: str,
+        expected_generation: int,
+        record: RouteRecord,
+        ttl_seconds: int,
+    ) -> bool:
+        ordering.append("route-cas")
+        return real_replace(
+            thread_key,
+            expected_claim=expected_claim,
+            expected_generation=expected_generation,
+            record=record,
+            ttl_seconds=ttl_seconds,
+        )
+
+    monkeypatch.setattr(affinity, "replace_if_generation", replace_if_generation)
+
+    def validate_candidate(candidate: SandboxHandle) -> None:
+        ordering.append("candidate-validated")
+        observed.append(candidate)
+        assert affinity.get("T1") == RouteRecord(handle=old)
+        assert fake_k8s.claims[candidate.claim_name].ready is True
+        sandbox = fake_k8s.sandboxes[candidate.sandbox_name]
+        assert sandbox.ready is True
+        assert sandbox.operating_mode == "Running"
 
     replacement = substrate.handoff(
         "T1",
         expected=old,
-        env={SESSION_ENV: old.session_id, "CURIE_WORKSPACE_REF": "private/ref"},
+        env={
+            "CURIE_WORKSPACE_REF": "workspace/candidate",
+            "CURIE_WORKSPACE_SHA256": "c" * 64,
+        },
         workspace_repo="acme-corp/acme-bot",
+        validate_candidate=validate_candidate,
     )
 
-    assert replacement.claim_name != old.claim_name
-    assert replacement.session_id == old.session_id
-    assert replacement.history_ref == old.history_ref == "history/private-base"
-    assert replacement.workspace_repo == "acme-corp/acme-bot"
-    assert replacement.generation == 1
+    assert observed == [replacement]
+    assert ordering == ["candidate-validated", "route-cas"]
     assert affinity.get("T1") == RouteRecord(handle=replacement)
-    assert fake_k8s.claims[replacement.claim_name].env[SESSION_ENV] == old.session_id
-    assert fake_k8s.claims[replacement.claim_name].env[HISTORY_ENV] == "history/private-base"
-    assert old.claim_name in fake_k8s.deleted
-    assert replacement.claim_name not in fake_k8s.deleted
+
+
+def test_handoff_candidate_validation_refusal_deletes_only_the_candidate(
+    substrate: SandboxSubstrate,
+    fake_k8s: FakeSandboxClient,
+    affinity: AffinityStore,
+) -> None:
+    old = substrate.claim(
+        "T1",
+        env={SESSION_ENV: "logical-session", HISTORY_ENV: "history/T1"},
+    )
+    claims_before = set(fake_k8s.claims)
+    observed: list[SandboxHandle] = []
+
+    def refuse_candidate(candidate: SandboxHandle) -> None:
+        observed.append(candidate)
+        raise RuntimeError("candidate runner attestation mismatch")
+
+    with pytest.raises(RuntimeError, match="candidate runner attestation mismatch"):
+        substrate.handoff(
+            "T1",
+            expected=old,
+            env={
+                "CURIE_WORKSPACE_REF": "workspace/candidate",
+                "CURIE_WORKSPACE_SHA256": "c" * 64,
+            },
+            workspace_repo="acme-corp/acme-bot",
+            validate_candidate=refuse_candidate,
+        )
+
+    assert len(observed) == 1
+    rejected = observed[0]
+    assert rejected.claim_name in fake_k8s.deleted
+    assert rejected.claim_name not in fake_k8s.claims
+    assert set(fake_k8s.claims) == claims_before
+    assert affinity.get("T1") == RouteRecord(handle=old)
+    assert old.claim_name not in fake_k8s.deleted
+
+
+def test_handoff_route_cas_loss_keeps_old_route_and_deletes_unexposed_candidate(
+    substrate: SandboxSubstrate,
+    fake_k8s: FakeSandboxClient,
+    affinity: AffinityStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old = substrate.claim(
+        "T1",
+        env={SESSION_ENV: "logical-session", HISTORY_ENV: "history/T1"},
+    )
+    created_before = set(fake_k8s.claims)
+    monkeypatch.setattr(
+        affinity,
+        "replace_if_generation",
+        lambda *_args, **_kwargs: False,
+    )
+
+    with pytest.raises(NoRouteError, match="lost its route fence"):
+        substrate.handoff(
+            "T1",
+            expected=old,
+            env={
+                "CURIE_WORKSPACE_REF": "workspace/candidate",
+                "CURIE_WORKSPACE_SHA256": "c" * 64,
+            },
+            workspace_repo="acme-corp/acme-bot",
+        )
+
+    assert affinity.get("T1") == RouteRecord(handle=old)
+    assert set(fake_k8s.claims) == created_before
+    assert old.claim_name not in fake_k8s.deleted
 
 
 def test_handoff_route_survives_old_claim_delete_failure_and_reaper_finishes_cleanup(

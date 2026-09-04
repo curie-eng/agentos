@@ -121,6 +121,8 @@ PROTECTED_STEPS = frozenset(
             "verify-and-publish",
             "Every asset has provenance from this workflow and commit",
         ),
+        ("close-on-next.yaml", "reconcile", "Close-on-next self-test"),
+        ("close-on-next.yaml", "reconcile", "Reconcile issues"),
     }
 )
 

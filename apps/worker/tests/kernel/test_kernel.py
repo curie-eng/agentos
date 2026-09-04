@@ -34,7 +34,7 @@ from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.kernel import ThreadBusyError
 from curie_worker.reply_sink import TargetRoute
 from curie_worker.runner_client import RunnerError, TurnStream
-from curie_worker.sandbox import QuotaRejection
+from curie_worker.sandbox import QuotaRejection, SandboxHandle
 from curie_worker.workspace import (
     WorkspacePreparationError,
     WorkspaceSelectionRefused,
@@ -74,6 +74,19 @@ def _qevent(
 
 def _thread_key(thread: str) -> str:
     return f"slack:C1:{thread}"
+
+
+def _safe_candidate_status(candidate: SandboxHandle) -> dict[str, object]:
+    return {
+        "status": SessionStatus.IDLE_AWAITING_INPUT.value,
+        "ready": True,
+        "turn_active": False,
+        "history_durable": True,
+        "session_id": candidate.session_id,
+        "sandbox_id": candidate.sandbox_id,
+        "managed_workspace": True,
+        "cwd": "/workspace",
+    }
 
 
 async def _wait_until(pred: Callable[[], bool], timeout: float = 5.0) -> None:
@@ -603,9 +616,20 @@ def test_late_workspace_selection_replaces_generic_sandbox_and_stays_sticky(
     make_harness,
 ) -> None:
     deployment_id = uuid.uuid4()
+    session_id = "agent-session-tLateWorkspace"
+    history_ref = "https://api.example.com/state/transcript/tLateWorkspace"
 
     async def go() -> None:
-        async with make_harness(binding=_workspace_binding(deployment_id)) as h:
+        async with make_harness(
+            binding=_workspace_binding(
+                deployment_id,
+                boot_env_override={
+                    "CURIE_RUNNER_TOKEN": "workspace-test-token",
+                    "CURIE_SESSION_ID": session_id,
+                    "CURIE_HISTORY_REF": history_ref,
+                },
+            )
+        ) as h:
             class WorkspaceProbe:
                 selected: str | None = None
                 handoffs = 0
@@ -621,10 +645,16 @@ def test_late_workspace_selection_replaces_generic_sandbox_and_stays_sticky(
                     self.handoffs += 1
                     old = kwargs["replace_handle"]
                     assert old is not None
+                    raw_env = kwargs["env"]
+                    assert isinstance(raw_env, dict)
                     handle = h.substrate.handoff(
                         _thread_key("tLateWorkspace"),
                         expected=old,
-                        env={"CURIE_WORKSPACE_REF": "workspace/private-base"},
+                        env={
+                            **raw_env,
+                            "CURIE_WORKSPACE_REF": "workspace/private-base",
+                            "CURIE_WORKSPACE_SHA256": "d" * 64,
+                        },
                         workspace_repo=str(kwargs["repo_full_name"]),
                     )
                     return SimpleNamespace(handle=handle, prepared=None)
@@ -639,6 +669,10 @@ def test_late_workspace_selection_replaces_generic_sandbox_and_stays_sticky(
             await h.kernel.process_event(_qevent("hello", thread="tLateWorkspace"))
             generic = h.substrate.lookup(_thread_key("tLateWorkspace"))
             assert generic is not None and generic.workspace_repo is None
+            # The durable pointer and logical session on the route must match
+            # the runner boot. A late replacement is built from this handle.
+            assert generic.session_id == session_id
+            assert generic.history_ref == history_ref
 
             await h.kernel.process_event(
                 _qevent(
@@ -649,7 +683,8 @@ def test_late_workspace_selection_replaces_generic_sandbox_and_stays_sticky(
             workspace = h.substrate.lookup(_thread_key("tLateWorkspace"))
             assert workspace is not None
             assert workspace.claim_name != generic.claim_name
-            assert workspace.session_id == generic.session_id
+            assert workspace.session_id == generic.session_id == session_id
+            assert workspace.history_ref == generic.history_ref == history_ref
             assert workspace.workspace_repo == "acme-corp/acme-bot"
             assert workspace.generation == generic.generation + 1
 
@@ -666,10 +701,31 @@ def test_late_workspace_selection_replaces_generic_sandbox_and_stays_sticky(
             ]
             claim_env = h.fake_k8s.claim_envs[-1] or {}
             assert claim_env["CURIE_WORKSPACE_REF"] == "workspace/private-base"
+            assert claim_env["CURIE_WORKSPACE_SHA256"] == "d" * 64
+            assert claim_env["CURIE_SESSION_ID"] == session_id
+            assert claim_env["CURIE_HISTORY_REF"] == history_ref
+            # This durable pointer is the worker-side proof that the first
+            # model turn remains available to the cold replacement. Replay is
+            # asserted at the runner store consumer, not simulated here.
+            assert h.runner.opened[:2] == [
+                "hello",
+                "Use https://github.com/acme-corp/acme-bot",
+            ]
+            forbidden_names = {
+                "CURIE_INTERNAL_WORKER_TOKEN",
+                "CURIE_API_KEY",
+                "S3_ACCESS_KEY",
+                "S3_SECRET_KEY",
+                "AWS_ACCESS_KEY_ID",
+                "AWS_SECRET_ACCESS_KEY",
+                "GITHUB_TOKEN",
+            }
+            assert forbidden_names.isdisjoint(claim_env)
             assert not any(
                 marker in f"{name}={value}".upper()
                 for name, value in claim_env.items()
                 for marker in ("AUTHORIZATION", "PASSWORD", "TOKEN", "SECRET")
+                if name != "CURIE_RUNNER_TOKEN"
             )
 
     asyncio.run(go())
@@ -732,6 +788,373 @@ def test_late_workspace_selection_defers_without_steering_until_boundary_is_safe
             assert probe.claims == 0
             assert h.runner.steers == []
             assert len(h.fake_k8s.claim_envs) == 1
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    "session_status",
+    [
+        pytest.param(SessionStatus.DONE, id="done"),
+        pytest.param(SessionStatus.IDLE_AWAITING_INPUT, id="idle-awaiting-input"),
+    ],
+)
+def test_workspace_handoff_boundary_accepts_completed_durable_status(
+    make_harness,
+    session_status: SessionStatus,
+) -> None:
+    """Both real post-turn terminal statuses are safe when replay is durable."""
+
+    async def go() -> None:
+        async with make_harness() as h:
+            old = h.substrate.claim(
+                _thread_key("tCompletedHandoffStatus"),
+                env={"CURIE_RUNNER_TOKEN": "workspace-test-token"},
+            )
+
+            async def status(*_args: object, **_kwargs: object) -> dict[str, object]:
+                return {
+                    "status": session_status.value,
+                    "turn_active": False,
+                    "history_durable": True,
+                }
+
+            h.kernel._runner.status = status  # type: ignore[method-assign]
+
+            assert await h.kernel._workspace_handoff_ready(old)
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    "status_payload",
+    [
+        pytest.param(
+            {"turn_active": False, "history_durable": True},
+            id="missing-status",
+        ),
+        pytest.param(
+            {
+                "status": "newer-runner-status",
+                "turn_active": False,
+                "history_durable": True,
+            },
+            id="unrecognized-status",
+        ),
+        pytest.param(
+            {
+                "status": SessionStatus.AWAITING_APPROVAL.value,
+                "turn_active": False,
+                "history_durable": True,
+            },
+            id="awaiting-approval",
+        ),
+    ],
+)
+def test_workspace_handoff_boundary_rejects_unsafe_or_unrecognized_status(
+    make_harness,
+    status_payload: dict[str, object],
+) -> None:
+    """A shape-drifted status is not evidence that replacement is safe."""
+
+    async def go() -> None:
+        async with make_harness() as h:
+            old = h.substrate.claim(
+                _thread_key("tUnknownHandoffStatus"),
+                env={"CURIE_RUNNER_TOKEN": "workspace-test-token"},
+            )
+
+            async def status(*_args: object, **_kwargs: object) -> dict[str, object]:
+                return dict(status_payload)
+
+            h.kernel._runner.status = status  # type: ignore[method-assign]
+
+            assert not await h.kernel._workspace_handoff_ready(old)
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    "unsafe_status",
+    [
+        pytest.param(
+            {
+                "status": "idle-awaiting-input",
+                "turn_active": True,
+                "history_durable": True,
+            },
+            id="became-busy",
+        ),
+        pytest.param(
+            {
+                "status": "idle-awaiting-input",
+                "turn_active": False,
+                "history_durable": False,
+            },
+            id="became-undurable",
+        ),
+    ],
+)
+def test_late_workspace_handoff_revalidates_boundary_before_route_replacement(
+    make_harness,
+    unsafe_status: dict[str, object],
+) -> None:
+    """Preparation latency cannot spend a one-shot safe-boundary observation."""
+
+    deployment_id = uuid.uuid4()
+
+    async def go() -> None:
+        async with make_harness(binding=_workspace_binding(deployment_id)) as h:
+            thread_key = _thread_key("tBoundaryChangedDuringPreparation")
+            old = h.substrate.claim(
+                thread_key,
+                env={"CURIE_RUNNER_TOKEN": "workspace-test-token"},
+            )
+            status_payloads = [
+                {
+                    "status": SessionStatus.DONE.value,
+                    "turn_active": False,
+                    "history_durable": True,
+                },
+                unsafe_status,
+            ]
+            status_reads = 0
+            ordering: list[str] = []
+
+            async def status(*_args: object, **_kwargs: object) -> dict[str, object]:
+                nonlocal status_reads
+                status_reads += 1
+                ordering.append(f"status-{status_reads}")
+                return dict(status_payloads[min(status_reads - 1, 1)])
+
+            h.kernel._runner.status = status  # type: ignore[method-assign]
+
+            class WorkspaceProbe:
+                replacements = 0
+
+                def select_repository(self, **_kwargs: object) -> str:
+                    return "acme-corp/acme-bot"
+
+                def claim_or_resume_with_handle(self, **_kwargs: object) -> object:
+                    self.replacements += 1
+                    ordering.append("prepared-and-verified")
+                    revalidate = _kwargs.get("revalidate_before_handoff")
+                    assert callable(revalidate), (
+                        "late handoff must pass a post-preparation revalidation callback"
+                    )
+                    revalidate()
+                    ordering.append("handoff")
+                    raise AssertionError(
+                        "a refused revalidation must prevent route replacement"
+                    )
+
+            probe = WorkspaceProbe()
+            h.kernel._workspace = probe  # type: ignore[assignment]
+
+            with pytest.raises(ThreadBusyError):
+                await h.kernel.process_event(
+                    _qevent(
+                        "Use https://github.com/acme-corp/acme-bot",
+                        thread="tBoundaryChangedDuringPreparation",
+                    )
+                )
+
+            assert status_reads == 2
+            assert probe.replacements == 1
+            assert ordering == ["status-1", "prepared-and-verified", "status-2"]
+            assert h.substrate.lookup(thread_key) == old
+            assert len(h.fake_k8s.claim_envs) == 1
+            assert h.runner.opened == []
+
+    asyncio.run(go())
+
+
+def test_late_workspace_candidate_attestation_uses_exact_authenticated_handle(
+    make_harness,
+) -> None:
+    deployment_id = uuid.uuid4()
+
+    async def go() -> None:
+        async with make_harness(binding=_workspace_binding(deployment_id)) as h:
+            thread_key = _thread_key("tCandidateAttestation")
+            old = h.substrate.claim(
+                thread_key,
+                env={
+                    "CURIE_RUNNER_TOKEN": "old-runner-token",
+                    "CURIE_SESSION_ID": "logical-session",
+                    "CURIE_HISTORY_REF": "history/tCandidateAttestation",
+                },
+            )
+            candidate = SandboxHandle(
+                thread_key=thread_key,
+                claim_name="candidate-claim",
+                sandbox_name="candidate-sandbox",
+                namespace=old.namespace,
+                service_fqdn="candidate.test-ns.svc.cluster.local",
+                port=old.port,
+                session_id=old.session_id,
+                history_ref=old.history_ref,
+                token="candidate-runner-token",
+                workspace_repo="acme-corp/acme-bot",
+                generation=old.generation + 1,
+            )
+            ordering: list[str] = []
+            status_calls: list[tuple[str, str | None]] = []
+
+            async def status(
+                base_url: str,
+                *,
+                token: str | None = None,
+                remaining_s: float | None = None,
+            ) -> dict[str, object]:
+                del remaining_s
+                status_calls.append((base_url, token))
+                if base_url == old.base_url:
+                    ordering.append("old-runner-revalidated")
+                    return {
+                        "status": SessionStatus.DONE.value,
+                        "turn_active": False,
+                        "history_durable": True,
+                    }
+                assert base_url == candidate.base_url
+                assert token == candidate.token
+                ordering.append("candidate-attested")
+                return _safe_candidate_status(candidate)
+
+            h.kernel._runner.status = status  # type: ignore[method-assign]
+
+            class WorkspaceProbe:
+                def claim_or_resume_with_handle(self, **kwargs: object) -> object:
+                    ordering.append("prepared-and-verified")
+                    revalidate = kwargs.get("revalidate_before_handoff")
+                    assert callable(revalidate)
+                    revalidate()
+                    validate_candidate = kwargs.get("validate_candidate")
+                    assert callable(validate_candidate), (
+                        "kernel must bridge candidate attestation into the coordinator"
+                    )
+                    validate_candidate(candidate)
+                    return SimpleNamespace(handle=candidate, prepared=None)
+
+            h.kernel._workspace = WorkspaceProbe()  # type: ignore[assignment]
+
+            result = await h.kernel._claim_or_resume(
+                thread_key,
+                {
+                    "CURIE_SESSION_ID": old.session_id,
+                    "CURIE_HISTORY_REF": old.history_ref or "",
+                },
+                workspace_deployment_id=deployment_id,
+                workspace_repo="acme-corp/acme-bot",
+                replace_handle=old,
+            )
+
+            assert result is candidate
+            assert ordering == [
+                "prepared-and-verified",
+                "old-runner-revalidated",
+                "candidate-attested",
+            ]
+            assert status_calls == [
+                (old.base_url, old.token),
+                (candidate.base_url, candidate.token),
+            ]
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        pytest.param("session_id", "other-session", id="session-id"),
+        pytest.param("sandbox_id", "other-sandbox", id="sandbox-id"),
+        pytest.param("managed_workspace", False, id="managed-workspace"),
+        pytest.param("cwd", "/tmp", id="cwd"),
+        pytest.param("ready", False, id="ready"),
+        pytest.param("status", SessionStatus.DONE.value, id="status"),
+        pytest.param("turn_active", True, id="turn-active"),
+        pytest.param("history_durable", False, id="history-durable"),
+    ],
+)
+def test_late_workspace_candidate_attestation_mismatch_refuses_handoff(
+    make_harness,
+    field: str,
+    invalid_value: object,
+) -> None:
+    deployment_id = uuid.uuid4()
+
+    async def go() -> None:
+        async with make_harness(binding=_workspace_binding(deployment_id)) as h:
+            thread_key = _thread_key("tCandidateMismatch")
+            old = h.substrate.claim(
+                thread_key,
+                env={
+                    "CURIE_RUNNER_TOKEN": "old-runner-token",
+                    "CURIE_SESSION_ID": "logical-session",
+                    "CURIE_HISTORY_REF": "history/tCandidateMismatch",
+                },
+            )
+            candidate = SandboxHandle(
+                thread_key=thread_key,
+                claim_name="candidate-claim",
+                sandbox_name="candidate-sandbox",
+                namespace=old.namespace,
+                service_fqdn="candidate.test-ns.svc.cluster.local",
+                port=old.port,
+                session_id=old.session_id,
+                history_ref=old.history_ref,
+                token="candidate-runner-token",
+                workspace_repo="acme-corp/acme-bot",
+                generation=old.generation + 1,
+            )
+
+            async def status(
+                base_url: str,
+                *,
+                token: str | None = None,
+                remaining_s: float | None = None,
+            ) -> dict[str, object]:
+                del remaining_s
+                if base_url == old.base_url:
+                    assert token == old.token
+                    return {
+                        "status": SessionStatus.DONE.value,
+                        "turn_active": False,
+                        "history_durable": True,
+                    }
+                assert base_url == candidate.base_url
+                assert token == candidate.token
+                payload = _safe_candidate_status(candidate)
+                payload[field] = invalid_value
+                return payload
+
+            h.kernel._runner.status = status  # type: ignore[method-assign]
+
+            class WorkspaceProbe:
+                def claim_or_resume_with_handle(self, **kwargs: object) -> object:
+                    revalidate = kwargs.get("revalidate_before_handoff")
+                    assert callable(revalidate)
+                    revalidate()
+                    validate_candidate = kwargs.get("validate_candidate")
+                    assert callable(validate_candidate), (
+                        "kernel must bridge candidate attestation into the coordinator"
+                    )
+                    validate_candidate(candidate)
+                    raise AssertionError("a mismatched candidate must never be returned")
+
+            h.kernel._workspace = WorkspaceProbe()  # type: ignore[assignment]
+
+            with pytest.raises(ThreadBusyError):
+                await h.kernel._claim_or_resume(
+                    thread_key,
+                    {
+                        "CURIE_SESSION_ID": old.session_id,
+                        "CURIE_HISTORY_REF": old.history_ref or "",
+                    },
+                    workspace_deployment_id=deployment_id,
+                    workspace_repo="acme-corp/acme-bot",
+                    replace_handle=old,
+                )
 
     asyncio.run(go())
 
@@ -856,7 +1279,11 @@ def test_a_selection_refusal_is_logged_so_an_operator_can_find_it(
 # the missing half.
 
 
-def _workspace_binding(deployment_id: uuid.UUID | None) -> object:
+def _workspace_binding(
+    deployment_id: uuid.UUID | None,
+    *,
+    boot_env_override: dict[str, str] | None = None,
+) -> object:
     """A binding carrying a fixed deployment id and the legacy flag.
 
     Fixed on purpose: the id is what an operator greps for, so the tests assert
@@ -882,7 +1309,10 @@ def _workspace_binding(deployment_id: uuid.UUID | None) -> object:
             kind: str | None = None,
             address: str | None = None,
         ) -> dict[str, str]:
-            return {"CURIE_RUNNER_TOKEN": "workspace-test-token"}
+            return dict(
+                boot_env_override
+                or {"CURIE_RUNNER_TOKEN": "workspace-test-token"}
+            )
 
         def packs_for(self, _resolved: object) -> BehaviorPacks:
             return BehaviorPacks()

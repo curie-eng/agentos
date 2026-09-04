@@ -741,6 +741,11 @@ def _tool_policy_outcome(gate: ApprovalGate, tool_name: str) -> ToolPolicyDecisi
 
     if gate.tool_policy is None or not is_mcp_tool(tool_name):
         return None
+    # These exact tools belong to the platform-owned approval server, not to
+    # the bundle or one of its connectors.  Leave them to their existing
+    # permission/in-process gates; every other MCP name remains fail-closed.
+    if tool_name == APPROVAL_TOOL_NAME or tool_name == PUBLISH_TOOL_NAME:
+        return None
     canonical = canonical_tool_name(
         tool_name,
         bundle_name=gate.bundle_name,

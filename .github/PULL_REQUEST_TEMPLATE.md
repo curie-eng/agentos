@@ -8,6 +8,23 @@
 
 Closes #
 
+## Trigger
+
+<!-- Required for a patch release PR (title: Prepare the vX.Y.Z release
+     where Z is not 0). List the issue numbers of the defects that
+     triggered this patch, for example #2202. Other pull requests may
+     leave this comment in place.
+
+     If you moved an open issue out of this milestone within 24 hours of
+     the cut, that issue needs a comment naming the release it moved from. -->
+
+## Live proof
+
+<!-- Required for a patch release PR. Name a run URL that re-verified each
+     trigger on a live surface, or an explicit waiver of the form:
+     waiver: <reason>
+     Other pull requests may leave this comment in place. -->
+
 ## Fix pin verification
 
 <!-- Verification is required for declared fixes. For a fix pull request,

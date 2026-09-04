@@ -49,6 +49,7 @@ from .history import (
     NullTranscriptStore,
     TranscriptStore,
     TurnRecord,
+    bound_turn_record,
     close_suspended_tool_calls,
 )
 from .memory import (
@@ -259,8 +260,11 @@ class SessionRunner:
         self._turn_open = False
         # Safe-boundary fence for replacing a runner. A fresh runner has no
         # completed turn to lose. Once a turn begins, only a successful durable
-        # transcript append re-authorizes replacement.
+        # transcript append re-authorizes replacement, unless an earlier turn
+        # was already lost by this process. Later appends cannot repair that
+        # missing prefix, so the loss remains sticky for this runner's lifetime.
         self._history_durable = True
+        self._history_loss_observed = False
         self._active_state: TurnState | None = None
 
     @property
@@ -343,7 +347,7 @@ class SessionRunner:
                     exc,
                 )
         try:
-            await self._history.append(
+            record = bound_turn_record(
                 TurnRecord(
                     user=event.text,
                     assistant=state.final_text,
@@ -372,8 +376,10 @@ class SessionRunner:
                     harness_replay=harness_replay,
                 )
             )
-            self._history_durable = True
+            await self._history.append(record)
+            self._history_durable = not self._history_loss_observed
         except Exception as exc:  # noqa: BLE001 - best-effort; never fail a completed turn
+            self._history_loss_observed = True
             self._history_durable = False
             logger.warning(
                 "history append failed session=%s error_class=%s: %s",
