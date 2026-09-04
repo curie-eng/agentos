@@ -1780,6 +1780,12 @@ jobs:
       - name: Upgrade the v0.8.4 release to the candidate chart
         run: |
           set -euo pipefail
+          # Live v0.8.4 worker env has duplicate CURIE_RUNNER_TOTAL_TIMEOUT_S
+          # (first-class plus retained extraEnv). Helm's 3-way strategic merge
+          # then drops the name from the live Deployment even when the candidate
+          # target is unique, which is the 2026-09-04 soak. Recreate that one
+          # workload so the candidate spec is applied in full.
+          kubectl delete deploy/curie-worker -n curie --wait=true --timeout=120s
           helm upgrade curie charts/curie -n curie \
             --reset-then-reuse-values --timeout 15m \
             --set api.image.repository=curie-api --set api.image.tag=upgrade-candidate --set api.image.digest= --set api.image.pullPolicy=Never \

@@ -691,6 +691,7 @@ def test_released_upgrade_workflow_pins_issue_2097_live_manifest_parity() -> Non
     assert "$RELEASED_V084_VALUES" in install_run
 
     upgrade_run = named_steps["Upgrade the v0.8.4 release to the candidate chart"]["run"]
+    assert "kubectl delete deploy/curie-worker -n curie" in upgrade_run
     assert "helm upgrade curie charts/curie -n curie" in upgrade_run
     assert "--reset-then-reuse-values" in upgrade_run
     assert (

@@ -121,7 +121,10 @@ def verify(
     if expect_env not in helm_env:
         _fail(f"helm target worker env is missing {expect_env}")
     if expect_env not in live_env:
-        _fail(f"live worker omits {expect_env} present on the helm target")
+        _fail(
+            f"live worker omits {expect_env} present on the helm target "
+            f"(live names: {sorted(live_env)})"
+        )
     if helm_env[expect_env] != live_env[expect_env]:
         _fail(
             f"{expect_env} helm target value {helm_env[expect_env]!r} "
