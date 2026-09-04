@@ -782,6 +782,14 @@ helm get values <release> -n <ns> -o yaml > values.yaml
 helm upgrade <release> <chart> -n <ns> -f values.yaml
 ```
 
+`curie cluster up` and `curie apply` do this without asking the operator to
+choose `--reuse-values` versus `--reset-then-reuse-values`. They persist
+`config.schemaVersion` on the release, run pure migrations from supported
+v0.8.x user values onto the v0.9.0 schema (legacy extraEnv entries with a
+first-class successor, external Secret references), and overlay the result so
+new chart defaults still apply. A second upgrade with no input change is a
+no-op. Plan and diff output stay redacted.
+
 ### Migrating the bundle store (0.5.x → 0.6.0, `minio` → `rustfs`)
 
 0.6.0 renamed the in-cluster object store. The chart cannot migrate it for you,

@@ -18,6 +18,15 @@
 nameOverride: ""
 fullnameOverride: ""
 
+# Installed configuration schema version (issue #2299). `curie cluster up` and
+# `curie apply` stamp this on every install and upgrade so later upgrades know
+# which migrations to run. Operators should not set this by hand.
+config:
+  schemaVersion: ""
+  # Chart / schema version the previous document was migrated from. Empty on a
+  # fresh install that already uses the current schema.
+  migratedFrom: ""
+
 global:
   imagePullPolicy: IfNotPresent
   # "" uses the cluster default StorageClass. Set to pin a class (e.g. local-path
