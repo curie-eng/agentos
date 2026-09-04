@@ -220,6 +220,15 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/langfuse-image-pin-assertions.sh
 
+      # Refuse untagged and :latest image references in values *Image keys
+      # and in rendered container image fields (#2318). The security probe's
+      # netshoot image was the first miss: a bare repository pulls :latest
+      # with implicit Always.
+      - name: helm render assertions (unpinned images)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/unpinned-image-assertions.sh
+
       # Keep the chart ClickHouse default and Langfuse pin as one supported
       # pair. ClickHouse 24.8 cannot apply Langfuse 3.225.x migration 39, so
       # the default must stay on 25.12 and AVX-required (#2210).
