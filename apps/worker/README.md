@@ -457,7 +457,7 @@ substrate = SandboxSubstrate(
 
 handle = substrate.claim(thread_ts)   # existing live route, or warm-pool claim
 # handle.base_url -> http://<serviceFQDN>:8080  (dial from inside the cluster)
-substrate.suspend(thread_ts, history_ref=sdk_session_id)
+substrate.suspend(thread_ts, history_ref=thread_history_ref)
 handle = substrate.resume(thread_ts)  # new claim, CURIE_HISTORY_REF injected
 substrate.release(thread_ts)          # delete claim -> sandbox+pod reaped
 substrate.reap_orphans()              # periodic tick: claims with no live route
@@ -487,6 +487,16 @@ Contract notes the kernel must know:
   state-store URL (`.../state/transcript/<thread_key>`), so there is nothing to
   capture off the ACI `final` frame and no frozen-contract change (ADR-0029); do
   not reintroduce a frame-captured resume id.
+- **Late workspace acquisition is a fenced cold replacement.** A repository URL
+  on an existing generic route proceeds only when the bearer-authenticated old
+  runner is idle, its complete structured history is durable, and it is not
+  suspended on an approval or unresolved side-effect boundary. The worker
+  revalidates that status after workspace preparation, then cold-creates a
+  candidate carrying the same logical session and history reference. Before the
+  affinity compare-and-swap, the candidate must attest its exact session and
+  sandbox identities, a ready idle state, durable history, and cwd `/workspace`.
+  Any unreadable or mismatched status deletes only the unexposed candidate and
+  leaves the generic route authoritative (ADR-0136).
 - **Reaping.** `release()` deletes the claim (the claim owns its sandbox and
   pod). Routes that expire in Valkey leave orphaned claims; `reap_orphans()`
   lists claims labeled `curietech.ai/managed-by=curie-sandbox-substrate` and

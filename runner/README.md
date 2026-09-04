@@ -20,6 +20,10 @@ locally in Docker.
 - Emits `side_effect_flag` when a non-idempotent tool executes (read-only
   allowlist, deny-by-default; see `side_effects.py`).
 - Loads and validates the mounted plugin bundle via `plugin_format.validate_bundle`.
+- Always exposes the Claude Code file tools and Curie's
+  `mcp__curie__publish_changes` tool, independent of bundle skills and bundle
+  MCP policy. Publication remains unusable without a managed `/workspace` and
+  only records an approval request; the trusted worker publishes after approval.
 - Offers Anthropic's provider-side `WebSearch` tool by default. A bundle can
   suppress it with a root `curie.bundle.json` containing
   `{"webSearch": false}`; the provider connection remains the only network
@@ -29,14 +33,19 @@ locally in Docker.
   OTLP-HTTP (the OpenTelemetry Protocol over HTTP) to the collector, which
   forwards to Langfuse.
 - Rehydrates from a history ref on start (`resume`), stateless-first
-  (ADR-0003, an Architecture Decision Record).
+  (ADR-0003, an Architecture Decision Record). Completed turns are stored as
+  structured replay; oversized text payloads are replaced with stable digest
+  markers before the state API's 64 KiB value boundary while tool-call
+  structure remains intact. An append failure makes the runner's
+  `history_durable` status fail closed for the rest of that process.
 
 ## HTTP surface (ACI channel)
 
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/healthz` | Liveness. |
-| GET | `/status` | Session status (done / idle-awaiting-input / classified-failure), readiness, turn state. |
+| GET | `/status` | Probe-safe session status, readiness, turn state, and transcript durability. |
+| GET | `/v1/status` | Bearer-authenticated handoff status, including session/sandbox identity and managed-workspace cwd attestation. |
 | POST | `/v1/event` | Open a turn: body is an ACI `event` frame; streams outbound NDJSON, ending in a `final`. |
 | POST | `/v1/steer` | Inject a follow-up into the live turn (`{"text": ...}`); 409 when no turn is active. |
 | POST | `/v1/interrupt` | Hard-stop the live turn: body is an ACI `interrupt` frame. |
@@ -46,14 +55,16 @@ side-channel injections whose output surfaces on the open `/v1/event` stream (th
 proven steering pattern). The finish race (a steer arriving as a turn ends,
 409) is owned by the worker.
 
-The three POST routes (`/v1/event`, `/v1/steer`, `/v1/interrupt`) require an
-`Authorization: Bearer <token>` header matching `CURIE_RUNNER_TOKEN` when that
-env var is set, returning 401 otherwise. This is per-sandbox transport auth
-(defense-in-depth on the ACI ingress alongside the NetworkPolicy), not part of
-the frozen ACI wire contract. Enforcement is only-when-configured: with the var
-unset the app is pass-through (CLI, fake-model CI, and pre-token sandboxes stay
-unauthenticated). `GET /healthz` and `GET /status` are never gated (the chart
-readinessProbe hits `/healthz`).
+The control routes (`/v1/event`, `/v1/steer`, `/v1/interrupt`, `/v1/reset`,
+`/v1/snapshot`, and `/v1/status`) require an `Authorization: Bearer <token>`
+header matching `CURIE_RUNNER_TOKEN` when that env var is set, returning 401
+otherwise. This is per-sandbox transport auth (defense-in-depth on the ACI
+ingress alongside the NetworkPolicy), not part of the frozen ACI wire contract.
+Enforcement is only-when-configured: with the var unset the app is pass-through
+(CLI, fake-model CI, and pre-token sandboxes stay unauthenticated). `GET
+/healthz` and probe-only `GET /status` are never gated (the chart readinessProbe
+hits `/healthz`); replacement authority comes only from authenticated
+`GET /v1/status`.
 
 ## Environment
 
