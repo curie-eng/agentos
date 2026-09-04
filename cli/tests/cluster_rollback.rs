@@ -407,11 +407,24 @@ async fn rollback_hands_helm_the_selected_revision() {
     );
 
     // ----- AC6: a release helm cannot find fails HERE, not as "no eligible revision" -----
+    // A SECOND directory, deliberately, rather than rewriting the `helm` above.
+    // Every `rollback()` before this line executed that file, and replacing an
+    // executable that has just been executed races the kernel's text-file
+    // accounting: on Linux the open-for-write or the following exec can return
+    // ETXTBSY while the previous child is still being torn down. The failure is
+    // load dependent, so it never appeared on a developer machine and appeared
+    // on CI as `failed to invoke helm; is it on PATH?` -- a spawn error the
+    // wrapper describes as a PATH problem no matter what errno it carries
+    // (#2236). Writing to a fresh directory and prepending it means no
+    // executable is ever rewritten after use, which removes the race by
+    // construction rather than by timing.
+    let refusing_dir = tempfile::tempdir().expect("tempdir for the refusing helm");
     write_exec(
-        dir.path(),
+        refusing_dir.path(),
         "helm",
         "#!/bin/sh\necho 'Error: release: not found' >&2\nexit 1\n",
     );
+    prepend_path(refusing_dir.path());
     let err = rollback(rollback_opts(None, false))
         .await
         .expect_err("an unreadable history is a hard failure");

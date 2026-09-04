@@ -236,6 +236,17 @@ def test_platform_get_reports_an_unwritten_valid_ref_as_absent(
     assert absent.status_code == 404, absent.text
 
 
+# A fixed version-1 UUID, not a freshly generated one. What this case is for is
+# the VERSION: the route accepts version 4 only, so a well-formed v1 must still
+# be refused, and any v1 proves that. Generating one at collection time bought
+# nothing and cost the test its identity -- the id changed on every run, so no
+# `Fix pin:` selector could ever name it (#2095) and no flake tracker could
+# follow it across runs. It also made the suite uncollectable under any parallel
+# runner, which is how this surfaced: four pytest-xdist workers each collected a
+# different id and the run aborted before a single test executed.
+NON_V4_UUID = "0950ec2e-a73c-11f1-b18a-9ae1cd7f129a"
+
+
 @pytest.mark.parametrize(
     "reply_ref",
     [
@@ -243,7 +254,7 @@ def test_platform_get_reports_an_unwritten_valid_ref_as_absent(
         "../",
         "a/b",
         "550E8400-E29B-41D4-A716-446655440000",
-        str(uuid.uuid1()),
+        NON_V4_UUID,
     ],
 )
 def test_noncanonical_refs_are_refused_before_any_valkey_write(
