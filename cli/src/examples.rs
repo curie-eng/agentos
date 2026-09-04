@@ -75,7 +75,7 @@ const SELF_UPGRADE_CRONJOB_ENV: &str = "SELF_UPGRADE_CRONJOB";
 // manifest exactly as the write Role's is. The manifest is edited far more often
 // than this file, so a widened grant must stop the install rather than ship in
 // it -- and this is the widest grant the bundle has.
-const PLATFORM_RULE_SHAPE: [(&str, &[&str]); 6] = [
+const PLATFORM_RULE_SHAPE: [(&str, &[&str], &[&str]); 6] = [
     (
         "",
         &[
@@ -85,15 +85,39 @@ const PLATFORM_RULE_SHAPE: [(&str, &[&str]); 6] = [
             "serviceaccounts",
             "persistentvolumeclaims",
         ],
+        &[
+            "get", "list", "watch", "create", "update", "patch", "delete",
+        ],
     ),
     (
         "apps",
         &["deployments", "statefulsets", "daemonsets", "replicasets"],
+        &[
+            "get", "list", "watch", "create", "update", "patch", "delete",
+        ],
     ),
-    ("batch", &["jobs", "cronjobs"]),
-    ("networking.k8s.io", &["networkpolicies", "ingresses"]),
-    ("rbac.authorization.k8s.io", &["roles", "rolebindings"]),
-    ("", &["pods", "events"]),
+    (
+        "batch",
+        &["jobs", "cronjobs"],
+        &[
+            "get", "list", "watch", "create", "update", "patch", "delete",
+        ],
+    ),
+    (
+        "networking.k8s.io",
+        &["networkpolicies", "ingresses"],
+        &[
+            "get", "list", "watch", "create", "update", "patch", "delete",
+        ],
+    ),
+    (
+        "rbac.authorization.k8s.io",
+        &["roles", "rolebindings"],
+        &[
+            "get", "list", "watch", "create", "update", "patch", "delete",
+        ],
+    ),
+    ("", &["pods", "events"], &["get", "list", "watch"]),
 ];
 // The one grant the write path may carry. Read from the shipped manifest and
 // asserted rather than assumed, so editing that file to widen the verb set stops
@@ -524,14 +548,10 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
                 "kubectl apply -f examples/sre-bot/manifests/upgrade-role.yaml -- the CONNECTOR's \
                  identity ({UPGRADER_IDENTITY}): create on jobs, so it can start an upgrade"
             ));
-            lines.push(format!(
-                "kubectl apply -f examples/sre-bot/manifests/platform-upgrade-role.yaml -- the \
-                 JOB's identity ({PLATFORM_UPGRADER_IDENTITY}) in namespace {}: namespace-admin \
-                 in all but name, because `helm upgrade` rewrites nearly every object the release \
-                 owns. READ THAT FILE. It exists for the ~90s an upgrade runs and the sandbox \
-                 never sees it",
-                identity.namespace
-            ));
+            lines.push(platform_upgrade_role_plan_line(
+                embedded_bundle_file("manifests/platform-upgrade-role.yaml")?,
+                &identity.namespace,
+            )?);
             lines.push(format!(
                 "kubectl apply -f <rendered ConfigMap {PLATFORM_UPGRADE_CONFIGMAP}> -- the upgrade \
                  script the Job runs, from examples/sre-bot/platform-upgrade/upgrade.sh"
@@ -1616,13 +1636,28 @@ fn render_platform_upgrade_configmap(script: &[u8], namespace: &str) -> Result<V
     Ok(rendered.into_bytes())
 }
 
-/// The platform-upgrade identity, rendered into the release's namespace.
+fn embedded_bundle_file(name: &str) -> Result<&'static [u8]> {
+    BUNDLE_FILES
+        .iter()
+        .find(|(candidate, _)| *candidate == name)
+        .map(|(_, contents)| *contents)
+        .ok_or_else(|| anyhow!("embedded SRE bot is missing {name}"))
+}
+
+fn yaml_str_list<'a>(value: &'a serde_json::Value, key: &str) -> Vec<&'a str> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .map(|items| items.iter().filter_map(serde_json::Value::as_str).collect())
+        .unwrap_or_default()
+}
+
+/// The shipped Role's rules, asserted against what this build knows how to render.
 ///
-/// The shipped manifest's rules are ASSERTED against what this build knows how to
-/// render before anything is emitted. This is the widest grant in the bundle --
-/// namespace-admin in all but name -- so a manifest that grows a rule must stop
-/// the install rather than have the installer grant it silently.
-fn render_platform_upgrade_role(source: &[u8], curie_namespace: &str) -> Result<Vec<u8>> {
+/// This is the widest grant in the bundle -- namespace-admin in all but name --
+/// so a manifest that grows a rule or a verb must stop the install rather than
+/// have the installer grant it silently.
+fn asserted_platform_rules(source: &[u8]) -> Result<Vec<serde_json::Value>> {
     let source = std::str::from_utf8(source)
         .context("embedded SRE bot platform-upgrade-role.yaml is not UTF-8")?;
     let mut rules: Option<Vec<serde_json::Value>> = None;
@@ -1650,26 +1685,59 @@ fn render_platform_upgrade_role(source: &[u8], curie_namespace: &str) -> Result<
             PLATFORM_RULE_SHAPE.len()
         );
     }
-    for (index, (group, resources)) in PLATFORM_RULE_SHAPE.iter().enumerate() {
+    for (index, (group, resources, verbs)) in PLATFORM_RULE_SHAPE.iter().enumerate() {
         let rule = &rules[index];
-        let groups: Vec<&str> = rule
-            .get("apiGroups")
-            .and_then(serde_json::Value::as_array)
-            .map(|items| items.iter().filter_map(serde_json::Value::as_str).collect())
-            .unwrap_or_default();
-        let actual: Vec<&str> = rule
-            .get("resources")
-            .and_then(serde_json::Value::as_array)
-            .map(|items| items.iter().filter_map(serde_json::Value::as_str).collect())
-            .unwrap_or_default();
-        if groups != [*group] || actual != *resources {
+        let groups = yaml_str_list(rule, "apiGroups");
+        let actual = yaml_str_list(rule, "resources");
+        let actual_verbs = yaml_str_list(rule, "verbs");
+        if groups != [*group] || actual != *resources || actual_verbs != *verbs {
             bail!(
-                "the embedded platform-upgrade Role's rule {index} is {groups:?}/{actual:?}, but \
-                 this build only knows how to render {:?}/{resources:?}",
+                "the embedded platform-upgrade Role's rule {index} is {groups:?}/{actual:?}/{actual_verbs:?}, but \
+                 this build only knows how to render {:?}/{resources:?}/{verbs:?}",
                 [group]
             );
         }
     }
+    Ok(rules)
+}
+
+fn platform_upgrade_grant_summary(rules: &[serde_json::Value]) -> String {
+    rules
+        .iter()
+        .map(|rule| {
+            format!(
+                "{:?}/{:?}/{:?}",
+                yaml_str_list(rule, "apiGroups"),
+                yaml_str_list(rule, "resources"),
+                yaml_str_list(rule, "verbs")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// `--dry-run` disclosure for the Job identity, derived from the Role this
+/// build would apply. A hand-written summary would keep describing the
+/// unmodified grant after the YAML changed.
+fn platform_upgrade_role_plan_line(source: &[u8], namespace: &str) -> Result<String> {
+    let rules = asserted_platform_rules(source)?;
+    Ok(format!(
+        "kubectl apply -f examples/sre-bot/manifests/platform-upgrade-role.yaml -- the \
+         JOB's identity ({PLATFORM_UPGRADER_IDENTITY}) in namespace {namespace}: {}. \
+         READ THAT FILE. It exists for the ~90s an upgrade runs and the sandbox \
+         never sees it",
+        platform_upgrade_grant_summary(&rules)
+    ))
+}
+
+/// The platform-upgrade identity, rendered into the release's namespace.
+///
+/// The shipped manifest's rules are ASSERTED against what this build knows how to
+/// render before anything is emitted. This is the widest grant in the bundle --
+/// namespace-admin in all but name -- so a manifest that grows a rule must stop
+/// the install rather than have the installer grant it silently.
+fn render_platform_upgrade_role(source: &[u8], curie_namespace: &str) -> Result<Vec<u8>> {
+    let rules = asserted_platform_rules(source)?;
 
     let mut documents: Vec<serde_json::Value> = vec![
         serde_json::json!({
@@ -2407,6 +2475,89 @@ mod tests {
         assert!(
             error.to_string().contains("rules"),
             "a widened Role must be refused by name: {error}"
+        );
+    }
+
+    #[test]
+    fn a_verb_widened_platform_role_stops_the_install() {
+        // Count and apiGroups/resources stay put. The existing appended-rule
+        // test never reaches the per-rule shape check, and that check used to
+        // ignore verbs, so `["*"]` on one rule installed as a
+        // namespace-admin-equivalent grant (#2287).
+        let source = String::from_utf8(platform_role_source().to_vec()).unwrap();
+        let widened = source.replace(
+            "    resources: [\"secrets\", \"configmaps\", \"services\", \"serviceaccounts\", \"persistentvolumeclaims\"]\n    verbs: [\"get\", \"list\", \"watch\", \"create\", \"update\", \"patch\", \"delete\"]",
+            "    resources: [\"secrets\", \"configmaps\", \"services\", \"serviceaccounts\", \"persistentvolumeclaims\"]\n    verbs: [\"*\"]",
+        );
+        assert_ne!(
+            widened, source,
+            "the fixture no longer matches the manifest"
+        );
+        assert_eq!(
+            widened.matches("verbs: [\"*\"]").count(),
+            1,
+            "the mutation must change only one rule's verbs: {widened}"
+        );
+        let resource_widened = source.replace(
+            "resources: [\"pods\", \"events\"]",
+            "resources: [\"pods\", \"events\", \"namespaces\"]",
+        );
+        assert_ne!(resource_widened, source);
+        let resource_error =
+            render_platform_upgrade_role(resource_widened.as_bytes(), "curie-prod")
+                .unwrap_err()
+                .to_string();
+        let error = render_platform_upgrade_role(widened.as_bytes(), "curie-prod")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            resource_error.contains("only knows how to render"),
+            "resource widening is the message class this test pins: {resource_error}"
+        );
+        assert!(
+            error.contains("only knows how to render"),
+            "a verb-widened Role must be refused by the same shape check as a resource widening: {error}"
+        );
+        assert!(
+            error.contains("\"*\""),
+            "the refusal must name the widened verbs: {error}"
+        );
+    }
+
+    #[test]
+    fn the_platform_upgrade_plan_line_is_derived_from_the_asserted_rules() {
+        let line = platform_upgrade_role_plan_line(platform_role_source(), "curie-prod").unwrap();
+        assert!(line.contains("curie-prod"), "{line}");
+        assert!(line.contains(PLATFORM_UPGRADER_IDENTITY), "{line}");
+        assert!(
+            line.contains(
+                r#"["secrets", "configmaps", "services", "serviceaccounts", "persistentvolumeclaims"]"#
+            ),
+            "the plan must name the resources this build would apply: {line}"
+        );
+        assert!(
+            line.contains(r#"["get", "list", "watch", "create", "update", "patch", "delete"]"#),
+            "the plan must name the verbs this build would apply: {line}"
+        );
+        assert!(
+            line.contains(r#"["pods", "events"]"#) && line.contains(r#"["get", "list", "watch"]"#),
+            "the plan must include the read-only pods/events rule: {line}"
+        );
+        assert!(
+            !line.contains("namespace-admin"),
+            "a hand-written characterization would describe a grant the YAML no longer has: {line}"
+        );
+        let source = String::from_utf8(platform_role_source().to_vec()).unwrap();
+        let widened = source.replace(
+            "    resources: [\"secrets\", \"configmaps\", \"services\", \"serviceaccounts\", \"persistentvolumeclaims\"]\n    verbs: [\"get\", \"list\", \"watch\", \"create\", \"update\", \"patch\", \"delete\"]",
+            "    resources: [\"secrets\", \"configmaps\", \"services\", \"serviceaccounts\", \"persistentvolumeclaims\"]\n    verbs: [\"*\"]",
+        );
+        let error = platform_upgrade_role_plan_line(widened.as_bytes(), "curie-prod")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("only knows how to render"),
+            "a verb-widened Role must not produce a plan line describing the unmodified grant: {error}"
         );
     }
 

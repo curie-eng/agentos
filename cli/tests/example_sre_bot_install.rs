@@ -2188,6 +2188,44 @@ fn custom_target_dry_run_reports_and_uses_only_the_selected_identities() {
 }
 
 #[test]
+fn platform_upgrade_dry_run_discloses_the_applied_role_verbs() {
+    let fixture = Fixture::new(nodes(vec![node("node-a", "4Gi", true)]), pods(vec![]));
+    let output = fixture.run(&["--dry-run", "--json", "--platform-upgrade"]);
+    let text = shown(&output);
+    assert!(
+        output.status.success(),
+        "platform-upgrade dry run must succeed: {text}"
+    );
+    let lines = dry_run_plan_lines(&output);
+    let role_line = lines
+        .iter()
+        .find(|line| line.contains("platform-upgrade-role.yaml"))
+        .unwrap_or_else(|| panic!("plan must disclose the Job Role: {lines:?}"));
+    assert!(
+        role_line.contains(r#"["get", "list", "watch", "create", "update", "patch", "delete"]"#),
+        "plan must name the verbs this build would apply: {role_line}"
+    );
+    assert!(
+        !role_line.contains("namespace-admin"),
+        "plan must not describe the grant in canned words: {role_line}"
+    );
+    let without = Fixture::new(nodes(vec![node("node-a", "4Gi", true)]), pods(vec![]));
+    let without_output = without.run(&["--dry-run", "--json"]);
+    assert!(
+        without_output.status.success(),
+        "default dry run must succeed: {}",
+        shown(&without_output)
+    );
+    let without_lines = dry_run_plan_lines(&without_output);
+    assert!(
+        without_lines
+            .iter()
+            .all(|line| !line.contains("platform-upgrade")),
+        "omitting the flag must keep the upgrade path out of the plan: {without_lines:?}"
+    );
+}
+
+#[test]
 fn custom_targets_thread_through_helm_kubectl_manifests_secret_discovery_and_connectors() {
     let fixture = Fixture::with_modes(
         nodes(vec![node("node-a", "4Gi", true)]),
