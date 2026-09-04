@@ -76,6 +76,48 @@ def test_models_reject_unknown_fields() -> None:
         Final(text="ok", nonsense=1)  # type: ignore[call-arg]
 
 
+def test_event_rejects_unknown_fields_on_direct_construction() -> None:
+    with pytest.raises(ValidationError):
+        Event(  # type: ignore[call-arg]
+            type="message",
+            text="hi",
+            user="U0EXAMPLE1",
+            ts="1.0",
+            nonsense=1,
+        )
+
+
+@pytest.mark.parametrize("field", ("session_id", "history_ref"))
+def test_interrupt_rejects_event_session_context_fields(field: str) -> None:
+    with pytest.raises(ValidationError):
+        Interrupt.model_validate({"reason": "stop", field: "context-example"})
+
+
+@pytest.mark.parametrize("field", ("session_id", "history_ref"))
+@pytest.mark.parametrize(
+    "value",
+    (
+        1,
+        False,
+        ["not-a-string"],
+        {"not": "a string"},
+    ),
+)
+def test_event_session_context_rejects_non_string_non_null_values(
+    field: str, value: object
+) -> None:
+    payload = {
+        "type": "message",
+        "text": "hi",
+        "user": "U0EXAMPLE1",
+        "ts": "1.0",
+        field: value,
+    }
+
+    with pytest.raises(ValidationError):
+        Event.model_validate(payload)
+
+
 def test_session_status_wire_values() -> None:
     assert SessionStatus.IDLE_AWAITING_INPUT.value == "idle-awaiting-input"
     assert SessionStatus.CLASSIFIED_FAILURE.value == "classified-failure"

@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: &str = "0.4.3";
+pub const PROTOCOL_VERSION: &str = "0.4.4";
 
 pub const RUNS_STREAM_DEFAULT: &str = "curie:runs";
 
@@ -329,6 +329,10 @@ pub enum InboundMessage {
         text: String,
         user: String,
         ts: String,
+        #[serde(default)]
+        session_id: Option<String>,
+        #[serde(default)]
+        history_ref: Option<String>,
     },
     #[serde(rename = "interrupt")]
     Interrupt {
@@ -447,6 +451,8 @@ mod tests {
             text: "hello".to_string(),
             user: "U1".to_string(),
             ts: "1.0".to_string(),
+            session_id: None,
+            history_ref: None,
         };
         let encoded = serde_json::to_string(&message).unwrap();
         let decoded: InboundMessage = serde_json::from_str(&encoded).unwrap();
@@ -485,13 +491,13 @@ mod tests {
 
     #[test]
     fn accepts_compatible_patch() {
-        let raw = r#"{"type":"final","version":"0.4.4","text":"x","status":"done"}"#;
+        let raw = r#"{"type":"final","version":"0.4.5","text":"x","status":"done"}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 
     #[test]
     fn accepts_unknown_fields() {
-        let raw = r#"{"type":"final","version":"0.4.3","text":"x","status":"done","extra":1}"#;
+        let raw = r#"{"type":"final","version":"0.4.4","text":"x","status":"done","extra":1}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 }
