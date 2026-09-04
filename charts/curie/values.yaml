@@ -353,7 +353,8 @@ postgres:
 
 # ---------------------------------------------------------------------------
 # Valkey (Redis-compatible). Langfuse cache/queue AND the dispatcher's Streams
-# queue. BYO: deploy=false + host/port (existingSecret key valkeyPassword).
+# queue. BYO: deploy=false + host/port (existingSecret key valkeyPassword), plus
+# tls=true for a managed store that only accepts TLS.
 # ---------------------------------------------------------------------------
 valkey:
   deploy: true
@@ -366,6 +367,11 @@ valkey:
   port: 6379
   password: valkeypass
   existingSecret: ""
+  # Connect over TLS (#2315). For a BYO store ONLY: the in-chart StatefulSet
+  # serves no TLS listener, so tls=true with deploy=true fails the render rather
+  # than shipping six consumers that cannot connect. Verification uses the
+  # system CA bundle -- a private CA or mutual TLS is not supported by this knob.
+  tls: false
   persistence:
     enabled: true
     size: 1Gi

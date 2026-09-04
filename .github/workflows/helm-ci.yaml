@@ -167,6 +167,19 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/valkey-existing-secret-assertions.sh
 
+      # Prove a BYO Valkey can be reached over TLS, and that the signal reaches
+      # every consumer of that store rather than some of them (#2315). Every
+      # managed Redis-compatible service an operator would bring is TLS-only or
+      # TLS-by-default and redis-py never downgrades, so a half-applied
+      # transport takes down the api, worker, dispatcher and both Langfuse
+      # Deployments at once with a healthy-looking render. Also proves the
+      # guard refuses valkey.tls against the in-chart store, which serves no
+      # TLS listener.
+      - name: helm render assertions (valkey TLS)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/valkey-tls-assertions.sh
+
       # Prove the tenant capacity ceiling actually binds the pods it is meant to.
       # The quota is PriorityClass-scoped, so if its scope is not the name the
       # sandbox pods carry it matches nothing and enforces nothing -- silently,
