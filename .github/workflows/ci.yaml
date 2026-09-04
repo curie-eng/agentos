@@ -643,6 +643,20 @@ jobs:
   # (docker driver), whose FROM lookup consults the local image store -- so the
   # overlay resolves the just-built base with no GHCR pull, no registry auth,
   # and works on any branch (including forks). Build only, never pushed.
+  #
+  # The base build is GHA-layer-cached off the SAME scope the `images` matrix
+  # writes for the worker image (`scope=worker`), via a named buildx builder
+  # that is NOT made the default (`use: false`) -- the mechanism the e2e-ladder
+  # job below documents at length (#697/#791/#803). `use: false` is load-bearing
+  # here: the overlay step is a plain `docker build` whose `FROM
+  # ...curie-worker:ci-local` must resolve out of the local daemon image store,
+  # which only the default `docker` driver consults. `load: true` puts the
+  # freshly built base into that store. Read-only cache (`cache-from` with no
+  # `cache-to`): the `images` matrix already refreshes `scope=worker` with
+  # `mode=max` on every run, and a second concurrent writer on one scope only
+  # contends for the reservation -- the exact failure the matrix comment above
+  # records. The overlay itself stays a plain `docker build`: it has no entry in
+  # the `images` matrix, so there is no scope for it to share.
   worker-local-image:
     name: Build worker-local overlay image (no push)
     runs-on: ubuntu-latest
@@ -650,8 +664,21 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Build the base worker image locally
-        run: docker build -t ghcr.io/curie-eng/curie-worker:ci-local -f apps/worker/Dockerfile .
+      - name: Set up a cache-only buildx builder (named, NOT the default -- preserves the overlay's FROM)
+        id: buildcache
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          use: false
+      - name: Build the base worker image locally (gha layer cache)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: apps/worker/Dockerfile
+          builder: ${{ steps.buildcache.outputs.name }}
+          tags: ghcr.io/curie-eng/curie-worker:ci-local
+          push: false
+          load: true
+          cache-from: type=gha,scope=worker
       - name: Build the worker-local overlay (no push)
         run: docker build --build-arg BASE_TAG=ci-local -f compose/worker-local.Dockerfile compose
 
@@ -663,6 +690,13 @@ jobs:
   # startup (issue #428). The build-only `images` job above cannot catch this
   # (it never runs the image). Build the real image and assert the entrypoint's
   # imports resolve inside it -- the one place that gap is observable.
+  #
+  # GHA-layer-cached off the same scope the `images` matrix writes for this
+  # image (`scope=dispatcher`), read-only: the matrix refreshes it with
+  # `mode=max` every run, so a second writer would only contend. `load: true`
+  # is required -- the assertion step runs the built image. The builder is
+  # created with `use: false` so the default `docker` driver stays current,
+  # matching the ladder jobs and keeping any local-tag lookup working.
   dispatcher-image-smoke:
     name: Dispatcher image imports resolve
     runs-on: ubuntu-latest
@@ -670,8 +704,21 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Build the dispatcher image locally
-        run: docker build -t curie-dispatcher:ci-smoke -f apps/dispatcher/Dockerfile .
+      - name: Set up a cache-only buildx builder (named, NOT the default)
+        id: buildcache
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          use: false
+      - name: Build the dispatcher image locally (gha layer cache)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: apps/dispatcher/Dockerfile
+          builder: ${{ steps.buildcache.outputs.name }}
+          tags: curie-dispatcher:ci-smoke
+          push: false
+          load: true
+          cache-from: type=gha,scope=dispatcher
       - name: Entrypoint imports resolve in the built image
         run: docker run --rm --entrypoint python curie-dispatcher:ci-smoke -c "import curie_dispatcher; import aci_protocol"
 
@@ -681,6 +728,13 @@ jobs:
   # stay importable from a source checkout while being absent from the isolated
   # image venv, and the process crash-loops on startup. The build-only `images`
   # job above never runs the image, so this is the one place that is observable.
+  #
+  # GHA-layer-cached off `scope=mail-adapter`, the scope the `images` matrix
+  # writes for this image, read-only for the same reason as the dispatcher job.
+  # `context: .` is kept explicit here (it is what the plain `docker build` this
+  # replaces used); the matrix entry for mail-adapter omits `context`, so the
+  # two builds may not share every layer -- that pre-existing asymmetry is left
+  # alone rather than widened by this change.
   mail-adapter-image-smoke:
     name: Mail adapter image imports resolve
     runs-on: ubuntu-latest
@@ -688,8 +742,21 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Build the mail adapter image locally
-        run: docker build -t curie-mail-adapter:ci-smoke -f apps/mail-adapter/Dockerfile .
+      - name: Set up a cache-only buildx builder (named, NOT the default)
+        id: buildcache
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          use: false
+      - name: Build the mail adapter image locally (gha layer cache)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: apps/mail-adapter/Dockerfile
+          builder: ${{ steps.buildcache.outputs.name }}
+          tags: curie-mail-adapter:ci-smoke
+          push: false
+          load: true
+          cache-from: type=gha,scope=mail-adapter
       - name: Entrypoint imports resolve in the built image
         run: docker run --rm --entrypoint python curie-mail-adapter:ci-smoke -c "import curie_mail_adapter; import aci_protocol; import pydantic_settings"
 
@@ -708,7 +775,10 @@ jobs:
   # ride the Rust job (cli/tests/eval_falsifiability.rs) -- the fake model can
   # only ever say "all done", so those cannot be expressed through this path.
   # Reuses the release binary the Rust job already built and uploaded, and builds
-  # the runner image locally (plain `docker build`, no registry auth).
+  # the runner image locally (no registry auth), GHA-layer-cached off
+  # `scope=runner` -- the same scope the `images` matrix writes for the runner.
+  # Read-only cache for the same reason as the smoke jobs above; `load: true`
+  # because the gate script runs a container from the tag.
   eval-falsifiability:
     name: Eval falsifiability gate (fake model, offline)
     runs-on: ubuntu-latest
@@ -724,8 +794,21 @@ jobs:
           path: cli/target/release
       - name: Make the binary executable
         run: chmod +x cli/target/release/curie
-      - name: Build the runner image locally
-        run: docker build -t curie-runner -f runner/Dockerfile .
+      - name: Set up a cache-only buildx builder (named, NOT the default)
+        id: buildcache
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          use: false
+      - name: Build the runner image locally (gha layer cache)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: runner/Dockerfile
+          builder: ${{ steps.buildcache.outputs.name }}
+          tags: curie-runner
+          push: false
+          load: true
+          cache-from: type=gha,scope=runner
       - name: Falsifiability gate (every committed case must go RED against the fake model)
         env:
           CURIE_BIN: cli/target/release/curie
