@@ -1427,6 +1427,132 @@ securityContext:
 {{- end -}}
 {{- end -}}
 
+{{/* ---- Langfuse Postgres startup gate (issues #1853, #2330) ----
+     Shared by BOTH Langfuse Deployments because both run their Prisma boot
+     migrations against the same Postgres. #1853 filed the crash-loop against
+     the web pod and keyed the gate under `langfuse.web.postgresReadiness`, a
+     per-Deployment path that was structurally unreachable from the worker; the
+     worker then reproduced the identical symptom (Prisma `P1001`,
+     `reason: Error`, namespace `BackOff`), which is #2330. The gate is now
+     chart-level (`langfuse.postgresReadiness`, the shape
+     `langfuse.clickhouseReadiness` already had) and rendered from one define on
+     both Deployments, ordered before the ClickHouse gate on both.
+
+     The probe is credential-free: `pg_isready` speaks the startup protocol
+     only, so no password or Secret reaches this container. It is bounded on
+     purpose -- after `attempts` polls it exits non-zero and hands the decision
+     back to the kubelet, which keeps a genuinely-down Postgres visible instead
+     of hanging forever.
+
+     `securityContext` is the CALLER's own container securityContext, floored to
+     non-root: the gate runs the POSTGRES image, not the Langfuse image, so
+     runAsUser 1001 (#351) is a floor rather than an inheritance. It is always
+     emitted, even for a blank caller context.
+
+     `langfuse.web.postgresReadiness` survives as a DEPRECATED ALIAS resolved by
+     `curie.langfuse.postgresReadinessValues`, and it is honoured for BOTH
+     Deployments -- a stored `enabled: false` or a BYO `image` must never
+     silently become web-only.
+
+     Call with a dict: `root` (the chart context) and `containerSecurityContext`
+     (the component's own). */}}
+{{- define "curie.langfuse.postgresReadinessValues" -}}
+{{/* Resolves the EFFECTIVE Postgres readiness config for both Deployments.
+
+     Starts from a deepCopy of the canonical `langfuse.postgresReadiness` block
+     and merges any operator-supplied `langfuse.web.postgresReadiness` over it,
+     so a PARTIAL legacy override (`--set langfuse.web.postgresReadiness.attempts=30`)
+     still inherits every other canonical field instead of blanking them.
+
+     Detection is sound only because `values.yaml` no longer ships a default at
+     the legacy path: anything present there came from an operator. A null or
+     empty legacy value falls through to the canonical block rather than
+     merging a null over it, and `langfuse.web` itself is guarded so a
+     `langfuse.web: null` release cannot crash the render. Neither path fails --
+     `helm upgrade --reuse-values` replays an operator's stored user-supplied
+     blob, so a `fail` here would abort upgrades on exactly the releases that
+     need the gate.
+
+     `keyPath` rides along solely so the validation `fail` in
+     `curie.langfuse.postgresGate` can name the path the operator actually set.
+     It is never rendered into a manifest. */}}
+{{- $root := . -}}
+{{- $effective := deepCopy $root.Values.langfuse.postgresReadiness -}}
+{{- $keyPath := "langfuse.postgresReadiness" -}}
+{{- $legacy := get ($root.Values.langfuse.web | default dict) "postgresReadiness" -}}
+{{- if and $legacy (kindIs "map" $legacy) (gt (len $legacy) 0) -}}
+{{- $effective = mergeOverwrite $effective (deepCopy $legacy) -}}
+{{- $keyPath = "langfuse.web.postgresReadiness" -}}
+{{- end -}}
+{{- $_ := set $effective "keyPath" $keyPath -}}
+{{- toYaml $effective -}}
+{{- end -}}
+
+{{- define "curie.langfuse.postgresGate" -}}
+{{- $root := .root -}}
+{{- $postgresReadiness := fromYaml (include "curie.langfuse.postgresReadinessValues" $root) -}}
+{{- $readinessSecurityContext := deepCopy (.containerSecurityContext | default dict) -}}
+{{- $_ := set $readinessSecurityContext "runAsNonRoot" true -}}
+{{- if not (hasKey $readinessSecurityContext "runAsUser") -}}
+{{- $_ := set $readinessSecurityContext "runAsUser" 1001 -}}
+{{- else if eq (int64 (get $readinessSecurityContext "runAsUser")) 0 -}}
+{{- $_ := set $readinessSecurityContext "runAsUser" 1001 -}}
+{{- end -}}
+{{- range $field := list "attempts" "intervalSeconds" "probeTimeoutSeconds" -}}
+{{- $value := index $postgresReadiness $field -}}
+{{- $integerKind := or (kindIs "int" $value) (kindIs "int64" $value) (kindIs "float64" $value) -}}
+{{- if or (not $integerKind) (not (regexMatch "^[0-9]+$" (printf "%v" $value))) (lt (int64 $value) 1) -}}
+{{- fail (printf "%s.%s must be an integer >= 1" $postgresReadiness.keyPath $field) -}}
+{{- end -}}
+{{- end -}}
+- name: wait-for-postgres
+  image: {{ $postgresReadiness.image | default $root.Values.postgres.image | quote }}
+  imagePullPolicy: {{ $root.Values.global.imagePullPolicy }}
+  securityContext:
+    {{- toYaml $readinessSecurityContext | nindent 4 }}
+  command:
+    - sh
+    - -ec
+    - |
+      echo "waiting for Postgres readiness"
+      attempt=1
+      last_exit_code=1
+      while [ "$attempt" -le "$POSTGRES_READINESS_ATTEMPTS" ]; do
+        if pg_isready \
+          -h "$POSTGRES_HOST" \
+          -p "$POSTGRES_PORT" \
+          -U "$POSTGRES_USER" \
+          -d "$POSTGRES_DATABASE" \
+          -t "$POSTGRES_READINESS_PROBE_TIMEOUT_SECONDS" \
+          >/dev/null 2>&1; then
+          exit 0
+        else
+          last_exit_code=$?
+        fi
+        if [ "$attempt" -lt "$POSTGRES_READINESS_ATTEMPTS" ]; then
+          sleep "$POSTGRES_READINESS_INTERVAL_SECONDS"
+        fi
+        attempt=$((attempt + 1))
+      done
+      echo "Postgres readiness exhausted for ${POSTGRES_HOST}:${POSTGRES_PORT} after ${POSTGRES_READINESS_ATTEMPTS} attempts: pg_isready=${last_exit_code} (0=accepting, 1=rejecting, 2=no-response, 3=no-attempt)" >&2
+      exit 1
+  env:
+    - name: POSTGRES_HOST
+      value: {{ include "curie.postgres.host" $root | quote }}
+    - name: POSTGRES_PORT
+      value: {{ $root.Values.postgres.port | quote }}
+    - name: POSTGRES_USER
+      value: {{ $root.Values.postgres.auth.username | quote }}
+    - name: POSTGRES_DATABASE
+      value: {{ $root.Values.postgres.auth.database | quote }}
+    - name: POSTGRES_READINESS_ATTEMPTS
+      value: {{ $postgresReadiness.attempts | quote }}
+    - name: POSTGRES_READINESS_INTERVAL_SECONDS
+      value: {{ $postgresReadiness.intervalSeconds | quote }}
+    - name: POSTGRES_READINESS_PROBE_TIMEOUT_SECONDS
+      value: {{ $postgresReadiness.probeTimeoutSeconds | quote }}
+{{- end -}}
+
 {{/* ---- Langfuse ClickHouse startup gate (issue #2009) ----
      Both Langfuse deployments run their ClickHouse migrations during boot, so a
      Helm upgrade that recreates the ClickHouse Service can start them before the
