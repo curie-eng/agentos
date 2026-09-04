@@ -129,6 +129,34 @@ def test_deploy_yaml_placeholder_channels_cannot_silently_rebind() -> None:
     )
 
 
+def test_self_upgrade_connector_docstring_names_the_tools_it_ships() -> None:
+    """The module docstring is this connector's blast-radius argument.
+
+    After the #2126 forward merge it claimed one zero-argument tool on a
+    three-tool file. A reviewer reading the header would stop. The invariant
+    that actually guards the connector is that no tool takes caller input
+    (curie#2292).
+    """
+
+    text = (BUNDLE / "connectors" / "self-upgrade" / "server.py").read_text(encoding="utf-8")
+    docstring = text[text.index('"""') + 3 : text.index('"""', 3)]
+    for tool in ("upgrade_self", "upgrade_platform", "latest_release"):
+        assert tool in docstring, (
+            f"self-upgrade module docstring must name {tool}; the file ships "
+            "three tools and the header is the security argument a reviewer reads"
+        )
+    assert "no tool takes caller input" in docstring, (
+        "self-upgrade module docstring must state the no-caller-input invariant; "
+        "that is the line, not the count of tools"
+    )
+    assert "one zero-argument tool" not in docstring, (
+        "self-upgrade module docstring still claims one zero-argument tool"
+    )
+    assert "exactly one thing" not in docstring, (
+        "self-upgrade module docstring still claims the connector does exactly one thing"
+    )
+
+
 def test_permission_map_matches_the_vanilla_kubernetes_connector() -> None:
     """Retiring the bespoke writers must retire their documentation too."""
 

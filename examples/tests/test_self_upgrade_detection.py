@@ -188,6 +188,50 @@ def test_the_running_connector_environment_survives_the_upgrade(
     )
 
 
+REVOKE = b"""connectors:
+  self-upgrade:
+    build:
+      context: connectors/self-upgrade
+    env:
+      SELF_UPGRADE_CRONJOB: sre-bot-self-upgrade
+      PLATFORM_UPGRADE_CRONJOB: ""
+      K8S_WRITE_ALLOWLIST: ns-a/deploy-a
+"""
+
+
+def test_a_carried_env_cannot_override_an_incoming_empty_value(
+    offline_registry: None,
+) -> None:
+    """A commit that revokes a grant by resetting env to empty must land.
+
+    connectors.yaml expresses "not granted" as an empty string. Carrying the
+    running value over that unconditionally made upgrade_self unable to
+    narrow a ceiling (curie#2292).
+    """
+
+    parsed = yaml.safe_load(
+        pin_build_connectors(
+            REVOKE,
+            "c" * 40,
+            {
+                "self-upgrade": {
+                    "PLATFORM_UPGRADE_CRONJOB": "sre-bot-platform-upgrade",
+                    "K8S_WRITE_ALLOWLIST": "ns-a/deploy-a,ns-b/deploy-b",
+                }
+            },
+        )
+    )
+    env = parsed["connectors"]["self-upgrade"]["env"]
+    assert env["PLATFORM_UPGRADE_CRONJOB"] == "", (
+        "a carried grant must not override an incoming empty value; empty is "
+        "how the declaration revokes the capability"
+    )
+    assert env["K8S_WRITE_ALLOWLIST"] == "ns-a/deploy-a", (
+        "a carried allowlist must not override a narrower incoming ceiling"
+    )
+    assert env["SELF_UPGRADE_CRONJOB"] == "sre-bot-self-upgrade"
+
+
 def test_replacing_one_member_leaves_the_others_byte_for_byte() -> None:
     original = _bundle({"connectors.yaml": b"old", "skills/sre-bot/SKILL.md": b"the skill"})
     swapped = _read(replace_member(original, "connectors.yaml", b"new"))
@@ -219,7 +263,7 @@ class _FakeApi:
         }
 
     def __call__(self, request, timeout=0):  # noqa: ANN001 - urlopen's shape
-        path = request.full_url.replace("http://api", "")
+        path = request.full_url.replace("http://api", "").split("?", 1)[0]
         import io as _io
 
         return _io.BytesIO(json.dumps(self.routes[path]).encode())
@@ -250,6 +294,7 @@ def test_the_served_version_wins_over_a_newer_undeployed_one(
                 "agent_id": "agent-1",
                 "version_id": "served",
                 "status": "active",
+                "environment": "prod",
                 "deployed_at": "2026-01-01T00:00:00",
                 "commit_sha": None,
             }
@@ -271,6 +316,73 @@ def test_the_served_version_wins_over_a_newer_undeployed_one(
 def test_no_active_deployment_reads_as_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
     # Never "up to date". A job that cannot tell must not report success.
     api = _FakeApi(deployments=[], versions=[{"id": "v", "commit_sha": "c" * 40}])
+    _patched(monkeypatch, api)
+    _agent, commit, version_id = deployed_commit("http://api", "k", "sre-bot")
+    assert commit is None and version_id is None
+
+
+def test_the_prod_deployment_wins_over_a_newer_active_dev_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Multiple active rows are normal; newest-across-environments is not prod.
+
+    create_deployment_row never stops the previous row, so an old active prod
+    row and a newer active dev row coexist. deployed_commit must match what
+    deploy() posts to (environment=prod), not the newest active row
+    (curie#2292).
+    """
+
+    api = _FakeApi(
+        deployments=[
+            {
+                "agent_id": "agent-1",
+                "version_id": "prod-v",
+                "status": "active",
+                "environment": "prod",
+                "deployed_at": "2026-01-01T00:00:00",
+                "commit_sha": "a" * 40,
+            },
+            {
+                "agent_id": "agent-1",
+                "version_id": "dev-v",
+                "status": "active",
+                "environment": "dev",
+                "deployed_at": "2026-09-01T00:00:00",
+                "commit_sha": "b" * 40,
+            },
+        ],
+        versions=[
+            {"id": "prod-v", "commit_sha": "a" * 40},
+            {"id": "dev-v", "commit_sha": "b" * 40},
+        ],
+    )
+    _patched(monkeypatch, api)
+
+    agent_id, commit, version_id = deployed_commit("http://api", "k", "sre-bot")
+
+    assert agent_id == "agent-1"
+    assert version_id == "prod-v"
+    assert commit == "a" * 40
+
+
+def test_an_active_dev_deployment_is_not_read_as_prod(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The falsifiable negative: no prod row must not report the dev commit."""
+
+    api = _FakeApi(
+        deployments=[
+            {
+                "agent_id": "agent-1",
+                "version_id": "dev-v",
+                "status": "active",
+                "environment": "dev",
+                "deployed_at": "2026-09-01T00:00:00",
+                "commit_sha": "b" * 40,
+            }
+        ],
+        versions=[{"id": "dev-v", "commit_sha": "b" * 40}],
+    )
     _patched(monkeypatch, api)
     _agent, commit, version_id = deployed_commit("http://api", "k", "sre-bot")
     assert commit is None and version_id is None
