@@ -2059,8 +2059,10 @@ security:
     # Driver image (must carry kubectl + bash); drives all three claims.
     kubectlImage: alpine/k8s:1.31.2
     # Egress-probe pod image (must carry curl + nslookup) the driver pod execs
-    # into to test egress under the chart's real NetworkPolicy.
-    netshootImage: nicolaka/netshoot
+    # into to test egress under the chart's real NetworkPolicy. Pinned to a
+    # released tag; a bare repository resolves to :latest with imagePullPolicy
+    # Always (#2318).
+    netshootImage: nicolaka/netshoot:v0.16
     busyboxImage: busybox:1.36
     # A public host the egress policy must BLOCK (reached on the baseline, denied
     # under the policy -- the before/after control that proves the CNI enforces).
