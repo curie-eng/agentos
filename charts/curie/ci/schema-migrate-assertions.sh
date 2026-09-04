@@ -80,6 +80,13 @@ container = job["spec"]["template"]["spec"]["containers"][0]
 script = " ".join(container.get("args") or [])
 if "python -m curie_api.schema_compat upgrade" not in script:
     fail("schema-migrate Job must exec python -m curie_api.schema_compat upgrade")
+if "import curie_api.schema_compat" not in script:
+    fail("schema-migrate Job must probe for schema_compat before calling it")
+if "alembic -c alembic.ini upgrade head" not in script:
+    fail(
+        "schema-migrate Job must fall back to Alembic on a pre-#2300 API image "
+        "(released-upgrade --reset-then-reuse-values keeps the old digest)"
+    )
 env = {item["name"]: item.get("value") for item in container.get("env", [])}
 if env.get("CURIE_SCHEMA_FORWARD_ONLY") != "false":
     fail(f"default forward-only must be false, got {env.get('CURIE_SCHEMA_FORWARD_ONLY')!r}")
@@ -95,6 +102,8 @@ if "alembic" in wait_script:
     fail("API schema-wait init must not invoke alembic")
 if "python -m curie_api.schema_compat wait" not in wait_script:
     fail("API schema-wait init must exec python -m curie_api.schema_compat wait")
+if "import curie_api.schema_compat" not in wait_script:
+    fail("API schema-wait init must probe for schema_compat before calling it")
 
 if jobs(disabled, "-schema-migrate"):
     fail("api.migrate.enabled=false must omit the schema-migrate Job")

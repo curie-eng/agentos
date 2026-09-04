@@ -89,7 +89,13 @@ spec:
                   print(type(error).__name__)
                   raise SystemExit(1)
               ' 2>/dev/null); then
-                  exec python -m curie_api.schema_compat upgrade
+                  if python -c 'import curie_api.schema_compat' >/dev/null 2>&1; then
+                    exec python -m curie_api.schema_compat upgrade
+                  fi
+                  # Retained pre-#2300 API image (helm --reset-then-reuse-values
+                  # keeps the old digest). That image still ships Alembic and
+                  # is already at its own head; upgrade head is a no-op.
+                  exec alembic -c alembic.ini upgrade head
                 fi
                 if [ "$attempt" -eq 1 ]; then
                   echo "Waiting for Postgres readiness"
