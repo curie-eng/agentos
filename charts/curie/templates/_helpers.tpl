@@ -170,6 +170,33 @@ ANTHROPIC_BASE_URL ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKE
 {{- end -}}
 {{- end -}}
 
+{{/* Whether consumers reach Valkey over TLS, as the literal string "true" or
+     "false" (#2315). ONE helper, included from BOTH curie.env.valkey and
+     curie.langfuse.env: the bug class this chart has hit twice (#2052, #2327)
+     is "two consumer groups read the same valkey.* field and only one of them
+     was updated", and a shared helper makes that divergence structurally
+     impossible rather than merely tested against.
+
+     Why the guard. The in-chart valkey/valkey:8-alpine StatefulSet is started
+     with --requirepass and serves no TLS listener, so rendering TLS against it
+     would break every consumer at once behind a perfectly healthy-looking
+     manifest and no failing preflight -- silent and total. Refuse at render
+     time instead, naming both keys and both ways out.
+
+     Why toString. Go templates read any non-empty string as truthy, so a
+     quoted "false" arriving from --set-string would otherwise turn TLS on
+     against a cleartext store; this is the same scar curie.managedSecret
+     carries for security.allowDevDefaults. A nil -- a --reuse-values upgrade
+     of a release created before this key existed coalesces it away -- is not
+     "true" either, and renders the pre-change "false". */}}
+{{- define "curie.valkey.tls" -}}
+{{- $tls := eq (toString .Values.valkey.tls) "true" -}}
+{{- if and $tls .Values.valkey.deploy -}}
+{{- fail "valkey.tls is true but valkey.deploy is also true: the in-chart Valkey serves no TLS listener, so every consumer would fail to connect. Set valkey.deploy=false and point valkey.host at your external TLS store, or leave valkey.tls=false." -}}
+{{- end -}}
+{{- $tls -}}
+{{- end -}}
+
 {{- define "curie.clickhouse.host" -}}
 {{- if .Values.clickhouse.deploy -}}
 {{- printf "%s-clickhouse" (include "curie.fullname" .) -}}
@@ -847,7 +874,11 @@ http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.
 {{- end -}}
 
 {{/* Valkey connection env for the app services (host/port + password from the
-     Secret). The apps build their own redis DSN from these parts. */}}
+     Secret, plus the transport). The apps build their own redis DSN from these
+     parts, and TLS is one of the parts -- rendered always, both values, so an
+     install that never set valkey.tls cannot be confused with a broken
+     template and a --reuse-values upgrade cannot leave a stale "true" behind
+     (#2315). */}}
 {{- define "curie.env.valkey" -}}
 - name: VALKEY_HOST
   value: {{ include "curie.valkey.host" . | quote }}
@@ -858,6 +889,8 @@ http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.
     secretKeyRef:
       name: {{ .Values.valkey.existingSecret | default (include "curie.secretName" .) }}
       key: valkeyPassword
+- name: VALKEY_TLS
+  value: {{ include "curie.valkey.tls" . | quote }}
 {{- end -}}
 
 {{/* Platform API connection env for first party services that call the API.
@@ -1052,6 +1085,14 @@ livenessProbe:
     secretKeyRef:
       name: {{ .Values.valkey.existingSecret | default (include "curie.secretName" .) }}
       key: valkeyPassword
+{{- /* Same helper as curie.env.valkey, so the two Langfuse Deployments and the
+       first-party apps cannot disagree about the transport of the one store
+       they share (#2315). Langfuse's REDIS_TLS_CA/_CERT/_KEY siblings are
+       deliberately NOT rendered: system-CA verification is the boundary for
+       every consumer here, and giving Langfuse alone a private-CA capability
+       is the asymmetry this helper exists to prevent. */}}
+- name: REDIS_TLS_ENABLED
+  value: {{ include "curie.valkey.tls" . | quote }}
 - name: LANGFUSE_S3_EVENT_UPLOAD_BUCKET
   value: {{ .Values.rustfs.bucket | quote }}
 {{- /* Both upload regions come from rustfs.region, never the literal
