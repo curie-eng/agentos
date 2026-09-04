@@ -54,10 +54,11 @@
           "classified_failure",
           "side_effect_halted",
           "idle",
-          "interrupted"
+          "interrupted",
+          "deadline_halted"
         ]
       },
-      "cardinality_bound": 168
+      "cardinality_bound": 192
     },
     "curie.turn.duration": {
       "type": "histogram",
@@ -86,10 +87,11 @@
           "classified_failure",
           "side_effect_halted",
           "idle",
-          "interrupted"
+          "interrupted",
+          "deadline_halted"
         ]
       },
-      "cardinality_bound": 168
+      "cardinality_bound": 192
     },
     "curie.queue.enqueue": {
       "type": "counter",
