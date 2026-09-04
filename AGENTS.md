@@ -198,13 +198,24 @@ Host ports (non-default host ports to avoid local collisions):
 Config lives in `.env.example` (copy to the gitignored `.env` to override; the
 stack runs on the baked defaults without one). Load-bearing facts:
 
-- **ClickHouse:** `compose.dev.yaml` stays on `:24.8` so an SSE4.2-only
+- **ClickHouse:** `compose.dev.yaml` stays on `:24.8.14.39` so an SSE4.2-only
   developer host can still boot the local stack (Langfuse `3.225.5` still
-  applies on 24.8). The Helm chart default is `:25.12`, required by the
-  Langfuse pin's ClickHouse migrations from 39 onward; AVX is a chart-default
-  requirement. `preflights.avxCheck` fails an AVX-less node unless the
-  operator pins a tag in `clickhouse.sse42SafeTags`. Do not move the two
-  chart pins independently (#2210).
+  applies on the 24.8 line). The Helm chart default is `:25.12.11.4`, required
+  by the Langfuse pin's ClickHouse migrations from 39 onward; AVX is a
+  chart-default requirement. `preflights.avxCheck` fails an AVX-less node
+  unless the operator pins a tag in `clickhouse.sse42SafeTags`. Do not move the
+  two chart pins independently (#2210). Both sides name a patch build, not a
+  `24.8` / `25.12` alias -- upstream republishes those (#2319).
+- **Postgres and Valkey are one pin, not two:** `postgres.image` is
+  digest-pinned (`postgres:16.15-alpine@sha256:cf78e766...`, because
+  PostgreSQL's version is two components) and `valkey.image` is
+  `valkey/valkey:8.1.10-alpine`. `charts/curie/values.yaml`, `compose.dev.yaml`,
+  the rust job's Valkey service in `.github/workflows/ci.yaml`, and
+  `charts/curie/ci/postgres-readiness-delay.Dockerfile` must all name the same
+  build; `compose/tests/test_generate_release_compose.py` asserts it.
+  `postgres.podSecurityContext.fsGroup` is `70`, the `postgres` gid inside the
+  pinned image, asserted against the running image by
+  `charts/curie/ci/postgres-fsgroup-assertions.sh` (#2319).
 - **Langfuse OTLP ingest is HTTP-only** (gRPC is silently unsupported). Services
   may emit OTLP over gRPC or HTTP to the OTel Collector (4317/4318); the
   collector always exports to Langfuse over HTTP. Send app traces to the

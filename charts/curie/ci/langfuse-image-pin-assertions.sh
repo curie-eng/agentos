@@ -112,7 +112,7 @@ echo "negative: replacing the reviewed version with :3 is rejected"
 WEB_DIGEST="sha256:$(printf 'aa%.0s' $(seq 32))"
 WORKER_DIGEST="sha256:$(printf 'bb%.0s' $(seq 32))"
 CLICKHOUSE_DIGEST="sha256:$(printf 'cc%.0s' $(seq 32))"
-CLICKHOUSE_TAG="25.12"  # charts/curie/values.yaml clickhouse.image.tag
+CLICKHOUSE_TAG="25.12.11.4"  # charts/curie/values.yaml clickhouse.image.tag
 
 DIGEST_RENDER="$TMP/chart-digest.yaml"
 DIGEST_CHECKER="$TMP/check-digest.py"
