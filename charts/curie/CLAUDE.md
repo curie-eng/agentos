@@ -42,12 +42,46 @@ component and rail detail in `charts/curie/README.md`.
     strategy values key**. Pinned by `ci/langfuse-recreate-assertions.sh`.
     Horizontal scale for Langfuse needs an Accepted out-of-band migrator; when
     that lands, this exception is removed rather than extended.
+- **The instrumented set is exactly the workloads whose container `env` block
+  includes the `curie.env.otel` helper.** That include *is* the boundary -- it
+  is not a count and not a list kept in prose, and this rule exists because a
+  written count of "four workloads" went stale the moment a fifth one landed
+  (#2331). The include renders `OTEL_EXPORTER_OTLP_ENDPOINT`, `_PROTOCOL` and
+  `_HEADERS` from the `otelCollector` block and calls `curie.otel.validate`, so
+  adding it is what puts a workload inside chart-owned, validated telemetry, and
+  omitting it is what leaves one outside. `grep -n 'curie.env.otel'
+  charts/curie/templates/` is the authoritative membership answer at any commit;
+  at the time of writing it selects `api.yaml`, `dispatcher.yaml`, `worker.yaml`,
+  `agent-sandbox.yaml` (the runner) and `mail-adapter.yaml`. Adding a workload
+  means adding the include. Configuring the same three variables through that
+  workload's `extraEnv` instead does **not** satisfy the
+  `security.checkDefaultCredentials` production gate: each workload would then
+  carry its own copy of the destination, so any one of them can drift from the
+  rest while the render still looks correct. Two corollaries. The chart half is
+  only half the boundary -- the workload's own entrypoint must call
+  `bootstrap_service_telemetry` (`packages/telemetry`), or the env arrives at a
+  process that reads none of it and whose logs never pass `RedactingLogFilter`.
+  And a workload with an egress NetworkPolicy needs a collector peer in it as
+  well; today the mail adapter is the only such workload (see the next
+  invariant).
 - **Mail-adapter egress is a separate fail-closed rail.** Enabling
   `mailAdapter.deploy` requires at least one
-  `mailAdapter.agentmail.httpsCidrs` entry. Its single egress-only policy allows
-  DNS, this release's API pods, and those CIDRs on TCP 443; with `api.deploy`
-  false, `mailAdapter.apiEgress.httpsCidrs` and `.port` replace the pod selector
-  with an explicit narrow BYO-API peer. It never selects a runner sandbox and
+  `mailAdapter.agentmail.httpsCidrs` entry. One egress-only policy is the
+  complete list of what that pod may reach, and every destination is a rule
+  inside it rather than a second policy object, so one object still shows
+  everything a pod holding three credentials can talk to -- read the rules in
+  `templates/mail-adapter.yaml` for the current set rather than trusting a count
+  here. As written today they are DNS, this release's API pods, those
+  `agentmail.httpsCidrs` on TCP 443, and -- only while `otelCollector.deploy` is
+  true -- this release's OTel Collector on its gRPC and HTTP ports. With
+  `api.deploy` false, `mailAdapter.apiEgress.httpsCidrs` and `.port` replace the
+  API pod selector with an explicit narrow BYO-API peer. Because this is the
+  only first-party service with an egress policy at all, it is also the only one
+  whose OTLP export can be dropped by its own rail: with `otelCollector.deploy`
+  false and an external `otelCollector.endpoint`, this policy has no peer for
+  that address, and the fix is an operator-supplied additional egress policy
+  selecting the adapter (NetworkPolicies union), not a broad allow in the chart
+  for an address the chart cannot know. It never selects a runner sandbox and
   never allows the Kubernetes API. The runtime pod mounts no ServiceAccount
   token and has no RBAC. Prefix-0 and prefix-1 routes fail render, including
   split default routes. Do not turn provider DNS into a broad CIDR or add a
