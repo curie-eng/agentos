@@ -760,6 +760,308 @@ jobs:
       - name: Entrypoint imports resolve in the built image
         run: docker run --rm --entrypoint python curie-mail-adapter:ci-smoke -c "import curie_mail_adapter; import aci_protocol; import pydantic_settings"
 
+  # The console UI image serves its build through an nginx template that lives
+  # as a heredoc in apps/ui/Dockerfile, not as a checked-in config file, so
+  # nothing reviews it directly. The build-only `images` job above never runs
+  # the image, and the Playwright suite previews the raw Vite build on port
+  # 4273, bypassing nginx entirely. That leaves the built container as the
+  # only place the served response headers, compression and cache behavior
+  # are observable at all. This job builds the real image, boots it, and pins
+  # those headers so a template regression fails CI instead of surfacing as a
+  # production caching or compression bug.
+  ui-image-smoke:
+    name: UI image response headers are correct
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Set up a cache-only buildx builder (named, NOT the default)
+        id: buildcache
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          use: false
+      - name: Build the UI image locally (gha layer cache)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: apps/ui/Dockerfile
+          builder: ${{ steps.buildcache.outputs.name }}
+          tags: curie-ui:ci-smoke
+          push: false
+          load: true
+          cache-from: type=gha,scope=ui
+      - name: Start the stub API upstream
+        run: |
+          set -euo pipefail
+          docker network create curie-ui-smoke-net
+          docker run -d --name curie-api-smoke \
+            --network curie-ui-smoke-net \
+            --network-alias curie-api \
+            -v "${PWD}/apps/ui/ci/smoke-upstream-api.py:/app/upstream.py:ro" \
+            python:3.13-slim \
+            python -u /app/upstream.py
+          # nginx resolves the proxy_pass upstream at startup, so the alias must
+          # already be resolvable and serving before the UI container starts or
+          # the UI exits 1.
+          for i in $(seq 1 40); do
+            if docker exec curie-api-smoke python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/agents').read()" >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 0.5
+          done
+          echo "Stub API upstream never became ready" >&2
+          docker logs curie-api-smoke || true
+          exit 1
+      - name: Start the UI container
+        run: |
+          set -euo pipefail
+          docker run -d --name curie-ui-smoke \
+            --network curie-ui-smoke-net \
+            -e CURIE_API_TARGET=http://curie-api:8000 \
+            -p 18080:8080 \
+            curie-ui:ci-smoke
+          for i in $(seq 1 40); do
+            if curl -sf -o /dev/null http://127.0.0.1:18080/; then
+              exit 0
+            fi
+            sleep 0.5
+          done
+          echo "UI container never became ready" >&2
+          docker logs curie-ui-smoke || true
+          exit 1
+      - name: Assert response headers
+        run: |
+          set -euo pipefail
+
+          # Resolve the hashed asset path from the running container rather
+          # than hardcoding a hash that changes on every build.
+          JS_ASSET_NAME="$(docker exec curie-ui-smoke sh -c 'cd /usr/share/nginx/html/assets && ls *.js' | head -1)"
+          if [ -z "$JS_ASSET_NAME" ]; then
+            echo "No hashed JS asset found in the built image" >&2
+            exit 1
+          fi
+          ASSET_PATH="/assets/${JS_ASSET_NAME}"
+          BASE_URL="http://127.0.0.1:18080"
+
+          gzip_headers="$(curl -sS -D - -o /dev/null -H 'Accept-Encoding: gzip' "${BASE_URL}${ASSET_PATH}" | tr 'A-Z' 'a-z')"
+
+          if ! echo "$gzip_headers" | grep -q '^content-encoding: gzip'; then
+            echo "Missing header: Content-Encoding: gzip on ${ASSET_PATH}" >&2
+            echo "$gzip_headers" >&2
+            exit 1
+          fi
+
+          if ! echo "$gzip_headers" | grep 'cache-control' | grep -q 'public'; then
+            echo "Missing token in Cache-Control: public on ${ASSET_PATH}" >&2
+            echo "$gzip_headers" >&2
+            exit 1
+          fi
+
+          if ! echo "$gzip_headers" | grep 'cache-control' | grep -q 'immutable'; then
+            echo "Missing token in Cache-Control: immutable on ${ASSET_PATH}" >&2
+            echo "$gzip_headers" >&2
+            exit 1
+          fi
+
+          if ! echo "$gzip_headers" | grep 'cache-control' | grep -q 'max-age=31536000'; then
+            echo "Missing token in Cache-Control: max-age=31536000 on ${ASSET_PATH}" >&2
+            echo "$gzip_headers" >&2
+            exit 1
+          fi
+
+          if ! echo "$gzip_headers" | grep -q '^vary: accept-encoding'; then
+            echo "Missing header: Vary: Accept-Encoding on ${ASSET_PATH}" >&2
+            echo "$gzip_headers" >&2
+            exit 1
+          fi
+
+          # Compressed transfer size must be meaningfully smaller than the
+          # identity size, proving gzip actually ran rather than the header
+          # being stamped without real compression behind it.
+          identity_size="$(curl -sS -o /dev/null -H 'Accept-Encoding: identity' -w '%{size_download}' "${BASE_URL}${ASSET_PATH}")"
+          compressed_size="$(curl -sS -o /dev/null -H 'Accept-Encoding: gzip' -w '%{size_download}' "${BASE_URL}${ASSET_PATH}")"
+          if [ "$identity_size" -le 0 ]; then
+            echo "Identity response for ${ASSET_PATH} was empty" >&2
+            exit 1
+          fi
+          half_identity=$((identity_size / 2))
+          if [ "$compressed_size" -ge "$half_identity" ]; then
+            echo "Gzip transfer size not meaningfully smaller than identity for ${ASSET_PATH}" >&2
+            echo "identity_size=${identity_size} compressed_size=${compressed_size}" >&2
+            exit 1
+          fi
+
+          # NEGATIVE case: without gzip in the request, the response must not
+          # claim to be gzip encoded, proving the header tracks the request
+          # rather than being stamped unconditionally.
+          identity_headers="$(curl -sS -D - -o /dev/null -H 'Accept-Encoding: identity' "${BASE_URL}${ASSET_PATH}" | tr 'A-Z' 'a-z')"
+          if echo "$identity_headers" | grep -q '^content-encoding: gzip'; then
+            echo "Content-Encoding: gzip present on an identity request for ${ASSET_PATH}" >&2
+            echo "$identity_headers" >&2
+            exit 1
+          fi
+
+          # index.html must not carry a long-lived cache like the hashed assets do.
+          index_headers="$(curl -sS -D - -o /dev/null "${BASE_URL}/" | tr 'A-Z' 'a-z')"
+          if ! echo "$index_headers" | grep 'cache-control' | grep -q 'no-cache'; then
+            echo "Missing token in Cache-Control: no-cache on / (index.html)" >&2
+            echo "$index_headers" >&2
+            exit 1
+          fi
+          if echo "$index_headers" | grep 'cache-control' | grep -q 'immutable'; then
+            echo "index.html Cache-Control unexpectedly contains immutable" >&2
+            echo "$index_headers" >&2
+            exit 1
+          fi
+          if echo "$index_headers" | grep 'cache-control' | grep -q 'max-age=31536000'; then
+            echo "index.html Cache-Control unexpectedly contains max-age=31536000" >&2
+            echo "$index_headers" >&2
+            exit 1
+          fi
+
+          # GUARD DEMONSTRATION for `try_files $uri =404` in the assets
+          # location. Without it a missing hashed asset falls through to the SPA
+          # fallback and returns an HTML body under a year-long immutable cache
+          # at a URL that will never be requested again with different content.
+          missing_asset_status="$(curl -sS -o /dev/null -w '%{http_code}' "${BASE_URL}/assets/does-not-exist-0000000.js")"
+          if [ "$missing_asset_status" != "404" ]; then
+            echo "A missing hashed asset returned ${missing_asset_status}, expected 404" >&2
+            exit 1
+          fi
+          missing_asset_headers="$(curl -sS -D - -o /dev/null "${BASE_URL}/assets/does-not-exist-0000000.js" | tr 'A-Z' 'a-z')"
+          if echo "$missing_asset_headers" | grep 'cache-control' | grep -q 'immutable'; then
+            echo "A missing hashed asset was served with an immutable Cache-Control" >&2
+            echo "$missing_asset_headers" >&2
+            exit 1
+          fi
+          if echo "$missing_asset_headers" | grep 'cache-control' | grep -q 'max-age=31536000'; then
+            echo "A missing hashed asset was served with a year-long max-age" >&2
+            echo "$missing_asset_headers" >&2
+            exit 1
+          fi
+
+          # API ISOLATION. `gzip off` inside location /api/ is what keeps proxied
+          # responses byte-identical. The subtle pairing: application/json IS in
+          # gzip_types, so this JSON body would be compressed by the server-scope
+          # gzip if the location-scope `gzip off` were removed. A gzipped
+          # response here is therefore a direct failure of that directive.
+          api_headers="$(curl -sS -D - -o /dev/null -H 'Accept-Encoding: gzip' "${BASE_URL}/api/agents" | tr 'A-Z' 'a-z')"
+          if echo "$api_headers" | grep -q '^content-encoding:'; then
+            echo "Proxied API response carries a Content-Encoding header; gzip off in location /api/ is not in effect" >&2
+            echo "$api_headers" >&2
+            exit 1
+          fi
+          api_declared_length="$(echo "$api_headers" | awk '/^content-length:/ {gsub(/[^0-9]/, "", $2); print $2}' | head -1)"
+          if [ -z "$api_declared_length" ]; then
+            echo "Proxied API response has no Content-Length; nginx re-chunked or rewrote the upstream body" >&2
+            echo "$api_headers" >&2
+            exit 1
+          fi
+          api_received_bytes="$(curl -sS -o /dev/null -H 'Accept-Encoding: gzip' -w '%{size_download}' "${BASE_URL}/api/agents")"
+          if [ "$api_declared_length" != "$api_received_bytes" ]; then
+            echo "Proxied API Content-Length ${api_declared_length} does not match the ${api_received_bytes} bytes received; the body was recompressed or re-chunked" >&2
+            exit 1
+          fi
+
+          # STREAMING. The upstream emits five SSE events 0.4s apart, so a
+          # pass-through proxy delivers them over roughly 1.6s. If nginx buffers
+          # the response they all land at once and the elapsed span collapses to
+          # near zero, which fails here.
+          sse_result="$(curl -sN --max-time 30 "${BASE_URL}/api/stream" | python3 -u -c '
+          import sys
+          import time
+
+          first = None
+          last = None
+          count = 0
+          while True:
+              line = sys.stdin.readline()
+              if not line:
+                  break
+              if line.startswith("data:"):
+                  now = time.monotonic()
+                  if first is None:
+                      first = now
+                  last = now
+                  count += 1
+          span_ms = int((last - first) * 1000) if first is not None else 0
+          print("%d %d" % (count, span_ms))
+          ')"
+          sse_count="$(echo "$sse_result" | awk '{print $1}')"
+          sse_span_ms="$(echo "$sse_result" | awk '{print $2}')"
+          if [ "$sse_count" != "5" ]; then
+            echo "Expected 5 SSE events through the /api/ proxy, received ${sse_count}" >&2
+            exit 1
+          fi
+          if [ "$sse_span_ms" -lt 1000 ]; then
+            echo "SSE events arrived within ${sse_span_ms}ms of each other; nginx buffered the stream instead of passing it through" >&2
+            exit 1
+          fi
+
+          # CONFIG-LEVEL PIN for the full gzip_types list. The build emits no
+          # JSON or SVG asset large enough to clear gzip_min_length, so there is
+          # no runtime path that would notice those types being dropped from the
+          # template; this assertion is their pin. The JS asset above already
+          # proves the runtime path end to end for the JavaScript types.
+          # Anchor on the directive line itself: this same config file also has
+          # an nginx comment mentioning gzip_types, and a plain grep would match
+          # that comment too, letting a required type be silently dropped from
+          # the real directive while the check still passes.
+          gzip_types_line="$(docker exec curie-ui-smoke grep -E '^[[:space:]]*gzip_types[[:space:]]' /etc/nginx/conf.d/default.conf)"
+          if [ -z "$gzip_types_line" ]; then
+            echo "nginx config has no gzip_types directive at all" >&2
+            exit 1
+          fi
+          for required_type in application/javascript text/javascript text/css application/json image/svg+xml; do
+            if ! echo "$gzip_types_line" | grep -qF "$required_type"; then
+              echo "nginx gzip_types is missing the required type: ${required_type}" >&2
+              echo "$gzip_types_line" >&2
+              exit 1
+            fi
+          done
+
+          # A CSS asset is gzipped too, if the build emits one and it is large
+          # enough to clear the server's gzip_min_length floor. Below that
+          # floor nginx correctly declines to compress it, so the check falls
+          # back to asserting the config declares text/css as compressible.
+          # Skip gracefully if the build emits no CSS asset at all.
+          GZIP_MIN="$(docker exec curie-ui-smoke sh -c "awk '/gzip_min_length/ {gsub(/[^0-9]/, \"\", \$2); print \$2}' /etc/nginx/conf.d/default.conf" | head -1)"
+          GZIP_MIN="${GZIP_MIN:-1024}"
+          CSS_ASSET_NAME="$(docker exec curie-ui-smoke sh -c 'cd /usr/share/nginx/html/assets && ls *.css 2>/dev/null || true' | head -1)"
+          if [ -n "$CSS_ASSET_NAME" ]; then
+            CSS_ASSET_SIZE="$(docker exec curie-ui-smoke sh -c "wc -c < /usr/share/nginx/html/assets/${CSS_ASSET_NAME}" | tr -d '[:space:]')"
+            css_headers="$(curl -sS -D - -o /dev/null -H 'Accept-Encoding: gzip' "${BASE_URL}/assets/${CSS_ASSET_NAME}" | tr 'A-Z' 'a-z')"
+            if ! echo "$css_headers" | grep 'cache-control' | grep -q 'immutable'; then
+              echo "Missing token in Cache-Control: immutable on /assets/${CSS_ASSET_NAME}" >&2
+              echo "$css_headers" >&2
+              exit 1
+            fi
+            if [ "$CSS_ASSET_SIZE" -ge "$GZIP_MIN" ]; then
+              if ! echo "$css_headers" | grep -q '^content-encoding: gzip'; then
+                echo "Missing header: Content-Encoding: gzip on /assets/${CSS_ASSET_NAME}" >&2
+                echo "$css_headers" >&2
+                exit 1
+              fi
+            else
+              echo "CSS asset ${CSS_ASSET_NAME} is ${CSS_ASSET_SIZE} bytes, below the gzip_min_length floor of ${GZIP_MIN}; asserting gzip_types config instead of runtime encoding"
+              if ! echo "$gzip_types_line" | grep -qF 'text/css'; then
+                echo "nginx config does not declare text/css in gzip_types" >&2
+                exit 1
+              fi
+            fi
+          else
+            echo "No CSS asset found in this build; skipping the CSS gzip assertion"
+          fi
+
+          echo "All UI image header assertions passed"
+      - name: Tear down the UI container and its API upstream
+        if: always()
+        run: |
+          docker rm -f curie-ui-smoke || true
+          docker rm -f curie-api-smoke || true
+          docker network rm curie-ui-smoke-net || true
+
   # FALSIFIABILITY gate for the committed eval suites (issue #619). This is NOT
   # an E2E test: it never runs a real agent or makes a model call. It boots the
   # runner's scripted FAKE model (offline, no credential, no network) -- a
