@@ -152,13 +152,13 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/clickhouse-logging-assertions.sh
 
-      # Prove Langfuse honors valkey.existingSecret on a BYO valkey install
-      # (#2052). A supported BYO install (valkey.deploy=false + host +
-      # existingSecret) had every component read the operator's Secret except
-      # Langfuse, which stayed pinned to the chart-managed Secret -- so trace
-      # ingestion died alone while the rest of the release stayed healthy,
-      # which is why nothing pointed at the cause.
-      - name: helm render assertions (langfuse valkey existingSecret)
+      # Prove Langfuse honors existingSecret for BYO valkey, postgres, and its
+      # own app keys (#2052, #2327). A supported BYO install has every other
+      # component read the operator's Secret except Langfuse: api and worker
+      # authenticate against the real postgres while both Langfuse Deployments
+      # present the chart-generated password and crash-loop at Prisma auth --
+      # so ingestion dies alone while the rest of the release stays healthy.
+      - name: helm render assertions (langfuse store existingSecret)
         run: |
           set -euo pipefail
           bash charts/curie/ci/valkey-existing-secret-assertions.sh

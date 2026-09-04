@@ -547,6 +547,18 @@ upgrading. Without it the collector pod fails to start with
 `CreateContainerConfigError`, which is the deliberate replacement for a silent
 401 on every trace export.
 
+Upgrade note for `langfuse.existingSecret` (#2327): the chart now actually reads
+`langfuseSalt` and `langfuseEncryptionKey` from that Secret. `values.yaml`
+already listed both as required keys, but the template ignored them -- an
+install already on this path was salting and encrypting with the chart-managed
+Secret's values instead, because those two keys ignored `existingSecret` while
+`NEXTAUTH_SECRET` and the `LANGFUSE_INIT_*` keys already honored it. Both
+Deployments now read the BYO Secret for real: a missing key fails loud with
+`CreateContainerConfigError`, a differing one fails silently and stops
+decrypting columns already written. Before upgrading, copy the live values out
+of the chart-managed `<release>-secrets` Secret into your BYO Secret, unless no
+encrypted data is worth preserving.
+
 Caveat: generation relies on Helm `lookup`, which is empty under client-side
 rendering. Driving this chart via `helm template | kubectl apply` or ArgoCD's
 client-side Helm (no live API lookup) regenerates these values on every sync and
