@@ -375,9 +375,12 @@ jobs:
           bash charts/curie/ci/sandbox-emptydir-sizelimit-assertions.sh
 
       # Prove the dispatcher is told where the platform API is and how to
-      # authenticate to it (issue #442). Unwired, it falls back to its code
-      # default http://localhost:8000 -- itself -- and every Slack Approve click
-      # dead-ends with only a warning.
+      # authenticate to it (issue #442), and that the UI's CURIE_API_TARGET
+      # uses the same helper (issue #2316). Unwired, the dispatcher falls back
+      # to its code default http://localhost:8000 -- itself -- and every Slack
+      # Approve click dead-ends with only a warning. An unwired UI stays Ready
+      # while every /api/ request fails at the proxy, so api.deploy=false with
+      # an empty ui.apiBaseUrl must fail the render closed.
       - name: helm render assertions (dispatcher API wiring)
         run: |
           set -euo pipefail

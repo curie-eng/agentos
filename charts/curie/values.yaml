@@ -1583,6 +1583,14 @@ worker:
 ui:
   deploy: true
   replicas: 1
+  # Platform API the UI's nginx reverse-proxies /api/ to. Empty (the default)
+  # derives the in-chart API Service, http://<fullname>-api:<api.service.port>.
+  # Set it to a full base URL to point at an API this chart did not deploy; that
+  # BYO value renders verbatim as CURIE_API_TARGET. Required when api.deploy is
+  # false: unlike the dispatcher, the UI stays Ready while every /api/ request
+  # fails at the proxy, so the render fails closed rather than shipping a
+  # stranded UI.
+  apiBaseUrl: ""
   image:
     repository: ghcr.io/curie-eng/curie-ui
     # Empty -> chart appVersion (immutable). Set to pin an explicit version tag.

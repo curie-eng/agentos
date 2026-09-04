@@ -126,6 +126,7 @@ helm upgrade curie charts/curie -n curie --reuse-values \
 | Value | Default | Meaning |
 | --- | --- | --- |
 | `dispatcher.apiBaseUrl` | `""` | Empty derives the in-chart API Service. A set value is used verbatim (BYO), and is **required** when `api.deploy: false`, where no in-chart Service exists to derive from. |
+| `ui.apiBaseUrl` | `""` | Empty derives the in-chart API Service for the UI's `CURIE_API_TARGET` nginx upstream. A set value is used verbatim (BYO). **Required** when `api.deploy: false` and `ui.deploy` is true: the UI's probes hit nginx `/` rather than the upstream, so an empty override fails the render closed instead of shipping a Ready UI that fails every `/api/` request. |
 | `dispatcher.apiPreflightTimeoutSeconds` | `120` | Bounded time for API `/health`, followed by a fresh same-size discovery-and-Slack budget. The bare dispatcher default remains 30 seconds. |
 | `dispatcher.startupProbe.initialDelaySeconds` | `0` | Delay before Kubernetes begins the dispatcher heartbeat startup probe. |
 | `dispatcher.startupProbe.periodSeconds` | `10` | Interval between dispatcher startup probes. |
