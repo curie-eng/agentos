@@ -550,21 +550,48 @@ credential because the Basic header is encoded, not encrypted.
 
 ### Langfuse Postgres startup readiness
 
-`langfuse.web.postgresReadiness` is enabled by default. Before Langfuse web
-starts, its `wait-for-postgres` init container makes a credential-free
-`pg_isready` protocol-readiness check only; it does not validate authentication
-or run migrations. Its `image` is empty by default and falls back to
-`postgres.image`; override it for a BYO Postgres/private registry when the
-default image is unavailable there.
+`langfuse.postgresReadiness` is enabled by default. Both `langfuse-web` and
+`langfuse-worker` render a `wait-for-postgres` init container from it, because
+both run Prisma schema migrations against Postgres at boot (#2330). The check
+is a credential-free `pg_isready` protocol-readiness check only; it does not
+validate authentication or run migrations. Its `image` is empty by default and
+falls back to `postgres.image`; override it for a BYO Postgres/private
+registry when the default image is unavailable there.
 
 Defaults are `attempts: 60`, `intervalSeconds: 2`, and
 `probeTimeoutSeconds: 2`: the wait is bounded to approximately 2--4 minutes,
-depending on how quickly each probe fails. While the Pod remains in `Init`, use
-`kubectl logs <langfuse-web-pod> -c wait-for-postgres` and check the Postgres
-endpoint, DNS, and network path. Exhaustion fails the init container so
-Kubernetes restarts it. After a successful protocol check, Langfuse web owns
-authentication and migrations: bad credentials and permanent migration failures
-are terminal there and are not retried by this gate.
+depending on how quickly each probe fails. While a Pod remains in `Init`, use
+`kubectl logs <langfuse-web-pod> -c wait-for-postgres` or
+`kubectl logs <langfuse-worker-pod> -c wait-for-postgres` (whichever Pod is
+stuck) and check the Postgres endpoint, DNS, and network path. Exhaustion
+fails the init container so Kubernetes restarts it. After a successful
+protocol check, the Langfuse container itself owns authentication and
+migrations: bad credentials and permanent migration failures are terminal
+there and are not retried by this gate.
+
+**Upgrading from a release that set `langfuse.web.postgresReadiness`:** that
+path is deprecated but still honoured — values supplied there are merged over
+the `langfuse.postgresReadiness` defaults and now apply to **both**
+Deployments, not web only, for consistency: whatever an operator configured
+under the old key -- a disable, a BYO `image`, a tuned attempt budget -- must
+take effect uniformly across both Deployments rather than silently applying to
+web only and letting the two diverge. The render does not refuse the old key:
+`helm upgrade --reuse-values` replays a release's stored
+user-supplied values, so a key set on an earlier version comes back on every
+upgrade, and failing the render on it would break the upgrade path for exactly
+the operators who customized the gate. Move any `--set`s or overlay files from
+`langfuse.web.postgresReadiness.*` to `langfuse.postgresReadiness.*`; the
+alias is removed in a future minor. `helm install`/`upgrade` prints a NOTES.txt
+reminder whenever the deprecated key is still set.
+
+`langfuse-worker` also carries its own `readinessProbe` (`httpGet /api/ready`)
+and `livenessProbe` (`tcpSocket` on the same port 3030) once the container is
+running. Liveness is deliberately a TCP check rather than an HTTP path: the
+worker is `replicas: 1` and runs the same boot migrations as web, and init
+containers do not re-run on a liveness restart, so an HTTP liveness probe
+hitting a Postgres/Valkey blip would restart the only replica straight into
+those migrations against a store that is still recovering — the crash-loop
+class this gate exists to prevent.
 
 Secrets: all credentials are written to one `<release>-secrets` Secret. A sealed
 `helm install` (the default) generates strong random values for all thirteen

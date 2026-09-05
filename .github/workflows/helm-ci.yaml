@@ -291,13 +291,30 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/langfuse-runasuser-assertions.sh
 
-      # Prove the web-only Postgres readiness gate is ordered before Langfuse,
-      # credential-free, bounded/tunable, hardened like the web container, and
-      # removable through its explicit values switch. Includes a red mutation.
+      # Prove the Postgres readiness gate is rendered on BOTH Langfuse
+      # Deployments (#2330: it was web-only, so langfuse-worker crash-looped on
+      # the same Prisma P1001 that #1853 fixed for web), ordered before the
+      # ClickHouse gate on each, credential-free, bounded/tunable, hardened from
+      # each Deployment's OWN containerSecurityContext, and removable through its
+      # values switch. `langfuse.web.postgresReadiness` stays honoured as a
+      # deprecated alias applied to both Deployments -- not refused, because a
+      # render fail would abort `helm upgrade --reuse-values` on exactly the
+      # releases that need the gate. Includes red mutations, armed per Deployment.
       - name: helm render assertions (langfuse postgres readiness)
         run: |
           set -euo pipefail
           bash charts/curie/ci/langfuse-postgres-readiness-assertions.sh
+
+      # Prove langfuse-worker carries both probes on its :3030 endpoint -- #71's
+      # criterion is that every Deployment with a persistent process has both a
+      # readiness and a liveness probe, and the worker was the last violation.
+      # Readiness is the SIGTERM-aware /api/ready so a terminating pod drains;
+      # liveness is tcpSocket so a Postgres or Valkey blip cannot restart the
+      # single replica into its boot migrations (#71, #2330).
+      - name: helm render assertions (langfuse worker probes)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/langfuse-worker-probe-assertions.sh
 
       # Prove the controller NetworkPolicy RBAC split (issue #350): exactly one
       # read-only cluster grant (get/list/watch) so the informer syncs, no

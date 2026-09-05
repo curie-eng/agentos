@@ -169,6 +169,25 @@ langfuse:
     maxAttempts: 60
     intervalSeconds: 2
     timeoutSeconds: 2
+  # Credential-free protocol readiness gate before either Langfuse Deployment
+  # starts its own migrations (#1853, #2330). Both Langfuse deployments run
+  # their schema migrations at boot against the same Postgres, so both are held
+  # behind this gate -- web reproduced Prisma `P1001` first (#1853) and the
+  # worker reproduced it identically once the web gate landed (#2330).
+  # Authentication and migration failures remain owned by the unmodified
+  # Langfuse entrypoint after this bounded wait succeeds.
+  # `langfuse.web.postgresReadiness` is a DEPRECATED alias: values supplied
+  # there are still honoured and are merged over these defaults for BOTH
+  # Deployments.
+  postgresReadiness:
+    enabled: true
+    # Empty reuses postgres.image; override for BYO Postgres when needed.
+    # This probe always runs as non-root, independently of a Langfuse image's
+    # containerSecurityContext override, because it uses the Postgres image.
+    image: ""
+    attempts: 60
+    intervalSeconds: 2
+    probeTimeoutSeconds: 2
   # NEXTAUTH_URL the browser reaches the web UI at. Override for a real ingress.
   nextauthUrl: http://localhost:23000
   # Dev-only secret material. Override in prod or set `existingSecret` to a
@@ -252,18 +271,11 @@ langfuse:
     # cap (~512Mi) OOM-crashes under a tight container limit; raise it in step
     # with the memory limit. Empty = leave the image default.
     nodeOptions: "--max-old-space-size=1024"
-    # Credential-free protocol readiness gate before Langfuse web starts its
-    # own migrations. Authentication and migration failures remain owned by
-    # the unmodified Langfuse entrypoint after this bounded wait succeeds.
-    postgresReadiness:
-      enabled: true
-      # Empty reuses postgres.image; override for BYO Postgres when needed.
-      # This probe always runs as non-root, independently of a web image's
-      # containerSecurityContext override, because it uses the Postgres image.
-      image: ""
-      attempts: 60
-      intervalSeconds: 2
-      probeTimeoutSeconds: 2
+    # DEPRECATED: langfuse.web.postgresReadiness moved to langfuse.postgresReadiness
+    # (#2330), which gates BOTH Langfuse Deployments. Values supplied at the old
+    # path are still honoured and are applied to BOTH; the chart no longer sets
+    # any default here. Move your overrides -- the alias is removed in a future
+    # minor.
     resources:
       requests: { cpu: 150m, memory: 384Mi }
       limits: { cpu: "1", memory: 1536Mi }
