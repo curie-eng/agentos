@@ -7,11 +7,15 @@
 //! - database compatibility windows (#2300)
 //! - the kind released-install upgrade CI rung (#2097)
 //!
-//! Drain is the existing #2010 gate: one drain per attempt. Resume after a
-//! completed drain must not drain accepted work again.
+//! Helm owns the existing drain and migration hooks. The live driver records
+//! transaction intent before Helm and completed milestones only after observing
+//! successful hook/schema state. Independent hook interruption remains a
+//! separate required released-upgrade matrix.
 
 use anyhow::{bail, Context, Result};
+use base64::Engine;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::command::{mask_secret, plain, require_on_path, run_capture, CommonOpts, OpsCommand};
 
@@ -71,6 +75,7 @@ pub struct UpgradeOpts {
     pub to: String,
     pub chart: Option<String>,
     pub yes: bool,
+    pub forward_only: bool,
 }
 
 /// What `cluster status` reports about the in-flight or last upgrade.
@@ -115,6 +120,14 @@ struct UpgradeRecord {
     canary: Option<Canary>,
     fail_forward: Option<FailForward>,
     resumed: bool,
+    #[serde(default)]
+    schema_decision: Option<serde_json::Value>,
+    #[serde(default)]
+    target_identity: Option<String>,
+    #[serde(default)]
+    helm_started: bool,
+    #[serde(default)]
+    retained_agents_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -416,8 +429,9 @@ impl UpgradeDriver for FakeUpgradeHost {
     fn load_record(&self) -> Option<UpgradeRecord> {
         self.record.clone()
     }
-    fn store_record(&mut self, record: UpgradeRecord) {
+    fn store_record(&mut self, record: UpgradeRecord) -> Result<()> {
         self.record = Some(record);
+        Ok(())
     }
     fn secret(&self) -> Option<&str> {
         self.secret.as_deref()
@@ -461,8 +475,8 @@ impl UpgradeDriver for FakeUpgradeHost {
         }
         match (&self.current, &self.known_good) {
             (Some(cur), Some(kg)) => cur == kg,
-            (None, _) => true,
-            _ => true,
+            (None, _) => false,
+            _ => false,
         }
     }
     fn interrupt_after(&self) -> Option<UpgradePhase> {
@@ -496,7 +510,11 @@ fn remaining_after(completed: &[UpgradePhase]) -> Vec<UpgradePhase> {
 }
 
 fn plan_lines(opts: &UpgradeOpts, from: Option<&str>, secret: Option<&str>) -> Vec<String> {
-    let from = from.unwrap_or("none");
+    let from = from.unwrap_or(if opts.common.dry_run {
+        "source not inspected"
+    } else {
+        "none"
+    });
     let chart = opts
         .chart
         .clone()
@@ -516,6 +534,9 @@ fn plan_lines(opts: &UpgradeOpts, from: Option<&str>, secret: Option<&str>) -> V
         "phase canary: target-version smoke".into(),
         "phase commit: record known-good version".into(),
     ];
+    if opts.common.dry_run {
+        lines.push("Offline plan: source configuration and database compatibility not inspected; execution validates both before mutation".into());
+    }
     if let Some(secret) = secret {
         lines.push(format!(
             "preserved credential api.credentials={}",
@@ -558,23 +579,24 @@ fn completed_output(
     }
 }
 
-fn fail_forward_for(opts: &UpgradeOpts, previous_serving: bool, reason: &str) -> FailForward {
-    if previous_serving {
-        FailForward {
-            command: format!(
-                "curie cluster rollback --yes --release {} --namespace {}",
-                opts.common.release, opts.common.namespace
-            ),
-            reason: reason.to_string(),
-        }
-    } else {
-        FailForward {
-            command: format!(
-                "curie cluster upgrade --to {} --release {} --namespace {}",
-                opts.to, opts.common.release, opts.common.namespace
-            ),
-            reason: reason.to_string(),
-        }
+fn fail_forward_for(opts: &UpgradeOpts, _previous_serving: bool, reason: &str) -> FailForward {
+    // Schema expansion may already have landed. A previous process still
+    // serving does not establish that a chart rollback can safely restart it.
+    fn quoted(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+    let mut command = format!(
+        "curie cluster upgrade --to {} --release {} --namespace {} --yes",
+        quoted(&opts.to),
+        quoted(&opts.common.release),
+        quoted(&opts.common.namespace),
+    );
+    if let Some(chart) = &opts.chart {
+        command.push_str(&format!(" --chart {}", quoted(chart)));
+    }
+    FailForward {
+        command,
+        reason: reason.to_string(),
     }
 }
 
@@ -584,7 +606,34 @@ trait UpgradeDriver {
     fn known_good(&self) -> Option<String>;
     fn set_known_good(&mut self, version: Option<String>);
     fn load_record(&self) -> Option<UpgradeRecord>;
-    fn store_record(&mut self, record: UpgradeRecord);
+    fn store_record(&mut self, record: UpgradeRecord) -> Result<()>;
+    fn retained_agents_fingerprint(&self) -> Option<String> {
+        None
+    }
+    fn owns_helm_transaction(&self) -> bool {
+        false
+    }
+    fn reconcile_applied(&self) -> Result<bool> {
+        Ok(false)
+    }
+    fn target_identity(&self) -> Option<String> {
+        None
+    }
+    fn schema_decision(&self) -> Option<serde_json::Value> {
+        None
+    }
+    fn validate(&mut self) -> Result<()> {
+        if self.refuse_config() {
+            bail!("configuration compatibility check refused the overlay before mutation");
+        }
+        if self.refuse_schema() {
+            bail!("database/application compatibility check refused the target schema before mutation");
+        }
+        Ok(())
+    }
+    fn configuration_plan(&self) -> Vec<String> {
+        Vec::new()
+    }
     fn secret(&self) -> Option<&str> {
         None
     }
@@ -629,7 +678,8 @@ async fn run_lifecycle_inner<H: UpgradeDriver>(
         bail!("--to requires a target version");
     }
     let from = host.current();
-    let plan = plan_lines(&opts, from.as_deref(), host.secret());
+    let mut plan = plan_lines(&opts, from.as_deref(), host.secret());
+    plan.extend(host.configuration_plan());
     let plan: Vec<String> = plan.into_iter().map(|l| host.redact(&l)).collect();
 
     if opts.common.dry_run {
@@ -638,16 +688,51 @@ async fn run_lifecycle_inner<H: UpgradeDriver>(
         }));
     }
 
-    let mut record = match host.load_record() {
-        Some(existing)
-            if existing.target_version == opts.to && existing.status == "in_progress" =>
+    let previous_record = host.load_record();
+    if let Some(record) = &previous_record {
+        if !matches!(
+            record.status.as_str(),
+            "in_progress" | "failed" | "succeeded"
+        ) || record.completed.len() > UpgradePhase::ALL.len()
+            || record.completed.as_slice() != &UpgradePhase::ALL[..record.completed.len()]
         {
+            bail!("upgrade checkpoint phases are not a valid durable prefix; preserve the record before retrying");
+        }
+    }
+    let unchanged_helm = host.owns_helm_transaction()
+        && previous_record.as_ref().is_some_and(|record| {
+            record.status == "succeeded"
+                && record.target_version == opts.to
+                && record.target_identity == host.target_identity()
+                && host.current().as_deref() == Some(opts.to.as_str())
+        });
+    let mut record = match previous_record {
+        Some(existing)
+            if existing.target_version == opts.to
+                && matches!(existing.status.as_str(), "in_progress" | "failed") =>
+        {
+            if host.owns_helm_transaction() && existing.target_identity != host.target_identity() {
+                bail!("upgrade target artifacts or retained configuration changed; preserve the checkpoint and restore the original target before resuming");
+            }
             let mut existing = existing;
             existing.resumed = true;
+            existing.status = "in_progress".into();
+            existing.fail_forward = None;
+            // Observations can go stale while the CLI is stopped. Resume
+            // idempotent writes, but always re-prove live convergence/canary.
+            existing.completed.retain(|phase| {
+                !matches!(
+                    phase,
+                    UpgradePhase::Converge | UpgradePhase::Canary | UpgradePhase::Commit
+                )
+            });
+            existing.convergence = None;
+            existing.canary = None;
             existing
         }
         Some(existing)
-            if existing.target_version != opts.to && existing.status == "in_progress" =>
+            if existing.target_version != opts.to
+                && matches!(existing.status.as_str(), "in_progress" | "failed") =>
         {
             bail!(
                 "an upgrade to {} is already in progress; resume it or wait",
@@ -666,6 +751,10 @@ async fn run_lifecycle_inner<H: UpgradeDriver>(
             canary: None,
             fail_forward: None,
             resumed: false,
+            schema_decision: host.schema_decision(),
+            target_identity: host.target_identity(),
+            helm_started: unchanged_helm,
+            retained_agents_fingerprint: host.retained_agents_fingerprint(),
         },
     };
 
@@ -673,7 +762,34 @@ async fn run_lifecycle_inner<H: UpgradeDriver>(
         && host.known_good().as_deref() == Some(opts.to.as_str());
 
     for phase in remaining_after(&record.completed) {
+        if record.completed.contains(&phase) {
+            continue;
+        }
+        if phase == UpgradePhase::Drain && host.owns_helm_transaction() {
+            // Helm owns drain -> migration -> rollout. Persist intent before
+            // starting it; these milestones are complete only after observed
+            // successful hooks and target release state, never before Helm.
+            let reconciled = record.helm_started && host.reconcile_applied()?;
+            if !reconciled {
+                record.helm_started = true;
+                host.store_record(record.clone())?;
+                host.apply_target(&opts.to)?;
+                if !host.reconcile_applied()? {
+                    bail!("Helm returned without verifiable target hooks/schema; preserve the checkpoint and resume after inspecting the release");
+                }
+            }
+            record.drain_completed = true;
+            record.completed.extend([
+                UpgradePhase::Drain,
+                UpgradePhase::Checkpoint,
+                UpgradePhase::Migrate,
+                UpgradePhase::Apply,
+            ]);
+            host.store_record(record.clone())?;
+            continue;
+        }
         if same_version
+            && !host.owns_helm_transaction()
             && matches!(
                 phase,
                 UpgradePhase::Drain
@@ -683,19 +799,24 @@ async fn run_lifecycle_inner<H: UpgradeDriver>(
             )
         {
             record.completed.push(phase);
-            host.store_record(record.clone());
+            host.store_record(record.clone())?;
             continue;
         }
         if phase == UpgradePhase::Drain && from.is_none() {
             record.completed.push(phase);
-            host.store_record(record.clone());
+            host.store_record(record.clone())?;
             continue;
         }
 
         match execute_phase(phase, &opts, host, &mut record)? {
             PhaseOutcome::Continue => {
                 record.completed.push(phase);
-                host.store_record(record.clone());
+                // Validation must precede the first cluster write, including
+                // the checkpoint itself. Plan is included in the first record
+                // persisted after validation succeeds.
+                if phase != UpgradePhase::Plan {
+                    host.store_record(record.clone())?;
+                }
                 if host.interrupt_after() == Some(phase) {
                     bail!("interrupted after durable phase {}", phase.as_str());
                 }
@@ -710,7 +831,7 @@ async fn run_lifecycle_inner<H: UpgradeDriver>(
                         &format!("upgrade failed during {}", phase.as_str()),
                     ));
                 }
-                host.store_record(record.clone());
+                host.store_record(record.clone())?;
                 return Ok(completed_output(&record, previous, Some(phase)));
             }
         }
@@ -719,7 +840,7 @@ async fn run_lifecycle_inner<H: UpgradeDriver>(
     record.status = "succeeded".into();
     record.known_good_version = Some(opts.to.clone());
     host.set_known_good(Some(opts.to.clone()));
-    host.store_record(record.clone());
+    host.store_record(record.clone())?;
     Ok(completed_output(&record, true, None))
 }
 
@@ -740,12 +861,7 @@ fn execute_phase<H: UpgradeDriver>(
     match phase {
         UpgradePhase::Plan => Ok(PhaseOutcome::Continue),
         UpgradePhase::Validate => {
-            if host.refuse_config() {
-                bail!("configuration compatibility check refused the overlay before mutation");
-            }
-            if host.refuse_schema() {
-                bail!("database/application compatibility check refused the target schema before mutation");
-            }
+            host.validate()?;
             Ok(PhaseOutcome::Continue)
         }
         UpgradePhase::Drain => {
@@ -798,16 +914,297 @@ fn execute_phase<H: UpgradeDriver>(
     }
 }
 
+fn hash_chart(path: &std::path::Path, digest: &mut Sha256) -> Result<()> {
+    let metadata =
+        std::fs::symlink_metadata(path).context("could not inspect target chart artifact")?;
+    if metadata.file_type().is_symlink() {
+        bail!("target chart artifact cannot contain unresolved symlinks");
+    }
+    if metadata.is_dir() {
+        let mut entries = std::fs::read_dir(path)?.collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let name = entry.file_name();
+            let bytes = name.as_encoded_bytes();
+            digest.update((bytes.len() as u64).to_be_bytes());
+            digest.update(bytes);
+            hash_chart(&entry.path(), digest)?;
+        }
+    } else if metadata.is_file() {
+        digest.update(metadata.len().to_be_bytes());
+        digest.update(std::fs::read(path)?);
+    } else {
+        bail!("target chart artifact contains an unsupported filesystem entry");
+    }
+    Ok(())
+}
+
 fn checkpoint_name(release: &str) -> String {
     format!("{release}-upgrade-checkpoint")
 }
+
+fn contains_manifest(actual: &serde_json::Value, expected: &serde_json::Value) -> bool {
+    match (actual, expected) {
+        (serde_json::Value::Object(actual), serde_json::Value::Object(expected)) => {
+            expected.iter().all(|(key, value)| {
+                actual
+                    .get(key)
+                    .is_some_and(|item| contains_manifest(item, value))
+            })
+        }
+        (serde_json::Value::Array(actual), serde_json::Value::Array(expected)) => {
+            actual.len() == expected.len()
+                && actual
+                    .iter()
+                    .zip(expected)
+                    .all(|(a, e)| contains_manifest(a, e))
+        }
+        _ => actual == expected,
+    }
+}
+
+fn object_identity(value: &serde_json::Value) -> Option<(&str, &str)> {
+    Some((
+        value.get("kind")?.as_str()?,
+        value.pointer("/metadata/name")?.as_str()?,
+    ))
+}
+
+fn hooks_succeeded(status: &serde_json::Value) -> bool {
+    status.pointer("/info/status").and_then(|v| v.as_str()) == Some("deployed")
+        && status
+            .get("hooks")
+            .and_then(|v| v.as_array())
+            .is_some_and(|hooks| {
+                hooks.iter().all(|hook| {
+                    let relevant = hook
+                        .get("events")
+                        .and_then(|v| v.as_array())
+                        .into_iter()
+                        .flatten()
+                        .any(|event| {
+                            matches!(
+                                event.as_str(),
+                                Some("pre-upgrade" | "post-upgrade" | "post-install")
+                            )
+                        });
+                    !relevant
+                        || hook.pointer("/last_run/phase").and_then(|v| v.as_str())
+                            == Some("Succeeded")
+                })
+            })
+}
+
+fn workload_images(value: &serde_json::Value) -> Vec<(&str, &str)> {
+    ["containers", "initContainers"]
+        .into_iter()
+        .flat_map(|field| {
+            value
+                .pointer(&format!("/spec/template/spec/{field}"))
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|container| {
+                    Some((
+                        container.get("name")?.as_str()?,
+                        container.get("image")?.as_str()?,
+                    ))
+                })
+        })
+        .collect()
+}
+
+#[derive(Deserialize)]
+struct SchemaRevision {
+    revision: String,
+    parents: Vec<String>,
+    kind: String,
+    sha256: String,
+}
+
+#[derive(Deserialize)]
+struct SchemaMetadata {
+    schema_min: String,
+    schema_head: String,
+    revisions: Vec<SchemaRevision>,
+}
+
+impl SchemaMetadata {
+    fn ancestors(
+        &self,
+        revision: &str,
+        visiting: &mut std::collections::BTreeSet<String>,
+        ordered: &mut Vec<String>,
+    ) -> Result<()> {
+        if ordered.iter().any(|item| item == revision) {
+            return Ok(());
+        }
+        if !visiting.insert(revision.to_owned()) {
+            bail!("target schema graph contains a cycle");
+        }
+        let item = self
+            .revisions
+            .iter()
+            .find(|item| item.revision == revision)
+            .context("database revision is unknown to the target schema graph")?;
+        for parent in &item.parents {
+            self.ancestors(parent, visiting, ordered)?;
+        }
+        visiting.remove(revision);
+        ordered.push(revision.to_owned());
+        Ok(())
+    }
+
+    fn plan(&self, source: &serde_json::Value, forward_only: bool) -> Result<serde_json::Value> {
+        let mut seen = std::collections::BTreeSet::new();
+        for revision in &self.revisions {
+            if revision.revision.is_empty()
+                || !seen.insert(&revision.revision)
+                || !matches!(
+                    revision.kind.as_str(),
+                    "expand" | "contract" | "irreversible"
+                )
+            {
+                bail!("target schema revision metadata is invalid");
+            }
+        }
+        let mut target = Vec::new();
+        self.ancestors(
+            &self.schema_head,
+            &mut std::collections::BTreeSet::new(),
+            &mut target,
+        )?;
+        if !target.contains(&self.schema_min) {
+            bail!("target schema minimum is outside its revision graph");
+        }
+        let current = source.get("current_revision").and_then(|v| v.as_str());
+        let mut applied = Vec::new();
+        if let Some(current) = current {
+            if !target.iter().any(|revision| revision == current) {
+                bail!("database revision is outside the target schema ancestry; downgrade or unknown schema is not an automatic upgrade");
+            }
+            self.ancestors(
+                current,
+                &mut std::collections::BTreeSet::new(),
+                &mut applied,
+            )?;
+        }
+        if current.is_some() {
+            let source_revisions = source.get("source_revisions").and_then(|value| value.as_object())
+                .context("serving API did not provide migration content identity; compatibility is unverified")?;
+            for (revision, digest) in source_revisions {
+                if applied.contains(revision) {
+                    let expected = self
+                        .revisions
+                        .iter()
+                        .find(|item| &item.revision == revision)
+                        .expect("validated ancestry");
+                    if digest.as_str() != Some(expected.sha256.as_str()) {
+                        bail!("serving and target images disagree on migration content for revision {revision}; upgrade refused before mutation");
+                    }
+                }
+            }
+            if source_revisions.is_empty() {
+                bail!("serving API migration identity is empty");
+            }
+        }
+        let pending: Vec<_> = target
+            .iter()
+            .filter(|revision| !applied.contains(revision))
+            .map(|revision| {
+                self.revisions
+                    .iter()
+                    .find(|item| &item.revision == revision)
+                    .expect("validated graph")
+            })
+            .collect();
+        let destructive = pending.iter().any(|item| item.kind != "expand");
+        if current.is_some() && destructive && !forward_only {
+            bail!("pending contract or irreversible schema migration requires explicit api.migrate.forwardOnly before any mutation");
+        }
+        Ok(serde_json::json!({
+            "decision": if pending.is_empty() { "noop" } else { "apply" },
+            "current_revision": current, "source_head": source.get("source_head"),
+            "target_min": self.schema_min, "target_head": self.schema_head,
+            "pending": pending.iter().map(|item| serde_json::json!({"revision": item.revision, "kind": item.kind})).collect::<Vec<_>>(),
+            "forward_only": forward_only, "rollback_compatible": current.is_some() && !destructive && source.get("schema_window").is_some_and(|window| window.is_object()),
+        }))
+    }
+}
+
+const SCHEMA_PROBE: &str = r#"
+import asyncio, hashlib, json
+from importlib.resources import files
+from pathlib import Path
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
+from curie_api.config import get_settings
+from alembic.config import Config
+from alembic.script import ScriptDirectory
+async def probe():
+    engine = create_async_engine(get_settings().database_url)
+    try:
+        async with engine.connect() as connection:
+            exists = (await connection.execute(text("SELECT to_regclass('curie.alembic_version')"))).scalar()
+            rows = (await connection.execute(text('SELECT version_num FROM curie.alembic_version'))).scalars().all() if exists else []
+            assert len(rows) <= 1
+        config = Config()
+        config.set_main_option('script_location', '/app/alembic')
+        script = ScriptDirectory.from_config(config)
+        heads = script.get_heads()
+        assert len(heads) == 1
+        revisions = {revision.revision: hashlib.sha256(Path(revision.path).read_bytes()).hexdigest() for revision in script.walk_revisions()}
+        window_file = files('curie_api').joinpath('schema_compat.json')
+        window = json.loads(window_file.read_text()) if window_file.is_file() else None
+        print(json.dumps({'current_revision': rows[0] if rows else None, 'source_head': heads[0], 'source_revisions': revisions, 'schema_window': window}))
+    finally:
+        await engine.dispose()
+asyncio.run(probe())
+"#;
+
+// These probes run inside the already owned service containers. Credentials
+// remain in their environment and neither probe emits credentials or row data.
+const QUEUE_PROBE: &str = r#"
+import asyncio, json
+from curie_worker.config import WorkerConfig
+from curie_worker.upgrade_drain import UpgradeDrainGate, _client
+async def probe():
+    config = WorkerConfig()
+    client = _client(config)
+    try:
+        gate = UpgradeDrainGate(client, config)
+        print(json.dumps({'queues_drained': not await gate.unsettled_deliveries()}))
+    finally:
+        await client.aclose()
+asyncio.run(probe())
+"#;
+
+const API_CANARY: &str = r#"
+import hashlib, json, urllib.request
+from curie_api.config import get_settings
+settings = get_settings()
+request = urllib.request.Request('http://127.0.0.1:8000/agents', headers={'X-API-Key': settings.api_key})
+with urllib.request.urlopen(request, timeout=15) as response:
+    agents = json.load(response)
+    assert response.status == 200 and isinstance(agents, list)
+with urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=15) as response:
+    assert response.status == 200 and json.load(response).get('status') == 'ok'
+identities = sorted(str(agent['id']) for agent in agents)
+assert len(set(identities)) == len(identities)
+fingerprint = hashlib.sha256(json.dumps(identities, separators=(',', ':')).encode()).hexdigest()
+print(json.dumps({'passed': True, 'agents_fingerprint': fingerprint}))
+"#;
 
 struct LiveHost {
     opts: UpgradeOpts,
     current: Option<String>,
     known_good: Option<String>,
     record: Option<UpgradeRecord>,
-    secret: Option<String>,
+    record_version: Option<String>,
+    schema_decision: Option<serde_json::Value>,
+    target_identity: Option<String>,
+    retained_agents_fingerprint: Option<String>,
+    config: Option<crate::config_migrate::MigrationOutcome>,
 }
 
 impl LiveHost {
@@ -815,34 +1212,44 @@ impl LiveHost {
         tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(run_capture(cmd)))
     }
 
-    fn inspect_version(&self) -> Option<String> {
+    fn inspect_version(&self) -> Result<Option<String>> {
         let cmd = OpsCommand::new(
             "helm",
             vec![
-                plain("status"),
-                plain(&self.opts.common.release),
+                plain("list"),
+                plain("--all"),
+                plain("--filter"),
+                plain(format!("^{}$", regex::escape(&self.opts.common.release))),
                 plain("-n"),
                 plain(&self.opts.common.namespace),
                 plain("-o"),
                 plain("json"),
             ],
         );
-        let (ok, out, _) = self.run(&cmd).ok()?;
+        let (ok, out, _) = self.run(&cmd)?;
         if !ok {
-            return None;
+            bail!("could not inspect the installed Helm release; verify cluster access before retrying");
         }
-        let v: serde_json::Value = serde_json::from_str(&out).ok()?;
-        v.pointer("/chart/metadata/version")
-            .and_then(|x| x.as_str())
-            .map(ToOwned::to_owned)
-            .or_else(|| {
-                v.pointer("/version")
-                    .and_then(|x| x.as_str())
-                    .map(ToOwned::to_owned)
-            })
+        let releases: Vec<serde_json::Value> =
+            serde_json::from_str(&out).context("installed Helm release list is not valid JSON")?;
+        let Some(release) = releases.iter().find(|item| {
+            item.get("name").and_then(|name| name.as_str())
+                == Some(self.opts.common.release.as_str())
+        }) else {
+            return Ok(None);
+        };
+        let chart = release
+            .get("chart")
+            .and_then(|v| v.as_str())
+            .context("installed Helm release has no chart version")?;
+        let version = chart
+            .strip_prefix("curie-")
+            .filter(|version| !version.is_empty())
+            .context("installed Helm release is not a versioned Curie chart")?;
+        Ok(Some(version.to_owned()))
     }
 
-    fn load_record(&self) -> Option<UpgradeRecord> {
+    fn load_record(&mut self) -> Result<Option<UpgradeRecord>> {
         let cmd = OpsCommand::new(
             "kubectl",
             vec![
@@ -852,24 +1259,389 @@ impl LiveHost {
                 plain("-n"),
                 plain(&self.opts.common.namespace),
                 plain("-o"),
-                plain("jsonpath={.data.record}"),
+                plain("json"),
+                plain("--ignore-not-found"),
             ],
         );
-        let (ok, out, _) = self.run(&cmd).ok()?;
-        if !ok || out.trim().is_empty() {
-            return None;
+        let (ok, out, _) = self.run(&cmd)?;
+        if !ok {
+            bail!("could not read the upgrade checkpoint; verify cluster access before retrying");
         }
-        serde_json::from_str(&out).ok()
+        if out.trim().is_empty() {
+            return Ok(None);
+        }
+        let object: serde_json::Value = serde_json::from_str(&out)
+            .context("upgrade checkpoint response is malformed; preserve it before retrying")?;
+        let version = object
+            .pointer("/metadata/resourceVersion")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .context("upgrade checkpoint has no resource version; preserve it before retrying")?;
+        let record = serde_json::from_str(
+            object
+                .pointer("/data/record")
+                .and_then(|value| value.as_str())
+                .context("upgrade checkpoint has no record")?,
+        )
+        .context(
+            "upgrade checkpoint is malformed; preserve it and repair the record before retrying",
+        )?;
+        self.record_version = Some(version.to_owned());
+        Ok(Some(record))
     }
 
-    fn persist_record(&self, record: &UpgradeRecord) -> Result<()> {
-        let json = serde_json::to_string(record)?;
-        if let Some(secret) = &self.secret {
-            if json.contains(secret) {
-                bail!("refusing to persist an unredacted credential in the upgrade checkpoint");
+    fn prepare_configuration(&mut self) -> Result<()> {
+        let chart = self
+            .opts
+            .chart
+            .as_deref()
+            .context("target chart was not resolved")?;
+        let (ok, out, _) = self.run(&OpsCommand::new(
+            "helm",
+            vec![plain("show"), plain("chart"), plain(chart)],
+        ))?;
+        if !ok {
+            bail!("could not inspect the target chart before upgrade");
+        }
+        let metadata: serde_json::Value =
+            serde_norway::from_str(&out).context("target chart metadata is malformed")?;
+        if metadata.get("name").and_then(|v| v.as_str()) != Some("curie")
+            || metadata.get("version").and_then(|v| v.as_str()) != Some(self.opts.to.as_str())
+            || metadata.get("appVersion").and_then(|v| v.as_str()) != Some(self.opts.to.as_str())
+        {
+            bail!("target chart and app versions must match --to before upgrade");
+        }
+        let values = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(super::up::fetch_release_values(&self.opts.common))
+        })?;
+        if values.is_some() != self.current.is_some() {
+            bail!("installed release changed during upgrade inspection; retry before mutation");
+        }
+        self.config = Some(crate::config_migrate::migrate_installed_config(
+            values.unwrap_or_else(|| serde_json::json!({})),
+            self.current.as_deref(),
+        )?);
+        if self.opts.forward_only {
+            self.config.as_mut().expect("prepared configuration").values["api"]["migrate"]
+                ["forwardOnly"] = true.into();
+        }
+        Ok(())
+    }
+
+    fn prepare_schema(&mut self) -> Result<()> {
+        let config = &self
+            .config
+            .as_ref()
+            .context("configuration not prepared")?
+            .values;
+        if config.pointer("/api/deploy").and_then(|v| v.as_bool()) == Some(false) {
+            bail!("transactional upgrade requires an API database probe; enable the API or use the separately owned external migration procedure");
+        }
+        // A retained explicit image pin can contradict the target chart metadata.
+        // Refuse until the operator selects matching target artifacts.
+        for component in ["api", "worker", "dispatcher", "ui", "mailAdapter"] {
+            if config
+                .pointer(&format!("/{component}/deploy"))
+                .and_then(|v| v.as_bool())
+                == Some(false)
+            {
+                continue;
+            }
+            if config
+                .pointer(&format!("/{component}/image/tag"))
+                .and_then(|v| v.as_str())
+                .is_some_and(|tag| !tag.is_empty() && tag != self.opts.to)
+                || config
+                    .pointer(&format!("/{component}/image/digest"))
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|digest| !digest.is_empty())
+            {
+                bail!("target artifact metadata cannot verify the retained {component} image pin; select matching target image metadata before upgrade");
             }
         }
-        let manifest = serde_json::json!({
+        let uses_runner = ["/worker/deploy", "/agentSandbox/deploy"]
+            .into_iter()
+            .any(|path| config.pointer(path).and_then(|value| value.as_bool()) != Some(false));
+        if uses_runner
+            && (config
+                .pointer("/agentSandbox/runner/tag")
+                .and_then(|value| value.as_str())
+                .is_some_and(|tag| !tag.is_empty() && tag != self.opts.to)
+                || config
+                    .pointer("/agentSandbox/runner/digest")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|digest| !digest.is_empty()))
+        {
+            bail!("target artifact metadata cannot verify the retained runner image pin; select matching target image metadata before upgrade");
+        }
+        let values = super::command::SecretValuesFileGuard::write_document(config)?;
+        let (ok, rendered, _) = self.run(&OpsCommand::new(
+            "helm",
+            vec![
+                plain("template"),
+                plain(&self.opts.common.release),
+                plain(
+                    self.opts
+                        .chart
+                        .as_deref()
+                        .context("target chart unresolved")?,
+                ),
+                plain("--namespace"),
+                plain(&self.opts.common.namespace),
+                plain("--show-only"),
+                plain("templates/schema-compat.yaml"),
+                plain("-f"),
+                plain(values.path().to_string_lossy().into_owned()),
+            ],
+        ))?;
+        if !ok {
+            bail!("target chart has no readable schema compatibility metadata; upgrade refused before mutation");
+        }
+        let object: serde_json::Value =
+            serde_norway::from_str(&rendered).context("target schema metadata is malformed")?;
+        if object
+            .pointer("/data/application-version")
+            .and_then(|v| v.as_str())
+            != Some(self.opts.to.as_str())
+        {
+            bail!("target schema metadata application version does not match --to");
+        }
+        let metadata: SchemaMetadata = serde_json::from_str(
+            object
+                .pointer("/data/compatibility.json")
+                .and_then(|v| v.as_str())
+                .context("target schema compatibility metadata is missing")?,
+        )
+        .context("target schema compatibility graph is malformed")?;
+        let source = if self.current.is_some() {
+            let probe = self
+                .service_probe(
+                    &self.retained_objects()?,
+                    "api",
+                    SCHEMA_PROBE,
+                    "upgrade-schema",
+                )?
+                .context(
+                    "installed API is unavailable for the required database compatibility probe",
+                )?;
+            if probe
+                .get("current_revision")
+                .is_none_or(|value| value.as_str().is_none_or(|revision| revision.is_empty()))
+            {
+                bail!("database schema probe did not return a verifiable revision; upgrade refused before mutation");
+            }
+            probe
+        } else {
+            serde_json::json!({"current_revision": null, "source_head": null})
+        };
+        let forward_only = config
+            .pointer("/api/migrate/forwardOnly")
+            .and_then(|v| v.as_bool())
+            == Some(true);
+        self.schema_decision = Some(metadata.plan(&source, forward_only)?);
+        self.target_identity = Some(self.compute_target_identity()?);
+        Ok(())
+    }
+
+    fn inspect_known_good(&self) -> Result<Option<String>> {
+        let (ok, raw, _) = self.run(&OpsCommand::new(
+            "helm",
+            vec![
+                plain("status"),
+                plain(&self.opts.common.release),
+                plain("-n"),
+                plain(&self.opts.common.namespace),
+                plain("-o"),
+                plain("json"),
+            ],
+        ))?;
+        if !ok {
+            bail!("could not inspect source Helm operation state before mutation");
+        }
+        let status: serde_json::Value =
+            serde_json::from_str(&raw).context("source Helm status is malformed")?;
+        let state = status
+            .pointer("/info/status")
+            .and_then(|value| value.as_str())
+            .context("source Helm status has no operation state")?;
+        if state.starts_with("pending-") {
+            bail!("another Helm operation is pending; wait for its owner before resuming this upgrade");
+        }
+        if state == "deployed"
+            && status
+                .pointer("/chart/metadata/version")
+                .and_then(|value| value.as_str())
+                == self.current.as_deref()
+        {
+            Ok(self.current.clone())
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn prepare_retained_data(&mut self) -> Result<()> {
+        if let Some(fingerprint) = self
+            .record
+            .as_ref()
+            .filter(|record| {
+                record.target_version == self.opts.to
+                    && matches!(record.status.as_str(), "in_progress" | "failed")
+            })
+            .and_then(|record| record.retained_agents_fingerprint.clone())
+        {
+            self.retained_agents_fingerprint = Some(fingerprint);
+            return Ok(());
+        }
+        let probe = self
+            .service_probe(
+                &self.retained_objects()?,
+                "api",
+                API_CANARY,
+                "upgrade-source-canary",
+            )?
+            .context("source API is unavailable for retained identity checkpointing")?;
+        if probe.get("passed").and_then(|value| value.as_bool()) != Some(true) {
+            bail!("source API storage smoke failed before upgrade mutation");
+        }
+        let fingerprint = probe
+            .get("agents_fingerprint")
+            .and_then(|value| value.as_str())
+            .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .context("source API returned no valid retained identity fingerprint")?;
+        self.retained_agents_fingerprint = Some(fingerprint.to_owned());
+        Ok(())
+    }
+
+    fn compute_target_identity(&self) -> Result<String> {
+        let mut digest = Sha256::new();
+        hash_chart(
+            std::path::Path::new(
+                self.opts
+                    .chart
+                    .as_deref()
+                    .context("target chart unresolved")?,
+            ),
+            &mut digest,
+        )?;
+        digest.update(serde_json::to_vec(
+            &self
+                .config
+                .as_ref()
+                .context("configuration not prepared")?
+                .values,
+        )?);
+        Ok(digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect())
+    }
+
+    fn observed_hooks_succeeded(&self, status: &serde_json::Value) -> bool {
+        if !hooks_succeeded(status) {
+            return false;
+        }
+        let config = &self.config.as_ref().expect("prepared configuration").values;
+        let enabled =
+            |path: &str| config.pointer(path).and_then(|value| value.as_bool()) != Some(false);
+        let mut expected = Vec::new();
+        if enabled("/api/deploy") && enabled("/api/migrate/enabled") {
+            expected.push("schema-migrate");
+        }
+        if self.current.is_some()
+            && enabled("/worker/deploy")
+            && enabled("/worker/upgradeDrain/enabled")
+        {
+            expected.extend(["upgrade-drain", "upgrade-drain-release"]);
+        }
+        expected.into_iter().all(|component| {
+            status["hooks"].as_array().is_some_and(|hooks| {
+                hooks.iter().any(|hook| {
+                    let Some(manifest) = hook.get("manifest").and_then(|value| value.as_str())
+                    else {
+                        return false;
+                    };
+                    let Ok(object) = serde_norway::from_str::<serde_json::Value>(manifest) else {
+                        return false;
+                    };
+                    object
+                        .pointer("/metadata/labels/app.kubernetes.io~1component")
+                        .and_then(|value| value.as_str())
+                        == Some(component)
+                        && hook
+                            .pointer("/last_run/phase")
+                            .and_then(|value| value.as_str())
+                            == Some("Succeeded")
+                })
+            })
+        })
+    }
+
+    fn helm_wait_timeout(&self) -> u64 {
+        let values = &self.config.as_ref().expect("prepared configuration").values;
+        let number = |path: &str, default: u64| {
+            values
+                .pointer(path)
+                .and_then(|value| value.as_u64())
+                .unwrap_or(default)
+        };
+        let delivery = number("/worker/deliveryBudgetSeconds", 600);
+        let grace = number("/worker/terminationGracePeriodSeconds", 1860)
+            .max(delivery.saturating_add(number("/worker/deliveryShutdownReserveSeconds", 60)));
+        // Helm's timeout bounds each Kubernetes operation, including hooks:
+        // https://helm.sh/docs/helm/helm_upgrade/
+        grace
+            .max(number("/worker/upgradeDrain/timeoutSeconds", 900))
+            .max(600)
+            .saturating_add(300)
+    }
+
+    fn reconcile_helm_apply(&self) -> Result<bool> {
+        if self.inspect_version()?.as_deref() != Some(self.opts.to.as_str()) {
+            return Ok(false);
+        }
+        let (ok, raw, _) = self.run(&OpsCommand::new(
+            "helm",
+            vec![
+                plain("status"),
+                plain(&self.opts.common.release),
+                plain("-n"),
+                plain(&self.opts.common.namespace),
+                plain("-o"),
+                plain("json"),
+            ],
+        ))?;
+        let status: serde_json::Value = serde_json::from_str(&raw)
+            .context("Helm status is malformed during transaction reconciliation")?;
+        if !ok || !self.observed_hooks_succeeded(&status) {
+            return Ok(false);
+        }
+        let values = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(super::up::fetch_release_values(&self.opts.common))
+        })?;
+        if values.as_ref() != self.config.as_ref().map(|config| &config.values) {
+            return Ok(false);
+        }
+        let source = self
+            .service_probe(
+                &self.retained_objects()?,
+                "api",
+                SCHEMA_PROBE,
+                "upgrade-schema",
+            )?
+            .context("target API unavailable during schema reconciliation")?;
+        Ok(source.get("current_revision")
+            == self
+                .schema_decision
+                .as_ref()
+                .and_then(|decision| decision.get("target_head")))
+    }
+
+    fn persist_record(&mut self, record: &UpgradeRecord) -> Result<()> {
+        let json = serde_json::to_string(record)?;
+        let mut manifest = serde_json::json!({
             "apiVersion": "v1",
             "kind": "ConfigMap",
             "metadata": {
@@ -882,53 +1654,58 @@ impl LiveHost {
             },
             "data": { "record": json }
         });
+        if let Some(version) = &self.record_version {
+            manifest["metadata"]["resourceVersion"] = version.clone().into();
+        }
         let tmp = tempfile::NamedTempFile::new().context("upgrade checkpoint tempfile")?;
         std::fs::write(tmp.path(), serde_json::to_vec_pretty(&manifest)?)?;
         let cmd = OpsCommand::new(
             "kubectl",
             vec![
-                plain("apply"),
+                plain(if self.record_version.is_some() {
+                    "replace"
+                } else {
+                    "create"
+                }),
                 plain("-f"),
                 plain(tmp.path().to_string_lossy().into_owned()),
                 plain("-n"),
                 plain(&self.opts.common.namespace),
+                plain("-o"),
+                plain("json"),
             ],
         );
-        let (ok, _, err) = self.run(&cmd)?;
+        let (ok, out, _) = self.run(&cmd)?;
         if !ok {
-            bail!("could not persist the upgrade checkpoint: {}", err.trim());
+            bail!("could not persist the upgrade checkpoint; another coordinator or cluster access may have changed; no subsequent phase was started");
         }
+        let object: serde_json::Value =
+            serde_json::from_str(&out).context("upgrade checkpoint write response is malformed")?;
+        self.record_version = Some(
+            object
+                .pointer("/metadata/resourceVersion")
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.is_empty())
+                .context("upgrade checkpoint write returned no resource version")?
+                .to_owned(),
+        );
         Ok(())
     }
 
     fn helm_upgrade(&self, to: &str) -> Result<()> {
+        if self.target_identity.as_deref() != Some(self.compute_target_identity()?.as_str()) {
+            bail!("target chart changed after validation; upgrade refused before Helm mutation");
+        }
         let chart = self
             .opts
             .chart
-            .clone()
-            .unwrap_or_else(|| "charts/curie".to_string());
-        let values_cmd = OpsCommand::new(
-            "helm",
-            vec![
-                plain("get"),
-                plain("values"),
-                plain(&self.opts.common.release),
-                plain("-n"),
-                plain(&self.opts.common.namespace),
-                plain("-o"),
-                plain("yaml"),
-            ],
-        );
-        let tmp = tempfile::NamedTempFile::new().context("upgrade values tempfile")?;
-        let (ok, out, err) = self.run(&values_cmd)?;
-        if ok && !out.trim().is_empty() {
-            std::fs::write(tmp.path(), out)?;
-        } else if !ok {
-            let missing = err.to_lowercase();
-            if !missing.contains("not found") && !missing.contains("release: not found") {
-                bail!("could not read retained helm values: {}", err.trim());
-            }
-        }
+            .as_deref()
+            .context("target chart was not resolved")?;
+        let config = self
+            .config
+            .as_ref()
+            .context("retained configuration was not validated")?;
+        let tmp = super::command::SecretValuesFileGuard::write_document(&config.values)?;
         let mut args = vec![
             plain("upgrade"),
             plain(&self.opts.common.release),
@@ -936,101 +1713,251 @@ impl LiveHost {
             plain("-n"),
             plain(&self.opts.common.namespace),
             plain("--wait"),
+            plain("--timeout"),
+            plain(format!("{}s", self.helm_wait_timeout())),
+            plain("-f"),
+            plain(tmp.path().to_string_lossy().into_owned()),
         ];
         if self.current.is_none() {
             args.push(plain("--install"));
             args.push(plain("--create-namespace"));
         }
-        if tmp.path().exists() && tmp.path().metadata().map(|m| m.len()).unwrap_or(0) > 0 {
-            args.push(plain("-f"));
-            args.push(plain(tmp.path().to_string_lossy().into_owned()));
-        }
         let cmd = OpsCommand::new("helm", args);
-        let (ok, _, err) = self.run(&cmd)?;
+        let (ok, _, _) = self.run(&cmd)?;
         if !ok {
-            bail!("helm upgrade to {to} failed: {}", err.trim());
+            bail!("helm upgrade to {to} failed; inspect the release and resume the same upgrade command");
         }
         Ok(())
     }
 
+    fn retained_objects(&self) -> Result<Vec<serde_json::Value>> {
+        let (ok, manifest, _) = self.run(&OpsCommand::new(
+            "helm",
+            vec![
+                plain("get"),
+                plain("manifest"),
+                plain(&self.opts.common.release),
+                plain("-n"),
+                plain(&self.opts.common.namespace),
+            ],
+        ))?;
+        if !ok {
+            bail!("could not read the retained target manifest for convergence");
+        }
+        let mut objects = Vec::new();
+        for document in serde_norway::Deserializer::from_str(&manifest) {
+            let mut value = serde_json::Value::deserialize(document)
+                .context("retained target manifest is malformed")?;
+            // Kubernetes writes Secret.stringData into base64 data and omits
+            // stringData on GET. Compare the persisted bytes, never print them.
+            if value.get("kind").and_then(|v| v.as_str()) == Some("Secret") {
+                if let Some(strings) = value.as_object_mut().and_then(|o| o.remove("stringData")) {
+                    let strings = strings
+                        .as_object()
+                        .context("retained Secret stringData is not an object")?;
+                    for (key, raw) in strings {
+                        let raw = raw
+                            .as_str()
+                            .context("retained Secret stringData contains a non-string")?;
+                        value["data"][key] =
+                            base64::engine::general_purpose::STANDARD.encode(raw).into();
+                    }
+                }
+            }
+            if !value.is_null() {
+                objects.push(value);
+            }
+        }
+        if objects.is_empty() {
+            bail!("retained target manifest contains no objects");
+        }
+        Ok(objects)
+    }
+
+    fn service_probe(
+        &self,
+        objects: &[serde_json::Value],
+        component: &str,
+        script: &str,
+        marker: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        let Some(object) = objects.iter().find(|object| {
+            object.get("kind").and_then(|v| v.as_str()) == Some("Deployment")
+                && object
+                    .pointer("/metadata/labels/app.kubernetes.io~1component")
+                    .and_then(|v| v.as_str())
+                    == Some(component)
+        }) else {
+            return Ok(None);
+        };
+        let name = object
+            .pointer("/metadata/name")
+            .and_then(|v| v.as_str())
+            .context("retained service Deployment has no name")?;
+        let (ok, output, _) = self.run(&OpsCommand::new(
+            "kubectl",
+            vec![
+                plain("exec"),
+                plain(format!("deployment/{name}")),
+                plain("-n"),
+                plain(&self.opts.common.namespace),
+                plain("-c"),
+                plain(component),
+                plain("--"),
+                plain("python"),
+                plain("-c"),
+                plain(script),
+                plain(marker),
+            ],
+        ))?;
+        if !ok {
+            return Ok(Some(serde_json::json!({})));
+        }
+        Ok(Some(serde_json::from_str(&output).context(
+            "upgrade service probe returned malformed JSON",
+        )?))
+    }
+
     fn live_convergence(&self) -> Result<Convergence> {
-        let cmd = OpsCommand::new(
+        let objects = self.retained_objects()?;
+        let tmp = super::command::SecretValuesFileGuard::write_document(&serde_json::json!({
+            "apiVersion": "v1", "kind": "List", "items": objects,
+        }))?;
+        let (ok, out, _) = self.run(&OpsCommand::new(
             "kubectl",
             vec![
                 plain("get"),
-                plain("deploy,sts,ds"),
+                plain("--ignore-not-found"),
+                plain("-f"),
+                plain(tmp.path().to_string_lossy().into_owned()),
                 plain("-n"),
                 plain(&self.opts.common.namespace),
                 plain("-o"),
                 plain("json"),
             ],
-        );
-        let (ok, out, err) = self.run(&cmd)?;
+        ))?;
         if !ok {
-            bail!("could not read workload status: {}", err.trim());
+            bail!("could not read the live objects named by the retained target manifest");
         }
-        let v: serde_json::Value = serde_json::from_str(&out).unwrap_or(serde_json::json!({}));
-        let items = v
-            .get("items")
-            .and_then(|i| i.as_array())
-            .cloned()
-            .unwrap_or_default();
-        let mut replicas_ok = !items.is_empty();
-        let mut unavailable_zero = true;
-        for item in &items {
-            let status = item.get("status").cloned().unwrap_or(serde_json::json!({}));
-            let spec = item.get("spec").cloned().unwrap_or(serde_json::json!({}));
-            let desired = spec.get("replicas").and_then(|n| n.as_u64()).unwrap_or(1);
-            let ready = status
-                .get("readyReplicas")
-                .and_then(|n| n.as_u64())
-                .unwrap_or(0);
-            let updated = status
-                .get("updatedReplicas")
-                .and_then(|n| n.as_u64())
-                .unwrap_or(ready);
-            let unavailable = status
-                .get("unavailableReplicas")
-                .and_then(|n| n.as_u64())
-                .unwrap_or(0);
-            if ready != desired || updated != desired {
-                replicas_ok = false;
-            }
-            if unavailable != 0 {
-                unavailable_zero = false;
-            }
-        }
+        let live: serde_json::Value =
+            serde_json::from_str(&out).context("live owned objects are malformed")?;
+        let items = match live.get("items").and_then(|v| v.as_array()) {
+            Some(items) => items.clone(),
+            None if object_identity(&live).is_some() => vec![live],
+            None => bail!("live owned object list has no items"),
+        };
         let mut conv = Convergence::exact_ok();
-        conv.replicas = replicas_ok;
-        conv.unavailable_zero = unavailable_zero;
-        conv.exact = conv.replicas && conv.unavailable_zero && conv.manifest_matches;
+        let mut workloads = 0;
+        for expected in &objects {
+            let Some(actual) = items
+                .iter()
+                .find(|item| object_identity(item) == object_identity(expected))
+            else {
+                conv.manifest_matches = false;
+                conv.images = false;
+                conv.replicas = false;
+                continue;
+            };
+            conv.manifest_matches &= contains_manifest(actual, expected);
+            let kind = expected.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+            if !matches!(kind, "Deployment" | "StatefulSet" | "DaemonSet") {
+                continue;
+            }
+            workloads += 1;
+            conv.images &= !workload_images(expected).is_empty()
+                && workload_images(actual) == workload_images(expected);
+            let generation = actual
+                .pointer("/metadata/generation")
+                .and_then(|v| v.as_u64());
+            let observed = actual
+                .pointer("/status/observedGeneration")
+                .and_then(|v| v.as_u64());
+            conv.generations &= generation.is_some() && generation == observed;
+            let (desired, ready, updated, unavailable) = if kind == "DaemonSet" {
+                (
+                    actual
+                        .pointer("/status/desiredNumberScheduled")
+                        .and_then(|v| v.as_u64()),
+                    actual
+                        .pointer("/status/numberReady")
+                        .and_then(|v| v.as_u64()),
+                    actual
+                        .pointer("/status/updatedNumberScheduled")
+                        .and_then(|v| v.as_u64()),
+                    actual
+                        .pointer("/status/numberUnavailable")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                )
+            } else {
+                (
+                    Some(
+                        actual
+                            .pointer("/spec/replicas")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(1),
+                    ),
+                    actual
+                        .pointer("/status/readyReplicas")
+                        .and_then(|v| v.as_u64()),
+                    actual
+                        .pointer("/status/updatedReplicas")
+                        .and_then(|v| v.as_u64()),
+                    actual
+                        .pointer("/status/unavailableReplicas")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                )
+            };
+            conv.replicas &= desired.is_some()
+                && ready.unwrap_or(0) == desired.unwrap_or(0)
+                && updated.unwrap_or(0) == desired.unwrap_or(0);
+            conv.unavailable_zero &= unavailable == 0;
+        }
+        conv.replicas &= workloads > 0;
+        let (ok, status, _) = self.run(&OpsCommand::new(
+            "helm",
+            vec![
+                plain("status"),
+                plain(&self.opts.common.release),
+                plain("-n"),
+                plain(&self.opts.common.namespace),
+                plain("-o"),
+                plain("json"),
+            ],
+        ))?;
+        let status: serde_json::Value = serde_json::from_str(&status).unwrap_or_default();
+        conv.hooks_healthy = ok && self.observed_hooks_succeeded(&status);
+        conv.queues_drained = self
+            .service_probe(&objects, "worker", QUEUE_PROBE, "upgrade-queue-probe")?
+            .is_none_or(|probe| {
+                probe.get("queues_drained").and_then(|v| v.as_bool()) == Some(true)
+            });
+        conv.exact = conv.images
+            && conv.generations
+            && conv.replicas
+            && conv.unavailable_zero
+            && conv.hooks_healthy
+            && conv.queues_drained
+            && conv.manifest_matches;
         Ok(conv)
     }
 
     fn live_canary(&self) -> Result<Canary> {
-        let conv = self.live_convergence()?;
+        // API/storage smoke plus retained agent identity proof. This does not
+        // claim a model turn, retained active approvals, or PR-lineage proof.
+        let objects = self.retained_objects()?;
         Ok(Canary {
-            passed: conv.exact && self.current.as_deref() == Some(self.opts.to.as_str()),
+            passed: self
+                .service_probe(&objects, "api", API_CANARY, "upgrade-canary")?
+                .is_some_and(|probe| {
+                    probe.get("passed").and_then(|value| value.as_bool()) == Some(true)
+                        && probe
+                            .get("agents_fingerprint")
+                            .and_then(|value| value.as_str())
+                            == self.retained_agents_fingerprint.as_deref()
+                }),
         })
-    }
-
-    fn live_drain(&self) -> Result<bool> {
-        // The chart's pre-upgrade Job is the #2010 gate. Apply runs helm, which
-        // fires that hook. This phase records the drain intent; an empty cluster
-        // (no worker) is a skip, not a refusal.
-        let cmd = OpsCommand::new(
-            "kubectl",
-            vec![
-                plain("get"),
-                plain("deploy"),
-                plain(format!("{}-worker", self.opts.common.release)),
-                plain("-n"),
-                plain(&self.opts.common.namespace),
-            ],
-        );
-        let (ok, _, _) = self.run(&cmd)?;
-        let _ = ok;
-        Ok(true)
     }
 }
 
@@ -1050,12 +1977,47 @@ impl UpgradeDriver for LiveHost {
     fn load_record(&self) -> Option<UpgradeRecord> {
         self.record.clone()
     }
-    fn store_record(&mut self, record: UpgradeRecord) {
+    fn store_record(&mut self, record: UpgradeRecord) -> Result<()> {
+        self.persist_record(&record)?;
         self.record = Some(record.clone());
-        let _ = self.persist_record(&record);
+        Ok(())
+    }
+    fn retained_agents_fingerprint(&self) -> Option<String> {
+        self.retained_agents_fingerprint.clone()
+    }
+    fn owns_helm_transaction(&self) -> bool {
+        true
+    }
+    fn reconcile_applied(&self) -> Result<bool> {
+        self.reconcile_helm_apply()
+    }
+    fn target_identity(&self) -> Option<String> {
+        self.target_identity.clone()
+    }
+    fn schema_decision(&self) -> Option<serde_json::Value> {
+        self.schema_decision.clone()
+    }
+    fn configuration_plan(&self) -> Vec<String> {
+        let mut plan = self
+            .config
+            .as_ref()
+            .map(crate::config_migrate::redacted_upgrade_plan)
+            .unwrap_or_default();
+        if let Some(decision) = &self.schema_decision {
+            plan.push(format!(
+                "Schema compatibility: {}{}",
+                decision["decision"].as_str().unwrap_or("unknown"),
+                if decision["forward_only"] == true {
+                    " (explicit forward-only)"
+                } else {
+                    ""
+                }
+            ));
+        }
+        plan
     }
     fn drain_once(&mut self) -> Result<bool> {
-        self.live_drain()
+        bail!("live drain is owned by the Helm transaction")
     }
     fn apply_target(&mut self, to: &str) -> Result<()> {
         self.helm_upgrade(to)?;
@@ -1078,23 +2040,38 @@ impl UpgradeDriver for LiveHost {
 }
 
 /// Live `curie cluster upgrade` entry point.
-pub async fn upgrade(opts: UpgradeOpts) -> Result<ClusterUpgradeOutput> {
+pub async fn upgrade(mut opts: UpgradeOpts) -> Result<ClusterUpgradeOutput> {
+    let resolved = crate::artifacts::resolve_chart(
+        opts.chart.as_deref(),
+        crate::artifacts::Channel::current(),
+        &opts.to,
+        crate::artifacts::cache_root,
+        std::path::Path::new("charts/curie").exists(),
+    )?;
     if opts.common.dry_run {
-        require_on_path("helm").ok();
+        opts.chart = Some(resolved.planned_target().to_string_lossy().into_owned());
         let mut live = LiveHost {
             opts: opts.clone(),
             current: None,
             known_good: None,
             record: None,
-            secret: None,
+            record_version: None,
+            schema_decision: None,
+            target_identity: None,
+            retained_agents_fingerprint: None,
+            config: None,
         };
-        live.current = live.inspect_version();
-        live.known_good = live.current.clone();
         return run_lifecycle_inner(opts, &mut live).await;
     }
 
     require_on_path("helm")?;
     require_on_path("kubectl")?;
+    opts.chart = Some(
+        crate::artifacts::ensure_cached(&resolved)
+            .await?
+            .to_string_lossy()
+            .into_owned(),
+    );
 
     if !opts.yes
         && !super::verbs::confirm(&format!(
@@ -1110,16 +2087,50 @@ pub async fn upgrade(opts: UpgradeOpts) -> Result<ClusterUpgradeOutput> {
         current: None,
         known_good: None,
         record: None,
-        secret: None,
+        record_version: None,
+        schema_decision: None,
+        target_identity: None,
+        retained_agents_fingerprint: None,
+        config: None,
     };
-    live.current = live.inspect_version();
-    live.record = live.load_record();
+    live.current = live.inspect_version()?;
+    if live.current.is_none() {
+        bail!("fresh installation requires cluster up before transactional upgrade; an absent Helm release does not prove an empty retained database");
+    }
+    live.record = LiveHost::load_record(&mut live)?;
+    live.prepare_configuration()?;
+    live.prepare_schema()?;
+    live.prepare_retained_data()?;
+    let observed_known_good = live.inspect_known_good()?;
     live.known_good = live
         .record
         .as_ref()
-        .and_then(|r| r.known_good_version.clone())
-        .or_else(|| live.current.clone());
-    run_lifecycle_inner(opts, &mut live).await
+        .and_then(|record| record.known_good_version.clone())
+        .or(observed_known_good);
+    let output = run_lifecycle_inner(opts, &mut live).await?;
+    if let ClusterUpgradeOutput::Completed {
+        status,
+        phase,
+        fail_forward,
+        ..
+    } = &output
+    {
+        if status == "failed" {
+            let error =
+                crate::exit::CliError::failure(format!("cluster upgrade failed during {phase}"))
+                    .with_fix(
+                        fail_forward
+                            .as_ref()
+                            .map(|recovery| recovery.command.clone())
+                            .unwrap_or_else(|| "inspect the upgrade checkpoint and retry".into()),
+                    );
+            return Err(crate::exit::with_json_payload(
+                error.into(),
+                crate::ui::CliOutput::to_json(&output),
+            ));
+        }
+    }
+    Ok(output)
 }
 
 /// Load the upgrade status view for `cluster status`.
@@ -1128,6 +2139,12 @@ pub async fn load_upgrade_status(
     release: &str,
     fallback_known_good: Option<String>,
 ) -> UpgradeStatusView {
+    let unavailable = || UpgradeStatusView {
+        phase: None,
+        status: "unavailable".into(),
+        known_good_version: None,
+        target_version: None,
+    };
     let cmd = OpsCommand::new(
         "kubectl",
         vec![
@@ -1138,17 +2155,21 @@ pub async fn load_upgrade_status(
             plain(namespace),
             plain("-o"),
             plain("jsonpath={.data.record}"),
+            plain("--ignore-not-found"),
         ],
     );
     let (ok, out, _) = match run_capture(&cmd).await {
         Ok(v) => v,
-        Err(_) => return UpgradeStatusView::idle(fallback_known_good),
+        Err(_) => return unavailable(),
     };
-    if !ok || out.trim().is_empty() {
+    if !ok {
+        return unavailable();
+    }
+    if out.trim().is_empty() {
         return UpgradeStatusView::idle(fallback_known_good);
     }
     match serde_json::from_str::<UpgradeRecord>(&out) {
         Ok(record) => status_from_record(Some(&record), fallback_known_good),
-        Err(_) => UpgradeStatusView::idle(fallback_known_good),
+        Err(_) => unavailable(),
     }
 }

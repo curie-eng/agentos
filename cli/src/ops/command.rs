@@ -307,10 +307,12 @@ impl SecretValuesFileGuard {
     /// with restrictive permissions atomically so the secret is never briefly
     /// world-readable.
     fn write(pairs: &[(String, String)]) -> Result<Self> {
-        ensure_secret_signal_cleanup()?;
+        Self::write_document(&nest_dotted_keys(pairs))
+    }
 
-        let doc = nest_dotted_keys(pairs);
-        let body = serde_json::to_vec(&doc).context("serializing secret helm values")?;
+    pub(crate) fn write_document(doc: &serde_json::Value) -> Result<Self> {
+        ensure_secret_signal_cleanup()?;
+        let body = serde_json::to_vec(doc).context("serializing secret helm values")?;
 
         let mut path = std::env::temp_dir();
         path.push(format!("curie-helm-values-{}.yaml", uuid::Uuid::new_v4()));
@@ -344,6 +346,10 @@ impl SecretValuesFileGuard {
         let guard = Self { path };
         test_pause_after_first_secret_file();
         Ok(guard)
+    }
+
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.path
     }
 }
 
