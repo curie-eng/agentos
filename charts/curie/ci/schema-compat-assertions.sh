@@ -5,7 +5,7 @@ chart_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 test_dir="$(mktemp -d)"
 trap 'rm -rf "$test_dir"' EXIT
 helm template acme-bot "$chart_dir" > "$test_dir/default.yaml"
-helm template acme-bot "$chart_dir" --set api.deploy=false > "$test_dir/no-api.yaml"
+helm template acme-bot "$chart_dir" --set api.deploy=false --set ui.apiBaseUrl=http://api.example.com > "$test_dir/no-api.yaml"
 helm template acme-bot "$chart_dir" --set api.image.tag=fixture-custom > "$test_dir/override.yaml"
 helm package "$chart_dir" --destination "$test_dir" >/dev/null
 helm template acme-bot "$test_dir"/*.tgz > "$test_dir/packaged.yaml"
