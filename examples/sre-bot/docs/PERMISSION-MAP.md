@@ -130,6 +130,6 @@ returned tool, including image-only tools absent from repository source.
 | `grafana/query_loki_logs` | `allow` |
 | `grafana/list_alert_rules` | `allow` |
 
-This table states the supported surface obligation. The current manifest
-still violates the observability read rows tracked in #2285. A failing
-consistency check is a dependency failure, never permission to skip it.
+This table states the supported surface obligation and matches the explicit
+manifest grants. The complete image catalog and live starter-prompt evidence
+remain tracked in #2285. A failing consistency check must never be skipped.
