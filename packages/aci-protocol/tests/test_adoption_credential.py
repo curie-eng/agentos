@@ -245,6 +245,55 @@ def test_malformed_json_errors_do_not_echo_secret_material() -> None:
     assert _CREDENTIAL not in f"invalid event frame: {json_exc.value}"
 
 
+_ESCAPED_KEY = "adoption_credenti\\u0061l"  # JSON-escaped spelling of the field name
+
+
+def _malformed_json_specimens() -> list[tuple[str, str | bytes | bytearray]]:
+    # Raw JSON that never parses, so pydantic reports ``json_invalid`` and would
+    # otherwise attach the WHOLE raw input. The escaped key defeats a literal
+    # field-name scrub; the keyless specimen has no field name to match at all.
+    escaped = (
+        '{"kind":"event","type":"message","text":"hi","user":"U0EXAMPLE1",'
+        f'"ts":"1.0","{_ESCAPED_KEY}":"{_CREDENTIAL}", bad}}'
+    )
+    keyless = f'{{"text":"{_CREDENTIAL}", bad}}'
+    return [
+        ("escaped-str", escaped),
+        ("escaped-bytes", escaped.encode()),
+        ("escaped-bytearray", bytearray(escaped.encode())),
+        ("keyless-str", keyless),
+        ("keyless-bytes", keyless.encode()),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("label", "raw"),
+    _malformed_json_specimens(),
+    ids=[label for label, _ in _malformed_json_specimens()],
+)
+def test_invalid_json_errors_redact_the_whole_raw_input(
+    label: str, raw: str | bytes | bytearray
+) -> None:
+    with pytest.raises(ValidationError) as exc:
+        Event.model_validate_json(raw)
+    error = exc.value
+    # ``str(exc)`` truncating a long input is not a protection; ``errors()`` is
+    # what a structured 400 body or a log formatter serializes.
+    surfaces = {
+        "str": str(error),
+        "repr": repr(error),
+        "errors": json.dumps(error.errors(), default=str),
+        "interpolated": f"invalid event frame: {error}",
+    }
+    leaked = [name for name, text in surfaces.items() if _CREDENTIAL in text]
+    assert not leaked, f"{label}: credential material in {leaked}"
+    # The diagnosis stays truthful: malformed JSON is reported as invalid JSON,
+    # not misdiagnosed as a malformed credential, and no raw input survives.
+    types = {err["type"] for err in error.errors()}
+    assert types == {"json_invalid"}, types
+    assert all(err["input"] == "<redacted>" for err in error.errors())
+
+
 def test_mapping_inputs_cannot_bypass_malformed_admission() -> None:
     from collections import UserDict
 

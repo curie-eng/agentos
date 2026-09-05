@@ -167,7 +167,9 @@ def redact_adoption_credential_error(exc: ValidationError) -> ValidationError:
 
     Errors whose loc is the credential field stay a closed malformed-credential
     failure. Unrelated failures (a missing ``text``, for example) keep their
-    diagnosis; only the credential material is scrubbed from their inputs.
+    diagnosis; only the credential material is scrubbed from their inputs. A
+    ``json_invalid`` error keeps its parser diagnosis but loses its input
+    entirely, because unparsed raw JSON cannot be scrubbed by field name.
     """
 
     errors = exc.errors()
@@ -184,9 +186,18 @@ def redact_adoption_credential_error(exc: ValidationError) -> ValidationError:
     scrubbed: list[Any] = []
     for err in errors:
         input_value = err.get("input")
+        item = dict(err)
+        if err.get("type") == "json_invalid":
+            # Raw JSON that never parsed: pydantic attaches the WHOLE input, and
+            # no field-name match can locate a credential inside it (an escaped
+            # key such as ``"adoption_credenti\u0061l"`` defeats a literal
+            # scrub). Drop the raw input outright; the parser's position-only
+            # message keeps the invalid-JSON diagnosis truthful.
+            item["input"] = "<redacted>"
+            scrubbed.append(item)
+            continue
         if isinstance(input_value, str) and "adoption_credential" in input_value:
             return _malformed_event_error()
-        item = dict(err)
         item["input"] = _scrub_credential_input(input_value)
         scrubbed.append(item)
     try:
