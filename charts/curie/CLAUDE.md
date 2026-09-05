@@ -42,6 +42,34 @@ component and rail detail in `charts/curie/README.md`.
     strategy values key**. Pinned by `ci/langfuse-recreate-assertions.sh`.
     Horizontal scale for Langfuse needs an Accepted out-of-band migrator; when
     that lands, this exception is removed rather than extended.
+  - **Third named exception: `langfuse-worker`'s probe cadences, also in
+    `templates/langfuse.yaml`.** Its `readinessProbe`/`livenessProbe` cadence
+    numbers (#2330) -- `initialDelaySeconds`, `periodSeconds`,
+    `timeoutSeconds`, `failureThreshold` -- are hardcoded to match
+    `langfuse-web`'s, three blocks above in the same file, instead of reading
+    from new `langfuse.worker.readinessProbe.*` / `.livenessProbe.*` values
+    keys. The probe types and endpoints deliberately differ from web's
+    (worker readiness is `httpGet /api/ready`, liveness is `tcpSocket`; web
+    uses `httpGet /api/public/health` for both -- see the liveness rationale
+    below) -- only the cadence numbers follow web. This is a knowing
+    deviation, not a claim that the invariant does not apply: this ticket
+    exists *because* `langfuse-web` and `langfuse-worker` had diverged (web
+    alone had the Postgres readiness gate), and adding values-driven probe
+    keys for the worker while `langfuse-web`'s probes stay hardcoded in the
+    same file would create a new asymmetry in the very file the ticket is
+    about. It is also not a new hole in the chart: every other long-running
+    Deployment already
+    hardcodes its probe numbers -- `api.yaml`, `ui.yaml`, `postgres.yaml`,
+    `clickhouse.yaml`, `valkey.yaml`, `rustfs.yaml`, `otel-collector.yaml`,
+    `mail-adapter.yaml`, `inference.yaml`, and the `curie.heartbeatProbes`
+    helper (used by `worker.yaml` and `dispatcher.yaml`) -- so `langfuse-web`
+    itself was already inside this exception before #2330. The only K8s Probes
+    genuinely driven by values in this chart are
+    `agentSandbox.runner.readinessProbe`, because its cadence couples to the
+    worker's claim-timeout budget, and `dispatcher.startupProbe`; nothing here
+    couples the same way. The correct end state is lifting `langfuse-web` and
+    `langfuse-worker` onto values-driven probes together, tracked as a separate
+    follow-up -- not extended piecemeal from this ticket.
 - **The instrumented set is exactly the workloads whose container `env` block
   includes the `curie.env.otel` helper.** That include *is* the boundary -- it
   is not a count and not a list kept in prose, and this rule exists because a
@@ -64,6 +92,28 @@ component and rail detail in `charts/curie/README.md`.
   And a workload with an egress NetworkPolicy needs a collector peer in it as
   well; today the mail adapter is the only such workload (see the next
   invariant).
+- **`langfuse-worker`'s liveness probe is `tcpSocket`, not HTTP.** Both
+  `/api/health` and `/api/ready` in the worker image run a Prisma `SELECT 1`
+  plus a Redis ping and differ only in SIGTERM handling, so an HTTP liveness
+  probe would poke the same stores the HTTP readiness probe already pokes.
+  `langfuse-worker` is `replicas: 1` and runs Prisma and ClickHouse migrations
+  at container boot, and init containers do NOT re-run on a liveness restart --
+  so an HTTP liveness probe would restart the only replica straight into those
+  boot migrations against a Postgres or Valkey that may still be recovering,
+  which is exactly the crash-loop class
+  this chart's readiness gates exist to prevent (#2330). Accepted trade-off:
+  `tcpSocket` will not catch a wedged Node event loop -- the kernel still
+  accepts on the listen backlog against a process doing nothing -- so
+  detection of that rides on the **readiness** probe instead, which does
+  exercise the event loop and the stores, and flips `Deployment.Available`.
+  The chart's other first-party liveness probes are likewise process-local
+  rather than store-probing: `api.yaml`'s `/health` does no store I/O,
+  `mail-adapter.yaml` documents `/healthz` as a static liveness signal while
+  `/readyz` alone waits on SQLite, `inference.yaml` uses `tcpSocket`, and
+  `worker.yaml`/`dispatcher.yaml` use the heartbeat-file check
+  (`curie.heartbeatProbes`). `langfuse-web` probing `/api/public/health` for
+  *both* readiness and liveness is the exception, not the pattern -- do not
+  copy its liveness shape onto the worker.
 - **Mail-adapter egress is a separate fail-closed rail.** Enabling
   `mailAdapter.deploy` requires at least one
   `mailAdapter.agentmail.httpsCidrs` entry. One egress-only policy is the
