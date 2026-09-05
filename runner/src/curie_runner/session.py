@@ -24,6 +24,7 @@ import hmac
 import logging
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from typing import Any, cast
 
 import anyio
 from aci_protocol import (
@@ -40,7 +41,12 @@ from claude_agent_sdk import AssistantMessage, ResultMessage
 from curie_telemetry import record_metric
 from opentelemetry.context import Context
 
-from .adapter import ModelSession, PartialMessageBoundary, StreamedToolUseBoundary
+from .adapter import (
+    ModelSession,
+    PartialMessageBoundary,
+    SessionQueryBusy,
+    StreamedToolUseBoundary,
+)
 from .approval import ApprovalGate
 from .budget import BUDGET_CLASSIFICATION, BudgetTracker
 from .history import NullTranscriptStore, TranscriptStore, TurnRecord
@@ -398,14 +404,18 @@ class SessionRunner:
     async def steer(self, text: str) -> bool:
         """Inject a follow-up message into the live turn without consuming output.
 
-        Returns False when no turn is active (the finish-race boundary F1 owns:
-        the caller falls back to opening a fresh turn). The steered output appears
-        on the already-open turn's NDJSON stream.
+        Returns False when no turn is active or its query admission is busy:
+        the caller uses the existing finish-race fallback to open a fresh turn.
+        A steer must not wait behind a drain that can retire its owning turn.
+        Accepted output appears on the already-open turn's NDJSON stream.
         """
 
         if self._session is None or not self._turn_open:
             return False
-        await self._session.query(text)
+        try:
+            await self._session.query(text)
+        except SessionQueryBusy:
+            return False
         return True
 
     async def interrupt(self, _reason: str = "") -> None:
@@ -535,13 +545,16 @@ class SessionRunner:
                     parent=parent,
                 ) as gen:
                     try:
-                        async for line in self._drive_turn(event, state, tracker, gen):
-                            if isinstance(parse_ndjson_line(line), Final):
-                                # The terminal decision is authoritative once the
-                                # Final reaches the consumer, even if it closes
-                                # without requesting the generator's next item.
-                                metric_outcome = self._metric_outcome(tracker)
-                            yield line
+                        async with contextlib.aclosing(
+                            cast("Any", self._drive_turn(event, state, tracker, gen))
+                        ) as turn_lines:
+                            async for line in turn_lines:
+                                if isinstance(parse_ndjson_line(line), Final):
+                                    # The terminal decision is authoritative once the
+                                    # Final reaches the consumer, even if it closes
+                                    # without requesting the generator's next item.
+                                    metric_outcome = self._metric_outcome(tracker)
+                                yield line
                         logger.info(
                             "turn end session=%s status=%s duration_ms=%d",
                             self._session_id,
@@ -719,127 +732,128 @@ class SessionRunner:
         assert self._session is not None
         gen.query_observed()
         await self._session.query(event.text)
-        async for message in self._session.receive_turn():
-            if isinstance(message, StreamedToolUseBoundary):
-                gen.record_first_response_boundary()
-                gen.streamed_tool_use(
-                    message.call_id,
-                    message.tool_name,
-                    observed_time_ns=message.observed_time_ns,
-                )
-                continue
-            if isinstance(message, PartialMessageBoundary):
-                gen.record_first_response_boundary()
-                continue
-            if _is_auth_rejection(message):
-                # A rejected model credential is terminal: stop the live session
-                # so the SDK/CLI does not keep retrying with backoff to the wall,
-                # then surface a distinct, immediate classified failure. Suppress
-                # a failing interrupt (a wedged transport -- the very state a bad
-                # credential can cause) so it cannot propagate to the generic
-                # retryable ``runner-error`` handler and defeat the fast-fail; the
-                # terminal ``model-credential-rejected`` error is emitted regardless.
-                with contextlib.suppress(Exception):
-                    await self._session.interrupt()
-                self._set_failed(gen)
-                for line in self._auth_halt_lines():
-                    yield line
-                return
-            usage = getattr(message, "usage", None)
-            # The terminal result carries the authoritative turn total; streaming
-            # assistant messages carry per-message output. Fold them differently
-            # so the same tokens are not counted twice (see BudgetTracker).
-            if isinstance(message, ResultMessage):
-                tracker.set_total(usage)
-            else:
-                tracker.add_increment(usage)
-            budget_hit = tracker.exceeded
-            events = translate_message(message, state, self._classifier, gen)
-            decided_result_final: Final | None = None
-            if isinstance(message, ResultMessage):
-                terminal_reason = getattr(message, "terminal_reason", None)
-                cancelled = self._interrupt_requested and not self._timeout_requested
-                subtype = message.subtype or ""
-                result_failed = self._timeout_requested or budget_hit or (
-                    not cancelled and (message.is_error or subtype.startswith("error"))
-                )
-                if not budget_hit:
-                    self._merge_gate_block(state)
-                    sdk_final = next(
-                        (outbound for outbound in events if isinstance(outbound, Final)),
-                        None,
+        async with contextlib.aclosing(cast("Any", self._session.receive_turn())) as messages:
+            async for message in messages:
+                if isinstance(message, StreamedToolUseBoundary):
+                    gen.record_first_response_boundary()
+                    gen.streamed_tool_use(
+                        message.call_id,
+                        message.tool_name,
+                        observed_time_ns=message.observed_time_ns,
                     )
-                    if sdk_final is not None:
-                        decided_result_final = _apply_approval_override(
-                            self._reclassify(sdk_final), state
-                        )
-                gen.result_boundary_observed(
-                    failed=result_failed,
-                    terminal_reason=terminal_reason,
-                    approval_paused=decided_result_final is not None
-                    and decided_result_final.status
-                    is SessionStatus.AWAITING_APPROVAL,
-                )
-
-            for outbound in events:
-                if isinstance(outbound, ToolNote):
-                    logger.info("tool call session=%s tool=%s", self._session_id, outbound.tool)
-                if isinstance(outbound, ErrorEvent):
-                    logger.error(
-                        "model error session=%s classification=%s",
-                        self._session_id,
-                        outbound.classification,
-                    )
-                if isinstance(outbound, Final):
-                    if budget_hit:
-                        self._set_failed(gen)
-                        for line in self._budget_halt_lines():
-                            yield line
-                        return
-                    if decided_result_final is None:
-                        self._merge_gate_block(state)
-                        final = _apply_approval_override(
-                            self._reclassify(outbound), state
-                        )
-                    else:
-                        final = decided_result_final
-                    for line in self._approval_not_acted_lines(state, final):
+                    continue
+                if isinstance(message, PartialMessageBoundary):
+                    gen.record_first_response_boundary()
+                    continue
+                if _is_auth_rejection(message):
+                    # A rejected model credential is terminal: stop the live session
+                    # so the SDK/CLI does not keep retrying with backoff to the wall,
+                    # then surface a distinct, immediate classified failure. Suppress
+                    # a failing interrupt (a wedged transport -- the very state a bad
+                    # credential can cause) so it cannot propagate to the generic
+                    # retryable ``runner-error`` handler and defeat the fast-fail; the
+                    # terminal ``model-credential-rejected`` error is emitted regardless.
+                    with contextlib.suppress(Exception):
+                        await self._session.interrupt()
+                    self._set_failed(gen)
+                    for line in self._auth_halt_lines():
                         yield line
-                    for line in self._false_completion_lines(state, final):
-                        yield line
-                    # A timeout can land while one of the warning lines above is
-                    # suspended at its yield. Re-apply its precedence immediately
-                    # before publishing the terminal final.
-                    final = self._reclassify(final)
-                    self._status = final.status
-                    self._turn_open = False
-                    gen.finish_turn(
-                        timeout_requested=self._timeout_requested,
-                        interrupt_requested=self._interrupt_requested,
-                        classified_failure=final.status
-                        is SessionStatus.CLASSIFIED_FAILURE,
-                        approval_paused=final.status
-                        is SessionStatus.AWAITING_APPROVAL,
-                        completed_without_result=final.status
-                        is SessionStatus.AWAITING_APPROVAL,
-                    )
-                    # Only a clean DONE reply belongs in the conversation
-                    # transcript. Classified failures and approval pauses are
-                    # terminal delivery outcomes, not assistant answers (#20).
-                    if final.status is SessionStatus.DONE:
-                        state.final_text = final.text
-                    yield to_ndjson_line(final)
                     return
-                yield to_ndjson_line(outbound)
+                usage = getattr(message, "usage", None)
+                # The terminal result carries the authoritative turn total; streaming
+                # assistant messages carry per-message output. Fold them differently
+                # so the same tokens are not counted twice (see BudgetTracker).
+                if isinstance(message, ResultMessage):
+                    tracker.set_total(usage)
+                else:
+                    tracker.add_increment(usage)
+                budget_hit = tracker.exceeded
+                events = translate_message(message, state, self._classifier, gen)
+                decided_result_final: Final | None = None
+                if isinstance(message, ResultMessage):
+                    terminal_reason = getattr(message, "terminal_reason", None)
+                    cancelled = self._interrupt_requested and not self._timeout_requested
+                    subtype = message.subtype or ""
+                    result_failed = self._timeout_requested or budget_hit or (
+                        not cancelled and (message.is_error or subtype.startswith("error"))
+                    )
+                    if not budget_hit:
+                        self._merge_gate_block(state)
+                        sdk_final = next(
+                            (outbound for outbound in events if isinstance(outbound, Final)),
+                            None,
+                        )
+                        if sdk_final is not None:
+                            decided_result_final = _apply_approval_override(
+                                self._reclassify(sdk_final), state
+                            )
+                    gen.result_boundary_observed(
+                        failed=result_failed,
+                        terminal_reason=terminal_reason,
+                        approval_paused=decided_result_final is not None
+                        and decided_result_final.status
+                        is SessionStatus.AWAITING_APPROVAL,
+                    )
 
-            if budget_hit:
-                # Budget crossed on a non-terminal message: stop the live run,
-                # then emit the same error+final pair.
-                await self._session.interrupt()
-                self._set_failed(gen)
-                for line in self._budget_halt_lines():
-                    yield line
-                return
+                for outbound in events:
+                    if isinstance(outbound, ToolNote):
+                        logger.info("tool call session=%s tool=%s", self._session_id, outbound.tool)
+                    if isinstance(outbound, ErrorEvent):
+                        logger.error(
+                            "model error session=%s classification=%s",
+                            self._session_id,
+                            outbound.classification,
+                        )
+                    if isinstance(outbound, Final):
+                        if budget_hit:
+                            self._set_failed(gen)
+                            for line in self._budget_halt_lines():
+                                yield line
+                            return
+                        if decided_result_final is None:
+                            self._merge_gate_block(state)
+                            final = _apply_approval_override(
+                                self._reclassify(outbound), state
+                            )
+                        else:
+                            final = decided_result_final
+                        for line in self._approval_not_acted_lines(state, final):
+                            yield line
+                        for line in self._false_completion_lines(state, final):
+                            yield line
+                        # A timeout can land while one of the warning lines above is
+                        # suspended at its yield. Re-apply its precedence immediately
+                        # before publishing the terminal final.
+                        final = self._reclassify(final)
+                        self._status = final.status
+                        self._turn_open = False
+                        gen.finish_turn(
+                            timeout_requested=self._timeout_requested,
+                            interrupt_requested=self._interrupt_requested,
+                            classified_failure=final.status
+                            is SessionStatus.CLASSIFIED_FAILURE,
+                            approval_paused=final.status
+                            is SessionStatus.AWAITING_APPROVAL,
+                            completed_without_result=final.status
+                            is SessionStatus.AWAITING_APPROVAL,
+                        )
+                        # Only a clean DONE reply belongs in the conversation
+                        # transcript. Classified failures and approval pauses are
+                        # terminal delivery outcomes, not assistant answers (#20).
+                        if final.status is SessionStatus.DONE:
+                            state.final_text = final.text
+                        yield to_ndjson_line(final)
+                        return
+                    yield to_ndjson_line(outbound)
+
+                if budget_hit:
+                    # Budget crossed on a non-terminal message: stop the live run,
+                    # then emit the same error+final pair.
+                    await self._session.interrupt()
+                    self._set_failed(gen)
+                    for line in self._budget_halt_lines():
+                        yield line
+                    return
 
         # The turn iterator ended without a terminal result (e.g. an interrupt
         # aborted before the model produced one). Emit a final so the stream

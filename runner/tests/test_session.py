@@ -2,14 +2,24 @@
 
 import asyncio
 import logging
+from collections import deque
 
 import anyio
 import pytest
 from aci_protocol import ErrorEvent, Event, Interrupt, SessionStatus, parse_ndjson
-from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, ToolUseBlock
+from aiohttp.test_utils import TestClient, TestServer
+from claude_agent_sdk import (
+    AssistantMessage,
+    ClaudeAgentOptions,
+    ResultMessage,
+    TextBlock,
+    ToolUseBlock,
+)
 from curie_runner import RunTracer, SideEffectClassifier, build_options
+from curie_runner import adapter as adapter_module
 from curie_runner import session as session_module
 from curie_runner.fake import FakeModelSession, default_turn
+from curie_runner.server import create_app
 from curie_runner.session import SessionRunner
 from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
@@ -1269,6 +1279,333 @@ def test_abandoned_stream_interrupts_the_sdk() -> None:
 
     anyio.run(go)
     assert fake.interrupts >= 1
+
+
+class _BufferedInterruptedSDK:
+    """External SDK buffer, grounded in its documented interrupt contract.
+
+    https://code.claude.com/docs/en/agent-sdk/python#example-using-interrupts
+    Interrupt leaves the interrupted ResultMessage in the shared stream. The
+    next query must not mistake it for its own result. A real worker-loss run
+    observed precisely that old error_during_execution result on the next turn.
+    """
+
+    def __init__(self, interrupt_outcome: str = "result") -> None:
+        self.messages: deque[object] = deque()
+        self.queries: list[str] = []
+        self.closed_readers = 0
+        self.active_readers = 0
+        self.interrupt_outcome = interrupt_outcome
+        self.waiting: anyio.Event | None = None
+
+    def deliver(self, message: object) -> None:
+        self.messages.append(message)
+        if self.waiting is not None:
+            self.waiting.set()
+
+    async def connect(self) -> None: ...
+
+    async def disconnect(self) -> None: ...
+
+    def result(self, text: str, *, interrupted: bool = False) -> ResultMessage:
+        return ResultMessage(
+            subtype="error_during_execution" if interrupted else "success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=interrupted,
+            num_turns=1,
+            session_id="synthetic-buffered-session",
+            result=text,
+        )
+
+    async def query(self, text: str) -> None:
+        self.queries.append(text)
+        if text == "first":
+            self.deliver(AssistantMessage(
+                content=[ToolUseBlock(id="synthetic-read", name="Read", input={})],
+                model="synthetic-model",
+            ))
+        else:
+            self.deliver(self.result("fresh response for " + text))
+
+    async def interrupt(self) -> None:
+        if self.interrupt_outcome == "result":
+            self.deliver(self.result("old interrupted response", interrupted=True))
+        elif self.interrupt_outcome == "error":
+            self.deliver(RuntimeError("synthetic-private-SDK-error"))
+        elif self.interrupt_outcome == "eof":
+            self.deliver(None)
+
+    async def receive_response(self):
+        self.active_readers += 1
+        try:
+            assert self.active_readers == 1, "two consumers entered one SDK stream"
+            while True:
+                if not self.messages:
+                    self.waiting = anyio.Event()
+                    await self.waiting.wait()
+                    self.waiting = None
+                message = self.messages.popleft()
+                if message is None:
+                    return
+                if isinstance(message, Exception):
+                    raise message
+                yield message
+                if isinstance(message, ResultMessage):
+                    return
+        finally:
+            self.active_readers -= 1
+            self.closed_readers += 1
+
+
+def _buffered_sdk_runner(monkeypatch, sdk: _BufferedInterruptedSDK) -> SessionRunner:
+    monkeypatch.setattr(adapter_module, "ClaudeSDKClient", lambda _options: sdk)
+    return SessionRunner(
+        session_factory=lambda: adapter_module.ClaudeAgentSession(ClaudeAgentOptions()),
+        ceiling=0,
+        tracer=RunTracer(None),
+        classifier=SideEffectClassifier(),
+        trace_name="buffered-interrupt",
+    )
+
+
+async def _abandon_buffered_turn(runner: SessionRunner) -> None:
+    first = runner.run_turn(Event(type="message", text="first", user="U", ts="1"))
+    with anyio.fail_after(2):
+        async for line in first:
+            if any(event.type == "tool_note" for event in parse_ndjson(line)):
+                break
+    await first.aclose()
+
+
+@pytest.mark.parametrize("check_closed_first", [False, True])
+def test_abandoned_sdk_response_cannot_become_the_next_turn_result(
+    monkeypatch, check_closed_first: bool
+) -> None:
+    sdk = _BufferedInterruptedSDK()
+    runner = _buffered_sdk_runner(monkeypatch, sdk)
+
+    async def go() -> None:
+        await runner.start()
+        await _abandon_buffered_turn(runner)
+        # Closing the actual session consumer must synchronously retire its SDK
+        # reader. GC on a later task cannot establish response ownership.
+        if check_closed_first:
+            assert sdk.closed_readers == 1
+        with anyio.fail_after(2):
+            lines = [line async for line in runner.run_turn(
+                Event(type="message", text="second", user="U", ts="2")
+            )]
+        events = parse_ndjson("".join(lines))
+        assert events[-1].status == SessionStatus.DONE
+        assert events[-1].text == "fresh response for second"
+        assert sdk.queries == ["first", "second"]
+        assert not any(event.type == "error" for event in events)
+        await runner.close()
+
+    anyio.run(go)
+
+
+@pytest.mark.parametrize("interrupt_outcome", ["missing", "error", "eof"])
+def test_unsettled_sdk_response_refuses_new_query_and_can_recover(
+    monkeypatch, interrupt_outcome: str
+) -> None:
+    sdk = _BufferedInterruptedSDK(interrupt_outcome)
+    runner = _buffered_sdk_runner(monkeypatch, sdk)
+    monkeypatch.setattr(adapter_module, "_RESPONSE_DRAIN_TIMEOUT_S", 0.01)
+
+    async def go() -> None:
+        await runner.start()
+        await _abandon_buffered_turn(runner)
+        with anyio.fail_after(1):
+            lines = [line async for line in runner.run_turn(
+                Event(type="message", text="must not submit", user="U", ts="2")
+            )]
+        events = parse_ndjson("".join(lines))
+        assert events[-1].status == SessionStatus.CLASSIFIED_FAILURE
+        assert sdk.queries == ["first"]
+        assert "synthetic-private-SDK-error" not in "".join(lines)
+        # A later actual boundary repairs this stream; the refused request was
+        # never submitted, so no response for it can be misattributed afterward.
+        sdk.messages.append(sdk.result("old interrupted response", interrupted=True))
+        with anyio.fail_after(1):
+            lines = [line async for line in runner.run_turn(
+                Event(type="message", text="recovered", user="U", ts="3")
+            )]
+        final = parse_ndjson("".join(lines))[-1]
+        assert final.status == SessionStatus.DONE
+        assert final.text == "fresh response for recovered"
+        assert sdk.queries == ["first", "recovered"]
+        await runner.close()
+
+    anyio.run(go)
+
+
+def test_active_sdk_steer_keeps_one_reader_and_normal_terminal_reuse(monkeypatch) -> None:
+    sdk = _BufferedInterruptedSDK()
+    runner = _buffered_sdk_runner(monkeypatch, sdk)
+
+    async def go() -> None:
+        await runner.start()
+        first = runner.run_turn(Event(type="message", text="first", user="U", ts="1"))
+        with anyio.fail_after(2):
+            async for line in first:
+                if any(event.type == "tool_note" for event in parse_ndjson(line)):
+                    break
+            assert await runner.steer("steered")
+            lines = [line async for line in first]
+        assert parse_ndjson("".join(lines))[-1].text == "fresh response for steered"
+        with anyio.fail_after(2):
+            lines = [line async for line in runner.run_turn(
+                Event(type="message", text="next normal", user="U", ts="2")
+            )]
+        final = parse_ndjson("".join(lines))[-1]
+        assert final.status == SessionStatus.DONE
+        assert final.text == "fresh response for next normal"
+        assert sdk.queries == ["first", "steered", "next normal"]
+        await runner.close()
+
+    anyio.run(go)
+
+
+def test_cancelled_sdk_drain_keeps_the_old_response_boundary_required(monkeypatch) -> None:
+    sdk = _BufferedInterruptedSDK("missing")
+    runner = _buffered_sdk_runner(monkeypatch, sdk)
+
+    async def go() -> None:
+        await runner.start()
+        await _abandon_buffered_turn(runner)
+        with anyio.move_on_after(0.01) as cancelled:
+            async for _line in runner.run_turn(
+                Event(type="message", text="cancelled before query", user="U", ts="2")
+            ):
+                pass
+        assert cancelled.cancel_called
+        assert sdk.queries == ["first"]
+        sdk.messages.append(sdk.result("old interrupted response", interrupted=True))
+        with anyio.fail_after(1):
+            lines = [line async for line in runner.run_turn(
+                Event(type="message", text="after cancellation", user="U", ts="3")
+            )]
+        final = parse_ndjson("".join(lines))[-1]
+        assert final.status == SessionStatus.DONE
+        assert final.text == "fresh response for after cancellation"
+        assert sdk.queries == ["first", "after cancellation"]
+        await runner.close()
+
+    anyio.run(go)
+
+
+@pytest.mark.parametrize("cancel_steer", [False, True])
+def test_steer_during_sdk_drain_refuses_without_reader_or_query(
+    monkeypatch, cancel_steer: bool
+) -> None:
+    sdk = _BufferedInterruptedSDK("missing")
+    runner = _buffered_sdk_runner(monkeypatch, sdk)
+
+    async def go() -> None:
+        await runner.start()
+        await _abandon_buffered_turn(runner)
+        lines: list[str] = []
+
+        async def next_turn() -> None:
+            async for line in runner.run_turn(
+                Event(type="message", text="second", user="U", ts="2")
+            ):
+                lines.append(line)
+
+        with anyio.fail_after(2):
+            async with TestClient(TestServer(create_app(runner))) as client:
+                fallback = None
+                async with anyio.create_task_group() as tasks:
+                    tasks.start_soon(next_turn)
+                    while sdk.waiting is None:
+                        await anyio.sleep(0)
+                    if cancel_steer:
+                        with anyio.CancelScope() as scope:
+                            scope.cancel()
+                            await runner.steer("cancelled steer")
+                        assert scope.cancelled_caught
+                    else:
+                        frame = {"kind": "event", "type": "message", "user": "U",
+                                 "ts": "3", "text": "steer during drain"}
+                        response = await client.post("/v1/steer", json=frame)
+                        assert response.status == 409
+                        assert "/v1/event" in (await response.json())["error"]
+                        # Exercise the existing fallback through real HTTP. Its
+                        # headers return while the first turn still owns its lock;
+                        # the SDK submission waits for that turn to finish.
+                        fallback = await client.post("/v1/event", json=frame)
+                        assert fallback.status == 200
+                    assert sdk.queries == ["first"]
+                    assert sdk.active_readers == 1
+                    sdk.deliver(sdk.result("old interrupted response", interrupted=True))
+                final = parse_ndjson("".join(lines))[-1]
+                assert final.status == SessionStatus.DONE
+                assert final.text == "fresh response for second"
+                if fallback is not None:
+                    final = parse_ndjson(await fallback.text())[-1]
+                    assert final.status == SessionStatus.DONE
+                    assert final.text == "fresh response for steer during drain"
+                    assert sdk.queries == ["first", "second", "steer during drain"]
+                else:
+                    assert sdk.queries == ["first", "second"]
+        assert sdk.active_readers == 0
+        await runner.close()
+
+    anyio.run(go)
+
+
+def test_steer_cannot_outlive_a_failed_drain_and_poison_the_next_turn(monkeypatch) -> None:
+    sdk = _BufferedInterruptedSDK("missing")
+    runner = _buffered_sdk_runner(monkeypatch, sdk)
+    monkeypatch.setattr(adapter_module, "_RESPONSE_DRAIN_TIMEOUT_S", 0.05)
+
+    async def go() -> None:
+        await runner.start()
+        await _abandon_buffered_turn(runner)
+        failed_lines: list[str] = []
+        failed_turn_finished = anyio.Event()
+        steer_results: list[bool] = []
+
+        async def refused_turn() -> None:
+            async for line in runner.run_turn(
+                Event(type="message", text="second", user="U", ts="2")
+            ):
+                failed_lines.append(line)
+            failed_turn_finished.set()
+
+        async def late_steer() -> None:
+            steer_results.append(await runner.steer("late steer"))
+
+        with anyio.fail_after(2):
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(refused_turn)
+                while sdk.waiting is None:
+                    await anyio.sleep(0)
+                tasks.start_soon(late_steer)
+                await failed_turn_finished.wait()
+                assert parse_ndjson("".join(failed_lines))[-1].status == (
+                    SessionStatus.CLASSIFIED_FAILURE
+                )
+                assert runner.turn_active is False
+                # A terminal arriving after the owning turn failed must not
+                # authorize a previously queued steer to submit on its behalf.
+                sdk.deliver(sdk.result("late old boundary", interrupted=True))
+        assert steer_results == [False]
+        assert sdk.queries == ["first"]
+        with anyio.fail_after(2):
+            lines = [line async for line in runner.run_turn(
+                Event(type="message", text="third", user="U", ts="3")
+            )]
+        final = parse_ndjson("".join(lines))[-1]
+        assert final.status == SessionStatus.DONE
+        assert final.text == "fresh response for third"
+        assert sdk.queries == ["first", "third"]
+        assert sdk.active_readers == 0
+        await runner.close()
+
+    anyio.run(go)
 
 
 def test_cross_task_abandon_does_not_wedge_turn_lock() -> None:
