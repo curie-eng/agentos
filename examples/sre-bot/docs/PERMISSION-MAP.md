@@ -19,32 +19,37 @@ unclassified and denied by `curie/mcp-tool-policy@1`.
 
 ### Reads allowed without approval
 
-| Canonical tool |
-|---|
-| `kubernetes/events_list` |
-| `kubernetes/namespaces_list` |
-| `kubernetes/projects_list` |
-| `kubernetes/nodes_log` |
-| `kubernetes/nodes_stats_summary` |
-| `kubernetes/nodes_top` |
-| `kubernetes/pods_list` |
-| `kubernetes/pods_list_in_namespace` |
-| `kubernetes/pods_get` |
-| `kubernetes/pods_top` |
-| `kubernetes/pods_log` |
-| `kubernetes/resources_list` |
-| `kubernetes/resources_get` |
+| Canonical tool | Effective decision |
+|---|---|
+| `kubernetes/events_list` | `allow` |
+| `kubernetes/namespaces_list` | `allow` |
+| `kubernetes/projects_list` | `allow` |
+| `kubernetes/nodes_log` | `allow` |
+| `kubernetes/nodes_stats_summary` | `allow` |
+| `kubernetes/nodes_top` | `allow` |
+| `kubernetes/pods_list` | `allow` |
+| `kubernetes/pods_list_in_namespace` | `allow` |
+| `kubernetes/pods_get` | `allow` |
+| `kubernetes/pods_top` | `allow` |
+| `kubernetes/pods_log` | `allow` |
+| `kubernetes/resources_list` | `allow` |
+| `kubernetes/resources_get` | `allow` |
 
 ### Mutations requiring approval
 
-| Canonical tool | Live tool |
+| Canonical tool | Effective decision |
 |---|---|
-| `kubernetes/pods_delete` | `mcp__kubernetes__pods_delete` |
-| `kubernetes/pods_exec` | `mcp__kubernetes__pods_exec` |
-| `kubernetes/pods_run` | `mcp__kubernetes__pods_run` |
-| `kubernetes/resources_create_or_update` | `mcp__kubernetes__resources_create_or_update` |
-| `kubernetes/resources_delete` | `mcp__kubernetes__resources_delete` |
-| `kubernetes/resources_scale` | `mcp__kubernetes__resources_scale` |
+| `kubernetes/pods_delete` | `approval-required` |
+| `kubernetes/pods_exec` | `approval-required` |
+| `kubernetes/pods_run` | `approval-required` |
+| `kubernetes/resources_create_or_update` | `approval-required` |
+| `kubernetes/resources_delete` | `approval-required` |
+| `kubernetes/resources_scale` | `approval-required` |
+
+The live names are `mcp__kubernetes__pods_delete`,
+`mcp__kubernetes__pods_exec`, `mcp__kubernetes__pods_run`,
+`mcp__kubernetes__resources_create_or_update`,
+`mcp__kubernetes__resources_delete` and `mcp__kubernetes__resources_scale`.
 
 These six entries are exact, not a wildcard. Each approval is one-shot and
 tool-name-scoped. Rejection leaves the call upstream of the MCP server.
@@ -105,3 +110,26 @@ was authorized, not that the API accepted it or the workload became healthy.
 Every mutation report therefore pairs the approval result with the Kubernetes
 API result and a follow-up read of resulting state. Job history is bounded by
 the CronJob retention settings; external logs and backups are operator-owned.
+
+## Supported connector policy inventory
+
+These effective decisions include the legacy upgrade gates. The executable
+contract compares these rows with the manifest and the declared connectors.
+Grafana entries are required examples; the live checker classifies every
+returned tool, including image-only tools absent from repository source.
+
+| Canonical tool | Effective decision |
+|---|---|
+| `self-upgrade/upgrade_self` | `approval-required` |
+| `self-upgrade/upgrade_platform` | `approval-required` |
+| `self-upgrade/latest_release` | `allow` |
+| `tempo/search_traces` | `allow` |
+| `tempo/get_trace` | `allow` |
+| `tempo/list_trace_tags` | `allow` |
+| `tempo/list_trace_tag_values` | `allow` |
+| `grafana/query_loki_logs` | `allow` |
+| `grafana/list_alert_rules` | `allow` |
+
+This table states the supported surface obligation. The current manifest
+still violates the observability read rows tracked in #2285. A failing
+consistency check is a dependency failure, never permission to skip it.
