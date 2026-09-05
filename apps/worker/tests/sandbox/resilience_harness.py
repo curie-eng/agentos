@@ -16,6 +16,7 @@ The substrate seam is synchronous, so the scenario drives concurrency with a
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import hashlib
 import json
@@ -23,8 +24,11 @@ import os
 import socket
 import subprocess
 import urllib.request
+import uuid
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
+
+from aci_protocol import Final, SessionStatus, parse_ndjson
 
 
 @dataclass(frozen=True)
@@ -43,13 +47,18 @@ class ResilienceConfig:
     concurrency: int
     batch: int
     runs: int
-    live_creds: bool
+    live_model: bool
 
     @classmethod
     def from_env(cls) -> ResilienceConfig:
         password = os.environ.get("TEST_VALKEY_PW", "valkeypass") or None
-        live = bool(
-            os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or os.environ.get("ANTHROPIC_API_KEY")
+        # Credentials belong to the selected cluster pool, not necessarily to
+        # this pytest process (CURIE_CREDENTIALS may come from a pod Secret).
+        # An explicitly required live run must execute and fail on missing
+        # prerequisites, never turn green through a host-credential skip.
+        live = (
+            os.environ.get("CURIE_SANDBOX_E2E_LIVE") == "1"
+            or os.environ.get("CURIE_E2E_LIVE") == "1"
         )
         return cls(
             namespace=os.environ.get("CURIE_SANDBOX_E2E_NAMESPACE", "curie-g1"),
@@ -60,7 +69,7 @@ class ResilienceConfig:
             concurrency=int(os.environ.get("CURIE_SANDBOX_E2E_CONCURRENCY", "5")),
             batch=int(os.environ.get("CURIE_SANDBOX_E2E_BATCH", "3")),
             runs=int(os.environ.get("CURIE_SANDBOX_E2E_RUNS", "1")),
-            live_creds=live,
+            live_model=live,
         )
 
 
@@ -194,18 +203,82 @@ def get_json(base: str, path: str) -> dict[str, object]:
 
 
 def post_event(
-    base: str, text: str, *, user: str = "U-soak", ts: str = "1.0"
+    base: str,
+    text: str,
+    *,
+    user: str = "U-soak",
+    ts: str = "1.0",
+    token: str = "",
+    trace_id: str | None = None,
 ) -> list[dict[str, object]]:
-    """POST an ACI ``message`` event and return the parsed NDJSON frames."""
+    """Drive an authenticated ACI turn and require a successful terminal frame.
+
+    HTTP 200 only means the stream opened. A classified failure, approval wait,
+    missing final or malformed wire response must fail the scenario. Error
+    diagnostics name types/status only; model text and bearer tokens stay out.
+    """
 
     body = json.dumps(
         {"kind": "event", "type": "message", "text": text, "user": user, "ts": ts}
     ).encode()
-    request = urllib.request.Request(
-        f"{base}/v1/event", data=body, headers={"Content-Type": "application/json"}
-    )
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if trace_id:
+        headers["traceparent"] = f"00-{trace_id}-{uuid.uuid4().hex[:16]}-01"
+    request = urllib.request.Request(f"{base}/v1/event", data=body, headers=headers)
     with urllib.request.urlopen(request, timeout=90) as resp:
-        return [json.loads(line) for line in resp.read().splitlines() if line.strip()]
+        raw = resp.read()
+    try:
+        frames = parse_ndjson(raw.decode())
+    except Exception:
+        # Decoder exceptions can include input_value and wire version reprs.
+        # Neither model output nor hostile frame contents belong in diagnostics.
+        raise AssertionError("runner emitted invalid NDJSON") from None
+    assert frames and isinstance(frames[-1], Final), "turn did not end in a final frame"
+    final = frames[-1]
+    assert final.status == SessionStatus.DONE, f"runner terminal status was {final.status.value}"
+    assert sum(isinstance(frame, Final) for frame in frames) == 1, "turn emitted multiple finals"
+    assert not any(frame.type == "error" for frame in frames), "turn emitted an error frame"
+    return [frame.model_dump(mode="json") for frame in frames]
+
+
+def cache_reads_for_trace(observations: Sequence[dict[str, object]], trace_id: str) -> int:
+    """Count only this turn's generation usage, never a global cached request.
+
+    Langfuse documents flat usageDetails and normalized OTel cache buckets:
+    https://langfuse.com/docs/observability/features/token-and-cost-tracking
+    """
+
+    total = 0
+    for observation in observations:
+        if observation.get("traceId") != trace_id or observation.get("type") != "GENERATION":
+            continue
+        usage = observation.get("usageDetails")
+        if isinstance(usage, dict):
+            count = usage.get("cache_read_input_tokens", usage.get("input_cached_tokens", 0))
+            assert isinstance(count, int) and not isinstance(count, bool) and count >= 0, (
+                "generation cache usage must be a nonnegative integer"
+            )
+            total += count
+    return total
+
+
+def trace_cache_reads(trace_id: str) -> int:
+    """Read one exact trace from the real Langfuse v3 public API."""
+
+    host = os.environ.get("LANGFUSE_HOST", "http://localhost:23000").rstrip("/")
+    public_key = os.environ.get("LANGFUSE_PUBLIC_KEY", "pk-lf-curie-dev")
+    secret_key = os.environ.get("LANGFUSE_SECRET_KEY", "sk-lf-curie-dev")
+    bearer = base64.b64encode(f"{public_key}:{secret_key}".encode()).decode()
+    # Same supported v3 query as curie_api.langfuse.LangfuseClient.observations.
+    request = urllib.request.Request(
+        f"{host}/api/public/observations?traceId={trace_id}&limit=100",
+        headers={"Authorization": f"Basic {bearer}"},
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        payload = json.loads(response.read())
+    return cache_reads_for_trace(payload["data"], trace_id)
 
 
 def live_sandboxclaims(

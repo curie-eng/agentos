@@ -13,9 +13,12 @@ import hashlib
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent))
 
 from resilience_harness import (  # noqa: E402
+    cache_reads_for_trace,
     collected_text,
     detect_cross_talk,
     final_frame,
@@ -103,3 +106,26 @@ def test_detect_cross_talk_false_when_no_markers_present() -> None:
     own = "soakmark-a-0-aaaa"
     others = [own, "soakmark-b-1-bbbb"]
     assert detect_cross_talk(own, others, "no markers at all") is False
+
+
+def test_cache_reads_are_attributed_only_to_the_requested_generation_trace() -> None:
+    observations: list[dict[str, object]] = [
+        {"traceId": "ours", "type": "GENERATION", "usageDetails": {"input_cached_tokens": 27}},
+        {"traceId": "ours", "type": "GENERATION", "usageDetails": {"cache_read_input_tokens": 3}},
+        {"traceId": "foreign", "type": "GENERATION", "usageDetails": {"input_cached_tokens": 999}},
+        {"traceId": "ours", "type": "SPAN", "usageDetails": {"input_cached_tokens": 999}},
+    ]
+    assert cache_reads_for_trace(observations, "ours") == 30
+    assert cache_reads_for_trace(observations, "unobserved") == 0
+
+
+@pytest.mark.parametrize("count", [-1, True, "27"])
+def test_cache_probe_rejects_malformed_usage(count: object) -> None:
+    with pytest.raises(AssertionError, match="nonnegative integer"):
+        cache_reads_for_trace(
+            [{
+                "traceId": "ours", "type": "GENERATION",
+                "usageDetails": {"input_cached_tokens": count},
+            }],
+            "ours",
+        )
