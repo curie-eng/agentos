@@ -593,7 +593,9 @@ async fn observe_inner(opts: &CommonOpts) -> Result<Observation> {
     let mut nodes = BTreeMap::new();
     for name in needed_nodes {
         let raw = capture(node_images_command(&name), "read serving Node image inventory").await
-            .context("tagged image alias requires get-node read access for the serving Pod; inspect that access or select a digest-pinned target image")?;
+            .map_err(|error| crate::exit::CliError::failure(format!(
+                "tagged image alias requires get-node read access for the serving Pod; inspect that access or select a digest-pinned target image: {error}"
+            )).with_fix("allow read access to the serving Node or select a digest-pinned target image, then rerun the same cluster command"))?;
         let node: Value =
             serde_json::from_str(&raw).context("serving Node image inventory is malformed")?;
         if text(&node, "/kind") != "Node" || text(&node, "/metadata/name") != name {

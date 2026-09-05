@@ -482,3 +482,23 @@ fn sibling_alias_refuses_unbound_inventory_and_unhealthy_or_stale_containers() {
         assert!(!String::from_utf8_lossy(&output.stderr).contains("PRIVATE_MESSAGE_SENTINEL"));
     }
 }
+
+#[test]
+fn denied_alias_node_read_returns_structured_up_recovery() {
+    let output = Fixture::new().run("up", "alias-forbidden");
+    assert_eq!(output.status.code(), Some(1));
+    let result = Fixture::json(&output); // Rejects trailing or multiple objects.
+    assert!(result["error"]
+        .as_str()
+        .unwrap()
+        .contains("get-node read access"));
+    let fix = result["fix"]
+        .as_str()
+        .expect("denied node read needs structured recovery");
+    assert!(
+        fix.contains("Node") && fix.contains("digest-pinned") && fix.contains("rerun"),
+        "{result}"
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("PRIVATE_MESSAGE_SENTINEL"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("PRIVATE_MESSAGE_SENTINEL"));
+}
