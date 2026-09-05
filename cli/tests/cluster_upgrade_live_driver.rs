@@ -1330,3 +1330,115 @@ fn forward_recovery_ignores_only_test_hooks_and_refuses_additional_executable_ho
         assert_eq!(before, fs::read(fixture.path("record.json")).unwrap());
     }
 }
+
+#[test]
+fn contract_refusal_returns_actionable_forward_only_recovery_before_mutation() {
+    let fixture = Fixture::new();
+    let output = fixture.run("schema-contract");
+    fixture.assert_refused_without_upgrade(&output);
+    assert_eq!(output.status.code(), Some(1));
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(result["error"].as_str().unwrap().contains("contract"));
+    assert!(result["fix"]
+        .as_str()
+        .is_some_and(|fix| fix.contains("--forward-only")));
+    assert!(!fixture.path("record.json").exists());
+}
+
+#[test]
+fn upgrade_pinned_image_uses_actual_repository_digest_authority() {
+    let fixture = Fixture::new();
+    let output = fixture.run("pinned-image-healthy");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["status"], "succeeded");
+    assert_eq!(
+        result["convergence"]["observed_images"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(!fixture.calls().contains("\"get\", \"node\""));
+    for scenario in [
+        "pinned-image-wrong-digest",
+        "pinned-image-wrong-repository",
+        "pinned-image-opaque",
+        "pinned-image-pod-drift",
+    ] {
+        let negative = Fixture::new();
+        let output = negative.run(scenario);
+        assert_eq!(output.status.code(), Some(1), "{scenario}");
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["convergence"]["images"], false, "{scenario}");
+        assert_eq!(result["known_good_version"], "0.8.5");
+    }
+}
+
+#[test]
+fn upgrade_alias_requires_unique_same_node_inventory() {
+    let fixture = Fixture::new();
+    let output = fixture.run("alias-image-healthy");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        fixture
+            .calls()
+            .matches("\"get\", \"node\", \"acme-node\"")
+            .count(),
+        1
+    );
+    let observations = fs::read_to_string(fixture.path("snapshot-observations.jsonl")).unwrap();
+    assert!(!observations.is_empty());
+    for line in observations.lines() {
+        let observation: Value = serde_json::from_str(line).unwrap();
+        assert_eq!(observation["server"], "https://cluster.example.com");
+        assert_eq!(observation["mode"], 0o600);
+        assert!(!PathBuf::from(observation["path"].as_str().unwrap()).exists());
+    }
+    for scenario in [
+        "alias-image-split",
+        "alias-image-ambiguous",
+        "alias-image-missing",
+        "alias-image-wrong-node",
+        "alias-image-wrong-digest",
+        "alias-image-wrong-repository",
+        "alias-image-opaque",
+        "alias-image-pod-drift",
+        "alias-image-denied",
+    ] {
+        let negative = Fixture::new();
+        let output = negative.run(scenario);
+        assert_eq!(output.status.code(), Some(1), "{scenario}");
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_ne!(result["status"], "succeeded", "{scenario}");
+        if matches!(scenario, "alias-image-denied" | "alias-image-wrong-node") {
+            assert!(result["error"]
+                .as_str()
+                .unwrap()
+                .contains("Node image inventory"));
+            assert!(result["fix"].as_str().unwrap().contains("get-node"));
+        }
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("fixture-private-node-denial"));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("fixture-private-node-denial"));
+    }
+}
+
+#[test]
+fn upgrade_dry_run_names_conditional_serving_node_read_without_executing_it() {
+    let fixture = Fixture::new();
+    let output = fixture.run_args("alias-image-denied", &["--dry-run"]);
+    assert!(output.status.success());
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let plan = result.to_string();
+    assert!(plan.contains("kubectl get node '<pod-node>' -o json"));
+    assert!(plan.contains("not an executable argument"));
+    assert!(fixture.calls().is_empty());
+}

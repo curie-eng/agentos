@@ -13,36 +13,15 @@ pub struct ObservedImage {
     pub image_id: String,
 }
 
-fn normalized_image(image: &str) -> String {
-    let mut image = image.to_string();
-    let first = image.split('/').next().unwrap_or("");
-    if !image.contains('/') {
-        image = format!("docker.io/library/{image}");
-    } else if !first.contains('.') && !first.contains(':') && first != "localhost" {
-        image = format!("docker.io/{image}");
-    }
-    if !image.contains('@') && !image.rsplit('/').next().unwrap_or("").contains(':') {
-        image.push_str(":latest");
-    }
-    image
-}
+use super::convergence::{needs_node_identity, normalize_image, observed_image_matches};
+use std::collections::{BTreeMap, BTreeSet};
 
-pub(super) fn observe(
-    expected: &Value,
-    pods: &[Value],
-    desired: Option<u64>,
-) -> (bool, Vec<ObservedImage>) {
-    let mut observations = Vec::new();
-    let Some(selector) = expected
+fn selected(expected: &Value, pod: &Value) -> bool {
+    expected
         .pointer("/spec/selector/matchLabels")
         .and_then(Value::as_object)
         .filter(|selector| !selector.is_empty())
-    else {
-        return (false, observations);
-    };
-    let selected: Vec<_> = pods
-        .iter()
-        .filter(|pod| {
+        .is_some_and(|selector| {
             pod.pointer("/metadata/labels")
                 .and_then(Value::as_object)
                 .is_some_and(|labels| {
@@ -51,7 +30,64 @@ pub(super) fn observe(
                         .all(|(key, value)| labels.get(key) == Some(value))
                 })
         })
-        .collect();
+}
+
+pub(super) fn required_nodes(objects: &[Value], pods: &[Value]) -> BTreeSet<String> {
+    let mut nodes = BTreeSet::new();
+    for expected in objects {
+        for pod in pods.iter().filter(|pod| selected(expected, pod)) {
+            for (field, status_field) in [
+                ("containers", "containerStatuses"),
+                ("initContainers", "initContainerStatuses"),
+            ] {
+                for container in expected
+                    .pointer(&format!("/spec/template/spec/{field}"))
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    let status = pod
+                        .pointer(&format!("/status/{status_field}"))
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .find(|status| status.get("name") == container.get("name"));
+                    if status.is_some_and(|status| {
+                        needs_node_identity(
+                            container.get("image").and_then(Value::as_str).unwrap_or(""),
+                            status,
+                        )
+                    }) {
+                        if let Some(node) = pod
+                            .pointer("/spec/nodeName")
+                            .and_then(Value::as_str)
+                            .filter(|node| !node.is_empty())
+                        {
+                            nodes.insert(node.to_owned());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    nodes
+}
+
+pub(super) fn observe(
+    expected: &Value,
+    pods: &[Value],
+    desired: Option<u64>,
+    nodes: &BTreeMap<String, Value>,
+) -> (bool, Vec<ObservedImage>) {
+    let mut observations = Vec::new();
+    if expected
+        .pointer("/spec/selector/matchLabels")
+        .and_then(Value::as_object)
+        .is_none_or(|selector| selector.is_empty())
+    {
+        return (false, observations);
+    }
+    let selected: Vec<_> = pods.iter().filter(|pod| selected(expected, pod)).collect();
     let mut exact = desired.is_some_and(|desired| selected.len() as u64 == desired);
     for pod in selected {
         exact &= pod.pointer("/status/phase").and_then(Value::as_str) == Some("Running")
@@ -107,8 +143,18 @@ pub(super) fn observe(
                     && actual
                         .and_then(|item| item.get("image"))
                         .and_then(Value::as_str)
-                        .is_some_and(|image| normalized_image(image) == normalized_image(wanted))
-                    && normalized_image(observed) == normalized_image(wanted)
+                        .is_some_and(|image| normalize_image(image) == normalize_image(wanted))
+                    && status.is_some_and(|status| {
+                        observed_image_matches(
+                            wanted,
+                            status,
+                            nodes.get(
+                                pod.pointer("/spec/nodeName")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or(""),
+                            ),
+                        )
+                    })
                     && (!must_run
                         || status.is_some_and(|status| {
                             status.get("ready").and_then(Value::as_bool) == Some(true)

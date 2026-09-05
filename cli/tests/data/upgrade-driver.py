@@ -60,7 +60,9 @@ if program == "kubectl" and args[:2] == ["config", "view"]:
     (root / "ambient-context-changed").write_text("https://changed.example.com")
     sys.exit(0)
 
-if scenario == "context-drift" and (root / "ambient-context-changed").exists():
+if (scenario == "context-drift" or scenario.startswith("alias-image-")) and (
+    root / "ambient-context-changed"
+).exists():
     config_path = pathlib.Path(os.environ.get("KUBECONFIG", "/missing-snapshot"))
     config = json.loads(config_path.read_text())
     with (root / "snapshot-observations.jsonl").open("a") as log:
@@ -181,6 +183,11 @@ database = {
     },
     "status": {"readyReplicas": 1, "updatedReplicas": 1, "observedGeneration": 1},
 }
+image_parity = scenario.startswith(("pinned-image-", "alias-image-"))
+if scenario.startswith("pinned-image-"):
+    database["spec"]["template"]["spec"]["containers"][0]["image"] = (
+        "postgres:16-alpine@sha256:" + "a" * 64
+    )
 with (root / "calls.jsonl").open("a") as log:
     log.write(json.dumps([program, *args]) + "\n")
 
@@ -559,7 +566,7 @@ if program == "helm":
         if scenario == "changed-pending-manifest":
             workload["spec"]["replicas"] = 2
         print(json.dumps(workload))
-        if scenario.startswith("recovery-"):
+        if scenario.startswith("recovery-") or image_parity:
             if scenario == "recovery-foreign-namespace":
                 database["metadata"]["namespace"] = "other-namespace"
             print("---")
@@ -697,7 +704,7 @@ elif program == "kubectl":
             print(json.dumps({"items": []}))
             sys.exit(0)
         objects = [workload]
-        if scenario.startswith("recovery-"):
+        if scenario.startswith("recovery-") or image_parity:
             objects.append(database)
             objects.append(
                 {
@@ -734,9 +741,40 @@ elif program == "kubectl":
             "meta.helm.sh/release-namespace": "upgrade-test",
         }
         print(json.dumps(database))
+    elif args[:2] == ["get", "node"]:
+        if scenario == "alias-image-denied":
+            print("fixture-private-node-denial", file=sys.stderr)
+            sys.exit(1)
+        names = [
+            "docker.io/library/postgres:16-alpine",
+            "docker.io/library/acme-postgres-alias:fixture",
+            "docker.io/library/import-fixture@sha256:" + "a" * 64,
+        ]
+        images = [{"names": names}]
+        if scenario == "alias-image-split":
+            images = [{"names": names[:1]}, {"names": names[1:]}]
+        if scenario == "alias-image-ambiguous":
+            images.append({"names": names})
+        if scenario == "alias-image-missing":
+            images = []
+        print(
+            json.dumps(
+                {
+                    "kind": "Node",
+                    "metadata": {
+                        "name": "other-node"
+                        if scenario == "alias-image-wrong-node"
+                        else "acme-node"
+                    },
+                    "status": {"images": images},
+                }
+            )
+        )
     elif args[:2] == ["get", "pods"]:
         pods = []
-        workloads = [workload] + ([database] if scenario.startswith("recovery-") else [])
+        workloads = [workload] + (
+            [database] if scenario.startswith("recovery-") or image_parity else []
+        )
         for item in workloads:
             containers = copy.deepcopy(item["spec"]["template"]["spec"]["containers"])
             statuses = [
@@ -763,6 +801,25 @@ elif program == "kubectl":
                     "status": {"phase": "Running", "containerStatuses": statuses},
                 }
             )
+        if image_parity:
+            postgres_pod = pods[1]
+            postgres_pod["spec"]["nodeName"] = "acme-node"
+            status = postgres_pod["status"]["containerStatuses"][0]
+            # Containerd may report a config SHA in image and RepoDigest in imageID.
+            # https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#ContainerStatus
+            status["image"] = "sha256:" + "b" * 64
+            status["imageID"] = "docker.io/library/postgres@sha256:" + "a" * 64
+            if scenario.startswith("alias-image-"):
+                status["image"] = "docker.io/library/acme-postgres-alias:fixture"
+                status["imageID"] = "docker.io/library/import-fixture@sha256:" + "a" * 64
+            if scenario.endswith("wrong-digest"):
+                status["imageID"] = status["imageID"].replace("a" * 64, "c" * 64)
+            if scenario.endswith("wrong-repository"):
+                status["imageID"] = "docker.io/library/foreign@sha256:" + "a" * 64
+            if scenario.endswith("opaque"):
+                status["imageID"] = "containerd://sha256:" + "a" * 64
+            if scenario.endswith("pod-drift"):
+                postgres_pod["spec"]["containers"][0]["image"] = "postgres:15-alpine"
         if scenario.startswith("init-image-"):
             pods[0]["spec"]["initContainers"] = copy.deepcopy(
                 workload["spec"]["template"]["spec"]["initContainers"]
