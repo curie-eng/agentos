@@ -813,6 +813,50 @@ fn sigterm_of_upgrade_cli_stops_owned_helm_before_later_mutation() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn sigkill_after_apply_resumes_same_command_and_rechecks_live_images() {
+    for scenario in ["resume-after-apply", "resume-after-apply-drift"] {
+        let fixture = Fixture::new();
+        fs::write(
+            fixture.path("owner-supervisor.py"),
+            include_str!("data/upgrade-owner-supervisor.py"),
+        )
+        .unwrap();
+        let command = fixture.command("pause-after-apply", &[]);
+        let output = Command::new("/usr/bin/python3")
+            .arg(fixture.path("owner-supervisor.py"))
+            .arg(scenario)
+            .arg(env!("CARGO_BIN_EXE_curie"))
+            .args(command.get_args())
+            .envs(command.get_envs().map(|(key, value)| (key, value.unwrap())))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let proof: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(proof["owner_killed"], true);
+        assert_eq!(proof["old_observer_exited"], true);
+        assert_eq!(proof["cleanup_complete"], true);
+        assert_eq!(proof["helm_applies"], 1);
+        assert_eq!(proof["fresh_convergence"], true, "{proof}");
+        assert_eq!(proof["resume_output"]["resumed"], true);
+        if scenario == "resume-after-apply" {
+            assert_eq!(proof["resume_exit"], 0);
+            assert_eq!(proof["resume_output"]["status"], "succeeded");
+            assert_eq!(proof["fresh_canary"], true);
+            assert_eq!(proof["record"]["known_good_version"], "0.9.0");
+        } else {
+            assert_eq!(proof["resume_exit"], 1);
+            assert_eq!(proof["resume_output"]["convergence"]["images"], false);
+            assert_ne!(proof["record"]["known_good_version"], "0.9.0");
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn overlapping_upgrade_refuses_before_checkpoint_and_reacquires_after_owner_exit() {
     let fixture = Fixture::new();
     let supervisor = fixture.path("operation-supervisor.py");
