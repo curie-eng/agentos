@@ -295,12 +295,16 @@ class Event(_AciModel):
         json_data: str | bytes | bytearray,
         **kwargs: Any,
     ) -> "Event":
+        # Raise outside the handler: ``from None`` hides traceback display but
+        # leaves the original raw-input error reachable through ``__context__``.
+        redacted: ValidationError | None = None
         try:
             return super().model_validate_json(json_data, **kwargs)
         except ValidationError as exc:
-            raise redact_adoption_credential_error(exc) from None
+            redacted = redact_adoption_credential_error(exc)
         except json.JSONDecodeError:
-            raise _malformed_event_error() from None
+            redacted = _malformed_event_error()
+        raise redacted
 
     @model_validator(mode="wrap")
     @classmethod
