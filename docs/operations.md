@@ -472,8 +472,14 @@ settings, PVC configuration, and all three credential references together with
 `worker.adapterCredentialsExistingSecret` and its key. Inline credentials on
 older installs are also retained through the protected values-file path. An
 explicit `--set mailAdapter.deploy=false` disables it; clearing an external
-credential reference does not restore a stale inline credential. Replacing a
-credential with an explicit inline value drops its retained external reference.
+credential reference does not restore a stale inline credential. A nonempty
+inline credential replaces its retained external reference; an empty inline
+clear leaves the external source active. An empty worker credential map also
+leaves its external source active. Changing the adapter's egress source while
+the worker uses an external credential map requires an explicit paired worker
+source decision; the CLI refuses an unpaired change before Helm runs. Restating
+the worker's Secret name or key acknowledges a pairing updated inside that
+Secret. The CLI checks this explicit decision, not equality of opaque credentials.
 
 Two platform-side steps come first, in this order:
 

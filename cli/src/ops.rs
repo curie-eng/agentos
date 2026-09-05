@@ -1676,8 +1676,10 @@ fn resolve_sealing_values(
 fn resolve_retained_mail_values(
     existing: Option<&serde_json::Value>,
     operator_sets: &[String],
-) -> Option<PrivateHelmValues> {
-    let existing = existing?;
+) -> Result<Option<PrivateHelmValues>> {
+    let Some(existing) = existing else {
+        return Ok(None);
+    };
     let mut retained = serde_json::json!({});
     if let Some(mail) = existing.get("mailAdapter") {
         retained["mailAdapter"] = mail.clone();
@@ -1692,6 +1694,55 @@ fn resolve_retained_mail_values(
         }
     }
     let overridden = operator_set_keys(operator_sets);
+    let operator_values: BTreeMap<_, _> = operator_set_entries(operator_sets)
+        .into_iter()
+        .map(|(key, value)| (key.trim(), value))
+        .collect();
+    let replaces_inline = |inline: &str| {
+        operator_values.iter().any(|(key, value)| {
+            key_is_or_descends_from(key, inline)
+                && !value.is_empty()
+                && !(*key == inline
+                    && inline == "worker.adapterCredentials"
+                    && serde_json::from_str::<serde_json::Value>(value)
+                        .is_ok_and(|value| value.as_object().is_some_and(|map| map.is_empty())))
+        })
+    };
+    // An externally managed worker map is opaque: changing only the adapter's
+    // source cannot safely derive or replace its paired worker credential.
+    // Require an explicit paired decision instead of creating a silent 401.
+    let changes_adapter_source = replaces_inline("mailAdapter.egressSecret")
+        || operator_values
+            .get("mailAdapter.egressSecretExistingSecret")
+            .is_some_and(|value| {
+                Some(*value)
+                    != lookup_dotted(existing, "mailAdapter.egressSecretExistingSecret").as_deref()
+            })
+        || (lookup_dotted(existing, "mailAdapter.egressSecretExistingSecret")
+            .is_some_and(|value| !value.is_empty())
+            && operator_values
+                .get("mailAdapter.egressSecretExistingSecretKey")
+                .is_some_and(|value| {
+                    *value
+                        != lookup_dotted(existing, "mailAdapter.egressSecretExistingSecretKey")
+                            .as_deref()
+                            .unwrap_or("mailEgressSecret")
+                }));
+    let changes_worker_source = replaces_inline("worker.adapterCredentials")
+        || overridden.contains("worker.adapterCredentialsExistingSecret")
+        || overridden.contains("worker.adapterCredentialsExistingSecretKey");
+    if changes_adapter_source
+        && !changes_worker_source
+        && lookup_dotted(existing, "worker.adapterCredentialsExistingSecret")
+            .is_some_and(|value| !value.is_empty())
+    {
+        bail!(
+            "changing the mail egress credential source requires an explicit paired worker \
+             source decision: also set worker.adapterCredentialsExistingSecret (clear it \
+             to use the chart-derived inline pair), its ExistingSecretKey, or supply \
+             worker.adapterCredentials"
+        );
+    }
     let mut cleared = BTreeMap::new();
     for inline in [
         "mailAdapter.agentmail.apiKey",
@@ -1700,13 +1751,11 @@ fn resolve_retained_mail_values(
         "worker.adapterCredentials",
     ] {
         let reference = format!("{inline}ExistingSecret");
-        // An explicit inline value replaces the external source. Conversely,
-        // an active or explicitly changed reference must not replay an old
-        // inline copy, even if Helm still recorded it before token rotation.
-        let remove = if overridden
-            .iter()
-            .any(|key| key_is_or_descends_from(key, inline))
-        {
+        // A nonempty inline value replaces the external source. An empty inline
+        // clear leaves that source active; its explicit reference clear remains
+        // the operator's way to remove it. Active sources never replay stale
+        // inline copies left in Helm before token rotation.
+        let remove = if replaces_inline(inline) {
             vec![reference.clone()]
         } else if overridden.contains(&reference)
             || lookup_dotted(&retained, &reference).is_some_and(|value| !value.is_empty())
@@ -1722,15 +1771,11 @@ fn resolve_retained_mail_values(
                 .pointer_mut(&pointer)
                 .and_then(serde_json::Value::as_object_mut)
             {
-                object.remove(leaf);
-                cleared.insert(
-                    path.clone(),
-                    if path == "worker.adapterCredentials" {
-                        "{}".to_string()
-                    } else {
-                        String::new()
-                    },
-                );
+                if let Some(removed) = object.remove(leaf) {
+                    let mut removed_leaves = BTreeMap::new();
+                    crate::installation::flatten_values(&removed, &path, &mut removed_leaves);
+                    cleared.extend(removed_leaves.into_keys().map(|key| (key, String::new())));
+                }
             }
         }
     }
@@ -1772,9 +1817,9 @@ fn resolve_retained_mail_values(
             _ => Some(value.clone()),
         }
     }
-    without_overrides(&retained, "", &overridden)
+    Ok(without_overrides(&retained, "", &overridden)
         .filter(|value| value.as_object().is_some_and(|object| !object.is_empty()))
-        .map(|document| PrivateHelmValues(document, cleared))
+        .map(|document| PrivateHelmValues(document, cleared)))
 }
 
 /// Every value a plain `cluster up` must carry forward, in one place.
@@ -3844,7 +3889,7 @@ fn complete_up_opts_without_runner_egress(
     clear_github_token: bool,
 ) -> Result<UpOpts> {
     let operator_sets = opts.operator_sets();
-    opts.retained_mail_values = resolve_retained_mail_values(existing, &operator_sets);
+    opts.retained_mail_values = resolve_retained_mail_values(existing, &operator_sets)?;
     resolve_preserved_runner_identity_values(&mut opts, existing, &operator_sets);
     resolve_preserved_gvisor_mode_value(&mut opts, existing, &operator_sets);
     resolve_preserved_worker_extra_env_values(&mut opts, existing, &operator_sets);
