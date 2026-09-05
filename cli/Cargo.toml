@@ -80,6 +80,10 @@ serde_norway = "0.9.42"
 crypto_box = { version = "0.9.1", features = ["seal", "std"] }
 base64 = "0.23.1"
 
+[target.'cfg(unix)'.dependencies]
+# Unix upgrade ownership/descriptor inheritance; Linux parent-death signal.
+libc = "0.2"
+
 [dev-dependencies]
 # The frozen ACI types are a normal dependency of the lib, but integration test
 # crates need them by name to build a SessionStatus for the status_json contract.

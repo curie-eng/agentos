@@ -13,6 +13,8 @@ mod command;
 mod providers;
 mod up;
 mod upgrade;
+mod upgrade_images;
+mod upgrade_owner;
 mod verbs;
 
 pub use command::*;
