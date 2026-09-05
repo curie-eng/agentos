@@ -58,7 +58,14 @@
       "kubernetes/resources_list",
       "kubernetes/resources_get",
       "self-upgrade/upgrade_self",
-      "self-upgrade/upgrade_platform"
+      "self-upgrade/upgrade_platform",
+      "grafana/query_loki_logs",
+      "grafana/list_alert_rules",
+      "tempo/search_traces",
+      "tempo/get_trace",
+      "tempo/list_trace_tags",
+      "tempo/list_trace_tag_values",
+      "self-upgrade/latest_release"
     ],
     "approvalRequired": [
       "kubernetes/pods_delete",

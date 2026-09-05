@@ -49,8 +49,8 @@ The [bundle schema](../examples/sre-bot/supported-surface.schema.json) governs
 the combined manifest, connectors and supported surface. The consumer compares
 the [permission map](../examples/sre-bot/docs/PERMISSION-MAP.md) and uses the
 product's policy classifier. A static pass proves declaration consistency only.
-The shipped policy defect in #2285 currently makes that command fail; fixing its
-prerequisite must precede a supported bundle pass.
+The supported reads are classified explicitly. The complete image catalog and
+eight starter-prompt observations in #2285 remain separate acceptance evidence.
 
 For catalog verification, place every connector's real MCP URL in a protected
 JSON object keyed by connector name. Run the following with that file path:
