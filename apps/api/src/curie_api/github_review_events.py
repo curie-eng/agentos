@@ -74,8 +74,8 @@ def _object(value: Any, code: str) -> dict[str, Any]:
     return value
 
 
-def _positive(value: Any, code: str) -> int:
-    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+def _positive(value: Any, code: str, maximum: int = 2**63 - 1) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or not 0 < value <= maximum:
         raise FeedbackIgnored(code)
     return value
 
@@ -178,7 +178,7 @@ def parse_feedback(event: str, payload: Any, delivery_id: str) -> UnverifiedFeed
         head_sha, commit_sha = head_sha.lower(), commit_sha.lower()
         if commit_sha != head_sha:
             raise FeedbackIgnored("stale_feedback_head")
-    pr_number = _positive(pr.get("number"), "not_pull_request")
+    pr_number = _positive(pr.get("number"), "not_pull_request", 2**31 - 1)
     if pr.get("state") != "open" or pr.get("merged") is True:
         raise FeedbackIgnored("terminal_pull_request")
     if event == "pull_request_review":

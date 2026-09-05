@@ -84,6 +84,7 @@ from .approvals import (
     PublicationCreateRequest,
     PublicationCreator,
     PublicationLineage,
+    VerifiedReviewFeedback,
 )
 from .behaviorpacks import (
     BehaviorPacks,
@@ -572,6 +573,7 @@ class TurnOutcome:
     approval_granted_tool: str | None = None
     publication_snapshot: RunnerWorkspaceSnapshot | None = None
     publication_snapshot_error: str | None = None
+    review_origin_key: str | None = None
 
 
 class ThreadBusyError(RuntimeError):
@@ -2243,6 +2245,7 @@ class Kernel:
         routed: _RouteResult | None = None
         review_head: str | None = None
         review_receipt: str | None = None
+        verified_review: VerifiedReviewFeedback | None = None
 
         def close_routed_turn() -> None:
             if routed is not None and routed.turn is not None:
@@ -2277,6 +2280,7 @@ class Kernel:
                             "GitHub feedback no longer belongs to this conversation."
                         )
                     review_head, review_receipt = verified.head_sha, verified.receipt
+                    verified_review = verified
                 async with self._lock.hold(self._config.lock_key(thread_key)):
                     routed = await self._route_and_start(
                         thread_key,
@@ -2288,6 +2292,8 @@ class Kernel:
                         source=qevent.source,
                         remaining_s=remaining_s,
                         required_review_head=review_head,
+                        verified_review=verified_review,
+                        review_turn=qevent if verified_review is not None else None,
                     )
             except BaseException:
                 # start_turn owns a live response as soon as it returns, which
@@ -2464,6 +2470,8 @@ class Kernel:
             ):
                 await self.interrupt_thread(thread_key, f"agent {agent_id} killed by operator")
             outcome = await self._consume(qevent, route, turn, nav, agent_id)
+            if verified_review is not None:
+                outcome.review_origin_key = verified_review.origin_key
             if (
                 outcome.status is SessionStatus.AWAITING_APPROVAL
                 and _is_publish_provenance(
@@ -2531,6 +2539,8 @@ class Kernel:
         force_lineage_replacement: bool = False,
         pending_publication_approval: bool = False,
         required_review_head: str | None = None,
+        verified_review: VerifiedReviewFeedback | None = None,
+        review_turn: QueuedTurn | None = None,
     ) -> _RouteResult:
         # A workspace-enabled thread must establish (or confirm) its repository
         # before any platform response path. This deliberately precedes the
@@ -2581,7 +2591,18 @@ class Kernel:
                         # turn can observe it. Refuse before lookup/adopt so a
                         # failed suspend cannot reuse the dirty runner across
                         # either boundary.
-                        raise PendingPublicationError(thread_key)
+                        if verified_review is None:
+                            raise PendingPublicationError(thread_key)
+                        if (
+                            lineage.has_pending_outcome
+                            or verified_review.reservation_id is None
+                        ):
+                            raise ThreadBusyError(
+                                f"thread {thread_key} is waiting for its earlier publication"
+                            )
+                        # Only the API-verified origin may reuse its own reserved
+                        # boundary. The DB-only reserve CAS below rechecks this
+                        # again before any model input, including on reclaim.
                     if lineage is not None and lineage.head_sha is not None:
                         lineage_branch = lineage.branch
                         lineage_head = lineage.head_sha
@@ -2613,6 +2634,21 @@ class Kernel:
         # mere presence of an affinity record as proof that a live route was
         # retained.
         existing_handle = await asyncio.to_thread(self._substrate.lookup, thread_key)
+        if (
+            required_review_head is not None
+            and existing_handle is not None
+            and not await self._workspace_handoff_ready(
+                existing_handle, remaining_s=remaining_s
+            )
+        ):
+            # The API-verified review owns a later publication revision. A steer
+            # cannot attribute an earlier turn's publication gate to this event,
+            # so retain this delivery in the existing bounded queue until the
+            # active turn has reached an idle, durable boundary. Ordinary Slack
+            # still follows its immediate steering path below.
+            raise ThreadBusyError(
+                f"thread {thread_key} is not ready for its queued review revision"
+            )
         materialized_lineage_head = lineage_head or lineage_base_sha
         if (
             materialized_lineage_head is not None
@@ -2663,7 +2699,7 @@ class Kernel:
             raise ThreadBusyError(
                 f"thread {thread_key} has not reached a durable workspace handoff boundary"
             )
-        if packs is not None:
+        if packs is not None and required_review_head is None:
             reply = match_greeting(packs, event.text) or match_help(packs, event.text)
             if reply is not None and existing_handle is None:
                 return _RouteResult(steered=False, canned_reply=reply)
@@ -2710,7 +2746,7 @@ class Kernel:
         retained_live_route = existing_handle is not None and handle == existing_handle
         claim_ms = round((time.monotonic() - claim_started) * 1000)
         logger.info("claim latency for %s: %d ms", thread_key, claim_ms)
-        if source.is_job:
+        if source.is_job or required_review_head is not None:
             # ADR-0079: a job is an OUTPUT, not a steering input. A cron digest or
             # a webhook must never fold itself into whatever a person is currently
             # saying, so this path does not attempt a steer at all.
@@ -2774,6 +2810,22 @@ class Kernel:
             if retained_live_route and active_before_steer:
                 _record_route("finish-race")
                 _lifecycle_event("runner.finish_race", "finish-race")
+        if verified_review is not None:
+            if (
+                review_turn is None
+                or workspace_deployment_id is None
+                or verified_review.origin_key != review_turn.event_id
+                or self._publication_creator is None
+            ):
+                raise WorkspaceSelectionRefused("GitHub feedback revision identity was refused.")
+            try:
+                await self._publication_creator.reserve_review_feedback(
+                    review_turn, workspace_deployment_id, verified_review
+                )
+            except ApprovalBackendError:
+                raise WorkspacePreparationError(
+                    "github-review-reservation", "GitHub review reservation is unavailable"
+                ) from None
         # The per-request timeout is min(runner_total_timeout_s, remaining
         # delivery budget): the budget can only ever SHORTEN a request, never
         # grant one more time than the delivery has left (ADR-0131).
@@ -3371,6 +3423,7 @@ class Kernel:
                         title=snapshot.publication_title,
                         body=snapshot.publication_body,
                         max_patch_bytes=self._config.publication_patch_max_bytes,
+                        review_origin_key=outcome.review_origin_key,
                     )
                 )
                 created = CreatedApproval(

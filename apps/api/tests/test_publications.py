@@ -4743,9 +4743,10 @@ def test_review_authority_downgrade_refuses_an_active_reservation(
     api_dir = Path(__file__).resolve().parents[1]
     config = Config(str(api_dir / "alembic.ini"))
     config.set_main_option("script_location", str(api_dir / "alembic"))
+    before_revision = _rows("SELECT version_num FROM curie.alembic_version")
     with pytest.raises(RuntimeError, match="revisions are active"):
         command.downgrade(config, "0041")
-    assert _rows("SELECT version_num FROM curie.alembic_version")[0]["version_num"] == "0042"
+    assert _rows("SELECT version_num FROM curie.alembic_version") == before_revision
     assert (
         _rows("SELECT status FROM curie.publication_review_reservations")[0]["status"] == "reserved"
     )

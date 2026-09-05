@@ -199,6 +199,10 @@ class Settings(BaseSettings):
     valkey_port: int = 26379
     valkey_url: str | None = None
 
+    # Read-only observer of worker terminal markers. WorkerConfig consumes the
+    # unprefixed KEY_PREFIX variable; CURIE_KEY_PREFIX is not its configuration.
+    worker_key_prefix: str = Field(default="curie:worker", validation_alias="KEY_PREFIX")
+
     # The runs stream approval resolutions enqueue resume turns onto (#244).
     # Must match the worker's CURIE_STREAM (its consumer side) -- which is why
     # the default is the shared declaration both lanes import (#492) rather than

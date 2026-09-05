@@ -7,12 +7,14 @@ push to the prod branch promotes; other events are acknowledged and ignored.
 
 import json
 import logging
+import uuid
 
 from fastapi import APIRouter, Header, HTTPException, Request, status
 
 from ..config import get_settings
 from ..deps import EvalQueueDep, SessionDep, StoreDep
 from ..gitflow import log_push_outcome, process_push, verify_signature
+from ..github_review_audit import claim_review_delivery, settle_review_delivery
 from ..github_review_events import FeedbackIgnored, FeedbackUnavailable, parse_feedback
 from ..github_review_store import admit_feedback
 from ..schemas import WebhookResult
@@ -59,6 +61,31 @@ async def github_webhook(
         if not settings.github_review_ingress_enabled:
             return WebhookResult(status="feedback_disabled")
         try:
+            delivery_id = uuid.UUID(x_github_delivery)
+            if str(delivery_id) != x_github_delivery.lower():
+                raise ValueError("noncanonical delivery")
+        except (ValueError, AttributeError):
+            raise HTTPException(400, {"code": "invalid_delivery"}) from None
+        audit, conflict = await claim_review_delivery(
+            session,
+            delivery_id=delivery_id,
+            event=x_github_event,
+            body=body,
+            payload=payload,
+        )
+        if conflict:
+            await session.commit()
+            return WebhookResult(
+                status="feedback_ignored", errors=[{"code": "delivery_identity_conflict"}]
+            )
+        if audit.status in {"ignored", "rejected"}:
+            assert audit.reason is not None
+            await session.commit()
+            return WebhookResult(status="feedback_ignored", errors=[{"code": audit.reason}])
+        if audit.status == "accepted":
+            await session.commit()
+            return WebhookResult(status="feedback_duplicate")
+        try:
             feedback = parse_feedback(x_github_event, payload, x_github_delivery)
             row, created = await admit_feedback(
                 session,
@@ -68,11 +95,31 @@ async def github_webhook(
                 traceparent=request.headers.get("traceparent"),
             )
         except FeedbackUnavailable as exc:
+            settle_review_delivery(audit, "retryable", exc.code)
+            await session.commit()
             raise HTTPException(503, {"code": exc.code}, headers={"Retry-After": "10"}) from None
         except FeedbackIgnored as exc:
             if exc.code == "invalid_delivery":
                 raise HTTPException(400, {"code": exc.code}) from None
+            disposition = (
+                "ignored"
+                if exc.code
+                in {
+                    "unsupported_action",
+                    "non_actionable_review",
+                    "empty_feedback",
+                    "edited_feedback",
+                    "not_pull_request",
+                    "non_human_sender",
+                    "app_authored",
+                }
+                else "rejected"
+            )
+            settle_review_delivery(audit, disposition, exc.code)
+            await session.commit()
             return WebhookResult(status="feedback_ignored", errors=[{"code": exc.code}])
+        settle_review_delivery(audit, "accepted", event_id=row.event_id)
+        await session.commit()
         if not created:
             return WebhookResult(status="feedback_duplicate")
         # The committed row is the recovery authority if Valkey or this API

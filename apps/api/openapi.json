@@ -4156,6 +4156,56 @@
         "title": "ResolvedTarget",
         "type": "object"
       },
+      "ReviewReservationOut": {
+        "properties": {
+          "origin_key": {
+            "title": "Origin Key",
+            "type": "string"
+          },
+          "reservation_id": {
+            "format": "uuid",
+            "title": "Reservation Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "origin_key",
+          "reservation_id"
+        ],
+        "title": "ReviewReservationOut",
+        "type": "object"
+      },
+      "ReviewReservationRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "deployment_id": {
+            "format": "uuid",
+            "title": "Deployment Id",
+            "type": "string"
+          },
+          "expected_head_sha": {
+            "pattern": "^[0-9a-f]{40}$",
+            "title": "Expected Head Sha",
+            "type": "string"
+          },
+          "expected_lineage_version": {
+            "minimum": 1.0,
+            "title": "Expected Lineage Version",
+            "type": "integer"
+          },
+          "turn": {
+            "$ref": "#/components/schemas/QueuedTurn"
+          }
+        },
+        "required": [
+          "turn",
+          "deployment_id",
+          "expected_lineage_version",
+          "expected_head_sha"
+        ],
+        "title": "ReviewReservationRequest",
+        "type": "object"
+      },
       "ReviewRevisionCancel": {
         "properties": {
           "expected_version": {
@@ -4338,9 +4388,29 @@
             "title": "Head Sha",
             "type": "string"
           },
+          "lineage_version": {
+            "title": "Lineage Version",
+            "type": "integer"
+          },
+          "origin_key": {
+            "title": "Origin Key",
+            "type": "string"
+          },
           "receipt": {
             "title": "Receipt",
             "type": "string"
+          },
+          "reservation_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reservation Id"
           },
           "sender": {
             "title": "Sender",
@@ -4351,7 +4421,10 @@
           "head_sha",
           "agent_id",
           "sender",
-          "receipt"
+          "receipt",
+          "origin_key",
+          "lineage_version",
+          "reservation_id"
         ],
         "title": "ReviewVerificationOut",
         "type": "object"
@@ -10924,6 +10997,74 @@
         "summary": "Append Cluster Message Reply",
         "tags": [
           "internal-cluster-message-replies"
+        ]
+      }
+    },
+    "/v1/internal/github/reviews/{event_id}/reserve": {
+      "post": {
+        "operationId": "reserve_review_v1_internal_github_reviews__event_id__reserve_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "event_id",
+            "required": true,
+            "schema": {
+              "title": "Event Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReviewReservationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewReservationOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reserve Review",
+        "tags": [
+          "internal-github-reviews"
         ]
       }
     },

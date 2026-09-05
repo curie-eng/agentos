@@ -29,6 +29,10 @@ class BoundReviewLineage:
     pr_number: int
     branch: str
     head_sha: str
+    repository_id: int
+    installation_id: int
+    pr_node_id: str
+    base_ref: str
 
 
 async def verify_feedback_truth(
@@ -47,13 +51,15 @@ async def verify_feedback_truth(
     if (
         feedback.repo_full_name.casefold() != lineage.repo_full_name.casefold()
         or feedback.pr_number != lineage.pr_number
+        or feedback.repository_id != lineage.repository_id
+        or feedback.installation_id != lineage.installation_id
     ):
         raise FeedbackIgnored("lineage_mismatch")
     try:
         token = await run_in_threadpool(
             credentials_for(settings).token_for_verified_installation,
             lineage.repo_full_name,
-            feedback.installation_id,
+            lineage.installation_id,
         )
     except (GitHubInstallationRefused, ValueError):
         raise FeedbackIgnored("installation_unverified") from None
@@ -99,7 +105,7 @@ async def verify_feedback_truth(
         return (
             isinstance(value, dict)
             and type(value.get("id")) is int
-            and value["id"] == feedback.repository_id
+            and value["id"] == lineage.repository_id
             and isinstance(value.get("full_name"), str)
             and value["full_name"].casefold() == lineage.repo_full_name.casefold()
         )
@@ -113,6 +119,8 @@ async def verify_feedback_truth(
         or not isinstance(base, dict)
         or type(pr.get("number")) is not int
         or pr["number"] != lineage.pr_number
+        or pr.get("node_id") != lineage.pr_node_id
+        or base.get("ref") != lineage.base_ref
         or not isinstance(pr.get("html_url"), str)
         or pr["html_url"].casefold()
         != f"https://github.com/{lineage.repo_full_name}/pull/{lineage.pr_number}".casefold()

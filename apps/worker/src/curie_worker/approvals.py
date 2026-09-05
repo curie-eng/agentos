@@ -116,6 +116,7 @@ class PublicationCreateRequest:
     body: str
     reply_conversation_id: str | None = None
     max_patch_bytes: int = 900_000
+    review_origin_key: str | None = None
 
     def to_json(self) -> dict[str, Any]:
         if len(self.patch) > self.max_patch_bytes:
@@ -143,6 +144,8 @@ class PublicationCreateRequest:
         }
         if self.reply_conversation_id is not None:
             payload["reply_conversation_id"] = self.reply_conversation_id
+        if self.review_origin_key is not None:
+            payload["review_origin_key"] = self.review_origin_key
         return payload
 
 
@@ -206,6 +209,9 @@ class VerifiedReviewFeedback:
     agent_id: uuid.UUID
     sender: str
     receipt: str
+    origin_key: str
+    lineage_version: int
+    reservation_id: uuid.UUID | None
 
 
 class PublicationCreator(Protocol):
@@ -225,6 +231,13 @@ class PublicationCreator(Protocol):
         turn: QueuedTurn,
         deployment_id: uuid.UUID,
     ) -> VerifiedReviewFeedback: ...
+
+    async def reserve_review_feedback(
+        self,
+        turn: QueuedTurn,
+        deployment_id: uuid.UUID,
+        verified: VerifiedReviewFeedback,
+    ) -> uuid.UUID: ...
 
 
 class ApprovalReader(Protocol):
@@ -304,11 +317,62 @@ class ApprovalClient:
                 or not isinstance(receipt, str)
                 or not receipt
                 or len(receipt) > 1024
+                or body["origin_key"] != turn.event_id
+                or type(body["lineage_version"]) is not int
+                or body["lineage_version"] < 1
             ):
                 raise ValueError("invalid verified feedback")
-            return VerifiedReviewFeedback(head, uuid.UUID(body["agent_id"]), sender, receipt)
+            return VerifiedReviewFeedback(
+                head,
+                uuid.UUID(body["agent_id"]),
+                sender,
+                receipt,
+                body["origin_key"],
+                body["lineage_version"],
+                uuid.UUID(body["reservation_id"]) if body["reservation_id"] is not None else None,
+            )
         except (ValueError, TypeError, KeyError):
             raise WorkspaceSelectionRefused(refusal) from None
+
+    async def reserve_review_feedback(
+        self,
+        turn: QueuedTurn,
+        deployment_id: uuid.UUID,
+        verified: VerifiedReviewFeedback,
+    ) -> uuid.UUID:
+        """Bind a verified origin to its own revision after the idle fence."""
+        if not self._worker_headers or verified.origin_key != turn.event_id:
+            raise WorkspaceSelectionRefused("GitHub feedback revision identity was refused.")
+        try:
+            response = await self._client.post(
+                f"{self._review_url}/{turn.event_id}/reserve",
+                json={
+                    "turn": turn.model_dump(mode="json"),
+                    "deployment_id": str(deployment_id),
+                    "expected_lineage_version": verified.lineage_version,
+                    "expected_head_sha": verified.head_sha,
+                },
+                headers=self._worker_headers,
+                follow_redirects=False,
+                # This endpoint performs only SQL CAS and must remain short
+                # while the worker holds the idle thread's route lock.
+                timeout=self._read_timeout_s,
+            )
+        except httpx.HTTPError:
+            raise ApprovalBackendError("GitHub review reservation transport unavailable") from None
+        if response.status_code in {401, 403, 404, 429} or response.status_code >= 500:
+            raise ApprovalBackendError("GitHub review reservation temporarily unavailable")
+        if response.status_code != 200:
+            raise WorkspaceSelectionRefused("GitHub feedback revision is no longer executable.")
+        try:
+            body = response.json()
+            if body["origin_key"] != turn.event_id:
+                raise ValueError("wrong review origin")
+            return uuid.UUID(body["reservation_id"])
+        except (ValueError, TypeError, KeyError):
+            raise WorkspaceSelectionRefused(
+                "GitHub feedback revision identity was refused."
+            ) from None
 
     async def create(self, request: ApprovalRequest) -> CreatedApproval:
         headers = {**self._headers, "Content-Type": "application/json"}
