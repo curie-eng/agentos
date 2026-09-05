@@ -12,6 +12,7 @@
 //! successful hook/schema state. Independent hook interruption remains a
 //! separate required released-upgrade matrix.
 
+use super::upgrade_recovery::{self as recovery, Operation};
 use anyhow::{bail, Context, Result};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -130,6 +131,8 @@ struct UpgradeRecord {
     helm_started: bool,
     #[serde(default)]
     retained_agents_fingerprint: Option<String>,
+    #[serde(default)]
+    operation: Option<Operation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -566,7 +569,11 @@ fn plan_lines(opts: &UpgradeOpts, from: Option<&str>, secret: Option<&str>) -> V
         super::upgrade_owner::capture_command().display(),
         super::upgrade_owner::namespace_command(&opts.common.namespace).display(),
         source_status_command(&opts.common).display(),
+        format!("Command template (exact source/target revision resolved at execution): {}", recovery::metadata_command(&opts.common, "<verified-revision>").display()),
+        format!("Conditional recovery evidence: {}", recovery::terminal_command(&opts.common).display()),
         format!("Command template (revision resolved from source Helm status at execution): {}", source_metadata_command(&opts.common, "<observed-revision>").display()),
+        "Recovery preflight renders templates/worker-upgrade-drain.yaml and templates/schema-migrate.yaml from the exact target chart with a private retained-values file.".into(),
+        "Conditional recovery reads metadata, values and manifest from the exact original pending Helm revision; no rollback is planned without the original completion witness.".into(),
         "Reject nonempty HELM_KUBE target/authentication overrides; use the selected kubeconfig".into(),
         "Bind all Helm/Kubernetes commands to one private captured kubeconfig; acquire same-host ownership by namespace UID and release before checkpoint mutation".into(),
         format!("phase plan: {from} -> {}", opts.to),
@@ -805,6 +812,7 @@ async fn run_lifecycle_inner<H: UpgradeDriver>(
             target_identity: host.target_identity(),
             helm_started: unchanged_helm,
             retained_agents_fingerprint: host.retained_agents_fingerprint(),
+            operation: None,
         },
     };
 
@@ -1273,6 +1281,9 @@ struct LiveHost {
     known_good: Option<String>,
     record: Option<UpgradeRecord>,
     record_version: Option<String>,
+    record_uid: Option<String>,
+    operation: Option<Operation>,
+    recovery_revision: Option<u64>,
     schema_decision: Option<serde_json::Value>,
     target_identity: Option<String>,
     retained_agents_fingerprint: Option<String>,
@@ -1364,8 +1375,432 @@ impl LiveHost {
         .context(
             "upgrade checkpoint is malformed; preserve it and repair the record before retrying",
         )?;
+        self.record_uid = object
+            .pointer("/metadata/uid")
+            .and_then(|value| value.as_str())
+            .filter(|uid| !uid.is_empty())
+            .map(str::to_owned);
         self.record_version = Some(version.to_owned());
         Ok(Some(record))
+    }
+
+    fn recovery_read(&self, command: &OpsCommand) -> Result<serde_json::Value> {
+        let command = self
+            .owner
+            .as_ref()
+            .ok_or_else(|| {
+                recovery::refusal("upgrade recovery requires captured target ownership")
+            })?
+            .bind(command);
+        let (ok, raw, _) = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                run_capture(&command),
+            ))
+        })
+        .map_err(|_| recovery::refusal("upgrade recovery evidence read timed out"))?
+        .map_err(|_| recovery::refusal("upgrade recovery evidence read failed"))?;
+        if !ok {
+            return Err(recovery::refusal(
+                "upgrade recovery evidence read was denied or failed",
+            ));
+        }
+        serde_json::from_str(&raw)
+            .map_err(|_| recovery::refusal("upgrade recovery evidence is malformed"))
+    }
+
+    fn prepare_operation(&mut self) -> Result<()> {
+        let owner = self.owner.as_ref().context("upgrade owner absent")?;
+        let local = owner.read_witness()?;
+        if let Some(record) = self
+            .record
+            .as_ref()
+            .filter(|record| record.target_version == self.opts.to)
+        {
+            if let Some(operation) = &record.operation {
+                if record.status != "succeeded" {
+                    let saved: Operation = local
+                        .ok_or_else(|| recovery::refusal("local upgrade witness is missing"))
+                        .and_then(|value| {
+                            serde_json::from_value(value).map_err(|_| {
+                                recovery::refusal("local upgrade witness is malformed")
+                            })
+                        })?;
+                    let mut comparable = saved.clone();
+                    if !record.helm_started && comparable.checkpoint_uid.is_empty() {
+                        comparable.checkpoint_uid = operation.checkpoint_uid.clone();
+                    }
+                    if &comparable != operation
+                        || (record.helm_started
+                            && self.record_uid.as_deref()
+                                != Some(operation.checkpoint_uid.as_str()))
+                    {
+                        return Err(recovery::refusal(
+                            "local and cluster upgrade witnesses do not match",
+                        ));
+                    }
+                }
+                if record.status != "succeeded" && operation.rollback_started {
+                    let expected = operation.expected_revision + 1;
+                    let uid = operation.completed_revision_uid.as_deref().ok_or_else(|| recovery::refusal("rollback completion was not durably bound; automatic recovery is unsupported"))?;
+                    let status = self.recovery_read(&source_status_command(&self.opts.common))?;
+                    let metadata = self.recovery_read(&recovery::metadata_command(
+                        &self.opts.common,
+                        &expected.to_string(),
+                    ))?;
+                    if status["version"].as_u64() != Some(expected)
+                        || status
+                            .pointer("/info/status")
+                            .and_then(|value| value.as_str())
+                            != Some("deployed")
+                        || recovery::metadata(
+                            &metadata,
+                            &self.opts.common,
+                            expected,
+                            "deployed",
+                            Some(&operation.id),
+                        )? != uid
+                    {
+                        return Err(recovery::refusal(
+                            "completed rollback revision identity changed",
+                        ));
+                    }
+                }
+                self.operation = Some(operation.clone());
+                return Ok(());
+            }
+        }
+        let status = self.recovery_read(&source_status_command(&self.opts.common))?;
+        let state = status
+            .pointer("/info/status")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        if state.starts_with("pending-") {
+            return Err(recovery::refusal(
+                "pending Helm operation has no matching durable local witness",
+            ));
+        }
+        let revision = status["version"]
+            .as_u64()
+            .filter(|n| *n > 0 && *n < u64::MAX - 1)
+            .ok_or_else(|| recovery::refusal("source Helm revision is invalid"))?;
+        if status["name"] != self.opts.common.release
+            || status["namespace"] != self.opts.common.namespace
+        {
+            return Err(recovery::refusal("source Helm identity is invalid"));
+        }
+        let metadata = self.recovery_read(&recovery::metadata_command(
+            &self.opts.common,
+            &revision.to_string(),
+        ))?;
+        let uid = recovery::metadata(&metadata, &self.opts.common, revision, state, None)?;
+        let id = uuid::Uuid::new_v4().to_string();
+        if metadata[0]["labels"][recovery::LABEL] == id {
+            return Err(recovery::refusal(
+                "new upgrade operation marker is not fresh",
+            ));
+        }
+        self.operation = Some(Operation {
+            id,
+            source_revision: revision,
+            source_uid: uid,
+            expected_revision: revision + 1,
+            checkpoint_uid: self.record_uid.clone().unwrap_or_default(),
+            target_identity: String::new(),
+            hooks_identity: String::new(),
+            pending_uid: None,
+            original_hook_uids: std::collections::BTreeMap::new(),
+            pending_manifest_identity: None,
+            completed_revision_uid: None,
+            rollback_started: false,
+        });
+        Ok(())
+    }
+
+    fn target_recovery_hooks(&self) -> Result<Vec<serde_json::Value>> {
+        let config = &self.config.as_ref().context("configuration absent")?.values;
+        let mut hooks = Vec::new();
+        for template in [
+            "templates/worker-upgrade-drain.yaml",
+            "templates/schema-migrate.yaml",
+        ] {
+            let raw = self.render_target_template(template, config)?;
+            for document in serde_norway::Deserializer::from_str(&raw) {
+                let value = serde_json::Value::deserialize(document)
+                    .map_err(|_| recovery::refusal("target recovery hook manifest is malformed"))?;
+                if !value.is_null() {
+                    hooks.push(value);
+                }
+            }
+        }
+        let operation = self.operation.as_ref().context("operation absent")?;
+        recovery::validate_hooks(&hooks, &operation.id, &self.opts.common.namespace)?;
+        hooks.sort_by_key(|hook| {
+            hook["metadata"]["name"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        });
+        Ok(hooks)
+    }
+
+    fn bind_operation_target(&mut self) -> Result<()> {
+        if self.operation.is_none() {
+            return Ok(());
+        }
+        let hooks_identity = recovery::digest(&self.target_recovery_hooks()?)?;
+        let target = self
+            .target_identity
+            .clone()
+            .context("target identity absent")?;
+        let operation = self.operation.as_mut().context("operation absent")?;
+        if !operation.target_identity.is_empty()
+            && (operation.target_identity != target || operation.hooks_identity != hooks_identity)
+        {
+            return Err(recovery::refusal(
+                "upgrade operation target or hook content changed",
+            ));
+        }
+        operation.target_identity = target;
+        operation.hooks_identity = hooks_identity;
+        Ok(())
+    }
+
+    fn bind_original_completion_if_verified(&mut self) -> Result<()> {
+        if self.operation.is_some() {
+            if let Ok((uid, manifest, hook_uids)) = self.observe_original_completion() {
+                let operation = self.operation.as_mut().expect("operation present");
+                operation.pending_uid = Some(uid);
+                operation.pending_manifest_identity = Some(manifest);
+                operation.original_hook_uids = hook_uids;
+                self.store_record(self.record.clone().context("checkpoint absent")?)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn observe_original_completion(
+        &self,
+    ) -> Result<(String, String, std::collections::BTreeMap<String, String>)> {
+        let operation = self.operation.as_ref().context("operation absent")?;
+        let status = self.recovery_read(&source_status_command(&self.opts.common))?;
+        if status["version"].as_u64() != Some(operation.expected_revision)
+            || status
+                .pointer("/info/status")
+                .and_then(|value| value.as_str())
+                != Some("pending-upgrade")
+        {
+            return Err(recovery::refusal(
+                "original invocation did not leave its expected pending revision",
+            ));
+        }
+        let metadata = self.recovery_read(&recovery::metadata_command(
+            &self.opts.common,
+            &operation.expected_revision.to_string(),
+        ))?;
+        let uid = recovery::metadata(
+            &metadata,
+            &self.opts.common,
+            operation.expected_revision,
+            "pending-upgrade",
+            Some(&operation.id),
+        )?;
+        let mut hooks = recovery::hook_manifests(&status, &operation.id)?;
+        recovery::validate_hooks(&hooks, &operation.id, &self.opts.common.namespace)?;
+        hooks.sort_by_key(|hook| {
+            hook["metadata"]["name"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        });
+        if recovery::digest(&hooks)? != operation.hooks_identity {
+            return Err(recovery::refusal(
+                "original pending hook content differs from selected target",
+            ));
+        }
+        let observed = self.recovery_read(&recovery::terminal_command(&self.opts.common))?;
+        recovery::all_terminal(
+            &hooks,
+            &observed,
+            &operation.id,
+            &self.opts.common.namespace,
+        )?;
+        let manifest = self.pending_manifest_identity(operation.expected_revision)?;
+        let after = self.recovery_read(&recovery::metadata_command(
+            &self.opts.common,
+            &operation.expected_revision.to_string(),
+        ))?;
+        if metadata != after {
+            return Err(recovery::refusal(
+                "pending revision changed during original completion observation",
+            ));
+        }
+        Ok((uid, manifest, recovery::job_uids(&hooks, &observed)?))
+    }
+
+    fn pending_manifest_identity(&self, revision: u64) -> Result<String> {
+        let command = OpsCommand::new(
+            "helm",
+            vec![
+                plain("get"),
+                plain("manifest"),
+                plain(&self.opts.common.release),
+                plain("-n"),
+                plain(&self.opts.common.namespace),
+                plain("--revision"),
+                plain(revision.to_string()),
+            ],
+        );
+        let command = self.owner.as_ref().context("owner absent")?.bind(&command);
+        let (ok, raw, _) = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                run_capture(&command),
+            ))
+        })
+        .map_err(|_| recovery::refusal("pending Helm manifest read timed out"))?
+        .map_err(|_| recovery::refusal("pending Helm manifest read failed"))?;
+        if !ok || raw.trim().is_empty() {
+            return Err(recovery::refusal("pending Helm manifest is unavailable"));
+        }
+        recovery::digest(&raw)
+    }
+
+    fn validate_pending_recovery(&mut self, status: &serde_json::Value) -> Result<()> {
+        let operation = self
+            .operation
+            .as_ref()
+            .ok_or_else(|| recovery::refusal("pending operation has no witness"))?;
+        let record = self
+            .record
+            .as_ref()
+            .ok_or_else(|| recovery::refusal("pending operation has no checkpoint"))?;
+        if status
+            .pointer("/info/status")
+            .and_then(|value| value.as_str())
+            != Some("pending-upgrade")
+            || operation.rollback_started
+            || status["version"].as_u64() != Some(operation.expected_revision)
+            || status["name"] != self.opts.common.release
+            || status["namespace"] != self.opts.common.namespace
+            || !record.helm_started
+            || !matches!(record.status.as_str(), "failed" | "in_progress")
+            || record.target_identity.as_deref() != Some(operation.target_identity.as_str())
+            || self.record_uid.as_deref() != Some(operation.checkpoint_uid.as_str())
+        {
+            return Err(recovery::refusal(
+                "pending Helm revision is not the exact original recoverable attempt",
+            ));
+        }
+        let metadata = self.recovery_read(&recovery::metadata_command(
+            &self.opts.common,
+            &operation.expected_revision.to_string(),
+        ))?;
+        let uid = recovery::metadata(
+            &metadata,
+            &self.opts.common,
+            operation.expected_revision,
+            "pending-upgrade",
+            Some(&operation.id),
+        )?;
+        if operation.pending_uid.as_deref() != Some(uid.as_str()) {
+            return Err(recovery::refusal(
+                "pending Helm UID was not bound by the original invocation",
+            ));
+        }
+        let manifest = self.pending_manifest_identity(operation.expected_revision)?;
+        if operation.pending_manifest_identity.as_deref() != Some(manifest.as_str()) {
+            return Err(recovery::refusal(
+                "pending Helm manifest content changed after original invocation",
+            ));
+        }
+        let mut hooks = recovery::hook_manifests(status, &operation.id)?;
+        recovery::validate_hooks(&hooks, &operation.id, &self.opts.common.namespace)?;
+        hooks.sort_by_key(|hook| {
+            hook["metadata"]["name"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        });
+        if recovery::digest(&hooks)? != operation.hooks_identity {
+            return Err(recovery::refusal(
+                "pending Helm hook content differs from the verified target",
+            ));
+        }
+        let values = self.recovery_read(&OpsCommand::new(
+            "helm",
+            vec![
+                plain("get"),
+                plain("values"),
+                plain(&self.opts.common.release),
+                plain("-n"),
+                plain(&self.opts.common.namespace),
+                plain("--revision"),
+                plain(operation.expected_revision.to_string()),
+                plain("-o"),
+                plain("json"),
+            ],
+        ))?;
+        if Some(&values) != self.config.as_ref().map(|config| &config.values) {
+            return Err(recovery::refusal(
+                "pending Helm retained configuration differs from the verified target",
+            ));
+        }
+        let observed = self.recovery_read(&recovery::terminal_command(&self.opts.common))?;
+        recovery::all_terminal(
+            &hooks,
+            &observed,
+            &operation.id,
+            &self.opts.common.namespace,
+        )?;
+        if recovery::job_uids(&hooks, &observed)? != operation.original_hook_uids {
+            return Err(recovery::refusal(
+                "an original retained hook Job UID changed",
+            ));
+        }
+        let source_metadata = self.recovery_read(&recovery::metadata_command(
+            &self.opts.common,
+            &operation.source_revision.to_string(),
+        ))?;
+        let source_state = source_metadata[0]["labels"]["status"]
+            .as_str()
+            .filter(|state| matches!(*state, "deployed" | "superseded" | "failed"))
+            .ok_or_else(|| recovery::refusal("source release state is uncertain"))?;
+        if recovery::metadata(
+            &source_metadata,
+            &self.opts.common,
+            operation.source_revision,
+            source_state,
+            None,
+        )? != operation.source_uid
+        {
+            return Err(recovery::refusal("source release UID changed"));
+        }
+        let target_metadata = self.recovery_read(&source_metadata_command(
+            &self.opts.common,
+            &operation.expected_revision.to_string(),
+        ))?;
+        if target_metadata["name"] != self.opts.common.release
+            || target_metadata["namespace"] != self.opts.common.namespace
+            || target_metadata["revision"].as_u64() != Some(operation.expected_revision)
+            || target_metadata["chart"] != "curie"
+            || target_metadata["version"] != self.opts.to
+            || target_metadata["appVersion"] != self.opts.to
+            || target_metadata["status"] != "pending-upgrade"
+        {
+            return Err(recovery::refusal("pending target chart metadata changed"));
+        }
+        if self
+            .schema_decision
+            .as_ref()
+            .is_none_or(|decision| decision["current_revision"] != decision["target_head"])
+        {
+            return Err(recovery::refusal(
+                "all target schema migrations must already be reached before recovery",
+            ));
+        }
+        self.recovery_revision = Some(operation.expected_revision);
+        Ok(())
     }
 
     fn prepare_configuration(&mut self) -> Result<()> {
@@ -1406,6 +1841,31 @@ impl LiveHost {
             values.unwrap_or_else(|| serde_json::json!({})),
             self.current.as_deref(),
         )?);
+        if [
+            "/worker/deploy",
+            "/worker/upgradeDrain/enabled",
+            "/api/migrate/enabled",
+        ]
+        .iter()
+        .any(|path| {
+            self.config
+                .as_ref()
+                .expect("prepared configuration")
+                .values
+                .pointer(path)
+                .and_then(|value| value.as_bool())
+                == Some(false)
+        }) {
+            // Preserve ordinary supported BYO/disabled-hook upgrades. They carry
+            // no automatic forward-recovery authority.
+            self.operation = None;
+            self.config.as_mut().expect("prepared configuration").values["upgradeRecovery"] =
+                serde_json::json!({"enabled": false, "operationId": ""});
+        }
+        if let Some(operation) = &self.operation {
+            self.config.as_mut().expect("prepared configuration").values["upgradeRecovery"] =
+                serde_json::json!({"enabled": true, "operationId": operation.id});
+        }
         if self.opts.forward_only {
             let values = &mut self.config.as_mut().expect("prepared configuration").values;
             for path in ["/api", "/api/migrate"] {
@@ -1854,7 +2314,7 @@ impl LiveHost {
         Ok(source)
     }
 
-    fn inspect_known_good(&self) -> Result<Option<String>> {
+    fn inspect_known_good(&mut self) -> Result<Option<String>> {
         let (ok, raw, _) = self.run(&source_status_command(&self.opts.common))?;
         if !ok {
             return Err(source_metadata_error(
@@ -1868,7 +2328,8 @@ impl LiveHost {
             .and_then(|value| value.as_str())
             .ok_or_else(|| source_metadata_error("source Helm status has no operation state"))?;
         if state.starts_with("pending-") {
-            bail!("another Helm operation is pending; wait for its owner before resuming this upgrade");
+            self.validate_pending_recovery(&status)?;
+            return Ok(None);
         }
         if state != "deployed" {
             return Ok(None);
@@ -2059,7 +2520,13 @@ impl LiveHost {
         ))?;
         let status: serde_json::Value = serde_json::from_str(&raw)
             .context("Helm status is malformed during transaction reconciliation")?;
-        if !ok || !self.observed_hooks_succeeded(&status) {
+        if !ok
+            || status
+                .pointer("/info/status")
+                .and_then(|value| value.as_str())
+                != Some("deployed")
+            || !self.observed_hooks_succeeded(&status)
+        {
             return Ok(false);
         }
         let values = tokio::task::block_in_place(|| {
@@ -2108,6 +2575,9 @@ impl LiveHost {
         if let Some(version) = &self.record_version {
             manifest["metadata"]["resourceVersion"] = version.clone().into();
         }
+        if let Some(uid) = &self.record_uid {
+            manifest["metadata"]["uid"] = uid.clone().into();
+        }
         let tmp = tempfile::NamedTempFile::new().context("upgrade checkpoint tempfile")?;
         std::fs::write(tmp.path(), serde_json::to_vec_pretty(&manifest)?)?;
         let cmd = OpsCommand::new(
@@ -2140,6 +2610,19 @@ impl LiveHost {
                 .context("upgrade checkpoint write returned no resource version")?
                 .to_owned(),
         );
+        let uid = object
+            .pointer("/metadata/uid")
+            .and_then(|value| value.as_str())
+            .filter(|uid| !uid.is_empty())
+            .ok_or_else(|| recovery::refusal("upgrade checkpoint write returned no UID"))?;
+        if self
+            .record_uid
+            .as_deref()
+            .is_some_and(|previous| previous != uid)
+        {
+            return Err(recovery::refusal("upgrade checkpoint UID changed"));
+        }
+        self.record_uid = Some(uid.to_owned());
         Ok(())
     }
 
@@ -2169,6 +2652,12 @@ impl LiveHost {
             plain("-f"),
             plain(tmp.path().to_string_lossy().into_owned()),
         ];
+        if let Some(operation) = &self.operation {
+            args.extend([
+                plain("--labels"),
+                plain(format!("{}={}", recovery::LABEL, operation.id)),
+            ]);
+        }
         if self.current.is_none() {
             args.push(plain("--install"));
             args.push(plain("--create-namespace"));
@@ -2465,9 +2954,26 @@ impl UpgradeDriver for LiveHost {
     fn load_record(&self) -> Option<UpgradeRecord> {
         self.record.clone()
     }
-    fn store_record(&mut self, record: UpgradeRecord) -> Result<()> {
+    fn store_record(&mut self, mut record: UpgradeRecord) -> Result<()> {
+        record.operation = self.operation.clone();
+        // Intent reaches the locked inode before the first cluster write. A
+        // failed initial write can be reconciled only before any Helm intent.
+        if let (Some(owner), Some(operation)) = (&self.owner, &self.operation) {
+            owner.write_witness(operation)?;
+        }
         self.persist_record(&record)?;
-        self.record = Some(record.clone());
+        if let Some(operation) = &mut self.operation {
+            let uid = self.record_uid.clone().context("checkpoint UID absent")?;
+            if operation.checkpoint_uid != uid {
+                operation.checkpoint_uid = uid;
+                record.operation = Some(operation.clone());
+                self.persist_record(&record)?;
+            }
+        }
+        if let (Some(owner), Some(operation)) = (&self.owner, &self.operation) {
+            owner.write_witness(operation)?;
+        }
+        self.record = Some(record);
         Ok(())
     }
     fn retained_agents_fingerprint(&self) -> Option<String> {
@@ -2508,7 +3014,89 @@ impl UpgradeDriver for LiveHost {
         bail!("live drain is owned by the Helm transaction")
     }
     fn apply_target(&mut self, to: &str) -> Result<()> {
-        self.helm_upgrade(to)?;
+        if let Some(revision) = self.recovery_revision {
+            // Recheck the complete read-only gate immediately before persisting
+            // rollback intent. A second interruption is deliberately unsupported.
+            let status = self.recovery_read(&source_status_command(&self.opts.common))?;
+            self.validate_pending_recovery(&status)?;
+            self.operation
+                .as_mut()
+                .context("operation absent")?
+                .rollback_started = true;
+            self.store_record(self.record.clone().context("checkpoint absent")?)?;
+            let command = OpsCommand::new(
+                "helm",
+                vec![
+                    plain("rollback"),
+                    plain(&self.opts.common.release),
+                    plain(revision.to_string()),
+                    plain("-n"),
+                    plain(&self.opts.common.namespace),
+                    plain("--wait"),
+                    plain("--timeout"),
+                    plain(format!("{}s", self.helm_wait_timeout())),
+                ],
+            );
+            let command = self.owner.as_ref().context("owner absent")?.bind(&command);
+            let (ok, _, _) = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(run_upgrade_capture(
+                    &command,
+                    self.owner.as_ref().and_then(|owner| owner.ownership_fd()),
+                ))
+            })?;
+            if !ok {
+                return Err(recovery::refusal("target-forward Helm rollback failed; interrupted rollback is not automatically recoverable"));
+            }
+            let status = self.recovery_read(&source_status_command(&self.opts.common))?;
+            let operation = self.operation.as_ref().context("operation absent")?;
+            if status["version"].as_u64() != Some(revision + 1)
+                || status
+                    .pointer("/info/status")
+                    .and_then(|value| value.as_str())
+                    != Some("deployed")
+                || status["name"] != self.opts.common.release
+                || status["namespace"] != self.opts.common.namespace
+            {
+                return Err(recovery::refusal(
+                    "rollback did not return the exact deployed successor revision",
+                ));
+            }
+            let metadata = self.recovery_read(&recovery::metadata_command(
+                &self.opts.common,
+                &(revision + 1).to_string(),
+            ))?;
+            let uid = recovery::metadata(
+                &metadata,
+                &self.opts.common,
+                revision + 1,
+                "deployed",
+                Some(&operation.id),
+            )?;
+            self.operation
+                .as_mut()
+                .context("operation absent")?
+                .completed_revision_uid = Some(uid);
+            self.store_record(self.record.clone().context("checkpoint absent")?)?;
+            self.recovery_revision = None;
+        } else if let Err(error) = self.helm_upgrade(to) {
+            // Binding after a returned failure is deliberately narrow. A process
+            // killed before this UID observation leaves recovery unsupported.
+            self.bind_original_completion_if_verified()?;
+            return Err(error);
+        }
+        if self.recovery_revision.is_none() {
+            let status = self.recovery_read(&source_status_command(&self.opts.common))?;
+            if status
+                .pointer("/info/status")
+                .and_then(|value| value.as_str())
+                .is_some_and(|state| state.starts_with("pending-"))
+            {
+                self.bind_original_completion_if_verified()?;
+                return Err(recovery::refusal(
+                    "Helm returned before its release completion was durably persisted",
+                ));
+            }
+        }
         self.set_current(Some(to.to_string()));
         Ok(())
     }
@@ -2545,6 +3133,9 @@ pub async fn upgrade(mut opts: UpgradeOpts) -> Result<ClusterUpgradeOutput> {
             known_good: None,
             record: None,
             record_version: None,
+            record_uid: None,
+            operation: None,
+            recovery_revision: None,
             schema_decision: None,
             target_identity: None,
             retained_agents_fingerprint: None,
@@ -2579,6 +3170,9 @@ pub async fn upgrade(mut opts: UpgradeOpts) -> Result<ClusterUpgradeOutput> {
         known_good: None,
         record: None,
         record_version: None,
+        record_uid: None,
+        operation: None,
+        recovery_revision: None,
         schema_decision: None,
         target_identity: None,
         retained_agents_fingerprint: None,
@@ -2589,8 +3183,10 @@ pub async fn upgrade(mut opts: UpgradeOpts) -> Result<ClusterUpgradeOutput> {
         bail!("fresh installation requires cluster up before transactional upgrade; an absent Helm release does not prove an empty retained database");
     }
     live.record = LiveHost::load_record(&mut live)?;
+    live.prepare_operation()?;
     live.prepare_configuration()?;
     live.prepare_schema()?;
+    live.bind_operation_target()?;
     live.prepare_retained_data()?;
     let observed_known_good = live.inspect_known_good()?;
     live.known_good = live

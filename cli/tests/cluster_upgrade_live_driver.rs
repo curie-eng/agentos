@@ -985,6 +985,11 @@ fn upgrade_offline_plan_names_capture_namespace_read_and_ownership_without_proce
     assert!(text.contains("kubectl config view --minify --raw -o json --flatten"));
     assert!(text.contains("kubectl get namespace upgrade-test -o json"));
     assert!(text.contains("same-host ownership"));
+    assert!(text.contains("templates/worker-upgrade-drain.yaml"));
+    assert!(text.contains("templates/schema-migrate.yaml"));
+    assert!(text.contains("kubectl get jobs,pods"));
+    assert!(text.contains("jsonpath-as-json={.metadata}"));
+    assert!(text.contains("exact original pending Helm revision"));
     assert!(fixture.calls().is_empty());
     assert!(!fixture.path("state").exists());
 }
@@ -1131,4 +1136,197 @@ fn bounded_source_metadata_read_stops_its_child_and_preserves_recovery() {
     let pid = fs::read_to_string(fixture.path("metadata-pid")).unwrap();
     let absent = Command::new("/usr/bin/python3").args(["-c", "import os,sys; p=int(sys.argv[1]);\ntry: os.kill(p,0)\nexcept ProcessLookupError: sys.exit(0)\nsys.exit(1)", &pid]).status().unwrap();
     assert!(absent.success(), "timed-out metadata child must be absent");
+}
+
+#[test]
+fn late_pending_upgrade_requires_durable_fresh_operation_before_target_forward_recovery() {
+    // Helm3.16.4 persists upgrade --labels before hooks, but rollback copies them.
+    // https://github.com/helm/helm/blob/v3.16.4/pkg/action/upgrade.go
+    // https://github.com/helm/helm/blob/v3.16.4/pkg/action/rollback.go
+    let fixture = Fixture::new();
+    let first = fixture.run("late-pending");
+    assert!(!first.status.success());
+    let record: Value =
+        serde_json::from_slice(&fs::read(fixture.path("record.json")).unwrap()).unwrap();
+    let operation = &record["operation"];
+    assert!(operation["id"]
+        .as_str()
+        .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok()));
+    assert_eq!(operation["expected_revision"], 2);
+    let calls: Vec<Vec<String>> = fixture
+        .calls()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let upgrade = calls
+        .iter()
+        .find(|args| args[0] == "helm" && args[1] == "upgrade")
+        .unwrap();
+    assert!(upgrade.iter().any(|arg| arg == "--labels"));
+    assert_eq!(record["completed"], json!(["plan", "validate"]));
+    let second = fixture.run("late-pending");
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stdout)
+    );
+    let calls: Vec<Vec<String>> = fixture
+        .calls()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|args| args[0] == "helm" && args[1] == "upgrade")
+            .count(),
+        1
+    );
+    let rollback = calls
+        .iter()
+        .find(|args| args[0] == "helm" && args[1] == "rollback")
+        .unwrap();
+    assert_eq!(rollback[3], "2");
+    assert!(!rollback
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--no-hooks" | "--force")));
+    let final_record: Value =
+        serde_json::from_slice(&fs::read(fixture.path("record.json")).unwrap()).unwrap();
+    assert_eq!(final_record["status"], "succeeded");
+    assert!(final_record["resumed"].as_bool().unwrap());
+}
+
+#[test]
+fn pending_forward_recovery_refuses_missing_or_uncertain_phase_and_owner_evidence() {
+    for scenario in [
+        "pending-rollback",
+        "missing-local-witness",
+        "truncated-local-witness",
+        "wrong-checkpoint-uid",
+        "wrong-release-uid",
+        "wrong-marker",
+        "wrong-revision",
+        "active-hook",
+        "missing-hook",
+        "orphan-hook-pod",
+        "wrong-pod-owner",
+        "terminating-hook",
+        "unknown-hook",
+        "schema-not-target",
+        "malformed-hook-active",
+        "replacement-hook-uid",
+        "ephemeral-hook-running",
+        "changed-pending-manifest",
+    ] {
+        let fixture = Fixture::new();
+        assert!(!fixture.run("late-pending").status.success());
+        if matches!(
+            scenario,
+            "missing-local-witness" | "truncated-local-witness"
+        ) {
+            let locks = fixture.path("state/curie/upgrades");
+            for entry in fs::read_dir(locks).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_file() {
+                    fs::write(
+                        path,
+                        if scenario == "missing-local-witness" {
+                            ""
+                        } else {
+                            "{"
+                        },
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        let before = fs::read(fixture.path("record.json")).unwrap();
+        let output = fixture.run(scenario);
+        assert!(!output.status.success(), "{scenario}");
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            value["fix"].as_str().is_some_and(|fix| !fix.is_empty()),
+            "{scenario}: {value}"
+        );
+        assert!(
+            !fixture.calls().lines().any(|line| {
+                let args: Vec<String> = serde_json::from_str(line).unwrap();
+                args[0] == "helm" && args[1] == "rollback"
+            }),
+            "{scenario}"
+        );
+        assert_eq!(
+            before,
+            fs::read(fixture.path("record.json")).unwrap(),
+            "{scenario}"
+        );
+    }
+}
+
+#[test]
+fn forward_recovery_accepts_zero_exit_pending_only_after_original_completion_binding() {
+    let fixture = Fixture::new();
+    // Helm3.16.4 action.recordRelease logs persistence failure and continues.
+    // https://github.com/helm/helm/blob/v3.16.4/pkg/action/action.go
+    let first = fixture.run("zero-exit-pending");
+    assert!(!first.status.success());
+    let record: Value =
+        serde_json::from_slice(&fs::read(fixture.path("record.json")).unwrap()).unwrap();
+    assert!(record["operation"]["pending_uid"].as_str().is_some());
+    let second = fixture.run("late-pending");
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stdout)
+    );
+    assert_eq!(fixture.calls().matches("\"helm\", \"rollback\"").count(), 1);
+}
+
+#[test]
+fn forward_recovery_rechecks_original_job_source_and_target_metadata_identity() {
+    for (scenario, expected) in [
+        (
+            "replacement-hook-uid",
+            "original retained hook Job UID changed",
+        ),
+        ("replaced-source-release", "source release UID changed"),
+        (
+            "source-metadata-wrong-chart",
+            "pending target chart metadata changed",
+        ),
+    ] {
+        let fixture = Fixture::new();
+        assert!(!fixture.run("late-pending").status.success());
+        let before = fs::read(fixture.path("record.json")).unwrap();
+        let output = fixture.run(scenario);
+        assert!(!output.status.success(), "{scenario}");
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            value["error"].as_str().unwrap().contains(expected),
+            "{scenario}: {value}"
+        );
+        assert!(!fixture.calls().contains("\"helm\", \"rollback\""));
+        assert_eq!(before, fs::read(fixture.path("record.json")).unwrap());
+    }
+}
+
+#[test]
+fn forward_recovery_ignores_only_test_hooks_and_refuses_additional_executable_hooks() {
+    let fixture = Fixture::new();
+    assert!(!fixture.run("late-pending").status.success());
+    let output = fixture.run("test-only-hook");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    for scenario in ["extra-upgrade-hook", "extra-rollback-hook"] {
+        let fixture = Fixture::new();
+        assert!(!fixture.run("late-pending").status.success());
+        let before = fs::read(fixture.path("record.json")).unwrap();
+        let output = fixture.run(scenario);
+        assert!(!output.status.success());
+        assert!(!fixture.calls().contains("\"helm\", \"rollback\""));
+        assert_eq!(before, fs::read(fixture.path("record.json")).unwrap());
+    }
 }
