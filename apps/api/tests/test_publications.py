@@ -4871,3 +4871,82 @@ def test_adding_app_after_pat_publication_does_not_backfill_legacy_identity(
         {"id": publication["lineage_id"]},
     ) == [{"github_repository_id": None, "head_sha": SECOND_REVISION_SHA}]
     assert _reserve_review(client, advanced.json(), "review:legacy-replay").status_code == 409
+
+
+@pytest.mark.parametrize("mutation", ["binding", "head"])
+def test_review_reservation_refreshes_authority_already_loaded_by_its_caller(
+    review_lineage_app: tuple[TestClient, dict[str, Any], str],
+    auth_headers: dict[str, str],
+    mutation: str,
+) -> None:
+    """A row lock must refresh objects retained during earlier authority reads."""
+    from curie_api.models import AgentChannel, ThreadPublicationLineage
+    from curie_api.schemas import ReviewRevisionReserve
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    client, truth, _ = review_lineage_app
+    deployment, _, lineage = _verified_lineage(client, truth, auth_headers)
+    later = None
+    if mutation == "head":
+        _, later = _create_publication(
+            client,
+            _publication_payload(
+                deployment["id"], conversation_id="review-original", base_sha=FIRST_REVISION_SHA
+            ),
+        )
+        assert _resolve(client, auth_headers, later["approval_id"]).status_code == 200
+
+    async def exercise() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with AsyncSession(engine) as session:
+                loaded = await session.get(ThreadPublicationLineage, uuid.UUID(lineage["id"]))
+                assert loaded is not None
+                binding = await session.get(AgentChannel, loaded.binding_id)
+                assert binding is not None
+                # Keep both strong references while another real API transaction
+                # changes authority. FOR UPDATE alone does not refresh this map.
+                if mutation == "binding":
+                    response = await asyncio.to_thread(
+                        client.patch,
+                        f"/agents/{deployment['agent_id']}/channels",
+                        params={
+                            "kind": "slack",
+                            "address": "C0EXAMPLE1",
+                            "expected_generation": binding.generation,
+                        },
+                        json={"kind": "slack", "address": "C0EXAMPLE1"},
+                        headers=auth_headers,
+                    )
+                else:
+                    assert later is not None
+                    truth["head_sha"] = EXTERNAL_REVISION_SHA
+                    response = await asyncio.to_thread(
+                        _advance_lineage,
+                        client,
+                        later["id"],
+                        expected_version=lineage["version"],
+                        expected_head_sha=FIRST_REVISION_SHA,
+                        head_sha=EXTERNAL_REVISION_SHA,
+                    )
+                    await asyncio.to_thread(_mark_outcome_history_ready, later["id"])
+                assert response.status_code == 200, response.text
+                with pytest.raises(crud.PublicationLineageConflict) as conflict:
+                    await crud.reserve_review_revision(
+                        session,
+                        ReviewRevisionReserve(
+                            repository_id=9001,
+                            pr_number=PR_NUMBER,
+                            expected_lineage_version=lineage["version"],
+                            origin_key=f"review:cached-{mutation}",
+                        ),
+                    )
+                assert conflict.value.code == (
+                    "publication.review_ineligible" if mutation == "binding"
+                    else "publication.lineage_stale"
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(exercise())
+    assert _rows("SELECT count(*) AS n FROM curie.publication_review_reservations")[0]["n"] == 0

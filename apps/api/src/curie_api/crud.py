@@ -2194,7 +2194,9 @@ async def _require_review_binding(
 ) -> AgentChannel:
     """Recheck original authority under the same transaction as reservation use."""
     binding = (
-        await session.get(AgentChannel, lineage.binding_id, with_for_update=True)
+        await session.get(
+            AgentChannel, lineage.binding_id, with_for_update=True, populate_existing=True
+        )
         if lineage.binding_id
         else None
     )
@@ -2239,6 +2241,7 @@ async def reserve_review_revision(
             ThreadPublicationLineage.pr_number == data.pr_number,
         )
         .with_for_update()
+        .execution_options(populate_existing=True)
     )
     if (
         lineage is None
