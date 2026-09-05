@@ -25,10 +25,48 @@ import httpx
 from aci_protocol import ApprovalRequest
 from curie_telemetry import inject_trace_context
 
+from .workspace import WorkspaceSelectionRefused
+
 # Re-exported so this module stays the kernel-facing seam for the approval
 # payload: ``ApprovalRequest`` is now the shared wire model (#492), not a
 # lane-local mirror of the API's schema.
 logger = logging.getLogger(__name__)
+
+_PUBLICATION_REFUSAL_CODES = {
+    "publication.github_unavailable",
+    "publication.lineage_stale",
+    "publication.lineage_terminal",
+}
+_TERMINAL_WORKSPACE_CONFLICT_DETAILS = {
+    "conversation has no selected repository workspace",
+    "publication repository differs from the thread workspace",
+    "thread workspace repository is no longer allowed",
+}
+
+
+def _publication_refusal(response: httpx.Response) -> str | None:
+    """Return a safe API-classified refusal instead of making it retryable."""
+
+    if response.status_code not in (409, 502, 503):
+        return None
+    try:
+        detail = response.json()["detail"]
+    except (KeyError, TypeError, ValueError):
+        return None
+    if isinstance(detail, dict):
+        code = detail.get("code")
+        message = detail.get("message")
+        if (
+            isinstance(code, str)
+            and code in _PUBLICATION_REFUSAL_CODES
+            and isinstance(message, str)
+            and message.strip()
+        ):
+            return message
+        return None
+    if isinstance(detail, str) and detail in _TERMINAL_WORKSPACE_CONFLICT_DETAILS:
+        return detail
+    return None
 
 __all__ = [
     "ApprovalBackendError",
@@ -41,6 +79,7 @@ __all__ = [
     "CreatedPublication",
     "PublicationCreateRequest",
     "PublicationCreator",
+    "PublicationLineage",
 ]
 
 
@@ -73,6 +112,7 @@ class PublicationCreateRequest:
     expires_in_seconds: int
     title: str
     body: str
+    reply_conversation_id: str | None = None
     max_patch_bytes: int = 900_000
 
     def to_json(self) -> dict[str, Any]:
@@ -80,7 +120,7 @@ class PublicationCreateRequest:
             raise ApprovalBackendError(
                 f"publication patch exceeds {self.max_patch_bytes} raw bytes"
             )
-        return {
+        payload: dict[str, Any] = {
             "deployment_id": str(self.deployment_id),
             "conversation_id": self.conversation_id,
             "repo_full_name": self.repo_full_name,
@@ -99,6 +139,9 @@ class PublicationCreateRequest:
             "title": self.title,
             "body": self.body,
         }
+        if self.reply_conversation_id is not None:
+            payload["reply_conversation_id"] = self.reply_conversation_id
+        return payload
 
 
 @dataclass(frozen=True)
@@ -106,6 +149,25 @@ class CreatedPublication:
     id: str
     approval_id: str
     status: str
+
+
+@dataclass(frozen=True)
+class PublicationLineage:
+    id: uuid.UUID
+    deployment_id: uuid.UUID
+    conversation_id: str
+    repo_full_name: str
+    base_sha: str
+    branch: str
+    pr_number: int | None
+    pr_url: str | None
+    head_sha: str | None
+    state: str
+    version: int
+    latest_revision: int
+    has_pending_revision: bool
+    has_pending_outcome: bool
+    visible_outcome_revision: int
 
 
 class ApprovalBackendError(Exception):
@@ -140,6 +202,13 @@ class PublicationCreator(Protocol):
     """Atomic trusted write seam used only for exact publish provenance."""
 
     async def create_publication(self, request: PublicationCreateRequest) -> CreatedPublication: ...
+
+    async def get_publication_lineage(
+        self,
+        deployment_id: uuid.UUID,
+        conversation_id: str,
+        repo_full_name: str,
+    ) -> PublicationLineage | None: ...
 
 
 class ApprovalReader(Protocol):
@@ -246,6 +315,9 @@ class ApprovalClient:
             )
         except httpx.HTTPError as exc:
             raise ApprovalBackendError(f"publication create failed: {exc}") from exc
+        refusal = _publication_refusal(response)
+        if refusal is not None:
+            raise WorkspaceSelectionRefused(refusal)
         if response.status_code not in (200, 201):
             raise ApprovalBackendError(
                 f"publication create failed: HTTP {response.status_code}: {response.text}"
@@ -259,3 +331,59 @@ class ApprovalClient:
             )
         except (ValueError, KeyError) as exc:
             raise ApprovalBackendError("publication create returned an unusable body") from exc
+
+    async def get_publication_lineage(
+        self,
+        deployment_id: uuid.UUID,
+        conversation_id: str,
+        repo_full_name: str,
+    ) -> PublicationLineage | None:
+        """Read credential-free lineage before choosing a runner route."""
+
+        if not self._worker_headers:
+            return None
+        try:
+            response = await self._client.get(
+                f"{self._publication_url}/lineage",
+                params={
+                    "deployment_id": str(deployment_id),
+                    "conversation_id": conversation_id,
+                    "repo_full_name": repo_full_name,
+                },
+                headers=self._worker_headers,
+                follow_redirects=False,
+            )
+        except httpx.HTTPError as exc:
+            raise ApprovalBackendError(f"publication lineage read failed: {exc}") from exc
+        if response.status_code == 404:
+            return None
+        refusal = _publication_refusal(response)
+        if refusal is not None:
+            raise WorkspaceSelectionRefused(refusal)
+        if response.status_code != 200:
+            raise ApprovalBackendError(
+                f"publication lineage read failed: HTTP {response.status_code}: {response.text}"
+            )
+        try:
+            body = response.json()
+            return PublicationLineage(
+                id=uuid.UUID(str(body["id"])),
+                deployment_id=uuid.UUID(str(body["deployment_id"])),
+                conversation_id=str(body["conversation_id"]),
+                repo_full_name=str(body["repo_full_name"]),
+                base_sha=str(body["base_sha"]),
+                branch=str(body["branch"]),
+                pr_number=int(body["pr_number"]) if body.get("pr_number") is not None else None,
+                pr_url=str(body["pr_url"]) if body.get("pr_url") is not None else None,
+                head_sha=str(body["head_sha"]) if body.get("head_sha") is not None else None,
+                state=str(body["state"]),
+                version=int(body["version"]),
+                latest_revision=int(body["latest_revision"]),
+                has_pending_revision=bool(body["has_pending_revision"]),
+                has_pending_outcome=bool(body["has_pending_outcome"]),
+                visible_outcome_revision=int(body["visible_outcome_revision"]),
+            )
+        except (ValueError, KeyError, TypeError) as exc:
+            raise ApprovalBackendError(
+                "publication lineage read returned an unusable body"
+            ) from exc

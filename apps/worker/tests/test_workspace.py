@@ -57,6 +57,7 @@ class _FakeCommands:
         self.events: list[str] = []
         self.available = True
         self.fail_stage: str | None = None
+        self.head_sha = "a" * 40
 
     def require(self, executable: str) -> None:
         self.calls.append({"require": executable})
@@ -96,6 +97,15 @@ class _FakeCommands:
             (checkout / "README.md").write_text("workspace ready\n")
             return _CommandResult()
 
+        if "fetch" in args:
+            self.events.append("fetch-exact")
+            return _CommandResult()
+
+        if "checkout" in args and "--detach" in args:
+            self.events.append("checkout-detached")
+            self.head_sha = args[-1]
+            return _CommandResult()
+
         if "remote" in args and "set-url" in args:
             self.events.append("set-url")
             assert cwd is not None
@@ -111,7 +121,7 @@ class _FakeCommands:
             return _CommandResult(stdout=f"{value}\n")
 
         if "rev-parse" in args:
-            return _CommandResult(stdout=f"{'a' * 40}\n")
+            return _CommandResult(stdout=f"{self.head_sha}\n")
 
         raise AssertionError(f"unexpected command: {args}")
 
@@ -304,6 +314,89 @@ def test_clone_is_private_full_blob_shallow_and_refuses_redirects(
     assert "http.followRedirects=false" in config_entries
     assert GIT_CREDENTIAL in config_entries
     assert stat.S_IMODE(prepared.checkout_mode) == 0o700
+
+
+def test_lineage_prepare_clones_the_stored_branch_at_the_exact_expected_head(
+    workspace: Any, tmp_path: Path
+) -> None:
+    """A revision starts from the PR head, not the repository default branch."""
+
+    expected_head = "a" * 40
+    branch = "curie/thread-lineage-example"
+    preparer, commands, objects = _preparer(workspace, tmp_path)
+
+    prepared = preparer.prepare_lineage(
+        deployment_id=DEPLOYMENT_ID,
+        thread_key="1700000000.000100",
+        generation="lineage-claim-2",
+        branch=branch,
+        expected_head=expected_head,
+    )
+
+    clone_call = next(call for call in commands.calls if "clone" in call.get("argv", []))
+    assert clone_call["argv"][:2] == ["git", "clone"]
+    assert "--depth=1" in clone_call["argv"]
+    assert "--single-branch" in clone_call["argv"]
+    assert clone_call["argv"][clone_call["argv"].index("--branch") + 1] == branch
+    assert prepared.materialized_head == expected_head
+    assert objects.objects[prepared.object_key]
+    assert GIT_CREDENTIAL.encode() not in objects.objects[prepared.object_key]
+
+
+def test_lineage_prepare_refuses_a_checkout_head_mismatch_before_upload(
+    workspace: Any, tmp_path: Path
+) -> None:
+    commands = _FakeCommands()
+    commands.head_sha = "b" * 40
+    preparer, _, objects = _preparer(workspace, tmp_path, commands=commands)
+
+    with pytest.raises(workspace.WorkspacePreparationError, match="expected lineage head"):
+        preparer.prepare_lineage(
+            deployment_id=DEPLOYMENT_ID,
+            thread_key="1700000000.000100",
+            generation="lineage-claim-stale",
+            branch="curie/thread-lineage-example",
+            expected_head="a" * 40,
+        )
+
+    assert objects.objects == {}
+
+
+def test_headless_lineage_prepare_fetches_exact_base_not_advanced_default(
+    workspace: Any, tmp_path: Path
+) -> None:
+    """A denied first revision rehydrates at its proposal base without a PR branch."""
+
+    expected_base = "a" * 40
+    commands = _FakeCommands()
+    commands.head_sha = "d" * 40
+    preparer, _, objects = _preparer(workspace, tmp_path, commands=commands)
+
+    prepared = preparer.prepare_lineage_base(
+        deployment_id=DEPLOYMENT_ID,
+        thread_key="1700000000.000100",
+        generation="headless-lineage-outcome-1",
+        expected_base=expected_base,
+    )
+
+    clone_call = next(call for call in commands.calls if "clone" in call.get("argv", []))
+    fetch_call = next(call for call in commands.calls if "fetch" in call.get("argv", []))
+    checkout_call = next(call for call in commands.calls if "checkout" in call.get("argv", []))
+    assert "--branch" not in clone_call["argv"]
+    assert fetch_call["argv"] == [
+        "git",
+        "fetch",
+        "--depth=1",
+        "--no-tags",
+        "origin",
+        expected_base,
+    ]
+    assert checkout_call["argv"] == ["git", "checkout", "--detach", expected_base]
+    assert GIT_CREDENTIAL in fetch_call["env"]["GIT_CONFIG_VALUE_1"]
+    assert GIT_CREDENTIAL not in " ".join(fetch_call["argv"])
+    assert prepared.base_sha == expected_base
+    assert prepared.materialized_head == expected_base
+    assert objects.objects[prepared.object_key]
 
 
 def test_internal_workspace_redemption_uses_only_worker_auth_and_deployment_id(
@@ -786,6 +879,8 @@ class _RecordingSubstrate:
         expected: object,
         env: dict[str, str] | None = None,
         workspace_repo: str,
+        workspace_materialized_head: str | None = None,
+        publication_visible_outcome_revision: int = 0,
         agent_name: str | None = None,
         validate_candidate: Callable[[object], None] | None = None,
     ) -> object:
@@ -798,6 +893,8 @@ class _RecordingSubstrate:
                 "expected": expected,
                 "env": payload,
                 "workspace_repo": workspace_repo,
+                "workspace_materialized_head": workspace_materialized_head,
+                "publication_visible_outcome_revision": publication_visible_outcome_revision,
                 "agent_name": agent_name,
                 "candidate": candidate,
             }
@@ -957,6 +1054,7 @@ def test_late_handoff_uses_substrate_handoff_and_keeps_credentials_out_of_claim_
         agent_name="acme-bot",
         repo_full_name="acme-corp/acme-bot",
         replace_handle=old_handle,
+        publication_visible_outcome_revision=2,
         revalidate_before_handoff=lambda: ordering.append("revalidated"),
     )
 
@@ -966,6 +1064,8 @@ def test_late_handoff_uses_substrate_handoff_and_keeps_credentials_out_of_claim_
     handoff = substrate.handoff_calls[0]
     assert handoff["expected"] is old_handle
     assert handoff["workspace_repo"] == "acme-corp/acme-bot"
+    assert handoff["workspace_materialized_head"] == result.prepared.materialized_head
+    assert handoff["publication_visible_outcome_revision"] == 2
     assert handoff["agent_name"] == "acme-bot"
     workspace_env = result.prepared.claim_env()
     assert handoff["env"]["CURIE_WORKSPACE_REF"] == workspace_env["CURIE_WORKSPACE_REF"]
@@ -992,6 +1092,41 @@ def test_late_handoff_uses_substrate_handoff_and_keeps_credentials_out_of_claim_
         for marker in ("AUTHORIZATION", "PASSWORD", "SECRET")
         if name != "CURIE_RUNNER_TOKEN"
     )
+
+
+def test_headless_lineage_claim_owns_original_base_for_later_publication(
+    workspace: Any, tmp_path: Path
+) -> None:
+    expected_base = "a" * 40
+    commands = _FakeCommands()
+    commands.head_sha = "d" * 40
+    preparer, _, _objects = _preparer(workspace, tmp_path, commands=commands)
+    observed: list[dict[str, object]] = []
+
+    class Substrate(_RecordingSubstrate):
+        def claim(self, thread_key: str, **kwargs: object) -> object:
+            observed.append({"thread_key": thread_key, **kwargs})
+            return super().claim(thread_key, **kwargs)
+
+    substrate = Substrate()
+    coordinator = workspace.WorkspaceClaimCoordinator(
+        preparer=preparer,
+        substrate=substrate,
+    )
+
+    result = coordinator.claim_or_resume_with_handle(
+        thread_key="1700000000.000100",
+        deployment_id=DEPLOYMENT_ID,
+        repo_full_name="acme-corp/acme-bot",
+        lineage_base_sha=expected_base,
+        publication_visible_outcome_revision=1,
+    )
+
+    assert result.prepared.base_sha == expected_base
+    assert result.prepared.materialized_head == expected_base
+    assert coordinator.current("1700000000.000100") == result.prepared
+    assert observed[0]["workspace_materialized_head"] == expected_base
+    assert observed[0]["publication_visible_outcome_revision"] == 1
     assert "clone" in commands.events
 
 
@@ -1186,9 +1321,20 @@ def test_late_handoff_fence_loss_restores_prior_durable_ownership(
             expected: object,
             env: dict[str, str] | None = None,
             workspace_repo: str,
+            workspace_materialized_head: str | None = None,
+            publication_visible_outcome_revision: int = 0,
             agent_name: str | None = None,
+            validate_candidate: Callable[[object], None] | None = None,
         ) -> object:
-            del expected, env, workspace_repo, agent_name
+            del (
+                expected,
+                env,
+                workspace_repo,
+                workspace_materialized_head,
+                publication_visible_outcome_revision,
+                agent_name,
+                validate_candidate,
+            )
             self.calls.append(("handoff", thread_key, {}))
             raise RuntimeError("late workspace handoff lost its route fence")
 

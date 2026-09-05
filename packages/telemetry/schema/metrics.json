@@ -977,6 +977,8 @@
           "/publications/{publication_id}",
           "/v1/internal/cluster-message-replies/{reply_ref}",
           "/v1/internal/publications",
+          "/v1/internal/publications/lineage",
+          "/v1/internal/publications/{publication_id}/lineage",
           "/v1/internal/publications/{publication_id}/credential",
           "/v1/internal/workspaces/{deployment_id}/credential",
           "/v1/internal/workspaces/{deployment_id}/selection",
@@ -1003,7 +1005,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 2800
+      "cardinality_bound": 2880
     },
     "curie.http.server.request.duration": {
       "type": "histogram",
@@ -1081,6 +1083,8 @@
           "/publications/{publication_id}",
           "/v1/internal/cluster-message-replies/{reply_ref}",
           "/v1/internal/publications",
+          "/v1/internal/publications/lineage",
+          "/v1/internal/publications/{publication_id}/lineage",
           "/v1/internal/publications/{publication_id}/credential",
           "/v1/internal/workspaces/{deployment_id}/credential",
           "/v1/internal/workspaces/{deployment_id}/selection",
@@ -1107,7 +1111,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 2800
+      "cardinality_bound": 2880
     },
     "curie.http.server.active": {
       "type": "up_down_counter",
@@ -1185,6 +1189,8 @@
           "/publications/{publication_id}",
           "/v1/internal/cluster-message-replies/{reply_ref}",
           "/v1/internal/publications",
+          "/v1/internal/publications/lineage",
+          "/v1/internal/publications/{publication_id}/lineage",
           "/v1/internal/publications/{publication_id}/credential",
           "/v1/internal/workspaces/{deployment_id}/credential",
           "/v1/internal/workspaces/{deployment_id}/selection",
@@ -1204,7 +1210,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 560
+      "cardinality_bound": 576
     },
     "curie.background.loop": {
       "type": "counter",

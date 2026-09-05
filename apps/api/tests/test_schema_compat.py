@@ -20,6 +20,7 @@ from alembic import command
 from alembic.config import Config
 from curie_api.config import get_settings
 from curie_api.schema_compat import (
+    KIND_CONTRACT,
     KIND_EXPAND,
     KIND_IRREVERSIBLE,
     AppWindow,
@@ -36,8 +37,8 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 ALEMBIC_DIR = Path(__file__).resolve().parents[1] / "alembic"
-HEAD = "0040"
-PREV = "0039"
+HEAD = "0041"
+PREV = "0040"
 
 
 def _alembic_config() -> Config:
@@ -80,14 +81,14 @@ def test_released_application_declares_a_machine_readable_window() -> None:
     assert window.schema_min == HEAD
     assert window.schema_head == HEAD
     kinds = load_kinds()
-    assert kinds[HEAD] == KIND_EXPAND
+    assert kinds[HEAD] == KIND_CONTRACT
     assert kinds[PREV] == KIND_EXPAND
     assert kinds["0016"] == KIND_IRREVERSIBLE
 
 
-def test_planner_applies_an_expand_and_marks_rollback_compatible() -> None:
+def test_planner_refuses_0041_contract_without_forward_only() -> None:
     window = AppWindow(schema_min=HEAD, schema_head=HEAD)
-    kinds = {PREV: KIND_EXPAND, HEAD: KIND_EXPAND}
+    kinds = {PREV: KIND_EXPAND, HEAD: KIND_CONTRACT}
     decision = plan_upgrade(
         current_revision=PREV,
         window=window,
@@ -95,10 +96,11 @@ def test_planner_applies_an_expand_and_marks_rollback_compatible() -> None:
         pending=(HEAD,),
         forward_only=False,
     )
-    assert decision.action == "apply"
-    assert decision.rollback_compatible is True
+    assert decision.action == "refuse"
+    assert decision.rollback_compatible is False
     assert decision.pending[0].revision == HEAD
-    assert decision.pending[0].kind == KIND_EXPAND
+    assert decision.pending[0].kind == KIND_CONTRACT
+    assert "forward-only" in decision.reason.lower()
 
 
 def test_planner_refuses_irreversible_before_mutation() -> None:
@@ -151,7 +153,7 @@ def test_already_at_head_is_noop() -> None:
     decision = plan_upgrade(
         current_revision=HEAD,
         window=window,
-        kinds={HEAD: KIND_EXPAND},
+        kinds={HEAD: KIND_CONTRACT},
         pending=(),
         forward_only=False,
     )
@@ -170,11 +172,12 @@ def test_assert_servable_refuses_below_min(isolated_migration_db: None) -> None:
 
 
 def test_n_minus_one_can_serve_an_unknown_newer_expand() -> None:
-    window = AppWindow(schema_min=PREV, schema_head=PREV)
-    known = {PREV, "0038"}
+    future_expand = "0042"
+    window = AppWindow(schema_min=HEAD, schema_head=HEAD)
+    known = {HEAD, PREV}
+    assert can_serve(future_expand, window, known) is True
     assert can_serve(HEAD, window, known) is True
-    assert can_serve(PREV, window, known) is True
-    assert can_serve("0038", window, known) is False
+    assert can_serve(PREV, window, known) is False
     assert can_serve(None, window, known) is False
 
 
@@ -183,9 +186,9 @@ def test_decision_json_is_redacted() -> None:
     decision = plan_upgrade(
         current_revision=PREV,
         window=window,
-        kinds={HEAD: KIND_EXPAND},
+        kinds={HEAD: KIND_CONTRACT},
         pending=(HEAD,),
-        forward_only=False,
+        forward_only=True,
     )
     payload = json.dumps(render_decision(decision))
     lowered = payload.lower()
@@ -196,14 +199,10 @@ def test_decision_json_is_redacted() -> None:
     assert HEAD in payload
 
 
-def test_upgrade_then_n_minus_one_serve_same_nonempty_database(
+def test_0041_contract_requires_forward_only_and_closes_n_minus_one_window(
     isolated_migration_db: None,
 ) -> None:
-    """Upgrade 0039 -> 0040 on one seeded database, then serve as N-1.
-
-    0040 is an expand (nullable column). The N-1 application does not know
-    revision 0040; after the upgrade it must still read the seeded row.
-    """
+    """0041 cannot run while N-1 remains eligible to serve the database."""
     cfg = _alembic_config()
     command.upgrade(cfg, PREV)
     assert current_revision() == PREV
@@ -218,7 +217,7 @@ def test_upgrade_then_n_minus_one_serve_same_nonempty_database(
             "id": approval_id,
             "conversation_id": "th-compat-2300",
             "author": "U1",
-            "summary": "seeded before expand",
+            "summary": "seeded before contract",
             "reply_kind": "slack",
             "reply_channel": "C0EXAMPLE1",
             "reply_placeholder": None,
@@ -226,38 +225,40 @@ def test_upgrade_then_n_minus_one_serve_same_nonempty_database(
         },
     )
 
-    outcome = apply_upgrade(forward_only=False, alembic_config=cfg)
+    refused = apply_upgrade(forward_only=False, alembic_config=cfg)
+    assert refused.action == "refuse"
+    assert refused.outcome == "refused"
+    assert refused.rollback_compatible is False
+    assert refused.pending[0].kind == KIND_CONTRACT
+    assert current_revision() == PREV
+
+    outcome = apply_upgrade(forward_only=True, alembic_config=cfg)
     assert outcome.action == "apply"
     assert outcome.outcome == "applied"
-    assert outcome.rollback_compatible is True
+    assert outcome.rollback_compatible is False
+    assert outcome.forward_only is True
     assert current_revision() == HEAD
 
     rows = _sql(
         "SELECT summary FROM curie.approvals WHERE id = :id",
         {"id": approval_id},
     )
-    assert rows == [("seeded before expand",)]
+    assert rows == [("seeded before contract",)]
 
-    # The expand column exists and is null on the preserved row.
-    col = _sql(
-        "SELECT workspace_conversation_id FROM curie.publications LIMIT 0"
-    )
+    # The contract migration preserves rows, but its new schema is N-only.
+    col = _sql("SELECT outcome_history_ready_at FROM curie.publications LIMIT 0")
     assert col == []
     pubs = _sql(
         "SELECT column_name FROM information_schema.columns "
         "WHERE table_schema = 'curie' AND table_name = 'publications' "
-        "AND column_name = 'workspace_conversation_id'"
+        "AND column_name = 'outcome_history_ready_at'"
     )
-    assert pubs, "0040 expand column must exist after upgrade"
+    assert pubs, "0041 contract column must exist after upgrade"
 
-    n1 = AppWindow(schema_min=PREV, schema_head=PREV)
-    assert can_serve(current_revision(), n1, {PREV}) is True
-
-    # Red-on-revert: the N application (min=0040) refuses a database that
-    # is still at 0039. Expand rollback is application rollback, not schema
-    # downgrade; serving N against the pre-expand revision is the unsupported
-    # direction.
+    # Red-on-revert: min=head=0041 closes the application rollback window.
     n = load_window()
+    assert n.schema_min == HEAD
+    assert n.schema_head == HEAD
     assert can_serve(PREV, n, {PREV, HEAD}) is False
 
 
@@ -281,32 +282,13 @@ def test_crash_retry_does_not_double_apply(
     alembic_copy = tmp_path / "alembic"
     shutil.copytree(ALEMBIC_DIR, alembic_copy)
     versions = alembic_copy / "versions"
-    (versions / "0041_compat_first.py").write_text(
+    (versions / "0042_compat_first.py").write_text(
         '''
-revision = "0041"
-down_revision = "0040"
-
-def upgrade():
-    from alembic import op
-    op.execute(
-        "INSERT INTO curie.compat_probe (rev) VALUES ('0041')"
-    )
-
-def downgrade():
-    from alembic import op
-    op.execute("DELETE FROM curie.compat_probe WHERE rev = '0041'")
-'''
-    )
-    (versions / "0042_compat_second.py").write_text(
-        '''
-import os
 revision = "0042"
 down_revision = "0041"
 
 def upgrade():
     from alembic import op
-    if os.environ.get("CURIE_COMPAT_PROBE_CRASH") == "1":
-        raise RuntimeError("injected crash after 0041")
     op.execute(
         "INSERT INTO curie.compat_probe (rev) VALUES ('0042')"
     )
@@ -314,6 +296,25 @@ def upgrade():
 def downgrade():
     from alembic import op
     op.execute("DELETE FROM curie.compat_probe WHERE rev = '0042'")
+'''
+    )
+    (versions / "0043_compat_second.py").write_text(
+        '''
+import os
+revision = "0043"
+down_revision = "0042"
+
+def upgrade():
+    from alembic import op
+    if os.environ.get("CURIE_COMPAT_PROBE_CRASH") == "1":
+        raise RuntimeError("injected crash after 0042")
+    op.execute(
+        "INSERT INTO curie.compat_probe (rev) VALUES ('0043')"
+    )
+
+def downgrade():
+    from alembic import op
+    op.execute("DELETE FROM curie.compat_probe WHERE rev = '0043'")
 '''
     )
     probe_cfg = Config()
@@ -325,45 +326,45 @@ def downgrade():
             apply_upgrade(
                 forward_only=False,
                 alembic_config=probe_cfg,
-                window=AppWindow(schema_min=HEAD, schema_head="0042"),
+                window=AppWindow(schema_min=HEAD, schema_head="0043"),
                 kinds={
                     **load_kinds(),
-                    "0041": KIND_EXPAND,
                     "0042": KIND_EXPAND,
+                    "0043": KIND_EXPAND,
                 },
             )
     finally:
         os.environ.pop("CURIE_COMPAT_PROBE_CRASH", None)
 
-    assert current_revision() == "0041"
+    assert current_revision() == "0042"
     rows = _sql("SELECT rev FROM curie.compat_probe ORDER BY rev")
-    assert [r[0] for r in rows] == ["0041"]
+    assert [r[0] for r in rows] == ["0042"]
 
     outcome = apply_upgrade(
         forward_only=False,
         alembic_config=probe_cfg,
-        window=AppWindow(schema_min=HEAD, schema_head="0042"),
+        window=AppWindow(schema_min=HEAD, schema_head="0043"),
         kinds={
             **load_kinds(),
-            "0041": KIND_EXPAND,
             "0042": KIND_EXPAND,
+            "0043": KIND_EXPAND,
         },
     )
     assert outcome.outcome == "applied"
-    assert current_revision() == "0042"
+    assert current_revision() == "0043"
     rows = _sql("SELECT rev FROM curie.compat_probe ORDER BY rev")
-    assert [r[0] for r in rows] == ["0041", "0042"]
+    assert [r[0] for r in rows] == ["0042", "0043"]
 
     again = apply_upgrade(
         forward_only=False,
         alembic_config=probe_cfg,
-        window=AppWindow(schema_min=HEAD, schema_head="0042"),
+        window=AppWindow(schema_min=HEAD, schema_head="0043"),
         kinds={
             **load_kinds(),
-            "0041": KIND_EXPAND,
             "0042": KIND_EXPAND,
+            "0043": KIND_EXPAND,
         },
     )
     assert again.action == "noop"
     rows = _sql("SELECT rev FROM curie.compat_probe ORDER BY rev")
-    assert [r[0] for r in rows] == ["0041", "0042"]
+    assert [r[0] for r in rows] == ["0042", "0043"]

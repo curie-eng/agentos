@@ -134,6 +134,8 @@ class SandboxSubstrate:
         env: dict[str, str] | None = None,
         agent_name: str | None = None,
         workspace_repo: str | None = None,
+        workspace_materialized_head: str | None = None,
+        publication_visible_outcome_revision: int = 0,
     ) -> SandboxHandle:
         """Return the thread's live sandbox, claiming a warm one if needed.
 
@@ -172,6 +174,10 @@ class SandboxSubstrate:
                         state=RouteState.LIVE,
                         agent_name=agent_name,
                         workspace_repo=workspace_repo,
+                        workspace_materialized_head=workspace_materialized_head,
+                        publication_visible_outcome_revision=(
+                            publication_visible_outcome_revision
+                        ),
                     )
                     outcome = "claimed"
             except Exception as exc:
@@ -253,6 +259,8 @@ class SandboxSubstrate:
         expected: SandboxHandle,
         env: dict[str, str],
         workspace_repo: str,
+        workspace_materialized_head: str | None = None,
+        publication_visible_outcome_revision: int = 0,
         agent_name: str | None = None,
         validate_candidate: Callable[[SandboxHandle], None] | None = None,
     ) -> SandboxHandle:
@@ -276,6 +284,8 @@ class SandboxSubstrate:
             history_ref=expected.history_ref,
             agent_name=agent_name,
             workspace_repo=workspace_repo,
+            workspace_materialized_head=workspace_materialized_head,
+            publication_visible_outcome_revision=publication_visible_outcome_revision,
             generation=expected.generation + 1,
             publish=False,
         )
@@ -354,6 +364,9 @@ class SandboxSubstrate:
         *,
         env: dict[str, str] | None = None,
         agent_name: str | None = None,
+        workspace_repo: str | None = None,
+        workspace_materialized_head: str | None = None,
+        publication_visible_outcome_revision: int | None = None,
     ) -> SandboxHandle:
         """Rehydrate a suspended thread into a fresh claim.
 
@@ -400,7 +413,15 @@ class SandboxSubstrate:
                     session_id=old.session_id,
                     history_ref=old.history_ref,
                     agent_name=agent_name,
-                    workspace_repo=old.workspace_repo,
+                    workspace_repo=workspace_repo or old.workspace_repo,
+                    workspace_materialized_head=(
+                        workspace_materialized_head or old.workspace_materialized_head
+                    ),
+                    publication_visible_outcome_revision=(
+                        publication_visible_outcome_revision
+                        if publication_visible_outcome_revision is not None
+                        else old.publication_visible_outcome_revision
+                    ),
                     generation=old.generation + 1,
                 )
             except Exception as exc:
@@ -605,6 +626,8 @@ class SandboxSubstrate:
         history_ref: str | None = None,
         agent_name: str | None = None,
         workspace_repo: str | None = None,
+        workspace_materialized_head: str | None = None,
+        publication_visible_outcome_revision: int = 0,
         generation: int = 0,
         publish: bool = True,
     ) -> SandboxHandle:
@@ -647,6 +670,8 @@ class SandboxSubstrate:
             history_ref=(env or {}).get(HISTORY_ENV) or history_ref,
             token=(env or {}).get(RUNNER_TOKEN_ENV, ""),
             workspace_repo=workspace_repo,
+            workspace_materialized_head=workspace_materialized_head,
+            publication_visible_outcome_revision=publication_visible_outcome_revision,
             generation=generation,
         )
         if not publish:

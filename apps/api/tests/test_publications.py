@@ -38,6 +38,7 @@ from curie_api.main import create_app
 from curie_api.resumequeue import ResumeQueue
 from curie_api.schemas import ChannelBindingWrite, PublicationCreate
 from curie_api.sweeper import sweep_expired_approvals
+from curie_telemetry import record_metric
 from curie_test_support.valkey import connect_or_skip
 from fastapi import Response
 from fastapi.testclient import TestClient
@@ -50,6 +51,11 @@ WORKER_TOKEN = "remote-dev-publication-worker-token"
 WORKER_HEADERS = {"X-Curie-Worker-Token": WORKER_TOKEN}
 PATCH_LIMIT = 900_000
 BASE_SHA = "0123456789abcdef0123456789abcdef01234567"
+FIRST_REVISION_SHA = "1123456789abcdef0123456789abcdef01234567"
+SECOND_REVISION_SHA = "2123456789abcdef0123456789abcdef01234567"
+EXTERNAL_REVISION_SHA = "3123456789abcdef0123456789abcdef01234567"
+PR_NUMBER = 123
+PR_URL = f"https://github.com/{REPO}/pull/{PR_NUMBER}"
 CLUSTER_MESSAGE_ADAPTER = "curie-cluster-message"
 _PUBLICATION_TRACEPARENT = "00-7123456789abcdef0123456789abcdef-7123456789abcdef-01"
 _REPLAY_TRACEPARENT = "00-8123456789abcdef0123456789abcdef-8123456789abcdef-01"
@@ -125,10 +131,12 @@ def _publication_payload(
     dedupe_key: str | None = None,
     author: str = "U0REQUEST1",
     expires_in_seconds: int | None = 600,
+    conversation_id: str | None = None,
+    base_sha: str = BASE_SHA,
 ) -> dict[str, Any]:
     return {
         "deployment_id": deployment_id,
-        "conversation_id": f"thread-{uuid.uuid4().hex[:8]}",
+        "conversation_id": conversation_id or f"thread-{uuid.uuid4().hex[:8]}",
         "repo_full_name": REPO,
         "author": author,
         "summary": "Publish the repository changes",
@@ -136,7 +144,7 @@ def _publication_payload(
         "reply_channel": "C0EXAMPLE1",
         "reply_placeholder": "1700000000.000001",
         "dedupe_key": dedupe_key or f"publish-{uuid.uuid4().hex}",
-        "base_sha": BASE_SHA,
+        "base_sha": base_sha,
         "patch_b64": base64.b64encode(patch).decode(),
         "changed_paths": ["README.md"],
         "expires_in_seconds": expires_in_seconds,
@@ -144,7 +152,10 @@ def _publication_payload(
 
 
 def _workspace_identity(payload: Mapping[str, Any]) -> str:
-    """Derive the authorization key from the unchanged adapter reply tuple."""
+    """Return the canonical authorization key for either worker request shape."""
+
+    if payload.get("reply_conversation_id") is not None:
+        return str(payload["conversation_id"])
 
     return channel_protocol.scoped_conversation_id(
         str(payload["reply_kind"]),
@@ -280,6 +291,129 @@ def _create_publication(
     )
     assert response.status_code in (200, 201), response.text
     return response.status_code, response.json()
+
+
+def _get_lineage(
+    client: TestClient,
+    *,
+    deployment_id: str,
+    conversation_id: str,
+    repo_full_name: str = REPO,
+) -> Any:
+    """Call the current worker endpoint with its canonical scoped identity."""
+
+    return client.get(
+        "/v1/internal/publications/lineage",
+        params={
+            "deployment_id": deployment_id,
+            "conversation_id": channel_protocol.scoped_conversation_id(
+                "slack", "C0EXAMPLE1", conversation_id
+            ),
+            "repo_full_name": repo_full_name,
+        },
+        headers=WORKER_HEADERS,
+    )
+
+
+def _advance_lineage(
+    client: TestClient,
+    publication_id: str,
+    *,
+    expected_version: int,
+    expected_head_sha: str | None,
+    head_sha: str,
+    state: str = "open",
+    pr_number: int = PR_NUMBER,
+    pr_url: str = PR_URL,
+) -> Any:
+    return client.patch(
+        f"/v1/internal/publications/{publication_id}/lineage",
+        json={
+            "expected_version": expected_version,
+            "expected_head_sha": expected_head_sha,
+            "state": state,
+            "pr_number": pr_number,
+            "pr_url": pr_url,
+            "head_sha": head_sha,
+        },
+        headers=WORKER_HEADERS,
+    )
+
+
+def _mark_outcome_history_ready(publication_id: str) -> None:
+    """Stand in for the worker transcript outbox in API-only lineage tests."""
+
+    _execute(
+        "UPDATE curie.publications SET outcome_history_ready_at = now() "
+        "WHERE id = :id",
+        {"id": uuid.UUID(publication_id)},
+    )
+
+
+def _open_lineage(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    *,
+    conversation_id: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    deployment = _create_deployment(client, auth_headers)
+    _, publication = _create_publication(
+        client,
+        _publication_payload(
+            deployment["id"],
+            conversation_id=conversation_id,
+            dedupe_key=f"{conversation_id}-revision-one",
+        ),
+    )
+    approved = _resolve(client, auth_headers, publication["approval_id"])
+    assert approved.status_code == 200, approved.text
+    advanced = _advance_lineage(
+        client,
+        publication["id"],
+        expected_version=1,
+        expected_head_sha=None,
+        head_sha=FIRST_REVISION_SHA,
+    )
+    assert advanced.status_code == 200, advanced.text
+    _mark_outcome_history_ready(publication["id"])
+    return deployment, publication
+
+
+def _get_lineage_with_http(
+    client: TestClient,
+    *,
+    deployment_id: str,
+    conversation_id: str,
+    handler: Any,
+) -> Any:
+    injected = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    original = client.app.state.http_client
+    client.app.state.http_client = injected
+    try:
+        return _get_lineage(
+            client,
+            deployment_id=deployment_id,
+            conversation_id=conversation_id,
+        )
+    finally:
+        client.app.state.http_client = original
+        asyncio.run(injected.aclose())
+
+
+def _healthy_github_pr(*, branch: str, head_sha: str) -> httpx.Response:
+    """A verified-open GitHub response for lineage/CAS control reads."""
+
+    return httpx.Response(
+        200,
+        json={
+            "number": PR_NUMBER,
+            "html_url": PR_URL,
+            "state": "open",
+            "merged": False,
+            "base": {"ref": "main", "sha": BASE_SHA},
+            "head": {"ref": branch, "sha": head_sha},
+        },
+    )
 
 
 def _rows(query: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
@@ -572,7 +706,7 @@ def test_publication_replay_refuses_a_changed_conversation_or_agent_identity(
     assert _counts() == (1, 1)
 
 
-def test_legacy_publication_replay_uses_only_its_bare_authorization_lane(
+def test_null_workspace_publication_replay_refuses_bare_authorization_fallback(
     publication_stack: tuple[TestClient, str],
     auth_headers: dict[str, str],
     clean_db: None,
@@ -586,8 +720,7 @@ def test_legacy_publication_replay_uses_only_its_bare_authorization_lane(
     exact = client.post(
         "/v1/internal/publications", json=payload, headers=WORKER_HEADERS
     )
-    assert exact.status_code == 200, exact.text
-    assert exact.json()["id"] == publication["id"]
+    assert exact.status_code == 409
     assert _rows(
         "SELECT workspace_conversation_id FROM curie.publications WHERE id = :id",
         {"id": publication["id"]},
@@ -600,19 +733,6 @@ def test_legacy_publication_replay_uses_only_its_bare_authorization_lane(
     )
     assert crossed.status_code == 409
 
-    _execute(
-        "DELETE FROM curie.thread_workspaces "
-        "WHERE selected_by_deployment_id = :deployment_id "
-        "AND conversation_id = :conversation_id",
-        {
-            "deployment_id": deployment["id"],
-            "conversation_id": payload["conversation_id"],
-        },
-    )
-    revoked = client.post(
-        "/v1/internal/publications", json=payload, headers=WORKER_HEADERS
-    )
-    assert revoked.status_code == 409
     assert _counts() == (1, 1)
 
 
@@ -635,6 +755,146 @@ def test_legacy_publication_replay_rechecks_the_current_allowlist(
     )
     assert replay.status_code == 409
     assert _counts() == (1, 1)
+
+
+def test_publication_splits_scoped_thread_identity_from_slack_reply_identity(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    from curie_worker.publication_store import PostgresPublicationStore
+    from curie_worker.slack_sink import _thread_ts
+
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    scoped_thread = "slack:C0EXAMPLE1:1700000000.000100"
+    reply_thread = "1700000000.000100"
+    payload = _publication_payload(
+        deployment["id"],
+        conversation_id=scoped_thread,
+        dedupe_key="scoped-thread-bare-slack-reply",
+    )
+    payload["reply_conversation_id"] = reply_thread
+
+    status_code, publication = _create_publication(client, payload)
+
+    assert status_code == 201
+    assert _rows(
+        "SELECT a.conversation_id AS reply_conversation_id, "
+        "l.conversation_id AS lineage_conversation_id "
+        "FROM curie.publications p "
+        "JOIN curie.approvals a ON a.id = p.approval_id "
+        "JOIN curie.thread_publication_lineages l ON l.id = p.lineage_id "
+        "WHERE p.id = :id",
+        {"id": publication["id"]},
+    ) == [
+        {
+            "reply_conversation_id": reply_thread,
+            "lineage_conversation_id": scoped_thread,
+        }
+    ]
+    assert _thread_ts(reply_thread) == reply_thread
+    assert _thread_ts(scoped_thread) is None
+
+    replay = client.post(
+        "/v1/internal/publications", json=payload, headers=WORKER_HEADERS
+    )
+    assert replay.status_code == 200, replay.text
+    changed_reply = dict(payload, reply_conversation_id="1700000000.000200")
+    conflict = client.post(
+        "/v1/internal/publications", json=changed_reply, headers=WORKER_HEADERS
+    )
+    assert conflict.status_code == 409
+
+    async def claim_outboxes() -> tuple[Any, Any]:
+        engine = create_async_engine(get_settings().database_url)
+        store = PostgresPublicationStore(
+            engine, schema="curie", lease_owner="split-identity-outbox"
+        )
+        try:
+            card = await store.claim_pending_card()
+            assert card is not None
+            await store.mark_card_delivered(card.publication_id)
+            approved = _resolve(client, auth_headers, publication["approval_id"])
+            assert approved.status_code == 200, approved.text
+            work = await store.claim_next()
+            assert work is not None
+            await store.persist_result(
+                work.publication_id,
+                outcome="failed",
+                pr_url=None,
+                error="safe terminal fixture",
+            )
+            cleanup = await store.claim_pending_cleanup()
+            assert cleanup is not None
+            await store.mark_cleanup_completed(cleanup.publication_id)
+            result = await store.pending_result(work.publication_id)
+            assert result is not None
+            return card, result
+        finally:
+            await engine.dispose()
+
+    card, result = asyncio.run(claim_outboxes())
+    assert card.target.conversation_id == reply_thread
+    assert result.target.conversation_id == reply_thread
+    assert result.workspace_conversation_id == scoped_thread
+
+
+def test_old_worker_publication_falls_back_to_one_conversation_identity(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    from curie_worker.publication_store import PostgresPublicationStore
+
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    payload = _publication_payload(
+        deployment["id"],
+        conversation_id="legacy-worker-conversation",
+        dedupe_key="legacy-worker-without-reply-conversation",
+    )
+
+    _, publication = _create_publication(client, payload)
+
+    stored = _rows(
+        "SELECT a.conversation_id AS reply_conversation_id, "
+        "l.conversation_id AS lineage_conversation_id "
+        "FROM curie.publications p "
+        "JOIN curie.approvals a ON a.id = p.approval_id "
+        "JOIN curie.thread_publication_lineages l ON l.id = p.lineage_id "
+        "WHERE p.id = :id",
+        {"id": publication["id"]},
+    )
+    assert stored == [
+        {
+            "reply_conversation_id": payload["conversation_id"],
+            "lineage_conversation_id": _workspace_identity(payload),
+        }
+    ]
+
+    _execute(
+        "UPDATE curie.publications "
+        "SET lineage_id = NULL, status = 'denied', patch_bytes = NULL, "
+        "approval_card_delivery_dead_lettered_at = now(), terminal_at = now() "
+        "WHERE id = :id",
+        {"id": publication["id"]},
+    )
+
+    async def claim_legacy_result() -> Any:
+        engine = create_async_engine(get_settings().database_url)
+        store = PostgresPublicationStore(
+            engine, schema="curie", lease_owner="legacy-lineageless-result"
+        )
+        try:
+            return await store.pending_result(uuid.UUID(publication["id"]))
+        finally:
+            await engine.dispose()
+
+    result = asyncio.run(claim_legacy_result())
+    assert result is not None
+    assert result.target.conversation_id == payload["conversation_id"]
+    assert result.workspace_conversation_id == _workspace_identity(payload)
 
 
 def test_exact_publication_replay_rechecks_the_current_thread_selection(
@@ -981,9 +1241,7 @@ def test_publication_result_store_separates_history_identity_from_bare_reply_rou
 
     result = asyncio.run(claim())
     assert result is not None
-    assert result.workspace_conversation_id == (
-        payload["conversation_id"] if legacy else _workspace_identity(payload)
-    )
+    assert result.workspace_conversation_id == _workspace_identity(payload)
     assert result.target.kind == payload["reply_kind"]
     assert result.target.address == payload["reply_channel"]
     assert result.target.conversation_id == payload["conversation_id"]
@@ -996,7 +1254,10 @@ def test_publication_card_and_result_claims_survive_process_replacement(
 ) -> None:
     """Expired leases reclaim, while failed result delivery observes backoff."""
 
-    from curie_worker.publication_store import PostgresPublicationStore
+    from curie_worker.publication_store import (
+        PostgresPublicationStore,
+        PublicationStoreError,
+    )
 
     client, _ = publication_stack
     deployment = _create_deployment(client, auth_headers)
@@ -1089,6 +1350,11 @@ def test_publication_card_and_result_claims_survive_process_replacement(
                 )
             retried_result = await first.pending_result(job.publication_id)
             assert retried_result is not None
+            with pytest.raises(
+                PublicationStoreError, match="publication result delivery CAS was lost"
+            ):
+                await first.mark_result_delivered(retried_result.publication_id)
+            await first.mark_outcome_history_ready(retried_result.publication_id)
             await first.mark_result_delivered(retried_result.publication_id)
             return (
                 abandoned_card.attempt,
@@ -1515,6 +1781,7 @@ class _LocalWorkspacePreparer:
             clean_clone_url=credential.clone_url,
             repo_full_name=credential.repo_full_name,
             base_sha=base_sha,
+            materialized_head=base_sha,
             checkout_mode=0o700,
             reference=self._workspace.WorkspaceRef(
                 url=f"https://objects.example.test/{object_key}",
@@ -1580,9 +1847,10 @@ class _RecordingWorkspaceCoordinator:
 def _testclient_transport(client: TestClient) -> Any:
     def transport(**request: Any) -> Any:
         parsed = urlsplit(str(request["url"]))
+        target = parsed.path + (f"?{parsed.query}" if parsed.query else "")
         response = client.request(
             str(request["method"]),
-            parsed.path,
+            target,
             headers=dict(request["headers"]),
             content=request.get("body"),
             follow_redirects=bool(request.get("allow_redirects", False)),
@@ -1662,7 +1930,6 @@ def test_coder_path_reaches_the_publication_boundary_through_real_runner_and_api
     runner_token = "coder-publication-runner-token"
     deployment = _create_deployment(client, auth_headers)
     conversation_id = "1700000000.000100"
-
     # A real, credential-free checkout supplies both the runner snapshot and
     # the worker's independently rehashed retained base.
     repo, base_sha, base_archive = _local_publication_repository(tmp_path, REPO)
@@ -1780,9 +2047,12 @@ def test_coder_path_reaches_the_publication_boundary_through_real_runner_and_api
         requests: list[dict[str, Any]] = []
 
         def approval_transport(request: httpx.Request) -> httpx.Response:
+            target = request.url.path
+            if request.url.query:
+                target += f"?{request.url.query.decode()}"
             response = client.request(
                 request.method,
-                request.url.path,
+                target,
                 headers=dict(request.headers),
                 content=request.content,
             )
@@ -1942,7 +2212,8 @@ def test_coder_path_reaches_the_publication_boundary_through_real_runner_and_api
     assert statuses == [201]
     assert len(requests) == 1
     assert "workspace_conversation_id" not in requests[0]
-    assert requests[0]["conversation_id"] == conversation_id
+    assert requests[0]["conversation_id"] == scoped
+    assert requests[0]["reply_conversation_id"] == conversation_id
     assert release_keys == [scoped]
     assert len(claims) == 1
     assert claims[0][0] == scoped
@@ -2130,9 +2401,12 @@ def test_kernel_publications_isolate_same_timestamp_across_slack_channels(
         requests: list[dict[str, Any]] = []
 
         def approval_transport(request: httpx.Request) -> httpx.Response:
+            target = request.url.path
+            if request.url.query:
+                target += f"?{request.url.query.decode()}"
             response = client.request(
                 request.method,
-                request.url.path,
+                target,
                 headers=dict(request.headers),
                 content=request.content,
             )
@@ -2718,7 +2992,7 @@ def test_publication_credential_is_approved_only_server_derived_and_audited(
 
 
 @pytest.mark.parametrize("legacy", [False, True])
-def test_publication_credential_rechecks_the_current_scoped_or_legacy_selection(
+def test_publication_credential_rechecks_canonical_selection_and_refuses_bare_fallback(
     publication_stack: tuple[TestClient, str],
     auth_headers: dict[str, str],
     clean_db: None,
@@ -2738,6 +3012,16 @@ def test_publication_credential_rechecks_the_current_scoped_or_legacy_selection(
     url = f"/v1/internal/publications/{publication['id']}/credential"
 
     issued = client.post(url, headers=WORKER_HEADERS)
+    if legacy:
+        assert issued.status_code == 403
+        audit = _rows(
+            "SELECT outcome, detail FROM curie.credential_redemption_audit_entries "
+            "WHERE publication_id = :id ORDER BY created_at, id",
+            {"id": publication["id"]},
+        )
+        assert [row["outcome"] for row in audit] == ["refused"]
+        assert "ghp_publication_operator" not in json.dumps(audit, default=str)
+        return
     assert issued.status_code == 200, issued.text
 
     _execute(
@@ -2746,9 +3030,7 @@ def test_publication_credential_rechecks_the_current_scoped_or_legacy_selection(
         "AND conversation_id = :conversation_id",
         {
             "deployment_id": deployment["id"],
-            "conversation_id": (
-                payload["conversation_id"] if legacy else _workspace_identity(payload)
-            ),
+            "conversation_id": _workspace_identity(payload),
         },
     )
     refused = client.post(url, headers=WORKER_HEADERS)
@@ -2762,6 +3044,51 @@ def test_publication_credential_rechecks_the_current_scoped_or_legacy_selection(
     )
     assert [row["outcome"] for row in audit] == ["issued", "refused"]
     assert "ghp_publication_operator" not in json.dumps(audit, default=str)
+
+
+def test_publication_credential_authorization_uses_scoped_lineage_identity(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    scoped_thread = "slack:C0EXAMPLE1:1700000000.000100"
+    reply_thread = "1700000000.000100"
+    payload = _publication_payload(
+        deployment["id"],
+        conversation_id=scoped_thread,
+        dedupe_key="scoped-workspace-credential-authorization",
+    )
+    payload["reply_conversation_id"] = reply_thread
+    _, publication = _create_publication(client, payload)
+    approved = _resolve(client, auth_headers, publication["approval_id"])
+    assert approved.status_code == 200, approved.text
+    url = f"/v1/internal/publications/{publication['id']}/credential"
+
+    issued = client.post(url, headers=WORKER_HEADERS)
+    assert issued.status_code == 200, issued.text
+
+    _execute(
+        "DELETE FROM curie.thread_workspaces "
+        "WHERE selected_by_deployment_id = :deployment_id "
+        "AND conversation_id = :conversation_id",
+        {"deployment_id": deployment["id"], "conversation_id": scoped_thread},
+    )
+    bare_selection = client.post(
+        f"/v1/internal/workspaces/{deployment['id']}/selection",
+        json={
+            "conversation_id": reply_thread,
+            "author": payload["author"],
+            "repo_full_name": REPO,
+        },
+        headers=WORKER_HEADERS,
+    )
+    assert bare_selection.status_code == 200, bare_selection.text
+
+    refused = client.post(url, headers=WORKER_HEADERS)
+    assert refused.status_code == 403
+    assert "authorized" in refused.json()["detail"]
 
 
 def test_disabled_deployment_flag_still_allows_authorized_publication(
@@ -2903,3 +3230,1123 @@ def test_terminal_patch_retention_reaps_bytes_but_keeps_public_metadata(
     assert read.json()["status"] == "succeeded"
     assert read.json()["result_url"].endswith("/pull/123")
     _assert_patch_private(read.json(), "terminal-private-patch")
+
+
+def test_two_publication_revisions_advance_one_durable_thread_lineage(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    """Each approved snapshot advances one branch and one PR by an exact head."""
+
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    conversation_id = "thread-two-revisions"
+    first_payload = _publication_payload(
+        deployment["id"],
+        conversation_id=conversation_id,
+        dedupe_key="lineage-revision-one",
+    )
+
+    first_status, first = _create_publication(client, first_payload)
+
+    assert first_status == 201
+    lineage_id = first["lineage_id"]
+    uuid.UUID(lineage_id)
+    assert first["revision_number"] == 1
+    assert first["expected_prior_head"] == BASE_SHA
+    assert first["lineage_base_sha"] == BASE_SHA
+    assert first["lineage_head_sha"] is None
+    assert first["lineage_state"] == "open"
+    assert first["lineage_version"] == 1
+    assert first["pr_number"] is None
+    assert first["pr_url"] is None
+    assert first["branch"].startswith("curie/publication-")
+
+    approved = _resolve(client, auth_headers, first["approval_id"])
+    assert approved.status_code == 200, approved.text
+    advanced = _advance_lineage(
+        client,
+        first["id"],
+        expected_version=1,
+        expected_head_sha=None,
+        head_sha=FIRST_REVISION_SHA,
+    )
+    assert advanced.status_code == 200, advanced.text
+    assert {
+        key: advanced.json()[key]
+        for key in (
+            "id",
+            "deployment_id",
+            "conversation_id",
+            "repo_full_name",
+            "base_sha",
+            "branch",
+            "pr_number",
+            "pr_url",
+            "head_sha",
+            "state",
+            "version",
+            "latest_revision",
+        )
+    } == {
+        "id": lineage_id,
+        "deployment_id": deployment["id"],
+        "conversation_id": _workspace_identity(first_payload),
+        "repo_full_name": REPO,
+        "base_sha": BASE_SHA,
+        "branch": first["branch"],
+        "pr_number": PR_NUMBER,
+        "pr_url": PR_URL,
+        "head_sha": FIRST_REVISION_SHA,
+        "state": "open",
+        "version": 2,
+        "latest_revision": 1,
+    }
+    assert (
+        client.get(f"/publications/{first['id']}", headers=auth_headers).json()[
+            "status"
+        ]
+        == "succeeded"
+    )
+    assert advanced.json()["has_pending_outcome"] is True
+    assert advanced.json()["visible_outcome_revision"] == 0
+    _mark_outcome_history_ready(first["id"])
+
+    second_payload = _publication_payload(
+        deployment["id"],
+        conversation_id=conversation_id,
+        base_sha=FIRST_REVISION_SHA,
+        dedupe_key="lineage-revision-two",
+    )
+    second_status, second = _create_publication(client, second_payload)
+
+    assert second_status == 201
+    assert second["lineage_id"] == lineage_id
+    assert second["revision_number"] == 2
+    assert second["expected_prior_head"] == FIRST_REVISION_SHA
+    assert second["branch"] == first["branch"]
+    assert second["pr_number"] == PR_NUMBER
+    assert second["pr_url"] == PR_URL
+    assert second["lineage_head_sha"] == FIRST_REVISION_SHA
+    assert second["lineage_version"] == 2
+
+    approved = _resolve(client, auth_headers, second["approval_id"])
+    assert approved.status_code == 200, approved.text
+    advanced = _advance_lineage(
+        client,
+        second["id"],
+        expected_version=2,
+        expected_head_sha=FIRST_REVISION_SHA,
+        head_sha=SECOND_REVISION_SHA,
+    )
+    assert advanced.status_code == 200, advanced.text
+    assert advanced.json()["id"] == lineage_id
+    assert advanced.json()["head_sha"] == SECOND_REVISION_SHA
+    assert advanced.json()["version"] == 3
+    assert advanced.json()["latest_revision"] == 2
+    assert advanced.json()["has_pending_outcome"] is True
+    assert advanced.json()["visible_outcome_revision"] == 1
+
+    current = _get_lineage_with_http(
+        client,
+        deployment_id=deployment["id"],
+        conversation_id=conversation_id,
+        handler=lambda _request: _healthy_github_pr(
+            branch=first["branch"], head_sha=SECOND_REVISION_SHA
+        ),
+    )
+    assert current.status_code == 200, current.text
+    assert current.json() == advanced.json()
+    assert _counts() == (2, 2)
+    assert _rows("SELECT count(*) AS count FROM curie.thread_publication_lineages") == [
+        {"count": 1}
+    ]
+
+
+def test_concurrent_first_revisions_create_one_lineage_and_one_approval(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    conversation_id = "thread-concurrent-first-revision"
+    selected = client.post(
+        f"/v1/internal/workspaces/{deployment['id']}/selection",
+        json={
+            "conversation_id": channel_protocol.scoped_conversation_id(
+                "slack", "C0EXAMPLE1", conversation_id
+            ),
+            "author": "U0REQUEST1",
+            "repo_full_name": REPO,
+        },
+        headers=WORKER_HEADERS,
+    )
+    assert selected.status_code == 200, selected.text
+    payloads = [
+        _publication_payload(
+            deployment["id"],
+            conversation_id=conversation_id,
+            dedupe_key=f"concurrent-lineage-{index}",
+        )
+        for index in range(2)
+    ]
+
+    def attempt(payload: dict[str, Any]) -> Any:
+        return client.post(
+            "/v1/internal/publications", json=payload, headers=WORKER_HEADERS
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(attempt, payloads))
+
+    assert sorted(response.status_code for response in responses) == [201, 409]
+    conflict = next(response for response in responses if response.status_code == 409)
+    assert conflict.json()["detail"]["code"] == "publication.revision_conflict"
+    winner = next(response.json() for response in responses if response.status_code == 201)
+    assert winner["revision_number"] == 1
+    assert winner["pr_number"] is None
+    assert winner["lineage_head_sha"] is None
+    assert _counts() == (1, 1)
+    assert _rows("SELECT count(*) AS count FROM curie.thread_publication_lineages") == [
+        {"count": 1}
+    ]
+
+
+def test_denied_first_revision_leaves_absent_pr_create_path_available(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    conversation_id = "thread-denied-first-revision"
+    _, first = _create_publication(
+        client,
+        _publication_payload(
+            deployment["id"],
+            conversation_id=conversation_id,
+            dedupe_key="denied-lineage-one",
+        ),
+    )
+    denied = _resolve(
+        client,
+        auth_headers,
+        first["approval_id"],
+        decision="rejected",
+    )
+    assert denied.status_code == 200, denied.text
+
+    after_denial = _get_lineage(
+        client,
+        deployment_id=deployment["id"],
+        conversation_id=conversation_id,
+    )
+    assert after_denial.status_code == 200, after_denial.text
+    assert after_denial.json()["pr_number"] is None
+    assert after_denial.json()["pr_url"] is None
+    assert after_denial.json()["head_sha"] is None
+    assert after_denial.json()["version"] == 1
+    assert after_denial.json()["has_pending_outcome"] is True
+    assert after_denial.json()["visible_outcome_revision"] == 0
+
+    blocked = client.post(
+        "/v1/internal/publications",
+        json=_publication_payload(
+            deployment["id"],
+            conversation_id=conversation_id,
+            dedupe_key="denied-lineage-two",
+        ),
+        headers=WORKER_HEADERS,
+    )
+    assert blocked.status_code == 409
+    assert blocked.json()["detail"]["code"] == "publication.outcome_pending"
+
+    _mark_outcome_history_ready(first["id"])
+    visible = _get_lineage(
+        client,
+        deployment_id=deployment["id"],
+        conversation_id=conversation_id,
+    )
+    assert visible.status_code == 200, visible.text
+    assert visible.json()["has_pending_outcome"] is False
+    assert visible.json()["visible_outcome_revision"] == 1
+    status_code, retry = _create_publication(
+        client,
+        _publication_payload(
+            deployment["id"],
+            conversation_id=conversation_id,
+            dedupe_key="denied-lineage-two-ready",
+        ),
+    )
+    assert status_code == 201
+    assert retry["lineage_id"] == first["lineage_id"]
+    assert retry["revision_number"] == 2
+    assert retry["branch"] == first["branch"]
+    assert retry["expected_prior_head"] == BASE_SHA
+    assert retry["pr_number"] is None
+    assert retry["pr_url"] is None
+    assert retry["lineage_head_sha"] is None
+    assert _counts() == (2, 2)
+
+
+def test_redeployment_reuses_agent_owned_thread_lineage(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    client, _ = publication_stack
+    first_deployment = _create_deployment(client, auth_headers)
+    conversation_id = "thread-same-agent-redeployment"
+    _, first = _create_publication(
+        client,
+        _publication_payload(
+            first_deployment["id"],
+            conversation_id=conversation_id,
+            dedupe_key="same-agent-redeployment-one",
+        ),
+    )
+    assert _resolve(client, auth_headers, first["approval_id"]).status_code == 200
+    advanced = _advance_lineage(
+        client,
+        first["id"],
+        expected_version=1,
+        expected_head_sha=None,
+        head_sha=FIRST_REVISION_SHA,
+    )
+    assert advanced.status_code == 200, advanced.text
+    _mark_outcome_history_ready(first["id"])
+
+    agent_id = first_deployment["agent_id"]
+    version = client.post(
+        f"/agents/{agent_id}/versions",
+        json={"version_label": "v2", "created_by": "operator"},
+        headers=auth_headers,
+    )
+    assert version.status_code == 201, version.text
+    redeployment = client.post(
+        "/deployments",
+        json={
+            "agent_id": agent_id,
+            "version_id": version.json()["id"],
+            "environment": "dev",
+            "workspace_enabled": True,
+        },
+        headers=auth_headers,
+    )
+    assert redeployment.status_code == 201, redeployment.text
+
+    _, second = _create_publication(
+        client,
+        _publication_payload(
+            redeployment.json()["id"],
+            conversation_id=conversation_id,
+            base_sha=FIRST_REVISION_SHA,
+            dedupe_key="same-agent-redeployment-two",
+        ),
+    )
+    assert second["lineage_id"] == first["lineage_id"]
+    assert second["branch"] == first["branch"]
+    assert second["pr_number"] == PR_NUMBER
+    assert second["revision_number"] == 2
+    assert _rows("SELECT count(*) AS count FROM curie.thread_publication_lineages") == [
+        {"count": 1}
+    ]
+
+
+def test_same_thread_and_repo_are_isolated_between_agents(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    client, _ = publication_stack
+    first_deployment = _create_deployment(client, auth_headers, channel="C0EXAMPLE1")
+    second_deployment = _create_deployment(client, auth_headers, channel="C0EXAMPLE2")
+    conversation_id = "thread-agent-isolation"
+
+    _, first = _create_publication(
+        client,
+        _publication_payload(
+            first_deployment["id"],
+            conversation_id=conversation_id,
+            dedupe_key="agent-isolation-one",
+        ),
+    )
+    _, second = _create_publication(
+        client,
+        _publication_payload(
+            second_deployment["id"],
+            conversation_id=conversation_id,
+            dedupe_key="agent-isolation-two",
+        ),
+    )
+
+    assert first["lineage_id"] != second["lineage_id"]
+    assert first["branch"] != second["branch"]
+    assert _rows("SELECT count(*) AS count FROM curie.thread_publication_lineages") == [
+        {"count": 2}
+    ]
+
+
+@pytest.mark.parametrize("terminal_state", ["merged", "closed"])
+def test_terminal_lineage_refuses_revision_and_credential_before_resolution(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_state: str,
+) -> None:
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    conversation_id = f"thread-{terminal_state}-lineage"
+    _, first = _create_publication(
+        client,
+        _publication_payload(
+            deployment["id"],
+            conversation_id=conversation_id,
+            dedupe_key=f"{terminal_state}-lineage-one",
+        ),
+    )
+    assert _resolve(client, auth_headers, first["approval_id"]).status_code == 200
+    opened = _advance_lineage(
+        client,
+        first["id"],
+        expected_version=1,
+        expected_head_sha=None,
+        head_sha=FIRST_REVISION_SHA,
+    )
+    assert opened.status_code == 200, opened.text
+    _mark_outcome_history_ready(first["id"])
+    _, pending = _create_publication(
+        client,
+        _publication_payload(
+            deployment["id"],
+            conversation_id=conversation_id,
+            base_sha=FIRST_REVISION_SHA,
+            dedupe_key=f"{terminal_state}-lineage-two",
+        ),
+    )
+    assert _resolve(client, auth_headers, pending["approval_id"]).status_code == 200
+    terminal = _advance_lineage(
+        client,
+        pending["id"],
+        expected_version=2,
+        expected_head_sha=FIRST_REVISION_SHA,
+        head_sha=FIRST_REVISION_SHA,
+        state=terminal_state,
+    )
+    assert terminal.status_code == 200, terminal.text
+    assert terminal.json()["state"] == terminal_state
+
+    def forbidden_resolver(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("terminal lineage reached credential resolution")
+
+    monkeypatch.setattr(
+        "curie_api.routers.publications.resolve_repository_credential",
+        forbidden_resolver,
+    )
+    credential = client.post(
+        f"/v1/internal/publications/{pending['id']}/credential",
+        headers=WORKER_HEADERS,
+    )
+    assert credential.status_code == 409
+    assert credential.headers["cache-control"] == "no-store"
+    assert credential.json()["detail"]["code"] == "publication.lineage_terminal"
+
+    refused = client.post(
+        "/v1/internal/publications",
+        json=_publication_payload(
+            deployment["id"],
+            conversation_id=conversation_id,
+            base_sha=FIRST_REVISION_SHA,
+            dedupe_key=f"{terminal_state}-lineage-three",
+        ),
+        headers=WORKER_HEADERS,
+    )
+    assert refused.status_code == 409
+    assert refused.json()["detail"]["code"] == "publication.lineage_terminal"
+    assert _counts() == (2, 2)
+    assert _rows(
+        "SELECT outcome FROM curie.credential_redemption_audit_entries "
+        "WHERE publication_id = :id ORDER BY created_at, id",
+        {"id": pending["id"]},
+    ) == [{"outcome": "refused"}]
+
+
+def test_publication_revision_refuses_a_checkout_not_at_the_lineage_head(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    conversation_id = "thread-stale-checkout-head"
+    _, first = _create_publication(
+        client,
+        _publication_payload(
+            deployment["id"],
+            conversation_id=conversation_id,
+            dedupe_key="stale-checkout-one",
+        ),
+    )
+    assert _resolve(client, auth_headers, first["approval_id"]).status_code == 200
+    advanced = _advance_lineage(
+        client,
+        first["id"],
+        expected_version=1,
+        expected_head_sha=None,
+        head_sha=FIRST_REVISION_SHA,
+    )
+    assert advanced.status_code == 200, advanced.text
+    _mark_outcome_history_ready(first["id"])
+
+    stale = client.post(
+        "/v1/internal/publications",
+        json=_publication_payload(
+            deployment["id"],
+            conversation_id=conversation_id,
+            base_sha=EXTERNAL_REVISION_SHA,
+            dedupe_key="stale-checkout-two",
+        ),
+        headers=WORKER_HEADERS,
+    )
+
+    assert stale.status_code == 409
+    assert stale.json()["detail"]["code"] == "publication.lineage_stale"
+    assert _counts() == (1, 1)
+    current = _get_lineage_with_http(
+        client,
+        deployment_id=deployment["id"],
+        conversation_id=conversation_id,
+        handler=lambda _request: _healthy_github_pr(
+            branch=first["branch"], head_sha=FIRST_REVISION_SHA
+        ),
+    ).json()
+    assert current["head_sha"] == FIRST_REVISION_SHA
+    assert current["version"] == 2
+
+
+def test_lineage_advance_cas_refuses_stale_version_and_expected_head(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    conversation_id = "thread-lineage-cas"
+    _, first = _create_publication(
+        client,
+        _publication_payload(
+            deployment["id"],
+            conversation_id=conversation_id,
+            dedupe_key="lineage-cas-one",
+        ),
+    )
+    assert _resolve(client, auth_headers, first["approval_id"]).status_code == 200
+    assert (
+        _advance_lineage(
+            client,
+            first["id"],
+            expected_version=1,
+            expected_head_sha=None,
+            head_sha=FIRST_REVISION_SHA,
+        ).status_code
+        == 200
+    )
+    _mark_outcome_history_ready(first["id"])
+    _, second = _create_publication(
+        client,
+        _publication_payload(
+            deployment["id"],
+            conversation_id=conversation_id,
+            base_sha=FIRST_REVISION_SHA,
+            dedupe_key="lineage-cas-two",
+        ),
+    )
+    assert _resolve(client, auth_headers, second["approval_id"]).status_code == 200
+
+    stale_version = _advance_lineage(
+        client,
+        second["id"],
+        expected_version=1,
+        expected_head_sha=FIRST_REVISION_SHA,
+        head_sha=SECOND_REVISION_SHA,
+    )
+    assert stale_version.status_code == 409
+    assert stale_version.json()["detail"]["code"] == "publication.lineage_stale"
+    stale_head = _advance_lineage(
+        client,
+        second["id"],
+        expected_version=2,
+        expected_head_sha=EXTERNAL_REVISION_SHA,
+        head_sha=SECOND_REVISION_SHA,
+    )
+    assert stale_head.status_code == 409
+    assert stale_head.json()["detail"]["code"] == "publication.lineage_stale"
+
+    current = _get_lineage_with_http(
+        client,
+        deployment_id=deployment["id"],
+        conversation_id=conversation_id,
+        handler=lambda _request: _healthy_github_pr(
+            branch=first["branch"], head_sha=FIRST_REVISION_SHA
+        ),
+    ).json()
+    assert current["head_sha"] == FIRST_REVISION_SHA
+    assert current["version"] == 2
+    assert (
+        client.get(f"/publications/{second['id']}", headers=auth_headers).json()[
+            "status"
+        ]
+        == "approved"
+    )
+
+
+def test_concurrent_lineage_advances_have_one_exact_cas_winner(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    conversation_id = "thread-concurrent-lineage-cas"
+    _, first = _create_publication(
+        client,
+        _publication_payload(
+            deployment["id"],
+            conversation_id=conversation_id,
+            dedupe_key="concurrent-cas-one",
+        ),
+    )
+    assert _resolve(client, auth_headers, first["approval_id"]).status_code == 200
+    assert (
+        _advance_lineage(
+            client,
+            first["id"],
+            expected_version=1,
+            expected_head_sha=None,
+            head_sha=FIRST_REVISION_SHA,
+        ).status_code
+        == 200
+    )
+    _mark_outcome_history_ready(first["id"])
+    _, second = _create_publication(
+        client,
+        _publication_payload(
+            deployment["id"],
+            conversation_id=conversation_id,
+            base_sha=FIRST_REVISION_SHA,
+            dedupe_key="concurrent-cas-two",
+        ),
+    )
+    assert _resolve(client, auth_headers, second["approval_id"]).status_code == 200
+
+    def attempt(head_sha: str) -> Any:
+        return _advance_lineage(
+            client,
+            second["id"],
+            expected_version=2,
+            expected_head_sha=FIRST_REVISION_SHA,
+            head_sha=head_sha,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(attempt, [SECOND_REVISION_SHA, EXTERNAL_REVISION_SHA]))
+
+    assert sorted(response.status_code for response in responses) == [200, 409]
+    loser = next(response for response in responses if response.status_code == 409)
+    assert loser.json()["detail"]["code"] == "publication.lineage_stale"
+    winner = next(response.json() for response in responses if response.status_code == 200)
+    current = _get_lineage_with_http(
+        client,
+        deployment_id=deployment["id"],
+        conversation_id=conversation_id,
+        handler=lambda _request: _healthy_github_pr(
+            branch=first["branch"], head_sha=winner["head_sha"]
+        ),
+    ).json()
+    assert current["head_sha"] == winner["head_sha"]
+    assert current["version"] == 3
+    assert current["latest_revision"] == 2
+
+
+def test_lineage_get_refreshes_stored_pr_truth_and_reports_pending_revision_safely(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    client, _ = publication_stack
+    conversation_id = "thread-refresh-open-lineage"
+    deployment, first = _open_lineage(
+        client,
+        auth_headers,
+        conversation_id=conversation_id,
+    )
+    _, pending = _create_publication(
+        client,
+        _publication_payload(
+            deployment["id"],
+            conversation_id=conversation_id,
+            base_sha=FIRST_REVISION_SHA,
+            dedupe_key="refresh-open-lineage-revision-two",
+        ),
+    )
+    calls: list[httpx.Request] = []
+
+    def github(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        # GitHub's Get a pull request response owns ``state``, ``merged``,
+        # ``html_url``, and base/head refs and SHAs:
+        # https://docs.github.com/en/rest/pulls/pulls?apiVersion=2022-11-28#get-a-pull-request
+        return httpx.Response(
+            200,
+            json={
+                "number": PR_NUMBER,
+                "html_url": PR_URL,
+                "state": "open",
+                "merged": False,
+                "base": {"ref": "main", "sha": BASE_SHA},
+                "head": {
+                    "ref": first["branch"],
+                    "sha": FIRST_REVISION_SHA,
+                },
+            },
+        )
+
+    refreshed = _get_lineage_with_http(
+        client,
+        deployment_id=deployment["id"],
+        conversation_id=conversation_id,
+        handler=github,
+    )
+
+    assert refreshed.status_code == 200, refreshed.text
+    body = refreshed.json()
+    assert set(body) == {
+        "id",
+        "deployment_id",
+        "conversation_id",
+        "repo_full_name",
+        "base_sha",
+        "branch",
+        "pr_number",
+        "pr_url",
+        "head_sha",
+        "state",
+        "version",
+        "latest_revision",
+        "has_pending_revision",
+        "has_pending_outcome",
+        "visible_outcome_revision",
+    }
+    assert body["id"] == first["lineage_id"]
+    assert body["pr_number"] == PR_NUMBER
+    assert body["pr_url"] == PR_URL
+    assert body["head_sha"] == FIRST_REVISION_SHA
+    assert body["state"] == "open"
+    assert body["latest_revision"] == 2
+    assert body["has_pending_revision"] is True
+    assert body["has_pending_outcome"] is False
+    assert body["visible_outcome_revision"] == 1
+    assert len(calls) == 1
+    assert calls[0].method == "GET"
+    assert calls[0].url.path == f"/repos/{REPO}/pulls/{PR_NUMBER}"
+    assert calls[0].headers["accept"] == "application/vnd.github+json"
+    assert calls[0].headers["x-github-api-version"] == "2022-11-28"
+    assert calls[0].headers["authorization"].startswith("Basic ")
+    rendered = json.dumps(body, sort_keys=True)
+    assert pending["id"] not in rendered
+    assert "authorization" not in rendered.casefold()
+    assert "credential" not in rendered.casefold()
+    assert "token" not in rendered.casefold()
+    assert _rows("SELECT * FROM curie.credential_redemption_audit_entries") == []
+
+
+def test_lineage_get_refuses_redirect_without_forwarding_authorization(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    """An authorization-bearing GitHub read stops at the first origin."""
+
+    client, _ = publication_stack
+    conversation_id = "thread-refresh-redirect-lineage"
+    deployment, publication = _open_lineage(
+        client,
+        auth_headers,
+        conversation_id=conversation_id,
+    )
+    calls: list[httpx.Request] = []
+
+    def github(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx.Response(
+                302,
+                headers={"Location": "https://capture.example.test/pull"},
+            )
+        raise AssertionError("the redirect target received the GitHub request")
+
+    # The app-wide client may follow redirects for unrelated consumers. The
+    # credentialed lineage operation must override that behavior at its callsite.
+    injected = httpx.AsyncClient(
+        transport=httpx.MockTransport(github),
+        follow_redirects=True,
+    )
+    original = client.app.state.http_client
+    client.app.state.http_client = injected
+    try:
+        refused = _get_lineage(
+            client,
+            deployment_id=deployment["id"],
+            conversation_id=conversation_id,
+        )
+    finally:
+        client.app.state.http_client = original
+        asyncio.run(injected.aclose())
+
+    assert refused.status_code == 503
+    assert refused.json()["detail"]["code"] == "publication.github_unavailable"
+    assert len(calls) == 1
+    assert calls[0].url.path == f"/repos/{REPO}/pulls/{PR_NUMBER}"
+    assert "Authorization" in calls[0].headers
+    assert _rows(
+        "SELECT status, head_sha, version FROM curie.thread_publication_lineages "
+        "WHERE id = :id",
+        {"id": uuid.UUID(publication["lineage_id"])},
+    ) == [{"status": "open", "head_sha": FIRST_REVISION_SHA, "version": 2}]
+
+
+@pytest.mark.parametrize("upstream_status", [403, 404, 429, 500, 502])
+def test_lineage_get_refuses_non_200_github_truth_without_mutating_lineage(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+    upstream_status: int,
+) -> None:
+    client, _ = publication_stack
+    conversation_id = f"thread-refresh-http-{upstream_status}-lineage"
+    deployment, publication = _open_lineage(
+        client,
+        auth_headers,
+        conversation_id=conversation_id,
+    )
+
+    refused = _get_lineage_with_http(
+        client,
+        deployment_id=deployment["id"],
+        conversation_id=conversation_id,
+        handler=lambda _request: httpx.Response(upstream_status),
+    )
+
+    assert refused.status_code == 503
+    detail = refused.json()["detail"]
+    assert detail["code"] == "publication.github_unavailable"
+    assert "Try again later" in detail["message"]
+    assert _rows(
+        "SELECT status, head_sha, version FROM curie.thread_publication_lineages "
+        "WHERE id = :id",
+        {"id": uuid.UUID(publication["lineage_id"])},
+    ) == [{"status": "open", "head_sha": FIRST_REVISION_SHA, "version": 2}]
+    assert _rows("SELECT * FROM curie.credential_redemption_audit_entries") == []
+
+
+def test_lineage_get_refuses_github_transport_failure_without_mutating_lineage(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    client, _ = publication_stack
+    conversation_id = "thread-refresh-transport-lineage"
+    deployment, publication = _open_lineage(
+        client,
+        auth_headers,
+        conversation_id=conversation_id,
+    )
+
+    def unavailable(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("upstream unavailable", request=request)
+
+    refused = _get_lineage_with_http(
+        client,
+        deployment_id=deployment["id"],
+        conversation_id=conversation_id,
+        handler=unavailable,
+    )
+
+    assert refused.status_code == 503
+    assert refused.json()["detail"]["code"] == "publication.github_unavailable"
+    assert _rows(
+        "SELECT status, head_sha, version FROM curie.thread_publication_lineages "
+        "WHERE id = :id",
+        {"id": uuid.UUID(publication["lineage_id"])},
+    ) == [{"status": "open", "head_sha": FIRST_REVISION_SHA, "version": 2}]
+    assert _rows("SELECT * FROM curie.credential_redemption_audit_entries") == []
+
+
+def test_lineage_get_adopts_head_for_migrated_succeeded_publication(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    """A legacy URL-only lineage learns its existing PR head exactly once."""
+
+    client, _ = publication_stack
+    conversation_id = "thread-migrated-succeeded-lineage"
+    deployment, publication = _open_lineage(
+        client,
+        auth_headers,
+        conversation_id=conversation_id,
+    )
+
+    async def clear_migration_unknown_head() -> None:
+        from curie_api.models import ThreadPublicationLineage
+
+        engine = create_async_engine(get_settings().database_url)
+        sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with sessionmaker() as session:
+                await session.execute(
+                    update(ThreadPublicationLineage)
+                    .where(
+                        ThreadPublicationLineage.id
+                        == uuid.UUID(publication["lineage_id"])
+                    )
+                    .values(head_sha=None, version=1)
+                )
+                await session.commit()
+        finally:
+            await engine.dispose()
+
+    asyncio.run(clear_migration_unknown_head())
+
+    def github(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "number": PR_NUMBER,
+                "html_url": PR_URL,
+                "state": "open",
+                "merged": False,
+                "base": {"ref": "main", "sha": BASE_SHA},
+                "head": {
+                    "ref": publication["branch"],
+                    "sha": FIRST_REVISION_SHA,
+                },
+            },
+        )
+
+    refreshed = _get_lineage_with_http(
+        client,
+        deployment_id=deployment["id"],
+        conversation_id=conversation_id,
+        handler=github,
+    )
+
+    assert refreshed.status_code == 200, refreshed.text
+    assert refreshed.json()["head_sha"] == FIRST_REVISION_SHA
+    assert refreshed.json()["version"] == 2
+    assert _rows(
+        "SELECT head_sha, version FROM curie.thread_publication_lineages "
+        "WHERE id = :id",
+        {"id": uuid.UUID(publication["lineage_id"])},
+    ) == [{"head_sha": FIRST_REVISION_SHA, "version": 2}]
+
+
+@pytest.mark.parametrize(
+    ("merged", "expected_state"),
+    [(True, "merged"), (False, "closed")],
+)
+def test_lineage_get_persists_terminal_github_truth_without_credential_redemption(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+    merged: bool,
+    expected_state: str,
+) -> None:
+    client, _ = publication_stack
+    conversation_id = f"thread-refresh-{expected_state}-lineage"
+    deployment, publication = _open_lineage(
+        client,
+        auth_headers,
+        conversation_id=conversation_id,
+    )
+    calls: list[httpx.Request] = []
+
+    def github(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "number": PR_NUMBER,
+                "html_url": PR_URL,
+                "state": "closed",
+                "merged": merged,
+                "base": {"ref": "main", "sha": BASE_SHA},
+                "head": {
+                    "ref": publication["branch"],
+                    "sha": FIRST_REVISION_SHA,
+                },
+            },
+        )
+
+    refreshed = _get_lineage_with_http(
+        client,
+        deployment_id=deployment["id"],
+        conversation_id=conversation_id,
+        handler=github,
+    )
+
+    assert refreshed.status_code == 200, refreshed.text
+    assert refreshed.json()["state"] == expected_state
+    assert refreshed.json()["head_sha"] == FIRST_REVISION_SHA
+    assert refreshed.json()["has_pending_revision"] is False
+    assert refreshed.json()["version"] == 3
+    assert len(calls) == 1
+    stored = client.get(
+        f"/publications/{publication['id']}", headers=auth_headers
+    )
+    assert stored.status_code == 200, stored.text
+    assert stored.json()["lineage_state"] == expected_state
+    assert _rows("SELECT * FROM curie.credential_redemption_audit_entries") == []
+
+
+@pytest.mark.parametrize("revision_status", ["approved", "launching", "running"])
+def test_lineage_get_reports_pending_revision_while_its_push_is_in_flight(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+    revision_status: str,
+) -> None:
+    client, _ = publication_stack
+    conversation_id = f"thread-refresh-in-flight-{revision_status}"
+    deployment, first = _open_lineage(
+        client,
+        auth_headers,
+        conversation_id=conversation_id,
+    )
+    _, revision = _create_publication(
+        client,
+        _publication_payload(
+            deployment["id"],
+            conversation_id=conversation_id,
+            base_sha=FIRST_REVISION_SHA,
+            dedupe_key=f"refresh-in-flight-{revision_status}",
+        ),
+    )
+    approved = _resolve(client, auth_headers, revision["approval_id"])
+    assert approved.status_code == 200, approved.text
+    if revision_status != "approved":
+        _execute(
+            "UPDATE curie.publications SET status = :status WHERE id = :id",
+            {"status": revision_status, "id": uuid.UUID(revision["id"])},
+        )
+
+    def github(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "number": PR_NUMBER,
+                "html_url": PR_URL,
+                "state": "open",
+                "merged": False,
+                "base": {"ref": "main", "sha": BASE_SHA},
+                "head": {
+                    "ref": first["branch"],
+                    "sha": SECOND_REVISION_SHA,
+                },
+            },
+        )
+
+    refreshed = _get_lineage_with_http(
+        client,
+        deployment_id=deployment["id"],
+        conversation_id=conversation_id,
+        handler=github,
+    )
+
+    assert refreshed.status_code == 200, refreshed.text
+    body = refreshed.json()
+    assert body["head_sha"] == FIRST_REVISION_SHA
+    assert body["version"] == 2
+    assert body["latest_revision"] == 2
+    assert body["has_pending_revision"] is True
+    assert _rows(
+        "SELECT head_sha, version FROM curie.thread_publication_lineages WHERE id = :id",
+        {"id": uuid.UUID(first["lineage_id"])},
+    ) == [{"head_sha": FIRST_REVISION_SHA, "version": 2}]
+
+
+def test_lineage_get_reports_external_head_without_pending_revision_or_overwrite(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    client, _ = publication_stack
+    conversation_id = "thread-refresh-stale-lineage"
+    deployment, publication = _open_lineage(
+        client,
+        auth_headers,
+        conversation_id=conversation_id,
+    )
+
+    def github(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "number": PR_NUMBER,
+                "html_url": PR_URL,
+                "state": "open",
+                "merged": False,
+                "base": {"ref": "main", "sha": BASE_SHA},
+                "head": {
+                    "ref": publication["branch"],
+                    "sha": EXTERNAL_REVISION_SHA,
+                },
+            },
+        )
+
+    stale = _get_lineage_with_http(
+        client,
+        deployment_id=deployment["id"],
+        conversation_id=conversation_id,
+        handler=github,
+    )
+
+    assert stale.status_code == 409
+    detail = stale.json()["detail"]
+    assert detail["code"] == "publication.lineage_stale"
+    assert detail["expected_head_sha"] == FIRST_REVISION_SHA
+    assert detail["actual_head_sha"] == EXTERNAL_REVISION_SHA
+    assert "credential" not in json.dumps(detail, sort_keys=True).casefold()
+    stored = client.get(
+        f"/publications/{publication['id']}", headers=auth_headers
+    )
+    assert stored.status_code == 200, stored.text
+    assert stored.json()["lineage_head_sha"] == FIRST_REVISION_SHA
+    assert stored.json()["lineage_state"] == "open"
+    assert _rows("SELECT * FROM curie.credential_redemption_audit_entries") == []
+
+
+@pytest.mark.parametrize(
+    ("operation", "method"),
+    [
+        ("/v1/internal/publications/lineage", "GET"),
+        ("/v1/internal/publications/{publication_id}/lineage", "PATCH"),
+    ],
+)
+def test_publication_lineage_route_operations_are_in_every_http_metric_domain(
+    operation: str,
+    method: str,
+) -> None:
+    active = {
+        "service.name": "curie-api",
+        "operation": operation,
+        "role": "server",
+        "source": method,
+    }
+    record_metric("curie.http.server.active", 1, attributes=active)
+    complete = {**active, "outcome": "2xx"}
+    record_metric("curie.http.server.request", attributes=complete)
+    record_metric("curie.http.server.request.duration", 0.001, attributes=complete)

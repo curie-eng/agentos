@@ -29,6 +29,7 @@ from .models import (
     Deployment,
     Environment,
     Publication,
+    ThreadPublicationLineage,
     ThreadWorkspace,
 )
 from .schemas import (
@@ -41,6 +42,7 @@ from .schemas import (
     DeploymentCreate,
     HookPartitionConfig,
     PublicationCreate,
+    PublicationLineageAdvance,
     VersionCreate,
 )
 from .workspace_policy import repository_is_allowed
@@ -50,6 +52,15 @@ _WORKSPACE_UNSET = object()
 
 class PublicationReplayConflict(RuntimeError):
     """A publication dedupe key was replayed with different private facts."""
+
+
+class PublicationLineageConflict(RuntimeError):
+    """A publication revision cannot safely mutate its thread lineage."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
 
 
 async def _adopt_publication_replay(
@@ -70,9 +81,19 @@ async def _adopt_publication_replay(
     deployment = await get_deployment(session, data.deployment_id)
     if deployment is None:
         raise LookupError("deployment not found")
+    reply_conversation_id = data.reply_conversation_id or data.conversation_id
+    workspace_conversation_id = (
+        data.conversation_id
+        if data.reply_conversation_id is not None
+        else scoped_conversation_id(
+            data.reply_kind,
+            data.reply_channel,
+            data.conversation_id,
+        )
+    )
     if (
         approval.agent_id != deployment.agent_id
-        or approval.conversation_id != data.conversation_id
+        or approval.conversation_id != reply_conversation_id
         or approval.reply_kind != data.reply_kind
         or approval.reply_channel != data.reply_channel
         or approval.reply_placeholder != data.reply_placeholder
@@ -90,22 +111,27 @@ async def _adopt_publication_replay(
         or publication.reply_placeholder != data.reply_placeholder
         or publication.reply_endpoint != data.reply_endpoint
         or publication.reply_adapter != data.reply_adapter
+        or publication.lineage is None
+        or publication.lineage.agent_id != deployment.agent_id
+        or publication.lineage.conversation_id != workspace_conversation_id
+        or publication.lineage.repo_full_name.casefold()
+        != publication.repo_full_name.casefold()
     ):
         raise PublicationReplayConflict(
             "publication dedupe key was replayed with different snapshot facts"
         )
-    # A NULL snapshot is an explicit pre-scoping lane. Choose it before any new
-    # derived lookup so a valid historical replay is authorized against the
-    # bare workspace row it originally used.
-    workspace_conversation_id = (
-        publication.workspace_conversation_id
-        if publication.workspace_conversation_id is not None
-        else approval.conversation_id
-    )
+    if publication.workspace_conversation_id is None:
+        # 0041 canonicalizes every genuinely legacy row. A NULL observed after
+        # that migration is corruption or an artificial downgrade lane, never
+        # authority to fall back to an adapter-native reply id.
+        raise PublicationReplayConflict(
+            "publication replay has no canonical workspace identity"
+        )
+    authorized_conversation_id = publication.workspace_conversation_id
     await _require_current_publication_workspace(
         session,
         data,
-        conversation_id=workspace_conversation_id,
+        conversation_id=authorized_conversation_id,
         deployment=deployment,
     )
     return publication
@@ -732,12 +758,17 @@ async def create_publication(
 
     existing = await _adopt_publication_replay(session, data, patch)
     if existing is not None:
+        await session.refresh(existing, ["lineage"])
         return existing, False
 
-    workspace_conversation_id = scoped_conversation_id(
-        data.reply_kind,
-        data.reply_channel,
-        data.conversation_id,
+    workspace_conversation_id = (
+        data.conversation_id
+        if data.reply_conversation_id is not None
+        else scoped_conversation_id(
+            data.reply_kind,
+            data.reply_channel,
+            data.conversation_id,
+        )
     )
     deployment, thread_workspace = await _require_current_publication_workspace(
         session,
@@ -745,6 +776,84 @@ async def create_publication(
         conversation_id=workspace_conversation_id,
     )
 
+    lineage = await _get_thread_publication_lineage(
+        session,
+        agent_id=deployment.agent_id,
+        conversation_id=workspace_conversation_id,
+        repo_full_name=thread_workspace.repo_full_name,
+        for_update=True,
+    )
+    if lineage is None:
+        lineage_id = uuid.uuid4()
+        lineage = ThreadPublicationLineage(
+            id=lineage_id,
+            agent_id=deployment.agent_id,
+            deployment_id=deployment.id,
+            conversation_id=workspace_conversation_id,
+            repo_full_name=thread_workspace.repo_full_name,
+            base_sha=data.base_sha,
+            branch=f"curie/publication-{lineage_id.hex}",
+            status="open",
+            version=1,
+            latest_revision=1,
+        )
+        session.add(lineage)
+        try:
+            await session.flush()
+        except IntegrityError as exc:
+            # A distinct first request can race this INSERT. Its approval and
+            # publication have not been flushed, so the losing transaction can
+            # safely roll back without leaving a second human decision.
+            await session.rollback()
+            existing = await _adopt_publication_replay(session, data, patch)
+            if existing is not None:
+                await session.refresh(existing, ["lineage"])
+                return existing, False
+            raise PublicationLineageConflict(
+                "publication.revision_conflict",
+                "another publication revision already owns this thread lineage",
+            ) from exc
+        revision_number = 1
+    else:
+        if lineage.status != "open":
+            raise PublicationLineageConflict(
+                "publication.lineage_terminal",
+                "the pull request for this thread is merged or closed; start a new thread",
+            )
+        pending_outcome = await session.scalar(
+            select(Publication.id).where(
+                Publication.lineage_id == lineage.id,
+                Publication.status.in_(("denied", "expired", "succeeded", "failed")),
+                Publication.outcome_history_ready_at.is_(None),
+            )
+        )
+        if pending_outcome is not None:
+            raise PublicationLineageConflict(
+                "publication.outcome_pending",
+                "the previous publication outcome is not yet durable in thread history",
+            )
+        expected_prior_head = lineage.head_sha or lineage.base_sha
+        if data.base_sha != expected_prior_head:
+            raise PublicationLineageConflict(
+                "publication.lineage_stale",
+                "the managed checkout is not at the current pull request head",
+            )
+        in_flight = await session.scalar(
+            select(Publication.id).where(
+                Publication.lineage_id == lineage.id,
+                Publication.status.in_(("pending", "approved", "launching", "running")),
+            )
+        )
+        if in_flight is not None:
+            raise PublicationLineageConflict(
+                "publication.revision_conflict",
+                "another publication revision is still in progress for this thread",
+            )
+        revision_number = lineage.latest_revision + 1
+        lineage.latest_revision = revision_number
+        lineage.updated_at = func.now()
+
+    expected_prior_head = lineage.head_sha or lineage.base_sha
     expires_at = None
     if data.expires_in_seconds is not None:
         expires_at = datetime.now(UTC).replace(tzinfo=None) + timedelta(
@@ -752,7 +861,7 @@ async def create_publication(
         )
     approval = Approval(
         agent_id=deployment.agent_id,
-        conversation_id=data.conversation_id,
+        conversation_id=data.reply_conversation_id or data.conversation_id,
         author=data.author,
         summary=data.summary,
         reply_kind=data.reply_kind,
@@ -770,18 +879,13 @@ async def create_publication(
         expires_at=expires_at,
     )
     session.add(approval)
-    try:
-        await session.flush()
-    except IntegrityError:
-        await session.rollback()
-        existing = await _adopt_publication_replay(session, data, patch)
-        if existing is None:
-            raise
-        return existing, False
     publication = Publication(
-        approval_id=approval.id,
+        approval=approval,
         deployment_id=deployment.id,
         workspace_conversation_id=workspace_conversation_id,
+        lineage=lineage,
+        revision_number=revision_number,
+        expected_prior_head=expected_prior_head,
         repo_full_name=thread_workspace.repo_full_name,
         status="pending",
         version=1,
@@ -799,37 +903,404 @@ async def create_publication(
     session.add(publication)
     try:
         await session.commit()
-    except IntegrityError:
-        # Two reclaimed deliveries can both miss the optimistic pre-read. The
-        # unique approval dedupe key is the arbiter; after rolling back the
-        # losing INSERT, re-read and adopt only an exact private-fact replay.
+    except IntegrityError as exc:
+        # The dedupe key and active-revision indexes arbitrate deliveries that
+        # raced after the locked lineage read. Adopt only an exact replay.
         await session.rollback()
         existing = await _adopt_publication_replay(session, data, patch)
         if existing is None:
-            raise
+            raise PublicationLineageConflict(
+                "publication.revision_conflict",
+                "another publication revision already owns this thread lineage",
+            ) from exc
+        await session.refresh(existing, ["lineage"])
         return existing, False
     await session.refresh(publication)
+    await session.refresh(publication, ["lineage"])
     return publication, True
 
 
 async def get_publication(session: AsyncSession, publication_id: uuid.UUID) -> Publication | None:
-    return await session.get(Publication, publication_id)
+    publication: Publication | None = await session.scalar(
+        select(Publication)
+        .options(selectinload(Publication.lineage))
+        .where(Publication.id == publication_id)
+    )
+    return publication
 
 
 async def get_publication_by_approval(
     session: AsyncSession, approval_id: uuid.UUID
 ) -> Publication | None:
     publication: Publication | None = await session.scalar(
-        select(Publication).where(Publication.approval_id == approval_id)
+        select(Publication)
+        .options(selectinload(Publication.lineage))
+        .where(Publication.approval_id == approval_id)
     )
     return publication
 
 
 async def list_publications(session: AsyncSession, *, limit: int = 100) -> list[Publication]:
     result = await session.scalars(
-        select(Publication).order_by(Publication.created_at.desc()).limit(limit)
+        select(Publication)
+        .options(selectinload(Publication.lineage))
+        .order_by(Publication.created_at.desc())
+        .limit(limit)
     )
     return list(result)
+
+
+async def _get_thread_publication_lineage(
+    session: AsyncSession,
+    *,
+    agent_id: uuid.UUID,
+    conversation_id: str,
+    repo_full_name: str,
+    for_update: bool = False,
+) -> ThreadPublicationLineage | None:
+    statement = (
+        select(ThreadPublicationLineage)
+        .where(
+            ThreadPublicationLineage.agent_id == agent_id,
+            ThreadPublicationLineage.conversation_id == conversation_id,
+            ThreadPublicationLineage.repo_full_name == repo_full_name,
+        )
+        .order_by(ThreadPublicationLineage.created_at.desc())
+        .limit(1)
+    )
+    if for_update:
+        statement = statement.with_for_update()
+    lineage: ThreadPublicationLineage | None = await session.scalar(statement)
+    return lineage
+
+
+async def get_thread_publication_lineage(
+    session: AsyncSession,
+    *,
+    deployment_id: uuid.UUID,
+    conversation_id: str,
+    repo_full_name: str,
+) -> ThreadPublicationLineage | None:
+    """Read one authorized thread lineage without exposing credentials."""
+
+    deployment = await get_deployment(session, deployment_id)
+    if deployment is None:
+        raise LookupError("deployment not found")
+    selected = await get_thread_workspace(
+        session,
+        agent_id=deployment.agent_id,
+        conversation_id=conversation_id,
+    )
+    if selected is None:
+        raise ValueError("conversation has no selected repository workspace")
+    if selected.repo_full_name.casefold() != repo_full_name.casefold():
+        raise ValueError("publication repository differs from the thread workspace")
+    if not repository_is_allowed(repo_full_name, get_settings().github_repo_allowlist):
+        raise ValueError("thread workspace repository is no longer allowed")
+    return await _get_thread_publication_lineage(
+        session,
+        agent_id=deployment.agent_id,
+        conversation_id=conversation_id,
+        repo_full_name=selected.repo_full_name,
+    )
+
+
+async def publication_lineage_has_pending_revision(
+    session: AsyncSession,
+    lineage: ThreadPublicationLineage,
+) -> bool:
+    """Return only whether private revision work still owns this lineage."""
+
+    if lineage.status != "open":
+        return False
+    pending_id = await session.scalar(
+        select(Publication.id)
+        .where(
+            Publication.lineage_id == lineage.id,
+            Publication.status.in_(("pending", "approved", "launching", "running")),
+        )
+        .limit(1)
+    )
+    return pending_id is not None
+
+
+async def publication_lineage_has_pending_outcome(
+    session: AsyncSession,
+    lineage: ThreadPublicationLineage,
+) -> bool:
+    """Return whether a terminal result still owes durable thread history."""
+
+    pending_id = await session.scalar(
+        select(Publication.id)
+        .where(
+            Publication.lineage_id == lineage.id,
+            Publication.status.in_(("denied", "expired", "succeeded", "failed")),
+            Publication.outcome_history_ready_at.is_(None),
+        )
+        .limit(1)
+    )
+    return pending_id is not None
+
+
+async def publication_lineage_visible_outcome_revision(
+    session: AsyncSession,
+    lineage: ThreadPublicationLineage,
+) -> int:
+    """Return the newest revision already present in durable thread history."""
+
+    revision = await session.scalar(
+        select(func.max(Publication.revision_number)).where(
+            Publication.lineage_id == lineage.id,
+            Publication.status.in_(("denied", "expired", "succeeded", "failed")),
+            Publication.outcome_history_ready_at.is_not(None),
+        )
+    )
+    return int(revision or 0)
+
+
+async def publication_lineage_has_inflight_push(
+    session: AsyncSession,
+    lineage: ThreadPublicationLineage,
+) -> bool:
+    """Return whether an authorized revision may currently be changing GitHub."""
+
+    if lineage.status != "open":
+        return False
+    inflight_id = await session.scalar(
+        select(Publication.id)
+        .where(
+            Publication.lineage_id == lineage.id,
+            Publication.status.in_(("approved", "launching", "running")),
+        )
+        .limit(1)
+    )
+    return inflight_id is not None
+
+
+async def initialize_publication_lineage_head(
+    session: AsyncSession,
+    lineage: ThreadPublicationLineage,
+    *,
+    expected_version: int,
+    head_sha: str,
+) -> ThreadPublicationLineage:
+    """CAS-initialize the unknown head of a migrated URL-only lineage."""
+
+    changed = await session.execute(
+        update(ThreadPublicationLineage)
+        .where(
+            ThreadPublicationLineage.id == lineage.id,
+            ThreadPublicationLineage.status == "open",
+            ThreadPublicationLineage.version == expected_version,
+            ThreadPublicationLineage.head_sha.is_(None),
+            ThreadPublicationLineage.pr_number == lineage.pr_number,
+            ThreadPublicationLineage.pr_url == lineage.pr_url,
+        )
+        .values(
+            head_sha=head_sha,
+            version=ThreadPublicationLineage.version + 1,
+            updated_at=func.now(),
+        )
+        .returning(ThreadPublicationLineage.id)
+    )
+    if changed.scalar_one_or_none() is None:
+        await session.rollback()
+        current = await session.get(ThreadPublicationLineage, lineage.id)
+        if (
+            current is not None
+            and current.status == "open"
+            and current.head_sha == head_sha
+            and current.pr_number == lineage.pr_number
+            and current.pr_url == lineage.pr_url
+        ):
+            return current
+        raise PublicationLineageConflict(
+            "publication.lineage_stale",
+            "pull request lineage changed while its migrated head was initialized",
+        )
+    await session.commit()
+    refreshed = await session.get(ThreadPublicationLineage, lineage.id)
+    assert refreshed is not None
+    await session.refresh(refreshed)
+    return refreshed
+
+
+async def mark_publication_lineage_terminal(
+    session: AsyncSession,
+    lineage: ThreadPublicationLineage,
+    *,
+    expected_version: int,
+    expected_head_sha: str,
+    state: str,
+) -> ThreadPublicationLineage:
+    """Persist observed terminal GitHub truth without changing the known head."""
+
+    if state not in ("merged", "closed"):
+        raise ValueError("terminal publication lineage state is invalid")
+    changed = await session.execute(
+        update(ThreadPublicationLineage)
+        .where(
+            ThreadPublicationLineage.id == lineage.id,
+            ThreadPublicationLineage.status == "open",
+            ThreadPublicationLineage.version == expected_version,
+            ThreadPublicationLineage.head_sha == expected_head_sha,
+            ThreadPublicationLineage.pr_number == lineage.pr_number,
+            ThreadPublicationLineage.pr_url == lineage.pr_url,
+        )
+        .values(
+            status=state,
+            version=ThreadPublicationLineage.version + 1,
+            updated_at=func.now(),
+        )
+        .returning(ThreadPublicationLineage.id)
+    )
+    if changed.scalar_one_or_none() is None:
+        await session.rollback()
+        current = await session.get(ThreadPublicationLineage, lineage.id)
+        if (
+            current is not None
+            and current.status == state
+            and current.head_sha == expected_head_sha
+            and current.pr_number == lineage.pr_number
+            and current.pr_url == lineage.pr_url
+        ):
+            return current
+        raise PublicationLineageConflict(
+            "publication.lineage_stale",
+            "pull request lineage changed while its terminal state was refreshed",
+        )
+    await session.commit()
+    refreshed = await session.get(ThreadPublicationLineage, lineage.id)
+    assert refreshed is not None
+    await session.refresh(refreshed)
+    return refreshed
+
+
+async def advance_publication_lineage(
+    session: AsyncSession,
+    publication_id: uuid.UUID,
+    data: PublicationLineageAdvance,
+) -> ThreadPublicationLineage:
+    """Atomically advance one approved revision and its exact lineage head."""
+
+    publication = await session.scalar(
+        select(Publication).where(Publication.id == publication_id).with_for_update()
+    )
+    if publication is None:
+        raise LookupError("publication not found")
+    if publication.lineage_id is None:
+        raise PublicationLineageConflict(
+            "publication.lineage_absent",
+            "publication has no thread pull request lineage",
+        )
+    lineage = await session.scalar(
+        select(ThreadPublicationLineage)
+        .where(ThreadPublicationLineage.id == publication.lineage_id)
+        .with_for_update()
+    )
+    if lineage is None:
+        raise PublicationLineageConflict(
+            "publication.lineage_absent",
+            "publication thread pull request lineage is absent",
+        )
+    if lineage.status != "open":
+        raise PublicationLineageConflict(
+            "publication.lineage_terminal",
+            "the pull request for this thread is merged or closed; start a new thread",
+        )
+    if publication.revision_number != lineage.latest_revision:
+        raise PublicationLineageConflict(
+            "publication.lineage_stale",
+            "publication revision is not the current thread lineage revision",
+        )
+    if data.pr_url != f"https://github.com/{lineage.repo_full_name}/pull/{data.pr_number}":
+        raise PublicationLineageConflict(
+            "publication.lineage_stale",
+            "pull request identity does not match the publication repository",
+        )
+    if lineage.pr_number is not None and (
+        lineage.pr_number != data.pr_number or lineage.pr_url != data.pr_url
+    ):
+        raise PublicationLineageConflict(
+            "publication.lineage_stale",
+            "pull request identity no longer matches the stored thread lineage",
+        )
+    if lineage.version != data.expected_version or lineage.head_sha != data.expected_head_sha:
+        raise PublicationLineageConflict(
+            "publication.lineage_stale",
+            "pull request lineage version or expected head is stale",
+        )
+    if publication.status not in ("approved", "launching", "running"):
+        raise PublicationLineageConflict(
+            "publication.revision_not_approved",
+            "publication revision must be approved before advancing its lineage",
+        )
+
+    head_predicate = (
+        ThreadPublicationLineage.head_sha.is_(None)
+        if data.expected_head_sha is None
+        else ThreadPublicationLineage.head_sha == data.expected_head_sha
+    )
+    changed = await session.execute(
+        update(ThreadPublicationLineage)
+        .where(
+            ThreadPublicationLineage.id == lineage.id,
+            ThreadPublicationLineage.status == "open",
+            ThreadPublicationLineage.version == data.expected_version,
+            head_predicate,
+        )
+        .values(
+            pr_number=data.pr_number,
+            pr_url=data.pr_url,
+            head_sha=data.head_sha,
+            status=data.state,
+            version=ThreadPublicationLineage.version + 1,
+            updated_at=func.now(),
+        )
+        .returning(ThreadPublicationLineage.id)
+    )
+    if changed.scalar_one_or_none() is None:
+        await session.rollback()
+        raise PublicationLineageConflict(
+            "publication.lineage_stale",
+            "pull request lineage changed before this revision could advance it",
+        )
+
+    terminal_state = data.state in ("merged", "closed")
+    publication_status = "failed" if terminal_state else "succeeded"
+    publication_values: dict[str, Any] = {
+        "status": publication_status,
+        "version": Publication.version + 1,
+        "patch_bytes": None,
+        "terminal_at": func.now(),
+        "updated_at": func.now(),
+        "result_url": data.pr_url,
+    }
+    if terminal_state:
+        publication_values["error"] = (
+            "the pull request for this thread is merged or closed; start a new thread"
+        )
+    settled = await session.execute(
+        update(Publication)
+        .where(
+            Publication.id == publication.id,
+            Publication.status == publication.status,
+            Publication.version == publication.version,
+        )
+        .values(**publication_values)
+        .returning(Publication.id)
+    )
+    if settled.scalar_one_or_none() is None:
+        await session.rollback()
+        raise PublicationLineageConflict(
+            "publication.lineage_stale",
+            "publication revision changed before its lineage could advance",
+        )
+    await session.commit()
+    refreshed = await session.get(ThreadPublicationLineage, lineage.id)
+    assert refreshed is not None
+    await session.refresh(refreshed)
+    return refreshed
 
 
 async def append_credential_redemption_audit(

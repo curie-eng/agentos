@@ -3439,6 +3439,18 @@
             "title": "Reply Channel",
             "type": "string"
           },
+          "reply_conversation_id": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reply Conversation Id"
+          },
           "reply_endpoint": {
             "anyOf": [
               {
@@ -3505,6 +3517,174 @@
         "title": "PublicationCreate",
         "type": "object"
       },
+      "PublicationLineageAdvance": {
+        "description": "Exact compare-and-set facts for one publication revision outcome.",
+        "properties": {
+          "expected_head_sha": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Head Sha"
+          },
+          "expected_version": {
+            "minimum": 1.0,
+            "title": "Expected Version",
+            "type": "integer"
+          },
+          "head_sha": {
+            "title": "Head Sha",
+            "type": "string"
+          },
+          "pr_number": {
+            "exclusiveMinimum": 0.0,
+            "title": "Pr Number",
+            "type": "integer"
+          },
+          "pr_url": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Pr Url",
+            "type": "string"
+          },
+          "state": {
+            "default": "open",
+            "enum": [
+              "open",
+              "merged",
+              "closed"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expected_version",
+          "expected_head_sha",
+          "pr_number",
+          "pr_url",
+          "head_sha"
+        ],
+        "title": "PublicationLineageAdvance",
+        "type": "object"
+      },
+      "PublicationLineageOut": {
+        "description": "Credential-free pull-request lineage facts safe for the worker.",
+        "properties": {
+          "base_sha": {
+            "title": "Base Sha",
+            "type": "string"
+          },
+          "branch": {
+            "title": "Branch",
+            "type": "string"
+          },
+          "conversation_id": {
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "deployment_id": {
+            "format": "uuid",
+            "title": "Deployment Id",
+            "type": "string"
+          },
+          "has_pending_outcome": {
+            "default": false,
+            "title": "Has Pending Outcome",
+            "type": "boolean"
+          },
+          "has_pending_revision": {
+            "default": false,
+            "title": "Has Pending Revision",
+            "type": "boolean"
+          },
+          "head_sha": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Head Sha"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "latest_revision": {
+            "title": "Latest Revision",
+            "type": "integer"
+          },
+          "pr_number": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pr Number"
+          },
+          "pr_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pr Url"
+          },
+          "repo_full_name": {
+            "title": "Repo Full Name",
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "open",
+              "merged",
+              "closed"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          },
+          "visible_outcome_revision": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Visible Outcome Revision",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "deployment_id",
+          "conversation_id",
+          "repo_full_name",
+          "base_sha",
+          "branch",
+          "pr_number",
+          "pr_url",
+          "head_sha",
+          "state",
+          "version",
+          "latest_revision"
+        ],
+        "title": "PublicationLineageOut",
+        "type": "object"
+      },
       "PublicationOut": {
         "description": "Patch-free publication metadata safe for operator and worker reads.",
         "properties": {
@@ -3520,6 +3700,17 @@
           "body": {
             "title": "Body",
             "type": "string"
+          },
+          "branch": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Branch"
           },
           "changed_paths": {
             "items": {
@@ -3549,10 +3740,104 @@
             ],
             "title": "Error"
           },
+          "expected_prior_head": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Prior Head"
+          },
           "id": {
             "format": "uuid",
             "title": "Id",
             "type": "string"
+          },
+          "lineage_base_sha": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lineage Base Sha"
+          },
+          "lineage_head_sha": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lineage Head Sha"
+          },
+          "lineage_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lineage Id"
+          },
+          "lineage_state": {
+            "anyOf": [
+              {
+                "enum": [
+                  "open",
+                  "merged",
+                  "closed"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lineage State"
+          },
+          "lineage_version": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lineage Version"
+          },
+          "pr_number": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pr Number"
+          },
+          "pr_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pr Url"
           },
           "reply_adapter": {
             "anyOf": [
@@ -3610,6 +3895,17 @@
             ],
             "title": "Result Url"
           },
+          "revision_number": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Revision Number"
+          },
           "status": {
             "title": "Status",
             "type": "string"
@@ -3644,6 +3940,16 @@
           "id",
           "approval_id",
           "deployment_id",
+          "lineage_id",
+          "revision_number",
+          "expected_prior_head",
+          "lineage_base_sha",
+          "lineage_head_sha",
+          "lineage_state",
+          "lineage_version",
+          "branch",
+          "pr_number",
+          "pr_url",
           "repo_full_name",
           "status",
           "version",
@@ -10333,6 +10639,83 @@
         ]
       }
     },
+    "/v1/internal/publications/lineage": {
+      "get": {
+        "operationId": "get_publication_lineage_v1_internal_publications_lineage_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "deployment_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Deployment Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "conversation_id",
+            "required": true,
+            "schema": {
+              "title": "Conversation Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "repo_full_name",
+            "required": true,
+            "schema": {
+              "title": "Repo Full Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicationLineageOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Publication Lineage",
+        "tags": [
+          "internal-publications"
+        ]
+      }
+    },
     "/v1/internal/publications/{publication_id}/credential": {
       "post": {
         "operationId": "redeem_publication_credential_v1_internal_publications__publication_id__credential_post",
@@ -10387,6 +10770,75 @@
           }
         },
         "summary": "Redeem Publication Credential",
+        "tags": [
+          "internal-publications"
+        ]
+      }
+    },
+    "/v1/internal/publications/{publication_id}/lineage": {
+      "patch": {
+        "operationId": "advance_publication_lineage_v1_internal_publications__publication_id__lineage_patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "publication_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Publication Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PublicationLineageAdvance"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicationLineageOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Advance Publication Lineage",
         "tags": [
           "internal-publications"
         ]

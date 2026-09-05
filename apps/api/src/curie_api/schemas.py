@@ -1395,6 +1395,7 @@ class PublicationCreate(BaseModel):
 
     deployment_id: uuid.UUID
     conversation_id: str = Field(min_length=1)
+    reply_conversation_id: str | None = Field(default=None, min_length=1)
     repo_full_name: str = Field(pattern=REPOSITORY_FULL_NAME_PATTERN)
     author: str = Field(min_length=1)
     summary: str = Field(min_length=1)
@@ -1467,6 +1468,57 @@ class PublicationCreate(BaseModel):
             raise ValueError("patch_b64 must be canonical base64") from exc
 
 
+class PublicationLineageAdvance(BaseModel):
+    """Exact compare-and-set facts for one publication revision outcome."""
+
+    expected_version: int = Field(ge=1)
+    expected_head_sha: str | None
+    state: Literal["open", "merged", "closed"] = "open"
+    pr_number: int = Field(gt=0)
+    pr_url: str = Field(min_length=1, max_length=2048)
+    head_sha: str
+
+    @field_validator("expected_head_sha", "head_sha")
+    @classmethod
+    def _full_commit_sha(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", value):
+            raise ValueError("lineage head must be one full 40-character commit id")
+        return value.lower()
+
+
+class PublicationLineageOut(BaseModel):
+    """Credential-free pull-request lineage facts safe for the worker."""
+
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+
+    id: uuid.UUID
+    deployment_id: uuid.UUID
+    conversation_id: str
+    repo_full_name: str
+    base_sha: str
+    branch: str
+    pr_number: int | None
+    pr_url: str | None
+    head_sha: str | None
+    state: Literal["open", "merged", "closed"] = Field(validation_alias="status")
+    version: int
+    latest_revision: int
+    # This is intentionally only a boolean. The worker needs to know whether a
+    # fenced replacement would race an unresolved revision, but must not learn
+    # that revision's identifier or private patch state.
+    has_pending_revision: bool = False
+    # True while a terminal publication outcome has not yet been acknowledged
+    # by the durable transcript outbox. No private patch or error text crosses
+    # this read seam.
+    has_pending_outcome: bool = False
+    # Monotonic within one lineage. The worker stores this on its route so a
+    # headless denial/failure causes exactly one cold history rehydrate even
+    # though the Git head itself did not move.
+    visible_outcome_revision: int = Field(default=0, ge=0)
+
+
 class PublicationOut(BaseModel):
     """Patch-free publication metadata safe for operator and worker reads."""
 
@@ -1475,6 +1527,16 @@ class PublicationOut(BaseModel):
     id: uuid.UUID
     approval_id: uuid.UUID
     deployment_id: uuid.UUID
+    lineage_id: uuid.UUID | None
+    revision_number: int | None
+    expected_prior_head: str | None
+    lineage_base_sha: str | None
+    lineage_head_sha: str | None
+    lineage_state: Literal["open", "merged", "closed"] | None
+    lineage_version: int | None
+    branch: str | None
+    pr_number: int | None
+    pr_url: str | None
     repo_full_name: str
     status: str
     version: int
