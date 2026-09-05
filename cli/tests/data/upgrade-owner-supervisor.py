@@ -89,5 +89,85 @@ def main():
     print(json.dumps(proof))
 
 
+def resume_after_apply():
+    """Kill the real CLI after durable Apply, then repeat its exact argv/env."""
+    root = Path(os.environ["UPGRADE_DRIVER_ROOT"])
+    assert Path(os.environ["TMPDIR"]) == root
+    cli = None
+    cli_fd = None
+    observer_fd = None
+    proof = {}
+    signal.signal(signal.SIGTERM, interrupted)
+    signal.signal(signal.SIGINT, interrupted)
+    try:
+        with (root / "cli.stdout").open("w") as stdout, (root / "cli.stderr").open("w") as stderr:
+            cli = subprocess.Popen(sys.argv[2:], stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr)
+            cli_fd = os.pidfd_open(cli.pid)
+            deadline = time.monotonic() + 10
+            while not (root / "observation-owner.json").exists():
+                assert cli.poll() is None, "CLI ended before post-Apply observation"
+                assert time.monotonic() < deadline, "post-Apply observation not reached"
+                time.sleep(0.01)
+            observer = json.loads((root / "observation-owner.json").read_text())
+            assert observer["parent"] == cli.pid
+            observer_fd = os.pidfd_open(observer["pid"])
+            before = json.loads((root / "record.json").read_text())
+            assert before["completed"] == ["plan", "validate", "drain", "checkpoint", "migrate", "apply"]
+            assert before["status"] == "in_progress"
+            assert before["known_good_version"] != before["target_version"]
+            signal.pidfd_send_signal(cli_fd, signal.SIGKILL)
+            cli.wait(timeout=5)
+            proof["owner_killed"] = cli.returncode == -signal.SIGKILL
+            # This child is only a read. Let it finish; do not fabricate a
+            # successful checkpoint, Helm result or recovery response.
+            (root / "release-observation").write_text("resume observation")
+            deadline = time.monotonic() + 5
+            while not exited(observer_fd):
+                assert time.monotonic() < deadline, "old observation did not finish"
+                time.sleep(0.01)
+            proof["old_observer_exited"] = True
+        before_resume = len((root / "calls.jsonl").read_text().splitlines())
+        if sys.argv[1] == "resume-after-apply-drift":
+            (root / "resume-image-drift").write_text("old image serving")
+        os.close(cli_fd)
+        cli_fd = None
+        cli = subprocess.Popen(sys.argv[2:], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        cli_fd = os.pidfd_open(cli.pid)
+        stdout, stderr = cli.communicate(timeout=20)
+        proof["resume_exit"] = cli.returncode
+        proof["resume_output"] = json.loads(stdout)
+        proof["record"] = json.loads((root / "record.json").read_text())
+        calls = [json.loads(line) for line in (root / "calls.jsonl").read_text().splitlines()]
+        proof["helm_applies"] = sum(call[:2] == ["helm", "upgrade"] for call in calls)
+        fresh = calls[before_resume:]
+        proof["fresh_convergence"] = (
+            any(call[:4] == ["kubectl", "get", "--ignore-not-found", "-f"] for call in fresh)
+            and any(call[:3] == ["kubectl", "get", "pods"] for call in fresh)
+        )
+        proof["fresh_canary"] = any("upgrade-canary" in call for call in fresh)
+        assert "fixture-kubeconfig-token" not in stdout + stderr
+    finally:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        terminate(cli_fd)
+        if cli is not None:
+            if cli_fd is None:
+                cli.kill()
+            cli.wait(timeout=5)
+        terminate(observer_fd)
+        deadline = time.monotonic() + 5
+        while observer_fd is not None and not exited(observer_fd):
+            assert time.monotonic() < deadline, "old observation cleanup failed"
+            time.sleep(0.01)
+        for fd in (cli_fd, observer_fd):
+            if fd is not None:
+                os.close(fd)
+        proof["cleanup_complete"] = True
+    print(json.dumps(proof))
+
+
 if __name__ == "__main__":
-    main()
+    if sys.argv[1] in ("resume-after-apply", "resume-after-apply-drift"):
+        resume_after_apply()
+    else:
+        main()

@@ -684,6 +684,16 @@ elif program == "kubectl":
             sys.exit(1)
         print(json.dumps({"metadata": {"resourceVersion": str(version), "uid": "checkpoint-uid"}}))
     elif args[:2] == ["get", "deploy,sts,ds"] or (args[0] == "get" and "-f" in args):
+        if scenario == "pause-after-apply" and not (root / "release-observation").exists():
+            record = json.loads((root / "record.json").read_text())
+            if record["completed"][-1] == "apply":
+                marker = root / "observation-owner.pending"
+                marker.write_text(json.dumps({"pid": os.getpid(), "parent": os.getppid()}))
+                marker.rename(root / "observation-owner.json")
+                deadline = time.monotonic() + 15
+                while not (root / "release-observation").exists():
+                    assert time.monotonic() < deadline, "observation not released"
+                    time.sleep(0.01)
         workload["status"] = {
             "readyReplicas": 1,
             "updatedReplicas": 1,
@@ -692,7 +702,7 @@ elif program == "kubectl":
         }
         if scenario == "stale-generation":
             workload["status"]["observedGeneration"] = 1
-        if scenario == "wrong-image":
+        if scenario == "wrong-image" or (root / "resume-image-drift").exists():
             workload["spec"]["template"]["spec"]["containers"][0]["image"] = (
                 "ghcr.io/curie-eng/curie-api:0.8.5"
             )
