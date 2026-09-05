@@ -456,6 +456,12 @@ fn offline_dry_run_does_not_claim_to_have_inspected_the_source() {
     assert!(output.status.success());
     assert!(fixture.calls().is_empty());
     assert!(String::from_utf8_lossy(&output.stdout).contains("not inspected"));
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("helm status acme-bot -n upgrade-test -o json"));
+    assert!(text.contains("helm get metadata acme-bot -n upgrade-test --revision"));
+    assert!(
+        text.contains("Command template (revision resolved from source Helm status at execution)")
+    );
 }
 
 #[test]
@@ -1032,4 +1038,97 @@ fn helm_target_overrides_refuse_before_upgrade_target_discovery_without_leaking_
             String::from_utf8_lossy(&empty.stdout)
         );
     }
+}
+
+#[test]
+fn source_known_good_uses_exact_revision_metadata_when_status_omits_chart() {
+    let fixture = Fixture::new();
+    let output = fixture.run("canary-fails");
+    assert_eq!(output.status.code(), Some(1));
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["known_good_version"], "0.8.5");
+    let calls = fixture.calls();
+    assert!(calls.contains("\"helm\", \"get\", \"metadata\""));
+    assert!(calls.contains("\"--revision\", \"1\""));
+}
+
+#[test]
+fn mismatched_source_metadata_refuses_before_checkpoint_or_upgrade() {
+    for scenario in [
+        "source-metadata-denied",
+        "source-metadata-malformed",
+        "source-metadata-wrong-name",
+        "source-metadata-wrong-namespace",
+        "source-metadata-wrong-revision",
+        "source-metadata-wrong-chart",
+        "source-metadata-wrong-version",
+        "source-metadata-failed",
+        "source-metadata-missing-revision",
+    ] {
+        let fixture = Fixture::new();
+        let output = fixture.run(scenario);
+        fixture.assert_refused_without_upgrade(&output);
+        assert_eq!(output.status.code(), Some(1), "{scenario}");
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            result["fix"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()),
+            "{scenario}"
+        );
+        assert!(!fixture.path("record.json").exists(), "{scenario}");
+        for stream in [&output.stdout, &output.stderr] {
+            assert!(!String::from_utf8_lossy(stream)
+                .contains("synthetic-source-metadata-secret-sentinel"));
+        }
+    }
+}
+
+#[test]
+fn invalid_source_status_identity_refuses_before_metadata_and_checkpoint() {
+    for scenario in [
+        "source-status-wrong-name",
+        "source-status-wrong-namespace",
+        "source-status-missing-revision",
+        "source-status-zero-revision",
+        "source-status-string-revision",
+    ] {
+        let fixture = Fixture::new();
+        let output = fixture.run(scenario);
+        fixture.assert_refused_without_upgrade(&output);
+        assert_eq!(output.status.code(), Some(1));
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(result["fix"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()));
+        assert!(!fixture.calls().contains("\"helm\", \"get\", \"metadata\""));
+        assert!(!fixture.path("record.json").exists());
+    }
+}
+
+#[test]
+fn bounded_source_metadata_read_stops_its_child_and_preserves_recovery() {
+    let fixture = Fixture::new();
+    let started = std::time::Instant::now();
+    let output = fixture.run("source-metadata-hung");
+    assert!(started.elapsed() < std::time::Duration::from_secs(20));
+    fixture.assert_refused_without_upgrade(&output);
+    assert_eq!(output.status.code(), Some(1));
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(result["error"]
+        .as_str()
+        .unwrap()
+        .contains("metadata read timed out"));
+    assert!(result["fix"]
+        .as_str()
+        .is_some_and(|value| !value.is_empty()));
+    assert!(!fixture.path("record.json").exists());
+    for stream in [&output.stdout, &output.stderr] {
+        assert!(
+            !String::from_utf8_lossy(stream).contains("synthetic-source-metadata-secret-sentinel")
+        );
+    }
+    let pid = fs::read_to_string(fixture.path("metadata-pid")).unwrap();
+    let absent = Command::new("/usr/bin/python3").args(["-c", "import os,sys; p=int(sys.argv[1]);\ntry: os.kill(p,0)\nexcept ProcessLookupError: sys.exit(0)\nsys.exit(1)", &pid]).status().unwrap();
+    assert!(absent.success(), "timed-out metadata child must be absent");
 }
