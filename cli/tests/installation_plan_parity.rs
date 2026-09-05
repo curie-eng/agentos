@@ -269,6 +269,9 @@ if [ "$1" = upgrade ]; then
     runner_real_mode_preserved='no'
     runner_egress_preserved='no'
     for argument in "$@"; do
+        if [ "$previous" = '-f' ] && [ -n "${CURIE_TEST_CAPTURE_MAIL_VALUES:-}" ] && grep -Fq '"mailAdapter"' "$argument"; then
+            cp "$argument" "$CURIE_TEST_CAPTURE_MAIL_VALUES"
+        fi
         if [ "$previous" = '-f' ] && grep -q '"sealing"' "$argument" && grep -q '"privateKey"' "$argument"; then
             sealing_key_present='yes'
         fi
@@ -1558,6 +1561,83 @@ fn cluster_up_dry_run_defers_sealing_resolution_without_inventing_a_key() {
             && visible.contains("generat"),
         "the preview must explain that live release discovery decides preservation or generation:\n{visible}"
     );
+}
+
+#[test]
+fn apply_and_plain_up_preserve_omitted_mail_but_honor_explicit_source_clear() {
+    let existing = json!({
+        "mailAdapter": {
+            "deploy": true,
+            "inbox": "mail@example.com",
+            "channelToken": "obsolete-inline-token",
+            "channelTokenExistingSecret": "acme-mail-credentials",
+            "channelTokenExistingSecretKey": "channel-key",
+            "allowedSenders": ["operator@example.com"],
+            "pollIntervalSeconds": 37
+        },
+        "worker": {
+            "adapterCredentialsExistingSecret": "acme-mail-credentials",
+            "adapterCredentialsExistingSecretKey": "worker-map"
+        }
+    });
+    for surface in ["up", "apply", "apply-clear"] {
+        let config = if surface == "apply-clear" {
+            format!(
+                "{}set:\n  mailAdapter.channelTokenExistingSecret: \"\"\n",
+                installation_for_the_stateful_guard()
+            )
+        } else {
+            installation_for_the_stateful_guard().to_string()
+        };
+        let fixture = HelmFixture::new(&config, HelmValuesResponse::Object(existing.clone()));
+        let captured = fixture.temp.path().join("mail-values.json");
+        let env = [("CURIE_TEST_CAPTURE_MAIL_VALUES", captured.to_str().unwrap())];
+        let output = if surface == "up" {
+            fixture.cluster_up_with(&["--fake-model"], &env)
+        } else {
+            fixture.apply(&[], &env)
+        };
+        json_output(output, surface);
+        let actual: Value =
+            serde_json::from_slice(&fs::read(captured).expect("Helm received mail values"))
+                .unwrap();
+        assert_eq!(actual["mailAdapter"]["deploy"], true);
+        assert_eq!(actual["mailAdapter"]["pollIntervalSeconds"], 37);
+        assert_eq!(
+            actual["mailAdapter"]["allowedSenders"],
+            json!(["operator@example.com"])
+        );
+        assert!(actual["mailAdapter"].get("channelToken").is_none());
+        if surface == "apply-clear" {
+            assert!(actual["mailAdapter"]
+                .get("channelTokenExistingSecret")
+                .is_none());
+            assert!(fixture
+                .calls()
+                .contains("--set-string mailAdapter.channelTokenExistingSecret="));
+        } else {
+            assert_eq!(
+                actual["mailAdapter"]["channelTokenExistingSecret"],
+                "acme-mail-credentials"
+            );
+        }
+        let diff = json_output(fixture.diff(&[]), "diff retained mail");
+        let entries = diff["entries"].as_array().unwrap();
+        let deploy = entries
+            .iter()
+            .find(|entry| entry["key"] == "mailAdapter.deploy")
+            .unwrap();
+        assert_eq!(deploy["kind"], "preserved");
+        let stale = entries
+            .iter()
+            .find(|entry| entry["key"] == "mailAdapter.channelToken")
+            .unwrap();
+        assert_eq!(
+            stale["kind"], "change",
+            "diff must disclose stripping the stale inline copy"
+        );
+        assert!(!fixture.calls().contains("obsolete-inline-token"));
+    }
 }
 
 #[test]

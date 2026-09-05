@@ -133,6 +133,16 @@ Installs (or upgrades) Curie's Helm chart onto the cluster you're pointed at:
 curie cluster up
 ```
 
+This is a full Helm upgrade. It carries forward the recorded generated secrets,
+sealing keys, Slack tokens, GitHub App and token, runner model and credential,
+gVisor mode, worker extra environment, trusted Slack origins, runner egress,
+and the installed `mailAdapter.*` values with the worker's paired adapter
+credential map or external Secret reference. Other values must be supplied again.
+Explicit `--set` and `--set-string` inputs override retained values. Retained mail
+values use a private temporary values file; the command shows field names only.
+The offline `--dry-run` does not read an installed release, so it cannot display
+that release's retained values.
+
 | Flag / env var | What it does |
 |---|---|
 | `--chart <path-or-tgz>` | Install from a local chart instead of the pinned release asset (for chart development). |
@@ -456,6 +466,14 @@ For the `local`-target equivalent (`curie local comms --slack`), see
 There is no `curie cluster comms --email` yet, so email is wired with a private
 Helm values file. The mail adapter ships off by default
 ([`apps/mail-adapter`](../apps/mail-adapter)).
+
+After email is configured, a plain `curie cluster up` preserves its recorded
+settings, PVC configuration, and all three credential references together with
+`worker.adapterCredentialsExistingSecret` and its key. Inline credentials on
+older installs are also retained through the protected values-file path. An
+explicit `--set mailAdapter.deploy=false` disables it; clearing an external
+credential reference does not restore a stale inline credential. Replacing a
+credential with an explicit inline value drops its retained external reference.
 
 Two platform-side steps come first, in this order:
 
