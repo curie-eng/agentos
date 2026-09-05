@@ -22,11 +22,13 @@ transcript key -- is the caller's job.
 
 from __future__ import annotations
 
+import hmac
 import logging
 import secrets
 import time
 import uuid
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 from aci_protocol import BootEnv
@@ -40,6 +42,7 @@ from .types import (
     MANAGED_BY_LABEL,
     MANAGED_BY_VALUE,
     THREAD_HASH_LABEL,
+    AdoptionState,
     CapacityExhaustedError,
     ClaimTimeoutError,
     NoRouteError,
@@ -136,6 +139,9 @@ class SandboxSubstrate:
         workspace_repo: str | None = None,
         workspace_materialized_head: str | None = None,
         publication_visible_outcome_revision: int = 0,
+        session_id: str | None = None,
+        history_ref: str | None = None,
+        conversation_token: str | None = None,
     ) -> SandboxHandle:
         """Return the thread's live sandbox, claiming a warm one if needed.
 
@@ -143,6 +149,15 @@ class SandboxSubstrate:
         history ref); the fast path passes none so the claim binds a pre-warmed
         generic sandbox. ``agent_name`` selects the per-agent warm pool when
         connector secrets are marked on ``env`` (#1488).
+
+        A warm bind (ADR-0116 d2 / ADR-0122) passes the conversation's
+        ``session_id``, ``history_ref``, and a freshly minted
+        ``conversation_token`` here instead of as env: the route is recorded
+        with that credential as ``AdoptionState.PENDING`` before the caller
+        sends the adopting ``Event``, so the durable copy exists before the
+        first request that could lose its response. Identity env and a
+        conversation token together are refused: they would describe a cold
+        pod bound at boot to one identity while the ACI adopts another.
         """
 
         started = time.monotonic()
@@ -172,12 +187,15 @@ class SandboxSubstrate:
                         thread_key,
                         env=env,
                         state=RouteState.LIVE,
+                        session_id=session_id,
+                        history_ref=history_ref,
                         agent_name=agent_name,
                         workspace_repo=workspace_repo,
                         workspace_materialized_head=workspace_materialized_head,
                         publication_visible_outcome_revision=(
                             publication_visible_outcome_revision
                         ),
+                        conversation_token=conversation_token,
                     )
                     outcome = "claimed"
             except Exception as exc:
@@ -313,6 +331,69 @@ class SandboxSubstrate:
         except Exception:  # noqa: BLE001 - route already swapped; reaper owns cleanup
             logger.exception("late workspace handoff left old claim for orphan reaping")
         return candidate
+
+    def mark_adoption_applied(
+        self, thread_key: str, *, expected: SandboxHandle
+    ) -> SandboxHandle | None:
+        """Record that the runner installed ``expected.token`` (ADR-0122 d2).
+
+        Called once the adopting turn acked ``adoption_applied: true`` on every
+        frame, or once the ``/v1/status`` attestation under the conversation
+        credential proved the binding after a lost response. Idempotent when
+        the route is already APPLIED for that credential (a retry that lost
+        its first response). Returns the applied handle, or ``None`` when the
+        fence was lost, in which case the caller holds a stale handle and must
+        re-resolve the route.
+
+        What is fenced, precisely. The write goes through the existing
+        ``replace_if_generation`` CAS, which atomically requires the route to
+        still name ``expected``'s claim AND generation: every writer that
+        replaces the claim (resume, handoff, release + re-claim) therefore
+        loses to or defeats this call. The remaining conditions (route LIVE,
+        same credential, state PENDING) are checked here between the read and
+        the CAS, so a same-claim, same-generation state flip inside that
+        window (``mark_suspended``) is NOT excluded by the store itself, and
+        no lock closes it today: the kernel's only ``suspend`` call runs after
+        its per-thread lock is released. This method therefore has NO
+        production caller in this slice. Before the kernel-wiring slice wires
+        one, ``AffinityStore`` must gain a CAS whose Lua predicate also
+        requires ``state == live`` and ``adoption_state == pending`` (or this
+        method must switch to it); a claim + generation fence alone does not
+        discharge that requirement.
+        """
+
+        record = self._affinity.get(thread_key)
+        if record is None or record.state is not RouteState.LIVE:
+            return None
+        current = record.handle
+        if (
+            current.claim_name != expected.claim_name
+            or current.generation != expected.generation
+            or not hmac.compare_digest(
+                current.token.encode("utf-8"), expected.token.encode("utf-8")
+            )
+        ):
+            return None
+        if current.adoption_state is AdoptionState.APPLIED:
+            return current
+        if current.adoption_state is not AdoptionState.PENDING:
+            return None
+        applied = replace(current, adoption_state=AdoptionState.APPLIED)
+        if not self._affinity.replace_if_generation(
+            thread_key,
+            expected_claim=expected.claim_name,
+            expected_generation=expected.generation,
+            record=RouteRecord(handle=applied, state=RouteState.LIVE),
+            ttl_seconds=self._config.route_ttl_seconds,
+        ):
+            return None
+        logger.info(
+            "adoption applied recorded for %s on claim %s generation %d",
+            thread_key,
+            applied.claim_name,
+            applied.generation,
+        )
+        return applied
 
     # -- suspend / resume -------------------------------------------------------
 
@@ -630,8 +711,22 @@ class SandboxSubstrate:
         publication_visible_outcome_revision: int = 0,
         generation: int = 0,
         publish: bool = True,
+        conversation_token: str | None = None,
     ) -> SandboxHandle:
         config = self._config
+        boot_env = env or {}
+        if conversation_token:
+            if any(key in boot_env for key in (SESSION_ENV, HISTORY_ENV, RUNNER_TOKEN_ENV)):
+                raise ValueError(
+                    "a warm-bind claim delivers session identity and its credential over "
+                    "the ACI; per-claim session, history, or runner-token env would boot "
+                    "a cold pod bound to a different identity"
+                )
+            token = conversation_token
+            adoption_state = AdoptionState.PENDING
+        else:
+            token = boot_env.get(RUNNER_TOKEN_ENV, "")
+            adoption_state = AdoptionState.NONE
         nonce = uuid.uuid4().hex[:6]
         name = config.claim_name_for(thread_key, nonce)
         thread_hash = name.rsplit("-", 1)[0].rsplit("-", 1)[-1]
@@ -664,15 +759,14 @@ class SandboxSubstrate:
             # claims receive their authoritative identity in this exact env;
             # the explicit values remain fallbacks for lifecycle callers that
             # preserve identity without carrying those optional env entries.
-            session_id=(env or {}).get(SESSION_ENV)
-            or session_id
-            or f"thread-{thread_hash}",
-            history_ref=(env or {}).get(HISTORY_ENV) or history_ref,
-            token=(env or {}).get(RUNNER_TOKEN_ENV, ""),
+            session_id=boot_env.get(SESSION_ENV) or session_id or f"thread-{thread_hash}",
+            history_ref=boot_env.get(HISTORY_ENV) or history_ref,
+            token=token,
             workspace_repo=workspace_repo,
             workspace_materialized_head=workspace_materialized_head,
             publication_visible_outcome_revision=publication_visible_outcome_revision,
             generation=generation,
+            adoption_state=adoption_state,
         )
         if not publish:
             return handle
