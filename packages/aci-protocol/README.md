@@ -58,12 +58,21 @@ Consumer authority policy, realized by the runner and not by this package:
 `runner_token` present wins and the bootstrap is never admitted (the cold path
 is unchanged); only `runner_bootstrap_token` present is bootstrap mode, where
 any gated request other than the adopting event is refused before a model turn
-starts; neither present is today's tokenless legacy boot, unchanged. Both are
-secret material: omitted from `repr`/`str`, never echoed by a validation error,
-and redacted by the generated Rust `Debug`. A present but blank or oversize
-value fails the boot parse closed; a declared-but-empty var is "unset", the
-rule every boot var already follows. Declaring the key is not bootstrap mode,
-adoption, retirement, or a pool.
+starts; neither present is today's tokenless legacy boot, unchanged.
+
+`runner_bootstrap_token` is handled as secret material: omitted from
+`repr`/`str`, never echoed by a validation error, and redacted by the generated
+Rust `Debug`. A present value that is empty, blank, oversize or not a string
+fails the boot parse closed. Unlike every other optional boot var, a
+declared-but-empty `CURIE_RUNNER_BOOTSTRAP_TOKEN` is not "unset": its only
+producer is a pool `Secret`, so an empty value is a mis-render, and only an
+absent key is the compatible legacy case. `runner_token` keeps its current
+handling, which predates this patch and is not changed by it: a
+declared-but-empty `CURIE_RUNNER_TOKEN` is unset, a blank value passes through
+verbatim with no size cap, and the value still appears in `repr` and in the
+Rust `Debug` output. Extending the redaction to it and the other token fields
+is a separate change. Declaring the key is not bootstrap mode, adoption,
+retirement, or a pool.
 
 **Inbound channel messages** (discriminated union on `kind`):
 

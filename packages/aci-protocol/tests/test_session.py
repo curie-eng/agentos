@@ -885,7 +885,9 @@ def test_the_substrate_writes_identity_otel_and_the_warm_pool_defaults() -> None
         "CURIE_SESSION_ID",  # agent-sandbox.yaml:420 ("warm-unbound")
         "CURIE_BUDGET",  # agent-sandbox.yaml:428
         # Substrate-only by contract (#1492, ADR-0122): a per-pool bootstrap
-        # credential arrives via secretKeyRef on the pool template. The worker's
+        # credential arrives via secretKeyRef on the pool template. Declared
+        # here as the PRODUCER TAG; the chart does not render it yet, so unlike
+        # the keys above it has no agent-sandbox.yaml citation. The worker's
         # per-claim render never writes it; a worker write would turn a bound
         # pod back into one that admits the pool's shared bootstrap.
         "CURIE_RUNNER_BOOTSTRAP_TOKEN",

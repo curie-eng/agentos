@@ -360,8 +360,11 @@ where
 
 
 # One admission rule for every credential-bearing field, mirroring the Python
-# ``admit_bounded_credential``: absent/null is None; a present value must be
-# non-blank and within the cap, and the error names the field, never the value.
+# ``admit_bounded_credential``: absent/null is None; a present value must be a
+# non-blank string within the cap, and the error names the field, never the
+# value. Decoded as a ``serde_json::Value`` first so a non-string (a number, a
+# bool, an array) also lands in the fixed-message arm: serde's own type error
+# for ``Option<String>`` would echo a scalar ("invalid type: integer `4711`").
 # The caps are interpolated from the Python constants so the two lanes cannot
 # drift on the bound.
 _BOUNDED_CREDENTIAL_DESERIALIZER = """fn deserialize_bounded_credential<'de, D>(
@@ -372,13 +375,15 @@ _BOUNDED_CREDENTIAL_DESERIALIZER = """fn deserialize_bounded_credential<'de, D>(
 where
     D: serde::Deserializer<'de>,
 {
-    let value = Option::<String>::deserialize(deserializer)?;
-    match &value {
-        None => Ok(None),
-        Some(s) if s.trim().is_empty() || s.chars().count() > max_chars => {
-            Err(serde::de::Error::custom(format!("malformed {what}")))
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s))
+            if !s.trim().is_empty() && s.chars().count() <= max_chars =>
+        {
+            Ok(Some(s))
         }
-        Some(_) => Ok(value),
+        Some(_) => Err(serde::de::Error::custom(format!("malformed {what}"))),
     }
 }"""
 
@@ -569,6 +574,41 @@ mod tests {
         let raw = format!("{BOOT_ENV_MINIMAL},\\"runner_bootstrap_token\\":\\"   \\"}}");
         let error = serde_json::from_str::<BootEnv>(&raw).unwrap_err();
         assert!(error.to_string().contains("malformed runner bootstrap token"));
+    }
+
+    #[test]
+    fn boot_env_rejects_non_string_bootstrap_token_without_echo() {
+        let specimens = [
+            "4711",
+            "true",
+            r#"["runner-bootstrap-token-fixture-PLACEHOLDER"]"#,
+            r#"{"v":"runner-bootstrap-token-fixture-PLACEHOLDER"}"#,
+        ];
+        for specimen in specimens {
+            let raw = format!("{BOOT_ENV_MINIMAL},\\"runner_bootstrap_token\\":{specimen}}}");
+            let rendered = serde_json::from_str::<BootEnv>(&raw).unwrap_err().to_string();
+            assert!(rendered.contains("malformed runner bootstrap token"), "{rendered}");
+            assert!(!rendered.contains("4711"), "{rendered}");
+            assert!(!rendered.contains("runner-bootstrap-token-fixture-PLACEHOLDER"), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn boot_env_explicit_null_bootstrap_token_is_none() {
+        let raw = format!("{BOOT_ENV_MINIMAL},\\"runner_bootstrap_token\\":null}}");
+        let decoded: BootEnv = serde_json::from_str(&raw).unwrap();
+        assert_eq!(decoded.runner_bootstrap_token, None);
+    }
+
+    #[test]
+    fn inbound_event_rejects_non_string_adoption_credential_without_echo() {
+        let raw = concat!(
+            r#"{"kind":"event","type":"message","text":"hi","user":"U1","ts":"1.0","#,
+            r#""adoption_credential":4711}"#
+        );
+        let rendered = serde_json::from_str::<InboundMessage>(raw).unwrap_err().to_string();
+        assert!(rendered.contains("malformed adoption credential"), "{rendered}");
+        assert!(!rendered.contains("4711"), "{rendered}");
     }
 
     #[test]

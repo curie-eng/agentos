@@ -82,15 +82,20 @@ def test_omitted_key_parses_to_none_and_renders_nothing() -> None:
     assert _KEY not in boot.to_env()
 
 
-def test_declared_but_empty_is_unset_like_every_other_boot_var() -> None:
-    """The BootEnv-wide rule: a declared-but-empty var is "unset", never a value.
+def test_declared_but_empty_fails_closed_unlike_every_other_boot_var() -> None:
+    """Deliberately NOT the ``_str_or_none`` rule ``runner_token`` follows.
 
-    Mirrors ``runner_token`` (``env.get(...) or None``). An empty bootstrap key
-    therefore yields the same legacy, tokenless boot a pod without the key gets;
-    nothing is relaxed relative to today, because the key did not exist.
+    ``CURIE_RUNNER_TOKEN`` treats empty as unset so a local/fake sandbox never
+    presents an empty bearer. The bootstrap key has no such producer: it comes
+    only from a pool Secret, so an empty value is a mis-rendered ``secretKeyRef``,
+    and decoding it as "neither token present" would boot a warm pod whose
+    gated routes pass through. Absent stays the compatible legacy case.
     """
-    boot = BootEnv.from_env(_warm_env(**{_KEY: ""}))
-    assert boot.runner_bootstrap_token is None
+    with pytest.raises(ValidationError) as exc:
+        BootEnv.from_env(_warm_env(**{_KEY: ""}))
+    assert [err["loc"] for err in exc.value.errors()] == [(_FIELD,)]
+    assert "malformed runner bootstrap token" in str(exc.value)
+    assert BootEnv.from_env(_COLD_ENV | {"CURIE_RUNNER_TOKEN": ""}).runner_token is None
 
 
 def test_cold_path_with_both_keys_parses_both_verbatim() -> None:
@@ -199,7 +204,7 @@ def test_oversize_by_one_is_rejected_and_at_the_bound_is_admitted() -> None:
         {"nested": _TOKEN},
         "",
         "   ",
-        "x" * (RUNNER_BOOTSTRAP_TOKEN_MAX_CHARS + 1),
+        _TOKEN + "x" * (RUNNER_BOOTSTRAP_TOKEN_MAX_CHARS - len(_TOKEN) + 1),
     ),
     ids=("int", "bool", "bytes", "list", "dict", "empty", "blank", "oversize"),
 )
@@ -213,11 +218,69 @@ def test_direct_construction_rejects_malformed_values_without_echo(value: object
     assert [err["loc"] for err in exc.value.errors()] == [(_FIELD,)]
 
 
-def test_model_validate_json_redacts_a_malformed_token() -> None:
-    raw = json.dumps({"session": _session().model_dump(), _FIELD: "   " + _TOKEN[:0]})
+@pytest.mark.parametrize(
+    "value",
+    (
+        _TOKEN + "x" * (RUNNER_BOOTSTRAP_TOKEN_MAX_CHARS - len(_TOKEN) + 1),
+        [_TOKEN],
+        {"nested": _TOKEN},
+        4711,
+        "",
+        "   ",
+    ),
+    ids=("oversize", "list", "dict", "int", "empty", "blank"),
+)
+def test_model_validate_json_redacts_a_malformed_token(value: object) -> None:
+    raw = json.dumps({"session": _session().model_dump(), _FIELD: value})
     with pytest.raises(ValidationError) as exc:
         BootEnv.model_validate_json(raw)
-    assert _TOKEN not in _surfaces(exc.value)
+    rendered = _surfaces(exc.value)
+    assert _TOKEN not in rendered
+    assert "4711" not in rendered
+    assert "malformed runner bootstrap token" in rendered
+    assert [err["loc"] for err in exc.value.errors()] == [(_FIELD,)]
+
+
+def test_model_validate_json_explicit_null_is_none() -> None:
+    raw = json.dumps({"session": _session().model_dump(), _FIELD: None})
+    assert BootEnv.model_validate_json(raw).runner_bootstrap_token is None
+
+
+def _context_chain(exc: BaseException) -> list[BaseException]:
+    out: list[BaseException] = []
+    cur: BaseException | None = exc
+    while cur is not None:
+        out.append(cur)
+        cur = cur.__context__ or cur.__cause__
+    return out[1:]
+
+
+@pytest.mark.parametrize(
+    "build",
+    (
+        lambda: BootEnv.model_validate_json(
+            '{"session": {}, "' + _FIELD + '": "' + _TOKEN + '", bad}'
+        ),
+        lambda: BootEnv.model_validate_json(
+            json.dumps({"session": {"plugin_dir": "/p"}, _FIELD: _TOKEN})
+        ),
+        lambda: BootEnv(session=_session(), runner_bootstrap_token=[_TOKEN]),  # type: ignore[arg-type]
+        lambda: BootEnv.from_env(
+            _warm_env(**{_KEY: _TOKEN + "x" * RUNNER_BOOTSTRAP_TOKEN_MAX_CHARS})
+        ),
+    ),
+    ids=("invalid-json", "unrelated-error", "ctor-list", "env-oversize"),
+)
+def test_no_chained_exception_retains_the_material(build: object) -> None:
+    """``raise ... from None`` only hides the chain; the original error would
+    still hang off ``__context__``. The redacted error is raised outside the
+    except block so an introspector that ignores ``__suppress_context__``
+    finds nothing behind it."""
+    with pytest.raises(ValidationError) as exc:
+        build()  # type: ignore[operator]
+    for chained in _context_chain(exc.value):
+        assert _TOKEN not in _surfaces(chained)
+    assert _context_chain(exc.value) == []
 
 
 def test_invalid_json_never_echoes_the_raw_input() -> None:
@@ -294,3 +357,6 @@ def test_generated_rust_carries_the_constant_and_redacts_the_field() -> None:
     ) in rust
     assert "malformed runner bootstrap token" in rust
     assert f"{RUNNER_BOOTSTRAP_TOKEN_MAX_CHARS}" in rust
+    # Non-strings are decoded through serde_json::Value so a scalar cannot be
+    # echoed by serde's own "invalid type: integer `...`" error.
+    assert "Option::<serde_json::Value>::deserialize(deserializer)" in rust
