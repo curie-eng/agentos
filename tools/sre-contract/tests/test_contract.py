@@ -29,16 +29,6 @@ def run(bundle, *args):
 def healthy(tmp_path):
     bundle = tmp_path / "sre-bot"
     shutil.copytree(ROOT / "examples/sre-bot", bundle)
-    # Explicit #2285 prerequisite fixture. This is not the shipped policy.
-    path = bundle / ".claude-plugin/plugin.json"
-    manifest = json.loads(path.read_text())
-    manifest["toolPolicy"]["allow"] = list(
-        dict.fromkeys(
-            manifest["toolPolicy"]["allow"]
-            + ["grafana/*", "tempo/*", "self-upgrade/latest_release"]
-        )
-    )
-    path.write_text(json.dumps(manifest))
     return bundle
 
 
@@ -216,6 +206,47 @@ def test_image_only_live_consumer_mutation_and_restoration(healthy, catalogs):
     assert run(healthy, "--endpoints", str(endpoint)).returncode == 0
 
 
+def test_pinned_grafana_alert_read_catalog_through_consumer(healthy, catalogs):
+    # The pinned producer selects ManageRulesRead under -disable-write:
+    # https://github.com/grafana/mcp-grafana/blob/130384b1be0ce618e35e0b9c8f38c4ec17bf9367/tools/alerting.go
+    # Its operation enum comes from ManageRulesReadParams, not the bundle policy:
+    # https://github.com/grafana/mcp-grafana/blob/130384b1be0ce618e35e0b9c8f38c4ec17bf9367/tools/alerting_manage_rules_types.go
+    responses, _, endpoint = catalogs
+    responses["grafana"] = [
+        tool
+        for tool in responses["grafana"]
+        if tool["name"] not in {"list_alert_rules", "alerting_manage_rules"}
+    ] + [
+        {
+            "name": "alerting_manage_rules",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "operation": {"type": "string", "enum": ["list", "get", "versions"]}
+                },
+                "required": ["operation"],
+            },
+            "annotations": {"readOnlyHint": True},
+        }
+    ]
+    result = run(healthy, "--endpoints", str(endpoint))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    # A server advertising the write-capable variant must not inherit the read grant.
+    original = copy.deepcopy(responses["grafana"])
+    responses["grafana"][-1]["annotations"]["readOnlyHint"] = False
+    responses["grafana"][-1]["inputSchema"]["properties"]["operation"]["enum"] += [
+        "create",
+        "update",
+        "delete",
+    ]
+    result = run(healthy, "--endpoints", str(endpoint))
+    assert result.returncode == 1
+    assert "grafana/alerting_manage_rules: ungated live write" in result.stderr
+    responses["grafana"] = original
+    assert run(healthy, "--endpoints", str(endpoint)).returncode == 0
+
+
 @pytest.mark.parametrize(
     "mutation, expected",
     [
@@ -347,4 +378,132 @@ def test_paginated_catalog_mutations_reject_then_restore(healthy, catalogs, muta
     else:
         assert "SRE contract failed:" in result.stderr
     responses["grafana"] = healthy_pages
+    assert run(healthy, "--endpoints", str(endpoint)).returncode == 0
+
+
+# Name/readOnlyHint projection of the pinned producer; raw descriptions and schemas
+# belong in private evidence. Registrations and read variants are bound by:
+# https://github.com/grafana/mcp-grafana/blob/130384b1be0ce618e35e0b9c8f38c4ec17bf9367/cmd/mcp-grafana/main.go
+# The actual-image consumer remains mandatory; this external HTTP fixture cannot
+# establish image identity, configured operation refusal or upstream effects.
+PINNED_GRAFANA_READ_TOOLS = (
+    "alerting_manage_routing",
+    "alerting_manage_rules",
+    "analyze_loki_labels",
+    "check_datasources_health",
+    "generate_deeplink",
+    "get_alert_group",
+    "get_annotation_tags",
+    "get_annotations",
+    "get_assertions",
+    "get_current_oncall_users",
+    "get_dashboard_by_uid",
+    "get_dashboard_panel_queries",
+    "get_dashboard_property",
+    "get_dashboard_summary",
+    "get_datasource",
+    "get_oncall_shift",
+    "get_query_examples",
+    "get_sift_analysis",
+    "get_sift_investigation",
+    "list_alert_groups",
+    "list_cloudwatch_dimensions",
+    "list_cloudwatch_metrics",
+    "list_cloudwatch_namespaces",
+    "list_datasources",
+    "list_loki_label_names",
+    "list_loki_label_values",
+    "list_oncall_schedules",
+    "list_oncall_teams",
+    "list_oncall_users",
+    "list_prometheus_label_names",
+    "list_prometheus_label_values",
+    "list_prometheus_metric_metadata",
+    "list_prometheus_metric_names",
+    "list_pyroscope_label_names",
+    "list_pyroscope_label_values",
+    "list_pyroscope_profile_types",
+    "list_sift_investigations",
+    "query_cloudwatch",
+    "query_loki_logs",
+    "query_loki_patterns",
+    "query_loki_stats",
+    "query_prometheus",
+    "query_prometheus_histogram",
+    "query_pyroscope",
+    "run_panel_query",
+    "search_dashboards",
+    "search_folders",
+    "suggest_loki_alloy_label_config",
+)
+
+
+@pytest.fixture
+def pinned_grafana_catalog(catalogs):
+    responses, calls, endpoint = catalogs
+    responses["grafana"] = [
+        {
+            "name": name,
+            "inputSchema": {"type": "object"},
+            "annotations": {"readOnlyHint": True},
+        }
+        for name in PINNED_GRAFANA_READ_TOOLS
+    ]
+    return responses, calls, endpoint
+
+
+def test_complete_pinned_grafana_catalog(healthy, pinned_grafana_catalog):
+    _, _, endpoint = pinned_grafana_catalog
+    result = run(healthy, "--endpoints", str(endpoint))
+    assert result.returncode == 0, result.stdout + result.stderr
+    manifest = json.loads((healthy / ".claude-plugin/plugin.json").read_text())
+    for collection in ("allow", "approvalRequired", "deny"):
+        assert all(not any(c in item for c in "*?[") for item in manifest["toolPolicy"][collection])
+
+
+@pytest.mark.parametrize("tool", ["query_loki_logs", "alerting_manage_rules", "list_datasources"])
+def test_pinned_read_grant_removal_rejects_then_restores(healthy, pinned_grafana_catalog, tool):
+    _, _, endpoint = pinned_grafana_catalog
+    path = healthy / ".claude-plugin/plugin.json"
+    original = path.read_bytes()
+    assert run(healthy, "--endpoints", str(endpoint)).returncode == 0
+    manifest = json.loads(original)
+    manifest["toolPolicy"]["allow"].remove("grafana/" + tool)
+    path.write_text(json.dumps(manifest))
+    result = run(healthy, "--endpoints", str(endpoint))
+    assert result.returncode == 1
+    assert f"grafana/{tool}: expected allow, got deny" in result.stderr
+    assert f"grafana/{tool}: uncovered live tool" in result.stderr
+    path.write_bytes(original)
+    assert run(healthy, "--endpoints", str(endpoint)).returncode == 0
+
+
+@pytest.mark.parametrize("mutation", ["missing", "extra", "write-as-allow"])
+def test_complete_catalog_mutations_reject_then_restore(healthy, pinned_grafana_catalog, mutation):
+    responses, _, endpoint = pinned_grafana_catalog
+    original = copy.deepcopy(responses["grafana"])
+    assert run(healthy, "--endpoints", str(endpoint)).returncode == 0
+    if mutation == "missing":
+        responses["grafana"] = [t for t in original if t["name"] != "alerting_manage_rules"]
+    elif mutation == "extra":
+        responses["grafana"].append(
+            {
+                "name": "unreviewed_read",
+                "inputSchema": {"type": "object"},
+                "annotations": {"readOnlyHint": True},
+            }
+        )
+    else:
+        next(t for t in responses["grafana"] if t["name"] == "alerting_manage_rules")[
+            "annotations"
+        ]["readOnlyHint"] = False
+    result = run(healthy, "--endpoints", str(endpoint))
+    assert result.returncode == 1
+    if mutation == "write-as-allow":
+        assert "grafana/alerting_manage_rules: ungated live write" in result.stderr
+    else:
+        assert "grafana: live catalog differs from supported surface" in result.stderr
+    if mutation == "extra":
+        assert "grafana/unreviewed_read: uncovered live tool" in result.stderr
+    responses["grafana"] = original
     assert run(healthy, "--endpoints", str(endpoint)).returncode == 0
