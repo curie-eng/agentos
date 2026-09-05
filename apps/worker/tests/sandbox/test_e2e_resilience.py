@@ -14,8 +14,9 @@ Every ACI turn must end successfully: an HTTP 200 stream or a failed final does
 not pass. Set CURIE_SANDBOX_E2E_LIVE=1 (or CURIE_E2E_LIVE=1) to require a live
 pool, content isolation, durable recall and cache evidence. Credentials may live
 only in the pool's Secret; missing prerequisites fail the live run, never skip it.
-Phase D requires CURIE_SANDBOX_E2E_HISTORY_REF to name a task-owned real state
-API transcript, CURIE_SANDBOX_E2E_HISTORY_TOKEN for its scoped credential and
+The whole scenario preflights its phase-D fixture before creating any claims:
+CURIE_SANDBOX_E2E_HISTORY_REF must name a task-owned real state API transcript,
+CURIE_SANDBOX_E2E_HISTORY_TOKEN supplies its scoped credential and
 CURIE_SANDBOX_E2E_HISTORY_MARKER for the synthetic token seeded in that transcript.
 
 These phases do not claim a worker process kill, a mid-tool pod kill, actual
@@ -41,7 +42,6 @@ import uuid
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from urllib.parse import urlparse
 
 import pytest
 
@@ -55,6 +55,7 @@ from resilience_fixtures import (  # noqa: E402, F401
 )
 from resilience_harness import (  # noqa: E402
     ResilienceConfig,
+    assert_exact_recall,
     collected_text,
     detect_cross_talk,
     final_frame,
@@ -65,6 +66,8 @@ from resilience_harness import (  # noqa: E402
     pod_uid,
     port_forward,
     post_event,
+    release_claims,
+    required_history_fixture,
     thread_hash,
     trace_cache_reads,
     unique_marker,
@@ -98,12 +101,12 @@ def _drive_turn(
 
     if cfg.live_model:
         # Read only the model-mode bit. Never dump the pod's credential env.
-        fake = kubectl(
-            cfg, "get", "pod", sandbox_name,
-            "-o", 'jsonpath={.spec.containers[?(@.name=="runner")]'
-            '.env[?(@.name=="CURIE_FAKE_MODEL")].value}',
-        ).strip().lower()
-        assert fake not in {"1", "true", "yes"}, "required live run reached a fake-model pod"
+        mode = kubectl(
+            cfg, "exec", sandbox_name, "-c", "runner", "--", "python", "-c",
+            "import os; print('fake' if os.environ.get('CURIE_FAKE_MODEL','').lower() "
+            "in {'1','true','yes'} else 'live')",
+        ).strip()
+        assert mode == "live", "required live run reached a fake-model or unverified pod"
     with port_forward(cfg, sandbox_name, port) as base:
         assert get_json(base, "/healthz") == {"ok": True}
         return post_event(base, text, user=user, ts=ts, token=token, trace_id=trace_id)
@@ -136,12 +139,7 @@ def test_e2e_resilience(
     assert isinstance(substrate, SandboxSubstrate)
     # The operator prepares an isolated transcript through the real state API.
     # An arbitrary marker is not a valid history ref: runner boot rejects it.
-    history_ref = os.environ.get("CURIE_SANDBOX_E2E_HISTORY_REF", "")
-    history_marker = os.environ.get("CURIE_SANDBOX_E2E_HISTORY_MARKER", "")
-    assert urlparse(history_ref).scheme in {"http", "https"} and history_marker, (
-        "configure a task-owned state API transcript URL and its synthetic expected marker "
-        "using CURIE_SANDBOX_E2E_HISTORY_REF and CURIE_SANDBOX_E2E_HISTORY_MARKER"
-    )
+    history_ref, history_token, history_marker = required_history_fixture(os.environ)
     print(f"\nEVIDENCE resilience_run={run} concurrency={cfg.concurrency} batch={cfg.batch}")
 
     scope = uuid.uuid4().hex
@@ -282,7 +280,6 @@ def test_e2e_resilience(
             load = pool.map(_sustained, others) if others else iter(())
             substrate.suspend(target, history_ref=history_ref)
             _wait_pod_gone(cfg, claimed[target].sandbox_name)
-            history_token = os.environ.get("CURIE_SANDBOX_E2E_HISTORY_TOKEN", "")
             resumed = substrate.resume(
                 target, env={BootEnv.env_key("history_token"): history_token},
             )
@@ -299,8 +296,10 @@ def test_e2e_resilience(
             for e in c.get("env", [])
         }
         actual_history_ref = env.get(HISTORY_ENV)
-        del env
+        history_token_matches = env.get(BootEnv.env_key("history_token")) == history_token
+        del env, containers, resumed_pod, history_token
         assert actual_history_ref == history_ref, "resumed pod missing injected history ref"
+        assert history_token_matches, "resumed pod missing matching scoped history credential"
         frames = _drive_turn(
             cfg, resumed.sandbox_name, resumed.port,
             "What exact verification token was recorded in the durable transcript? "
@@ -309,12 +308,13 @@ def test_e2e_resilience(
         )
         _assert_final(frames)
         if cfg.live_model:
-            assert history_marker in collected_text(frames), "resumed runner lost durable history"
+            assert_exact_recall(frames, history_marker)
         for key in others:
             assert pod_uid(pod_of_sandbox(cfg, claimed[key].sandbox_name)) == uids[key], (
                 f"suspend/resume disturbed concurrently loaded thread {key}"
             )
-        print(f"EVIDENCE phase_d_resume_injected_history_ref pod={resumed.sandbox_name}")
+        proof = "authenticated_runner_recall" if cfg.live_model else "UNPROVED_environment_only"
+        print(f"EVIDENCE phase_d_history={proof}")
 
         # -- Cache-warmth proxy: same pod across consecutive turns ------------
         stable = loaded[-1] if len(loaded) > 1 else target
@@ -334,11 +334,7 @@ def test_e2e_resilience(
         print(f"EVIDENCE same_pod_across_turns uid={first_uid}")
 
     finally:
-        for key in list(claimed):
-            try:
-                substrate.release(key)
-            except Exception:
-                pass
+        release_claims(substrate.release, list(claimed))
 
 
 @pytest.mark.skipif(
@@ -354,12 +350,13 @@ def test_cache_read_tokens_probe(
 
     assert isinstance(substrate, SandboxSubstrate)
     key = f"cache-{uuid.uuid4().hex}"
+    handle = substrate.claim(key)
     try:
-        handle = substrate.claim(key)
         # A unique, substantial prompt makes the continuation useful for a
         # real cache probe. Two tiny replies alone may never reach a provider's
         # minimum cacheable prefix size.
-        context = "\n".join(f"Record {i}: {key} item {i * 17}" for i in range(500))
+        values = [unique_marker(key, i) for i in range(500)]
+        context = "\n".join(f"Record {i}: {value}" for i, value in enumerate(values))
         _drive_turn(
             cfg, handle.sandbox_name, handle.port,
             f"Remember these records for the next turn. Reply only READY.\n{context}",
@@ -367,10 +364,11 @@ def test_cache_read_tokens_probe(
         )
         trace_id = uuid.uuid4().hex
         followup = _drive_turn(
-            cfg, handle.sandbox_name, handle.port, "What is the item value in Record 17?",
+            cfg, handle.sandbox_name, handle.port,
+            "What is the exact value in Record 17? Reply only that value.",
             user=key, ts="2.0", token=handle.token, trace_id=trace_id,
         )
-        assert "289" in collected_text(followup), "follow-up did not retain the primed records"
+        assert_exact_recall(followup, values[17])
         deadline = time.monotonic() + 120
         while True:
             reads = trace_cache_reads(trace_id)
@@ -381,4 +379,4 @@ def test_cache_read_tokens_probe(
         assert trace_cache_reads(uuid.uuid4().hex) == 0, "unobserved trace reported cached tokens"
         print(f"EVIDENCE cache_followup_trace={trace_id} cache_read_input_tokens={reads}")
     finally:
-        substrate.release(key)
+        release_claims(substrate.release, [key])

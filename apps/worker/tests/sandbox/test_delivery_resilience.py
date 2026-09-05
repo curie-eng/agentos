@@ -27,8 +27,9 @@ from curie_runner import RunTracer, SideEffectClassifier, create_app
 from curie_runner.fake import FakeModelSession
 from curie_runner.session import SessionRunner
 from curie_worker.consumer import Consumer
+from curie_worker.delivery_lease import DeliveryLeaseStore
 
-from apps.worker.tests.kernel.conftest import kernel_harness
+from apps.worker.tests.kernel.conftest import _ProcessEventSpy, kernel_harness
 
 
 class ReceiptModel(FakeModelSession):
@@ -80,8 +81,9 @@ def _runner(model: ReceiptModel) -> SessionRunner:
 
 
 @pytest.mark.parametrize("fault", ["before-effect", "after-effect"])
+@pytest.mark.parametrize("fenced", [False, True], ids=["legacy-unfenced", "current-fenced"])
 def test_reclaimed_delivery_commits_exactly_one_receipt(
-    fault: str, names: dict[str, str], sync_redis: redis.Redis, tmp_path: Path,
+    fault: str, fenced: bool, names: dict[str, str], sync_redis: redis.Redis, tmp_path: Path,
 ) -> None:
     async def run() -> None:
         receipt = tmp_path / "effect-receipts"
@@ -99,16 +101,28 @@ def test_reclaimed_delivery_commits_exactly_one_receipt(
         async with kernel_harness(
             names, sync_redis, runner_app=create_app(first_runner), reclaim_min_idle_ms=0,
         ) as first:
-            consumer = Consumer(redis=first.async_redis, kernel=first.kernel, config=first.config)
+            first_calls = _ProcessEventSpy(first.kernel)
+            first_config = first.config.model_copy(update={"consumer_name": "departed-worker"})
+            consumer = Consumer(
+                redis=first.async_redis, kernel=first.kernel, config=first_config,
+                leases=DeliveryLeaseStore(first.async_redis, first_config) if fenced else None,
+            )
             await consumer.ensure_group()
             entry_id = await first.async_redis.xadd(first.config.stream, to_stream_fields(event))
             deliveries = await first.async_redis.xreadgroup(
                 first.config.consumer_group, "departed-worker", {first.config.stream: ">"}, count=1,
             )
-            assert deliveries
-            task = asyncio.create_task(first.kernel.process_event(event))
+            assert deliveries[0][1][0][0] == entry_id
+            if fenced:
+                await consumer._dispatch(*deliveries[0][1][0])
+                task = next(iter(consumer._inflight))
+            else:
+                task = asyncio.create_task(first.kernel.process_event(event))
             try:
                 await asyncio.wait_for(first_model.reached.wait(), timeout=5)
+                if fenced:
+                    lease = first_calls.leases_for(event.event_id)[0]
+                    assert lease is not None and lease.generation == 1
                 if fault == "after-effect":
                     async with asyncio.timeout(5):
                         while not await first.async_redis.exists(
@@ -135,12 +149,17 @@ def test_reclaimed_delivery_commits_exactly_one_receipt(
         async with kernel_harness(
             names, sync_redis, runner_app=create_app(second_runner), reclaim_min_idle_ms=0,
         ) as second:
+            second_calls = _ProcessEventSpy(second.kernel)
+            second_config = second.config.model_copy(update={"consumer_name": "replacement-worker"})
             consumer = Consumer(
-                redis=second.async_redis, kernel=second.kernel, config=second.config
+                redis=second.async_redis, kernel=second.kernel, config=second_config,
+                leases=DeliveryLeaseStore(second.async_redis, second_config) if fenced else None,
             )
             await consumer.ensure_group()
             assert await consumer._reclaim_once() == 1
             await asyncio.wait_for(asyncio.gather(*list(consumer._inflight)), timeout=10)
+            if fenced:
+                assert second_calls.leases_for(event.event_id)[0].generation == 2
             assert receipt.read_text() == "committed\n"
             expected_queries = [] if fault == "after-effect" else [event.text]
             assert second_model.queries == expected_queries
@@ -159,7 +178,7 @@ def test_reclaimed_delivery_commits_exactly_one_receipt(
             )
             duplicate = await second.async_redis.xreadgroup(
                 second.config.consumer_group,
-                second.config.consumer_name,
+                second_config.consumer_name,
                 {second.config.stream: ">"},
                 count=1,
             )
@@ -168,6 +187,5 @@ def test_reclaimed_delivery_commits_exactly_one_receipt(
             await asyncio.wait_for(asyncio.gather(*list(consumer._inflight)), timeout=10)
             assert receipt.read_text() == "committed\n"
             assert second_model.queries == expected_queries
-            assert entry_id
 
     asyncio.run(run())

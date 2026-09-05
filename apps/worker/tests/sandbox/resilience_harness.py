@@ -21,12 +21,15 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import socket
 import subprocess
+import time
 import urllib.request
 import uuid
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 from aci_protocol import Final, SessionStatus, parse_ndjson
 
@@ -119,6 +122,58 @@ def collected_text(frames: Sequence[dict[str, object]]) -> str:
         if isinstance(value, str) and value:
             parts.append(value)
     return " ".join(parts)
+
+
+def assert_exact_recall(frames: Sequence[dict[str, object]], expected: str) -> None:
+    """A substring in a UUID, tool note, or echoed context is not final recall."""
+    final = final_frame(frames)
+    assert final is not None and final.get("status") == "done", "successful final absent"
+    text = final.get("text")
+    assert isinstance(text, str) and text.strip() == expected, (
+        "final did not recall the exact value"
+    )
+
+
+def required_history_fixture(env: Mapping[str, str]) -> tuple[str, str, str]:
+    """Validate fixture shape, never claim authentication or a fetch from this check.
+
+    Only a real authenticated runner recall can prove durable history. The fake
+    lane remains environment-only. Decoding the scoped token prevents passing a
+    raw platform key into a sandbox; the real state API still verifies its HMAC.
+    """
+    ref = env.get("CURIE_SANDBOX_E2E_HISTORY_REF", "")
+    marker = env.get("CURIE_SANDBOX_E2E_HISTORY_MARKER", "")
+    token = env.get("CURIE_SANDBOX_E2E_HISTORY_TOKEN", "")
+    valid = False
+    try:
+        url = urlparse(ref)
+        match = re.search(r"/agents/([^/]+)/state/transcript/[^/]+/?$", url.path)
+        prefix, payload, signature = token.split(".")
+        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        valid = bool(
+            url.scheme in {"http", "https"} and url.hostname
+            and not url.username and not url.password and not url.query and not url.fragment
+            and match and str(uuid.UUID(match.group(1))) == match.group(1)
+            and marker and prefix == "sbx" and signature
+            and isinstance(claims, dict) and claims.get("agent") == match.group(1)
+            and claims.get("scope") == "state" and type(claims.get("exp")) is int
+            and claims["exp"] > time.time()
+        )
+    except (ValueError, TypeError):
+        pass
+    assert valid, "configure a transcript-key URL, matching scoped state token and expected marker"
+    return ref, token, marker
+
+
+def release_claims(release: Callable[[str], None], keys: Sequence[str]) -> None:
+    """Attempt every task-owned release, then fail if any cleanup failed."""
+    failures: list[str] = []
+    for key in keys:
+        try:
+            release(key)
+        except Exception as exc:
+            failures.append(type(exc).__name__)
+    assert not failures, f"task-owned claim cleanup failed ({len(failures)} failures)"
 
 
 def detect_cross_talk(marker: str, other_markers: Sequence[str], text: str) -> bool:
