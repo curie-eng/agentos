@@ -3648,6 +3648,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 emit(
                     ops::up(
                         UpOpts {
+                            retained_mail_values: None,
                             common: CommonOpts {
                                 namespace,
                                 release,
