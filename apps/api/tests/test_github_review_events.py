@@ -172,7 +172,9 @@ def test_app_reinstallation_does_not_change_feedback_execution_identity() -> Non
     assert replacement.installation_id != original.installation_id
 
 
-@pytest.mark.parametrize("association", [None, "NONE", "CONTRIBUTOR", "FIRST_TIMER", [], "member"])
+@pytest.mark.parametrize(
+    "association", [None, "NONE", "FIRST_TIME_CONTRIBUTOR", "FIRST_TIMER", [], "member"]
+)
 def test_drive_by_or_malformed_sender_association_cannot_authorize_feedback(association) -> None:
     payload = feedback_payload()
     payload["comment"]["author_association"] = association
@@ -731,8 +733,11 @@ def test_binding_quota_refuses_new_feedback_and_keeps_an_observable_row(review_s
     assert valkey.xlen(stream) == 0
 
 
+@pytest.mark.parametrize("permission_case", [
+    "legacy", "allowed", "revoked", "wrong_id", "bad_login", "http404", "http403", "timeout",
+])
 def test_real_review_consumer_waits_for_active_turn_and_revalidates_before_new_turn(
-    review_stack, tmp_path
+    review_stack, tmp_path, permission_case,
 ) -> None:
     """Actual API/DB/Valkey/consumer/RunnerClient; GitHub and ACI peer are fixtures.
 
@@ -760,6 +765,25 @@ def test_real_review_consumer_waits_for_active_turn_and_revalidates_before_new_t
     from apps.worker.tests.kernel.conftest import kernel_harness, make_config
 
     client, truth, valkey, stream = review_stack
+    permission = {"permission": "write", "role_name": "write", "user": {"id": 41}}
+    permission_status = 200
+    permission_timeout = False
+    if permission_case != "legacy":
+        from dataclasses import replace
+
+        truth.payload["comment"]["author_association"] = "CONTRIBUTOR"
+        truth.comment["author_association"] = "CONTRIBUTOR"
+        truth.feedback = replace(truth.feedback, author_association="CONTRIBUTOR")
+
+    def github_permission(request):
+        if request.url.path != f"/repos/{REPO}/collaborators/example-reviewer/permission":
+            return truth.handle(request)
+        truth.calls.append(request.url.path)
+        assert request.headers["Authorization"] == "Bearer fixture-app-token-private-sentinel"
+        if permission_timeout:
+            raise httpx.ReadTimeout("synthetic permission timeout", request=request)
+        return httpx.Response(permission_status, json=permission)
+
     settings = get_settings()
     names = {"stream": stream, "group": f"{stream}:group",
              "prefix": settings.worker_key_prefix, "sandbox_prefix": f"{stream}:sandbox"}
@@ -778,6 +802,7 @@ def test_real_review_consumer_waits_for_active_turn_and_revalidates_before_new_t
     objects_client.create_bucket(Bucket=bucket)
 
     async def exercise() -> None:
+        nonlocal permission_status, permission_timeout
         sock = socket.socket()
         sock.bind(("127.0.0.1", 0))
         sock.listen(16)
@@ -878,9 +903,55 @@ def test_real_review_consumer_waits_for_active_turn_and_revalidates_before_new_t
                         h.runner.default_script = [
                             Final(text="review complete", status=SessionStatus.DONE)
                         ]
+                        if permission_case == "revoked":
+                            permission["permission"] = "read"
+                        elif permission_case == "wrong_id":
+                            permission["user"] = {"id": 42}
+                        elif permission_case == "bad_login":
+                            truth.comment["user"]["login"] = "wrong/path"
+                        elif permission_case.startswith("http"):
+                            permission_status = int(permission_case[4:])
+                        elif permission_case == "timeout":
+                            permission_timeout = True
                         truth.calls.clear()
                         await consumer._dispatch(review_id, review_fields)
                         await handler_done(review_id)
+                        if permission_case in {"revoked", "wrong_id", "bad_login"}:
+                            assert h.runner.opened == [original.text]
+                            assert h.runner.steers == [ordinary_steer.text]
+                            assert await asyncio.to_thread(
+                                review_rows, "SELECT id FROM curie.publication_review_reservations"
+                            ) == []
+                            assert await h.async_redis.xpending_range(
+                                stream, h.config.consumer_group, review_id, review_id, 1
+                            ) == []
+                            reconciler = client.app.state.github_review_reconciler
+                            assert await reconciler.reconcile_terminal() == 1
+                            code = {
+                                "revoked": "sender_permission_refused",
+                                "wrong_id": "sender_permission_identity_mismatch",
+                                "bad_login": "non_human_sender",
+                            }[permission_case]
+                            assert await asyncio.to_thread(
+                                review_rows,
+                                "SELECT status,error_code FROM curie.github_review_feedback",
+                            ) == [{"status": "refused", "error_code": code}]
+                            return
+                        if permission_case in {"http404", "http403", "timeout"}:
+                            assert h.runner.opened == [original.text]
+                            assert len(await h.async_redis.xpending_range(
+                                stream, h.config.consumer_group, review_id, review_id, 1
+                            )) == 1
+                            assert await asyncio.to_thread(
+                                review_rows, "SELECT id FROM curie.publication_review_reservations"
+                            ) == []
+                            assert await asyncio.to_thread(
+                                review_rows,
+                                "SELECT status,error_code FROM curie.github_review_feedback",
+                            ) == [{"status": "queued", "error_code": None}]
+                            permission_status, permission_timeout = 200, False
+                            await consumer._dispatch(review_id, review_fields)
+                            await handler_done(review_id)
                         assert len(h.runner.opened) == 2
                         assert h.runner.opened[1] == json.loads(review_fields["payload"])["text"]
                         assert h.runner.steers == [ordinary_steer.text]
@@ -908,15 +979,21 @@ def test_real_review_consumer_waits_for_active_turn_and_revalidates_before_new_t
                     await asyncio.gather(server_task, return_exceptions=True)
                 sock.close()
 
+    original_github = client.app.state.http_client
+    injected = httpx.AsyncClient(transport=httpx.MockTransport(github_permission))
+    client.app.state.http_client = injected
     try:
         client.portal.call(exercise)
     finally:
+        client.app.state.http_client = original_github
+
         def cleanup_sandbox_keys():
             keys = list(valkey.scan_iter(match=f"{stream}:sandbox*"))
             if keys:
                 valkey.delete(*keys)
 
         with ExitStack() as cleanup:
+            cleanup.callback(client.portal.call, injected.aclose)
             cleanup.callback(cleanup_sandbox_keys)
             cleanup.callback(objects_client.close)
             cleanup.callback(objects_client.delete_bucket, Bucket=bucket)
