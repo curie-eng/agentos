@@ -2203,7 +2203,9 @@ async def _require_review_binding(
     workspace = await get_thread_workspace(
         session, agent_id=lineage.agent_id, conversation_id=lineage.conversation_id
     )
-    deployment = await get_deployment(session, lineage.deployment_id)
+    deployment = await session.get(
+        Deployment, lineage.deployment_id, with_for_update=True, populate_existing=True
+    )
     if (
         binding is None
         or binding.agent_id != lineage.agent_id

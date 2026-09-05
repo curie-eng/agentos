@@ -4840,20 +4840,21 @@ def test_adding_app_after_pat_publication_does_not_backfill_legacy_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client, truth, _ = review_lineage_app
+    conversation_id = "legacy-pat-thread"
     app_id = get_settings().github_app_id
     monkeypatch.setenv("GITHUB_APP_ID", "")
     get_settings.cache_clear()
     deployment, publication = _open_lineage(
         client,
         auth_headers,
-        conversation_id='test-2',
+        conversation_id=conversation_id,
     )
     monkeypatch.setenv("GITHUB_APP_ID", app_id)
     get_settings.cache_clear()
     _, later = _create_publication(
         client,
         _publication_payload(
-            deployment["id"], conversation_id="legacy-pat-thread", base_sha=FIRST_REVISION_SHA
+            deployment["id"], conversation_id=conversation_id, base_sha=FIRST_REVISION_SHA
         ),
     )
     assert _resolve(client, auth_headers, later["approval_id"]).status_code == 200
@@ -4873,14 +4874,14 @@ def test_adding_app_after_pat_publication_does_not_backfill_legacy_identity(
     assert _reserve_review(client, advanced.json(), "review:legacy-replay").status_code == 409
 
 
-@pytest.mark.parametrize("mutation", ["binding", "head"])
+@pytest.mark.parametrize("mutation", ["binding", "head", "deployment"])
 def test_review_reservation_refreshes_authority_already_loaded_by_its_caller(
     review_lineage_app: tuple[TestClient, dict[str, Any], str],
     auth_headers: dict[str, str],
     mutation: str,
 ) -> None:
     """A row lock must refresh objects retained during earlier authority reads."""
-    from curie_api.models import AgentChannel, ThreadPublicationLineage
+    from curie_api.models import AgentChannel, Deployment, ThreadPublicationLineage
     from curie_api.schemas import ReviewRevisionReserve
     from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -4904,6 +4905,8 @@ def test_review_reservation_refreshes_authority_already_loaded_by_its_caller(
                 assert loaded is not None
                 binding = await session.get(AgentChannel, loaded.binding_id)
                 assert binding is not None
+                held_deployment = await session.get(Deployment, loaded.deployment_id)
+                assert held_deployment is not None
                 # Keep both strong references while another real API transaction
                 # changes authority. FOR UPDATE alone does not refresh this map.
                 if mutation == "binding":
@@ -4918,6 +4921,10 @@ def test_review_reservation_refreshes_authority_already_loaded_by_its_caller(
                         json={"kind": "slack", "address": "C0EXAMPLE1"},
                         headers=auth_headers,
                     )
+                elif mutation == "deployment":
+                    response = await asyncio.to_thread(
+                        client.delete, f"/deployments/{deployment['id']}", headers=auth_headers
+                    )
                 else:
                     assert later is not None
                     truth["head_sha"] = EXTERNAL_REVISION_SHA
@@ -4930,7 +4937,9 @@ def test_review_reservation_refreshes_authority_already_loaded_by_its_caller(
                         head_sha=EXTERNAL_REVISION_SHA,
                     )
                     await asyncio.to_thread(_mark_outcome_history_ready, later["id"])
-                assert response.status_code == 200, response.text
+                assert response.status_code == (204 if mutation == "deployment" else 200), (
+                    response.text
+                )
                 with pytest.raises(crud.PublicationLineageConflict) as conflict:
                     await crud.reserve_review_revision(
                         session,
@@ -4942,7 +4951,7 @@ def test_review_reservation_refreshes_authority_already_loaded_by_its_caller(
                         ),
                     )
                 assert conflict.value.code == (
-                    "publication.review_ineligible" if mutation == "binding"
+                    "publication.review_ineligible" if mutation != "head"
                     else "publication.lineage_stale"
                 )
         finally:
