@@ -35,7 +35,7 @@ from curie_api.github_review_truth import BoundReviewLineage, verify_feedback_tr
 from curie_api.main import create_app
 from curie_test_support.valkey import connect_or_skip
 from fastapi.testclient import TestClient
-from sqlalchemy import text
+from sqlalchemy import literal, text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 DELIVERY = str(uuid.UUID(int=1))
@@ -735,6 +735,7 @@ def test_binding_quota_refuses_new_feedback_and_keeps_an_observable_row(review_s
 
 @pytest.mark.parametrize("permission_case", [
     "legacy", "allowed", "revoked", "wrong_id", "bad_login", "http404", "http403", "timeout",
+    "reserve_unavailable", "http403_cap", "reserve_cap",
 ])
 def test_real_review_consumer_waits_for_active_turn_and_revalidates_before_new_turn(
     review_stack, tmp_path, permission_case,
@@ -768,6 +769,8 @@ def test_real_review_consumer_waits_for_active_turn_and_revalidates_before_new_t
     permission = {"permission": "write", "role_name": "write", "user": {"id": 41}}
     permission_status = 200
     permission_timeout = False
+    reservation_fault_installed = False
+    reservation_fault_name = f"review_reservation_{uuid.uuid4().hex}"
     permission_path = f"/repos/{REPO}/collaborators/example-reviewer/permission"
     lineage_authorization = "Basic " + base64.b64encode(
         b"x-access-token:fixture-app-token-private-sentinel"
@@ -814,6 +817,39 @@ def test_real_review_consumer_waits_for_active_turn_and_revalidates_before_new_t
         secret_key=settings.s3_secret_key, region=settings.s3_region,
     )
     objects_client.create_bucket(Bucket=bucket)
+
+    def install_reservation_fault() -> None:
+        nonlocal reservation_fault_installed
+        # Real task-owned database fault at the reserve sibling, after the live
+        # API verifier succeeds. The API/DB/Valkey are never replaced by doubles.
+        # clean_db depends on _disposable_db: this function exists only in that
+        # run's freshly created DB. The runtime owner also drops its own volume
+        # after a killed pytest. Names and the origin predicate are task scoped.
+        reservation_fault_installed = True
+        review_rows(f"""
+            CREATE FUNCTION curie.{reservation_fault_name}()
+            RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN RAISE EXCEPTION 'task-owned reservation failure'; END $$
+        """)
+        origin = str(literal(truth.feedback.event_id).compile(
+            compile_kwargs={"literal_binds": True}
+        ))
+        review_rows(f"""
+            CREATE TRIGGER {reservation_fault_name}
+            BEFORE INSERT ON curie.publication_review_reservations
+            FOR EACH ROW WHEN (NEW.origin_key = {origin})
+            EXECUTE FUNCTION curie.{reservation_fault_name}()
+        """)
+
+    def remove_reservation_fault() -> None:
+        nonlocal reservation_fault_installed
+        if reservation_fault_installed:
+            review_rows(
+                f"DROP TRIGGER IF EXISTS {reservation_fault_name} "
+                "ON curie.publication_review_reservations"
+            )
+            review_rows(f"DROP FUNCTION IF EXISTS curie.{reservation_fault_name}()")
+            reservation_fault_installed = False
 
     async def exercise() -> None:
         nonlocal permission_status, permission_timeout
@@ -867,6 +903,7 @@ def test_real_review_consumer_waits_for_active_turn_and_revalidates_before_new_t
                 async with kernel_harness(
                     names, valkey, binding=BindingResolver(engine, make_config(names)),
                     publication_creator=publication_client, workspace_factory=workspace,
+                    max_delivery=2, reclaim_min_idle_ms=1,
                 ) as h:
                     await asyncio.to_thread(
                         h.substrate.claim, thread_key,
@@ -942,9 +979,11 @@ def test_real_review_consumer_waits_for_active_turn_and_revalidates_before_new_t
                         elif permission_case == "bad_login":
                             truth.comment["user"]["login"] = "wrong/path"
                         elif permission_case.startswith("http"):
-                            permission_status = int(permission_case[4:])
+                            permission_status = int(permission_case[4:].removesuffix("_cap"))
                         elif permission_case == "timeout":
                             permission_timeout = True
+                        elif permission_case.startswith("reserve"):
+                            await asyncio.to_thread(install_reservation_fault)
                         truth.calls.clear()
                         await consumer._dispatch(review_id, review_fields)
                         await handler_done(review_id)
@@ -969,7 +1008,10 @@ def test_real_review_consumer_waits_for_active_turn_and_revalidates_before_new_t
                                 "SELECT status,error_code FROM curie.github_review_feedback",
                             ) == [{"status": "refused", "error_code": code}]
                             return
-                        if permission_case in {"http404", "http403", "timeout"}:
+                        if permission_case in {
+                            "http404", "http403", "timeout", "reserve_unavailable",
+                            "http403_cap", "reserve_cap",
+                        }:
                             assert h.runner.opened == [original.text]
                             assert len(await h.async_redis.xpending_range(
                                 stream, h.config.consumer_group, review_id, review_id, 1
@@ -981,7 +1023,40 @@ def test_real_review_consumer_waits_for_active_turn_and_revalidates_before_new_t
                                 review_rows,
                                 "SELECT status,error_code FROM curie.github_review_feedback",
                             ) == [{"status": "queued", "error_code": None}]
+                            # A transient authority read is not terminal. It is
+                            # still bounded by the existing real PEL delivery cap.
+                            assert await consumer._dead_letter_over_cap() == set()
+                            if permission_case.endswith("_cap"):
+                                await h.async_redis.xclaim(
+                                    stream, h.config.consumer_group, h.config.consumer_name,
+                                    min_idle_time=0, message_ids=[review_id], idle=1000,
+                                )
+                                assert await consumer._dead_letter_over_cap() == {review_id}
+                                assert await h.async_redis.xpending_range(
+                                    stream, h.config.consumer_group, review_id, review_id, 1
+                                ) == []
+                                dead = await h.async_redis.xrange(
+                                    h.config.dead_letter_stream_name()
+                                )
+                                assert len(dead) == 1
+                                assert dead[0][1]["dl_original_id"] == review_id
+                                assert json.loads(dead[0][1]["payload"]) == json.loads(
+                                    review_fields["payload"]
+                                )
+                                reconciler = client.app.state.github_review_reconciler
+                                assert await reconciler.reconcile_terminal() == 1
+                                assert await asyncio.to_thread(
+                                    review_rows,
+                                    "SELECT status,error_code FROM curie.github_review_feedback",
+                                ) == [{
+                                    "status": "dead_lettered",
+                                    "error_code": "delivery_dead_lettered",
+                                }]
+                                assert h.runner.opened == [original.text]
+                                return
                             permission_status, permission_timeout = 200, False
+                            await asyncio.to_thread(remove_reservation_fault)
+                            truth.calls.clear()
                             await consumer._dispatch(review_id, review_fields)
                             await handler_done(review_id)
                         assert len(h.runner.opened) == 2
@@ -1004,6 +1079,7 @@ def test_real_review_consumer_waits_for_active_turn_and_revalidates_before_new_t
                     finally:
                         hold.set()
                         await asyncio.gather(*list(consumer._inflight), return_exceptions=True)
+                        await asyncio.to_thread(remove_reservation_fault)
         finally:
             await engine.dispose()
             server.should_exit = True
