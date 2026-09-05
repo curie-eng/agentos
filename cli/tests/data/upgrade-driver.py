@@ -208,10 +208,26 @@ if program == "helm":
                 )
             )
         else:
+            if scenario.startswith("source-status-"):
+                status = {"name": "acme-bot", "namespace": "upgrade-test", "version": 1, "info": {"status": "deployed"}}
+                if scenario == "source-status-wrong-name":
+                    status["name"] = "acme-other"
+                elif scenario == "source-status-wrong-namespace":
+                    status["namespace"] = "other-test"
+                elif scenario == "source-status-missing-revision":
+                    status.pop("version")
+                elif scenario == "source-status-zero-revision":
+                    status["version"] = 0
+                elif scenario == "source-status-string-revision":
+                    status["version"] = "1"
+                print(json.dumps(status))
+                sys.exit(0)
             print(
                 json.dumps(
                     {
-                        "chart": {"metadata": {"version": installed}},
+                        "name": "acme-bot",
+                        "namespace": "upgrade-test",
+                        "version": 2 if (root / "installed-version").exists() else 1,
                         "info": {"status": "failed" if scenario == "helm-failed" else "deployed"},
                         "hooks": []
                         if scenario == "missing-hooks"
@@ -236,6 +252,29 @@ if program == "helm":
                     }
                 )
             )
+    elif args[:2] == ["get", "metadata"]:
+        # Helm3.16.4 status deliberately strips Chart; get metadata is separate.
+        # https://github.com/helm/helm/blob/v3.16.4/cmd/helm/status.go
+        # https://github.com/helm/helm/blob/v3.16.4/pkg/action/get_metadata.go
+        if scenario == "source-metadata-hung":
+            (root / "metadata-pid").write_text(str(os.getpid()))
+            print("synthetic-source-metadata-secret-sentinel", file=sys.stderr, flush=True)
+            time.sleep(60)
+        if scenario == "source-metadata-denied":
+            print("synthetic-source-metadata-secret-sentinel", file=sys.stderr)
+            sys.exit(1)
+        if scenario == "source-metadata-malformed":
+            print("synthetic-source-metadata-secret-sentinel")
+            sys.exit(0)
+        installed = (root / "installed-version").read_text() if (root / "installed-version").exists() else "0.8.5"
+        metadata = {"name": "acme-bot", "namespace": "upgrade-test", "revision": int(args[args.index("--revision") + 1]), "chart": "curie", "version": installed, "appVersion": installed, "status": "deployed"}
+        changes = {"source-metadata-wrong-name": ("name", "acme-other"), "source-metadata-wrong-namespace": ("namespace", "other-test"), "source-metadata-wrong-revision": ("revision", 99), "source-metadata-wrong-chart": ("chart", "other-chart"), "source-metadata-wrong-version": ("version", "0.7.0"), "source-metadata-failed": ("status", "failed")}
+        if scenario in changes:
+            key, value = changes[scenario]
+            metadata[key] = value
+        if scenario == "source-metadata-missing-revision":
+            metadata.pop("revision")
+        print(json.dumps(metadata))
     elif args[:2] == ["show", "chart"]:
         version = "0.8.5" if scenario == "wrong-chart" else "0.9.0"
         print(f"name: curie\nversion: {version}\nappVersion: {version}")

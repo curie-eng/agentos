@@ -515,6 +515,43 @@ fn remaining_after(completed: &[UpgradePhase]) -> Vec<UpgradePhase> {
         .collect()
 }
 
+fn source_status_command(opts: &CommonOpts) -> OpsCommand {
+    OpsCommand::new(
+        "helm",
+        vec![
+            plain("status"),
+            plain(&opts.release),
+            plain("-n"),
+            plain(&opts.namespace),
+            plain("-o"),
+            plain("json"),
+        ],
+    )
+}
+
+fn source_metadata_command(opts: &CommonOpts, revision: &str) -> OpsCommand {
+    OpsCommand::new(
+        "helm",
+        vec![
+            plain("get"),
+            plain("metadata"),
+            plain(&opts.release),
+            plain("-n"),
+            plain(&opts.namespace),
+            plain("--revision"),
+            plain(revision),
+            plain("-o"),
+            plain("json"),
+        ],
+    )
+}
+
+fn source_metadata_error(message: &str) -> anyhow::Error {
+    crate::exit::CliError::failure(message)
+        .with_fix("inspect the selected release with helm status and helm get metadata --revision for that same revision; restore read access and resolve any release mismatch before rerunning this upgrade")
+        .into()
+}
+
 fn plan_lines(opts: &UpgradeOpts, from: Option<&str>, secret: Option<&str>) -> Vec<String> {
     let from = from.unwrap_or(if opts.common.dry_run {
         "source not inspected"
@@ -528,6 +565,8 @@ fn plan_lines(opts: &UpgradeOpts, from: Option<&str>, secret: Option<&str>) -> V
     let mut lines = vec![
         super::upgrade_owner::capture_command().display(),
         super::upgrade_owner::namespace_command(&opts.common.namespace).display(),
+        source_status_command(&opts.common).display(),
+        format!("Command template (revision resolved from source Helm status at execution): {}", source_metadata_command(&opts.common, "<observed-revision>").display()),
         "Reject nonempty HELM_KUBE target/authentication overrides; use the selected kubeconfig".into(),
         "Bind all Helm/Kubernetes commands to one private captured kubeconfig; acquire same-host ownership by namespace UID and release before checkpoint mutation".into(),
         format!("phase plan: {from} -> {}", opts.to),
@@ -1816,39 +1855,74 @@ impl LiveHost {
     }
 
     fn inspect_known_good(&self) -> Result<Option<String>> {
-        let (ok, raw, _) = self.run(&OpsCommand::new(
-            "helm",
-            vec![
-                plain("status"),
-                plain(&self.opts.common.release),
-                plain("-n"),
-                plain(&self.opts.common.namespace),
-                plain("-o"),
-                plain("json"),
-            ],
-        ))?;
+        let (ok, raw, _) = self.run(&source_status_command(&self.opts.common))?;
         if !ok {
-            bail!("could not inspect source Helm operation state before mutation");
+            return Err(source_metadata_error(
+                "could not inspect source Helm operation state before mutation",
+            ));
         }
-        let status: serde_json::Value =
-            serde_json::from_str(&raw).context("source Helm status is malformed")?;
+        let status: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|_| source_metadata_error("source Helm status is malformed"))?;
         let state = status
             .pointer("/info/status")
             .and_then(|value| value.as_str())
-            .context("source Helm status has no operation state")?;
+            .ok_or_else(|| source_metadata_error("source Helm status has no operation state"))?;
         if state.starts_with("pending-") {
             bail!("another Helm operation is pending; wait for its owner before resuming this upgrade");
         }
-        if state == "deployed"
-            && status
-                .pointer("/chart/metadata/version")
-                .and_then(|value| value.as_str())
-                == self.current.as_deref()
-        {
-            Ok(self.current.clone())
-        } else {
-            Ok(None)
+        if state != "deployed" {
+            return Ok(None);
         }
+        let revision = status
+            .get("version")
+            .and_then(|value| value.as_u64())
+            .filter(|revision| *revision > 0)
+            .ok_or_else(|| {
+                source_metadata_error("source Helm status has no valid release revision")
+            })?;
+        if status.get("name").and_then(|value| value.as_str()) != Some(&self.opts.common.release)
+            || status.get("namespace").and_then(|value| value.as_str())
+                != Some(&self.opts.common.namespace)
+        {
+            return Err(source_metadata_error(
+                "source Helm status does not identify the selected release",
+            ));
+        }
+        // Helm status deliberately removes Chart from its JSON output; obtain the
+        // metadata from the exact observed revision instead of guessing its version.
+        // https://github.com/helm/helm/blob/v3.16.4/cmd/helm/status.go
+        // https://github.com/helm/helm/blob/v3.16.4/pkg/action/get_metadata.go
+        let command = source_metadata_command(&self.opts.common, &revision.to_string());
+        let command = self
+            .owner
+            .as_ref()
+            .map_or_else(|| command.clone(), |owner| owner.bind(&command));
+        let (ok, raw, _) = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                run_capture(&command),
+            ))
+        })
+        .map_err(|_| source_metadata_error("source Helm metadata read timed out"))?
+        .map_err(|_| source_metadata_error("source Helm metadata read failed"))?;
+        if !ok {
+            return Err(source_metadata_error("source Helm metadata read failed"));
+        }
+        let metadata: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|_| source_metadata_error("source Helm metadata is malformed"))?;
+        if metadata.get("name").and_then(|value| value.as_str()) != Some(&self.opts.common.release)
+            || metadata.get("namespace").and_then(|value| value.as_str())
+                != Some(&self.opts.common.namespace)
+            || metadata.get("revision").and_then(|value| value.as_u64()) != Some(revision)
+            || metadata.get("status").and_then(|value| value.as_str()) != Some(state)
+            || metadata.get("chart").and_then(|value| value.as_str()) != Some("curie")
+            || metadata.get("version").and_then(|value| value.as_str()) != self.current.as_deref()
+        {
+            return Err(source_metadata_error(
+                "source Helm metadata does not match the observed release revision and version",
+            ));
+        }
+        Ok(self.current.clone())
     }
 
     fn prepare_retained_data(&mut self) -> Result<()> {
