@@ -9,7 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 READS = (
     "grafana/query_loki_logs",
-    "grafana/list_alert_rules",
+    "grafana/alerting_manage_rules",
     "tempo/search_traces",
     "tempo/get_trace",
     "tempo/list_trace_tags",
