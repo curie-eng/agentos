@@ -78,6 +78,15 @@ const STAGED_OBJECT: &str = "100 bundle.tar";
 /// dance both the helm and kubectl stubs need identically. Returns the path
 /// written.
 fn write_exec(dir: &Path, name: &str, body: &str) -> PathBuf {
+    let body = if matches!(name, "helm" | "kubectl") {
+        format!(
+            "#!/bin/sh\n{}\n{}",
+            include_str!("data/converged-installation-read.sh"),
+            body.strip_prefix("#!/bin/sh\n").unwrap_or(body)
+        )
+    } else {
+        body.to_string()
+    };
     let path = dir.join(name);
     fs::write(&path, body).unwrap_or_else(|error| panic!("write {name} stub: {error}"));
     let mut permissions = fs::metadata(&path)

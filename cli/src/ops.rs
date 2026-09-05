@@ -19,6 +19,8 @@ use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, ChildStdout, Command};
 
+mod convergence;
+
 /// One external command: the program plus its argument vector, with secret
 /// argument values tagged so they can be masked in any printed form.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5041,13 +5043,15 @@ pub fn up_commands(o: &UpOpts) -> Vec<OpsCommand> {
 /// (live for a real run, [`chart_fullname`] under `--dry-run`), so this builder
 /// still makes no cluster call of its own.
 pub fn status_commands(o: &CommonOpts, fullname: &ReleaseFullname) -> Vec<OpsCommand> {
-    vec![
+    let mut commands = vec![
         helm_status_cmd(o),
         pods_cmd(o),
         svc_cmd(o, fullname, "ui"),
         svc_cmd(o, fullname, "langfuse-web"),
         kubeconfig_host_cmd(),
-    ]
+    ];
+    commands.extend(convergence::dry_run_commands(o));
+    commands
 }
 
 fn helm_status_cmd(o: &CommonOpts) -> OpsCommand {
@@ -6560,9 +6564,15 @@ async fn run_prepared_up(
         ));
     }
     if opts.common.dry_run {
-        return Ok(ClusterUpOutput::DryRun(crate::ui::DryRunPlan {
-            lines: cmds.iter().map(|cmd| cmd.display()).collect(),
-        }));
+        let mut lines: Vec<String> = cmds.iter().map(OpsCommand::display).collect();
+        lines.push("# After Helm and ownership stamping, verify convergence for at most 300 seconds; repeat observations every 2 seconds while rollout is pending.".to_owned());
+        lines.push(convergence::DRY_RUN_NOTE.to_owned());
+        lines.extend(
+            convergence::dry_run_commands(&opts.common)
+                .iter()
+                .map(OpsCommand::display),
+        );
+        return Ok(ClusterUpOutput::DryRun(crate::ui::DryRunPlan { lines }));
     }
     let release_namespace_existed_before_install = ownership_candidates
         .iter()
@@ -6586,7 +6596,7 @@ async fn run_prepared_up(
     let label = format!("installing release {}", opts.common.release);
     for cmd in &cmds {
         if let Some(job) = gvisor_preflight_job.as_deref() {
-            let outcome = run_install_with_gvisor_observer(
+            let outcome = match run_install_with_gvisor_observer(
                 &cl,
                 &label,
                 "installed",
@@ -6595,7 +6605,13 @@ async fn run_prepared_up(
                 job,
                 release_namespace_existed_before_install,
             )
-            .await?;
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    return Err(convergence::installation_failure(&opts.common, error).await)
+                }
+            };
             match outcome {
                 GvisorInstallOutcome::Installed => {}
                 GvisorInstallOutcome::RuntimeClassRejected { rejection, step } if detect_facts => {
@@ -6620,7 +6636,9 @@ async fn run_prepared_up(
                         .into_iter()
                         .next()
                         .expect("cluster up always has one Helm command");
-                    run_step(&cl, &label, "installed", &retry).await?;
+                    if let Err(error) = run_step(&cl, &label, "installed", &retry).await {
+                        return Err(convergence::installation_failure(&opts.common, error).await);
+                    }
                 }
                 GvisorInstallOutcome::RuntimeClassRejected { rejection, step } => {
                     step.fail("failed");
@@ -6633,7 +6651,9 @@ async fn run_prepared_up(
                 }
             }
         } else {
-            run_step(&cl, &label, "installed", cmd).await?;
+            if let Err(error) = run_step(&cl, &label, "installed", cmd).await {
+                return Err(convergence::installation_failure(&opts.common, error).await);
+            }
         }
     }
 
@@ -6660,6 +6680,12 @@ async fn run_prepared_up(
         }
     }
 
+    let step = cl.step("waiting for exact target workload convergence");
+    if let Err(error) = convergence::wait(&opts.common).await {
+        step.fail("not converged");
+        return Err(error);
+    }
+    step.done("converged");
     Ok(ClusterUpOutput::Up {
         namespace: opts.common.namespace.clone(),
         release: opts.common.release.clone(),
@@ -6757,9 +6783,12 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
         // `dry_run_fullname` computes it and emits the caveat that says so.
         let fullname = dry_run_fullname(&opts.release);
         return Ok(ClusterStatusOutput::DryRun(crate::ui::DryRunPlan {
-            lines: status_commands(&opts, &fullname)
-                .iter()
-                .map(|cmd| cmd.display())
+            lines: std::iter::once(convergence::DRY_RUN_NOTE.to_owned())
+                .chain(
+                    status_commands(&opts, &fullname)
+                        .iter()
+                        .map(OpsCommand::display),
+                )
                 .collect(),
         }));
     }
@@ -6791,7 +6820,7 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
 
     // (b) Pod health.
     let (ok, out, _) = run_capture(&pods_cmd(&opts)).await?;
-    let (pods, ready, total, unhealthy) = if ok {
+    let (pods, ready, total, mut unhealthy) = if ok {
         let items: Vec<serde_json::Value> = serde_json::from_str::<serde_json::Value>(&out)
             .ok()
             .and_then(|v| v.get("items").and_then(|i| i.as_array()).cloned())
@@ -6800,6 +6829,16 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
     } else {
         (Vec::new(), 0, 0, Vec::new())
     };
+
+    // The same target-manifest check gates up/apply and this read surface.
+    // Keep the existing JSON schema: diagnoses use its unhealthy string list.
+    match convergence::observe(&opts).await {
+        Ok(observation) => unhealthy.extend(observation.issues),
+        Err(error) => unhealthy.push(format!("convergence could not be verified: {error}")),
+    }
+    if !ok {
+        unhealthy.push("could not list release pods".to_string());
+    }
 
     // (c) URL discovery. Resolve the release's rendered fullname once, here on
     // the live branch -- `--dry-run` returned above without touching kubectl.
@@ -6815,7 +6854,7 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
         resolve_service_url(&opts, &fullname, "langfuse-web", "Langfuse", &host, false).await,
     ];
 
-    Ok(ClusterStatusOutput::Status(Box::new(ClusterStatus {
+    let output = ClusterStatusOutput::Status(Box::new(ClusterStatus {
         namespace: opts.namespace.clone(),
         revision,
         release_state,
@@ -6827,7 +6866,20 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
         unhealthy,
         pods_listed: ok,
         urls,
-    })))
+    }));
+    let json = crate::ui::CliOutput::to_json(&output);
+    if json["healthy"] != true {
+        return Err(crate::ui::ui().failed_report(
+            &output,
+            crate::exit::CliError::failure(format!(
+                "target release has not converged: {}",
+                json["pods"]["unhealthy"].as_array().map(|reasons| reasons.iter().filter_map(serde_json::Value::as_str).collect::<Vec<_>>().join("; ")).unwrap_or_default()
+            ))
+                .with_fix("inspect the unhealthy rollout reasons, correct the target configuration and rerun `curie cluster up`")
+                .into(),
+        ));
+    }
+    Ok(output)
 }
 
 /// Output of `cluster down`: the dry-run plan, an operator abort, or the removed
@@ -7587,7 +7639,7 @@ fn collect_pod_summary(pods: &[serde_json::Value]) -> (Vec<PodRow>, usize, usize
         let display_status = if terminating {
             "Terminating"
         } else if !reason.is_empty() {
-            reason
+            convergence::reason(reason)
         } else {
             phase
         };
