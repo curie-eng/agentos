@@ -30,6 +30,9 @@ Env mapping:
     CURIE_HEARTBEAT_INTERVAL_SECONDS -> heartbeat_interval_s
 """
 
+import json
+from typing import Annotated
+
 from aci_protocol.service_config import (
     API_KEY_ENV,
     HEARTBEAT_FILE_ENV,
@@ -40,11 +43,20 @@ from aci_protocol.service_config import (
     api_url_validation_alias,
     warn_if_deprecated_api_url_env,
 )
-from pydantic import Field, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from pydantic_settings.sources import (
     PydanticBaseSettingsSource,
 )
+
+
+class ThreadedBotAdmission(BaseModel):
+    """One explicitly trusted bot in one channel; no wildcard or cross product."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    channel_id: str = Field(strict=True, pattern=r"^[CG][A-Z0-9]+$")
+    bot_id: str = Field(strict=True, pattern=r"^B[A-Z0-9]+$")
 
 
 class DispatcherConfig(BaseSettings):
@@ -76,6 +88,9 @@ class DispatcherConfig(BaseSettings):
     slack_app_token: str = ""
     slack_bot_token: str = ""
     slack_signing_secret: str = ""
+    slack_threaded_bot_allowlist: Annotated[tuple[ThreadedBotAdmission, ...], NoDecode] = Field(
+        default=(), validation_alias="CURIE_SLACK_THREADED_BOT_ALLOWLIST"
+    )
 
     valkey_host: str = "localhost"
     valkey_port: int = 6379
@@ -156,6 +171,13 @@ class DispatcherConfig(BaseSettings):
     heartbeat_interval_s: float = Field(
         default=10.0, validation_alias=HEARTBEAT_INTERVAL_ENV
     )
+
+    @field_validator("slack_threaded_bot_allowlist", mode="before")
+    @classmethod
+    def _decode_threaded_bot_allowlist(cls, value: object) -> object:
+        # Decode here so JSON null is rejected instead of being discarded by
+        # the settings env source and silently replaced by the empty default.
+        return json.loads(value) if isinstance(value, str) else value
 
     @model_validator(mode="after")
     def _require_independent_chat_attester(self) -> "DispatcherConfig":

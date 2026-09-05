@@ -47,8 +47,8 @@ bot-authored `app_mention` posted at the root of a channel is ingested, so an al
 `IgnoringSelfEvents` middleware drops the bot's own posts before any listener runs).
 
 Still refused: a bot-authored `app_mention` that carries a `thread_ts`, as a loop guard
-between two Curie installations in one workspace — the cost is that an alert bot replying
-*inside* a thread is not ingested; a `message` event outside the DM lane, which the app
+between two Curie installations in one workspace, unless its exact sender/channel pair
+is explicitly trusted as described below; a `message` event outside the DM lane, which the app
 never subscribed to; a redelivery whose dedupe key is already claimed; and a button click
 with nowhere to reply — an App Home or modal click, which carries no channel and no
 message.
@@ -63,6 +63,34 @@ currently deliver, so they are not dispositions to expect in production logs —
 kept on purpose, and `docs/interfaces/channel-ingress/INTERFACE.md` says why. If the grep
 finds nothing, the refusal was Bolt's, above these handlers — that same document is the
 system of record for this contract.
+
+### Trusted bot continuations
+
+`CURIE_SLACK_THREADED_BOT_ALLOWLIST` is a JSON array of exact channel/bot pairs:
+
+```bash
+export CURIE_SLACK_THREADED_BOT_ALLOWLIST='[{"channel_id":"C0EXAMPLE1","bot_id":"B0EXAMPLE1"}]'
+```
+
+It defaults to `[]`. Malformed JSON, missing or extra keys, blank identifiers,
+non-channel or non-bot identifiers, and wildcards prevent dispatcher startup.
+A pair admits only that bot's threaded channel mentions; pairs never form a
+cross product. Use the event's `bot_id`, not the bot's user ID or display name.
+The authenticated Slack event supplies both identifiers. Deduplication, content
+filters, and Bolt's self-event suppression still run. This grants no approval
+rights and does not create a human principal.
+
+Trust only a dedicated sender that does not automatically reply to Curie.
+The dispatcher cannot tell whether another bot identity is another Curie
+installation: allowlisting such a bot removes the cross-installation loop guard
+for that pair. All unlisted bot/channel pairs retain the default refusal.
+Remove the pair and restart the dispatcher to revoke threaded admission.
+
+Compose forwards this variable in both dev and generated release stacks. Helm
+operators can set the same variable with `dispatcher.extraEnv`; no new chart
+value is required. Runtime Slack proof requires an installed sender app and
+live delivery; the Bolt/Valkey tests alone do not establish that Slack delivered
+or that the worker answered.
 
 ## The queue seam (what the worker consumes)
 
@@ -124,6 +152,7 @@ Read from the environment by `DispatcherConfig()` (a `pydantic_settings.BaseSett
 | `VALKEY_PORT` | `6379` | Valkey port (compose maps it to `26379` on the host) |
 | `VALKEY_PASSWORD` | "" | Valkey password (compose dev: `valkeypass`) |
 | `VALKEY_DB` | `0` | Valkey db index |
+| `CURIE_SLACK_THREADED_BOT_ALLOWLIST` | `[]` | exact `{channel_id, bot_id}` pairs allowed to mention the agent inside channel threads |
 | `CURIE_STREAM` | `curie:runs` | Stream the jobs land on |
 | `CURIE_DEDUPE_PREFIX` | `curie:dedupe:` | dedupe key prefix |
 | `CURIE_DEDUPE_TTL_SECONDS` | `3600` | dedupe guard TTL |
