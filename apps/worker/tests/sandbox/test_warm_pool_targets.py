@@ -48,6 +48,7 @@ from .test_warm_pool_contract import (
     BASELINE_CREDENTIAL,
     CONNECTOR_SECRET_NAME,
     GENERATION,
+    OBSERVED_CREDENTIAL_REVISIONS,
     _config,
     _project,
     _resolved,
@@ -109,6 +110,7 @@ def _winner(**overrides: object) -> ActiveWinner:
 
 def _target(winner: ActiveWinner | None = None, **kw: object) -> VersionPoolTarget:
     winner = winner or _winner()
+    kw.setdefault("credential_revisions", OBSERVED_CREDENTIAL_REVISIONS)
     return build_target(
         winner,
         _resolver(),
@@ -152,6 +154,14 @@ def test_bundle_ref_without_sha_is_reported_unrealizable() -> None:
     target = _target(_winner(bundle_sha256=None))
     assert not target.realizable
     assert target.refusal == "bundle-sha256-missing"
+
+
+def test_missing_credential_authority_cannot_name_a_realizable_pool() -> None:
+    target = _target(credential_revisions=None)
+    assert not target.realizable
+    assert target.refusal == "credential-authority-unverified"
+    with pytest.raises(TargetError, match="credential-authority-unverified"):
+        derive_ref(target, prefix="curie", slot=SLOT)
 
 
 # --- refs -------------------------------------------------------------------------
@@ -281,6 +291,7 @@ def test_ref_is_a_value_and_serializes_without_material() -> None:
         model_credential_ref=BASELINE_CREDENTIAL,
         connector_secret_name=CONNECTOR_SECRET_NAME,
         credential_generation=GENERATION,
+        credential_revisions=OBSERVED_CREDENTIAL_REVISIONS,
     )
     ref = derive_ref(target, prefix="curie", slot=SLOT)
     again = VersionPoolRef(**ref.as_dict())  # type: ignore[arg-type]
@@ -521,6 +532,7 @@ def test_active_winner_query_agrees_with_the_resolver_on_real_postgres() -> None
                 credential_generation=CredentialGeneration.for_window(
                     str(agent_id), issued_at=1_800_000_000
                 ),
+                credential_revisions=OBSERVED_CREDENTIAL_REVISIONS,
             )
             assert not target.realizable
             assert target.refusal == "bundleless-winner"
@@ -562,6 +574,7 @@ def test_active_winner_query_returns_bundle_sha256_on_real_postgres() -> None:
                 credential_generation=CredentialGeneration.for_window(
                     str(agent_id), issued_at=1_800_000_000
                 ),
+                credential_revisions=OBSERVED_CREDENTIAL_REVISIONS,
             )
             assert target.realizable
             assert target.bundle_sha256 == "ab" * 32

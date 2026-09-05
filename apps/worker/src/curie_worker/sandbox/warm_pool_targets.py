@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import re
 import uuid
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
@@ -36,6 +37,7 @@ from ..binding import ResolvedDeployment
 from .warm_pool_contract import (
     CapabilityProjection,
     CredentialGeneration,
+    CredentialRevision,
     SecretKeyRef,
     warm_boot_projection,
 )
@@ -186,6 +188,7 @@ def build_target(
     model_credential_ref: SecretKeyRef | None,
     connector_secret_name: str | None,
     credential_generation: CredentialGeneration | None,
+    credential_revisions: Mapping[str, CredentialRevision] | None = None,
 ) -> VersionPoolTarget:
     """Project the winner under the resolver's current defaults into a target."""
 
@@ -201,12 +204,15 @@ def build_target(
         model_credential_ref=model_credential_ref,
         connector_secret_name=connector_secret_name,
         credential_generation=credential_generation,
+        credential_revisions=credential_revisions,
     )
     refusal: str | None = None
     if not resolved.bundle_ref:
         refusal = "bundleless-winner"
     elif not winner.bundle_sha256:
         refusal = "bundle-sha256-missing"
+    elif not projection.credential_authority_complete:
+        refusal = "credential-authority-unverified"
     return VersionPoolTarget(
         namespace=namespace,
         agent_id=str(resolved.agent_id),

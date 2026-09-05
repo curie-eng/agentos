@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from dataclasses import replace
 
 import pytest
 from aci_protocol import BootEnv
@@ -37,6 +38,7 @@ from curie_worker.sandbox.warm_pool_contract import (
     CapabilityProjection,
     ColdReason,
     CredentialGeneration,
+    CredentialRevision,
     ProjectionError,
     SecretKeyRef,
     classify_claim,
@@ -66,6 +68,24 @@ CREDENTIALS_ENV = BootEnv.env_key("credentials_ref")
 MODEL_ENV = BootEnv.env_key("model")
 MEMORY_REF_ENV = BootEnv.env_key("memory_ref")
 CONNECTOR_SECRET_KEYS_ENV = BootEnv.env_key("connector_secret_keys")
+
+# Explicit synthetic API observations for this pure helper test. They do not
+# claim a production Secret watcher, fresh read, or rotation lifecycle exists.
+OBSERVED_CREDENTIAL_REVISIONS = {
+    CREDENTIALS_ENV: CredentialRevision(BASELINE_CREDENTIAL, "example-model-uid", "11"),
+    "GH_TOKEN": CredentialRevision(
+        SecretKeyRef(CONNECTOR_SECRET_NAME, "GH_TOKEN"), "example-connector-uid", "12"
+    ),
+    "OTHER_TOKEN": CredentialRevision(
+        SecretKeyRef(CONNECTOR_SECRET_NAME, "OTHER_TOKEN"), "example-connector-uid", "12"
+    ),
+    **{
+        key: CredentialRevision(
+            SecretKeyRef("curie-platform-credentials", "apiKey"), "example-signing-uid", "13"
+        )
+        for key in (HISTORY_TOKEN_ENV, MEMORY_TOKEN_ENV, STATE_TOKEN_ENV)
+    },
+}
 
 
 def _resolved(**overrides: object) -> ResolvedDeployment:
@@ -122,6 +142,7 @@ def _project(
         "model_credential_ref": BASELINE_CREDENTIAL,
         "connector_secret_name": CONNECTOR_SECRET_NAME,
         "credential_generation": generation,
+        "credential_revisions": OBSERVED_CREDENTIAL_REVISIONS,
     }
     kwargs.update(overrides)
     return warm_boot_projection(_resolver(cfg), resolved, **kwargs)  # type: ignore[arg-type]
@@ -233,6 +254,7 @@ def _identity(**overrides: object) -> dict[str, object]:
         "memory": True,
         "model_credential_ref": BASELINE_CREDENTIAL,
         "connector_secret_name": CONNECTOR_SECRET_NAME,
+        "credential_revisions": OBSERVED_CREDENTIAL_REVISIONS,
     }
     base.update(overrides)
     return base
@@ -450,15 +472,133 @@ def _claim_env(resolved: ResolvedDeployment | None = None, **overrides: str) -> 
 
 def test_fresh_matching_turn_is_warm_eligible() -> None:
     projection = _project()
-    verdict = classify_claim(_claim_env(), projection, now=GENERATION.issued_at + 1)
+    verdict = classify_claim(
+        _claim_env(),
+        projection,
+        now=GENERATION.issued_at + 1,
+        current_credential_revisions=OBSERVED_CREDENTIAL_REVISIONS,
+    )
     assert verdict.warm, verdict
     assert verdict.reasons == ()
+
+
+@pytest.mark.parametrize("rotated", [False, True])
+def test_unverified_credential_revision_never_reuses_an_existing_pool(rotated: bool) -> None:
+    """Fixed Secret names cannot attest which credential a warm process loaded."""
+
+    resolved = _resolved(secrets={"GH_TOKEN": "example-old-connector"})
+    projection = _project(resolved)
+    claim = _claim_env(resolved)
+    if rotated:
+        claim["GH_TOKEN"] = "example-new-connector"
+        claim[CREDENTIALS_ENV] = "example-new-model"
+    # No fresh authoritative Secret observation is available. Neither equal
+    # material nor a changed value under an unchanged key can prove warm parity.
+    verdict = classify_claim(claim, projection, now=GENERATION.issued_at + 1)
+    assert not verdict.warm
+    assert ColdReason.CREDENTIAL_AUTHORITY_UNVERIFIED in verdict.reasons
+
+
+@pytest.mark.parametrize("key", [CREDENTIALS_ENV, "GH_TOKEN", HISTORY_TOKEN_ENV])
+@pytest.mark.parametrize("field", ["uid", "resource_version"])
+def test_changed_authoritative_revision_refuses_the_old_generation(key: str, field: str) -> None:
+    # Kubernetes ObjectMeta defines UID as object identity and resourceVersion
+    # as opaque: https://kubernetes.io/docs/reference/kubernetes-api/common-definitions/object-meta/
+    # These are synthetic observations, not proof of a production Secret reader.
+    resolved = _resolved(secrets={"GH_TOKEN": "example-connector"})
+    old = _project(resolved)
+    current = dict(OBSERVED_CREDENTIAL_REVISIONS)
+    changed_keys = (
+        (HISTORY_TOKEN_ENV, MEMORY_TOKEN_ENV, STATE_TOKEN_ENV)
+        if key == HISTORY_TOKEN_ENV
+        else (key,)
+    )
+    for changed_key in changed_keys:
+        current[changed_key] = replace(current[changed_key], **{field: "example-new-revision"})
+    new = _project(resolved, credential_revisions=current)
+    assert old.capability_generation != new.capability_generation
+    refused = classify_claim(
+        _claim_env(resolved),
+        old,
+        current_credential_revisions=current,
+        now=GENERATION.issued_at + 1,
+    )
+    assert not refused.warm
+    assert ColdReason.GENERATION_MISMATCH in refused.reasons
+    assert key in refused.mismatched_keys
+    # Same observed source revisions on a newly constructed generation are a
+    # pure healthy control; creating/rotating actual pods remains unproved.
+    assert classify_claim(
+        _claim_env(resolved),
+        new,
+        current_credential_revisions=current,
+        now=GENERATION.issued_at + 1,
+    ).warm
+
+
+@pytest.mark.parametrize("key", [CREDENTIALS_ENV, "GH_TOKEN", HISTORY_TOKEN_ENV])
+def test_missing_current_credential_authority_is_cold(key: str) -> None:
+    resolved = _resolved(secrets={"GH_TOKEN": "example-connector"})
+    current = dict(OBSERVED_CREDENTIAL_REVISIONS)
+    current.pop(key)
+    verdict = classify_claim(
+        _claim_env(resolved),
+        _project(resolved),
+        current_credential_revisions=current,
+        now=GENERATION.issued_at + 1,
+    )
+    assert not verdict.warm
+    assert ColdReason.CREDENTIAL_AUTHORITY_UNVERIFIED in verdict.reasons
+
+
+def test_unknown_projected_authority_cannot_be_replaced_by_a_current_claim() -> None:
+    projection = _project(credential_revisions=None)
+    assert not projection.credential_authority_complete
+    verdict = classify_claim(
+        _claim_env(),
+        projection,
+        current_credential_revisions=OBSERVED_CREDENTIAL_REVISIONS,
+        now=GENERATION.issued_at + 1,
+    )
+    assert not verdict.warm
+    assert ColdReason.CREDENTIAL_AUTHORITY_UNVERIFIED in verdict.reasons
+
+
+def test_revision_of_a_different_secret_does_not_attest_the_projected_ref() -> None:
+    current = dict(OBSERVED_CREDENTIAL_REVISIONS)
+    current[CREDENTIALS_ENV] = replace(
+        current[CREDENTIALS_ENV], source=SecretKeyRef("different-secret", "agentCredentials")
+    )
+    projection = _project(credential_revisions=current)
+    assert not projection.credential_authority_complete
+    assert not classify_claim(
+        _claim_env(),
+        projection,
+        current_credential_revisions=current,
+        now=GENERATION.issued_at + 1,
+    ).warm
+
+
+def test_mixed_state_signer_snapshot_cannot_form_a_warm_generation() -> None:
+    current = dict(OBSERVED_CREDENTIAL_REVISIONS)
+    current[HISTORY_TOKEN_ENV] = replace(current[HISTORY_TOKEN_ENV], resource_version="other")
+    projection = _project(credential_revisions=current)
+    assert not projection.credential_authority_complete
+    assert not classify_claim(
+        _claim_env(),
+        projection,
+        current_credential_revisions=current,
+        now=GENERATION.issued_at + 1,
+    ).warm
 
 
 def test_generation_mismatch_is_cold_rather_than_another_pool() -> None:
     projection = _project()
     verdict = classify_claim(
-        _claim_env(_resolved(model="claude-sonnet-5")), projection, now=GENERATION.issued_at + 1
+        _claim_env(_resolved(model="claude-sonnet-5")),
+        projection,
+        now=GENERATION.issued_at + 1,
+        current_credential_revisions=OBSERVED_CREDENTIAL_REVISIONS,
     )
     assert not verdict.warm
     assert ColdReason.GENERATION_MISMATCH in verdict.reasons
@@ -468,7 +608,12 @@ def test_generation_mismatch_is_cold_rather_than_another_pool() -> None:
 def test_memory_false_binding_turn_is_cold() -> None:
     resolved = _resolved(memory=False)
     projection = _project(resolved)
-    verdict = classify_claim(_claim_env(resolved), projection, now=GENERATION.issued_at + 1)
+    verdict = classify_claim(
+        _claim_env(resolved),
+        projection,
+        now=GENERATION.issued_at + 1,
+        current_credential_revisions=OBSERVED_CREDENTIAL_REVISIONS,
+    )
     assert not verdict.warm
     assert verdict.reasons == (ColdReason.MEMORY_FALSE_BINDING_STATE,)
 
@@ -484,7 +629,12 @@ def test_memory_false_binding_turn_is_cold() -> None:
     ],
 )
 def test_per_claim_overlay_env_is_cold(key: str, reason: ColdReason) -> None:
-    verdict = classify_claim(_claim_env(**{key: "x"}), _project(), now=GENERATION.issued_at + 1)
+    verdict = classify_claim(
+        _claim_env(**{key: "x"}),
+        _project(),
+        now=GENERATION.issued_at + 1,
+        current_credential_revisions=OBSERVED_CREDENTIAL_REVISIONS,
+    )
     assert not verdict.warm
     assert verdict.reasons == (reason,)
 
@@ -492,20 +642,35 @@ def test_per_claim_overlay_env_is_cold(key: str, reason: ColdReason) -> None:
 def test_resume_eval_and_workspace_flags_are_cold() -> None:
     projection = _project()
     now = GENERATION.issued_at + 1
-    assert classify_claim(_claim_env(), projection, resume=True, now=now).reasons == (
-        ColdReason.RESUME_HISTORY,
-    )
-    assert classify_claim(_claim_env(), projection, eval_lane=True, now=now).reasons == (
-        ColdReason.EVAL_LANE,
-    )
-    assert classify_claim(_claim_env(), projection, workspace_stage=True, now=now).reasons == (
-        ColdReason.WORKSPACE_STAGE,
-    )
+    assert classify_claim(
+        _claim_env(),
+        projection,
+        resume=True,
+        now=now,
+        current_credential_revisions=OBSERVED_CREDENTIAL_REVISIONS,
+    ).reasons == (ColdReason.RESUME_HISTORY,)
+    assert classify_claim(
+        _claim_env(),
+        projection,
+        eval_lane=True,
+        now=now,
+        current_credential_revisions=OBSERVED_CREDENTIAL_REVISIONS,
+    ).reasons == (ColdReason.EVAL_LANE,)
+    assert classify_claim(
+        _claim_env(),
+        projection,
+        workspace_stage=True,
+        now=now,
+        current_credential_revisions=OBSERVED_CREDENTIAL_REVISIONS,
+    ).reasons == (ColdReason.WORKSPACE_STAGE,)
 
 
 def test_unknown_extra_claim_env_is_cold_not_guessed() -> None:
     verdict = classify_claim(
-        _claim_env(CURIE_FUTURE_KNOB="1"), _project(), now=GENERATION.issued_at + 1
+        _claim_env(CURIE_FUTURE_KNOB="1"),
+        _project(),
+        now=GENERATION.issued_at + 1,
+        current_credential_revisions=OBSERVED_CREDENTIAL_REVISIONS,
     )
     assert not verdict.warm
     assert verdict.reasons == (ColdReason.EXTRA_CLAIM_ENV,)
@@ -514,7 +679,12 @@ def test_unknown_extra_claim_env_is_cold_not_guessed() -> None:
 
 def test_expired_credential_generation_is_cold_until_a_new_generation() -> None:
     projection = _project()
-    verdict = classify_claim(_claim_env(), projection, now=GENERATION.expires_at)
+    verdict = classify_claim(
+        _claim_env(),
+        projection,
+        now=GENERATION.expires_at,
+        current_credential_revisions=OBSERVED_CREDENTIAL_REVISIONS,
+    )
     assert not verdict.warm
     assert verdict.reasons == (ColdReason.CREDENTIAL_GENERATION_EXPIRED,)
 
@@ -522,16 +692,37 @@ def test_expired_credential_generation_is_cold_until_a_new_generation() -> None:
 def test_a_generation_near_expiry_is_cold_by_the_admission_margin() -> None:
     projection = _project()
     edge = GENERATION.expires_at - DEFAULT_CREDENTIAL_ADMISSION_MARGIN_SECONDS
-    assert not classify_claim(_claim_env(), projection, now=edge).warm
-    assert classify_claim(_claim_env(), projection, now=edge - 1).warm
+    assert not classify_claim(
+        _claim_env(),
+        projection,
+        now=edge,
+        current_credential_revisions=OBSERVED_CREDENTIAL_REVISIONS,
+    ).warm
+    assert classify_claim(
+        _claim_env(),
+        projection,
+        now=edge - 1,
+        current_credential_revisions=OBSERVED_CREDENTIAL_REVISIONS,
+    ).warm
     # A caller with a longer worst-case turn widens the margin.
-    assert not classify_claim(_claim_env(), projection, now=edge - 1, margin_seconds=3600).warm
+    assert not classify_claim(
+        _claim_env(),
+        projection,
+        now=edge - 1,
+        margin_seconds=3600,
+        current_credential_revisions=OBSERVED_CREDENTIAL_REVISIONS,
+    ).warm
 
 
 def test_missing_version_stable_key_on_the_claim_is_a_mismatch() -> None:
     env = _claim_env()
     env.pop(BootEnv.env_key("approval_required_tools"))
-    verdict = classify_claim(env, _project(), now=GENERATION.issued_at + 1)
+    verdict = classify_claim(
+        env,
+        _project(),
+        now=GENERATION.issued_at + 1,
+        current_credential_revisions=OBSERVED_CREDENTIAL_REVISIONS,
+    )
     assert verdict.reasons == (ColdReason.GENERATION_MISMATCH,)
 
 
@@ -539,7 +730,12 @@ def test_a_secret_ref_the_template_carries_but_the_claim_lacks_is_a_mismatch() -
     projection = _project()
     env = _claim_env()
     env.pop(CREDENTIALS_ENV)
-    verdict = classify_claim(env, projection, now=GENERATION.issued_at + 1)
+    verdict = classify_claim(
+        env,
+        projection,
+        now=GENERATION.issued_at + 1,
+        current_credential_revisions=OBSERVED_CREDENTIAL_REVISIONS,
+    )
     assert verdict.reasons == (ColdReason.GENERATION_MISMATCH,)
     assert CREDENTIALS_ENV in verdict.mismatched_keys
 
@@ -549,22 +745,42 @@ def test_connector_secret_set_drift_is_a_mismatch_in_both_directions() -> None:
     projection = _project(with_secret)
     now = GENERATION.issued_at + 1
     # The template references GH_TOKEN; a claim rendered without it is skew.
-    verdict = classify_claim(_claim_env(), projection, now=now)
+    verdict = classify_claim(
+        _claim_env(),
+        projection,
+        now=now,
+        current_credential_revisions=OBSERVED_CREDENTIAL_REVISIONS,
+    )
     assert ColdReason.GENERATION_MISMATCH in verdict.reasons
     assert "GH_TOKEN" in verdict.mismatched_keys
     # The claim renders GH_TOKEN; a template without it is skew.
-    verdict = classify_claim(_claim_env(with_secret), _project(), now=now)
+    verdict = classify_claim(
+        _claim_env(with_secret),
+        _project(),
+        now=now,
+        current_credential_revisions=OBSERVED_CREDENTIAL_REVISIONS,
+    )
     assert ColdReason.GENERATION_MISMATCH in verdict.reasons
     assert "GH_TOKEN" in verdict.mismatched_keys
     # Same secrets on both sides: warm.
-    assert classify_claim(_claim_env(with_secret), projection, now=now).warm
+    assert classify_claim(
+        _claim_env(with_secret),
+        projection,
+        now=now,
+        current_credential_revisions=OBSERVED_CREDENTIAL_REVISIONS,
+    ).warm
 
 
 def test_state_token_presence_must_match_the_generation_keys() -> None:
     projection = _project()
     env = _claim_env()
     env.pop(HISTORY_TOKEN_ENV)
-    verdict = classify_claim(env, projection, now=GENERATION.issued_at + 1)
+    verdict = classify_claim(
+        env,
+        projection,
+        now=GENERATION.issued_at + 1,
+        current_credential_revisions=OBSERVED_CREDENTIAL_REVISIONS,
+    )
     assert verdict.reasons == (ColdReason.GENERATION_MISMATCH,)
     assert HISTORY_TOKEN_ENV in verdict.mismatched_keys
 
@@ -578,14 +794,24 @@ def test_a_no_key_claim_against_a_keyed_generation_is_cold() -> None:
             _resolved(), "1234.5678", kind="slack", address="C0EXAMPLE1"
         )
     )
-    verdict = classify_claim(unkeyed_env, keyed, now=GENERATION.issued_at + 1)
+    verdict = classify_claim(
+        unkeyed_env,
+        keyed,
+        now=GENERATION.issued_at + 1,
+        current_credential_revisions=OBSERVED_CREDENTIAL_REVISIONS,
+    )
     assert verdict.reasons == (ColdReason.GENERATION_MISMATCH,)
     assert set(verdict.mismatched_keys) >= {HISTORY_TOKEN_ENV, MEMORY_TOKEN_ENV, STATE_TOKEN_ENV}
 
 
 def test_a_keyed_claim_against_a_credential_free_projection_is_cold() -> None:
     unkeyed = _project(config=_config(api_key="", credentials=""), model_credential_ref=None)
-    verdict = classify_claim(_claim_env(), unkeyed, now=GENERATION.issued_at + 1)
+    verdict = classify_claim(
+        _claim_env(),
+        unkeyed,
+        now=GENERATION.issued_at + 1,
+        current_credential_revisions=OBSERVED_CREDENTIAL_REVISIONS,
+    )
     assert ColdReason.GENERATION_MISMATCH in verdict.reasons
     assert CREDENTIALS_ENV in verdict.mismatched_keys
     assert HISTORY_TOKEN_ENV in verdict.mismatched_keys
@@ -597,6 +823,11 @@ def test_a_claim_rendered_without_the_model_credential_is_cold() -> None:
             _resolved(), "1234.5678", kind="slack", address="C0EXAMPLE1"
         )
     )
-    verdict = classify_claim(env, _project(), now=GENERATION.issued_at + 1)
+    verdict = classify_claim(
+        env,
+        _project(),
+        now=GENERATION.issued_at + 1,
+        current_credential_revisions=OBSERVED_CREDENTIAL_REVISIONS,
+    )
     assert verdict.reasons == (ColdReason.GENERATION_MISMATCH,)
     assert verdict.mismatched_keys == (CREDENTIALS_ENV,)

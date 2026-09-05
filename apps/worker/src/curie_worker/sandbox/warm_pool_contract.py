@@ -21,13 +21,13 @@ guessed into or out of the hash.
 
 Credentials are identity only:
 
-- the model credential and per-agent connector secrets are the ``secretKeyRef``
-  NAME and KEY the chart baseline template already delivers them by;
+- the model credential and per-agent connector secrets carry their
+  ``secretKeyRef`` NAME/KEY plus authoritative Secret UID/resourceVersion;
 - the agent-scoped ``state`` / ``state.app`` tokens (ADR-0033) are a nonsecret
   ``CredentialGeneration`` -- agent, scopes, issued/expiry window -- whose values
   are minted later with the EXISTING ``sandbox_token`` codec into a protected
   Secret. A renewal is a new generation, so a new pool; nothing rotates under a
-  running pod;
+  running pod. The signing-key Secret's revision is also part of the projection;
 - the per-claim ``runner_token`` and the pool bootstrap value are never in the
   projection at all: the bootstrap arrives by ``secretKeyRef`` and the
   conversation credential arrives on the existing adoption call (W1).
@@ -36,6 +36,11 @@ This module creates, reads and writes nothing: no Secret, no Template, no Pool,
 no Postgres, no Valkey. It is the shared helper the realizer and W1's adoption
 path both call, and the contract the review of the Template writer's authority
 (a separately unresolved prerequisite) can assume.
+
+The metadata producer must independently observe the actual credential sources
+and recheck them for each claim. This module does not provide that producer or
+verify a caller's provenance. Missing metadata keeps a target unrealizable and
+a claim cold; fixed Secret names alone never manufacture a generation.
 """
 
 from __future__ import annotations
@@ -69,7 +74,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 #: Bump only with a recorded reason: it changes every generation on every install.
-PROJECTION_VERSION = 1
+# V2 includes authoritative credential source revisions. A fixed Secret name
+# cannot identify what an already-running pod loaded before a Secret update.
+PROJECTION_VERSION = 2
 
 #: A warm claim is refused this many seconds BEFORE the generation's credentials
 #: expire, so a turn admitted at the edge cannot lose its state tokens mid-turn.
@@ -193,6 +200,33 @@ class SecretKeyRef:
 
     def as_dict(self) -> dict[str, str]:
         return {"name": self.name, "key": self.key}
+
+
+@dataclass(frozen=True, slots=True)
+class CredentialRevision:
+    """Nonsecret identity from an authoritative credential-source observation.
+
+    The producer must read the actual Secret UID/resourceVersion and bind its
+    name/key to the credential being rendered. For generated state tokens this
+    names the signing-key Secret. Constructing this value does not verify its
+    provenance; no such production observation/rotation producer exists here.
+    Never derive either revision field from a fixed name or credential bytes.
+    """
+
+    source: SecretKeyRef
+    uid: str
+    resource_version: str
+
+    def __post_init__(self) -> None:
+        if not all(isinstance(v, str) and v.strip() for v in (self.uid, self.resource_version)):
+            raise ProjectionError("credential revision needs an observed UID and resourceVersion")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "source": self.source.as_dict(),
+            "uid": self.uid,
+            "resource_version": self.resource_version,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -323,6 +357,7 @@ class CapabilityProjection:
     secret_refs: Mapping[str, SecretKeyRef]
     credential_keys: tuple[str, ...]
     credential_generation: CredentialGeneration | None
+    credential_revisions: Mapping[str, CredentialRevision] = field(default_factory=dict)
     projection_version: int = PROJECTION_VERSION
     capability_generation: str = field(init=False)
 
@@ -330,6 +365,11 @@ class CapabilityProjection:
         object.__setattr__(self, "env", MappingProxyType(dict(sorted(self.env.items()))))
         object.__setattr__(
             self, "secret_refs", MappingProxyType(dict(sorted(self.secret_refs.items())))
+        )
+        object.__setattr__(
+            self,
+            "credential_revisions",
+            MappingProxyType(dict(sorted(self.credential_revisions.items()))),
         )
         digest = hashlib.sha256(self.canonical_json().encode("utf-8")).hexdigest()
         object.__setattr__(self, "capability_generation", digest)
@@ -347,6 +387,7 @@ class CapabilityProjection:
             "env": dict(self.env),
             "secret_refs": {k: v.as_dict() for k, v in self.secret_refs.items()},
             "credential_keys": list(self.credential_keys),
+            "credential_revisions": {k: v.as_dict() for k, v in self.credential_revisions.items()},
             "credential_generation": (
                 None if self.credential_generation is None else self.credential_generation.as_dict()
             ),
@@ -362,6 +403,20 @@ class CapabilityProjection:
         """The object-name prefix of the generation (names, never identity)."""
 
         return self.capability_generation[:12]
+
+    @property
+    def credential_authority_complete(self) -> bool:
+        """Every loaded credential has a source revision, with exact ref binding."""
+
+        required = set(self.secret_refs) | set(self.credential_keys)
+        if required != set(self.credential_revisions):
+            return False
+        # boot_env signs every state scope with the same platform key. A mixed
+        # signing snapshot cannot describe any generation that renderer minted.
+        signers = {self.credential_revisions[key] for key in self.credential_keys}
+        return len(signers) <= 1 and all(
+            self.credential_revisions[key].source == ref for key, ref in self.secret_refs.items()
+        )
 
 
 def _iter_connector_keys(env: Mapping[str, str]) -> Iterator[str]:
@@ -385,6 +440,7 @@ def project_boot_env(
     model_credential_ref: SecretKeyRef | None,
     connector_secret_name: str | None,
     credential_generation: CredentialGeneration | None,
+    credential_revisions: Mapping[str, CredentialRevision] | None = None,
 ) -> CapabilityProjection:
     """Project one rendered boot env into its warm-template identity.
 
@@ -480,6 +536,11 @@ def project_boot_env(
         secret_refs=secret_refs,
         credential_keys=ordered_credential_keys,
         credential_generation=credential_generation,
+        credential_revisions={
+            key: revision
+            for key, revision in (credential_revisions or {}).items()
+            if key in secret_refs or key in ordered_credential_keys
+        },
     )
 
 
@@ -491,6 +552,7 @@ def warm_boot_projection(
     model_credential_ref: SecretKeyRef | None,
     connector_secret_name: str | None,
     credential_generation: CredentialGeneration | None,
+    credential_revisions: Mapping[str, CredentialRevision] | None = None,
 ) -> CapabilityProjection:
     """The projection of ``resolved`` under this worker's current defaults.
 
@@ -513,6 +575,7 @@ def warm_boot_projection(
         model_credential_ref=model_credential_ref,
         connector_secret_name=connector_secret_name,
         credential_generation=credential_generation,
+        credential_revisions=credential_revisions,
     )
 
 
@@ -530,6 +593,7 @@ class ColdReason(StrEnum):
     APPROVAL_DECISION = "approval-decision"
     EXTRA_CLAIM_ENV = "extra-claim-env"
     CREDENTIAL_GENERATION_EXPIRED = "credential-generation-expired"
+    CREDENTIAL_AUTHORITY_UNVERIFIED = "credential-authority-unverified"
 
 
 _COLD_OVERLAY_KEYS = MappingProxyType(
@@ -566,6 +630,7 @@ def classify_claim(
     workspace_stage: bool = False,
     now: int | None = None,
     margin_seconds: int = DEFAULT_CREDENTIAL_ADMISSION_MARGIN_SECONDS,
+    current_credential_revisions: Mapping[str, CredentialRevision] | None = None,
 ) -> Eligibility:
     """Whether the cold claim env this turn WOULD send can instead bind ``projection``.
 
@@ -627,6 +692,21 @@ def classify_claim(
         rendered_tokens.discard(_STATE_TOKEN_ENV)
     if expected_tokens != rendered_tokens:
         mismatched.extend(sorted(expected_tokens ^ rendered_tokens))
+    required_revisions = set(projection.secret_refs) | set(projection.credential_keys)
+    current_revisions = current_credential_revisions or {}
+    # The renderer's credential values are intentionally never compared or
+    # hashed. Only a fresh authoritative observation can match the exact sources
+    # the warm generation loaded. Missing provenance must stay cold.
+    if not projection.credential_authority_complete or not required_revisions <= set(
+        current_revisions
+    ):
+        reasons.append(ColdReason.CREDENTIAL_AUTHORITY_UNVERIFIED)
+    else:
+        mismatched.extend(
+            key
+            for key in sorted(required_revisions)
+            if current_revisions[key] != projection.credential_revisions[key]
+        )
     generation_mismatch = [
         k
         for k in mismatched
