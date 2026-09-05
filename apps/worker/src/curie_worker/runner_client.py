@@ -108,6 +108,10 @@ def _scrub(text: str, *secrets: str) -> str:
 
 
 _REFUSAL_STATUSES = frozenset({400, 401, 403, 409})
+# The runner's fixed refusal for a bootstrap principal on any route but the
+# adopting /v1/event (runner/src/curie_runner/server.py). Its presence on a 403
+# is the only signal that the server is a realizing bootstrap-mode adopter.
+_BOOTSTRAP_ADOPTION_ONLY = "bootstrap credential permits adoption only"
 
 
 def _refusal(message: str, *secrets: str) -> tuple[int | None, str]:
@@ -509,6 +513,51 @@ class RunnerClient:
                     _scrub(str(exc), bootstrap_token, conversation_token)
                 ) from None
             raise AdoptionRefused(status, reason) from None
+
+    async def adoption_authority(
+        self,
+        base_url: str,
+        *,
+        bootstrap_token: str,
+        remaining_s: float | None = None,
+    ) -> bool:
+        """Is this runner a realizing bootstrap-mode adopter for ``bootstrap_token``?
+
+        The pre-activation gate before any adopting event is sent: an older
+        runner that ignores the optional adoption fields (and the bootstrap
+        BootEnv key) would serve the adopting turn under its boot identity and
+        START A MODEL TURN, and its missing ack is only visible afterwards. So
+        the authority is established first, through the existing gated status
+        route rather than the protocol version (a contract-only build carries
+        the same version): a realizing runner in bootstrap mode answers a
+        bootstrap bearer on ``GET /v1/status`` with the fixed 403 refusal and
+        starts nothing; an old open runner answers 200, an old or cold
+        per-claim runner 401, and anything else is a transport or server
+        fault. Only the exact 403 is ``True``; everything else fails closed.
+        """
+
+        if not bootstrap_token:
+            raise RunnerError("adoption authority requires the bootstrap credential")
+
+        async def request(headers: dict[str, str] | None) -> tuple[bool, str]:
+            async with self._session.get(
+                f"{base_url}/v1/status",
+                headers=headers,
+                timeout=self._request_timeout(remaining_s),
+            ) as resp:
+                if resp.status != 403:
+                    await resp.read()
+                    return False, "conflict"
+                try:
+                    body = await resp.json()
+                except Exception:  # noqa: BLE001 - any unreadable body is "not established"
+                    return False, "conflict"
+                error = body.get("error") if isinstance(body, dict) else None
+                return error == _BOOTSTRAP_ADOPTION_ONLY, (
+                    "success" if error == _BOOTSTRAP_ADOPTION_ONLY else "conflict"
+                )
+
+        return await self._rpc("status", bootstrap_token, request)
 
     async def adoption_applied(
         self,

@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import Any
+from urllib.parse import quote
 
 import anyio
 import pytest
@@ -647,12 +648,32 @@ def test_adoptable_history_ref_is_bound_to_the_pods_state_authority() -> None:
     assert (
         adoptable_history_ref(f"{base}/transcript/thread-1", env) == f"{base}/transcript/thread-1"
     )
+    # The worker quotes the thread key with safe="" (binding.py), so a Slack
+    # key's ":" and a nested "/" arrive percent-encoded and must pass AS SENT.
+    for key in ("C0EXAMPLE1:1700000000.000100", "slack/C0EXAMPLE1/1700000000.000100"):
+        quoted = f"{base}/transcript/{quote(key, safe='')}"
+        assert adoptable_history_ref(quoted, env) == quoted
+    assert adoptable_history_ref(f"{base}/transcript/thread-1", {"CURIE_STATE_URL": base + "/"})
     for outside in (
         "http://api.example.com/agents/other/state/transcript/thread-1",
         "http://evil.example.com/agents/acme/state/transcript/thread-1",
         "https://api.example.com/agents/acme/state/transcript/thread-1",
+        "http://api.example.com:8080/agents/acme/state/transcript/thread-1",
         f"{base}x/transcript/thread-1",
         base,
+        # Same host, prefix intact as a string, but dot segments escape the
+        # namespace once normalized: refused on the PARSED form.
+        f"{base}/../other/state/transcript/thread-1",
+        f"{base}/transcript/%2e%2e/%2e%2e/other/state/transcript/thread-1",
+        f"{base}/transcript/.%2E/../other/state/transcript/thread-1",
+        f"{base}/transcript/./thread-1",
+        f"{base}//transcript/thread-1",
+        f"{base}/transcript/",
+        # Userinfo, query and fragment are never part of a transcript key.
+        "http://user:pw@api.example.com/agents/acme/state/transcript/thread-1",
+        f"{base}/transcript/thread-1?x=1",
+        f"{base}/transcript/thread-1#frag",
+        "not a url",
     ):
         with pytest.raises(HistoryError):
             adoptable_history_ref(outside, env)

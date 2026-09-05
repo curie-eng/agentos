@@ -492,6 +492,78 @@ def test_non_refusal_failure_is_scrubbed_and_not_an_adoption_refusal() -> None:
     asyncio.run(go())
 
 
+def test_adoption_authority_is_established_only_by_a_realizing_bootstrap_runner() -> None:
+    """Root correction 6: authority first, through the status route, never by version."""
+
+    async def go() -> None:
+        client = RunnerClient(total_timeout_s=30.0)
+        try:
+            async with _real_runner() as warm:
+                assert await client.adoption_authority(warm.base_url, bootstrap_token=_BOOT) is True
+                # Establishing authority started no turn and bound nothing.
+                assert warm.sessions[0].queries == [] and warm.runner.session_id == "warm-unbound"
+                # The wrong pool credential establishes nothing (401 -> False).
+                assert (
+                    await client.adoption_authority(warm.base_url, bootstrap_token="other-pool")
+                    is False
+                )
+                # After adoption the bootstrap is retired: authority is gone too.
+                turn = await client.start_adopting_turn(
+                    warm.base_url,
+                    _event(),
+                    bootstrap_token=_BOOT,
+                    conversation_token=_CONV,
+                    session_id=_SESSION,
+                    history_ref=None,
+                )
+                await _drain(turn)
+                assert (
+                    await client.adoption_authority(warm.base_url, bootstrap_token=_BOOT) is False
+                )
+            async with _real_runner(token="per-claim-token-0123456789", bootstrap=None) as cold:
+                # A cold per-claim runner (even presented with its own token) is not an adopter.
+                assert (
+                    await client.adoption_authority(
+                        cold.base_url, bootstrap_token="per-claim-token-0123456789"
+                    )
+                    is False
+                )
+            async with _real_runner(token=None, bootstrap=None) as open_runner:
+                # An OLD or open runner answers 200 on the probe: refused, so no
+                # adopting event (and no model turn) is ever sent to it.
+                assert (
+                    await client.adoption_authority(open_runner.base_url, bootstrap_token=_BOOT)
+                    is False
+                )
+                assert open_runner.sessions[0].queries == []
+        finally:
+            await client.close()
+
+    asyncio.run(go())
+
+
+def test_adoption_authority_rejects_a_forged_403_without_the_fixed_reason() -> None:
+    app = web.Application()
+
+    async def status(_: web.Request) -> web.Response:
+        return web.json_response({"error": "forbidden"}, status=403)
+
+    app.add_routes([web.get("/v1/status", status)])
+
+    async def go() -> None:
+        server = TestServer(app)
+        await server.start_server()
+        client = RunnerClient(total_timeout_s=30.0)
+        try:
+            base = str(server.make_url("")).rstrip("/")
+            assert await client.adoption_authority(base, bootstrap_token=_BOOT) is False
+        finally:
+            await client.close()
+            await server.close()
+
+    asyncio.run(go())
+
+
 def test_recovery_probe_refuses_a_legacy_attestation_without_session_id() -> None:
     """A runner that answers 200 without attesting a session cannot be trusted as bound."""
 

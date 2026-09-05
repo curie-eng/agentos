@@ -10,15 +10,17 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableMapping
 from dataclasses import dataclass, replace
 from pathlib import Path
+from urllib.parse import unquote
 
 import anyio
 from aci_protocol import BootEnv
 from aiohttp import web
 from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
 from curie_telemetry import bootstrap_service_telemetry
+from yarl import URL
 
 from . import __version__
 from .adapter import (
@@ -66,7 +68,7 @@ from .otel import RunTracer, build_tracer_provider
 from .plugin import load_bundle_web_search_enabled
 from .redact import install_stdout_redaction
 from .sdk_auth import UnsupportedCredentialError
-from .server import bind_status_attestation, create_app
+from .server import Snapshotter, bind_status_attestation, create_app
 from .session import ConversationBinder, SessionRunner
 from .side_effects import SideEffectClassifier
 from .state import (
@@ -181,18 +183,76 @@ def adoptable_history_ref(history_ref: str | None, env: Mapping[str, str]) -> st
     namespace the pod was booted for: it must sit under ``CURIE_STATE_URL``
     (``.../agents/<id>/state``). A pod booted with no state authority admits
     no ref at all. An absent ref is the history-less adoption and passes.
+
+    The comparison is on PARSED URLs, not on the string: the scheme, host
+    and port must match exactly; userinfo, a query, or a fragment is refused;
+    and every path segment below the base is checked for the dot forms
+    (``.``, ``..``, and their percent-encodings) that would walk out of the
+    namespace once a server normalizes them. The ref is parsed in its encoded
+    form so the worker's percent-encoded thread key (``binding.py`` quotes the
+    key with ``safe=""``, so a Slack ``:`` arrives as ``%3A``) is compared as
+    sent rather than requoted, and any ref the parser would rewrite is
+    refused outright rather than "helpfully" normalized.
     """
 
     if not history_ref:
         return None
-    base = (env.get(STATE_URL_ENV) or "").rstrip("/")
-    if not base:
+    raw_base = (env.get(STATE_URL_ENV) or "").rstrip("/")
+    if not raw_base:
         raise HistoryError(
             "adoption named a history_ref but this runner has no configured state authority"
         )
-    if not history_ref.startswith(base + "/"):
-        raise HistoryError("adoption history_ref is outside this runner's state authority")
+    outside = HistoryError("adoption history_ref is outside this runner's state authority")
+    try:
+        base = URL(raw_base, encoded=True)
+        ref = URL(history_ref, encoded=True)
+    except ValueError as exc:
+        raise outside from exc
+    if str(ref) != history_ref or ref.user is not None or ref.query_string or ref.fragment:
+        raise outside
+    if (ref.scheme, ref.host, ref.port) != (base.scheme, base.host, base.port):
+        raise outside
+    prefix = base.raw_path.rstrip("/") + "/"
+    if not ref.raw_path.startswith(prefix):
+        raise outside
+    for segment in ref.raw_path[len(prefix) :].split("/"):
+        if unquote(segment) in ("", ".", ".."):
+            raise outside
     return history_ref
+
+
+def retire_bootstrap_from_process_env(environ: MutableMapping[str, str]) -> bool:
+    """Drop the pool bootstrap credential from the process environment.
+
+    The runner keeps the bootstrap in ``CredentialAuthority`` (private memory)
+    and nowhere else. It must not be inheritable by any child: the harness
+    SDK builds its subprocess environment from ``os.environ`` and the MCP tool
+    capability probe merges ``os.environ`` too, so leaving the key in place
+    would hand a credential that can adopt EVERY unbound pod of the pool to
+    prompt-driven code. Called once, immediately after ``RunnerConfig`` has
+    read it and before any spawn. Returns whether a value was present.
+    """
+
+    return environ.pop(BootEnv.env_key("runner_bootstrap_token"), None) is not None
+
+
+def build_app_for(
+    config: RunnerConfig, runner: SessionRunner, snapshotter: Snapshotter | None
+) -> web.Application:
+    """The one boot-time app construction: per-claim, bootstrap, or open.
+
+    ``CredentialAuthority`` decides the mode from the two BootEnv credentials
+    exactly as the contract documents: a present ``runner_token`` wins and the
+    bootstrap is never admitted; only a bootstrap present means bootstrap mode;
+    neither means the tokenless legacy boot.
+    """
+
+    return create_app(
+        runner,
+        token=config.runner_token,
+        bootstrap_token=config.runner_bootstrap_token,
+        snapshotter=snapshotter,
+    )
 
 
 @dataclass
@@ -687,6 +747,10 @@ def _serve() -> None:
     )
     logger.info("runner starting fake_model=%s", fake_model)
     config = RunnerConfig.from_env(os.environ)
+    # First thing after the parse and before ANY child can be spawned: the
+    # bootstrap lives in the authority only, never in a child's environment.
+    if retire_bootstrap_from_process_env(os.environ):
+        logger.info("pool bootstrap credential read and removed from the process environment")
     logger.info(
         "runner configured session=%s model=%s port=%d harness=%s",
         config.session.session_id,
@@ -746,7 +810,7 @@ def _serve() -> None:
 
     snapshot_callback = capture_mounted_workspace if workspace_path is not None else None
 
-    app = create_app(runner, token=config.runner_token, snapshotter=snapshot_callback)
+    app = build_app_for(config, runner, snapshot_callback)
 
     async def _startup(_app: web.Application) -> None:
         try:
