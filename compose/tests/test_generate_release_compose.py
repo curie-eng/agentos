@@ -929,3 +929,26 @@ def test_generated_compose_validates_with_docker(tmp_path):
         text=True,
     )
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("raw", [None, '[{"channel_id":"C123","bot_id":"B2"}]'])
+def test_threaded_bot_allowlist_reaches_dev_and_generated_release_compose(raw, tmp_path):
+    """Exercise Compose interpolation on both delivery paths, including opt-out."""
+    generate = load_generate()
+    env = os.environ.copy()
+    env.pop("CURIE_SLACK_THREADED_BOT_ALLOWLIST", None)
+    if raw is not None:
+        env["CURIE_SLACK_THREADED_BOT_ALLOWLIST"] = raw
+    for name, content in [("dev", DEV_TEXT), ("release", generate(DEV_TEXT, OTEL_TEXT, "9.9.9"))]:
+        path = tmp_path / f"{name}.yaml"
+        path.write_text(content)
+        result = subprocess.run(
+            [
+                "docker", "compose", "--env-file", "/dev/null",
+                "--project-directory", str(REPO_ROOT), "-f", str(path),
+                "--profile", "slack", "--profile", "full", "config", "--format", "json",
+            ],
+            env=env, capture_output=True, text=True, check=True, timeout=30,
+        )
+        dispatcher = json.loads(result.stdout)["services"]["curie-dispatcher"]
+        assert dispatcher["environment"]["CURIE_SLACK_THREADED_BOT_ALLOWLIST"] == (raw or "[]")
