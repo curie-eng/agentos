@@ -11,6 +11,9 @@
 
 #![cfg(unix)]
 
+mod support;
+use support::{serve, MockServer, Request, Response};
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -354,6 +357,10 @@ if tool == "helm":
 
 if tool == "kubectl":
     joined = " ".join(args)
+    if " get secret acme-github-app " in " " + joined + " ":
+        event("kubectl:get-app-secret")
+        print((root / "app-secret.json").read_text())
+        raise SystemExit(0)
     if args and args[0] == "proxy":
         event("kubectl:proxy")
         print("placeholder proxy is forbidden", file=sys.stderr)
@@ -443,10 +450,15 @@ raise SystemExit(1)
 
 struct FakeCluster {
     dir: tempfile::TempDir,
+    github: MockServer,
 }
 
 impl FakeCluster {
     fn new(scenario: &str) -> Self {
+        Self::with_identity_status(scenario, 200)
+    }
+
+    fn with_identity_status(scenario: &str, status: u16) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let bin_dir = dir.path().join("bin");
         fs::create_dir(&bin_dir).expect("create shim dir");
@@ -481,7 +493,29 @@ impl FakeCluster {
                 fs::write(dir.path().join(format!("live__{name}")), "").expect("seed live object");
             }
         }
-        Self { dir }
+        // The stable App-identity guard now precedes sandbox writes. Model only
+        // the external GitHub service, using a generated RSA key as in its own
+        // consumer suite (https://docs.github.com/en/rest/apps/apps#get-the-authenticated-app).
+        let pem = Command::new("openssl")
+            .args(["genrsa", "2048"])
+            .output()
+            .unwrap();
+        assert!(pem.status.success());
+        fs::write(dir.path().join("app.pem"), &pem.stdout).unwrap();
+        let encoded =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &pem.stdout);
+        fs::write(dir.path().join("app-secret.json"), serde_json::json!({"apiVersion":"v1", "kind":"Secret", "metadata":{"name":"acme-github-app"}, "data":{"app-pem":encoded}}).to_string()).unwrap();
+        let github = serve(move |_req: &Request| {
+            Response::json(
+                status,
+                if status == 200 {
+                    r#"{"id":1234567,"name":"acme-bot"}"#
+                } else {
+                    r#"{"message":"unauthorized"}"#
+                },
+            )
+        });
+        Self { dir, github }
     }
 
     fn state(&self) -> &Path {
@@ -534,6 +568,7 @@ impl FakeCluster {
         command
             .args(&args)
             .env("PATH", self.child_path())
+            .env("CURIE_GITHUB_API_URL", &self.github.base_url)
             .env("FAKE_CLUSTER_STATE", self.state())
             .env("FAKE_CLUSTER_SCENARIO", scenario)
             .env("FAKE_SENSITIVE_SENTINEL", sensitive_stderr_sentinel());
@@ -2176,4 +2211,33 @@ fn disconnect_uses_the_same_sandbox_barrier_and_retains_its_sibling_output() {
                 < position(&events, "kubectl:rollout-restart"),
         "disconnect bypassed the shared sandbox recovery barrier: {events:?}"
     );
+}
+
+#[test]
+fn invalid_app_identity_cannot_repair_missing_sandboxes_or_upgrade() {
+    let cluster = FakeCluster::with_identity_status("pre-missing", 401);
+    let output = cluster.run("pre-missing", false);
+    assert_eq!(output.status.code(), Some(1));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(value["error"]
+        .as_str()
+        .unwrap()
+        .contains("does not authenticate"));
+    assert!(value["fix"].as_str().is_some_and(|fix| !fix.is_empty()));
+    assert!(cluster
+        .github
+        .recorded()
+        .iter()
+        .any(|request| request.method == "GET" && request.path == "/app"));
+    let events = cluster.events();
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.starts_with("kubectl:create") || event.starts_with("helm:upgrade")),
+        "{events:?}"
+    );
+    assert!(!cluster
+        .state()
+        .join("live__acme-platform-agent-red-runner")
+        .exists());
 }
