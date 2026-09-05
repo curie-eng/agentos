@@ -36,7 +36,11 @@ class TestSdkApprovalGateWorkflowContract:
         assert set(trigger["pull_request"]["paths"]) == {
             "uv.lock",
             ".github/workflows/sdk-approval-gate.yaml",
-            "tools/sdk-lock-gate/**",
+            "tools/sdk-lock-gate/detect.py",
+            "tools/sdk-lock-gate/run-proof.py",
+            "tools/sdk-lock-gate/tests/test_approval_paths.py",
+            "tools/sdk-lock-gate/tests/test_live_proof_consumer.py",
+            "tools/sdk-lock-gate/tests/test_sdk_lock_gate.py",
             "runner/src/curie_runner/__main__.py",
             "runner/src/curie_runner/adapter.py",
             "runner/src/curie_runner/approval.py",
@@ -56,7 +60,7 @@ class TestSdkApprovalGateWorkflowContract:
             "runner/tests/test_live.py",
             "runner/tests/test_mcp_tool_capability.py",
         }
-        assert len(trigger["pull_request"]["paths"]) == 21
+        assert len(trigger["pull_request"]["paths"]) == 25
 
     def test_detect_job_runs_detect_py_and_exposes_its_output(self) -> None:
         workflow = load_workflow()
