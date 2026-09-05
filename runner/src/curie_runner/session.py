@@ -24,6 +24,7 @@ import hmac
 import logging
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from typing import Protocol
 
 import anyio
 from aci_protocol import (
@@ -31,6 +32,7 @@ from aci_protocol import (
     Event,
     Final,
     Interrupt,
+    OutboundEvent,
     SessionStatus,
     ToolNote,
     parse_ndjson_line,
@@ -51,7 +53,9 @@ from .budget import BUDGET_CLASSIFICATION, BudgetTracker
 from .history import (
     ApprovalContext,
     ConversationMessage,
+    ConversationReplay,
     HarnessReplayState,
+    HistoryRecord,
     NullTranscriptStore,
     TranscriptStore,
     TurnRecord,
@@ -183,6 +187,31 @@ def _apply_approval_override(final: Final, state: TurnState) -> Final:
     return final
 
 
+class ConversationBinder(Protocol):
+    """How a runner booted without a conversation acquires one at adoption.
+
+    ``load`` resolves the conversation's durable transcript for ``history_ref``
+    and returns the store, the replay prefix a fresh model session must
+    reconstruct, and the compaction summary record to append once the binding
+    is applied (``None`` when the load did not compact); it raises when the
+    history cannot be loaded, and the caller then leaves the runner exactly as
+    it was. It must write nothing durable itself, so a failed adoption is
+    inert on the transcript too. ``rebind`` repoints the session factory at
+    the bound identity so the next session it produces carries the
+    conversation's replay and session id (ADR-0116 decision 2, ADR-0122).
+    """
+
+    async def load(
+        self, session_id: str, history_ref: str | None
+    ) -> tuple[TranscriptStore, ConversationReplay, HistoryRecord | None]: ...
+
+    def rebind(self, session_id: str, replay: ConversationReplay) -> None: ...
+
+
+class ConversationBindingError(RuntimeError):
+    """The runner cannot bind a conversation in its current state."""
+
+
 class SessionRunner:
     """Drives one model session, streaming ACI NDJSON for each inbound frame."""
 
@@ -203,8 +232,19 @@ class SessionRunner:
         approval_decision: str | None = None,
         false_completion_check: bool = False,
         history_resumed: bool = False,
+        conversation_binder: ConversationBinder | None = None,
+        boot_replay: ConversationReplay | None = None,
     ) -> None:
         self._factory = session_factory
+        # Adoption support (ADR-0116 d2 / ADR-0122): None means this runner was
+        # bound at boot (per-claim env) and cannot be re-bound; a binder lets a
+        # bootstrap-mode runner take its conversation from the adopting Event.
+        self._binder = conversation_binder
+        # Set only for the adopting turn: every outbound frame of that turn
+        # carries ``adoption_applied: true`` so the producer can distinguish a
+        # runner that applied the credential from a tolerant consumer that
+        # ignored the field and served the turn anyway.
+        self._ack_adoption = False
         self._ceiling = ceiling
         self._tracer = tracer
         self._classifier = classifier
@@ -238,6 +278,10 @@ class SessionRunner:
         self._false_completion_check = false_completion_check
         self._history_resumed = history_resumed
         self._resume_cache_metric_recorded = False
+        # The replay the factory was actually built with at boot; restored if a
+        # rebind's connect fails so an aborted adoption leaves the boot factory
+        # intact rather than repointed at an empty replay.
+        self._boot_replay = boot_replay if boot_replay is not None else ConversationReplay()
 
         self._session: ModelSession | None = None
         # One turn consumes the SDK generator at a time. This MUST be a
@@ -305,6 +349,86 @@ class SessionRunner:
         """Whether every completed logical turn is present in durable replay."""
 
         return self._history_durable
+
+    @property
+    def session_id(self) -> str | None:
+        """The conversation this runner currently serves (boot-bound or adopted)."""
+
+        return self._session_id
+
+    async def bind_conversation(self, session_id: str, history_ref: str | None) -> None:
+        """Bind an unbound (bootstrap-mode) runner to one conversation, atomically.
+
+        Order is load-bearing. The transcript is loaded FIRST, while nothing
+        about this runner has changed, so a failed or unauthorized history load
+        leaves the boot identity, store, and live session untouched. Only then
+        is the factory repointed and a replacement model session connected with
+        the conversation's replay; if that connect fails the factory is
+        restored to the boot identity before the error propagates. The runner's
+        own identity (session id, trace name, transcript store, attestation
+        source) changes last, after the replacement session is live. Taken
+        under the turn lock so it can never overlap a turn.
+        """
+
+        if self._binder is None:
+            raise ConversationBindingError("this runner was bound at boot and cannot adopt")
+        async with self._turn_lock:
+            store, replay, summary = await self._binder.load(session_id, history_ref)
+            previous_id = self._session_id
+            previous_replay = self._boot_replay
+            self._binder.rebind(session_id, replay)
+            replacement: ModelSession | None = None
+            try:
+                replacement = self._factory()
+                await replacement.connect()
+            except BaseException:
+                # BaseException on purpose: a cancellation arriving here must
+                # roll the factory back exactly like a connect failure, and a
+                # replacement that already spawned a harness child is closed
+                # rather than leaked.
+                if previous_id is not None:
+                    self._binder.rebind(previous_id, previous_replay)
+                if replacement is not None:
+                    with contextlib.suppress(Exception):
+                        await replacement.close()
+                raise
+            # From here the swap is synchronous: no await sits between the
+            # first identity assignment and the last, so no observer (and no
+            # cancellation) can see a half-adopted runner.
+            old = self._session
+            self._session = replacement
+            self._session_id = session_id
+            self._trace_name = f"curie-run:{session_id}"
+            self._history = store
+            self._history_resumed = replay.present
+            self._resume_cache_metric_recorded = False
+            self._boot_replay = replay
+            self._interrupt_requested = False
+            self._turn_open = False
+            self._active_state = None
+            self._status = SessionStatus.IDLE_AWAITING_INPUT
+            self._started = True
+            if old is not None:
+                with contextlib.suppress(Exception):
+                    await old.close()
+            if summary is not None:
+                # The compaction record is written only now, after the binding
+                # is applied, so a refused adoption leaves the transcript as it
+                # found it. Same best-effort posture as the boot path's append.
+                try:
+                    await store.append(summary)
+                except Exception:  # noqa: BLE001 - durable summary is best-effort
+                    logger.warning(
+                        "compaction summary append failed after adoption session=%s",
+                        session_id,
+                    )
+
+    def _line(self, model: OutboundEvent) -> str:
+        """Encode one outbound frame, stamping the adoption ack on the adopting turn."""
+
+        if self._ack_adoption:
+            model = model.model_copy(update={"adoption_applied": True})
+        return to_ndjson_line(model)
 
     async def remember(
         self,
@@ -541,7 +665,7 @@ class SessionRunner:
         """
 
         if isinstance(message, Interrupt):
-            yield to_ndjson_line(
+            yield self._line(
                 Final(text="run interrupted", status=SessionStatus.IDLE_AWAITING_INPUT)
             )
             self._status = SessionStatus.IDLE_AWAITING_INPUT
@@ -555,6 +679,7 @@ class SessionRunner:
         *,
         parent: Context | None = None,
         turn_epoch: str | None = None,
+        adoption_applied: bool = False,
     ) -> AsyncGenerator[str]:
         """Run one turn, streaming ACI NDJSON lines and enforcing the budget.
 
@@ -574,6 +699,7 @@ class SessionRunner:
             self._timeout_interrupt_settled = None
             self._timeout_interrupt_delivered = False
             self._turn_epoch = turn_epoch
+            self._ack_adoption = adoption_applied
             self._turn_open = True
             self._history_durable = False
             state = TurnState()
@@ -657,7 +783,7 @@ class SessionRunner:
                                 interrupt_requested=self._interrupt_requested,
                                 classified_failure=True,
                             )
-                            yield to_ndjson_line(
+                            yield self._line(
                                 Final(
                                     text="run timed out",
                                     status=SessionStatus.CLASSIFIED_FAILURE,
@@ -676,7 +802,7 @@ class SessionRunner:
                                 interrupt_requested=True,
                                 classified_failure=False,
                             )
-                            yield to_ndjson_line(
+                            yield self._line(
                                 Final(
                                     text="run interrupted",
                                     status=SessionStatus.IDLE_AWAITING_INPUT,
@@ -693,13 +819,13 @@ class SessionRunner:
                             self._status = SessionStatus.CLASSIFIED_FAILURE
                             metric_outcome = self._metric_outcome(tracker)
                             self._set_failed(gen)
-                            yield to_ndjson_line(
+                            yield self._line(
                                 ErrorEvent(
                                     message=f"runner error: {exc}",
                                     classification="runner-error",
                                 )
                             )
-                            yield to_ndjson_line(
+                            yield self._line(
                                 Final(
                                     text="run failed",
                                     status=SessionStatus.CLASSIFIED_FAILURE,
@@ -763,6 +889,7 @@ class SessionRunner:
                     emit_completed_metrics()
                 finally:
                     self._active_state = None
+                    self._ack_adoption = False
                     self._turn_open = False
                     self._turn_epoch = None
                     self._timeout_interrupt_settled = None
@@ -948,9 +1075,9 @@ class SessionRunner:
                         SessionStatus.AWAITING_APPROVAL,
                     }:
                         state.final_text = final.text
-                    yield to_ndjson_line(final)
+                    yield self._line(final)
                     return
-                yield to_ndjson_line(outbound)
+                yield self._line(outbound)
 
             if budget_hit:
                 # Budget crossed on a non-terminal message: stop the live run,
@@ -991,7 +1118,7 @@ class SessionRunner:
         # halt: its structured tool call and gate context must cross runners.
         if final.status is SessionStatus.AWAITING_APPROVAL:
             state.final_text = final.text or state.assistant_text
-        yield to_ndjson_line(final)
+        yield self._line(final)
 
     def _approval_not_acted_lines(self, state: TurnState, final: Final) -> list[str]:
         """The OBSERVE-ONLY reconciliation warning (#544, Decision A2).
@@ -1024,7 +1151,7 @@ class SessionRunner:
                 self._session_id,
             )
             return [
-                to_ndjson_line(
+                self._line(
                     ErrorEvent(
                         message=(
                             "resumed policy approval was not acted on this turn: "
@@ -1070,7 +1197,7 @@ class SessionRunner:
                 self._session_id,
             )
             return [
-                to_ndjson_line(
+                self._line(
                     ErrorEvent(
                         message=(
                             "turn declared done with a substantive answer but made "
@@ -1150,13 +1277,13 @@ class SessionRunner:
         self._turn_open = False
         self._status = SessionStatus.CLASSIFIED_FAILURE
         return [
-            to_ndjson_line(
+            self._line(
                 ErrorEvent(
                     message="output token budget exceeded",
                     classification=BUDGET_CLASSIFICATION,
                 )
             ),
-            to_ndjson_line(
+            self._line(
                 Final(
                     text="run halted: output token budget exceeded",
                     status=SessionStatus.CLASSIFIED_FAILURE,
@@ -1179,13 +1306,13 @@ class SessionRunner:
         self._turn_open = False
         self._status = SessionStatus.CLASSIFIED_FAILURE
         return [
-            to_ndjson_line(
+            self._line(
                 ErrorEvent(
                     message="model credential rejected by provider (check CURIE_CREDENTIALS)",
                     classification=AUTH_REJECTED_CLASSIFICATION,
                 )
             ),
-            to_ndjson_line(
+            self._line(
                 Final(
                     text="run failed: model credential rejected by provider",
                     status=SessionStatus.CLASSIFIED_FAILURE,
