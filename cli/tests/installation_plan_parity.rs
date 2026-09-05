@@ -152,6 +152,9 @@ if [ "$1" = show ] && [ "$2" = chart ]; then
     exit 0
 fi
 if [ "$1" = template ]; then
+    if [ -n "${CURIE_TEST_REAL_HELM:-}" ]; then
+        exec "$CURIE_TEST_REAL_HELM" "$@"
+    fi
     case " $* " in
         *" --show-only templates/preflight-gvisor.yaml "*)
             printf '%s\n' 'Error: could not find template templates/preflight-gvisor.yaml in chart' >&2
@@ -1682,6 +1685,56 @@ fn empty_inline_mail_clears_preserve_external_sources_through_up_and_apply() {
                     "{surface}: empty {inline}={value:?} must not switch credential sources"
                 );
             }
+        }
+    }
+}
+
+#[test]
+fn empty_worker_map_clear_reaches_real_helm_with_its_map_type_intact() {
+    let helm = Command::new("sh")
+        .args(["-c", "command -v helm"])
+        .output()
+        .unwrap();
+    assert!(
+        helm.status.success(),
+        "real Helm is required for the CLI consumer render"
+    );
+    let helm = String::from_utf8(helm.stdout).unwrap();
+    for value in ["", "{}"] {
+        for surface in ["up", "apply"] {
+            let config = format!(
+                "{}set:\n  security.gvisor.mode: off\n  worker.adapterCredentials: {value:?}\n",
+                installation_for_the_stateful_guard()
+            );
+            let mut existing = external_mail_sources();
+            existing["mailAdapter"]["ingressEnabled"] = json!(false);
+            existing["mailAdapter"]["agentmail"]["httpsCidrs"] = json!(["203.0.113.10/32"]);
+            let fixture = HelmFixture::new(&config, HelmValuesResponse::Object(existing));
+            let env = [("CURIE_TEST_REAL_HELM", helm.trim())];
+            let output = if surface == "up" {
+                fixture.cluster_up_with(
+                    &[
+                        "--fake-model",
+                        "--set",
+                        "security.gvisor.mode=off",
+                        "--set",
+                        &format!("worker.adapterCredentials={value}"),
+                    ],
+                    &env,
+                )
+            } else {
+                fixture.apply(
+                    &[
+                        "--chart",
+                        concat!(env!("CARGO_MANIFEST_DIR"), "/../charts/curie"),
+                    ],
+                    &env,
+                )
+            };
+            json_output(
+                output,
+                &format!("{surface}: real Helm accepts empty map {value:?}"),
+            );
         }
     }
 }

@@ -4115,6 +4115,16 @@ enum PlannedHelmValues {
 enum HelmSetFlag {
     Set,
     SetString,
+    SetJson,
+}
+
+fn typed_empty_worker_map_override(expression: &str) -> Option<String> {
+    let (key, value) = expression.split_once('=')?;
+    (key.trim() == "worker.adapterCredentials"
+        && (value.is_empty()
+            || serde_json::from_str::<serde_json::Value>(value)
+                .is_ok_and(|value| value.as_object().is_some_and(|map| map.is_empty()))))
+    .then(|| "worker.adapterCredentials={}".to_string())
 }
 
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -4138,9 +4148,14 @@ impl UpValuePlan {
             .into_iter()
             .map(|(key, value)| (key.trim().to_string(), value.to_string()))
             .collect();
+        let typed = typed_empty_worker_map_override(&expression);
         self.entries.push(PlannedHelmValues::Set {
-            flag: HelmSetFlag::Set,
-            expression,
+            flag: if typed.is_some() {
+                HelmSetFlag::SetJson
+            } else {
+                HelmSetFlag::Set
+            },
+            expression: typed.unwrap_or(expression),
             effective,
         });
     }
@@ -4157,9 +4172,14 @@ impl UpValuePlan {
                 .map(|(key, value)| (key.trim().to_string(), value.to_string()))
                 .collect()
         };
+        let typed = typed_empty_worker_map_override(&expression);
         self.entries.push(PlannedHelmValues::Set {
-            flag: HelmSetFlag::SetString,
-            expression,
+            flag: if typed.is_some() {
+                HelmSetFlag::SetJson
+            } else {
+                HelmSetFlag::SetString
+            },
+            expression: typed.unwrap_or(expression),
             effective,
         });
     }
@@ -4183,6 +4203,7 @@ impl UpValuePlan {
                     args.push(plain(match flag {
                         HelmSetFlag::Set => "--set",
                         HelmSetFlag::SetString => "--set-string",
+                        HelmSetFlag::SetJson => "--set-json",
                     }));
                     args.push(CmdArg::HelmSetExpression(expression.clone()));
                 }
