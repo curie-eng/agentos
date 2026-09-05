@@ -221,7 +221,11 @@ def test_unrelated_missing_field_is_not_reported_as_malformed_credential() -> No
 
 
 def test_protocol_version_is_the_compatible_patch() -> None:
-    assert PROTOCOL_VERSION == "0.4.5"
+    # 0.4.5 introduced this contract; later optional-field patches on the same
+    # 0.4 line stay wire compatible with it.
+    from aci_protocol import is_compatible
+
+    assert is_compatible("0.4.5", PROTOCOL_VERSION)
 
 
 def test_malformed_json_errors_do_not_echo_secret_material() -> None:
