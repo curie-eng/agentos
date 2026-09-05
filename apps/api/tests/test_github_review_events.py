@@ -768,6 +768,10 @@ def test_real_review_consumer_waits_for_active_turn_and_revalidates_before_new_t
     permission = {"permission": "write", "role_name": "write", "user": {"id": 41}}
     permission_status = 200
     permission_timeout = False
+    permission_path = f"/repos/{REPO}/collaborators/example-reviewer/permission"
+    lineage_authorization = "Basic " + base64.b64encode(
+        b"x-access-token:fixture-app-token-private-sentinel"
+    ).decode()
     if permission_case != "legacy":
         from dataclasses import replace
 
@@ -776,7 +780,17 @@ def test_real_review_consumer_waits_for_active_turn_and_revalidates_before_new_t
         truth.feedback = replace(truth.feedback, author_association="CONTRIBUTOR")
 
     def github_permission(request):
-        if request.url.path != f"/repos/{REPO}/collaborators/example-reviewer/permission":
+        # Observed with a scoped App installation token on GitHub REST,
+        # 2026-09-05: Basic x-access-token and Bearer both read the same private
+        # PR (200); an invalid Basic credential is refused (404). The existing
+        # lineage reader uses Basic; review verification still requires Bearer.
+        if (
+            request.url.path == f"/repos/{REPO}/pulls/17"
+            and request.headers.get("Authorization") == lineage_authorization
+        ):
+            truth.calls.append(request.url.path)
+            return httpx.Response(200, json=truth.pr)
+        if request.url.path != permission_path:
             return truth.handle(request)
         truth.calls.append(request.url.path)
         assert request.headers["Authorization"] == "Bearer fixture-app-token-private-sentinel"
@@ -821,6 +835,21 @@ def test_real_review_consumer_waits_for_active_turn_and_revalidates_before_new_t
                     api_base_url=api_url, api_key="", client=http,
                     worker_token="fixture-review-worker-token", read_timeout_s=2.0,
                 )
+                lineage = (await asyncio.to_thread(
+                    review_rows, "SELECT deployment_id FROM curie.thread_publication_lineages"
+                ))[0]
+                lineage_response = await http.get(
+                    f"{api_url}/v1/internal/publications/lineage",
+                    params={
+                        "deployment_id": str(lineage["deployment_id"]),
+                        "conversation_id": thread_key,
+                        "repo_full_name": REPO,
+                    },
+                    headers={"X-Curie-Worker-Token": "fixture-review-worker-token"},
+                )
+                assert lineage_response.status_code == 200, lineage_response.text
+                assert lineage_response.json()["head_sha"] == HEAD
+                assert lineage_response.json()["conversation_id"] == thread_key
 
                 def workspace(substrate):
                     return WorkspaceClaimCoordinator(
@@ -875,6 +904,9 @@ def test_real_review_consumer_waits_for_active_turn_and_revalidates_before_new_t
                         first_id, _ = await dispatch_new()
                         async with asyncio.timeout(10):
                             while not h.runner.turn_active:
+                                assert first_id in consumer._inflight_ids, (
+                                    "initial ordinary delivery ended before a model turn opened"
+                                )
                                 await asyncio.sleep(0.01)
                         ordinary_steer = original.model_copy(update={
                             "event_id": f"ordinary-{uuid.uuid4()}", "text": "Also cover the edge."
@@ -956,6 +988,10 @@ def test_real_review_consumer_waits_for_active_turn_and_revalidates_before_new_t
                         assert h.runner.opened[1] == json.loads(review_fields["payload"])["text"]
                         assert h.runner.steers == [ordinary_steer.text]
                         assert f"/repos/{REPO}/pulls/17" in truth.calls
+                        if permission_case == "legacy":
+                            assert permission_path not in truth.calls
+                        else:
+                            assert permission_path in truth.calls
                         assert await h.async_redis.xpending_range(
                             stream, h.config.consumer_group, review_id, review_id, 1
                         ) == []
