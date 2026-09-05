@@ -28,6 +28,7 @@ from curie_worker.sandbox.warm_pool_targets import (
     ActiveWinner,
     LookupOutcome,
     ObservedGeneration,
+    SlotAllocation,
     TargetError,
     VersionPoolRef,
     VersionPoolTarget,
@@ -36,6 +37,7 @@ from curie_worker.sandbox.warm_pool_targets import (
     build_target,
     derive_ref,
     lookup,
+    slot_secret_names,
 )
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
@@ -57,6 +59,7 @@ _DB_URL = os.environ.get(
 _SCHEMA = os.environ.get("TEST_DB_SCHEMA", "curie")
 
 _ORDER_KEY = "(d.environment = 'prod') DESC, d.deployed_at DESC, d.id DESC"
+SLOT = SlotAllocation("curie-warm-bootstrap", 4, 1)
 
 
 # --- the winner query is the resolver's winner -------------------------------------
@@ -136,7 +139,7 @@ def test_bundleless_winner_is_reported_unrealizable_not_replaced() -> None:
     assert target.refusal == "bundleless-winner"
     assert target.version_id == str(_resolved().version_id)
     with pytest.raises(TargetError, match="bundleless"):
-        derive_ref(target, prefix="curie")
+        derive_ref(target, prefix="curie", slot=SLOT)
 
 
 def test_target_without_a_deployment_id_is_refused() -> None:
@@ -157,14 +160,9 @@ _DNS_LABEL = re.compile(r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$")
 
 
 def test_ref_names_are_dns_labels_distinct_from_helm_pools() -> None:
-    ref = derive_ref(_target(), prefix="curie")
-    names = {
-        ref.template_name,
-        ref.pool_name,
-        ref.bootstrap_secret_name,
-        ref.credential_secret_name,
-    }
-    assert len(names) == 4
+    ref = derive_ref(_target(), prefix="curie", slot=SLOT)
+    names = {ref.template_name, ref.pool_name, ref.bootstrap_secret_name}
+    assert len(names) == 3
     for name in names:
         assert _DNS_LABEL.match(name), name
         assert len(name) <= 63
@@ -175,30 +173,91 @@ def test_ref_names_are_dns_labels_distinct_from_helm_pools() -> None:
     assert ref.capability_generation == _target().capability_generation
     assert ref.namespace == "curie"
     assert ref.version_id == _target().version_id
+    assert ref.slot_index == 1
+
+
+def test_secret_name_is_the_granted_slot_not_a_hash_family() -> None:
+    """A static resourceNames grant must cover the Secret after a restart (ADR-0122 d.4)."""
+
+    granted = slot_secret_names("curie-warm-bootstrap", 4)
+    assert granted == (
+        "curie-warm-bootstrap-0",
+        "curie-warm-bootstrap-1",
+        "curie-warm-bootstrap-2",
+        "curie-warm-bootstrap-3",
+    )
+    a = derive_ref(_target(), prefix="curie", slot=SLOT)
+    b = derive_ref(_target(_winner(model="claude-sonnet-5")), prefix="curie", slot=SLOT)
+    assert a.bootstrap_secret_name in granted
+    # Same slot, different generation: the NAME is the slot; identity is labels.
+    assert a.bootstrap_secret_name == b.bootstrap_secret_name
+    assert a.capability_generation != b.capability_generation
+    assert a.template_name != b.template_name
+    assert a.pool_name != b.pool_name
+
+
+@pytest.mark.parametrize(
+    ("prefix", "max_slots", "index"),
+    [
+        ("curie-warm-bootstrap", 4, 4),
+        ("curie-warm-bootstrap", 4, -1),
+        ("curie-warm-bootstrap", 0, 0),
+        ("Curie-Warm", 4, 0),
+        ("", 4, 0),
+        ("curie-agent-x-warm", 4, 0),
+    ],
+)
+def test_slot_outside_the_grant_is_refused(prefix: str, max_slots: int, index: int) -> None:
+    with pytest.raises(TargetError):
+        SlotAllocation(prefix, max_slots, index)
 
 
 def test_ref_names_change_with_the_generation_and_version() -> None:
-    a = derive_ref(_target(), prefix="curie")
-    b = derive_ref(_target(_winner(model="claude-sonnet-5")), prefix="curie")
+    a = derive_ref(_target(), prefix="curie", slot=SLOT)
+    b = derive_ref(_target(_winner(model="claude-sonnet-5")), prefix="curie", slot=SLOT)
     c = derive_ref(
         _target(_winner(version_id=uuid.UUID("00000000-0000-4000-8000-0000000000a2"))),
         prefix="curie",
+        slot=SLOT,
     )
     assert len({a.pool_name, b.pool_name, c.pool_name}) == 3
-    assert a.template_name != b.template_name != c.template_name
+    assert len({a.template_name, b.template_name, c.template_name}) == 3
 
 
 @pytest.mark.parametrize(
     "prefix",
-    ["", "Curie", "cu_rie", "-curie", "x" * 40, "curie-agent-x", "curie-runner-pool"],
+    [
+        "",
+        "Curie",
+        "cu_rie",
+        "-curie",
+        "x" * 40,
+        "curie-agent-x",
+        "curie-runner-pool",
+        "curie-runner",
+    ],
 )
 def test_ref_refuses_bad_prefixes(prefix: str) -> None:
     with pytest.raises(TargetError):
-        derive_ref(_target(), prefix=prefix)
+        derive_ref(_target(), prefix=prefix, slot=SLOT)
+
+
+def test_pool_name_reserves_controller_headroom_under_the_label_limit() -> None:
+    longest_ok = "x" * 21
+    ref = derive_ref(_target(), prefix=longest_ok, slot=SLOT)
+    assert len(ref.pool_name) <= 63 - 12
+    with pytest.raises(TargetError, match="pool"):
+        derive_ref(_target(), prefix="x" * 22, slot=SLOT)
+
+
+def test_slot_secret_name_may_not_collide_with_pool_objects() -> None:
+    ref = derive_ref(_target(), prefix="curie", slot=SLOT)
+    colliding = SlotAllocation(ref.pool_name[: -len("-0")], 1, 0)
+    assert colliding.secret_name == ref.pool_name[: -len("-0")] + "-0"
 
 
 def test_ref_is_a_value_and_serializes_without_material() -> None:
-    ref = derive_ref(_target(), prefix="curie")
+    ref = derive_ref(_target(), prefix="curie", slot=SLOT)
     again = VersionPoolRef(**ref.as_dict())  # type: ignore[arg-type]
     assert again == ref
     # A ref is names and env KEYS only; the same dict is what a log line may carry.
@@ -206,11 +265,11 @@ def test_ref_is_a_value_and_serializes_without_material() -> None:
         "namespace",
         "version_id",
         "capability_generation",
+        "slot_index",
         "template_name",
         "pool_name",
         "bootstrap_secret_name",
         "bootstrap_secret_key",
-        "credential_secret_name",
         "credential_secret_keys",
     }
     assert json.dumps(ref.as_dict())
@@ -221,7 +280,7 @@ def test_ref_is_a_value_and_serializes_without_material() -> None:
 
 def test_lookup_matches_only_the_current_generation() -> None:
     target = _target()
-    ref = derive_ref(target, prefix="curie")
+    ref = derive_ref(target, prefix="curie", slot=SLOT)
     observed = ObservedGeneration(
         template_name=ref.template_name,
         version_id=target.version_id,
@@ -256,13 +315,25 @@ def test_lookup_refuses_an_unrealizable_target() -> None:
 
 
 async def _engine_or_skip() -> AsyncEngine:
+    """A reachable, MIGRATED database, or a skip that says which half is missing.
+
+    A reachable server without the ``curie`` schema (another task's fresh
+    stack on the shared port) is not evidence about this query either way, so
+    it skips with that reason rather than failing on ``UndefinedTableError``.
+    """
+
     engine = create_async_engine(_DB_URL)
     try:
-        async with engine.connect():
-            pass
+        async with engine.connect() as conn:
+            table = (
+                await conn.execute(text("SELECT to_regclass(:name)"), {"name": f"{_SCHEMA}.agents"})
+            ).scalar_one()
     except (SQLAlchemyError, OSError) as exc:  # pragma: no cover - environment dependent
         await engine.dispose()
         pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+    if table is None:  # pragma: no cover - environment dependent
+        await engine.dispose()
+        pytest.skip(f"Postgres at {_DB_URL} has no migrated {_SCHEMA}.agents table")
     return engine
 
 
@@ -433,7 +504,7 @@ def test_active_winner_query_returns_bundle_sha256_on_real_postgres() -> None:
             )
             assert target.realizable
             assert target.bundle_sha256 == "ab" * 32
-            assert derive_ref(target, prefix="curie").version_id == str(version)
+            assert derive_ref(target, prefix="curie", slot=SLOT).version_id == str(version)
             assert await active_winner(engine, _SCHEMA, uuid.uuid4()) is None
         finally:
             await _cleanup(engine, agent_ids)

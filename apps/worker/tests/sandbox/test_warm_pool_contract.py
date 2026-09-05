@@ -30,6 +30,7 @@ from curie_worker.binding import (
 )
 from curie_worker.config import WorkerConfig
 from curie_worker.sandbox.warm_pool_contract import (
+    DEFAULT_CREDENTIAL_ADMISSION_MARGIN_SECONDS,
     PROJECTION_THREAD_SENTINEL,
     STATE_APP_SCOPE,
     STATE_SCOPE,
@@ -518,8 +519,51 @@ def test_expired_credential_generation_is_cold_until_a_new_generation() -> None:
     assert verdict.reasons == (ColdReason.CREDENTIAL_GENERATION_EXPIRED,)
 
 
+def test_a_generation_near_expiry_is_cold_by_the_admission_margin() -> None:
+    projection = _project()
+    edge = GENERATION.expires_at - DEFAULT_CREDENTIAL_ADMISSION_MARGIN_SECONDS
+    assert not classify_claim(_claim_env(), projection, now=edge).warm
+    assert classify_claim(_claim_env(), projection, now=edge - 1).warm
+    # A caller with a longer worst-case turn widens the margin.
+    assert not classify_claim(_claim_env(), projection, now=edge - 1, margin_seconds=3600).warm
+
+
 def test_missing_version_stable_key_on_the_claim_is_a_mismatch() -> None:
     env = _claim_env()
     env.pop(BootEnv.env_key("approval_required_tools"))
     verdict = classify_claim(env, _project(), now=GENERATION.issued_at + 1)
     assert verdict.reasons == (ColdReason.GENERATION_MISMATCH,)
+
+
+def test_a_secret_ref_the_template_carries_but_the_claim_lacks_is_a_mismatch() -> None:
+    projection = _project()
+    env = _claim_env()
+    env.pop(CREDENTIALS_ENV)
+    verdict = classify_claim(env, projection, now=GENERATION.issued_at + 1)
+    assert verdict.reasons == (ColdReason.GENERATION_MISMATCH,)
+    assert CREDENTIALS_ENV in verdict.mismatched_keys
+
+
+def test_connector_secret_set_drift_is_a_mismatch_in_both_directions() -> None:
+    with_secret = _resolved(secrets={"GH_TOKEN": "value"})
+    projection = _project(with_secret)
+    now = GENERATION.issued_at + 1
+    # The template references GH_TOKEN; a claim rendered without it is skew.
+    verdict = classify_claim(_claim_env(), projection, now=now)
+    assert ColdReason.GENERATION_MISMATCH in verdict.reasons
+    assert "GH_TOKEN" in verdict.mismatched_keys
+    # The claim renders GH_TOKEN; a template without it is skew.
+    verdict = classify_claim(_claim_env(with_secret), _project(), now=now)
+    assert ColdReason.GENERATION_MISMATCH in verdict.reasons
+    assert "GH_TOKEN" in verdict.mismatched_keys
+    # Same secrets on both sides: warm.
+    assert classify_claim(_claim_env(with_secret), projection, now=now).warm
+
+
+def test_state_token_presence_must_match_the_generation_keys() -> None:
+    projection = _project()
+    env = _claim_env()
+    env.pop(HISTORY_TOKEN_ENV)
+    verdict = classify_claim(env, projection, now=GENERATION.issued_at + 1)
+    assert verdict.reasons == (ColdReason.GENERATION_MISMATCH,)
+    assert HISTORY_TOKEN_ENV in verdict.mismatched_keys

@@ -70,7 +70,7 @@ SELECT DISTINCT ON (a.id)
        a.memory AS memory,
        d.id AS deployment_id,
        d.workspace_enabled AS workspace_enabled,
-       d.environment::text AS environment,
+       CAST(d.environment AS text) AS environment,
        v.id AS version_id,
        v.version_label AS version_label,
        v.bundle_ref AS bundle_ref,
@@ -204,38 +204,98 @@ def build_target(
 # RFC 1123 label, as Kubernetes validates object names used as pod-name prefixes.
 _DNS_LABEL = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
 _MAX_LABEL = 63
+# The Agent Sandbox controller derives Sandbox / pod / Service names FROM the
+# pool name; those derived names must also fit the label limit. The suffix the
+# vendored controller appends is not part of any contract we own, so a
+# documented conservative budget is reserved here (adversarial cleared-attack 3,
+# Fable D-2) rather than trusting the pool name alone to fit.
+_CONTROLLER_SUFFIX_BUDGET = 12
+_MAX_POOL_LABEL = _MAX_LABEL - _CONTROLLER_SUFFIX_BUDGET
 # The chart's generic and per-agent pool shapes ({fullname}-runner-pool and
 # {fullname}-agent-<name>-runner-pool) and the infix the CLI's Helm-revision
 # recovery derives; version-pool names must never be mistaken for either.
 _HELM_POOL_SUFFIX = "-runner-pool"
 _HELM_AGENT_INFIX = "-agent-"
 _INFIX = "-vp-"
-_SUFFIXES = {
-    "template": "-tpl",
-    "pool": "-pool",
-    "bootstrap": "-bootstrap",
-    "credential": "-state",
-}
+_SUFFIXES = {"template": "-tpl", "pool": "-pool"}
+
+
+def _validate_label(kind: str, name: str, *, limit: int = _MAX_LABEL) -> None:
+    if not name or len(name) > limit or not _DNS_LABEL.match(name):
+        raise TargetError(f"{kind} name {name!r} is not a valid label of at most {limit} chars")
+    if name.endswith(_HELM_POOL_SUFFIX) or _HELM_AGENT_INFIX in name or name.endswith("-runner"):
+        raise TargetError(f"{kind} name {name!r} reads as a chart Helm pool")
+
+
+@dataclass(frozen=True, slots=True)
+class SlotAllocation:
+    """One bounded, chart-granted Secret slot (proposal D3, amendment B2, Fable D-1).
+
+    Accepted ADR-0122 decision 4 needs exact-name Secret ``get`` that survives a
+    worker restart and a second replica. Kubernetes ``resourceNames`` is a
+    static list, so Secret names cannot be derived from a version or generation
+    hash: they are ``{secret_prefix}-{index}`` for ``index < max_slots``, where
+    both values are the chart-exported ``CURIE_WARM_BOOTSTRAP_SECRET_PREFIX`` /
+    ``CURIE_WARM_BOOTSTRAP_MAX_SLOTS`` rendered from the SAME template variables
+    as the Role's ``resourceNames``. Which generation currently occupies a slot
+    is carried by labels, never by the name. Allocation, quarantine and
+    exhaustion policy belong to the realizer; this type only refuses a name the
+    grant could not cover.
+    """
+
+    secret_prefix: str
+    max_slots: int
+    index: int
+
+    def __post_init__(self) -> None:
+        if not self.secret_prefix or not _DNS_LABEL.match(self.secret_prefix):
+            raise TargetError(
+                f"slot secret prefix {self.secret_prefix!r} is not a lowercase DNS label"
+            )
+        if self.max_slots <= 0:
+            raise TargetError("slot bound must be a positive integer")
+        if not 0 <= self.index < self.max_slots:
+            raise TargetError(
+                f"slot index {self.index} is outside the granted range 0..{self.max_slots - 1}"
+            )
+        _validate_label("slot secret", self.secret_name)
+
+    @property
+    def secret_name(self) -> str:
+        return f"{self.secret_prefix}-{self.index}"
+
+
+def slot_secret_names(secret_prefix: str, max_slots: int) -> tuple[str, ...]:
+    """The exact bounded name list the chart must grant as ``resourceNames``.
+
+    The chart assertion (proposal control 14) compares its rendered list to this
+    function's output for the same prefix and bound; a realizer refuses to
+    create any Secret name outside it even where the API would allow it.
+    """
+
+    return tuple(SlotAllocation(secret_prefix, max_slots, i).secret_name for i in range(max_slots))
 
 
 @dataclass(frozen=True, slots=True)
 class VersionPoolRef:
     """The deterministic object names of one (version, generation) pool.
 
-    ``bootstrap_secret_key`` is the substrate-only ``BootEnv`` key the pool
-    Secret is delivered under; ``credential_secret_keys`` are the generation
-    Secret's keys. Names only: existence, ownership and authority are decided by
-    a realizer this module does not contain.
+    Template and pool names are generation-derived. The ONE granted slot Secret
+    carries both the substrate-only bootstrap key (``bootstrap_secret_key``) and
+    the generation's state-credential keys (``credential_secret_keys``): one
+    Secret per generation, so the exact-name grant, quarantine and retirement
+    have a single object to cover. Names only: existence, ownership and
+    authority are decided by a realizer this module does not contain.
     """
 
     namespace: str
     version_id: str
     capability_generation: str
+    slot_index: int
     template_name: str
     pool_name: str
     bootstrap_secret_name: str
     bootstrap_secret_key: str
-    credential_secret_name: str
     credential_secret_keys: tuple[str, ...]
 
     def as_dict(self) -> dict[str, Any]:
@@ -255,14 +315,14 @@ def _validate_prefix(prefix: str) -> None:
         raise TargetError(f"pool name prefix {prefix!r} collides with the chart's Helm pool shapes")
 
 
-def derive_ref(target: VersionPoolTarget, *, prefix: str) -> VersionPoolRef:
-    """Names for ``target``'s pool under ``prefix`` (the chart-exported release name).
+def derive_ref(target: VersionPoolTarget, *, prefix: str, slot: SlotAllocation) -> VersionPoolRef:
+    """Names for ``target``'s pool under ``prefix`` in the granted ``slot``.
 
     ``prefix`` must be the operator-owned name the chart exports for the
     worker, not a value derived by stripping a pool suffix (an operator
-    override makes that derivation wrong). Refuses an unrealizable target and
-    any name that would exceed the 63-character label limit or read as a Helm
-    generic / per-agent pool.
+    override makes that derivation wrong). Refuses an unrealizable target, any
+    prefix or name outside the label rules, a pool name without controller
+    headroom, and a slot the grant could not cover.
     """
 
     if not target.realizable:
@@ -270,25 +330,22 @@ def derive_ref(target: VersionPoolTarget, *, prefix: str) -> VersionPoolRef:
             f"target is not realizable ({target.refusal}); no ref for a {target.refusal}"
         )
     _validate_prefix(prefix)
-    version12 = uuid.UUID(target.version_id).hex[:12]
-    stem = f"{prefix}{_INFIX}{version12}-{target.capability_generation[:12]}"
+    version8 = uuid.UUID(target.version_id).hex[:8]
+    stem = f"{prefix}{_INFIX}{version8}-{target.capability_generation[:12]}"
     names = {kind: f"{stem}{suffix}" for kind, suffix in _SUFFIXES.items()}
-    for kind, name in names.items():
-        if len(name) > _MAX_LABEL or not _DNS_LABEL.match(name):
-            raise TargetError(
-                f"{kind} name {name!r} is not a valid label of at most {_MAX_LABEL} chars"
-            )
-        if name.endswith(_HELM_POOL_SUFFIX) or _HELM_AGENT_INFIX in name:
-            raise TargetError(f"{kind} name {name!r} reads as a chart Helm pool")
+    _validate_label("template", names["template"])
+    _validate_label("pool", names["pool"], limit=_MAX_POOL_LABEL)
+    if slot.secret_name in names.values():
+        raise TargetError("slot secret name collides with a template or pool name")
     return VersionPoolRef(
         namespace=target.namespace,
         version_id=target.version_id,
         capability_generation=target.capability_generation,
+        slot_index=slot.index,
         template_name=names["template"],
         pool_name=names["pool"],
-        bootstrap_secret_name=names["bootstrap"],
+        bootstrap_secret_name=slot.secret_name,
         bootstrap_secret_key=BootEnv.env_key("runner_bootstrap_token"),
-        credential_secret_name=names["credential"],
         credential_secret_keys=tuple(target.projection.credential_keys),
     )
 

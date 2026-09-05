@@ -71,6 +71,14 @@ logger = logging.getLogger(__name__)
 #: Bump only with a recorded reason: it changes every generation on every install.
 PROJECTION_VERSION = 1
 
+#: A warm claim is refused this many seconds BEFORE the generation's credentials
+#: expire, so a turn admitted at the edge cannot lose its state tokens mid-turn.
+#: Sized to the worker's configurable runner ceiling (``runner_total_timeout_s``
+#: is capped at 1800 s); a caller with a longer worst case passes a larger margin
+#: to ``classify_claim``. The realizer must replace generations with at least
+#: this much headroom or every turn near the edge goes cold.
+DEFAULT_CREDENTIAL_ADMISSION_MARGIN_SECONDS = 1800
+
 #: The thread key handed to ``boot_env`` when projecting. It only ever lands in
 #: per-conversation keys, which the projection drops; a test pins that it never
 #: reaches the canonical JSON.
@@ -557,6 +565,7 @@ def classify_claim(
     eval_lane: bool = False,
     workspace_stage: bool = False,
     now: int | None = None,
+    margin_seconds: int = DEFAULT_CREDENTIAL_ADMISSION_MARGIN_SECONDS,
 ) -> Eligibility:
     """Whether the cold claim env this turn WOULD send can instead bind ``projection``.
 
@@ -604,8 +613,24 @@ def classify_claim(
     missing = set(projection.env) - seen_stable
     if missing:
         mismatched.extend(sorted(missing))
+    # A secretKeyRef the template carries that this claim would NOT render (a
+    # baseline credential or connector key that disappeared) is a different
+    # capability too, not a warm hit with a stray Secret mounted.
+    missing_refs = set(projection.secret_refs) - set(claim_env)
+    if missing_refs:
+        mismatched.extend(sorted(missing_refs))
+    # The state tokens the cold path mints must be exactly the generation Secret's
+    # keys; a no-key claim against a keyed generation (or the reverse) is skew.
+    expected_tokens = set(projection.credential_keys)
+    rendered_tokens = {k for k in CREDENTIAL_KEY_SCOPES if k in claim_env}
+    if not projection.memory:
+        rendered_tokens.discard(_STATE_TOKEN_ENV)
+    if expected_tokens != rendered_tokens:
+        mismatched.extend(sorted(expected_tokens ^ rendered_tokens))
     generation_mismatch = [
-        k for k in mismatched if k in _ENV_CLASSES or k in connector_keys or k == _CREDENTIALS_ENV
+        k
+        for k in mismatched
+        if k in _ENV_CLASSES or k in connector_keys or k in projection.secret_refs
     ]
     if generation_mismatch and ColdReason.GENERATION_MISMATCH not in reasons:
         reasons.insert(0, ColdReason.GENERATION_MISMATCH)
@@ -619,7 +644,7 @@ def classify_claim(
         reasons.append(ColdReason.WORKSPACE_STAGE)
     if projection.credential_generation is not None:
         current = now if now is not None else int(time.time())
-        if not projection.credential_generation.admits(current):
+        if not projection.credential_generation.admits(current, margin_seconds=margin_seconds):
             reasons.append(ColdReason.CREDENTIAL_GENERATION_EXPIRED)
     return Eligibility(
         warm=not reasons,
