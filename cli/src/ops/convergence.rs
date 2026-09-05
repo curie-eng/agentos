@@ -1,7 +1,7 @@
 //! Read-only convergence against Helm's exact installed target manifest.
 //! Shared by up/apply and status; this does not perform transactional recovery.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -123,7 +123,20 @@ fn workloads_command(namespace: &str) -> OpsCommand {
     )
 }
 
-pub(super) const DRY_RUN_NOTE: &str = "# Convergence plan only: <revision> and each <manifest-namespace> are resolved at runtime from Helm status and the target workload/hook manifests; placeholders are not executable arguments. Recheck Helm revision after each observation.";
+fn node_images_command(node: &str) -> OpsCommand {
+    OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("get"),
+            plain("node"),
+            plain(node),
+            plain("-o"),
+            plain("json"),
+        ],
+    )
+}
+
+pub(super) const DRY_RUN_NOTE: &str = "# Convergence plan only: <revision> and each <manifest-namespace> are resolved at runtime from Helm status and the target workload/hook manifests; placeholders are not executable arguments. <pod-node> is read only if a tagged image reports a different alias, requiring get-node access for that serving Pod's node. Recheck Helm revision after each observation.";
 
 /// Preview the same pure command builders the observer executes. Dynamic
 /// arguments are explicitly identified by DRY_RUN_NOTE in the caller's plan.
@@ -132,6 +145,7 @@ pub(super) fn dry_run_commands(opts: &CommonOpts) -> Vec<OpsCommand> {
         helm_status_command(opts),
         manifest_command(opts, "<revision>"),
         workloads_command("<manifest-namespace>"),
+        node_images_command("<pod-node>"),
         helm_status_command(opts),
     ]
 }
@@ -173,7 +187,12 @@ fn manifest_identity(image: &str) -> Option<String> {
     Some(format!("{repository}@{digest}"))
 }
 
-fn observed_image_matches(expected: &str, status: &Value) -> bool {
+fn needs_node_identity(expected: &str, status: &Value) -> bool {
+    manifest_identity(expected).is_none()
+        && normalize_image(text(status, "/image")) != normalize_image(expected)
+}
+
+fn observed_image_matches(expected: &str, status: &Value, node: Option<&Value>) -> bool {
     let image_id = text(status, "/imageID");
     if let Some(expected) = manifest_identity(expected) {
         // Containerd can report a config SHA in status.image for a digest-pinned
@@ -183,9 +202,39 @@ fn observed_image_matches(expected: &str, status: &Value) -> bool {
             .unwrap_or(image_id);
         return manifest_identity(image_id).as_ref() == Some(&expected);
     }
-    // A tag is a requested reference, not immutable content authority. Require
-    // its reported spelling plus an actual runtime image observation.
-    normalize_image(text(status, "/image")) == normalize_image(expected) && !image_id.is_empty()
+    // A tag is a requested reference, not immutable content authority.
+    if !needs_node_identity(expected, status) {
+        return !image_id.is_empty();
+    }
+    let Some(node) = node else { return false };
+    let Some(identity) = manifest_identity(
+        image_id
+            .strip_prefix("docker-pullable://")
+            .unwrap_or(image_id),
+    ) else {
+        return false;
+    };
+    // Kubelet's per-node inventory groups aliases for one loaded image. Never
+    // combine separate entries or infer equivalence from tag/repository text.
+    // Missing/truncated/ambiguous inventory cannot establish this binding.
+    let matches: Vec<_> = array(node, "/status/images")
+        .iter()
+        .filter(|image| {
+            array(image, "/names")
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|name| normalize_image(name) == normalize_image(expected))
+        })
+        .collect();
+    matches.len() == 1
+        && array(matches[0], "/names")
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|name| normalize_image(name) == normalize_image(text(status, "/image")))
+        && array(matches[0], "/names")
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|name| manifest_identity(name).as_ref() == Some(&identity))
 }
 
 fn selected(workload: &Value, pod: &Value) -> bool {
@@ -251,7 +300,13 @@ fn pod_reasons(pod: &Value, result: &mut Observation) {
     }
 }
 
-fn compare_containers(expected: &Value, actual: &Value, pod: bool, result: &mut Observation) {
+fn compare_containers(
+    expected: &Value,
+    actual: &Value,
+    pod: bool,
+    nodes: &BTreeMap<String, Value>,
+    result: &mut Observation,
+) {
     let id = text(actual, "/metadata/name");
     for (field, status_field, init) in [
         ("containers", "containerStatuses", false),
@@ -283,9 +338,12 @@ fn compare_containers(expected: &Value, actual: &Value, pod: bool, result: &mut 
             let status = array(actual, &format!("/status/{status_field}"))
                 .iter()
                 .find(|item| text(item, "/name") == name);
-            let valid = status.is_some_and(|status| {
-                observed_image_matches(image, status)
-                    && if init
+            let image_matches = status.is_some_and(|status| {
+                observed_image_matches(image, status, nodes.get(text(actual, "/spec/nodeName")))
+            });
+            let valid = image_matches
+                && status.is_some_and(|status| {
+                    if init
                         && container.get("restartPolicy").and_then(Value::as_str) != Some("Always")
                     {
                         status
@@ -296,11 +354,15 @@ fn compare_containers(expected: &Value, actual: &Value, pod: bool, result: &mut 
                         status.get("ready").and_then(Value::as_bool) == Some(true)
                             && status.pointer("/state/running").is_some()
                     }
-            });
+                });
             if !valid {
                 result.issue(
                     id,
-                    format!("container {name} has no ready target image observation"),
+                    if !image_matches && status.is_some_and(|status| needs_node_identity(image, status)) {
+                        format!("container {name} tagged alias has no unique same-node image binding; inspect the serving Node image inventory or select a digest-pinned target image")
+                    } else {
+                        format!("container {name} has no ready target image observation")
+                    },
                 );
             }
         }
@@ -328,7 +390,13 @@ fn compare_containers(expected: &Value, actual: &Value, pod: bool, result: &mut 
     }
 }
 
-fn workload(expected: &Value, actual: &Value, items: &[Value], result: &mut Observation) {
+fn workload(
+    expected: &Value,
+    actual: &Value,
+    items: &[Value],
+    nodes: &BTreeMap<String, Value>,
+    result: &mut Observation,
+) {
     let id = text(expected, "/metadata/name");
     let kind = text(expected, "/kind");
     let generation = actual
@@ -390,7 +458,7 @@ fn workload(expected: &Value, actual: &Value, items: &[Value], result: &mut Obse
     if expected.pointer("/spec/selector") != actual.pointer("/spec/selector") {
         result.issue(id, "workload selector differs from target");
     }
-    compare_containers(expected, actual, false, result);
+    compare_containers(expected, actual, false, nodes, result);
     let pods: Vec<_> = items
         .iter()
         .filter(|item| text(item, "/kind") == "Pod" && selected(expected, item))
@@ -416,7 +484,7 @@ fn workload(expected: &Value, actual: &Value, items: &[Value], result: &mut Obse
             );
         }
         pod_reasons(pod, result);
-        compare_containers(expected, pod, true, result);
+        compare_containers(expected, pod, true, nodes, result);
     }
 }
 
@@ -495,13 +563,51 @@ async fn observe_inner(opts: &CommonOpts) -> Result<Observation> {
             .context("target workload response has no items")?
             .clone();
     }
+    let mut needed_nodes = BTreeSet::new();
+    for object in &expected {
+        for pod in namespaces[namespace(object, opts)]
+            .iter()
+            .filter(|item| text(item, "/kind") == "Pod" && selected(object, item))
+        {
+            for (field, statuses) in [
+                ("containers", "containerStatuses"),
+                ("initContainers", "initContainerStatuses"),
+            ] {
+                for container in array(object, &format!("/spec/template/spec/{field}")) {
+                    if array(pod, &format!("/status/{statuses}"))
+                        .iter()
+                        .any(|status| {
+                            text(status, "/name") == text(container, "/name")
+                                && needs_node_identity(text(container, "/image"), status)
+                        })
+                    {
+                        let node = text(pod, "/spec/nodeName");
+                        if !node.is_empty() {
+                            needed_nodes.insert(node.to_owned());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut nodes = BTreeMap::new();
+    for name in needed_nodes {
+        let raw = capture(node_images_command(&name), "read serving Node image inventory").await
+            .context("tagged image alias requires get-node read access for the serving Pod; inspect that access or select a digest-pinned target image")?;
+        let node: Value =
+            serde_json::from_str(&raw).context("serving Node image inventory is malformed")?;
+        if text(&node, "/kind") != "Node" || text(&node, "/metadata/name") != name {
+            bail!("image inventory did not identify the serving Pod's Node; retry with a verifiable node observation");
+        }
+        nodes.insert(name, node);
+    }
     for object in &expected {
         let items = &namespaces[namespace(object, opts)];
         if let Some(actual) = items.iter().find(|item| {
             text(item, "/kind") == text(object, "/kind")
                 && text(item, "/metadata/name") == text(object, "/metadata/name")
         }) {
-            workload(object, actual, items, &mut result);
+            workload(object, actual, items, &nodes, &mut result);
         } else {
             result.issue(text(object, "/metadata/name"), "target workload is absent");
         }

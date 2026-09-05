@@ -38,6 +38,12 @@ if scenario.startswith("pinned-"):
     deployment["spec"]["template"]["spec"]["initContainers"] = [
         {"name": "wait-for-postgres", "image": pinned_image}
     ]
+alias_image = "example.com/custom-api:sibling"
+alias_id = "example.com/imported-api@sha256:" + "d" * 64
+if scenario.startswith("alias-"):
+    deployment["spec"]["template"]["spec"]["initContainers"] = [
+        {"name": "init-api", "image": "example.com/custom-api:target"}
+    ]
 expected = [copy.deepcopy(deployment), copy.deepcopy(statefulset)]
 for item in expected:
     item.pop("status", None)
@@ -118,6 +124,29 @@ if program == "helm":
         sys.exit(0)
 
 if program == "kubectl":
+    if args[:2] == ["get", "node"]:
+        if scenario == "alias-forbidden":
+            print("Forbidden PRIVATE_MESSAGE_SENTINEL", file=sys.stderr)
+            sys.exit(1)
+        names = ["example.com/custom-api:target", alias_image, alias_id]
+        images = [{"names": names}]
+        if scenario == "alias-split-entry":
+            images = [{"names": names[:2]}, {"names": names[2:]}]
+        if scenario == "alias-ambiguous":
+            images.append({"names": [names[0], "example.com/imported-api@sha256:" + "e" * 64]})
+        if scenario == "alias-missing-entry":
+            images = []
+        if scenario == "alias-no-reported-alias":
+            images = [{"names": [names[0], names[2]]}]
+        emit(
+            {
+                "kind": "Node",
+                "metadata": {
+                    "name": "acme-other-node" if scenario == "alias-wrong-node" else args[2]
+                },
+                "status": {"images": images},
+            }
+        )
     if "namespace" in args or "namespaces" in args:
         emit({"kind": "Namespace", "metadata": {"name": args[-1]}})
     if "config" in args:
@@ -221,6 +250,34 @@ if program == "kubectl":
             pods[1]["spec"]["containers"][0]["image"] = pinned_image.replace("a" * 64, "b" * 64)
         if scenario == "pinned-init-failed":
             pinned_statuses[0]["state"]["terminated"]["exitCode"] = 1
+    if scenario.startswith("alias-"):
+        pods[0]["spec"]["nodeName"] = "acme-node"
+        pods[0]["status"]["containerStatuses"][0].update(image=alias_image, imageID=alias_id)
+        pods[0]["spec"]["initContainers"] = copy.deepcopy(
+            deployment["spec"]["template"]["spec"]["initContainers"]
+        )
+        pods[0]["status"]["initContainerStatuses"] = [
+            {
+                "name": "init-api",
+                "image": alias_image,
+                "imageID": alias_id,
+                "state": {"terminated": {"exitCode": 0}},
+            }
+        ]
+        if scenario == "alias-wrong-digest":
+            pods[0]["status"]["containerStatuses"][0]["imageID"] = alias_id.replace(
+                "d" * 64, "e" * 64
+            )
+        if scenario == "alias-wrong-repository":
+            pods[0]["status"]["containerStatuses"][0]["imageID"] = alias_id.replace(
+                "imported-api", "other-api"
+            )
+        if scenario == "alias-opaque-id":
+            pods[0]["status"]["containerStatuses"][0]["imageID"] = "containerd://sha256:" + "d" * 64
+        if scenario == "alias-pod-drift":
+            pods[0]["spec"]["containers"][0]["image"] = "example.com/custom-api:old"
+        if scenario == "alias-init-failed":
+            pods[0]["status"]["initContainerStatuses"][0]["state"]["terminated"]["exitCode"] = 1
     if scenario in ["healthy-sidecar", "unready-sidecar"]:
         pods[0]["spec"]["containers"].append(
             {"name": "mesh-proxy", "image": "example.com/proxy:custom"}

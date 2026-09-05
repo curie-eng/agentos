@@ -346,6 +346,11 @@ fn offline_dry_runs_expose_the_real_convergence_readset_and_dynamic_inputs() {
             "{verb}: {json}"
         );
         assert!(plan.contains("resolved at runtime"), "{verb}: {json}");
+        assert!(
+            plan.contains("kubectl get node '<pod-node>' -o json"),
+            "{verb}: {json}"
+        );
+        assert!(plan.contains("requiring get-node access"), "{verb}: {json}");
         if verb == "up" {
             assert!(plan.contains("300 seconds"), "{json}");
         }
@@ -427,4 +432,53 @@ fn timed_out_observation_retains_last_safe_cause_and_recovery() {
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
     panic!("timed-out observation process survived");
+}
+
+#[test]
+fn sibling_tag_alias_requires_same_node_image_inventory_identity() {
+    // Actual Kubernetes 1.31/containerd run: one Node.status.images entry
+    // groups the requested tag, reported sibling tag and exact imageID.
+    // https://kubernetes.io/docs/reference/kubernetes-api/cluster-resources/node-v1/#NodeStatus
+    for verb in ["status", "up"] {
+        let fixture = Fixture::new();
+        let output = fixture.run(verb, "alias-healthy");
+        assert!(
+            output.status.success(),
+            "{verb}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        if verb == "status" {
+            assert_eq!(Fixture::json(&output)["healthy"], true);
+        }
+        let calls = fs::read_to_string(fixture.0.path().join("calls.jsonl")).unwrap();
+        assert!(calls.contains("\"kubectl\", \"get\", \"node\", \"acme-node\""));
+    }
+}
+
+#[test]
+fn sibling_alias_refuses_unbound_inventory_and_unhealthy_or_stale_containers() {
+    for scenario in [
+        "alias-split-entry",
+        "alias-ambiguous",
+        "alias-missing-entry",
+        "alias-wrong-node",
+        "alias-no-reported-alias",
+        "alias-forbidden",
+        "alias-wrong-digest",
+        "alias-wrong-repository",
+        "alias-opaque-id",
+        "alias-pod-drift",
+        "alias-init-failed",
+    ] {
+        let output = Fixture::new().run("status", scenario);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{scenario}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(Fixture::json(&output)["healthy"], false, "{scenario}");
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("PRIVATE_MESSAGE_SENTINEL"));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("PRIVATE_MESSAGE_SENTINEL"));
+    }
 }
