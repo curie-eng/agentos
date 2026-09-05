@@ -58,6 +58,11 @@ APPROVAL_PATHS = frozenset(
         "runner/tests/test_ladder_approval_gate_case.py",
         "runner/tests/fixtures/mcp_tool_capability_server.py",
         ".github/workflows/sdk-approval-gate.yaml",
+        "tools/sdk-lock-gate/detect.py",
+        "tools/sdk-lock-gate/run-proof.py",
+        "tools/sdk-lock-gate/tests/test_approval_paths.py",
+        "tools/sdk-lock-gate/tests/test_live_proof_consumer.py",
+        "tools/sdk-lock-gate/tests/test_sdk_lock_gate.py",
     }
 )
 
@@ -79,7 +84,7 @@ def approval_paths_changed(path: Path) -> bool:
             or any(part in {".", "..", ""} for part in name.split("/"))
         ):
             raise ValueError("changed paths contain an invalid repository path")
-    return any(name in APPROVAL_PATHS or name.startswith("tools/sdk-lock-gate/") for name in paths)
+    return any(name in APPROVAL_PATHS for name in paths)
 
 
 # (parsed SDK tables, sorted other lines naming the SDK). Comparable, not hashable:

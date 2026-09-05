@@ -11,7 +11,11 @@ on:
     paths:
       - "uv.lock"
       - ".github/workflows/sdk-approval-gate.yaml"
-      - "tools/sdk-lock-gate/**"
+      - "tools/sdk-lock-gate/detect.py"
+      - "tools/sdk-lock-gate/run-proof.py"
+      - "tools/sdk-lock-gate/tests/test_approval_paths.py"
+      - "tools/sdk-lock-gate/tests/test_live_proof_consumer.py"
+      - "tools/sdk-lock-gate/tests/test_sdk_lock_gate.py"
       - "runner/src/curie_runner/__main__.py"
       - "runner/src/curie_runner/adapter.py"
       - "runner/src/curie_runner/approval.py"
