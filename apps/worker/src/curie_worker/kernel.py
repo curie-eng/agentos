@@ -2241,6 +2241,8 @@ class Kernel:
         # next same-thread event can route, and release the Valkey lock before
         # streaming so a follow-up can steer.
         routed: _RouteResult | None = None
+        review_head: str | None = None
+        review_receipt: str | None = None
 
         def close_routed_turn() -> None:
             if routed is not None and routed.turn is not None:
@@ -2248,6 +2250,33 @@ class Kernel:
 
         try:
             try:
+                if qevent.event_id.startswith("github-feedback-"):
+                    verifier = getattr(
+                        self._publication_creator, "verify_review_feedback", None
+                    )
+                    if verifier is None or workspace_deployment_id is None:
+                        raise WorkspaceSelectionRefused(
+                            "GitHub feedback requires a configured trusted workspace verifier; "
+                            "no model turn started."
+                        )
+                    try:
+                        started = time.monotonic()
+                        try:
+                            async with asyncio.timeout(remaining_s):
+                                verified = await verifier(qevent, workspace_deployment_id)
+                        finally:
+                            if remaining_s is not None:
+                                remaining_s = max(0.0, remaining_s - (time.monotonic() - started))
+                    except (ApprovalBackendError, TimeoutError):
+                        raise WorkspacePreparationError(
+                            "github-review-verification",
+                            "GitHub feedback verification is temporarily unavailable",
+                        ) from None
+                    if verified.agent_id != agent_id or verified.sender != qevent.author:
+                        raise WorkspaceSelectionRefused(
+                            "GitHub feedback no longer belongs to this conversation."
+                        )
+                    review_head, review_receipt = verified.head_sha, verified.receipt
                 async with self._lock.hold(self._config.lock_key(thread_key)):
                     routed = await self._route_and_start(
                         thread_key,
@@ -2258,6 +2287,7 @@ class Kernel:
                         agent_name=agent_name,
                         source=qevent.source,
                         remaining_s=remaining_s,
+                        required_review_head=review_head,
                     )
             except BaseException:
                 # start_turn owns a live response as soon as it returns, which
@@ -2369,6 +2399,16 @@ class Kernel:
             logger.warning("turn start failed for %s: %r", qevent.event_id, exc)
             return TurnOutcome(terminal_ok=False, classification="runner-error")
         assert routed is not None
+        if review_receipt is not None:
+            try:
+                await self._reply_for(qevent, route, review_receipt)
+            except asyncio.CancelledError:
+                close_routed_turn()
+                raise
+            except Exception:
+                # The turn's result uses the existing durable completion path;
+                # a receipt delivery outage cannot start a second model turn.
+                logger.warning("GitHub feedback receipt delivery unavailable")
         try:
             release_order()
         except BaseException:
@@ -2490,6 +2530,7 @@ class Kernel:
         publication_visible_outcome_revision: int | None = None,
         force_lineage_replacement: bool = False,
         pending_publication_approval: bool = False,
+        required_review_head: str | None = None,
     ) -> _RouteResult:
         # A workspace-enabled thread must establish (or confirm) its repository
         # before any platform response path. This deliberately precedes the
@@ -2502,7 +2543,12 @@ class Kernel:
                 raise WorkspacePreparationError(
                     "wiring", "workspace-enabled deployment has no trusted coordinator"
                 )
-            repo_fact = parse_github_repo_fact(event.text)
+            # A verified review already belongs to the persisted workspace. Its
+            # untrusted body may link other repositories; those are context,
+            # never a request to select a different workspace.
+            repo_fact = (
+                None if required_review_head is not None else parse_github_repo_fact(event.text)
+            )
             workspace_repo = await asyncio.to_thread(
                 self._workspace.select_repository,
                 thread_key=thread_key,
@@ -2548,6 +2594,11 @@ class Kernel:
                             and lineage.visible_outcome_revision > 0
                         ):
                             lineage_base_sha = lineage.base_sha
+        if required_review_head is not None and lineage_head != required_review_head:
+            raise WorkspaceSelectionRefused(
+                "The pull request changed after GitHub feedback verification; "
+                "no model turn started."
+            )
         # Greeting/help pre-model short-circuit (ADR-0018): under the per-thread
         # route lock, if an enabled greeting/help pack matches the message text AND
         # the thread has no existing route, it is provably a NEW turn (it cannot be

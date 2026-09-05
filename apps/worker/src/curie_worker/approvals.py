@@ -17,12 +17,13 @@ from __future__ import annotations
 
 import base64
 import logging
+import re
 import uuid
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 import httpx
-from aci_protocol import ApprovalRequest
+from aci_protocol import ApprovalRequest, QueuedTurn
 from curie_telemetry import inject_trace_context
 
 from .workspace import WorkspaceSelectionRefused
@@ -67,6 +68,7 @@ def _publication_refusal(response: httpx.Response) -> str | None:
     if isinstance(detail, str) and detail in _TERMINAL_WORKSPACE_CONFLICT_DETAILS:
         return detail
     return None
+
 
 __all__ = [
     "ApprovalBackendError",
@@ -198,6 +200,14 @@ class ApprovalCreator(Protocol):
     async def create(self, request: ApprovalRequest) -> CreatedApproval: ...
 
 
+@dataclass(frozen=True)
+class VerifiedReviewFeedback:
+    head_sha: str
+    agent_id: uuid.UUID
+    sender: str
+    receipt: str
+
+
 class PublicationCreator(Protocol):
     """Atomic trusted write seam used only for exact publish provenance."""
 
@@ -209,6 +219,12 @@ class PublicationCreator(Protocol):
         conversation_id: str,
         repo_full_name: str,
     ) -> PublicationLineage | None: ...
+
+    async def verify_review_feedback(
+        self,
+        turn: QueuedTurn,
+        deployment_id: uuid.UUID,
+    ) -> VerifiedReviewFeedback: ...
 
 
 class ApprovalReader(Protocol):
@@ -230,13 +246,69 @@ class ApprovalClient:
         client: httpx.AsyncClient,
         read_timeout_s: float,
         worker_token: str = "",
+        review_timeout_s: float = 30.0,
     ) -> None:
         self._url = f"{api_base_url.rstrip('/')}/approvals"
         self._publication_url = f"{api_base_url.rstrip('/')}/v1/internal/publications"
+        self._review_url = f"{api_base_url.rstrip('/')}/v1/internal/github/reviews"
         self._headers = {"X-API-Key": api_key} if api_key else {}
         self._worker_headers = {"X-Curie-Worker-Token": worker_token} if worker_token else {}
         self._client = client
         self._read_timeout_s = read_timeout_s
+        self._review_timeout_s = review_timeout_s
+
+    async def verify_review_feedback(
+        self,
+        turn: QueuedTurn,
+        deployment_id: uuid.UUID,
+    ) -> VerifiedReviewFeedback:
+        """Read the API's current App/binding/head authority, never a credential."""
+        refusal = (
+            "GitHub feedback could not be verified for this conversation; no model turn started."
+        )
+        if (
+            not self._worker_headers
+            or re.fullmatch(
+                r"github-feedback-[0-9a-f-]{36}",
+                turn.event_id,
+            )
+            is None
+        ):
+            raise WorkspaceSelectionRefused(refusal)
+        try:
+            response = await self._client.post(
+                f"{self._review_url}/{turn.event_id}/verify",
+                json={"turn": turn.model_dump(mode="json"), "deployment_id": str(deployment_id)},
+                headers=self._worker_headers,
+                follow_redirects=False,
+                timeout=self._review_timeout_s,
+            )
+        except httpx.HTTPError:
+            raise ApprovalBackendError(
+                "GitHub feedback verification transport unavailable"
+            ) from None
+        if response.status_code in {401, 403, 404, 429} or response.status_code >= 500:
+            raise ApprovalBackendError("GitHub feedback verification temporarily unavailable")
+        if response.status_code != 200:
+            # Response bodies may contain upstream/model text; expose only our
+            # fixed policy refusal. Infrastructure/auth/rollout failures above
+            # remain retryable and cannot silently ACK an unexecuted turn.
+            raise WorkspaceSelectionRefused(refusal)
+        try:
+            body = response.json()
+            head, sender, receipt = body["head_sha"], body["sender"], body["receipt"]
+            if (
+                not isinstance(head, str)
+                or re.fullmatch(r"[0-9a-f]{40}", head) is None
+                or sender != turn.author
+                or not isinstance(receipt, str)
+                or not receipt
+                or len(receipt) > 1024
+            ):
+                raise ValueError("invalid verified feedback")
+            return VerifiedReviewFeedback(head, uuid.UUID(body["agent_id"]), sender, receipt)
+        except (ValueError, TypeError, KeyError):
+            raise WorkspaceSelectionRefused(refusal) from None
 
     async def create(self, request: ApprovalRequest) -> CreatedApproval:
         headers = {**self._headers, "Content-Type": "application/json"}
