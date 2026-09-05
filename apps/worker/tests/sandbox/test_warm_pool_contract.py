@@ -567,3 +567,36 @@ def test_state_token_presence_must_match_the_generation_keys() -> None:
     verdict = classify_claim(env, projection, now=GENERATION.issued_at + 1)
     assert verdict.reasons == (ColdReason.GENERATION_MISMATCH,)
     assert HISTORY_TOKEN_ENV in verdict.mismatched_keys
+
+
+def test_a_no_key_claim_against_a_keyed_generation_is_cold() -> None:
+    """A no-key render mints no state tokens; a keyed template is different authority."""
+
+    keyed = _project()
+    unkeyed_env = dict(
+        _resolver(_config(api_key="")).boot_env(
+            _resolved(), "1234.5678", kind="slack", address="C0EXAMPLE1"
+        )
+    )
+    verdict = classify_claim(unkeyed_env, keyed, now=GENERATION.issued_at + 1)
+    assert verdict.reasons == (ColdReason.GENERATION_MISMATCH,)
+    assert set(verdict.mismatched_keys) >= {HISTORY_TOKEN_ENV, MEMORY_TOKEN_ENV, STATE_TOKEN_ENV}
+
+
+def test_a_keyed_claim_against_a_credential_free_projection_is_cold() -> None:
+    unkeyed = _project(config=_config(api_key="", credentials=""), model_credential_ref=None)
+    verdict = classify_claim(_claim_env(), unkeyed, now=GENERATION.issued_at + 1)
+    assert ColdReason.GENERATION_MISMATCH in verdict.reasons
+    assert CREDENTIALS_ENV in verdict.mismatched_keys
+    assert HISTORY_TOKEN_ENV in verdict.mismatched_keys
+
+
+def test_a_claim_rendered_without_the_model_credential_is_cold() -> None:
+    env = dict(
+        _resolver(_config(credentials="")).boot_env(
+            _resolved(), "1234.5678", kind="slack", address="C0EXAMPLE1"
+        )
+    )
+    verdict = classify_claim(env, _project(), now=GENERATION.issued_at + 1)
+    assert verdict.reasons == (ColdReason.GENERATION_MISMATCH,)
+    assert verdict.mismatched_keys == (CREDENTIALS_ENV,)

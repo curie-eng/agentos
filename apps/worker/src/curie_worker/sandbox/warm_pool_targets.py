@@ -85,13 +85,35 @@ ORDER BY a.id, (d.environment = 'prod') DESC, d.deployed_at DESC, d.id DESC
 _JSON_COLUMNS = ("behavior_packs", "approval_required_tools", "approval_routes", "secrets")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, eq=False)
 class ActiveWinner:
-    """The in-force deployment for one agent plus the worker-owned bundle digest."""
+    """The in-force deployment for one agent plus the worker-owned bundle digest.
+
+    Equality and hashing use nonsecret identity only: ``resolved`` carries the
+    local tier's connector-secret VALUES, so the generated dataclass comparison
+    would compare credential bytes. ``repr`` likewise never prints ``resolved``.
+    """
 
     resolved: ResolvedDeployment
     bundle_sha256: str | None
     environment: str
+
+    def identity(self) -> tuple[str, str, str | None, str | None, str]:
+        return (
+            str(self.resolved.agent_id),
+            str(self.resolved.version_id),
+            None if self.resolved.deployment_id is None else str(self.resolved.deployment_id),
+            self.bundle_sha256,
+            self.environment,
+        )
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, ActiveWinner):
+            return NotImplemented
+        return self.identity() == other.identity()
+
+    def __hash__(self) -> int:
+        return hash(self.identity())
 
     def __repr__(self) -> str:  # never the connector-secret values on `resolved`
         return (
@@ -240,7 +262,11 @@ class SlotAllocation:
     as the Role's ``resourceNames``. Which generation currently occupies a slot
     is carried by labels, never by the name. Allocation, quarantine and
     exhaustion policy belong to the realizer; this type only refuses a name the
-    grant could not cover.
+    grant could not cover. A slot's Secret may be written only while the slot is
+    unoccupied (its previous pool and template deleted and quarantined); it is
+    never updated in place under a live pool, because with static slot names
+    that rewrite would be exactly the value rotation beneath running pods that
+    Accepted ADR-0122 and Decision B forbid.
     """
 
     secret_prefix: str
@@ -335,8 +361,8 @@ def derive_ref(target: VersionPoolTarget, *, prefix: str, slot: SlotAllocation) 
     names = {kind: f"{stem}{suffix}" for kind, suffix in _SUFFIXES.items()}
     _validate_label("template", names["template"])
     _validate_label("pool", names["pool"], limit=_MAX_POOL_LABEL)
-    if slot.secret_name in names.values():
-        raise TargetError("slot secret name collides with a template or pool name")
+    # Slot Secret names end in a digit; template/pool names end in -tpl/-pool,
+    # so the three are disjoint by construction (pinned by a test, not a guard).
     return VersionPoolRef(
         namespace=target.namespace,
         version_id=target.version_id,

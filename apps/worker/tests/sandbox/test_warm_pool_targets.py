@@ -40,6 +40,7 @@ from curie_worker.sandbox.warm_pool_targets import (
     slot_secret_names,
 )
 from sqlalchemy import text
+from sqlalchemy.engine import make_url
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
@@ -250,14 +251,38 @@ def test_pool_name_reserves_controller_headroom_under_the_label_limit() -> None:
         derive_ref(_target(), prefix="x" * 22, slot=SLOT)
 
 
-def test_slot_secret_name_may_not_collide_with_pool_objects() -> None:
+def test_slot_secret_names_are_structurally_disjoint_from_pool_objects() -> None:
     ref = derive_ref(_target(), prefix="curie", slot=SLOT)
-    colliding = SlotAllocation(ref.pool_name[: -len("-0")], 1, 0)
-    assert colliding.secret_name == ref.pool_name[: -len("-0")] + "-0"
+    assert ref.bootstrap_secret_name[-1].isdigit()
+    assert ref.template_name.endswith("-tpl") and ref.pool_name.endswith("-pool")
+    for name in slot_secret_names("curie-vp-00000000-000000000000", 3):
+        assert name not in {ref.template_name, ref.pool_name}
+
+
+def test_active_winner_equality_and_repr_ignore_secret_values() -> None:
+    a = _winner(secrets={"GH_TOKEN": "MATERIAL-A-91c2"})
+    b = _winner(secrets={"GH_TOKEN": "MATERIAL-B-91c2"})
+    assert a == b and hash(a) == hash(b)
+    assert a != _winner(version_id=uuid.UUID("00000000-0000-4000-8000-0000000000a2"))
+    assert "MATERIAL-A-91c2" not in repr(a) + str(a)
 
 
 def test_ref_is_a_value_and_serializes_without_material() -> None:
-    ref = derive_ref(_target(), prefix="curie", slot=SLOT)
+    material = {
+        "GH_TOKEN": "CONNECTOR-MATERIAL-4d1e",
+        "OTHER_TOKEN": "CONNECTOR-MATERIAL-4d1f",
+    }
+    credential = "MODEL-CREDENTIAL-MATERIAL-4d20"
+    winner = _winner(secrets=material)
+    target = build_target(
+        winner,
+        _resolver(_config(credentials=credential)),
+        namespace="curie",
+        model_credential_ref=BASELINE_CREDENTIAL,
+        connector_secret_name=CONNECTOR_SECRET_NAME,
+        credential_generation=GENERATION,
+    )
+    ref = derive_ref(target, prefix="curie", slot=SLOT)
     again = VersionPoolRef(**ref.as_dict())  # type: ignore[arg-type]
     assert again == ref
     # A ref is names and env KEYS only; the same dict is what a log line may carry.
@@ -272,7 +297,11 @@ def test_ref_is_a_value_and_serializes_without_material() -> None:
         "bootstrap_secret_key",
         "credential_secret_keys",
     }
-    assert json.dumps(ref.as_dict())
+    rendered = json.dumps(ref.as_dict()) + repr(ref) + str(ref) + repr(target) + str(target)
+    rendered += target.projection.canonical_json()
+    for value in (*material.values(), credential):
+        assert value not in rendered
+    assert "GH_TOKEN" in target.projection.secret_refs
 
 
 # --- lookup: current generation or cold, never another pool ------------------------
@@ -314,12 +343,20 @@ def test_lookup_refuses_an_unrealizable_target() -> None:
 # --- real Postgres: the query agrees with the resolver ----------------------------
 
 
+def _db_locator() -> str:
+    """Host and port only: the URL may carry a password and skip reasons reach reports."""
+
+    url = make_url(_DB_URL)
+    return f"{url.host}:{url.port}"
+
+
 async def _engine_or_skip() -> AsyncEngine:
     """A reachable, MIGRATED database, or a skip that says which half is missing.
 
     A reachable server without the ``curie`` schema (another task's fresh
     stack on the shared port) is not evidence about this query either way, so
     it skips with that reason rather than failing on ``UndefinedTableError``.
+    Skip reasons name the host, port and exception TYPE only.
     """
 
     engine = create_async_engine(_DB_URL)
@@ -330,22 +367,42 @@ async def _engine_or_skip() -> AsyncEngine:
             ).scalar_one()
     except (SQLAlchemyError, OSError) as exc:  # pragma: no cover - environment dependent
         await engine.dispose()
-        pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+        pytest.skip(f"Postgres not reachable at {_db_locator()}: {type(exc).__name__}")
     if table is None:  # pragma: no cover - environment dependent
         await engine.dispose()
-        pytest.skip(f"Postgres at {_DB_URL} has no migrated {_SCHEMA}.agents table")
+        pytest.skip(f"Postgres at {_db_locator()} has no migrated {_SCHEMA}.agents table")
     return engine
 
 
+SEEDED_JSON = {
+    "behavior_packs": {"greeting": {"enabled": True}},
+    "approval_required_tools": ["Bash", "Write"],
+    "approval_routes": {"ops": {"resolve": {"kind": "slack", "address": "C0EXAMPLE9"}}},
+    "secrets": {"GH_TOKEN": "seeded-synthetic-value"},
+}
+
+
 async def _seed_agent(engine: AsyncEngine, *, name: str, address: str, memory: bool) -> uuid.UUID:
+    """One agent with every JSONB column populated, so coercion parity is exercised."""
+
     agent_id = uuid.uuid4()
     async with engine.begin() as conn:
         await conn.execute(
             text(
-                f"INSERT INTO {_SCHEMA}.agents (id, name, model, memory) "
-                "VALUES (:id, :name, 'claude-opus-5', :memory)"
+                f"INSERT INTO {_SCHEMA}.agents (id, name, model, memory, behavior_packs, "
+                "approval_required_tools, approval_routes, secrets) "
+                "VALUES (:id, :name, 'claude-opus-5', :memory, CAST(:packs AS jsonb), "
+                "CAST(:gates AS jsonb), CAST(:routes AS jsonb), CAST(:secrets AS jsonb))"
             ),
-            {"id": agent_id, "name": name, "memory": memory},
+            {
+                "id": agent_id,
+                "name": name,
+                "memory": memory,
+                "packs": json.dumps(SEEDED_JSON["behavior_packs"]),
+                "gates": json.dumps(SEEDED_JSON["approval_required_tools"]),
+                "routes": json.dumps(SEEDED_JSON["approval_routes"]),
+                "secrets": json.dumps(SEEDED_JSON["secrets"]),
+            },
         )
         await conn.execute(
             text(
@@ -445,6 +502,10 @@ def test_active_winner_query_agrees_with_the_resolver_on_real_postgres() -> None
             assert winner is not None
             assert winner.resolved.version_id == prod_version
             assert winner.resolved.model_dump() == resolved.model_dump()
+            assert winner.resolved.behavior_packs == SEEDED_JSON["behavior_packs"]
+            assert winner.resolved.approval_required_tools == SEEDED_JSON["approval_required_tools"]
+            assert winner.resolved.approval_routes == SEEDED_JSON["approval_routes"]
+            assert winner.resolved.secrets == SEEDED_JSON["secrets"]
             assert winner.bundle_sha256 is None
             assert winner.environment == "prod"
 
