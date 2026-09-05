@@ -526,6 +526,10 @@ fn plan_lines(opts: &UpgradeOpts, from: Option<&str>, secret: Option<&str>) -> V
         .clone()
         .unwrap_or_else(|| format!("curie-{}", opts.to));
     let mut lines = vec![
+        super::upgrade_owner::capture_command().display(),
+        super::upgrade_owner::namespace_command(&opts.common.namespace).display(),
+        "Reject nonempty HELM_KUBE target/authentication overrides; use the selected kubeconfig".into(),
+        "Bind all Helm/Kubernetes commands to one private captured kubeconfig; acquire same-host ownership by namespace UID and release before checkpoint mutation".into(),
         format!("phase plan: {from} -> {}", opts.to),
         "phase validate: configuration overlay and schema compatibility".into(),
         "phase drain: worker upgrade drain gate (issue 2010)".into(),
@@ -1224,6 +1228,7 @@ print(json.dumps({'passed': True, 'agents_fingerprint': fingerprint}))
 "#;
 
 struct LiveHost {
+    owner: Option<super::upgrade_owner::UpgradeOwner>,
     opts: UpgradeOpts,
     current: Option<String>,
     known_good: Option<String>,
@@ -1237,7 +1242,13 @@ struct LiveHost {
 
 impl LiveHost {
     fn run(&self, cmd: &OpsCommand) -> Result<(bool, String, String)> {
-        tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(run_capture(cmd)))
+        let command = self
+            .owner
+            .as_ref()
+            .map_or_else(|| cmd.clone(), |owner| owner.bind(cmd));
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(run_capture(&command))
+        })
     }
 
     fn inspect_version(&self) -> Result<Option<String>> {
@@ -1340,8 +1351,14 @@ impl LiveHost {
             bail!("target chart and app versions must match --to before upgrade");
         }
         let values = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(super::up::fetch_release_values(&self.opts.common))
+            tokio::runtime::Handle::current().block_on(
+                super::up::fetch_release_values_with_environment(
+                    &self.opts.common,
+                    self.owner
+                        .as_ref()
+                        .map_or_else(Vec::new, |owner| owner.environment()),
+                ),
+            )
         })?;
         if values.is_some() != self.current.is_some() {
             bail!("installed release changed during upgrade inspection; retry before mutation");
@@ -1972,8 +1989,14 @@ impl LiveHost {
             return Ok(false);
         }
         let values = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(super::up::fetch_release_values(&self.opts.common))
+            tokio::runtime::Handle::current().block_on(
+                super::up::fetch_release_values_with_environment(
+                    &self.opts.common,
+                    self.owner
+                        .as_ref()
+                        .map_or_else(Vec::new, |owner| owner.environment()),
+                ),
+            )
         })?;
         if values.as_ref() != self.config.as_ref().map(|config| &config.values) {
             return Ok(false);
@@ -2078,7 +2101,14 @@ impl LiveHost {
         }
         let cmd = OpsCommand::new("helm", args);
         let (ok, _, _) = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(run_upgrade_capture(&cmd))
+            let cmd = self
+                .owner
+                .as_ref()
+                .map_or_else(|| cmd.clone(), |owner| owner.bind(&cmd));
+            tokio::runtime::Handle::current().block_on(run_upgrade_capture(
+                &cmd,
+                self.owner.as_ref().and_then(|owner| owner.ownership_fd()),
+            ))
         })?;
         if !ok {
             bail!("helm upgrade to {to} failed; inspect the release and resume the same upgrade command");
@@ -2435,6 +2465,7 @@ pub async fn upgrade(mut opts: UpgradeOpts) -> Result<ClusterUpgradeOutput> {
     if opts.common.dry_run {
         opts.chart = Some(resolved.planned_target().to_string_lossy().into_owned());
         let mut live = LiveHost {
+            owner: None,
             opts: opts.clone(),
             current: None,
             known_good: None,
@@ -2466,7 +2497,9 @@ pub async fn upgrade(mut opts: UpgradeOpts) -> Result<ClusterUpgradeOutput> {
         bail!("upgrade aborted");
     }
 
+    let owner = super::upgrade_owner::UpgradeOwner::acquire(&opts.common).await?;
     let mut live = LiveHost {
+        owner: Some(owner),
         opts: opts.clone(),
         current: None,
         known_good: None,

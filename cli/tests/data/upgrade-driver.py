@@ -24,6 +24,88 @@ def api_image(values):
     return (image.get("repository") or "ghcr.io/curie-eng/curie-api") + ":0.9.0"
 
 
+# Capture and target-pinning recording boundary. No real credentials are used.
+if program == "kubectl" and args[:2] == ["config", "view"]:
+    view = {
+        "apiVersion": "v1",
+        "kind": "Config",
+        "current-context": "acme-context",
+        "clusters": [
+            {
+                "name": "acme-cluster",
+                "cluster": {
+                    "server": os.environ.get(
+                        "UPGRADE_DRIVER_SERVER", "https://cluster.example.com"
+                    ),
+                    "certificate-authority-data": "Zml4dHVyZS1jYQ==",
+                },
+            }
+        ],
+        "contexts": [
+            {"name": "acme-context", "context": {"cluster": "acme-cluster", "user": "acme-user"}}
+        ],
+        "users": [{"name": "acme-user", "user": {"token": "fixture-kubeconfig-token"}}],
+    }
+    if scenario == "target-config-forbidden":
+        print("fixture-kubeconfig-token", file=sys.stderr)
+        sys.exit(1)
+    if scenario == "target-config-malformed":
+        print("fixture-kubeconfig-token")
+        sys.exit(0)
+    if scenario == "target-config-unbound":
+        view["current-context"] = "different-context"
+    if scenario == "target-config-ambiguous":
+        view["clusters"].append(copy.deepcopy(view["clusters"][0]))
+    print(json.dumps(view))
+    (root / "ambient-context-changed").write_text("https://changed.example.com")
+    sys.exit(0)
+
+if scenario == "context-drift" and (root / "ambient-context-changed").exists():
+    config_path = pathlib.Path(os.environ.get("KUBECONFIG", "/missing-snapshot"))
+    config = json.loads(config_path.read_text())
+    with (root / "snapshot-observations.jsonl").open("a") as log:
+        log.write(
+            json.dumps(
+                {
+                    "path": str(config_path),
+                    "mode": config_path.stat().st_mode & 0o777,
+                    "server": config["clusters"][0]["cluster"]["server"],
+                }
+            )
+            + "\n"
+        )
+    assert config["clusters"][0]["cluster"]["server"] == "https://cluster.example.com"
+
+if program == "kubectl" and args[:2] == ["get", "namespace"]:
+    if scenario == "target-namespace-forbidden":
+        print("fixture-kubeconfig-token", file=sys.stderr)
+        sys.exit(1)
+    if scenario in ("target-namespace-wrong", "target-namespace-missing-uid"):
+        print(
+            json.dumps(
+                {
+                    "kind": "Namespace",
+                    "metadata": {
+                        "name": "other" if scenario == "target-namespace-wrong" else args[2]
+                    },
+                }
+            )
+        )
+        sys.exit(0)
+    print(
+        json.dumps(
+            {
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": {
+                    "name": args[2],
+                    "uid": os.environ.get("UPGRADE_DRIVER_NAMESPACE_UID", "acme-namespace-uid"),
+                },
+            }
+        )
+    )
+    sys.exit(0)
+
 retained_values = json.loads((root / "values.json").read_text())
 
 workload = {

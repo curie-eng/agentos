@@ -80,8 +80,8 @@ serde_norway = "0.9.42"
 crypto_box = { version = "0.9.1", features = ["seal", "std"] }
 base64 = "0.23.1"
 
-[target.'cfg(target_os = "linux")'.dependencies]
-# Linux parent-death signal and exact owned-process identity checks.
+[target.'cfg(unix)'.dependencies]
+# Unix upgrade ownership/descriptor inheritance; Linux parent-death signal.
 libc = "0.2"
 
 [dev-dependencies]

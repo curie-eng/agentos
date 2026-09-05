@@ -69,7 +69,9 @@ impl Fixture {
                 format!("{}:/usr/bin:/bin", self.temp.path().display()),
             )
             .env("UPGRADE_DRIVER_ROOT", self.temp.path())
-            .env("UPGRADE_DRIVER_SCENARIO", scenario);
+            .env("UPGRADE_DRIVER_SCENARIO", scenario)
+            .env("TMPDIR", self.temp.path())
+            .env("XDG_STATE_HOME", self.path("state"));
         command
     }
 
@@ -801,4 +803,233 @@ fn sigkill_of_upgrade_cli_stops_owned_helm_before_later_mutation() {
 #[test]
 fn sigterm_of_upgrade_cli_stops_owned_helm_before_later_mutation() {
     assert_upgrade_owner_death("SIGTERM");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn overlapping_upgrade_refuses_before_checkpoint_and_reacquires_after_owner_exit() {
+    let fixture = Fixture::new();
+    let supervisor = fixture.path("operation-supervisor.py");
+    fs::write(
+        &supervisor,
+        include_str!("data/upgrade-operation-supervisor.py"),
+    )
+    .unwrap();
+    let command = fixture.command("owner-death", &[]);
+    let mut process = Command::new("/usr/bin/python3");
+    process
+        .arg(supervisor)
+        .arg(command.get_program())
+        .args(command.get_args());
+    for (key, value) in command.get_envs() {
+        process.env(key, value.unwrap());
+    }
+    let output = process.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let proof: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(proof["overlap_exit"], 3);
+    assert_eq!(proof["alias_overlap_exit"], 3);
+    assert_eq!(proof["independent_target_exit"], 0);
+    assert_eq!(proof["direct_child_holds_same_lock_inode"], true);
+    assert_eq!(proof["checkpoint_unchanged"], true);
+    assert_eq!(proof["retry_exit"], 0);
+    assert_eq!(proof["cleanup_complete"], true);
+}
+
+#[test]
+fn upgrade_uses_one_private_target_snapshot_despite_ambient_context_change() {
+    let fixture = Fixture::new();
+    let output = fixture.run("context-drift");
+    assert!(
+        output.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let snapshots: Vec<Value> = fs::read_to_string(fixture.path("snapshot-observations.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(snapshots.len() > 10);
+    assert!(snapshots
+        .iter()
+        .all(|item| item["mode"] == 0o600 && item["server"] == "https://cluster.example.com"));
+    assert!(snapshots
+        .iter()
+        .all(|item| item["path"] == snapshots[0]["path"]));
+    assert!(!std::path::Path::new(snapshots[0]["path"].as_str().unwrap()).exists());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("fixture-kubeconfig-token"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("fixture-kubeconfig-token"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn unsafe_local_upgrade_state_refuses_without_checkpoint_or_helm_mutation() {
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.path("state")).unwrap();
+    fs::create_dir(fixture.path("redirected-state")).unwrap();
+    std::os::unix::fs::symlink(
+        fixture.path("redirected-state"),
+        fixture.path("state/curie"),
+    )
+    .unwrap();
+    let output = fixture.run("healthy");
+    fixture.assert_refused_without_upgrade(&output);
+    assert!(!fixture.path("record.json").exists());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(value["fix"].as_str().is_some_and(|fix| !fix.is_empty()));
+    assert!(fs::read_dir(fixture.path("redirected-state"))
+        .unwrap()
+        .next()
+        .is_none());
+}
+
+#[test]
+fn unproven_upgrade_target_refuses_before_checkpoint_and_redacts_raw_credentials() {
+    for scenario in [
+        "target-config-forbidden",
+        "target-config-malformed",
+        "target-config-unbound",
+        "target-config-ambiguous",
+        "target-namespace-forbidden",
+        "target-namespace-wrong",
+        "target-namespace-missing-uid",
+    ] {
+        let fixture = Fixture::new();
+        let output = fixture.run(scenario);
+        fixture.assert_refused_without_upgrade(&output);
+        assert!(!fixture.path("record.json").exists());
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(value["fix"].as_str().is_some_and(|fix| !fix.is_empty()));
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("fixture-kubeconfig-token"));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("fixture-kubeconfig-token"));
+        assert!(!fs::read_dir(fixture.temp.path()).unwrap().any(|item| item
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("curie-helm-values-")));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn redirected_or_shared_upgrade_lock_refuses_before_new_checkpoint_write() {
+    for mode in ["symlink", "hardlink", "world-readable"] {
+        let fixture = Fixture::new();
+        assert!(fixture.run("healthy").status.success());
+        let before = fs::read(fixture.path("record.json")).unwrap();
+        let directory = fixture.path("state/curie/upgrades");
+        let lock = fs::read_dir(&directory)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        match mode {
+            "symlink" => {
+                fs::remove_file(&lock).unwrap();
+                fs::write(fixture.path("redirected-lock"), "untouched").unwrap();
+                std::os::unix::fs::symlink(fixture.path("redirected-lock"), &lock).unwrap();
+            }
+            "hardlink" => fs::hard_link(&lock, fixture.path("second-lock-name")).unwrap(),
+            _ => fs::set_permissions(&lock, fs::Permissions::from_mode(0o644)).unwrap(),
+        }
+        fs::write(fixture.path("calls.jsonl"), "").unwrap();
+        let output = fixture.run("healthy");
+        fixture.assert_refused_without_upgrade(&output);
+        assert_eq!(fs::read(fixture.path("record.json")).unwrap(), before);
+        if mode == "symlink" {
+            assert_eq!(
+                fs::read_to_string(fixture.path("redirected-lock")).unwrap(),
+                "untouched"
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn world_writable_upgrade_state_refuses_before_creating_ownership() {
+    let fixture = Fixture::new();
+    fs::create_dir(fixture.path("state")).unwrap();
+    fs::set_permissions(fixture.path("state"), fs::Permissions::from_mode(0o777)).unwrap();
+    let output = fixture.run("healthy");
+    fixture.assert_refused_without_upgrade(&output);
+    assert!(!fixture.path("state/curie").exists());
+    assert!(!fixture.path("record.json").exists());
+}
+
+#[test]
+fn upgrade_offline_plan_names_capture_namespace_read_and_ownership_without_processes() {
+    let fixture = Fixture::new();
+    let output = fixture
+        .command("healthy", &["--dry-run"])
+        .env("PATH", "/missing-tools")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let text = value.to_string();
+    assert!(text.contains("kubectl config view --minify --raw -o json --flatten"));
+    assert!(text.contains("kubectl get namespace upgrade-test -o json"));
+    assert!(text.contains("same-host ownership"));
+    assert!(fixture.calls().is_empty());
+    assert!(!fixture.path("state").exists());
+}
+
+#[test]
+fn helm_target_overrides_refuse_before_upgrade_target_discovery_without_leaking_values() {
+    // Helm3.16.4 EnvSettings binds each of these independently of KUBECONFIG:
+    // https://github.com/helm/helm/blob/v3.16.4/pkg/cli/environment.go
+    // Actual Helm endpoint probe contacted only HELM_KUBEAPISERVER's endpoint
+    // with a conflicting kubeconfig, and only the captured endpoint once unset.
+    for name in [
+        "HELM_KUBEAPISERVER",
+        "HELM_KUBECONTEXT",
+        "HELM_KUBECAFILE",
+        "HELM_KUBETOKEN",
+        "HELM_KUBEASUSER",
+        "HELM_KUBEASGROUPS",
+        "HELM_KUBEINSECURE_SKIP_TLS_VERIFY",
+        "HELM_KUBETLS_SERVER_NAME",
+    ] {
+        let fixture = Fixture::new();
+        let output = fixture
+            .command("healthy", &[])
+            .env(name, "fixture-helm-override-private-value")
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{name}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(value["error"].as_str().unwrap().contains(name));
+        assert!(value["fix"].as_str().unwrap().contains("kubeconfig"));
+        assert!(!String::from_utf8_lossy(&output.stdout)
+            .contains("fixture-helm-override-private-value"));
+        assert!(!String::from_utf8_lossy(&output.stderr)
+            .contains("fixture-helm-override-private-value"));
+        assert!(!fixture.path("ambient-context-changed").exists());
+        assert!(!fixture.path("record.json").exists());
+        assert!(!fixture.path("state").exists());
+        let empty = fixture
+            .command("healthy", &[])
+            .env(name, "")
+            .output()
+            .unwrap();
+        assert!(
+            empty.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&empty.stdout)
+        );
+    }
 }

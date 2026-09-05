@@ -488,14 +488,17 @@ pub(crate) fn require_on_path(bin: &str) -> Result<()> {
 
 /// Run one command capturing stdout; returns (success, stdout, stderr).
 pub async fn run_capture(cmd: &OpsCommand) -> Result<(bool, String, String)> {
-    capture_process(cmd, false).await
+    capture_process(cmd, false, None).await
 }
 
 /// Capture the Helm mutation owned by the transactional upgrade. On Linux its
 /// direct child is also stopped when the spawning CLI thread dies. This does
 /// not stop Kubernetes hook Jobs, plugins' descendants, or remote writers.
-pub(super) async fn run_upgrade_capture(cmd: &OpsCommand) -> Result<(bool, String, String)> {
-    capture_process(cmd, true).await
+pub(super) async fn run_upgrade_capture(
+    cmd: &OpsCommand,
+    ownership_fd: Option<i32>,
+) -> Result<(bool, String, String)> {
+    capture_process(cmd, true, ownership_fd).await
 }
 
 #[cfg(target_os = "linux")]
@@ -519,7 +522,11 @@ fn arm_parent_death(expected_parent: libc::pid_t) -> std::io::Result<()> {
     Ok(())
 }
 
-async fn capture_process(cmd: &OpsCommand, owned_upgrade: bool) -> Result<(bool, String, String)> {
+async fn capture_process(
+    cmd: &OpsCommand,
+    owned_upgrade: bool,
+    ownership_fd: Option<i32>,
+) -> Result<(bool, String, String)> {
     // Materialize any secret values into a private 0600 `-f` file so the secret
     // stays out of the argv/process table. `_secret_files` guards live until the
     // end of this function, so the temp files are removed after `helm` exits
@@ -537,19 +544,32 @@ async fn capture_process(cmd: &OpsCommand, owned_upgrade: bool) -> Result<(bool,
         .args(cmd.argv())
         .envs(cmd.env.iter().chain(cmd.secret_env.iter()).cloned())
         .kill_on_drop(true);
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     if owned_upgrade {
+        #[cfg(target_os = "linux")]
         let expected_parent = unsafe { libc::getpid() };
         // SAFETY: the callback only executes the non-allocating libc/errno
         // operations documented in arm_parent_death.
         unsafe {
-            process.pre_exec(move || arm_parent_death(expected_parent));
+            process.pre_exec(move || {
+                #[cfg(target_os = "linux")]
+                arm_parent_death(expected_parent)?;
+                if let Some(fd) = ownership_fd {
+                    // Keep the same flock open description through direct Helm
+                    // exec. Parent exit cannot release ownership before this
+                    // child exits. fcntl affects only the forked descriptor table.
+                    if libc::fcntl(fd, libc::F_SETFD, 0) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
         }
     }
-    // Other platforms retain the existing subprocess behavior; no parent-death
-    // or automatic orphan-recovery guarantee is made for them.
-    #[cfg(not(target_os = "linux"))]
-    let _ = owned_upgrade;
+    // Non-Unix targets retain ordinary subprocess behavior. On macOS the lock
+    // is inherited, but Linux's parent-death signal is not claimed or emulated.
+    #[cfg(not(unix))]
+    let _ = (owned_upgrade, ownership_fd);
     let output = process
         .output()
         .await
