@@ -27,7 +27,9 @@ def all_steps(workflow: dict) -> list[dict]:
 
 
 class TestSdkApprovalGateWorkflowContract:
-    def test_trigger_is_pull_request_on_main_and_next_scoped_to_sdk_and_approval_paths(self) -> None:
+    def test_trigger_is_pull_request_on_main_and_next_scoped_to_sdk_and_approval_paths(
+        self,
+    ) -> None:
         workflow = load_workflow()
         trigger = workflow["on"]
 
