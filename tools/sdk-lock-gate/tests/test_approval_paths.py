@@ -76,6 +76,9 @@ def test_each_enforcement_path_runs_live_with_unchanged_lock(tmp_path: Path, pat
     "path",
     [
         "README.md",
+        "tools/sdk-lock-gate/README.md",
+        "tools/sdk-lock-gate/tests/README.md",
+        "tools/sdk-lock-gate/detect.py.bak",
         "runner/src/curie_runner/otel.py",
         "runner/tests/test_otel.py",
         "runner/src/curie_runner/approval.py.bak",
@@ -92,6 +95,9 @@ def test_unrelated_paths_do_not_run_live(tmp_path: Path, path: str) -> None:
         ".github/workflows/sdk-approval-gate.yaml",
         "tools/sdk-lock-gate/detect.py",
         "tools/sdk-lock-gate/tests/test_approval_paths.py",
+        "tools/sdk-lock-gate/run-proof.py",
+        "tools/sdk-lock-gate/tests/test_live_proof_consumer.py",
+        "tools/sdk-lock-gate/tests/test_sdk_lock_gate.py",
     ],
 )
 def test_gate_changes_reprove_the_guard(tmp_path: Path, path: str) -> None:
@@ -155,7 +161,11 @@ def test_workflow_outer_filter_is_only_named_policy_and_gate_paths() -> None:
     assert set(workflow[True]["pull_request"]["paths"]) == set(POLICY_PATHS) | {
         "uv.lock",
         ".github/workflows/sdk-approval-gate.yaml",
-        "tools/sdk-lock-gate/**",
+        "tools/sdk-lock-gate/detect.py",
+        "tools/sdk-lock-gate/run-proof.py",
+        "tools/sdk-lock-gate/tests/test_approval_paths.py",
+        "tools/sdk-lock-gate/tests/test_live_proof_consumer.py",
+        "tools/sdk-lock-gate/tests/test_sdk_lock_gate.py",
     }
 
 
