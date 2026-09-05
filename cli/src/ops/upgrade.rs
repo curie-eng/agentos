@@ -587,6 +587,8 @@ fn plan_lines(opts: &UpgradeOpts, from: Option<&str>, secret: Option<&str>) -> V
         ),
         "phase converge: exact images, generations, replicas, unavailable=0, hooks, queues, manifest"
             .into(),
+        "# Conditional image alias read: <pod-node> is resolved from selected serving Pods; this placeholder is not an executable argument and requires get-node access".into(),
+        super::convergence::node_images_command("<pod-node>").display(),
         "phase canary: target-version smoke".into(),
         "phase commit: record known-good version".into(),
     ];
@@ -1184,7 +1186,9 @@ impl SchemaMetadata {
             .collect();
         let destructive = pending.iter().any(|item| item.kind != "expand");
         if current.is_some() && destructive && !forward_only {
-            bail!("pending contract or irreversible schema migration requires explicit api.migrate.forwardOnly before any mutation");
+            return Err(crate::exit::CliError::failure("pending contract or irreversible schema migration requires explicit api.migrate.forwardOnly before any mutation")
+                .with_fix("review the target contract migrations and retained-data backup, then rerun the same cluster upgrade command with --forward-only if forward-only migration is intended; otherwise select a compatible target")
+                .into());
         }
         Ok(serde_json::json!({
             "decision": if pending.is_empty() { "noop" } else { "apply" },
@@ -2767,6 +2771,33 @@ impl LiveHost {
         )?))
     }
 
+    fn serving_node_images(&self, name: &str) -> Result<serde_json::Value> {
+        let failure = || {
+            crate::exit::CliError::failure("could not verify serving Node image inventory for upgrade convergence")
+            .with_fix("restore get-node access for the serving Pod's node and retry the same upgrade; missing or ambiguous image inventory cannot prove a tagged alias")
+        };
+        let owner = self.owner.as_ref().ok_or_else(failure)?;
+        let command = owner.bind(&super::convergence::node_images_command(name));
+        let (ok, raw, _) = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                run_capture(&command),
+            ))
+        })
+        .map_err(|_| failure())?
+        .map_err(|_| failure())?;
+        if !ok {
+            return Err(failure().into());
+        }
+        let node: serde_json::Value = serde_json::from_str(&raw).map_err(|_| failure())?;
+        if node.get("kind").and_then(|v| v.as_str()) != Some("Node")
+            || node.pointer("/metadata/name").and_then(|v| v.as_str()) != Some(name)
+        {
+            return Err(failure().into());
+        }
+        Ok(node)
+    }
+
     fn live_convergence(&self) -> Result<Convergence> {
         let objects = self.retained_objects()?;
         let tmp = super::command::SecretValuesFileGuard::write_document(&serde_json::json!({
@@ -2820,6 +2851,10 @@ impl LiveHost {
             .get("items")
             .and_then(|value| value.as_array())
             .context("running Pod image observation has no items")?;
+        let mut nodes = std::collections::BTreeMap::new();
+        for name in super::upgrade_images::required_nodes(&objects, pods) {
+            nodes.insert(name.clone(), self.serving_node_images(&name)?);
+        }
         let mut conv = Convergence::exact_ok();
         let mut workloads = 0;
         for expected in &objects {
@@ -2887,7 +2922,8 @@ impl LiveHost {
                 && ready.unwrap_or(0) == desired.unwrap_or(0)
                 && updated.unwrap_or(0) == desired.unwrap_or(0);
             conv.unavailable_zero &= unavailable == 0;
-            let (images_match, images) = super::upgrade_images::observe(expected, pods, desired);
+            let (images_match, images) =
+                super::upgrade_images::observe(expected, pods, desired, &nodes);
             conv.images &= images_match;
             conv.observed_images.extend(images);
         }

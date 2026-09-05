@@ -39,75 +39,96 @@ const APP_PATH: &str = "/app";
 const MATCHING_APP_ID: &str = "1234567";
 const OTHER_APP_ID: &str = "7654321";
 
-/// Logs every helm/kubectl invocation. Answers only the reads this verb
-/// needs before it mutates (values, Secret, fullname discovery) plus, when
-/// `ALLOW_MUTATION=1`, the upgrade and rollout. Everything else is refused
-/// so a test cannot pass by running some other command that happened to
-/// succeed.
-const TOOL_SHIM: &str = r#"#!/usr/bin/env bash
-tool=$(basename "$0")
-echo "$tool $*" >> "$SHIM_LOG"
-if [ "$tool" = "helm" ] && [ "$1" = "get" ] && [ "$2" = "values" ]; then
-  echo "$FAKE_VALUES"
-  exit 0
-fi
-if [ "$tool" = "helm" ] && [ "$1" = "history" ]; then
-  if [ -f "$SHIM_LOG.upgraded" ]; then
-    echo '[{"revision":12,"status":"superseded","chart":"curie-0.8.6"},{"revision":13,"status":"deployed","chart":"curie-0.8.6"}]'
-  else
-    echo '[{"revision":12,"status":"deployed","chart":"curie-0.8.6"}]'
-  fi
-  exit 0
-fi
-if [ "$tool" = "helm" ] && [ "$1" = "get" ] && [ "$2" = "manifest" ]; then
-  cat <<'MANIFEST'
----
-apiVersion: extensions.agents.x-k8s.io/v1beta1
-kind: SandboxTemplate
-metadata:
-  name: curie-runner
-  labels:
-    app.kubernetes.io/component: agent-sandbox
-    app.kubernetes.io/instance: curie
-    app.kubernetes.io/managed-by: Helm
-spec:
-  service: true
----
-apiVersion: extensions.agents.x-k8s.io/v1beta1
-kind: SandboxWarmPool
-metadata:
-  name: curie-runner-pool
-  labels:
-    app.kubernetes.io/component: agent-sandbox
-    app.kubernetes.io/instance: curie
-    app.kubernetes.io/managed-by: Helm
-spec:
-  replicas: 0
-  sandboxTemplateRef:
-    name: curie-runner
-MANIFEST
-  exit 0
-fi
-if [ "$tool" = "kubectl" ] && [ "$1" = "get" ] \
-  && [[ "$2" == sandboxtemplates.extensions.agents.x-k8s.io,* ]]; then
-  echo '{"items":[{"apiVersion":"extensions.agents.x-k8s.io/v1beta1","kind":"SandboxTemplate","metadata":{"name":"curie-runner","labels":{"app.kubernetes.io/component":"agent-sandbox","app.kubernetes.io/instance":"curie","app.kubernetes.io/managed-by":"Helm"},"annotations":{"meta.helm.sh/release-name":"curie","meta.helm.sh/release-namespace":"curie"}},"spec":{"service":true}},{"apiVersion":"extensions.agents.x-k8s.io/v1beta1","kind":"SandboxWarmPool","metadata":{"name":"curie-runner-pool","labels":{"app.kubernetes.io/component":"agent-sandbox","app.kubernetes.io/instance":"curie","app.kubernetes.io/managed-by":"Helm"},"annotations":{"meta.helm.sh/release-name":"curie","meta.helm.sh/release-namespace":"curie"}},"spec":{"replicas":0,"sandboxTemplateRef":{"name":"curie-runner"}}}]}'
-  exit 0
-fi
-if [ "$tool" = "kubectl" ] && echo "$*" | grep -q " get secret "; then
-  echo "$FAKE_SECRET_JSON"
-  exit 0
-fi
-if [ "$ALLOW_MUTATION" = "1" ]; then
-  if [ "$tool" = "helm" ] && [ "$1" = "upgrade" ]; then
-    touch "$SHIM_LOG.upgraded"
-    exit 0
-  fi
-  if [ "$tool" = "kubectl" ]; then
-    exit 0
-  fi
-fi
-echo "shim: refusing to execute: $tool $*" >&2
-exit 1
+/// Logs every helm/kubectl invocation. Models the deployed revision and
+/// sandbox pair required by next's reconciliation barrier, as exercised by
+/// `github_app_sandbox_reconciliation`. Only an allowed Helm upgrade advances
+/// history; unrelated commands fail closed.
+const TOOL_SHIM: &str = r#"#!/usr/bin/env python3
+import json
+import os
+import sys
+from pathlib import Path
+
+tool = Path(sys.argv[0]).name
+args = sys.argv[1:]
+log = Path(os.environ["SHIM_LOG"])
+with log.open("a") as stream:
+    stream.write(tool + " " + " ".join(args) + "\n")
+upgraded = log.with_suffix(".upgraded")
+revision = 13 if upgraded.exists() else 12
+
+def emit(value):
+    print(json.dumps(value))
+    raise SystemExit(0)
+
+def sandbox(kind, name, spec):
+    return {
+        "apiVersion": "extensions.agents.x-k8s.io/v1beta1",
+        "kind": kind,
+        "metadata": {
+            "name": name,
+            "labels": {
+                "app.kubernetes.io/component": "agent-sandbox",
+                "app.kubernetes.io/instance": "curie",
+                "app.kubernetes.io/managed-by": "Helm",
+            },
+            "annotations": {
+                "meta.helm.sh/release-name": "curie",
+                "meta.helm.sh/release-namespace": "curie",
+            },
+        },
+        "spec": spec,
+    }
+
+objects = [
+    sandbox("SandboxTemplate", "curie-runner", {"service": True}),
+    sandbox("SandboxWarmPool", "curie-runner-pool", {
+        "replicas": 0, "sandboxTemplateRef": {"name": "curie-runner"}
+    }),
+]
+if tool == "helm":
+    if args == ["history", "curie", "-n", "curie", "-o", "json", "--max", "256"]:
+        rows = [{"revision": 12, "status": "deployed", "chart": "curie-0.8.6", "description": "Upgrade complete"}]
+        if upgraded.exists():
+            rows[0]["status"] = "superseded"
+            rows.append({"revision": 13, "status": "deployed", "chart": "curie-0.8.6", "description": "Upgrade complete"})
+        emit(rows)
+    if args == ["get", "values", "curie", "-n", "curie", "--revision", str(revision), "-o", "json"]:
+        print(os.environ["FAKE_VALUES"])
+        raise SystemExit(0)
+    if args == ["get", "manifest", "curie", "-n", "curie", "--revision", str(revision)]:
+        print("\n---\n".join(json.dumps(obj) for obj in objects))
+        raise SystemExit(0)
+    upgrade_prefix = ["upgrade", "curie", "charts/curie", "-n", "curie", "--reuse-values"]
+    connect_tail = ["--set-string", "api.githubAppId=1234567", "--set-file",
+                    "api.githubAppPrivateKey=" + str(log.parent / "app.pem"),
+                    "--set", "api.githubCloneBase=https://github.com"]
+    disconnect_tail = ["--set", "api.githubAppId=", "--set", "api.githubAppPrivateKey=",
+                       "--set", "api.githubAppExistingSecret="]
+    if os.environ.get("ALLOW_MUTATION") == "1" and args in [
+        upgrade_prefix + connect_tail, upgrade_prefix + disconnect_tail
+    ]:
+        upgraded.touch()
+        raise SystemExit(0)
+if tool == "kubectl":
+    if args == ["-n", "curie", "get", "secret", "my-github-app", "-o", "json"]:
+        print(os.environ["FAKE_SECRET_JSON"])
+        raise SystemExit(0)
+    if args == ["get", "sandboxtemplates.extensions.agents.x-k8s.io,sandboxwarmpools.extensions.agents.x-k8s.io", "-n", "curie", "-o", "json", "--request-timeout=5s"]:
+        emit({"apiVersion": "v1", "items": objects})
+    for kind, component in [("svc", "api"), ("deployment", "worker")]:
+        if args == ["-n", "curie", "get", kind, "-l",
+                    "app.kubernetes.io/instance=curie,app.kubernetes.io/component=" + component,
+                    "-o", r'jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}']:
+            print("curie-" + component)
+            raise SystemExit(0)
+    if os.environ.get("ALLOW_MUTATION") == "1" and upgraded.exists() and args in [
+        ["-n", "curie", "rollout", "restart", "deployment/curie-api"],
+        ["-n", "curie", "rollout", "status", "deployment/curie-api", "--timeout=180s"],
+    ]:
+        raise SystemExit(0)
+print("shim: refusing to execute: " + tool + " " + " ".join(args), file=sys.stderr)
+raise SystemExit(1)
 "#;
 
 fn generate_rsa_pem(path: &Path) {

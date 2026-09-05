@@ -12,13 +12,14 @@
 #![cfg(unix)]
 
 mod support;
-use support::{serve, MockServer, Request, Response};
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
+
+use support::{serve, MockServer, Request, Response};
 
 const RELEASE: &str = "acme-platform";
 const NAMESPACE: &str = "acme-system";
@@ -120,7 +121,7 @@ spec:
 
 // One script is installed under both tool names. Python keeps the fake
 // cluster's state machine readable without depending on PyYAML or a shell YAML
-// parser. It never receives credential material.
+// parser. It receives only the generated test credential, never live material.
 const TOOL_SHIM: &str = r#"#!/usr/bin/env python3
 import json
 import os
@@ -356,11 +357,10 @@ if tool == "helm":
     raise SystemExit(1)
 
 if tool == "kubectl":
-    joined = " ".join(args)
-    if " get secret acme-github-app " in " " + joined + " ":
-        event("kubectl:get-app-secret")
-        print((root / "app-secret.json").read_text())
+    if args == ["-n", os.environ["FAKE_CLUSTER_NAMESPACE"], "get", "secret", "acme-github-app", "-o", "json"]:
+        print((root / "github-app-secret.json").read_text())
         raise SystemExit(0)
+    joined = " ".join(args)
     if args and args[0] == "proxy":
         event("kubectl:proxy")
         print("placeholder proxy is forbidden", file=sys.stderr)
@@ -493,27 +493,42 @@ impl FakeCluster {
                 fs::write(dir.path().join(format!("live__{name}")), "").expect("seed live object");
             }
         }
-        // The stable App-identity guard now precedes sandbox writes. Model only
-        // the external GitHub service, using a generated RSA key as in its own
-        // consumer suite (https://docs.github.com/en/rest/apps/apps#get-the-authenticated-app).
-        let pem = Command::new("openssl")
+        // The released identity guard authenticates the BYO key before the
+        // sandbox barrier. Generate a real PEM and mock only GitHub's documented
+        // GET /app response, as in github_app_identity (issue #2269).
+        // https://docs.github.com/en/rest/apps/apps#get-the-authenticated-app
+        let key = Command::new("openssl")
             .args(["genrsa", "2048"])
             .output()
-            .unwrap();
-        assert!(pem.status.success());
-        fs::write(dir.path().join("app.pem"), &pem.stdout).unwrap();
-        let encoded =
-            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &pem.stdout);
-        fs::write(dir.path().join("app-secret.json"), serde_json::json!({"apiVersion":"v1", "kind":"Secret", "metadata":{"name":"acme-github-app"}, "data":{"app-pem":encoded}}).to_string()).unwrap();
-        let github = serve(move |_req: &Request| {
-            Response::json(
-                status,
-                if status == 200 {
-                    r#"{"id":1234567,"name":"acme-bot"}"#
-                } else {
-                    r#"{"message":"unauthorized"}"#
-                },
-            )
+            .expect("generate test App PEM");
+        assert!(key.status.success(), "openssl genrsa failed");
+        let secret = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {"name": "acme-github-app"},
+            "data": {
+                "app-pem": base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    &key.stdout,
+                )
+            }
+        });
+        let secret_path = dir.path().join("github-app-secret.json");
+        fs::write(&secret_path, secret.to_string()).expect("write test App Secret");
+        fs::set_permissions(&secret_path, fs::Permissions::from_mode(0o600))
+            .expect("protect test App Secret");
+        let github = serve(move |request: &Request| {
+            if status == 200
+                && request.method == "GET"
+                && request.path == "/app"
+                && request
+                    .header("authorization")
+                    .is_some_and(|value| value.starts_with("Bearer "))
+            {
+                Response::json(200, r#"{"id":1234567,"name":"acme-bot"}"#)
+            } else {
+                Response::json(401, r#"{"message":"Unauthorized"}"#)
+            }
         });
         Self { dir, github }
     }
@@ -568,9 +583,10 @@ impl FakeCluster {
         command
             .args(&args)
             .env("PATH", self.child_path())
-            .env("CURIE_GITHUB_API_URL", &self.github.base_url)
             .env("FAKE_CLUSTER_STATE", self.state())
             .env("FAKE_CLUSTER_SCENARIO", scenario)
+            .env("FAKE_CLUSTER_NAMESPACE", namespace)
+            .env("CURIE_GITHUB_API_URL", &self.github.base_url)
             .env("FAKE_SENSITIVE_SENTINEL", sensitive_stderr_sentinel());
         if scenario == "helm-upgrade-hang" {
             command.env("CURIE_TEST_GITHUB_APP_HELM_TIMEOUT_MS", "150");

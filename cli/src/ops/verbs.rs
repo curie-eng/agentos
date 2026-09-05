@@ -1,11 +1,10 @@
 //! `curie cluster status | down` plus the release, secret, service-URL and
 //! observability discovery those verbs (and the rest of the CLI) read through.
 
-use super::convergence;
 use anyhow::{bail, Context, Result};
 
 #[allow(unused_imports)]
-use super::{command::*, providers::*, up::*};
+use super::{command::*, convergence, providers::*, up::*};
 
 pub struct DownOpts {
     pub common: CommonOpts,

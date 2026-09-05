@@ -2,7 +2,6 @@
 //! preservation rules, gvisor / priority-class / controller preflight, and the
 //! install runner with its gvisor event observer.
 
-use super::convergence;
 use anyhow::{bail, Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::Stdio;
@@ -11,7 +10,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, ChildStdout, Command};
 
 #[allow(unused_imports)]
-use super::{command::*, providers::*, verbs::*};
+use super::{command::*, convergence, providers::*, verbs::*};
 
 /// Typed retained values use the same protected file lifecycle as credentials.
 /// Debug and command rendering expose field names only.
@@ -49,6 +48,7 @@ pub struct UpOpts {
     /// Existing mail lifecycle and paired worker credentials, with explicit
     /// operator overrides removed. Populated by the one release-values read.
     pub retained_mail_values: Option<PrivateHelmValues>,
+
     pub common: CommonOpts,
     pub chart: String,
     pub no_expose: bool,
@@ -1157,6 +1157,13 @@ fn reindex_inferred_provider_egress(
     }
 }
 
+fn is_retained_mail_key(key: &str) -> bool {
+    key_is_or_descends_from(key, "mailAdapter")
+        || key_is_or_descends_from(key, "worker.adapterCredentials")
+        || key == "worker.adapterCredentialsExistingSecret"
+        || key == "worker.adapterCredentialsExistingSecretKey"
+}
+
 /// Does a plain `cluster up` carry this key forward when nothing re-passes it?
 ///
 /// The honest half of `curie diff`. `up` does a FULL upgrade, so a key present
@@ -1182,10 +1189,7 @@ fn reindex_inferred_provider_egress(
 /// says it carries names and never secrets. `sealing_test` below asserts the
 /// two lists agree by construction rather than by a hand-kept fixture.
 pub fn is_preserved_by_up(key: &str) -> bool {
-    key_is_or_descends_from(key, "mailAdapter")
-        || key_is_or_descends_from(key, "worker.adapterCredentials")
-        || key == "worker.adapterCredentialsExistingSecret"
-        || key == "worker.adapterCredentialsExistingSecretKey"
+    is_retained_mail_key(key)
         || COMMS_MANAGED_KEYS.contains(&key)
         || GITHUB_APP_MANAGED_KEYS.contains(&key)
         || REQUIRED_SECRETS.iter().any(|(k, _)| *k == key)
@@ -1967,6 +1971,10 @@ fn overlay_secret_refs(
         } else {
             format!("{prefix}.{key}")
         };
+        // Retained mail values already own typed preservation and source changes.
+        if is_retained_mail_key(&path) {
+            continue;
+        }
         if is_external_secret_ref_key(&path) && !overridden.contains(&path) {
             match child {
                 serde_json::Value::String(raw) if raw.is_empty() => {}
@@ -2044,6 +2052,9 @@ fn overlay_json(
                     key_is_or_descends_from(prefix, key) || key_is_or_descends_from(key, prefix)
                 })
             {
+                return;
+            }
+            if is_retained_mail_key(prefix) {
                 return;
             }
             if overlay_family_is_managed(prefix) && !is_external_secret_ref_key(prefix) {
@@ -4258,7 +4269,7 @@ mod tests {
             Some(existing),
             None,
             false,
-            false,
+            true,
         )
         .unwrap()
     }
@@ -4418,6 +4429,11 @@ mod tests {
         assert_eq!(
             actual["mailAdapter"]["channelTokenExistingSecretKey"],
             "channel-key"
+        );
+        let command = &up_commands(&opts)[0];
+        assert!(
+            !command.display().contains("channelTokenExistingSecret="),
+            "migration overlay must not resurrect the replaced external reference"
         );
         assert_eq!(
             actual["worker"]["adapterCredentialsExistingSecretKey"],
