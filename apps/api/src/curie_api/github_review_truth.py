@@ -180,4 +180,25 @@ async def verify_feedback_truth(
     expected = replace(feedback, repo_full_name=observed.repo_full_name, url=observed.url)
     if observed != expected:
         raise FeedbackIgnored("feedback_changed")
+    if observed.author_association == "CONTRIBUTOR":
+        # Association does not establish effective repository permission. Keep
+        # the existing OWNER/MEMBER/COLLABORATOR policy, and authorize this
+        # fallback only through the current, installation-verified App token.
+        # Permission results are read again on every pre-model verification.
+        # https://docs.github.com/en/rest/collaborators/collaborators#get-repository-permissions-for-a-user
+        permission = await read(
+            f"{repo_path}/collaborators/{observed.sender_login}/permission",
+            "sender_permission_unavailable",
+        )
+        user = permission.get("user")
+        if (
+            not isinstance(user, dict)
+            or type(user.get("id")) is not int
+            or user["id"] != observed.sender_id
+        ):
+            raise FeedbackIgnored("sender_permission_identity_mismatch")
+        # The documented legacy field folds maintain into write. Descriptive
+        # role_name and unexpected values cannot grant authority.
+        if permission.get("permission") not in ("write", "admin"):
+            raise FeedbackIgnored("sender_permission_refused")
     return lineage.head_sha

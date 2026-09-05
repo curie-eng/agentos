@@ -146,7 +146,11 @@ def parse_feedback(event: str, payload: Any, delivery_id: str) -> UnverifiedFeed
     if feedback.get("performed_via_github_app") is not None:
         raise FeedbackIgnored("app_authored")
     association = feedback.get("author_association")
-    if not isinstance(association, str) or association not in {"OWNER", "MEMBER", "COLLABORATOR"}:
+    # CONTRIBUTOR is only a claim here. The shared truth verifier additionally
+    # requires current App-proven write/admin permission before admitting it.
+    if not isinstance(association, str) or association not in {
+        "OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR"
+    }:
         raise FeedbackIgnored("unauthorized_association")
     feedback_id = _positive(feedback.get("id"), "invalid_feedback")
     body = feedback.get("body")
