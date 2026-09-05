@@ -276,7 +276,10 @@ class GitHubReviewReconciler:
                             <= datetime.now(UTC).replace(tzinfo=None),
                         ),
                     )
-                    .with_for_update(skip_locked=True)
+                    # NO KEY UPDATE still excludes competing mutators while
+                    # allowing concurrent delivery-audit FK references. FOR
+                    # UPDATE would skip an eligible row held only by KEY SHARE.
+                    .with_for_update(skip_locked=True, key_share=True)
                 )
                 if row is None:
                     continue

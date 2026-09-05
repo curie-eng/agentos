@@ -1401,6 +1401,105 @@ def test_before_model_recheck_refuses_stale_binding_or_lineage_version(
     assert valkey.xlen(stream) == 1
 
 
+@pytest.mark.parametrize(
+    ("holder_kind", "mutation", "refusal"),
+    [
+        ("delivery", None, None),
+        ("mutator", None, None),
+        ("delivery", "UPDATE curie.agent_channels SET generation=generation+1",
+         "binding_no_longer_authorized"),
+        ("delivery", "UPDATE curie.thread_publication_lineages SET version=version+1",
+         "binding_or_lineage_changed"),
+    ],
+    ids=["audit-reference", "competing-mutator", "stale-binding", "stale-lineage"],
+)
+def test_review_outbox_recovers_under_delivery_reference_without_racing_mutators(
+    review_stack, holder_kind, mutation, refusal
+) -> None:
+    client, truth, valkey, stream = review_stack
+    # Admit through the real signed HTTP route while the fixture stream has
+    # the wrong type. Actual XADD fails, leaving the committed outbox eligible
+    # for recovery after removing this task-owned fault; neither store is mocked.
+    valkey.set(stream, "fixture-wrong-stream-type")
+    response = post_review(client, truth)
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "feedback_waiting"
+    assert review_rows("SELECT status,error_code FROM curie.github_review_feedback") == [
+        {"status": "waiting", "error_code": "enqueue_unavailable"}
+    ]
+    assert valkey.get(stream) == "fixture-wrong-stream-type"
+    valkey.delete(stream)
+    review_rows("UPDATE curie.github_review_feedback SET next_attempt_at=NULL")
+    if mutation is not None:
+        review_rows(mutation)
+    event_id = truth.feedback.event_id
+    reconciler = client.app.state.github_review_reconciler
+
+    async def recover_with_holder() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.connect() as holder, holder.begin() as transaction:
+                if holder_kind == "delivery":
+                    # A real child FK reference holds KEY SHARE on its parent
+                    # until commit, just like settling a concurrent audit row.
+                    # It must not prevent the outbox's non-key state update.
+                    await holder.execute(text("""
+                        INSERT INTO curie.github_review_deliveries (
+                          delivery_id,event_kind,action,body_sha256,sender_type,
+                          author_association,status,event_id
+                        ) SELECT :delivery,event_kind,action,body_sha256,sender_type,
+                          author_association,status,event_id
+                          FROM curie.github_review_deliveries WHERE delivery_id=:original
+                    """), {"delivery": uuid.uuid4(), "original": uuid.UUID(DELIVERY)})
+                    assert await holder.scalar(text(
+                        "SELECT count(*) FROM curie.github_review_deliveries WHERE event_id=:event"
+                    ), {"event": event_id}) == 2
+                else:
+                    assert await holder.scalar(text(
+                        "SELECT event_id FROM curie.github_review_feedback "
+                        "WHERE event_id=:event FOR NO KEY UPDATE"
+                    ), {"event": event_id}) == event_id
+                async with asyncio.timeout(5):
+                    enqueued = await reconciler.reconcile_once(event_id)
+                if holder_kind == "mutator":
+                    assert enqueued == 0
+                    assert valkey.xlen(stream) == 0
+                    assert await holder.scalar(text(
+                        "SELECT status FROM curie.github_review_feedback WHERE event_id=:event"
+                    ), {"event": event_id}) == "waiting"
+                else:
+                    assert enqueued == (0 if refusal else 1)
+                    assert await holder.scalar(text(
+                        "SELECT status FROM curie.github_review_feedback WHERE event_id=:event"
+                    ), {"event": event_id}) == ("refused" if refusal else "queued")
+                # Explicit release is part of the control: a real competing
+                # mutator must block this pass, then allow the next one through.
+                await transaction.rollback()
+            assert await reconciler.reconcile_once(event_id) == (
+                1 if holder_kind == "mutator" else 0
+            )
+        finally:
+            await engine.dispose()
+
+    client.portal.call(recover_with_holder)
+    rows = review_rows(
+        "SELECT event_id,status,error_code,stream_id FROM curie.github_review_feedback"
+    )
+    assert len(rows) == 1
+    assert rows[0]["event_id"] == event_id
+    assert rows[0]["status"] == ("refused" if refusal else "queued")
+    assert rows[0]["error_code"] == refusal
+    assert valkey.xlen(stream) == (0 if refusal else 1)
+    if refusal:
+        assert rows[0]["stream_id"] is None
+    else:
+        receipt, fields = valkey.xrange(stream)[0]
+        assert rows[0]["stream_id"] == receipt
+        assert json.loads(fields["payload"])["event_id"] == event_id
+        assert post_review(client, truth).json()["status"] == "feedback_duplicate"
+        assert valkey.xlen(stream) == 1
+
+
 def test_concurrent_distinct_delivery_headers_for_one_feedback_enqueue_once(review_stack) -> None:
     client, truth, valkey, stream = review_stack
     barrier = threading.Barrier(4)
