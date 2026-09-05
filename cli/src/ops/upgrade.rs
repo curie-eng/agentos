@@ -140,6 +140,8 @@ pub struct Convergence {
     pub hooks_healthy: bool,
     pub queues_drained: bool,
     pub manifest_matches: bool,
+    #[serde(default)]
+    pub observed_images: Vec<super::upgrade_images::ObservedImage>,
 }
 
 impl Convergence {
@@ -153,6 +155,7 @@ impl Convergence {
             hooks_healthy: true,
             queues_drained: true,
             manifest_matches: true,
+            observed_images: Vec::new(),
         }
     }
 
@@ -166,6 +169,7 @@ impl Convergence {
             "hooks_healthy": self.hooks_healthy,
             "queues_drained": self.queues_drained,
             "manifest_matches": self.manifest_matches,
+            "observed_images": self.observed_images,
         })
     }
 }
@@ -195,7 +199,7 @@ pub enum ClusterUpgradeOutput {
         previous_serving: bool,
         unchanged: bool,
         plan: Vec<String>,
-        convergence: Option<Convergence>,
+        convergence: Option<Box<Convergence>>,
         canary: Option<Canary>,
         fail_forward: Option<FailForward>,
     },
@@ -229,7 +233,7 @@ impl crate::ui::CliOutput for ClusterUpgradeOutput {
                     "previous_serving": previous_serving,
                     "unchanged": unchanged,
                     "plan": plan,
-                    "convergence": convergence.as_ref().map(Convergence::to_json),
+                    "convergence": convergence.as_deref().map(Convergence::to_json),
                     "canary": canary.as_ref().map(|c| serde_json::json!({"passed": c.passed})),
                     "fail_forward": fail_forward.as_ref().map(|f| serde_json::json!({
                         "command": f.command,
@@ -573,7 +577,7 @@ fn completed_output(
         unchanged: record.status == "succeeded"
             && record.from_version.as_deref() == Some(record.target_version.as_str()),
         plan: record.plan.clone(),
-        convergence: record.convergence.clone(),
+        convergence: record.convergence.clone().map(Box::new),
         canary: record.canary.clone(),
         fail_forward: record.fail_forward.clone(),
     }
@@ -728,6 +732,7 @@ async fn run_lifecycle_inner<H: UpgradeDriver>(
             });
             existing.convergence = None;
             existing.canary = None;
+            existing.schema_decision = host.schema_decision();
             existing
         }
         Some(existing)
@@ -943,6 +948,12 @@ fn checkpoint_name(release: &str) -> String {
     format!("{release}-upgrade-checkpoint")
 }
 
+fn target_image_error(message: &str) -> anyhow::Error {
+    crate::exit::CliError::failure(message)
+        .with_fix("select the target package's declared API image and matching schema metadata, then rerun the same upgrade command; custom images require separately verified compatibility metadata")
+        .into()
+}
+
 fn contains_manifest(actual: &serde_json::Value, expected: &serde_json::Value) -> bool {
     match (actual, expected) {
         (serde_json::Value::Object(actual), serde_json::Value::Object(expected)) => {
@@ -1125,6 +1136,12 @@ impl SchemaMetadata {
         Ok(serde_json::json!({
             "decision": if pending.is_empty() { "noop" } else { "apply" },
             "current_revision": current, "source_head": source.get("source_head"),
+            "source_metadata": {
+                "source_head": source.get("source_head"),
+                "source_revisions": source.get("source_revisions"),
+                "schema_window": source.get("schema_window"),
+                "database_endpoint_fingerprint": source.get("database_endpoint_fingerprint"),
+            },
             "target_min": self.schema_min, "target_head": self.schema_head,
             "pending": pending.iter().map(|item| serde_json::json!({"revision": item.revision, "kind": item.kind})).collect::<Vec<_>>(),
             "forward_only": forward_only, "rollback_compatible": current.is_some() && !destructive && source.get("schema_window").is_some_and(|window| window.is_object()),
@@ -1137,6 +1154,7 @@ import asyncio, hashlib, json
 from importlib.resources import files
 from pathlib import Path
 from sqlalchemy import text
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 from curie_api.config import get_settings
 from alembic.config import Config
@@ -1156,7 +1174,9 @@ async def probe():
         revisions = {revision.revision: hashlib.sha256(Path(revision.path).read_bytes()).hexdigest() for revision in script.walk_revisions()}
         window_file = files('curie_api').joinpath('schema_compat.json')
         window = json.loads(window_file.read_text()) if window_file.is_file() else None
-        print(json.dumps({'current_revision': rows[0] if rows else None, 'source_head': heads[0], 'source_revisions': revisions, 'schema_window': window}))
+        url = make_url(get_settings().database_url)
+        endpoint = hashlib.sha256(json.dumps([url.host, url.port or 5432, url.database], separators=(',', ':')).encode()).hexdigest()
+        print(json.dumps({'current_revision': rows[0] if rows else None, 'source_head': heads[0], 'source_revisions': revisions, 'schema_window': window, 'database_endpoint_fingerprint': endpoint}))
     finally:
         await engine.dispose()
 asyncio.run(probe())
@@ -1164,6 +1184,12 @@ asyncio.run(probe())
 
 // These probes run inside the already owned service containers. Credentials
 // remain in their environment and neither probe emits credentials or row data.
+const DATABASE_RECOVERY_PROBE: &str = r#"
+export PGPASSWORD="$POSTGRES_PASSWORD"
+export PGOPTIONS='-c default_transaction_read_only=on'
+exec psql -X -A -t --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" -v ON_ERROR_STOP=1 -c "SELECT json_build_object('current_revision', (SELECT version_num FROM curie.alembic_version), 'database_name', current_database())"
+"#;
+
 const QUEUE_PROBE: &str = r#"
 import asyncio, json
 from curie_worker.config import WorkerConfig
@@ -1323,8 +1349,16 @@ impl LiveHost {
             self.current.as_deref(),
         )?);
         if self.opts.forward_only {
-            self.config.as_mut().expect("prepared configuration").values["api"]["migrate"]
-                ["forwardOnly"] = true.into();
+            let values = &mut self.config.as_mut().expect("prepared configuration").values;
+            for path in ["/api", "/api/migrate"] {
+                if values
+                    .pointer(path)
+                    .is_some_and(|value| !value.is_object() && !value.is_null())
+                {
+                    bail!("retained {path} must be a map before setting --forward-only");
+                }
+            }
+            values["api"]["migrate"]["forwardOnly"] = true.into();
         }
         Ok(())
     }
@@ -1375,31 +1409,10 @@ impl LiveHost {
         {
             bail!("target artifact metadata cannot verify the retained runner image pin; select matching target image metadata before upgrade");
         }
-        let values = super::command::SecretValuesFileGuard::write_document(config)?;
-        let (ok, rendered, _) = self.run(&OpsCommand::new(
-            "helm",
-            vec![
-                plain("template"),
-                plain(&self.opts.common.release),
-                plain(
-                    self.opts
-                        .chart
-                        .as_deref()
-                        .context("target chart unresolved")?,
-                ),
-                plain("--namespace"),
-                plain(&self.opts.common.namespace),
-                plain("--show-only"),
-                plain("templates/schema-compat.yaml"),
-                plain("-f"),
-                plain(values.path().to_string_lossy().into_owned()),
-            ],
-        ))?;
-        if !ok {
-            bail!("target chart has no readable schema compatibility metadata; upgrade refused before mutation");
-        }
+        let rendered = self.render_target_template("templates/schema-compat.yaml", config)?;
         let object: serde_json::Value =
             serde_norway::from_str(&rendered).context("target schema metadata is malformed")?;
+        self.verify_target_api_image(config, &object)?;
         if object
             .pointer("/data/application-version")
             .and_then(|v| v.as_str())
@@ -1415,16 +1428,12 @@ impl LiveHost {
         )
         .context("target schema compatibility graph is malformed")?;
         let source = if self.current.is_some() {
-            let probe = self
-                .service_probe(
-                    &self.retained_objects()?,
-                    "api",
-                    SCHEMA_PROBE,
-                    "upgrade-schema",
-                )?
-                .context(
-                    "installed API is unavailable for the required database compatibility probe",
-                )?;
+            let objects = self.retained_objects()?;
+            let probe = self.service_probe(&objects, "api", SCHEMA_PROBE, "upgrade-schema")?;
+            let probe = match probe {
+                Some(probe) if probe.get("current_revision").is_some() => probe,
+                _ => self.recover_schema_source(&objects)?,
+            };
             if probe
                 .get("current_revision")
                 .is_none_or(|value| value.as_str().is_none_or(|revision| revision.is_empty()))
@@ -1442,6 +1451,349 @@ impl LiveHost {
         self.schema_decision = Some(metadata.plan(&source, forward_only)?);
         self.target_identity = Some(self.compute_target_identity()?);
         Ok(())
+    }
+
+    fn render_target_template(&self, template: &str, config: &serde_json::Value) -> Result<String> {
+        let values = super::command::SecretValuesFileGuard::write_document(config)?;
+        let (ok, rendered, _) = self.run(&OpsCommand::new(
+            "helm",
+            vec![
+                plain("template"),
+                plain(&self.opts.common.release),
+                plain(
+                    self.opts
+                        .chart
+                        .as_deref()
+                        .context("target chart unresolved")?,
+                ),
+                plain("--namespace"),
+                plain(&self.opts.common.namespace),
+                plain("--show-only"),
+                plain(template),
+                plain("-f"),
+                plain(values.path().to_string_lossy().into_owned()),
+            ],
+        ))?;
+        if !ok {
+            return Err(target_image_error(
+                "target chart metadata or API manifest could not be rendered before mutation",
+            ));
+        }
+        Ok(rendered)
+    }
+
+    fn verify_target_api_image(
+        &self,
+        config: &serde_json::Value,
+        metadata: &serde_json::Value,
+    ) -> Result<()> {
+        let declared = metadata
+            .pointer("/data/api-image")
+            .and_then(|value| value.as_str())
+            .filter(|image| !image.is_empty())
+            .ok_or_else(|| {
+                target_image_error("target schema metadata does not declare an API image")
+            })?;
+
+        // The effective declaration is values-controlled. A repository override
+        // cannot authorize itself by changing both the metadata and Deployment.
+        // Bind it to this package's default API image as well. This proves chart
+        // declaration parity, not a signature or immutable registry identity.
+        let mut packaged_config = config.clone();
+        if let Some(api) = packaged_config
+            .get_mut("api")
+            .and_then(|value| value.as_object_mut())
+        {
+            api.remove("image");
+        }
+        let packaged =
+            self.render_target_template("templates/schema-compat.yaml", &packaged_config)?;
+        let packaged: serde_json::Value = serde_norway::from_str(&packaged)
+            .map_err(|_| target_image_error("packaged target schema metadata is malformed"))?;
+        if packaged
+            .pointer("/data/api-image")
+            .and_then(|value| value.as_str())
+            != Some(declared)
+        {
+            return Err(target_image_error(
+                "retained API image does not match the target package's schema declaration",
+            ));
+        }
+
+        let rendered = self.render_target_template("templates/api.yaml", config)?;
+        let mut images = Vec::new();
+        let mut deployments = 0;
+        for document in serde_norway::Deserializer::from_str(&rendered) {
+            let object = serde_json::Value::deserialize(document)
+                .map_err(|_| target_image_error("target API manifest is malformed"))?;
+            if object.get("kind").and_then(|value| value.as_str()) != Some("Deployment")
+                || object
+                    .pointer("/metadata/labels/app.kubernetes.io~1component")
+                    .and_then(|value| value.as_str())
+                    != Some("api")
+            {
+                continue;
+            }
+            deployments += 1;
+            let containers = object
+                .pointer("/spec/template/spec/containers")
+                .and_then(|value| value.as_array())
+                .ok_or_else(|| target_image_error("target API Deployment has no containers"))?;
+            for container in containers.iter().filter(|container| {
+                container.get("name").and_then(|value| value.as_str()) == Some("api")
+            }) {
+                images.push(
+                    container
+                        .get("image")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default()
+                        .to_owned(),
+                );
+            }
+        }
+        if deployments != 1 || images.len() != 1 || images[0] != declared {
+            return Err(target_image_error(
+                "target API Deployment image does not match its schema metadata",
+            ));
+        }
+        Ok(())
+    }
+
+    fn recover_schema_source(&self, objects: &[serde_json::Value]) -> Result<serde_json::Value> {
+        // A fresh operation cannot infer source compatibility from the target.
+        // Recovery reuses only this attempt's verified source artifact metadata,
+        // then re-reads current schema state from the same owned database endpoint.
+        let record = self.record.as_ref().filter(|record| {
+            record.target_version == self.opts.to
+                && matches!(record.status.as_str(), "in_progress" | "failed")
+                && record.helm_started
+                && record.completed.len() <= UpgradePhase::ALL.len()
+                && record.completed.as_slice() == &UpgradePhase::ALL[..record.completed.len()]
+        }).context("installed API is unavailable and no verified incomplete upgrade checkpoint permits database recovery")?;
+        if record.target_identity.as_deref() != Some(self.compute_target_identity()?.as_str()) {
+            bail!("API-unavailable recovery requires the checkpoint's exact target chart and retained configuration");
+        }
+        let mut source = record
+            .schema_decision
+            .as_ref()
+            .and_then(|decision| decision.get("source_metadata"))
+            .filter(|source| {
+                source
+                    .get("source_revisions")
+                    .and_then(|value| value.as_object())
+                    .is_some_and(|revisions| !revisions.is_empty())
+            })
+            .cloned()
+            .context(
+                "upgrade checkpoint has no verified source metadata for API-unavailable recovery",
+            )?;
+        if self
+            .config
+            .as_ref()
+            .and_then(|config| config.values.pointer("/postgres/deploy"))
+            .and_then(|value| value.as_bool())
+            == Some(false)
+        {
+            bail!("external database recovery requires its separately owned read-only procedure");
+        }
+        for api in objects.iter().filter(|object| {
+            object.get("kind").and_then(|value| value.as_str()) == Some("Deployment")
+                && object
+                    .pointer("/metadata/labels/app.kubernetes.io~1component")
+                    .and_then(|value| value.as_str())
+                    == Some("api")
+        }) {
+            let name = api
+                .pointer("/metadata/name")
+                .and_then(|value| value.as_str())
+                .context("retained API has no name for availability inspection")?;
+            let (ok, raw, _) = self.run(&OpsCommand::new(
+                "kubectl",
+                vec![
+                    plain("get"),
+                    plain("deployment"),
+                    plain(name),
+                    plain("-n"),
+                    plain(&self.opts.common.namespace),
+                    plain("--ignore-not-found"),
+                    plain("-o"),
+                    plain("json"),
+                ],
+            ))?;
+            if !ok {
+                bail!("could not inspect API availability before database recovery");
+            }
+            if !raw.trim().is_empty() {
+                let live: serde_json::Value =
+                    serde_json::from_str(&raw).context("API availability response is malformed")?;
+                if live
+                    .pointer("/status/readyReplicas")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0)
+                    > 0
+                {
+                    bail!("running API schema probe failed; repair the probe instead of using API-unavailable recovery");
+                }
+            }
+        }
+        let databases: Vec<_> = objects
+            .iter()
+            .filter(|object| {
+                object.get("kind").and_then(|value| value.as_str()) == Some("StatefulSet")
+                    && object
+                        .pointer("/metadata/labels/app.kubernetes.io~1instance")
+                        .and_then(|value| value.as_str())
+                        == Some(self.opts.common.release.as_str())
+                    && object
+                        .pointer("/spec/selector/matchLabels/app.kubernetes.io~1component")
+                        .and_then(|value| value.as_str())
+                        == Some("postgres")
+            })
+            .collect();
+        if databases.len() != 1 {
+            bail!("API-unavailable recovery requires exactly one matching Helm-owned Postgres StatefulSet");
+        }
+        let database = databases[0];
+        if database
+            .pointer("/metadata/namespace")
+            .and_then(|value| value.as_str())
+            .is_some_and(|namespace| namespace != self.opts.common.namespace)
+        {
+            bail!("retained Postgres StatefulSet belongs to a different namespace");
+        }
+        let name = database
+            .pointer("/metadata/name")
+            .and_then(|value| value.as_str())
+            .context("owned Postgres StatefulSet has no name")?;
+        let service = database
+            .pointer("/spec/serviceName")
+            .and_then(|value| value.as_str())
+            .context("owned Postgres StatefulSet has no service identity")?;
+        let container = database
+            .pointer("/spec/template/spec/containers")
+            .and_then(|value| value.as_array())
+            .into_iter()
+            .flatten()
+            .find(|container| {
+                container.get("name").and_then(|value| value.as_str()) == Some("postgres")
+            })
+            .context("owned Postgres StatefulSet has no database container")?;
+        let database_name = container
+            .get("env")
+            .and_then(|value| value.as_array())
+            .into_iter()
+            .flatten()
+            .find(|env| env.get("name").and_then(|value| value.as_str()) == Some("POSTGRES_DB"))
+            .and_then(|env| env.get("value"))
+            .and_then(|value| value.as_str())
+            .context("owned Postgres database name is not verifiable")?;
+        let port = objects
+            .iter()
+            .find(|object| {
+                object.get("kind").and_then(|value| value.as_str()) == Some("Service")
+                    && object
+                        .pointer("/metadata/name")
+                        .and_then(|value| value.as_str())
+                        == Some(service)
+            })
+            .and_then(|service| service.pointer("/spec/ports"))
+            .and_then(|value| value.as_array())
+            .into_iter()
+            .flatten()
+            .find(|port| port.get("name").and_then(|value| value.as_str()) == Some("postgres"))
+            .and_then(|port| port.get("port"))
+            .and_then(|value| value.as_u64())
+            .context("retained Postgres service port is not verifiable")?;
+        let endpoint: String = Sha256::digest(serde_json::to_vec(&serde_json::json!([
+            service,
+            port,
+            database_name
+        ]))?)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+        if source
+            .get("database_endpoint_fingerprint")
+            .and_then(|value| value.as_str())
+            != Some(endpoint.as_str())
+        {
+            bail!(
+                "owned Postgres endpoint does not match the checkpoint's verified source database"
+            );
+        }
+        let (ok, raw, _) = self.run(&OpsCommand::new(
+            "kubectl",
+            vec![
+                plain("get"),
+                plain("statefulset"),
+                plain(name),
+                plain("-n"),
+                plain(&self.opts.common.namespace),
+                plain("-o"),
+                plain("json"),
+            ],
+        ))?;
+        if !ok {
+            bail!("could not inspect live Postgres ownership before database recovery");
+        }
+        let live_database: serde_json::Value =
+            serde_json::from_str(&raw).context("live Postgres ownership response is malformed")?;
+        if live_database
+            .pointer("/metadata/name")
+            .and_then(|value| value.as_str())
+            != Some(name)
+            || live_database
+                .pointer("/metadata/namespace")
+                .and_then(|value| value.as_str())
+                != Some(self.opts.common.namespace.as_str())
+            || live_database
+                .pointer("/metadata/annotations/meta.helm.sh~1release-name")
+                .and_then(|value| value.as_str())
+                != Some(self.opts.common.release.as_str())
+            || live_database
+                .pointer("/metadata/annotations/meta.helm.sh~1release-namespace")
+                .and_then(|value| value.as_str())
+                != Some(self.opts.common.namespace.as_str())
+            || live_database.pointer("/spec/selector/matchLabels")
+                != database.pointer("/spec/selector/matchLabels")
+        {
+            bail!("live Postgres ownership does not match the retained release");
+        }
+        let (ok, output, _) = self.run(&OpsCommand::new(
+            "kubectl",
+            vec![
+                plain("exec"),
+                plain(format!("statefulset/{name}")),
+                plain("-n"),
+                plain(&self.opts.common.namespace),
+                plain("-c"),
+                plain("postgres"),
+                plain("--"),
+                plain("sh"),
+                plain("-c"),
+                plain(DATABASE_RECOVERY_PROBE),
+                plain("upgrade-database-recovery"),
+            ],
+        ))?;
+        if !ok {
+            bail!("owned database read-only recovery probe failed; checkpoint preserved without Helm mutation");
+        }
+        let current: serde_json::Value = serde_json::from_str(&output)
+            .context("owned database recovery probe returned malformed JSON")?;
+        if current
+            .get("database_name")
+            .and_then(|value| value.as_str())
+            != Some(database_name)
+        {
+            bail!("queried database catalog does not match the verified retained endpoint");
+        }
+        let revision = current
+            .get("current_revision")
+            .and_then(|value| value.as_str())
+            .filter(|revision| !revision.is_empty())
+            .context("owned database recovery probe returned no verifiable revision")?;
+        source["current_revision"] = revision.into();
+        Ok(source)
     }
 
     fn inspect_known_good(&self) -> Result<Option<String>> {
@@ -1846,6 +2198,31 @@ impl LiveHost {
             None if object_identity(&live).is_some() => vec![live],
             None => bail!("live owned object list has no items"),
         };
+        let (ok, raw_pods, _) = self.run(&OpsCommand::new(
+            "kubectl",
+            vec![
+                plain("get"),
+                plain("pods"),
+                plain("-n"),
+                plain(&self.opts.common.namespace),
+                plain("-l"),
+                plain(format!(
+                    "app.kubernetes.io/instance={}",
+                    self.opts.common.release
+                )),
+                plain("-o"),
+                plain("json"),
+            ],
+        ))?;
+        if !ok {
+            bail!("could not read actual running Pod image identities for convergence");
+        }
+        let pod_list: serde_json::Value = serde_json::from_str(&raw_pods)
+            .context("running Pod image observation is malformed")?;
+        let pods = pod_list
+            .get("items")
+            .and_then(|value| value.as_array())
+            .context("running Pod image observation has no items")?;
         let mut conv = Convergence::exact_ok();
         let mut workloads = 0;
         for expected in &objects {
@@ -1913,6 +2290,9 @@ impl LiveHost {
                 && ready.unwrap_or(0) == desired.unwrap_or(0)
                 && updated.unwrap_or(0) == desired.unwrap_or(0);
             conv.unavailable_zero &= unavailable == 0;
+            let (images_match, images) = super::upgrade_images::observe(expected, pods, desired);
+            conv.images &= images_match;
+            conv.observed_images.extend(images);
         }
         conv.replicas &= workloads > 0;
         let (ok, status, _) = self.run(&OpsCommand::new(

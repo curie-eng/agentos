@@ -527,3 +527,228 @@ fn retained_runner_image_pin_must_match_the_upgrade_target() {
     fixture.values(json!({"agentSandbox": {"runner": {"tag": "0.8.4"}}}));
     fixture.assert_refused_without_upgrade(&fixture.run("healthy"));
 }
+
+#[test]
+fn malformed_forward_only_parent_returns_structured_refusal_without_mutation() {
+    for api in [json!("invalid"), json!({"migrate": "invalid"})] {
+        let fixture = Fixture::new();
+        fixture.values(json!({"api": api}));
+        let output = fixture.run_args("healthy", &["--forward-only"]);
+        fixture.assert_refused_without_upgrade(&output);
+        let result: Value = serde_json::from_slice(&output.stdout)
+            .expect("invalid retained values must produce a structured error, never panic");
+        assert!(result["error"].as_str().unwrap().contains("api"));
+        assert!(!fixture.path("record.json").exists());
+    }
+}
+
+#[test]
+fn matching_incomplete_upgrade_recovers_schema_probe_without_a_running_api() {
+    let fixture = Fixture::new();
+    assert!(!fixture.run("helm-hook-fails").status.success());
+    fs::write(fixture.path("api-unavailable"), "true").unwrap();
+    let output = fixture.run("recovery-api-down");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(fixture.calls().contains("upgrade-database-recovery"));
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["status"], "succeeded");
+    assert_eq!(result["known_good_version"], "0.9.0");
+}
+
+#[test]
+fn unavailable_api_recovery_refuses_unverified_checkpoint_artifact_or_database() {
+    for scenario in [
+        "recovery-no-checkpoint",
+        "recovery-changed-chart",
+        "recovery-db-mismatch",
+        "recovery-db-fails",
+    ] {
+        let fixture = Fixture::new();
+        if scenario != "recovery-no-checkpoint" {
+            assert!(!fixture.run("helm-hook-fails").status.success());
+        }
+        if scenario == "recovery-changed-chart" {
+            fs::write(fixture.path("candidate-chart"), "different artifact").unwrap();
+        }
+        fs::write(fixture.path("api-unavailable"), "true").unwrap();
+        fs::write(fixture.path("calls.jsonl"), "").unwrap();
+        let previous = fs::read(fixture.path("record.json")).ok();
+        let output = fixture.run(scenario);
+        fixture.assert_refused_without_upgrade(&output);
+        assert_eq!(
+            previous,
+            fs::read(fixture.path("record.json")).ok(),
+            "{scenario}"
+        );
+        if scenario != "recovery-db-fails" {
+            assert!(
+                !fixture.calls().contains("upgrade-database-recovery"),
+                "{scenario}"
+            );
+        }
+    }
+}
+
+#[test]
+fn running_pod_image_identity_is_observed_and_stale_or_missing_images_refuse() {
+    let healthy = Fixture::new();
+    let output = healthy.run("healthy");
+    assert!(output.status.success());
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let images = result["convergence"]["observed_images"]
+        .as_array()
+        .expect("actual running image observations are part of convergence evidence");
+    assert_eq!(images.len(), 1);
+    assert_eq!(images[0]["container"], "api");
+    assert!(images[0]["image_id"]
+        .as_str()
+        .unwrap()
+        .ends_with(&"d".repeat(64)));
+    for scenario in [
+        "wrong-running-image",
+        "missing-running-image-id",
+        "missing-running-pod",
+        "stale-extra-pod",
+    ] {
+        let fixture = Fixture::new();
+        let output = fixture.run(scenario);
+        assert_eq!(output.status.code(), Some(1), "{scenario}");
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["status"], "failed", "{scenario}");
+        assert_eq!(result["convergence"]["images"], false, "{scenario}");
+        assert_eq!(result["known_good_version"], "0.8.5", "{scenario}");
+    }
+}
+
+#[test]
+fn recovery_replans_from_the_actual_new_database_revision() {
+    let fixture = Fixture::new();
+    assert!(!fixture.run("helm-hook-fails").status.success());
+    fs::write(fixture.path("api-unavailable"), "true").unwrap();
+    let output = fixture.run("recovery-db-advanced");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let record: Value =
+        serde_json::from_slice(&fs::read(fixture.path("record.json")).unwrap()).unwrap();
+    assert_eq!(record["schema_decision"]["current_revision"], "0040");
+    assert_eq!(record["schema_decision"]["pending"], json!([]));
+}
+
+#[test]
+fn recovery_refuses_wrong_catalog_ambiguous_owner_or_running_api_probe_failure() {
+    for scenario in [
+        "recovery-db-unknown",
+        "recovery-db-byo",
+        "recovery-running-api-probe-fails",
+        "recovery-duplicate-db",
+        "recovery-foreign-namespace",
+        "recovery-live-catalog-mismatch",
+    ] {
+        let fixture = Fixture::new();
+        if scenario == "recovery-db-byo" {
+            fixture.values(json!({"postgres": {"deploy": false}}));
+        }
+        assert!(!fixture.run("helm-hook-fails").status.success());
+        fs::write(fixture.path("api-unavailable"), "true").unwrap();
+        fs::write(fixture.path("calls.jsonl"), "").unwrap();
+        let before = fs::read(fixture.path("record.json")).unwrap();
+        let output = fixture.run(scenario);
+        fixture.assert_refused_without_upgrade(&output);
+        assert_eq!(
+            before,
+            fs::read(fixture.path("record.json")).unwrap(),
+            "{scenario}"
+        );
+        if !matches!(
+            scenario,
+            "recovery-db-unknown" | "recovery-live-catalog-mismatch"
+        ) {
+            assert!(
+                !fixture.calls().contains("upgrade-database-recovery"),
+                "{scenario}"
+            );
+        }
+    }
+}
+
+#[test]
+fn init_container_image_identity_uses_the_same_running_image_contract() {
+    let fixture = Fixture::new();
+    let output = fixture.run("init-image-healthy");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        result["convergence"]["observed_images"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let missing = Fixture::new();
+    let output = missing.run("init-image-missing-id");
+    assert_eq!(output.status.code(), Some(1));
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["convergence"]["images"], false);
+}
+
+#[test]
+fn target_schema_metadata_must_bind_the_effective_api_image_before_any_write() {
+    for scenario in [
+        "metadata-image-missing",
+        "metadata-image-empty",
+        "metadata-image-invalid",
+        "metadata-image-mismatch",
+        "rendered-api-image-mismatch",
+        "rendered-api-missing",
+        "rendered-api-duplicate",
+    ] {
+        let fixture = Fixture::new();
+        let output = fixture.run(scenario);
+        fixture.assert_refused_without_upgrade(&output);
+        assert!(
+            !fixture.path("record.json").exists(),
+            "{scenario}: wrote checkpoint before image validation"
+        );
+        let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            json["fix"].as_str().is_some_and(|fix| !fix.is_empty()),
+            "{scenario}: {json}"
+        );
+    }
+}
+
+#[test]
+fn retained_repository_override_cannot_self_authorize_schema_compatibility() {
+    let fixture = Fixture::new();
+    fixture.values(json!({"api":{"image":{"repository":"example.com/acme-api", "tag":"0.9.0"}}}));
+    let output = fixture.run("healthy");
+    fixture.assert_refused_without_upgrade(&output);
+    assert!(!fixture.path("record.json").exists());
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        json["fix"].as_str().is_some_and(|fix| !fix.is_empty()),
+        "{json}"
+    );
+
+    let fixture = Fixture::new();
+    fixture.values(
+        json!({"api":{"image":{"repository":"ghcr.io/curie-eng/curie-api", "tag":"0.9.0"}}}),
+    );
+    let output = fixture.run("healthy");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
