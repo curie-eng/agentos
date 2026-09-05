@@ -447,6 +447,8 @@ Wraps the umbrella Helm chart and the deployed release, the way `linkerd` or
 | `curie cluster reset-thread <agent> --thread-key <key> --yes` | Force a stuck thread's sandbox to be released via the platform API (`POST /agents/{id}/threads/{thread_key}/reset`, #737).<br>• The worker's next maintenance tick releases the thread's claim and route, so its next message cold-creates a fresh sandbox; conversation history is not deleted.<br>• Interrupts a live turn on the thread first, so it refuses without `--yes`. |
 | `curie cluster delete <agent> --yes` | End every active deployment, then delete the agent through the platform API. Destructive and irreversible: refuses without `--yes`.<br>• If the final agent deletion fails, the agent remains present but any deployments already ended stay ended. |
 
+On Linux, stopping the transactional upgrade CLI also stops its direct Helm mutation process. Use an ordinary Helm executable for this protection; wrappers, privileged executables, child processes launched by Helm plugins, and Kubernetes hook Jobs are outside it. Other platforms retain their existing process behavior. An interrupted upgrade still requires inspection of the release and hooks before recovery; this process protection does not prove that an in-flight cluster request was cancelled.
+
 ##### `curie local|cluster observability`: API-backed queries
 
 The bare commands above remain URL/surface reports. Queries are read-only and

@@ -17,7 +17,9 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::command::{mask_secret, plain, require_on_path, run_capture, CommonOpts, OpsCommand};
+use super::command::{
+    mask_secret, plain, require_on_path, run_capture, run_upgrade_capture, CommonOpts, OpsCommand,
+};
 
 /// Durable phases of a cluster upgrade. Order is load-bearing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2075,7 +2077,9 @@ impl LiveHost {
             args.push(plain("--create-namespace"));
         }
         let cmd = OpsCommand::new("helm", args);
-        let (ok, _, _) = self.run(&cmd)?;
+        let (ok, _, _) = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(run_upgrade_capture(&cmd))
+        })?;
         if !ok {
             bail!("helm upgrade to {to} failed; inspect the release and resume the same upgrade command");
         }

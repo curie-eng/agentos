@@ -46,8 +46,9 @@ impl Fixture {
         self.run_args(scenario, &[])
     }
 
-    fn run_args(&self, scenario: &str, extra: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_curie"))
+    fn command(&self, scenario: &str, extra: &[&str]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_curie"));
+        command
             .args([
                 "--json",
                 "cluster",
@@ -68,9 +69,12 @@ impl Fixture {
                 format!("{}:/usr/bin:/bin", self.temp.path().display()),
             )
             .env("UPGRADE_DRIVER_ROOT", self.temp.path())
-            .env("UPGRADE_DRIVER_SCENARIO", scenario)
-            .output()
-            .unwrap()
+            .env("UPGRADE_DRIVER_SCENARIO", scenario);
+        command
+    }
+
+    fn run_args(&self, scenario: &str, extra: &[&str]) -> Output {
+        self.command(scenario, extra).output().unwrap()
     }
 
     fn run_status(&self) -> Output {
@@ -751,4 +755,122 @@ fn retained_repository_override_cannot_self_authorize_schema_compatibility() {
         "{}",
         String::from_utf8_lossy(&output.stdout)
     );
+}
+
+// Kernel semantics: https://man7.org/linux/man-pages/man2/PR_SET_PDEATHSIG.2const.html
+// Linux parent-death handling is an owned-process capability, not a claim about
+// remote Helm writers or the Kubernetes hook Jobs that outlive a Helm client.
+#[cfg(target_os = "linux")]
+mod owner_death {
+    use super::*;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::process::{Child, Stdio};
+    use std::time::{Duration, Instant};
+
+    struct OwnedProcesses {
+        cli: Child,
+        helm: Option<OwnedFd>,
+    }
+
+    impl Drop for OwnedProcesses {
+        fn drop(&mut self) {
+            let _ = self.cli.kill();
+            let _ = self.cli.wait();
+            if let Some(helm) = &self.helm {
+                // A pidfd targets this exact owned child even if its numeric PID
+                // has been reused by the time a failed assertion unwinds.
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        helm.as_raw_fd(),
+                        libc::SIGKILL,
+                        std::ptr::null::<libc::siginfo_t>(),
+                        0,
+                    );
+                }
+            }
+        }
+    }
+
+    fn stopped(fd: &OwnedFd) -> bool {
+        let mut event = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // pidfd readiness means the process exited, including an unreaped
+        // zombie. It does not depend on the host PID 1 reaping promptly.
+        unsafe { libc::poll(&mut event, 1, 0) == 1 }
+    }
+
+    fn killed_owner_stops_helm(signal: i32) {
+        let fixture = Fixture::new();
+        let stdout = fs::File::create(fixture.path("cli.stdout")).unwrap();
+        let stderr = fs::File::create(fixture.path("cli.stderr")).unwrap();
+        let cli = fixture
+            .command("owner-death", &[])
+            .env("TMPDIR", fixture.temp.path())
+            .stdin(Stdio::null())
+            .stdout(stdout)
+            .stderr(stderr)
+            .spawn()
+            .unwrap();
+        let mut processes = OwnedProcesses { cli, helm: None };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !fixture.path("helm-owner.json").exists() {
+            assert!(
+                processes.cli.try_wait().unwrap().is_none(),
+                "CLI ended before Helm: {}",
+                fs::read_to_string(fixture.path("cli.stdout")).unwrap()
+            );
+            assert!(Instant::now() < deadline, "owned Helm did not start");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let owner: Value =
+            serde_json::from_slice(&fs::read(fixture.path("helm-owner.json")).unwrap()).unwrap();
+        assert_eq!(
+            owner["parent"].as_u64(),
+            Some(u64::from(processes.cli.id()))
+        );
+        let helm_pid = owner["pid"].as_i64().unwrap() as libc::pid_t;
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, helm_pid, 0) } as i32;
+        assert!(
+            fd >= 0,
+            "opening owned Helm pidfd: {}",
+            std::io::Error::last_os_error()
+        );
+        processes.helm = Some(unsafe { OwnedFd::from_raw_fd(fd) });
+        assert!(!stopped(processes.helm.as_ref().unwrap()));
+        // This is the actual CLI process, not a dropped future or a stand-in
+        // parent. SIGTERM additionally crosses its installed cleanup handler.
+        assert_eq!(
+            unsafe { libc::kill(processes.cli.id() as libc::pid_t, signal) },
+            0
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while processes.cli.try_wait().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "CLI did not stop after signal");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        fs::write(fixture.path("release-helm"), b"owner stopped").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !stopped(processes.helm.as_ref().unwrap()) {
+            assert!(Instant::now() < deadline, "Helm survived its owning CLI");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !fixture.path("after-owner-mutation").exists(),
+            "Helm continued to mutate after its actual CLI owner died"
+        );
+    }
+
+    #[test]
+    fn sigkill_of_upgrade_cli_stops_owned_helm_before_later_mutation() {
+        killed_owner_stops_helm(libc::SIGKILL);
+    }
+
+    #[test]
+    fn sigterm_of_upgrade_cli_stops_owned_helm_before_later_mutation() {
+        killed_owner_stops_helm(libc::SIGTERM);
+    }
 }

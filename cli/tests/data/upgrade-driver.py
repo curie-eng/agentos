@@ -8,6 +8,7 @@ import json
 import os
 import pathlib
 import sys
+import time
 
 root = pathlib.Path(os.environ["UPGRADE_DRIVER_ROOT"])
 scenario = os.environ["UPGRADE_DRIVER_SCENARIO"]
@@ -250,6 +251,16 @@ if program == "helm":
                 )
             )
     elif args[0] == "upgrade":
+        if scenario == "owner-death":
+            witness = root / "helm-owner.pending"
+            witness.write_text(json.dumps({"pid": os.getpid(), "parent": os.getppid()}))
+            witness.rename(root / "helm-owner.json")
+            deadline = time.monotonic() + 15
+            while not (root / "release-helm").exists():
+                if time.monotonic() > deadline:
+                    sys.exit(70)
+                time.sleep(0.01)
+            (root / "after-owner-mutation").write_text("mutation after owner termination")
         if scenario == "helm-hook-fails":
             sys.exit(1)
         if "-f" in args:
