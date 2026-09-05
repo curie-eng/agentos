@@ -155,6 +155,39 @@ fn normalize_image(image: &str) -> String {
     image
 }
 
+/// A digest-qualified runtime reference can omit the requested tag. Compare
+/// the canonical repository and the exact manifest digest, never a config ID
+/// or an assumed equivalence between different registry digests.
+fn manifest_identity(image: &str) -> Option<String> {
+    let image = normalize_image(image);
+    let (repository, digest) = image.split_once('@')?;
+    if digest.is_empty() || digest.contains('@') {
+        return None;
+    }
+    let last_segment = repository.rsplit('/').next()?;
+    let repository = if let Some((_, tag)) = last_segment.split_once(':') {
+        &repository[..repository.len() - tag.len() - 1]
+    } else {
+        repository
+    };
+    Some(format!("{repository}@{digest}"))
+}
+
+fn observed_image_matches(expected: &str, status: &Value) -> bool {
+    let image_id = text(status, "/imageID");
+    if let Some(expected) = manifest_identity(expected) {
+        // Containerd can report a config SHA in status.image for a digest-pinned
+        // request. Only the qualified imageID supplies manifest identity then.
+        let image_id = image_id
+            .strip_prefix("docker-pullable://")
+            .unwrap_or(image_id);
+        return manifest_identity(image_id).as_ref() == Some(&expected);
+    }
+    // A tag is a requested reference, not immutable content authority. Require
+    // its reported spelling plus an actual runtime image observation.
+    normalize_image(text(status, "/image")) == normalize_image(expected) && !image_id.is_empty()
+}
+
 fn selected(workload: &Value, pod: &Value) -> bool {
     let selector = &workload["spec"]["selector"];
     let labels = &pod["metadata"]["labels"];
@@ -251,10 +284,7 @@ fn compare_containers(expected: &Value, actual: &Value, pod: bool, result: &mut 
                 .iter()
                 .find(|item| text(item, "/name") == name);
             let valid = status.is_some_and(|status| {
-                // Kubelet reports image and opaque runtime imageID; the latter
-                // proves an observation exists, not registry digest equivalence.
-                normalize_image(text(status, "/image")) == normalize_image(image)
-                    && !text(status, "/imageID").is_empty()
+                observed_image_matches(image, status)
                     && if init
                         && container.get("restartPolicy").and_then(Value::as_str) != Some("Always")
                     {
@@ -544,16 +574,31 @@ pub(super) async fn installation_failure(
 
 pub(super) async fn wait(opts: &CommonOpts) -> Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+    let mut last_issues: Vec<String> = Vec::new();
     loop {
-        let result = tokio::time::timeout_at(deadline, observe(opts))
+        let observation = tokio::time::timeout_at(deadline, observe(opts))
             .await
-            .context("post-Helm convergence timed out after 300 seconds")??;
+            .context("post-Helm convergence timed out after 300 seconds")
+            .and_then(|result| result);
+        let result = match observation {
+            Ok(result) => result,
+            Err(error) if last_issues.is_empty() => return Err(error),
+            Err(error) => {
+                return Err(crate::exit::CliError::failure(format!(
+                    "{error}; last observed rollout reasons: {}",
+                    last_issues.join("; ")
+                ))
+                .with_fix("run `curie cluster status` to inspect the failed rollout; correct the target configuration and rerun `curie cluster up`")
+                .into());
+            }
+        };
         if result.issues.is_empty() {
             return Ok(());
         }
         if result.terminal || tokio::time::Instant::now() + Duration::from_secs(2) >= deadline {
             return Err(crate::exit::CliError::failure(format!("target release has not converged: {}", result.issues.join("; "))).with_fix("run `curie cluster status` to inspect the failed rollout; correct the target configuration and rerun `curie cluster up`").into());
         }
+        last_issues = result.issues;
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }

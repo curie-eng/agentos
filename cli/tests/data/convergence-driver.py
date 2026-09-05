@@ -27,6 +27,17 @@ statefulset["spec"]["template"]["spec"]["containers"] = [{"name": "valkey", "ima
 statefulset["status"].update(currentRevision="current", updateRevision="current")
 if scenario == "foreign-hook":
     statefulset["metadata"]["namespace"] = "another-managed-namespace"
+# Containerd may report a config digest in ContainerStatus.image even though
+# imageID names the requested repository manifest digest. Observed on the real
+# September 2026 cluster run; Kubernetes allows runtime-resolved image spellings:
+# https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#ContainerStatus
+pinned_image = "acme-postgres:16@sha256:" + "a" * 64
+pinned_id = "docker.io/library/acme-postgres@sha256:" + "a" * 64
+if scenario.startswith("pinned-"):
+    statefulset["spec"]["template"]["spec"]["containers"][0]["image"] = pinned_image
+    deployment["spec"]["template"]["spec"]["initContainers"] = [
+        {"name": "wait-for-postgres", "image": pinned_image}
+    ]
 expected = [copy.deepcopy(deployment), copy.deepcopy(statefulset)]
 for item in expected:
     item.pop("status", None)
@@ -50,6 +61,13 @@ if program == "helm":
         sys.exit(0)
     if args[0] == "status":
         if "json" in args:
+            if scenario == "degraded-then-hung":
+                counter = root / "status-observations"
+                count = int(counter.read_text()) + 1 if counter.exists() else 1
+                counter.write_text(str(count))
+                if count >= 3:
+                    (root / "hung-pid").write_text(str(os.getpid()))
+                    time.sleep(30)
             if scenario == "hung-read":
                 (root / "hung-pid").write_text(str(os.getpid()))
                 time.sleep(30)
@@ -166,6 +184,43 @@ if program == "kubectl":
                 "status": {"phase": "Running", "containerStatuses": statuses},
             }
         )
+    if scenario.startswith("pinned-"):
+        pods[0]["spec"]["initContainers"] = copy.deepcopy(
+            deployment["spec"]["template"]["spec"]["initContainers"]
+        )
+        pods[0]["status"]["initContainerStatuses"] = [
+            {
+                "name": "wait-for-postgres",
+                "image": "sha256:" + "c" * 64,
+                "imageID": pinned_id,
+                "ready": True,
+                "state": {"terminated": {"exitCode": 0, "reason": "Completed"}},
+            }
+        ]
+        pods[1]["status"]["containerStatuses"][0].update(
+            image="sha256:" + "c" * 64, imageID=pinned_id
+        )
+        pinned_statuses = [
+            pods[0]["status"]["initContainerStatuses"][0],
+            pods[1]["status"]["containerStatuses"][0],
+        ]
+        if scenario == "pinned-pullable":
+            for status in pinned_statuses:
+                status["imageID"] = "docker-pullable://" + pinned_id
+        if scenario == "pinned-wrong-digest":
+            for status in pinned_statuses:
+                status["image"] = pinned_image  # Name alone cannot override a wrong digest.
+                status["imageID"] = pinned_id.replace("a" * 64, "b" * 64)
+        if scenario == "pinned-wrong-repository":
+            for status in pinned_statuses:
+                status["imageID"] = pinned_id.replace("acme-postgres", "other-postgres")
+        if scenario == "pinned-opaque-id":
+            for status in pinned_statuses:
+                status["imageID"] = "containerd://sha256:" + "c" * 64
+        if scenario == "pinned-pod-drift":
+            pods[1]["spec"]["containers"][0]["image"] = pinned_image.replace("a" * 64, "b" * 64)
+        if scenario == "pinned-init-failed":
+            pinned_statuses[0]["state"]["terminated"]["exitCode"] = 1
     if scenario in ["healthy-sidecar", "unready-sidecar"]:
         pods[0]["spec"]["containers"].append(
             {"name": "mesh-proxy", "image": "example.com/proxy:custom"}
@@ -189,6 +244,13 @@ if program == "kubectl":
             ready=False,
             state={
                 "waiting": {"reason": "CrashLoopBackOff", "message": "PRIVATE_MESSAGE_SENTINEL"}
+            },
+        )
+    if scenario == "degraded-then-hung":
+        pods[0]["status"]["containerStatuses"][0].update(
+            ready=False,
+            state={
+                "waiting": {"reason": "ImagePullBackOff", "message": "PRIVATE_MESSAGE_SENTINEL"}
             },
         )
     if scenario == "wrong-image":

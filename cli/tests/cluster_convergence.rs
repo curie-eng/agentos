@@ -355,3 +355,76 @@ fn offline_dry_runs_expose_the_real_convergence_readset_and_dynamic_inputs() {
         );
     }
 }
+
+#[test]
+fn pinned_images_use_reported_manifest_identity_for_regular_and_init_containers() {
+    for scenario in ["pinned-healthy", "pinned-pullable"] {
+        for verb in ["status", "up"] {
+            let output = Fixture::new().run(verb, scenario);
+            assert!(
+                output.status.success(),
+                "{verb}/{scenario}: {} / {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if verb == "status" {
+                assert_eq!(Fixture::json(&output)["healthy"], true);
+            }
+        }
+    }
+}
+
+#[test]
+fn pinned_images_reject_mismatched_or_unproven_identity_and_unhealthy_init() {
+    for scenario in [
+        "pinned-wrong-digest",
+        "pinned-wrong-repository",
+        "pinned-opaque-id",
+        "pinned-pod-drift",
+        "pinned-init-failed",
+    ] {
+        let output = Fixture::new().run("status", scenario);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{scenario}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(Fixture::json(&output)["healthy"], false, "{scenario}");
+    }
+}
+
+#[test]
+fn timed_out_observation_retains_last_safe_cause_and_recovery() {
+    let fixture = Fixture::new();
+    let started = std::time::Instant::now();
+    let output = fixture.run("up", "degraded-then-hung");
+    assert_eq!(output.status.code(), Some(1));
+    let json = Fixture::json(&output);
+    assert!(
+        json["error"].as_str().unwrap().contains("ImagePullBackOff"),
+        "{json}"
+    );
+    assert!(
+        json["error"].as_str().unwrap().contains("timed out"),
+        "{json}"
+    );
+    assert!(
+        json["fix"]
+            .as_str()
+            .unwrap()
+            .contains("curie cluster status"),
+        "{json}"
+    );
+    assert!(!json.to_string().contains("PRIVATE_MESSAGE_SENTINEL"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("PRIVATE_MESSAGE_SENTINEL"));
+    assert!(started.elapsed() < std::time::Duration::from_secs(20));
+    let pid = fs::read_to_string(fixture.0.path().join("hung-pid")).unwrap();
+    for _ in 0..20 {
+        if !std::path::Path::new("/proc").join(pid.trim()).exists() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    panic!("timed-out observation process survived");
+}
