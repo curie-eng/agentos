@@ -108,6 +108,41 @@ impl UpgradeOwner {
         None
     }
 
+    pub(super) fn read_witness(&self) -> Result<Option<Value>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = &self._lock;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|_| failure("could not read local upgrade witness"))?;
+        let mut bytes = Vec::new();
+        file.take(65537)
+            .read_to_end(&mut bytes)
+            .map_err(|_| failure("could not read local upgrade witness"))?;
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        if bytes.len() > 65536 {
+            return Err(failure("local upgrade witness exceeds its bounded format"));
+        }
+        serde_json::from_slice(&bytes).map(Some).map_err(|_| {
+            failure("local upgrade witness is truncated or malformed; preserve it before recovery")
+        })
+    }
+
+    pub(super) fn write_witness(&self, witness: &impl serde::Serialize) -> Result<()> {
+        use std::io::{Seek, SeekFrom, Write};
+        let bytes = serde_json::to_vec(witness)?;
+        if bytes.len() > 65536 {
+            return Err(failure("local upgrade witness exceeds its bounded format"));
+        }
+        let mut file = &self._lock;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|_| failure("could not persist local upgrade witness"))?;
+        file.write_all(&bytes)
+            .and_then(|_| file.set_len(bytes.len() as u64))
+            .and_then(|_| file.sync_all())
+            .map_err(|_| failure("could not durably persist local upgrade witness"))
+    }
+
     pub(super) fn environment(&self) -> Vec<(String, String)> {
         snapshot_env(&self.kubeconfig)
     }

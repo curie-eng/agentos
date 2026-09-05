@@ -184,6 +184,189 @@ database = {
 with (root / "calls.jsonl").open("a") as log:
     log.write(json.dumps([program, *args]) + "\n")
 
+
+def recovery_hooks(values):
+    marker = values.get("upgradeRecovery", {}).get("operationId", "")
+    return [
+        {
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": {
+                "name": "acme-bot-" + component,
+                "namespace": "upgrade-test",
+                "labels": {
+                    "app.kubernetes.io/component": component,
+                    "curie-upgrade-operation": marker,
+                },
+                "annotations": {
+                    "helm.sh/hook": events,
+                    "helm.sh/hook-delete-policy": "before-hook-creation",
+                    "helm.sh/hook-weight": weight,
+                },
+            },
+            "spec": {
+                "template": {
+                    "metadata": {"labels": {"curie-upgrade-operation": marker}},
+                    "spec": {
+                        "restartPolicy": "Never",
+                        "containers": [
+                            {"name": component, "image": "example.com/acme-phase:0.9.0"}
+                        ],
+                    },
+                }
+            },
+        }
+        for component, events, weight in [
+            ("upgrade-drain", "pre-upgrade,pre-rollback", "-10"),
+            ("schema-migrate", "post-install,pre-upgrade,pre-rollback", "-5"),
+            ("upgrade-drain-release", "post-upgrade,post-rollback", "-10"),
+        ]
+    ]
+
+
+pending = (root / "late-pending").exists()
+if program == "helm" and args[0] == "status" and pending:
+    hooks = [
+        {
+            "manifest": json.dumps(hook),
+            "events": hook["metadata"]["annotations"]["helm.sh/hook"].split(","),
+            "last_run": {"phase": "Succeeded"},
+        }
+        for hook in recovery_hooks(retained_values)
+    ]
+    if scenario == "unknown-hook":
+        hooks.append(copy.deepcopy(hooks[0]))
+    if scenario in ("test-only-hook", "extra-upgrade-hook", "extra-rollback-hook"):
+        event = (
+            "test"
+            if scenario == "test-only-hook"
+            else "post-upgrade"
+            if scenario == "extra-upgrade-hook"
+            else "pre-rollback"
+        )
+        hooks.append(
+            {
+                "events": [event],
+                "manifest": json.dumps(
+                    {
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "metadata": {
+                            "name": "acme-readonly-probe",
+                            "namespace": "upgrade-test",
+                            "annotations": {"helm.sh/hook": event},
+                        },
+                    }
+                ),
+            }
+        )
+    print(
+        json.dumps(
+            {
+                "name": "acme-bot",
+                "namespace": "upgrade-test",
+                "version": 3 if scenario == "wrong-revision" else 2,
+                "info": {
+                    "status": "pending-rollback"
+                    if scenario == "pending-rollback"
+                    else "pending-upgrade"
+                },
+                "hooks": hooks,
+            }
+        )
+    )
+    sys.exit(0)
+if program == "helm" and args[0] == "rollback":
+    assert args[2] == "2"
+    (root / "late-pending").unlink()
+    (root / "rollback-complete").write_text("3")
+    sys.exit(0)
+if program == "kubectl" and args[:2] == ["get", "secret"]:
+    revision = args[2].split(".v")[-1]
+    marker = (
+        (root / "operation-label").read_text()
+        if (root / "operation-label").exists()
+        else "old-operation"
+    )
+    metadata = {
+        "name": args[2],
+        "namespace": "upgrade-test",
+        "uid": "release-uid-" + revision,
+        "resourceVersion": revision,
+        "labels": {
+            "owner": "helm",
+            "name": "acme-bot",
+            "version": revision,
+            "status": "pending-upgrade"
+            if pending and revision == "2"
+            else ("failed" if scenario == "helm-failed" else "deployed"),
+            "curie-upgrade-operation": marker,
+        },
+    }
+    if scenario == "wrong-release-uid":
+        metadata["uid"] = "replacement-uid"
+    if scenario == "replaced-source-release" and revision == "1":
+        metadata["uid"] = "replacement-source-uid"
+    if scenario == "wrong-marker":
+        metadata["labels"]["curie-upgrade-operation"] = "inherited-marker"
+    print(json.dumps([metadata]))
+    sys.exit(0)
+if program == "kubectl" and args[:2] == ["get", "jobs,pods"]:
+    objects = []
+    for hook in recovery_hooks(retained_values):
+        job = copy.deepcopy(hook)
+        job["metadata"]["uid"] = job["metadata"]["name"] + "-uid"
+        job["status"] = {
+            "active": 0,
+            "succeeded": 1,
+            "conditions": [{"type": "Complete", "status": "True"}],
+        }
+        pod = {
+            "kind": "Pod",
+            "metadata": {
+                "name": job["metadata"]["name"] + "-pod",
+                "namespace": "upgrade-test",
+                "labels": dict(job["spec"]["template"]["metadata"]["labels"]),
+                "ownerReferences": [
+                    {
+                        "apiVersion": "batch/v1",
+                        "kind": "Job",
+                        "name": job["metadata"]["name"],
+                        "uid": job["metadata"]["uid"],
+                        "controller": True,
+                    }
+                ],
+            },
+            "status": {
+                "phase": "Succeeded",
+                "containerStatuses": [{"name": "phase", "state": {"terminated": {"exitCode": 0}}}],
+            },
+        }
+        objects.extend([job, pod])
+    if scenario == "active-hook":
+        objects[0]["status"]["active"] = 1
+    if scenario == "malformed-hook-active":
+        objects[0]["status"]["active"] = "1"
+    if scenario == "replacement-hook-uid":
+        objects[0]["metadata"]["uid"] = "replacement-job-uid"
+        objects[1]["metadata"]["ownerReferences"][0]["uid"] = "replacement-job-uid"
+    if scenario == "ephemeral-hook-running":
+        objects[1]["status"]["ephemeralContainerStatuses"] = [
+            {"name": "debug", "state": {"running": {}}}
+        ]
+    if scenario == "missing-hook":
+        objects.pop(0)
+    if scenario == "terminating-hook":
+        objects[0]["metadata"]["deletionTimestamp"] = "2026-01-01T00:00:00Z"
+    if scenario == "wrong-pod-owner":
+        objects[1]["metadata"]["ownerReferences"][0]["uid"] = "foreign-uid"
+    if scenario == "orphan-hook-pod":
+        orphan = copy.deepcopy(objects[1])
+        orphan["metadata"]["ownerReferences"] = []
+        objects.append(orphan)
+    print(json.dumps({"items": objects}))
+    sys.exit(0)
+
 if program == "helm":
     if args[0] in ("status", "list"):
         installed = (
@@ -209,7 +392,12 @@ if program == "helm":
             )
         else:
             if scenario.startswith("source-status-"):
-                status = {"name": "acme-bot", "namespace": "upgrade-test", "version": 1, "info": {"status": "deployed"}}
+                status = {
+                    "name": "acme-bot",
+                    "namespace": "upgrade-test",
+                    "version": 1,
+                    "info": {"status": "deployed"},
+                }
                 if scenario == "source-status-wrong-name":
                     status["name"] = "acme-other"
                 elif scenario == "source-status-wrong-namespace":
@@ -227,7 +415,9 @@ if program == "helm":
                     {
                         "name": "acme-bot",
                         "namespace": "upgrade-test",
-                        "version": 2 if (root / "installed-version").exists() else 1,
+                        "version": 3
+                        if (root / "rollback-complete").exists()
+                        else (2 if (root / "installed-version").exists() else 1),
                         "info": {"status": "failed" if scenario == "helm-failed" else "deployed"},
                         "hooks": []
                         if scenario == "missing-hooks"
@@ -266,9 +456,28 @@ if program == "helm":
         if scenario == "source-metadata-malformed":
             print("synthetic-source-metadata-secret-sentinel")
             sys.exit(0)
-        installed = (root / "installed-version").read_text() if (root / "installed-version").exists() else "0.8.5"
-        metadata = {"name": "acme-bot", "namespace": "upgrade-test", "revision": int(args[args.index("--revision") + 1]), "chart": "curie", "version": installed, "appVersion": installed, "status": "deployed"}
-        changes = {"source-metadata-wrong-name": ("name", "acme-other"), "source-metadata-wrong-namespace": ("namespace", "other-test"), "source-metadata-wrong-revision": ("revision", 99), "source-metadata-wrong-chart": ("chart", "other-chart"), "source-metadata-wrong-version": ("version", "0.7.0"), "source-metadata-failed": ("status", "failed")}
+        installed = (
+            (root / "installed-version").read_text()
+            if (root / "installed-version").exists()
+            else "0.8.5"
+        )
+        metadata = {
+            "name": "acme-bot",
+            "namespace": "upgrade-test",
+            "revision": int(args[args.index("--revision") + 1]),
+            "chart": "curie",
+            "version": installed,
+            "appVersion": installed,
+            "status": "pending-upgrade" if pending else "deployed",
+        }
+        changes = {
+            "source-metadata-wrong-name": ("name", "acme-other"),
+            "source-metadata-wrong-namespace": ("namespace", "other-test"),
+            "source-metadata-wrong-revision": ("revision", 99),
+            "source-metadata-wrong-chart": ("chart", "other-chart"),
+            "source-metadata-wrong-version": ("version", "0.7.0"),
+            "source-metadata-failed": ("status", "failed"),
+        }
         if scenario in changes:
             key, value = changes[scenario]
             metadata[key] = value
@@ -281,6 +490,16 @@ if program == "helm":
     elif args[0] == "template":
         rendered_values = json.loads(pathlib.Path(args[args.index("-f") + 1]).read_text())
         rendered_image = api_image(rendered_values)
+        if "templates/worker-upgrade-drain.yaml" in args or "templates/schema-migrate.yaml" in args:
+            print(
+                "\n---\n".join(
+                    json.dumps(hook)
+                    for hook in recovery_hooks(rendered_values)
+                    if ("schema-migrate" in hook["metadata"]["name"])
+                    == ("templates/schema-migrate.yaml" in args)
+                )
+            )
+            sys.exit(0)
         if "templates/api.yaml" in args:
             # The actual api.yaml emits a Service followed by the Deployment.
             print(json.dumps({"apiVersion": "v1", "kind": "Service"}))
@@ -337,6 +556,8 @@ if program == "helm":
     elif args[:2] == ["get", "values"]:
         print((root / "values.json").read_text())
     elif args[:2] == ["get", "manifest"]:
+        if scenario == "changed-pending-manifest":
+            workload["spec"]["replicas"] = 2
         print(json.dumps(workload))
         if scenario.startswith("recovery-"):
             if scenario == "recovery-foreign-namespace":
@@ -390,6 +611,14 @@ if program == "helm":
             (root / "values.json").write_text(values)
         (root / "installed-version").write_text("0.9.0")
         (root / "api-unavailable").unlink(missing_ok=True)
+        if scenario in ("late-pending", "zero-exit-pending"):
+            (root / "operation-label").write_text(
+                args[args.index("--labels") + 1].split("=", 1)[1]
+                if "--labels" in args
+                else "missing"
+            )
+            (root / "late-pending").write_text("pending")
+            sys.exit(0 if scenario == "zero-exit-pending" else 1)
         if scenario == "helm-success-reply-lost":
             sys.exit(1)
     else:
@@ -408,7 +637,12 @@ elif program == "kubectl":
                 print(
                     json.dumps(
                         {
-                            "metadata": {"resourceVersion": version},
+                            "metadata": {
+                                "resourceVersion": version,
+                                "uid": "wrong-checkpoint"
+                                if scenario == "wrong-checkpoint-uid"
+                                else "checkpoint-uid",
+                            },
                             "data": {"record": record.read_text()},
                         }
                     )
@@ -441,7 +675,7 @@ elif program == "kubectl":
             -1
         ] == scenario.removeprefix("interrupt-after-"):
             sys.exit(1)
-        print(json.dumps({"metadata": {"resourceVersion": str(version)}}))
+        print(json.dumps({"metadata": {"resourceVersion": str(version), "uid": "checkpoint-uid"}}))
     elif args[:2] == ["get", "deploy,sts,ds"] or (args[0] == "get" and "-f" in args):
         workload["status"] = {
             "readyReplicas": 1,
@@ -587,7 +821,11 @@ elif program == "kubectl":
                         if scenario == "schema-null"
                         else "unknown"
                         if scenario == "schema-unknown"
-                        else ("0040" if (root / "installed-version").exists() else "0039"),
+                        else (
+                            "0039"
+                            if scenario == "schema-not-target"
+                            else ("0040" if (root / "installed-version").exists() else "0039")
+                        ),
                         "source_head": "0039",
                         "database_endpoint_fingerprint": hashlib.sha256(
                             json.dumps(
