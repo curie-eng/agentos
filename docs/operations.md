@@ -208,6 +208,11 @@ cluster facts.
 curie cluster status
 ```
 
+A release that has not converged returns exit code 1 with its status report and
+rollout reasons. `--json` retains the same report object with `healthy: false`.
+The check compares the installed Helm target with live workload generations,
+replica counts and serving pod images; an `Available` condition alone is insufficient.
+
 Reports whether the release is healthy, which pods are ready, and the URLs
 to reach it -- including the web console, where you can see your agents,
 their deployed versions, and their run history. That console URL includes a
