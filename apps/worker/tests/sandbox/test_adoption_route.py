@@ -274,3 +274,209 @@ def test_resume_of_a_pending_route_cold_creates_with_a_fresh_per_claim_token(
     env = fake_k8s.claims[resumed.claim_name].env
     assert env[SESSION_ENV] == _SESSION and env[HISTORY_ENV] == _HISTORY
     assert env[RUNNER_TOKEN_ENV] == resumed.token
+
+
+# --- the applied transition is decided INSIDE Valkey (ADR-0122 d3 Lua predicate) --
+
+
+def test_mark_applied_loses_to_a_concurrent_suspend_of_the_same_claim(
+    fake_k8s: FakeSandboxClient, affinity: AffinityStore, config: SubstrateConfig
+) -> None:
+    """The window the claim + generation CAS could not close.
+
+    A suspend flips the route's state without changing claim or generation.
+    The caller of ``mark_adoption_applied`` holds a handle read BEFORE that
+    flip; the predicate must refuse it, and it must do so in the store, not in
+    a Python check that a concurrent writer can interleave with.
+    """
+
+    substrate = SandboxSubstrate(fake_k8s, affinity, config)
+    pending = substrate.claim("T-lua-susp", session_id=_SESSION, conversation_token=_CONV)
+    # The competing transition lands between the caller's read and its CAS.
+    affinity.mark_suspended("T-lua-susp", _HISTORY, config.suspended_route_ttl_seconds)
+    assert (
+        affinity.mark_adoption_applied(
+            "T-lua-susp",
+            expected_claim=pending.claim_name,
+            expected_generation=pending.generation,
+            expected_token=_CONV,
+            record=RouteRecord(handle=replace(pending, adoption_state=AdoptionState.APPLIED)),
+            ttl_seconds=config.route_ttl_seconds,
+        )
+        == 0
+    )
+    stored = affinity.get("T-lua-susp")
+    assert stored is not None
+    assert stored.state is RouteState.SUSPENDED
+    assert stored.handle.adoption_state is AdoptionState.PENDING
+
+
+def test_mark_applied_predicate_answers_write_idempotent_or_lost(
+    fake_k8s: FakeSandboxClient, affinity: AffinityStore, config: SubstrateConfig
+) -> None:
+    substrate = SandboxSubstrate(fake_k8s, affinity, config)
+    pending = substrate.claim("T-lua", session_id=_SESSION, conversation_token=_CONV)
+    applied = RouteRecord(handle=replace(pending, adoption_state=AdoptionState.APPLIED))
+
+    def cas(**overrides: object) -> int:
+        args: dict[str, object] = {
+            "expected_claim": pending.claim_name,
+            "expected_generation": pending.generation,
+            "expected_token": _CONV,
+            "record": applied,
+            "ttl_seconds": config.route_ttl_seconds,
+        }
+        args.update(overrides)
+        return affinity.mark_adoption_applied("T-lua", **args)  # type: ignore[arg-type]
+
+    # Every wrong shape is 0 and writes nothing.
+    assert cas(expected_token=_CONV_B) == 0
+    assert cas(expected_generation=pending.generation + 1) == 0
+    assert cas(expected_claim="claim-stale") == 0
+    assert (
+        affinity.mark_adoption_applied(
+            "T-missing",
+            expected_claim=pending.claim_name,
+            expected_generation=pending.generation,
+            expected_token=_CONV,
+            record=applied,
+            ttl_seconds=config.route_ttl_seconds,
+        )
+        == 0
+    )
+    stored = affinity.get("T-lua")
+    assert stored is not None and stored.handle.adoption_state is AdoptionState.PENDING
+    # The one matching write is 1; a repeat is 2 (already applied, no write).
+    assert cas() == 1
+    assert cas() == 2
+    stored = affinity.get("T-lua")
+    assert stored is not None and stored.handle == applied.handle
+    # Already applied for ANOTHER credential is still lost, never idempotent.
+    assert cas(expected_token=_CONV_B) == 0
+    # A cold (never pending) route can never be marked applied.
+    cold = substrate.claim("T-lua-cold", env={SESSION_ENV: _SESSION, RUNNER_TOKEN_ENV: "tok"})
+    assert (
+        affinity.mark_adoption_applied(
+            "T-lua-cold",
+            expected_claim=cold.claim_name,
+            expected_generation=cold.generation,
+            expected_token="tok",
+            record=RouteRecord(handle=replace(cold, adoption_state=AdoptionState.APPLIED)),
+            ttl_seconds=config.route_ttl_seconds,
+        )
+        == 0
+    )
+
+
+def test_racing_appliers_produce_exactly_one_write(
+    fake_k8s: FakeSandboxClient, affinity: AffinityStore, config: SubstrateConfig
+) -> None:
+    """Two replicas settling the same lost-response adoption: one writes, one is idempotent."""
+
+    import threading
+
+    substrate = SandboxSubstrate(fake_k8s, affinity, config)
+    pending = substrate.claim("T-lua-race", session_id=_SESSION, conversation_token=_CONV)
+    results: list[SandboxHandle | None] = []
+    barrier = threading.Barrier(2)
+
+    def settle() -> None:
+        barrier.wait()
+        results.append(substrate.mark_adoption_applied("T-lua-race", expected=pending))
+
+    workers = [threading.Thread(target=settle) for _ in range(2)]
+    for w in workers:
+        w.start()
+    for w in workers:
+        w.join()
+    assert len(results) == 2
+    assert all(r is not None and r.adoption_state is AdoptionState.APPLIED for r in results)
+    assert results[0] == results[1]
+    stored = affinity.get("T-lua-race")
+    assert stored is not None and stored.handle.adoption_state is AdoptionState.APPLIED
+
+
+# --- a fenced release never deletes a replacement owner's claim -------------------
+
+
+def test_release_claim_is_fenced_on_claim_and_generation(
+    fake_k8s: FakeSandboxClient, affinity: AffinityStore, config: SubstrateConfig
+) -> None:
+    substrate = SandboxSubstrate(fake_k8s, affinity, config)
+    pending = substrate.claim("T-rel", session_id=_SESSION, conversation_token=_CONV)
+    # A replacement owner re-claimed the thread under a new claim name.
+    substrate.release("T-rel")
+    fresh = substrate.claim("T-rel", session_id=_SESSION, conversation_token=_CONV_B)
+    assert fresh.claim_name != pending.claim_name
+    # The stale holder's fenced release is a no-op for the replacement...
+    assert substrate.release_claim("T-rel", expected=pending) is False
+    stored = affinity.get("T-rel")
+    assert stored is not None and stored.handle == fresh
+    assert fresh.claim_name in fake_k8s.claims
+    # ...a wrong generation is refused too...
+    assert (
+        substrate.release_claim("T-rel", expected=replace(fresh, generation=fresh.generation + 1))
+        is False
+    )
+    # ...and the matching holder releases exactly its own claim.
+    assert substrate.release_claim("T-rel", expected=fresh) is True
+    assert affinity.get("T-rel") is None
+    assert fresh.claim_name not in fake_k8s.claims
+    assert substrate.release_claim("T-rel", expected=fresh) is False
+
+
+# --- the adopting-event marker rides the route and clears under a fence -----------
+
+
+def test_adopting_event_marker_is_written_at_pending_and_cleared_under_a_fence(
+    fake_k8s: FakeSandboxClient, affinity: AffinityStore, config: SubstrateConfig
+) -> None:
+    substrate = SandboxSubstrate(fake_k8s, affinity, config)
+    pending = substrate.claim(
+        "T-mark", session_id=_SESSION, conversation_token=_CONV, adopting_event_id="evt-1"
+    )
+    assert pending.adopting_event_id == "evt-1"
+    stored = affinity.get("T-mark")
+    assert stored is not None and stored.handle.adopting_event_id == "evt-1"
+    # The marker survives the applied transition (same record, same fence).
+    applied = substrate.mark_adoption_applied("T-mark", expected=pending)
+    assert applied is not None and applied.adopting_event_id == "evt-1"
+    # A stale handle (wrong marker / generation / suspended) cannot clear it...
+    assert (
+        substrate.clear_adopting_event(
+            "T-mark", expected=replace(applied, adopting_event_id="evt-9")
+        )
+        is False
+    )
+    assert (
+        substrate.clear_adopting_event(
+            "T-mark", expected=replace(applied, generation=applied.generation + 1)
+        )
+        is False
+    )
+    assert (
+        substrate.clear_adopting_event("T-mark", expected=replace(applied, adopting_event_id=None))
+        is False
+    )
+    affinity.mark_suspended("T-mark", _HISTORY, config.suspended_route_ttl_seconds)
+    assert substrate.clear_adopting_event("T-mark", expected=applied) is False
+    suspended = affinity.get("T-mark")
+    assert suspended is not None and suspended.state is RouteState.SUSPENDED
+    assert suspended.handle.adopting_event_id == "evt-1"
+    # ...the live holder clears it exactly once.
+    affinity.replace(
+        "T-mark", RouteRecord(handle=applied, state=RouteState.LIVE), config.route_ttl_seconds
+    )
+    # Even from the PENDING-shaped handle the kernel routed with: the written
+    # record is the APPLIED form.
+    assert substrate.clear_adopting_event("T-mark", expected=pending) is True
+    cleared = affinity.get("T-mark")
+    assert cleared is not None and cleared.handle.adopting_event_id is None
+    assert cleared.handle.adoption_state is AdoptionState.APPLIED
+    assert substrate.clear_adopting_event("T-mark", expected=applied) is False
+    # A cold route never carries the key on the wire, and a marker without a
+    # conversation token is refused.
+    cold = substrate.claim("T-mark-cold", env={SESSION_ENV: _SESSION, RUNNER_TOKEN_ENV: "tok"})
+    assert "adopting_event_id" not in json.loads(RouteRecord(handle=cold).to_json())
+    with pytest.raises(ValueError):
+        substrate.claim("T-mark-bad", session_id=_SESSION, adopting_event_id="evt-2")

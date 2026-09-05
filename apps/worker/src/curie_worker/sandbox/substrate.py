@@ -142,6 +142,7 @@ class SandboxSubstrate:
         session_id: str | None = None,
         history_ref: str | None = None,
         conversation_token: str | None = None,
+        adopting_event_id: str | None = None,
     ) -> SandboxHandle:
         """Return the thread's live sandbox, claiming a warm one if needed.
 
@@ -196,6 +197,7 @@ class SandboxSubstrate:
                             publication_visible_outcome_revision
                         ),
                         conversation_token=conversation_token,
+                        adopting_event_id=adopting_event_id,
                     )
                     outcome = "claimed"
             except Exception as exc:
@@ -345,48 +347,46 @@ class SandboxSubstrate:
         fence was lost, in which case the caller holds a stale handle and must
         re-resolve the route.
 
-        What is fenced, precisely. The write goes through the existing
-        ``replace_if_generation`` CAS, which atomically requires the route to
-        still name ``expected``'s claim AND generation: every writer that
-        replaces the claim (resume, handoff, release + re-claim) therefore
-        loses to or defeats this call. The remaining conditions (route LIVE,
-        same credential, state PENDING) are checked here between the read and
-        the CAS, so a same-claim, same-generation state flip inside that
-        window (``mark_suspended``) is NOT excluded by the store itself, and
-        no lock closes it today: the kernel's only ``suspend`` call runs after
-        its per-thread lock is released. This method therefore has NO
-        production caller in this slice. Before the kernel-wiring slice wires
-        one, ``AffinityStore`` must gain a CAS whose Lua predicate also
-        requires ``state == live`` and ``adoption_state == pending`` (or this
-        method must switch to it); a claim + generation fence alone does not
-        discharge that requirement.
+        The whole predicate is evaluated atomically inside Valkey
+        (``AffinityStore.mark_adoption_applied``): the route must still be
+        LIVE, name ``expected``'s claim AND generation, carry the same
+        credential, and be PENDING. A same-claim, same-generation state flip
+        between a read here and the write (``mark_suspended`` from the kernel's
+        suspend, which runs after its per-thread lock is released) therefore
+        loses or wins inside the store, never in this process; there is no
+        read-modify-write window left to close with a lock.
         """
 
-        record = self._affinity.get(thread_key)
-        if record is None or record.state is not RouteState.LIVE:
-            return None
-        current = record.handle
-        if (
-            current.claim_name != expected.claim_name
-            or current.generation != expected.generation
-            or not hmac.compare_digest(
-                current.token.encode("utf-8"), expected.token.encode("utf-8")
-            )
-        ):
-            return None
-        if current.adoption_state is AdoptionState.APPLIED:
-            return current
-        if current.adoption_state is not AdoptionState.PENDING:
-            return None
-        applied = replace(current, adoption_state=AdoptionState.APPLIED)
-        if not self._affinity.replace_if_generation(
+        applied = replace(expected, adoption_state=AdoptionState.APPLIED)
+        outcome = self._affinity.mark_adoption_applied(
             thread_key,
             expected_claim=expected.claim_name,
             expected_generation=expected.generation,
+            expected_token=expected.token,
             record=RouteRecord(handle=applied, state=RouteState.LIVE),
             ttl_seconds=self._config.route_ttl_seconds,
-        ):
+        )
+        if outcome == 0:
             return None
+        if outcome == 2:
+            # Already applied for this credential: hand back the stored handle
+            # so a caller that lost its first response sees the same fields the
+            # winner recorded (the route may carry a later touch, never a
+            # different identity, under the predicate above).
+            record = self._affinity.get(thread_key)
+            if record is None or record.state is not RouteState.LIVE:
+                return None
+            current = record.handle
+            if (
+                current.claim_name != expected.claim_name
+                or current.generation != expected.generation
+                or current.adoption_state is not AdoptionState.APPLIED
+                or not hmac.compare_digest(
+                    current.token.encode("utf-8"), expected.token.encode("utf-8")
+                )
+            ):
+                return None
+            return current
         logger.info(
             "adoption applied recorded for %s on claim %s generation %d",
             thread_key,
@@ -394,6 +394,64 @@ class SandboxSubstrate:
             applied.generation,
         )
         return applied
+
+    def clear_adopting_event(self, thread_key: str, *, expected: SandboxHandle) -> bool:
+        """Drop the adopting-event marker once that turn's fate is known.
+
+        Fenced inside the store on LIVE + APPLIED + claim + generation + the
+        marker itself. The caller's ``expected`` is usually the handle it
+        routed with, which still reads PENDING; the written record is the
+        APPLIED form, the only state the predicate admits. False when the
+        fence was lost or ``expected`` carries no marker; nothing is written
+        in either case.
+        """
+
+        if not expected.adopting_event_id:
+            return False
+        return self._affinity.clear_adopting_event(
+            thread_key,
+            expected_claim=expected.claim_name,
+            expected_generation=expected.generation,
+            expected_event_id=expected.adopting_event_id,
+            record=RouteRecord(
+                handle=replace(
+                    expected, adopting_event_id=None, adoption_state=AdoptionState.APPLIED
+                ),
+                state=RouteState.LIVE,
+            ),
+            ttl_seconds=self._config.route_ttl_seconds,
+        )
+
+    def release_claim(self, thread_key: str, *, expected: SandboxHandle) -> bool:
+        """Release the thread's sandbox only while the route still names ``expected``.
+
+        The fenced form of ``release`` for callers that decided to end a
+        session on the strength of a handle they hold (an adopting turn that
+        failed its authority probe, or settled without an ack). ``release``
+        deletes whatever the route names at call time, which after the route
+        lock is gone may be a replacement owner's claim; this one compares the
+        claim name AND generation first and does nothing on a mismatch.
+        Returns whether the sandbox was released.
+        """
+
+        record = self._affinity.get(thread_key)
+        if record is None:
+            return False
+        current = record.handle
+        if (
+            current.claim_name != expected.claim_name
+            or current.generation != expected.generation
+        ):
+            return False
+        self._k8s.delete_claim(expected.claim_name)
+        self._affinity.delete_if_claim(thread_key, expected.claim_name)
+        logger.info(
+            "released %s on claim %s generation %d (fenced)",
+            thread_key,
+            expected.claim_name,
+            expected.generation,
+        )
+        return True
 
     # -- suspend / resume -------------------------------------------------------
 
@@ -712,9 +770,12 @@ class SandboxSubstrate:
         generation: int = 0,
         publish: bool = True,
         conversation_token: str | None = None,
+        adopting_event_id: str | None = None,
     ) -> SandboxHandle:
         config = self._config
         boot_env = env or {}
+        if adopting_event_id and not conversation_token:
+            raise ValueError("an adopting event id belongs to a warm-bind claim only")
         if conversation_token:
             if any(key in boot_env for key in (SESSION_ENV, HISTORY_ENV, RUNNER_TOKEN_ENV)):
                 raise ValueError(
@@ -767,6 +828,7 @@ class SandboxSubstrate:
             publication_visible_outcome_revision=publication_visible_outcome_revision,
             generation=generation,
             adoption_state=adoption_state,
+            adopting_event_id=adopting_event_id if conversation_token else None,
         )
         if not publish:
             return handle

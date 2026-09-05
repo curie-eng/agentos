@@ -81,6 +81,15 @@ class RunnerError(Exception):
     """The runner returned an unexpected HTTP status or an unreadable stream."""
 
 
+class AdoptionAttestationMismatch(RunnerError):
+    """A readable ``/v1/status`` attested no conversation, or another one.
+
+    Distinct from a server fault (5xx) or a transport error, which say nothing
+    about the pod's identity: this shape is definitive, the answering runner
+    is not bound to the caller's conversation.
+    """
+
+
 class AdoptionRefused(RunnerError):
     """The runner refused an adopting ``/v1/event`` (ADR-0122).
 
@@ -602,9 +611,11 @@ class RunnerClient:
                 data = await resp.json()
                 attested = data.get("session_id") if isinstance(data, dict) else None
                 if not isinstance(attested, str) or not attested:
-                    raise RunnerError("/v1/status attested no conversation; not adopted")
+                    raise AdoptionAttestationMismatch(
+                        "/v1/status attested no conversation; not adopted"
+                    )
                 if attested != session_id:
-                    raise RunnerError(
+                    raise AdoptionAttestationMismatch(
                         "/v1/status attested a different conversation; refusing this route"
                     )
                 return True, "success"

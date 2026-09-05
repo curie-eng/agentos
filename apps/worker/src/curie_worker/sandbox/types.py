@@ -165,6 +165,12 @@ class SandboxHandle:
     # ADR-0122: whether ``token`` has been installed on the runner. Defaulted so
     # every route written before the field existed rehydrates as the cold path.
     adoption_state: AdoptionState = AdoptionState.NONE
+    # ADR-0122 / root correction 3: the id of the event whose adopting turn
+    # this route's pod was (or is being) bound with, recorded at the PENDING
+    # write and cleared only once that turn's terminal answer is known. A
+    # redelivery of that same event that finds the route APPLIED with its own
+    # id here must not open a plain turn: the first turn may already have run.
+    adopting_event_id: str | None = None
 
     @property
     def sandbox_id(self) -> str:
@@ -195,6 +201,8 @@ class RouteRecord:
         # only once every replica understands it (rollout order: worker last).
         if payload["adoption_state"] == AdoptionState.NONE.value:
             del payload["adoption_state"]
+        if payload["adopting_event_id"] is None:
+            del payload["adopting_event_id"]
         return json.dumps(payload, sort_keys=True)
 
     @classmethod
