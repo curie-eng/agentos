@@ -187,6 +187,14 @@ The nodePort is pinned in values (langfuse.web.service.nodePort) so it survives 
 
 App services send OTLP traces to the collector, NOT directly to Langfuse:
   {{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.service.grpcPort }} (gRPC) / :{{ .Values.otelCollector.service.httpPort }} (HTTP)
+{{- $legacyPostgresReadiness := get (.Values.langfuse.web | default dict) "postgresReadiness" }}
+{{- if and $legacyPostgresReadiness (kindIs "map" $legacyPostgresReadiness) (gt (len $legacyPostgresReadiness) 0) }}
+
+!! langfuse.web.postgresReadiness is DEPRECATED. The value you supplied is
+   still being honoured, and now applies to BOTH the Langfuse web and worker
+   Deployments (#2330), not web only. Move it to langfuse.postgresReadiness;
+   the alias is removed in a future minor.
+{{- end }}
 {{- end }}
 
 {{/*
