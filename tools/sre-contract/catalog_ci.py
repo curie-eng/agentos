@@ -7,6 +7,7 @@ Containers and the temporary directory belong only to this invocation.
 
 from __future__ import annotations
 
+import http.client
 import json
 import subprocess
 import sys
@@ -14,17 +15,87 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 BUNDLE = ROOT / "examples/sre-bot"
 
+# MCP 2.1.1 streamable HTTP initialize. Headers from
+# mcp/client/streamable_http.py:_prepare_headers. Transport:
+# https://modelcontextprotocol.io/specification/2025-06-18/basic/transports
+INITIALIZE = json.dumps(
+    {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "sre-catalog-ci", "version": "0"},
+        },
+    }
+).encode()
+HANDSHAKE_HEADERS = {
+    "Accept": "application/json, text/event-stream",
+    "Content-Type": "application/json",
+}
+
+
+class StartupNonretryable(Exception):
+    """The listener completed a non-HTTP or wrong-protocol response."""
+
 
 def docker(*args):
     return subprocess.run(
         ["docker", *args], check=True, capture_output=True, text=True, timeout=600
     ).stdout.strip()
+
+
+def _application_handshake(host, port, path):
+    conn = http.client.HTTPConnection(host, port, timeout=1)
+    try:
+        conn.request("POST", path, INITIALIZE, HANDSHAKE_HEADERS)
+        response = conn.getresponse()
+        return response.status
+    except http.client.RemoteDisconnected:
+        # Subclasses BadStatusLine; CPython stores line as repr("").
+        raise OSError("unreadiness") from None
+    except http.client.BadStatusLine as exc:
+        line = exc.line if isinstance(getattr(exc, "line", None), str) else ""
+        if line.strip().strip("'\""):
+            raise StartupNonretryable("wrong protocol") from None
+        raise OSError("unreadiness") from None
+    except (http.client.IncompleteRead, http.client.UnknownProtocol):
+        raise OSError("unreadiness") from None
+    finally:
+        conn.close()
+
+
+def wait_until_application_ready(url, *, timeout=60):
+    """Wait until the MCP process answers HTTP. Do not retry checker assertions.
+
+    TCP connect is not ready: a published Docker port can accept before the
+    application serves. Retry connection-level unreadiness only. Completed HTTP,
+    including 401 and 5xx, means the process is serving so the checker runs
+    once. Non-HTTP bytes are nonretryable.
+    """
+    target = urlsplit(url)
+    host, port, path = target.hostname, target.port, target.path or "/"
+    if not host or port is None:
+        raise StartupNonretryable("invalid endpoint")
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            _application_handshake(host, port, path)
+            return
+        except StartupNonretryable:
+            raise
+        except (OSError, http.client.HTTPException, TimeoutError):
+            if time.monotonic() >= deadline:
+                raise TimeoutError("connector startup") from None
+            time.sleep(0.2)
 
 
 def main():
@@ -96,21 +167,8 @@ users:
                 endpoints[name] = f"http://{address}/mcp"
             path = temp / "endpoints.json"
             path.write_text(json.dumps(endpoints))
-            # Bounded startup readiness by TCP only, not retries of failed assertions.
-            import socket
-            from urllib.parse import urlsplit
-
             for url in endpoints.values():
-                target = urlsplit(url)
-                deadline = time.monotonic() + 60
-                while True:
-                    try:
-                        with socket.create_connection((target.hostname, target.port), timeout=1):
-                            break
-                    except OSError:
-                        if time.monotonic() >= deadline:
-                            raise TimeoutError("connector startup") from None
-                        time.sleep(0.2)
+                wait_until_application_ready(url, timeout=60)
             return subprocess.run(
                 [
                     sys.executable,
