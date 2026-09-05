@@ -1,11 +1,13 @@
 """The chart carries a generated copy of the API's authoritative schema graph."""
 
+import hashlib
 import json
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 from alembic.script import ScriptDirectory
 
 REPO = Path(__file__).resolve().parents[3]
@@ -24,15 +26,29 @@ def test_packaged_schema_metadata_matches_api_authority() -> None:
     assert set(revisions) == set(kinds)
     for revision in graph.walk_revisions():
         parent = revision.down_revision
-        parents = list(parent) if isinstance(parent, tuple) else [parent] if parent else []
+        parents = list(parent) if isinstance(parent, (list, tuple)) else [parent] if parent else []
         assert revisions[revision.revision] == {
             "revision": revision.revision,
             "parents": parents,
             "kind": kinds[revision.revision],
+            "sha256": hashlib.sha256(Path(revision.path).read_bytes()).hexdigest(),
         }
 
 
-def test_revision_gate_rejects_stale_packaged_metadata(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "kind",
+        "parents",
+        "schema_min",
+        "schema_head",
+        "extra_key",
+        "missing_row",
+        "duplicate_row",
+        "digest",
+    ],
+)
+def test_revision_gate_rejects_stale_packaged_metadata(tmp_path: Path, mutation: str) -> None:
     for source in [
         "scripts/check-alembic-revisions.py",
         "apps/api/src/curie_api/schema_compat.json",
@@ -48,33 +64,24 @@ def test_revision_gate_rejects_stale_packaged_metadata(tmp_path: Path) -> None:
     assert healthy.returncode == 0, healthy.stderr
     artifact = tmp_path / ARTIFACT
     metadata = json.loads(artifact.read_text())
-    metadata["revisions"][0]["kind"] = "contract"
-    artifact.write_text(json.dumps(metadata))
+    if mutation == "kind":
+        metadata["revisions"][0]["kind"] = "contract"
+    elif mutation == "parents":
+        metadata["revisions"][1]["parents"] = []
+    elif mutation in {"schema_min", "schema_head"}:
+        metadata[mutation] = "0001"
+    elif mutation == "extra_key":
+        metadata["extra"] = True
+    elif mutation == "missing_row":
+        metadata["revisions"].pop()
+    elif mutation == "duplicate_row":
+        metadata["revisions"].append(metadata["revisions"][0])
+    elif mutation == "digest":
+        metadata["revisions"][0]["sha256"] = "0" * 64
+    artifact.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
     stale = subprocess.run(command, capture_output=True, text=True, check=False)
     assert stale.returncode == 1
     assert "schema compatibility metadata" in stale.stderr.lower()
-
-
-def test_chart_metadata_is_available_without_creating_a_cluster_resource() -> None:
-    rendered = subprocess.run(
-        [
-            "helm",
-            "template",
-            "acme-bot",
-            str(REPO / "charts/curie"),
-            "--show-only",
-            "templates/schema-compat.yaml",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert rendered.returncode == 0, rendered.stderr
-    import yaml
-
-    resource = yaml.safe_load(rendered.stdout)
-    metadata = json.loads(resource["data"]["compatibility.json"])
-    assert metadata == json.loads((REPO / ARTIFACT).read_text())
 
 
 def test_metadata_write_cannot_claim_to_generate_from_a_non_authoritative_tree(

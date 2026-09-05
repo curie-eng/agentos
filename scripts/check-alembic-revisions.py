@@ -1,5 +1,6 @@
 import argparse
 import ast
+import hashlib
 import json
 import re
 import sys
@@ -259,12 +260,17 @@ def main() -> int:
             revisions = []
             for revision in ScriptDirectory(str(script_location)).walk_revisions():
                 parent = revision.down_revision
-                parents = list(parent) if isinstance(parent, tuple) else [parent] if parent else []
+                parents = (
+                    list(parent)
+                    if isinstance(parent, (list, tuple))
+                    else [parent] if parent else []
+                )
                 revisions.append(
                     {
                         "revision": revision.revision,
                         "parents": parents,
                         "kind": kinds_payload[revision.revision],
+                        "sha256": hashlib.sha256(Path(revision.path).read_bytes()).hexdigest(),
                     }
                 )
             metadata = {
