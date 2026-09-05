@@ -84,6 +84,7 @@ from .approvals import (
     PublicationCreateRequest,
     PublicationCreator,
     PublicationLineage,
+    ReviewAuthorityUnavailable,
     VerifiedReviewFeedback,
 )
 from .behaviorpacks import (
@@ -2271,9 +2272,11 @@ class Kernel:
                             if remaining_s is not None:
                                 remaining_s = max(0.0, remaining_s - (time.monotonic() - started))
                     except (ApprovalBackendError, TimeoutError):
-                        raise WorkspacePreparationError(
-                            "github-review-verification",
-                            "GitHub feedback verification is temporarily unavailable",
+                        # No model turn has started. Preserve the same delivery
+                        # for bounded reclaim, rather than exhausting the model
+                        # attempt budget and ACKing feedback that never ran.
+                        raise ReviewAuthorityUnavailable(
+                            "GitHub feedback verification is temporarily unavailable"
                         ) from None
                     if verified.agent_id != agent_id or verified.sender != qevent.author:
                         raise WorkspaceSelectionRefused(
@@ -2823,8 +2826,11 @@ class Kernel:
                     review_turn, workspace_deployment_id, verified_review
                 )
             except ApprovalBackendError:
-                raise WorkspacePreparationError(
-                    "github-review-reservation", "GitHub review reservation is unavailable"
+                # The reserve sibling has the same pre-model transport policy.
+                # A transport failure must revalidate the exact origin
+                # on reclaim; the existing SQL reservation CAS remains sole writer.
+                raise ReviewAuthorityUnavailable(
+                    "GitHub review reservation is temporarily unavailable"
                 ) from None
         # The per-request timeout is min(runner_total_timeout_s, remaining
         # delivery budget): the budget can only ever SHORTEN a request, never

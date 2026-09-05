@@ -180,6 +180,14 @@ class ApprovalBackendError(Exception):
     than suspending a session no resolution could ever wake."""
 
 
+class ReviewAuthorityUnavailable(Exception):
+    """Review authority is unavailable before any model turn was accepted.
+
+    Keep the delivery pending for the shared bounded reclaim/dead-letter lane;
+    spending the model attempt budget would settle feedback that never ran.
+    """
+
+
 @dataclass(frozen=True)
 class SettledApproval:
     """A resolved record's outcome, for stamping its card (#1084).
