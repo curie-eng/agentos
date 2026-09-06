@@ -2348,8 +2348,11 @@ alias Curie assigned it, so a pass covers three things at once: the alias
 resolves, the server is serving MCP, and its tool surface is the expected one.
 """
 
+import errno
 import json
 import sys
+import time
+import urllib.error
 import urllib.request
 
 url, expected_csv = sys.argv[1], sys.argv[2]
@@ -2359,7 +2362,7 @@ expected = sorted(name for name in expected_csv.split(",") if name)
 state = {"session": None, "version": "2024-11-05"}
 
 
-def post(body, notification=False):
+def post(body, notification=False, timeout=60):
     headers = {
         "Content-Type": "application/json",
         # Both, because a streamable-HTTP server may answer either shape.
@@ -2371,7 +2374,7 @@ def post(body, notification=False):
     request = urllib.request.Request(
         url, data=json.dumps(body).encode(), headers=headers, method="POST"
     )
-    with urllib.request.urlopen(request, timeout=60) as response:
+    with urllib.request.urlopen(request, timeout=timeout) as response:
         session = response.headers.get("mcp-session-id")
         if session:
             state["session"] = session
@@ -2389,19 +2392,33 @@ def fail(message):
     raise SystemExit(1)
 
 
+# Container running is earlier than MCP serving. Retry only connection-refused
+# startup on initialize; an HTTP/auth/protocol error still fails immediately.
+# The deadline covers every dial and sleep, and tools/list remains exact below.
+ready_deadline = time.monotonic() + 30
 try:
-    handshake = post(
-        {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": state["version"],
-                "capabilities": {},
-                "clientInfo": {"name": "curie-e2e-ladder", "version": "0"},
-            },
-        }
-    )
+    while True:
+        remaining = ready_deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("MCP server did not become reachable within 30s")
+        try:
+            handshake = post(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": state["version"],
+                        "capabilities": {},
+                        "clientInfo": {"name": "curie-e2e-ladder", "version": "0"},
+                    },
+                }, timeout=min(remaining, 10)
+            )
+            break
+        except urllib.error.URLError as exc:
+            if not isinstance(exc.reason, OSError) or exc.reason.errno != errno.ECONNREFUSED:
+                raise
+            time.sleep(min(.25, max(0, ready_deadline - time.monotonic())))
 except Exception as exc:
     fail("the MCP handshake did not complete: %s: %s" % (type(exc).__name__, exc))
 
@@ -3566,6 +3583,13 @@ pin_local_source_images() {
 
 inject_local_runner_failure() {
     LOCAL_OTEL_FAILURE_MODE=1
+    # OpenRouter credentials deliberately select their own provider endpoint
+    # (runner sdk_auth.resolve_sdk_env). A URL override alone therefore still
+    # runs a healthy live turn. Give this failing worker only a placeholder;
+    # retain presence as well as value so cleanup restores the operator input.
+    LOCAL_OTEL_ORIGINAL_CREDENTIALS_SET="${CURIE_CREDENTIALS+x}"
+    LOCAL_OTEL_ORIGINAL_CREDENTIALS="${CURIE_CREDENTIALS-}"
+    export CURIE_CREDENTIALS=not-a-real-token-ladder
     export CURIE_FAKE_MODEL=0
     export CURIE_MODEL_BASE_URL="$LOCAL_OTEL_ENDPOINT"
     export CURIE_MODEL_API_BACKEND=messages
@@ -3575,6 +3599,12 @@ inject_local_runner_failure() {
 }
 
 restore_local_runner_health() {
+    if [[ "${LOCAL_OTEL_ORIGINAL_CREDENTIALS_SET:-}" == x ]]; then
+        export CURIE_CREDENTIALS="$LOCAL_OTEL_ORIGINAL_CREDENTIALS"
+    else
+        unset CURIE_CREDENTIALS
+    fi
+    unset LOCAL_OTEL_ORIGINAL_CREDENTIALS_SET LOCAL_OTEL_ORIGINAL_CREDENTIALS
     if [[ "$LIVE" == "1" ]]; then
         export CURIE_FAKE_MODEL=0
     else

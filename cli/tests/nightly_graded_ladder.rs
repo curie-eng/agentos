@@ -3010,3 +3010,112 @@ fn live_cluster_rung_reports_but_does_not_propagate_evaluator_failure() {
          stdout:\n{stdout}\nstderr:\n{stderr}"
     );
 }
+
+#[test]
+fn runner_failure_control_replaces_and_restores_provider_credential() {
+    for credential in [None, Some(""), Some("sk-or-fixture-only")] {
+        let dir = tempfile::tempdir().unwrap();
+        let capture = dir.path().join("worker-env");
+        let script = format!(
+            "set -eu\n{}\n{}\n\
+             docker() {{ printf '%s' \"${{CURIE_CREDENTIALS-unset}}\" > \"$CAPTURE\"; }}\n\
+             sleep() {{ :; }}\n\
+             LOCAL_OTEL_ENDPOINT=http://127.0.0.1:9\nREPO_ROOT=/fixture\nLIVE=1\n\
+             inject_local_runner_failure\n\
+             python3 -c 'import os; c=open(os.environ[\"CAPTURE\"]).read(); assert c and c != \"unset\" and not c.startswith(\"sk-or-\"), \"failure control still selects the live provider\"'\n\
+             restore_local_runner_health\n\
+             python3 -c 'import os; expected=os.environ[\"EXPECTED\"]; actual=os.environ.get(\"CURIE_CREDENTIALS\",\"unset\"); assert actual == expected, \"original credential presence/value was not restored\"'\n",
+            ladder_function("inject_local_runner_failure"),
+            ladder_function("restore_local_runner_health"),
+        );
+        let mut command = Command::new("bash");
+        command
+            .arg("-c")
+            .arg(script)
+            .env("CAPTURE", &capture)
+            .env("EXPECTED", credential.unwrap_or("unset"))
+            .env_remove("CURIE_CREDENTIALS");
+        if let Some(value) = credential {
+            command.env("CURIE_CREDENTIALS", value);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn connector_probe_waits_for_serving_and_still_rejects_wrong_tools() {
+    let probe = ladder_python_heredoc("write_connector_probe");
+    for wrong_tools in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("probe.py");
+        fs::write(&path, &probe).unwrap();
+        // A real loopback HTTP MCP fixture starts after the probe first dials.
+        // This is an external MCP mock, never a mocked platform datastore.
+        let fixture = r#"
+import http.server,json,socket,sys,threading,time
+with socket.socket() as reserved:
+    reserved.bind(('127.0.0.1',0)); port=reserved.getsockname()[1]
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self,*args): pass
+    def do_POST(self):
+        body=json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        if body['method']=='notifications/initialized':
+            self.send_response(202); self.end_headers(); return
+        result=({'protocolVersion':'2024-11-05','capabilities':{},'serverInfo':{'name':'fixture','version':'1'}}
+                if body['method']=='initialize' else {'tools':[{'name':'wrong' if wrong else 'expected'}]})
+        payload=json.dumps({'jsonrpc':'2.0','id':body['id'],'result':result}).encode()
+        self.send_response(200); self.send_header('Content-Type','application/json')
+        self.send_header('Content-Length',str(len(payload))); self.end_headers(); self.wfile.write(payload)
+def serve():
+    time.sleep(.2)
+    with http.server.HTTPServer(('127.0.0.1',port),Handler) as server: server.serve_forever()
+path=sys.argv[1]; wrong=sys.argv[2]=='1'
+threading.Thread(target=serve,daemon=True).start()
+sys.argv=[path,'http://127.0.0.1:%d/mcp'%port,'expected']
+exec(compile(open(path).read(),path,'exec'))
+"#;
+        let output = Command::new("python3")
+            .arg("-c")
+            .arg(fixture)
+            .arg(path)
+            .arg(if wrong_tools { "1" } else { "0" })
+            .output()
+            .unwrap();
+        if wrong_tools {
+            assert!(!output.status.success());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("tools/list returned"));
+        } else {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("OK expected"));
+        }
+    }
+}
+
+#[test]
+fn connector_probe_stops_when_server_never_becomes_ready() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("probe.py");
+    fs::write(&path, ladder_python_heredoc("write_connector_probe")).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let started = std::time::Instant::now();
+    let output = Command::new("python3")
+        .arg(path)
+        .arg(format!("http://127.0.0.1:{port}/mcp"))
+        .arg("expected")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("within 30s"));
+    assert!(started.elapsed() < std::time::Duration::from_secs(35));
+}
